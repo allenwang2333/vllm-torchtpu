@@ -1102,7 +1102,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
-        state_indices = self._bm_state_ids(state_indices.to(torch.int32))
+        state_indices = self._bm_state_ids(
+            state_indices
+            if state_indices.dtype == torch.int32
+            else state_indices.to(torch.int32)
+        )
         core_attn_out, z = gdn_pooled_pcp_op(
             hidden_states,
             qkvz_weight,
@@ -1192,7 +1196,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 (recurrent_state,) = kv_cache
                 assert attn_metadata.mamba_state_indices is not None
                 state_indices = self._bm_state_ids(
-                    attn_metadata.mamba_state_indices.to(torch.int32)
+                    attn_metadata.mamba_state_indices
+                    if attn_metadata.mamba_state_indices.dtype == torch.int32
+                    else attn_metadata.mamba_state_indices.to(torch.int32)
                 )
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
@@ -1242,7 +1248,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # `block_tables[:, 0]` only when compact sizing was skipped and
                 # mamba shares the attention block pool (uniform layout).
                 if attn_metadata.mamba_state_indices is not None:
-                    state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
+                    state_indices = (
+                        attn_metadata.mamba_state_indices
+                        if attn_metadata.mamba_state_indices.dtype == torch.int32
+                        else attn_metadata.mamba_state_indices.to(torch.int32)
+                    )
                 else:
                     max_reqs = attn_metadata.seq_lens.shape[0]
                     max_blocks_per_req = attn_metadata.block_tables.shape[0] // max_reqs
@@ -1250,7 +1260,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         attn_metadata.block_tables,
                         (max_reqs, max_blocks_per_req),
                     )
-                    state_indices = block_tables_2d[:, 0].to(torch.int32)
+                    state_indices = (
+                        block_tables_2d[:, 0]
+                        if block_tables_2d.dtype == torch.int32
+                        else block_tables_2d[:, 0].to(torch.int32)
+                    )
 
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify windows

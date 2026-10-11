@@ -572,3 +572,71 @@ def test_td8295_random_recovery_avoids_extra_vocab_reductions(
     assert any_calls == 0
     assert torch.equal(out, ref)
     assert out[:, 0].tolist() == [0, 7, 0, 5, 6]
+
+
+def test_td8309_rejection_sampler_gdn_and_kda_int32_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.309: verify int32 cumsum/cast guards in rejection_sampler, gdn, and kda."""
+    from types import SimpleNamespace
+
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op as gdn
+    from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kda
+
+    # 1. _get_segment_info uses native int32 cumsum without torch.cat
+    cat_calls = 0
+    orig_cat = torch.cat
+
+    def _counting_cat(*a: object, **kw: object) -> torch.Tensor:
+        nonlocal cat_calls
+        cat_calls += 1
+        return orig_cat(*a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(torch, "cat", _counting_cat)
+    for dt in (torch.int32, torch.int64):
+        nd = torch.tensor([3, 0, 2, 4], dtype=dt)
+        seg, grp = rs._get_segment_info(nd, 9)
+        assert seg.dtype == torch.int32
+        assert grp.dtype == torch.int32
+        assert grp.tolist() == [0, 1, 2, 0, 1, 0, 1, 2, 3]
+    assert cat_calls == 0
+
+    # 2. kda_attention_op._token_sequence_ids returns int32 with dtype=jnp.int32 cumsum
+    qsl = jnp.array([0, 2, 5], dtype=jnp.int32)
+    seq_idx = kda._token_sequence_ids(qsl, num_tokens=5, num_seqs=2)
+    assert seq_idx.dtype == jnp.int32
+    assert seq_idx.tolist() == [0, 0, 1, 1, 1]
+
+    # 3. gdn_attention_op._forward_fused_pooled_pcp with int32 and int64 state_indices
+    monkeypatch.setattr(gdn, "is_pcp_streaming_attention_metadata", lambda _m: True)
+    for dt in (torch.int32, torch.int64):
+        captured_ids = []
+        dummy_gdn = SimpleNamespace(
+            gdn_pooled_pcp_op=lambda *ops, cap=captured_ids: (
+                cap.append(ops[10]),
+                (torch.zeros(4, 2, 4), torch.zeros(4, 2, 4)),
+            )[1],
+            _require_pcp_projection_parameters=lambda: (
+                torch.zeros(8, 8),
+                torch.ones(8),
+            ),
+            in_proj_ba=lambda h: (torch.zeros(4, 4), None),
+            _bm_state_ids=lambda ids: ids,
+            conv1d=SimpleNamespace(weight=torch.zeros(4, 4), bias=torch.zeros(4)),
+            A_log=torch.zeros(2),
+            dt_bias=torch.zeros(2),
+            _apply_output_projection=lambda out, z, n: out,
+        )
+        meta = SimpleNamespace(
+            mamba_state_indices=torch.tensor([1, 3], dtype=dt),
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        )
+        res = gdn.VllmGatedDeltaNetAttention._forward_fused_pooled_pcp(
+            dummy_gdn, torch.zeros(4, 8), torch.zeros(4, 8), meta
+        )
+        assert res.shape == (4, 2, 4)
+        assert captured_ids[0].dtype == torch.int32

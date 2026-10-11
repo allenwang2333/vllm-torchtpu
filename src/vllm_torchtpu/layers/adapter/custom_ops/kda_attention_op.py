@@ -74,7 +74,7 @@ def _token_sequence_ids(
     """
     starts = query_start_loc[1:num_seqs]
     marks = jnp.zeros((num_tokens,), jnp.int32).at[starts].add(1, mode="drop")
-    return jnp.minimum(jnp.cumsum(marks), num_seqs - 1)
+    return jnp.minimum(jnp.cumsum(marks, dtype=jnp.int32), num_seqs - 1)
 
 
 def kimi_short_conv_scan(
