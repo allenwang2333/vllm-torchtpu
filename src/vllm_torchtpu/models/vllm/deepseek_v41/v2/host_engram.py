@@ -13,6 +13,7 @@ editing the shared runner: ``forward_model`` calls
 ``input_ids_cpu``, ``positions_cpu`` and ``query_start_loc_cpu`` are final.
 """
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import repeat
@@ -34,6 +35,7 @@ except ImportError:
     )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
@@ -110,9 +112,12 @@ def _resolve_async_spec_state(
     runner: Any, pre_async: Any, *, identity_num_reqs: int = 0
 ) -> _AsyncSpecState | None:
     """Resolve async speculative stride, rejection counts, and committed tokens."""
-    spec_config = getattr(runner, "speculative_config", None)
-    num_spec = getattr(spec_config, "num_speculative_tokens", None)
-    req_id_to_index = getattr(pre_async, "req_id_to_index_copy", None)
+    num_spec, req_id_to_index = (
+        getattr(
+            getattr(runner, "speculative_config", None), "num_speculative_tokens", None
+        ),
+        getattr(pre_async, "req_id_to_index_copy", None),
+    )
     if not isinstance(num_spec, int) or num_spec <= 0 or not req_id_to_index:
         return None
     wait_for_copy = getattr(pre_async, "wait_for_copy", None)
@@ -120,8 +125,7 @@ def _resolve_async_spec_state(
     if not isinstance(sampled_cpu, torch.Tensor):
         return None
     sampled = sampled_cpu.numpy()
-    if sampled.ndim == 1:
-        sampled = sampled[:, None]
+    sampled = sampled[:, None] if sampled.ndim == 1 else sampled
     num_rows = int(sampled.shape[0])
     if not (
         0 < identity_num_reqs <= num_rows
@@ -141,13 +145,19 @@ def _resolve_async_spec_state(
         runner._host_engram_spec_ws, runner._host_engram_ref_drafts = ws, {}
     _, lengths, num_draft, rejected = ws
     valid = sampled != -1
-    valid.sum(axis=1, dtype=np.int32, out=lengths)
-    # Compact each row's valid tokens to its front, preserving their order.
-    if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:])):
+    if bool(valid.all()):
+        lengths.fill(valid.shape[1])
         tokens = sampled
     else:
-        order = np.argsort(~valid, axis=1, kind="stable")
-        tokens = np.take_along_axis(sampled, order, axis=1)
+        valid.sum(axis=1, dtype=np.int32, out=lengths)
+        # Compact each row's valid tokens to its front, preserving their order.
+        tokens = (
+            sampled
+            if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:]))
+            else np.take_along_axis(
+                sampled, np.argsort(~valid, axis=1, kind="stable"), axis=1
+            )
+        )
     num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
     if not num_draft_per_req:
         num_draft.fill(0)
@@ -157,7 +167,14 @@ def _resolve_async_spec_state(
         and num_draft_per_req
         == (
             (ref_drafts := runner._host_engram_ref_drafts).get(v0)
-            or ref_drafts.setdefault(v0, dict.fromkeys(range(num_rows), v0))
+            or ref_drafts.setdefault(
+                v0,
+                getattr(
+                    sys.modules.get("vllm_torchtpu.runner.tpu_runner"),
+                    "_cached_uniform_draft_map",
+                    lambda n, k: dict.fromkeys(range(n), k),
+                )(num_rows, v0),
+            )
         )
     ):
         num_draft.fill(v0)
@@ -289,15 +306,21 @@ def _resolve_decode_lookback_cpu(
     np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
-    np.greater_equal(pos, 0, out=valid)
-    np.less(pos, max_cols, out=tmp_b)
-    np.logical_and(valid, tmp_b, out=valid)
     rows = local + start_index if start_index else local
-    np.multiply(pos, valid, out=clipped)
     out_slice = lookback_np[:num_reqs]
-    out_slice[:] = token_ids_cpu[rows, clipped]
-    np.logical_not(valid, out=tmp_b)
-    np.copyto(out_slice, -1, where=tmp_b)
+    if (
+        int(starts_1d.min()) >= int(offsets.shape[1])
+        and int(starts_1d.max()) <= max_cols
+    ):
+        out_slice[:] = token_ids_cpu[rows, pos]
+    else:
+        np.greater_equal(pos, 0, out=valid)
+        np.less(pos, max_cols, out=tmp_b)
+        np.logical_and(valid, tmp_b, out=valid)
+        np.multiply(pos, valid, out=clipped)
+        out_slice[:] = token_ids_cpu[rows, clipped]
+        np.logical_not(valid, out=tmp_b)
+        np.copyto(out_slice, -1, where=tmp_b)
     if sampled_overlay is not None:
         np.subtract(
             pos,
@@ -384,8 +407,6 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     expressed as NumPy array operations over the chunk rather than per-request
     tensor ops.
     """
-    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-
     ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
     if getattr(ctx, "position_ids_override", None) is not None:
         desc = getattr(ctx, "sequence_layout_descriptor", None)
@@ -403,7 +424,9 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     batch = runner.input_batch
     seq_lens = runner.seq_lens_np[:chunk_num_reqs]
     prompt_lens = batch.num_prompt_tokens[start_index : start_index + chunk_num_reqs]
-    all_prompt = bool(np.all(seq_lens <= prompt_lens))
+    all_prompt = (
+        chunk_num_reqs == 0 or int(seq_lens[0]) <= int(prompt_lens[0])
+    ) and bool(np.all(seq_lens <= prompt_lens))
     if all_prompt and start_index == 0:
         return HostEngramInputs(
             input_ids=runner.input_ids_cpu,
@@ -422,26 +445,39 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
 
     pre_async = getattr(runner, "_pre_async_results", None)
     req_id_to_index: Any = getattr(pre_async, "req_id_to_index_copy", None)
-    req_ids = getattr(batch, "req_ids", None)
+    req_ids: Any = getattr(batch, "req_ids", None)
     chunk_req_ids = (
-        req_ids[start_index : start_index + chunk_num_reqs]
+        (
+            req_ids
+            if start_index == 0 and len(req_ids) == chunk_num_reqs
+            else req_ids[start_index : start_index + chunk_num_reqs]
+        )
         if req_id_to_index and req_ids is not None
         else None
     )
-    req_key = (
-        tuple(chunk_req_ids)
-        if chunk_req_ids is not None
+    can_check_id = (
+        chunk_req_ids is not None
         and start_index == 0
         and len(req_id_to_index) == chunk_num_reqs
-        else None
     )
     ref_req: Any = getattr(runner, "_host_engram_ref_req_dict", None)
     runner._host_engram_ref_req_dict = ref_req = (
         ref_req
-        if req_key is None or (ref_req is not None and ref_req[0] == req_key)
-        else (req_key, {r: i for i, r in enumerate(req_key)})
+        if not can_check_id or (ref_req is not None and ref_req[2] == chunk_req_ids)
+        else [
+            tuple(chunk_req_ids or ()),
+            (ref_d := {r: i for i, r in enumerate(chunk_req_ids or ())}),
+            list(chunk_req_ids or ()),
+            ref_d,
+        ]
     )
-    is_identity_reqs = req_key is not None and req_id_to_index == ref_req[1]
+    is_identity_reqs = can_check_id and (
+        req_id_to_index is ref_req[3]
+        or (
+            req_id_to_index == ref_req[1]
+            and ref_req.__setitem__(3, req_id_to_index) is None
+        )
+    )
     is_async_spec = pre_async is not None and (
         getattr(pre_async, "spec_decode_num_rejected_tokens", None) is not None
         or getattr(runner, "speculative_config", None) is not None
@@ -465,12 +501,17 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     if chunk_req_ids is not None:
         qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
         q_start, n_sched = qsl[:-1], qsl[1:] - qsl[:-1]
-        fast_id = is_identity_reqs and bool(np.all(n_sched > 0))
+        q0, active_len = int(qsl[0]), int(qsl[-1])
+        span_len = active_len - q0
+        is_uniform_stride = span_len == chunk_num_reqs * stride and bool(
+            np.all(n_sched == stride)
+        )
+        fast_id = is_identity_reqs and (is_uniform_stride or bool(np.all(n_sched > 0)))
         pre_pos: Any = (
             None
             if fast_id
             else np.fromiter(
-                map(req_id_to_index.get, chunk_req_ids, repeat(-1)),
+                map(req_id_to_index.get, chunk_req_ids or (), repeat(-1)),
                 dtype=np.int32,
                 count=chunk_num_reqs,
             )
@@ -527,13 +568,9 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 lengths=ov_lengths,
             )
         if all_matched or matched.any():
-            m_len = n_sched if all_matched else n_sched[matched]
-            q0, active_len = int(qsl[0]), int(qsl[-1])
-            span_len = active_len - q0
-            uniform_stride = (
-                is_identity
-                and span_len == chunk_num_reqs * stride
-                and bool(np.all(m_len == stride))
+            m_len, uniform_stride = (
+                n_sched if all_matched else n_sched[matched],
+                is_identity and is_uniform_stride,
             )
             dst_idx: slice | np.ndarray = (
                 slice(q0, active_len)

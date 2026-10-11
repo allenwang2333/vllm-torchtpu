@@ -539,3 +539,21 @@ def test_td8342_host_engram_c_dict_fast_paths_and_lookback_dirty_tracking():
     np.testing.assert_array_equal(
         res_hetero.lookback_token_ids.numpy()[:4], lb_ref_h[:4]
     )
+
+    # 4. TD8.359: All-accepted valid.all() fast path & pointer-identity ref_req[3] reuse
+    runner_all = _make_runner(8, k=5, depth=4, seed=77)
+    sampled_all = torch.ones((8, 6), dtype=torch.int32) * 19
+    runner_all._pre_async_results.wait_for_copy = lambda: sampled_all
+    shared_req_map = {f"req-{i}": i for i in range(8)}
+    runner_all._pre_async_results.req_id_to_index_copy = shared_req_map
+    runner_all._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+    out_all1 = he.capture_host_engram_inputs(runner_all, 8)
+    assert out_all1 is not None and out_all1.host_ready is True
+    assert runner_all._host_engram_ref_req_dict[3] is shared_req_map
+    # Second call with same shared_req_map hits `req_id_to_index is ref_req[3]`
+    out_all2 = he.capture_host_engram_inputs(runner_all, 8)
+    assert out_all2 is not None and out_all2.host_ready is True
+    ids_all_ref, pos_all_ref, lb_all_ref = _reference(runner_all, 8)
+    np.testing.assert_array_equal(out_all2.input_ids.numpy(), ids_all_ref)
+    np.testing.assert_array_equal(out_all2.positions.numpy(), pos_all_ref)
+    np.testing.assert_array_equal(out_all2.lookback_token_ids.numpy(), lb_all_ref)
