@@ -610,7 +610,7 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 
 
 _ORIG_GPU_UPDATE_STATES = GPUModelRunner._update_states
-_ARANGE_INTP: np.ndarray = np.arange(4096, dtype=np.intp)
+_ARANGE_INTP: np.ndarray = np.arange(4096, dtype=np.int32)
 
 
 @functools.lru_cache(maxsize=64)
@@ -2706,20 +2706,24 @@ class TPUModelRunner(GPUModelRunner):
         """
         buf = self.lookback_token_ids
         assert buf is not None
-        buf.np.fill(-1)
+        buf.np[num_reqs:].fill(-1)
         if num_reqs > 0:
             depth = buf.np.shape[1]
             starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
-            pos = starts - np.arange(1, depth + 1)
-            limit = self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
+            pos = starts - _ARANGE_INTP[1 : depth + 1]
             replay_starts = getattr(self, "_replay_starts", None)
+            limit = (
+                self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
+                if replay_starts
+                else self.input_batch.num_prompt_tokens[:num_reqs, None]
+            )
             if replay_starts:
                 for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                     if replay_starts.get(req_id) == starts[row, 0]:
                         limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
             valid = (pos >= 0) & (pos < limit)
-            rows = np.arange(num_reqs)[:, None]
-            ids = self.input_batch.token_ids_cpu[rows, np.clip(pos, 0, None)]
+            rows = _ARANGE_INTP[:num_reqs, None]
+            ids = self.input_batch.token_ids_cpu[rows, np.maximum(pos, 0)]
             buf.np[:num_reqs] = np.where(valid, ids, -1)
         return buf.copy_to_gpu()
 
@@ -2988,8 +2992,8 @@ class TPUModelRunner(GPUModelRunner):
                 req_arange = arange_np[:n_reqs]
                 col_arange = arange_np[:w]
             else:
-                req_arange = np.arange(n_reqs, dtype=np.intp)
-                col_arange = np.arange(w, dtype=np.intp)
+                req_arange = np.arange(n_reqs, dtype=np.int32)
+                col_arange = np.arange(w, dtype=np.int32)
             flat_idx = (req_arange * max_model_len + start_idx)[:, None] + col_arange
             col_mask = col_arange < lens_arr[:, None]
             val_mask = sampled_np != INVALID_TOKEN_ID
@@ -5001,7 +5005,12 @@ class TPUModelRunner(GPUModelRunner):
                             SpecLogprobsChunk(
                                 tensors=self.gather_logprobs(logits, row_tokens),
                                 row_starts=np.concatenate(
-                                    ([0], np.cumsum(md.draft_lengths_cpu + 1)[:-1])
+                                    (
+                                        np.zeros(1, dtype=np.int32),
+                                        np.cumsum(
+                                            md.draft_lengths_cpu + 1, dtype=np.int32
+                                        )[:-1],
+                                    )
                                 ),
                             )
                         )
@@ -5052,7 +5061,7 @@ class TPUModelRunner(GPUModelRunner):
                         spec_logprobs_chunks.append(
                             SpecLogprobsChunk(
                                 tensors=self.gather_logprobs(logits, selected),
-                                row_starts=np.arange(num_reqs),
+                                row_starts=_ARANGE_INTP[:num_reqs],
                             )
                         )
                     # Non-verify chunk in a spec step: reset the read offsets

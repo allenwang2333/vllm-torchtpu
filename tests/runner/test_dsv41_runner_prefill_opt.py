@@ -1041,3 +1041,50 @@ def test_td8235_fast_update_states_and_count_input_chunks():
         num_scheduled_tokens={"r0": 3, "r1": 3},
     )
     assert runner._count_input_chunks(so_chunks) == (1, 2)
+
+
+def test_td8303_lookback_token_ids_and_arange_int32():
+    """Verify TD8.303 native np.int32 _ARANGE_INTP, tail-only lookback fill, and
+    deferred num_prompt_tokens copy when replay_starts is empty."""
+    from vllm_torchtpu.runner.tpu_runner import _ARANGE_INTP
+
+    assert _ARANGE_INTP.dtype == np.int32
+
+    runner = object.__new__(TPUModelRunner)
+
+    class _LookbackBuf:
+        def __init__(self, rows: int, depth: int):
+            self.np = np.full((rows, depth), 77, dtype=np.int32)
+
+        def copy_to_gpu(self) -> torch.Tensor:
+            return torch.from_numpy(self.np.copy())
+
+    runner.lookback_token_ids = _LookbackBuf(rows=4, depth=2)
+    prompt_tokens = np.array([256, 256, 1024, 512], dtype=np.int32)
+    tokens = np.arange(1000, dtype=np.int32)[None, :].repeat(4, axis=0)
+    runner.input_batch = SimpleNamespace(
+        req_ids=["resumed", "later", "fresh", "idle"],
+        num_computed_tokens_cpu=np.array([768, 800, 512, 0], dtype=np.int32),
+        num_prompt_tokens=prompt_tokens,
+        num_tokens_no_spec=np.array([1000, 1000, 1024, 0], dtype=np.int32),
+        token_ids_cpu=tokens,
+    )
+
+    # Empty replay_starts: tail row [3] filled with -1, active rows [0:3] populated
+    runner._replay_starts = {}
+    out_no_replay = runner._prepare_lookback_token_ids(2)
+    assert out_no_replay.dtype == torch.int32
+    assert out_no_replay[0].tolist() == [-1, -1]
+    assert out_no_replay[1].tolist() == [-1, -1]
+    assert out_no_replay[2].tolist() == [-1, -1]
+    assert out_no_replay[3].tolist() == [-1, -1]
+
+    # Non-empty replay_starts: copies num_prompt_tokens without mutating original array
+    runner.lookback_token_ids.np.fill(77)
+    runner._replay_starts = {"resumed": 768, "later": 768, "fresh": 512}
+    out_replay = runner._prepare_lookback_token_ids(3)
+    assert out_replay[0].tolist() == [767, 766]
+    assert out_replay[1].tolist() == [-1, -1]
+    assert out_replay[2].tolist() == [511, 510]
+    assert out_replay[3].tolist() == [-1, -1]
+    assert prompt_tokens.tolist() == [256, 256, 1024, 512]
