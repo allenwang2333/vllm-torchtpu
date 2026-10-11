@@ -695,9 +695,9 @@ def test_ngram_hash_state_forward_reuses_mapped_batch():
             self._tensor = tensor
             self.calls = 0
 
-        def __getitem__(self, idx):
+        def index_select(self, dim, idx):
             self.calls += 1
-            return self._tensor[idx]
+            return self._tensor.index_select(dim, idx)
 
     class SpyState(common_engram.NgramHashState):
         def write_cache(self, cache, slots, values, valid):

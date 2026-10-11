@@ -107,7 +107,7 @@ class NgramHashState(upstream.NgramHashState):
         mapped: torch.Tensor | None = None
         if self.use_slot_cache:
             assert self._cache is not None and slot_mapping is not None
-            mapped = self.token_map[input_ids.long()].masked_fill(
+            mapped = self.token_map.index_select(0, input_ids.int()).masked_fill(
                 dead_mask, upstream.DEAD_ID
             )
             valid = slot_mapping >= 0
@@ -117,14 +117,21 @@ class NgramHashState(upstream.NgramHashState):
             if not self.use_slot_cache:
                 return torch.full_like(window, self.pad_id)
             assert self._cache is not None
-            # int32 block / slot math (TPU emulates int64 divide, modulo and
-            # multiply-add); only the gather indices are int64.
-            logical = past.clamp(min=0, max=block_table.shape[1] * self.block_size - 1)
-            blocks = block_table[reqs, (logical // self.block_size).long()].int()
+            # Positions, block ids and slots are < 2**31: gather in int32 from
+            # the flattened table instead of 2D int64 advanced indexing.
+            logical = past.clamp(
+                min=0, max=block_table.shape[1] * self.block_size - 1
+            ).int()
+            block_idx = (
+                reqs.int() * block_table.shape[1] + logical // self.block_size
+            ).reshape(-1)
+            blocks = (
+                block_table.reshape(-1).index_select(0, block_idx).view_as(logical)
+            ).int()
             slots = (blocks * self.block_size + logical % self.block_size).clamp(
                 min=0, max=self._cache.numel() - 1
             )
-            return self._cache[slots.long()]
+            return self._cache.index_select(0, slots.reshape(-1)).view_as(slots)
 
         tables = (self.token_map, self.multipliers, self.primes, self.offsets)
         return self._hash(
@@ -272,38 +279,43 @@ class NgramHashState(upstream.NgramHashState):
         count = input_ids.numel()
         _, ngram = multipliers.shape
         dev = input_ids.device
-        # Rows, shifts and positions in int32: the [count, reqs] request
-        # compare and the [count, ngram] source / window index math run in
-        # native 32-bit ops instead of TPU-emulated int64 (positions and
-        # token counts fit int32). Gather indices are widened with `.long()`.
+        # Rows, positions, request ids and lookback columns are < 2**31: keep
+        # them int32 and gather with flat 1D ``index_select``; ``source`` is
+        # widened to int64 only for the hash multiply below.
         rows = torch.arange(count, dtype=torch.int32, device=dev)
+        qsl_i32 = query_start_loc.int()
+        pos_i32 = positions.int()
         reqs = (
-            (rows.unsqueeze(1) >= query_start_loc[1:].unsqueeze(0))
-            .sum(-1)
+            (rows.unsqueeze(1) >= qsl_i32[1:].unsqueeze(0))
+            .sum(-1, dtype=torch.int32)
             .clamp(max=lookback_token_ids.shape[0] - 1)
         )
-        starts = query_start_loc[reqs].long().clamp(max=count - 1)
-        pos_i32 = positions.int()
-        chunk_positions = pos_i32[starts]
+        starts = qsl_i32.index_select(0, reqs).clamp(max=count - 1)
+        chunk_positions = pos_i32.index_select(0, starts)
         shifts = torch.arange(ngram, dtype=torch.int32, device=dev)
         past = pos_i32[:, None] - shifts
         in_chunk = past >= chunk_positions[:, None]
-        indices = (rows[:, None] - shifts).clamp(min=0).long()
+        indices = (rows[:, None] - shifts).clamp(min=0)
         if mapped_batch is None:
-            mapped_batch = token_map[input_ids.long()].masked_fill(
+            mapped_batch = token_map.index_select(0, input_ids.int()).masked_fill(
                 dead_mask, upstream.DEAD_ID
             )
-        batch = mapped_batch[indices]
+        batch = mapped_batch.index_select(0, indices.reshape(-1)).view(count, ngram)
         cols = chunk_positions[:, None] - 1 - past
         in_window = ~in_chunk & (cols >= 0) & (cols < self.lookback_depth)
-        cols = cols.clamp(min=0, max=self.lookback_depth - 1).long()
+        cols = cols.clamp(min=0, max=self.lookback_depth - 1)
         reqs_col = reqs[:, None]
-        window_ids = lookback_token_ids[reqs_col, cols]
-        known = in_window & (window_ids >= 0)
-        mapped_lookback = token_map[lookback_token_ids.clamp(min=0).long()].masked_fill(
-            lookback_dead_mask, upstream.DEAD_ID
+        lb_idx = (reqs_col * lookback_token_ids.shape[1] + cols).reshape(-1)
+        window_ids = (
+            lookback_token_ids.reshape(-1).index_select(0, lb_idx).view(count, ngram)
         )
-        window = mapped_lookback[reqs_col, cols]
+        known = in_window & (window_ids >= 0)
+        mapped_lookback = (
+            token_map.index_select(0, lookback_token_ids.clamp(min=0).reshape(-1).int())
+            .view_as(lookback_token_ids)
+            .masked_fill(lookback_dead_mask, upstream.DEAD_ID)
+        )
+        window = mapped_lookback.reshape(-1).index_select(0, lb_idx).view(count, ngram)
         source = torch.where(
             in_chunk,
             batch,
@@ -579,7 +591,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         start = min(self.head_start, self.n_hash_cols)
         end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        selected = indices[:, start:end].long()
+        # Hash ids are int32 (``_hash`` / host hash); keep the rows int32.
+        selected = indices[:, start:end].int()
         valid = (selected >= self.vocab_start_idx) & (selected < self.vocab_end_idx)
         pad = self.part_n_hash_cols - (end - start)
         if pad:
@@ -609,8 +622,17 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if indices.device != work_device:
             indices = indices.to(work_device)
         rows, valid = self._select_local_heads(indices)
-        values = weight[rows].unflatten(-1, (-1, self.block_size)).float()
-        scale = (scales[rows].to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
+        flat_rows = rows.reshape(-1)
+        values = (
+            weight.index_select(0, flat_rows)
+            .view(*rows.shape, *weight.shape[1:])
+            .unflatten(-1, (-1, self.block_size))
+            .float()
+        )
+        scale_bits = scales.index_select(0, flat_rows).view(
+            *rows.shape, *scales.shape[1:]
+        )
+        scale = (scale_bits.to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
         out.copy_(
             (values * scale)
             .flatten(-2)
