@@ -113,11 +113,23 @@ def main() -> None:
             for variant, fn in (("baseline", baseline), ("candidate", candidate)):
                 print(f"COMPILE {variant} tokens={tokens}", flush=True)
                 start = time.perf_counter()
-                executable = fn.lower(*inputs).compile()
+                lowered = fn.lower(*inputs)
+                executable = lowered.compile()
                 compile_s = time.perf_counter() - start
-                (out / "compiler/hlo" / f"{variant}-{tokens}.txt").write_text(
-                    executable.as_text()
-                )
+                compiler_path = out / "compiler/hlo" / f"{variant}-{tokens}"
+                try:
+                    compiler_path.with_suffix(".txt").write_text(executable.as_text())
+                except jax.errors.JaxRuntimeError as error:
+                    # The pinned libtpu may emit async-update HLO that this
+                    # jaxlib cannot deserialize. Preserve the error and the
+                    # pre-optimization IR, then measure the compiled program.
+                    compiler_path.with_suffix(".inspection-error.txt").write_text(
+                        str(error)
+                    )
+                    compiler_path.with_suffix(".stablehlo.mlir").write_text(
+                        lowered.as_text()
+                    )
+                    print(f"HLO_INSPECTION_FALLBACK {variant} tokens={tokens}: {error}")
                 for _ in range(3):
                     output = executable(*inputs).block_until_ready()
                 samples = []
