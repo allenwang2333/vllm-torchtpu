@@ -284,6 +284,69 @@ class TestCacheKvShard:
         assert torch.all(raw_fp8[0] == 0)
         assert not torch.all(raw_fp8[1] == 0)
 
+    def test_td8385_sharded_zero_replicated_row_indices_and_pages_fast_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        # 1. Contiguous sharded (page_stride == rows == 4, block_offset=4)
+        paged_contig = PagedCacheRows(
+            raw, ((4, 4, 256), torch.bfloat16, 4 * 512, 8 * 512, 4, True, 0)
+        )
+        # 2. Strided sharded (page_stride == 8 != rows == 4, block_offset=4)
+        paged_strided = PagedCacheRows(
+            raw, ((4, 4, 256), torch.bfloat16, 8 * 512, 4 * 512, 4, True, 0)
+        )
+        # 3. Rank-0 sharded (block_offset=0, row_offset=0 -> row_delta=0)
+        paged_rank0 = PagedCacheRows(
+            raw, ((4, 4, 256), torch.bfloat16, 4 * 512, 0, 0, True, 0)
+        )
+
+        orig_clamp = torch.Tensor.clamp
+        orig_mod = torch.Tensor.__mod__
+        orig_floordiv = torch.Tensor.__floordiv__
+        counts = {"clamp": 0, "mod": 0, "floordiv": 0}
+
+        def spy_clamp(self, *args, **kwargs):
+            counts["clamp"] += 1
+            return orig_clamp(self, *args, **kwargs)
+
+        def spy_mod(self, other):
+            counts["mod"] += 1
+            return orig_mod(self, other)
+
+        def spy_floordiv(self, other):
+            counts["floordiv"] += 1
+            return orig_floordiv(self, other)
+
+        monkeypatch.setattr(torch.Tensor, "clamp", spy_clamp)
+        monkeypatch.setattr(torch.Tensor, "__mod__", spy_mod)
+        monkeypatch.setattr(torch.Tensor, "__floordiv__", spy_floordiv)
+
+        slots = torch.tensor([-5, -1, 0, 15, 16, 19, 20, 31, 32, 40], dtype=torch.int32)
+        # Contiguous sharded: owned slots are [16..31]; zero floordiv, mod, clamp
+        idx_contig = paged_contig.row_indices(slots)
+        assert idx_contig.tolist() == [-1, -1, -1, -1, 8, 11, 12, 23, -1, -1]
+        assert counts == {"clamp": 0, "mod": 0, "floordiv": 0}
+
+        # Rank-0 sharded: owned slots are [0..15]; row_delta == 0, page_delta == 0
+        idx_rank0 = paged_rank0.row_indices(slots)
+        assert idx_rank0.tolist() == [-1, -1, 0, 15, -1, -1, -1, -1, -1, -1]
+        assert counts == {"clamp": 0, "mod": 0, "floordiv": 0}
+
+        # Strided sharded: 1 floordiv, still zero mod and zero clamp
+        valid = torch.tensor(
+            [True, True, True, True, True, False, True, True, True, True]
+        )
+        idx_strided = paged_strided.row_indices(slots, valid=valid)
+        assert idx_strided.tolist() == [-1, -1, -1, -1, 4, -1, 12, 31, -1, -1]
+        assert counts == {"clamp": 0, "mod": 0, "floordiv": 1}
+
+        bt = torch.tensor([[-1, 0, 3, 4], [5, 7, 8, 12]], dtype=torch.int32)
+        assert paged_contig.pages(bt).tolist() == [[0, 0, 0, 2], [3, 5, 0, 0]]
+        assert paged_strided.pages(bt).tolist() == [[0, 0, 0, 1], [3, 7, 0, 0]]
+        assert paged_rank0.pages(bt).tolist() == [[0, 0, 3, 0], [0, 0, 0, 0]]
+        assert counts == {"clamp": 0, "mod": 0, "floordiv": 1}
+
     def test_native_cache_view_sharded_property(self, monkeypatch: pytest.MonkeyPatch):
         class Base:
             def bind_kv_cache(self, cache):

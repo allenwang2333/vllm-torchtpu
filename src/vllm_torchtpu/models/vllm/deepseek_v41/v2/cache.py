@@ -458,20 +458,27 @@ class PagedCacheRows:
         return self.raw.device
 
     def row_indices(self, slots, valid=None):
-        slots = slots if slots.dtype == torch.int32 else slots.int()
-        if not self.sharded and self.page_stride == self.shape[1]:
+        slots, rows = (
+            slots if slots.dtype == torch.int32 else slots.int(),
+            self.shape[1],
+        )
+        if not self.sharded and self.page_stride == rows:
             return slots if self.row_offset == 0 else self.row_offset + slots
-        blocks = slots // self.shape[1]
-        rem = slots % self.shape[1]
         if not self.sharded:
-            base = blocks * self.page_stride + rem
+            base = slots + (slots // rows) * (self.page_stride - rows)
             return base if self.row_offset == 0 else self.row_offset + base
         if self.replicated_blocks == 0:
-            local_blocks = (
-                blocks if self.block_offset == 0 else blocks - self.block_offset
+            owned = (slots >= max(0, self.block_offset * rows)) & (
+                slots < (self.block_offset + self.shape[0]) * rows
             )
-            owned = (slots >= 0) & (local_blocks >= 0) & (local_blocks < self.shape[0])
+            base = (
+                slots
+                if self.page_stride == rows
+                else slots + (slots // rows) * (self.page_stride - rows)
+            )
+            row_delta = self.row_offset - self.block_offset * self.page_stride
         else:
+            blocks = slots // rows
             sharded_blocks = self.shape[0] - self.replicated_blocks
             sharded_local = blocks - self.block_offset
             in_rep = (blocks >= 0) & (blocks < self.replicated_blocks)
@@ -480,11 +487,11 @@ class PagedCacheRows:
             local_blocks = torch.where(
                 in_rep, blocks, self.replicated_blocks + sharded_local
             )
+            base = local_blocks * self.page_stride + (slots - blocks * rows)
+            row_delta = self.row_offset
         if valid is not None:
             owned = owned & valid
-        safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
-        base = safe_blocks * self.page_stride + rem
-        indices = base if self.row_offset == 0 else self.row_offset + base
+        indices = base if row_delta == 0 else row_delta + base
         return indices.masked_fill(~owned, -1)
 
     def pages(self, block_table):
@@ -504,15 +511,12 @@ class PagedCacheRows:
             )
             return pages if self.page_offset == 0 else pages + self.page_offset
         if self.replicated_blocks == 0:
-            local_blocks = (
-                block_table
-                if self.block_offset == 0
-                else block_table - self.block_offset
+            local_blocks, page_delta = (
+                block_table,
+                self.page_offset - self.block_offset * self.page_scale,
             )
-            owned = (
-                (block_table >= 0)
-                & (local_blocks >= 0)
-                & (local_blocks < self.shape[0])
+            owned = (block_table >= max(0, self.block_offset)) & (
+                block_table < self.block_offset + self.shape[0]
             )
         else:
             sharded_blocks = self.shape[0] - self.replicated_blocks
@@ -523,10 +527,10 @@ class PagedCacheRows:
             local_blocks = torch.where(
                 in_rep, block_table, self.replicated_blocks + sharded_local
             )
-        safe_blocks = local_blocks.clamp(min=0, max=max(self.shape[0] - 1, 0))
-        pages = safe_blocks if self.page_scale == 1 else safe_blocks * self.page_scale
-        if self.page_offset != 0:
-            pages = pages + self.page_offset
+            page_delta = self.page_offset
+        pages = local_blocks if self.page_scale == 1 else local_blocks * self.page_scale
+        if page_delta != 0:
+            pages = pages + page_delta
         return pages.masked_fill(~owned, 0)
 
     def copy_raw(self, updated):
