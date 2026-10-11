@@ -299,3 +299,39 @@ def test_td8357_stale_fast_uniform_spec_k_is_ignored(stale):
     _prepare(runner, sched)
     (got,) = runner.spec_decode_manager.calls
     assert got.tolist() == [3, 0]
+
+
+# --- TD8.370: repeat uniform layout skips the query_start_loc_np rewrite -----
+
+
+def test_td8370_repeat_uniform_layout_skips_qsl_rewrite():
+    from unittest import mock
+
+    runner, sched = _runner({"req-0": 0, "req-1": 1})
+    _prepare(runner, sched)
+    assert runner.query_start_loc_np.tolist() == [0, 3, 6]
+    with mock.patch.object(np, "cumsum", side_effect=AssertionError):
+        _prepare(runner, sched)
+    assert runner.query_start_loc_np.tolist() == [0, 3, 6]
+
+    # A ragged step rewrites and drops the token; the next uniform rewrites.
+    ragged = SimpleNamespace(
+        total_num_scheduled_tokens=5,
+        num_scheduled_tokens={"req-0": 2, "req-1": 3},
+        scheduled_spec_decode_tokens={},
+    )
+    _prepare(runner, ragged)
+    assert runner.query_start_loc_np.tolist() == [0, 2, 5]
+    assert runner._qsl_uniform_token is None
+    _prepare(runner, sched)
+    assert runner.query_start_loc_np.tolist() == [0, 3, 6]
+
+
+def test_td8370_replaced_qsl_buffer_is_rewritten():
+    runner, sched = _runner({"req-0": 0, "req-1": 1})
+    _prepare(runner, sched)
+    fresh = torch.zeros(3, dtype=torch.int32)
+    runner.query_start_loc_cpu = fresh
+    runner.query_start_loc_np = fresh.numpy()
+    _prepare(runner, sched)
+    assert runner.query_start_loc_np.tolist() == [0, 3, 6]

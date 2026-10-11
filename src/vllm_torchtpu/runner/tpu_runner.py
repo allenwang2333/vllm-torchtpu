@@ -3438,14 +3438,26 @@ class TPUModelRunner(GPUModelRunner):
 
         # Prepare the attention metadata query_start_loc_np up front so the
         # heterogeneous token-preparation path can reuse it without list
-        # comprehension + np.concatenate.
-        self.query_start_loc_np[0] = 0
-        np.cumsum(
-            num_scheduled_tokens_per_req, out=self.query_start_loc_np[1 : num_reqs + 1]
-        )
-        # Keep padded entries equal to the last valid location so padded
-        # requests have zero length instead of a negative q_len.
-        self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
+        # comprehension + np.concatenate. This is the buffer's only writer, so
+        # a repeat of the last uniform (num_reqs, count) layout is already
+        # in place.
+        qsl_np = self.query_start_loc_np
+        last_qsl = getattr(self, "_qsl_uniform_token", None)
+        if not (
+            uniform_sched
+            and last_qsl is not None
+            and last_qsl[0] is qsl_np
+            and last_qsl[1] == num_reqs
+            and last_qsl[2] == first_sched
+        ):
+            qsl_np[0] = 0
+            np.cumsum(num_scheduled_tokens_per_req, out=qsl_np[1 : num_reqs + 1])
+            # Keep padded entries equal to the last valid location so padded
+            # requests have zero length instead of a negative q_len.
+            qsl_np[num_reqs + 1 :] = qsl_np[num_reqs]
+            self._qsl_uniform_token = (
+                (qsl_np, num_reqs, first_sched) if uniform_sched else None
+            )
 
         # Fast path for decode-only: all requests have exactly 1 token.
         if max_num_scheduled_tokens_all_reqs == 1:
