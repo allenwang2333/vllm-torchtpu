@@ -976,6 +976,23 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             {"mixed_live_gather": True},
             {"mixed_live_gather": True, "mixed_live_widths": (256,)},
             {"mixed_live_gather": True, "mixed_live_widths": (128, 256)},
+            # TPU_DCP_MLA_MIXED_BODY: each body lever alone and the default set.
+            *(
+                {
+                    "mixed_live_gather": True,
+                    "mixed_live_widths": (256, 384),
+                    "mixed_body_levers": levers,
+                }
+                for levers in (
+                    ("tr",),
+                    ("zu",),
+                    ("pv512",),
+                    ("noinf",),
+                    ("pbf16",),
+                    sparse_mla.MIXED_BODY_DEFAULT,
+                )
+            ),
+            {"mixed_live_gather": True, "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT},
         ):
             out, lse = jax.block_until_ready(run(topk_glued, **kw))
             np.testing.assert_array_equal(
@@ -990,6 +1007,14 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         row = int(np.argmax(np.where(own, counts[:real_tokens], -1)))
         moved = topk_glued.at[row, 0].set((topk_glued[row, 0] + 1) % 8192)
         bad, _ = jax.block_until_ready(run(moved, mixed_live_gather=True))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+        bad, _ = jax.block_until_ready(
+            run(
+                moved,
+                mixed_live_gather=True,
+                mixed_body_levers=sparse_mla.MIXED_BODY_DEFAULT,
+            )
+        )
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
 
     @parameterized.parameters((512, 300), (1024, 1000), (1024, 77))
