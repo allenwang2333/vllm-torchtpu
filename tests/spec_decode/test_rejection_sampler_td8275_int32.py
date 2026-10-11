@@ -498,3 +498,77 @@ def test_random_matches_int64_reference(synthetic, idx_dtype, num_draft, pad):
     ref = _old_random_rejection_sample_with_segment(*args)
     assert out.dtype == ref.dtype == torch.int32
     assert torch.equal(out, ref)
+
+
+def test_td8295_random_recovery_avoids_extra_vocab_reductions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.295: random recovery uses 1 argmax and 0 torch.any [T, V] reductions."""
+    vocab = 16
+    # 5 rows covering:
+    # 0: synthetic reject of greedy draft==0 (no recovery mass, draft==0)
+    # 1: synthetic reject of greedy draft==7 (no recovery mass, draft>0)
+    # 2: reject where only token 0 has residual mass (recovered_token_ids==0, mass>0)
+    # 3: reject where token 5 has residual mass (recovered_token_ids==5, mass>0)
+    # 4: placeholder draft (-1) recovering target argmax
+    draft = torch.tensor([0, 7, 3, 2, -1], dtype=torch.int32)
+    nd = torch.tensor([1, 1, 1, 1, 1], dtype=torch.int32)
+    seg, grp = rs._get_segment_info(nd, 5)
+    bonus = torch.tensor([9, 10, 11, 12, 13], dtype=torch.int32)
+    target = torch.full((5, vocab), -100.0, dtype=torch.float32)
+    target[0, 0] = 100.0
+    target[1, 7] = 100.0
+    target[2, 3] = 0.0
+    target[2, 0] = 10.0
+    target[3, 2] = 0.0
+    target[3, 5] = 10.0
+    target[4, 6] = 100.0
+
+    temps = torch.tensor([[0.0], [0.0], [1.0], [1.0], [0.0]], dtype=torch.float32)
+    top_k = torch.zeros((5, 1), dtype=torch.int32)
+    top_p = torch.ones((5, 1), dtype=torch.float32)
+    accept_u = torch.ones(5, dtype=torch.float32)
+    recover_u = torch.full((5, vocab), 0.5, dtype=torch.float32)
+    rates = torch.zeros(2, dtype=torch.float32)
+
+    argmax_calls = 0
+    any_calls = 0
+    orig_argmax = torch.argmax
+    orig_any = torch.any
+
+    def _counting_argmax(*a: object, **kw: object) -> torch.Tensor:
+        nonlocal argmax_calls
+        argmax_calls += 1
+        return orig_argmax(*a, **kw)  # type: ignore[arg-type]
+
+    def _counting_any(*a: object, **kw: object) -> torch.Tensor:
+        nonlocal any_calls
+        any_calls += 1
+        return orig_any(*a, **kw)  # type: ignore[arg-type]
+
+    args = (
+        draft,
+        target,
+        nd,
+        bonus,
+        seg,
+        grp,
+        1,
+        temps,
+        top_k,
+        top_p,
+        accept_u,
+        recover_u,
+        rates,
+        True,
+    )
+    ref = _old_random_rejection_sample_with_segment(*args)
+
+    monkeypatch.setattr(torch, "argmax", _counting_argmax)
+    monkeypatch.setattr(torch, "any", _counting_any)
+    out = rs._random_rejection_sample_with_segment.__wrapped__(*args)
+
+    assert argmax_calls == 1
+    assert any_calls == 0
+    assert torch.equal(out, ref)
+    assert out[:, 0].tolist() == [0, 7, 0, 5, 6]
