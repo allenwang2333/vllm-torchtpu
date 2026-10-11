@@ -328,7 +328,7 @@ def _derive_pcp_rank_major_reorder_indices(
         pcp_size=pcp_size,
         interleave_size=interleave_size,
     )
-    rank_req_ends = jnp.cumsum(rank_counts, axis=1)
+    rank_req_ends = jnp.cumsum(rank_counts, axis=1, dtype=jnp.int32)
     rank_req_starts = rank_req_ends - rank_counts
 
     full_padded_num_tokens = local_padded_num_tokens * pcp_size
@@ -408,7 +408,7 @@ def _derive_pcp_ragged_exchange_descriptors(
         valid,
         jnp.logical_or(jnp.logical_not(previous_valid), rank_major != previous + 1),
     )
-    run_ids = jnp.cumsum(run_starts.astype(jnp.int32), axis=1) - 1
+    run_ids = jnp.cumsum(run_starts, axis=1, dtype=jnp.int32) - 1
 
     # For one request and rank, every run is an interleave chunk. All chunks
     # except the first and last have I tokens, so their count is at most

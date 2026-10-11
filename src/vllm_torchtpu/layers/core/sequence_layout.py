@@ -198,7 +198,11 @@ def _localize_token_tensor_and_gather_indices(
         device=request_major_gather_indices.device,
     )
     gather_dtype = request_major_gather_indices.dtype
-    request_gathers = request_major_gather_indices.int()
+    request_gathers = (
+        request_major_gather_indices
+        if request_major_gather_indices.dtype == torch.int32
+        else request_major_gather_indices.int()
+    )
     gather_valid = request_gathers.ge(0)
     safe_request_gathers = request_gathers.clamp_min(0)
     packed_gathers = torch.index_select(

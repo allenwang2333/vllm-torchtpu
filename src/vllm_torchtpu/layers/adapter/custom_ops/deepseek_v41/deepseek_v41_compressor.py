@@ -60,14 +60,23 @@ def save_compress_norm(
         cache = state_cache
         # Rows, requests and ring slots are < 2**31: native int32 + 1D gathers.
         rows = torch.arange(count, dtype=torch.int32, device=kv_score.device)
-        requests = token_to_req_indices.int().clamp(max=query_start_loc.numel() - 2)
-        qsl_i32 = query_start_loc.int()
+        requests = (
+            token_to_req_indices
+            if token_to_req_indices.dtype == torch.int32
+            else token_to_req_indices.int()
+        ).clamp(max=query_start_loc.numel() - 2)
+        qsl_i32 = (
+            query_start_loc
+            if query_start_loc.dtype == torch.int32
+            else query_start_loc.int()
+        )
         starts = qsl_i32.index_select(0, requests)
         ends = qsl_i32.index_select(0, requests + 1)
         previous_slots = (
-            slot_mapping.int().clamp(min=0) // capacity * capacity
-            + (positions.int() - 1) % capacity
-        )
+            slot_mapping if slot_mapping.dtype == torch.int32 else slot_mapping.int()
+        ).clamp(min=0) // capacity * capacity + (
+            (positions if positions.dtype == torch.int32 else positions.int()) - 1
+        ) % capacity
         previous = torch.where(
             (rows > starts)[:, None],
             kv_score_f32.index_select(0, (rows - 1).clamp(min=0)),
@@ -124,9 +133,12 @@ def write_csa_values(
 
 def write_compressed_cache(caches, slots, values, valid, num_states):
     nope, rope = caches
-    records = (
-        row_indices(slots, num_states, nope.shape[1], 0).masked_fill(~valid, -1).int()
-    )
+    records = row_indices(
+        slots if slots.dtype == torch.int32 else slots.int(),
+        num_states,
+        nope.shape[1],
+        0,
+    ).masked_fill(~valid, -1)
     assert _write_op is not None
     updated_nope, updated_rope = _write_op(nope, rope, records, values)
     nope.copy_(updated_nope)

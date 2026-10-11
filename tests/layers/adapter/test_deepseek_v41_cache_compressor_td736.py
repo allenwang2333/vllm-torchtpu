@@ -711,3 +711,85 @@ def test_compressor_save_compress_norm_and_csa_packing_and_module(
     comp.state_cache = sc_obj
     out_r2 = comp.forward(p_flipped, positions[:3])
     assert out_r2 is not None and out_r2.shape == (3, 4)
+
+
+def test_td8304_compressor_sequence_layout_and_gdn_int32(monkeypatch):
+    """Verify TD8.304 int32 guards in deepseek_v41_compressor, sequence_layout,
+    and gdn_attention."""
+    from vllm_torchtpu.layers.core.gdn_attention import (
+        _derive_pcp_ragged_exchange_descriptors,
+        _derive_pcp_rank_major_reorder_indices,
+    )
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        _localize_token_tensor_and_gather_indices,
+    )
+
+    # 1. write_compressed_cache with int32 and int64 slots
+    seen_records: list[torch.Tensor] = []
+
+    def _capture_write(nope, rope, records, values):
+        seen_records.append(records)
+        return nope + 1, rope + 2
+
+    monkeypatch.setattr(comp_mod, "_write_op", _capture_write)
+    for dt in (torch.int32, torch.int64):
+        nope_t = torch.zeros((2, 4, ROW_WORDS), dtype=torch.int32)
+        rope_t = torch.zeros((2, 2, ROW_WORDS), dtype=torch.int32)
+        comp_mod.write_compressed_cache(
+            (nope_t, rope_t),
+            torch.tensor([0, 3], dtype=dt),
+            torch.zeros((2, 512), dtype=torch.bfloat16),
+            torch.tensor([True, False]),
+            2,
+        )
+    assert len(seen_records) == 2
+    assert seen_records[0].dtype == torch.int32
+    assert seen_records[1].dtype == torch.int32
+    assert torch.equal(seen_records[0], seen_records[1])
+
+    # 2. _localize_token_tensor_and_gather_indices with int32 and int64 gather indices
+    tokens = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    packed_to_req = np.array([0, 1, 2, -1], dtype=np.int32)
+    req_to_packed = np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+    gathers_i32 = torch.tensor([0, 2, 5, -1], dtype=torch.int32)
+    gathers_i64 = gathers_i32.to(torch.int64)
+    tok32, loc32 = _localize_token_tensor_and_gather_indices(
+        tokens,
+        gathers_i32,
+        local_packed_to_request=packed_to_req,
+        request_to_packed=req_to_packed,
+        local_start=0,
+        local_end=3,
+    )
+    tok64, loc64 = _localize_token_tensor_and_gather_indices(
+        tokens,
+        gathers_i64,
+        local_packed_to_request=packed_to_req,
+        request_to_packed=req_to_packed,
+        local_start=0,
+        local_end=3,
+    )
+    assert loc32.dtype == torch.int32
+    assert loc64.dtype == torch.int64
+    assert torch.equal(tok32, tok64)
+    assert torch.equal(loc32.to(torch.int64), loc64)
+
+    # 3. _derive_pcp_rank_major_reorder_indices and exchange descriptors int32 cumsum
+    reorder = _derive_pcp_rank_major_reorder_indices(
+        jnp.array([0, 2, 4], dtype=jnp.int32),
+        jnp.array([0, 0], dtype=jnp.int32),
+        pcp_size=2,
+        interleave_size=1,
+        local_padded_num_tokens=4,
+    )
+    assert reorder.dtype == jnp.int32
+    in_starts, out_starts, run_lens = _derive_pcp_ragged_exchange_descriptors(
+        reorder,
+        pcp_size=2,
+        interleave_size=1,
+        local_padded_num_tokens=4,
+        max_num_requests=2,
+    )
+    assert in_starts.dtype == jnp.int32
+    assert out_starts.dtype == jnp.int32
+    assert run_lens.dtype == jnp.int32
