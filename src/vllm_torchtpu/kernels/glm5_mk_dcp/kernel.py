@@ -114,6 +114,8 @@ class Tiles:
     scan_depth: int = 8
     topk_kc: int = 512          # local extraction chunk (1-chip sweep j-ffda0844: 256 -> 512 = -3 us/row)
     topk_kc_global: int = 256   # global compaction chunk (owns ~K/R slots: one chunk with the dyn count)
+    kloc: int = 0               # local candidates per row (0: KT). < KT: exchange only the local top-kloc;
+                                # exact (fallback to KT for the layer when a truncated rank reaches T')
     kch: int = 0                # candidate-key AG in chunks of kch rows, double-buffered (0: all TMAX rows
                                 # at once). VMEM R * TMAX * KT * 4 B -> 2 * R * kch * KT * 4 B (conc 16)
 
@@ -335,6 +337,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     NPR = pg // 128                                      # key rows per page
     KT = cfg.KT
     KR_ = KT // 128                                      # candidate rows
+    KLOC = tiles.kloc if 0 < tiles.kloc < KT else KT     # local candidates per row (fast round)
+    assert KLOC % 128 == 0, KLOC
+    KLR = KLOC // 128
     # own_u entries: gather source (page << 8 | slot, or staging row << 2 | seg) | row bitmask << MB_SH
     MB_SH = 27
     SRC_MASK = (1 << MB_SH) - 1
@@ -448,7 +453,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         "oslot_s": pltpu.SMEM((KR_, 128), I32),
         "cand_v": pltpu.VMEM((TMAX, KR_, 128), I32),
         "own_s": pltpu.SMEM((cfg.QMAX * KR_, 128), I32), "own_v": pltpu.VMEM((TMAX, KR_, 128), I32),
-        "nown_s": pltpu.SMEM((TMAX,), I32),
+        "nown_s": pltpu.SMEM((TMAX,), I32), "fb_s": pltpu.SMEM((1,), I32),
         # per-request union of the rows' owned winners (+ per-row membership over it)
         "own_u": pltpu.SMEM((UR_, 128), I32), "own_uv": pltpu.VMEM((UR_, 128), I32),
         
@@ -836,7 +841,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                     device_id_type=pl.DeviceIdType.MESH)
             pl.semaphore_wait(barrier, R)
 
-        def exchange(src_of_d, dst, ss, rs, wait=True, rows=None):
+        def exchange(src_of_d, dst, ss, rs, wait=True, rows=None, dst_of_i=None):
             """Start src_of_d(d) -> dst[me] on every peer d; wait R-1 receives and sends.
             Race freedom (WHITEBOARD §5): every exchange is all-to-all, and each receive buffer is
             consumed before this rank starts the next exchange whose completion peers need before
@@ -845,6 +850,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return None if wait else (lambda: None)
             src_fn = src_of_d if rows is None else (lambda d: src_of_d(d).at[pl.ds(0, rows)])
             dst_fn = (lambda i: dst.at[i]) if rows is None else (lambda i: dst.at[i, pl.ds(0, rows)])
+            if dst_of_i is not None:
+                dst_fn = dst_of_i
             for d in range(R):
                 @pl.when(me != d)
                 def _(d=d):
@@ -1222,43 +1229,54 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             cp.start()
             cp.wait()
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).start()
-            # local scan per request -> keys per row -> local top-KT -> ksend
-            scr["ksend"][...] = jnp.full((TMAX, KR_, 128), INT_MIN, I32)
-            pi.mark("I_scan_ltopk")
+            # local scan per request -> keys per row -> local top-k -> ksend -> AG -> global top-KT
+            def topk_round(klr, ph):
+                scr["ksend"][...] = jnp.full((TMAX, KR_, 128), INT_MIN, I32)
+                ph.mark("I_scan_ltopk")
 
-            def per_req(b, c):
-                @pl.when(qmeta[b, 3] > 0)
+                def per_req(b, c):
+                    @pl.when(qmeta[b, 3] > 0)
+                    def _():
+                        scan_request(l, b, klr)
+                    return c
+                lax.fori_loop(0, B, per_req, 0)
+                ph.mark("I_agk")
+                # chunk c -> kall[c % NKS]: a peer rewrites slot c % 2 only at chunk c + 2, which it
+                # starts after receiving this rank's chunk c + 1, sent after this rank consumed chunk c
+
+                def k_chunk(c, cc):
+                    slot = c % NKS
+                    r0 = pl.multiple_of(c * KCH, KCH)
+                    n = jnp.minimum(KCH, T - r0)
+                    scr["kall"][slot, me, :, 0:klr, :] = scr["ksend"][pl.ds(r0, KCH), 0:klr, :]
+                    exchange(lambda d: scr["ksend"].at[pl.ds(r0, KCH), pl.ds(0, klr)], scr["kall"].at[slot],
+                             "k_send", "k_recv", rows=n,
+                             dst_of_i=lambda i_: scr["kall"].at[slot, i_, pl.ds(0, n), pl.ds(0, klr)])
+
+                    def per_row(i, c2):
+                        t_ = r0 + i
+
+                        @pl.when(rmeta[t_, 0] > 0)
+                        def _():
+                            global_row(t_, slot, i, klr)
+
+                        @pl.when(rmeta[t_, 0] <= 0)
+                        def _():
+                            scr["nown_s"][t_] = jnp.int32(0)
+                        return c2
+                    lax.fori_loop(0, n, per_row, 0)
+                    return cc
+                lax.fori_loop(0, (T + KCH - 1) // KCH, k_chunk, 0)
+
+            scr["fb_s"][0] = jnp.int32(0)
+            topk_round(KLR, pi)
+            if KLR < KR_:
+                @pl.when(scr["fb_s"][0] > 0)
                 def _():
-                    scan_request(l, b)
-                return c
-            lax.fori_loop(0, B, per_req, 0)
-            # AG candidate keys, global top-KT, owned winners
-            pi.mark("I_agk")
-            # chunk c -> kall[c % NKS]: a peer rewrites slot c % 2 only at chunk c + 2, which it starts
-            # after receiving this rank's chunk c + 1, sent after this rank consumed chunk c
-
-            def k_chunk(c, cc):
-                slot = c % NKS
-                r0 = pl.multiple_of(c * KCH, KCH)
-                n = jnp.minimum(KCH, T - r0)
-                scr["kall"][slot, me] = scr["ksend"][pl.ds(r0, KCH)]
-                exchange(lambda d: scr["ksend"].at[pl.ds(r0, KCH)], scr["kall"].at[slot], "k_send", "k_recv",
-                         rows=n)
-
-                def per_row(i, c2):
-                    t_ = r0 + i
-
-                    @pl.when(rmeta[t_, 0] > 0)
-                    def _():
-                        global_row(t_, slot, i)
-
-                    @pl.when(rmeta[t_, 0] <= 0)
-                    def _():
-                        scr["nown_s"][t_] = jnp.int32(0)
-                    return c2
-                lax.fori_loop(0, n, per_row, 0)
-                return cc
-            lax.fori_loop(0, (T + KCH - 1) // KCH, k_chunk, 0)
+                    pf = Phases(tiles.trace)                 # scopes opened and closed inside the branch
+                    pf.mark("I_fallback")
+                    topk_round(KR_, pf)
+                    pf.end()
 
             pi.mark("I_union")
 
@@ -1279,7 +1297,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
             pi.end()
 
-        def scan_request(l, b):
+        def scan_request(l, b, klr=KR_):
             """Score request b's rows against this rank's local indexer keys; local top-KT per row."""
             ps_ = Phases(tiles.trace)
             ps_.mark("I_scan")
@@ -1365,9 +1383,11 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     pos = rmeta[t_, 1]
                     L_ = pos + 1
                     nval = (L_ // G_) * ILV + jnp.clip(L_ % G_ - ILV * me, 0, ILV)
-                    topk2.local_topk(scr["keys"].at[qq], nval, KT, scr["cidx"], scr["ksend"].at[t_],
-                                     scr["kpre"], scr["tk_acc"], scr["tk_cc"], kc=tiles.topk_kc)
-                    scr["cand_v"][t_] = scr["cidx"][...]
+                    topk2.local_topk(scr["keys"].at[qq], nval, klr * 128, scr["cidx"].at[pl.ds(0, klr)],
+                                     scr["ksend"].at[t_, pl.ds(0, klr)], scr["kpre"],
+                                     scr["tk_acc"].at[pl.ds(0, min(tiles.topk_kc, klr * 128))],
+                                     scr["tk_cc"], kc=tiles.topk_kc)
+                    scr["cand_v"][t_, 0:klr, :] = scr["cidx"][0:klr, :]
             ps_.end()
 
         def resolve_union():
@@ -1465,20 +1485,34 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["nuo_s"][b] = res[2]
             return off + (res[1] + 127) // 128
 
-        def global_row(t_, slot, tl):
+        def global_row(t_, slot, tl, klr=KR_):
             """Row t_'s global top-KT over all ranks' candidates -> own_v / nown_s (build_union copies a
             request's rows to own_s)."""
+            NRk = R * klr
+            GKk = rup(NRk, 128)
             for s_ in range(R):
-                scr["gk"][s_ * KR_:(s_ + 1) * KR_, :] = scr["kall"][slot, s_, tl]
-            if GKR > R * KR_:
-                scr["gk"][R * KR_:GKR, :] = jnp.full((GKR - R * KR_, 128), INT_MIN, I32)
+                scr["gk"][s_ * klr:(s_ + 1) * klr, :] = scr["kall"][slot, s_, tl, 0:klr, :]
+            if GKk > NRk:
+                scr["gk"][NRk:GKk, :] = jnp.full((GKk - NRk, 128), INT_MIN, I32)
             # owned winners' local indices compacted by the vector extraction itself (payload = the
             # candidate's local index): no per-entry scalar gather (a rank owning most winners was a
             # multi-ms straggler, PHASES.draft1.md)
-            n_own = topk2.global_owned(scr["gk"], me, KT, scr["oslot"], scr["kpre"],
-                                       scr["tk_acc"].at[pl.ds(0, min(tiles.topk_kc_global, KT))],
-                                       scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc_global,
-                                       pay_ref=scr["cand_v"].at[t_], pay_out=scr["own_v"].at[t_])
+            n_own, T_ = topk2.global_owned(scr["gk"].at[pl.ds(0, GKk)], me, KT, scr["oslot"], scr["kpre"],
+                                           scr["tk_acc"].at[pl.ds(0, min(tiles.topk_kc_global, KT))],
+                                           scr["tk_cc"], scr["gmk"], kc=tiles.topk_kc_global,
+                                           pay_ref=scr["cand_v"].at[t_, pl.ds(0, klr)],
+                                           pay_out=scr["own_v"].at[t_], kr=klr, return_t=True)
+            if klr < KR_:
+                # exactness: T' (union of the local top-kloc) <= T (full). A rank whose list was cut
+                # (more than kloc valid keys) and whose kloc-th key >= T' may hold winners it did not
+                # send -> flag the layer for the full round. Replicated (every rank sees every list).
+                L_ = rmeta[t_, 1] + 1
+                f = jnp.int32(0)
+                for s_ in range(R):
+                    nval_s = (L_ // G_) * ILV + jnp.clip(L_ % G_ - ILV * s_, 0, ILV)
+                    kth = jnp.min(scr["gk"][s_ * klr:(s_ + 1) * klr, :])
+                    f = f | jnp.logical_and(nval_s > klr * 128, kth >= T_).astype(I32)
+                scr["fb_s"][0] = scr["fb_s"][0] | f
             kio = (lax.broadcasted_iota(I32, (KR_, 128), 0) * 128 + lax.broadcasted_iota(I32, (KR_, 128), 1))
             scr["own_v"][t_] = jnp.where(kio < n_own, scr["own_v"][t_], -1)
             scr["nown_s"][t_] = n_own

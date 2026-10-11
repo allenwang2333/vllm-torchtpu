@@ -237,12 +237,12 @@ def local_topk(keys_ref, n_valid, K, idx_v, key_v, pre_ref, acc_ref, cc_ref, kc=
 
 
 def global_owned(kall_ref, me, K, own_v, pre_ref, acc_ref, cc_ref, mk_ref, kc=256, pay_ref=None,
-                 pay_out=None):
+                 pay_out=None, kr=None, return_t=False):
     """kall_ref (R*K//128, 128) i32: the R ranks' candidate keys, rank-major (position = r*K + slot).
     The global top-K (ties -> lower position) restricted to rank `me`'s rows, compacted:
     own_v (K//128, 128) i32 = this rank's winning candidate SLOTS ascending, -1 padded.
     mk_ref (128, 128) i32 scratch. Returns the count of owned winners."""
-    KR = K // 128
+    KR = K // 128 if kr is None else kr          # candidate rows per rank (rank-major blocks)
     NR = kall_ref.shape[0]
     assert NR % 128 == 0
     nbk = NR // 128
@@ -262,5 +262,6 @@ def global_owned(kall_ref, me, K, own_v, pre_ref, acc_ref, cc_ref, mk_ref, kc=25
     # pay_ref (KR, 128) i32 >= 0 per candidate slot: the selected slots' payloads compacted in slot
     # order into pay_out (INT_MIN past the count) by the same extraction (keys = payloads, T = 0)
     mk_ref[0:KR, :] = jnp.where(sel, pay_ref[...], jnp.int32(INT_MIN))
-    return extract_payload(mk_ref, 1, jnp.int32(0), jnp.int32(INT_MAX), K, own_v, pay_out, pre_ref,
-                           acc_ref, cc_ref, kc=kc)
+    n = extract_payload(mk_ref, 1, jnp.int32(0), jnp.int32(INT_MAX), K, own_v, pay_out, pre_ref,
+                        acc_ref, cc_ref, kc=kc)
+    return (n, T) if return_t else n
