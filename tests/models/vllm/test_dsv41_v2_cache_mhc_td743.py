@@ -218,6 +218,70 @@ class TestPagedCacheRowsTD743:
         paged.write(torch.tensor([0, 1], dtype=torch.int64), vals_bf16)
         assert write_rec_dtypes == [torch.int32, torch.int32]
 
+    def test_td8291_paged_cache_rows_cpu_getitem_int32_index_select(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        layout = ((8, 4, 256), torch.bfloat16, 2048, 0)
+        raw_lo = torch.arange(16 * ROW_WORDS, dtype=torch.int32).reshape(16, ROW_WORDS)
+        raw_hi = (
+            torch.arange(16 * ROW_WORDS, dtype=torch.int32).reshape(16, ROW_WORDS)
+            + 1000
+        )
+        paged_1b = PagedCacheRows(raw_lo.clone(), layout)
+        paged_2b = PagedCacheRows((raw_lo.clone(), raw_hi.clone()), layout)
+
+        index_select_dtypes: list[torch.dtype] = []
+        orig_index_select = torch.Tensor.index_select
+
+        def spy_index_select(self_t: torch.Tensor, dim: int, index: torch.Tensor):
+            index_select_dtypes.append(index.dtype)
+            return orig_index_select(self_t, dim, index)
+
+        monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+
+        pages_1b = torch.tensor([[0, 2], [-1, 3]], dtype=torch.int32)
+        pages_2b = torch.tensor([[0, 2], [-1, 5]], dtype=torch.int32)
+        offsets = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
+        out_1b = paged_1b[pages_1b, offsets]
+        assert out_1b.shape == (2, 2, 256)
+        out_2b = paged_2b[pages_2b, offsets]
+        assert out_2b.shape == (2, 2, 256)
+        assert index_select_dtypes == [
+            torch.int32,
+            torch.int32,
+            torch.int32,
+        ]
+        # Verify equivalence against 64-bit gather reference on 1-bank and 2-bank pools
+        records_1b = (
+            pages_1b * paged_1b.shape[1] + offsets + paged_1b.row_offset
+        ).clamp(min=0)
+        pool_1b = (
+            raw_lo.view(torch.int8)
+            .reshape(-1, 256 * paged_1b.dtype.itemsize)
+            .view(paged_1b.dtype)
+        )
+        assert torch.equal(out_1b, pool_1b[records_1b.long()])
+        pool_lo = (
+            raw_lo.view(torch.int8)
+            .reshape(-1, 256 * paged_2b.dtype.itemsize)
+            .view(paged_2b.dtype)
+        )
+        pool_hi = (
+            raw_hi.view(torch.int8)
+            .reshape(-1, 256 * paged_2b.dtype.itemsize)
+            .view(paged_2b.dtype)
+        )
+        records_2b = (
+            pages_2b * paged_2b.shape[1] + offsets + paged_2b.row_offset
+        ).clamp(min=0)
+        bank_records = pool_lo.shape[0]
+        ref_2b = torch.where(
+            (records_2b >= bank_records).unsqueeze(-1),
+            pool_hi[(records_2b - bank_records).clamp(min=0).long()],
+            pool_lo[records_2b.clamp(max=bank_records - 1).long()],
+        )
+        assert torch.equal(out_2b, ref_2b)
+
     def test_write_fp8_and_write_cache_dtype_guards(
         self, monkeypatch: pytest.MonkeyPatch
     ):

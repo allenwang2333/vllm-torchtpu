@@ -252,3 +252,43 @@ def test_align_filter_runs_once(monkeypatch) -> None:
         lambda: pytest.fail("must not be called"),
     )
     moe_hierarchical.align_ep_weight_filter()
+
+
+def test_td8291_hash_moe_select_and_routed_topk_ids_int32_index_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.291: Verify _hash_moe_select and _hash_routed_topk_ids use native
+    torch.int32 1D .index_select(0, ...) for both int32 and int64 input_ids."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter import fused_moe_ep
+
+    seen_dtypes: list[torch.dtype] = []
+    orig_index_select = torch.Tensor.index_select
+
+    def _spy_index_select(self, dim, index):
+        seen_dtypes.append(index.dtype)
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", _spy_index_select)
+
+    scores = torch.rand(6, 16, dtype=torch.float32)
+    table = torch.randint(0, 16, (32, 4), dtype=torch.int32)
+    ids32 = torch.randint(0, 32, (2, 3), dtype=torch.int32)
+    ids64 = ids32.to(torch.int64)
+
+    w32, idx32 = moe_routing._hash_moe_select(
+        scores, table, ids32, renormalize=False, routed_scaling_factor=1.0
+    )
+    w64, idx64 = moe_routing._hash_moe_select(
+        scores, table, ids64, renormalize=False, routed_scaling_factor=1.0
+    )
+    assert torch.equal(w32, w64)
+    assert torch.equal(idx32, idx64)
+
+    layer = SimpleNamespace(hash_indices_table=table)
+    ep32 = fused_moe_ep.hash_topk_ids_operand(layer, ids32)
+    ep64 = fused_moe_ep.hash_topk_ids_operand(layer, ids64)
+    assert ep32 is not None and ep64 is not None
+    assert torch.equal(ep32, ep64)
+    assert seen_dtypes == [torch.int32, torch.int32, torch.int32, torch.int32]

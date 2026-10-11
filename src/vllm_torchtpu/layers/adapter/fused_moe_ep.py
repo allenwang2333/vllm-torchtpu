@@ -452,10 +452,10 @@ def hash_topk_ids_operand(layer, input_ids: torch.Tensor | None) -> torch.Tensor
             "the fused EP MoE kernel is armed for a hash-routed layer, which "
             "selects its experts from input_ids, and none were supplied"
         )
-    idx = input_ids if input_ids.dtype == torch.int64 else input_ids.long()
-    if idx.ndim != 1:
-        idx = idx.flatten()
-    selected = table[idx]
+    idx = (
+        input_ids if input_ids.dtype == torch.int32 else input_ids.to(torch.int32)
+    ).reshape(-1)
+    selected = table.index_select(0, idx)
     return selected if selected.dtype == torch.int32 else selected.to(torch.int32)
 
 

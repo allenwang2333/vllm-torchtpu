@@ -65,16 +65,16 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     "layers": (1, 7, 0, "TD8.140 / TD8.159 / TD8.166"),
     "layers/adapter": (
         54,
-        6479,
-        1704,
+        6477,
+        1702,
         "TD8.108 / TD8.128 / TD8.140 / TD8.141 / TD8.196 / TD8.207 / TD8.213 / TD8.219"
-        " / TD8.285",
+        " / TD8.285 / TD8.291",
     ),
     "layers/core": (
         12,
         2140,
         536,
-        "TD8.81 / TD8.94 / TD8.110 / TD8.134 / TD8.175 / TD8.199 / TD8.281",
+        "TD8.81 / TD8.94 / TD8.110 / TD8.134 / TD8.175 / TD8.199 / TD8.281 / TD8.290",
     ),
     "models": (1, 0, 0, "TD8.155 / TD8.166"),
     "models/vllm": (4, 334, 112, "TD8.67 / TD8.154 / TD8.155 / TD8.158"),
@@ -90,7 +90,7 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
         " / TD8.248 / TD8.249 / TD8.250 / TD8.251 / TD8.253 / TD8.254 / TD8.255"
         " / TD8.256 / TD8.257 / TD8.258 / TD8.259 / TD8.260 / TD8.261 / TD8.263"
         " / TD8.264 / TD8.266 / TD8.267 / TD8.269 / TD8.271 / EXT-1A / TD8.283"
-        " / TD8.287 / TD8.288",
+        " / TD8.287 / TD8.288 / TD8.289 / TD8.291",
     ),
     "models/vllm/kimi_k3": (8, 1310, 316, "TD8.87 / TD8.124 / TD8.154 / TD8.158"),
     "offload": (4, 916, 294, "TD8.88 / TD8.121 / TD8.144 / TD8.151 / TD8.157"),

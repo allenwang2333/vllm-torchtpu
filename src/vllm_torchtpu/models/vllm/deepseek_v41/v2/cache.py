@@ -541,16 +541,20 @@ class PagedCacheRows:
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             valid = records >= 0
-            rec = records.clamp(min=0).long()
+            rec = records.clamp(min=0).int()
             if self.raw_hi is None:
-                selected = pool[rec]
+                selected = pool.index_select(0, rec.reshape(-1)).reshape(
+                    *rec.shape, self.row_bytes
+                )
             else:
                 pool_hi = self.raw_hi.view(torch.int8).reshape(-1, self.row_bytes)
                 in_hi = rec >= self.bank_records
-                lo_idx = rec.masked_fill(in_hi, 0)
-                hi_idx = (rec - self.bank_records).masked_fill(~in_hi, 0)
+                lo_idx = rec.masked_fill(in_hi, 0).reshape(-1)
+                hi_idx = (rec - self.bank_records).masked_fill(~in_hi, 0).reshape(-1)
                 selected = torch.where(
-                    in_hi.unsqueeze(-1), pool_hi[hi_idx], pool[lo_idx]
+                    in_hi.unsqueeze(-1),
+                    pool_hi.index_select(0, hi_idx).reshape(*rec.shape, self.row_bytes),
+                    pool.index_select(0, lo_idx).reshape(*rec.shape, self.row_bytes),
                 )
             if self.sharded:
                 selected = selected.masked_fill(~valid.unsqueeze(-1), 0)

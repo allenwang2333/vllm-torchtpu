@@ -309,10 +309,10 @@ def _hash_moe_select(
     flat input_ids rather than dynamic gating logits.
     """
     flat_input_ids = (
-        input_ids if input_ids.dtype == torch.int64 else input_ids.long()
-    ).flatten()
+        input_ids if input_ids.dtype == torch.int32 else input_ids.to(torch.int32)
+    ).reshape(-1)
     # Keep the table's dtype (int32 for DeepSeek-V4); callers cast to int32.
-    topk_ids = hash_indices_table[flat_input_ids]
+    topk_ids = hash_indices_table.index_select(0, flat_input_ids)
     if scores.ndim != 2:
         topk_ids = topk_ids.reshape(*scores.shape[:-1], topk_ids.shape[-1])
     topk_weights = _gather_expert_scores(scores, topk_ids)
