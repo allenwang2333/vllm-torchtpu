@@ -222,3 +222,133 @@ def test_td8300_read_cache_1d_int32_index_select_and_spec_logprobs_int32(slot_dt
     )
     lists = spec_logprobs_lists([chunk], [2, 1])
     assert lists.cu_num_generated_tokens == [0, 2, 3]
+
+
+def test_td8308_cache_slots_row_slots_and_dsv4_int32_guards(monkeypatch):
+    """Verify TD8.308 int32 cast guards in cache ops, dsv4 attention, and dspark."""
+    from unittest import mock
+
+    from vllm_torchtpu.models.vllm.deepseek_v4 import attention as dsv4_attn
+    from vllm_torchtpu.models.vllm.deepseek_v4 import dspark as dsv4_dspark
+
+    # 1. read_cache non-CPU path with int32 and int64 slots
+    captured_slots = []
+    monkeypatch.setattr(
+        cache_mod,
+        "_read_values_op",
+        lambda cache, slots, *args: (
+            captured_slots.append(slots) or torch.zeros(slots.numel(), 4)
+        ),
+    )
+    fake_cache = mock.MagicMock()
+    fake_cache.device.type = "tpu"
+    layout = SimpleNamespace(
+        geometry=(4, 4, 0),
+        elements=4,
+        dtype=torch.bfloat16,
+    )
+    for dt in (torch.int32, torch.int64):
+        out = cache_mod.read_cache(
+            fake_cache, torch.tensor([[0, 1], [2, 3]], dtype=dt), layout=layout
+        )
+        assert out.shape == (2, 2, 4)
+    assert len(captured_slots) == 2
+    assert all(s.dtype == torch.int32 for s in captured_slots)
+
+    # 2. cache_slots and row_slots with int32 and int64 inputs
+    for dt in (torch.int32, torch.int64):
+        meta = SimpleNamespace(
+            seq_lens=torch.tensor([4, 4], dtype=dt),
+            block_tables=torch.arange(8, dtype=dt),
+            query_start_loc=torch.tensor([0, 2, 4], dtype=dt),
+        )
+        pos = torch.tensor([0, 1, 2, 3], dtype=dt)
+        reqs = torch.tensor([0, 0, 1, 1], dtype=dt)
+        slots_r1 = cache_mod.cache_slots(
+            meta, pos, rows_per_page=2, compress_ratio=1, requests=reqs
+        )
+        slots_r2 = cache_mod.cache_slots(
+            meta, pos, rows_per_page=2, compress_ratio=2, requests=reqs
+        )
+        assert slots_r1.dtype == torch.int32
+        assert slots_r2.dtype == torch.int32
+
+        r_slots = cache_mod.row_slots(
+            torch.arange(8, dtype=dt).view(2, 4),
+            reqs,
+            pos[:, None],
+            rows_per_page=2,
+        )
+        assert r_slots.dtype == torch.int32
+
+    # 3. dsv4/dspark.py _insert_context_kv with int32 and int64 positions
+    for dt in (torch.int32, torch.int64):
+        captured_ops = []
+        sw_cache = torch.zeros(2, 4, 8)
+        attn = SimpleNamespace(
+            _get_active_sw_cache=lambda c=sw_cache: c,
+            custom_prefix="swa",
+            kv_rope=lambda kv, p: kv,
+            mla_attn=SimpleNamespace(n_local_heads=2, head_dim=4),
+            compress_ratio=1,
+            attn_sink=torch.zeros(2),
+            attn_op=lambda *ops, cap=captured_ops: (
+                cap.append(ops),
+                (None, torch.ones(2, 4, 8)),
+            )[1],
+        )
+        meta_swa = SimpleNamespace(
+            seq_lens=torch.tensor([2], dtype=torch.int32),
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        )
+        dsv4_dspark._insert_context_kv(
+            attn, torch.zeros(2, 4), torch.tensor([1, 3], dtype=dt), meta_swa
+        )
+        assert len(captured_ops) == 1
+        assert captured_ops[0][9].dtype == torch.int32
+        assert torch.equal(captured_ops[0][9], torch.tensor([2, 4], dtype=torch.int32))
+
+    # 4. dsv4/attention.py _run_mqa with int32 and int64 positions (is_csa=False)
+    for dt in (torch.int32, torch.int64):
+        captured_mqa = []
+        sw_cache = torch.zeros(2, 4, 8)
+        swa_layer = SimpleNamespace(
+            kv_cache=sw_cache,
+            prefix="swa",
+        )
+        dummy_attn = SimpleNamespace(
+            _get_active_sw_cache=lambda c=sw_cache: c,
+            attention_kind="swa",
+            swa_cache_layer=swa_layer,
+            main_cache_layer=swa_layer,
+            compress_ratio=2,
+            attn_sink=torch.zeros(2),
+            attn_op=lambda *ops, cap=captured_mqa: (
+                cap.append(ops),
+                (torch.ones(2, 2, 4), torch.ones(2, 4, 8)),
+            )[1],
+        )
+        meta_swa = SimpleNamespace(
+            seq_lens=torch.tensor([2], dtype=torch.int32),
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        )
+        monkeypatch.setattr(
+            dsv4_attn,
+            "get_forward_context",
+            lambda meta=meta_swa: SimpleNamespace(attn_metadata={"swa": meta}),
+        )
+        out_mqa = dsv4_attn.DeepseekTPUAttentionMixin._run_mqa(
+            dummy_attn,
+            torch.zeros(2, 2, 4),
+            torch.zeros(2, 4),
+            torch.tensor([1, 3], dtype=dt),
+            torch.zeros(2, 2, 4),
+            topk_indices=None,
+        )
+        assert out_mqa.shape == (2, 2, 4)
+        assert captured_mqa[0][9].dtype == torch.int32
+        assert torch.equal(captured_mqa[0][9], torch.tensor([1, 2], dtype=torch.int32))

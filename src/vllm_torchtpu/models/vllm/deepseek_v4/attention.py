@@ -504,7 +504,14 @@ class DeepseekTPUAttentionMixin:
             assert topk_indices is not None
             extra = topk_indices
         else:
-            extra = (positions + 1).to(torch.int32) // max(1, self.compress_ratio)
+            extra = (
+                (
+                    positions
+                    if positions.dtype == torch.int32
+                    else positions.to(torch.int32)
+                )
+                + 1
+            ) // max(1, self.compress_ratio)
 
         operands = (
             q,

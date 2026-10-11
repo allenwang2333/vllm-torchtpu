@@ -121,7 +121,11 @@ def _insert_context_kv(
         metadata.request_distribution,
         orig_sw_cache.clone(),
         metadata.seq_lens.clone(),
-        (positions + 1).to(torch.int32) // attn.compress_ratio,
+        (
+            (positions if positions.dtype == torch.int32 else positions.to(torch.int32))
+            + 1
+        )
+        // attn.compress_ratio,
         metadata.block_tables.clone(),
         metadata.query_start_loc.clone(),
         metadata.request_distribution.clone(),
