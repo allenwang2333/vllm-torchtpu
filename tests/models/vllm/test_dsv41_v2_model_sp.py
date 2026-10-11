@@ -4,6 +4,7 @@
 import unittest.mock
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from math import prod
 from types import SimpleNamespace
 from typing import Any
 
@@ -1070,6 +1071,7 @@ def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
     model = v2_model.DeepseekV41Model.__new__(v2_model.DeepseekV41Model)
     torch.nn.Module.__init__(model)
     model.start_layer, model.end_layer, model._ced_boundary = 0, 4, 4
+    model._ced_compile_sizes = (4, 5, 6)
     model.use_sequence_parallel = sequence_parallel
     model.use_native_mega_moe = False
     model._mtp_hidden_buffer = None
@@ -1134,7 +1136,7 @@ def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
     pipeline = v2_model.DeepseekV41EngramPipeline(
         owner=model, vllm_config=cfg, boundaries=(0, 2, 4), stage=stage
     )
-    for count, offset in [(6, 0), (4, 10), (6, 20)]:
+    for count, offset in [(6, 0), (4, 10), (5, 15), (6, 20)]:
         ids = torch.arange(count) + offset
         positions = torch.arange(count)
         with override(Context(torch.zeros(count, dtype=torch.bool))):
@@ -1166,3 +1168,58 @@ def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
     ):
         pipeline(ids, positions)
     assert not model._engram_prepared_outside_stage
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_engram_boundary_concretizes_sp_rows_from_full_token_bucket(tp_size):
+    from vllm.compilation.piecewise_backend import create_concrete_args
+
+    buckets = (16, 17, 32)
+    tail_shapes = {"hidden_states": (16,), "post_mix": (4,), "res_mix": (4, 4)}
+    compiled_buckets = []
+
+    def backend(graph, example_inputs):
+        for bucket in buckets:
+            concrete = create_concrete_args(graph, bucket)
+            outputs = graph(*concrete)
+            expected_rows = -(-bucket // tp_size)
+            assert [value.shape[0] for value in outputs] == [
+                expected_rows,
+                expected_rows,
+                expected_rows,
+            ]
+            compiled_buckets.append(bucket)
+        return graph.forward
+
+    def continuation(positions, packed, shapes):
+        state = v2_model._unpack_engram_boundary(
+            packed, shapes, positions.shape[0], tp_size
+        )
+        return (
+            state["hidden_states"],
+            state["post_mix"],
+            state["res_mix"],
+            state["aux_1"],
+        )
+
+    compiled = torch.compile(continuation, backend=backend, fullgraph=True)
+    for count in buckets:
+        rows = -(-count // tp_size)
+        state = v2_model.upstream.IntermediateTensors(
+            {
+                name: torch.arange(rows * prod(shape)).reshape(rows, *shape)
+                for name, shape in tail_shapes.items()
+            }
+            | {"aux_1": torch.arange(count * 16).reshape(count, 16)}
+        )
+        packed, shapes = v2_model._pack_engram_boundary(state, count, tp_size, buckets)
+        positions = torch.arange(count)
+        torch._dynamo.mark_dynamic(positions, 0)
+        for value in packed.tensors.values():
+            assert value.shape[0] == count
+            torch._dynamo.mark_dynamic(value, 0)
+        actual = compiled(positions, packed, shapes)
+        for result, expected in zip(actual, state.tensors.values(), strict=True):
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert set(compiled_buckets) == set(buckets)

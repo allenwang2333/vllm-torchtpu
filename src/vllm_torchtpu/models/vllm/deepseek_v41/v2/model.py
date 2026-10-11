@@ -5,6 +5,7 @@
 from collections.abc import Sequence
 from dataclasses import replace
 from itertools import islice
+from math import prod
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -212,6 +213,55 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+def _pack_engram_boundary(
+    state: upstream.IntermediateTensors,
+    num_tokens: int,
+    tp_size: int,
+    token_buckets: tuple[int, ...],
+) -> tuple[upstream.IntermediateTensors, dict[str, tuple[int, ...]]]:
+    tensors = {}
+    shapes = {}
+    for name, value in state.tensors.items():
+        if name.startswith("aux_"):
+            tensors[name] = value
+            continue
+        shape = tuple(value.shape[1:])
+        columns = prod(shape)
+        # vLLM concretizes every independent symbol to the full token bucket.
+        # Give SP state that same leading dimension, without an all-gather.
+        # Only small mix tensors or non-divisible buckets need padding.
+        widths = []
+        for bucket in token_buckets:
+            rows = -(-bucket // tp_size)
+            widths.append(-(-(rows * columns) // bucket))
+        width = max(widths, default=columns)
+        flat = value.reshape(-1)
+        tensors[name] = torch.nn.functional.pad(
+            flat, (0, num_tokens * width - flat.numel())
+        ).view(num_tokens, width)
+        shapes[name] = shape
+    return upstream.IntermediateTensors(tensors), shapes
+
+
+def _unpack_engram_boundary(
+    state: upstream.IntermediateTensors,
+    shapes: dict[str, tuple[int, ...]],
+    num_tokens: int,
+    tp_size: int,
+) -> upstream.IntermediateTensors:
+    rows = -(-num_tokens // tp_size)
+    return upstream.IntermediateTensors(
+        {
+            name: value.reshape(-1)[: rows * prod(shapes[name])].view(
+                rows, *shapes[name]
+            )
+            if name in shapes
+            else value
+            for name, value in state.tensors.items()
+        }
+    )
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -235,6 +285,12 @@ class DeepseekV41EngramStage(_StageBase):
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.stage = stage
+        self.tp_size = (
+            upstream.get_tensor_model_parallel_world_size()
+            if owner._stage_uses_sequence_parallel(stage)
+            else 1
+        )
+        self.token_buckets = owner._ced_compile_sizes
 
     def forward(
         self,
@@ -243,8 +299,21 @@ class DeepseekV41EngramStage(_StageBase):
         intermediate_tensors: upstream.IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | upstream.IntermediateTensors:
-        return self.owner._forward_stage(
+        intermediate_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> (
+        torch.Tensor
+        | upstream.IntermediateTensors
+        | tuple[upstream.IntermediateTensors, dict[str, tuple[int, ...]]]
+    ):
+        if intermediate_shapes is not None:
+            assert intermediate_tensors is not None
+            intermediate_tensors = _unpack_engram_boundary(
+                intermediate_tensors,
+                intermediate_shapes,
+                positions.shape[0],
+                self.tp_size,
+            )
+        output = self.owner._forward_stage(
             input_ids,
             positions,
             intermediate_tensors,
@@ -253,6 +322,17 @@ class DeepseekV41EngramStage(_StageBase):
             stage=self.stage,
             layer_range=(self.start_layer, self.end_layer),
         )
+        end = (
+            self.owner._ced_boundary
+            if self.stage == "encoder"
+            else self.owner.end_layer
+        )
+        if self.end_layer < end:
+            assert isinstance(output, upstream.IntermediateTensors)
+            return _pack_engram_boundary(
+                output, positions.shape[0], self.tp_size, self.token_buckets
+            )
+        return output
 
 
 class DeepseekV41EngramPipeline(_StageBase):
@@ -304,6 +384,7 @@ class DeepseekV41EngramPipeline(_StageBase):
         )
         self.owner._engram_prepared_outside_stage = True
         context = upstream.get_forward_context()
+        intermediate_shapes = None
         try:
             for index, segment in enumerate(segments):
                 pending = deferred.get(segment.start_layer)
@@ -318,11 +399,14 @@ class DeepseekV41EngramPipeline(_StageBase):
                         intermediate_tensors,
                         inputs_embeds,
                         lookback_token_ids,
+                        intermediate_shapes=intermediate_shapes,
                     )
                 if index == len(segments) - 1:
-                    return output
+                    return cast(torch.Tensor | upstream.IntermediateTensors, output)
                 if isinstance(output, (list, tuple)) and len(output) == 1:
                     output = output[0]
+                assert isinstance(output, tuple)
+                output, intermediate_shapes = output
                 assert isinstance(output, upstream.IntermediateTensors)
                 # DEFER_AND_FUSE must enqueue this graph before the next H2D,
                 # without waiting for its computation to finish.
