@@ -232,3 +232,30 @@ def test_lookback_valid_step_resets_synced_state():
     ids = TPUModelRunner._prepare_lookback_token_ids(runner, 2)
     assert buf.uploads == 3  # the -1 buffer must be re-uploaded
     assert (ids == -1).all()
+
+
+# --- TD8.362: 1D all-past-prompt check ahead of the 2D window -----------------
+
+
+def test_td8362_all_past_prompt_skips_window(monkeypatch):
+    runner = _lookback_runner([50, 60], [10, 47], depth=3)  # 60 - 47 >= 3
+    # The 2D window would index _ARANGE_INTP; poison it to prove it is skipped.
+    monkeypatch.setattr(tr_mod, "_ARANGE_INTP", None)
+    ids = TPUModelRunner._prepare_lookback_token_ids(runner, 2)
+    assert (ids == -1).all()
+    assert runner.lookback_token_ids.uploads == 1
+
+
+def test_td8362_inside_window_still_gathers():
+    runner = _lookback_runner([50, 49], [10, 47], depth=3)  # 49 - 47 < 3
+    ids = TPUModelRunner._prepare_lookback_token_ids(runner, 2)
+    np.testing.assert_array_equal(ids.numpy(), _old_lookback(runner, 2))
+    assert ids.numpy()[1].tolist() == [-1, -1, 146]  # only pos 46 < prompt 47
+
+
+def test_td8362_before_prompt_start_falls_through_to_all_minus_one():
+    # computed 0 < depth: the 1D check fails, the window finds nothing valid.
+    runner = _lookback_runner([0, 60], [10, 10], depth=2)
+    ids = TPUModelRunner._prepare_lookback_token_ids(runner, 2)
+    assert (ids == -1).all()
+    np.testing.assert_array_equal(ids.numpy(), _old_lookback(runner, 2))

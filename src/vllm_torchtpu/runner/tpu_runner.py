@@ -2737,26 +2737,35 @@ class TPUModelRunner(GPUModelRunner):
         assert buf is not None
         if num_reqs > 0:
             depth = buf.np.shape[1]
-            starts = self.input_batch.num_computed_tokens_cpu[:num_reqs, None]
-            pos = starts - _ARANGE_INTP[1 : depth + 1]
+            computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
             replay_starts = getattr(self, "_replay_starts", None)
-            limit = (
-                self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
-                if replay_starts
-                else self.input_batch.num_prompt_tokens[:num_reqs, None]
-            )
-            if replay_starts:
-                for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    if replay_starts.get(req_id) == starts[row, 0]:
-                        limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
-            valid = (pos >= 0) & (pos < limit)
-            if valid.any():
-                buf.np[num_reqs:].fill(-1)
-                rows = _ARANGE_INTP[:num_reqs, None]
-                ids = self.input_batch.token_ids_cpu[rows, np.maximum(pos, 0)]
-                buf.np[:num_reqs] = np.where(valid, ids, -1)
-                self._lookback_all_neg1_synced = False
-                return buf.copy_to_gpu()
+            # Without replay limits the window [starts - depth, starts) reads
+            # prompt ids only, so a request at least `depth` tokens past its
+            # prompt has none; skip the 2D window when that holds for all.
+            if replay_starts or not bool(
+                (
+                    computed - self.input_batch.num_prompt_tokens[:num_reqs] >= depth
+                ).all()
+            ):
+                starts = computed[:, None]
+                pos = starts - _ARANGE_INTP[1 : depth + 1]
+                limit = (
+                    self.input_batch.num_prompt_tokens[:num_reqs, None].copy()
+                    if replay_starts
+                    else self.input_batch.num_prompt_tokens[:num_reqs, None]
+                )
+                if replay_starts:
+                    for row, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                        if replay_starts.get(req_id) == starts[row, 0]:
+                            limit[row, 0] = self.input_batch.num_tokens_no_spec[row]
+                valid = (pos >= 0) & (pos < limit)
+                if valid.any():
+                    buf.np[num_reqs:].fill(-1)
+                    rows = _ARANGE_INTP[:num_reqs, None]
+                    ids = self.input_batch.token_ids_cpu[rows, np.maximum(pos, 0)]
+                    buf.np[:num_reqs] = np.where(valid, ids, -1)
+                    self._lookback_all_neg1_synced = False
+                    return buf.copy_to_gpu()
         # No request has prompt history in its window (steady-state decode):
         # the whole buffer is -1. This method is its only writer, so once an
         # all -1 buffer has been uploaded the device copy already holds it.
