@@ -833,14 +833,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         num_tokens = positions.shape[0]
         # Allocate o_padded from positions via zeros_like + expand so TorchTPU's
         # lowering does not call torch.empty on a compound SymInt expression.
-        o_padded = (
-            torch.zeros_like(
-                positions[:, None, None],
-                dtype=hidden_states.dtype,
-            )
-            .expand(-1, self.padded_heads, self.head_dim)
-            .contiguous()
-        )
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
             hidden_states
         )
@@ -867,6 +859,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 local_q=qr_local is not None,
                 num_tokens=num_tokens,
             )
+        o_padded: Any = (
+            None
+            if (
+                qr_local is not None
+                and isinstance(swa_kv, PagedCacheRows)
+                and self._fp8_kv
+                and bool(self.compress_ratio)
+                and getattr(self._prepare_and_attn_fn, "__func__", None)
+                is DeepseekV41Attention._prepare_tpu
+            )
+            else torch.zeros_like(
+                positions[:, None, None],
+                dtype=hidden_states.dtype,
+            )
+            .expand(-1, self.padded_heads, self.head_dim)
+            .contiguous()
+        )
         args = (
             hidden_states,
             qr,

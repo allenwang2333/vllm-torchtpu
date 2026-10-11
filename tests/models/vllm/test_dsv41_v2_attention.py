@@ -862,3 +862,112 @@ def test_td8339_compressor_write_slots_memo_key_omits_dynamic_token_count(monkey
         assert len(expected_key) == 3
         assert len(stage_cache[expected_key]) == 3
         assert out.shape == (4, 8)
+
+
+def test_td8360_forward_skips_o_padded_on_fused_qo_path(monkeypatch):
+    """TD8.360: Verify DeepseekV41Attention.forward skips allocating o_padded when
+    guaranteed to take the fused_qo (sparse_fp8_attention_qo) return path in
+    _prepare_tpu, and still allocates o_padded on non-fused_qo paths."""
+    count = 4
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    hidden = torch.ones((count, 8), dtype=torch.bfloat16)
+    qr = torch.ones((count, 4), dtype=torch.bfloat16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+
+    swa_cache = MagicMock(spec=PagedCacheRows)
+    swa_cache.numel.return_value = 128
+    swa_cache.shape = (8, 16, 512)
+    swa_cache.page_stride = 16
+    swa_cache.row_offset = 0
+    swa_cache.sharded = False
+    swa_cache.pages.return_value = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+    )
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"swa": meta, "comp": meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+
+    attn = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn.padded_heads = 2
+    attn.n_local_heads = 2
+    attn.head_dim = 4
+    attn.q_lora_rank = 4
+    attn.window_size = 64
+    attn.compress_ratio = 2
+    attn._max_model_len = 64
+    attn._fp8_kv = True
+    attn._sp_sharded_input = False
+    attn._replicated_local_q = True
+    attn._local_q_attn = True
+    attn._ced_decoder = False
+    attn._ced_global_from_encoder = False
+    attn.compressor = None
+    attn.indexer = None
+    attn.scale = 0.25
+    attn.attn_sink = torch.zeros(2, dtype=torch.float32)
+    attn._full_attn_sink = torch.zeros(4, dtype=torch.float32)
+    attn._tp_rank_1d = torch.zeros(1, dtype=torch.int32)
+    attn._tpu_rope_cache = torch.zeros(8, 4, dtype=torch.float32)
+    attn._swa_max_requests = 4
+    attn._precompact_records = True
+    attn._token_parallel_attn = True
+    attn.compressed_cache_prefix = "comp"
+    attn.topk_indices_buffer = torch.zeros((count, 8), dtype=torch.int32)
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa", kv_cache=swa_cache)
+    attn._static_forward_context = {"comp": SimpleNamespace(kv_cache=swa_cache)}
+    attn.wq_b = SimpleNamespace(weight=torch.zeros(1), weight_scale=torch.ones(1))
+    attn.wo_a = SimpleNamespace(weight=torch.zeros(1), weight_scale=torch.ones(1))
+    attn._wq_b_full = torch.zeros(1)
+    attn._wq_b_full_scale = torch.ones(1)
+    attn._wo_a_full = torch.zeros(1)
+    attn._wo_a_full_scale = torch.ones(1)
+    attn._run_parallel_input_projections = lambda h: (None, None, None)
+    attn._split_qkv_and_norm = lambda x: (qr, None, kv)
+    attn._rotate = lambda x, pos: x
+    attn.wo_b = lambda x: (x * 2, None)
+    attn._prepare_and_attn_fn = attn._prepare_tpu
+
+    projected = torch.full((count, 6), 3.0, dtype=torch.bfloat16)
+    qo_calls = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention_qo",
+        lambda *a, **kw: qo_calls.append(True) or projected,
+    )
+
+    zeros_like_calls = []
+    orig_zeros_like = torch.zeros_like
+
+    def spy_zeros_like(t, *a, **kw):
+        zeros_like_calls.append(t.shape)
+        return orig_zeros_like(t, *a, **kw)
+
+    monkeypatch.setattr(torch, "zeros_like", spy_zeros_like)
+
+    # 1. Fused QO path skips allocating o_padded (0 zeros_like calls)
+    out = attn.forward(positions, hidden)
+    assert qo_calls == [True]
+    assert zeros_like_calls == []
+    assert torch.equal(out, projected * 2)
+
+    # 2. Non-fused_qo path (e.g. compress_ratio == 0 on L0/L1) allocates o_padded
+    attn.compress_ratio = 0
+    attn.wq_b = lambda q_in: torch.zeros(
+        (count, attn.n_local_heads * attn.head_dim), dtype=torch.bfloat16
+    )
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_attention",
+        lambda q, *a, **kw: torch.ones_like(q),
+    )
+    attn._o_proj = lambda o, pos: o.sum(dim=1)
+    out_uncompressed = attn.forward(positions, hidden)
+    assert zeros_like_calls == [(count, 1, 1)]
+    assert out_uncompressed.shape == (count, attn.head_dim)
