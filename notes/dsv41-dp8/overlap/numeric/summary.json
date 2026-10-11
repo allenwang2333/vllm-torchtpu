@@ -1,0 +1,1832 @@
+{
+  "timings": {
+    "serial-1": [
+      {
+        "label": "round-0-extend",
+        "server_prefill_mean_s": 1.9532024925865699,
+        "new_tokens_per_s": 51043.747909040525,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-1-extend",
+        "server_prefill_mean_s": 1.8951732249988709,
+        "new_tokens_per_s": 51753.567254615766,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-2-extend",
+        "server_prefill_mean_s": 1.9084459375590086,
+        "new_tokens_per_s": 50109.977217836065,
+        "logprobs_requested": true
+      }
+    ],
+    "overlap": [
+      {
+        "label": "round-0-extend",
+        "server_prefill_mean_s": 1.4609985832648817,
+        "new_tokens_per_s": 62292.05528682335,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-1-extend",
+        "server_prefill_mean_s": 1.4647855018265545,
+        "new_tokens_per_s": 63130.92170106813,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-2-extend",
+        "server_prefill_mean_s": 1.4726937153318431,
+        "new_tokens_per_s": 61782.667195942064,
+        "logprobs_requested": true
+      }
+    ],
+    "fresh": [
+      {
+        "label": "round-0-extend",
+        "server_prefill_mean_s": 1.4790153833164368,
+        "new_tokens_per_s": 62430.25964925483,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-1-extend",
+        "server_prefill_mean_s": 1.4710174415959045,
+        "new_tokens_per_s": 62358.42407813432,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-2-extend",
+        "server_prefill_mean_s": 1.478889660036657,
+        "new_tokens_per_s": 59816.481188824466,
+        "logprobs_requested": true
+      }
+    ],
+    "serial-2": [
+      {
+        "label": "round-0-extend",
+        "server_prefill_mean_s": 1.8935960169765167,
+        "new_tokens_per_s": 51769.13950670362,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-1-extend",
+        "server_prefill_mean_s": 1.8809700111742131,
+        "new_tokens_per_s": 51280.759503591056,
+        "logprobs_requested": false
+      },
+      {
+        "label": "round-2-extend",
+        "server_prefill_mean_s": 1.9020080088812392,
+        "new_tokens_per_s": 51842.49349789008,
+        "logprobs_requested": true
+      }
+    ]
+  },
+  "outputs": {
+    "serial-1": {
+      "prime-0": [
+        "tor",
+        "tor",
+        "tor"
+      ],
+      "prime-1": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-2": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-3": [
+        " the",
+        "\n",
+        "\n"
+      ],
+      "prime-4": [
+        " the",
+        "\n",
+        "\n"
+      ],
+      "prime-5": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-6": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-7": [
+        "\n",
+        "\n",
+        " "
+      ],
+      "extend-0": [
+        "2",
+        "2",
+        "1"
+      ],
+      "extend-1": [
+        ".",
+        ".",
+        "."
+      ],
+      "extend-2": [
+        "eps",
+        "\n",
+        "\n"
+      ],
+      "extend-3": [
+        "endor",
+        "\n",
+        "\n"
+      ],
+      "extend-4": [
+        "/",
+        "+",
+        "+"
+      ],
+      "extend-5": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-6": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-7": [
+        "\n",
+        "           ",
+        "\n"
+      ]
+    },
+    "overlap": {
+      "prime-0": [
+        "tor",
+        "tor",
+        " the"
+      ],
+      "prime-1": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-2": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-3": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-4": [
+        " the",
+        " the",
+        "\n"
+      ],
+      "prime-5": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-6": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-7": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-0": [
+        "2",
+        "2",
+        "0"
+      ],
+      "extend-1": [
+        ".",
+        ".",
+        "."
+      ],
+      "extend-2": [
+        "\n",
+        "eps",
+        "eps"
+      ],
+      "extend-3": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-4": [
+        "/",
+        "/",
+        "+"
+      ],
+      "extend-5": [
+        " Auto",
+        "\n",
+        "\n"
+      ],
+      "extend-6": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-7": [
+        "\n",
+        "\n",
+        "\n"
+      ]
+    },
+    "fresh": {
+      "prime-0": [
+        "tor",
+        "tor",
+        "tor"
+      ],
+      "prime-1": [
+        "_",
+        "_",
+        " the"
+      ],
+      "prime-2": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-3": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-4": [
+        " the",
+        "\n",
+        "\n"
+      ],
+      "prime-5": [
+        "\n",
+        " prompt",
+        "\n"
+      ],
+      "prime-6": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-7": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-0": [
+        "2",
+        "2",
+        "2"
+      ],
+      "extend-1": [
+        ".",
+        ".",
+        "."
+      ],
+      "extend-2": [
+        "\n",
+        "eps",
+        "\n"
+      ],
+      "extend-3": [
+        "endor",
+        "\n",
+        "endor"
+      ],
+      "extend-4": [
+        "/",
+        "+",
+        "+"
+      ],
+      "extend-5": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-6": [
+        "orch",
+        "\n",
+        "\n"
+      ],
+      "extend-7": [
+        "\n",
+        "\n",
+        "\n"
+      ]
+    },
+    "serial-2": {
+      "prime-0": [
+        "tor",
+        "tor",
+        " the"
+      ],
+      "prime-1": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-2": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-3": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "prime-4": [
+        "\n",
+        " the",
+        "\n"
+      ],
+      "prime-5": [
+        " prompt",
+        "\n",
+        "\n"
+      ],
+      "prime-6": [
+        "_",
+        "_",
+        "_"
+      ],
+      "prime-7": [
+        " ",
+        "\n",
+        "\n"
+      ],
+      "extend-0": [
+        "2",
+        "2",
+        "0"
+      ],
+      "extend-1": [
+        ".",
+        ".",
+        "."
+      ],
+      "extend-2": [
+        "\n",
+        "eps",
+        "\n"
+      ],
+      "extend-3": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-4": [
+        "+",
+        "/",
+        "+"
+      ],
+      "extend-5": [
+        "\n",
+        "\n",
+        "\n"
+      ],
+      "extend-6": [
+        "orch",
+        "\n",
+        "\n"
+      ],
+      "extend-7": [
+        "\n",
+        "\n",
+        "           "
+      ]
+    }
+  },
+  "top_logprobs": {
+    "serial-1": {
+      "prime-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "tor"
+          ],
+          "top_logprobs": [
+            {
+              "tor": -3.9375,
+              "_": -4.0625,
+              " the": -4.0625,
+              "\n": -4.125,
+              " ": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.625
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -3.625,
+              "\n": -3.75,
+              "\n\n": -4.375,
+              ",": -4.875,
+              " ": -4.875
+            }
+          ]
+        }
+      ],
+      "prime-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.6875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.6875,
+              "_": -4.0625,
+              "t": -4.375,
+              ".": -4.5,
+              "x": -4.625
+            }
+          ]
+        }
+      ],
+      "prime-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.9375,
+              ".": -4.3125,
+              "l": -4.4375,
+              "t": -4.4375,
+              "\n\n": -4.5
+            }
+          ]
+        }
+      ],
+      "prime-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.5625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.5625,
+              " ": -3.875,
+              "\":": -4.0625,
+              "\n\n": -4.25,
+              "1": -4.4375
+            }
+          ]
+        }
+      ],
+      "prime-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.4375,
+              ".": -3.75,
+              ",": -4.0,
+              "\n\n": -4.1875,
+              " you": -4.25
+            }
+          ]
+        }
+      ],
+      "prime-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.9375
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -2.9375,
+              "\n": -3.0625,
+              "\n\n": -3.6875,
+              "__": -4.0625,
+              ",": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -0.75
+          ],
+          "tokens": [
+            " "
+          ],
+          "top_logprobs": [
+            {
+              " ": -0.75,
+              "\",\n": -1.125,
+              " second": -2.625,
+              " quick": -3.375,
+              " the": -3.5
+            }
+          ]
+        }
+      ],
+      "extend-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "1"
+          ],
+          "top_logprobs": [
+            {
+              "1": 0.0,
+              "2": -8.5,
+              "3": -11.125,
+              "0": -11.375,
+              "4": -13.0
+            }
+          ]
+        }
+      ],
+      "extend-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "."
+          ],
+          "top_logprobs": [
+            {
+              ".": 0.0,
+              ".\n\n": -7.375,
+              ",": -7.625,
+              ".org": -7.875,
+              ".\n": -8.0
+            }
+          ]
+        }
+      ],
+      "extend-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "vel": -3.375,
+              "le": -3.5625,
+              "ff": -3.5625,
+              "f": -3.8125
+            }
+          ]
+        }
+      ],
+      "extend-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.1875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.1875,
+              "ly": -4.0625,
+              ".": -4.125,
+              "_": -4.25,
+              ",": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -4.0
+          ],
+          "tokens": [
+            "+"
+          ],
+          "top_logprobs": [
+            {
+              "+": -4.0,
+              "f": -4.3125,
+              "w": -4.3125,
+              ".": -4.375,
+              "p": -4.375
+            }
+          ]
+        }
+      ],
+      "extend-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.3125
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.3125,
+              "ft": -3.0625,
+              " ": -3.5625,
+              "_": -4.1875,
+              "\n\n": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "ht": -3.125,
+              "\n\n": -3.5,
+              "uth": -3.8125,
+              "hing": -3.9375
+            }
+          ]
+        }
+      ],
+      "extend-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.4375,
+              "ny": -3.6875,
+              "stein": -4.0625,
+              "_": -4.125,
+              "k": -4.125
+            }
+          ]
+        }
+      ]
+    },
+    "overlap": {
+      "prime-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -0.625
+          ],
+          "tokens": [
+            " the"
+          ],
+          "top_logprobs": [
+            {
+              " the": -0.625,
+              "\n": -1.875,
+              "\n\n\n": -3.0,
+              " \n": -3.125,
+              "\n\n": -3.5
+            }
+          ]
+        }
+      ],
+      "prime-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.625
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -3.625,
+              "\n": -3.75,
+              "\n\n": -4.375,
+              ",": -4.875,
+              " ": -4.875
+            }
+          ]
+        }
+      ],
+      "prime-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.6875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.6875,
+              "_": -4.0625,
+              "t": -4.375,
+              ".": -4.5,
+              "x": -4.625
+            }
+          ]
+        }
+      ],
+      "prime-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.9375,
+              ".": -4.3125,
+              "l": -4.4375,
+              "t": -4.4375,
+              "\n\n": -4.5
+            }
+          ]
+        }
+      ],
+      "prime-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.5625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.5625,
+              " ": -3.875,
+              "\":": -4.0625,
+              "\n\n": -4.25,
+              "1": -4.4375
+            }
+          ]
+        }
+      ],
+      "prime-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.4375,
+              ".": -3.75,
+              ",": -4.0,
+              "\n\n": -4.1875,
+              " you": -4.25
+            }
+          ]
+        }
+      ],
+      "prime-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.9375
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -2.9375,
+              "\n": -3.0625,
+              "\n\n": -3.6875,
+              "__": -4.0625,
+              ",": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              " ": -3.0,
+              "_": -3.625,
+              ",": -4.25,
+              ".": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -1.0
+          ],
+          "tokens": [
+            "0"
+          ],
+          "top_logprobs": [
+            {
+              "0": -1.0,
+              "1": -1.25,
+              "2": -1.625,
+              "3": -2.5625,
+              "\n": -4.6875
+            }
+          ]
+        }
+      ],
+      "extend-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "."
+          ],
+          "top_logprobs": [
+            {
+              ".": 0.0,
+              ".\n\n": -7.375,
+              ",": -7.625,
+              ".org": -7.875,
+              ".\n": -8.0
+            }
+          ]
+        }
+      ],
+      "extend-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "eps"
+          ],
+          "top_logprobs": [
+            {
+              "eps": 0.0,
+              "ep": -18.0,
+              " eps": -20.125,
+              "EPS": -21.0,
+              "ages": -22.5
+            }
+          ]
+        }
+      ],
+      "extend-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.1875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.1875,
+              "ly": -4.0625,
+              ".": -4.125,
+              "_": -4.25,
+              ",": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -4.0
+          ],
+          "tokens": [
+            "+"
+          ],
+          "top_logprobs": [
+            {
+              "+": -4.0,
+              "f": -4.3125,
+              "w": -4.3125,
+              ".": -4.375,
+              "p": -4.375
+            }
+          ]
+        }
+      ],
+      "extend-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.3125
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.3125,
+              "ft": -3.0625,
+              " ": -3.5625,
+              "_": -4.1875,
+              "\n\n": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "ht": -3.125,
+              "\n\n": -3.5,
+              "uth": -3.8125,
+              "hing": -3.9375
+            }
+          ]
+        }
+      ],
+      "extend-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.0625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.0625,
+              "stein": -3.625,
+              "_": -3.9375,
+              "k": -4.25,
+              "st": -4.5
+            }
+          ]
+        }
+      ]
+    },
+    "fresh": {
+      "prime-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "tor"
+          ],
+          "top_logprobs": [
+            {
+              "tor": -3.9375,
+              "_": -4.0625,
+              " the": -4.0625,
+              "\n": -4.125,
+              " ": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -0.375
+          ],
+          "tokens": [
+            " the"
+          ],
+          "top_logprobs": [
+            {
+              " the": -0.375,
+              "\n": -2.125,
+              ":": -3.25,
+              " Download": -3.25,
+              " ": -3.875
+            }
+          ]
+        }
+      ],
+      "prime-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.6875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.6875,
+              "_": -4.0625,
+              "t": -4.375,
+              ".": -4.5,
+              "x": -4.625
+            }
+          ]
+        }
+      ],
+      "prime-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.9375,
+              ".": -4.3125,
+              "l": -4.4375,
+              "t": -4.4375,
+              "\n\n": -4.5
+            }
+          ]
+        }
+      ],
+      "prime-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.5625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.5625,
+              " ": -3.875,
+              "\":": -4.0625,
+              "\n\n": -4.25,
+              "1": -4.4375
+            }
+          ]
+        }
+      ],
+      "prime-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.4375,
+              ".": -3.75,
+              ",": -4.0,
+              "\n\n": -4.1875,
+              " you": -4.25
+            }
+          ]
+        }
+      ],
+      "prime-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.9375
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -2.9375,
+              "\n": -3.0625,
+              "\n\n": -3.6875,
+              "__": -4.0625,
+              ",": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              " ": -3.0,
+              "_": -3.625,
+              ",": -4.25,
+              ".": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -1.8125
+          ],
+          "tokens": [
+            "2"
+          ],
+          "top_logprobs": [
+            {
+              "2": -1.8125,
+              "0": -2.0,
+              "1": -2.0625,
+              "3": -2.4375,
+              ",": -3.25
+            }
+          ]
+        }
+      ],
+      "extend-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "."
+          ],
+          "top_logprobs": [
+            {
+              ".": 0.0,
+              ".\n\n": -7.0,
+              ",": -7.375,
+              ".\n": -7.6875,
+              " of": -7.9375
+            }
+          ]
+        }
+      ],
+      "extend-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "vel": -3.375,
+              "le": -3.5625,
+              "ff": -3.5625,
+              "f": -3.8125
+            }
+          ]
+        }
+      ],
+      "extend-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -0.125
+          ],
+          "tokens": [
+            "endor"
+          ],
+          "top_logprobs": [
+            {
+              "endor": -0.125,
+              "ariable": -3.5,
+              "intage": -3.5,
+              "irtual": -5.125,
+              "end": -5.625
+            }
+          ]
+        }
+      ],
+      "extend-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -4.0
+          ],
+          "tokens": [
+            "+"
+          ],
+          "top_logprobs": [
+            {
+              "+": -4.0,
+              "f": -4.3125,
+              "w": -4.3125,
+              ".": -4.375,
+              "p": -4.375
+            }
+          ]
+        }
+      ],
+      "extend-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.3125
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.3125,
+              "ft": -3.0625,
+              " ": -3.5625,
+              "_": -4.1875,
+              "\n\n": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "ht": -3.125,
+              "\n\n": -3.5,
+              "uth": -3.8125,
+              "hing": -3.9375
+            }
+          ]
+        }
+      ],
+      "extend-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.0625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.0625,
+              "stein": -3.625,
+              "_": -3.9375,
+              "k": -4.25,
+              "st": -4.5
+            }
+          ]
+        }
+      ]
+    },
+    "serial-2": {
+      "prime-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -0.625
+          ],
+          "tokens": [
+            " the"
+          ],
+          "top_logprobs": [
+            {
+              " the": -0.625,
+              "\n": -1.875,
+              "\n\n\n": -3.0,
+              " \n": -3.125,
+              "\n\n": -3.5
+            }
+          ]
+        }
+      ],
+      "prime-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.625
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -3.625,
+              "\n": -3.75,
+              "\n\n": -4.375,
+              ",": -4.875,
+              " ": -4.875
+            }
+          ]
+        }
+      ],
+      "prime-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.6875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.6875,
+              "_": -4.0625,
+              "t": -4.375,
+              ".": -4.5,
+              "x": -4.625
+            }
+          ]
+        }
+      ],
+      "prime-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.9375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.9375,
+              ".": -4.3125,
+              "l": -4.4375,
+              "t": -4.4375,
+              "\n\n": -4.5
+            }
+          ]
+        }
+      ],
+      "prime-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.5625
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.5625,
+              " ": -3.875,
+              "\":": -4.0625,
+              "\n\n": -4.25,
+              "1": -4.4375
+            }
+          ]
+        }
+      ],
+      "prime-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.4375,
+              ".": -3.75,
+              ",": -4.0,
+              "\n\n": -4.1875,
+              " you": -4.25
+            }
+          ]
+        }
+      ],
+      "prime-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.9375
+          ],
+          "tokens": [
+            "_"
+          ],
+          "top_logprobs": [
+            {
+              "_": -2.9375,
+              "\n": -3.0625,
+              "\n\n": -3.6875,
+              "__": -4.0625,
+              ",": -4.125
+            }
+          ]
+        }
+      ],
+      "prime-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              " ": -3.0,
+              "_": -3.625,
+              ",": -4.25,
+              ".": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-0": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -1.0
+          ],
+          "tokens": [
+            "0"
+          ],
+          "top_logprobs": [
+            {
+              "0": -1.0,
+              "1": -1.25,
+              "2": -1.625,
+              "3": -2.5625,
+              "\n": -4.6875
+            }
+          ]
+        }
+      ],
+      "extend-1": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "."
+          ],
+          "top_logprobs": [
+            {
+              ".": 0.0,
+              ".\n\n": -7.375,
+              ",": -7.625,
+              ".org": -7.875,
+              ".\n": -8.0
+            }
+          ]
+        }
+      ],
+      "extend-2": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "vel": -3.375,
+              "le": -3.5625,
+              "ff": -3.5625,
+              "f": -3.8125
+            }
+          ]
+        }
+      ],
+      "extend-3": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -3.1875
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -3.1875,
+              "ly": -4.0625,
+              ".": -4.125,
+              "_": -4.25,
+              ",": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-4": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -4.0
+          ],
+          "tokens": [
+            "+"
+          ],
+          "top_logprobs": [
+            {
+              "+": -4.0,
+              "f": -4.3125,
+              "w": -4.3125,
+              ".": -4.375,
+              "p": -4.375
+            }
+          ]
+        }
+      ],
+      "extend-5": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.3125
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.3125,
+              "ft": -3.0625,
+              " ": -3.5625,
+              "_": -4.1875,
+              "\n\n": -4.3125
+            }
+          ]
+        }
+      ],
+      "extend-6": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            -2.4375
+          ],
+          "tokens": [
+            "\n"
+          ],
+          "top_logprobs": [
+            {
+              "\n": -2.4375,
+              "ht": -3.125,
+              "\n\n": -3.5,
+              "uth": -3.8125,
+              "hing": -3.9375
+            }
+          ]
+        }
+      ],
+      "extend-7": [
+        {
+          "text_offset": [
+            0
+          ],
+          "token_logprobs": [
+            0.0
+          ],
+          "tokens": [
+            "           "
+          ],
+          "top_logprobs": [
+            {
+              "           ": 0.0,
+              "       ": -5.75,
+              "   ": -12.75,
+              "            ": -13.5625,
+              "               ": -13.8125
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
