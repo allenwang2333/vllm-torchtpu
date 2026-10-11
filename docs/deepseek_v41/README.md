@@ -120,6 +120,21 @@ Validation scripts and raw experiment evidence are maintained separately from
 the runtime change. Cache validation alone does not establish full-model
 numerical equivalence, memory usage or serving performance.
 
+With v2 and `TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`, multiple offloaded Engram
+layers split the full stage (or CED encoder) before each later Engram consumer.
+For configured layer IDs 1 and 14, layers 0 through 13 are submitted before
+layer 14's host gather and packed H2D transfer. The continuation retains the
+pending mHC residual/mixes, SP token ownership and auxiliary hidden states.
+Only the final segment finalizes the stage and publishes CED encoder KV.
+The first Engram is still staged before computation begins.
+
+`TPU_DEEPSEEK_V41_ENGRAM_OVERLAP=0` restores serial staging for debugging and
+matched performance comparisons. Keep offload enabled in both runs and keep
+the workload, compilation buckets and KV budget identical. Compare unprofiled
+latency separately from XProf captures: the extra graph dispatch and boundary
+tensors can outweigh the hidden transfer, especially for decode. Performance
+and memory improvements require full-model measurements on the target TPU.
+
 DeepSeek V4.1 benchmark configurations and the standalone prefill scripts
 now enable prefix caching by default. Set `ENABLE_PREFIX_CACHING=false` for
 uncached baseline measurements. The shared benchmark runner uses its normal
