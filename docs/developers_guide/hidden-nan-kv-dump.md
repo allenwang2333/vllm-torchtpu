@@ -2,23 +2,25 @@
 
 ## TL;DR
 
-设置 `TPU_HIDDEN_NAN_KV_DUMP=1` 后，在真实主模型 forward 结束、sampling 之前，
+`TPU_HIDDEN_NAN_KV_DUMP` 默认开启，在真实主模型 forward 结束、sampling 之前，
 同步 hidden 并检测 NaN。首次发现异常时，同步缓存及 slot metadata，记录异常
 request ID、hidden 行与该 request 在本 worker 上的 FA/GDN tensor。
 实际截取的 hidden/KV 切片也执行 `synchronize_tensors(..., wait=True)` 后再复制到 CPU，
 避免延迟执行的切片在同步前被读取。
-默认关闭；每个 worker 生命周期最多尝试一次，单文件硬上限 64 MiB。
+设置 `TPU_HIDDEN_NAN_KV_DUMP=0` 可关闭；每个 worker 生命周期最多尝试一次，
+单文件硬上限 64 MiB。
 
 该入口独立于 V6D 的 `check_nan_on_save`，纯 Raiden P→D 也可用。目前入口支持
-Qwen GDN 架构、PP=1、layer-major KV pool；不支持的组合在 runner 初始化时报错。
+Qwen GDN 架构、PP=1、layer-major KV pool；不支持的组合需要显式关闭，
+否则在 runner 初始化时报错。
 开启后，首次异常之前每个主模型 forward 都会等待同步并检查 hidden，会增加延迟。
 
 ## 开启与读取
 
-在所有 prefill/decode worker 的启动环境中设置：
+未设置该变量时，所有 prefill/decode worker 默认开启。需要关闭时，在启动环境中设置：
 
 ```bash
-export TPU_HIDDEN_NAN_KV_DUMP=1
+export TPU_HIDDEN_NAN_KV_DUMP=0
 ```
 
 出现真实 request hidden NaN 时，日志打印 `Hidden NaN KV dump`、`request_id`、rank、
