@@ -294,6 +294,34 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             cache[key] = engrams
         return engrams
 
+    def _engram_host_col_slice(self) -> tuple[int, int] | None:
+        """Hash columns ``[start, end)`` every local Engram shard reads, or None.
+
+        Without a DP gather of the hashes (shared-memory tables or DP size 1),
+        only this rank's shards read the host hashes, so ``hash_on_host`` can
+        skip the other columns when all local shards read the same slice.
+        """
+        cached = self.__dict__.get("_engram_host_col_slice")
+        if cached is None:
+            # A shard without the head-split fields (None) disables slicing.
+            slices = {
+                (
+                    min(embed.head_start, embed.n_hash_cols),
+                    min(embed.head_start + embed.part_n_hash_cols, embed.n_hash_cols),
+                )
+                if (embed := getattr(engram, "embed_tokens", None)) is not None
+                and hasattr(embed, "head_start")
+                else None
+                for engram in DeepseekV41Model._engram_modules(self)
+            }
+            shared = (
+                getattr(self, "engram_dp_shared_memory", False)
+                or upstream.get_engram_dp_size() == 1
+            )
+            cached = (next(iter(slices)) if shared and len(slices) == 1 else None,)
+            self.__dict__["_engram_host_col_slice"] = cached
+        return cached[0]
+
     def _engram_offload_flags(self) -> tuple[bool, bool]:
         """Cached `(has_cpu_offload, has_host_dma)` across active Engram modules."""
         has_custom = (
@@ -449,7 +477,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     input_ids, swa_metadata, lookback_token_ids
                 )
                 if host is not None:
-                    engram_hashes = self.engram_hash.hash_on_host(*host)
+                    engram_hashes = self.engram_hash.hash_on_host(
+                        *host,
+                        col_slice=DeepseekV41Model._engram_host_col_slice(self),
+                    )
                     host_image_mask = (
                         host[3]
                         if len(host) > 3 and host[3] is not None

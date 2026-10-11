@@ -159,6 +159,8 @@ class NgramHashState(upstream.NgramHashState):
         dead_mask,
         lookback_token_ids,
         lookback_dead_mask,
+        *,
+        col_slice: tuple[int, int] | None = None,
     ):
         """``forward`` on CPU tensors, for steps whose tokens are all prompt.
 
@@ -176,6 +178,10 @@ class NgramHashState(upstream.NgramHashState):
         1, heads, T]``) so every inner loop runs over the tokens rather than
         over the 4 shifts or 8 heads; the lookback window is resolved once per
         request and the in-chunk sources are a strided view of the mapped ids.
+
+        ``col_slice=(start, end)`` computes only hash columns ``[start, end)``
+        (the columns this rank's Engram shards read) and leaves the others 0;
+        the per-element int64 remainder dominates the host cost.
         """
         count = input_ids.numel()
         layers, ngram = self.multipliers.shape
@@ -298,6 +304,16 @@ class NgramHashState(upstream.NgramHashState):
         rolled_t = torch.from_numpy(
             np.ascontiguousarray(rolled.transpose(2, 0, 1))
         ).unsqueeze(-1)
+        if col_slice is not None and 0 <= col_slice[0] < col_slice[1] <= (
+            (ngram - 1) * heads
+        ):
+            # Column c of the output is (shift c // heads, head c % heads).
+            sliced = tables.column_slice(*col_slice, heads)
+            out = torch.zeros(count, layers, (ngram - 1) * heads, dtype=torch.int32)
+            out[:, :, col_slice[0] : col_slice[1]] = torch.remainder(
+                rolled_t.squeeze(-1).index_select(2, sliced[0]), sliced[1]
+            ).add_(sliced[2])
+            return out
         hashed_t = torch.from_numpy(hashed.view().reshape(count, *hashed.shape[:3]))
         torch.remainder(
             rolled_t,
@@ -449,6 +465,22 @@ class _HostHashTables:
     def scratch(self, count: int) -> np.ndarray:
         """``[layers, ngram - 1, heads, count]`` int64 work buffer, reused."""
         return self._ensure_scratch(count)[0]
+
+    def column_slice(
+        self, start: int, end: int, heads: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(shift index, primes, offsets)`` for hash columns ``[start, end)``."""
+        memo = self._memo.get("column_slice")
+        if memo is None or memo[0] != (start, end, heads):
+            layers = self.primes.shape[0]
+            memo = (
+                (start, end, heads),
+                torch.arange(start, end) // heads,
+                torch.from_numpy(self.primes.reshape(layers, -1)[:, start:end].copy()),
+                torch.from_numpy(self.offsets.reshape(layers, -1)[:, start:end].copy()),
+            )
+            self._memo["column_slice"] = memo
+        return memo[1], memo[2], memo[3]
 
     def request_rows(
         self,

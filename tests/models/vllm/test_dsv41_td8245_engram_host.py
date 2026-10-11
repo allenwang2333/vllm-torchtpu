@@ -550,3 +550,31 @@ def test_td8384_hash_on_host_pre_transpose_torch_remainder_and_request_rows_memc
     out2 = state.hash_on_host(*args)
     assert state._host_tables.scratch(48).__array_interface__["data"][0] == scratch_ptr
     assert torch.equal(out1, out2)
+
+
+@pytest.mark.parametrize("col_slice", [(0, 3), (3, 6), (6, 9), (21, 24), (0, 24)])
+def test_td8392_hash_on_host_col_slice_matches_full(col_slice):
+    """Only columns [start, end) are hashed; they equal the full result and
+    every other column is 0. Out-of-range slices fall back to the full hash."""
+    state = _state()
+    args = _inputs(32, 6, dead_frac=0.1)
+    full = state.hash_on_host(*args)
+    part = state.hash_on_host(*args, col_slice=col_slice)
+    s, e = col_slice
+    assert part.shape == full.shape and part.dtype == torch.int32
+    assert torch.equal(part[:, :, s:e], full[:, :, s:e])
+    assert not part[:, :, :s].any() and not part[:, :, e:].any()
+    # Memoized per slice; a different slice rebuilds the tables.
+    memo = state._host_tables._memo["column_slice"]
+    assert memo[0] == (s, e, 8)
+    assert state.hash_on_host(*args, col_slice=col_slice).equal(part)
+    assert state._host_tables._memo["column_slice"] is memo
+
+
+@pytest.mark.parametrize("col_slice", [None, (3, 3), (5, 2), (-1, 3), (20, 25)])
+def test_td8392_hash_on_host_invalid_col_slice_is_full(col_slice):
+    state = _state()
+    args = _inputs(5, 6)
+    assert torch.equal(
+        state.hash_on_host(*args, col_slice=col_slice), state.hash_on_host(*args)
+    )

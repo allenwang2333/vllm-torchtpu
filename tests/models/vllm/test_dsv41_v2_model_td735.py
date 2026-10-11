@@ -66,7 +66,7 @@ def test_prepare_engram_reuses_host_image_sentinel_mask(monkeypatch):
         use_slot_cache=True,
         lookback_depth=2,
         ensure_cache=lambda: True,
-        hash_on_host=lambda *args: torch.zeros((3, 1, 2), dtype=torch.int64),
+        hash_on_host=lambda *args, **kw: torch.zeros((3, 1, 2), dtype=torch.int64),
     )
 
     host_obj = SimpleNamespace(
@@ -771,3 +771,40 @@ def test_td8367_ced_decoder_owner_kwargs_identity_fast_path_and_single_offload_f
     assert len(seen_replay_starts) == 2
     assert seen_replay_starts[0] is seen_replay_starts[1]
     assert torch.equal(seen_replay_starts[0], torch.zeros(1, dtype=torch.int32))
+
+
+def _embed(head_start, part=3, n=24):
+    return SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            head_start=head_start, part_n_hash_cols=part, n_hash_cols=n
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "engrams,shared,dp,want",
+    [
+        ((_embed(3), _embed(3)), False, 1, (3, 6)),  # DP 1, one slice
+        ((_embed(21), _embed(21)), True, 4, (21, 24)),  # shared-memory tables
+        ((_embed(23, part=3),), False, 1, (23, 24)),  # clipped at n_hash_cols
+        ((_embed(3), _embed(6)), False, 1, None),  # shards disagree
+        ((_embed(3),), False, 2, None),  # hashes DP-gathered
+        ((_embed(3), SimpleNamespace(embed_tokens=SimpleNamespace())), False, 1, None),
+        ((), False, 1, None),
+    ],
+)
+def test_td8392_engram_host_col_slice(monkeypatch, engrams, shared, dp, want):
+    model = object.__new__(DeepseekV41Model)
+    model.engram_dp_shared_memory = shared
+    monkeypatch.setattr(
+        DeepseekV41Model, "_engram_modules", lambda self, end_layer=None: engrams
+    )
+    calls = []
+    monkeypatch.setattr(
+        v2_model.upstream, "get_engram_dp_size", lambda: calls.append(1) or dp
+    )
+    assert DeepseekV41Model._engram_host_col_slice(model) == want
+    n = len(calls)
+    # Cached after the first call, including a None result.
+    assert DeepseekV41Model._engram_host_col_slice(model) == want
+    assert len(calls) == n
