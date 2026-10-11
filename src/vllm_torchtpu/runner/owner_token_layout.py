@@ -526,30 +526,38 @@ def step_owner_required_tokens(
         block_ids = table.block_table.np
     raw_first_blocks = block_ids[start_index : start_index + num_reqs, 0]
     scheduled_arr = np.asarray(num_scheduled_tokens_per_req)
-    req_key = (
-        tp_size,
-        owner_layout,
-        start_index,
-        num_reqs,
-        np.asarray(raw_first_blocks).tobytes(),
-        scheduled_arr.tobytes(),
-    )
+    req_meta_key = (tp_size, owner_layout, start_index, num_reqs)
     cached_req = getattr(runner, "_kv_shard_required_tokens_cache", None)
-    if cached_req is not None and cached_req[0] == req_key:
-        return cached_req[1]
-    first_blocks = np.asarray(raw_first_blocks, dtype=np.int32)
+    if (
+        cached_req is not None
+        and cached_req[0] == req_meta_key
+        and np.array_equal(cached_req[1], raw_first_blocks)
+        and np.array_equal(cached_req[2], scheduled_arr)
+    ):
+        return cached_req[3]
+    first_blocks = np.array(raw_first_blocks, dtype=np.int32, copy=True)
+    scheduled = np.array(scheduled_arr, dtype=np.int32, copy=True)
     if (
         (first_blocks < owner_layout.num_replicated)
         | (first_blocks >= owner_layout.num_blocks)
     ).any():
-        runner._kv_shard_required_tokens_cache = (req_key, 0)
+        runner._kv_shard_required_tokens_cache = (
+            req_meta_key,
+            first_blocks,
+            scheduled,
+            0,
+        )
         return 0
     owners = _owners_from_first_blocks(first_blocks, owner_layout)
-    runner._kv_shard_owners_cache = (owner_layout, req_key[4], owners)
-    scheduled = np.asarray(scheduled_arr, dtype=np.int32)
+    runner._kv_shard_owners_cache = (owner_layout, first_blocks, owners)
     per_owner = np.bincount(owners, weights=scheduled, minlength=tp_size)
     required = int(tp_size * int(per_owner.max()))
-    runner._kv_shard_required_tokens_cache = (req_key, required)
+    runner._kv_shard_required_tokens_cache = (
+        req_meta_key,
+        first_blocks,
+        scheduled,
+        required,
+    )
     return required
 
 
@@ -616,20 +624,32 @@ def attach_step_owner_token_layout(
     rows = getattr(ctx, "req_indices", None)
     if rows is None:
         rows = slice(ctx.start_index, ctx.start_index + ctx.num_reqs)
-    raw_q_loc = (
-        q_loc_cpu.detach().cpu().numpy()
-        if isinstance(q_loc_cpu, torch.Tensor)
-        else q_loc_cpu
+    q_loc_tuple = (
+        (
+            q_loc_cpu
+            if len(q_loc_cpu) == ctx.num_reqs + 1
+            else q_loc_cpu[: ctx.num_reqs + 1]
+        )
+        if isinstance(q_loc_cpu, tuple)
+        else None
     )
     q_loc_np = (
-        raw_q_loc
-        if isinstance(raw_q_loc, np.ndarray)
-        and raw_q_loc.ndim == 1
-        and np.issubdtype(raw_q_loc.dtype, np.integer)
-        else np.asarray(raw_q_loc, dtype=np.int32)
+        None
+        if q_loc_tuple is not None
+        else (
+            q_loc_cpu[: ctx.num_reqs + 1]
+            if isinstance(q_loc_cpu, np.ndarray)
+            and q_loc_cpu.ndim == 1
+            and np.issubdtype(q_loc_cpu.dtype, np.integer)
+            else np.asarray(
+                q_loc_cpu.detach().cpu().numpy()
+                if isinstance(q_loc_cpu, torch.Tensor)
+                else q_loc_cpu,
+                dtype=np.int32,
+            )[: ctx.num_reqs + 1]
+        )
     )
     first_blocks = block_ids[rows, 0]
-    first_blocks_bytes = np.asarray(first_blocks).tobytes()
     num_reqs_padded = int(first.query_start_loc.shape[0]) - 1
     step_key = (
         tp_size,
@@ -638,12 +658,19 @@ def attach_step_owner_token_layout(
         first.query_start_loc.device,
         owner_layout,
         paddings_tuple,
-        first_blocks_bytes,
-        q_loc_np[: ctx.num_reqs + 1].tobytes(),
     )
     cached_step = getattr(runner, "_kv_shard_step_layout_cache", None)
-    if cached_step is not None and cached_step[0] == step_key:
-        _, layout, perm_t, inv_t, q_loc_t = cached_step
+    if (
+        cached_step is not None
+        and cached_step[0] == step_key
+        and (
+            isinstance(cached_step[2], tuple) and cached_step[2] == q_loc_tuple
+            if q_loc_tuple is not None
+            else np.array_equal(cached_step[2], q_loc_np)
+        )
+        and np.array_equal(cached_step[1], first_blocks)
+    ):
+        _, _, _, layout, perm_t, inv_t, q_loc_t = cached_step
         for meta in metas:
             meta.owner_token_layout = layout
             meta.owner_perm = perm_t
@@ -654,19 +681,22 @@ def attach_step_owner_token_layout(
     if (
         owners_cache is not None
         and owners_cache[0] == owner_layout
-        and owners_cache[1] == first_blocks_bytes
+        and np.array_equal(owners_cache[1], first_blocks)
     ):
-        owners = owners_cache[2]
+        first_blocks_copy, owners = owners_cache[1], owners_cache[2]
     else:
-        owners = _owners_from_first_blocks(first_blocks, owner_layout)
-        runner._kv_shard_owners_cache = (owner_layout, first_blocks_bytes, owners)
-    scheduled = q_loc_np[1 : ctx.num_reqs + 1] - q_loc_np[: ctx.num_reqs]
+        first_blocks_copy = np.array(first_blocks, dtype=np.int32, copy=True)
+        owners = _owners_from_first_blocks(first_blocks_copy, owner_layout)
+        runner._kv_shard_owners_cache = (owner_layout, first_blocks_copy, owners)
+    q_loc_arr = (
+        np.asarray(q_loc_tuple, dtype=np.int32) if q_loc_np is None else q_loc_np
+    )
     step_paddings = (
         tuple(p for p in paddings_tuple if p >= padded_tokens) or paddings_tuple
     )
     layout = build_owner_token_layout(
         owners,
-        scheduled,
+        q_loc_arr[1 : ctx.num_reqs + 1] - q_loc_arr[: ctx.num_reqs],
         tp_size,
         step_paddings,
         num_padded_tokens=padded_tokens,
@@ -683,6 +713,8 @@ def attach_step_owner_token_layout(
         meta.owner_q_loc = q_loc_t
     runner._kv_shard_step_layout_cache = (
         step_key,
+        first_blocks_copy,
+        q_loc_tuple if q_loc_tuple is not None else q_loc_arr.copy(),
         layout,
         perm_t,
         inv_t,

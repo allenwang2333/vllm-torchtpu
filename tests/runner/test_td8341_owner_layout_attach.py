@@ -97,3 +97,49 @@ def test_attach_positional_layout_sets_every_metadata():
         for m in metas:
             assert m.owner_perm is metas[0].owner_perm is not None
             assert m.owner_q_loc is metas[0].owner_q_loc
+
+
+def test_td8348_required_tokens_and_step_layout_tuple_and_array_equal_caches():
+    runner = _runner(num_reqs=4)
+    bt = runner.input_batch.block_table.block_tables[0]._bt_cpu_np
+    sched = np.array([1, 1, 1, 1], dtype=np.int32)
+    with (
+        mock.patch.object(otl.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True),
+        mock.patch.object(otl, "_sharded_group_id", lambda r: 0),
+    ):
+        # 1. step_owner_required_tokens caches copied arrays & _kv_shard_owners_cache
+        req1 = otl.step_owner_required_tokens(runner, 0, 4, sched)
+        assert req1 == 4
+        assert len(runner._kv_shard_required_tokens_cache) == 4
+        assert isinstance(runner._kv_shard_required_tokens_cache[1], np.ndarray)
+        assert isinstance(runner._kv_shard_required_tokens_cache[2], np.ndarray)
+        assert isinstance(runner._kv_shard_owners_cache[1], np.ndarray)
+        assert otl.step_owner_required_tokens(runner, 0, 4, sched) == 4
+
+        # 2. attach_step_owner_token_layout with tuple reuses _kv_shard_owners_cache
+        q_tuple = (0, 1, 2, 3, 4)
+        runner._attn_metadata_builder_ctx.query_start_loc_cpu = q_tuple
+        per_layer1, _ = _per_layer(num_reqs=4)
+        with mock.patch.object(
+            otl, "_owners_from_first_blocks", wraps=otl._owners_from_first_blocks
+        ) as spy_owners:
+            layout1 = otl.attach_step_owner_token_layout(runner, per_layer1)
+            assert layout1 is not None
+            assert spy_owners.call_count == 0
+        assert runner._kv_shard_step_layout_cache[2] is q_tuple
+
+        # 3. Cache hit with padded tuple slices to q_tuple without build
+        runner._attn_metadata_builder_ctx.query_start_loc_cpu = (0, 1, 2, 3, 4, 4, 4)
+        per_layer2, _ = _per_layer(num_reqs=4)
+        with mock.patch.object(
+            otl, "build_owner_token_layout", wraps=otl.build_owner_token_layout
+        ) as spy_build:
+            layout2 = otl.attach_step_owner_token_layout(runner, per_layer2)
+            assert layout2 is layout1
+            assert spy_build.call_count == 0
+
+        # 4. Out-of-range first_blocks caches 0 and hits cache on repeat
+        bt[0, 0] = 0  # < num_replicated (4)
+        assert otl.step_owner_required_tokens(runner, 0, 4, sched) == 0
+        assert runner._kv_shard_required_tokens_cache[3] == 0
+        assert otl.step_owner_required_tokens(runner, 0, 4, sched) == 0
