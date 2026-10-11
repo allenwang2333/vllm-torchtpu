@@ -1175,6 +1175,9 @@ def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
 def test_engram_boundary_concretizes_sp_rows_from_full_token_bucket(tp_size):
     from vllm.compilation.piecewise_backend import create_concrete_args
 
+    # Hardware differs between cases, while production keeps it constant.
+    # Do not let Dynamo generalize the closure's TP size across cases.
+    torch._dynamo.reset()
     buckets = (16, 17, 32)
     tail_shapes = {"hidden_states": (16,), "post_mix": (4,), "res_mix": (4, 4)}
     compiled_buckets = []
