@@ -153,7 +153,10 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     what a shard's `g_local` experts actually expect to hold.
 
     """
-    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    override = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
+    if override is None and tile_m in (32, 64) and rows_alloc <= ep * g_local * tile_m:
+        return (16, tile_m)
+    rungs = override or HEIGHT_RUNGS
     step = tile_m // rungs
     if (
         rungs < 2
@@ -744,7 +747,11 @@ def _build_fused_ep_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    push_from_vmem = (
+        False
+        if host.os.environ.get("VLLM_DSV41_MOE_V2_COALESCED_PUSH", "0") == "1"
+        else ragged_rows_alloc <= ep * g_local * tile_m
+    )
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -1794,44 +1801,106 @@ def _build_fused_ep_moe_kernel(
                         mehop_scl_sem,
                     ).start()
 
+        def push_scales_only(e):
+            """Push only the 1-sublane scale mirrors for active expert e."""
+            for d in range(ep):
+                region_blocks = commit_len_sm[e, d]
+                is_me = jnp.int32(d) == me
+
+                @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
+                def _():
+                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                    pltpu.make_async_remote_copy(
+                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        send_sem=send_scl_sem,
+                        recv_sem=recv_scl_sem,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(_and_nonempty(is_me, region_blocks))
+                def _():
+                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                    pltpu.make_async_copy(
+                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        mehop_scl_sem,
+                    ).start()
+
+        def push_all_peers_coalesced():
+            """Push the contiguous [g=0..g_local-1] payload slab ONCE per peer rank d."""
+            for d in range(ep):
+                src_block0 = contrib_off_sm[0, d]
+                dst_block0 = push_dst_sm[0, d]
+                total_blocks = (
+                    contrib_off_sm[g_local - 1, d]
+                    + commit_len_sm[g_local - 1, d]
+                    - src_block0
+                )
+                is_me = jnp.int32(d) == me
+
+                @pl.when(_and_nonempty(jnp.logical_not(is_me), total_blocks))
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=contrib_hbm.at[
+                            pl.ds(src_block0 * ROWBLK, total_blocks * ROWBLK)
+                        ],
+                        dst_ref=recv_hbm.at[
+                            pl.ds(dst_block0 * ROWBLK, total_blocks * ROWBLK)
+                        ],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(_and_nonempty(is_me, total_blocks))
+                def _():
+                    pltpu.make_async_copy(
+                        contrib_hbm.at[
+                            pl.ds(src_block0 * ROWBLK, total_blocks * ROWBLK)
+                        ],
+                        recv_hbm.at[
+                            pl.ds(dst_block0 * ROWBLK, total_blocks * ROWBLK)
+                        ],
+                        mehop_sem,
+                    ).start()
+
+            def _push_scl_step(vi, _):
+                push_scales_only(visit_sm[vi])
+                return _
+
+            lax.fori_loop(0, n_visit, _push_scl_step, jnp.int32(0))
+
         def visit_step(visit_i, carry):
-            """One step of the visit list: compute, then drain and push."""
+            """Compute expert tiles without flushing pipeline between experts."""
             e = visit_sm[visit_i]
             carry = expert_tiles(e, visit_i, carry)
-            if push_from_vmem:
-                # Each tile shipped itself; there is nothing left to flush.
-                return carry
-            carry = drain_commits(carry)
-            push_expert(e)
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        if not push_from_vmem:
+            drain_commits(carry_end)
+            push_all_peers_coalesced()
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
             if push_from_vmem:
-                # Sends are per staging parity and the reuse guards already
-                # took all but the last two; arrivals are still a total,
-                # because a peer signals them whatever parity it sent from.
                 drain_shipped(carry_end)
                 _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
                 _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
                 return
-            # The per-tile head waits consume every commit but the last one
-            # per parity; the drains below consume those.
-            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ROWS))
-            _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
-            # The mirror moves whole sublanes, one per tile a run spans,
-            # so its counts are their own rows of the count table rather
-            # than a division of the row counts.
+            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ALIGNED_ROWS))
+            _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ALIGNED_ROWS))
             _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
             _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
-            # Deferred own-destination drain: the total sums my own-dest
-            # region lengths, and a skipped pair owes exactly zero rows.
-            self_blocks = commit_len_sm[0, me]
-            for g in range(1, g_local):
-                self_blocks = self_blocks + commit_len_sm[g, me]
+            self_blocks = (
+                contrib_off_sm[g_local - 1, me]
+                + commit_len_sm[g_local - 1, me]
+                - contrib_off_sm[0, me]
+            )
             _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 

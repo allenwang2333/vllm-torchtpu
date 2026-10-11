@@ -627,12 +627,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL": lambda: (
-        False
-        if os.environ.get("USE_MOE_FUSED_EP_KERNEL") == "0"
-        else (
-            environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
-            or env_bool("USE_MOE_FUSED_EP_KERNEL")()
-        )
+        environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
+        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
     ),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its

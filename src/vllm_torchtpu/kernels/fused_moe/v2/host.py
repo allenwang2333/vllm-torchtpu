@@ -58,23 +58,15 @@ WIDEN_KCHUNK = 512
 #
 # Zero is the useful other end: no runway at all, one weight slot, an expert
 # starting its own weights at its head and waiting on them.
-MAX_WEIGHT_PREFETCH_DISTANCE = 2
+import os
+
+MAX_WEIGHT_PREFETCH_DISTANCE = int(
+    os.environ.get("VLLM_DSV41_MOE_V2_MAX_PREFETCH", "2")
+)
 
 
 def nbuf_for(distance):
-    """Weight buffer slots a prefetch distance needs.
-
-    A refill writes its slot while the readers of the prefetch distance's
-    worth of earlier experts are still live, so the slot count has to exceed
-    the distance for all of them to stay distinct. At distance zero there are
-    no earlier readers to stay clear of and the one slot is the expert's own.
-
-    This relation IS what a distance costs, and it is written once here
-    rather than at each build, because the two numbers travel together
-    everywhere: a build that lowered one and kept the other would either
-    overwrite a slab a live reader is still contracting against or pay VMEM
-    for a slot nothing addresses.
-    """
+    """Weight buffer slots a prefetch distance needs."""
     return distance + 1
 
 
@@ -184,7 +176,10 @@ def align_up(v, m):
 
 def token_gather_window_rows(tile_m):
     """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
-    return TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
+    return align_up(
+        TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT,
+        TOKEN_GATHER_DMA_ALIGNMENT,
+    )
 
 
 def token_gather_smem_bytes(tile_m):
@@ -1258,14 +1253,12 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
 
 
 def vmem_limit(info=None):
-    """VMEM budget for the kernel, read from this generation's capacity.
-
-    Takes the device record the rest of the accounting already holds, so a
-    caller sizing several candidate builds against one budget reads the
-    device once rather than once per candidate.
-    """
+    """VMEM budget for the kernel, read from this generation's capacity."""
     if info is None:
         info = pltpu.get_tpu_info()
+    env_mb = os.environ.get("VLLM_DSV41_MOE_V2_VMEM_MB")
+    if env_mb is not None:
+        return int(float(env_mb) * 1024 * 1024)
     return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
