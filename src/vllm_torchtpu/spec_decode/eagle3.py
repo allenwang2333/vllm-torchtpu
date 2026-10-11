@@ -970,7 +970,9 @@ class Eagle3Proposer:
             .argmax(dim=-1)
             .int()
         )
-        return (draft_id + d2t.index_select(0, draft_id)).to(torch.int32)
+        return draft_id + (
+            d2t if d2t.dtype == torch.int32 else d2t.to(torch.int32)
+        ).index_select(0, draft_id)
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1425,13 +1427,21 @@ class Eagle3Proposer:
                 * nt.shape[1]
                 + last_valid_col
             )
-            next_token_ids = nt.reshape(-1).index_select(0, flat_col).to(torch.int32)
+            next_token_ids = (
+                nt.reshape(-1)
+                if nt.dtype == torch.int32
+                else nt.reshape(-1).to(torch.int32)
+            ).index_select(0, flat_col)
             # Anchor the seed position at qsl_end-1 (like the sync path) using
             # the REAL per-request draft count.
             # num_draft is read on-device from the chunk's draft_lengths snapshot
             # draft_lengths is None for a chunk with no spec metadata.
             if chunk.draft_lengths is not None:
-                num_draft_dev = chunk.draft_lengths[:num_reqs].to(torch.int32)
+                num_draft_dev = (
+                    chunk.draft_lengths[:num_reqs]
+                    if chunk.draft_lengths.dtype == torch.int32
+                    else chunk.draft_lengths[:num_reqs].to(torch.int32)
+                )
             else:
                 num_draft_np = np.array(
                     [
@@ -1442,12 +1452,16 @@ class Eagle3Proposer:
                 )
                 num_draft_dev = torch.from_numpy(num_draft_np).to(runner.device)
             accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
-            num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
+            num_rejected_out = num_draft_dev - accepted_drafts
             # qsl_end already lives on-device in the chunk's attn context (the
             # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
             # it instead of a fresh H2D of query_start_loc_np.
-            qsl_end = chunk.attn_ctx.query_start_loc[1 : num_reqs + 1].to(torch.int32)
-            last_token_indices = (qsl_end - 1 - num_rejected_out).to(torch.int32)
+            qsl_end = (
+                chunk.attn_ctx.query_start_loc[1 : num_reqs + 1]
+                if chunk.attn_ctx.query_start_loc.dtype == torch.int32
+                else chunk.attn_ctx.query_start_loc[1 : num_reqs + 1].to(torch.int32)
+            )
+            last_token_indices = qsl_end - 1 - num_rejected_out
             # Partial-prefill (discard) requests have no sampled token; seed
             # them from the host request state (same value as the sync path).
             ov_i = [i for i in range(num_reqs) if start + i in discard_set]
@@ -1469,7 +1483,11 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
+            next_token_ids = (
+                device_seed[start : start + num_reqs]
+                if device_seed.dtype == torch.int32
+                else device_seed[start : start + num_reqs].to(torch.int32)
+            )
             # Partial-prefill (discard) reqs: override seed from host req_state.
             ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
             if ov_i:

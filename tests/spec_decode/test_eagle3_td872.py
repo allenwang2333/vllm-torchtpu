@@ -1590,3 +1590,65 @@ def test_td8297_last_token_indices_and_gather_indices_int32(monkeypatch):
     p_pre._draft_seed_input_ids = spy_seed
     p_pre._precompile_draft_seed()
     assert seen_lti_dtypes and all(dt == torch.int32 for dt in seen_lti_dtypes)
+
+
+def test_td8305_eagle3_int32_cast_guards():
+    # 1. _draft_propose_token with int32 and int64 draft_id_to_target_id
+    p = _proposer("eagle3")
+    _eager(p)
+    logits = torch.tensor([[0.1, 0.9, 0.2], [0.8, 0.1, 0.2]], dtype=torch.float32)
+    for dt in (torch.int32, torch.int64):
+        p.draft_model = SimpleNamespace(
+            draft_id_to_target_id=torch.tensor([10, 20, 30], dtype=dt),
+            lm_head="head",
+            logits_processor=lambda _h, _x: logits,
+        )
+        out_tok = p._draft_propose_token(torch.zeros((2, 4)))
+        assert out_tok.dtype == torch.int32
+        assert out_tok.tolist() == [21, 10]
+
+    # 2. _prepare_draft_inputs async next_tokens_device path with int32 and int64 inputs
+    results_async = []
+    for dt in (torch.int32, torch.int64):
+        proposer, chunk, sched = _prep_setup()
+        chunk.draft_lengths = torch.tensor([1, 2, 1], dtype=dt)
+        chunk.attn_ctx = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2, 5, 7], dtype=dt)
+        )
+        nt_dev = torch.tensor([[11, -1], [22, 23], [33, -1]], dtype=dt)
+        ids_a, _, gather_a, rej_a = proposer._prepare_draft_inputs(
+            chunk,
+            sampled_token_ids=None,
+            discard_sampled_tokens_req_indices=[],
+            num_rejected_tokens_np=None,
+            scheduler_output=sched,
+            next_tokens_device=nt_dev,
+        )
+        assert ids_a.dtype == torch.int32
+        assert gather_a.dtype == torch.int32
+        assert rej_a.dtype == torch.int32
+        results_async.append((ids_a, gather_a, rej_a))
+    assert torch.equal(results_async[0][0], results_async[1][0])
+    assert torch.equal(results_async[0][1], results_async[1][1])
+    assert torch.equal(results_async[0][2], results_async[1][2])
+
+    # 3. _prepare_draft_inputs device_seed path with int32 and int64 device_seed
+    proposer, chunk, sched = _prep_setup()
+    ids_s32, _, gather_s32, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=sched,
+        device_seed=torch.tensor([11, 22, 33], dtype=torch.int32),
+    )
+    ids_s64, _, gather_s64, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=sched,
+        device_seed=torch.tensor([11, 22, 33], dtype=torch.int64),
+    )
+    assert torch.equal(ids_s32, ids_s64)
+    assert torch.equal(gather_s32, gather_s64)
