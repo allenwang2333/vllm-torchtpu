@@ -725,7 +725,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_bias_padded,
                 orig_intermediate,
             ) = self._dequantize_and_pad(layer)
-            self._release_source_weights(layer)
             op = self._prebuild_w4a8(
                 layer,
                 activation_str,
@@ -733,6 +732,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_weight_padded,
                 orig_intermediate,
             )
+            self._release_source_weights(layer)
             (
                 w13_weight_processed,
                 w2_weight_processed,
