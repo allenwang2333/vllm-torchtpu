@@ -255,15 +255,20 @@ def build_pcp_logits_indices(
     token_owner_start_offsets_per_req: list[int] | np.ndarray | None = None,
     *,
     token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+    inverse_order: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return global packed indices for each request's last query token."""
-    _, inverse_order = build_pcp_rank_major_token_order(
-        num_scheduled_tokens_per_req,
-        pcp_size,
-        interleave_size,
-        padded_num_tokens,
-        token_owner_start_offsets_per_req,
-        token_start_offsets_per_req=token_start_offsets_per_req,
+    inverse_order = (
+        build_pcp_rank_major_token_order(
+            num_scheduled_tokens_per_req,
+            pcp_size,
+            interleave_size,
+            padded_num_tokens,
+            token_owner_start_offsets_per_req,
+            token_start_offsets_per_req=token_start_offsets_per_req,
+        )[1]
+        if inverse_order is None
+        else inverse_order
     )
     if len(num_scheduled_tokens_per_req) == 0:
         return np.empty((0,), dtype=np.int32)

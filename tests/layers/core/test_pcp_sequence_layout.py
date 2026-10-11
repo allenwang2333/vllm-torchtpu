@@ -1410,3 +1410,70 @@ def test_td8298_pcp_layout_and_sequence_layout_native_int32_dtypes(monkeypatch):
     )
     assert plan._packed_to_request_major_token_indices.dtype == np.int32
     assert plan._request_major_to_packed_token_indices.dtype == np.int32
+
+
+def test_td8325_pcp_logits_indices_reuses_precomputed_inverse_order(monkeypatch):
+    import vllm_torchtpu.layers.core.pcp_sequence_layout as pcp_seq_mod
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
+
+    _, inv = pcp_layout.build_pcp_rank_major_token_order(
+        [4, 8], pcp_size=2, interleave_size=2, padded_num_tokens=16
+    )
+    expected = pcp_layout.build_pcp_logits_indices(
+        [4, 8], pcp_size=2, interleave_size=2, padded_num_tokens=16, token_offset=4
+    )
+
+    order_calls: list[int] = []
+    orig_build_order = pcp_layout.build_pcp_rank_major_token_order
+
+    def _spy_build_order(*args, **kwargs):
+        order_calls.append(1)
+        return orig_build_order(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pcp_layout, "build_pcp_rank_major_token_order", _spy_build_order
+    )
+    actual = pcp_layout.build_pcp_logits_indices(
+        [4, 8],
+        pcp_size=2,
+        interleave_size=2,
+        padded_num_tokens=16,
+        token_offset=4,
+        inverse_order=inv,
+    )
+    assert order_calls == []
+    assert actual.dtype == np.int32
+    np.testing.assert_array_equal(actual, expected)
+
+    # Verify prepare_real calls build_pcp_rank_major_token_order only once
+    runner = _planner_runner_stub(
+        scheduled=[16, 16], computed=[0, 0], prompt=[16, 16], token_paddings=[32]
+    )
+    runner.seq_lens_np = np.asarray([16, 16], dtype=np.int32)
+    planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=2, interleave_size=16))
+    monkeypatch.setattr(pcp_seq_mod, "_get_native_pcp_rank", lambda: 0)
+    monkeypatch.setattr(pcp_seq_mod, "_get_native_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(pcp_seq_mod.envs, "VLLM_TPU_DEBUG_PCP_LAYOUT", True)
+
+    cumsum_dtypes: list[object] = []
+    orig_cumsum = np.cumsum
+
+    def _spy_cumsum(a, axis=None, dtype=None, out=None):
+        cumsum_dtypes.append(dtype)
+        return orig_cumsum(a, axis=axis, dtype=dtype, out=out)
+
+    monkeypatch.setattr(pcp_seq_mod.np, "cumsum", _spy_cumsum)
+    order_calls.clear()
+    planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([16, 16]),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([16, 16], dtype=np.int32),
+        total_num_scheduled_tokens=32,
+        use_max_model_len=True,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    assert len(order_calls) == 1
+    assert all(dt == np.int32 for dt in cumsum_dtypes)

@@ -707,7 +707,8 @@ def prepare_pcp_sequence_layout(
         interleave_size,
         padded_total_num_scheduled_tokens,
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
-    ).astype(np.int32)
+        inverse_order=request_major_to_packed_token_indices,
+    )
     logits_indices_cpu = torch.full(
         (padded_num_reqs,), -1, dtype=torch.int32, device="cpu"
     )
@@ -752,7 +753,8 @@ def prepare_pcp_sequence_layout(
             np.cumsum(
                 np.concatenate(
                     [np.array([0], dtype=np.int32), num_scheduled_tokens_per_req]
-                )
+                ),
+                dtype=np.int32,
             ).tolist(),
             runner.seq_lens_np[:num_reqs].copy().tolist(),
             layout_debug,
