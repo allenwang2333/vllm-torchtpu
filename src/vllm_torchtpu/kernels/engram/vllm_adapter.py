@@ -51,7 +51,7 @@ def initialize_fused_engram() -> None:
         "pallas::engram_offload_fused",
         _engram_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None,) * 4,
+        input_partition_specs=(P(),) * 12,
     )
 
     def fake(

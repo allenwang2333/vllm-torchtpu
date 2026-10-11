@@ -6,9 +6,10 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # (input width, stream count, hidden width) -> (token tile, contracting tile).
-# Keep the full output width for the gate reduction. At the released shape,
-# these tiles need a 3.2 MiB accumulator and a 6.25 MiB FP8 weight tile.
-BLOCK_SIZES = {(6144, 4, 5120): (32, 256)}
+# Stream values first, then one key stream at a time. At the released shape,
+# these tiles need a 5 MiB accumulator and a 0.625 MiB FP8 weight tile;
+# the larger token tile reduces rereads of the full projection weight.
+BLOCK_SIZES = {(6144, 4, 5120): (256, 128)}
 
 
 def get_block_sizes(tokens: int, width: int, streams: int, dim: int) -> tuple[int, int]:

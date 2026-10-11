@@ -111,17 +111,22 @@ def fused_engram(
         x_scratch,
         xs_scratch,
         acc_scratch,
+        values_scratch,
     ):
-        step = pl.program_id(1)
+        output_block = pl.program_id(1)
+        step = pl.program_id(2)
 
-        @pl.when(step == 0)
+        @pl.when((output_block == 0) & (step == 0))
         def prepare():
             rows = dequantize_rows(raw_ref[...], scale_ref[...])
             embedded = rows.transpose(1, 0, 2).reshape(tile_m, in_features)
             quantized, activation_scale = quantize_tensor(embedded, weight.dtype)
             x_scratch[...] = quantized
             xs_scratch[...] = activation_scale
-            acc_scratch[...] = jnp.zeros((tile_m, out_features), jnp.float32)
+
+        @pl.when(step == 0)
+        def reset_accumulator():
+            acc_scratch[...] = jnp.zeros((tile_m, dim), jnp.float32)
 
         x = x_scratch[:, pl.ds(step * tile_k, tile_k)]
         acc_scratch[...] += jnp.dot(x, w_ref[...], preferred_element_type=jnp.float32)
@@ -131,44 +136,60 @@ def fused_engram(
             projection = (acc_scratch[...] * xs_scratch[...] * ws_ref[...]).astype(
                 hidden.dtype
             )
-            out_ref[...] = gated_residual(
-                h_ref[...],
-                projection,
-                q_ref[...],
-                k_ref[...],
-                mask_ref[:, 0],
-                eps,
-                clamp_value,
-            )
 
-    def token_block(i, k):
+            @pl.when(output_block == 0)
+            def save_values():
+                values_scratch[...] = projection
+
+            @pl.when(output_block != 0)
+            def apply_gate():
+                kv = jnp.concatenate((projection, values_scratch[...]), axis=-1)
+                out_ref[...] = gated_residual(
+                    h_ref[...][:, None, :],
+                    kv,
+                    q_ref[...],
+                    k_ref[...],
+                    mask_ref[:, 0],
+                    eps,
+                    clamp_value,
+                )[:, 0, :]
+
+    def token_block(i, j, k):
         return 0, i + rank * (tokens // tile_m), 0
 
-    def local_block(i, k):
-        return i, 0, 0
+    def stream_index(j):
+        return jnp.maximum(j - 1, 0)
 
-    return pl.pallas_call(
+    def projection_index(j):
+        # Retain the shared value vector, then consume one key stream at a time.
+        return jnp.where(j == 0, streams, j - 1)
+
+    def local_block(i, j, k):
+        return stream_index(j), i, 0
+
+    result = pl.pallas_call(
         kernel,
-        grid=(tokens // tile_m, steps),
+        grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
             pl.BlockSpec((tp, tile_m, raw_words), token_block),
             pl.BlockSpec((tp, tile_m, scales.shape[-1]), token_block),
-            pl.BlockSpec((tile_m, streams, dim), local_block),
-            pl.BlockSpec((tile_k, out_features), lambda i, k: (k, 0)),
-            pl.BlockSpec(weight_scale.shape, lambda i, k: (0,)),
-            pl.BlockSpec(query_weight.shape, lambda i, k: (0, 0)),
-            pl.BlockSpec(key_weight.shape, lambda i, k: (0, 0)),
-            pl.BlockSpec((tile_m, 1), lambda i, k: (i, 0)),
+            pl.BlockSpec((None, tile_m, dim), local_block),
+            pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
+            pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
+            pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
+            pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
+            pl.BlockSpec((tile_m, 1), lambda i, j, k: (i, 0)),
         ],
-        out_specs=pl.BlockSpec((tile_m, streams, dim), local_block),
-        out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
+        out_specs=pl.BlockSpec((None, tile_m, dim), local_block),
+        out_shape=jax.ShapeDtypeStruct((streams, tokens, dim), hidden.dtype),
         scratch_shapes=[
             pltpu.VMEM((tile_m, in_features), weight.dtype),
             pltpu.VMEM((tile_m, 1), jnp.float32),
-            pltpu.VMEM((tile_m, out_features), jnp.float32),
+            pltpu.VMEM((tile_m, dim), jnp.float32),
+            pltpu.VMEM((tile_m, dim), hidden.dtype),
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary"),
+            dimension_semantics=("parallel", "arbitrary", "arbitrary"),
             vmem_limit_bytes=(
                 None
                 if interpret
@@ -180,10 +201,11 @@ def fused_engram(
     )(
         raw,
         scales,
-        hidden,
+        hidden.transpose(1, 0, 2),
         weight,
         weight_scale,
-        query_weight,
-        key_weight,
+        query_weight[:, None, :],
+        key_weight[:, None, :],
         token_mask.reshape(tokens, 1),
     )
+    return result.transpose(1, 0, 2)
