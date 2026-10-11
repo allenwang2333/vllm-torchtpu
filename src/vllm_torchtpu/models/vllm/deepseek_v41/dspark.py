@@ -1,4 +1,3 @@
-import vllm_torchtpu.envs as envs
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +14,7 @@ import vllm_torchtpu.envs as envs
 """TPU implementation of the DeepSeek-V4.1 DSpark speculative decoding draft model."""
 
 from __future__ import annotations
+import vllm_torchtpu.envs as envs
 
 import os
 

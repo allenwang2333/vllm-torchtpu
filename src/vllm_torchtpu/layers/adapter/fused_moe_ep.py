@@ -1,3 +1,4 @@
+import vllm_torchtpu.envs as envs
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,7 +52,6 @@ import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
