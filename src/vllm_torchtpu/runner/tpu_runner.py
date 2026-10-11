@@ -2781,10 +2781,17 @@ class TPUModelRunner(GPUModelRunner):
             # Without replay limits the window [starts - depth, starts) reads
             # prompt ids only, so a request at least `depth` tokens past its
             # prompt has none; skip the 2D window when that holds for all.
-            if replay_starts or not bool(
+            if replay_starts or not (
                 (
-                    computed - self.input_batch.num_prompt_tokens[:num_reqs] >= depth
-                ).all()
+                    getattr(self, "_lookback_all_neg1_synced", False)
+                    and getattr(self, "_fast_uniform_spec_k", None) is not None
+                )
+                or bool(
+                    (
+                        computed - self.input_batch.num_prompt_tokens[:num_reqs]
+                        >= depth
+                    ).all()
+                )
             ):
                 starts = computed[:, None]
                 pos = starts - _ARANGE_INTP[1 : depth + 1]
@@ -3081,15 +3088,16 @@ class TPUModelRunner(GPUModelRunner):
                     req_state.output_token_ids[-n_placeholder:] = sampled_ids
                 end_idx = num_tokens_no_spec[:n_reqs]
                 start_idx = end_idx - np.asarray(placeholder_list, dtype=end_idx.dtype)
-            lens_arr = np.asarray(gen_lens, dtype=end_idx.dtype)
+            sampled_np = pre_next_tokens_cpu[:n_reqs].numpy()
+            w = sampled_np.shape[1]
+            is_full = gen_lens.count(w) == n_reqs
+            lens_arr: Any = w if is_full else np.asarray(gen_lens, dtype=end_idx.dtype)
             end_tok_idx = start_idx + lens_arr
             assert int(end_tok_idx.max()) <= max_model_len, (
                 f"write end {int(end_tok_idx.max())} exceeds max_model_len "
                 f"{max_model_len}"
             )
             num_tokens_no_spec[:n_reqs] = end_tok_idx
-            sampled_np = pre_next_tokens_cpu[:n_reqs].numpy()
-            w = sampled_np.shape[1]
             arange_np: Any = getattr(self, "arange_np", None)
             if isinstance(arange_np, np.ndarray) and arange_np.size >= max(n_reqs, w):
                 req_arange = arange_np[:n_reqs]
@@ -3098,9 +3106,16 @@ class TPUModelRunner(GPUModelRunner):
                 req_arange = np.arange(n_reqs, dtype=np.int32)
                 col_arange = np.arange(w, dtype=np.int32)
             flat_idx = (req_arange * max_model_len + start_idx)[:, None] + col_arange
-            col_mask = col_arange < lens_arr[:, None]
-            val_mask = sampled_np != INVALID_TOKEN_ID
-            token_ids_cpu.ravel()[flat_idx[col_mask]] = sampled_np[val_mask]
+            no_mask = is_full and int(sampled_np.min()) != INVALID_TOKEN_ID
+            token_ids_cpu.ravel()[
+                flat_idx
+                if no_mask
+                else flat_idx[
+                    (sampled_np != INVALID_TOKEN_ID)
+                    if is_full
+                    else (col_arange < lens_arr[:, None])
+                ]
+            ] = sampled_np if no_mask else sampled_np[sampled_np != INVALID_TOKEN_ID]
             return
 
         get_req_idx = req_id_to_index.get

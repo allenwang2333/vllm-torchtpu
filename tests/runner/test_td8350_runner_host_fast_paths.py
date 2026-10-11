@@ -309,3 +309,77 @@ def test_td8389_attn_group_walk_cache_and_for_layers_gid_dedup():
         sub_meta2 = TPUModelRunner.build_attention_metadata_for_layers(runner, fset, 4)
     stage_fn.assert_called_once()
     assert list(sub_meta2) == list(sub_meta1)
+
+
+def test_td8394_modify_prev_results_full_accept_and_lookback_short_circuit(monkeypatch):
+    """TD8.394: (a) _modify_prev_results skips np.asarray(gen_lens) and boolean
+    mask indexing when gen_lens.count(w) == n_reqs and sampled_np has no -1;
+    (b) _prepare_lookback_token_ids short-circuits in O(1) when
+    _lookback_all_neg1_synced is True and _fast_uniform_spec_k is not None."""
+    # Part (b): _prepare_lookback_token_ids O(1) short-circuit
+    runner_lb = _lookback_runner([50, 60], [10, 10])
+    TPUModelRunner._prepare_lookback_token_ids(runner_lb, 2)
+    assert runner_lb._lookback_all_neg1_synced is True
+    runner_lb._fast_uniform_spec_k = ({}, ["r0", "r1"], 5)
+    # Poison num_prompt_tokens to prove the subtraction/all() is short-circuited
+    runner_lb.input_batch.num_prompt_tokens = None
+    ids = TPUModelRunner._prepare_lookback_token_ids(runner_lb, 2)
+    assert ids is runner_lb.lookback_token_ids.gpu
+    assert runner_lb.lookback_token_ids.uploads == 1
+
+    # Part (a): _modify_prev_results full-accept vs partial-accept
+    def make_prev_runner(sampled_tensor, draft_k=2):
+        r = object.__new__(TPUModelRunner)
+        r.arange_np = np.arange(32, dtype=np.int32)
+        req0 = SimpleNamespace(output_token_ids=[1, 2, -1, -1, -1])
+        req1 = SimpleNamespace(output_token_ids=[3, 4, -1, -1, -1])
+        r.input_batch = SimpleNamespace(
+            req_ids=["r0", "r1"],
+            req_id_to_index={"r0": 0, "r1": 1},
+            num_tokens_no_spec=np.array([7, 9], dtype=np.int32),
+            token_ids_cpu=np.zeros((2, 16), dtype=np.int32),
+        )
+        r._pre_async_results = SimpleNamespace(
+            req_ids=["r0", "r1"],
+            request_seq_lens=[(0, req0, 7, "r0"), (1, req1, 9, "r1")],
+            discard_sampled_tokens_req_indices=set(),
+            num_draft_per_req={0: draft_k, 1: draft_k},
+            copy_state=None,
+            wait_for_copy=lambda: sampled_tensor,
+        )
+        return r, req0, req1
+
+    # 1. Full accept (all 3 tokens valid per request): np.asarray is NOT called
+    sampled_full = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+    r_full, req0_f, req1_f = make_prev_runner(sampled_full)
+    orig_asarray = np.asarray
+    asarray_calls = []
+
+    def spy_asarray(a, *args, **kwargs):
+        asarray_calls.append(a)
+        return orig_asarray(a, *args, **kwargs)
+
+    monkeypatch.setattr(np, "asarray", spy_asarray)
+    TPUModelRunner._modify_prev_results(r_full)
+    monkeypatch.undo()
+    assert asarray_calls == []
+    assert req0_f.output_token_ids == [1, 2, 10, 11, 12]
+    assert req1_f.output_token_ids == [3, 4, 20, 21, 22]
+    assert r_full.input_batch.num_tokens_no_spec.tolist() == [7, 9]
+    assert r_full.input_batch.token_ids_cpu[0, 4:7].tolist() == [10, 11, 12]
+    assert r_full.input_batch.token_ids_cpu[1, 6:9].tolist() == [20, 21, 22]
+
+    # 2. Partial accept with arange_np=None & non-uniform drafts: falls back to mask
+    sampled_part = torch.tensor([[10, 11, 12], [20, 21, -1]], dtype=torch.int32)
+    r_part, req0_p, req1_p = make_prev_runner(sampled_part)
+    r_part.arange_np = None
+    r_part._pre_async_results.num_draft_per_req = {0: 2, 1: 1}
+    req1_p.output_token_ids = [3, 4, 5, -1, -1]
+    r_part.input_batch.num_tokens_no_spec = np.array([7, 8], dtype=np.int32)
+    TPUModelRunner._modify_prev_results(r_part)
+    assert req0_p.output_token_ids == [1, 2, 10, 11, 12]
+    assert req1_p.output_token_ids == [3, 4, 5, 20, 21]
+    assert r_part.input_batch.num_tokens_no_spec.tolist() == [7, 8]
+    assert r_part.input_batch.token_ids_cpu[0, 4:7].tolist() == [10, 11, 12]
+    assert r_part.input_batch.token_ids_cpu[1, 6:8].tolist() == [20, 21]
+    assert r_part.input_batch.token_ids_cpu[1, 8] == 0
