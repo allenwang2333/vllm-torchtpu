@@ -246,14 +246,14 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
         request_token_owner_start + request_q_len, request_ranks
     ) - _rank_token_count_before(request_token_owner_start, request_ranks)
     local_counts = jnp.where(req_active[:, None], local_counts, 0)
-    rank_local_q_ends = jnp.cumsum(local_counts, axis=0)
+    rank_local_q_ends = jnp.cumsum(local_counts, axis=0, dtype=jnp.int32)
     request_rank_local_q_starts = rank_local_q_ends - local_counts
 
     writeback_counts = _rank_token_count_before(
         request_absolute_query_end[:, None], request_ranks
     ) - _rank_token_count_before(request_absolute_query_start[:, None], request_ranks)
     writeback_counts = jnp.where(req_active[:, None], writeback_counts, 0)
-    rank_writeback_ends = jnp.cumsum(writeback_counts, axis=0)
+    rank_writeback_ends = jnp.cumsum(writeback_counts, axis=0, dtype=jnp.int32)
     request_writeback_starts = rank_writeback_ends - writeback_counts
 
     # Broadcast all request/tile/rank coordinates into [request, tile, rank].
@@ -375,7 +375,7 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
             jnp.int32
         )
         compact_groups = jnp.where(positions < active_count, num_groups[tile_ids], 0)
-        group_starts = jnp.cumsum(compact_groups) - compact_groups
+        group_starts = jnp.cumsum(compact_groups, dtype=jnp.int32) - compact_groups
 
         padded_ids = jnp.zeros((1, index_capacity), dtype=jnp.int32)
         padded_ids = padded_ids.at[0, :num_tiles].set(tile_ids)

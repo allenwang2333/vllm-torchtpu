@@ -988,3 +988,42 @@ def test_vllm_adapter_prebuild_build_op_and_run(monkeypatch):
             torch.ones(1, 4, 512),
             torch.ones(2, 8),
         )
+
+
+def test_td8316_adaptive_fused_moe_host_int32_cumsum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.316: Verify all 12 jnp.cumsum calls in adaptive_fused_moe/host.py
+    pass explicit dtype=jnp.int32."""
+    cumsum_dtypes: list[object] = []
+    orig_cumsum = jnp.cumsum
+
+    def _spy_cumsum(a, axis=None, dtype=None, out=None):
+        cumsum_dtypes.append(dtype)
+        return orig_cumsum(a, axis=axis, dtype=dtype, out=out)
+
+    monkeypatch.setattr(host.jnp, "cumsum", _spy_cumsum)
+    topk_idx = jnp.zeros((16, 2), dtype=jnp.int32)
+    rt = host.build_routing_tables(
+        topk_idx,
+        e_total=4,
+        ep=2,
+        t_local=8,
+        block=16,
+        tile_m=8,
+        shard_stride=16,
+    )
+    host.build_routing_tables_sharded(
+        topk_idx,
+        jnp.int32(0),
+        e_total=4,
+        ep=2,
+        t_local=8,
+        block=16,
+        tile_m=8,
+        shard_stride=16,
+        all_gather_rows=lambda x: jnp.repeat(x, 2, axis=0),
+    )
+    host.shard_transport_tables_in_blocks(rt, jnp.int32(0), e_total=4, ep=2)
+    assert len(cumsum_dtypes) == 12
+    assert all(dt == jnp.int32 for dt in cumsum_dtypes)

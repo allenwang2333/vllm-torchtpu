@@ -933,3 +933,64 @@ class TestWrapper:
                 v=v_2h,
                 kv_cache=cache_2h,
             )
+
+    def test_td8316_schedule_and_wrapper_int32_cumsum(self, monkeypatch):
+        """TD8.316: Verify all jnp.cumsum calls in pcp_streaming_rpa/schedule.py
+        and pcp_streaming_rpa/wrapper.py pass explicit dtype=jnp.int32, and
+        _build_writeback_segment_descriptors accumulates bool segment_starts
+        directly without an intermediate .astype(jnp.int32)."""
+        cumsum_calls: list[tuple[object, object]] = []
+        orig_cumsum = jnp.cumsum
+
+        def _spy_cumsum(a, axis=None, dtype=None, out=None):
+            cumsum_calls.append((a.dtype, dtype))
+            return orig_cumsum(a, axis=axis, dtype=dtype, out=out)
+
+        monkeypatch.setattr(schedule.jnp, "cumsum", _spy_cumsum)
+        monkeypatch.setattr(wrapper.jnp, "cumsum", _spy_cumsum)
+
+        kv_lens = jnp.array([6, 4], dtype=jnp.int32)
+        page_indices = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 4, 6], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+
+        schedule.build_pcp_streaming_schedule_inputs_from_metadata_jax(
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            global_bucket_tokens=8,
+            local_kv_cache_num_blocks=4,
+            page_size=2,
+            pcp_size=2,
+            interleave_size=1,
+            q_block_size=2,
+        )
+        assert len(cumsum_calls) == 4
+        assert all(dt == jnp.int32 for _, dt in cumsum_calls)
+
+        cumsum_calls.clear()
+        query_rows = wrapper._compute_pcp_local_query_row_mapping(
+            jnp.array([2, 2], dtype=jnp.int32),
+            token_owner_starts=jnp.array([0, 2], dtype=jnp.int32),
+            request_absolute_starts=jnp.array([0, 0], dtype=jnp.int32),
+            local_padded_tokens=4,
+            pcp_size=2,
+            pcp_rank=0,
+            interleave_size=1,
+        )
+        wb_mapping = wrapper._compute_pcp_kv_writeback_mapping(
+            query_rows,
+            page_indices,
+            local_kv_cache_num_blocks=4,
+            page_size=2,
+            pcp_size=2,
+            interleave_size=1,
+        )
+        wrapper._build_writeback_segment_descriptors(
+            jnp.array([0, 1, 3, -1], dtype=jnp.int32),
+            wb_mapping.writeback_counts[0],
+        )
+        assert len(cumsum_calls) == 3
+        assert all(dt == jnp.int32 for _, dt in cumsum_calls)
+        assert cumsum_calls[2] == (jnp.bool_, jnp.int32)

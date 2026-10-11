@@ -310,7 +310,7 @@ def _compute_pcp_local_query_row_mapping(
         token_owner_starts, pcp_rank, pcp_size, interleave_size
     )
     local_counts = jnp.where(q_lens > 0, local_counts, 0)
-    req_ends = jnp.cumsum(local_counts)
+    req_ends = jnp.cumsum(local_counts, dtype=jnp.int32)
     total_local_tokens = req_ends[-1]
 
     local_token_indices = jnp.arange(local_padded_tokens, dtype=jnp.int32)
@@ -498,7 +498,7 @@ def _compute_pcp_kv_writeback_mapping(
         mode="drop",
     )
     request_owner_prefixes = (
-        jnp.cumsum(request_owner_counts, axis=0) - request_owner_counts
+        jnp.cumsum(request_owner_counts, axis=0, dtype=jnp.int32) - request_owner_counts
     )
 
     row_request_starts = request_starts[
@@ -579,7 +579,7 @@ def _build_writeback_segment_descriptors(
         active,
         jnp.logical_or(jnp.logical_not(previous_active), discontinuous),
     )
-    segment_ids = jnp.cumsum(segment_starts.astype(jnp.int32)) - 1
+    segment_ids = jnp.cumsum(segment_starts, dtype=jnp.int32) - 1
     num_segments = jnp.sum(segment_starts, dtype=jnp.int32)
     drop_index = jnp.asarray(num_descriptor_slots, dtype=jnp.int32)
 
