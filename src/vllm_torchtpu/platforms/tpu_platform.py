@@ -859,6 +859,15 @@ class TpuPlatform(Platform):
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
             extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            if (
+                vllm_config.model_config is not None
+                and "Qwen3_5MoeForConditionalGeneration"
+                in (vllm_config.model_config.architectures or [])
+                and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
+                in ("1", "true", "yes", "on")
+                and budget >= 8192
+            ):
+                extra_bucket_sizes += [5120, 6144, 7168]
             if envs.TPU_TOKEN_BUCKET_HALF_STEPS:
                 extra_bucket_sizes += _get_half_step_token_paddings(8, budget)
             if envs.TPU_TOKEN_BUCKET_LINEAR:

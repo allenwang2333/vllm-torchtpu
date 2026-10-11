@@ -1216,10 +1216,9 @@ def test_check_and_update_config_auto_stream_interval(monkeypatch):
         vllm_config.model_config.architectures = []
         vllm_config.model_config.is_hybrid = False
         vllm_config.model_config.max_model_len = 4096
-        vllm_config.cache_config = SimpleNamespace(
+        vllm_config.cache_config = CacheConfig(
             enable_prefix_caching=False,
             mamba_cache_mode="none",
-            kv_cache_memory_bytes=None,
         )
         vllm_config.compilation_config = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
@@ -1241,11 +1240,15 @@ def test_check_and_update_config_auto_stream_interval(monkeypatch):
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
             prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
             decode_context_parallel_size=1,
+            is_moe_model=False,
+            enable_expert_parallel=False,
             use_sequence_parallel_moe=False,
         )
         return vllm_config
 
+    monkeypatch.setattr(TpuPlatform, "_prepare_singlehost_tpu_env", lambda ws: None)
     monkeypatch.delenv("TPU_STREAM_INTERVAL", raising=False)
     cfg_default = _make_cfg(1)
     TpuPlatform.check_and_update_config(cfg_default)
@@ -1301,4 +1304,73 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
     TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)
     assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
     assert len(to_calls) == 2
+
+
+def test_qwen35_auto_defaults_adds_upper_prefill_token_buckets(monkeypatch):
+    """Qwen3.5-397B with max_num_batched_tokens >= 8192 auto-adds 5120, 6144, 7168
+    under TPU_QWEN35_AUTO_DEFAULTS=1."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    def _make_cfg(archs: list[str], budget: int = 8192):
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {}
+        vllm_config.model_config = MagicMock()
+        vllm_config.model_config.dtype = torch.bfloat16
+        vllm_config.model_config.architectures = archs
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.max_model_len = 262144
+        vllm_config.cache_config = CacheConfig(
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+        )
+        vllm_config.compilation_config = MagicMock()
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.scheduler_config = SimpleNamespace(
+            max_num_batched_tokens=budget,
+            max_num_seqs=16,
+            async_scheduling=False,
+            scheduler_cls=None,
+            stream_interval=1,
+        )
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = None
+        vllm_config.parallel_config = SimpleNamespace(
+            nnodes=1,
+            node_rank=0,
+            world_size=8,
+            world_size_across_dp=8,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+            decode_context_parallel_size=1,
+            is_moe_model=False,
+            enable_expert_parallel=False,
+            use_sequence_parallel_moe=False,
+        )
+        return vllm_config
+
+    monkeypatch.setattr(TpuPlatform, "_prepare_singlehost_tpu_env", lambda ws: None)
+    monkeypatch.setattr(envs, "TPU_TOKEN_BUCKET_EXTRA", [4, 8, 48, 3072])
+    monkeypatch.setattr(envs, "TPU_TOKEN_BUCKET_HALF_STEPS", False)
+    monkeypatch.setattr(envs, "TPU_TOKEN_BUCKET_LINEAR", False)
+    monkeypatch.delenv("TPU_QWEN35_AUTO_DEFAULTS", raising=False)
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "")
+
+    cfg_qwen = _make_cfg(["Qwen3_5MoeForConditionalGeneration"], budget=8192)
+    TpuPlatform.check_and_update_config(cfg_qwen)
+    for b in (5120, 6144, 7168):
+        assert b in cfg_qwen.compilation_config.compile_sizes
+
+    monkeypatch.setenv("TPU_QWEN35_AUTO_DEFAULTS", "0")
+    cfg_off = _make_cfg(["Qwen3_5MoeForConditionalGeneration"], budget=8192)
+    TpuPlatform.check_and_update_config(cfg_off)
+    for b in (5120, 6144, 7168):
+        assert b not in cfg_off.compilation_config.compile_sizes
+
+
+
+
 

@@ -590,12 +590,13 @@ def test_auto_table_rule_and_files_exist(monkeypatch):
     assert pick(2, 16).endswith("_corr_c32.json")
     assert pick(1, 12).endswith("_corr_c112_mk2p.json")
     assert pick(1, 16).endswith("_corr_c112_mk2p.json")
-    assert pick(1, 24).endswith("_corr_c32.json")
+    assert pick(1, 24).endswith("_corr_c112_mk2p.json")
+    assert pick(1, 32).endswith("_corr_c32.json")
     monkeypatch.setenv("VLLM_TPU_QWEN35_MEGAKERNEL", "1")
     assert pick(1, 8).endswith("_corr_c112_mk2p.json")
     assert pick(1, 16).endswith("_corr_c112_mk2p.json")
     monkeypatch.delenv("VLLM_TPU_QWEN35_MEGAKERNEL", raising=False)
-    for args in ((1, 8), (1, 16), (1, 24), (4, 32)):
+    for args in ((1, 8), (1, 16), (1, 32), (4, 32)):
         path = pick(*args)
         with open(path) as f:
             table = json.load(f)

@@ -91,7 +91,7 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     of device HBM (60 layers x one FP8 expert) for lower decode MoE imbalance
     in the few-token kernel: 128 total copies for small batches (max_num_seqs <= 8)
     when the megakernel is off, 112 co-activation-solved 2-pass Po2C copies for
-    medium batches (max_num_seqs <= 16, or max_num_seqs <= 8 with the megakernel
+    medium batches (max_num_seqs <= 24, or max_num_seqs <= 8 with the megakernel
     where 112 is the max copy count keeping VEC route_dedup active), and 32
     co-activation-solved copies for larger batches or DCP > 1 to preserve
     HBM KV cache headroom."""
@@ -103,7 +103,7 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     )
     if dcp_size <= 1 and max_num_seqs <= 8 and not mk_on:
         name = "expert_placement_dp8_ep8_opt_copies128.json"
-    elif dcp_size <= 1 and max_num_seqs <= 16:
+    elif dcp_size <= 1 and max_num_seqs <= 24:
         name = "expert_placement_tp8_ep8_agentx_corr_c112_mk2p.json"
     else:
         name = "expert_placement_tp8_ep8_agentx_corr_c32.json"
