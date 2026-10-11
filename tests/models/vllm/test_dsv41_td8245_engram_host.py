@@ -253,3 +253,61 @@ def test_td8294_host_hash_and_select_local_heads_np_int32_buffers(
         scale_out,
     )
     assert seen_index_dtypes == [torch.int32]
+
+
+def test_td8340_request_rows_array_equal_and_gather_bufs_reuse():
+    """TD8.340: request_rows stores qsl_i32.copy() and compares via np.array_equal;
+    ParallelEngramEmbedding reuses (_gather_bufs) across steady-shape steps."""
+    tables = ce._HostHashTables.from_state(_state(seed=11))
+    rows = np.arange(12, dtype=np.int32)
+    qsl = np.array([0, 6, 12], dtype=np.int32)
+    reqs1, starts1, base1 = tables.request_rows(qsl, rows, 12, 2, 3)
+    cached = tables._memo["request_rows"]
+    assert cached[0] == (12, 2, 3)
+    assert cached[1] is not qsl and cached[1].dtype == np.int32
+    assert np.array_equal(cached[1], qsl)
+    # In-place mutation of caller's qsl invalidates cache on next call
+    qsl[1] = 4
+    reqs2, starts2, _ = tables.request_rows(qsl, rows, 12, 2, 3)
+    assert reqs2 is not reqs1
+    assert reqs2.tolist() == [0] * 4 + [1] * 8
+    assert starts2.tolist() == [0] * 4 + [4] * 8
+
+    weight = (
+        torch.arange(100 * 32, dtype=torch.int32)
+        .remainder(251)
+        .to(torch.uint8)
+        .reshape(100, 32)
+    )
+    scales = (
+        torch.arange(200, dtype=torch.int32)
+        .remainder(250)
+        .to(torch.uint8)
+        .reshape(100, 2)
+    )
+    emb, _ = _embedding(weight, scales)
+    emb.vocab_start_idx = 10
+    emb.vocab_end_idx = 110
+    emb.head_start = 2
+    emb.part_n_hash_cols = 3  # 2 active cols + 1 padded col
+
+    idx1 = torch.tensor([[1, 2, 15, 25], [3, 4, 5, 109]], dtype=torch.int32)
+    raw_out = torch.zeros((2, 3, 32), dtype=torch.uint8)
+    scale_out = torch.zeros((2, 3, 2), dtype=torch.uint8)
+    emb.gather_raw(idx1, raw_out, scale_out)
+    bufs1 = emb._gather_bufs
+    assert bufs1[0] == (2, 3, 2)
+    assert torch.equal(raw_out[0, 0], weight[5])
+    assert torch.equal(raw_out[0, 1], weight[15])
+    assert torch.equal(scale_out[0, :2], scales[[5, 15]])
+    assert torch.all(scale_out[:, 2] == ce._INVALID_SCALE)
+    assert torch.all(scale_out[1, 0] == ce._INVALID_SCALE)
+    assert torch.equal(scale_out[1, 1], scales[99])
+
+    idx2 = torch.tensor([[1, 2, 30, 40], [3, 4, 50, 200]], dtype=torch.int32)
+    emb.gather_raw(idx2, raw_out, scale_out)
+    assert emb._gather_bufs is bufs1
+    assert torch.equal(raw_out[0, 0], weight[20])
+    assert torch.equal(raw_out[0, 1], weight[30])
+    assert torch.equal(raw_out[1, 0], weight[40])
+    assert torch.all(scale_out[1, 1:] == ce._INVALID_SCALE)

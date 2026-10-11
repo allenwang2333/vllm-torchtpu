@@ -427,10 +427,14 @@ class _HostHashTables:
         ``query_start_loc`` (e.g. ``0, 6, ..., 1152``), so the per-row
         ``searchsorted`` runs only when it changes. Callers only read them.
         """
-        key = (count, active_reqs, depth, qsl_np.dtype.str, qsl_np.tobytes())
+        key = (count, active_reqs, depth)
         cached = self._memo.get("request_rows")
-        if cached is not None and cached[0] == key:
-            return cached[1], cached[2], cached[3]
+        if (
+            cached is not None
+            and cached[0] == key
+            and np.array_equal(qsl_np, cached[1])
+        ):
+            return cached[2], cached[3], cached[4]
         qsl_i32 = np.asarray(qsl_np, dtype=np.int32)
         reqs = np.minimum(
             np.searchsorted(qsl_i32[1:], rows, side="right"),
@@ -438,7 +442,7 @@ class _HostHashTables:
         ).astype(np.int32, copy=False)
         starts = np.minimum(qsl_i32[reqs], np.int32(count - 1))
         req_base = reqs[None, :] * np.int32(depth + 1)
-        self._memo["request_rows"] = (key, reqs, starts, req_base)
+        self._memo["request_rows"] = (key, qsl_i32.copy(), reqs, starts, req_base)
         return reqs, starts, req_base
 
     def work(
@@ -667,21 +671,33 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         self, indices: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """``_select_local_heads`` for host (NumPy) hash ids."""
-        start = min(self.head_start, self.n_hash_cols)
-        end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        selected = indices[:, start:end].astype(np.int32, copy=False) - np.int32(
-            self.vocab_start_idx
+        start, end = (
+            min(self.head_start, self.n_hash_cols),
+            min(self.head_start + self.part_n_hash_cols, self.n_hash_cols),
         )
-        valid = selected.view(np.uint32) < np.uint32(
-            self.vocab_end_idx - self.vocab_start_idx
+        cols, bufs = end - start, getattr(self, "_gather_bufs", None)
+        if bufs is None or bufs[0] != (indices.shape[0], self.part_n_hash_cols, cols):
+            rows = np.zeros((indices.shape[0], self.part_n_hash_cols), dtype=np.int32)
+            self._gather_bufs = bufs = (
+                (indices.shape[0], self.part_n_hash_cols, cols),
+                rows,
+                np.zeros(rows.shape, dtype=np.bool_),
+                rows.reshape(-1),
+                torch.from_numpy(rows.reshape(-1)),
+            )
+        _, rows, valid, _, _ = bufs
+        np.subtract(
+            indices[:, start:end],
+            np.int32(self.vocab_start_idx),
+            out=rows[:, :cols],
+            casting="unsafe",
         )
-        pad = self.part_n_hash_cols - (end - start)
-        if pad:
-            selected = np.pad(selected, ((0, 0), (0, pad)))
-            valid = np.pad(valid, ((0, 0), (0, pad)))
-        # `selected` is a fresh array (subtraction / pad) and `valid` was read
-        # from it above, so clamp it in place instead of allocating `rows`.
-        rows = np.clip(selected, 0, self.part_num_embeddings - 1, out=selected)
+        np.less(
+            rows[:, :cols].view(np.uint32),
+            np.uint32(self.vocab_end_idx - self.vocab_start_idx),
+            out=valid[:, :cols],
+        )
+        np.clip(rows[:, :cols], 0, self.part_num_embeddings - 1, out=rows[:, :cols])
         return rows, valid
 
     def gather_raw(self, indices, raw_out, scale_out):
@@ -705,8 +721,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         work_device = weight.device
         if indices.device != work_device:
             indices = indices.to(work_device)
-        rows, valid = self._select_local_heads_np(np.asarray(indices))
-        flat = rows.reshape(-1)
+        self._select_local_heads_np(np.asarray(indices))
+        _, _, valid, flat, flat_t = self._gather_bufs
         # The uint8 / NumPy views of the storage, rebuilt only when it changes
         # (every step of all 4 Engram layers otherwise re-creates both).
         views = getattr(self, "_raw_views", None)
@@ -716,7 +732,7 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         torch.index_select(
             views[2],
             0,
-            torch.from_numpy(flat),
+            flat_t,
             out=raw_out.view(-1, self.dim),
         )
         blocks = self.dim // self.block_size
