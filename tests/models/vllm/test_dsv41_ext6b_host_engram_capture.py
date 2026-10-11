@@ -342,3 +342,38 @@ def test_td8246_host_engram_zero_alloc_fast_paths():
     np.testing.assert_array_equal(res3.input_ids.numpy(), ids_ref3)
     np.testing.assert_array_equal(res3.positions.numpy(), pos_ref3)
     np.testing.assert_array_equal(res3.lookback_token_ids.numpy(), lb_ref3)
+
+
+def test_td8247_capture_host_engram_contiguous_fast_path():
+    runner = _make_runner(8, k=5, depth=4, seed=123)
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+    # 1. Steady-state identity-order & uniform-stride fast path
+    res_fast1 = he.capture_host_engram_inputs(runner, 8)
+    res_fast = he.capture_host_engram_inputs(runner, 8)
+    assert (
+        res_fast1 is not None and res_fast is not None and res_fast.host_ready is True
+    )
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(res_fast.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(res_fast.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(res_fast.lookback_token_ids.numpy(), lb_ref)
+
+    # Shrinking active_len under full_overwrite=True resyncs the dirty tail [24:48]
+    res_shrunk = he.capture_host_engram_inputs(runner, 4)
+    assert res_shrunk is not None and res_shrunk.host_ready is True
+    ids_ref_s, pos_ref_s, lb_ref_s = _reference(runner, 4)
+    np.testing.assert_array_equal(res_shrunk.input_ids.numpy(), ids_ref_s)
+    np.testing.assert_array_equal(res_shrunk.positions.numpy(), pos_ref_s)
+    np.testing.assert_array_equal(
+        res_shrunk.lookback_token_ids.numpy()[:4], lb_ref_s[:4]
+    )
+
+    # 2. Reordered requests (all_matched=True, is_identity=False, uniform_stride=False)
+    runner_reord = _make_runner(8, k=5, depth=4, seed=123)
+    res_reord = he.capture_host_engram_inputs(runner_reord, 8)
+    assert res_reord is not None and res_reord.host_ready is True
+    ids_ref_r, pos_ref_r, lb_ref_r = _reference(runner_reord, 8)
+    np.testing.assert_array_equal(res_reord.input_ids.numpy(), ids_ref_r)
+    np.testing.assert_array_equal(res_reord.positions.numpy(), pos_ref_r)
+    np.testing.assert_array_equal(res_reord.lookback_token_ids.numpy(), lb_ref_r)

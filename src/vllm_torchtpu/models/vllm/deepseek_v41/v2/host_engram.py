@@ -195,7 +195,12 @@ class _SampledOverlay:
 
 
 def _acquire_host_scratch(
-    runner: Any, attr: str, template: torch.Tensor, active_len: int
+    runner: Any,
+    attr: str,
+    template: torch.Tensor,
+    active_len: int,
+    *,
+    full_overwrite: bool = False,
 ) -> torch.Tensor:
     """Return a reusable host scratch tensor synced over ``[:active_len]``."""
     scratch: Any = getattr(runner, attr, None)
@@ -213,7 +218,9 @@ def _acquire_host_scratch(
         int(template.shape[0]),
         max(active_len, int(getattr(runner, dirty_attr, int(template.shape[0])))),
     )
-    scratch.numpy()[:sync_len] = template.numpy()[:sync_len]
+    sync_start = active_len if full_overwrite else 0
+    if sync_start < sync_len:
+        scratch.numpy()[sync_start:sync_len] = template.numpy()[sync_start:sync_len]
     setattr(runner, dirty_attr, active_len)
     return scratch
 
@@ -421,19 +428,32 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             dtype=np.int64,
             count=chunk_num_reqs,
         )
-        qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1].astype(
-            np.int64, copy=False
-        )
+        qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
         q_start = qsl[:-1]
         n_sched = qsl[1:] - q_start
         matched = (pre_pos >= 0) & (n_sched > 0)
+        all_matched = chunk_num_reqs > 0 and bool(matched.all())
+        is_identity = (
+            all_matched
+            and int(pre_pos[0]) == 0
+            and int(pre_pos[-1]) == chunk_num_reqs - 1
+            and bool(np.all(pre_pos[1:] == pre_pos[:-1] + 1))
+        )
         if spec_state is not None:
             # Rows this step did not carry over keep zero rejections and no
             # overlay; the lookback then reads token_ids_cpu as-is.
-            safe_pos = np.where(matched, pre_pos, 0)
-            rejected_by_req = np.where(matched, spec_state.rejected[safe_pos], 0)
             num_tokens_no_spec = getattr(batch, "num_tokens_no_spec", None)
-            n_draft = spec_state.num_draft[safe_pos]
+            if is_identity:
+                rejected_by_req = spec_state.rejected[:chunk_num_reqs]
+                n_draft = spec_state.num_draft[:chunk_num_reqs]
+                ov_tokens = spec_state.tokens[:chunk_num_reqs]
+                ov_lengths = spec_state.lengths[:chunk_num_reqs]
+            else:
+                safe_pos = np.where(matched, pre_pos, 0)
+                rejected_by_req = np.where(matched, spec_state.rejected[safe_pos], 0)
+                n_draft = spec_state.num_draft[safe_pos]
+                ov_tokens = spec_state.tokens[safe_pos]
+                ov_lengths = np.where(matched, spec_state.lengths[safe_pos], 0)
             if num_tokens_no_spec is not None:
                 write_start = (
                     np.asarray(
@@ -454,30 +474,46 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                     - n_draft
                 )
             sampled_overlay = _SampledOverlay(
-                tokens=spec_state.tokens[safe_pos],
+                tokens=ov_tokens,
                 starts=write_start,
-                lengths=np.where(matched, spec_state.lengths[safe_pos], 0),
+                lengths=ov_lengths,
             )
-        if matched.any():
-            m_len = n_sched[matched]
+        if all_matched or matched.any():
+            m_len = n_sched if all_matched else n_sched[matched]
+            q0 = int(qsl[0])
+            active_len = int(qsl[-1])
+            span_len = active_len - q0
+            uniform_stride = (
+                is_identity
+                and span_len == chunk_num_reqs * stride
+                and bool(np.all(m_len == stride))
+            )
             dst_idx: slice | np.ndarray = (
-                slice(int(qsl[0]), int(qsl[-1]))
-                if bool(matched.all())
+                slice(q0, active_len)
+                if all_matched
                 else _ragged_arange(q_start[matched], m_len)
             )
-            src_idx = _ragged_arange(pre_pos[matched] * stride, m_len)
+            if uniform_stride:
+                src_idx: slice | np.ndarray = slice(0, span_len)
+                max_src_idx = span_len - 1
+            else:
+                src_idx = _ragged_arange(pre_pos[matched] * stride, m_len)
+                max_src_idx = int(src_idx.max())
             flat_src = _async_source_tokens_cpu(
                 pre_async, prefer_next_tokens_tpu=(spec_state is not None)
             )
-            if flat_src is None or int(flat_src.numel()) <= int(src_idx.max()):
+            if flat_src is None or int(flat_src.numel()) <= max_src_idx:
                 return _unresolved_host_inputs(runner, all_prompt)
-            active_len = int(qsl[-1])
             ids = _acquire_host_scratch(
-                runner, "_host_engram_ids_scratch", runner.input_ids_cpu, active_len
+                runner,
+                "_host_engram_ids_scratch",
+                runner.input_ids_cpu,
+                active_len,
+                full_overwrite=(all_matched and q0 == 0),
             )
             ids.numpy()[dst_idx] = flat_src.numpy()[src_idx]
             if rejected_by_req is not None:
-                m_rej = rejected_by_req[matched]
+                m_rej = rejected_by_req if all_matched else rejected_by_req[matched]
                 if m_rej.any():
                     positions = _acquire_host_scratch(
                         runner,
@@ -485,7 +521,13 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                         runner.positions_cpu,
                         active_len,
                     )
-                    positions.numpy()[dst_idx] -= np.repeat(m_rej, m_len)
+                    if uniform_stride:
+                        pos_view = positions.numpy()[dst_idx].reshape(
+                            chunk_num_reqs, stride
+                        )
+                        pos_view -= m_rej[:, None]
+                    else:
+                        positions.numpy()[dst_idx] -= np.repeat(m_rej, m_len)
 
     lookback = _resolve_decode_lookback_cpu(
         runner,
