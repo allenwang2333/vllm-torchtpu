@@ -91,7 +91,7 @@ class KimiDecoder:
                 f"K3 decode: the ops hold {ops.num_slots} KDA slots; "
                 f"--max-num-seqs {config.max_num_seqs} needs {needed}"
             )
-        self.slot_map = SlotMap(self.sub_base)
+        self.slot_map = SlotMap(self.sub_base, int(ops.attention_dp))
         self.layout: Control | None = None
         self.control: torch.Tensor | None = None
         self.device_plan: np.ndarray | None = None
@@ -249,10 +249,11 @@ class KimiDecoder:
             raise RuntimeError(
                 f"K3 decode: KDA state blocks {kda.tolist()} are not shared blocks"
             )
-        if not kda.any():
-            for state in self.ops.slots:  # the decoder has no position-0 reset
-                for shard in range(self.ops.attention_dp):
-                    state[0, slot + shard * self.ops.num_slots].zero_()
+        # The decoder has no position-0 reset. Under attention DP the importer
+        # clears the slot (from the null blocks) on the request's group only.
+        if not kda.any() and self.groups == 1:
+            for state in self.ops.slots:
+                state[0, slot].zero_()
             return
         assert self._importer is not None
         started = time.perf_counter()
@@ -603,12 +604,17 @@ class KimiDecoder:
         for i, request in enumerate(requests):
             if request.scheduled <= 0:
                 continue
+            table = self._mla_table(request)
+            group = self._group_of(request) if self.groups > 1 else 0
+            if self.slot_map.group(request.req_id) not in (None, group):
+                # Only its old group held its state: placed in another group
+                # (after a preemption), it starts there as a new request.
+                self.slot_map.release([request.req_id])
             fresh = request.req_id not in self.slot_map
-            slot = self.slot_map.allocate(request.req_id)
+            slot = self.slot_map.allocate(request.req_id, group)
             if fresh:
                 self.tracked.discard(request.req_id)
                 self._admit(request, slot)
-            table = self._mla_table(request)
             sampling = request.sampling.as_tuple()
             if request.req_id in self.tracked:
                 entries.append((slot, False, 0, 0, sampling))

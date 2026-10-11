@@ -270,6 +270,24 @@ def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def _state_blocks_per_request(kv_cache_config: Any) -> int:
+    """The most shared blocks a request holds at once: vLLM's ``align`` mode
+    keeps at most ``2 + num_speculative_blocks + num_prefill_checkpoint_blocks``
+    per KDA (Mamba) group (``MambaSpec.max_memory_usage_bytes``)."""
+    from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+
+    total = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, MambaSpec):
+            total += (
+                2 + spec.num_speculative_blocks + spec.num_prefill_checkpoint_blocks
+            )
+    return total
+
+
 def _install(scheduler: Any) -> None:
     """Point the scheduler's MLA managers at their group regions, pair the
     pages a KV load writes, and check each region's capacity."""
@@ -384,9 +402,12 @@ def install() -> None:
         if dp > 1:
             max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
             shared = backend.shared_blocks(vllm_config)
+            if shared is None:
+                kv_cache_config = kwargs.get("kv_cache_config") or args[0]
+                shared = _state_blocks_per_request(kv_cache_config) * max_seqs + 1
             _PENDING = {
                 "groups": dp,
-                "shared": 12 * max_seqs + 1 if shared is None else shared,
+                "shared": shared,
                 "cap": max_seqs // dp,
             }
         try:

@@ -237,13 +237,17 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     if dp > 1:
         # This rank's DP group attends its rows of each local row owner's rows
         # (see decode_megakernel.stack); KDA state row k * G + p holds shard
-        # k of group row p, in slot ``slot + k * slots`` (G = batch / dp).
+        # k of group row p, at bank entry ``s + k * n`` for the row's slot s
+        # of the group's n slots (G = batch / dp; pools.group_slots).
         owners = decode_options.get("sequence_parallel_size", 4)
         per_pair = batch_size // dp // owners
         data_group = jax.lax.axis_index("tp") // (32 // dp)
         row = jnp.arange(batch_size // dp)
         group_rows = row // per_pair * (batch_size // owners) + data_group * per_pair + row % per_pair
-        state_index = jnp.concatenate([slots[group_rows] + k * (conv_slots.shape[0] // dp) for k in range(dp)])
+        group_slots = conv_slots.shape[0] // dp
+        local = slots[group_rows]
+        local = jnp.where(local == 0, 0, local - data_group * (group_slots - 1))
+        state_index = jnp.concatenate([local + k * group_slots for k in range(dp)])
     # The stack reads the input KDA states from their slots itself where it
     # can (DP1 above four rows or a selected verify row; DP2 at B2..B128).
     # DP2 indices already include each held head shard's bank offset.

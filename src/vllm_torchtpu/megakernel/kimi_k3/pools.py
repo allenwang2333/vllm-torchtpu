@@ -67,24 +67,43 @@ def kda_state_index(layer: int) -> int:
     return _KDA_INDEX[layer]
 
 
-class SlotMap:
-    """Host-side request-id -> private KDA slot allocation; slot 0 is the null slot."""
+def group_slots(num_slots: int, groups: int) -> int:
+    """A rank's KDA slots per held head shard: under attention DP each group
+    allocates its own share ``n - 1`` of the ``num_slots - 1`` request slots
+    (group ``g``: slots ``g (n - 1) + 1 .. (g + 1) (n - 1)``), which its ranks
+    hold at bank entries ``1 .. n - 1``, after the null slot 0."""
+    return -(-(num_slots - 1) // groups) + 1
 
-    def __init__(self, num_slots: int) -> None:
-        self._free = list(range(num_slots - 1, 0, -1))
+
+class SlotMap:
+    """Host-side request-id -> private KDA slot allocation; slot 0 is the null
+    slot. Under attention DP a request's slot is in its group's share
+    (:func:`group_slots`)."""
+
+    def __init__(self, num_slots: int, groups: int = 1) -> None:
+        share = group_slots(num_slots, groups) - 1
+        self._free = [
+            list(range(min((g + 1) * share, num_slots - 1), g * share, -1))
+            for g in range(groups)
+        ]
+        self._share = share
         self._slots: dict[str, int] = {}
 
     def __contains__(self, req_id: str) -> bool:
         return req_id in self._slots
 
-    def allocate(self, req_id: str) -> int:
+    def group(self, req_id: str) -> int | None:
+        slot = self._slots.get(req_id)
+        return None if slot is None else (slot - 1) // self._share
+
+    def allocate(self, req_id: str, group: int = 0) -> int:
         if req_id in self._slots:
             return self._slots[req_id]
-        if not self._free:
+        if not self._free[group]:
             raise RuntimeError(
                 "K3 decode: no free KDA slot (more live requests than --max-num-seqs?)"
             )
-        slot = self._free.pop()
+        slot = self._free[group].pop()
         self._slots[req_id] = slot
         return slot
 
@@ -92,7 +111,7 @@ class SlotMap:
         for req_id in req_ids:
             slot = self._slots.pop(req_id, None)
             if slot is not None:
-                self._free.append(slot)
+                self._free[(slot - 1) // self._share].append(slot)
 
 
 def _raw_tensor(kv_cache: Any) -> torch.Tensor:
@@ -283,7 +302,8 @@ class KdaImporter:
         )
         self._mesh = mesh
         # Attention DP: mesh position p holds the head shards p % G + k G
-        # (G = 32 / attention_dp), shard k's state in slot s + k num_slots.
+        # (G = 32 / attention_dp), shard k's state at bank entry s + k n for
+        # its group's slot s of n (:func:`group_slots`).
         self._attention_dp = int(attention_dp)
         self._num_slots = int(num_slots)
         self.raw_pools: list[torch.Tensor] = []
@@ -317,6 +337,7 @@ class KdaImporter:
             self._state_perm,
         )
         dp, num_slots = self._attention_dp, self._num_slots
+        share = group_slots(num_slots, dp) - 1
         world = self._mesh.size
         group = world // dp
 
@@ -360,6 +381,12 @@ class KdaImporter:
                 conv_state = jax.lax.ppermute(conv_state, MESH_AXIS, perm)
                 recurrent_state = jax.lax.ppermute(recurrent_state, MESH_AXIS, perm)
             rank = jax.lax.axis_index(MESH_AXIS)
+            local = slot[0]
+            if dp > 1:
+                # Only the request's group holds its slot; the other groups'
+                # ranks write their null slot.
+                owner = (slot[0] - 1) // share
+                local = jnp.where(owner == rank // group, slot[0] - owner * share, 0)
             for shift in range(dp):
                 # Shard (p + shift G) mod 32 from its mesh position: held
                 # shard k of this rank.
@@ -373,7 +400,7 @@ class KdaImporter:
                     )
                 )
                 k = (rank + shift * group) % world // group
-                index = slot[0] + k * num_slots
+                index = local + k * (share + 1)
                 conv = jax.lax.dynamic_update_index_in_dim(conv, conv_k, index, axis=0)
                 recurrent = jax.lax.dynamic_update_index_in_dim(
                     recurrent, recurrent_k, index, axis=0

@@ -37,6 +37,7 @@ from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS, NUM_LAYERS
 from vllm_torchtpu.megakernel.kimi_k3.pools import (
     KDA_LAYERS,
+    group_slots,
 )
 from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, kernel_modules
 
@@ -188,8 +189,9 @@ class DecodeOps:
         )
         self.names = tuple(sorted(self.weights))
         materialize(self.weights[self.names[-1]])
-        # Attention DP: slot s + k * num_slots holds held shard k's heads.
-        state_slots = self.num_slots * self.attention_dp
+        # Attention DP: bank entry s + k * n holds held shard k's heads of its
+        # group's slot s (pools.group_slots).
+        state_slots = group_slots(self.num_slots, self.attention_dp) * self.attention_dp
         conv = torch.zeros(
             (1, state_slots, KDA_LAYERS, 3, 3, CONV_HEAD_ROWS, 128),
             dtype=torch.bfloat16,
