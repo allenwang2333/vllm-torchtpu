@@ -467,7 +467,7 @@ def test_replica_split_matches_unsplit(q_len, chunk_tokens, a2a_merge, two_seqs)
     # calls would be the same program and the comparison would be vacuous.
     def gathers(**extra):
         hlo = streamindex_topk_dcp.lower(*args, **kwargs, **extra).as_text()
-        return len(re.findall(r"all-gather", hlo))
+        return len(re.findall(r"all[_-]gather", hlo))
 
     assert gathers(replica_axis_name="dcp_lane") > gathers()
 
