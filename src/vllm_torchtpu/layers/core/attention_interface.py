@@ -1220,6 +1220,9 @@ def sparse_mla_attention_dcp(
             topk_cap=topk_cap,
             # Decode chunks: tokens per grid step (1 = kernel default).
             small_chunk_batch_size=small_chunk_batch,
+            # Full prefill chunks of the capped path: per-step live-row
+            # buckets (opt-in; the kernel ignores it elsewhere).
+            prefill_row_bucket=envs.TPU_DCP_MLA_PREFILL_ROW_BUCKET,
             **chunk_kwargs,
             **split_kwargs,
         )

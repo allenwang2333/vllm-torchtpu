@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_CAPPED_PREP: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
+    TPU_DCP_MLA_PREFILL_ROW_BUCKET: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
@@ -447,6 +448,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = the kernel default (unchanged).
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 1),
+    # DCP sparse MLA, capped path, full prefill chunks only
+    # (`sparse_ragged_paged_attention(prefill_row_bucket=True)`): each
+    # attention grid step DMAs and attends only the first 192/256/topk_cap
+    # rows its tokens' max kv_len needs, checks the overflow fix-up once per
+    # step, and drops the pipelining loop's artificial q dependency. Same
+    # outputs and lse; decode-sized chunks are untouched. Off by default.
+    "TPU_DCP_MLA_PREFILL_ROW_BUCKET": env_bool(
+        "TPU_DCP_MLA_PREFILL_ROW_BUCKET", default=False
+    ),
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest backbone step (tokens) that uses it; above this, the

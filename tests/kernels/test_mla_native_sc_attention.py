@@ -14,6 +14,7 @@
 """Standalone sparse-attention tests for both physical cache layouts."""
 
 import functools
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -1227,6 +1228,215 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             moved = topk_idx.at[row, 0].set((topk_idx[row, 0] + 1) % 8192)
             bad, _ = jax.block_until_ready(run(moved, small_chunk_batch_size))
             self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    # Per-grid-step live-row maxes of the mixed-bucket case: every ordered pair
+    # of the {192, 256, 512 (+ fix-up)} bodies, the 192/193 and 512/513 edges,
+    # and empty steps (0 = a rank owning none of the step's rows).
+    _ROW_BUCKET_MIX_STEPS = (
+        150, 0, 193, 192, 300, 256, 193, 600, 513, 150, 600, 0, 256, 512, 1, 193
+    )  # fmt: skip
+
+    def _row_bucket_case(self, case, rng):
+        """(problem, topk, owns, counts, page_table, cu_q_lens, distribution).
+
+        Production DCP prefill shape: 64 heads, top-k 2048, one 256-token
+        chunk per 16-token grid step x 16. `uniform_<n>`: every row holds n
+        live entries. `mixed`: per-step maxes `_ROW_BUCKET_MIX_STEPS`, one
+        row at the max and the rest uniform in [0, max]. `overflow`: every
+        row holds all 2048 (the fix-up on every step). `dead_chunk`: 200 real
+        rows in a 512-token batch, so the second chunk has no real token.
+        `mixed_decode`: 2 decode requests + a prefill in two chunks.
+        """
+        topk, bz = 2048, 16
+        query_tokens, seq_q = 256, (256,)
+        if case == "dead_chunk":
+            query_tokens, seq_q = 512, (200,)
+        elif case == "mixed_decode":
+            query_tokens, seq_q = 512, (4, 4, 504)
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        )
+        if case.startswith("uniform_"):
+            counts = np.full(query_tokens, int(case.split("_")[1]))
+        elif case == "overflow":
+            counts = np.full(query_tokens, topk)
+        elif case == "mixed":
+            counts = np.zeros(query_tokens, np.int64)
+            for j, s in enumerate(self._ROW_BUCKET_MIX_STEPS):
+                n = rng.integers(0, s + 1, bz)
+                n[rng.integers(0, bz)] = s
+                counts[j * bz : (j + 1) * bz] = n
+        else:
+            pool = np.array([0, 1, 129, 192, 193, 256, 257, 511, 512, 513, 1025])
+            counts = np.resize(pool, query_tokens)
+            rng.shuffle(counts)
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        # As `sparse_mla_attention_dcp`: a row the rank owns none of gets key 0.
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        num_seqs = len(seq_q)
+        page_table = jnp.concatenate(
+            [problem["page_table"]]
+            + [
+                jnp.asarray(rng.permutation(problem["page_table"].shape[0]), jnp.int32)
+                for _ in range(num_seqs - 1)
+            ]
+        )
+        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
+        num_decode = sum(1 for n in seq_q if n == 4)
+        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+        return problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution
+
+    def _row_bucket_run(self, problem, page_table, cu_q_lens, distribution, owns):
+        """`run(topk, flag, fn=None)`: the production DCP call, lse masked."""
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+
+        def run(topk_in, flag, fn=None):
+            out, lse = (fn or sparse_mla.sparse_ragged_paged_attention)(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                lse_lane_dense=True,
+                q_pe=q_pe,
+                small_chunk_batch_size=4,
+                prefill_row_bucket=flag,
+            )
+            return out, jnp.where(owns[:, None], lse, -jnp.inf)
+
+        return run
+
+    @parameterized.parameters(
+        "uniform_128",
+        "uniform_192",
+        "uniform_193",
+        "uniform_256",
+        "uniform_257",
+        "uniform_512",
+        "uniform_513",
+        "mixed",
+        "overflow",
+        "dead_chunk",
+        "mixed_decode",
+    )
+    def test_prefill_row_bucket_bit_identical(self, case):
+        """TPU_DCP_MLA_PREFILL_ROW_BUCKET on == off, bit for bit.
+
+        Each grid step attends the smallest of the 192/256/512-row bodies
+        holding its max live count (with the overflow fix-up past 512), so
+        every real row's output and lse must equal the flag-off kernel's.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._row_bucket_case(case, rng)
+        )
+        real_tokens = int(cu_q_lens[-1])
+        run = self._row_bucket_run(problem, page_table, cu_q_lens, distribution, owns)
+
+        # The flag takes effect (full prefill chunks only).
+        self.assertNotEqual(
+            str(jax.make_jaxpr(lambda: run(topk_idx, True))()),
+            str(jax.make_jaxpr(lambda: run(topk_idx, False))()),
+        )
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx, False), run(topk_idx, True))
+        )
+        np.testing.assert_array_equal(bits(out)[:real_tokens], bits(ref)[:real_tokens])
+        np.testing.assert_array_equal(
+            np.asarray(lse)[:real_tokens], np.asarray(ref_lse)[:real_tokens]
+        )
+        real_out = np.asarray(out, np.float32)[:real_tokens]
+        self.assertTrue(np.isfinite(real_out).all())
+        empty = ~np.asarray(owns)[:real_tokens]
+        self.assertTrue(np.all(np.asarray(lse)[:real_tokens][empty] == -np.inf))
+        # Positive control: the output is attention, not the aliased q.
+        self.assertGreater(
+            np.abs(
+                real_out
+                - np.asarray(problem["q"][..., :NOPE_DIM], np.float32)[:real_tokens]
+            ).max(),
+            2e-2,
+        )
+
+    def test_prefill_row_bucket_misindexed_step_fails(self):
+        """Negative control: each grid step reading its neighbour's max.
+
+        Rolling the per-step maxes by one makes a 193-row step take the
+        192-row body and a 513-row step skip the fix-up; the mixed-bucket
+        case must then differ from the flag-off kernel, so the bitwise
+        comparison above can catch a bucket-selection bug.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._row_bucket_case("mixed", rng)
+        )
+        real_tokens = int(cu_q_lens[-1])
+        run = self._row_bucket_run(problem, page_table, cu_q_lens, distribution, owns)
+        real_chunk = sparse_mla.sparse_attention_chunk
+
+        def misindexed_chunk(*args, step_max=None, **kwargs):
+            if step_max is not None:
+                step_max = jnp.roll(step_max, -1)
+            return real_chunk(*args, step_max=step_max, **kwargs)
+
+        static = (
+            "sm_scale",
+            "k_scale",
+            "return_lse",
+            "cache_layout",
+            "gather_and_attention_chunk_size",
+            "topk_cap",
+            "lse_lane_dense",
+            "small_chunk_batch_size",
+            "prefill_row_bucket",
+        )
+
+        # A new function object around the undecorated wrapper: jax caches
+        # traces per function, so this is what makes the patch get traced.
+        def fresh_fn(*args, **kwargs):
+            return sparse_mla.sparse_ragged_paged_attention.__wrapped__(*args, **kwargs)
+
+        fresh = jax.jit(fresh_fn, static_argnames=static)
+        with mock.patch.object(sparse_mla, "sparse_attention_chunk", misindexed_chunk):
+            bad, _ = jax.block_until_ready(run(topk_idx, True, fresh))
+        ref, _ = jax.block_until_ready(run(topk_idx, False))
+        bad_f = np.asarray(bad, np.float32)[:real_tokens]
+        ref_f = np.asarray(ref, np.float32)[:real_tokens]
+        self.assertFalse(np.array_equal(bad_f, ref_f))
+        self.assertGreater(np.nanmax(np.abs(bad_f - ref_f)), 2e-2)
+
+    def test_prefill_row_bucket_decode_untouched(self):
+        """Decode buckets (chunk smaller than 256) trace the same with the flag."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(16, (4, 4), rng)
+        )
+        run = self._row_bucket_run(problem, page_table, cu_q_lens, distribution, owns)
+        self.assertEqual(
+            str(jax.make_jaxpr(lambda: run(topk_idx, True))()),
+            str(jax.make_jaxpr(lambda: run(topk_idx, False))()),
+        )
 
     @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
     def test_split_q_lse_bit_identical_tensorcore(self, query_tokens, seq_q):

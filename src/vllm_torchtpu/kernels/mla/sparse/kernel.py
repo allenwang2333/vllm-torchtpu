@@ -39,6 +39,10 @@ PACKED_ATOM_ROWS = GATHER_ATOM_ROWS
 DEFAULT_PACKED_BKV = 256
 DEFAULT_PACKED_GATHER_ATOMS = 2
 DEFAULT_PACKED_CHUNK_TOKENS = 16
+# Prefill row bucketing (`prefill_row_bucket`): static live-row bodies below
+# topk_cap, chosen per grid step by the step's max kv_len (the topk_cap body,
+# fix-up included, is the last one).
+PREFILL_ROW_BUCKETS = (192, 256)
 
 
 def cdiv(a, b):
@@ -439,7 +443,17 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    prefill_row_bucket: bool = False,
+    step_max_ref=None,
+    step0: int = 0,
 ):
+    # `prefill_row_bucket`: drop the artificial prev_out -> bq dependency of
+    # the pipelining loop below. Bucketed mode (`step_max_ref` set,
+    # prefill_row_bucket only): `step_max_ref` [steps of the call] holds each
+    # grid step's max kv_len (`step0` is this chunk's first step). Each step
+    # DMAs and attends only the first `rows` of the smallest bucket holding
+    # that max.
+    #
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -539,6 +553,29 @@ def _attention_kernel(
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
 
+    row_buckets = (bkv_sz,)
+    if step_max_ref is not None:
+        assert prefill_row_bucket and capped_windows is not None
+        row_buckets = tuple(b for b in PREFILL_ROW_BUCKETS if b < bkv_sz) + (bkv_sz,)
+        for b in row_buckets:
+            assert b % (8 * native_sc_gather.ROPE_PACKING) == 0, b
+
+    def for_bucket(step, fn):
+        """fn(rows) under `pl.when` for the bucket of grid step `step`."""
+        if step_max_ref is None:
+            return fn(None)
+        mx = step_max_ref[step0 + step]
+        for i, rows in enumerate(row_buckets):
+            if len(row_buckets) == 1:
+                cond = mx >= 0
+            elif i == 0:
+                cond = mx <= rows
+            elif i == len(row_buckets) - 1:
+                cond = mx > row_buckets[i - 1]
+            else:
+                cond = jnp.logical_and(mx > row_buckets[i - 1], mx <= rows)
+            pl.when(cond)(functools.partial(fn, rows))
+
     def attention_step1_qk_softmax(
         q,  # [num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
@@ -548,7 +585,7 @@ def _attention_kernel(
         assert len(kv.shape) == 2
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim)
+        assert kv.shape[1] == head_dim and kv.shape[0] <= bkv_sz
 
         # Single-block softmax: each query attends exactly one gathered kv
         # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
@@ -601,7 +638,7 @@ def _attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[3, bkv_sem_idx]
 
@@ -647,15 +684,29 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
+        src_nope = cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)]
+        src_rope = cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)]
+        if rows is not None and rows < bkv_sz:
+            # Bucketed: only the first `rows` of each token's window-0 rows
+            # (static extent per bucket; waits mirror the same slices).
+            rope_rows = rows // native_sc_gather.ROPE_PACKING
+            bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :, pl.ds(0, rows)]
+            bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :, pl.ds(0, rope_rows)]
+            src_nope = cache_kv_nope_hbm_ref.at[
+                pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+            ]
+            src_rope = cache_kv_rope_hbm_ref.at[
+                pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows)
+            ]
         if not wait:
             _async_copy(
-                cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                src_nope,
                 bkv_nope_vmem_ref,
                 sem_nope,
                 wait,
             )
             _async_copy(
-                cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                src_rope,
                 bkv_rope_vmem_ref,
                 sem_rope,
                 wait,
@@ -732,10 +783,22 @@ def _attention_kernel(
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
-    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
+    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, step=None):
+        if step_max_ref is not None:
+            return for_bucket(
+                step,
+                lambda rows: _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=rows),
+            )
         return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx)
 
-    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
+    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, step=None):
+        if step_max_ref is not None:
+            return for_bucket(
+                step,
+                lambda rows: _fetch_bkv_batch(
+                    seq_idx_start, bkv_sem_idx, wait=True, rows=rows
+                ),
+            )
         return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True)
 
     def start_fetch_bq_batch(seq_idx_start, bq_sem_idx):
@@ -783,21 +846,33 @@ def _attention_kernel(
             pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
-    def load_bkv(bkv_sem_idx, batch_idx):
+    def load_bkv(bkv_sem_idx, batch_idx, rows=None):
+        if rows is not None and rows < bkv_sz:
+            return unpack_bkv(
+                bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx, pl.ds(0, rows)],
+                bkv_rope_x2_ref.at[
+                    bkv_sem_idx,
+                    batch_idx,
+                    pl.ds(0, rows // native_sc_gather.ROPE_PACKING),
+                ],
+                lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+                rows=rows,
+            )
         return unpack_bkv(
             bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
             bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
         )
 
-    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
+    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len, rows=None):
+        rows = bkv_sz if rows is None else rows
         bkv_nope = bkv_nope_ref[...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
             # expands the packed byte lanes before folding them into the
             # logical 512-byte NOPE vector.
             bkv_nope = pltpu.bitcast(bkv_nope, jnp.uint8)
-        bkv_nope = bkv_nope.reshape(bkv_sz, nope_dim)
+        bkv_nope = bkv_nope.reshape(rows, nope_dim)
         bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
         bkv_rope = bkv_rope_ref[...]
@@ -806,7 +881,7 @@ def _attention_kernel(
             # uint32[128] rows. Expanding their byte lanes recovers one
             # contiguous 128-byte row per selected token.
             bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
-            bkv_rope = bkv_rope.reshape(bkv_sz, 128)
+            bkv_rope = bkv_rope.reshape(rows, 128)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
@@ -1042,16 +1117,10 @@ def _attention_kernel(
         def prefetch_next_seq():
             sem_ids_ref[0] = next_bi_sem_idx
             start_fetch_bq_batch(next_seq_idx, next_bi_sem_idx)
-            start_fetch_bkv_batch(next_seq_idx, next_bi_sem_idx)
+            start_fetch_bkv_batch(next_seq_idx, next_bi_sem_idx, pl.program_id(0) + 1)
 
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
-
-        prev_p = None
-        prev_bkv = None
-        prev_l_sum = None
-        prev_m = None
-        prev_out = None
 
         def write_blse(batch_idx, m, l_sum):
             # log-sum-exp in the *unshifted* frame, so a peer holding a
@@ -1063,7 +1132,7 @@ def _attention_kernel(
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
-        wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+        wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, pl.program_id(0))
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
@@ -1077,43 +1146,59 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+        def attend(rows):
+            prev_p = None
+            prev_bkv = None
+            prev_l_sum = None
+            prev_m = None
+            prev_out = None
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows)
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                if prev_out is not None and not prefill_row_bucket:
+                    # Artificial dependency to force MXU/VPU interleaving by
+                    # limiting LLO's QK runahead
+                    # We use jnp.where to prevent XLA from optimizing the
+                    # dependency away. prev_out won't be inf in practice.
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-            p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
-            if prev_p is not None:
-                assert prev_bkv is not None
-                assert prev_l_sum is not None
-                out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                if prev_p is not None:
+                    assert prev_bkv is not None
+                    assert prev_l_sum is not None
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
 
-                # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
-                write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                prev_out = out
+                    # Store output from acc to bo.
+                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
+                    write_blse(batch_idx - 1, prev_m, prev_l_sum)
+                    prev_out = out
 
-            prev_p = p
-            prev_bkv = bkv
-            prev_l_sum = l_sum
-            prev_m = m
+                prev_p = p
+                prev_bkv = bkv
+                prev_l_sum = l_sum
+                prev_m = m
 
-        # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+            # end of pipelining loop
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
+
+        for_bucket(pl.program_id(0), attend)
+
         if packed_bkv is not None:
             fixup_overflow_tokens(bi_sem_idx, bo_sem_idx)
         if capped_windows is not None:
-            fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
+            if step_max_ref is not None:
+                # One fix-up check per grid step: no token of the step can
+                # overflow unless the step's max kv_len does.
+                pl.when(step_max_ref[step0 + pl.program_id(0)] > bkv_sz)(
+                    functools.partial(fixup_capped_overflow, bi_sem_idx, bo_sem_idx)
+                )
+            else:
+                fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
         if return_lse:
             _send_blse_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1123,7 +1208,7 @@ def _attention_kernel(
     @pl.when(batch_start_seq_idx == start_seq_idx)
     def prologue():
         start_fetch_bq_batch(batch_start_seq_idx, 0)
-        start_fetch_bkv_batch(batch_start_seq_idx, 0)
+        start_fetch_bkv_batch(batch_start_seq_idx, 0, pl.program_id(0))
 
     process()
 
@@ -1164,6 +1249,24 @@ def _packed_attention_kernel(
         *refs,
         packed_bkv=packed_bkv,
         tok_off_ref=tok_off_ref,
+    )
+
+
+def _bucket_attention_kernel(
+    kernel_body,
+    kv_lens_ref,
+    start_end_seq_idx_ref,
+    sem_ids_ref,
+    step_max_ref,
+    *refs,
+):
+    """`_attention_kernel` with the bucketed mode's fourth scalar prefetch."""
+    return kernel_body(
+        kv_lens_ref,
+        start_end_seq_idx_ref,
+        sem_ids_ref,
+        *refs,
+        step_max_ref=step_max_ref,
     )
 
 
@@ -1329,6 +1432,7 @@ def prepare_outputs(
         "topk_cap",
         "capped_window_prep",
         "lse_lane_dense",
+        "prefill_row_bucket",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1368,6 +1472,7 @@ def sparse_ragged_paged_attention(
     capped_window_prep: bool = True,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    prefill_row_bucket: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1454,6 +1559,14 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      prefill_row_bucket: With capped window prep, and only when every chunk
+        is a full `gather_and_attention_chunk_size` prefill chunk (larger than
+        `small_chunk_tokens`): each attention grid step DMAs and attends only
+        the first 192, 256 or `topk_cap` rows of its tokens' window 0, the
+        smallest bucket holding the step's max kv_len (scalar-prefetched,
+        one `pl.when` body per bucket); the overflow fix-up is checked once
+        per step; and the pipelining loop drops its artificial prev_out -> q
+        dependency. Same outputs and lse. Decode-sized chunks are untouched.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1566,7 +1679,18 @@ def sparse_ragged_paged_attention(
         and q.shape[0] % uniform_chunk == 0
         and not (packed_gather and uniform_chunk <= packed_chunk_tokens)
     )
+    # Row bucketing applies to the prefill chunk configuration only: capped
+    # window prep with every chunk the full `gather_and_attention_chunk_size`
+    # and larger than the decode bucket. Decode (and any other chunk config)
+    # is untouched.
+    prefill_row_bucket = (
+        prefill_row_bucket
+        and window_prep
+        and uniform_chunk == gather_and_attention_chunk_size
+        and uniform_chunk > small_chunk_tokens
+    )
     window_indices_all = None
+    step_max_all = None
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
     if window_prep:
         assert topk_cap is not None
@@ -1597,6 +1721,12 @@ def sparse_ragged_paged_attention(
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
         )
+        if prefill_row_bucket:
+            # Per-call (hoisted out of the chunk loop): each grid step's max
+            # kv_len, the bucket selector of every chunk's kernel.
+            step_max_all = jnp.max(
+                kv_lens.astype(jnp.int32).reshape(-1, prep_batch), axis=1
+            )
     else:
         kv_lens, physical_indices = prepare_gather_indices(
             topk_indices,
@@ -1691,6 +1821,8 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            prefill_row_bucket=prefill_row_bucket,
+            step_max=step_max_all,
         )
         if return_lse:
             q, lse = result
@@ -1795,6 +1927,8 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    prefill_row_bucket: bool = False,
+    step_max: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1972,7 +2106,18 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            prefill_row_bucket=prefill_row_bucket,
         )
+        if step_max is not None:
+            # Fourth scalar prefetch: each grid step's max kv_len (the whole
+            # call's array, built once; this chunk starts at step `step0`).
+            assert prefill_row_bucket and packed is None and capped_windows is not None
+            assert start_seq_idx % batch_size == 0
+            scalar_prefetches += (step_max,)
+            kernel_body = functools.partial(
+                _bucket_attention_kernel,
+                functools.partial(kernel_body, step0=start_seq_idx // batch_size),
+            )
         if packed is not None:
             # Fourth scalar prefetch: per-token atom offset into the stream.
             scalar_prefetches += (packed.tok_off,)
