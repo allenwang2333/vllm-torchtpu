@@ -280,6 +280,11 @@ def _first_ge(paddings: list[int] | tuple[int, ...], value: int) -> int:
     return int(paddings[index])
 
 
+_all_plan_cache: dict[tuple[int, int], SequenceLayoutPlan] = (
+    {} if (_owner_layout_mod := None) is None else {}
+)
+
+
 class AllSequenceLayoutPlanner:
     @property
     def requires_backend_preinit(self) -> bool:
@@ -311,21 +316,24 @@ class AllSequenceLayoutPlanner:
         target_num_reqs: int,
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan:
+        global _owner_layout_mod
         del (
             scheduler_output,
             use_max_model_len,
             target_num_reqs,
             padded_num_reqs,
         )
-        required_tokens = int(total_num_scheduled_tokens)
+        required_tokens = total_tokens = int(total_num_scheduled_tokens)
         if envs.TPU_DEEPSEEK_V41_KV_SHARD:
-            from vllm_torchtpu.runner.owner_token_layout import (
-                step_owner_required_tokens,
+            mod = _owner_layout_mod or (
+                _owner_layout_mod := __import__(
+                    "vllm_torchtpu.runner.owner_token_layout",
+                    fromlist=["step_owner_required_tokens"],
+                )
             )
-
             required_tokens = max(
                 required_tokens,
-                step_owner_required_tokens(
+                mod.step_owner_required_tokens(
                     runner,
                     start_index,
                     num_reqs,
@@ -337,13 +345,18 @@ class AllSequenceLayoutPlanner:
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)
 
-        return SequenceLayoutPlan(
-            descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-            token_slice=slice(0, padded_num_tokens),
-            global_num_tokens=int(total_num_scheduled_tokens),
-            global_padded_num_tokens=padded_num_tokens,
-            local_num_tokens=int(total_num_scheduled_tokens),
-            local_padded_num_tokens=padded_num_tokens,
+        return _all_plan_cache.get(
+            key := (total_tokens, padded_num_tokens)
+        ) or _all_plan_cache.setdefault(
+            key,
+            SequenceLayoutPlan(
+                descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+                token_slice=slice(0, padded_num_tokens),
+                global_num_tokens=total_tokens,
+                global_padded_num_tokens=padded_num_tokens,
+                local_num_tokens=total_tokens,
+                local_padded_num_tokens=padded_num_tokens,
+            ),
         )
 
     def prepare_dummy(
@@ -355,13 +368,18 @@ class AllSequenceLayoutPlanner:
     ) -> SequenceLayoutPlan:
         del num_reqs, kv_cache_initialized
         num_tokens = int(num_tokens)
-        return SequenceLayoutPlan(
-            descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-            token_slice=slice(0, num_tokens),
-            global_num_tokens=num_tokens,
-            global_padded_num_tokens=num_tokens,
-            local_num_tokens=num_tokens,
-            local_padded_num_tokens=num_tokens,
+        return _all_plan_cache.get(
+            key := (num_tokens, num_tokens)
+        ) or _all_plan_cache.setdefault(
+            key,
+            SequenceLayoutPlan(
+                descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+                token_slice=slice(0, num_tokens),
+                global_num_tokens=num_tokens,
+                global_padded_num_tokens=num_tokens,
+                local_num_tokens=num_tokens,
+                local_padded_num_tokens=num_tokens,
+            ),
         )
 
     def finalize_hidden_states(
@@ -396,10 +414,9 @@ def is_pcp_streaming_sequence_layout(
     kind: str | SequenceLayoutKind,
     protocol: str,
 ) -> bool:
-    kind_value = kind.value if isinstance(kind, SequenceLayoutKind) else str(kind)
-    return (
-        kind_value == SequenceLayoutKind.PARTIAL.value
-        and protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+    return protocol == PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL and (
+        (kind.value if isinstance(kind, SequenceLayoutKind) else str(kind))
+        == SequenceLayoutKind.PARTIAL.value
     )
 
 

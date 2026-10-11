@@ -1477,3 +1477,102 @@ def test_td8325_pcp_logits_indices_reuses_precomputed_inverse_order(monkeypatch)
     )
     assert len(order_calls) == 1
     assert all(dt == np.int32 for dt in cumsum_dtypes)
+
+
+def test_td8355_all_sequence_layout_plan_cache_and_protocol_short_circuit(
+    monkeypatch,
+):
+    import vllm_torchtpu.runner.owner_token_layout as owner_token_layout
+
+    planner = AllSequenceLayoutPlanner()
+    dummy_1 = planner.prepare_dummy(
+        num_tokens=16, num_reqs=4, kv_cache_initialized=True
+    )
+    dummy_2 = planner.prepare_dummy(
+        num_tokens=16, num_reqs=8, kv_cache_initialized=False
+    )
+    assert dummy_1 is dummy_2
+
+    runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32, 64],
+        _dp_target_bucket=None,
+    )
+    real_1 = planner.prepare_real(
+        runner=runner,
+        scheduler_output=SimpleNamespace(),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
+        total_num_scheduled_tokens=8,
+        use_max_model_len=False,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    real_2 = planner.prepare_real(
+        runner=runner,
+        scheduler_output=SimpleNamespace(),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
+        total_num_scheduled_tokens=8,
+        use_max_model_len=False,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    assert real_1 is real_2
+    assert real_1.local_padded_num_tokens == 16
+
+    # Verify _owner_layout_mod lazy initialization and reuse under KV_SHARD.
+    monkeypatch.setattr(sequence_layout, "_owner_layout_mod", None)
+    monkeypatch.setattr(sequence_layout.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True)
+    monkeypatch.setattr(
+        owner_token_layout,
+        "step_owner_required_tokens",
+        lambda *_args, **_kwargs: 28,
+    )
+    kv_plan_1 = planner.prepare_real(
+        runner=runner,
+        scheduler_output=SimpleNamespace(),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
+        total_num_scheduled_tokens=8,
+        use_max_model_len=False,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    assert sequence_layout._owner_layout_mod is owner_token_layout
+    kv_plan_2 = planner.prepare_real(
+        runner=runner,
+        scheduler_output=SimpleNamespace(),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
+        total_num_scheduled_tokens=8,
+        use_max_model_len=False,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    assert kv_plan_1 is kv_plan_2
+    assert kv_plan_1.local_padded_num_tokens == 32
+
+    # Short-circuit on protocol != PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+    # avoids coercing kind via str().
+    class _BadStrKind:
+        def __str__(self) -> str:
+            raise AssertionError("str() should not be called on non-PCP protocol")
+
+    assert (
+        sequence_layout.is_pcp_streaming_sequence_layout(
+            kind=_BadStrKind(),  # type: ignore[arg-type]
+            protocol=sequence_layout.DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
+        )
+        is False
+    )
+    assert (
+        sequence_layout.is_pcp_streaming_sequence_layout(
+            kind=SequenceLayoutKind.PARTIAL,
+            protocol=sequence_layout.PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+        )
+        is True
+    )
