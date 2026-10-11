@@ -102,6 +102,10 @@ class DFlashProposer:
             tuple[Any, Any, int, tuple[str | None, ...]] | None
         ) = None
         self._draft_kv_layer_getter: Any = None
+        self._draft_single_group_meta_cache: dict[
+            tuple[frozenset[str], Any, int],
+            tuple[AttentionMetadata, dict[str, AttentionMetadata]],
+        ] = {}
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[
             int, tuple[torch.Tensor, torch.Tensor]
@@ -446,15 +450,37 @@ class DFlashProposer:
             )
             <= b0._active_block_table_columns(chunk_ctx, tnb)
         ):
-            meta = AttentionMetadata(
-                input_positions=input_positions,
-                block_tables=staged,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                request_distribution=request_distribution,
+            meta, out_dict = self._draft_single_group_meta_cache.get(
+                key := (frozen_layer_names, b0, padded_num_reqs)
+            ) or self._draft_single_group_meta_cache.setdefault(
+                key,
+                (
+                    _m := AttentionMetadata(
+                        input_positions=input_positions,
+                        block_tables=staged,
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        request_distribution=request_distribution,
+                    ),
+                    dict.fromkeys(frozen_layer_names, _m),
+                ),
             )
-            meta.seq_lens_cpu = seq_lens_cpu
-            return dict.fromkeys(frozen_layer_names, meta)
+            (
+                meta.input_positions,
+                meta.block_tables,
+                meta.seq_lens,
+                meta.query_start_loc,
+                meta.request_distribution,
+                meta.seq_lens_cpu,
+            ) = (
+                input_positions,
+                staged,
+                seq_lens,
+                query_start_loc,
+                request_distribution,
+                seq_lens_cpu,
+            )
+            return out_dict
         saved_ctx = runner._attn_metadata_builder_ctx
         draft_ctx = AttentionMetadataBuilderContext(
             num_reqs,
@@ -683,9 +709,26 @@ class DFlashProposer:
         the draft's KV through it would corrupt the cache silently instead of
         failing.
         """
-        self._get_draft_kv_cache_layer_names()
         try:
-            return self._draft_kv_layer_getter(attn_metadata)
+            return (
+                self._draft_kv_layer_getter
+                if (
+                    self._draft_kv_layer_getter is not None
+                    and (cached := self._draft_kv_layer_names_cache) is not None
+                    and cached[0] is (draft_model := self.draft_model)
+                    and (
+                        (layers := cached[1]) is None
+                        or (
+                            draft_model.model.layers is layers
+                            and len(layers) == cached[2]
+                        )
+                    )
+                )
+                else (
+                    self._get_draft_kv_cache_layer_names(),
+                    self._draft_kv_layer_getter,
+                )[1]
+            )(attn_metadata)
         except KeyError as exc:
             raise RuntimeError(
                 f"No attention metadata for draft layer {exc.args[0]!r}; "

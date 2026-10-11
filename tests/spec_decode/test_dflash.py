@@ -1866,24 +1866,32 @@ def test_td8351_build_attn_metadata_for_draft_single_group_fast_path():
         chunk_ctx=chunk.attn_ctx,
     )
     assert fallback_calls == []
+    assert out_zero_reqs is out
+    assert out_zero_reqs["draft_layer_0"] is meta
     assert out_zero_reqs["draft_layer_0"].block_tables is staged_draft
+    assert meta.seq_lens_cpu == (0, 0)
 
     chunk.attn_ctx.num_reqs = 2
+    seq_lens_step2 = torch.tensor([110, 110], dtype=torch.int32, device=device)
     out_zero_max = proposer._build_attn_metadata_for_draft(
         num_reqs=2,
         start_index=0,
         use_max_model_len=chunk.attn_ctx.use_max_model_len,
-        seq_lens=seq_lens,
+        seq_lens=seq_lens_step2,
         query_start_loc=qsl,
         request_distribution=req_dist,
         position_ids_override=None,
         padded_num_reqs=2,
-        seq_lens_cpu=(0, 0),
+        seq_lens_cpu=(110, 110),
         max_active_seq_len=0,
         chunk_ctx=chunk.attn_ctx,
     )
     assert fallback_calls == []
+    assert out_zero_max is out
+    assert out_zero_max["draft_layer_0"] is meta
     assert out_zero_max["draft_layer_0"].block_tables is staged_draft
+    assert meta.seq_lens is seq_lens_step2
+    assert meta.seq_lens_cpu == (110, 110)
 
     # Active column growth across chunk -> draft boundary falls back cleanly.
     chunk.attn_ctx.max_active_seq_len = 254
@@ -1892,3 +1900,50 @@ def test_td8351_build_attn_metadata_for_draft_single_group_fast_path():
     )
     assert len(fallback_calls) == 1
     assert out_fallback["draft_layer_0"] == "fallback"
+
+
+def test_td8356_draft_layer_getter_direct_call_and_single_group_meta_cache():
+    """TD8.356: _build_draft_layer_metadata invokes cached _draft_kv_layer_getter
+    directly without calling _get_draft_kv_cache_layer_names on steady-state hits,
+    and refreshes when draft_model or layers change."""
+    proposer = _make_proposer(draft_tp=1)
+    orig_get_names = proposer._get_draft_kv_cache_layer_names
+    call_count = 0
+
+    def counting_get_names():
+        nonlocal call_count
+        call_count += 1
+        return orig_get_names()
+
+    proposer._get_draft_kv_cache_layer_names = counting_get_names
+    l0 = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(layer_name="d0"))
+    )
+    l1 = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(layer_name="d1"))
+    )
+    layers_list = [l0, l1]
+    proposer.draft_model = SimpleNamespace(model=SimpleNamespace(layers=layers_list))
+    md = {"t0": "target_md", "d0": "md0", "d1": "md1"}
+
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+    assert call_count == 1
+    # Steady-state hit: direct getter call without _get_draft_kv_cache_layer_names.
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+    assert call_count == 1
+
+    # Mutating layers length invalidates fast check and refreshes cache.
+    layers_list.pop()
+    assert proposer._build_draft_layer_metadata(md) == ("md0",)
+    assert call_count == 2
+    assert proposer._build_draft_layer_metadata(md) == ("md0",)
+    assert call_count == 2
+
+    # Hook-based draft_model (cached[1] is None) also hits direct getter path.
+    proposer.draft_model = SimpleNamespace(
+        get_draft_kv_cache_layer_names=lambda: ["d0", "d1"]
+    )
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+    assert call_count == 3
+    assert proposer._build_draft_layer_metadata(md) == ("md0", "md1")
+    assert call_count == 3
