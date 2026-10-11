@@ -355,11 +355,13 @@ class DFlashProposer:
     ) -> dict[int, torch.Tensor] | None:
         """Return `chunk_ctx.staged_block_tables` when its draft-group tables
         already match `padded_num_reqs` and `draft_ctx`'s active column bound."""
-        if chunk_ctx is None or chunk_ctx.position_ids_override is not None:
-            return None
-        staged_tables = getattr(chunk_ctx, "staged_block_tables", None)
-        attn_groups = getattr(self.runner, "attn_groups", None)
-        if not staged_tables or not attn_groups or not self._draft_attn_layer_names:
+        if (
+            chunk_ctx is None
+            or chunk_ctx.position_ids_override is not None
+            or not (staged_tables := getattr(chunk_ctx, "staged_block_tables", None))
+            or not (attn_groups := getattr(self.runner, "attn_groups", None))
+            or not self._draft_attn_layer_names
+        ):
             return None
         builders = self._get_draft_group_builders(attn_groups)
         if not builders:
@@ -410,6 +412,49 @@ class DFlashProposer:
         No mamba fields: DFlash drafters are attention-only."""
         runner = self.runner
         frozen_layer_names = self._get_frozen_draft_attn_layer_names()
+        if (
+            chunk_ctx is not None
+            and chunk_ctx.position_ids_override is None
+            and position_ids_override is None
+            and use_max_model_len == chunk_ctx.use_max_model_len
+            and max_active_seq_len is not None
+            and (staged_tables := getattr(chunk_ctx, "staged_block_tables", None))
+            and (attn_groups := getattr(runner, "attn_groups", None))
+            and bool(self._draft_attn_layer_names)
+            and len(builders := self._get_draft_group_builders(attn_groups)) == 1
+            and not getattr(b0 := builders[0], "is_mamba_group", True)
+            and (bs := getattr(b0, "target_block_size", 0)) > 0
+            and (input_positions := getattr(runner, "position_ids", None)) is not None
+            and (staged := staged_tables.get(b0.kv_cache_group_id)) is not None
+            and staged.numel()
+            == padded_num_reqs * (tnb := b0._block_table_geometry(chunk_ctx)[1])
+            and (
+                tnb
+                if num_reqs <= 0 or tnb <= 16
+                else (
+                    min(16, tnb)
+                    if max_active_seq_len <= 0
+                    else min(
+                        tnb,
+                        1
+                        << max(
+                            4,
+                            (((max_active_seq_len + bs - 1) // bs) - 1).bit_length(),
+                        ),
+                    )
+                )
+            )
+            <= b0._active_block_table_columns(chunk_ctx, tnb)
+        ):
+            meta = AttentionMetadata(
+                input_positions=input_positions,
+                block_tables=staged,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+            )
+            meta.seq_lens_cpu = seq_lens_cpu
+            return dict.fromkeys(frozen_layer_names, meta)
         saved_ctx = runner._attn_metadata_builder_ctx
         draft_ctx = AttentionMetadataBuilderContext(
             num_reqs,

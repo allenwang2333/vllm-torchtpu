@@ -1777,3 +1777,118 @@ def test_td8335_dflash_vectorized_active_max_and_single_chunk_host_return(
         ],
     )
     assert multi_host == [[11, 12, 13], [21, 22, 23], [31, 32, 33]]
+
+
+def test_td8351_build_attn_metadata_for_draft_single_group_fast_path():
+    device = torch.device("cpu")
+    proposer = _make_proposer(draft_tp=1)
+    proposer._draft_attn_layer_names = {"draft_layer_0", "draft_layer_1"}
+    fallback_calls = []
+
+    def fake_build(layer_names, padded_num_reqs):
+        fallback_calls.append((layer_names, padded_num_reqs))
+        return dict.fromkeys(layer_names, "fallback")
+
+    class _Builder:
+        def __init__(self, gid: int, tnb: int, bs: int = 16):
+            self.kv_cache_group_id = gid
+            self.tnb = tnb
+            self.target_block_size = bs
+            self.is_mamba_group = False
+
+        def _block_table_geometry(self, _ctx):
+            return None, self.tnb
+
+        def _active_block_table_columns(self, ctx, tnb):
+            if getattr(ctx, "num_reqs", 1) <= 0 or tnb <= 16:
+                return tnb
+            ms = getattr(ctx, "max_active_seq_len", 0) or 0
+            if ms <= 0:
+                return min(16, tnb)
+            needed = (ms + self.target_block_size - 1) // self.target_block_size
+            return min(tnb, 1 << max(4, (needed - 1).bit_length()))
+
+    target_group = SimpleNamespace(
+        layer_names=["target_layer"],
+        metadata_builders=[_Builder(0, 64)],
+    )
+    draft_group = SimpleNamespace(
+        layer_names=["draft_layer_0", "draft_layer_1"],
+        metadata_builders=[_Builder(1, 64)],
+    )
+    pos_ids = torch.arange(10, dtype=torch.int32, device=device)
+    proposer.runner = SimpleNamespace(
+        device=device,
+        position_ids=pos_ids,
+        _attn_metadata_builder_ctx=None,
+        attn_groups=[[target_group, draft_group]],
+        build_attention_metadata_for_layers=fake_build,
+    )
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+    chunk.attn_ctx.seq_lens_cpu = (100, 100)
+    chunk.attn_ctx.max_active_seq_len = 100
+    staged_draft = torch.ones(128, dtype=torch.int32)
+    chunk.attn_ctx.staged_block_tables = {1: staged_draft}
+    seq_lens = torch.tensor([105, 105], dtype=torch.int32, device=device)
+
+    out = proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=seq_lens
+    )
+    assert fallback_calls == []
+    assert set(out.keys()) == {"draft_layer_0", "draft_layer_1"}
+    meta = out["draft_layer_0"]
+    assert out["draft_layer_1"] is meta
+    assert meta.input_positions is pos_ids
+    assert meta.block_tables is staged_draft
+    assert meta.seq_lens is seq_lens
+    assert meta.seq_lens_cpu == (100, 100)
+
+    # Also exercise num_reqs <= 0 and max_active_seq_len <= 0 fast-path branches.
+    qsl, req_dist = proposer._get_static_attn_tensors(2)
+    chunk.attn_ctx.num_reqs = 0
+    out_zero_reqs = proposer._build_attn_metadata_for_draft(
+        num_reqs=0,
+        start_index=0,
+        use_max_model_len=chunk.attn_ctx.use_max_model_len,
+        seq_lens=seq_lens,
+        query_start_loc=qsl,
+        request_distribution=req_dist,
+        position_ids_override=None,
+        padded_num_reqs=2,
+        seq_lens_cpu=(0, 0),
+        max_active_seq_len=0,
+        chunk_ctx=chunk.attn_ctx,
+    )
+    assert fallback_calls == []
+    assert out_zero_reqs["draft_layer_0"].block_tables is staged_draft
+
+    chunk.attn_ctx.num_reqs = 2
+    out_zero_max = proposer._build_attn_metadata_for_draft(
+        num_reqs=2,
+        start_index=0,
+        use_max_model_len=chunk.attn_ctx.use_max_model_len,
+        seq_lens=seq_lens,
+        query_start_loc=qsl,
+        request_distribution=req_dist,
+        position_ids_override=None,
+        padded_num_reqs=2,
+        seq_lens_cpu=(0, 0),
+        max_active_seq_len=0,
+        chunk_ctx=chunk.attn_ctx,
+    )
+    assert fallback_calls == []
+    assert out_zero_max["draft_layer_0"].block_tables is staged_draft
+
+    # Active column growth across chunk -> draft boundary falls back cleanly.
+    chunk.attn_ctx.max_active_seq_len = 254
+    out_fallback = proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=seq_lens
+    )
+    assert len(fallback_calls) == 1
+    assert out_fallback["draft_layer_0"] == "fallback"
