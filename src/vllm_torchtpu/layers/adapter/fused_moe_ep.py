@@ -452,7 +452,7 @@ def _build_op(
                 "__wrapped__",
                 fused_moe_func_fp8_dispatch,
             )
-            rhs_qdtype = jnp.float4_e2m1fn if weight_format == "fp4" else None
+            rhs_qdtype = None
 
             def _local_path_c(
                 x_l, w1_l, w2_l, w1s_l, w2s_l, ids_l, w_l, rank_l
