@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_DCP_MLA_MIXED_LIVE: bool = False
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
+    TPU_DCP_MLA_MIXED_BODY: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -512,6 +513,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": lambda: os.getenv(
         "TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""
     ),
+    # With TPU_DCP_MLA_MIXED_LIVE: attention-body rewrites of the live grid
+    # steps -- "1" = the bitwise-identical default set (byte-transpose NOPE
+    # unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
+    # MXU/VPU dependency), or a comma list of lever names
+    # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty = off.
+    "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
