@@ -93,12 +93,17 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
     except Exception as e:  # noqa: BLE001 - never block startup on the credit
         logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
         return 0, "?"
+    # Only deduct extra MTP expert slots when `mtp.layers.0` is actually placed
+    # by the placement table; standard 60-layer tables leave MTP at 64 slots,
+    # so charging `slots - 64` for an unplaced MTP layer wastes ~176 MB/TC of
+    # KV cache budget.
     mtp_extra_slots = (
         (slots - 64)
         if (
             expert_placement.enabled()
             and os.environ.get("TPU_EXPERT_PLACEMENT_MTP", "1") != "0"
             and slots > 64
+            and expert_placement.placed("mtp.layers.0.mlp.experts")
         )
         else 0
     )

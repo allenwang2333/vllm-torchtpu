@@ -602,3 +602,36 @@ def test_auto_table_rule_and_files_exist(monkeypatch):
             table = json.load(f)
         assert table["slots_per_core"] == 64 + table["extra_slots"]
         assert len(table["layers"]) == 60
+
+
+def test_expert_slot_kv_credit_only_charges_mtp_when_placed(monkeypatch):
+    from vllm_torchtpu import expert_placement
+    from vllm_torchtpu.platforms.tpu_platform import _expert_slot_kv_credit
+
+    c112_path = expert_placement.auto_table(1, 16)
+    _use(monkeypatch, c112_path)
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT_MTP", "1")
+    text = SimpleNamespace(
+        hidden_size=4096,
+        moe_intermediate_size=1024,
+        num_experts=512,
+        num_hidden_layers=60,
+    )
+    m_cfg = SimpleNamespace(hf_text_config=text)
+    p_cfg = SimpleNamespace(tensor_parallel_size=8, data_parallel_size=1)
+
+    # Standard 60-layer c112_mk2p table (78 slots): mtp.layers.0 is not placed,
+    # so mtp_extra_slots must be 0 and full 120-slot credit (1440 MiB/TC) is returned.
+    credit_unplaced, slots = _expert_slot_kv_credit(m_cfg, p_cfg)
+    assert slots == 78
+    assert credit_unplaced == (80 - 78) * 60 * 3 * 4096 * 1024
+
+    # When mtp.layers.0 is placed, (slots - 64) = 14 extra slots are deducted.
+    monkeypatch.setattr(
+        expert_placement,
+        "placed",
+        lambda prefix: prefix == "mtp.layers.0.mlp.experts",
+    )
+    credit_placed, _ = _expert_slot_kv_credit(m_cfg, p_cfg)
+    assert credit_placed == ((80 - 78) * 60 - 14) * 3 * 4096 * 1024
+
