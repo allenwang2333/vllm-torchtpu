@@ -291,22 +291,20 @@ class NgramHashState(upstream.NgramHashState):
             np.bitwise_xor(
                 rolled[:, shift - 2], rolled[:, shift - 1], out=rolled[:, shift - 1]
             )
-        # The int64 bucket ids reuse one scratch buffer: a fresh array of this
-        # size is page-faulted in on every call otherwise.
-        np.remainder(rolled[:, :, None, :], tables.primes, out=hashed)
-        # Add the table offsets while narrowing straight into the device
-        # path's [T, layers, heads] layout: one pass instead of an in-place
-        # int64 add plus a transposing astype copy (95 + 211 us at T=1152).
-        # The result is a fresh array each call: callers keep the tensor.
+        # Transpose the 8x-smaller rolled [layers, ngram - 1, T] to [T, layers,
+        # ngram - 1, 1] first, then compute contiguous PyTorch remainder + add_
+        # into the reused hashed scratch buffer before narrowing to int32.
         heads = hashed.shape[2]
-        out = np.empty((count, layers, (ngram - 1) * heads), dtype=np.int32)
-        np.add(
-            hashed,
-            tables.offsets,
-            out=out.reshape(count, layers, ngram - 1, heads).transpose(1, 2, 3, 0),
-            casting="unsafe",
-        )
-        return torch.from_numpy(out)
+        rolled_t = torch.from_numpy(
+            np.ascontiguousarray(rolled.transpose(2, 0, 1))
+        ).unsqueeze(-1)
+        hashed_t = torch.from_numpy(hashed.view().reshape(count, *hashed.shape[:3]))
+        torch.remainder(
+            rolled_t,
+            torch.from_numpy(tables.primes.squeeze(-1)),
+            out=hashed_t,
+        ).add_(torch.from_numpy(tables.offsets.squeeze(-1)))
+        return hashed_t.to(torch.int32).reshape(count, layers, (ngram - 1) * heads)
 
     def _hash(
         self,
@@ -473,7 +471,15 @@ class _HostHashTables:
         if (
             cached is not None
             and cached[0] == key
-            and np.array_equal(qsl_np, cached[1])
+            and (
+                (
+                    qsl_np.shape == cached[1].shape
+                    and qsl_np.dtype == cached[1].dtype
+                    and qsl_np.flags.c_contiguous
+                    and memoryview(qsl_np) == memoryview(cached[1])
+                )
+                or np.array_equal(qsl_np, cached[1])
+            )
             and "request_rows_cols" in self._memo
         ):
             return cached[2], cached[3], cached[4]

@@ -59,18 +59,18 @@ def test_hash_on_host_matches_device_path_formula(reqs, tpr, dead_frac, monkeypa
     state = _state()
     args = _inputs(reqs, tpr, dead_frac=dead_frac)
     captured = {}
-    orig_add = np.add
+    orig_rem = torch.remainder
 
-    def spy_add(a, b, *rest, **kw):
-        if kw.get("casting") == "unsafe" and "out" in kw:
-            captured["hashed"] = np.array(a, copy=True)
-            captured["offsets"] = np.array(b, copy=True)
-        return orig_add(a, b, *rest, **kw)
+    def spy_rem(a, b, *, out=None):
+        res = orig_rem(a, b, out=out)
+        if out is not None:
+            captured["hashed_t"] = res.numpy().copy()
+        return res
 
-    monkeypatch.setattr(ce.np, "add", spy_add)
+    monkeypatch.setattr(torch, "remainder", spy_rem)
     got = state.hash_on_host(*args)
-    monkeypatch.setattr(ce.np, "add", orig_add)
-    hashed = captured["hashed"] + captured["offsets"]
+    monkeypatch.setattr(torch, "remainder", orig_rem)
+    hashed = captured["hashed_t"].transpose(1, 2, 3, 0) + state._host_tables.offsets
     layers = hashed.shape[0]
     want = hashed.reshape(layers, -1, args[0].numel()).transpose(2, 0, 1)
     want = want.astype(np.int32, order="C")
@@ -494,3 +494,59 @@ def test_td8377_ref_qsl_memoryview_fast_path_and_shared_raw_starts():
     np.testing.assert_array_equal(out2.input_ids.numpy(), ids_ref)
     np.testing.assert_array_equal(out2.positions.numpy(), pos_ref)
     np.testing.assert_array_equal(out2.lookback_token_ids.numpy(), lb_ref)
+
+
+def test_td8384_hash_on_host_pre_transpose_torch_remainder_and_request_rows_memcmp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """TD8.384: Verify request_rows uses C-level memoryview equality before
+    falling back to np.array_equal, and hash_on_host pre-transposes rolled
+    before contiguous torch.remainder + .add_ into the reused hashed scratch."""
+    tables = ce._HostHashTables.from_state(_state(seed=84))
+    rows = np.arange(12, dtype=np.int32)
+    qsl = np.array([0, 6, 12], dtype=np.int32)
+    reqs1, starts1, base1 = tables.request_rows(qsl, rows, 12, 2, 3)
+
+    ae_calls = 0
+    orig_ae = np.array_equal
+
+    def spy_ae(a, b, *rest, **kw):
+        nonlocal ae_calls
+        ae_calls += 1
+        return orig_ae(a, b, *rest, **kw)
+
+    monkeypatch.setattr(ce.np, "array_equal", spy_ae)
+
+    # C-contiguous int32 hit short-circuits on memoryview equality
+    reqs2, starts2, base2 = tables.request_rows(qsl.copy(), rows, 12, 2, 3)
+    assert ae_calls == 0
+    assert reqs2 is reqs1 and starts2 is starts1 and base2 is base1
+
+    # Non-contiguous int32 view falls back to np.array_equal and still hits cache
+    qsl_strided = np.array([0, 99, 6, 99, 12], dtype=np.int32)[::2]
+    assert not qsl_strided.flags.c_contiguous
+    reqs3, starts3, base3 = tables.request_rows(qsl_strided, rows, 12, 2, 3)
+    assert ae_calls == 1
+    assert reqs3 is reqs1 and starts3 is starts1 and base3 is base1
+
+    # int64 qsl falls back to np.array_equal and still hits cache
+    qsl_i64 = np.array([0, 6, 12], dtype=np.int64)
+    reqs4, starts4, base4 = tables.request_rows(qsl_i64, rows, 12, 2, 3)
+    assert ae_calls == 2
+    assert reqs4 is reqs1 and starts4 is starts1 and base4 is base1
+
+    # Changed C-contiguous int32 qsl checks memoryview (False), falls back to
+    # np.array_equal (False), and recomputes
+    qsl_diff = np.array([0, 4, 12], dtype=np.int32)
+    reqs5, _, _ = tables.request_rows(qsl_diff, rows, 12, 2, 3)
+    assert ae_calls == 3
+    assert reqs5 is not reqs1 and reqs5.tolist() == [0] * 4 + [1] * 8
+
+    # Verify hash_on_host reuses hashed scratch buffer across steps
+    state = _state(seed=84)
+    args = _inputs(8, 6, seed=84)
+    out1 = state.hash_on_host(*args)
+    scratch_ptr = state._host_tables.scratch(48).__array_interface__["data"][0]
+    out2 = state.hash_on_host(*args)
+    assert state._host_tables.scratch(48).__array_interface__["data"][0] == scratch_ptr
+    assert torch.equal(out1, out2)
