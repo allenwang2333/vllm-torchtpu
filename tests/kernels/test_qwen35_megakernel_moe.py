@@ -201,11 +201,15 @@ def test_pack_weights_ecopy_placement(monkeypatch):
 
     table_path = expert_placement.auto_table(dcp_size=1, max_num_seqs=16)
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", table_path)
-    c_full72 = dataclasses.replace(K.FULL_EP, stack_e=False, e_slots=72, paged_kv=True)
+    slots = expert_placement.slots()
+    assert slots == 78
+    c_full78 = dataclasses.replace(
+        K.FULL_EP, stack_e=False, e_slots=slots, paged_kv=True
+    )
     cores0 = expert_placement.cores(0)
-    ec0 = K.encode_ecopy(c_full72, cores0)
+    ec0 = K.encode_ecopy(c_full78, cores0)
     assert len(ec0) == 512
-    assert sum(1 for x in ec0 if x > 0) == 64
+    assert sum(1 for x in ec0 if x > 0) == 112
 
 
 def test_tp16_shared_and_routed_expert_packing():

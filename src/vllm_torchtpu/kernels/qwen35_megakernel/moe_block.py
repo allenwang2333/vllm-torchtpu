@@ -205,9 +205,10 @@ class MoEBlock:
                 lane_b = lax.broadcasted_iota(I32, (128, E), 1)
                 rr = row_b - NCP
                 in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
+                cp_code = (row_b % R) * EXTRA + lax.div(row_b, R) + 1
                 bm = jnp.where(
                     row_b < NCP,
-                    jnp.where(cpi == row_b + 1, 1.0, 0.0),
+                    jnp.where(cpi == cp_code, 1.0, 0.0),
                     jnp.where(
                         rr < R,
                         jnp.where(in_rank, 1.0, 0.0),
