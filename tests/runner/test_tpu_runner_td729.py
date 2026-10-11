@@ -355,3 +355,113 @@ def test_assemble_async_spec_substitution_uniform_heterogeneous_and_multichunk()
     assert boot_idx_e is _cached_identity_map(0)
     assert boot_draft_e is _cached_uniform_draft_map(0, 0)
     assert boot_rej_e is None
+
+
+def test_td8278_substitute_placeholder_and_sample_spec_verify_chunk_int32():
+    import contextlib
+    import inspect
+    from unittest.mock import MagicMock
+
+    sub_fn = inspect.unwrap(tpu_runner._substitute_placeholder_token)
+    select_dtypes: list[torch.dtype] = []
+    orig_index_select = torch.Tensor.index_select
+
+    def _spy_index_select(self, dim, index):
+        select_dtypes.append(index.dtype)
+        return orig_index_select(self, dim, index)
+
+    for idx_dtype in (torch.int32, torch.int64):
+        input_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+        ref_ids = input_ids.clone()
+        cur_idx = torch.tensor([1, 3, 3, 3], dtype=idx_dtype)
+        pre_idx = torch.tensor([2, 0, -1, -1], dtype=idx_dtype)
+        next_tokens = torch.tensor([101, 102, 103, 104], dtype=torch.int64)
+
+        mask = pre_idx > -1
+        safe = torch.clamp_min(pre_idx, 0).long()
+        ref_new = next_tokens[safe].to(ref_ids.dtype)
+        ref_orig = ref_ids[cur_idx.long()]
+        ref_ids.scatter_(0, cur_idx.long(), torch.where(mask, ref_new, ref_orig))
+
+        select_dtypes.clear()
+        with patch.object(torch.Tensor, "index_select", _spy_index_select):
+            out = sub_fn(input_ids, cur_idx.long(), pre_idx, next_tokens)
+        assert select_dtypes == [torch.int32, torch.int32]
+        assert torch.equal(out, ref_ids)
+
+    # _sample_spec_verify_chunk non-greedy path: int32 safe_seg index_select
+    runner = object.__new__(TPUModelRunner)
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+    runner.drafter = object.__new__(tpu_runner.Eagle3Proposer)
+    runner.spec_gather_bonus_and_target_logits = lambda logits, b_idx, t_idx: (
+        logits[b_idx.long()],
+        logits[t_idx.long()],
+    )
+    temps = torch.tensor([[0.7], [1.2]], dtype=torch.float32)
+    top_k = torch.tensor([[10], [20]], dtype=torch.int32)
+    top_p = torch.tensor([[0.9], [0.8]], dtype=torch.float32)
+    runner._build_padded_sampling_params = lambda s, e, b: (temps, top_k, top_p)
+    runner.sample_from_logits_func = lambda b, t, u, tk, tp, all_greedy=False: (
+        torch.tensor([[7], [8]], dtype=torch.int32)
+    )
+    captured_rs_kwargs: list[dict] = []
+
+    def _fake_rs(**kwargs):
+        captured_rs_kwargs.append(kwargs)
+        return torch.tensor([[1, 2, 7], [3, -1, -1]], dtype=torch.int32)
+
+    runner.rejection_sampler = MagicMock(side_effect=_fake_rs)
+    runner.rejection_sampler.synthetic_mode = False
+
+    logits = torch.randn((5, 16), dtype=torch.float32)
+    so = SimpleNamespace(
+        scheduled_spec_decode_tokens={"r0": [1, 2], "r1": [3]},
+        num_scheduled_tokens={"r0": 3, "r1": 2},
+    )
+    for seg_dtype in (torch.int32, torch.int64):
+        md = SimpleNamespace(
+            bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int32),
+            target_logits_indices=torch.tensor([0, 1, 3, 3], dtype=torch.int32),
+            draft_token_ids=torch.tensor([1, 2, 3, 0], dtype=torch.int32),
+            draft_lengths=torch.tensor([2, 1], dtype=torch.int32),
+            draft_lengths_cpu=np.array([2, 1], dtype=np.int32),
+            # Include out-of-range sentinel 2 (= num_reqs) to test clamp
+            segment_ids=torch.tensor([0, 0, 1, 2], dtype=seg_dtype),
+            group_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        )
+        select_dtypes.clear()
+        with patch.object(torch.Tensor, "index_select", _spy_index_select):
+            res = runner._sample_spec_verify_chunk(
+                logits, md, None, so, 0, 2, False, torch.Generator()
+            )
+        assert res.shape == (2, 3)
+        assert select_dtypes == [torch.int32, torch.int32, torch.int32]
+        kw = captured_rs_kwargs[-1]
+        expected_seg = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+        assert torch.equal(kw["temperatures"], temps[expected_seg])
+        assert torch.equal(kw["top_k"], top_k[expected_seg])
+        assert torch.equal(kw["top_p"], top_p[expected_seg])
+
+    # _precompile_rejection_sampler passes segment_ids with dtype=torch.int32
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner.speculative_config = SimpleNamespace(
+        num_speculative_tokens=2, use_eagle=lambda: True, method="eagle3"
+    )
+    runner._model_supports_top_tokens = lambda: False
+    runner.num_tokens_paddings = [4]
+    runner.num_reqs_paddings = [1]
+    runner.max_num_reqs = 1
+    runner.vocab_size = 16
+    runner._hidden_states_dtype = torch.bfloat16
+    runner.device = torch.device("cpu")
+    runner._precompile_timed = lambda name: contextlib.nullcontext()
+    runner._spec_verify_bucket_reachable = lambda nt, nr: True
+    runner.spec_bonus_and_target_logits = lambda logits_in, b, t: (
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros((4, 16), dtype=torch.bfloat16),
+    )
+    captured_rs_kwargs.clear()
+    with patch.object(tpu_runner, "synchronize_tensors"):
+        runner._precompile_rejection_sampler()
+    assert len(captured_rs_kwargs) == 2
+    assert all(kw["segment_ids"].dtype == torch.int32 for kw in captured_rs_kwargs)

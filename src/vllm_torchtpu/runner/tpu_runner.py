@@ -336,8 +336,8 @@ def _substitute_placeholder_token(
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
-    original_values = input_ids[token_in_tpu_cur_input_indices]
+    new_token_values = next_tokens.index_select(0, safe_idx.int()).to(input_ids.dtype)
+    original_values = input_ids.index_select(0, token_in_tpu_cur_input_indices.int())
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
@@ -4856,6 +4856,9 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
+        safe_seg = md.segment_ids.int().clamp(
+            min=0, max=max(0, req_temperatures.shape[0] - 1)
+        )
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -4864,9 +4867,9 @@ class TPUModelRunner(GPUModelRunner):
             segment_ids=md.segment_ids,
             group_indices=md.group_indices,
             max_draft_tokens=self.speculative_config.num_speculative_tokens,
-            temperatures=req_temperatures[md.segment_ids],
-            top_k=req_top_k[md.segment_ids],
-            top_p=req_top_p[md.segment_ids],
+            temperatures=req_temperatures.index_select(0, safe_seg),
+            top_k=req_top_k.index_select(0, safe_seg),
+            top_p=req_top_p.index_select(0, safe_seg),
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
