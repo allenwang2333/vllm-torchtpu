@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_STREAMIDX_TOPK_WIDTH_BUCKETS: int = 0
+    TPU_STREAMIDX_TOPK_WIDTH_BUCKETS_MIN_TOKENS: int = 256
     TPU_STREAMIDX_REPLICA_SPLIT: bool = False
     TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS: int = 256
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
@@ -870,6 +871,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # long max_model_len over few DCP ranks they otherwise move padding. Exact.
     "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS": env_nonnegative_int(
         "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS", 0
+    ),
+    # Smallest token bucket that takes the width buckets. Decode buckets read
+    # little past their rows and pay the runtime switch, so they keep the table.
+    "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS_MIN_TOKENS": env_nonnegative_int(
+        "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS_MIN_TOKENS", 256
     ),
     # DCP StreamIndex: split the token axis over the TP lanes DCP leaves
     # replicated, so each lane scores and selects 1/lanes of the rows, then

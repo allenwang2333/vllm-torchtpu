@@ -491,6 +491,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         topk_width_buckets = envs.TPU_STREAMIDX_TOPK_WIDTH_BUCKETS
+        width_buckets_min_tokens = envs.TPU_STREAMIDX_TOPK_WIDTH_BUCKETS_MIN_TOKENS
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -561,7 +562,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=kv_pages_per_block,
                 num_queries_per_block=queries_per_block,
                 skip_empty_decode=skip_empty_decode,
-                topk_width_buckets=topk_width_buckets,
+                topk_width_buckets=(
+                    topk_width_buckets
+                    if q.shape[0] >= width_buckets_min_tokens
+                    else 0
+                ),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -610,6 +615,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         topk_width_buckets = envs.TPU_STREAMIDX_TOPK_WIDTH_BUCKETS
+        width_buckets_min_tokens = envs.TPU_STREAMIDX_TOPK_WIDTH_BUCKETS_MIN_TOKENS
         replica_split = envs.TPU_STREAMIDX_REPLICA_SPLIT
         replica_min_tokens = envs.TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS
         num_replicas = mesh.shape[DCP_LANE_AXIS_NAME]
@@ -667,7 +673,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 skip_empty_decode=skip_empty_decode,
-                topk_width_buckets=topk_width_buckets,
+                topk_width_buckets=(
+                    topk_width_buckets
+                    if q.shape[0] >= width_buckets_min_tokens
+                    else 0
+                ),
                 chunk_tokens=chunk_tokens,
                 a2a_merge=bucket_a2a,
                 replica_axis_name=(
