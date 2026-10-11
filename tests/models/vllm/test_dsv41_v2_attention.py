@@ -819,6 +819,6 @@ def test_token_requests_matches_bucketize(lens):
     metadata = SimpleNamespace(query_start_loc=qsl)
     out = v2_attn._token_requests(metadata, torch.zeros(tokens, dtype=torch.int32))
     rows = torch.arange(tokens)
-    ref = torch.bucketize(rows, qsl[1:], right=True)
+    ref = torch.bucketize(rows, qsl[1:], right=True, out_int32=True)
     assert out.dtype == ref.dtype
     assert torch.equal(out, ref)

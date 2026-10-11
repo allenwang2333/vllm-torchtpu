@@ -569,3 +569,39 @@ class TestMhcPreMixAndGatesTD743:
             rtol=5e-3,
             atol=1e-5,
         )
+
+
+def test_td8302_paged_cache_rows_and_attn_kernels_int32_guards():
+    """Verify TD8.302 int32 cast guards in PagedCacheRows and attention_kernels."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+
+    raw = torch.arange(16 * ROW_WORDS, dtype=torch.int32).reshape(16, ROW_WORDS)
+    paged = PagedCacheRows(raw, ((4, 4, 256), torch.bfloat16, 2048, 0))
+
+    slots_i32 = torch.tensor([0, 3, 7], dtype=torch.int32)
+    slots_i64 = slots_i32.to(torch.int64)
+    assert paged.row_indices(slots_i32) is slots_i32
+    assert torch.equal(paged.row_indices(slots_i32), paged.row_indices(slots_i64))
+
+    bt_i32 = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
+    bt_i64 = bt_i32.to(torch.int64)
+    assert paged.pages(bt_i32) is bt_i32
+    assert torch.equal(paged.pages(bt_i32), paged.pages(bt_i64))
+
+    b_i32 = torch.tensor([0, 2], dtype=torch.int32)
+    r_i32 = torch.tensor([1, 3], dtype=torch.int32)
+    out_i32 = paged[b_i32, r_i32]
+    out_i64 = paged[b_i32.to(torch.int64), r_i32.to(torch.int64)]
+    assert torch.equal(out_i32.view(torch.int16), out_i64.view(torch.int16))
+
+    x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    perm_i32 = torch.tensor([2, -1, 0, 5], dtype=torch.int32)
+    perm_i64 = perm_i32.to(torch.int64)
+    assert torch.equal(
+        ak._permute_owner_tokens_torch(x, perm_i32),
+        ak._permute_owner_tokens_torch(x, perm_i64),
+    )
+    assert torch.equal(
+        ak._unpermute_owner_tokens_torch(x, perm_i32),
+        ak._unpermute_owner_tokens_torch(x, perm_i64),
+    )

@@ -458,7 +458,7 @@ class PagedCacheRows:
         return self.raw.device
 
     def row_indices(self, slots, valid=None):
-        slots = slots.int()
+        slots = slots if slots.dtype == torch.int32 else slots.int()
         if not self.sharded and self.page_stride == self.shape[1]:
             return slots if self.row_offset == 0 else self.row_offset + slots
         blocks = slots // self.shape[1]
@@ -495,7 +495,9 @@ class PagedCacheRows:
         """
         if not self.pages_aligned:
             return None
-        block_table = block_table.int()
+        block_table = (
+            block_table if block_table.dtype == torch.int32 else block_table.int()
+        )
         if not self.sharded:
             pages = (
                 block_table if self.page_scale == 1 else block_table * self.page_scale
@@ -536,12 +538,15 @@ class PagedCacheRows:
             self.raw_hi.copy_(updated_hi)
 
     def __getitem__(self, indices):
-        blocks, rows = indices[0].int(), indices[1].int()
+        blocks, rows = (
+            indices[0] if indices[0].dtype == torch.int32 else indices[0].int(),
+            indices[1] if indices[1].dtype == torch.int32 else indices[1].int(),
+        )
         records = self.row_indices(blocks * self.shape[1] + rows)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             valid = records >= 0
-            rec = records.clamp(min=0).int()
+            rec = records.clamp(min=0)
             if self.raw_hi is None:
                 selected = pool.index_select(0, rec.reshape(-1)).reshape(
                     *rec.shape, self.row_bytes

@@ -257,7 +257,7 @@ def _attend_window(
         if fallback:
             result = patch(result)
         flat = uncovered.reshape(-1)
-        overflow = flat & (jnp.cumsum(flat) > fallback)
+        overflow = flat & (jnp.cumsum(flat, dtype=jnp.int32) > fallback)
         return tuple(
             jnp.where(overflow.reshape(-1, *([1] * (r.ndim - 1))), jnp.nan, r)
             for r in result
@@ -1170,7 +1170,7 @@ def _permute_owner_tokens_torch(
 ) -> torch.Tensor:
     """Gather token rows ``x`` (``[T, ...]``) into owner-major ``[T_pad, ...]``."""
     # Token ids are < 2**31: index_select takes the int32 permutation directly.
-    perm = owner_perm.int()
+    perm = owner_perm if owner_perm.dtype == torch.int32 else owner_perm.int()
     valid = perm >= 0
     gathered = x.index_select(0, perm.clamp(min=0))
     mask = valid.reshape((perm.shape[0],) + (1,) * (x.ndim - 1))
@@ -1181,7 +1181,7 @@ def _unpermute_owner_tokens_torch(
     x_perm: torch.Tensor, owner_inv: torch.Tensor
 ) -> torch.Tensor:
     """Restore owner-major ``x_perm`` (``[T_pad, ...]``) to batch order ``[T, ...]``."""
-    inv = owner_inv.int()
+    inv = owner_inv if owner_inv.dtype == torch.int32 else owner_inv.int()
     valid = inv >= 0
     gathered = x_perm.index_select(0, inv.clamp(min=0))
     mask = valid.reshape((inv.shape[0],) + (1,) * (x_perm.ndim - 1))
