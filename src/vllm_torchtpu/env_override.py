@@ -346,7 +346,11 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     if dcp.isdigit() and int(dcp) > 1:
         if "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS" not in os.environ:
             _set_env("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
-        if "MOE_FUSED_EP_KERNEL_IMPL" not in os.environ:
+        if (
+            "MOE_FUSED_EP_KERNEL_IMPL" not in os.environ
+            and os.environ.get("USE_MOE_FUSED_EP_KERNEL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
             _set_env("MOE_FUSED_EP_KERNEL_IMPL", "v2")
 
 
