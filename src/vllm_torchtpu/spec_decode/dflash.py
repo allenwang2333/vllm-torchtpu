@@ -1239,9 +1239,11 @@ class DFlashProposer:
         num_reqs = (query_start_loc[1:] > query_start_loc[:-1]).sum(dtype=torch.int32)
         safe_req_indices = torch.minimum(req_indices, torch.clamp(num_reqs - 1, min=0))
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
-        start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
+        start_positions = (
+            position_ids[query_start_loc[safe_req_indices]].to(torch.int32).unsqueeze(1)
+        )
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
-        last_positions = position_ids[end_indices].unsqueeze(1)
+        last_positions = position_ids[end_indices].to(torch.int32).unsqueeze(1)
         return safe_req_indices, valid_mask, start_positions, last_positions
 
     def _layout_draft_block(
@@ -1260,20 +1262,16 @@ class DFlashProposer:
         input builders, so the layout, padding and clamps exist once.
         """
         device = base_tokens.device
-        padded_num_reqs = base_tokens.shape[0]
 
         # Format input_ids with base tokens and MASK placeholders
-        input_ids = torch.full(
-            (padded_len,), mask_token_id, dtype=torch.int32, device=device
+        input_ids_unpadded = F.pad(
+            base_tokens.unsqueeze(1), (0, block_size - 1), value=mask_token_id
+        ).flatten()
+        input_ids = F.pad(
+            input_ids_unpadded,
+            (0, padded_len - input_ids_unpadded.shape[0]),
+            value=mask_token_id,
         )
-        scatter_indices = torch.arange(
-            0,
-            padded_num_reqs * block_size,
-            block_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        input_ids.scatter_(0, scatter_indices, base_tokens)
 
         offsets = torch.arange(
             0, block_size, dtype=torch.int32, device=device
@@ -1345,7 +1343,7 @@ class DFlashProposer:
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
             self._request_window_bounds(query_start_loc, position_ids, padded_num_reqs)
         )
-        start_positions_padded = (start_positions * valid_mask).to(torch.int32)
+        start_positions_padded = start_positions * valid_mask
 
         # Count accepted tokens per request and extract the base token
         num_valid = (next_tokens_device_padded != invalid_token_id).sum(
@@ -1367,7 +1365,7 @@ class DFlashProposer:
         # anchor prompt chunks at last_pos + 1.
         num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
         verify_base = start_positions_padded + num_accepted
-        prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
+        prompt_base = (last_positions + 1) * valid_mask
         base_pos = torch.where(num_draft > 0, verify_base, prompt_base)
 
         return self._layout_draft_block(
@@ -1420,7 +1418,7 @@ class DFlashProposer:
         _, valid_mask, _, last_positions = self._request_window_bounds(
             query_start_loc, position_ids, padded_num_reqs
         )
-        base_pos = ((last_positions + 1) * valid_mask).to(torch.int32)
+        base_pos = (last_positions + 1) * valid_mask
 
         return self._layout_draft_block(
             base_tokens, base_pos, block_size, padded_len, mask_token_id

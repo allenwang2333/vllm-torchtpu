@@ -1432,3 +1432,36 @@ def test_td8236_host_prep_fast_paths(device):
         chunk, num_tokens_padded=10, seq_lens=torch.tensor([125, 245], device=device)
     )
     assert captured_ctxs[-1].max_active_seq_len == 240 + proposer.block_size
+
+
+def test_td8252_int32_window_bounds_and_pad_layout(device):
+    proposer = _make_proposer(draft_tp=1)
+    proposer._max_model_len = 4096
+    qsl = torch.tensor([0, 3, 5, 5, 5], dtype=torch.int32, device=device)
+    pos_i64 = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int64, device=device)
+
+    safe_idx, valid_mask, start_pos, last_pos = proposer._request_window_bounds(
+        qsl, pos_i64, padded_num_reqs=4
+    )
+    assert safe_idx.dtype == torch.int32
+    assert valid_mask.dtype == torch.int32
+    assert start_pos.dtype == torch.int32
+    assert last_pos.dtype == torch.int32
+    assert start_pos.squeeze(1).tolist() == [10, 20, 20, 20]
+    assert last_pos.squeeze(1).tolist() == [12, 21, 21, 21]
+
+    base_tokens = torch.tensor([101, 202, 99, 99], dtype=torch.int32, device=device)
+    base_pos = torch.tensor([[13], [22], [0], [0]], dtype=torch.int32, device=device)
+    for padded_len in (20, 24):
+        ids, pos, sl = proposer._layout_draft_block(
+            base_tokens, base_pos, block_size=5, padded_len=padded_len, mask_token_id=99
+        )
+        ref_ids = torch.full((padded_len,), 99, dtype=torch.int32, device=device)
+        scatter_idx = torch.arange(0, 20, 5, dtype=torch.int32, device=device)
+        ref_ids.scatter_(0, scatter_idx, base_tokens)
+        assert ids.dtype == torch.int32
+        assert pos.dtype == torch.int32
+        assert sl.dtype == torch.int32
+        assert torch.equal(ids, ref_ids)
+
+    assert proposer._can_reuse_staged_block_tables(None, None, 4) is None
