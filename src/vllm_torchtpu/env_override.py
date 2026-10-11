@@ -245,6 +245,18 @@ if os.environ.get("TPU_DISABLE_PR989_KERNELS", "0").strip().lower() in (
     _set_env("TPU_GDN_FUSED_NORM_QUANT", "0")
     _set_env("TPU_FUSED_QK_NORM_ROPE", "0")
     _set_env("TPU_EXPERT_PLACEMENT", "")
+    _set_env("TPU_GREEDY_TOP_TOKENS", "0")
+    _set_env("TPU_SAMPLER_TOPK_CANDIDATES", "0")
+    _set_env("VLLM_TPU_FUSED_DRAFT_LOOP", "0")
+    _set_env("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "0")
+elif os.environ.get("TPU_RAIDEN_JOB_NAME", "").strip().lower() == "decode":
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "0")
+else:
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+    if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
+        _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 
 
 def _user_has_flag(flag_name: str) -> bool:
@@ -287,6 +299,58 @@ if _libtpu_extra_args or _existing_libtpu_args:
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
+def _has_cli_opt(argv: list[str], opt: str) -> bool:
+    return any(a == opt or a.startswith(opt + "=") for a in argv)
+
+
+def _get_cli_opt(argv: list[str], opt: str) -> str | None:
+    for i, a in enumerate(argv):
+        if a == opt and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(opt + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _apply_qwen35_serve_cli_defaults() -> None:
+    """ of the Qwen3.5-397B checkpoint: MTP=3 speculative decoding
+    and 4 tokenizer renderer workers unless the command line sets them."""
+    import sys
+
+    if os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+    argv = sys.argv
+    if (
+        "serve" not in argv[:3]
+        or "bench" in argv[:3]
+        or "qwen3.5-397b" not in " ".join(argv).lower()
+    ):
+        return
+    for opt, val in (
+        ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
+        ("--renderer-num-workers", "4"),
+    ):
+        if not _has_cli_opt(argv, opt):
+            argv.extend([opt, val])
+            CHANGES.append(["argv_add", opt, val])
+    if "TPU_RPA_DECODE_BATCHED" not in os.environ:
+        _set_env("TPU_RPA_DECODE_BATCHED", "1")
+    if "TPU_MOE_SINGLE_SORT" not in os.environ:
+        _set_env("TPU_MOE_SINGLE_SORT", "1")
+    dcp = _get_cli_opt(argv, "--decode-context-parallel-size") or ""
+    if dcp.isdigit() and int(dcp) > 1:
+        if "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS" not in os.environ:
+            _set_env("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
+        if "MOE_FUSED_EP_KERNEL_IMPL" not in os.environ:
+            _set_env("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+
+
+_apply_qwen35_serve_cli_defaults()
 os.environ.setdefault(
     "VLLM_TORCHTPU_CONFIG_CHANGES", json.dumps(CHANGES, separators=(",", ":"))
 )
