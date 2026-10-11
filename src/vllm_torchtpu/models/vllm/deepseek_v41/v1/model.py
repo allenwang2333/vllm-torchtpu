@@ -40,6 +40,7 @@ from ..common.mhc import (
     pre,
     shifted_post_pre,
 )
+from ..v2.ced import _ced_inverse_rows, _scatter_decoder_rows
 from .attention import DeepseekV41Attention
 from .engram import Engram, NgramHashState
 from .ops import compact_rope_caches
@@ -198,13 +199,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         cached = getattr(self, "_ced_non_identity_cache", None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
-        # The extra output row absorbs padded scatter writes. Reusing row
-        # zero for padding would overwrite a real request's first result.
-        indices = torch.tensor(
-            indices_tuple
-            + (num_positions,) * (plan.padded_num_tokens - len(indices_tuple)),
-            dtype=torch.int64,
-            device=positions.device,
+        # Output rows gather their decoder row through an int32 inverse map;
+        # rows with no decoder row read the appended zero row. This replaces
+        # an int64 ``index_copy_`` whose padded duplicate indices lower to a
+        # duplicate-write SparseCore scatter (see v2 `_scatter_decoder_rows`).
+        indices = _ced_inverse_rows(
+            indices_tuple, plan.padded_num_tokens, num_positions, positions.device
         )
         gather = torch.tensor(
             indices_tuple
@@ -328,8 +328,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             output = output[0]
         if indices is None:
             return output
-        result = output.new_zeros((positions.shape[0] + 1, output.shape[-1]))
-        return result.index_copy_(0, indices, output)[:-1]
+        return _scatter_decoder_rows(output, indices)
 
     # Keep the upstream forward order; adapt its Engram metadata access here,
     # alongside attention/compressor adapters, so the runner stays model-neutral.

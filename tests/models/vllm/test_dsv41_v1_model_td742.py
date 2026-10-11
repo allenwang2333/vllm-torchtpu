@@ -107,7 +107,8 @@ def test_ced_helper_caches_and_all_zero_vs_nonzero_replay_starts():
     t2 = m._get_ced_non_identity_tensors(plan_a, 4, positions)
     assert t2 is t1
     indices, gather, bounds = t1
-    assert torch.equal(indices, torch.tensor([0, 2, 4, 4], dtype=torch.int64))
+    # TD8.311: int32 inverse row map (output row -> decoder row; 4 = zero row).
+    assert torch.equal(indices, torch.tensor([0, 4, 1, 4], dtype=torch.int32))
     assert gather.dtype == torch.int32
     assert torch.equal(gather, torch.tensor([0, 2, 3, 3], dtype=torch.int32))
     assert torch.equal(bounds, torch.tensor([0, 1, 2], dtype=torch.int32))
@@ -841,8 +842,8 @@ def test_td8307_v1_attention_and_model_int32_guards():
         padded_num_tokens=4,
     )
     indices, gather, bounds = m._get_ced_non_identity_tensors(plan, 4, positions_i32)
-    assert indices.dtype == torch.int64
-    assert torch.equal(indices, torch.tensor([0, 2, 4, 4], dtype=torch.int64))
+    assert indices.dtype == torch.int32
+    assert torch.equal(indices, torch.tensor([0, 4, 1, 4], dtype=torch.int32))
     assert gather.dtype == torch.int32
     assert torch.equal(gather, torch.tensor([0, 2, 3, 3], dtype=torch.int32))
     assert bounds.dtype == torch.int32

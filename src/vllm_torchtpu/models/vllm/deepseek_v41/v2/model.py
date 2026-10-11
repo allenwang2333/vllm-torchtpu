@@ -35,6 +35,8 @@ from .attention import (
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
+    _ced_inverse_rows,
+    _scatter_decoder_rows,
     _zero_hits,
     plan_decoder_replay,
     prefix_replay_enabled,
@@ -71,28 +73,6 @@ def _ced_config(
     assert hf_config is not None
     ced_boundary = hf_config.num_hidden_layers // 2
     return ced_enabled, ced_boundary
-
-
-def _ced_inverse_rows(
-    indices: tuple[int, ...], padded_rows: int, total_rows: int, device
-) -> torch.Tensor:
-    """Row map for `_scatter_decoder_rows`: output row r reads decoder row
-    ``k`` when ``indices[k] == r``, else the appended zero row ``padded_rows``."""
-    inverse = [padded_rows] * total_rows
-    for k, r in enumerate(indices):
-        inverse[r] = k
-    return torch.tensor(inverse, dtype=torch.int32, device=device)
-
-
-def _scatter_decoder_rows(tensor: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
-    """Place decoder rows back at their positions; other rows are zero.
-
-    A gather through the inverse row map rather than ``index_copy_`` with
-    padded duplicate indices: the duplicate-write scatter lowers to a
-    SparseCore scatter that halted the chip at a 576-row decoder bucket
-    (E0200 in ``tt_jit_index_copy``).
-    """
-    return torch.nn.functional.pad(tensor, (0, 0, 0, 1)).index_select(0, inverse)
 
 
 def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
