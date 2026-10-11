@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_LIVE: bool = False
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
+    TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -497,6 +498,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MXU/VPU dependency), or a comma list of lever names
     # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty = off.
     "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
+    # DCP sparse MLA, mixed / prefill buckets (> 32 tokens): the mixed-step
+    # counterpart of TPU_DCP_MLA_MASK_IN_KERNEL. Drop the per-layer owns mask,
+    # dummy-key update of the top-k (and the copy of the top-k it forces when
+    # a later layer reuses it) and the lse select; the kernel takes each
+    # token's true kv_len (0 = this rank owns none of its top-k), attends
+    # nothing for such a token (out = 0) and writes its lse as -inf itself.
+    # Every owning row is bit-identical; the merge result is unchanged.
+    "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": env_bool(
+        "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL", default=False
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

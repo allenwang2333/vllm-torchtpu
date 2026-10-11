@@ -1158,11 +1158,14 @@ def sparse_mla_attention_dcp(
         # Decode buckets with TPU_DCP_MLA_MASK_IN_KERNEL: the kernel takes the
         # true kv_len (0 = this rank owns none of the token's top-k) and writes
         # that token's lse as -inf itself, so none of the glue below runs.
-        mask_in_kernel = (
-            envs.TPU_DCP_MLA_MASK_IN_KERNEL
-            and topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
-        )
+        decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        mask_in_kernel = envs.TPU_DCP_MLA_MASK_IN_KERNEL and decode_bucket
         fused_prep = mask_in_kernel and envs.TPU_DCP_MLA_FUSED_PREP
+        # Mixed / prefill buckets with TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: the
+        # same contract (raw top-k, empty rows' lse -inf from the kernel).
+        mask_in_kernel = mask_in_kernel or (
+            envs.TPU_DCP_MLA_MIXED_MASK_IN_KERNEL and not decode_bucket
+        )
         if not mask_in_kernel:
             # A rank owning none of a token's top-k still has to be handed one
             # valid entry: the kernel derives `kv_len` from the `-1` tail and
