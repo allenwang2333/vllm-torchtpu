@@ -682,3 +682,64 @@ def test_td8371_write_global_kv_int32_flat_index_select(monkeypatch):
                 assert index_slots.dtype == torch.int32
         assert torch.equal(records_by_dtype[0], records_by_dtype[1])
         assert torch.equal(slots_by_dtype[0], slots_by_dtype[1])
+
+
+def test_td8376_prepare_tpu_pos_i32_and_non_causal_int32_bounds(monkeypatch):
+    """TD8.376: _prepare_tpu pre-casts pos_i32 and requests once and keeps
+    non_causal SWA window bounds (end_pos, query_len, start_pos, logical) in
+    int32 across both stage-cached and uncached paths."""
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
+    swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    captured_records: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, k_c, v_c, recs, *a, **kw: (
+            captured_records.append(recs.clone()) or torch.zeros_like(q)
+        ),
+    )
+
+    for use_stage_cache in (True, False):
+        for non_causal in (False, True):
+            case_records: list[torch.Tensor] = []
+            for dt in (torch.int32, torch.int64):
+                swa_meta = SimpleNamespace(
+                    seq_lens=torch.tensor([130, 130], dtype=dt),
+                    block_tables=swa_table,
+                    query_start_loc=torch.tensor([0, 2, 4], dtype=dt),
+                )
+                ctx = SimpleNamespace(
+                    attn_metadata={"swa_pfx": swa_meta},
+                    additional_kwargs={},
+                )
+                monkeypatch.setattr(v2_attn, "get_forward_context", lambda c=ctx: c)
+                attn = _make_swa_attn(
+                    window_size=128, ced_decoder=False, has_fast_swa_offset=True
+                )
+                attn.non_causal_multi_token_decode = non_causal
+                pos = torch.tensor([65, 129, 64, 128], dtype=dt)
+                qr = torch.ones((4, 16), dtype=torch.bfloat16)
+                kv = torch.ones((4, 8), dtype=torch.bfloat16)
+                out = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+                captured_records.clear()
+                if use_stage_cache:
+                    with v2_attn.stage_attention_cache_scope():
+                        attn._prepare_tpu(None, qr, kv, None, None, None, pos, out)
+                        stage_cache = v2_attn._active_stage_attn_cache
+                        assert stage_cache is not None
+                        addr = next(
+                            v
+                            for k, v in stage_cache.items()
+                            if k[0] == "swa_token_addr"
+                        )
+                        _, requests, pos_col, pos_rem, logical, _, _ = addr
+                        assert requests.dtype == torch.int32
+                        assert pos_col.dtype == torch.int32
+                        assert pos_rem.dtype == torch.int32
+                        assert logical.dtype == torch.int32
+                else:
+                    attn._prepare_tpu(None, qr, kv, None, None, None, pos, out)
+                assert len(captured_records) == 1
+                case_records.append(captured_records[0])
+            assert torch.equal(case_records[0], case_records[1])

@@ -1287,8 +1287,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
-        swa_row_slots_masked = None
-        swa_slots_key = None
+        swa_row_slots_masked = swa_slots_key = None
+        pos_i32 = positions.int()
         if (
             stage_cache is not None
             and rows_per_page is not None
@@ -1315,21 +1315,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     positions.shape[0], dtype=torch.int32, device=positions.device
                 )
                 valid_token = token_rows < swa.query_start_loc[-1]
-                requests = _token_requests(swa, positions).clamp(
-                    max=swa_table.shape[0] - 1
+                requests = (
+                    _token_requests(swa, pos_i32)
+                    .clamp(max=swa_table.shape[0] - 1)
+                    .int()
                 )
-                pos_col = (req_base := requests.int() * swa_table.shape[1]) + (
-                    (positions.int() // rows_per_page).clamp(max=swa_table.shape[1] - 1)
+                pos_col = (req_base := requests * swa_table.shape[1]) + (
+                    (pos_i32 // rows_per_page).clamp(max=swa_table.shape[1] - 1)
                 )
-                pos_rem = (positions % rows_per_page).int()
+                pos_rem = pos_i32 % rows_per_page
                 if non_causal:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                    end_pos = swa.seq_lens.index_select(0, req_idx)
-                    query_len = swa.query_start_loc.index_select(
+                    end_pos = swa.seq_lens.int().index_select(0, req_idx)
+                    query_len = (qsl_i32 := swa.query_start_loc.int()).index_select(
                         0, req_idx + 1
-                    ) - swa.query_start_loc.index_select(0, req_idx)
+                    ) - qsl_i32.index_select(0, req_idx)
                     prefix_len = (end_pos - query_len).clamp(min=0)
-                    start_pos = (prefix_len - self.window_size).clamp(min=0).int()
+                    start_pos = (prefix_len - self.window_size).clamp(min=0)
                     logical = (
                         start_pos[:, None]
                         + torch.arange(
@@ -1343,7 +1345,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 else:
                     logical = (
-                        positions.int()[:, None]
+                        pos_i32[:, None]
                         - self.window_size
                         + 1
                         + torch.arange(
@@ -1505,19 +1507,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 ) = cached_swa_slots
         else:
             swa_write = None
-            swa_slots = _cache_slots(swa_cache, swa, positions).int()
+            swa_slots = _cache_slots(swa_cache, swa, pos_i32).int()
             swa_valid = swa_slots >= 0
             swa_valid_int32 = swa_valid
             swa_invalid_3d = (~swa_valid)[:, None, None]
-            requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
+            requests = (
+                _token_requests(swa, pos_i32).clamp(max=swa_table.shape[0] - 1).int()
+            )
             if non_causal and swa.seq_lens.numel() > 0:
                 req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                end_pos = swa.seq_lens.index_select(0, req_idx)
-                query_len = swa.query_start_loc.index_select(
+                end_pos = swa.seq_lens.int().index_select(0, req_idx)
+                query_len = (qsl_i32 := swa.query_start_loc.int()).index_select(
                     0, req_idx + 1
-                ) - swa.query_start_loc.index_select(0, req_idx)
+                ) - qsl_i32.index_select(0, req_idx)
                 prefix_len = (end_pos - query_len).clamp(min=0)
-                start_pos = (prefix_len - self.window_size).clamp(min=0).int()
+                start_pos = (prefix_len - self.window_size).clamp(min=0)
                 logical = (
                     start_pos[:, None]
                     + torch.arange(
@@ -1529,7 +1533,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             else:
                 logical = (
-                    positions.int()[:, None]
+                    pos_i32[:, None]
                     - self.window_size
                     + 1
                     + torch.arange(
@@ -1738,7 +1742,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     else None
                 )
                 if cached_comp_inputs is None:
-                    lengths = ((positions.int() + 1) // self.compress_ratio)[:, None]
+                    lengths = ((pos_i32 + 1) // self.compress_ratio)[:, None]
                     if segmented_main and owner_perm is not None:
                         seg_count = owner_perm.shape[0] // tp_ranks
                         # index_select, not a tensor-bound slice: slicing calls
