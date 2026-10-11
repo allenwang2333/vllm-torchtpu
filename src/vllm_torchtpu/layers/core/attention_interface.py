@@ -1008,6 +1008,15 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def _mixed_body_levers(value: str) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.MIXED_BODY_DEFAULT
+    return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1227,6 +1236,7 @@ def sparse_mla_attention_dcp(
             mixed_live_widths=tuple(
                 int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
             ),
+            mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
             **chunk_kwargs,
             **split_kwargs,
         )
