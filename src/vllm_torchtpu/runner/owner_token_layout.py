@@ -496,6 +496,29 @@ def _sharded_group_id(runner: Any) -> int:
     return int(cached[1])
 
 
+def _col0_token(table: Any, start: int, num_reqs: int) -> tuple | None:
+    """Identity of column 0 of block-table rows ``[start, start + num_reqs)``.
+
+    Tracked tables (`block_table_delta.ensure_tracked`) bump ``_bt_rewrites``
+    on every row mutation except ``append_row``, which writes from column
+    ``num_blocks_per_row[row]`` on. So while the counter is unchanged, column 0
+    of a row that already held a block cannot change. None when untracked.
+    """
+    rewrites = getattr(table, "_bt_rewrites", None)
+    return None if rewrites is None else (table, rewrites, start, num_reqs)
+
+
+def _col0_snapshot_token(table: Any, start: int, num_reqs: int) -> tuple | None:
+    """`_col0_token` to cache with a column-0 snapshot: None unless every row
+    already holds a block, since `append_row` on an empty row writes column 0."""
+    token = _col0_token(table, start, num_reqs)
+    if token is None or not bool(
+        (table.num_blocks_per_row[start : start + num_reqs] > 0).all()
+    ):
+        return None
+    return token
+
+
 def step_owner_required_tokens(
     runner: Any,
     start_index: int,
@@ -527,16 +550,29 @@ def step_owner_required_tokens(
     raw_first_blocks = block_ids[start_index : start_index + num_reqs, 0]
     scheduled_arr = np.asarray(num_scheduled_tokens_per_req)
     req_meta_key = (tp_size, owner_layout, start_index, num_reqs)
+    col0_token = _col0_token(table, start_index, num_reqs)
     cached_req = getattr(runner, "_kv_shard_required_tokens_cache", None)
     if (
         cached_req is not None
         and cached_req[0] == req_meta_key
-        and np.array_equal(cached_req[1], raw_first_blocks)
-        and np.array_equal(cached_req[2], scheduled_arr)
+        and (
+            (col0_token is not None and cached_req[4] == col0_token)
+            or np.array_equal(cached_req[1], raw_first_blocks)
+        )
+        and (
+            # An owning read-only array cannot have changed since cached.
+            (
+                cached_req[5] is scheduled_arr
+                and scheduled_arr.base is None
+                and not scheduled_arr.flags.writeable
+            )
+            or np.array_equal(cached_req[2], scheduled_arr)
+        )
     ):
         return cached_req[3]
     first_blocks = np.array(raw_first_blocks, dtype=np.int32, copy=True)
     scheduled = np.array(scheduled_arr, dtype=np.int32, copy=True)
+    snapshot_token = _col0_snapshot_token(table, start_index, num_reqs)
     if (
         (first_blocks < owner_layout.num_replicated)
         | (first_blocks >= owner_layout.num_blocks)
@@ -546,6 +582,8 @@ def step_owner_required_tokens(
             first_blocks,
             scheduled,
             0,
+            snapshot_token,
+            scheduled_arr,
         )
         return 0
     owners = _owners_from_first_blocks(first_blocks, owner_layout)
@@ -557,6 +595,8 @@ def step_owner_required_tokens(
         first_blocks,
         scheduled,
         required,
+        snapshot_token,
+        scheduled_arr,
     )
     return required
 
@@ -621,9 +661,17 @@ def attach_step_owner_token_layout(
     block_ids = getattr(table, "_bt_cpu_np", None)
     if block_ids is None:
         block_ids = table.block_table.np
-    rows = getattr(ctx, "req_indices", None)
-    if rows is None:
-        rows = slice(ctx.start_index, ctx.start_index + ctx.num_reqs)
+    req_indices = getattr(ctx, "req_indices", None)
+    rows = (
+        slice(ctx.start_index, ctx.start_index + ctx.num_reqs)
+        if req_indices is None
+        else req_indices
+    )
+    col0_token = (
+        _col0_token(table, ctx.start_index, ctx.num_reqs)
+        if req_indices is None
+        else None
+    )
     q_loc_tuple = (
         (
             q_loc_cpu
@@ -668,9 +716,12 @@ def attach_step_owner_token_layout(
             if q_loc_tuple is not None
             else np.array_equal(cached_step[2], q_loc_np)
         )
-        and np.array_equal(cached_step[1], first_blocks)
+        and (
+            (col0_token is not None and cached_step[7] == col0_token)
+            or np.array_equal(cached_step[1], first_blocks)
+        )
     ):
-        _, _, _, layout, perm_t, inv_t, q_loc_t = cached_step
+        layout, perm_t, inv_t, q_loc_t = cached_step[3:7]
         for meta in metas:
             meta.owner_token_layout = layout
             meta.owner_perm = perm_t
@@ -719,5 +770,8 @@ def attach_step_owner_token_layout(
         perm_t,
         inv_t,
         q_loc_t,
+        None
+        if col0_token is None
+        else _col0_snapshot_token(table, ctx.start_index, ctx.num_reqs),
     )
     return layout

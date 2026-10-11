@@ -110,7 +110,7 @@ def test_td8348_required_tokens_and_step_layout_tuple_and_array_equal_caches():
         # 1. step_owner_required_tokens caches copied arrays & _kv_shard_owners_cache
         req1 = otl.step_owner_required_tokens(runner, 0, 4, sched)
         assert req1 == 4
-        assert len(runner._kv_shard_required_tokens_cache) == 4
+        assert len(runner._kv_shard_required_tokens_cache) == 6
         assert isinstance(runner._kv_shard_required_tokens_cache[1], np.ndarray)
         assert isinstance(runner._kv_shard_required_tokens_cache[2], np.ndarray)
         assert isinstance(runner._kv_shard_owners_cache[1], np.ndarray)
