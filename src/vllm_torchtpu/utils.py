@@ -86,19 +86,24 @@ def host_rss_gib() -> float:
 
 
 def release_memory_to_os() -> None:
-    """Forces Python GC and instructs the C allocator to return free memory
-    to the OS.
+    """Run the cyclic GC, then hand the C allocator's free memory to the OS.
 
-    Dropping the last reference to a host tensor frees it, but glibc keeps
-    chunks below its mmap threshold (up to 32 MiB) in its arenas for reuse,
-    so a process that freed tens of GiB of mid-sized tensors can stay that
-    large. The GC pass reaps tensors held only by reference cycles first.
+    Dropping the last reference to a host tensor frees it to the allocator,
+    not to the OS. The serving image preloads gperftools tcmalloc
+    (LD_PRELOAD), which keeps freed spans in its page heap: glibc's
+    malloc_trim only trims glibc's own arenas and releases none of it, and a
+    DeepSeek-V4 worker that staged and freed ~73 GiB of weights stayed at
+    ~80 GiB RSS for the life of the server. Under tcmalloc this calls
+    MallocExtension_ReleaseFreeMemory; under glibc malloc, malloc_trim(0).
+    The GC pass first reaps tensors held only by reference cycles.
     """
     gc.collect()
-    try:  # noqa: SIM105 (malloc_trim exists only on glibc)
-        ctypes.CDLL(None).malloc_trim(0)
-    except Exception:  # noqa: S110
-        pass
+    libc = ctypes.CDLL(None)
+    tcmalloc_release = getattr(libc, "MallocExtension_ReleaseFreeMemory", None)
+    if tcmalloc_release is not None:
+        tcmalloc_release()
+    else:
+        libc.malloc_trim(0)
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:

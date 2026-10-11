@@ -56,11 +56,13 @@ local kvOffload = cdk.boolVar('KV_OFFLOAD', true) || cdk.boolVar('ENABLE_KV_OFFL
 // 30 GiB/rank x 8 ranks = 240 GiB/host, the same host footprint as the TP=16 note above. The 900 GiB/host
 // limit also covers /dev/shm (memory-backed, up to 300Gi) and the vLLM processes, so raise it with care.
 // j-2c8a1b3b-17f0-4b33-bfb6 ran with 12079595520 bytes (11.25 GiB/rank = 90 GiB/host).
-// 24, not 30: the host-staged weights stay resident after loading (~640 GiB anon a host, per the
-// "hostmem:" lines of j-f432a2c4-3c5f-4658-b382), so 30 GiB/rank left no margin and that run and
-// j-191aa11f-389d-43cb-bc1d were OOM-killed as the store came up. 24 GiB/rank = 192 GiB/host,
-// ~20% fewer DRAM KV blocks. Back to 30 once the staging is actually freed.
-local kvOffloadingSize = cdk.var('KV_OFFLOADING_SIZE', '24');
+// 48 GiB/rank = 384 GiB/host. Until vllm-torchtpu returned freed memory to tcmalloc's page heap
+// (release_memory_to_os), each TPU process kept its ~73 GiB of staged weights after loading (~645 GiB
+// anon a host: j-ee9a6ca2-0e32-4583-a32c held 852/900 GiB anon on the head pod with 24 GiB/rank), and
+// 30 GiB/rank OOM-killed j-191aa11f-389d-43cb-bc1d and j-f432a2c4-3c5f-4658-b382 as the store came up.
+// With the staging released the head pod should hold ~65 GiB of processes + 384 GiB of store +
+// 32 GiB premapped (see TPU_PREMAPPED_BUFFER_SIZE), about 480 GiB; check the "hostmem:" lines.
+local kvOffloadingSize = cdk.var('KV_OFFLOADING_SIZE', '48');
 local offloadControllerPort = cdk.numVar('OFFLOAD_CONTROLLER_PORT', 27801);
 local globalRegistryPort = cdk.numVar('GLOBAL_REGISTRY_PORT', 27800);
 local raidenJobName = cdk.var('RAIDEN_JOB_NAME', 'dsv4-offload-probe');
@@ -276,14 +278,11 @@ local hostMemSampleSeconds = cdk.numVar('HOST_MEM_SAMPLE_SECONDS', 30);
 // infx-qwen35-agentx (one var sets both, as there). Without it every transfer maps its own DMA
 // buffer: in j-f74e6597-85ac-4f79-869a MapDmaBuffer took ~850 ms during program reloads and
 // blocked that rank's H2D/D2H, stalling all 16 ranks for ~1.1 s.
-// It pins 4 GiB in each of the 8 TPU processes a host, 32 GiB, which only fits beside
-// KV_OFFLOADING_SIZE=24: with 30 it took j-191aa11f-389d-43cb-bc1d and j-f432a2c4-3c5f-4658-b382
-// past the 900Gi host limit. j-d0188942-b76b-47ec-98db (24, no buffer) held 835/900 GiB on the head
-// pod for the whole benchmark, so this leaves ~30 GiB. none sets neither variable, and libtpu then
-// enables no buffer.
+// It pins 4 GiB in each of the 8 TPU processes a host, 32 GiB, counted in the KV_OFFLOADING_SIZE
+// budget above. none sets neither variable, and libtpu then enables no buffer.
 local premappedBufferSize = cdk.var('TPU_PREMAPPED_BUFFER_SIZE', '4294967296');
-// vllm-torchtpu ee93d4833+: after loading, log the CPU tensor storage still reachable and what holds
-// it, to find what keeps the staged weights resident. 0 turns it off.
+// vllm-torchtpu ee93d4833+: after loading, log the CPU tensor storage still reachable, what holds it,
+// and the process RSS. 0 turns it off.
 local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
 // Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
 // runner/step_timing_log.py); 0 turns it off.
