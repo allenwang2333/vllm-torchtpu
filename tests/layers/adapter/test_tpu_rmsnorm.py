@@ -97,3 +97,10 @@ def test_small_hidden_not_taken(vllm_config_context):
     n = _norm(hidden=512)
     x = torch.randn(4096, 512).to(torch.bfloat16).to("tpu")
     assert not n._pallas_ok and not n._use_pallas(x, None)
+
+
+def test_keep_upstream_path_pins_a_traced_once_model(vllm_config_context):
+    model = torch.nn.Sequential(_norm(), _norm())
+    assert tpu_rmsnorm.keep_upstream_path(model) == 2
+    x = torch.randn(4096, 6144).to(torch.bfloat16).to("tpu")
+    assert not any(m._use_pallas(x, None) for m in model)
