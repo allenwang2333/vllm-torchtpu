@@ -145,3 +145,41 @@ def test_td8345_meta_cache_array_equal_and_parse_all_valid_fast_path():
     rows_m, lens_m = ao.parse_sampled_token_ids_cpu(mixed)
     assert lens_m == [6, 4, 6, 6]
     assert rows_m[1] == all_valid[1, :4].tolist()
+
+
+@pytest.mark.parametrize(
+    "num_draft,cu_sched,hit",
+    [
+        (np.array([3, 3], dtype=np.int32), np.array([4, 8], dtype=np.int32), True),
+        # Same values in a strided view and in int64 still hit (array_equal).
+        (np.array([3, 0, 3], dtype=np.int32)[::2], np.array([4, 8]), True),
+        (np.array([3, 2], dtype=np.int32), np.array([4, 7], dtype=np.int32), False),
+        (np.array([3], dtype=np.int32), np.array([4], dtype=np.int32), False),
+        (np.array([3, 3], dtype=np.int32), np.array([4, 9], dtype=np.int32), False),
+    ],
+)
+def test_td8387_meta_cache_key_memoryview_compare(num_draft, cu_sched, hit):
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    runner = SimpleNamespace(
+        max_num_tokens=64,
+        input_ids_cpu=torch.arange(100, 164, dtype=torch.int32),
+        arange_np=np.arange(64, dtype=np.int32),
+        num_tokens_paddings=[8, 16, 32, 64],
+        device=torch.device("cpu"),
+    )
+    mgr = SpeculativeDecodingManager(runner)
+    md1 = mgr.get_spec_decode_metadata(
+        np.array([3, 3], dtype=np.int32),
+        np.array([4, 8], dtype=np.int32),
+        padded_num_reqs=4,
+        skip_host_draft_tokens=True,
+    )
+    md2 = mgr.get_spec_decode_metadata(
+        num_draft, cu_sched, padded_num_reqs=4, skip_host_draft_tokens=True
+    )
+    assert (md2.target_logits_indices is md1.target_logits_indices) is hit
+    if not hit:
+        assert md2.draft_lengths_cpu.tolist() == num_draft.tolist()

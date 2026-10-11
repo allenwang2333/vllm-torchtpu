@@ -250,8 +250,10 @@ class SpeculativeDecodingManager:
         if (
             key is not None
             and key[2] == padded_num_reqs
-            and np.array_equal(num_draft_tokens, key[0])
-            and np.array_equal(cu_num_scheduled_tokens, key[1])
+            # memoryview equality compares buffers element-wise in C (shape and
+            # values, like np.array_equal) without its Python-level overhead.
+            and memoryview(num_draft_tokens) == memoryview(key[0])
+            and memoryview(cu_num_scheduled_tokens) == memoryview(key[1])
         ):
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
