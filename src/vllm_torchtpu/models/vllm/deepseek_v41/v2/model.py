@@ -296,17 +296,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def _engram_offload_flags(self) -> tuple[bool, bool]:
         """Cached `(has_cpu_offload, has_host_dma)` across active Engram modules."""
-        custom = getattr(self, "_has_cpu_offloaded_engram", None)
-        if (
-            custom is not None
-            and getattr(custom, "__func__", None)
+        has_custom = (
+            "_has_cpu_offloaded_engram" in self.__dict__
+            or getattr(
+                type(self),
+                "_has_cpu_offloaded_engram",
+                DeepseekV41Model._has_cpu_offloaded_engram,
+            )
             is not DeepseekV41Model._has_cpu_offloaded_engram
-        ) or not (engrams := DeepseekV41Model._engram_modules(self)):
+        )
+        if has_custom or not (engrams := DeepseekV41Model._engram_modules(self)):
             return (
-                (bool(custom()), False)
-                if custom is not None
-                and getattr(custom, "__func__", None)
-                is not DeepseekV41Model._has_cpu_offloaded_engram
+                (bool(self._has_cpu_offloaded_engram()), False)
+                if has_custom
                 else (False, False)
             )
         first_embed = engrams[0].embed_tokens

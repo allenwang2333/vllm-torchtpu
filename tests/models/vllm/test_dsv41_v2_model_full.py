@@ -2494,3 +2494,53 @@ class TestMhcFlatSliceAndPostCollapseFusion:
             assert torch.equal(aux_list[0], v2_model._mean_hc_streams(ref_post))
         else:
             assert torch.equal(out, ref_collapsed)
+
+    def test_engram_offload_flags_torch_compile_no_recursion(self) -> None:
+        class _Embed(torch.nn.Module):
+            def __init__(self, host_offload: bool) -> None:
+                super().__init__()
+                self.host_offload = host_offload
+                self.cpu_offload = host_offload
+                self.host_dma = False
+
+        class _Engram(torch.nn.Module):
+            def __init__(self, host_offload: bool) -> None:
+                super().__init__()
+                self.embed_tokens = _Embed(host_offload)
+
+        class _Layer(torch.nn.Module):
+            def __init__(self, host_offload: bool) -> None:
+                super().__init__()
+                self.engram = _Engram(host_offload)
+
+        class _TracedModel(DeepseekV41Model):
+            def __init__(self, host_offload: bool) -> None:
+                torch.nn.Module.__init__(self)
+                self.layers = torch.nn.ModuleList([_Layer(host_offload)])
+                self.start_layer = 0
+                self.end_layer = 1
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                skip = torch.compiler.is_compiling() and any(
+                    DeepseekV41Model._engram_offload_flags(self)
+                )
+                return x + (1.0 if skip else 0.0)
+
+        m_off = _TracedModel(True)
+        assert m_off._engram_offload_flags() == (True, False)
+        m_hbm = _TracedModel(False)
+        assert m_hbm._engram_offload_flags() == (False, False)
+
+        orig_trace = sys.gettrace()
+        sys.settrace(None)
+        try:
+            out_off = torch.compile(m_off, backend="eager", fullgraph=True)(
+                torch.zeros(2)
+            )
+            out_hbm = torch.compile(m_hbm, backend="eager", fullgraph=True)(
+                torch.zeros(2)
+            )
+        finally:
+            sys.settrace(orig_trace)
+        assert torch.equal(out_off, torch.ones(2))
+        assert torch.equal(out_hbm, torch.zeros(2))
