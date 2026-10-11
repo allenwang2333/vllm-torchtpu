@@ -2687,6 +2687,7 @@ def test_prepare_inputs_uniform_multi_token_and_reject_subtract_cache():
         input_batch=SimpleNamespace(
             num_reqs=2,
             req_ids=["req-0", "req-1"],
+            req_id_to_index={"req-0": 0, "req-1": 1},
             num_computed_tokens_cpu=np.array([4, 8], dtype=np.int32),
             token_ids_cpu=token_ids_cpu,
             token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),

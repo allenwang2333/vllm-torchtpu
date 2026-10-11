@@ -3568,13 +3568,27 @@ class TPUModelRunner(GPUModelRunner):
             and self._pre_async_results is not None
             and self._pre_async_results.spec_decode_num_rejected_tokens is not None
         ):
-            get_req_idx = self._pre_async_results.req_id_to_index_copy.get
-            seq_idx_prefix = np.fromiter(
-                (get_req_idx(req_id, -1) for req_id in chunk_req_ids),
-                dtype=np.int32,
-                count=num_reqs,
-            )
-            seq_idx_bytes = seq_idx_prefix.tobytes()
+            prev_req_id_to_index = self._pre_async_results.req_id_to_index_copy
+            seq_idx_bytes: bytes | tuple[str, int]
+            if (
+                start_index == 0
+                and prev_req_id_to_index == self.input_batch.req_id_to_index
+            ):
+                # Batch order unchanged since the previous step: InputBatch
+                # keeps req_id_to_index[req_ids[i]] == i, so every chunk
+                # request's previous position is its current one. A tuple
+                # tag never equals a bytes key, and sched_tokens_bytes pins
+                # num_reqs in every key that embeds it.
+                seq_idx_prefix = self.arange_np[:num_reqs]
+                seq_idx_bytes = ("identity", num_reqs)
+            else:
+                get_req_idx = prev_req_id_to_index.get
+                seq_idx_prefix = np.fromiter(
+                    (get_req_idx(req_id, -1) for req_id in chunk_req_ids),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
+                seq_idx_bytes = seq_idx_prefix.tobytes()
             self._last_async_seq_idx_prefix = seq_idx_prefix
             self._last_async_seq_idx_bytes = seq_idx_bytes
             reject_subtract_key = (
@@ -3637,7 +3651,10 @@ class TPUModelRunner(GPUModelRunner):
             if sched_spec_tokens:
                 get_spec = sched_spec_tokens.get
                 num_draft_tokens = np.fromiter(
-                    (len(get_spec(req_id, ())) for req_id in chunk_req_ids),
+                    map(
+                        len,
+                        map(get_spec, chunk_req_ids, itertools.repeat((), num_reqs)),
+                    ),
                     dtype=np.int32,
                     count=num_reqs,
                 )
