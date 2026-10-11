@@ -121,24 +121,41 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     if sampled.ndim == 1:
         sampled = sampled[:, None]
     num_rows = int(sampled.shape[0])
-    pre_positions = np.fromiter(
-        req_id_to_index.values(), dtype=np.int64, count=len(req_id_to_index)
-    )
-    if int(pre_positions.min()) < 0 or int(pre_positions.max()) >= num_rows:
+    pre_vals = req_id_to_index.values()
+    if min(pre_vals) < 0 or max(pre_vals) >= num_rows:
         return None
     spec_num_rejected = getattr(pre_async, "spec_decode_num_rejected_tokens", None)
     stride = 1 + num_spec if spec_num_rejected is not None else 1
+    ws = getattr(runner, "_host_engram_spec_ws", None)
+    if ws is None or ws[0] != num_rows:
+        ws = (
+            num_rows,
+            np.empty(num_rows, dtype=np.int64),
+            np.empty(num_rows, dtype=np.int64),
+            np.empty(num_rows, dtype=np.int64),
+        )
+        runner._host_engram_spec_ws = ws
+    _, lengths, num_draft, rejected = ws
     valid = sampled != -1
-    lengths = valid.sum(axis=1, dtype=np.int64)
+    valid.sum(axis=1, dtype=np.int64, out=lengths)
     # Compact each row's valid tokens to its front, preserving their order.
     if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:])):
         tokens = sampled
     else:
         order = np.argsort(~valid, axis=1, kind="stable")
         tokens = np.take_along_axis(sampled, order, axis=1)
-    num_draft = np.zeros(num_rows, dtype=np.int64)
     num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
-    if num_draft_per_req:
+    if not num_draft_per_req:
+        num_draft.fill(0)
+    elif (
+        len(num_draft_per_req) == num_rows
+        and min(num_draft_per_req) == 0
+        and max(num_draft_per_req) == num_rows - 1
+        and min(draft_vals := num_draft_per_req.values()) == max(draft_vals)
+    ):
+        num_draft.fill(num_draft_per_req[0])
+    else:
+        num_draft.fill(0)
         draft_pos = np.fromiter(
             num_draft_per_req.keys(), dtype=np.int64, count=len(num_draft_per_req)
         )
@@ -148,15 +165,17 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
         in_range = (draft_pos >= 0) & (draft_pos < num_rows)
         num_draft[draft_pos[in_range]] = draft_cnt[in_range]
     if spec_num_rejected is not None:
-        rejected = np.where(num_draft > 0, np.maximum(num_draft - lengths + 1, 0), 0)
+        np.subtract(num_draft, lengths, out=rejected)
+        rejected += 1
+        np.maximum(rejected, 0, out=rejected)
+        rejected[num_draft <= 0] = 0
     else:
-        rejected = np.zeros(num_rows, dtype=np.int64)
+        rejected.fill(0)
     discard = getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
     if discard:
         discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int64)
         discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
         if discard_idx.size:
-            lengths = lengths.copy()
             lengths[discard_idx] = 0
     return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft)
 
@@ -220,32 +239,58 @@ def _resolve_decode_lookback_cpu(
     ):
         lookback = torch.empty_like(src_lookback)
         runner._host_engram_lookback_scratch = lookback
+        cap_rows = int(src_lookback.shape[0])
+        depth = int(src_lookback.shape[1])
+        runner._host_engram_lookback_offsets = np.arange(1, depth + 1, dtype=np.int64)[
+            None, :
+        ]
+        runner._host_engram_local_rows = np.arange(cap_rows, dtype=np.int64)[:, None]
+        runner._host_engram_lookback_ws = (
+            np.empty((cap_rows, depth), dtype=np.int64),
+            np.empty((cap_rows, depth), dtype=np.int64),
+            np.empty((cap_rows, depth), dtype=np.bool_),
+            np.empty((cap_rows, depth), dtype=np.bool_),
+        )
     lookback_np = lookback.numpy()
     if num_reqs < int(lookback.shape[0]):
         lookback_np[num_reqs:] = src_lookback.numpy()[num_reqs:]
-    depth = int(lookback.shape[1])
+    offsets = runner._host_engram_lookback_offsets
+    local = runner._host_engram_local_rows[:num_reqs]
+    pos_buf, clipped_buf, valid_buf, tmp_b_buf = runner._host_engram_lookback_ws
+    pos = pos_buf[:num_reqs]
+    clipped = clipped_buf[:num_reqs]
+    valid = valid_buf[:num_reqs]
+    tmp_b = tmp_b_buf[:num_reqs]
     starts_1d = np.asarray(
         batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
         dtype=np.int64,
     )
     if rejected_by_req is not None:
         starts_1d = starts_1d - rejected_by_req
-    starts = starts_1d[:, None]
-    pos = starts - np.arange(1, depth + 1, dtype=np.int64)
+    np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
-    valid = (pos >= 0) & (pos < max_cols)
-    local = np.arange(num_reqs, dtype=np.int64)[:, None]
+    np.greater_equal(pos, 0, out=valid)
+    np.less(pos, max_cols, out=tmp_b)
+    np.logical_and(valid, tmp_b, out=valid)
     rows = local + start_index if start_index else local
-    clipped = np.where(valid, pos, 0)
-    gathered = np.where(valid, token_ids_cpu[rows, clipped], -1)
+    np.multiply(pos, valid, out=clipped)
+    out_slice = lookback_np[:num_reqs]
+    out_slice[:] = token_ids_cpu[rows, clipped]
+    np.logical_not(valid, out=tmp_b)
+    np.copyto(out_slice, -1, where=tmp_b)
     if sampled_overlay is not None:
-        rel = pos - sampled_overlay.starts[:, None]
-        hit = (rel >= 0) & (rel < sampled_overlay.lengths[:, None])
-        if hit.any():
-            overlay = sampled_overlay.tokens[local, np.where(hit, rel, 0)]
-            gathered = np.where(hit, overlay, gathered)
-    lookback_np[:num_reqs] = gathered
+        np.subtract(pos, sampled_overlay.starts[:, None], out=pos)
+        np.greater_equal(pos, 0, out=valid)
+        np.less(pos, sampled_overlay.lengths[:, None], out=tmp_b)
+        np.logical_and(valid, tmp_b, out=valid)
+        if valid.any():
+            np.multiply(pos, valid, out=clipped)
+            np.copyto(
+                out_slice,
+                sampled_overlay.tokens[local, clipped],
+                where=valid,
+            )
     return lookback
 
 

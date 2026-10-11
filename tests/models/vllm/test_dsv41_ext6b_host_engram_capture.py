@@ -311,3 +311,34 @@ def test_host_scratch_buffer_reuse_and_resync():
     assert res2.lookback_token_ids is lb_scratch
     assert torch.equal(res2.input_ids[12:24], runner.input_ids_cpu[12:24])
     assert torch.equal(res2.positions[12:24], runner.positions_cpu[12:24])
+
+
+def test_td8246_host_engram_zero_alloc_fast_paths():
+    runner = _make_runner(8, k=5, depth=4, seed=99)
+    res1 = he.capture_host_engram_inputs(runner, 8)
+    assert res1 is not None and res1.host_ready is True
+    spec_ws = runner._host_engram_spec_ws
+    lb_ws = runner._host_engram_lookback_ws
+    offsets = runner._host_engram_lookback_offsets
+    local_rows = runner._host_engram_local_rows
+
+    # Second call reuses the exact same preallocated NumPy workspace buffers
+    res2 = he.capture_host_engram_inputs(runner, 8)
+    assert res2 is not None and res2.host_ready is True
+    assert runner._host_engram_spec_ws is spec_ws
+    assert runner._host_engram_lookback_ws is lb_ws
+    assert runner._host_engram_lookback_offsets is offsets
+    assert runner._host_engram_local_rows is local_rows
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(res2.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(res2.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(res2.lookback_token_ids.numpy(), lb_ref)
+
+    # Also verify non-uniform num_draft_per_req with full 0..R-1 keys
+    runner._pre_async_results.num_draft_per_req[3] = 2
+    res3 = he.capture_host_engram_inputs(runner, 8)
+    assert res3 is not None and res3.host_ready is True
+    ids_ref3, pos_ref3, lb_ref3 = _reference(runner, 8)
+    np.testing.assert_array_equal(res3.input_ids.numpy(), ids_ref3)
+    np.testing.assert_array_equal(res3.positions.numpy(), pos_ref3)
+    np.testing.assert_array_equal(res3.lookback_token_ids.numpy(), lb_ref3)
