@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = True
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
+    TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
@@ -1328,6 +1329,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # three uniform draws stay eager: same generator, shapes and order).
     "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN", True),
     "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", True),
+    # With TPU_FP8_LINEAR_PALLAS: the skinny kernel takes its per-channel weight
+    # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
+    # ring. Without it XLA stages the scale (o_proj f32[6144]) into VMEM with a copy
+    # placed right before the call, whose ~0.8 us issue latency is exposed each
+    # layer at decode. Outputs are bit-identical.
+    "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
