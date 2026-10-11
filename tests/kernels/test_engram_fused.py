@@ -10,6 +10,7 @@ import pytest
 import torch
 from jax import export
 
+from vllm_torchtpu.kernels.engram import tuned_block_sizes
 from vllm_torchtpu.kernels.engram.kernel import fused_engram
 
 pytestmark = pytest.mark.cpu_test
@@ -49,9 +50,13 @@ def test_released_engram_shapes_lower_to_one_tpu_call(tokens):
 
 @pytest.mark.parametrize("tp", [1, 2, 8])
 @pytest.mark.parametrize("masked", [False, True])
-def test_fused_engram_matches_torch_offload(tp, masked):
-    tokens, local_width, streams, dim = 32, 128, 4, 128
+@pytest.mark.parametrize("tile_m", [32, 64])
+def test_fused_engram_matches_torch_offload(tp, masked, tile_m, monkeypatch):
+    tokens, local_width, streams, dim = tile_m, 128, 4, 128
     width = tp * local_width
+    monkeypatch.setitem(
+        tuned_block_sizes.BLOCK_SIZES, (width, streams, dim), (tile_m, 128)
+    )
     rng = torch.Generator().manual_seed(53)
     raw = (
         torch.randn(tp, tokens * tp, local_width, generator=rng)

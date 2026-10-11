@@ -11,7 +11,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.engram.tuned_block_sizes import get_block_sizes
+from vllm_torchtpu.kernels.engram.tuned_block_sizes import (
+    VECTOR_TILE_M,
+    get_block_sizes,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 
 
@@ -95,7 +98,9 @@ def fused_engram(
     assert hidden.dtype == jnp.bfloat16, hidden.dtype
     assert weight.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2), weight.dtype
     tile_m, tile_k = get_block_sizes(tokens, in_features, streams, dim)
+    vector_m = min(VECTOR_TILE_M, tile_m)
     assert tokens % tile_m == 0 and in_features % tile_k == 0
+    assert tile_m % vector_m == 0
     steps = in_features // tile_k
 
     def kernel(
@@ -118,11 +123,15 @@ def fused_engram(
 
         @pl.when((output_block == 0) & (step == 0))
         def prepare():
-            rows = dequantize_rows(raw_ref[...], scale_ref[...])
-            embedded = rows.transpose(1, 0, 2).reshape(tile_m, in_features)
-            quantized, activation_scale = quantize_tensor(embedded, weight.dtype)
-            x_scratch[...] = quantized
-            xs_scratch[...] = activation_scale
+            def prepare_rows(index, _):
+                tile = pl.ds(index * vector_m, vector_m)
+                rows = dequantize_rows(raw_ref[:, tile, :], scale_ref[:, tile, :])
+                embedded = rows.transpose(1, 0, 2).reshape(vector_m, in_features)
+                quantized, activation_scale = quantize_tensor(embedded, weight.dtype)
+                x_scratch[tile, :] = quantized
+                xs_scratch[tile, :] = activation_scale
+
+            jax.lax.fori_loop(0, tile_m // vector_m, prepare_rows, None)
 
         @pl.when(step == 0)
         def reset_accumulator():
@@ -133,26 +142,30 @@ def fused_engram(
 
         @pl.when(step == steps - 1)
         def finish():
-            projection = (acc_scratch[...] * xs_scratch[...] * ws_ref[...]).astype(
-                hidden.dtype
-            )
+            def finish_rows(index, _):
+                tile = pl.ds(index * vector_m, vector_m)
+                projection = (
+                    acc_scratch[tile, :] * xs_scratch[tile, :] * ws_ref[...]
+                ).astype(hidden.dtype)
 
-            @pl.when(output_block == 0)
-            def save_values():
-                values_scratch[...] = projection
+                @pl.when(output_block == 0)
+                def save_values():
+                    values_scratch[tile, :] = projection
 
-            @pl.when(output_block != 0)
-            def apply_gate():
-                kv = jnp.concatenate((projection, values_scratch[...]), axis=-1)
-                out_ref[...] = gated_residual(
-                    h_ref[...][:, None, :],
-                    kv,
-                    q_ref[...],
-                    k_ref[...],
-                    mask_ref[:, 0],
-                    eps,
-                    clamp_value,
-                )[:, 0, :]
+                @pl.when(output_block != 0)
+                def apply_gate():
+                    kv = jnp.concatenate((projection, values_scratch[tile, :]), axis=-1)
+                    out_ref[tile, :] = gated_residual(
+                        h_ref[tile, :][:, None, :],
+                        kv,
+                        q_ref[...],
+                        k_ref[...],
+                        mask_ref[tile, 0],
+                        eps,
+                        clamp_value,
+                    )[:, 0, :]
+
+            jax.lax.fori_loop(0, tile_m // vector_m, finish_rows, None)
 
     def token_block(i, j, k):
         return 0, i + rank * (tokens // tile_m), 0

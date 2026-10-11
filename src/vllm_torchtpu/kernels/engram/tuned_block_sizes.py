@@ -11,6 +11,9 @@ logger = init_logger(__name__)
 # the larger token tile reduces rereads of the full projection weight.
 BLOCK_SIZES = {(6144, 4, 5120): (256, 128)}
 
+# Keep unpacking and gate intermediates small while the MXU uses wider tiles.
+VECTOR_TILE_M = 32
+
 
 def get_block_sizes(tokens: int, width: int, streams: int, dim: int) -> tuple[int, int]:
     key = (width, streams, dim)
