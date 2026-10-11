@@ -158,6 +158,20 @@ significance. Keep overlap disabled outside experiments until both numerical
 equivalence and a useful performance gain are demonstrated. The 2048-token
 minimum compilation bucket also limits conclusions about optimized decode.
 
+Rank 0 XProf analysis `an-oxnfmkf2ci` shows that the first chunk's second
+Engram transfer API call runs during the first split encoder computation.
+However, the serial run already overlaps later chunks' host preparation with
+previous chunks' device computation under async scheduling: 147.17 ms of
+160.95 ms of `prepare_embeddings` overlaps device modules longer than 1 ms.
+The split run increases total XLA module executions from 269 to 295 and summed
+device-module duration from 1510.24 ms to 1526.59 ms in this prefill capture.
+These observations are consistent with limited additional overlap benefit
+and added execution cost. Host API intervals do not measure physical DMA
+occupancy, and this trace does not explain the decode output differences.
+
+Both server logs confirm offload and the fixed KV budget, but do not expose
+`total_hbm_used_gb`; no peak or resident HBM improvement is established.
+
 DeepSeek V4.1 benchmark configurations and the standalone prefill scripts
 now enable prefix caching by default. Set `ENABLE_PREFIX_CACHING=false` for
 uncached baseline measurements. The shared benchmark runner uses its normal
