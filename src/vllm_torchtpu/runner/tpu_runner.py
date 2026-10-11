@@ -1182,12 +1182,22 @@ class TPUModelRunner(GPUModelRunner):
             )
             return
         target = self.model if model is None else model
-        max_len = self.model_config.max_model_len
+        from vllm.model_executor.layers.rotary_embedding import (
+            DeepseekScalingRotaryEmbedding,
+        )
+
+        spec_extra = (
+            self.speculative_config.num_speculative_tokens + 1
+            if self.speculative_config is not None
+            else 0
+        )
+        max_len = self.model_config.max_model_len + spec_extra
         num_eligible = 0
         num_truncated = 0
         for name, module in target.named_modules():
             if type(module) not in (
                 RotaryEmbedding,
+                DeepseekScalingRotaryEmbedding,
                 MRotaryEmbedding,
                 MRotaryEmbeddingInterleaved,
             ):
