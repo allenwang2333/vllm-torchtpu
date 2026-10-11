@@ -35,6 +35,7 @@ except ImportError:
     from jax._src.pallas.mosaic import tpu_info
 
 from tests.kernels.test_masked_dense_mla import TOKEN_PAD, MaskedDenseTestBase
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 
 CHUNK = sparse_mla_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
@@ -147,6 +148,38 @@ class SparseChunkForiLoweringTest(parameterized.TestCase):
     def test_below_min_chunks_stays_unrolled(self):
         text = _lowered_text(4 * CHUNK, "tensorcore", fori_min_chunks=5)
         self.assertEqual(_program_shape(text), (0, 4))
+
+
+class SparsePrefixChunkBoundsTest(parameterized.TestCase):
+    """The masked-dense route's sparse prefix never hands a chunk past the rows."""
+
+    @parameterized.parameters(
+        dict(num_rows=41, fori_min_chunks=None),
+        dict(num_rows=3 * CHUNK + 5, fori_min_chunks=None),
+        dict(num_rows=3 * CHUNK + 5, fori_min_chunks=2),
+    )
+    def test_chunks_stay_inside_the_rows(self, num_rows, fori_min_chunks):
+        spans = []
+
+        def run_chunk(q, start_pos, chunk_size, token_end, caches):
+            spans.append((start_pos, chunk_size))
+            return q
+
+        # Under one chunk of suffix minimum, the rounded-up starts overrun.
+        with mock.patch.object(mla_dispatch, "MASKED_DENSE_MIN_SUFFIX_TOKENS", 0):
+            jax.make_jaxpr(
+                lambda q, split: mla_dispatch._sparse_prefix(
+                    q, split, run_chunk, (), fori_min_chunks=fori_min_chunks
+                )
+            )(jnp.zeros((num_rows, 1)), jnp.int32(num_rows))
+        covered = 0
+        for start, size in spans:
+            if isinstance(start, int):
+                self.assertLessEqual(start + size, num_rows)
+                covered = max(covered, start + size)
+            else:  # One traced fori body stands for every full chunk.
+                covered = max(covered, (num_rows // CHUNK) * CHUNK)
+        self.assertEqual(covered, num_rows)
 
 
 @pytest.mark.tpu_test

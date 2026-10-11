@@ -286,8 +286,16 @@ def _sparse_prefix(q, split_token, run_chunk, caches, **loop_options):
             q,
         )
 
+    # Crop the last chunk to the query rows, as the unrolled loop did. With a
+    # suffix minimum under one chunk the rounded-up starts run past the rows,
+    # and the chunk kernel cannot reshape a gather of fewer rows than its size.
     return sparse_kernel.run_chunk_loop(
-        num_starts * chunk_size, chunk_size, step, q, caches, **loop_options
+        min(num_starts * chunk_size, q.shape[0]),
+        chunk_size,
+        step,
+        q,
+        caches,
+        **loop_options,
     )
 
 
