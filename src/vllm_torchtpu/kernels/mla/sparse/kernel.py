@@ -1393,15 +1393,6 @@ def _attention_kernel(
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
         bkv_nope = bkv_nope_ref[...]
-        # Live-group mode zeroes the rows past kv_len on the packed words
-        # (one uint32[128] NOPE row per token; ROPE rows hold byte k of four
-        # tokens 4r + k) instead of on the unpacked fp8 [rows, 640] tile:
-        # the same zero bytes, a fraction of the vector work.
-        word_zero = sparsecore_layout and group_tab_ref is not None
-        if word_zero:
-            kv_len = get_kv_len()
-            row = lax.broadcasted_iota(jnp.int32, bkv_nope.shape, 0)
-            bkv_nope = jnp.where(row < kv_len, bkv_nope, jnp.uint32(0))
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
             # expands the packed byte lanes before folding them into the
@@ -1412,14 +1403,6 @@ def _attention_kernel(
         bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
         bkv_rope = bkv_rope_ref[...]
-        if word_zero:
-            quad = lax.broadcasted_iota(jnp.int32, bkv_rope.shape, 0) * 4
-            keep = jnp.zeros(bkv_rope.shape, jnp.uint32)
-            for k in range(4):
-                keep = keep | jnp.where(
-                    quad + k < kv_len, jnp.uint32(0xFF << (8 * k)), jnp.uint32(0)
-                )
-            bkv_rope = bkv_rope & keep
         if sparsecore_layout:
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
@@ -1437,10 +1420,9 @@ def _attention_kernel(
         # Zero keys beyond kv_len: the "-1" tail is gathered from scattered
         # pages and can decode to fp8 NaN; score masking zeroes the weights,
         # but 0 * NaN = NaN in the PV einsum, so the data must be finite too.
-        if not word_zero:
-            kv_len = get_kv_len()
-            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-            bkv = jnp.where(k_span < kv_len, bkv, 0)
+        kv_len = get_kv_len()
+        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+        bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
