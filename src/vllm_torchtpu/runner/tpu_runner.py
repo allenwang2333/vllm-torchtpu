@@ -336,9 +336,22 @@ def _substitute_placeholder_token(
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens.index_select(0, safe_idx.int()).to(input_ids.dtype)
-    original_values = input_ids.index_select(0, token_in_tpu_cur_input_indices.int())
-    update_values = torch.where(mask, new_token_values, original_values)
+    new_token_values = next_tokens.index_select(
+        0, safe_idx if safe_idx.dtype == torch.int32 else safe_idx.int()
+    )
+    original_values = input_ids.index_select(
+        0,
+        token_in_tpu_cur_input_indices
+        if token_in_tpu_cur_input_indices.dtype == torch.int32
+        else token_in_tpu_cur_input_indices.int(),
+    )
+    update_values = torch.where(
+        mask,
+        new_token_values
+        if new_token_values.dtype == input_ids.dtype
+        else new_token_values.to(input_ids.dtype),
+        original_values,
+    )
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
 
@@ -4244,7 +4257,7 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output.num_scheduled_tokens[r]
                     for r in self.input_batch.req_ids
                 ],
-                dtype=np.int64,
+                dtype=np.int32,
             )
             mm_tok_cumsum = np.concatenate([[0], np.cumsum(req_tok)])
             # Per-token MM offsets on the host so the chunk loop can slice
@@ -6332,11 +6345,15 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_specs = [(nlen, torch.int64) for nlen in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            next_specs.append(
+                (
+                    self.max_num_reqs
+                    * (1 + self.speculative_config.num_speculative_tokens),
+                    torch.int32,
+                )
             )
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
@@ -6349,8 +6366,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_specs:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,

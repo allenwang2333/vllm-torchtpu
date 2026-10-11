@@ -465,3 +465,48 @@ def test_td8278_substitute_placeholder_and_sample_spec_verify_chunk_int32():
         runner._precompile_rejection_sampler()
     assert len(captured_rs_kwargs) == 2
     assert all(kw["segment_ids"].dtype == torch.int32 for kw in captured_rs_kwargs)
+
+
+def test_td8299_substitute_placeholder_token_and_precompile_spec_int32():
+    import contextlib
+    import inspect
+
+    sub_fn = inspect.unwrap(tpu_runner._substitute_placeholder_token)
+    for next_dtype in (torch.int32, torch.int64):
+        input_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+        cur_idx = torch.tensor([1, 2, 3, 3], dtype=torch.int64)
+        pre_idx = torch.tensor([2, 0, -1, -1], dtype=torch.int32)
+        next_tokens = torch.tensor([101, 102, 103, 104], dtype=next_dtype)
+        out = sub_fn(input_ids, cur_idx, pre_idx, next_tokens)
+        assert out.dtype == torch.int32
+        assert out.tolist() == [10, 103, 101, 40]
+
+    runner = object.__new__(TPUModelRunner)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner.speculative_config = SimpleNamespace(
+        num_speculative_tokens=2, use_eagle=lambda: True, method="eagle3"
+    )
+    runner.drafter = object.__new__(tpu_runner.Eagle3Proposer)
+    runner.num_tokens_paddings = [8]
+    runner.num_reqs_paddings = [2, 4]
+    runner.max_num_reqs = 4
+    runner.device = torch.device("cpu")
+    runner._precompile_timed = lambda name: contextlib.nullcontext()
+
+    seen_calls: list[tuple[int, int, torch.dtype]] = []
+
+    def _record_sub(inp, cur, pre, nxt):
+        seen_calls.append((inp.shape[0], nxt.shape[0], nxt.dtype))
+        return inp
+
+    with (
+        patch.object(tpu_runner, "_substitute_placeholder_token", _record_sub),
+        patch.object(tpu_runner, "synchronize_tensors"),
+    ):
+        runner._precompile_substitute_placeholder_token()
+
+    assert seen_calls == [
+        (8, 2, torch.int64),
+        (8, 4, torch.int64),
+        (8, 12, torch.int32),
+    ]
