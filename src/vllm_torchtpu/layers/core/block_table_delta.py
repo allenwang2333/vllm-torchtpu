@@ -259,8 +259,8 @@ class BlockTableDeltaStager:
             tuple[
                 int,
                 int,
-                bytes,
-                bytes,
+                np.ndarray,
+                np.ndarray,
                 np.ndarray,
                 np.ndarray,
                 np.ndarray,
@@ -293,14 +293,12 @@ class BlockTableDeltaStager:
                 and rewrites == st.total_rewrites
             ):
                 cur_plan: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-                nblocks_bytes = nblocks.tobytes()
-                st_nblocks_bytes = st.nblocks.tobytes()
                 if (
                     prev_plan is not None
                     and prev_plan[0] == tnb
                     and prev_plan[1] == active_cols
-                    and nblocks_bytes == prev_plan[2]
-                    and st_nblocks_bytes == prev_plan[3]
+                    and np.array_equal(nblocks, prev_plan[2])
+                    and np.array_equal(st.nblocks, prev_plan[3])
                 ):
                     cur_plan = (prev_plan[4], prev_plan[5], prev_plan[6])
                 else:
@@ -318,11 +316,13 @@ class BlockTableDeltaStager:
                             app_rows, lo = changed_rows[valid], lo_all[valid]
                         row_offsets = app_rows * np.int32(tnb) + lo
                         cur_plan = (app_rows, lo, row_offsets)
+                        nblocks_snap = nblocks.copy()
+                        st_nblocks_snap = st.nblocks.copy()
                         prev_plan = (
                             tnb,
                             active_cols,
-                            nblocks_bytes,
-                            st_nblocks_bytes,
+                            nblocks_snap,
+                            st_nblocks_snap,
                             app_rows,
                             lo,
                             row_offsets,
