@@ -1655,7 +1655,6 @@ class Eagle3Proposer:
                 )
                 return (
                     draft_input_ids,
-                    gather_indices,
                     num_rejected_out,
                     step0_gather_indices,
                     pos_step1,
@@ -2338,7 +2337,6 @@ class Eagle3Proposer:
             if prep_step1 and step0_pad_len > 0:
                 (
                     draft_input_ids,
-                    gather_indices,
                     num_rejected_out,
                     self._last_step0_gather_indices,
                     pos_step1,
@@ -2354,6 +2352,7 @@ class Eagle3Proposer:
                     chunk.position_ids,
                     chunk.attn_ctx.seq_lens,
                 )
+                gather_indices = self._last_step0_gather_indices
                 self._last_prep_step1 = (pos_step1, seq_lens_step1)
             elif prep_step1:
                 (
