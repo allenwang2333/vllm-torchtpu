@@ -13,3 +13,58 @@
 # limitations under the License.
 """Config-driven composable TPU Pallas megakernel library."""
 
+from vllm_torchtpu.kernels.megakernel import (
+    blocks,
+    comm,
+    kernel,
+    models,
+    ops,
+    planner,
+    pool_alias,
+    spec,
+    stream,
+    vmem,
+)
+from vllm_torchtpu.kernels.megakernel.kernel import KernelContext, build, make_step
+from vllm_torchtpu.kernels.megakernel.spec import (
+    Block,
+    ExecSpec,
+    LayerType,
+    ModelSpec,
+    ScratchReq,
+    SmallField,
+    Spec,
+    StateDecl,
+    SwitchSlot,
+    Tiles,
+    WeightDecl,
+    default_tiles,
+)
+
+__all__ = [
+    "Block",
+    "ExecSpec",
+    "KernelContext",
+    "LayerType",
+    "ModelSpec",
+    "ScratchReq",
+    "SmallField",
+    "Spec",
+    "StateDecl",
+    "SwitchSlot",
+    "Tiles",
+    "WeightDecl",
+    "blocks",
+    "build",
+    "comm",
+    "default_tiles",
+    "kernel",
+    "make_step",
+    "models",
+    "ops",
+    "planner",
+    "pool_alias",
+    "spec",
+    "stream",
+    "vmem",
+]

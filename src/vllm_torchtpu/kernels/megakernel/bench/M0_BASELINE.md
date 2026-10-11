@@ -59,3 +59,4 @@ python3 -m vllm_torchtpu.kernels.megakernel.bench.bench_glm5_dcp --mode=aot
 # Run on live TPU v7x hardware when attached
 python3 -m vllm_torchtpu.kernels.megakernel.bench.bench_qwen35 --mode=tpu
 ```
+
