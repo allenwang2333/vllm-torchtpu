@@ -742,3 +742,104 @@ def test_td8386_host_engram_chunks_ref_drafts_ptr_and_lookback_np_cache() -> Non
     np.testing.assert_array_equal(out2.input_ids.numpy(), ids_ref)
     np.testing.assert_array_equal(out2.positions.numpy(), pos_ref)
     np.testing.assert_array_equal(out2.lookback_token_ids.numpy(), lb_ref)
+
+
+def test_td8393_uniform_delta_lookback_slice_and_direct_int32_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.393: Verify uniform-delta 2D strided slice in _resolve_decode_lookback_cpu
+    (both d_min == depth and d_min > depth, plus non-uniform delta fallback) and
+    direct int32 slicing of num_computed_tokens_cpu / num_tokens_no_spec."""
+    runner = _make_runner(4, k=5, depth=4, seed=93)
+    batch = runner.input_batch
+    ov_tokens = np.arange(4 * 8, dtype=np.int32).reshape(4, 8) + 100
+    ov_lengths = np.full(4, 8, dtype=np.int32)
+
+    orig_subtract = he.np.subtract
+    subtract_calls = 0
+
+    def counting_subtract(*args: object, **kwargs: object) -> object:
+        nonlocal subtract_calls
+        subtract_calls += 1
+        return orig_subtract(*args, **kwargs)
+
+    monkeypatch.setattr(he.np, "subtract", counting_subtract)
+
+    # 1a. Uniform delta with d_min == depth (4 == 4 -> stop is None)
+    ov_starts_eq = np.array([10, 20, 30, 40], dtype=np.int32)
+    raw_starts_eq = ov_starts_eq + 4
+    overlay_eq = he._SampledOverlay(
+        tokens=ov_tokens, starts=ov_starts_eq, lengths=ov_lengths
+    )
+    subtract_calls = 0
+    lb_eq = he._resolve_decode_lookback_cpu(
+        runner,
+        batch,
+        4,
+        0,
+        sampled_overlay=overlay_eq,
+        raw_starts=raw_starts_eq,
+    )
+    assert subtract_calls == 0
+    np.testing.assert_array_equal(lb_eq.numpy(), ov_tokens[:, 3::-1])
+
+    # 1b. Uniform delta with d_min > depth (6 > 4 -> stop is 6 - 1 - 4 = 1)
+    raw_starts_gt = ov_starts_eq + 6
+    subtract_calls = 0
+    lb_gt = he._resolve_decode_lookback_cpu(
+        runner,
+        batch,
+        4,
+        0,
+        sampled_overlay=overlay_eq,
+        raw_starts=raw_starts_gt,
+    )
+    assert subtract_calls == 0
+    np.testing.assert_array_equal(lb_gt.numpy(), ov_tokens[:, 5:1:-1])
+
+    # 1c. Non-uniform delta (delta = [5, 4, 6, 4]) falls back to np.subtract + 2D fancy
+    raw_starts_mixed = ov_starts_eq + np.array([5, 4, 6, 4], dtype=np.int32)
+    subtract_calls = 0
+    lb_mixed = he._resolve_decode_lookback_cpu(
+        runner,
+        batch,
+        4,
+        0,
+        sampled_overlay=overlay_eq,
+        raw_starts=raw_starts_mixed,
+    )
+    assert subtract_calls == 1
+    expected_mixed = np.stack(
+        [
+            ov_tokens[0, 4:0:-1],
+            ov_tokens[1, 3::-1],
+            ov_tokens[2, 5:1:-1],
+            ov_tokens[3, 3::-1],
+        ]
+    )
+    np.testing.assert_array_equal(lb_mixed.numpy(), expected_mixed)
+
+    # 2. Direct int32 slicing of num_computed_tokens_cpu and num_tokens_no_spec
+    runner.input_batch.num_computed_tokens_cpu = np.array(
+        [20, 30, 40, 50, 60], dtype=np.int32
+    )
+    runner.input_batch.num_tokens_no_spec = np.array(
+        [25, 35, 45, 55, 65], dtype=np.int32
+    )
+    out = he.capture_host_engram_inputs(runner, 4)
+    assert out is not None and out.host_ready is True
+    ids_ref, pos_ref, lb_ref = _reference(runner, 4)
+    np.testing.assert_array_equal(out.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(out.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(out.lookback_token_ids.numpy(), lb_ref)
+
+    # Fallback when dtype is int64
+    runner.input_batch.num_computed_tokens_cpu = np.array(
+        [20, 30, 40, 50, 60], dtype=np.int64
+    )
+    runner.input_batch.num_tokens_no_spec = np.array(
+        [25, 35, 45, 55, 65], dtype=np.int64
+    )
+    out64 = he.capture_host_engram_inputs(runner, 4)
+    assert out64 is not None and out64.host_ready is True
+    np.testing.assert_array_equal(out64.lookback_token_ids.numpy(), lb_ref)

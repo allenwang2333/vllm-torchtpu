@@ -299,10 +299,11 @@ def _resolve_decode_lookback_cpu(
     if num_reqs < sync_rows:
         lookback_np[num_reqs:sync_rows] = src_lookback.numpy()[num_reqs:sync_rows]
     runner._host_engram_lookback_dirty = num_reqs
-    offsets, local, out_slice = (
+    offsets, local, out_slice, depth = (
         runner._host_engram_lookback_offsets,
         runner._host_engram_local_rows[:num_reqs],
         lookback_np[:num_reqs],
+        int(runner._host_engram_lookback_offsets.shape[1]),
     )
     pos, clipped, valid, tmp_b = (
         pos_buf[:num_reqs],
@@ -330,21 +331,34 @@ def _resolve_decode_lookback_cpu(
     )
     if (
         sampled_overlay is not None
-        and int(
-            (
-                delta := starts_1d
-                - (
-                    ov_starts
-                    if (ov_starts := sampled_overlay.starts).dtype == np.int32
-                    else ov_starts.astype(np.int32)
-                )
-            ).min()
+        and (
+            d_min := int(
+                (
+                    delta := starts_1d
+                    - (
+                        ov_starts
+                        if (ov_starts := sampled_overlay.starts).dtype == np.int32
+                        else ov_starts.astype(np.int32)
+                    )
+                ).min()
+            )
         )
-        >= int(offsets.shape[1])
+        >= depth
         and bool((delta <= sampled_overlay.lengths).all())
     ):
-        np.subtract(delta[:, None], offsets, out=pos)
-        out_slice[:] = sampled_overlay.tokens[local, pos]
+        _ = (
+            None
+            if (is_unif_d := int(delta.max()) == d_min)
+            else np.subtract(delta[:, None], offsets, out=pos)
+        )
+        out_slice[:] = (
+            sampled_overlay.tokens[
+                :num_reqs,
+                d_min - 1 : (d_min - 1 - depth if d_min > depth else None) : -1,
+            ]
+            if is_unif_d
+            else sampled_overlay.tokens[local, pos]
+        )
         return lookback
     np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
@@ -539,9 +553,15 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         None,
         None,
     )
-    raw_starts = np.asarray(
-        batch.num_computed_tokens_cpu[start_index : start_index + chunk_num_reqs],
-        dtype=np.int32,
+    raw_starts = (
+        nct[:chunk_num_reqs]
+        if start_index == 0
+        and isinstance(nct := batch.num_computed_tokens_cpu, np.ndarray)
+        and nct.dtype == np.int32
+        else np.asarray(
+            batch.num_computed_tokens_cpu[start_index : start_index + chunk_num_reqs],
+            dtype=np.int32,
+        )
     )
     if chunk_req_ids is not None:
         qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
@@ -610,9 +630,17 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 )
             if num_tokens_no_spec is not None:
                 write_start = (
-                    np.asarray(
-                        num_tokens_no_spec[start_index : start_index + chunk_num_reqs],
-                        dtype=np.int32,
+                    (
+                        num_tokens_no_spec[:chunk_num_reqs]
+                        if start_index == 0
+                        and isinstance(num_tokens_no_spec, np.ndarray)
+                        and num_tokens_no_spec.dtype == np.int32
+                        else np.asarray(
+                            num_tokens_no_spec[
+                                start_index : start_index + chunk_num_reqs
+                            ],
+                            dtype=np.int32,
+                        )
                     )
                     - 1
                     - n_draft
