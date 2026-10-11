@@ -53,8 +53,8 @@ def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
     width = logits.shape[-1]
     if width == 0:
         return torch.zeros_like(logits, dtype=torch.bool)
-    lengths = torch.as_tensor(lengths, device=logits.device)
-    visible = torch.arange(width, device=logits.device) < lengths
+    lengths = torch.as_tensor(lengths, device=logits.device, dtype=torch.int32)
+    visible = torch.arange(width, device=logits.device, dtype=torch.int32) < lengths
     scores = F.pad(
         logits.masked_fill(~visible, -torch.inf),
         (0, -width % block_size),
@@ -63,7 +63,8 @@ def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
     scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
     last = (lengths - 1) // block_size
     scores = scores.masked_fill(
-        torch.arange(scores.shape[-1], device=scores.device) == last, torch.inf
+        torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32) == last,
+        torch.inf,
     )
     selected = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
@@ -80,14 +81,38 @@ def select_compressed_indices(scores, lengths, topk, *, candidates=None):
     """
     if topk < 0:
         raise ValueError("topk must be nonnegative")
-    valid = torch.arange(scores.shape[-1], device=scores.device) < torch.as_tensor(
-        lengths, device=scores.device
-    )
+    valid = torch.arange(
+        scores.shape[-1], device=scores.device, dtype=torch.int32
+    ) < torch.as_tensor(lengths, device=scores.device, dtype=torch.int32)
     if candidates is not None:
         valid = valid & candidates
     masked = scores.masked_fill(~valid, -torch.inf)
-    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1).indices.sort(-1).values
-    return indices.masked_fill(masked.gather(-1, indices) == -torch.inf, -1).int()
+    indices = (
+        masked.topk(min(topk, scores.shape[-1]), dim=-1)
+        .indices.to(torch.int32)
+        .sort(-1)
+        .values
+    )
+    return indices.masked_fill(
+        masked.reshape(-1)
+        .index_select(
+            0,
+            (
+                (
+                    torch.arange(
+                        masked.reshape(-1, masked.shape[-1]).shape[0],
+                        device=masked.device,
+                        dtype=torch.int32,
+                    )
+                    * masked.shape[-1]
+                ).reshape(*masked.shape[:-1], 1)
+                + indices
+            ).reshape(-1),
+        )
+        .reshape(indices.shape)
+        == -torch.inf,
+        -1,
+    )
 
 
 def sparse_attention(q, kv, sink, indices, scale):
@@ -95,8 +120,17 @@ def sparse_attention(q, kv, sink, indices, scale):
     if kv.shape[1] == 0 or indices.shape[-1] == 0:
         return torch.zeros_like(q)
     valid = (indices >= 0) & (indices < kv.shape[1])
-    batch = torch.arange(kv.shape[0], device=kv.device)[:, None, None]
-    selected = kv[batch, indices.long().clamp(0, kv.shape[1] - 1)]
+    batch = (
+        torch.arange(kv.shape[0], device=kv.device, dtype=torch.int32) * kv.shape[1]
+    )[:, None, None]
+    selected = (
+        kv.flatten(0, 1)
+        .index_select(
+            0,
+            (batch + indices.to(torch.int32).clamp(0, kv.shape[1] - 1)).reshape(-1),
+        )
+        .reshape(*indices.shape, *kv.shape[2:])
+    )
     selected = selected.masked_fill(~valid.unsqueeze(-1), 0).float()
     logits = torch.einsum("bshd,bskd->bshk", q.float(), selected) * scale
     logits = logits.masked_fill(~valid.unsqueeze(-2), -torch.inf)
@@ -2356,9 +2390,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 block_mask.scatter_(
                     1, ids.masked_fill(~valid_ids, num_blocks).long(), True
                 )
-                candidates = block_mask.gather(
-                    1, (logical_compressed // self.candidate_block_size).long()
-                )[None]
+                candidates = (
+                    block_mask.reshape(-1)
+                    .index_select(
+                        0,
+                        (
+                            torch.arange(count, device=ids.device, dtype=torch.int32)[
+                                :, None
+                            ]
+                            * (num_blocks + 1)
+                            + logical_compressed.to(torch.int32)
+                            // self.candidate_block_size
+                        ).reshape(-1),
+                    )
+                    .reshape(1, count, capacity)
+                )
         if candidates is not None:
             candidates = candidates | (lengths.max() <= self._config["index_topk"])
         return select_compressed_indices(

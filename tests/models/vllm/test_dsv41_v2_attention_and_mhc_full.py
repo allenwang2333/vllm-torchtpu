@@ -1248,3 +1248,95 @@ class TestDeepseekV41AttentionMethods:
         )
         attn.process_weights_after_loading(torch.bfloat16)
         assert torch.equal(attn._full_attn_sink, attn.attn_sink.float())
+
+
+def test_td8289_native_int32_index_select_and_arange(monkeypatch):
+    select_calls = []
+    arange_dtypes = []
+    orig_index_select = torch.Tensor.index_select
+    orig_arange = torch.arange
+
+    def spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, self.dtype, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    def spy_arange(*args, **kwargs):
+        out = orig_arange(*args, **kwargs)
+        arange_dtypes.append(out.dtype)
+        return out
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+    monkeypatch.setattr(torch, "arange", spy_arange)
+
+    # 1. select_candidate_blocks uses int32 arange
+    arange_dtypes.clear()
+    keep = v2_attn.select_candidate_blocks(
+        torch.tensor([[1.0, 5.0, 2.0, 3.0, 9.0, 0.0]]),
+        lengths=[5],
+        topk_blocks=1,
+        block_size=2,
+    )
+    assert keep.tolist() == [[False, False, False, False, True, True]]
+    assert arange_dtypes == [torch.int32, torch.int32]
+
+    # 2. select_compressed_indices uses int32 arange and 1D int32 index_select
+    scores = torch.tensor(
+        [
+            [[1.0, 4.0, 2.0, -torch.inf], [0.5, -torch.inf, 3.0, 2.0]],
+        ],
+        dtype=torch.float32,
+    )
+    lengths = torch.tensor([[[3], [1]]], dtype=torch.int64)
+    select_calls.clear()
+    arange_dtypes.clear()
+    idx = v2_attn.select_compressed_indices(scores, lengths, topk=2)
+    assert idx.dtype == torch.int32
+    assert idx.tolist() == [[[1, 2], [0, -1]]]
+    assert select_calls == [(1, torch.float32, 0, torch.int32)]
+    assert arange_dtypes == [torch.int32, torch.int32]
+
+    # 3. sparse_attention uses int32 arange and 1D int32 index_select
+    q = torch.randn(2, 3, 4, 8, dtype=torch.float32)
+    kv = torch.randn(2, 6, 8, dtype=torch.float32)
+    sink = torch.zeros(4, dtype=torch.float32)
+    indices = torch.tensor(
+        [
+            [[0, 2, -1], [1, 5, 3], [4, 0, 1]],
+            [[5, 1, 2], [-1, 3, 4], [0, 2, 5]],
+        ],
+        dtype=torch.int32,
+    )
+    select_calls.clear()
+    arange_dtypes.clear()
+    out_sa = v2_attn.sparse_attention(q, kv, sink, indices, 0.5)
+    assert out_sa.shape == q.shape
+    assert select_calls == [(2, torch.float32, 0, torch.int32)]
+    assert arange_dtypes == [torch.int32]
+
+    # 4. _select_indices candidate filter uses 1D int32 index_select on block_mask
+    attn = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn._config = {"candidate_topk_blocks": 2, "index_topk": 2}
+    attn.candidate_block_size = 2
+    attn.candidate_block_buffer = torch.tensor([[0, 2], [1, -1]], dtype=torch.int32)
+    attn.indexer = SimpleNamespace(
+        indexer_op=SimpleNamespace(candidate_blocks=True, candidate_write=False)
+    )
+    scores_2 = torch.tensor(
+        [[[1.0, 2.0, 9.0, 8.0, 5.0, 6.0], [7.0, 8.0, 3.0, 4.0, 1.0, 2.0]]],
+        dtype=torch.float32,
+    )
+    lengths_2 = torch.tensor([[6], [6]], dtype=torch.int32)
+    logical_2 = orig_arange(6, dtype=torch.int32)[None, :].expand(2, -1)
+    select_calls.clear()
+    arange_dtypes.clear()
+    sel_2 = attn._select_indices(scores_2, lengths_2, logical_2, count=2)
+    assert sel_2.dtype == torch.int32
+    # Row 0 allowed blocks: {0, 2} -> indices {0, 1, 4, 5}, top-2 are [4, 5]
+    # Row 1 allowed blocks: {1} -> indices {2, 3}, top-2 are [2, 3]
+    assert sel_2.tolist() == [[4, 5], [2, 3]]
+    assert select_calls == [
+        (1, torch.bool, 0, torch.int32),
+        (1, torch.float32, 0, torch.int32),
+    ]
+    assert all(dt == torch.int32 for dt in arange_dtypes)
