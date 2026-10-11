@@ -130,14 +130,38 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
 
         if not csa_nope_hosts:
             raise ValueError(f"No CSA layer in MLA layers: {mla_layer_names}")
+        mla_ptrs: dict[int, str] = {}
+        for layer_name in mla_layer_names:
+            entry = kv_caches[layer_name]
+            for idx_t, t in enumerate(entry if isinstance(entry, tuple) else (entry,)):
+                if t.numel() > 0:
+                    ptr = int(t.data_ptr())
+                    tag_t = f"{layer_name}[{idx_t}]"
+                    assert ptr not in mla_ptrs, (
+                        f"KV cache aliasing detected: {tag_t} aliases {mla_ptrs[ptr]}"
+                    )
+                    mla_ptrs[ptr] = tag_t
 
-        min_host_page_size = min(h.shape[1] for h in csa_nope_hosts)
-        csa_nope_hosts = [h for h in csa_nope_hosts if h.shape[1] == min_host_page_size]
+        swa_rows = (
+            per_layer_spec(swa_layer_groups[0][0]).block_size * 2
+            if (swa_layer_groups and swa_layer_groups[0])
+            else min(h.shape[1] for h in csa_nope_hosts)
+        )
+        csa_nope_hosts = sorted(
+            [h for h in csa_nope_hosts if h.shape[1] >= swa_rows],
+            key=lambda h: int(h.shape[1]),
+        )
+        if not csa_nope_hosts:
+            raise ValueError(
+                f"No CSA NoPE host with rows >= {swa_rows} in MLA layers: {mla_layer_names}"
+            )
 
-        swa_overflow_shape = tuple(csa_nope_hosts[0].shape)
-        if swa_layer_groups and swa_layer_groups[0]:
-            swa_rows = per_layer_spec(swa_layer_groups[0][0]).block_size * 2
-            swa_overflow_shape = (num_blocks, swa_rows, csa_cache_layout.ROW_WORDS)
+        swa_overflow_blocks = min(num_blocks, max(64, num_swa_aux + 1))
+        swa_overflow_shape = (
+            swa_overflow_blocks,
+            swa_rows,
+            csa_cache_layout.ROW_WORDS,
+        )
 
         def _host_at(
             hosts: list[torch.Tensor],
@@ -182,6 +206,15 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                             swa.kv_cache = kv_caches[swa.prefix]
                         if mod.ensure_cache():
                             init_caches.append(mod._cache)
+                    if hasattr(mod, "state_cache") and getattr(mod, "state_cache", None) is not None and hasattr(mod, "k_cache_prefix"):
+                        _st_e = kv_caches.get(mod.state_cache.prefix)
+                        _k_e = kv_caches.get(mod.k_cache_prefix)
+                        _st_t = _st_e[0] if isinstance(_st_e, tuple) else _st_e
+                        _no_t = _k_e[0] if isinstance(_k_e, tuple) else _k_e
+                        if _st_t is not None and _no_t is not None:
+                            _al = bool(_st_t.data_ptr() == _no_t.data_ptr())
+                            object.__setattr__(mod, "_aliased_state_to_nope", _al)
+                            assert _al == (_st_t.data_ptr() == _no_t.data_ptr())
                     if hasattr(mod, "_get_dummy_main_cache"):
                         init_caches.append(mod._get_dummy_main_cache(runner.device))
             if init_caches:

@@ -25,7 +25,9 @@ from types import SimpleNamespace
 
 import torch
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 
+from vllm_torchtpu.distributed.tp_collectives import tp_token_shard_ok
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
@@ -156,8 +158,7 @@ class DSparkProposer(DFlashProposer):
         if hasattr(self.draft_model, "init_tp_markov_meta"):
             self.draft_model.init_tp_markov_meta()
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def _dflash_forward_and_sample(
+    def _dflash_forward_and_sample_body(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -172,6 +173,30 @@ class DSparkProposer(DFlashProposer):
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
         """
+        sample_start = 0 if self.sample_from_anchor else 1
+        num_pred = block_size - sample_start
+        tp_size = get_tensor_model_parallel_world_size()
+        num_tokens = positions.shape[0]
+        padded_num_reqs = num_tokens // block_size
+        can_skip_final_ag = (
+            sample_start == 0
+            and num_tokens == padded_num_reqs * block_size
+            and tp_token_shard_ok(num_tokens, tp_size)
+            and hasattr(self.draft_model, "can_run_fused_sharded_markov")
+            and self.draft_model.can_run_fused_sharded_markov()
+        )
+        if can_skip_final_ag:
+            sharded_hidden = self.draft_model.model(
+                input_ids=input_ids,
+                positions=positions,
+                skip_final_all_gather=True,
+            )
+            prev = input_ids[: padded_num_reqs * block_size : block_size]
+            draft_tokens_chunk = self.draft_model.sample_draft_tokens(
+                sharded_hidden, prev, num_pred, pred_sharded=True
+            )
+            return draft_tokens_chunk, sharded_hidden
+
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -179,8 +204,6 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
-        sample_start = 0 if self.sample_from_anchor else 1
-        num_pred = block_size - sample_start
         if sample_start > 0:
             pred_hidden = valid_hidden.view(
                 padded_num_reqs, block_size, hidden.shape[-1]
@@ -216,3 +239,12 @@ class DSparkProposer(DFlashProposer):
         draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
 
         return draft_tokens_chunk, hidden
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _dflash_forward_and_sample(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._dflash_forward_and_sample_body(input_ids, positions, block_size)

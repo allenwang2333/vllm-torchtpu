@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 from vllm.distributed import (
@@ -130,7 +132,11 @@ class DeepseekV4MLP(nn.Module):
         if (
             gu_s is None
             or down_s is None
-            or gu_s.ndim != 1
+            or gu_s.ndim not in (1, 4)
+            or (
+                gu_s.ndim == 4
+                and os.environ.get("VLLM_DSV41_REPL_SHARED_EXPERTS", "0") != "1"
+            )
             or down_s.ndim not in (1, 4)
             or getattr(self.gate_up_proj, "bias", None) is not None
             or getattr(self.down_proj, "bias", None) is not None
@@ -167,11 +173,19 @@ class DeepseekV4MLP(nn.Module):
             .reshape(k_dim, 2 * tp_size * i_shard)
             .clone(memory_format=torch.contiguous_format)
         )
-        tp_gate_up_s = (
-            gather(gu_s.data.reshape(2, i_shard).contiguous(), 1)
-            .reshape(-1)
-            .clone(memory_format=torch.contiguous_format)
-        )
+        if gu_s.ndim == 4:
+            k_blk = gu_s.shape[1]
+            tp_gate_up_s = (
+                gather(gu_s.data.reshape(1, k_blk, 2, i_shard).contiguous(), 3)
+                .reshape(1, k_blk, 1, 2 * tp_size * i_shard)
+                .clone(memory_format=torch.contiguous_format)
+            )
+        else:
+            tp_gate_up_s = (
+                gather(gu_s.data.reshape(2, i_shard).contiguous(), 1)
+                .reshape(-1)
+                .clone(memory_format=torch.contiguous_format)
+            )
         tp_down_w_raw = gather(down_w.contiguous(), 0)
         if down_s.ndim == 4:
             tp_down_w = tp_down_w_raw
@@ -327,6 +341,7 @@ class DeepseekV4MLP(nn.Module):
         return_token_sharded: bool = False,
         *,
         input_is_token_sharded: bool = False,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         if hidden_states_fp8 is None:
             hidden_states_fp8 = self._prequant[0]
@@ -375,13 +390,14 @@ class DeepseekV4MLP(nn.Module):
                     swiglu_limit=self.swiglu_limit,
                 )
             if (
-                getattr(self.down_proj, "reduce_results", False)
+                not skip_all_reduce
+                and getattr(self.down_proj, "reduce_results", False)
                 and not getattr(self.down_proj, "disable_tp", False)
                 and get_tensor_model_parallel_world_size() > 1
             ):
                 x = tensor_model_parallel_all_reduce(x)
             if return_token_sharded:
-                if getattr(self.down_proj, "reduce_results", False):
+                if getattr(self.down_proj, "reduce_results", False) and not skip_all_reduce:
                     return tp_shard_slice(x, dim=0)
                 return tp_reduce_scatter(x, dim=0)
             return x

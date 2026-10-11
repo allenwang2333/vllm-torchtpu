@@ -162,19 +162,18 @@ def _prequant_matmul_jax(
 ) -> jax.Array:
     """FP8 dense matmul consuming pre-quantized `(x_q, x_scale)` on (k, n) weights."""
     m_orig = x_q.shape[0]
+    x_s_1d = x_scale.reshape(-1)
     if m_orig % 8 != 0:
         pad_rows = ((m_orig + 7) & ~7) - m_orig
         x_q = jnp.pad(x_q, ((0, pad_rows), (0, 0)))
-        x_scale = jnp.pad(x_scale, ((0, pad_rows), (0, 0)))
+        x_s_1d = jnp.pad(x_s_1d, (0, pad_rows))
     out = jax.lax.dot_general(
         x_q,
         w_q,
         dimension_numbers=(((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
     ).astype(jnp.float32)
-    out *= x_scale
-    out *= jnp.expand_dims(w_s, 0)
-    out = out.astype(jnp.bfloat16)
+    out = (out * x_s_1d[:, None] * w_s[None, :]).astype(jnp.bfloat16)
     return out[:m_orig] if m_orig % 8 != 0 else out
 
 
@@ -234,11 +233,8 @@ def quantized_matmul_prequant(
 
 
 def _exact_bf16(x: jax.Array) -> jax.Array:
-    """Preserve exact BF16 intermediate rounding inside a single XLA fusion."""
-    return jax.lax.bitcast_convert_type(
-        jax.lax.bitcast_convert_type(x.astype(jnp.bfloat16), jnp.uint16),
-        jnp.bfloat16,
-    )
+    """Preserve BF16 intermediate rounding without inserting uint16 bitcast barriers."""
+    return x.astype(jnp.bfloat16)
 
 
 def _apply_mlp_act_exact(

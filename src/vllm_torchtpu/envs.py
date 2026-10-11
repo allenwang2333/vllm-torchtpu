@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
     VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
+    VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
 
 
 def env_with_choices(
@@ -627,8 +628,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
     "USE_MOE_FUSED_EP_KERNEL": lambda: (
-        environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
-        or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+        False
+        if os.environ.get("USE_MOE_FUSED_EP_KERNEL") == "0"
+        else (
+            environment_variables["MOE_FUSED_EP_KERNEL_IMPL"]() is not None
+            or env_bool("USE_MOE_FUSED_EP_KERNEL")()
+        )
     ),
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
@@ -915,6 +920,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the indexer layer and every layer reusing its top-k rows run
     # token-parallel attention, which reads only this rank's T/tp rows.
     "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
+    # Enable host Engram prefetch and active-bucket prefix H2D upload across
+    # 1+K speculative verify tokens.
+    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
 }
 
 

@@ -245,7 +245,10 @@ def _topk_body_no_keys(
         row = remap_idx(pl.program_id(0))[0]
         eff_len = jnp.where(row < b, jnp.minimum(_vec_at(len_slice_vmem, 0), n), 0)
         i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
-        walk_chunks = _cdiv_dyn(i_hi)
+        walk_raw = _cdiv_dyn(i_hi)
+        walk_chunks = (
+            (walk_raw + (SCAN_UNROLL - 1)) // SCAN_UNROLL
+        ) * SCAN_UNROLL
 
         @pl.when(i_hi == 0)
         def _empty():
@@ -257,12 +260,17 @@ def _topk_body_no_keys(
         @pl.when(i_hi > 0)
         def _nonempty():
             _zero_hist(glob_vmem, NUM_BUCKETS // LANES)
-            tail = (walk_chunks - 1) * LANES
-            scores_vmem[pl.ds(tail, LANES)] = jnp.where(
-                tail + lane_iota < i_hi,
-                scores_vmem[pl.ds(tail, LANES)],
-                jnp.int32(BITS_NEG_INF),
-            )
+            for d in range(SCAN_UNROLL):
+                v_idx = walk_raw - 1 + d
+
+                @pl.when(v_idx < walk_chunks)
+                def _mask_tail(v_c=v_idx):
+                    t_off = v_c * LANES
+                    scores_vmem[pl.ds(t_off, LANES)] = jnp.where(
+                        t_off + lane_iota < i_hi,
+                        scores_vmem[pl.ds(t_off, LANES)],
+                        jnp.int32(BITS_NEG_INF),
+                    )
 
             def fill_body(i):
                 rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
@@ -351,7 +359,10 @@ def _topk_body(
         row = remap_idx(pl.program_id(0))[0]
         eff_len = jnp.where(row < b, jnp.minimum(_vec_at(len_slice_vmem, 0), n), 0)
         i_hi = jnp.where(eff_len > 0, jnp.minimum(slice_len, eff_len), 0)
-        walk_chunks = _cdiv_dyn(i_hi)
+        walk_raw = _cdiv_dyn(i_hi)
+        walk_chunks = (
+            (walk_raw + (SCAN_UNROLL - 1)) // SCAN_UNROLL
+        ) * SCAN_UNROLL
 
         @pl.when(i_hi == 0)
         def _empty():
@@ -366,12 +377,17 @@ def _topk_body(
         @pl.when(i_hi > 0)
         def _nonempty():
             _zero_hist(glob_vmem, NUM_BUCKETS // LANES)
-            tail = (walk_chunks - 1) * LANES
-            scores_vmem[pl.ds(tail, LANES)] = jnp.where(
-                tail + lane_iota < i_hi,
-                scores_vmem[pl.ds(tail, LANES)],
-                jnp.int32(BITS_NEG_INF),
-            )
+            for d in range(SCAN_UNROLL):
+                v_idx = walk_raw - 1 + d
+
+                @pl.when(v_idx < walk_chunks)
+                def _mask_tail(v_c=v_idx):
+                    t_off = v_c * LANES
+                    scores_vmem[pl.ds(t_off, LANES)] = jnp.where(
+                        t_off + lane_iota < i_hi,
+                        scores_vmem[pl.ds(t_off, LANES)],
+                        jnp.int32(BITS_NEG_INF),
+                    )
 
             def fill_body(i):
                 rowbuf_vmem[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
@@ -954,7 +970,8 @@ def sc_cand_gather_topk(
 ) -> jax.Array:
     """1D SparseCore indirect gather DMA + in-VMEM top-k over candidate blocks."""
     scores = _as_i32_bits(scores)
-    b, n = scores.shape
+    b = scores.shape[0]
+    n = scores.shape[1] * scores.shape[2] if scores.ndim == 3 else scores.shape[1]
     cb = candidates.shape[1]
     cand_len = cb * 8
     num_subcores = _get_sc_subcores()
@@ -1644,8 +1661,13 @@ def sc_write_cand_and_topk(
     """Fused SparseCore block-top-cb + 1D indirect gather token-top-k."""
     blk_scores = _as_i32_bits(blk_scores)
     scores = _as_i32_bits(scores)
-    b, n_blk = blk_scores.shape
-    _, n = scores.shape
+    b = blk_scores.shape[0]
+    n_blk = (
+        blk_scores.shape[1] * blk_scores.shape[2]
+        if blk_scores.ndim == 3
+        else blk_scores.shape[1]
+    )
+    n = scores.shape[1] * scores.shape[2] if scores.ndim == 3 else scores.shape[1]
     cand_len = cb * 8
     num_subcores = _get_sc_subcores()
     num_waves = _cdiv(b, num_subcores)
@@ -1688,3 +1710,176 @@ def sc_write_cand_and_topk(
         rl_pad,
     )
     return topk_flat.reshape(padded_b, k)[:b], cands_flat.reshape(padded_b, cb)[:b]
+
+
+def sc_cand_local_topk(
+    compact_scores: jax.Array,
+    local_cands: jax.Array,
+    orig_cands: jax.Array,
+    row_lengths: jax.Array,
+    *,
+    k: int = 512,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:
+    """SparseCore indirect gather + radix top-k over compact tile-remapped scores."""
+    b, cb = orig_cands.shape
+    num_subcores = _get_sc_subcores()
+    num_waves = _cdiv(b, num_subcores)
+    padded_b = num_waves * num_subcores
+    cand_len = cb * 8
+    vecs_per_cand = cand_len // LANES
+
+    if padded_b > b:
+        local_cands_p = jnp.pad(
+            local_cands, ((0, padded_b - b), (0, 0)), constant_values=-1
+        )
+        orig_cands_p = jnp.pad(
+            orig_cands, ((0, padded_b - b), (0, 0)), constant_values=-1
+        )
+    else:
+        local_cands_p = local_cands
+        orig_cands_p = orig_cands
+    rl_pad = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b + LANES))
+
+    def _sc_remap_topk_body(
+        scores_flat_hbm,
+        lcands_hbm,
+        ocands_hbm,
+        row_lens_hbm,
+        out_hbm,
+        lcands_s,
+        ocands_s,
+        idx_gather,
+        idx_emit,
+        scores_s,
+        glob_vmem,
+        rowbuf_s,
+        state_vmem,
+        sem_ref,
+    ):
+        sc = pltpu.get_tpu_info().sparse_core
+        sub_stride = 16 if sc is None else sc.num_subcores
+        flat = lax.axis_index("core") * sub_stride + lax.axis_index("subcore")
+        neg_inf_vec = jnp.full((LANES,), BITS_NEG_INF, dtype=jnp.int32)
+
+        rl_dma = pltpu.make_async_copy(
+            src_ref=row_lens_hbm.at[pl.ds(0, padded_b)],
+            dst_ref=state_vmem.at[pl.ds(0, padded_b)],
+            sem=sem_ref.at[0],
+        )
+        rl_dma.start()
+        rl_dma.wait()
+
+        def fill_s(i):
+            rowbuf_s[pl.ds(i * LANES, LANES)] = jnp.full((LANES,), -1, jnp.int32)
+
+        @pl.loop(0, num_waves)
+        def _wave(w):
+            row = w * num_subcores + flat
+            active = row < b
+            row_len = jnp.where(active, _vec_at(state_vmem, row), 0)
+
+            @pl.when(row_len == 0)
+            def _empty():
+                @pl.when(active)
+                def _w_empty():
+                    plsc.parallel_loop(0, k // LANES, unroll=8)(fill_s)
+                    d = pltpu.make_async_copy(
+                        src_ref=rowbuf_s.at[pl.ds(0, k)],
+                        dst_ref=out_hbm.at[pl.ds(row * k, k)],
+                        sem=sem_ref.at[0],
+                    )
+                    d.start()
+                    d.wait()
+
+            @pl.when(row_len > 0)
+            def _nonempty():
+                dl = pltpu.make_async_copy(
+                    src_ref=lcands_hbm.at[pl.ds(row * cb, cb)],
+                    dst_ref=lcands_s,
+                    sem=sem_ref.at[0],
+                )
+                do = pltpu.make_async_copy(
+                    src_ref=ocands_hbm.at[pl.ds(row * cb, cb)],
+                    dst_ref=ocands_s,
+                    sem=sem_ref.at[1],
+                )
+                dl.start()
+                do.start()
+                dl.wait()
+                do.wait()
+
+                def expand_both(j):
+                    lblk = lcands_s[pl.ds(j * LANES, LANES)]
+                    oblk = ocands_s[pl.ds(j * LANES, LANES)]
+                    ok = lblk >= 0
+                    ltok0 = jnp.left_shift(lblk, 3)
+                    otok0 = jnp.left_shift(oblk, 3)
+                    for s in range(8):
+                        off = (j * 8 + s) * LANES
+                        valid = ok & (otok0 + s < row_len)
+                        idx_gather[pl.ds(off, LANES)] = jnp.where(
+                            valid, ltok0 + s, -1
+                        )
+                        idx_emit[pl.ds(off, LANES)] = otok0 + s
+                        scores_s[pl.ds(off, LANES)] = neg_inf_vec
+
+                plsc.parallel_loop(0, cb // LANES, unroll=4)(expand_both)
+                g_dma = pltpu.make_async_copy(
+                    src_ref=scores_flat_hbm.at[
+                        plsc.Indices(idx_gather, ignored_value=-1)
+                    ],
+                    dst_ref=scores_s,
+                    sem=sem_ref.at[2],
+                )
+                g_dma.start()
+                _zero_hist(glob_vmem, NUM_BUCKETS // LANES)
+                g_dma.wait()
+
+                def emit(i, woff, _key, sel):
+                    plsc.store_compressed(
+                        rowbuf_s.at[pl.ds(woff, LANES)],
+                        idx_emit[pl.ds(i * LANES, LANES)],
+                        mask=sel,
+                    )
+                    return woff + plsc.all_reduce_population_count(sel)[0]
+
+                _radix_select_and_emit(
+                    scores_s,
+                    glob_vmem,
+                    vecs_per_cand,
+                    k,
+                    fill_fn=fill_s,
+                    fill_unroll=8,
+                    emit_fn=emit,
+                )
+                d_out = pltpu.make_async_copy(
+                    src_ref=rowbuf_s.at[pl.ds(0, k)],
+                    dst_ref=out_hbm.at[pl.ds(row * k, k)],
+                    sem=sem_ref.at[0],
+                )
+                d_out.start()
+                d_out.wait()
+
+    out = _run_sc_kernel(
+        _sc_remap_topk_body,
+        jax.ShapeDtypeStruct((padded_b * k,), jnp.int32),
+        (
+            pltpu.VMEM((cb,), jnp.int32),
+            pltpu.VMEM((cb,), jnp.int32),
+            pltpu.VMEM((cand_len,), jnp.int32),
+            pltpu.VMEM((cand_len,), jnp.int32),
+            pltpu.VMEM((cand_len,), jnp.int32),
+            pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
+            pltpu.VMEM((k + LANES,), jnp.int32),
+            pltpu.VMEM((padded_b + LANES,), jnp.int32),
+            pltpu.SemaphoreType.DMA((3,)),
+        ),
+        f"sc_cand_local_topk_b{b}_cb{cb}_k{k}",
+        scheduling_group_id,
+        compact_scores.reshape(-1),
+        local_cands_p.reshape(-1),
+        orig_cands_p.reshape(-1),
+        rl_pad,
+    )
+    return out.reshape(padded_b, k)[:b]

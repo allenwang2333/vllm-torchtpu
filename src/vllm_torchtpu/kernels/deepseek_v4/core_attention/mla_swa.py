@@ -164,7 +164,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
-    kv_len = kv_lens_ref[seq_idx]
+    kv_len = kv_lens_ref[seq_idx] & 0xFFFFF
 
     def flash_attention(
         bq_vmem_ref,  # [bq_sz, num_q_heads, head_dim] VMEM ref
@@ -409,7 +409,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             cp.start()
 
     def _get_kv_len(seq_idx):
-        return jnp.where(seq_idx < end_seq_idx, kv_lens_ref[seq_idx], 0)
+        return jnp.where(seq_idx < end_seq_idx, kv_lens_ref[seq_idx] & 0xFFFFF, 0)
 
     def _get_q_len(seq_idx):
         return jnp.where(
@@ -426,7 +426,16 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         # first key it can ever need is q_pos_min - sliding_window + 1.
         kv_len_s = _get_kv_len(seq_idx)
         q_len_s = _get_q_len(seq_idx)
-        min_start = jnp.where(q_len_s > 1, kv_len_s - q_len_s, 0) if ced_decoder else 0
+        eff_q_span_s = jnp.where(
+            seq_idx < end_seq_idx,
+            jnp.maximum(q_len_s, kv_lens_ref[seq_idx] >> 20),
+            0,
+        )
+        min_start = (
+            jnp.where(eff_q_span_s > 1, kv_len_s - eff_q_span_s, 0)
+            if ced_decoder
+            else 0
+        )
         return jnp.maximum(
             kv_len_s - q_len_s + bq_idx * bq_sz - sliding_window + 1,
             min_start,
@@ -446,7 +455,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             lkv_dim,
         )
 
-        kv_len = kv_lens_ref[seq_idx]
+        kv_len = kv_lens_ref[seq_idx] & 0xFFFFF
         # Window base for this (seq, bq) block plus the relative block. `start_offset`
         # is an exact token position, so `kv_len_start` is generally not a multiple
         # of page_size; `page_off` is where inside its page the window starts.
@@ -1606,6 +1615,9 @@ def _mla_batched_verify_kernel(
     q_hbm_ref,
     new_kv_hbm_ref,
     cache_kv_hbm_ref,
+    in_output_hbm_ref,
+    in_l_hbm_ref,
+    in_m_hbm_ref,
     o_hbm_ref,
     updated_cache_kv_hbm_ref,
     l_hbm_ref,
@@ -1629,6 +1641,8 @@ def _mla_batched_verify_kernel(
     skip_kv_update: bool,
     non_causal_block: bool = False,
 ):
+    del in_output_hbm_ref, in_l_hbm_ref, in_m_hbm_ref
+
     def async_copy(src, dst, sem, wait=False):
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -1670,14 +1684,6 @@ def _mla_batched_verify_kernel(
     num_seqs = end_seq_idx - start_seq_idx
     num_batches = cdiv(num_seqs, seq_batch_sz)
 
-    def get_cache_span(kv_len):
-        start_offset = jnp.maximum(
-            kv_len - static_q_len - sliding_window + 1, jnp.int32(0)
-        )
-        kv_left = jnp.maximum(kv_len - start_offset, jnp.int32(0))
-        kv_left_frm_cache = jnp.maximum(kv_left - static_q_len, jnp.int32(0))
-        return start_offset, jnp.minimum(kv_left_frm_cache, bkv_sz - static_q_len)
-
     def _fetch_bq(batch_idx, sem_idx, wait=False):
         if not wait:
             wait_update_kv_cache(batch_idx - 2, sem_idx)
@@ -1701,61 +1707,48 @@ def _mla_batched_verify_kernel(
     def _fetch_bkv(batch_idx, sem_idx, wait=False):
         if ced_decoder:
             return
-        s_start = start_seq_idx + batch_idx * seq_batch_sz
         sem_kv = sems.at[sem_idx, 4]
         if wait:
-            total_rows = jnp.int32(0)
-            for s in range(seq_batch_sz):
-                seq_idx = s_start + s
-                seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
-                kv_len = jnp.where(
-                    seq_idx < end_seq_idx, kv_lens_ref[seq_idx_clamped], 0
-                )
-                _, bkv_sz_frm_cache = get_cache_span(kv_len)
-                total_rows = total_rows + jnp.where(
-                    seq_idx < end_seq_idx, bkv_sz_frm_cache, 0
-                )
-            dst_all = bkv_batch_x2_vmem.at[sem_idx, pl.ds(0, total_rows)]
+            dst_all = bkv_batch_x2_vmem.at[sem_idx, pl.ds(0, seq_batch_sz * bkv_sz)]
             async_copy(dst_all, dst_all, sem_kv, wait=True)
             return
 
+        s_start = start_seq_idx + batch_idx * seq_batch_sz
         for s in range(seq_batch_sz):
             seq_idx = s_start + s
             seq_idx_clamped = jnp.minimum(seq_idx, max_num_seqs - 1)
             kv_len = jnp.where(
                 seq_idx < end_seq_idx, kv_lens_ref[seq_idx_clamped], 0
             )
-            start_offset, bkv_sz_frm_cache = get_cache_span(kv_len)
-            kv_p_start = start_offset // logical_page_size
-            page_off = start_offset - kv_p_start * logical_page_size
+            kv_p_start = (
+                jnp.maximum(
+                    kv_len - static_q_len - sliding_window + 1, jnp.int32(0)
+                )
+                // logical_page_size
+            )
             page_indices_offset = jnp.minimum(
                 seq_idx_clamped * pages_per_seq + kv_p_start,
                 num_page_indices - 1,
             )
             bkv_s_base = s * bkv_sz
-            vmem_off = 0
-            for i in range(bkv_p + 1):
-                avail = logical_page_size - page_off
-                chunk_sz = jnp.where(
+            for i in range(bkv_p):
+                page_idx = jnp.where(
                     seq_idx < end_seq_idx,
-                    jnp.clip(bkv_sz_frm_cache - vmem_off, jnp.int32(0), avail),
+                    page_indices_ref[
+                        jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                    ],
                     0,
                 )
-                page_idx = page_indices_ref[
-                    jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                ]
                 async_copy(
                     reshaped_cache_hbm_ref.at[
-                        pl.ds(page_idx * phys_tokens_per_page + page_off, chunk_sz)
+                        pl.ds(page_idx * phys_tokens_per_page, logical_page_size)
                     ],
                     bkv_batch_x2_vmem.at[
-                        sem_idx, pl.ds(bkv_s_base + vmem_off, chunk_sz)
+                        sem_idx, pl.ds(bkv_s_base + i * logical_page_size, logical_page_size)
                     ],
                     sem_kv,
                     wait=False,
                 )
-                page_off = 0
-                vmem_off += chunk_sz
 
     num_l_heads = l_batch_x2_vmem.shape[2]
     q_idx_vec = lax.broadcasted_iota(
@@ -1822,67 +1815,101 @@ def _mla_batched_verify_kernel(
                 m_batch_x2_vmem[sem_idx, ...] = m_2d
             return
 
-        m_vec_1d = lax.broadcasted_iota(jnp.int32, (1, bkv_sz), 1)
-        for s in range(seq_batch_sz):
-            seq_idx = s_start + s
-            kv_len = jnp.where(
-                seq_idx < end_seq_idx,
-                kv_lens_ref[jnp.minimum(seq_idx, max_num_seqs - 1)],
-                0,
+        kv_len_vec = jnp.stack(
+            [
+                jnp.where(
+                    s_start + s < end_seq_idx,
+                    kv_lens_ref[jnp.minimum(s_start + s, max_num_seqs - 1)],
+                    jnp.int32(0),
+                )
+                for s in range(seq_batch_sz)
+            ]
+        )
+        kv_p_start_vec = (
+            jnp.maximum(kv_len_vec - static_q_len - sliding_window + 1, jnp.int32(0))
+            // logical_page_size
+        )
+        start_offset_vec = kv_p_start_vec * logical_page_size
+        cache_end_vec = jnp.maximum(kv_len_vec - static_q_len, jnp.int32(0))
+
+        bkv_cache_all = pltpu.bitcast(
+            bkv_batch_x2_vmem[sem_idx, ...], jnp.bfloat16
+        ).reshape(seq_batch_sz, bkv_sz, head_dim)
+        bkv_cache_all = jnp.where(
+            (
+                start_offset_vec[:, None, None]
+                + lax.broadcasted_iota(jnp.int32, (seq_batch_sz, bkv_sz, head_dim), 1)
             )
-            start_offset, bkv_sz_u = get_cache_span(kv_len)
-            for t in range(static_q_len):
-                bkv_batch_x2_vmem[
-                    sem_idx, s * bkv_sz + bkv_sz_u + t, ...
-                ] = new_kv_u8_vmem[s * static_q_len + t, ...]
-            bkv_s = pltpu.bitcast(
-                bkv_batch_x2_vmem[sem_idx, s * bkv_sz : (s + 1) * bkv_sz, ...],
-                jnp.bfloat16,
-            ).reshape(bkv_sz, head_dim)
-            k_span = start_offset + m_vec_1d
-            q_span = (kv_len - static_q_len) + q_idx_vec
-            keep = (q_span - k_span).astype(jnp.uint32) < jnp.uint32(sliding_window)
-            if non_causal_block:
-                keep = keep | ((k_span >= kv_len - static_q_len) & (k_span < kv_len))
-            valid_kv = m_vec_1d.T < (bkv_sz_u + static_q_len)
-            bkv_w = jnp.where(valid_kv, bkv_s, 0)
-            q_s = q_batch_x2_vmem[
-                sem_idx, s * static_q_len : (s + 1) * static_q_len, ...
-            ].reshape(static_q_len * num_q_heads, head_dim)
-            s_mat = (
-                jnp.einsum("nd,md->nm", q_s, bkv_w, preferred_element_type=jnp.float32)
-                * sm_scale
+            < cache_end_vec[:, None, None],
+            bkv_cache_all,
+            jnp.zeros_like(bkv_cache_all),
+        )
+        m_cache_iota = lax.broadcasted_iota(jnp.int32, (seq_batch_sz, bkv_sz), 1)
+        k_pos_raw = start_offset_vec[:, None] + m_cache_iota
+        k_pos_cache = jnp.where(
+            k_pos_raw < cache_end_vec[:, None], k_pos_raw, jnp.int32(-1 << 20)
+        )
+
+        new_kv_all = pltpu.bitcast(new_kv_u8_vmem[...], jnp.bfloat16).reshape(
+            seq_batch_sz, static_q_len, head_dim
+        )
+        new_kv_pad = jnp.pad(
+            new_kv_all, ((0, 0), (0, 128 - static_q_len), (0, 0))
+        )
+        m_new_iota = lax.broadcasted_iota(jnp.int32, (seq_batch_sz, 128), 1)
+        k_pos_new = jnp.where(
+            m_new_iota < static_q_len,
+            cache_end_vec[:, None] + m_new_iota,
+            jnp.int32(-1 << 20),
+        )
+
+        bkv_w = jnp.concatenate([bkv_cache_all, new_kv_pad], axis=1)
+        q_all = q_batch_x2_vmem[sem_idx, ...].reshape(
+            seq_batch_sz, static_q_len * num_q_heads, head_dim
+        )
+
+        q_pos = cache_end_vec[:, None, None] + q_idx_vec[None, :, :]
+        k_pos_3d = jnp.concatenate([k_pos_cache, k_pos_new], axis=1)[:, None, :]
+
+        keep = (q_pos - k_pos_3d).astype(jnp.uint32) < jnp.uint32(sliding_window)
+        if non_causal_block:
+            keep = keep | (k_pos_3d >= cache_end_vec[:, None, None])
+
+        s_all = (
+            jnp.einsum(
+                "snd,smd->snm",
+                q_all,
+                bkv_w,
+                preferred_element_type=jnp.float32,
             )
-            s_mat = jnp.where(keep, s_mat, jnp.finfo(jnp.float32).min)
-            m_curr = jnp.max(s_mat, axis=1, keepdims=True)
-            p_mat = jnp.exp(s_mat - m_curr)
-            pv_s = jnp.einsum(
-                "nm,md->nd", p_mat, bkv_w, preferred_element_type=jnp.float32
-            )
-            l_curr = jnp.sum(p_mat, axis=1)
-            m_1d = m_curr[:, 0]
-            if unnormalized_output:
-                out_s = pv_s.astype(q_dtype)
-            else:
-                sinks_t = jnp.tile(attention_sinks, static_q_len)
-                l_tot = (l_curr + jnp.exp(sinks_t - m_1d))[:, None]
-                out_s = (pv_s * pl.reciprocal(l_tot, approx=True)).astype(q_dtype)
-            o_batch_x2_vmem[
-                sem_idx, s * static_q_len : (s + 1) * static_q_len, ...
-            ] = out_s.reshape(static_q_len, num_q_heads, head_dim)
-            if unnormalized_output:
-                l_2d = l_curr.reshape(static_q_len, num_q_heads)
-                m_2d = m_1d.reshape(static_q_len, num_q_heads)
-                if num_q_heads < num_l_heads:
-                    pad_cfg = ((0, 0), (0, num_l_heads - num_q_heads))
-                    l_2d = jnp.pad(l_2d, pad_cfg)
-                    m_2d = jnp.pad(m_2d, pad_cfg)
-                l_batch_x2_vmem[
-                    sem_idx, s * static_q_len : (s + 1) * static_q_len, ...
-                ] = l_2d
-                m_batch_x2_vmem[
-                    sem_idx, s * static_q_len : (s + 1) * static_q_len, ...
-                ] = m_2d
+            * sm_scale
+        )
+        s_all = jnp.where(keep, s_all, jnp.finfo(jnp.float32).min)
+        m_curr = jnp.max(s_all, axis=2, keepdims=True)
+        p_all = jnp.exp(s_all - m_curr)
+        pv_all = jnp.einsum(
+            "snm,smd->snd", p_all, bkv_w, preferred_element_type=jnp.float32
+        )
+        l_curr = jnp.sum(p_all, axis=2)
+        m_flat = m_curr[:, :, 0]
+        if unnormalized_output:
+            out_all = pv_all.astype(q_dtype)
+        else:
+            sinks_t = jnp.tile(attention_sinks, static_q_len)[None, :]
+            l_tot = (l_curr + jnp.exp(sinks_t - m_flat))[:, :, None]
+            out_all = (pv_all * pl.reciprocal(l_tot, approx=True)).astype(q_dtype)
+        o_batch_x2_vmem[sem_idx, ...] = out_all.reshape(
+            tok_per_batch, num_q_heads, head_dim
+        )
+        if unnormalized_output:
+            l_2d = l_curr.reshape(tok_per_batch, num_q_heads)
+            m_2d = m_flat.reshape(tok_per_batch, num_q_heads)
+            if num_q_heads < num_l_heads:
+                pad_cfg = ((0, 0), (0, num_l_heads - num_q_heads))
+                l_2d = jnp.pad(l_2d, pad_cfg)
+                m_2d = jnp.pad(m_2d, pad_cfg)
+            l_batch_x2_vmem[sem_idx, ...] = l_2d
+            m_batch_x2_vmem[sem_idx, ...] = m_2d
 
     def _send_bo(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -2030,7 +2057,8 @@ def run_mla_batched_verify_kernel(
     bkv_p = (
         1
         if ced_decoder
-        else max(2, cdiv(sliding_window + static_q_len - 1, logical_page_size))
+        else align_to(sliding_window + logical_page_size - 1, 128)
+        // logical_page_size
     )
     bkv_sz = bkv_p * logical_page_size
     tok_b = seq_batch_sz * static_q_len
@@ -2051,6 +2079,9 @@ def run_mla_batched_verify_kernel(
     nkv_vmem = pltpu.VMEM((2, tok_b) + new_kv.shape[1:], new_kv.dtype)
     sems = pltpu.SemaphoreType.DMA((2, 7))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_output = jnp.zeros_like(q)
+    in_l = jnp.zeros((num_tokens, num_l_heads), jnp.float32)
+    in_m = jnp.full((num_tokens, num_l_heads), -1e30, jnp.float32)
     scope_name = (
         f"SWA-v-bq_{static_q_len}-bkvp_{bkv_p}"
         f"{'-ced' if ced_decoder else ''}"
@@ -2073,7 +2104,15 @@ def run_mla_batched_verify_kernel(
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
-                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM), hbm, hbm, hbm],
+                in_specs=[
+                    pl.BlockSpec(memory_space=pltpu.VMEM),
+                    hbm,
+                    hbm,
+                    hbm,
+                    hbm,
+                    hbm,
+                    hbm,
+                ],
                 out_specs=[hbm, hbm, hbm, hbm],
                 grid=(1,),
                 scratch_shapes=[
@@ -2097,7 +2136,12 @@ def run_mla_batched_verify_kernel(
                 jax.ShapeDtypeStruct((num_tokens, num_l_heads), jnp.float32),
                 jax.ShapeDtypeStruct((num_tokens, num_l_heads), jnp.float32),
             ],
-            input_output_aliases={7: 1},
+            input_output_aliases={
+                8: 0,
+                7: 1,
+                9: 2,
+                10: 3,
+            },
             name=scope_name,
         )
     )(
@@ -2109,6 +2153,9 @@ def run_mla_batched_verify_kernel(
         q,
         new_kv,
         cache_kv,
+        in_output,
+        in_l,
+        in_m,
     )
 
 
@@ -2500,20 +2547,26 @@ def mla_sliding_window_ragged_paged_attention(
         and q.shape[0] <= 1536
     ):
         for _cand in (5, 3, 4):
-            if q.shape[0] % _cand == 0:
+            if q.shape[0] >= _cand:
                 eff_verify_q_len = _cand
                 break
 
     if (
         2 <= eff_verify_q_len <= 8
         and chunk_prefill_size is None
-        and q.shape[0] % eff_verify_q_len == 0
+        and q.shape[0] >= eff_verify_q_len
     ):
+        seq_q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+        active_seq = jnp.arange(max_num_seqs, dtype=jnp.int32) < distribution[2]
         is_uniform_verify = (
             (distribution[0] == 0)
             & (distribution[1] == 0)
             & (distribution[2] > 0)
             & (cu_q_lens[distribution[2]] == distribution[2] * eff_verify_q_len)
+            & jnp.all(
+                ~active_seq
+                | ((seq_q_lens == eff_verify_q_len) & ((kv_lens >> 20) == 0))
+            )
         )
 
         def _run_uniform_verify(kv_in):

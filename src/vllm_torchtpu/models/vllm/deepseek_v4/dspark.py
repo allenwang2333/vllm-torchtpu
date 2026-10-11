@@ -87,7 +87,7 @@ def _get_dspark_swa_store_op(logical_page_size: int):
         import functools
 
         from jax.sharding import PartitionSpec as P
-        from torch_tpu import pallas
+        from torch_tpu._internal import pallas
         from vllm_torchtpu.kernels.deepseek_v41.tp_attention import (
             swa_store_all_pallas,
         )

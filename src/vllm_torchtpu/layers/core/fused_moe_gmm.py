@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 from jax import numpy as jnp
@@ -251,9 +252,12 @@ def _moe_gmm_tiling(
                 tile_n=tiles.tile_n,
                 bucket_base=64,
             )
+    _sub_tile = os.environ.get("VLLM_DSV41_MOE_SUBLANE_TILING", "1") == "1"
+    _sub_tile_m32_cap = min(max(dims.size_group * 100, 1024), 4800)
+    _sub_tile_m64_cap = min(256 * dims.size_group, 12288)
     if (
         dims.size_group > 1
-        and 32 <= dims.size_m <= dims.size_group * 64
+        and 32 <= dims.size_m <= (_sub_tile_m32_cap if _sub_tile else dims.size_group * 40)
         and 32 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(
@@ -263,12 +267,13 @@ def _moe_gmm_tiling(
             bucket_base=32,
         )
     if (
-        dims.size_group > 1
-        and 64 * dims.size_group < dims.size_m <= 165 * dims.size_group
+        _sub_tile
+        and dims.size_group > 1
+        and _sub_tile_m32_cap < dims.size_m <= _sub_tile_m64_cap
         and 64 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(
-            tile_m=128 if dims.size_m <= 104 * dims.size_group else 256,
+            tile_m=64,
             tile_k=tiles.tile_k,
             tile_n=tiles.tile_n,
             bucket_base=64,
@@ -294,14 +299,9 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    _rhs_blk = (
-        (rhs.shape[1] * get_packing_factor(rhs.dtype, rhs_quant_dtype)) // rhs_scale.shape[1]
-        if rhs_scale is not None else 0
-    )
-    is_fp4_w4a16 = (
+    is_fp4_weight = (
         jnp.issubdtype(rhs.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-        and _rhs_blk < 128
     )
     return gmm_v2(
         lhs=lhs,
@@ -314,7 +314,7 @@ def gmm_wrapper(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=not is_fp4_w4a16,
+        maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
         lhs_scale=lhs_scale,
         out_row_scale=out_row_scale,
@@ -719,20 +719,24 @@ def moe_gmm(
 
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
-    _w2_blk = ((w2.shape[1] * packing_factor) // w2_scale.shape[1]) if w2_scale is not None else 0
     is_w2_fp4 = (
-        rhs_quant_dtype == jnp.float4_e2m1fn
-        or (
+        (
             jnp.issubdtype(w2.dtype, jnp.floating)
             and jax.dtypes.itemsize_bits(w2.dtype) == 4
         )
-    ) and (_w2_blk < 128)
-    fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
-    if is_w2_fp4 and lhs_scale is not None:
-        x = (
-            x.reshape(x.shape[0], lhs_scale.shape[1], -1) * lhs_scale[:, :, None]
-        ).reshape(x.shape).astype(jnp.bfloat16)
+        or rhs_quant_dtype == jnp.float4_e2m1fn
+    )
+    if (is_w2_fp4 or w1.dtype == jnp.float4_e2m1fn) and lhs_scale is not None:
+        if lhs_scale.shape[1] == 1:
+            x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
+        else:
+            nb = lhs_scale.shape[1]
+            x = (
+                x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
+                * lhs_scale[:, :, None]
+            ).reshape(x.shape).astype(lhs_scale.dtype)
         lhs_scale = None
+    fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     gmm1_res = gmm_wrapper(
         x,
         w1,
@@ -1021,16 +1025,15 @@ def fused_moe_func(
     # Under EP, auto-enable up to 128 tokens when TPU_MOE_DENSE_EXPERT_THRESHOLD
     # is unset (0) across all supported quantization & intermediate-size regimes.
     effective_dense_threshold = (
-        (
-            192
-            if packing_factor == 2 and w2.shape[1] * packing_factor <= 512
-            else (160 if w2.shape[1] * packing_factor <= 512 else 128)
-        )
+        32
         if (_DENSE_EXPERT_THRESHOLD == 0 and use_ep)
         else _DENSE_EXPERT_THRESHOLD
     )
     use_dense_expert = (
         0 < num_tokens <= effective_dense_threshold
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+        and rhs_quant_dtype in (None, jnp.float8_e4m3fn)
         and can_use_dense_expert(
             hidden_states,
             w1,
@@ -1268,17 +1271,20 @@ def fused_moe_func_fp8_dispatch(
         topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
     num_tokens = hidden_q.shape[0]
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
+    is_fp4_w4a8 = (
+        rhs_quant_dtype == jnp.float4_e2m1fn
+        and w1.dtype in (jnp.float4_e2m1fn, jnp.uint8)
+    )
     effective_dense_threshold = (
-        (
-            192
-            if packing_factor == 2 and w2.shape[1] * packing_factor <= 512
-            else (160 if w2.shape[1] * packing_factor <= 512 else 128)
-        )
+        32
         if (_DENSE_EXPERT_THRESHOLD == 0 and use_ep)
         else _DENSE_EXPERT_THRESHOLD
     )
     use_dense_expert = (
         0 < num_tokens <= effective_dense_threshold
+        and w1.dtype == jnp.float8_e4m3fn
+        and w2.dtype == jnp.float8_e4m3fn
+        and rhs_quant_dtype in (None, jnp.float8_e4m3fn)
         and can_use_dense_expert(
             jax.ShapeDtypeStruct((num_tokens, hidden_size), act_dtype),
             w1,
@@ -1307,14 +1313,27 @@ def fused_moe_func_fp8_dispatch(
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
     if use_dense_expert:
-        hidden_bf16 = (
-            jax.lax.bitcast_convert_type(hidden_q, jnp.float8_e4m3fn)
-            .astype(act_dtype)
-            .reshape(num_tokens, -1, MOE_FP8_DISPATCH_BLOCK)
-            * jnp.expand_dims(hidden_scale, -1)
-        ).reshape(num_tokens, hidden_size)
+        is_w4a16 = rhs_quant_dtype is None and w1.dtype == jnp.float4_e2m1fn
+        if is_w4a16:
+            hidden_bf16 = (
+                jax.lax.bitcast_convert_type(hidden_q, jnp.float8_e4m3fn)
+                .astype(act_dtype)
+                .reshape(num_tokens, -1, MOE_FP8_DISPATCH_BLOCK)
+                * jnp.expand_dims(hidden_scale, -1)
+            ).reshape(num_tokens, hidden_size)
+            return dense_expert_moe(
+                hidden_bf16,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                rhs_quant_dtype=rhs_quant_dtype,
+            )[:orig_num_tokens, :hidden_size]
         return dense_expert_moe(
-            hidden_bf16,
+            jnp.empty((num_tokens, hidden_size), act_dtype),
             w1,
             w2,
             w1_scale,
@@ -1323,7 +1342,29 @@ def fused_moe_func_fp8_dispatch(
             topk_ids,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
+            hidden_q=hidden_q,
+            hidden_scale=hidden_scale,
         )[:orig_num_tokens, :hidden_size]
+
+    is_fp4_rhs = rhs_quant_dtype == jnp.float4_e2m1fn or (
+        jnp.issubdtype(w1.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(w1.dtype) == 4
+    )
+    _bf16_lhs = (
+        is_fp4_rhs
+        and os.environ.get("VLLM_DSV41_MOE_FP4_BF16_LHS", "0") == "1"
+    )
+    if _bf16_lhs:
+        hidden_in = (
+            jax.lax.bitcast_convert_type(hidden_q, jnp.float8_e4m3fn)
+            .astype(act_dtype)
+            .reshape(num_tokens, -1, MOE_FP8_DISPATCH_BLOCK)
+            * jnp.expand_dims(hidden_scale, -1)
+        ).reshape(num_tokens, hidden_size)
+    else:
+        hidden_in = jax.lax.bitcast_convert_type(
+            hidden_q.reshape(num_tokens, hidden_size // 4, 4), jnp.float32
+        )
 
     effective_onehot_threshold = (
         _FAST_ONEHOT_AUTO_THRESHOLD
@@ -1333,6 +1374,7 @@ def fused_moe_func_fp8_dispatch(
                 _ONEHOT_MOE_PERMUTE_THRESHOLD is None
                 or _ONEHOT_MOE_PERMUTE_THRESHOLD < 0
             )
+            and _bf16_lhs
             and act_dtype == jnp.bfloat16
         )
         else onehot_moe_permute_threshold
@@ -1349,20 +1391,24 @@ def fused_moe_func_fp8_dispatch(
         onehot_permute,
         w_sorted,
     ) = prepare_routed_gmm_inputs(
-        hidden_q,
+        hidden_in,
         topk_ids,
         topk_weights,
         local_num_experts=w1.shape[0],
         topk=topk,
         use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
+        use_sparse_core=use_sparse_core if _bf16_lhs else False,
         onehot_moe_permute_threshold=effective_onehot_threshold,
         skip_padded_tokens=skip_padded_tokens,
         return_sorted_indices=True,
         return_onehot_combine=True,
     )
     x = moe_gmm(
-        jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn),
+        x
+        if _bf16_lhs
+        else jax.lax.bitcast_convert_type(x, jnp.float8_e4m3fn).reshape(
+            x.shape[0], hidden_size
+        ),
         w1,
         w1_scale,
         w1_bias,
@@ -1378,12 +1424,16 @@ def fused_moe_func_fp8_dispatch(
         num_tokens=num_tokens,
         topk=topk,
         use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
+        use_sparse_core=use_sparse_core if _bf16_lhs else False,
         onehot_moe_permute_threshold=effective_onehot_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         sorted_indices=sorted_indices,
         onehot_permute=onehot_permute,
         w_sorted=w_sorted,
-        lhs_scale=hidden_scale[token_indices_sorted],
+        lhs_scale=None
+        if _bf16_lhs
+        else hidden_scale[token_indices_sorted].reshape(
+            token_indices_sorted.shape[0], -1
+        ),
     )
     return x[:orig_num_tokens, :hidden_size]

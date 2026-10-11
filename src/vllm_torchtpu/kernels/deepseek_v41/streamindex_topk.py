@@ -14,6 +14,7 @@
 """StreamIndex top-k for the DeepSeek-V4.1 indexer (SEQ_ALONG_LANE layout)."""
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -41,10 +42,15 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
 from vllm_torchtpu.kernels.deepseek_v41.sparsecore_topk import (
     sc_build_cand_page_table,
     sc_cand_gather_topk,
+    sc_cand_local_topk,
     sc_cand_pregathered_topk,
     sc_gather_cand_kv_blocks,
     sc_write_cand_and_topk,
     sparsecore_topk,
+)
+
+_INDEXER_CAND_READ_16K = (
+    os.environ.get("VLLM_DSV41_INDEXER_CAND_READ_16K", "0") == "1"
 )
 
 
@@ -223,8 +229,9 @@ def kernel(
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
             jnp.int32, (bq_sz, bkv_sz), 1
         )
+        nbs_blk = 2 if (num_sublanes_bkv % 16 == 0) else num_blk_sublanes_bkv
         lane_id = (
-            lax.broadcasted_iota(jnp.int32, (1, num_blk_sublanes_bkv, 128), 2)
+            lax.broadcasted_iota(jnp.int32, (1, nbs_blk, 128), 2)
             if produce_blk_scores
             else None
         )
@@ -270,10 +277,9 @@ def kernel(
                 s_blk = (
                     jnp.where(is_newest, jnp.inf, s_summed)
                     .astype(jnp.bfloat16)
-                    .reshape(-1, num_sublanes_bkv, 128)
+                    .reshape(-1, nbs_blk * 8, 128)
                 )
-                nbs = num_blk_sublanes_bkv
-                chunks = [s_blk[:, i * nbs : (i + 1) * nbs, :] for i in range(8)]
+                chunks = [s_blk[:, i * nbs_blk : (i + 1) * nbs_blk, :] for i in range(8)]
                 for step in (4, 2, 1):
                     half = len(chunks) // 2
                     keep_first = (lane_id & step) == 0
@@ -288,7 +294,11 @@ def kernel(
                         )
                         for i in range(half)
                     ]
-                ret_blk.append(chunks[0].astype(jnp.float32))
+                ret_blk.append(
+                    chunks[0]
+                    .reshape(-1, num_blk_sublanes_bkv, 128)
+                    .astype(jnp.float32)
+                )
 
         scores = jnp.concatenate(ret, axis=0)
         blk_scores = jnp.concatenate(ret_blk, axis=0) if produce_blk_scores else None
@@ -600,7 +610,7 @@ def _compute_metadata(
 def _chunk_and_bq_config(max_num_tokens: int) -> tuple[int, int, int, int]:
     is_decode_or_verify = max_num_tokens <= 1536
     bq_mixed_in = 8 if is_decode_or_verify else 128
-    bkv_p = 16 if is_decode_or_verify else 8
+    bkv_p = 64 if is_decode_or_verify else 8
     chunk_tokens = (
         512
         if (not is_decode_or_verify and max_num_tokens >= 512 and max_num_tokens % 512 == 0)
@@ -761,6 +771,402 @@ def compute_indexer_step_metadata_jax(
     )
 
 
+def _score_cand_chunk(
+    q_chunk: jax.Array,       # [chunk_T, num_q_heads, head_dim]
+    w_chunk: jax.Array,       # [chunk_T, num_q_heads]
+    cache_kv: jax.Array,      # [total_pages, 33, 4, page_size] uint8 — UNTOUCHED!
+    c_seq_ids: jax.Array,     # [chunk_T]
+    kvl_chunk: jax.Array,     # [chunk_T]
+    qpos_chunk: jax.Array,    # [chunk_T]
+    rl_chunk: jax.Array,      # [chunk_T]
+    cands_chunk: jax.Array,   # [chunk_T, cb]
+    page_indices: jax.Array,  # [eff_max_seqs * pages_per_seq]
+    decode_end_seq: jax.Array,# scalar i32 (distribution[1])
+    *,
+    k: int,
+    pages_per_seq: int,
+    bq_sz: int,
+    max_sub_seqs: int = 1,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:
+    """Zero-copy reshape + sub_seq-coalesced 16-tile async DMA + MXU QK^T + SparseCore top-k."""
+    chunk_T, num_q_heads, head_dim = q_chunk.shape
+    cb = cands_chunk.shape[1]
+    _, sub_groups, pack, page_size = cache_kv.shape
+    kv_head_dim_groups = head_dim // pack
+    tiles_per_page = page_size // 128
+    tile_shift = (tiles_per_page - 1).bit_length()
+    tile_mask = tiles_per_page - 1
+    num_groups = chunk_T // bq_sz
+
+    tiles_per_block = 16
+    bkv_step_tokens = tiles_per_block * 128
+    max_seq_tiles = pages_per_seq * tiles_per_page
+    max_tiles = align_to(min(max_sub_seqs * max_seq_tiles, bq_sz * cb), tiles_per_block)
+    if max_sub_seqs == 1:
+        max_tiles = align_to(min(max_seq_tiles, cb), tiles_per_block)
+    n_key_words = align_to(max_sub_seqs * max_seq_tiles, 128)
+
+    cands_g = cands_chunk.reshape(num_groups, bq_sz, cb)
+    seq_ids_g = c_seq_ids.reshape(num_groups, bq_sz)
+    sub_seq = jnp.clip(seq_ids_g - seq_ids_g[:, :1], 0, max_sub_seqs - 1)
+    cand_key = jnp.where(
+        cands_g >= 0,
+        sub_seq[:, :, None] * max_seq_tiles + (cands_g >> 4),
+        n_key_words,
+    )
+    tile_present = (
+        jnp.zeros((num_groups, n_key_words), dtype=jnp.bool_)
+        .at[jnp.arange(num_groups)[:, None, None], cand_key]
+        .set(True, mode="drop")
+    )
+    n_active_tiles = jnp.sum(tile_present.astype(jnp.int32), axis=1)
+    n_steps_grp = (n_active_tiles + (tiles_per_block - 1)) // tiles_per_block
+
+    tile_to_slot = jnp.cumsum(tile_present.astype(jnp.int32), axis=1) - 1
+    active_key = (
+        jnp.zeros((num_groups, max_tiles + 1), dtype=jnp.int32)
+        .at[
+            jnp.arange(num_groups)[:, None],
+            jnp.where(tile_present, tile_to_slot, max_tiles),
+        ]
+        .set(jnp.arange(n_key_words, dtype=jnp.int32)[None, :])[:, :max_tiles]
+    )
+
+    safe_key = jnp.maximum(active_key, 0)
+    if max_sub_seqs == 1:
+        safe_t128 = safe_key
+        seq_for_tile = seq_ids_g[:, 0:1]
+    else:
+        key_sub = safe_key // max_seq_tiles
+        safe_t128 = safe_key % max_seq_tiles
+        seq_for_tile = seq_ids_g[:, 0:1] + key_sub
+    page_in_seq = safe_t128 >> tile_shift
+    phys_pages = page_indices[
+        jnp.minimum(
+            seq_for_tile * pages_per_seq + page_in_seq,
+            page_indices.shape[0] - 1,
+        )
+    ]
+    packed_pt = (phys_pages << 16) | safe_t128
+
+    safe_cands = jnp.maximum(cands_g, 0)
+    safe_cand_key = jnp.minimum(
+        sub_seq[:, :, None] * max_seq_tiles + (safe_cands >> 4),
+        n_key_words - 1,
+    )
+    flat_cand_key = (
+        jnp.arange(num_groups, dtype=jnp.int32)[:, None, None] * n_key_words
+        + safe_cand_key
+    ).reshape(-1)
+    cand_slots = tile_to_slot.reshape(-1)[flat_cand_key].reshape(num_groups, bq_sz, cb)
+    bq_pad = align_to(bq_sz, 8)
+    bq_out = bq_pad if chunk_T < 8 else bq_sz
+    out_T = num_groups * bq_out
+    row_offsets = (
+        jnp.arange(chunk_T, dtype=jnp.int32)[:, None] * (max_tiles * 16)
+    )
+    lbase_blk = jnp.where(
+        cands_chunk >= 0,
+        row_offsets
+        + ((cand_slots << 4) | (safe_cands & 15)).reshape(chunk_T, cb),
+        -1,
+    )
+
+    ring_depth = 2
+    q_g = q_chunk.reshape(num_groups, bq_sz, num_q_heads, head_dim)
+    w_g = w_chunk.reshape(num_groups, bq_sz, num_q_heads)
+    dec_f32_g = (seq_ids_g < decode_end_seq).astype(jnp.float32)
+
+    def _cand_tc_coalesced(
+        packed_pt_ref,     # SMEM: [num_groups, max_tiles]
+        n_steps_ref,       # SMEM: [num_groups]
+        q_vmem_ref,        # VMEM: [num_groups, bq_sz, num_q_heads, head_dim]
+        w_vmem_ref,        # VMEM: [num_groups, bq_sz, num_q_heads]
+        dec_vmem_ref,      # VMEM: [num_groups, bq_sz] float32
+        kvl_vmem_ref,      # VMEM: [num_groups, bq_sz]
+        qpos_vmem_ref,     # VMEM: [num_groups, bq_sz]
+        cache_kv_hbm_ref,  # HBM:  [total_pages, 33, 4, page_size] uint8
+        scores_hbm_ref,    # HBM:  [out_T, max_tiles, 128] int32
+        kv_ring_vmem_ref,  # VMEM: [ring_depth, 33, 4, 2048] uint8
+        out_ring_vmem_ref, # VMEM: [ring_depth, bq_out, tiles_per_block, 128] int32
+        sem_ref,           # DMA semaphores: [2, ring_depth]
+    ):
+        lane_128 = lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+
+        @pl.loop(0, num_groups)
+        def _grp_loop(g):
+            n_st = n_steps_ref[g]
+
+            @pl.when(n_st > 0)
+            def _run_grp():
+                q_rows = q_vmem_ref[g]
+                w_rows = w_vmem_ref[g].astype(jnp.float32)
+                dec_vec = dec_vmem_ref[g][:, None]
+                kvl_vec = kvl_vmem_ref[g][:, None]
+                qpos_vec = qpos_vmem_ref[g][:, None]
+
+                w_max = jnp.max(w_rows, axis=-1, keepdims=True)
+                rel_w = jnp.where(w_max > 0.0, w_rows / w_max, 0.0)
+                eff_rel_w = (
+                    rel_w
+                    if max_sub_seqs == 1
+                    else jnp.where(dec_vec > 0.0, 1.0, rel_w)
+                )[:, :, None]
+                q_scaled = (
+                    q_rows.astype(jnp.float32) * eff_rel_w
+                ).astype(q_rows.dtype)
+                if bq_pad > bq_sz:
+                    q_rows_p = jnp.pad(
+                        q_scaled, ((0, bq_pad - bq_sz), (0, 0), (0, 0))
+                    )
+                    w_max_p = jnp.pad(w_max, ((0, bq_pad - bq_sz), (0, 0)))
+                    w_rows_p = jnp.pad(w_rows, ((0, bq_pad - bq_sz), (0, 0)))
+                    dec_p = jnp.pad(dec_vec, ((0, bq_pad - bq_sz), (0, 0)))
+                    kvl_p = jnp.pad(kvl_vec, ((0, bq_pad - bq_sz), (0, 0)))
+                    qpos_p = jnp.pad(qpos_vec, ((0, bq_pad - bq_sz), (0, 0)))
+                else:
+                    q_rows_p = q_scaled
+                    w_max_p = w_max
+                    w_rows_p = w_rows
+                    dec_p = dec_vec
+                    kvl_p = kvl_vec
+                    qpos_p = qpos_vec
+                q_hm = q_rows_p.transpose(1, 0, 2).reshape(
+                    num_q_heads * bq_pad, head_dim
+                )
+
+                def _issue_16_tiles(s, slot):
+                    u_base = s * tiles_per_block
+                    for t_i in range(tiles_per_block):
+                        pt = packed_pt_ref[g, u_base + t_i]
+                        p = pt >> 16
+                        l_off = pl.multiple_of((pt & tile_mask) * 128, 128)
+                        pltpu.make_async_copy(
+                            cache_kv_hbm_ref.at[p, :, :, pl.ds(l_off, 128)],
+                            kv_ring_vmem_ref.at[slot, :, :, pl.ds(t_i * 128, 128)],
+                            sem_ref.at[0, slot],
+                        ).start()
+
+                def _wait_16_tiles(slot):
+                    pltpu.make_async_copy(
+                        kv_ring_vmem_ref.at[slot],
+                        kv_ring_vmem_ref.at[slot],
+                        sem_ref.at[0, slot],
+                    ).wait()
+
+                def _start_out(s, slot):
+                    pltpu.make_async_copy(
+                        out_ring_vmem_ref.at[slot],
+                        scores_hbm_ref.at[
+                            pl.ds(g * bq_out, bq_out),
+                            pl.ds(s * tiles_per_block, tiles_per_block),
+                            :,
+                        ],
+                        sem_ref.at[1, slot],
+                    ).start()
+
+                def _wait_out(s, slot):
+                    pltpu.make_async_copy(
+                        out_ring_vmem_ref.at[slot],
+                        scores_hbm_ref.at[
+                            pl.ds(g * bq_out, bq_out),
+                            pl.ds(s * tiles_per_block, tiles_per_block),
+                            :,
+                        ],
+                        sem_ref.at[1, slot],
+                    ).wait()
+
+                @pl.loop(0, jnp.minimum(n_st, ring_depth))
+                def _pro(s):
+                    _issue_16_tiles(s, s)
+
+                @pl.loop(0, n_st)
+                def _step(s):
+                    slot = s % ring_depth
+
+                    @pl.when(s >= ring_depth)
+                    def _wait_prev():
+                        _wait_out(s - ring_depth, slot)
+                        _issue_16_tiles(s, slot)
+
+                    _wait_16_tiles(slot)
+                    kv_tile = kv_ring_vmem_ref.at[slot][...]
+                    bkv = pltpu.bitcast(
+                        kv_tile[:kv_head_dim_groups].reshape(
+                            head_dim, bkv_step_tokens
+                        ),
+                        jnp.float8_e4m3fn,
+                    )
+                    bkv_scale = pltpu.bitcast(
+                        kv_tile[kv_head_dim_groups : kv_head_dim_groups + 1].reshape(
+                            pack, bkv_step_tokens
+                        )[0:1],
+                        jnp.float8_e8m0fnu,
+                    ).astype(jnp.float32)
+
+                    qk = jnp.einsum(
+                        "nd,dm->nm",
+                        q_hm,
+                        bkv,
+                        preferred_element_type=jnp.float32,
+                    )
+                    st = jnp.maximum(qk, 0.0).reshape(
+                        num_q_heads, bq_pad, bkv_step_tokens
+                    )
+                    if max_sub_seqs == 1 and chunk_T >= 8:
+                        s_summed_p = (st.sum(axis=0) * w_max_p) * bkv_scale
+                    else:
+                        s_dec = (st * w_rows_p.T[:, :, None]).sum(axis=0)
+                        s_mix = st.sum(axis=0) * w_max_p
+                        s_summed_p = (
+                            s_dec * dec_p + s_mix * (1.0 - dec_p)
+                        ) * bkv_scale
+
+                    kv_pos = jnp.concatenate(
+                        [
+                            (packed_pt_ref[g, s * tiles_per_block + t_i] & 0xFFFF)
+                            * 128
+                            + lane_128
+                            for t_i in range(tiles_per_block)
+                        ],
+                        axis=1,
+                    )
+                    mask = (kv_pos < kvl_p) & (kv_pos <= qpos_p)
+                    s_masked = jnp.where(mask, s_summed_p, -jnp.inf).reshape(
+                        bq_pad, tiles_per_block, 128
+                    )[:bq_out]
+                    out_ring_vmem_ref.at[slot][...] = pltpu.bitcast(
+                        s_masked, jnp.int32
+                    )
+                    _start_out(s, slot)
+
+                @pl.loop(jnp.maximum(0, n_st - ring_depth), n_st)
+                def _epi(s):
+                    _wait_out(s, s % ring_depth)
+
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    compact_scores = pl.pallas_call(
+        _cand_tc_coalesced,
+        out_shape=jax.ShapeDtypeStruct(
+            (out_T, max_tiles, 128), jnp.int32
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(1,),
+            in_specs=[vmem_spec, vmem_spec, vmem_spec, vmem_spec, vmem_spec, hbm_spec],
+            out_specs=hbm_spec,
+            scratch_shapes=[
+                pltpu.VMEM((ring_depth, sub_groups, pack, bkv_step_tokens), jnp.uint8),
+                pltpu.VMEM((ring_depth, bq_out, tiles_per_block, 128), jnp.int32),
+                pltpu.SemaphoreType.DMA((2, ring_depth)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=100 * 1024 * 1024,
+            disable_bounds_checks=True,
+        ),
+        name=f"StreamIdxCandTC16_g{num_groups}_bq{bq_sz}_ms{max_sub_seqs}_mt{max_tiles}",
+    )(
+        packed_pt,
+        n_steps_grp,
+        q_g,
+        w_g,
+        dec_f32_g,
+        kvl_chunk.reshape(num_groups, bq_sz),
+        qpos_chunk.reshape(num_groups, bq_sz),
+        cache_kv,
+    )
+    if scheduling_group_id is not None:
+        compact_scores = xla_metadata.set_xla_metadata(
+            compact_scores, _scheduling_group_id=scheduling_group_id
+        )
+    return sc_cand_local_topk(
+        compact_scores,
+        lbase_blk,
+        cands_chunk,
+        rl_chunk,
+        k=k,
+        scheduling_group_id=scheduling_group_id,
+    )
+
+
+def streamindex_cand_read_topk(
+    q_prep: jax.Array,
+    w_prep: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    candidates: jax.Array,
+    *,
+    eff_row_lengths: jax.Array,
+    seq_ids_all: jax.Array,
+    k: int = 512,
+    compression_ratio: int = 1,
+) -> jax.Array:
+    """Fast 16K candidate-only reader pipeline (cand_mode == 'read')."""
+    T = q_prep.shape[0]
+    pages_per_seq = page_indices.shape[0] // seq_lens.shape[0]
+    token_ids = jnp.arange(T, dtype=jnp.int32)
+    q_start = cu_q_lens[seq_ids_all]
+    q_len = cu_q_lens[seq_ids_all + 1] - q_start
+    seq_len = seq_lens[seq_ids_all]
+    token_pos = seq_len - q_len + (token_ids - q_start)
+    shift_comp = (compression_ratio - 1).bit_length()
+    kv_len_tok = seq_len >> shift_comp
+    q_pos_tok = ((token_pos + 1) >> shift_comp) - 1
+    dec_end = distribution[1]
+
+    bq_sz = 6 if T % 6 == 0 else (8 if T % 8 == 0 else 1)
+    max_chunk_T = 64 * bq_sz
+    max_sub = 1 if T % 6 == 0 else (bq_sz if T <= 64 else 1)
+
+    if T > max_chunk_T and T % max_chunk_T == 0:
+        outs = []
+        for s0 in range(0, T, max_chunk_T):
+            s1 = s0 + max_chunk_T
+            outs.append(
+                _score_cand_chunk(
+                    q_prep[s0:s1],
+                    w_prep[s0:s1],
+                    cache_kv,
+                    seq_ids_all[s0:s1],
+                    kv_len_tok[s0:s1],
+                    q_pos_tok[s0:s1],
+                    eff_row_lengths[s0:s1],
+                    candidates[s0:s1],
+                    page_indices,
+                    dec_end,
+                    k=k,
+                    pages_per_seq=pages_per_seq,
+                    bq_sz=bq_sz,
+                    max_sub_seqs=max_sub,
+                )
+            )
+        return jnp.concatenate(outs, axis=0)
+
+    return _score_cand_chunk(
+        q_prep,
+        w_prep,
+        cache_kv,
+        seq_ids_all,
+        kv_len_tok,
+        q_pos_tok,
+        eff_row_lengths,
+        candidates,
+        page_indices,
+        dec_end,
+        k=k,
+        pages_per_seq=pages_per_seq,
+        bq_sz=bq_sz,
+        max_sub_seqs=max_sub,
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -867,7 +1273,7 @@ def streamindex_topk(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     seq_batch_size=seq_batch_size,
-                    buffer_count=DEFAULT_BUFFER_COUNT[case.value],
+                    buffer_count=min(DEFAULT_BUFFER_COUNT[case.value], 2),
                     chunk_idx=chunk_idx,
                     produce_blk_scores=produce_blk,
                 ),
@@ -880,7 +1286,7 @@ def streamindex_topk(
                 ),
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+                    vmem_limit_bytes=max(DEFAULT_VMEM_LIMIT_BYTES, 120 * 1024 * 1024),
                     disable_bounds_checks=True,
                 ),
                 out_shape=out_shapes if produce_blk else out_shapes[0],
@@ -895,7 +1301,7 @@ def streamindex_topk(
         return res if produce_blk else (res, None)
 
     bq_mixed = min(num_queries_per_block, chunk_len)
-    decode_req_batch_size = 4
+    decode_req_batch_size = 1 if bkv_p * page_size >= 32768 else 4
     decode_batch_end = (
         distribution[0] // decode_req_batch_size * decode_req_batch_size
     )
@@ -930,10 +1336,36 @@ def streamindex_topk(
             0,
         )
 
+    if (
+        _INDEXER_CAND_READ_16K
+        and candidates is not None
+        and not produce_blk
+    ):
+        return streamindex_cand_read_topk(
+            q,
+            prepared_indexer_weights,
+            cache_kv,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            candidates,
+            eff_row_lengths=eff_row_lengths,
+            seq_ids_all=seq_ids_all,
+            k=k,
+            compression_ratio=compression_ratio,
+        )
+
     cand_rank_map = None
     cand_p_pad = 0
     blk_per_page = page_size // 8
-    if candidates is not None and not produce_blk and pages_per_seq > 160:
+    if (
+        candidates is not None
+        and not produce_blk
+        and pages_per_seq > 160
+        and bkv_p < 64
+        and precomputed_pass_num_steps is None
+    ):
         page_indices, cand_rank_map, n_active_pages, cand_p_pad = (
             sc_build_cand_page_table(
                 candidates,
@@ -1108,9 +1540,12 @@ def streamindex_topk(
         for slice_spec, pass_meta in ordered_passes:
             if (
                 state is not None
-                and not need_smem_split
                 and slice_spec[7] is MlaCase.DECODE
-                and start >= max_num_seqs
+                and (
+                    (not need_smem_split and start >= max_num_seqs)
+                    or max_num_tokens % 6 == 0
+                    or max_num_tokens > 1536
+                )
             ):
                 continue
             run = functools.partial(
@@ -1132,14 +1567,15 @@ def streamindex_topk(
         assert state is not None
         scores, blk_scores = state
         assert scores is not None
-        scores = scores.reshape(chunk_len, -1)
 
         rl_m = eff_row_lengths[start : start + chunk_len]
         if produce_blk:
             assert blk_scores is not None
-            num_blk_sub_bkv = bkv_p * page_size // 1024
+            num_blk_sub_bkv = (
+                2 if (bkv_p * page_size) % 2048 == 0 else bkv_p * page_size // 1024
+            )
             chunk_topk_idxs, cands_m = sc_write_cand_and_topk(
-                blk_scores.reshape(chunk_len, -1),
+                blk_scores,
                 scores,
                 rl_m,
                 cb=candidate_topk_blocks,
@@ -1163,7 +1599,7 @@ def streamindex_topk(
             )
         else:
             chunk_topk_idxs = sparsecore_topk(
-                scores,
+                scores.reshape(chunk_len, -1),
                 k,
                 row_lengths=rl_m,
                 scheduling_group_id=sc_group,

@@ -124,8 +124,8 @@ def _combine_arrivals(
             out_dtype=out_dtype,
         )
         return combine(arrivals, coef, rows)
-    rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
-    coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
+    rows_fp8 = arrivals[pos.T.reshape(-1)]
+    coef_k = coef.T.reshape(-1)
     terms = []
     for k in range(topk):
         slot_rows = lax.slice(
@@ -500,9 +500,13 @@ def fused_ep_moe_v2(
             topk_weights = jnp.where(valid_route, topk_w_l.astype(jnp.float32), 0.0)
         else:
             scores = _apply_scoring_fn(gate_l, scoring_fn)
-            select_rows = MAX_ROUTING_BLOCK
-            while t_local % select_rows:
-                select_rows //= 2
+            select_rows = (
+                t_local
+                if t_local <= MAX_ROUTING_BLOCK
+                else next(
+                    d for d in range(MAX_ROUTING_BLOCK, 7, -8) if t_local % d == 0
+                )
+            )
             if hash_l is not None:
                 topk_idx = hash_l.astype(jnp.int32)
                 topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
@@ -527,16 +531,6 @@ def fused_ep_moe_v2(
             if routed_scaling_factor != 1.0:
                 topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
             topk_weights = jnp.where(row_routes, topk_weights, 0.0)
-        # A count of the masked rows would be the other half of this: an
-        # incident today is degraded output against a completely clean log.
-        # It is not added here because the only in-trace channel for it,
-        # jax.debug.print, makes the program refuse to lower for TPU from a
-        # host, which is how this repository verifies that a change served
-        # the same program. A counter belongs in a metrics channel outside
-        # the trace.
-        # One all-gather carries the indices, the row scales where the rows
-        # were quantized, and the per-expert pair counts the routing plan
-        # would otherwise exchange in a collective of its own.
         local_blocks = topk_idx.astype(jnp.int32).reshape(
             t_local * topk // block, block
         )

@@ -103,6 +103,112 @@ def _stateless_counter_uniform_u(
     return ((h & 0x007FFFFF).to(torch.float32) + 0.5) * (span / 8388608.0) + min_val
 
 
+def _apply_cand_topk_topp_and_gumbel(
+    cand_v: torch.Tensor,
+    cand_id: torch.Tensor,
+    global_lse_1d: torch.Tensor,
+    global_draft_logit_1d: torch.Tensor,
+    tail_sampled_ids: torch.Tensor,
+    row_draft_token_ids: torch.Tensor,
+    seed_lo: torch.Tensor,
+    row_top_k: torch.Tensor | None,
+    row_top_p: torch.Tensor | None,
+    k_per_shard: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_rows, m_cand = cand_v.shape
+    sorted_v, sort_idx = torch.sort(cand_v, dim=-1, descending=True)
+    sorted_id = cand_id.gather(-1, sort_idx)
+
+    global_lse_col = global_lse_1d.unsqueeze(1)
+    draft_logit_col = global_draft_logit_1d.unsqueeze(1)
+
+    if row_top_k is not None:
+        has_topk = row_top_k > 0
+        k_clamped = row_top_k.clamp(min=1, max=m_cand)
+        topk_cut = sorted_v.gather(-1, (k_clamped - 1).to(torch.int64))
+        after_topk_v = torch.where(
+            has_topk & (sorted_v < topk_cut),
+            torch.full_like(sorted_v, -1e12),
+            sorted_v,
+        )
+        topk_covered = has_topk & (row_top_k <= k_per_shard)
+        base_lse = torch.where(
+            has_topk,
+            torch.logsumexp(after_topk_v, dim=-1, keepdim=True),
+            global_lse_col,
+        )
+        draft_topk_ok = (~has_topk) | (draft_logit_col >= topk_cut)
+    else:
+        has_topk = torch.zeros(
+            (n_rows, 1), dtype=torch.bool, device=sorted_v.device
+        )
+        after_topk_v = sorted_v
+        topk_covered = has_topk
+        base_lse = global_lse_col
+        draft_topk_ok = torch.ones_like(has_topk)
+
+    if row_top_p is not None:
+        has_topp = row_top_p < 1.0
+        probs = torch.exp(after_topk_v - base_lse)
+        cum_probs = torch.cumsum(probs, dim=-1)
+        reached = cum_probs >= row_top_p
+        any_reached = reached.any(dim=-1, keepdim=True)
+        first_idx = torch.where(
+            any_reached,
+            reached.to(torch.int32).argmax(dim=-1, keepdim=True),
+            torch.full(
+                (n_rows, 1),
+                m_cand - 1,
+                dtype=torch.int32,
+                device=sorted_v.device,
+            ),
+        )
+        p_thresh = probs.gather(-1, first_idx.to(torch.int64))
+        masked_v = torch.where(
+            has_topp & (probs < p_thresh),
+            torch.full_like(after_topk_v, -1e12),
+            after_topk_v,
+        )
+        topp_covered = has_topp & any_reached
+        draft_prob_pre = torch.exp(draft_logit_col - base_lse)
+        draft_topp_ok = (~has_topp) | (draft_prob_pre >= p_thresh)
+    else:
+        masked_v = after_topk_v
+        topp_covered = torch.zeros_like(has_topk)
+        draft_topp_ok = torch.ones_like(has_topk)
+
+    covered = topk_covered | topp_covered
+    masked_lse = torch.logsumexp(masked_v, dim=-1, keepdim=True)
+    draft_kept = draft_topk_ok & draft_topp_ok
+    cand_draft_logit = torch.where(
+        draft_kept,
+        draft_logit_col,
+        torch.full_like(draft_logit_col, -1e12),
+    )
+
+    row_idx = torch.arange(
+        n_rows, dtype=torch.int32, device=sorted_v.device
+    ).unsqueeze(1)
+    u_cand = _stateless_counter_uniform_u(row_idx, sorted_id, seed_lo)
+    gumbel_cand = -torch.log(-torch.log(u_cand) + 1e-30)
+    cand_scores = torch.where(
+        sorted_id == row_draft_token_ids,
+        torch.full_like(masked_v, -1e30),
+        masked_v + gumbel_cand,
+    )
+    cand_best_pos = cand_scores.argmax(dim=-1, keepdim=True)
+    cand_sampled = sorted_id.gather(-1, cand_best_pos).squeeze(-1).to(torch.int32)
+
+    out_lse = torch.where(covered, masked_lse, global_lse_col).squeeze(-1)
+    out_draft_logit = torch.where(
+        covered, cand_draft_logit, draft_logit_col
+    ).squeeze(-1)
+    out_sampled = torch.where(
+        covered.squeeze(-1), cand_sampled, tail_sampled_ids
+    )
+    return out_lse, out_draft_logit, out_sampled
+
+
 def tp_local_random_spec_verify_logits(
     logits_processor,
     lm_head: torch.nn.Module,
@@ -111,14 +217,18 @@ def tp_local_random_spec_verify_logits(
     row_draft_token_ids: torch.Tensor,
     seed_lo: torch.Tensor,
     u_local: torch.Tensor | None = None,
+    row_top_k: torch.Tensor | None = None,
+    row_top_p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute exact global logsumexp, draft logit, and Gumbel-sampled token IDs across TP shards.
 
     Avoids materializing or AllGathering full-vocabulary [N, V] logits OR [N, V_shard] float32 uniform
     tensors in HBM by generating stateless counter-hash uniform variates in VPU registers when u_local
-    is None and reducing each local shard to [N, 4] int32-bitcast scalars before tp_all_gather.
+    is None and reducing each local shard to [N, 4] (or [N, 132] with top-k/top-p) int32-bitcast scalars
+    before tp_all_gather.
     """
     tp_size = getattr(lm_head, "tp_size", 1)
+    need_filtering = (row_top_k is not None) or (row_top_p is not None)
     if tp_size <= 1:
         logits_full = (
             logits_processor(lm_head, hidden_states).to(torch.float32)
@@ -153,7 +263,22 @@ def tp_local_random_spec_verify_logits(
             logits_full + gumbel_noise,
         )
         sampled_ids = scores.argmax(dim=-1).to(torch.int32)
-        return global_lse, draft_logit, sampled_ids
+        if not need_filtering:
+            return global_lse, draft_logit, sampled_ids
+        k_cand = min(512, logits_full.shape[-1])
+        top_v, top_i = torch.topk(logits_full, k_cand, dim=-1)
+        return _apply_cand_topk_topp_and_gumbel(
+            top_v,
+            top_i.to(torch.int32),
+            global_lse,
+            draft_logit,
+            sampled_ids,
+            row_draft_token_ids,
+            seed_lo,
+            row_top_k,
+            row_top_p,
+            k_cand,
+        )
 
     logits_local = (
         logits_processor._get_logits(
@@ -203,19 +328,71 @@ def tp_local_random_spec_verify_logits(
     local_best_score, local_best_idx = gumbel_scores.max(dim=-1, keepdim=True)
     global_idx = local_best_idx.to(torch.int32) + start_t
 
+    if not need_filtering:
+        packed = torch.cat(
+            [
+                local_lse.view(torch.int32),
+                local_draft_logit.view(torch.int32),
+                local_best_score.view(torch.int32),
+                global_idx,
+            ],
+            dim=-1,
+        )
+        n_rows, raw_width = packed.shape[0], packed.shape[1]
+        pad_width = ((raw_width + 127) // 128) * 128
+        packed_aligned = (
+            torch.cat(
+                (
+                    packed,
+                    torch.zeros(
+                        (*packed.shape[:-1], pad_width - raw_width),
+                        dtype=packed.dtype,
+                        device=packed.device,
+                    ),
+                ),
+                dim=-1,
+            )
+            if pad_width > raw_width
+            else packed
+        )
+        gathered = tp_all_gather(packed_aligned, dim=0).view(
+            tp_size, n_rows, pad_width
+        )[..., :raw_width]
+
+        global_lse = torch.logsumexp(gathered[..., 0].view(torch.float32), dim=0)
+        global_draft_logit = gathered[..., 1].view(torch.float32).max(dim=0).values
+        winner_rank = gathered[..., 2].view(torch.float32).argmax(dim=0, keepdim=True)
+        sampled_ids = gathered[..., 3].gather(0, winner_rank).squeeze(0).to(torch.int32)
+        return global_lse, global_draft_logit, sampled_ids
+
+    k_cand = min(64, logits_local.shape[-1])
+    local_top_v, local_top_i = torch.topk(logits_local, k_cand, dim=-1)
+    local_top_id = local_top_i.to(torch.int32) + start_t
     packed = torch.cat(
         [
             local_lse.view(torch.int32),
             local_draft_logit.view(torch.int32),
             local_best_score.view(torch.int32),
             global_idx,
+            local_top_v.view(torch.int32),
+            local_top_id,
         ],
         dim=-1,
     )
     n_rows, raw_width = packed.shape[0], packed.shape[1]
     pad_width = ((raw_width + 127) // 128) * 128
     packed_aligned = (
-        torch.cat((packed, torch.zeros((*packed.shape[:-1], pad_width - raw_width), dtype=packed.dtype, device=packed.device)), dim=-1)
+        torch.cat(
+            (
+                packed,
+                torch.zeros(
+                    (*packed.shape[:-1], pad_width - raw_width),
+                    dtype=packed.dtype,
+                    device=packed.device,
+                ),
+            ),
+            dim=-1,
+        )
         if pad_width > raw_width
         else packed
     )
@@ -226,8 +403,30 @@ def tp_local_random_spec_verify_logits(
     global_lse = torch.logsumexp(gathered[..., 0].view(torch.float32), dim=0)
     global_draft_logit = gathered[..., 1].view(torch.float32).max(dim=0).values
     winner_rank = gathered[..., 2].view(torch.float32).argmax(dim=0, keepdim=True)
-    sampled_ids = gathered[..., 3].gather(0, winner_rank).squeeze(0).to(torch.int32)
-    return global_lse, global_draft_logit, sampled_ids
+    tail_sampled_ids = gathered[..., 3].gather(0, winner_rank).squeeze(0).to(torch.int32)
+    cand_v = (
+        gathered[..., 4 : 4 + k_cand]
+        .view(torch.float32)
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_cand)
+    )
+    cand_id = (
+        gathered[..., 4 + k_cand : 4 + 2 * k_cand]
+        .permute(1, 0, 2)
+        .reshape(n_rows, tp_size * k_cand)
+    )
+    return _apply_cand_topk_topp_and_gumbel(
+        cand_v,
+        cand_id,
+        global_lse,
+        global_draft_logit,
+        tail_sampled_ids,
+        row_draft_token_ids,
+        seed_lo,
+        row_top_k,
+        row_top_p,
+        k_cand,
+    )
 
 
 def tp_local_topk_logits(

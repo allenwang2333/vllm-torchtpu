@@ -128,6 +128,7 @@ def get_mhc_post_collapse_norm_v41_op(rms_eps: float = 1e-6):
         functools.partial(mhc_post_collapse_norm_v41, rms_eps=rms_eps),
         6,
         _fake_mhc_post_collapse_norm_v41,
+        donate_argnums=(1,),
     )
 
 
@@ -182,6 +183,7 @@ def get_mhc_ops_v41(
             functools.partial(mhc_fused_post_pre_v41, **kw),
             9,
             _fake_mhc_fused_post_pre_v41,
+            donate_argnums=(1,),
         ),
         post=get_mhc_post_v41_op(),
         pre_quant=_get_or_register_op(
@@ -195,6 +197,7 @@ def get_mhc_ops_v41(
             functools.partial(mhc_fused_post_pre_quant_v41, **kw, write_bf16=True),
             9,
             _fake_mhc_fused_post_pre_quant_v41,
+            donate_argnums=(1,),
         ),
         engram_gate=get_engram_gate_v41_op(rms_eps),
         fused_engram=_get_or_register_op(
@@ -214,5 +217,6 @@ def get_mhc_ops_v41(
             functools.partial(mhc_fused_post_pre_quant_v41, **kw, write_bf16=False),
             9,
             _fake_mhc_fused_post_pre_quant_fp8_only_v41,
+            donate_argnums=(1,),
         ),
     )

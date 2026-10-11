@@ -325,6 +325,10 @@ class DFlashProposer:
             or not isinstance(chunk.attn_metadata, dict)
         ):
             return None
+        bt_cache = getattr(self, "_reusable_draft_bt_cache", None)
+        if bt_cache is None:
+            bt_cache = {}
+            self._reusable_draft_bt_cache = bt_cache
         tables: dict[str, torch.Tensor] = {}
         for layer_name in self._draft_attn_layer_names:
             md = chunk.attn_metadata.get(layer_name)
@@ -339,10 +343,14 @@ class DFlashProposer:
             if target_reqs == padded_num_reqs:
                 tables[layer_name] = md.block_tables
             else:
-                blocks_per_req = md.block_tables.shape[0] // target_reqs
-                tables[layer_name] = md.block_tables[
-                    : padded_num_reqs * blocks_per_req
-                ]
+                bt = md.block_tables
+                ckey = (layer_name, id(bt), padded_num_reqs)
+                cached_slice = bt_cache.get(ckey)
+                if cached_slice is None or cached_slice[0] is not bt:
+                    blocks_per_req = bt.shape[0] // target_reqs
+                    cached_slice = (bt, bt[: padded_num_reqs * blocks_per_req])
+                    bt_cache[ckey] = cached_slice
+                tables[layer_name] = cached_slice[1]
         return tables
 
     def _build_draft_attn_metadata(
@@ -350,6 +358,7 @@ class DFlashProposer:
         chunk: DraftChunkInputs,
         num_tokens_padded: int,
         seq_lens: torch.Tensor,
+        reusable_tables: dict[str, torch.Tensor] | None = None,
     ) -> dict:
         """
         Construct attention metadata for DFlash draft forward.
@@ -361,7 +370,10 @@ class DFlashProposer:
         query_start_loc, request_distribution = self._get_static_attn_tensors(
             padded_num_reqs
         )
-        reusable_tables = self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
+        if reusable_tables is None:
+            reusable_tables = self._get_reusable_draft_block_tables(
+                chunk, padded_num_reqs
+            )
         if reusable_tables is not None:
             _, _, pos_buf, _ = self._get_static_prep_bufs()
             return {
@@ -631,11 +643,13 @@ class DFlashProposer:
             total_draft_tokens = chunk.num_reqs * block_size
             padded_len = self._get_padded_len(total_draft_tokens)
             padded_num_reqs = padded_len // block_size
+            reusable_tables = self._get_reusable_draft_block_tables(
+                chunk, padded_num_reqs
+            )
             if (
                 chunk.aux_hidden_states
                 and next_tokens_device is not None
-                and self._get_reusable_draft_block_tables(chunk, padded_num_reqs)
-                is not None
+                and reusable_tables is not None
             ):
                 target_hidden = chunk.aux_hidden_states
                 aux_first = (
@@ -647,10 +661,14 @@ class DFlashProposer:
                 position_ids_device = chunk.position_ids
                 if position_ids_device.dim() > 1:
                     position_ids_device = position_ids_device[0]
-                ctx_positions = position_ids_device[:num_target_tokens]
+                ctx_positions = (
+                    position_ids_device
+                    if position_ids_device.shape[0] == num_target_tokens
+                    else position_ids_device[:num_target_tokens]
+                )
                 ctx_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
                 draft_lengths_in = (
-                    chunk.draft_lengths.to(torch.int32)
+                    chunk.draft_lengths
                     if chunk.draft_lengths is not None
                     else self._zero_draft_lengths(chunk.num_reqs)
                 )
@@ -671,7 +689,17 @@ class DFlashProposer:
                     chunk,
                     padded_len,
                     seq_lens_buf,
+                    reusable_tables=reusable_tables,
                 )
+                out_padded_reqs = 0
+                if return_device:
+                    from vllm_torchtpu.runner.tpu_runner import (
+                        _get_padded_num_reqs_with_upper_limit,
+                    )
+
+                    out_padded_reqs = _get_padded_num_reqs_with_upper_limit(
+                        chunk.num_reqs, self.runner.max_num_reqs
+                    )
                 with (
                     set_forward_context(
                         draft_attn_metadata,
@@ -690,7 +718,7 @@ class DFlashProposer:
                             target_hidden,
                             ctx_positions,
                             ctx_md_tuple,
-                            next_tokens_device.to(torch.int32),
+                            next_tokens_device,
                             draft_lengths_in,
                             seq_lens_buf,
                             num_reqs_t,
@@ -698,17 +726,11 @@ class DFlashProposer:
                             padded_len,
                             self.mask_token_id,
                             INVALID_TOKEN_ID,
+                            out_padded_reqs,
                         )
                     )
                 if return_device:
-                    from vllm_torchtpu.runner.tpu_runner import (
-                        _get_padded_num_reqs_with_upper_limit,
-                    )
-
-                    r_pad = _get_padded_num_reqs_with_upper_limit(
-                        chunk.num_reqs, self.runner.max_num_reqs
-                    )
-                    return _pad_or_slice_rows(draft_tokens_chunk, r_pad)
+                    return draft_tokens_chunk
                 return draft_tokens_chunk.cpu().tolist()[: chunk.num_reqs]
 
         # 1. Hoist all KV cache updates across chunks to the top of propose
@@ -1085,6 +1107,7 @@ class DFlashProposer:
                         num_tokens,
                         self.mask_token_id,
                         INVALID_TOKEN_ID,
+                        r_pad,
                     )
                 )
                 synchronize_tensors(full_chunk, wait=True)
@@ -1498,7 +1521,7 @@ class DFlashProposer:
         )
         num_accepted = num_valid.unsqueeze(1).to(torch.int32)
 
-        num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
+        num_draft = draft_lengths[safe_req_indices].to(torch.int32).unsqueeze(1)
         is_verify_window = (num_draft > 0).to(torch.int32)
         verify_base = start_positions_padded + num_accepted
         prompt_base = ((last_positions + 1) * valid_mask).to(torch.int32)
@@ -1552,12 +1575,13 @@ class DFlashProposer:
         padded_len: int,
         mask_token_id: int,
         invalid_token_id: int,
+        out_padded_reqs: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Single-graph fused DSpark context KV store + device prep + draft + sample."""
+        """Single-graph fused DSpark context KV store + device prep + draft + sample + static pad."""
         _ = self._run_context_kv_precompute_in_graph(
             target_hidden_states, ctx_positions, ctx_md_tuple
         )
-        return self._prep_forward_and_sample_body(
+        draft_tokens_chunk, hidden = self._prep_forward_and_sample_body(
             next_tokens_device,
             ctx_md_tuple[0].query_start_loc,
             ctx_positions,
@@ -1569,6 +1593,11 @@ class DFlashProposer:
             mask_token_id,
             invalid_token_id,
         )
+        if out_padded_reqs > 0:
+            draft_tokens_chunk = _pad_or_slice_rows(
+                draft_tokens_chunk, out_padded_reqs
+            )
+        return draft_tokens_chunk, hidden
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_build_dflash_inputs_next_tokens(

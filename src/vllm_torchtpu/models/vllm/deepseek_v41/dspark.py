@@ -247,6 +247,30 @@ class DSparkDeepseekV41Model(nn.Module):
         from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
         from vllm_torchtpu.utils import synchronize_tensors
 
+        for _layer in self.layers:
+            _attn = getattr(_layer, "attn", None)
+            if _attn is not None:
+                for _prop in (
+                    "kv_rope_op",
+                    "q_rope_op",
+                    "kvnorm_rope_op",
+                    "qnorm_rope_op",
+                    "context_kv_attn_op",
+                    "attn_op",
+                    "qkv_norm_rope_op",
+                    "qkv_norm_rope_quant_op",
+                    "qkv_norm_rope_and_quant_op",
+                    "wq_b_q_rope_op",
+                    "wq_b_q_rope_prequant_op",
+                    "o_proj_op",
+                    "o_proj_wob_op",
+                ):
+                    if hasattr(type(_attn), _prop):
+                        try:
+                            _ = getattr(_attn, _prop)
+                        except Exception:
+                            pass
+
         mp_w = getattr(self.main_proj, "weight", None)
         mp_s = getattr(self.main_proj, "weight_scale", None)
         n_chunks = len(self.target_layer_ids)

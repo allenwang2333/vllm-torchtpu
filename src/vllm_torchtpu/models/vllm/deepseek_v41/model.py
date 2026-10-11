@@ -1175,6 +1175,8 @@ class DeepseekV41Model(nn.Module):
             if get_pp_group().is_first_rank
             else PPMissingLayer()
         )
+        if hasattr(config, "_tpu_candidate_block_buffer"):
+            delattr(config, "_tpu_candidate_block_buffer")
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         tp_size = get_tensor_model_parallel_world_size()
@@ -1209,6 +1211,8 @@ class DeepseekV41Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        if hasattr(config, "_tpu_candidate_block_buffer"):
+            delattr(config, "_tpu_candidate_block_buffer")
 
         total_layers = int(config.num_hidden_layers)
         ced_boundary = total_layers // 2
@@ -1543,7 +1547,9 @@ class DeepseekV41Model(nn.Module):
                 device=positions.device,
                 out_1d_i32_buf=buf_1d,
             )
-            if engram_hashes is None:
+            if engram_hashes is not None:
+                self._engram_buf_dirty = True
+            else:
                 tp_size = get_tensor_model_parallel_world_size()
                 t_local = (
                     num_tokens // tp_size
@@ -1551,15 +1557,19 @@ class DeepseekV41Model(nn.Module):
                     else num_tokens
                 )
                 if buf_1d is not None:
-                    if buf_1d.ndim == 2:
-                        buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
-                    else:
-                        n_bytes = (
-                            t_local
-                            * n_tables
-                            * _engram_table_bytes(n_hash_cols, self._engram_packed_dim)
-                        )
-                        buf_1d[:n_bytes].zero_()
+                    if getattr(self, "_engram_buf_dirty", False):
+                        if buf_1d.ndim == 2:
+                            buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
+                        else:
+                            n_bytes = (
+                                t_local
+                                * n_tables
+                                * _engram_table_bytes(
+                                    n_hash_cols, self._engram_packed_dim
+                                )
+                            )
+                            buf_1d[:n_bytes].zero_()
+                        self._engram_buf_dirty = False
                     engram_hashes = buf_1d
                 else:
                     cols_flat = (t_local * n_tables * n_hash_cols) // num_tokens
@@ -1678,8 +1688,22 @@ class DeepseekV41Model(nn.Module):
 
         if plan is None or plan.passthrough:
             if hidden_states.shape[0] != num_tokens:
-                hidden_states = tp_all_gather(hidden_states, dim=0)
-                pre_mix = tp_all_gather(pre_mix, dim=0)
+                pm_cols = int(pre_mix.shape[-1])
+                pm_pad = ((pm_cols + 127) // 128) * 128
+                pm_aligned = torch.nn.functional.pad(
+                    pre_mix.to(hidden_states.dtype), (0, pm_pad - pm_cols)
+                )
+                hs_flat = hidden_states.reshape(hidden_states.shape[0], -1)
+                hs_cols = hs_flat.shape[-1]
+                gathered_seam = tp_all_gather(
+                    torch.cat([hs_flat, pm_aligned], dim=-1), dim=0
+                )
+                hidden_states = gathered_seam[:, :hs_cols].reshape(
+                    num_tokens, *hidden_states.shape[1:]
+                )
+                pre_mix = gathered_seam[:, hs_cols : hs_cols + pm_cols].to(
+                    pre_mix.dtype
+                )
             return self.decoder_stage(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1699,19 +1723,34 @@ class DeepseekV41Model(nn.Module):
             end_row = start_row + t_local
             local_idx = (gather_idx - start_row).clamp(0, t_local - 1)
             in_shard = (gather_idx >= start_row) & (gather_idx < end_row)
-            dec_hidden = tensor_model_parallel_all_reduce(
-                torch.where(
-                    in_shard.view(-1, 1, 1),
-                    hidden_states[local_idx],
-                    torch.zeros_like(hidden_states[local_idx]),
+            hs_sel = torch.where(
+                in_shard.view(-1, 1, 1),
+                hidden_states[local_idx],
+                torch.zeros_like(hidden_states[local_idx]),
+            )
+            pm_sel = torch.where(
+                in_shard.view(-1, 1),
+                pre_mix[local_idx],
+                torch.zeros_like(pre_mix[local_idx]),
+            )
+            hs_flat = hs_sel.reshape(hs_sel.shape[0], -1)
+            hs_cols = hs_flat.shape[-1]
+            pm_cols = int(pm_sel.shape[-1])
+            pm_pad = ((pm_cols + 127) // 128) * 128
+            reduced_seam = tensor_model_parallel_all_reduce(
+                torch.cat(
+                    [
+                        hs_flat,
+                        torch.nn.functional.pad(
+                            pm_sel.to(hs_flat.dtype), (0, pm_pad - pm_cols)
+                        ),
+                    ],
+                    dim=-1,
                 )
             )
-            dec_pre_mix = tensor_model_parallel_all_reduce(
-                torch.where(
-                    in_shard.view(-1, 1),
-                    pre_mix[local_idx],
-                    torch.zeros_like(pre_mix[local_idx]),
-                )
+            dec_hidden = reduced_seam[:, :hs_cols].reshape(hs_sel.shape)
+            dec_pre_mix = reduced_seam[:, hs_cols : hs_cols + pm_cols].to(
+                pm_sel.dtype
             )
             dec_positions = positions.index_select(0, gather_idx)
         else:
