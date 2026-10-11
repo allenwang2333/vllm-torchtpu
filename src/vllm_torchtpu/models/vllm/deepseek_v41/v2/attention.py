@@ -1295,10 +1295,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 requests = _token_requests(swa, positions).clamp(
                     max=swa_table.shape[0] - 1
                 )
-                pos_col = (
-                    (positions // rows_per_page)
-                    .clamp(max=swa_table.shape[1] - 1)
-                    .long()
+                pos_col = (req_base := requests.int() * swa_table.shape[1]) + (
+                    (positions.int() // rows_per_page).clamp(max=swa_table.shape[1] - 1)
                 )
                 pos_rem = (positions % rows_per_page).int()
                 if non_causal:
@@ -1350,7 +1348,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     safe = logical.clamp(
                         min=0, max=swa_table.shape[1] * rows_per_page - 1
                     )
-                    swa_pages = (safe // rows_per_page).long()
+                    swa_pages = safe // rows_per_page
                     swa_page_rem = safe % rows_per_page
                     max_prev_pages = max(2, (swa_width - 1) // rows_per_page + 1)
                     c_last = swa_pages[:, -1]
@@ -1362,8 +1360,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         swa_pages == col[:, None] for col in prev_cols[:-1]
                     )
                     swa_3page = (
-                        c_last,
-                        prev_cols,
+                        req_base + c_last if non_causal else pos_col,
+                        tuple(req_base + col for col in prev_cols),
                         is_c_last,
                         is_prev_cols,
                         swa_page_rem,
@@ -1393,8 +1391,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             swa_slots_key = self._stage_cache_key("swa_token_slots", *swa_key[1:])
             cached_swa_slots = stage_cache.get(swa_slots_key)
             if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
-                requests_i64 = requests.long()
-                b2 = swa_table[requests_i64, pos_col].int()
+                flat_table = (
+                    swa_table if swa_table.dtype == torch.int32 else swa_table.int()
+                ).reshape(-1)
+                b2 = flat_table.index_select(0, pos_col)
                 swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
                 swa_valid = swa_slots >= 0
                 swa_valid_int32 = swa_valid.int()
@@ -1409,14 +1409,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         is_prev_cols,
                         swa_page_rem,
                     ) = swa_3page
-                    b_last = swa_table[requests_i64, c_last].int() if non_causal else b2
-                    swa_blocks = swa_table[requests_i64, prev_cols[-1]].int()[:, None]
+                    b_last = flat_table.index_select(0, c_last) if non_causal else b2
+                    swa_blocks = flat_table.index_select(0, prev_cols[-1])[:, None]
                     for col, is_col in zip(
                         reversed(prev_cols[:-1]),
                         reversed(is_prev_cols),
                         strict=True,
                     ):
-                        b_col = swa_table[requests_i64, col].int()[:, None]
+                        b_col = flat_table.index_select(0, col)[:, None]
                         swa_blocks = torch.where(is_col, b_col, swa_blocks)
                     swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
                     swa_row_slots, invalid_window = (

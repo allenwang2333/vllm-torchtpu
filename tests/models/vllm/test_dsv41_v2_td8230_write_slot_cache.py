@@ -325,7 +325,7 @@ def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
         assert len(swa_entries) == 1
         valid_token, requests, pos_col, pos_rem, logical, _, swa_3page = swa_entries[0]
         assert requests.dtype == torch.int32
-        assert pos_col.dtype == torch.int64
+        assert pos_col.dtype == torch.int32
         assert pos_rem.dtype == torch.int32
         assert logical.dtype == torch.int32
         assert swa_3page is not None
@@ -336,8 +336,8 @@ def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
             is_prev_cols,
             swa_page_rem,
         ) = swa_3page
-        assert c_last.dtype == torch.int64
-        assert all(col.dtype == torch.int64 for col in prev_cols)
+        assert c_last.dtype == torch.int32
+        assert all(col.dtype == torch.int32 for col in prev_cols)
         assert is_c_last.dtype == torch.bool
         assert all(m.dtype == torch.bool for m in is_prev_cols)
         assert swa_page_rem.dtype == torch.int32
@@ -582,3 +582,63 @@ def test_td8269_flat_int32_block_table_index_select_in_write_global_kv(monkeypat
         swa_cache = v2_attn._active_stage_attn_cache
         assert swa_cache is not None
         assert any(k[0] == "swa_token_addr" for k in swa_cache)
+
+
+def test_td8358_swa_token_addr_and_slots_1d_int32_flat_index_select(monkeypatch):
+    """TD8.358: swa_token_addr precomputes 1D int32 flat indices and swa_token_slots
+    gathers via flat_table.index_select for both int32 and int64 block_tables and
+    causal/non_causal modes."""
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
+    swa_table_i32 = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+    )
+    swa_table_i64 = swa_table_i32.to(torch.int64)
+    captured_records: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, k_c, v_c, recs, *a, **kw: (
+            captured_records.append(recs.clone()) or torch.zeros_like(q)
+        ),
+    )
+
+    for non_causal in (False, True):
+        for bt in (swa_table_i32, swa_table_i64):
+            swa_meta = SimpleNamespace(
+                seq_lens=torch.tensor([130, 130], dtype=torch.int32),
+                block_tables=bt,
+                query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+            )
+            ctx = SimpleNamespace(
+                attn_metadata={"swa_pfx": swa_meta},
+                additional_kwargs={},
+            )
+            monkeypatch.setattr(v2_attn, "get_forward_context", lambda c=ctx: c)
+            attn = _make_swa_attn(
+                window_size=128, ced_decoder=False, has_fast_swa_offset=True
+            )
+            attn.non_causal_multi_token_decode = non_causal
+            pos = torch.tensor([65, 129, 64, 128], dtype=torch.int32)
+            qr = torch.ones((4, 16), dtype=torch.bfloat16)
+            kv = torch.ones((4, 8), dtype=torch.bfloat16)
+            out = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+            with v2_attn.stage_attention_cache_scope():
+                attn._prepare_tpu(None, qr, kv, None, None, None, pos, out)
+                stage_cache = v2_attn._active_stage_attn_cache
+                assert stage_cache is not None
+                addr_entry = next(
+                    v for k, v in stage_cache.items() if k[0] == "swa_token_addr"
+                )
+                _, requests, pos_col, _, _, _, swa_3page = addr_entry
+                width = swa_table_i32.shape[1]
+                expected_pos_col = requests * width + (pos // 64).clamp(max=width - 1)
+                assert torch.equal(pos_col, expected_pos_col)
+                assert swa_3page is not None
+                c_last, prev_cols, _, _, _ = swa_3page
+                assert c_last.dtype == torch.int32
+                assert all(col.dtype == torch.int32 for col in prev_cols)
+
+    assert len(captured_records) == 4
+    assert torch.equal(captured_records[0], captured_records[1])
+    assert torch.equal(captured_records[2], captured_records[3])
