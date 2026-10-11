@@ -1971,7 +1971,7 @@ def sparse_ragged_paged_attention(
         all_groups_fit = jnp.all(
             jnp.where(active_grp_mask, n_unique, 0) <= m_union
         )
-        swa_acc_grp, swa_l_qh, swa_m_qh = prepare_swa_inputs(
+        swa_acc_grp, swa_l_aligned[:dec_cap], swa_m_aligned[:dec_cap] = prepare_swa_inputs(
             swa_accumution, swa_l, swa_m
         )
         swa_l_qh = swa_l_qh[:, :num_q_heads]

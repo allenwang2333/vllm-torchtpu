@@ -109,6 +109,7 @@ class DSparkProposer(DFlashProposer):
                     48 * b,
                     64 * b,
                     80 * b,
+                    96 * b,
                     128 * b,
                     256 * b,
                     512 * b,

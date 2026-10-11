@@ -167,10 +167,19 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     from vllm.config import VllmConfig
 
+    from vllm.config import model as _cfg_model, utils as _cfg_utils
     from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
     if getattr(VllmConfig, "_tpu_additional_config_hash_patch", False):
         return
+
+    _orig_ghf = _cfg_utils.get_hash_factors
+
+    def _safe_get_hash_factors(config, ignored_factors):
+        return _orig_ghf(config, set(ignored_factors) | {"hf_config", "hf_text_config"})
+
+    _cfg_utils.get_hash_factors = _safe_get_hash_factors
+    _cfg_model.get_hash_factors = _safe_get_hash_factors
 
     original = VllmConfig.compute_hash
 

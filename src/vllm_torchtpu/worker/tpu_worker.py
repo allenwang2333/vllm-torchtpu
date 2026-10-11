@@ -690,6 +690,9 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("model_load", model_config=self.model_config)
         self.model_runner.load_model()
+        if os.environ.get("VLLM_LOG_POST_WARMUP_HBM") == "1":
+            free_b, total_b = torch.accelerator.get_memory_info()
+            print(f"[PRE_KV_WEIGHTS_HBM] chip={os.environ.get('POD_G_CHIP_ID','0')} rank={self.rank} used_gib={(total_b-free_b)/(1024**3):.3f} free_gib={free_b/(1024**3):.3f} total_gib={total_b/(1024**3):.3f}", flush=True)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
