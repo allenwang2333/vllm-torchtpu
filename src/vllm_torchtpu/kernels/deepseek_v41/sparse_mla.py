@@ -951,7 +951,7 @@ def resolve_csa_union_params(
             else align_to(2 * topk, 128)
         )
         return 5, m_u
-    b_q = 8 if num_q_heads <= 128 else envs.VLLM_DSV41_CSA_UNION_BQ
+    b_q = envs.VLLM_DSV41_CSA_UNION_BQ if envs.VLLM_DSV41_CSA_UNION_BQ > 0 else 8
     if (
         not ced_decoder
         and num_tokens > max_num_seqs
@@ -1984,7 +1984,7 @@ def _launch_grouped_or_batched_attention(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
     if _FAST_GROUPED_ATTN:
-        target_gb = 8 if (num_q_heads <= 16 or b_q <= 2) else (4 if num_q_heads <= 128 else 1)
+        target_gb = 8 if num_q_heads <= 16 else (4 if (num_q_heads <= 64 or b_q <= 2) else 2)
         g_batch = (
             _largest_divisor(num_groups, target_gb)
             if (m_union == u_chunk and num_q_heads <= 128)
