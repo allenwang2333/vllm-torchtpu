@@ -607,3 +607,75 @@ def test_td8272_2d_comb_res_mix_and_int32_default_pre_mix(monkeypatch):
     assert seen_arange_dtypes == [torch.int32]
     expected_pre = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * tokens, dtype=torch.float32)
     assert torch.equal(default_pre, expected_pre)
+
+
+def test_td8367_ced_decoder_owner_kwargs_identity_fast_path_and_single_offload_flags(
+    monkeypatch,
+):
+    import numpy as np
+
+    class _TrackedPlan:
+        def __init__(self, indices, qsl, padded):
+            self._indices = indices
+            self._qsl = qsl
+            self.padded_num_tokens = padded
+            self.qsl_reads = 0
+
+        @property
+        def indices(self):
+            return self._indices
+
+        @property
+        def query_start_loc(self):
+            self.qsl_reads += 1
+            return self._qsl
+
+    enc_layout = SimpleNamespace(owners=np.array([0, 1], dtype=np.int32))
+    first = SimpleNamespace(
+        owner_perm=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        owner_q_loc=torch.zeros((2, 2), dtype=torch.int32),
+        owner_token_layout=enc_layout,
+    )
+    plan = _TrackedPlan((1, 3), (0, 1, 2), 4)
+    bounds = torch.tensor([0, 1, 2], dtype=torch.int32)
+    holder = SimpleNamespace()
+
+    out1 = DeepseekV41Model._get_ced_decoder_owner_kwargs(first, plan, bounds, holder)
+    assert plan.qsl_reads == 1
+
+    # Second call with same (plan, enc_layout, tp_size, bounds.device) hits by identity
+    # without reading plan.query_start_loc.
+    out2 = DeepseekV41Model._get_ced_decoder_owner_kwargs(first, plan, bounds, holder)
+    assert out2 is out1
+    assert plan.qsl_reads == 1
+
+    # Equivalent plan instance hits by value-equality fallback.
+    plan_eq = _TrackedPlan((1, 3), (0, 1, 2), 4)
+    out3 = DeepseekV41Model._get_ced_decoder_owner_kwargs(
+        first, plan_eq, bounds, holder
+    )
+    assert out3 is out1
+    assert plan_eq.qsl_reads == 1
+
+    # Verify forward unpacks _engram_offload_flags once when both flags are False.
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    model._ced_enabled = False
+    model.start_layer = 0
+    model.end_layer = 1
+    model.layers = [_make_engram_layer(cpu_offload=False, host_dma=False)]
+    model.full_stage = lambda *a, **kw: "done"
+    flag_calls = []
+    orig_flags = DeepseekV41Model._engram_offload_flags
+
+    def _spy_flags(self):
+        flag_calls.append(1)
+        return orig_flags(self)
+
+    monkeypatch.setattr(DeepseekV41Model, "_engram_offload_flags", _spy_flags)
+    assert (
+        model.forward(
+            torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32)
+        )
+        == "done"
+    )
+    assert len(flag_calls) == 1

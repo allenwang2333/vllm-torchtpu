@@ -296,9 +296,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def _engram_offload_flags(self) -> tuple[bool, bool]:
         """Cached `(has_cpu_offload, has_host_dma)` across active Engram modules."""
-        engrams = DeepseekV41Model._engram_modules(self)
-        if not engrams:
-            return False, False
+        custom = getattr(self, "_has_cpu_offloaded_engram", None)
+        if (
+            custom is not None
+            and getattr(custom, "__func__", None)
+            is not DeepseekV41Model._has_cpu_offloaded_engram
+        ) or not (engrams := DeepseekV41Model._engram_modules(self)):
+            return (
+                (bool(custom()), False)
+                if custom is not None
+                and getattr(custom, "__func__", None)
+                is not DeepseekV41Model._has_cpu_offloaded_engram
+                else (False, False)
+            )
         first_embed = engrams[0].embed_tokens
         last_embed = engrams[-1].embed_tokens
         key = (
@@ -473,10 +483,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     dp_shared_memory=self.engram_dp_shared_memory,
                     gather_fn=upstream.gather_engram_hashes,
                 )
-                cpu_offload = self._has_cpu_offloaded_engram()
-                host_dma = not cpu_offload and DeepseekV41Model._has_host_dma_engram(
-                    self
-                )
+                cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
                 if cpu_offload:
                     gathered_hashes = gathered_hashes.to("cpu")
                 elif host_dma and gathered_hashes.device.type == "tpu":
@@ -493,7 +500,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     engram.prepare_embeddings(
                         gathered_hashes[:, engram.layer_hash_index]
                     )
-                    if host_dma:
+                    if not cpu_offload and host_dma:
                         staged = getattr(engram, "_active_rows", None)
                         if staged is not None and staged.device.type == "tpu":
                             synchronize_tensors((staged,), wait=False)
@@ -625,30 +632,47 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         non-identity CED decoder replay bucket when ``KV_SHARD`` is active."""
         if first is None or getattr(first, "owner_perm", None) is None:
             return {}
-        from vllm_torchtpu.runner.owner_token_layout import (
-            _positional_layout,
-            build_owner_token_layout,
-            owner_layout_tensors,
-        )
-
-        enc_q_loc, enc_layout, padded = (
+        enc_q_loc, enc_layout, target = (
             getattr(first, "owner_q_loc", None),
             getattr(first, "owner_token_layout", None),
-            int(plan.padded_num_tokens),
+            DeepseekV41Model if owner is None else owner,
         )
         tp_size = (
             int(enc_q_loc.shape[0])
             if enc_q_loc is not None
             else upstream.get_tensor_model_parallel_world_size()
         )
-        req_owners, qsl, target = (
-            getattr(enc_layout, "owners", None),
+        cached = getattr(target, cache_attr, None)
+        if cached is not None and (
             (
-                plan.query_start_loc
-                if isinstance(plan.query_start_loc, tuple)
-                else tuple(plan.query_start_loc)
-            ),
-            DeepseekV41Model if owner is None else owner,
+                cached[2] is plan
+                and cached[3] is enc_layout
+                and cached[4] == tp_size
+                and cached[5] == bounds.device
+            )
+            or cached[0]
+            == (
+                id(enc_layout) if enc_layout is not None else None,
+                tp_size,
+                qsl if isinstance((qsl := plan.query_start_loc), tuple) else tuple(qsl),
+                len(plan.indices) > 0
+                and getattr(enc_layout, "owners", None) is not None,
+                int(plan.padded_num_tokens),
+                int(bounds.shape[0]) - 1,
+                bounds.device,
+            )
+        ):
+            return cached[1]
+        from vllm_torchtpu.runner.owner_token_layout import (
+            _positional_layout,
+            build_owner_token_layout,
+            owner_layout_tensors,
+        )
+
+        req_owners, qsl, padded = (
+            getattr(enc_layout, "owners", None),
+            qsl if isinstance((qsl := plan.query_start_loc), tuple) else tuple(qsl),
+            int(plan.padded_num_tokens),
         )
         cache_key = (
             id(enc_layout) if enc_layout is not None else None,
@@ -659,9 +683,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             int(bounds.shape[0]) - 1,
             bounds.device,
         )
-        cached = getattr(target, cache_attr, None)
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
         if len(plan.indices) > 0 and req_owners is not None:
             dec_layout = build_owner_token_layout(
                 req_owners,
@@ -691,7 +712,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 "owner_inv": inv_t,
                 "owner_q_loc": q_loc_t,
             }
-        setattr(target, cache_attr, (cache_key, result))
+        setattr(
+            target,
+            cache_attr,
+            (cache_key, result, plan, enc_layout, tp_size, bounds.device),
+        )
         return result
 
     def forward(
@@ -702,11 +727,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
-        offload_engram = (
-            self._has_cpu_offloaded_engram()
-            or DeepseekV41Model._has_host_dma_engram(self)
-        )
-        if offload_engram:
+        cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
+        if cpu_offload or host_dma:
             input_ids_prep = (
                 input_ids.to(torch.int64)
                 if getattr(
@@ -963,12 +985,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
+        cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
-            torch.compiler.is_compiling()
-            and (
-                self._has_cpu_offloaded_engram()
-                or DeepseekV41Model._has_host_dma_engram(self)
-            )
+            torch.compiler.is_compiling() and (cpu_offload or host_dma)
         )
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,
