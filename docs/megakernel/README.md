@@ -321,9 +321,9 @@ words, min_tokens; `platforms/tpu_platform.py`).
   batches 1–8, and 3 at batches 9–16 (compiled request buckets 1, 2, 4, 8
   and 16, up to `--max-num-seqs`), and 0 anywhere; the per-batch-size
   schedule chooses among them and the decoder rejects any other at startup.
-- Each decode request holds ~190 MB of the decode KV budget however short
-  (its KDA state), so the budget bounds decode concurrency (6 GiB: ~30
-  requests). Under KV pressure a request can hang: its Stage-3 transfer
+- Besides its pages, each decode request holds one KDA state block per KDA
+  group of the decode KV budget (two while it crosses a page), 7.5 MiB a
+  rank each. Under KV pressure a request can hang: its Stage-3 transfer
   completes but the completion is dropped as unmapped.
 
 ## Tools
