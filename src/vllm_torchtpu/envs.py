@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = True
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
+    TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
@@ -1304,6 +1305,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # greedy draft argmax all-gathers a (max, id) pair per row instead of the
     # full logits (spec_decode/utils.vocab_parallel_argmax).
     "TPU_SAMPLER_VOCAB_PARALLEL": env_bool("TPU_SAMPLER_VOCAB_PARALLEL", True),
+    # MTP draft (DeepSeek / GLM-5.2): split the replicated eh_proj (2H -> H,
+    # nn.Linear upstream) by output column across TP and all-gather the
+    # result, so each draft pass reads H*2H/tp weight bytes instead of H*2H
+    # (spec_decode/utils.ColumnParallelEhProj). Same per-element dot product.
+    "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP"),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
