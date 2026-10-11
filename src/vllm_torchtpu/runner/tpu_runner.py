@@ -2797,6 +2797,7 @@ class TPUModelRunner(GPUModelRunner):
         num_prompt_tokens = input_batch.num_prompt_tokens
         num_tokens_no_spec = input_batch.num_tokens_no_spec
         append_row = input_batch.block_table.append_row
+        req_states = []
         for i, (req_id, num_comp, num_out, new_blocks) in enumerate(
             zip(
                 req_ids,
@@ -2806,6 +2807,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         ):
             req_state = requests[req_id]
+            req_states.append(req_state)
             req_state.num_computed_tokens, req_state.prev_num_draft_len = num_comp, 0
             if num_out < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_out:]
@@ -2830,25 +2832,33 @@ class TPUModelRunner(GPUModelRunner):
                 and all(ids is not None and len(ids) == k for ids in spec_list)
                 and int(starts.max()) + k <= max_len
             ):
-                spec_np = np.fromiter(
-                    itertools.chain.from_iterable(spec_list),
-                    dtype=np.int32,
-                    count=n_reqs * k,
-                )
                 rows = _ARANGE_INTP[:n_reqs]
                 k_off = _ARANGE_INTP[:k]
-                flat_idx = ((rows * max_len + starts)[:, None] + k_off).ravel()
-                input_batch.token_ids_cpu.ravel()[flat_idx] = spec_np
-                input_batch.is_token_ids.ravel()[flat_idx] = True
-                for req_id, cur_spec, ids in zip(
-                    req_ids, input_batch.spec_token_ids[:n_reqs], spec_list
+                idx = (rows * max_len + starts)[:, None] + k_off
+                if spec_list.count(first_spec) == n_reqs:
+                    # Every request drafts the same ids (async scheduling's
+                    # placeholder rows): broadcast one row over the
+                    # [n_reqs, k] index instead of flattening n_reqs lists.
+                    input_batch.token_ids_cpu.ravel()[idx] = np.asarray(
+                        first_spec, dtype=np.int32
+                    )
+                else:
+                    input_batch.token_ids_cpu.ravel()[idx.ravel()] = np.fromiter(
+                        itertools.chain.from_iterable(spec_list),
+                        dtype=np.int32,
+                        count=n_reqs * k,
+                    )
+                input_batch.is_token_ids.ravel()[idx.ravel()] = True
+                for req_state, cur_spec, ids in zip(
+                    req_states, input_batch.spec_token_ids[:n_reqs], spec_list
                 ):
-                    cur_spec[:] = ids
-                    requests[req_id].prev_num_draft_len = k
+                    if cur_spec != ids:
+                        cur_spec[:] = ids
+                    req_state.prev_num_draft_len = k
             else:
                 update_spec = input_batch.update_req_spec_token_ids
-                for req_id in req_ids:
-                    update_spec(requests[req_id], scheduled_spec_tokens)
+                for req_state in req_states:
+                    update_spec(req_state, scheduled_spec_tokens)
 
         input_batch.refresh_metadata()
         return True
@@ -5472,13 +5482,19 @@ class TPUModelRunner(GPUModelRunner):
                     pooler_output.extend(out)
 
         with self._stage_timing.host_stage("output_assembly"):
+            # Same batch as the previous step: copying the cached all-None
+            # dict skips re-hashing every req_id into a fresh one.
+            cached_plp = getattr(self, "_prompt_logprobs_template", None)
+            if cached_plp is None or cached_plp[0] != req_ids:
+                cached_plp = (list(req_ids), dict.fromkeys(req_ids))
+                self._prompt_logprobs_template = cached_plp
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=self.input_batch.req_id_to_index.copy(),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=logprobs,
-                prompt_logprobs_dict=dict.fromkeys(req_ids),
+                prompt_logprobs_dict=cached_plp[1].copy(),
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )

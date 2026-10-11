@@ -2870,6 +2870,34 @@ def test_sample_tokens_dispatches_drafter_before_modify_prev_results():
         TPUModelRunner.sample_tokens(runner, grammar_output=None)
     assert runner._pre_async_results.spec_decode_num_rejected_tokens is None
 
+    # TD8.352: the all-None prompt_logprobs_dict comes from a cached template
+    # keyed by a private copy of req_ids; each output gets its own copy.
+    template_ids, template = runner._prompt_logprobs_template
+    assert template_ids == ["req-0"] and template == {"req-0": None}
+    real_output = tpu_runner.ModelRunnerOutput
+    outputs = []
+
+    def capture(**kwargs):
+        out = real_output(**kwargs)
+        outputs.append(out)
+        return out
+
+    runner.execute_model_state = state
+    with (
+        patch.object(
+            tpu_runner.AsyncTPUCopyState,
+            "from_device_chunks",
+            return_value=SimpleNamespace(),
+        ),
+        patch.object(tpu_runner, "ModelRunnerOutput", side_effect=capture),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._prompt_logprobs_template[1] is template  # hit
+    (out,) = outputs
+    assert out.prompt_logprobs_dict == dict.fromkeys(out.req_ids)
+    assert out.prompt_logprobs_dict is not template
+    assert out.req_ids is not template_ids
+
 
 def test_modify_prev_results_uses_cached_copy_state_and_handles_discard_or_removed():
     from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
