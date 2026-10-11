@@ -476,10 +476,15 @@ class DSparkDeepseekV41Model(nn.Module):
                 kv_rotated = layers[0].attn._rotate(kv_normed, positions)
                 assert v2_attn._active_stage_attn_cache is not None
                 v2_attn._active_stage_attn_cache["context_kv_pre_rotated"] = True
-                kv_by_layer = kv_rotated.transpose(0, 1).contiguous()
+                # Per-layer 128-lane-aligned column slices of the flat
+                # [T, layers * head_dim] rows: transposing the 3-D
+                # [T, layers, head_dim] view (layers padded to 8 sublanes on
+                # TPU) costs XLA a relayout copy of the whole tensor.
+                kv_flat = kv_rotated.reshape(kv_rotated.shape[0], -1)
                 for i, layer in enumerate(layers):
                     layer_md = None if metadata is None else metadata[i]
-                    _insert_context_kv(layer.attn, kv_by_layer[i], positions, layer_md)
+                    kv_i = kv_flat[:, i * head_dim : (i + 1) * head_dim].contiguous()
+                    _insert_context_kv(layer.attn, kv_i, positions, layer_md)
             else:
                 for i, layer in enumerate(layers):
                     attn = layer.attn

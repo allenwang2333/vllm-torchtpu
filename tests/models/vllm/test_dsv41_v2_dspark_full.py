@@ -1781,12 +1781,26 @@ def test_dspark_fused_context_kv_unquantized_and_fp8_parity(
     monkeypatch.setattr(
         v2_dspark,
         "_insert",
-        lambda cache, slots, kv, valid, **kw: fused_inserts.append(kv.clone()),
+        lambda cache, slots, kv, valid, **kw: fused_inserts.append(kv.clone())
+        or fused_contiguous.append(kv.is_contiguous()),
+    )
+    fused_contiguous: list[bool] = []
+    rotated: list[torch.Tensor] = []
+    rotate0 = model.layers[0].attn._rotate
+    model.layers[0].attn._rotate = (
+        lambda x, pos: rotated.append(rotate0(x, pos)) or (rotated[-1])
     )
     model.precompute_and_store_context_kv(main_x, positions, metadata=md)
+    model.layers[0].attn._rotate = rotate0
     assert len(fused_inserts) == 2
     for u_kv, f_kv in zip(unfused_inserts, fused_inserts, strict=True):
         assert torch.allclose(u_kv, f_kv, atol=1e-6, rtol=1e-6)
+    # TD8.256: flat 128-lane column slices equal the former 3-D transpose
+    # rows bitwise, and each layer's KV is contiguous.
+    kv_by_layer = rotated[-1].transpose(0, 1).contiguous()
+    for i, f_kv in enumerate(fused_inserts):
+        assert torch.equal(f_kv, kv_by_layer[i])
+    assert fused_contiguous == [True, True]
 
     # 3. Quantized (FP8 weight_scale) path
     model._fused_context_wkv_weight = None

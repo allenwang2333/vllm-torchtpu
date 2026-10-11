@@ -80,14 +80,14 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     "models/vllm/deepseek_v4": (6, 915, 228, "TD8.85 / TD8.126 / TD8.154 / TD8.158"),
     "models/vllm/deepseek_v41": (
         22,
-        5588,
+        5589,
         1548,
         "TD8.114 / TD8.131 / TD8.132 / TD8.153 / TD8.185 / TD8.203 / TD8.207"
         " / TD8.208 / TD8.213 / TD8.217 / TD8.219 / TD8.221 / TD8.223 / TD8.226"
         " / TD8.229 / TD8.230 / TD8.231 / TD8.232 / TD8.233 / TD8.238 / TD8.239"
         " / TD8.240 / TD8.241 / TD8.242 / TD8.244 / TD8.245 / TD8.246 / TD8.247"
         " / TD8.248 / TD8.249 / TD8.250 / TD8.251 / TD8.253 / TD8.254 / TD8.255"
-        " / TD8.257",
+        " / TD8.256 / TD8.257",
     ),
     "models/vllm/kimi_k3": (8, 1310, 316, "TD8.87 / TD8.124 / TD8.154 / TD8.158"),
     "offload": (4, 916, 294, "TD8.88 / TD8.121 / TD8.144 / TD8.151 / TD8.157"),
