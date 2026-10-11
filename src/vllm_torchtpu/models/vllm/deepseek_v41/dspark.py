@@ -603,6 +603,17 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             ckpt_up_proj_name="w3",
             num_experts=self.config.dspark_n_routed_experts,
         )
+        if envs.VLLM_DSV41_MODULO_EXPERT_BALANCE:
+            from vllm.distributed import get_ep_group
+
+            ep_size = get_ep_group().world_size
+            num_experts = self.config.dspark_n_routed_experts
+            if ep_size > 1 and num_experts % ep_size == 0:
+                g_local = num_experts // ep_size
+                expert_mapping = [
+                    (pname, wname, (eid % ep_size) * g_local + (eid // ep_size), sid)
+                    for pname, wname, eid, sid in expert_mapping
+                ]
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"

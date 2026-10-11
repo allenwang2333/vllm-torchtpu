@@ -621,16 +621,27 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            x = ragged_gather_v2(
-                hidden_states_local,
-                token_indices_sorted,
-                jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
-            )
+            if hidden_states_local.dtype == jnp.float8_e4m3fn:
+                x = jax.lax.bitcast_convert_type(
+                    ragged_gather_v2(
+                        jax.lax.bitcast_convert_type(hidden_states_local, jnp.int8),
+                        token_indices_sorted,
+                        jnp.array([0], dtype=jnp.int32),
+                        valid_count[None],
+                    ),
+                    jnp.float8_e4m3fn,
+                )
+            else:
+                x = ragged_gather_v2(
+                    hidden_states_local,
+                    token_indices_sorted,
+                    jnp.array([0], dtype=jnp.int32),
+                    valid_count[None],
+                )
     elif (
         use_sparse_core
-        and 3072 < m <= 16384
-        and hidden_states_local.dtype in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4)
+        and 3072 < m <= 32768
+        and hidden_states_local.dtype in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4, jnp.float8_e4m3fn)
         and hidden_states_local.shape[-1] >= 128
         and hidden_states_local.shape[-1] % 128 == 0
         and hidden_states_local.shape[0]
@@ -642,12 +653,23 @@ def prepare_routed_gmm_inputs(
             if (not use_ep and not skip_padded_tokens)
             else group_sizes_local.sum(dtype=jnp.int32)[None]
         )
-        x = ragged_gather_v2(
-            hidden_states_local,
-            token_indices_sorted,
-            jnp.array([0], dtype=jnp.int32),
-            end_count,
-        )
+        if hidden_states_local.dtype == jnp.float8_e4m3fn:
+            x = jax.lax.bitcast_convert_type(
+                ragged_gather_v2(
+                    jax.lax.bitcast_convert_type(hidden_states_local, jnp.int8),
+                    token_indices_sorted,
+                    jnp.array([0], dtype=jnp.int32),
+                    end_count,
+                ),
+                jnp.float8_e4m3fn,
+            )
+        else:
+            x = ragged_gather_v2(
+                hidden_states_local,
+                token_indices_sorted,
+                jnp.array([0], dtype=jnp.int32),
+                end_count,
+            )
     else:
         x = hidden_states_local[token_indices_sorted]
     if return_onehot_combine:
@@ -733,7 +755,9 @@ def moe_gmm(
         and jax.dtypes.itemsize_bits(w1.dtype) == 4
         and (w1_scale is None or w1.shape[1] // w1_scale.shape[1] < 128)
     )
-    if is_w1_fp4_w4a16 and lhs_scale is not None:
+    if not is_w1_fp4_w4a16 and lhs_scale is not None and x.shape[1] % 512 == 0 and lhs_scale.shape[1] in (1, x.shape[1] // 512):
+        lhs_scale = jnp.broadcast_to(lhs_scale.astype(jnp.bfloat16), (x.shape[0], x.shape[1] // 512))
+    elif is_w1_fp4_w4a16 and lhs_scale is not None:
         if lhs_scale.shape[1] == 1:
             x = (x.astype(jnp.float32) * lhs_scale).astype(lhs_scale.dtype)
         else:
@@ -764,12 +788,22 @@ def moe_gmm(
         gmm1_in = jnp.concatenate([u8_pair[..., 0], u8_pair[..., 1]], axis=1)
         gmm1_scale = gmm1_res[:, inter_dim // 2 : inter_dim // 2 + 1]
     elif (
-        not is_w2_fp4
-        and w2_scale is not None
+        w2_scale is not None
         and inter_dim % 128 == 0
-        and gmm1_res.shape[0] <= 4608
+        and (
+            (not is_w2_fp4 and gmm1_res.shape[0] <= 4608)
+            or (
+                is_w2_fp4
+                and os.environ.get("VLLM_DSV41_MOE_FP4_GMM2_FP8", "1") == "1"
+                and inter_dim % 512 == 0
+            )
+        )
     ):
         gmm1_in, gmm1_scale = quantize_lhs_rows(gmm1_res[:, :inter_dim])
+        if is_w2_fp4 and gmm1_scale is not None and inter_dim % 512 == 0:
+            gmm1_scale = jnp.broadcast_to(
+                gmm1_scale.astype(jnp.bfloat16), (gmm1_in.shape[0], inter_dim // 512)
+            )
     else:
         gmm1_in = gmm1_res[:, :inter_dim]
         gmm1_scale = None

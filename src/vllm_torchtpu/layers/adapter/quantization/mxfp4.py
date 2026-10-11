@@ -693,7 +693,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         import hashlib
         _raw_sig = layer.w13_weight.data.cpu().reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
-        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}".encode()).hexdigest()[:16]
+        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}_{int(envs.VLLM_DSV41_MODULO_EXPERT_BALANCE)}".encode()).hexdigest()[:16]
         _meta_path = f"/dev/shm/dsv41_fp4_cache/meta_{_meta_key}.pt"
         if os.path.exists(_meta_path + ".done"):
             _m = torch.load(_meta_path, map_location="cpu", weights_only=True)

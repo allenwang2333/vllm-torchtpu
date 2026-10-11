@@ -264,6 +264,8 @@ def _build_op(
         t_local = T_global // ep
         e_total = w1.shape[0]
         g_local = e_total // ep
+        if envs.VLLM_DSV41_MODULO_EXPERT_BALANCE and ep > 1:
+            topk_ids = (topk_ids.astype(jnp.int32) % ep) * g_local + (topk_ids.astype(jnp.int32) // ep)
         onehot_thr = resolve_onehot_permute_threshold()
         _fn_dispatch = getattr(
             fused_moe_func_fp8_dispatch,

@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
     VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
+    VLLM_DSV41_MODULO_EXPERT_BALANCE: bool = False
 
 
 def env_with_choices(
@@ -923,6 +924,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable host Engram prefetch and active-bucket prefix H2D upload across
     # 1+K speculative verify tokens.
     "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
+    "VLLM_DSV41_MODULO_EXPERT_BALANCE": env_bool("VLLM_DSV41_MODULO_EXPERT_BALANCE", False),
 }
 
 
