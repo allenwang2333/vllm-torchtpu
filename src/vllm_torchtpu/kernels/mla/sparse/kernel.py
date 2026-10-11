@@ -1010,6 +1010,12 @@ def capped_live_windows(
     return jnp.clip(jnp.max(token_windows), 1, num_windows).astype(jnp.int32)
 
 
+# `body_levers` the live-group body accepts (`TPU_DCP_MLA_MIXED_BODY`).
+MIXED_BODY_LEVERS = ("tr", "zu", "pv512", "noinf", "pbf16")
+# The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
+MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -1035,6 +1041,7 @@ def _attention_kernel(
     lse_mask_empty: bool = False,
     group_tab_ref=None,
     live_widths: tuple[int, ...] = (),
+    body_levers: tuple[str, ...] = (),
 ):
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
@@ -1087,6 +1094,19 @@ def _attention_kernel(
     # bkv_sz; rows past a token's kv_len are zero / masked either way, so the
     # result is the same. Steps wider than every width run the full body.
     assert not live_widths or group_tab_ref is not None
+    # Body levers (`body_levers`, live-group mode only; `MIXED_BODY_LEVERS`):
+    #   "tr"     unpack the NOPE words with four stride-4 row loads and a 4x4
+    #            byte transpose on 32-bit words, then a native bitcast to fp8,
+    #            instead of the u8 reshape relayout (same bytes, same layout).
+    #   "zu"     zero keys past kv_len on the 32-bit NOPE words (per row) only;
+    #            ROPE rows past kv_len are left as gathered -- they reach only
+    #            QK scores that the kv_len mask replaces, while PV reads NOPE.
+    #   "pv512"  PV contracts against the NOPE columns only (the output keeps
+    #            just those), instead of all head_dim columns.
+    #   "noinf"  drop the artificial prev_out -> q dependency.
+    #   "pbf16"  feed P to the PV matmul as q's dtype (not bit-exact).
+    assert not body_levers or group_tab_ref is not None
+    assert set(body_levers) <= set(MIXED_BODY_LEVERS), body_levers
     fix_refs = None
     if capped_windows is not None:
         assert sparsecore_layout
@@ -1188,7 +1208,12 @@ def _attention_kernel(
         p,
         kv,
         l_sum,
+        levers=(),
     ):
+        if "pv512" in levers and split_q:
+            kv = kv[:, :o_dim]
+        if "pbf16" in levers:
+            p = p.astype(q_dtype)
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
 
         # We use `k_scale` for the PV step as well since MLA uses a shared
@@ -1410,7 +1435,61 @@ def _attention_kernel(
             pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
-    def load_bkv(bkv_sem_idx, batch_idx, rows=None):
+    def load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers):
+        """`load_bkv` for the live body with `body_levers` (see above)."""
+        rows = bkv_sz if rows is None else rows
+        nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
+        rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
+        rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
+        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+        zu = "zu" in levers
+        if "tr" in levers:
+            # Row r of the NOPE tile holds key r's 512 bytes as 128 words;
+            # the fp8 tile wants each word to hold one byte column of four
+            # consecutive keys. xs[j] = keys 4s + j (stride-4 rows).
+            quarter = rows // 4
+            xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
+            if zu:
+                key4 = lax.broadcasted_iota(jnp.int32, xs[0].shape, 0) * 4
+                xs = [
+                    jnp.where(key4 < kv_len - j, x, jnp.uint32(0))
+                    for j, x in enumerate(xs)
+                ]
+            lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+            ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+            a0 = (xs[0] & lo16) | (xs[2] << 16)
+            a2 = (xs[0] >> 16) | (xs[2] & hi16)
+            a1 = (xs[1] & lo16) | (xs[3] << 16)
+            a3 = (xs[1] >> 16) | (xs[3] & hi16)
+            cols = [
+                (a0 & ev8) | ((a1 & ev8) << 8),  # byte 0 of keys 4s..4s+3
+                ((a0 >> 8) & ev8) | (a1 & od8),  # byte 1
+                (a2 & ev8) | ((a3 & ev8) << 8),  # byte 2
+                ((a2 >> 8) & ev8) | (a3 & od8),  # byte 3
+            ]
+            bkv_nope = jnp.concatenate(
+                [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
+            )
+        else:
+            words = nope_ref[pl.ds(0, rows)]
+            if zu:
+                key = lax.broadcasted_iota(jnp.int32, words.shape, 0)
+                words = jnp.where(key < kv_len, words, jnp.uint32(0))
+            bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(rows, nope_dim)
+            bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
+        bkv_rope = pltpu.bitcast(rope_ref[...], jnp.uint8).reshape(rows, 128)
+        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if bkv.shape[-1] < head_dim:
+            bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+        if not zu:
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
+        return bkv
+
+    def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
+        if levers:
+            return load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers)
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
         rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
         if rows is not None:
@@ -1622,7 +1701,7 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        def run_steps(rows=None):
+        def run_steps(rows=None, levers=()):
             prev_p = None
             prev_bkv = None
             prev_l_sum = None
@@ -1630,22 +1709,25 @@ def _attention_kernel(
             prev_out = None
             for batch_idx in range(batch_size):
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                bkv = load_bkv(bi_sem_idx, batch_idx, rows)
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
                 bq = load_bq(bi_sem_idx, batch_idx)
 
-                if prev_out is not None:
+                if prev_out is not None and "noinf" not in levers:
                     # Artificial dependency to force MXU/VPU interleaving by limiting
                     # LLO's QK runahead
                     # We use jnp.where to prevent XLA from optimizing the dependency away.
                     # prev_out won't be inf in practice.
-                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                    dep = prev_out
+                    if dep.shape != bq.shape:  # "pv512": a NOPE-wide output
+                        dep = dep[:, :1]
+                    bq = jnp.where(dep == jnp.inf, dep, bq)
 
                 p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
                 if prev_p is not None:
                     assert prev_bkv is not None
                     assert prev_l_sum is not None
-                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                    out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum, levers)
 
                     # Store output from acc to bo.
                     bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
@@ -1658,7 +1740,7 @@ def _attention_kernel(
                 prev_m = m
 
             # end of pipelining loop
-            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+            out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum, levers)
             bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
             write_blse(batch_size - 1, prev_m, prev_l_sum)
 
@@ -1668,10 +1750,16 @@ def _attention_kernel(
             lower = None
             for width in tuple(live_widths) + (bkv_sz,):
                 fits = need <= width if lower is None else (need > lower) & (need <= width)
-                pl.when(fits)(functools.partial(run_steps, width if width < bkv_sz else None))
+                pl.when(fits)(
+                    functools.partial(
+                        run_steps,
+                        width if width < bkv_sz else None,
+                        tuple(body_levers),
+                    )
+                )
                 lower = width
         else:
-            run_steps()
+            run_steps(None, tuple(body_levers))
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1776,6 +1864,7 @@ def prepare_outputs(
         "fused_window_prep",
         "mixed_live_gather",
         "mixed_live_widths",
+        "mixed_body_levers",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1814,6 +1903,7 @@ def sparse_ragged_paged_attention(
     fused_window_prep: bool = False,
     mixed_live_gather: bool = False,
     mixed_live_widths: tuple[int, ...] = (),
+    mixed_body_levers: tuple[str, ...] = (),
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1897,6 +1987,9 @@ def sparse_ragged_paged_attention(
         (multiples of 128 below `topk_cap`); a grid step whose live atoms fit
         a width runs its attention body on that many rows of each token's
         tile instead of `topk_cap`. Same outputs.
+      mixed_body_levers: With `mixed_live_gather` taken: attention-body
+        rewrites of the live grid steps (`MIXED_BODY_LEVERS`, documented at
+        `_attention_kernel`). `MIXED_BODY_DEFAULT` is bitwise-identical.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -2003,6 +2096,10 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_live_widths {mixed_live_widths} must be ascending multiples of "
             f"128 below topk_cap ({topk_cap})"
+        )
+    if not set(mixed_body_levers) <= set(MIXED_BODY_LEVERS):
+        raise ValueError(
+            f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
@@ -2205,6 +2302,7 @@ def sparse_ragged_paged_attention(
             group_tab=group_tab,
             group_num_live=None if group_num_live is None else group_num_live[i],
             group_widths=mixed_live_widths if group_tab is not None else (),
+            group_levers=mixed_body_levers if group_tab is not None else (),
         )
         if return_lse:
             q, lse = result
@@ -2314,6 +2412,7 @@ def sparse_attention_chunk(
     group_tab: jax.Array | None = None,
     group_num_live: jax.Array | None = None,
     group_widths: tuple[int, ...] = (),
+    group_levers: tuple[str, ...] = (),
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -2482,7 +2581,11 @@ def sparse_attention_chunk(
             lse_mask_empty=lse_mask_empty,
         )
         if live_views is not None:
-            group_body = functools.partial(kernel_body, live_widths=tuple(group_widths))
+            group_body = functools.partial(
+                kernel_body,
+                live_widths=tuple(group_widths),
+                body_levers=tuple(group_levers),
+            )
 
             def kernel_body(kv_lens_ref, bounds_ref, sem_ids_ref, tab_ref, *rest):
                 return group_body(
