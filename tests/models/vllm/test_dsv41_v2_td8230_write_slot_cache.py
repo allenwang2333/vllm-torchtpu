@@ -324,10 +324,18 @@ def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
         swa_entries = [v for k, v in stage_cache.items() if k[0] == "swa_token_addr"]
         assert len(swa_entries) == 1
         valid_token, requests, pos_col, pos_rem, logical, _, swa_3page = swa_entries[0]
+        assert requests.dtype == torch.int32
+        assert pos_col.dtype == torch.int64
         assert pos_rem.dtype == torch.int32
         assert logical.dtype == torch.int32
         assert swa_3page is not None
-        c_last, prev_cols, is_c_last, is_prev_cols, swa_page_rem = swa_3page
+        (
+            c_last,
+            prev_cols,
+            is_c_last,
+            is_prev_cols,
+            swa_page_rem,
+        ) = swa_3page
         assert c_last.dtype == torch.int64
         assert all(col.dtype == torch.int64 for col in prev_cols)
         assert is_c_last.dtype == torch.bool
@@ -434,7 +442,8 @@ def test_td8258_token_requests_replayed_and_cache_slots_int32_addressing():
 
     reqs_64 = v2_attn._token_requests(meta, pos_i64)
     reqs_32 = v2_attn._token_requests(meta, pos_i32)
-    assert reqs_64.dtype == torch.int64
+    assert reqs_64.dtype == torch.int32
+    assert reqs_32.dtype == torch.int32
     assert torch.equal(reqs_64, reqs_32)
 
     starts_64 = torch.tensor([2, 0], dtype=torch.int64)
@@ -493,3 +502,83 @@ def test_td8261_row_slots_seg_idx_and_select_indices_int32(monkeypatch):
     assert selected.dtype == torch.int32
     assert attn.candidate_block_buffer.dtype == torch.int32
     assert torch.all(attn.candidate_block_buffer[:2] >= 0)
+
+
+def test_td8269_flat_int32_block_table_index_select_in_write_global_kv(monkeypatch):
+    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+
+    kv_table = torch.tensor([[1, 2, 6], [3, 4, 9]], dtype=torch.int32)
+    idx_table = kv_table + 1
+    metadata = {"kv": _meta(kv_table, qsl=(0, 4, 7)), "idx": _meta(idx_table)}
+    positions = torch.tensor([0, 1, 5, 9, 2, 3, 15, 17], dtype=torch.int64)
+    index_cache = _paged_cache(row_offset=32)
+    inserted: list[torch.Tensor] = []
+    attn = _make_attn(monkeypatch, metadata, index_cache, inserted)
+
+    with v2_attn.stage_attention_cache_scope():
+        attn._write_global_kv(torch.ones(COUNT, 10), positions)
+        stage_cache = v2_attn._active_stage_attn_cache
+        assert stage_cache is not None
+        gkv_entries = [v for k, v in stage_cache.items() if k[0] == "global_kv_addr"]
+        assert len(gkv_entries) == 1
+        (
+            kv_idx,
+            kv_rem,
+            idx_idx,
+            idx_rem,
+            valid_token,
+            valid_group,
+            group_positions,
+        ) = gkv_entries[0]
+        assert kv_idx.dtype == torch.int32
+        assert kv_rem.dtype == torch.int32
+        assert idx_idx.dtype == torch.int32
+        assert idx_rem.dtype == torch.int32
+        assert valid_token.dtype == torch.bool
+        assert valid_group.dtype == torch.bool
+        assert group_positions.dtype == torch.int32
+        assert torch.equal(kv_idx, idx_idx)
+        # Also test distinct idx_table shape/ratio branch for idx_idx
+        attn.indexer.k_cache.compress_ratio = 4
+        attn._write_global_kv(torch.ones(COUNT, 10), positions)
+        gkv_entries2 = [
+            v
+            for k, v in stage_cache.items()
+            if k[0] == "global_kv_addr" and v is not gkv_entries[0]
+        ]
+        assert len(gkv_entries2) == 1
+        kv_idx2, kv_rem2, idx_idx2, idx_rem2, _, _, _ = gkv_entries2[0]
+        assert kv_idx2.dtype == torch.int32
+        assert idx_idx2.dtype == torch.int32
+        assert idx_rem2.dtype == torch.int32
+        assert not torch.equal(kv_idx2, idx_idx2)
+
+    # Also exercise _prepare_tpu win_starts.index_select path
+    swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    swa_meta = SimpleNamespace(
+        seq_lens=torch.tensor([130, 130], dtype=torch.int32),
+        block_tables=swa_table,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    ctx_win = SimpleNamespace(
+        attn_metadata={"swa_pfx": swa_meta},
+        additional_kwargs={
+            "deepseek_v41_window_starts": torch.tensor([64, 64], dtype=torch.int32)
+        },
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx_win)
+    monkeypatch.setattr(
+        v2_attn, "sparse_fp8_attention", lambda q, *a, **kw: torch.zeros_like(q)
+    )
+    swa_attn = _make_swa_attn(
+        window_size=128, ced_decoder=False, has_fast_swa_offset=True
+    )
+    pos_swa = torch.tensor([65, 129, 64, 128], dtype=torch.int32)
+    qr = torch.ones((4, 16), dtype=torch.bfloat16)
+    kv = torch.ones((4, 8), dtype=torch.bfloat16)
+    out = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+    with v2_attn.stage_attention_cache_scope():
+        swa_attn._prepare_tpu(None, qr, kv, None, None, None, pos_swa, out)
+        swa_cache = v2_attn._active_stage_attn_cache
+        assert swa_cache is not None
+        assert any(k[0] == "swa_token_addr" for k in swa_cache)
