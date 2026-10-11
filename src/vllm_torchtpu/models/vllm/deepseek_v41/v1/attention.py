@@ -203,8 +203,9 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             compress_ratio=self.compress_ratio,
             rows_per_page=self.cache_num_states,
         )
-        valid = (compressed_slots >= 0) & ((positions + 1) % self.compress_ratio == 0)
-        group_positions = positions // self.compress_ratio * self.compress_ratio
+        pos_i32 = positions.int()
+        valid = (compressed_slots >= 0) & ((pos_i32 + 1) % self.compress_ratio == 0)
+        group_positions = pos_i32 // self.compress_ratio * self.compress_ratio
         compressor_ops.write_compressed_cache(
             self.kv_cache,
             compressed_slots,
@@ -292,14 +293,16 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         selected = None
         if self.compress_ratio:
             capacity = max(1, self._max_model_len // self.compress_ratio)
-            lengths = ((positions + 1) // self.compress_ratio)[:, None]
+            lengths = ((positions.int() + 1) // self.compress_ratio)[:, None]
             if self.indexer is not None:
                 if self._all_indices_fit:
-                    logical_compressed = torch.arange(capacity, device=positions.device)
+                    logical_compressed = torch.arange(
+                        capacity, device=positions.device, dtype=torch.int32
+                    )
                     logical_compressed = logical_compressed[None, :].expand(count, -1)
                     selected = logical_compressed.masked_fill(
                         logical_compressed >= lengths, -1
-                    ).int()
+                    )
                 else:
                     indexer = self.indexer
                     index_q = cast(torch.Tensor, index_q)

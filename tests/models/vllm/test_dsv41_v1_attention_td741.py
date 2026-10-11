@@ -369,6 +369,12 @@ def test_projections_rotate_write_global_kv_and_prepare_tpu(
     # 3. _prepare_tpu with _all_indices_fit == True
     attn._max_model_len = 8
     attn._prepare_tpu(h, qr, kv, None, kv_s, idx_w2, pos, out)
+    assert attn.topk_indices_buffer.dtype == torch.int32
+    assert attn.topk_indices_buffer[:3, :4].tolist() == [
+        [-1, -1, -1, -1],
+        [0, -1, -1, -1],
+        [0, -1, -1, -1],
+    ]
 
     # 4. _prepare_tpu with compress_ratio == 2 but indexer is None
     saved_indexer = attn.indexer

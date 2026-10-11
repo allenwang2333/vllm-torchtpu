@@ -64,7 +64,24 @@ def test_v1_compact_rope_caches_and_rotary() -> None:
     assert out_uncomp.dtype == torch.bfloat16
 
     # Compressed + YaRN + float32 x + float32 positions + inverse=True
-    out_comp_inv = v1_ops.rotary(x_f32, pos_f32, cfg, compressed=True, inverse=True)
+    arange_dtypes: list = []
+    orig_arange = torch.arange
+
+    def _spy_arange(*args, **kwargs):
+        arange_dtypes.append(kwargs.get("dtype"))
+        return orig_arange(*args, **kwargs)
+
+    v1_ops.torch = SimpleNamespace(
+        arange=_spy_arange,
+        float32=torch.float32,
+        stack=torch.stack,
+        cat=torch.cat,
+    )
+    try:
+        out_comp_inv = v1_ops.rotary(x_f32, pos_f32, cfg, compressed=True, inverse=True)
+    finally:
+        v1_ops.torch = torch
+    assert arange_dtypes == [torch.float32, torch.float32]
     assert out_comp_inv.shape == x_f32.shape
     assert out_comp_inv.dtype == torch.float32
 

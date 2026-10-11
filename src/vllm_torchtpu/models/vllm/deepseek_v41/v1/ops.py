@@ -52,7 +52,8 @@ def rotary(x, positions, config, *, compressed, inverse=False):
         low = max(math.floor(correction(yarn["beta_fast"])), 0)
         high = min(math.ceil(correction(yarn["beta_slow"])), dim - 1)
         ramp = (
-            (torch.arange(dim // 2, device=x.device) - low) / max(high - low, 1e-3)
+            (torch.arange(dim // 2, device=x.device, dtype=torch.float32) - low)
+            / max(high - low, 1e-3)
         ).clamp(0, 1)
         frequencies = frequencies * (1 - ramp + ramp / yarn["factor"])
     pos_f32 = (
