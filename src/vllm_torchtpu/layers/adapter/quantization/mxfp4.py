@@ -326,7 +326,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
                 experts_start=layer._experts_start,
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
-                rhs_quant_dtype=self.rhs_quant_dtype,
+                rhs_quant_dtype=(None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
             )
 
         # Step 1: Routing
@@ -359,7 +359,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "rhs_quant_dtype": self.rhs_quant_dtype,
+            "rhs_quant_dtype": (None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
@@ -788,7 +788,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
+            rhs_quant_dtype=(None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else jnp.float4_e2m1fn),
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
