@@ -238,7 +238,7 @@ def request_owners(
     """Owner rank of each request in ``rows`` from column 0 of a sharded KV
     cache group's host block table."""
     return _owners_from_first_blocks(
-        np.asarray(block_ids[rows, 0], dtype=np.int64), layout
+        np.asarray(block_ids[rows, 0], dtype=np.int32), layout
     )
 
 
@@ -311,13 +311,13 @@ def extract_request_owners_from_block_table(
             f"for block table with {num_table_rows} rows"
         )
     limits = (
-        None if blocks_per_req is None else np.asarray(blocks_per_req, dtype=np.int64)
+        None if blocks_per_req is None else np.asarray(blocks_per_req, dtype=np.int32)
     )
     if limits is not None and limits.shape != (total_reqs,):
         raise ValueError(
             f"Expected num_blocks_per_req of shape ({total_reqs},), got {limits.shape}"
         )
-    owners = np.full(total_reqs, int(default_owner), dtype=np.int64)
+    owners = np.full(total_reqs, int(default_owner), dtype=np.int32)
     num_rep = int(layout.num_replicated)
     num_total = int(layout.num_blocks)
     for req_idx in range(total_reqs):
@@ -420,7 +420,7 @@ def prepare_kv_shard_owner_token_layout(
     tokens_arr = (
         num_scheduled_tokens.detach().cpu().numpy()
         if isinstance(num_scheduled_tokens, torch.Tensor)
-        else np.asarray(num_scheduled_tokens, dtype=np.int64)
+        else np.asarray(num_scheduled_tokens, dtype=np.int32)
     )
     owners = extract_request_owners_from_block_table(
         block_table,
@@ -537,7 +537,7 @@ def step_owner_required_tokens(
     cached_req = getattr(runner, "_kv_shard_required_tokens_cache", None)
     if cached_req is not None and cached_req[0] == req_key:
         return cached_req[1]
-    first_blocks = np.asarray(raw_first_blocks, dtype=np.int64)
+    first_blocks = np.asarray(raw_first_blocks, dtype=np.int32)
     if (
         (first_blocks < owner_layout.num_replicated)
         | (first_blocks >= owner_layout.num_blocks)
@@ -546,7 +546,7 @@ def step_owner_required_tokens(
         return 0
     owners = _owners_from_first_blocks(first_blocks, owner_layout)
     runner._kv_shard_owners_cache = (owner_layout, req_key[4], owners)
-    scheduled = np.asarray(scheduled_arr, dtype=np.int64)
+    scheduled = np.asarray(scheduled_arr, dtype=np.int32)
     per_owner = np.bincount(owners, weights=scheduled, minlength=tp_size)
     required = int(tp_size * int(per_owner.max()))
     runner._kv_shard_required_tokens_cache = (req_key, required)
@@ -624,7 +624,7 @@ def attach_step_owner_token_layout(
         if isinstance(raw_q_loc, np.ndarray)
         and raw_q_loc.ndim == 1
         and np.issubdtype(raw_q_loc.dtype, np.integer)
-        else np.asarray(raw_q_loc, dtype=np.int64)
+        else np.asarray(raw_q_loc, dtype=np.int32)
     )
     first_blocks = block_ids[rows, 0]
     first_blocks_bytes = np.asarray(first_blocks).tobytes()

@@ -183,7 +183,9 @@ def topk_mask(
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         # Search negated logits so the predicate is monotonic increasing.
         neg_threshold = (-threshold).unsqueeze(-1)
-        count_gt = torch.sum((logits > neg_threshold).to(torch.int32), dim=-1)
+        # Accumulate in int32 directly (counts <= vocab); a plain int32 sum
+        # promotes the reduction output to int64.
+        count_gt = (logits > neg_threshold).sum(dim=-1, dtype=torch.int32)
         return count_gt >= k
 
     cutoff = -_float32_bsearch(logits.shape[:-1], predicate, logits.device)
