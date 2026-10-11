@@ -19,6 +19,8 @@ XLA reference's own error on the cell: XLA's fp8 x fp8 dot accumulates below f32
 this kernel does not, so the kernel must land inside 2x the reference's error.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -231,13 +233,12 @@ def test_scale_dma_stacked_eager_bit_identical():
 
 
 def _scale_copy_lines(hlo: str, n: int) -> list[str]:
-    """Compiled-HLO copy/slice start/done lines on an f32[n] or f32[1,n] buffer."""
-    return [
-        ln.strip()[:200]
-        for ln in hlo.splitlines()
-        if any(op in ln for op in ("copy-start", "copy-done", "slice-start"))
-        and (f"f32[{n}]" in ln or f"f32[1,{n}]" in ln)
-    ]
+    """Compiled-HLO instructions that copy or slice an f32[n] / f32[1,n] buffer (the
+    scale): the defining op is a copy/slice start and its result is that shape."""
+    pat = re.compile(
+        r"=\s*\(f32\[(?:1,)?%d\][^=]*\)\s+(?:copy|slice)-start\(" % n
+    )
+    return [ln.strip()[:200] for ln in hlo.splitlines() if pat.search(ln)]
 
 
 @pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 16384), (6144, 1536)])
