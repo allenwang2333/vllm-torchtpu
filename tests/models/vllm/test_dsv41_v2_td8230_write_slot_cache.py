@@ -290,9 +290,56 @@ def test_write_global_kv_without_fast_offset_uses_row_indices(monkeypatch):
     assert torch.equal(got, ref)
 
 
-def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
-    from test_dsv41_v2_stage_attn_cache import _make_swa_attn
+def _make_swa_attn(
+    *,
+    window_size: int,
+    ced_decoder: bool,
+    has_fast_swa_offset: bool,
+    rows_per_page: int = 64,
+) -> Any:
+    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn.prefix = "swa_pfx"
+    attn.window_size = window_size
+    attn._ced_decoder = ced_decoder
+    attn._ced_global_from_encoder = False
+    attn._local_q_attn = False
+    attn.compressor = None
+    attn.indexer = None
+    attn.compress_ratio = 2
+    attn._config = {"index_topk": 4}
+    attn._max_model_len = 256
+    attn._fp8_kv = True
+    attn.n_local_heads = 2
+    attn.head_dim = 8
+    attn.scale = 0.25
+    attn.attn_sink = torch.zeros(2)
+    attn._swa_max_requests = 16
+    attn._precompact_records = False
+    attn._token_parallel_attn = False
+    attn._full_attn_sink = False
+    attn._tp_rank_1d = 0
+    attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
+    attn._rotate = lambda x, p: x
+    attn.wq_b = lambda qr: qr
 
+    cache_mock = MagicMock(spec=PagedCacheRows)
+    cache_mock.numel.return_value = 1024
+    cache_mock.shape = (64, rows_per_page, 512)
+    cache_mock.page_stride = 64
+    cache_mock.row_offset = 1000 if has_fast_swa_offset else None
+    cache_mock.row_indices = lambda slots, ro=(1000 if has_fast_swa_offset else 0): (
+        ro + (slots // rows_per_page * 64 + slots % rows_per_page)
+    )
+    cache_mock.pages.return_value = torch.tensor([[1, 2], [3, 4]])
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
+    attn.kv_cache = cache_mock
+    attn._static_forward_context = {"swa_pfx": SimpleNamespace(kv_cache=cache_mock)}
+    attn.compressed_cache_prefix = "swa_pfx"
+    return attn
+
+
+def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
     swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
     swa_meta = SimpleNamespace(
         seq_lens=torch.tensor([130, 130], dtype=torch.int32),
@@ -340,3 +387,85 @@ def test_td8254_prepare_tpu_3page_swa_int64_positions_addressing(monkeypatch):
     assert len(captured_records) == 2
     assert captured_records[0].dtype == torch.int32
     assert torch.equal(captured_records[0], captured_records[1])
+
+
+def test_td8257_compressed_lengths_and_logical_compressed_int32_addressing(monkeypatch):
+    swa_table = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32)
+    swa_meta = SimpleNamespace(
+        seq_lens=torch.tensor([130, 130], dtype=torch.int32),
+        block_tables=swa_table,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    ctx = SimpleNamespace(
+        attn_metadata={"swa_pfx": swa_meta, "idx_pfx": swa_meta},
+        additional_kwargs={},
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, *a, **kw: torch.zeros_like(q),
+    )
+    attn = _make_swa_attn(window_size=128, ced_decoder=False, has_fast_swa_offset=True)
+    attn._config = {"index_topk": 1000}
+    attn._max_model_len = 256
+    attn.indexer = SimpleNamespace(
+        head_dim=8,
+        n_head=2,
+        wk=lambda x: x,
+        k_norm=lambda x: x,
+        k_cache=SimpleNamespace(
+            prefix="idx_pfx", compress_ratio=2, kv_cache=attn.kv_cache
+        ),
+    )
+    pos_i64 = torch.tensor([65, 129, 64, 128], dtype=torch.int64)
+    qr = torch.ones((4, 16), dtype=torch.bfloat16)
+    kv = torch.ones((4, 8), dtype=torch.bfloat16)
+    idx_w = torch.ones((4, 2), dtype=torch.bfloat16)
+    out = torch.zeros((4, 2, 8), dtype=torch.bfloat16)
+
+    with v2_attn.stage_attention_cache_scope():
+        attn._prepare_tpu(None, qr, kv, None, None, idx_w, pos_i64, out)
+        stage_cache = v2_attn._active_stage_attn_cache
+        assert stage_cache is not None
+        comp_entries = [
+            v for k, v in stage_cache.items() if k[0] == "compressed_inputs"
+        ]
+        assert len(comp_entries) == 1
+        lengths, lengths_comp, _, _ = comp_entries[0]
+        assert lengths.dtype == torch.int32
+        assert lengths_comp.dtype == torch.int32
+
+    # Also verify _select_paged_indices query_split dtypes when lengths is int32
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
+    captured_indexer_args: list[tuple[torch.Tensor, torch.Tensor]] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_indexer",
+        lambda q_p, ic, recs, w_p, len_p, cand_p, wr, wk, req_p, **kw: (
+            captured_indexer_args.append((len_p, kw["batch_max"]))
+            or (
+                torch.zeros((16, 8), dtype=torch.int32),
+                torch.zeros((q_p.shape[0], 4), dtype=torch.int32),
+                torch.zeros((q_p.shape[0], 0), dtype=torch.int32),
+            )
+        ),
+    )
+    attn._config = {"index_topk": 4}
+    attn.candidate_block_size = 64
+    attn.candidate_block_buffer = torch.full((16, 4), -1, dtype=torch.int32)
+    attn._project_index_q = lambda q_in, p_in: torch.zeros(
+        (q_in.shape[0], 2, 8), dtype=torch.bfloat16
+    )
+    attn.indexer.indexer_op = SimpleNamespace(
+        candidate_blocks=None, candidate_write=False
+    )
+    attn.kv_cache.raw = torch.zeros((16, 8), dtype=torch.int32)
+
+    with v2_attn.stage_attention_cache_scope():
+        attn._prepare_tpu(None, qr, kv, None, None, idx_w, pos_i64, out)
+    assert len(captured_indexer_args) == 1
+    lengths_part, batch_max = captured_indexer_args[0]
+    assert lengths_part.dtype == torch.int32
+    assert batch_max.dtype == torch.int32

@@ -1624,7 +1624,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     else None
                 )
                 if cached_comp_inputs is None:
-                    lengths = ((positions + 1) // self.compress_ratio)[:, None]
+                    lengths = ((positions.int() + 1) // self.compress_ratio)[:, None]
                     if segmented_main and owner_perm is not None:
                         seg_count = owner_perm.shape[0] // tp_ranks
                         # index_select, not a tensor-bound slice: slicing calls
@@ -1666,12 +1666,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if self.indexer is not None:
                     if self._all_indices_fit:
                         logical_compressed = torch.arange(
-                            capacity, device=positions.device
+                            capacity, dtype=torch.int32, device=positions.device
                         )[None, :].expand(count, -1)
                         selected = logical_compressed.masked_fill(
                             (logical_compressed >= lengths) | (~swa_valid[:, None]),
                             -1,
-                        ).int()
+                        )
                     else:
                         indexer = self.indexer
                         weights = cast(torch.Tensor, weights)
@@ -1756,7 +1756,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         else:
                             index_q = self._project_index_q(qr, positions)
                             logical_compressed = torch.arange(
-                                capacity, device=positions.device
+                                capacity, dtype=torch.int32, device=positions.device
                             )[None, :].expand(count, -1)
                             keys = _read_rows(
                                 index_cache,
@@ -2351,7 +2351,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     1, ids.masked_fill(~valid_ids, num_blocks).long(), True
                 )
                 candidates = block_mask.gather(
-                    1, logical_compressed // self.candidate_block_size
+                    1, (logical_compressed // self.candidate_block_size).long()
                 )[None]
         if candidates is not None:
             candidates = candidates | (lengths.max() <= self._config["index_topk"])
