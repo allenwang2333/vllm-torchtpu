@@ -268,8 +268,8 @@ class DSparkProposer(DFlashProposer):
         the first maximum, so ties resolve to the lowest token id without an
         indirect ``gather`` across ``tp_size``.
         """
-        scores = gathered[:, 0].view(tp_size, num_reqs)
-        ids = gathered[:, 1].view(tp_size, num_reqs)
+        scores = (gathered_3d := gathered.view(tp_size, num_reqs, 2))[..., 0]
+        ids = gathered_3d[..., 1]
         best_score = scores[0]
         best_id = ids[0]
         for r in range(1, tp_size):
@@ -285,15 +285,23 @@ class DSparkProposer(DFlashProposer):
         block_size: int,
         sample_start: int,
     ) -> torch.Tensor:
-        req_bases = (
-            torch.arange(padded_num_reqs, dtype=torch.int32, device=valid_hidden.device)
-            * block_size
+        is_empty = sample_start >= block_size or padded_num_reqs == 0
+        is_passthrough = not is_empty and block_size == 1 and sample_start == 0
+        h3d = (
+            valid_hidden
+            if (is_empty or is_passthrough)
+            else valid_hidden.view(padded_num_reqs, block_size, -1)
         )
-        slot_offsets = torch.arange(
-            sample_start, block_size, dtype=torch.int32, device=valid_hidden.device
+        return (
+            valid_hidden[:0]
+            if is_empty
+            else valid_hidden
+            if is_passthrough
+            else (h3d[:, sample_start:, :] if sample_start > 0 else h3d)
+            .transpose(0, 1)
+            .contiguous()
+            .view(-1, valid_hidden.shape[-1])
         )
-        slot_order = (slot_offsets[:, None] + req_bases[None, :]).reshape(-1)
-        return valid_hidden.index_select(0, slot_order)
 
     def _sample_markov_sharded(
         self,

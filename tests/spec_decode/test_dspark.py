@@ -1113,3 +1113,63 @@ def test_td8312_dspark_int32_cast_guards():
     for s64, s32 in zip(steps_i64, steps_i32, strict=True):
         assert s64.dtype == s32.dtype == torch.int32
         assert torch.equal(s64, s32)
+
+
+def test_td8361_slot_major_hidden_fast_paths_and_gathered_candidate_3d_view():
+    """TD8.361: Verify _slot_major_hidden empty/passthrough/3D-transpose paths
+    and _select_gathered_candidate single 3D view."""
+    from vllm_torchtpu.spec_decode.dspark import _slot_major_hidden
+
+    hidden_size = 8
+    valid_hidden = torch.arange(4 * 3 * hidden_size, dtype=torch.float32).reshape(
+        12, hidden_size
+    )
+
+    # 1) sample_start >= block_size -> empty slice
+    empty_ge = _slot_major_hidden(
+        valid_hidden, padded_num_reqs=4, block_size=3, sample_start=3
+    )
+    assert empty_ge.shape == (0, hidden_size)
+    empty_gt = _slot_major_hidden(
+        valid_hidden, padded_num_reqs=4, block_size=3, sample_start=5
+    )
+    assert empty_gt.shape == (0, hidden_size)
+
+    # 2) padded_num_reqs == 0 -> empty slice
+    empty_reqs = _slot_major_hidden(
+        valid_hidden[:0], padded_num_reqs=0, block_size=3, sample_start=0
+    )
+    assert empty_reqs.shape == (0, hidden_size)
+
+    # 3) block_size == 1 and sample_start == 0 -> direct passthrough
+    h_b1 = valid_hidden[:4]
+    got_b1 = _slot_major_hidden(h_b1, padded_num_reqs=4, block_size=1, sample_start=0)
+    assert got_b1 is h_b1
+
+    # 4) block_size > 1 with sample_start == 0 and sample_start > 0
+    for sample_start in (0, 1, 2):
+        got = _slot_major_hidden(
+            valid_hidden, padded_num_reqs=4, block_size=3, sample_start=sample_start
+        )
+        req_bases = torch.arange(4, dtype=torch.int32) * 3
+        slot_offsets = torch.arange(sample_start, 3, dtype=torch.int32)
+        slot_order = (slot_offsets[:, None] + req_bases[None, :]).reshape(-1)
+        ref = valid_hidden.index_select(0, slot_order)
+        assert torch.equal(got, ref)
+        assert got.is_contiguous()
+
+    # 5) _select_gathered_candidate single 3D view with tie-breaking
+    gathered = torch.tensor(
+        [
+            [5.0, 100.0],
+            [2.0, 101.0],
+            [5.0, 200.0],
+            [7.0, 201.0],
+            [4.0, 300.0],
+            [7.0, 301.0],
+        ],
+        dtype=torch.float32,
+    )
+    best = DSparkProposer._select_gathered_candidate(gathered, tp_size=3, num_reqs=2)
+    assert best.dtype == torch.int32
+    assert best.tolist() == [100, 201]
