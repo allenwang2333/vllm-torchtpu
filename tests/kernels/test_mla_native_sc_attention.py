@@ -1017,6 +1017,102 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         )
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
 
+    @parameterized.product(
+        (
+            {"query_tokens": 64, "seq_q": (4, 4, 49)},
+            {"query_tokens": 512, "seq_q": (4, 4, 300)},
+            {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        ),
+        overflow=(False, True),
+    )
+    def test_mixed_mask_in_kernel_bit_identical(self, query_tokens, seq_q, overflow):
+        """TPU_DCP_MLA_MIXED_MASK_IN_KERNEL (mixed buckets): the raw top-k with
+        `lse_mask_empty` matches the production DCP glue (dummy key 0 + owns
+        lse mask) bit for bit on every owning real row, on the served mixed
+        configuration (live gather, widths, body levers) and the plain capped
+        path; empty rows get lse == -inf and a finite output by themselves,
+        including a 16-token grid step whose tokens all own nothing."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261012 + query_tokens + int(overflow))
+        problem, topk_glued, owns, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        if not overflow:
+            counts = np.clip(rng.normal(128, 30, size=query_tokens), 0, 400).astype(int)
+        counts[0] = 0
+        counts[16:32] = 0  # one whole grid step owns nothing (0 live atoms)
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        owns = jnp.any(topk_raw >= 0, axis=-1)
+        topk_glued = topk_raw.at[:, 0].set(
+            jnp.where(owns, topk_raw[:, 0], jnp.int32(0))
+        )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        own = np.asarray(owns)[:real_tokens]
+        self.assertTrue((~own).any() and own.any())
+        served = {
+            "mixed_live_gather": True,
+            "mixed_live_widths": (256, 384),
+            "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT,
+        }
+        for kw in ({}, {"mixed_live_gather": True}, served):
+            ref, ref_lse = jax.block_until_ready(run(topk_glued, **kw))
+            ref_lse = jnp.where(owns[:, None], ref_lse, -jnp.inf)
+            out, lse = jax.block_until_ready(run(topk_raw, lse_mask_empty=True, **kw))
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens][own], bits(ref)[:real_tokens][own], err_msg=str(kw)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens][own].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens][own].view(np.uint32),
+                err_msg=str(kw),
+            )
+            self.assertTrue(
+                np.all(np.asarray(lse)[:real_tokens][~own] == -np.inf), str(kw)
+            )
+            self.assertTrue(
+                np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all(), str(kw)
+            )
+        # Positive control 1: without the in-kernel mask the raw top-k leaves
+        # finite lse on the empty rows (the merge would weight them in).
+        _, bad_lse = jax.block_until_ready(run(topk_raw, **served))
+        self.assertFalse(np.all(np.asarray(bad_lse)[:real_tokens][~own] == -np.inf))
+        # Positive control 2: one moved live entry of the longest row moves it.
+        row = int(np.argmax(np.where(own, counts[:real_tokens], -1)))
+        moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(run(moved, lse_mask_empty=True, **served))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
     @parameterized.parameters((512, 300), (1024, 1000), (1024, 77))
     def test_capped_window_live_matches_reference(self, num_tokens, real):
         """`prepare_capped_window_live`: per chunk, window 0 is a permutation of
