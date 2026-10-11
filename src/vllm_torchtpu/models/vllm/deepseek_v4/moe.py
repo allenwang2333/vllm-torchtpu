@@ -32,6 +32,7 @@ from vllm_torchtpu.distributed.tp_collectives import (
     tp_reduce_scatter,
 )
 from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.fused_moe import (
     moe_fp8_dispatch_enabled,
     quantize_moe_dispatch,

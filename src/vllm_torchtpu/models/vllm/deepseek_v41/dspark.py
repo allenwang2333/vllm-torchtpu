@@ -840,20 +840,54 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
                 prev = step
             return torch.stack(draft_tokens, dim=1)
 
-        logits_local = self.logits_processor._get_logits(
-            pred_kcb, lm_head, None, skip_gather=True
-        )
-        assert logits_local is not None
-        logits_full = tp_all_gather(
-            logits_local.contiguous(), dim=-1
-        ).view(num_pred, padded_num_reqs, -1)[..., : self.config.vocab_size]
+        shard_cols = int(lm_head.weight.shape[0])
+        w2_pad, pad_bias, start_t = meta
+        lm_w_pad = getattr(self, "_tp_lm_w_pad", None)
+        shard_pad = int(w2_pad.shape[0])
+        if lm_w_pad is not None:
+            logits_kbv = torch.nn.functional.linear(pred_kcb, lm_w_pad).view(
+                num_pred, padded_num_reqs, shard_pad
+            )
+        else:
+            logits_local = self.logits_processor._get_logits(
+                pred_kcb, lm_head, None, skip_gather=True
+            )
+            assert logits_local is not None
+            if shard_pad > shard_cols:
+                logits_local = torch.cat(
+                    (
+                        logits_local,
+                        torch.zeros(
+                            (logits_local.shape[0], shard_pad - shard_cols),
+                            dtype=logits_local.dtype,
+                            device=logits_local.device,
+                        ),
+                    ),
+                    dim=-1,
+                )
+            logits_kbv = logits_local.view(num_pred, padded_num_reqs, shard_pad)
+
         draft_tokens = []
         prev = prev_init
         for idx in range(num_pred):
-            bias = self.markov_bias(self.markov_embed(prev))
-            step = self.map_draft_to_target(
-                (logits_full[idx] + bias).argmax(dim=-1)
+            bias_local = torch.nn.functional.linear(self.markov_embed(prev), w2_pad)
+            local_val, local_idx = (
+                logits_kbv[idx] + bias_local + pad_bias
+            ).max(dim=-1, keepdim=True)
+            packed_local = torch.cat(
+                [
+                    local_val.to(torch.float32).view(torch.int32),
+                    local_idx.to(torch.int32) + start_t,
+                ],
+                dim=-1,
             )
+            packed_all = tp_all_gather(packed_local, dim=0).view(
+                tp_size, padded_num_reqs, 2
+            )
+            all_vals = packed_all[..., 0].view(torch.float32)
+            all_idxs = packed_all[..., 1]
+            best_shard = all_vals.argmax(dim=0, keepdim=True)
+            step = all_idxs.gather(0, best_shard).squeeze(0)
             draft_tokens.append(step)
             prev = step
         return torch.stack(draft_tokens, dim=1)
