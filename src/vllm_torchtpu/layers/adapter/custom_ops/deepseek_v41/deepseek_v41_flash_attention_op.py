@@ -96,7 +96,9 @@ def _prepare_swa_metadata(
         )
         raw_kv_lens = jnp.maximum(0, raw_kv_lens - base_pages * logical_page_size)
         swa_kv_lens = raw_kv_lens | (eff_span_packed << 20)
-        page_table_2d = swa_page_indices.reshape(max_num_seqs, pages_per_seq)
+        page_table_2d = swa_page_indices[
+            : max_num_seqs * pages_per_seq
+        ].reshape(max_num_seqs, pages_per_seq)
         col_idx = jnp.minimum(
             base_pages[:, None] + jnp.arange(window_pages, dtype=jnp.int32)[None, :],
             pages_per_seq - 1,

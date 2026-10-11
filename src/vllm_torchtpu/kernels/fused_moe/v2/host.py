@@ -58,23 +58,15 @@ WIDEN_KCHUNK = 512
 #
 # Zero is the useful other end: no runway at all, one weight slot, an expert
 # starting its own weights at its head and waiting on them.
-MAX_WEIGHT_PREFETCH_DISTANCE = 2
+import os
+
+MAX_WEIGHT_PREFETCH_DISTANCE = int(
+    os.environ.get("VLLM_DSV41_MOE_V2_MAX_PREFETCH", "2")
+)
 
 
 def nbuf_for(distance):
-    """Weight buffer slots a prefetch distance needs.
-
-    A refill writes its slot while the readers of the prefetch distance's
-    worth of earlier experts are still live, so the slot count has to exceed
-    the distance for all of them to stay distinct. At distance zero there are
-    no earlier readers to stay clear of and the one slot is the expert's own.
-
-    This relation IS what a distance costs, and it is written once here
-    rather than at each build, because the two numbers travel together
-    everywhere: a build that lowered one and kept the other would either
-    overwrite a slab a live reader is still contracting against or pay VMEM
-    for a slot nothing addresses.
-    """
+    """Weight buffer slots a prefetch distance needs."""
     return distance + 1
 
 
@@ -184,7 +176,10 @@ def align_up(v, m):
 
 def token_gather_window_rows(tile_m):
     """Int32 rows in one aligned HBM-to-SMEM token-gather window."""
-    return TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT
+    return align_up(
+        TOKEN_GATHER_TILES_PER_WINDOW * tile_m + TOKEN_GATHER_DMA_ALIGNMENT,
+        TOKEN_GATHER_DMA_ALIGNMENT,
+    )
 
 
 def token_gather_smem_bytes(tile_m):
@@ -1258,14 +1253,12 @@ def shard_count_vector(routing, expert_rows, me, *, e_total, ep):
 
 
 def vmem_limit(info=None):
-    """VMEM budget for the kernel, read from this generation's capacity.
-
-    Takes the device record the rest of the accounting already holds, so a
-    caller sizing several candidate builds against one budget reads the
-    device once rather than once per candidate.
-    """
+    """VMEM budget for the kernel, read from this generation's capacity."""
     if info is None:
         info = pltpu.get_tpu_info()
+    env_mb = os.environ.get("VLLM_DSV41_MOE_V2_VMEM_MB")
+    if env_mb is not None:
+        return int(float(env_mb) * 1024 * 1024)
     return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
@@ -1355,6 +1348,9 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    n_act_scales=1,
+    n_wire_scales=1,
+    wire_dtype=None,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1376,6 +1372,7 @@ def vmem_scratch_arrays(
     sixteen-bit wire takes the same geometry at twice the bytes.
     """
     form = weight_form(weight_format)
+    wire = form.wire_dtype if wire_dtype is None else wire_dtype
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
@@ -1417,16 +1414,23 @@ def vmem_scratch_arrays(
     # WEIGHT slabs need so a refill and the live readers of the prefetch
     # distance's worth of earlier experts occupy distinct slots, which is a
     # different question and a larger answer.
+    ls_shape = (
+        (OUT_PARITIES, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK)
+        if n_act_scales == 1
+        else (
+            OUT_PARITIES,
+            n_act_scales,
+            act_scale_window_rows(capacity),
+            HIDDEN_LANE_BLOCK,
+        )
+    )
     act_scale = (
-        [
-            (
-                "ls_vm",
-                (OUT_PARITIES, act_scale_window_rows(capacity), HIDDEN_LANE_BLOCK),
-                jnp.float32,
-            )
-        ]
-        if form.quantized_activations
-        else []
+        [("ls_vm", ls_shape, jnp.float32)] if form.quantized_activations else []
+    )
+    oscl_shape = (
+        (OUT_PARITIES, 1, capacity)
+        if n_wire_scales == 1
+        else (OUT_PARITIES, 1, n_wire_scales, capacity)
     )
     return [
         # The indirect form keeps each token row as one lane-block row.
@@ -1442,14 +1446,21 @@ def vmem_scratch_arrays(
         (
             "out_vm",
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
-            form.wire_dtype,
+            wire,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        ("oscl_vm", oscl_shape, jnp.float32),
     ]
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    requantize_mid=True,
+    wire_dtype=None,
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1471,18 +1482,15 @@ def vmem_tile_body_arrays(
     so it is not counted again here.
     """
     form = weight_form(weight_format)
+    wire = form.wire_dtype if wire_dtype is None else wire_dtype
     tile_m = capacity
     arrays = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
     ]
     # The second matmul takes the intermediate quantized only where its
-    # weights are. The other formats contract the bf16 rows directly -- but
-    # they still materialize a second copy: the non-requantizing path
-    # concatenates the chunk list into one [tile_m, inter] bf16 array while
-    # the chunks that feed it are still live. The requantizing path does not,
-    # because it quantizes straight out of the chunk list into mid_q.
-    if form.quantized_activations:
+    # weights are and requantize_mid is enabled.
+    if form.quantized_activations and requantize_mid:
         arrays.append(("mid_q", (tile_m, inter), FP8))
     else:
         arrays.append(("mid_concat", (tile_m, inter), jnp.bfloat16))
@@ -1493,7 +1501,7 @@ def vmem_tile_body_arrays(
     # An eight-bit wire quantizes the down projection into a fresh array
     # while down_bf16, the bf16 source it reduces over, is still live. A
     # sixteen-bit wire ships down_bf16 itself and materializes nothing.
-    if form.wire_dtype is FP8:
+    if wire is FP8:
         arrays.append(("wire_rows", (tile_m, hidden), FP8))
     if weight_format == WeightFormat.FP4:
         arrays.append(
@@ -1524,6 +1532,10 @@ def vmem_estimate_bytes(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    n_act_scales=1,
+    n_wire_scales=1,
+    requantize_mid=True,
+    wire_dtype=None,
     info=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
@@ -1550,9 +1562,18 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        n_act_scales=n_act_scales,
+        n_wire_scales=n_wire_scales,
+        wire_dtype=wire_dtype,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        requantize_mid=requantize_mid,
+        wire_dtype=wire_dtype,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1587,6 +1608,10 @@ def fit_weight_slots(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    n_act_scales=1,
+    n_wire_scales=1,
+    requantize_mid=True,
+    wire_dtype=None,
     info=None,
     limit=None,
 ):
@@ -1630,6 +1655,10 @@ def fit_weight_slots(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                n_act_scales=n_act_scales,
+                n_wire_scales=n_wire_scales,
+                requantize_mid=requantize_mid,
+                wire_dtype=wire_dtype,
                 info=info,
             ),
             limit,

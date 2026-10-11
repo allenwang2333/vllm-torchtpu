@@ -298,8 +298,11 @@ def gmm_wrapper(
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
     is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+        (
+            jnp.issubdtype(rhs.dtype, jnp.floating)
+            and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+        )
+        or rhs_quant_dtype == jnp.float4_e2m1fn
     )
     use_fp8_lhs = (not is_fp4_weight) or (lhs_scale is not None)
     return gmm_v2(
@@ -798,7 +801,12 @@ def moe_gmm(
     else:
         gmm1_in = gmm1_res[:, :inter_dim]
         gmm1_scale = None
-    if gmm1_scale is not None and is_w2_fp4 and w2_scale is not None:
+    if (
+        gmm1_scale is not None
+        and is_w2_fp4
+        and w2_scale is not None
+        and gmm1_scale.shape != (gmm1_in.shape[0], w2_scale.shape[1])
+    ):
         gmm1_scale = jnp.broadcast_to(
             gmm1_scale.reshape(-1, 1), (gmm1_in.shape[0], w2_scale.shape[1])
         )

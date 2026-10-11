@@ -635,6 +635,8 @@ def _patch_multiproc_worker_global_rank_env() -> None:
 
 
 def _run_engine_core_with_tpu_patches(*args, **kwargs):
+    from vllm_torchtpu.runner.kv_cache_deepseek_v41_flash import _apply_compact_swa_block_pool_patch
+    _apply_compact_swa_block_pool_patch()
     from vllm_torchtpu import patch_registry
 
     patch_registry.apply("engine_core")

@@ -1,4 +1,3 @@
-import vllm_torchtpu.envs as envs
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +51,7 @@ import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -182,6 +182,10 @@ def _build_op(
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    subchannel_fp8 = bool(envs.VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8)
+    requantize_mid = bool(envs.VLLM_DSV41_MOE_V2_REQUANTIZE)
+    wire_bf16_max_tokens = int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS)
+
     key = (
         topk,
         renormalize,
@@ -196,6 +200,9 @@ def _build_op(
         has_hash_ids,
         precomputed_routing,
         token_replica_groups,
+        subchannel_fp8,
+        requantize_mid,
+        wire_bf16_max_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -204,12 +211,32 @@ def _build_op(
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
     routing_kw = dict(
-        scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
+        scoring_fn=scoring_fn,
+        routed_scaling_factor=routed_scaling_factor,
+        subchannel_fp8=subchannel_fp8,
+        requantize_mid=requantize_mid,
     )
 
+    def _unpack_fp4_u8(w1, w2):
+        if weight_format == "fp4" and w1.dtype == jnp.uint8:
+            w1 = jax.lax.bitcast_convert_type(w1, jnp.float4_e2m1fn).reshape(
+                *w1.shape[:-1], w1.shape[-1] * 2
+            )
+            w2 = jax.lax.bitcast_convert_type(w2, jnp.float4_e2m1fn).reshape(
+                *w2.shape[:-1], w2.shape[-1] * 2
+            )
+        return w1, w2
+
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
+        w1, w2 = _unpack_fp4_u8(w1, w2)
         w1_scale = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
         w2_scale = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
+        _cap = int(
+            os.environ.get(
+                "VLLM_DSV41_MOE_V2_CAPACITY",
+                "32" if x.shape[0] <= 128 else ("64" if x.shape[0] <= 1024 else str(_TILE_M)),
+            )
+        )
         return fused_ep_moe_v2(
             x,
             w1,
@@ -221,7 +248,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=_cap,
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -230,6 +257,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            wire_bf16=(x.shape[0] <= wire_bf16_max_tokens),
             **bias_kw,
             **routing_kw,
         )
@@ -246,6 +274,7 @@ def _build_op(
         score_bias: jax.Array | None = None,
         hash_ids: jax.Array | None = None,
     ) -> jax.Array:
+        w1, w2 = _unpack_fp4_u8(w1, w2)
         from jax import lax
         from vllm_torchtpu.kernels.fused_moe.v2.layer import (
             _apply_scoring_fn,
@@ -264,8 +293,6 @@ def _build_op(
         t_local = T_global // ep
         e_total = w1.shape[0]
         g_local = e_total // ep
-        if getattr(envs, "VLLM_DSV41_MODULO_EXPERT_BALANCE", False) and ep > 1:
-            topk_ids = (topk_ids.astype(jnp.int32) % ep) * g_local + (topk_ids.astype(jnp.int32) // ep)
         onehot_thr = resolve_onehot_permute_threshold()
         _fn_dispatch = getattr(
             fused_moe_func_fp8_dispatch,
@@ -427,6 +454,8 @@ def _build_op(
         topk_weights: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
+        w1_scale = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
+        w2_scale = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
         T_global, hidden = x.shape
         (ax,) = mesh.axis_names
         ep = mesh.shape[ax]
@@ -435,9 +464,13 @@ def _build_op(
         g_local = e_total // ep
 
         fp4_max_t = int(
-            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "0")
+            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "16384" if ep <= 2 else "0")
         )
-        use_path_c = T_global <= (fp4_max_t if weight_format == "fp4" else 512)
+        fp8_max_t = int(os.environ.get("VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS", "512"))
+        use_path_c = (
+            T_global <= (fp4_max_t if weight_format == "fp4" else fp8_max_t)
+            and (t_local % 8 == 0)
+        )
         if use_path_c and weight_format in ("fp8", "fp4"):
             from jax import lax
             from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -452,7 +485,11 @@ def _build_op(
                 "__wrapped__",
                 fused_moe_func_fp8_dispatch,
             )
-            rhs_qdtype = None
+            rhs_qdtype = (
+                None
+                if w1.dtype == jnp.float4_e2m1fn
+                else (jnp.float4_e2m1fn if weight_format == "fp4" else None)
+            )
 
             def _local_path_c(
                 x_l, w1_l, w2_l, w1s_l, w2s_l, ids_l, w_l, rank_l
@@ -520,6 +557,12 @@ def _build_op(
             )
 
         def _run_v2(x_s, ids_s, w_s):
+            _cap_s = int(
+                os.environ.get(
+                    "VLLM_DSV41_MOE_V2_CAPACITY",
+                    "32" if x_s.shape[0] <= 128 else ("64" if x_s.shape[0] <= 1024 else str(_TILE_M)),
+                )
+            )
             return fused_ep_moe_v2(
                 x_s,
                 w1,
@@ -531,7 +574,7 @@ def _build_op(
                 topk=topk,
                 renormalize=False,
                 mesh=mesh,
-                capacity=_TILE_M,
+                capacity=_cap_s,
                 block=None,
                 ragged_stride=None,
                 weight_format=WeightFormat(weight_format),
@@ -543,10 +586,16 @@ def _build_op(
                 topk_weights_override=w_s.astype(jnp.float32),
                 routed_scaling_factor=1.0,
                 token_replica_groups=token_replica_groups,
+                subchannel_fp8=subchannel_fp8,
+                requantize_mid=requantize_mid,
+                wire_bf16=(x_s.shape[0] <= wire_bf16_max_tokens),
             )
 
         _max_v2_t_local = int(
-            os.environ.get("VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS", "32768")
+            os.environ.get(
+                "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS",
+                "32768" if ep <= 2 else "8192",
+            )
         )
         if t_local <= _max_v2_t_local:
             return _run_v2(x, topk_ids, topk_weights)
@@ -626,6 +675,10 @@ def fused_moe_ep(
 ) -> torch.Tensor:
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
+        w1 = w1.view(torch.uint8)
+        w2 = w2.view(torch.uint8)
+        scales = (w1_scale, w2_scale)
+    elif w1.dtype in (torch.uint8, torch.int32):
         scales = (w1_scale, w2_scale)
     else:
         scales = (
@@ -833,8 +886,13 @@ def prebuild_fused_moe_ep(
                 layer.w2_weight_scale_inv,
             )
     w1, w2, w1_scale, w2_scale = weights
-    local_experts, hidden = w1.shape[0], w1.shape[1]
-    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
+    local_experts = w1.shape[0]
+    if weight_format == "fp4" and w1.dtype == torch.int32:
+        hidden = w1.shape[1] * PACK4
+        inter = w1.shape[2] // 2
+    else:
+        hidden = w1.shape[1]
+        inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
 
     max_node_tokens = _max_node_tokens(ep, pcp)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
@@ -940,11 +998,18 @@ def fused_moe_ep_unsupported_reason(
     w1, w2, w1_scale, w2_scale = weights
     if w1.ndim != 3 or w2.ndim != 3 or w2.shape[0] != w1.shape[0]:
         return f"weight rank/expert mismatch {tuple(w1.shape)} {tuple(w2.shape)}"
-    local_experts, hidden = w1.shape[:2]
-    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
-    packing = 2 if weight_format == "fp4" else 1
-    if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
-        return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
+    local_experts = w1.shape[0]
+    if weight_format == "fp4" and w1.dtype == torch.int32:
+        hidden = w1.shape[1] * PACK4
+        inter = w1.shape[2] // 2
+        if w2.shape != (local_experts, inter // PACK4, hidden):
+            return f"w2 {tuple(w2.shape)} is not [E, {inter // PACK4}, {hidden}]"
+    else:
+        hidden = w1.shape[1]
+        inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
+        packing = 2 if weight_format == "fp4" else 1
+        if w2.shape[1] != inter or w2.shape[2] * packing != hidden:
+            return f"w2 {tuple(w2.shape)} is not [E, {inter}, {hidden}]"
     from vllm_torchtpu.kernels.fused_moe.v2.kernel import ACT_FNS
 
     if activation not in ACT_FNS:
@@ -952,8 +1017,11 @@ def fused_moe_ep_unsupported_reason(
             f"activation {activation!r} is not wired to the kernel's ACT_FNS {ACT_FNS}"
         )
     if weight_format == "fp4":
-        if w1.dtype != torch.float4_e2m1fn_x2 or w2.dtype != w1.dtype:
-            return "the FP4 form requires native float4_e2m1fn_x2 weights"
+        if (
+            w1.dtype not in (torch.float4_e2m1fn_x2, torch.uint8, torch.int32)
+            or w2.dtype != w1.dtype
+        ):
+            return "the FP4 form requires native float4_e2m1fn_x2, uint8, or int32 weights"
         if not isinstance(rhs_qb, int) or rhs_qb <= 0:
             return "NVFP4 fused EP requires a positive integer block size"
         packed_row_tile = U32_SUBLANE_TILE * PACK4

@@ -15,7 +15,6 @@
 
 import copy
 import dataclasses
-import os
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -632,6 +631,8 @@ def _clear_stage_caches(
                 attn._step_indexer_metadata = None
             attn._step_csa_union = None
             attn._step_swa_metadata = None
+            attn._step_swa_metadata_by_pages = None
+            attn._step_swa_win_metadata_by_pages = None
             attn._step_tp_swa_metadata = None
             attn._step_cos_sin = None
             attn._step_cos_sin_local = None
@@ -1250,6 +1251,8 @@ class DeepseekV41Model(nn.Module):
             _build_layer,
             prefix=f"{prefix}.layers",
         )
+        if hasattr(config, "_tpu_candidate_block_buffer"):
+            delattr(config, "_tpu_candidate_block_buffer")
 
         engram_lids = (
             self.engram_layout.layer_ids if self.engram_layout is not None else ()
@@ -1567,17 +1570,6 @@ class DeepseekV41Model(nn.Module):
                         all_real = False
             if all_real:
                 self._csa_ops_warmed = True
-                if not torch.compiler.is_compiling() and positions.device.type == "tpu":
-                    free_b, total_b = torch.accelerator.get_memory_info()
-                    used_b = total_b - free_b
-                    print(
-                        f"[POST_WARMUP_HBM] chip={os.environ.get('POD_G_CHIP_ID', '0')} "
-                        f"rank={get_tensor_model_parallel_rank()} "
-                        f"used_gib={used_b/(1024**3):.3f} "
-                        f"free_gib={free_b/(1024**3):.3f} "
-                        f"total_gib={total_b/(1024**3):.3f}",
-                        flush=True,
-                    )
 
         num_tokens = int(positions.shape[0])
         engram_hashes: torch.Tensor | None = None
@@ -1593,7 +1585,9 @@ class DeepseekV41Model(nn.Module):
                 device=positions.device,
                 out_1d_i32_buf=buf_1d,
             )
-            if engram_hashes is None:
+            if engram_hashes is not None:
+                self._engram_buf_dirty = True
+            else:
                 tp_size = get_tensor_model_parallel_world_size()
                 t_local = (
                     num_tokens // tp_size
@@ -1601,15 +1595,19 @@ class DeepseekV41Model(nn.Module):
                     else num_tokens
                 )
                 if buf_1d is not None:
-                    if buf_1d.ndim == 2:
-                        buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
-                    else:
-                        n_bytes = (
-                            t_local
-                            * n_tables
-                            * _engram_table_bytes(n_hash_cols, self._engram_packed_dim)
-                        )
-                        buf_1d[:n_bytes].zero_()
+                    if getattr(self, "_engram_buf_dirty", False):
+                        if buf_1d.ndim == 2:
+                            buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
+                        else:
+                            n_bytes = (
+                                t_local
+                                * n_tables
+                                * _engram_table_bytes(
+                                    n_hash_cols, self._engram_packed_dim
+                                )
+                            )
+                            buf_1d[:n_bytes].zero_()
+                        self._engram_buf_dirty = False
                     engram_hashes = buf_1d
                 else:
                     cols_flat = (t_local * n_tables * n_hash_cols) // num_tokens
@@ -1740,7 +1738,7 @@ class DeepseekV41Model(nn.Module):
         dec_q_loc = plan.query_start_loc.to(dev, non_blocking=True)
         dec_seq_lens = plan.seq_lens.to(dev, non_blocking=True)
         dec_dist = plan.request_distribution.to(dev, non_blocking=True)
-        gather_idx = plan.gather_indices.to(dev, non_blocking=True)
+        gather_idx = plan.gather_idx.to(dev, non_blocking=True) if hasattr(plan, "gather_idx") else plan.gather_indices.to(dev, non_blocking=True)
         scatter_idx = plan.scatter_indices.to(dev, non_blocking=True)
         if hidden_states.shape[0] != num_tokens:
             tp_rank = get_tensor_model_parallel_rank()
@@ -1749,19 +1747,34 @@ class DeepseekV41Model(nn.Module):
             end_row = start_row + t_local
             local_idx = (gather_idx - start_row).clamp(0, t_local - 1)
             in_shard = (gather_idx >= start_row) & (gather_idx < end_row)
-            dec_hidden = tensor_model_parallel_all_reduce(
-                torch.where(
-                    in_shard.view(-1, 1, 1),
-                    hidden_states[local_idx],
-                    torch.zeros_like(hidden_states[local_idx]),
+            hs_sel = torch.where(
+                in_shard.view(-1, 1, 1),
+                hidden_states[local_idx],
+                torch.zeros_like(hidden_states[local_idx]),
+            )
+            pm_sel = torch.where(
+                in_shard.view(-1, 1),
+                pre_mix[local_idx],
+                torch.zeros_like(pre_mix[local_idx]),
+            )
+            hs_flat = hs_sel.reshape(hs_sel.shape[0], -1)
+            hs_cols = hs_flat.shape[-1]
+            pm_cols = int(pm_sel.shape[-1])
+            pm_pad = ((pm_cols + 127) // 128) * 128
+            reduced_seam = tensor_model_parallel_all_reduce(
+                torch.cat(
+                    [
+                        hs_flat,
+                        torch.nn.functional.pad(
+                            pm_sel.to(hs_flat.dtype), (0, pm_pad - pm_cols)
+                        ),
+                    ],
+                    dim=-1,
                 )
             )
-            dec_pre_mix = tensor_model_parallel_all_reduce(
-                torch.where(
-                    in_shard.view(-1, 1),
-                    pre_mix[local_idx],
-                    torch.zeros_like(pre_mix[local_idx]),
-                )
+            dec_hidden = reduced_seam[:, :hs_cols].contiguous().reshape(hs_sel.shape)
+            dec_pre_mix = reduced_seam[:, hs_cols : hs_cols + pm_cols].contiguous().to(
+                pm_sel.dtype
             )
             dec_positions = positions.index_select(0, gather_idx)
         else:
@@ -2012,16 +2025,3 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
                 ffn_mod, "process_weights_after_loading"
             ):
                 ffn_mod.process_weights_after_loading()
-        try:
-            free_b, total_b = torch.accelerator.get_memory_info()
-            used_b = total_b - free_b
-            print(
-                f"[PRE_KV_WEIGHTS_HBM] chip={os.environ.get('POD_G_CHIP_ID', '0')} "
-                f"rank={get_tensor_model_parallel_rank()} "
-                f"used_gib={used_b/(1024**3):.3f} "
-                f"free_gib={free_b/(1024**3):.3f} "
-                f"total_gib={total_b/(1024**3):.3f}",
-                flush=True,
-            )
-        except Exception:
-            pass
