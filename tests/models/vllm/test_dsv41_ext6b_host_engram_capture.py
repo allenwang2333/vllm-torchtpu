@@ -557,3 +557,67 @@ def test_td8342_host_engram_c_dict_fast_paths_and_lookback_dirty_tracking():
     np.testing.assert_array_equal(out_all2.input_ids.numpy(), ids_all_ref)
     np.testing.assert_array_equal(out_all2.positions.numpy(), pos_all_ref)
     np.testing.assert_array_equal(out_all2.lookback_token_ids.numpy(), lb_all_ref)
+
+
+def test_td8372_full_overlay_lookback_skips_token_ids_cpu_gather() -> None:
+    """Verify full-overlay lookback fast path skips batch.token_ids_cpu."""
+    from types import SimpleNamespace
+
+    runner = SimpleNamespace(
+        lookback_token_ids=SimpleNamespace(cpu=torch.zeros((4, 3), dtype=torch.int32))
+    )
+    overlay_tokens = np.arange(100, 124, dtype=np.int32).reshape(4, 6)
+    overlay = he._SampledOverlay(
+        tokens=overlay_tokens,
+        starts=np.array([10, 20, 30, 40], dtype=np.int32),
+        lengths=np.array([6, 6, 6, 6], dtype=np.int32),
+    )
+
+    class _NoTokenIdsBatch:
+        num_computed_tokens_cpu = np.array([15, 24, 36, 43], dtype=np.int32)
+
+        @property
+        def token_ids_cpu(self):
+            raise AssertionError(
+                "batch.token_ids_cpu should not be accessed on full-overlay fast path"
+            )
+
+    # 1. Full-overlay fast path (delta = [5, 4, 6, 3] >= depth=3 and <= lengths=6)
+    lb_fast = he._resolve_decode_lookback_cpu(
+        runner,
+        _NoTokenIdsBatch(),
+        4,
+        0,
+        sampled_overlay=overlay,
+    )
+    expected_fast = np.array(
+        [
+            [overlay_tokens[0, 4], overlay_tokens[0, 3], overlay_tokens[0, 2]],
+            [overlay_tokens[1, 3], overlay_tokens[1, 2], overlay_tokens[1, 1]],
+            [overlay_tokens[2, 5], overlay_tokens[2, 4], overlay_tokens[2, 3]],
+            [overlay_tokens[3, 2], overlay_tokens[3, 1], overlay_tokens[3, 0]],
+        ],
+        dtype=np.int32,
+    )
+    np.testing.assert_array_equal(lb_fast.numpy(), expected_fast)
+
+    # 2. Partial-overlay fallback (req 0 has delta=2 < depth=3)
+    token_table = np.arange(1000, 1000 + 4 * 50, dtype=np.int32).reshape(4, 50)
+    partial_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([12, 24, 36, 43], dtype=np.int32),
+        token_ids_cpu=token_table,
+    )
+    lb_partial = he._resolve_decode_lookback_cpu(
+        runner,
+        partial_batch,
+        4,
+        0,
+        sampled_overlay=overlay,
+    )
+    expected_partial = expected_fast.copy()
+    expected_partial[0] = [
+        overlay_tokens[0, 1],
+        overlay_tokens[0, 0],
+        token_table[0, 9],
+    ]
+    np.testing.assert_array_equal(lb_partial.numpy(), expected_partial)

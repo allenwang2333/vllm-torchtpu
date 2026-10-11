@@ -292,22 +292,44 @@ def _resolve_decode_lookback_cpu(
     if num_reqs < sync_rows:
         lookback_np[num_reqs:sync_rows] = src_lookback.numpy()[num_reqs:sync_rows]
     runner._host_engram_lookback_dirty = num_reqs
-    offsets = runner._host_engram_lookback_offsets
-    local = runner._host_engram_local_rows[:num_reqs]
+    offsets, local, out_slice = (
+        runner._host_engram_lookback_offsets,
+        runner._host_engram_local_rows[:num_reqs],
+        lookback_np[:num_reqs],
+    )
     pos_buf, clipped_buf, valid_buf, tmp_b_buf = runner._host_engram_lookback_ws
-    pos, clipped = pos_buf[:num_reqs], clipped_buf[:num_reqs]
-    valid, tmp_b = valid_buf[:num_reqs], tmp_b_buf[:num_reqs]
-    starts_1d = np.asarray(
+    pos, clipped, valid, tmp_b = (
+        pos_buf[:num_reqs],
+        clipped_buf[:num_reqs],
+        valid_buf[:num_reqs],
+        tmp_b_buf[:num_reqs],
+    )
+    raw_starts = np.asarray(
         batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
         dtype=np.int32,
     )
-    if rejected_by_req is not None:
-        starts_1d = starts_1d - np.asarray(rejected_by_req, dtype=np.int32)
+    starts_1d = (
+        raw_starts
+        if rejected_by_req is None
+        else raw_starts - np.asarray(rejected_by_req, dtype=np.int32)
+    )
+    if (
+        sampled_overlay is not None
+        and int(
+            (
+                delta := starts_1d - np.asarray(sampled_overlay.starts, dtype=np.int32)
+            ).min()
+        )
+        >= int(offsets.shape[1])
+        and bool(np.all(delta <= sampled_overlay.lengths))
+    ):
+        np.subtract(delta[:, None], offsets, out=pos)
+        out_slice[:] = sampled_overlay.tokens[local, pos]
+        return lookback
     np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
     rows = local + start_index if start_index else local
-    out_slice = lookback_np[:num_reqs]
     if (
         int(starts_1d.min()) >= int(offsets.shape[1])
         and int(starts_1d.max()) <= max_cols
@@ -322,11 +344,7 @@ def _resolve_decode_lookback_cpu(
         np.logical_not(valid, out=tmp_b)
         np.copyto(out_slice, -1, where=tmp_b)
     if sampled_overlay is not None:
-        np.subtract(
-            pos,
-            np.asarray(sampled_overlay.starts, dtype=np.int32)[:, None],
-            out=pos,
-        )
+        np.subtract(delta[:, None], offsets, out=pos)
         np.greater_equal(pos, 0, out=valid)
         np.less(pos, sampled_overlay.lengths[:, None], out=tmp_b)
         np.logical_and(valid, tmp_b, out=valid)
