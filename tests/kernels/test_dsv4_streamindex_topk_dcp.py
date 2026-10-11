@@ -439,8 +439,11 @@ def test_dcp_width_buckets_do_not_change_the_result(chunk_tokens, dcp_size):
 
     hlo = streamindex_topk_dcp.lower(*args, **kwargs, topk_width_buckets=2).as_text()
     widths = set(re.findall(r"sc_topk_direct_b\d+_n(\d+)_", hlo))
-    # Three table widths, plus the merge kernel at dcp_size * k.
-    assert len(widths) >= 4, f"width switch not built, top-k widths {widths}"
+    # One top-k per table width: 4x, 2x and 1x the rank-local sequence. (The
+    # merge kernel's dcp_size * k can coincide with one, so count only these.)
+    local = KV_LEN // dcp_size
+    expected = {str(m * local) for m in (4, 2, 1)}
+    assert expected <= widths, f"width switch not built: {widths} vs {expected}"
 
     full = np.asarray(streamindex_topk_dcp(*args, **kwargs))
     bucketed = np.asarray(
