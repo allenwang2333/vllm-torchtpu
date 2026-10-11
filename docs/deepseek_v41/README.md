@@ -120,20 +120,43 @@ Validation scripts and raw experiment evidence are maintained separately from
 the runtime change. Cache validation alone does not establish full-model
 numerical equivalence, memory usage or serving performance.
 
-With v2 and `TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`, multiple offloaded Engram
-layers split the full stage (or CED encoder) before each later Engram consumer.
+With v2, `TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1` and the experimental opt-in
+`TPU_DEEPSEEK_V41_ENGRAM_OVERLAP=1`, multiple offloaded Engram layers split the
+full stage (or CED encoder) before each later Engram consumer.
 For configured layer IDs 1 and 14, layers 0 through 13 are submitted before
 layer 14's host gather and packed H2D transfer. The continuation retains the
 pending mHC residual/mixes, SP token ownership and auxiliary hidden states.
 Only the final segment finalizes the stage and publishes CED encoder KV.
 The first Engram is still staged before computation begins.
 
-`TPU_DEEPSEEK_V41_ENGRAM_OVERLAP=0` restores serial staging for debugging and
-matched performance comparisons. Keep offload enabled in both runs and keep
-the workload, compilation buckets and KV budget identical. Compare unprofiled
-latency separately from XProf captures: the extra graph dispatch and boundary
+`TPU_DEEPSEEK_V41_ENGRAM_OVERLAP=0` is the default and stages all rows before
+compute. For matched performance comparisons, keep offload enabled in both
+runs and keep the workload, compilation buckets and KV budget identical.
+Compare unprofiled latency separately from XProf captures: the extra graph dispatch and boundary
 tensors can outweigh the hidden transfer, especially for decode. Performance
 and memory improvements require full-model measurements on the target TPU.
+
+The 2026-10-11 experiment `exp-2sggvyuxri` measured offload with overlap off/on
+on the same v7x-8 allocation: TP8/EP8, DP1, SP/CED enabled, concurrency 1,
+prefix caching disabled, an 8192-token chunk, compile buckets 2048/8192 and
+14 GiB KV cache per rank. Each case used eight measured requests after warmup;
+profiles were captured separately. Serial source was `1d83629c`, and overlap
+source was `5f4261b2` (the latter fixes split-boundary shape specialization).
+
+| Unprofiled mean latency | Serial | Overlap | Change |
+| --- | ---: | ---: | ---: |
+| 100k input, 1 output: TTFT | 1925.54 ms | 1945.11 ms | +1.02% |
+| 8192 input, 32 output: TTFT | 271.86 ms | 268.28 ms | -1.32% |
+| 8192 input, 32 output: TPOT | 106.93 ms | 107.72 ms | +0.74% |
+| 8192 input, 32 output: end to end | 3586.74 ms | 3607.57 ms | +0.58% |
+
+All requests completed. Prefill generated texts matched, but six of eight
+decode texts differed, so full-model numerical equivalence **failed** this
+gate. The cause has not been isolated; the passing unit tests do not resolve
+it. This single small A/B run does not establish a speedup or statistical
+significance. Keep overlap disabled outside experiments until both numerical
+equivalence and a useful performance gain are demonstrated. The 2048-token
+minimum compilation bucket also limits conclusions about optimized decode.
 
 DeepSeek V4.1 benchmark configurations and the standalone prefill scripts
 now enable prefix caching by default. Set `ENABLE_PREFIX_CACHING=false` for
