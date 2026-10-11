@@ -66,6 +66,11 @@ if TYPE_CHECKING:
     DP_SCHED_ENABLED: bool = False
     TPU_PREFILL_GATE_MIN_CADENCES: int = 0
     TPU_PREFILL_GATE_LOG_STEPS: int = 1000
+    TPU_DP_CADENCE_FILLER_TOKENS: int = 32
+    TPU_DP_CADENCE_ATTN_BUDGET: float = 40.0
+    TPU_DP_CADENCE_MIN_CHUNK: int = 64
+    TPU_DP_CADENCE_BOUND_ESCAPE: bool = False
+    TPU_DP_CADENCE_LOG_STEPS: int = 1000
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -638,6 +643,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PREFILL_GATE_LOG_STEPS": env_nonnegative_int(
         "TPU_PREFILL_GATE_LOG_STEPS", 1000
     ),
+    # DpCadenceScheduler: total tokens a rank with no decoding request may
+    # prefill on a throttled (non-cadence) step; small enough to keep the DP
+    # bucket at the decode-only size. 0 leaves such a rank idle.
+    "TPU_DP_CADENCE_FILLER_TOKENS": env_nonnegative_int(
+        "TPU_DP_CADENCE_FILLER_TOKENS", 32
+    ),
+    # DpCadenceScheduler: per-step prefill attention budget, in millions of
+    # chunk tokens x context. A cadence step's chunk limit is budget / the
+    # longest context the rank prefills. 0 disables the cap.
+    "TPU_DP_CADENCE_ATTN_BUDGET": env_float("TPU_DP_CADENCE_ATTN_BUDGET", 40.0),
+    # DpCadenceScheduler: floor on the attention-capped chunk, so a prompt with
+    # a very long context still advances.
+    "TPU_DP_CADENCE_MIN_CHUNK": env_nonnegative_int("TPU_DP_CADENCE_MIN_CHUNK", 64),
+    # DpCadenceScheduler: keep vLLM's capacity-bound escape (a rank that left
+    # requests waiting prefills on throttled steps too).
+    "TPU_DP_CADENCE_BOUND_ESCAPE": env_bool("TPU_DP_CADENCE_BOUND_ESCAPE"),
+    # DpCadenceScheduler: steps between per-rank step-cost log lines (0 disables).
+    "TPU_DP_CADENCE_LOG_STEPS": env_nonnegative_int("TPU_DP_CADENCE_LOG_STEPS", 1000),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
