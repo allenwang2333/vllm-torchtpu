@@ -130,14 +130,14 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     if ws is None or ws[0] != num_rows:
         ws = (
             num_rows,
-            np.empty(num_rows, dtype=np.int64),
-            np.empty(num_rows, dtype=np.int64),
-            np.empty(num_rows, dtype=np.int64),
+            np.empty(num_rows, dtype=np.int32),
+            np.empty(num_rows, dtype=np.int32),
+            np.empty(num_rows, dtype=np.int32),
         )
         runner._host_engram_spec_ws = ws
     _, lengths, num_draft, rejected = ws
     valid = sampled != -1
-    valid.sum(axis=1, dtype=np.int64, out=lengths)
+    valid.sum(axis=1, dtype=np.int32, out=lengths)
     # Compact each row's valid tokens to its front, preserving their order.
     if valid.shape[1] <= 1 or bool(np.all(valid[:, :-1] >= valid[:, 1:])):
         tokens = sampled
@@ -157,10 +157,10 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
     else:
         num_draft.fill(0)
         draft_pos = np.fromiter(
-            num_draft_per_req.keys(), dtype=np.int64, count=len(num_draft_per_req)
+            num_draft_per_req.keys(), dtype=np.int32, count=len(num_draft_per_req)
         )
         draft_cnt = np.fromiter(
-            num_draft_per_req.values(), dtype=np.int64, count=len(num_draft_per_req)
+            num_draft_per_req.values(), dtype=np.int32, count=len(num_draft_per_req)
         )
         in_range = (draft_pos >= 0) & (draft_pos < num_rows)
         num_draft[draft_pos[in_range]] = draft_cnt[in_range]
@@ -173,7 +173,7 @@ def _resolve_async_spec_state(runner: Any, pre_async: Any) -> _AsyncSpecState | 
         rejected.fill(0)
     discard = getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
     if discard:
-        discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int64)
+        discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int32)
         discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
         if discard_idx.size:
             lengths[discard_idx] = 0
@@ -248,13 +248,13 @@ def _resolve_decode_lookback_cpu(
         runner._host_engram_lookback_scratch = lookback
         cap_rows = int(src_lookback.shape[0])
         depth = int(src_lookback.shape[1])
-        runner._host_engram_lookback_offsets = np.arange(1, depth + 1, dtype=np.int64)[
+        runner._host_engram_lookback_offsets = np.arange(1, depth + 1, dtype=np.int32)[
             None, :
         ]
-        runner._host_engram_local_rows = np.arange(cap_rows, dtype=np.int64)[:, None]
+        runner._host_engram_local_rows = np.arange(cap_rows, dtype=np.int32)[:, None]
         runner._host_engram_lookback_ws = (
-            np.empty((cap_rows, depth), dtype=np.int64),
-            np.empty((cap_rows, depth), dtype=np.int64),
+            np.empty((cap_rows, depth), dtype=np.int32),
+            np.empty((cap_rows, depth), dtype=np.int32),
             np.empty((cap_rows, depth), dtype=np.bool_),
             np.empty((cap_rows, depth), dtype=np.bool_),
         )
@@ -270,10 +270,10 @@ def _resolve_decode_lookback_cpu(
     tmp_b = tmp_b_buf[:num_reqs]
     starts_1d = np.asarray(
         batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
-        dtype=np.int64,
+        dtype=np.int32,
     )
     if rejected_by_req is not None:
-        starts_1d = starts_1d - rejected_by_req
+        starts_1d = starts_1d - np.asarray(rejected_by_req, dtype=np.int32)
     np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
@@ -287,7 +287,11 @@ def _resolve_decode_lookback_cpu(
     np.logical_not(valid, out=tmp_b)
     np.copyto(out_slice, -1, where=tmp_b)
     if sampled_overlay is not None:
-        np.subtract(pos, sampled_overlay.starts[:, None], out=pos)
+        np.subtract(
+            pos,
+            np.asarray(sampled_overlay.starts, dtype=np.int32)[:, None],
+            out=pos,
+        )
         np.greater_equal(pos, 0, out=valid)
         np.less(pos, sampled_overlay.lengths[:, None], out=tmp_b)
         np.logical_and(valid, tmp_b, out=valid)
@@ -305,14 +309,17 @@ def _ragged_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     """Concatenation of ``range(starts[i], starts[i] + lengths[i])``."""
     if lengths.size and bool(np.all(lengths == lengths[0])):
         return (
-            np.asarray(starts, dtype=np.int64)[:, None]
-            + np.arange(int(lengths[0]), dtype=np.int64)
+            np.asarray(starts, dtype=np.int32)[:, None]
+            + np.arange(int(lengths[0]), dtype=np.int32)
         ).reshape(-1)
-    offsets = np.repeat(np.cumsum(lengths) - lengths, lengths)
+    offsets = np.repeat(
+        np.cumsum(lengths, dtype=np.int32) - np.asarray(lengths, dtype=np.int32),
+        lengths,
+    )
     return (
-        np.arange(offsets.shape[0], dtype=np.int64)
+        np.arange(offsets.shape[0], dtype=np.int32)
         - offsets
-        + np.repeat(starts, lengths)
+        + np.repeat(np.asarray(starts, dtype=np.int32), lengths)
     )
 
 
@@ -346,7 +353,7 @@ def _dummy_host_inputs(runner, ctx) -> HostEngramInputs:
     if cached is None or cached[0] != key:
         inputs = HostEngramInputs(
             input_ids=torch.zeros(num_tokens, dtype=torch.int32),
-            positions=torch.zeros(num_tokens, dtype=torch.int64),
+            positions=torch.zeros(num_tokens, dtype=torch.int32),
             query_start_loc=torch.zeros(qsl_len, dtype=torch.int32),
             lookback_token_ids=torch.full((lb_rows, depth), -1, dtype=torch.int32),
             all_prompt=True,
@@ -425,7 +432,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         chunk_req_ids = req_ids[start_index : start_index + chunk_num_reqs]
         pre_pos = np.fromiter(
             map(req_id_to_index.get, chunk_req_ids, repeat(-1)),
-            dtype=np.int64,
+            dtype=np.int32,
             count=chunk_num_reqs,
         )
         qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
@@ -449,16 +456,20 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 ov_tokens = spec_state.tokens[:chunk_num_reqs]
                 ov_lengths = spec_state.lengths[:chunk_num_reqs]
             else:
-                safe_pos = np.where(matched, pre_pos, 0)
-                rejected_by_req = np.where(matched, spec_state.rejected[safe_pos], 0)
+                safe_pos = np.where(matched, pre_pos, np.int32(0))
+                rejected_by_req = np.where(
+                    matched, spec_state.rejected[safe_pos], np.int32(0)
+                )
                 n_draft = spec_state.num_draft[safe_pos]
                 ov_tokens = spec_state.tokens[safe_pos]
-                ov_lengths = np.where(matched, spec_state.lengths[safe_pos], 0)
+                ov_lengths = np.where(
+                    matched, spec_state.lengths[safe_pos], np.int32(0)
+                )
             if num_tokens_no_spec is not None:
                 write_start = (
                     np.asarray(
                         num_tokens_no_spec[start_index : start_index + chunk_num_reqs],
-                        dtype=np.int64,
+                        dtype=np.int32,
                     )
                     - 1
                     - n_draft
@@ -469,7 +480,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                         batch.num_computed_tokens_cpu[
                             start_index : start_index + chunk_num_reqs
                         ],
-                        dtype=np.int64,
+                        dtype=np.int32,
                     )
                     - n_draft
                 )

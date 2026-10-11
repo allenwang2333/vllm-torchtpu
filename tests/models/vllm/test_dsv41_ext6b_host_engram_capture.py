@@ -174,11 +174,24 @@ def test_positions_untouched_without_rejections():
     res = he.capture_host_engram_inputs(runner, 6)
     assert res is not None and res.positions is runner.positions_cpu
     assert res.input_ids is not runner.input_ids_cpu
-    assert torch.equal(res.input_ids, runner._pre_async_results.next_tokens_tpu[
-        torch.from_numpy(he._ragged_arange(
-            np.array([runner._pre_async_results.req_id_to_index_copy[f"req-{i}"] * 6
-                      for i in range(6)]), np.full(6, 6)))
-    ])  # fmt: skip
+    assert torch.equal(
+        res.input_ids,
+        runner._pre_async_results.next_tokens_tpu.index_select(
+            0,
+            torch.from_numpy(
+                he._ragged_arange(
+                    np.array(
+                        [
+                            runner._pre_async_results.req_id_to_index_copy[f"req-{i}"]
+                            * 6
+                            for i in range(6)
+                        ]
+                    ),
+                    np.full(6, 6),
+                )
+            ),
+        ),
+    )
 
 
 def test_resolve_async_spec_state_branches():
@@ -377,3 +390,104 @@ def test_td8247_capture_host_engram_contiguous_fast_path():
     np.testing.assert_array_equal(res_reord.input_ids.numpy(), ids_ref_r)
     np.testing.assert_array_equal(res_reord.positions.numpy(), pos_ref_r)
     np.testing.assert_array_equal(res_reord.lookback_token_ids.numpy(), lb_ref_r)
+
+
+def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
+    # 1. _ragged_arange returns np.int32 across uniform, non-uniform, and empty inputs
+    u_arr = he._ragged_arange(
+        np.array([10, 20], dtype=np.int64), np.array([2, 2], dtype=np.int64)
+    )
+    assert u_arr.dtype == np.int32 and u_arr.tolist() == [10, 11, 20, 21]
+    nu_arr = he._ragged_arange(
+        np.array([10, 20, 30], dtype=np.int64), np.array([2, 0, 3], dtype=np.int64)
+    )
+    assert nu_arr.dtype == np.int32 and nu_arr.tolist() == [10, 11, 30, 31, 32]
+    e_arr = he._ragged_arange(
+        np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    )
+    assert e_arr.dtype == np.int32 and e_arr.tolist() == []
+
+    # 2. _dummy_host_inputs allocates int32 positions
+    dummy_runner = SimpleNamespace(
+        max_num_tokens=16,
+        max_num_reqs=4,
+        lookback_token_ids=SimpleNamespace(cpu=torch.zeros((4, 4), dtype=torch.int32)),
+    )
+    dummy_ctx = SimpleNamespace(
+        position_ids_override=torch.zeros(8, dtype=torch.int32),
+        query_start_loc=None,
+        num_reqs=2,
+    )
+    dummy_inputs = he._dummy_host_inputs(dummy_runner, dummy_ctx)
+    assert dummy_inputs.positions.dtype == torch.int32
+
+    # 3. Spec state, lookback, and capture use np.int32 scratch & zero-copy views
+    seen_lookback_calls = []
+    orig_lookback = he._resolve_decode_lookback_cpu
+
+    def spy_lookback(
+        runner,
+        batch,
+        num_reqs,
+        start_index,
+        *,
+        rejected_by_req=None,
+        sampled_overlay=None,
+    ):
+        seen_lookback_calls.append((rejected_by_req, sampled_overlay))
+        return orig_lookback(
+            runner,
+            batch,
+            num_reqs,
+            start_index,
+            rejected_by_req=rejected_by_req,
+            sampled_overlay=sampled_overlay,
+        )
+
+    monkeypatch.setattr(he, "_resolve_decode_lookback_cpu", spy_lookback)
+
+    for with_no_spec in (True, False):
+        for identity in (True, False):
+            runner = _make_runner(8, k=5, depth=4, seed=42, with_no_spec=with_no_spec)
+            runner.input_batch.num_computed_tokens_cpu = (
+                runner.input_batch.num_computed_tokens_cpu.astype(np.int32)
+            )
+            if runner.input_batch.num_tokens_no_spec is not None:
+                runner.input_batch.num_tokens_no_spec = (
+                    runner.input_batch.num_tokens_no_spec.astype(np.int32)
+                )
+            if identity:
+                runner._pre_async_results.req_id_to_index_copy = {
+                    f"req-{i}": i for i in range(8)
+                }
+                runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+            else:
+                runner._pre_async_results.num_draft_per_req[0] = 3
+
+            seen_lookback_calls.clear()
+            res = he.capture_host_engram_inputs(runner, 8)
+            assert res is not None and res.host_ready is True
+
+            _, lengths_ws, num_draft_ws, rejected_ws = runner._host_engram_spec_ws
+            assert lengths_ws.dtype == np.int32
+            assert num_draft_ws.dtype == np.int32
+            assert rejected_ws.dtype == np.int32
+
+            assert runner._host_engram_lookback_offsets.dtype == np.int32
+            assert runner._host_engram_local_rows.dtype == np.int32
+            pos_buf, clipped_buf, _, _ = runner._host_engram_lookback_ws
+            assert pos_buf.dtype == np.int32
+            assert clipped_buf.dtype == np.int32
+
+            assert len(seen_lookback_calls) == 1
+            rej_arg, ov_arg = seen_lookback_calls[0]
+            assert rej_arg is not None and rej_arg.dtype == np.int32
+            assert ov_arg is not None
+            assert ov_arg.starts.dtype == np.int32
+            assert ov_arg.lengths.dtype == np.int32
+            assert np.shares_memory(
+                np.asarray(
+                    runner.input_batch.num_computed_tokens_cpu[:8], dtype=np.int32
+                ),
+                runner.input_batch.num_computed_tokens_cpu,
+            )
