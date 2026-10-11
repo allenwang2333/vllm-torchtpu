@@ -315,6 +315,7 @@ class TestW4MoECorrectness:
     def test_custom_routing_called(self, device):
         """W4 MoE apply_monolithic should use custom_routing_function when present."""
         layer = MagicMock()
+        layer.moe_config.swiglu_limit = None
         layer.moe_config.experts_per_token = 2
         layer.moe_config.moe_parallel_config.use_ep = False
         layer.renormalize = True
