@@ -207,12 +207,16 @@ def test_scale_dma_is_bit_identical(k, n, config, m, real):
         )(x, wq, ws)
 
     y0, y1 = f(False), f(True)
-    np.testing.assert_array_equal(np.asarray(y1, np.float32), np.asarray(y0, np.float32))
+    np.testing.assert_array_equal(
+        np.asarray(y1, np.float32), np.asarray(y0, np.float32)
+    )
     # Positive control: the result depends on every scale column, so a scale the
     # kernel never received (or read before its DMA landed) cannot pass the above.
     ws2 = ws.at[n // 2].multiply(2.0)
     y2 = jax.jit(
-        lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, config=config, scale_dma=True)
+        lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+            a, b, c, config=config, scale_dma=True
+        )
     )(x, wq, ws2)
     assert not np.array_equal(np.asarray(y2, np.float32), np.asarray(y1, np.float32))
 
@@ -235,9 +239,7 @@ def test_scale_dma_stacked_eager_bit_identical():
 def _scale_copy_lines(hlo: str, n: int) -> list[str]:
     """Compiled-HLO instructions that copy or slice an f32[n] / f32[1,n] buffer (the
     scale): the defining op is a copy/slice start and its result is that shape."""
-    pat = re.compile(
-        r"=\s*\(f32\[(?:1,)?%d\][^=]*\)\s+(?:copy|slice)-start\(" % n
-    )
+    pat = re.compile(rf"=\s*\(f32\[(?:1,)?{n}\][^=]*\)\s+(?:copy|slice)-start\(")
     return [ln.strip()[:200] for ln in hlo.splitlines() if pat.search(ln)]
 
 
@@ -260,3 +262,10 @@ def test_scale_dma_lowers_scale_to_hbm(k, n):
     off_lines = _scale_copy_lines(off.compile().as_text(), n)
     print(f"default scale copies ({k},{n}): {off_lines}")
     assert _scale_copy_lines(on.compile().as_text(), n) == []
+
+
+def test_scale_dma_applies():
+    assert fp8_skinny.scale_dma_applies(6144)  # o_proj
+    assert fp8_skinny.scale_dma_applies(16384) and fp8_skinny.scale_dma_applies(8192)
+    assert not fp8_skinny.scale_dma_applies(1536)  # dense gate_up
+    assert not fp8_skinny.scale_dma_applies(2688)  # q_a + kv_a (padded)

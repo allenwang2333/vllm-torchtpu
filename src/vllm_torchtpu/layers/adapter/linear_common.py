@@ -177,7 +177,12 @@ def _fp8_linear_pallas_jax(
         kw, ks = w_k, s_k
     if fp8_skinny.supports(x.shape[0], kw, ks):
         return fp8_skinny.fp8_skinny_matmul(
-            x, kw, ks, n_logical=n_out, scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+            x,
+            kw,
+            ks,
+            n_logical=n_out,
+            scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+            and fp8_skinny.scale_dma_applies(kw.shape[1]),
         )
     return xla_quantized_matmul(x, w_q, w_s)
 
