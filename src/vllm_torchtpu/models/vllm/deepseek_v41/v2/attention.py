@@ -214,13 +214,16 @@ def save_compress_norm(
     if ratio == 2:
         capacity = state_cache.shape[1]
         cache = state_cache
-        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
+        pos_i32 = positions.int()
+        rows = torch.arange(
+            kv_score.shape[0], dtype=torch.int32, device=kv_score.device
+        )
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
         starts = query_start_loc[requests]
         ends = query_start_loc[requests + 1]
         previous_slots = (
-            slot_mapping.clamp(min=0) // capacity * capacity
-            + (positions - 1) % capacity
+            slot_mapping.int().clamp(min=0) // capacity * capacity
+            + (pos_i32 - 1) % capacity
         )
         stored = cache[previous_slots // capacity, previous_slots % capacity]
         previous = torch.where(
@@ -232,7 +235,7 @@ def save_compress_norm(
         # All reads above refer to the old ring. Keep unique physical writes.
         publish = valid & (rows >= ends - capacity)
         write_cache(cache, slot_mapping, kv_score.float(), publish, after=stored)
-        valid = valid & (positions % 2 == 1)
+        valid = valid & (pos_i32 % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
@@ -280,7 +283,7 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         if self.state_cache is None:
             state_cache = query_start_loc = requests = None
             cache = self._static_forward_context[self.k_cache_prefix].kv_cache
-            slots = _cache_slots(cache, metadata[self.k_cache_prefix], positions)
+            slots = _cache_slots(cache, metadata[self.k_cache_prefix], positions).int()
         else:
             state_metadata = metadata[self.state_cache.prefix]
             state_cache = self.state_cache.kv_cache
@@ -304,9 +307,11 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                     query_start_loc = state_metadata.query_start_loc
                     requests = _token_requests(state_metadata, positions)
                     clamped_requests = requests.clamp(max=table.shape[0] - 1)
-                    ring_rem = positions % state_rows
+                    ring_rem = positions.int() % state_rows
                     token_rows = torch.arange(
-                        positions.shape[0], device=positions.device
+                        positions.shape[0],
+                        dtype=torch.int32,
+                        device=positions.device,
                     )
                     valid_token = token_rows < query_start_loc[-1]
                     cached_state = (
@@ -338,19 +343,21 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                 ):
                     slots = cached_slots[1]
                 else:
-                    blocks = table[clamped_requests, 0].long()
+                    blocks = table[clamped_requests, 0].int()
                     slots = (blocks * state_rows + ring_rem).masked_fill(
                         ~valid_token, -1
                     )
                     stage_cache[slot_key] = (state_metadata.block_tables, slots)
             else:
-                slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
+                slots = _cache_slots(
+                    state_cache, state_metadata, positions, ring=True
+                ).int()
                 query_start_loc = state_metadata.query_start_loc
                 requests = _token_requests(state_metadata, positions)
-        latent = (
-            torch.zeros_like(positions[:, None], dtype=torch.bfloat16)
-            .expand(-1, self.head_dim)
-            .contiguous()
+        latent = torch.empty(
+            (positions.shape[0], self.head_dim),
+            dtype=torch.bfloat16,
+            device=positions.device,
         )
         save_compress_norm(
             kv_score,

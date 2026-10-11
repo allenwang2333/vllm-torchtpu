@@ -57,9 +57,10 @@ def _make_compressor(monkeypatch, metadata, captured):
     return comp
 
 
-def test_compressor_write_slots_shared_per_block_table(monkeypatch):
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_compressor_write_slots_shared_per_block_table(monkeypatch, pos_dtype):
     table = torch.tensor([[3, 5], [7, 9]], dtype=torch.int32)
-    positions = torch.arange(COUNT, dtype=torch.int32) + 2
+    positions = torch.arange(COUNT, dtype=pos_dtype) + 2
     metadata = {"state": _meta(table, qsl=(0, 4, 6))}
     captured: list[torch.Tensor] = []
     comp = _make_compressor(monkeypatch, metadata, captured)
@@ -67,22 +68,81 @@ def test_compressor_write_slots_shared_per_block_table(monkeypatch):
     # Reference: uncached ring slots.
     comp.forward(torch.ones(COUNT, 10), positions)
     expected = captured[-1].clone()
+    assert expected.dtype == torch.int32
 
     with v2_attn.stage_attention_cache_scope():
         comp.forward(torch.ones(COUNT, 10), positions)
         comp.forward(torch.ones(COUNT, 10), positions)
         # Second layer reuses the first layer's slots tensor.
         assert captured[-1] is captured[-2]
+        assert captured[-1].dtype == torch.int32
         assert torch.equal(captured[-1], expected)
 
         # A new block_tables tensor invalidates the shared slots.
         metadata["state"].block_tables = table + 10
         comp.forward(torch.ones(COUNT, 10), positions)
         assert captured[-1] is not captured[-2]
+        assert captured[-1].dtype == torch.int32
         assert not torch.equal(captured[-1], expected)
     metadata["state"].block_tables = table + 10
     comp.forward(torch.ones(COUNT, 10), positions)
+    assert captured[-1].dtype == torch.int32
     assert torch.equal(captured[-1], captured[-2])
+
+
+def test_td8250_save_compress_norm_int32_ring_and_empty_latent_parity(monkeypatch):
+    monkeypatch.setattr(v2_attn, "write_cache", lambda *a, **kw: None)
+    kv_score = torch.randn(COUNT, 9, dtype=torch.float32)
+    positions_i64 = torch.arange(COUNT, dtype=torch.int64) + 2
+    positions_i32 = positions_i64.int()
+    slots_i64 = torch.tensor([12, 13, 14, 15, 28, 29, -1, -1], dtype=torch.int64)
+    slots_i32 = slots_i64.int()
+    qsl = torch.tensor([0, 4, 6], dtype=torch.int32)
+    reqs = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
+    nw = torch.ones(8, dtype=torch.float32)
+
+    seen_indices: list[tuple[torch.dtype, torch.dtype]] = []
+    backing = torch.randn(16, ROWS, 9, dtype=torch.float32)
+
+    class _SpyStateCache:
+        shape = (16, ROWS, 9)
+
+        def __getitem__(self, idx):
+            b, r = idx
+            seen_indices.append((b.dtype, r.dtype))
+            return backing[b, r]
+
+    latent_zero = torch.zeros((COUNT, 8), dtype=torch.bfloat16)
+    latent_dirty = torch.full((COUNT, 8), -77.0, dtype=torch.bfloat16)
+    v2_attn.save_compress_norm(
+        kv_score,
+        positions_i32,
+        _SpyStateCache(),
+        slots_i32,
+        qsl,
+        reqs,
+        nw,
+        1e-6,
+        2,
+        latent_zero,
+    )
+    v2_attn.save_compress_norm(
+        kv_score,
+        positions_i64,
+        _SpyStateCache(),
+        slots_i64,
+        qsl,
+        reqs,
+        nw,
+        1e-6,
+        2,
+        latent_dirty,
+    )
+    assert seen_indices == [
+        (torch.int32, torch.int32),
+        (torch.int32, torch.int32),
+    ]
+    assert torch.equal(latent_dirty, latent_zero)
 
 
 # ---------------------------------------------------------------------------
