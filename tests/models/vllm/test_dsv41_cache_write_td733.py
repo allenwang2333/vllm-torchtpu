@@ -152,3 +152,29 @@ def test_write_cache_words_interpret_preserves_untouched_and_writes_subrows():
         expected[row, sub * width : (sub + 1) * width] = np.asarray(words[src_idx])
 
     np.testing.assert_array_equal(np.asarray(out), expected)
+
+
+def test_td8327_cache_write_jnp_arange_explicit_int32(monkeypatch):
+    orig_arange = jnp.arange
+    seen_dtypes: list[object] = []
+
+    def _spy_arange(*args, **kwargs):
+        seen_dtypes.append(kwargs.get("dtype"))
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(cw.jnp, "arange", _spy_arange)
+
+    pool_init = jnp.zeros((64, cw.HEAD_DIM), dtype=jnp.int32)
+    scales_init = jnp.zeros((2, 1, cw.SLAB_KEYS), dtype=jnp.int32)
+    records = jnp.asarray([0, 1], dtype=jnp.int32)
+    keys = jnp.ones((2, cw.HEAD_DIM), dtype=jnp.bfloat16)
+    cw.write_index_cache(
+        pool_init, scales_init, records, keys, cw.SLAB_KEYS, interpret=True
+    )
+
+    cache_init = jnp.zeros((4, 128), dtype=jnp.int32)
+    words = jnp.ones((2, 32), dtype=jnp.int32)
+    cw.write_cache_words(cache_init, records, words, interpret=True)
+
+    assert len(seen_dtypes) >= 2
+    assert all(dt == jnp.int32 for dt in seen_dtypes)

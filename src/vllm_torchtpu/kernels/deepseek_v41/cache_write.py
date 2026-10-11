@@ -71,7 +71,10 @@ def _write_kernel(
             pltpu.make_async_copy(source, destination, sem).start()
             pltpu.make_async_copy(source, destination, sem).wait()
         key_bytes, scale_words = _quantize(keys_buf[...].reshape(INPUT_KEYS, HEAD_DIM))
-        mapping = records_buf[...][:, None] == (base + jnp.arange(SLAB_KEYS))[None, :]
+        mapping = (
+            records_buf[...][:, None]
+            == (base + jnp.arange(SLAB_KEYS, dtype=jnp.int32))[None, :]
+        )
         # A unique destination has exactly one source. BF16 represents every
         # byte exactly; the MXU permutation therefore preserves the FP8 bits.
         mapped = jnp.einsum(
@@ -183,7 +186,7 @@ def _word_write_kernel(
         ):
             pltpu.make_async_copy(source, destination, sem).start()
             pltpu.make_async_copy(source, destination, sem).wait()
-        columns = jnp.arange(128)[None, :]
+        columns = jnp.arange(128, dtype=jnp.int32)[None, :]
         result = row_buf[...]
         values_matrix = values_buf[...]
         for source in range(2 * per_row):

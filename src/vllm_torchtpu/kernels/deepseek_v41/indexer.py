@@ -93,7 +93,7 @@ def _score_kernel(
                 + jnp.maximum(similarities[:, head], 0) * weights[:, head : head + 1]
             )
         values = values * key_scales
-        logical = step * KEY_TILE + jnp.arange(KEY_TILE)
+        logical = step * KEY_TILE + jnp.arange(KEY_TILE, dtype=jnp.int32)
         page_valid = (physical_page(step) >= 0) & (
             physical_page(step) < scales_ref.shape[0]
         )
@@ -167,7 +167,9 @@ def paged_scores(
     def request_scores(row, result):
         request = requests[row]
         # This supports repeated and permuted request IDs, not just packed rows.
-        first = ~jnp.any((jnp.arange(rows) < row) & (requests == request))
+        first = ~jnp.any(
+            (jnp.arange(rows, dtype=jnp.int32) < row) & (requests == request)
+        )
 
         def run(previous):
             pages = block_table[request]
@@ -333,7 +335,7 @@ def _native_score_kernel(
                     + jnp.maximum(similarities[:, head], 0)
                     * weighted[:, head : head + 1]
                 )
-            tile_iota = jnp.arange(tile_keys)
+            tile_iota = jnp.arange(tile_keys, dtype=jnp.int32)
             key_page_ids = tile_iota // page_size
             logical = block * tile_keys + tile_iota
             page_valid = jnp.zeros((tile_keys,), jnp.bool_)

@@ -285,6 +285,52 @@ class TestKernelsDeepseekV41Indexer:
             np.asarray(out3), np.array([10, 21, 32], dtype=np.int32)
         )
 
+    def test_td8327_indexer_jnp_arange_explicit_int32(self, monkeypatch):
+        orig_arange = jnp.arange
+        seen_dtypes: list[object] = []
+
+        def _spy_arange(*args, **kwargs):
+            seen_dtypes.append(kwargs.get("dtype"))
+            return orig_arange(*args, **kwargs)
+
+        monkeypatch.setattr(indexer_kernel.jnp, "arange", _spy_arange)
+
+        pool, scales = _make_native_pool_and_scales(2, 128, seed=3)
+        block_table = jnp.array([[0, 1], [1, 0]], dtype=jnp.int32)
+        requests = jnp.array([0, 1], dtype=jnp.int32)
+        lengths = jnp.array([64, 128], dtype=jnp.int32)
+        weights = jnp.ones((2, 1), dtype=jnp.float32)
+
+        indexer_kernel.paged_scores(
+            jnp.ones((2, 1, 128), dtype=jnp.float8_e4m3fn),
+            weights,
+            pool,
+            scales,
+            block_table,
+            requests,
+            lengths,
+            128,
+            page_size=128,
+            page_stride=128,
+            interpret=True,
+        )
+        indexer_kernel.native_paged_scores(
+            jnp.ones((2, 1, 128), dtype=jnp.bfloat16),
+            weights,
+            pool,
+            scales,
+            block_table,
+            requests,
+            lengths,
+            128,
+            page_size=128,
+            page_stride=128,
+            interpret=True,
+        )
+
+        assert len(seen_dtypes) >= 3
+        assert all(dt == jnp.int32 for dt in seen_dtypes)
+
 
 class TestDeepseekV41IndexerOps:
     def test_indexer_cache_init_and_methods(self, monkeypatch):
