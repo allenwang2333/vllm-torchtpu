@@ -960,7 +960,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     def _get_stage_tp_rank_1d(self, stage_cache: dict[Any, Any] | None = None):
         rank_1d = self._tp_rank_1d
         if stage_cache is not None and isinstance(rank_1d, torch.Tensor):
-            key = self._stage_cache_key("stage_tp_rank_1d", rank_1d.device)
+            # Called per layer per step: rebuild the key only when the rank
+            # tensor changes.
+            entry = self.__dict__.get("_rank1d_stage_entry")
+            if entry is None or entry[0] is not rank_1d:
+                entry = self.__dict__["_rank1d_stage_entry"] = (
+                    rank_1d,
+                    self._stage_cache_key("stage_tp_rank_1d", rank_1d.device),
+                )
+            key = entry[1]
             cached = stage_cache.get(key)
             if cached is None:
                 cached = (
@@ -978,17 +986,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Same shape/dtype does not mean same values: compressed layers use
             # compress_rope_theta (upstream deepseek_v41/common/rope.py), so the
             # key must carry the rope config or layers read the wrong cos/sin.
-            return stage_cache.setdefault(
-                self._stage_cache_key(
-                    "stage_tpu_rope_cache",
-                    rope_cache.device,
-                    rope_cache.shape,
-                    rope_cache.dtype,
-                    bool(self.compress_ratio),
-                    getattr(getattr(self, "rotary_emb", None), "base", None),
-                ),
-                rope_cache,
-            )
+            # The config is fixed per layer, so the key is rebuilt only when
+            # the cache tensor changes (called per layer per step).
+            entry = self.__dict__.get("_rope_stage_entry")
+            if entry is None or entry[0] is not rope_cache:
+                entry = self.__dict__["_rope_stage_entry"] = (
+                    rope_cache,
+                    self._stage_cache_key(
+                        "stage_tpu_rope_cache",
+                        rope_cache.device,
+                        rope_cache.shape,
+                        rope_cache.dtype,
+                        bool(self.compress_ratio),
+                        getattr(getattr(self, "rotary_emb", None), "base", None),
+                    ),
+                )
+            return stage_cache.setdefault(entry[1], rope_cache)
         return rope_cache
 
     def _rotate(self, values, positions, inverse=False):
@@ -2021,10 +2034,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     }
             else:
                 owner_kwargs = {}
+            # Read the env flag once per stage, not once per layer.
             fused_swa = (
-                stage_cache.setdefault("fused_swa", envs.TPU_DEEPSEEK_V41_FUSED_SWA)
-                if stage_cache is not None
-                else envs.TPU_DEEPSEEK_V41_FUSED_SWA
+                envs.TPU_DEEPSEEK_V41_FUSED_SWA
+                if stage_cache is None
+                else stage_cache["fused_swa"]
+                if "fused_swa" in stage_cache
+                else stage_cache.setdefault(
+                    "fused_swa", envs.TPU_DEEPSEEK_V41_FUSED_SWA
+                )
             )
             if fused_qo:
                 return sparse_fp8_attention_qo(
@@ -2223,8 +2241,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # padding (split change alone at C=16: L20 3.20 -> 1.48 ms,
         # L24 0.75 -> 0.31 ms).
         ranks = get_tensor_model_parallel_world_size()
+        # A sharded cache already answers this without the env read.
         kv_shard = bool(
-            envs.TPU_DEEPSEEK_V41_KV_SHARD or getattr(index_cache, "sharded", False)
+            getattr(index_cache, "sharded", False) or envs.TPU_DEEPSEEK_V41_KV_SHARD
         )
         split = ranks > 1
         stage_cache = _active_stage_attn_cache

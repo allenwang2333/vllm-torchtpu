@@ -1564,3 +1564,41 @@ class TestTd78StageInvariantHoistingAndFullCoverage:
         assert call_count == 1
         for out in outs[1:]:
             assert torch.equal(out, outs[0])
+
+
+def test_td8383_stage_keys_memoized_per_tensor(monkeypatch):
+    """The rope / tp-rank stage keys are built once per tensor and reused for
+    every later stage cache; replacing the tensor rebuilds the key."""
+    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    rope_t = torch.ones((16, 8), dtype=torch.bfloat16)
+    rank_1d_t = torch.tensor([1], dtype=torch.int32)
+    attn._tpu_rope_cache = rope_t
+    attn._tp_rank_1d = rank_1d_t
+    attn.compress_ratio = 4
+    attn.rotary_emb = SimpleNamespace(base=160000.0)
+
+    first: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(first) is rope_t
+    assert attn._get_stage_tp_rank_1d(first) is rank_1d_t
+    rope_key = attn.__dict__["_rope_stage_entry"][1]
+    rank_key = attn.__dict__["_rank1d_stage_entry"][1]
+    assert first == {rope_key: rope_t, rank_key: rank_1d_t}
+
+    # Next step: a fresh stage cache, no key rebuild.
+    def no_rebuild(*a, **k):
+        raise AssertionError("stage key rebuilt")
+
+    monkeypatch.setattr(attn, "_stage_cache_key", no_rebuild)
+    second: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(second) is rope_t
+    assert attn._get_stage_tp_rank_1d(second) is rank_1d_t
+    assert second == first
+    monkeypatch.undo()
+
+    # A replaced tensor gets its own (equal-config) entry.
+    new_rope = torch.zeros((16, 8), dtype=torch.bfloat16)
+    attn._tpu_rope_cache = new_rope
+    third: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(third) is new_rope
+    assert attn.__dict__["_rope_stage_entry"][0] is new_rope
