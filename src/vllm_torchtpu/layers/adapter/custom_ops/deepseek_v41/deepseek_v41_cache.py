@@ -213,14 +213,26 @@ def masked_row_indices(slots, page_size, page_stride, row_offset):
 def read_cache(cache, slots, *, layout=None):
     """Read old state through the existing cache-read operation."""
     if layout is None:
-        return cache[slots // cache.shape[1], slots % cache.shape[1]]
+        return (
+            cache.flatten(0, 1)
+            .index_select(
+                0,
+                (slots if slots.dtype == torch.int32 else slots.int()).reshape(-1),
+            )
+            .reshape(*slots.shape, *cache.shape[2:])
+        )
     page_size, page_stride, row_offset = layout.geometry
     elements, dtype = layout.elements, layout.dtype
     if cache.device.type == "cpu":
         records = row_indices(slots, page_size, page_stride, row_offset)
         pool = cache.view(torch.int8).reshape(-1, elements * dtype.itemsize)
         return (
-            pool[records.long()]
+            pool.index_select(
+                0,
+                (records if records.dtype == torch.int32 else records.int()).reshape(
+                    -1
+                ),
+            )
             .contiguous()
             .view(dtype)
             .reshape(*slots.shape, elements)
@@ -228,7 +240,7 @@ def read_cache(cache, slots, *, layout=None):
     assert _read_values_op is not None
     gathered = _read_values_op(
         cache,
-        slots.flatten().int(),
+        (slots if slots.dtype == torch.int32 else slots.int()).flatten(),
         elements,
         dtype == torch.float32,
         page_size,

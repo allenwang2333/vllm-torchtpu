@@ -85,7 +85,9 @@ def spec_logprobs_lists(
         logprob_token_ids=np.concatenate(ids),
         logprobs=np.concatenate(lps),
         sampled_token_ranks=np.concatenate(ranks),
-        cu_num_generated_tokens=np.concatenate(([0], np.cumsum(gen_lens))).tolist(),
+        cu_num_generated_tokens=np.concatenate(
+            ([0], np.cumsum(gen_lens, dtype=np.int32))
+        ).tolist(),
     )
 
 

@@ -182,3 +182,43 @@ def test_save_compress_norm_ratio2_matches_int64(monkeypatch, pos_dtype):
     ref = comp_mod.rms_norm(values, torch.ones(dim), 1e-6)
     ref = ref.masked_fill(~valid[:, None], 0).to(torch.bfloat16)
     assert torch.equal(latent.view(torch.int16), ref.view(torch.int16))
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_td8300_read_cache_1d_int32_index_select_and_spec_logprobs_int32(slot_dtype):
+    import numpy as np
+
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        LogprobsTensors,
+        SpecLogprobsChunk,
+        spec_logprobs_lists,
+    )
+
+    g = torch.Generator().manual_seed(300)
+    dense = torch.randn((4, 8, 16), generator=g, dtype=torch.bfloat16)
+    slots = torch.tensor([[0, 7, 9], [15, 23, 31]], dtype=slot_dtype)
+    ref_dense = dense[slots // dense.shape[1], slots % dense.shape[1]]
+    got_dense = cache_mod.read_cache(dense, slots, layout=None)
+    assert torch.equal(got_dense.view(torch.int16), ref_dense.view(torch.int16))
+
+    raw = torch.randint(
+        0, 1000, (32, cache_mod.ROW_WORDS), generator=g, dtype=torch.int32
+    )
+    layout = cache_mod.RecordLayout(8, 8, 0, 256, torch.bfloat16)
+    got_layout = cache_mod.read_cache(raw, slots, layout=layout)
+    pool = raw.view(torch.int8).reshape(-1, 256 * 2)
+    ref_layout = (
+        pool[slots.long()].contiguous().view(torch.bfloat16).reshape(*slots.shape, 256)
+    )
+    assert torch.equal(got_layout.view(torch.int16), ref_layout.view(torch.int16))
+
+    chunk = SpecLogprobsChunk(
+        tensors=LogprobsTensors(
+            logprob_token_ids=torch.tensor([[10, 11], [20, 21], [30, 31]]),
+            logprobs=torch.zeros((3, 2)),
+            selected_token_ranks=torch.tensor([0, 1, 0]),
+        ),
+        row_starts=np.array([0, 2], dtype=np.int32),
+    )
+    lists = spec_logprobs_lists([chunk], [2, 1])
+    assert lists.cu_num_generated_tokens == [0, 2, 3]
