@@ -978,6 +978,11 @@ def test_td68_attention_metadata_and_runner_optimizations():
         runner, ["attn.0", "attn.1"], 4
     )
     assert set(md_layers1) == {"attn.0", "attn.1"}
+    # TD8.341: cached group ids are a frozenset (used as a plan-cache key).
+    assert all(
+        isinstance(gids, frozenset)
+        for _, gids in runner._layer_group_selection_cache.values()
+    )
     # Second call hits _layer_group_selection_cache and pre-staged block tables
     md_layers2 = TPUModelRunner.build_attention_metadata_for_layers(
         runner, ["attn.0", "attn.1"], 4

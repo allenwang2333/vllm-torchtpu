@@ -574,8 +574,10 @@ def attach_step_owner_token_layout(
     )
     if ctx is None or ctx.num_reqs <= 0 or padded_tokens <= 0:
         return None
-    metas = tuple({id(m): m for m in per_layer_attn_metadata.values()}.values())
-    first = metas[0]
+    # Layers share per-group metadata objects; re-assigning the same fields on
+    # a shared object is idempotent and cheaper than an id()-keyed dedup.
+    metas = per_layer_attn_metadata.values()
+    first = next(iter(metas))
     raw_paddings = runner.num_tokens_paddings
     paddings_cache = getattr(runner, "_kv_shard_paddings_cache", None)
     if paddings_cache is None or paddings_cache[0] != id(raw_paddings):

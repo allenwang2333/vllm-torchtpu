@@ -1707,10 +1707,12 @@ class TPUModelRunner(GPUModelRunner):
                     selected = [n for n in group.layer_names if n in layer_names]
                     if selected:
                         selected_groups.append((group, selected))
-            gids = {
+            # frozenset: `_get_staged_walk_plan` keys its plan cache on it
+            # directly instead of re-freezing a set on every draft step.
+            gids = frozenset(
                 group.metadata_builders[0].kv_cache_group_id
                 for group, _ in selected_groups
-            }
+            )
             selection_cache[selection_key] = (selected_groups, gids)
         ctx = self._attn_metadata_builder_ctx
         if ctx.staged_block_tables is None and selected_groups:
