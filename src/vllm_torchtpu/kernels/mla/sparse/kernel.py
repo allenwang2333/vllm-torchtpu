@@ -1014,6 +1014,9 @@ def capped_live_windows(
 MIXED_BODY_LEVERS = ("tr", "zu", "pv512", "noinf", "pbf16")
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
+# Buckets up to this many tokens keep the plain live body: at 64 tokens the
+# levers measured within noise to +2.5 % (partly filled bucket).
+MIXED_BODY_MAX_SKIP_TOKENS = 64
 
 
 def _attention_kernel(
@@ -2302,7 +2305,11 @@ def sparse_ragged_paged_attention(
             group_tab=group_tab,
             group_num_live=None if group_num_live is None else group_num_live[i],
             group_widths=mixed_live_widths if group_tab is not None else (),
-            group_levers=mixed_body_levers if group_tab is not None else (),
+            group_levers=(
+                mixed_body_levers
+                if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
+                else ()
+            ),
         )
         if return_lse:
             q, lse = result
