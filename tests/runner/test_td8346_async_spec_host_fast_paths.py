@@ -12,6 +12,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -234,3 +235,67 @@ def test_num_draft_tokens_map_matches_generator():
     np.testing.assert_array_equal(got, ref)
     assert got.dtype == np.int32
     assert got.tolist() == [2, 0]
+
+
+# --- TD8.357: uniform scheduled-token and draft-count fast paths -----------
+
+
+def test_td8357_cached_uniform_int32_array_is_shared_and_read_only():
+    from vllm_torchtpu.runner.tpu_runner import _cached_uniform_int32_array
+
+    arr, raw = _cached_uniform_int32_array(4, 6)
+    assert arr.dtype == np.int32 and arr.tolist() == [6, 6, 6, 6]
+    assert raw == np.full(4, 6, dtype=np.int32).tobytes()
+    assert not arr.flags.writeable
+    assert _cached_uniform_int32_array(4, 6)[0] is arr
+
+
+def test_td8357_uniform_schedule_uses_cached_array():
+    from vllm_torchtpu.runner.tpu_runner import _cached_uniform_int32_array
+
+    runner, sched = _runner({"req-0": 0, "req-1": 1})
+    _prepare(runner, sched)
+    # Same values the fromiter path produced for [3, 3].
+    assert runner._last_sched_tokens_bytes == np.array([3, 3], np.int32).tobytes()
+    assert runner._last_sched_tokens_bytes is _cached_uniform_int32_array(2, 3)[1]
+    assert runner.query_start_loc_np[:3].tolist() == [0, 3, 6]
+    assert runner.seq_lens_np[:2].tolist() == [7, 11]
+
+
+def test_td8357_ragged_schedule_keeps_fromiter_path():
+    runner, sched = _runner({"req-0": 0, "req-1": 1})
+    sched.num_scheduled_tokens = {"req-0": 2, "req-1": 3}
+    sched.total_num_scheduled_tokens = 5
+    _prepare(runner, sched)
+    assert runner._last_sched_tokens_bytes == np.array([2, 3], np.int32).tobytes()
+    assert runner.query_start_loc_np[:3].tolist() == [0, 2, 5]
+    assert runner.seq_lens_np[:2].tolist() == [6, 11]
+
+
+def test_td8357_fast_uniform_spec_k_reuses_verified_count():
+    from vllm_torchtpu.runner.tpu_runner import _cached_uniform_int32_array
+
+    spec = {"req-0": [7, 8], "req-1": [7, 8]}
+    runner, sched = _runner({"req-0": 0, "req-1": 1}, spec_tokens=spec)
+    sched.scheduled_spec_decode_tokens = spec
+    runner._fast_uniform_spec_k = (spec, ["req-0", "req-1"], 2)
+    _prepare(runner, sched)
+    (got,) = runner.spec_decode_manager.calls
+    assert got.tolist() == [2, 2] and got.dtype == np.int32
+    np.testing.assert_array_equal(got, _cached_uniform_int32_array(2, 2)[0])
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [
+        lambda spec: ({"req-0": [1, 2]}, ["req-0", "req-1"], 2),  # other dict
+        lambda spec: (spec, ["req-1", "req-0"], 2),  # other request order
+    ],
+)
+def test_td8357_stale_fast_uniform_spec_k_is_ignored(stale):
+    spec = {"req-0": [7, 8, 9]}  # req-1 drafts nothing
+    runner, sched = _runner({"req-0": 0, "req-1": 1}, spec_tokens=spec)
+    runner._fast_uniform_spec_k = stale(spec)
+    _prepare(runner, sched)
+    (got,) = runner.spec_decode_manager.calls
+    assert got.tolist() == [3, 0]

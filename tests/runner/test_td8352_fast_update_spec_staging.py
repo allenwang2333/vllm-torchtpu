@@ -114,3 +114,16 @@ def test_ragged_spec_falls_back_with_cached_states_in_order():
     assert TPUModelRunner._try_fast_update_states(runner, _sched(spec)) is True
     assert fallback == [runner.requests[r] for r in _IDS]
     assert not runner.input_batch.is_token_ids.any()
+
+
+def test_td8357_fast_path_records_uniform_spec_k_only_when_verified():
+    spec = dict.fromkeys(_IDS, [-1, -1])
+    runner, _ = _runner([[], [], []])
+    so = _sched(spec)
+    assert TPUModelRunner._try_fast_update_states(runner, so) is True
+    assert runner._fast_uniform_spec_k == (spec, _IDS, 2)
+    assert runner._fast_uniform_spec_k[0] is spec
+
+    runner, _ = _runner([[], [], []])
+    TPUModelRunner._try_fast_update_states(runner, _sched({"r0": [1]}))
+    assert getattr(runner, "_fast_uniform_spec_k", None) is None

@@ -624,6 +624,14 @@ def _cached_uniform_draft_map(n: int, k: int) -> dict[int, int]:
     return dict.fromkeys(range(n), k)
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_uniform_int32_array(n: int, val: int) -> tuple[np.ndarray, bytes]:
+    """`np.full(n, val, int32)` (read-only, shared across steps) and its bytes."""
+    arr = np.full(n, val, dtype=np.int32)
+    arr.flags.writeable = False
+    return arr, arr.tobytes()
+
+
 def _uniform_placeholder_count(
     num_draft_per_req: dict[int, int] | None, n_reqs: int
 ) -> int | None:
@@ -2855,6 +2863,10 @@ class TPUModelRunner(GPUModelRunner):
                     if cur_spec != ids:
                         cur_spec[:] = ids
                     req_state.prev_num_draft_len = k
+                # Every req_ids entry was just verified to draft exactly k
+                # tokens; `_prepare_inputs` reuses this instead of re-reading
+                # the n_reqs lengths.
+                self._fast_uniform_spec_k = (scheduled_spec_tokens, req_ids, k)
             else:
                 update_spec = input_batch.update_req_spec_token_ids
                 for req_state in req_states:
@@ -2864,6 +2876,7 @@ class TPUModelRunner(GPUModelRunner):
         return True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        self._fast_uniform_spec_k = None
         finished_req_ids = scheduler_output.finished_req_ids
         preempted_req_ids = scheduler_output.preempted_req_ids
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
@@ -3361,8 +3374,16 @@ class TPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_per_req = [
             num_scheduled_tokens[req_id] for req_id in req_ids[start_index:num_reqs]
         ]
+        first_sched = num_scheduled_tokens_per_req[0]
+        # Steady-state decode / spec verify: every request schedules the same
+        # count, so max == first and the array is a cached constant.
+        uniform_sched = num_scheduled_tokens_per_req.count(first_sched) == len(
+            num_scheduled_tokens_per_req
+        )
         use_max_model_len = (
-            most_model_len is None or max(num_scheduled_tokens_per_req) > most_model_len
+            most_model_len is None
+            or (first_sched if uniform_sched else max(num_scheduled_tokens_per_req))
+            > most_model_len
         )
         if use_max_model_len:
             if len(num_scheduled_tokens_per_req) > self.num_reqs_max_model_len:
@@ -3381,14 +3402,21 @@ class TPUModelRunner(GPUModelRunner):
                 end_index = start_index + self.num_reqs_most_model_len
             else:
                 end_index = num_reqs
-        max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
-        total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_reqs = len(num_scheduled_tokens_per_req)
         chunk_req_ids = req_ids[start_index:end_index]
-        num_scheduled_tokens_per_req = np.fromiter(
-            num_scheduled_tokens_per_req, dtype=np.int32, count=num_reqs
-        )
-        sched_tokens_bytes = num_scheduled_tokens_per_req.tobytes()
+        if uniform_sched:
+            max_num_scheduled_tokens_all_reqs = first_sched
+            total_num_scheduled_tokens = num_reqs * first_sched
+            num_scheduled_tokens_per_req, sched_tokens_bytes = (
+                _cached_uniform_int32_array(num_reqs, first_sched)
+            )
+        else:
+            max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
+            total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
+            num_scheduled_tokens_per_req = np.fromiter(
+                num_scheduled_tokens_per_req, dtype=np.int32, count=num_reqs
+            )
+            sched_tokens_bytes = num_scheduled_tokens_per_req.tobytes()
         assert max_num_scheduled_tokens_all_reqs > 0
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
@@ -3687,15 +3715,30 @@ class TPUModelRunner(GPUModelRunner):
         if self.speculative_config:
             sched_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
             if sched_spec_tokens:
-                get_spec = sched_spec_tokens.get
-                num_draft_tokens = np.fromiter(
-                    map(
-                        len,
-                        map(get_spec, chunk_req_ids, itertools.repeat((), num_reqs)),
-                    ),
-                    dtype=np.int32,
-                    count=num_reqs,
-                )
+                fast_spec = getattr(self, "_fast_uniform_spec_k", None)
+                if (
+                    start_index == 0
+                    and fast_spec is not None
+                    and fast_spec[0] is sched_spec_tokens
+                    and fast_spec[1] == chunk_req_ids
+                ):
+                    # `_try_fast_update_states` verified this step's requests
+                    # all draft fast_spec[2] > 0 tokens.
+                    num_draft_tokens = _cached_uniform_int32_array(
+                        num_reqs, fast_spec[2]
+                    )[0]
+                else:
+                    get_spec = sched_spec_tokens.get
+                    num_draft_tokens = np.fromiter(
+                        map(
+                            len,
+                            map(
+                                get_spec, chunk_req_ids, itertools.repeat((), num_reqs)
+                            ),
+                        ),
+                        dtype=np.int32,
+                        count=num_reqs,
+                    )
                 if num_draft_tokens.any():
                     spec_decode_metadata = (
                         self.spec_decode_manager.get_spec_decode_metadata(
