@@ -1044,8 +1044,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             cached_addr = stage_cache.get(slot_key)
             if cached_addr is None:
                 pos_i32 = positions.int()
-                requests = _token_requests(kv_meta, positions).clamp(
-                    max=kv_table.shape[0] - 1
+                requests = (
+                    _token_requests(kv_meta, positions)
+                    .clamp(max=kv_table.shape[0] - 1)
+                    .int()
                 )
                 logical = pos_i32 // self.compress_ratio
                 kv_col = (logical // kv_rows).clamp(max=kv_table.shape[1] - 1)
@@ -1122,7 +1124,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     kv_write_invalid,
                 ) = cached_write
             else:
-                kv_blocks = kv_table.reshape(-1).index_select(0, kv_idx).int()
+                kv_blocks = (
+                    (kv_table if kv_table.dtype == torch.int32 else kv_table.int())
+                    .reshape(-1)
+                    .index_select(0, kv_idx)
+                )
                 compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
                     ~valid_token, -1
                 )
@@ -1137,7 +1143,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     idx_blocks = kv_blocks
                     index_slots = compressed_slots
                 else:
-                    idx_blocks = idx_table.reshape(-1).index_select(0, idx_idx).int()
+                    idx_blocks = (
+                        (
+                            idx_table
+                            if idx_table.dtype == torch.int32
+                            else idx_table.int()
+                        )
+                        .reshape(-1)
+                        .index_select(0, idx_idx)
+                    )
                     index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
                         ~valid_token, -1
                     )

@@ -642,3 +642,43 @@ def test_td8358_swa_token_addr_and_slots_1d_int32_flat_index_select(monkeypatch)
     assert len(captured_records) == 4
     assert torch.equal(captured_records[0], captured_records[1])
     assert torch.equal(captured_records[2], captured_records[3])
+
+
+def test_td8371_write_global_kv_int32_flat_index_select(monkeypatch):
+    """TD8.371: _write_global_kv pre-converts requests to int32 and pre-casts
+    kv_table/idx_table to int32 before reshape(-1).index_select(0, ...)."""
+    kv_table_i32 = torch.tensor([[1, 2, 6], [3, 4, 9]], dtype=torch.int32)
+    kv_table_i64 = kv_table_i32.to(torch.int64)
+    positions = torch.tensor([0, 1, 5, 9, 2, 3, 15, 17], dtype=torch.int64)
+
+    for distinct_idx in (False, True):
+        records_by_dtype: list[torch.Tensor] = []
+        slots_by_dtype: list[torch.Tensor] = []
+        for kv_t in (kv_table_i32, kv_table_i64):
+            idx_t = (kv_t + 1) if distinct_idx else kv_t
+            metadata = {"kv": _meta(kv_t, qsl=(0, 4, 7)), "idx": _meta(idx_t)}
+            index_cache = _paged_cache(row_offset=32)
+            inserted: list[torch.Tensor] = []
+            attn = _make_attn(monkeypatch, metadata, index_cache, inserted)
+            if distinct_idx:
+                attn.indexer.k_cache.compress_ratio = 4
+            with v2_attn.stage_attention_cache_scope():
+                recs, _ = attn._write_global_kv(torch.ones(COUNT, 10), positions)
+                records_by_dtype.append(recs.clone())
+                slots_by_dtype.append(inserted[-1].clone())
+                stage_cache = v2_attn._active_stage_attn_cache
+                assert stage_cache is not None
+                addr_entry = next(
+                    v for k, v in stage_cache.items() if k[0] == "global_kv_addr"
+                )
+                kv_idx, _, idx_idx, _, _, _, _ = addr_entry
+                assert kv_idx.dtype == torch.int32
+                assert idx_idx.dtype == torch.int32
+                write_entry = next(
+                    v for k, v in stage_cache.items() if k[0] == "global_kv_write_slots"
+                )
+                _, _, compressed_slots, _, index_slots, _, _, _, _ = write_entry
+                assert compressed_slots.dtype == torch.int32
+                assert index_slots.dtype == torch.int32
+        assert torch.equal(records_by_dtype[0], records_by_dtype[1])
+        assert torch.equal(slots_by_dtype[0], slots_by_dtype[1])
