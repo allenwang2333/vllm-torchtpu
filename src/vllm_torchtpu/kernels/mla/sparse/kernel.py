@@ -427,7 +427,8 @@ def _capped_window_live_kernel(
     (a < A(g)) go to the front, block `off(g) + a`, so a chunk's live atoms
     are one prefix; the dead blocks fill the region from its end, so the
     region stays a permutation of valid physical rows (an overflowing chunk
-    gathers all of it). Windows w >= 1 keep the token-major order of
+    gathers all of it). A group with every atom live keeps its rows
+    token-major at `off(g)` (the kernel then fetches it with one DMA). Windows w >= 1 keep the token-major order of
     `prepare_capped_window_indices`. The region is staged in VMEM (two slots)
     and written with one DMA per chunk.
     """
@@ -478,20 +479,34 @@ def _capped_window_live_kernel(
         live = tab_ref[g]
         off = tab_ref[num_groups + g]
         dead_before = tb * atoms_w - off
-        lane = lax.broadcasted_iota(jnp.int32, (bz // 2, 128), 1)
-        for a in range(atoms_w):
-            j, h = divmod(a * atom, 128)
-            even = phys_ref[pl.ds(j * bz, bz // 2, stride=2), :]
-            odd = phys_ref[pl.ds(j * bz + 1, bz // 2, stride=2), :]
-            if h == 0:
-                tile = jnp.where(lane < atom, even, pltpu.roll(odd, atom, 1))
-            else:
-                tile = jnp.where(lane < atom, pltpu.roll(even, atom, 1), odd)
-            pos = jnp.where(
-                a < live, off + a, region_tiles - 1 - (dead_before + a - live)
-            )
-            start = pl.multiple_of(pos * tile_rows, tile_rows)
-            stage_ref[slot, pl.ds(start, tile_rows), :] = tile
+        @pl.when(live == atoms_w)
+        def _whole_group():
+            # Every atom live: the group's rows token-major (as the
+            # token-major prep lays them out), so the kernel fetches the
+            # group with one DMA per cache.
+            for jj in range(lane_rows):
+                tok_ref[pl.ds(jj, bz, stride=lane_rows), :] = phys[
+                    :, jj * 128 : (jj + 1) * 128
+                ]
+            start = pl.multiple_of(off * tile_rows, tile_rows)
+            stage_ref[slot, pl.ds(start, bz * lane_rows), :] = tok_ref[...]
+
+        @pl.when(live < atoms_w)
+        def _blocks():
+            lane = lax.broadcasted_iota(jnp.int32, (bz // 2, 128), 1)
+            for a in range(atoms_w):
+                j, h = divmod(a * atom, 128)
+                even = phys_ref[pl.ds(j * bz, bz // 2, stride=2), :]
+                odd = phys_ref[pl.ds(j * bz + 1, bz // 2, stride=2), :]
+                if h == 0:
+                    tile = jnp.where(lane < atom, even, pltpu.roll(odd, atom, 1))
+                else:
+                    tile = jnp.where(lane < atom, pltpu.roll(even, atom, 1), odd)
+                pos = jnp.where(
+                    a < live, off + a, region_tiles - 1 - (dead_before + a - live)
+                )
+                start = pl.multiple_of(pos * tile_rows, tile_rows)
+                stage_ref[slot, pl.ds(start, tile_rows), :] = tile
 
         @pl.when(tb == gpc - 1)
         def _flush():
@@ -842,6 +857,7 @@ def live_group_supported(chunk_size: int, kernel_batch_size: int, topk_cap: int)
         and tile % (8 * 128) == 0
         and topk_cap % 128 == 0
         and topk_cap % atom == 0
+        and tile % topk_cap == 0
     )
 
 
@@ -1211,9 +1227,33 @@ def _attention_kernel(
         g = seq_idx_start // batch_size
         live = group_tab_ref[g]
         off = group_tab_ref[num_groups + g]
-        for a in range(bkv_sz // atom_rows):
+        num_atoms = bkv_sz // atom_rows
+        # A whole group (every atom live) sits token-major at block `off`:
+        # the incumbent's one DMA per cache from its first token row.
+        whole_row = off * (batch_size * atom_rows // bkv_sz)
 
-            @pl.when(a < live)
+        @pl.when(live == num_atoms)
+        def _copy_whole():
+            if wait:
+                _async_copy(nope_dst, nope_dst, sem_nope, True)
+                _async_copy(rope_dst, rope_dst, sem_rope, True)
+            else:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[pl.ds(whole_row, batch_size)],
+                    nope_dst,
+                    sem_nope,
+                    False,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[pl.ds(whole_row, batch_size)],
+                    rope_dst,
+                    sem_rope,
+                    False,
+                )
+
+        for a in range(num_atoms):
+
+            @pl.when((a < live) & (live < num_atoms))
             def _copy_block():
                 nope_slot = nope_dst.at[:, pl.ds(a * atom_rows, atom_rows)]
                 rope_slot = rope_dst.at[:, pl.ds(a * rope_atom_rows, rope_atom_rows)]
