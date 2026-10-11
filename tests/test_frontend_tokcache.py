@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 
 try:
     from vllm_torchtpu import frontend_tokcache as tokcache_mod

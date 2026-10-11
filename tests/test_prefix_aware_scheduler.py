@@ -305,13 +305,9 @@ def test_free_block_fit_tier_preserves_order_when_no_warm_request_fits():
         num_preemptions=1,
     )
     # 160 cold tokens -> 10 blocks > 5 free blocks
-    r_warm_nonfit = _make_request(
-        "warm_nonfit", num_tokens=1000, arrival_time=now - 15
-    )
+    r_warm_nonfit = _make_request("warm_nonfit", num_tokens=1000, arrival_time=now - 15)
     # 32 cold tokens -> 2 blocks <= 5 free blocks, but warmth == 0 (cold, not warm)
-    r_cold_small = _make_request(
-        "cold_small", num_tokens=32, arrival_time=now - 10
-    )
+    r_cold_small = _make_request("cold_small", num_tokens=32, arrival_time=now - 10)
 
     s = _make_scheduler(
         [r_preempted, r_warm_nonfit, r_cold_small],
@@ -351,7 +347,6 @@ def test_free_block_fit_tier_inactive_when_head_fits_in_free_blocks():
     q = s._select_waiting_queue_for_scheduling()
     assert q is not None
     assert [r.request_id for r in q] == ["preempted_fits", "warm"]
-
 
 
 def _running_request(request_id: str, prompt: int, computed: int) -> SimpleNamespace:
@@ -439,7 +434,7 @@ def test_cold_prefill_chunk_cap_only_caps_cold_requests_at_high_concurrency():
     cold = _running_request("cold", prompt=90_000, computed=0)
     assert s._cap_cold_prefill_tokens(cold, 0, 8128) == 2048 - 64
 
-    # At 32 decoders (128 decode tokens), cap is 2048 - 128 = 1920 (exact 3 * 640 Mamba blocks).
+    # At 32 decoders (128 decode tokens), cap is 2048 - 128 = 1920 (exact 3 * 640 Mamba blocks).  # noqa: E501
     s._step_num_decoding = 32
     s._step_decode_tokens = 128
     assert s._cap_cold_prefill_tokens(cold, 0, 8064) == 1920
@@ -455,14 +450,14 @@ def test_cold_prefill_chunk_cap_only_caps_cold_requests_at_high_concurrency():
     s._step_decode_tokens = 44
     assert s._cap_cold_prefill_tokens(cold, 0, 8128) == 8128
 
-    # When waiting queue is non-empty, cold request in running IS capped to unlock waiting.
+    # When waiting queue is non-empty, cold request in running IS capped to unlock waiting.  # noqa: E501
     s._step_num_decoding = 4
     s._step_decode_tokens = 16
     s.waiting = [warm]
     s._step_running_prefill_ids = {id(cold)}
     assert s._cap_cold_prefill_tokens(cold, 2048, 8128) == 2048 - 16
 
-    # First-step admission from waiting only triggers on decoder count (not self-triggering).
+    # First-step admission from waiting only triggers on decoder count (not self-triggering).  # noqa: E501
     s._step_running_prefill_ids = set()
     assert s._cap_cold_prefill_tokens(cold, 0, 8128) == 8128
 
@@ -484,7 +479,7 @@ def test_step_total_cap_prevents_multi_prefill_8192_bucket_spill():
     assert s._cap_cold_prefill_tokens(c1, 0, 8080) == 1936
     s._step_prefill_tokens_by_req[id(c1)] = 1920
 
-    # Second cold chunk: 112 + 1920 = 2032 already scheduled; fits within 4096 cap (1936 -> 1920)
+    # Second cold chunk: 112 + 1920 = 2032 already scheduled; fits within 4096 cap (1936 -> 1920)  # noqa: E501
     assert s._cap_cold_prefill_tokens(c2, 0, 6160) == 1936
     s._step_prefill_tokens_by_req[id(c2)] = 1920
 
@@ -493,7 +488,7 @@ def test_step_total_cap_prevents_multi_prefill_8192_bucket_spill():
     # rather than spilling the step into the 8192 XLA bucket.
     assert s._cap_cold_prefill_tokens(c3, 0, 4240) == 0
 
-    # Strict 2048 step-total cap (TPU_SCHED_STEP_TOTAL_CAP=2048) defers 2nd prefill immediately:
+    # Strict 2048 step-total cap (TPU_SCHED_STEP_TOTAL_CAP=2048) defers 2nd prefill immediately:  # noqa: E501
     s._step_total_cap = 2048
     s._step_prefill_tokens_by_req = {}
     assert s._cap_cold_prefill_tokens(c1, 0, 8080) == 1936
@@ -521,4 +516,3 @@ def test_warm_streak_cadence_gating_defers_prefills_until_k_decode_steps():
     # Streak = 2 >= 2 -> prefill admitted
     s._pure_decode_streak = 2
     assert s._cap_cold_prefill_tokens(warm, 18_000, 2000) == 2000
-

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Vectorized VMEM load/store and state ring-buffer helpers for GDN v3.
-"""
+"""Vectorized VMEM load/store and state ring-buffer helpers for GDN v3."""
 
 import math
 
@@ -449,7 +448,9 @@ def load_activation_as_compact(
         v_compact = jnp.stack(v_list, axis=1)
     else:
         qkv_vmem_ref[...] = qkv_vreg
-        q_compact = load_compact_heads(qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim)
+        q_compact = load_compact_heads(
+            qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim
+        )
         k_compact = load_compact_heads(
             qkv_vmem_ref, cfgs.num_kq_heads, cfgs.kq_head_dim, k_offset
         )

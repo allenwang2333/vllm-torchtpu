@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
 import functools
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -362,9 +362,7 @@ def _compiled_extract_draft_token_ids(
     logits_indices: torch.Tensor,
     target_logits_indices: torch.Tensor,
 ) -> torch.Tensor:
-    return extract_draft_token_ids(
-        input_ids, logits_indices, target_logits_indices
-    )
+    return extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
 
 
 @_static_shape_args
@@ -396,7 +394,7 @@ def _compiled_assemble_spec_and_rejected(
     if src.shape[0] < bound:
         src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
     num_rejected = (draft_lengths - num_valid + 1).clamp(min=0).to(torch.int32)
-    if B < max_num_reqs:
+    if max_num_reqs > B:
         num_rejected = torch.nn.functional.pad(num_rejected, (0, max_num_reqs - B))
     return src, num_rejected
 
@@ -485,4 +483,3 @@ def _compiled_assemble_prefill_bootstrap(
     if src.shape[0] < bound:
         src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
     return src
-

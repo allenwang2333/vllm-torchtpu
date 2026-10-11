@@ -108,9 +108,7 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     def _note(fast: bool) -> None:
         _STATS[0 if fast else 1] += 1
         if (_STATS[0] + _STATS[1]) % _LOG_EVERY == 0:
-            logger.info(
-                "QX_FAST_COMPILED_CALL: fast=%d slow=%d", _STATS[0], _STATS[1]
-            )
+            logger.info("QX_FAST_COMPILED_CALL: fast=%d slow=%d", _STATS[0], _STATS[1])
 
     @functools.wraps(fn)
     def qx_fast_compiled(*args: Any, **kwargs: Any) -> Any:

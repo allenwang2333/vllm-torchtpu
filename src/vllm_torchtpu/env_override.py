@@ -288,7 +288,9 @@ if _sc_offload_bytes is not None:
 
 CHANGES.extend(["libtpu_add", tok] for tok in _libtpu_extra_args)
 if _libtpu_extra_args or _existing_libtpu_args:
-    _assembled = " ".join(x for x in [" ".join(_libtpu_extra_args), _existing_libtpu_args] if x)
+    _assembled = " ".join(
+        x for x in [" ".join(_libtpu_extra_args), _existing_libtpu_args] if x
+    )
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 

@@ -287,14 +287,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     )
         super().update_connector_output(connector_output)
 
-    def _quiet_lookup(self, req_status: Any, base_tokens: int) -> int | None:
+    def _quiet_lookup(self, req_status: Any, base_tokens: int) -> int | None:  # noqa: F821
         """Probe ``self._lookup(req_status)`` starting from ``base_tokens``
         without emitting duplicate lookup events."""
         req_status.num_locally_computed_tokens = base_tokens
         tracker = getattr(self, "_events_tracker", None)
-        orig_record = (
-            getattr(tracker, "record_lookup", None) if tracker else None
-        )
+        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
         orig_partial = (
             getattr(tracker, "record_partial_lookup", None) if tracker else None
         )
@@ -312,7 +310,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
     def resolve_divergent_local_hit_tokens(
         self,
-        request: Request,
+        request: Request,  # noqa: F821
         num_local: int,
         num_reconciled: int,
         block_size: int,
@@ -384,7 +382,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     def resolve_divergent_local_hit_tokens(
         self,
-        request: Request,
+        request: Request,  # noqa: F821
         num_local: int,
         num_reconciled: int,
         block_size: int,
@@ -580,9 +578,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (fence_job_ids, _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

@@ -525,9 +525,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state_dtype = getattr(
                 torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
             )
-            if getattr(
-                self.cache_config, "mamba_ssm_cache_dtype", "auto"
-            ) in ("auto", "float32", "fp8", "float8_e4m3fn"):
+            if getattr(self.cache_config, "mamba_ssm_cache_dtype", "auto") in (
+                "auto",
+                "float32",
+                "fp8",
+                "float8_e4m3fn",
+            ):
                 temporal_state_dtype = getattr(
                     torch, DEFAULT_POOLED_GDN_SSM_STATE_DTYPE.split(".")[1]
                 )

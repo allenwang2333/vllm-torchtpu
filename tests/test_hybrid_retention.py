@@ -17,8 +17,6 @@ cross-turn Mamba boundary + partial-tail LRU retention."""
 from types import SimpleNamespace
 from typing import NamedTuple
 
-import pytest
-
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 
 BS = 256  # attention / mamba block size
@@ -110,14 +108,28 @@ POOL = None
 
 class FakeMambaManager:
     @classmethod
-    def find_longest_cache_hit(cls, block_hashes, max_length, kv_cache_group_ids,
-                               block_pool, kv_cache_spec, drop_eagle_block,
-                               alignment_tokens, dcp_world_size=1, pcp_world_size=1):
+    def find_longest_cache_hit(
+        cls,
+        block_hashes,
+        max_length,
+        kv_cache_group_ids,
+        block_pool,
+        kv_cache_spec,
+        drop_eagle_block,
+        alignment_tokens,
+        dcp_world_size=1,
+        pcp_world_size=1,
+    ):
         for fine_idx in range(min(max_length // HB, len(block_hashes)) - 1, -1, -1):
-            found = [block_pool.cached.get((block_hashes[fine_idx], g)) for g in kv_cache_group_ids]
+            found = [
+                block_pool.cached.get((block_hashes[fine_idx], g))
+                for g in kv_cache_group_ids
+            ]
             if all(found):
                 n = (fine_idx * HB) // BS
-                return tuple([block_pool.null] * n + [b] for b in found), (fine_idx + 1) * HB
+                return tuple([block_pool.null] * n + [b] for b in found), (
+                    fine_idx + 1
+                ) * HB
         return tuple([] for _ in kv_cache_group_ids), 0
 
 
@@ -134,12 +146,21 @@ def _setup(prompt=1000, osl=600, mamba=True, max_conversations=None, bs=BS):
     if mamba:
         groups.append(SpecGroup(MambaSpec(), [1], FakeMambaManager, False))
         managers.append(mamba_mgr)
-    coord = SimpleNamespace(attention_groups=groups, single_type_managers=managers,
-                            block_pool=pool, _cache_hit_alignment_tokens=HB)
+    coord = SimpleNamespace(
+        attention_groups=groups,
+        single_type_managers=managers,
+        block_pool=pool,
+        _cache_hit_alignment_tokens=HB,
+    )
     kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
     total = prompt + osl
-    req = SimpleNamespace(request_id="r", num_prompt_tokens=prompt, num_tokens=total,
-                          num_computed_tokens=total, block_hashes=list(range(total // HB)))
+    req = SimpleNamespace(
+        request_id="r",
+        num_prompt_tokens=prompt,
+        num_tokens=total,
+        num_computed_tokens=total,
+        block_hashes=list(range(total // HB)),
+    )
     # Attention blocks: all full blocks hashed, owned by the request.
     attn = [Block(i, block_hash=("a", i)) for i in range(-(-total // bs))]
     for b in attn:
@@ -251,18 +272,18 @@ def test_dense_retention_demotes_nothing():
 
 
 def test_pins_both_full_boundary_and_partial_tail_blocks():
-    # BS=640, HB=128, prompt=800 -> full boundary at 640 (idx 4), partial tail at 768 (idx 5).
+    # BS=640, HB=128, prompt=800 -> full boundary at 640 (idx 4), partial tail at 768 (idx 5).  # noqa: E501
     r, pool, req, attn, partial_state, other = _setup(prompt=800, osl=200, bs=640)
     full_state = Block(99, block_hash=("s_full", 640 // HB - 1))
     pool.cached[(640 // HB - 1, 1)] = full_state
     pool.free_block_queue.q.insert(0, full_state)
 
-    # Suppose full_state is released at prefill end, while partial_state is held 1 step by CoW.
+    # Suppose full_state is released at prefill end, while partial_state is held 1 step by CoW.  # noqa: E501
     pool.free_block_queue.q.remove(partial_state)
     partial_state.ref_cnt = 1
 
     r.pin_running([req])
-    # full_state is pinned immediately; req stays in _pending_partial waiting for partial_state.
+    # full_state is pinned immediately; req stays in _pending_partial waiting for partial_state.  # noqa: E501
     assert full_state.ref_cnt == 1 and full_state not in pool.free_block_queue.q
     assert "r" in r._pinned and "r" in r._pending_partial
 
@@ -283,7 +304,9 @@ def test_pins_both_full_boundary_and_partial_tail_blocks():
 
 
 def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
-    r, pool, req1, attn1, state1, other = _setup(prompt=1000, osl=600, max_conversations=2)
+    r, pool, req1, attn1, state1, other = _setup(
+        prompt=1000, osl=600, max_conversations=2
+    )
     req1.request_id = "convA_turn1"
     r.coordinator.single_type_managers[0].req_to_blocks["convA_turn1"] = attn1
 
@@ -293,7 +316,7 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
     r.on_request_freed(req1, snap1)
     assert state1.ref_cnt == 1 and len(r._conv_lru) == 1
 
-    # Turn 2 of convA finishes at a deeper boundary: state1 is unpinned, state2 is retained.
+    # Turn 2 of convA finishes at a deeper boundary: state1 is unpinned, state2 is retained.  # noqa: E501
     prompt2, total2 = 2000, 2400
     req2 = SimpleNamespace(
         request_id="convA_turn2",
@@ -310,7 +333,7 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
     assert state1.ref_cnt == 0 and state1 in pool.free_block_queue.q
     assert state2.ref_cnt == 1 and len(r._conv_lru) == 1
 
-    # Allocating all blocks in the pool (+1 for state2) automatically evicts state2 from _conv_lru.
+    # Allocating all blocks in the pool (+1 for state2) automatically evicts state2 from _conv_lru.  # noqa: E501
     total_available_with_lru = pool.get_num_free_blocks() + 1
     allocated = pool.get_new_blocks(total_available_with_lru)
     assert len(allocated) == total_available_with_lru

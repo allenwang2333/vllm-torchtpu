@@ -396,9 +396,7 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
             cores[r].append(g)
             order.append(g)
 
-    hot, hprim, hcopy = (
-        np.asarray(t) for t in kernel.hot_tables(prim, copy, order)
-    )
+    hot, hprim, hcopy = (np.asarray(t) for t in kernel.hot_tables(prim, copy, order))
     hot1h = kernel.hot_onehot(hot)
     prim_j = jnp.asarray(prim, jnp.int32)
     copy_j = jnp.asarray(copy, jnp.int32)
@@ -439,4 +437,3 @@ def test_scores_copies_entry_matches_reference_across_ranks(tokens, extra_slots)
     w, ids = _router(scores, topk)
     want = _reference(x, ids, w, w13_all, s13_all, w2_all, s2_all)
     _assert_close(total_out.astype(jnp.bfloat16), want, 2.5e-2)
-

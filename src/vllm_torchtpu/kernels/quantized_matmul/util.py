@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Weight quantization packing, padding, and scale reshape utilities for quantized matmul.
-"""
+"""Weight quantization packing, padding, and scale reshape utilities for quantized matmul."""  # noqa: E501
 
 from collections.abc import Callable
 from typing import Any

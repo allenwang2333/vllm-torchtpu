@@ -115,7 +115,7 @@ def data() -> dict:
     primary permutation and optional copies."""
     global _DATA, _DATA_PATH
     path = _path()
-    if _DATA is None or _DATA_PATH != path:
+    if _DATA is None or path != _DATA_PATH:
         with open(path) as f:
             table = json.load(f)
         experts = int(table["experts"])

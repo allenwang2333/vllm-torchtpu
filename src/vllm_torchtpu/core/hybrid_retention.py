@@ -163,9 +163,7 @@ class HybridStateRetention:
                     continue
                 mgr._hybrid_retention_hooked = True
 
-                orig_cache_partial = getattr(
-                    mgr, "_cache_partial_tail_block", None
-                )
+                orig_cache_partial = getattr(mgr, "_cache_partial_tail_block", None)
                 if callable(orig_cache_partial):
 
                     def _wrapped_cache_partial(
@@ -185,9 +183,7 @@ class HybridStateRetention:
                                     rid, _gid, src_blk, int(num_tokens)
                                 )
                             else:
-                                req_blocks = getattr(
-                                    _mgr, "req_to_blocks", {}
-                                ).get(rid)
+                                req_blocks = getattr(_mgr, "req_to_blocks", {}).get(rid)
                                 bidx = int(num_tokens) // int(_mgr.block_size)
                                 if req_blocks and bidx < len(req_blocks):
                                     self._record_tracked_block(
@@ -216,16 +212,10 @@ class HybridStateRetention:
                         )
                         pending_cows = getattr(_mgr, "_pending_cow_copies", None)
                         cow_len_before = (
-                            len(pending_cows)
-                            if isinstance(pending_cows, list)
-                            else 0
+                            len(pending_cows) if isinstance(pending_cows, list) else 0
                         )
-                        ret = _orig(
-                            request_id, num_tokens, num_tokens_main_model
-                        )
-                        if had_partial is not None and isinstance(
-                            pending_cows, list
-                        ):
+                        ret = _orig(request_id, num_tokens, num_tokens_main_model)
+                        if had_partial is not None and isinstance(pending_cows, list):
                             _, src_blk = had_partial
                             for src_c, cow_blk in pending_cows[cow_len_before:]:
                                 if src_c is src_blk:
@@ -259,9 +249,7 @@ class HybridStateRetention:
         reset_prefix_cache) so cross-turn Mamba pins are automatically evicted
         whenever free blocks run low."""
         pool = self.block_pool
-        if pool is not None and not getattr(
-            pool, "_hybrid_retention_guarded", False
-        ):
+        if pool is not None and not getattr(pool, "_hybrid_retention_guarded", False):
             pool._hybrid_retention_guarded = True
             orig_get_new_blocks = getattr(pool, "get_new_blocks", None)
             if callable(orig_get_new_blocks):
@@ -269,10 +257,7 @@ class HybridStateRetention:
                 def _guarded_get_new_blocks(
                     num_blocks: int, _orig: Any = orig_get_new_blocks
                 ) -> Any:
-                    while (
-                        self._conv_lru
-                        and self._get_num_free_blocks() < num_blocks
-                    ):
+                    while self._conv_lru and self._get_num_free_blocks() < num_blocks:
                         if not self.evict_oldest_conversation():
                             break
                     return _orig(num_blocks)
@@ -291,9 +276,7 @@ class HybridStateRetention:
                 pool.reset_prefix_cache = _guarded_reset_prefix_cache
 
         kvm = self.kvm
-        if kvm is not None and not getattr(
-            kvm, "_hybrid_retention_guarded", False
-        ):
+        if kvm is not None and not getattr(kvm, "_hybrid_retention_guarded", False):
             kvm._hybrid_retention_guarded = True
             orig_allocate_slots = getattr(kvm, "allocate_slots", None)
             if callable(orig_allocate_slots):
@@ -340,9 +323,7 @@ class HybridStateRetention:
         return alignment if alignment > 0 else self._mamba_block_size()
 
     def _max_retained_blocks_per_turn(self) -> int:
-        num_mamba_gids = max(
-            1, sum(len(g.group_ids) for g in self.mamba_groups)
-        )
+        num_mamba_gids = max(1, sum(len(g.group_ids) for g in self.mamba_groups))
         return 2 * num_mamba_gids
 
     def _probe(self, request: Any, max_length: int) -> tuple[list[Any], int]:
@@ -435,7 +416,9 @@ class HybridStateRetention:
     def _is_own_boundary(self, request: Any, hit: int) -> bool:
         # The replay boundary is floor(prompt) at hash or block granularity;
         # anything older is a shared-prefix junction, not this turn's snapshot.
-        return hit > 0 and hit > request.num_prompt_tokens - 2 * self._mamba_block_size()
+        return (
+            hit > 0 and hit > request.num_prompt_tokens - 2 * self._mamba_block_size()
+        )
 
     # ------------------------------------------------------- conversation LRU
     def _conv_key(self, request: Any) -> Any:
@@ -521,9 +504,7 @@ class HybridStateRetention:
                 break
         return count
 
-    def _store_in_conv_lru(
-        self, request: Any, blocks: list[Any], hit: int
-    ) -> None:
+    def _store_in_conv_lru(self, request: Any, blocks: list[Any], hit: int) -> None:
         if self.max_conversations <= 0 or not blocks or hit <= 0:
             return
         max_blocks = self._max_retained_blocks_per_turn()
@@ -539,7 +520,7 @@ class HybridStateRetention:
 
         self._evict_matching_conv_entries(request)
 
-        #Re-filter in case _evict_matching_conv_entries changed ref_cnt.
+        # Re-filter in case _evict_matching_conv_entries changed ref_cnt.
         retainable = [
             b
             for b in candidates

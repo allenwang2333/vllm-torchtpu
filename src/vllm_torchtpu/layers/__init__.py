@@ -28,9 +28,7 @@ def _maybe_install_frontend_tokcache() -> None:
     except Exception as e:  # never break startup
         import logging
 
-        logging.getLogger(__name__).warning(
-            "[QX_TOKCACHE] install failed: %r", e
-        )
+        logging.getLogger(__name__).warning("[QX_TOKCACHE] install failed: %r", e)
 
 
 def _maybe_install_frontend_fix() -> None:

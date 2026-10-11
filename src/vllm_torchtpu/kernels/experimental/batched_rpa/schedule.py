@@ -286,9 +286,7 @@ class RpaSchedule:
             p_offset = self.dma_kv_cache[step, batch_idx, 0]
             bkv_sz_cache = self.dma_kv_cache[step, batch_idx, 1]
             dst_off = page_idx << self.cfgs.serve.page_size_log2
-            dma_sz = jnp.clip(
-                bkv_sz_cache - dst_off, 0, self.cfgs.serve.page_size
-            )
+            dma_sz = jnp.clip(bkv_sz_cache - dst_off, 0, self.cfgs.serve.page_size)
             src_off = jnp.minimum(
                 p_offset + page_idx, self.cfgs.serve.num_page_indices - 1
             )
@@ -660,9 +658,7 @@ class BaseMetadataComputer:
                     dma_sz = kv_left_frm_cache - dst_vmem
                     dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-                    src_hbm = jnp.minimum(
-                        p_offset + i, cfgs.serve.num_page_indices - 1
-                    )
+                    src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
 
                     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
                         dma_valid = jnp.where(dma_sz > 0, 1, 0)

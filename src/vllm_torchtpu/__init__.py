@@ -1628,9 +1628,7 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     original_get_cached_block = BlockPool.get_cached_block
     original_schedule = Scheduler.schedule
 
-    _GROUP_ID_SUFFIX = tuple(
-        i.to_bytes(4, "big", signed=False) for i in range(64)
-    )
+    _GROUP_ID_SUFFIX = tuple(i.to_bytes(4, "big", signed=False) for i in range(64))
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1646,14 +1644,10 @@ def _patch_vllm_same_step_prefix_hits() -> None:
 
     @functools.wraps(original_remove_cached_block_hashes)
     def _remove_cached_block_hashes(self, *args, **kwargs):
-        evicted_hashes = original_remove_cached_block_hashes(
-            self, *args, **kwargs
-        )
+        evicted_hashes = original_remove_cached_block_hashes(self, *args, **kwargs)
         if evicted_hashes:
             d = self.__dict__
-            d["_tpu_prefix_cache_epoch"] = (
-                d.get("_tpu_prefix_cache_epoch", 0) + 1
-            )
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         return evicted_hashes
 
     @functools.wraps(original_reset_prefix_cache)
@@ -1723,9 +1717,7 @@ def _patch_vllm_same_step_prefix_hits() -> None:
         if unwritten:
             unwritten.clear()
             d = pool.__dict__
-            d["_tpu_prefix_cache_epoch"] = (
-                d.get("_tpu_prefix_cache_epoch", 0) + 1
-            )
+            d["_tpu_prefix_cache_epoch"] = d.get("_tpu_prefix_cache_epoch", 0) + 1
         return original_schedule(self, *args, **kwargs)
 
     for wrapper in (

@@ -418,7 +418,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 )
 
                 patch_offload_without_eagle_groups()
-            except Exception:
+            except Exception:  # noqa: S110
                 pass
 
     def initialize_cache(

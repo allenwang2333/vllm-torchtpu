@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet (GDN) v3.
-"""
+"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet (GDN) v3."""  # noqa: E501
 
 import dataclasses
 import enum

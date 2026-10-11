@@ -32,6 +32,8 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
     qk_norm_rope_gate,
+)
+from vllm_torchtpu.kernels.experimental.qk_norm_rope_gate import (
     reference as qk_norm_rope_gate_reference,
 )
 from vllm_torchtpu.logger import init_logger

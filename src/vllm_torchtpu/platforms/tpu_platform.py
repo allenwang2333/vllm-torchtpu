@@ -907,7 +907,8 @@ class TpuPlatform(Platform):
 
         if (
             model_config is not None
-            and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and "Qwen3_5MoeForConditionalGeneration"
+            in (model_config.architectures or [])
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -944,8 +945,8 @@ class TpuPlatform(Platform):
                     dcp_size,
                 )
             # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
-                    # while reserving ~2.5 GiB of HBM headroom for runtime activations
-                    # and program-load scratch buffers under DCP=1 and DCP>1.
+            # while reserving ~2.5 GiB of HBM headroom for runtime activations
+            # and program-load scratch buffers under DCP=1 and DCP>1.
             if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
                 safe_kv = 32_500_000_000
                 max_ablat_kv = 41_559_696_640
@@ -962,7 +963,7 @@ class TpuPlatform(Platform):
             ):
                 safe_kv = min(safe_kv, max_ablat_kv)
             # Apply the shape-calibrated HBM KV memory budget unless the caller
-                    # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
+            # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
             requested = cache_config.kv_cache_memory_bytes
             keep = requested is not None and os.environ.get(
                 "TPU_KV_BYTES_EXPLICIT", "0"

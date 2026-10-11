@@ -244,14 +244,14 @@ def test_get_output_attaches_spec_logprobs():
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
 
 
-
 def test_compiled_async_spec_helpers_match_eager(device):
     if device.type != "tpu":
         pytest.skip("TPU compiled helpers require TPU device")
     from types import SimpleNamespace
+
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-    # 1. _compiled_assemble_spec_and_rejected (B=4, p=8, num_reqs=2, K=3, max_num_reqs=8)
+    # 1. _compiled_assemble_spec_and_rejected (B=4, p=8, num_reqs=2, K=3, max_num_reqs=8)  # noqa: E501
     next_tokens = torch.tensor(
         [
             [10, 11, 99, -1],
@@ -338,7 +338,9 @@ def test_compiled_async_spec_helpers_match_eager(device):
         _compiled_pad_non_spec_next_tokens,
     )
 
-    sel_non_spec = torch.tensor([[301], [302], [0], [0]], dtype=torch.int64, device=device)
+    sel_non_spec = torch.tensor(
+        [[301], [302], [0], [0]], dtype=torch.int64, device=device
+    )
     padded_non_spec = _compiled_pad_non_spec_next_tokens(sel_non_spec, 3)
     assert padded_non_spec.shape == (4, 4)
     assert padded_non_spec.dtype == torch.int32

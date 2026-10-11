@@ -1,5 +1,4 @@
-"""Device-resident attention and hybrid GDN metadata preparation for TPU Runner.
-"""
+"""Device-resident attention and hybrid GDN metadata preparation for TPU Runner."""
 
 from __future__ import annotations
 
@@ -684,9 +683,7 @@ def stage_block_table_uploads(
         has_ckpt = ctx.mamba_ckpt_window > 1
         ckpt_end = n_tables + 2 * n_mamba if has_ckpt else n_tables + n_mamba
         ckpts = (
-            products[n_tables + n_mamba : ckpt_end]
-            if has_ckpt
-            else (None,) * n_mamba
+            products[n_tables + n_mamba : ckpt_end] if has_ckpt else (None,) * n_mamba
         )
         ctx.staged_mamba_products = {
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)

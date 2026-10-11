@@ -10,6 +10,7 @@ Run on ONE TPU chip (self-contained; loads batched_rpa from $REPO, no install):
   REPO=/path/to/rpam_bench/old_src python3 rpam_vpu_diet_bench.py --variants old --quick
 Writes /tmp/rpam_bench_<tag>.json and prints a table.
 """
+
 import argparse
 import json
 import os
@@ -19,21 +20,29 @@ import time
 import types
 
 REPO = os.environ["REPO"]
-for _name, _sub in [("vllm_torchtpu", ""), ("vllm_torchtpu.kernels", "kernels"),
-                    ("vllm_torchtpu.kernels.experimental", "kernels/experimental")]:
+for _name, _sub in [
+    ("vllm_torchtpu", ""),
+    ("vllm_torchtpu.kernels", "kernels"),
+    ("vllm_torchtpu.kernels.experimental", "kernels/experimental"),
+]:
     _m = types.ModuleType(_name)
     _m.__path__ = [os.path.join(REPO, "vllm_torchtpu", _sub)]
     sys.modules[_name] = _m
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
+from vllm_torchtpu.kernels.experimental.batched_rpa import (  # noqa: E402
+    configs,
+    wrapper,
+)
 
 P = argparse.ArgumentParser()
 P.add_argument("--quick", action="store_true", help="fewer iters, no sweep on T=512")
-P.add_argument("--variants", default="old,new,new_k2048_c64,new_k1024_c128,new_k2048_c128")
+P.add_argument(
+    "--variants", default="old,new,new_k2048_c64,new_k1024_c128,new_k2048_c128"
+)
 P.add_argument("--T", default="512,2048,8192")
 P.add_argument("--ctx", default="0,32768,100000")
 P.add_argument("--iters", type=int, default=5)
@@ -63,7 +72,9 @@ VARIANTS = {
 dev = jax.devices()[0]
 print("device:", dev.device_kind, "jax", jax.__version__, "REPO", REPO, flush=True)
 
-cache_shape = wrapper.get_kv_cache_shape(NUM_PAGES, PAGE, NKV, D, KV_DT, kv_layout=LAYOUT)
+cache_shape = wrapper.get_kv_cache_shape(
+    NUM_PAGES, PAGE, NKV, D, KV_DT, kv_layout=LAYOUT
+)
 key = jax.random.PRNGKey(0)
 k0, k1, k2, k3, k4 = jax.random.split(key, 5)
 base_cache = (jax.random.normal(k0, cache_shape, jnp.float32) * 0.5).astype(KV_DT)
@@ -84,9 +95,22 @@ def inputs(T, ctx):
 def run(T, ctx, blocks, cache, args=None):
     q, k, v, kv_lens, cu, dist = args if args is not None else inputs(T, ctx)
     return wrapper.ragged_paged_attention(
-        q, k, v, cache, kv_lens, page_indices, cu, dist,
-        sm_scale=D ** -0.5, k_scale=A.k_scale, v_scale=1.0, kv_layout=LAYOUT,
-        decode_query_size=4, mask_value=-1e30, prefill_block_sizes=blocks)
+        q,
+        k,
+        v,
+        cache,
+        kv_lens,
+        page_indices,
+        cu,
+        dist,
+        sm_scale=D**-0.5,
+        k_scale=A.k_scale,
+        v_scale=1.0,
+        kv_layout=LAYOUT,
+        decode_query_size=4,
+        mask_value=-1e30,
+        prefill_block_sizes=blocks,
+    )
 
 
 def reference_rows(T, ctx, cache, rows):
@@ -95,9 +119,12 @@ def reference_rows(T, ctx, cache, rows):
     n_tok = ctx + T
     npg = -(-n_tok // PAGE)
     c = cache[:npg].astype(jnp.float32)  # [npg, 2, D/4, 4, PAGE]
-    kk = c[:, 0].reshape(npg, D, PAGE).transpose(0, 2, 1).reshape(-1, D)[:n_tok] * A.k_scale
+    kk = (
+        c[:, 0].reshape(npg, D, PAGE).transpose(0, 2, 1).reshape(-1, D)[:n_tok]
+        * A.k_scale
+    )
     vv = c[:, 1].reshape(npg, D, PAGE).transpose(0, 2, 1).reshape(-1, D)[:n_tok]
-    s = jnp.einsum("nhd,td->nht", q, kk, precision="highest") * D ** -0.5
+    s = jnp.einsum("nhd,td->nht", q, kk, precision="highest") * D**-0.5
     pos = ctx + jnp.asarray(rows)
     s = jnp.where(jnp.arange(n_tok)[None, None, :] <= pos[:, None, None], s, -jnp.inf)
     w = jax.nn.softmax(s, axis=-1)
@@ -116,8 +143,9 @@ for vname in A.variants.split(","):
         blocks = None
         if bkv is not None:
             bq = min(1024, -(-T // 256) * 256)
-            blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bqc, bkv_sz=bkv,
-                                        batch_size=2, n_buffer=3)
+            blocks = configs.BlockSizes(
+                bq_sz=bq, bq_c_sz=bqc, bkv_sz=bkv, batch_size=2, n_buffer=3
+            )
         for ctx in CTXs:
             rec = dict(variant=vname, T=T, ctx=ctx, diet=diet, bkv=bkv, bq_c=bqc)
             try:
@@ -141,11 +169,15 @@ for vname in A.variants.split(","):
                 rec["ms_min"] = round(1e3 * min(times), 3)
                 o = np.asarray(out.astype(jnp.float32))
                 rec["finite"] = bool(np.isfinite(o).all())
-                rows = sorted(set(list(range(min(32, T))) + list(range(max(0, T - 32), T))))
+                rows = sorted(
+                    set(list(range(min(32, T))) + list(range(max(0, T - 32), T)))
+                )
                 ref = np.asarray(reference_rows(T, ctx, cache, np.asarray(rows)))
                 rec["max_abs_err_vs_f32_ref"] = float(np.abs(o[rows] - ref).max())
                 if (T, ctx) in old_out:
-                    rec["max_abs_diff_vs_old"] = float(np.abs(o - old_out[(T, ctx)]).max())
+                    rec["max_abs_diff_vs_old"] = float(
+                        np.abs(o - old_out[(T, ctx)]).max()
+                    )
                 elif vname.startswith("old") and bkv is None:
                     old_out[(T, ctx)] = o
             except Exception as e:  # VMEM OOM / compile failures are results too.
@@ -153,16 +185,30 @@ for vname in A.variants.split(","):
             print(json.dumps(rec), flush=True)
             results.append(rec)
 
-print("\n%-16s %5s %7s %10s %10s %12s %12s" % (
-    "variant", "T", "ctx", "ms_med", "speedup", "err_vs_ref", "diff_vs_old"))
-base = {(r["T"], r["ctx"]): r.get("ms_median") for r in results if r["variant"] == "old"}
+print(
+    "\n%-16s %5s %7s %10s %10s %12s %12s"  # noqa: UP031
+    % ("variant", "T", "ctx", "ms_med", "speedup", "err_vs_ref", "diff_vs_old")
+)
+base = {
+    (r["T"], r["ctx"]): r.get("ms_median") for r in results if r["variant"] == "old"
+}
 for r in results:
     b = base.get((r["T"], r["ctx"]))
     sp = (b / r["ms_median"]) if b and r.get("ms_median") else float("nan")
-    print("%-16s %5d %7d %10s %10.3f %12s %12s" % (
-        r["variant"], r["T"], r["ctx"], r.get("ms_median", r.get("error", "")[:10]), sp,
-        "%.2e" % r["max_abs_err_vs_f32_ref"] if "max_abs_err_vs_f32_ref" in r else "-",
-        "%.2e" % r["max_abs_diff_vs_old"] if "max_abs_diff_vs_old" in r else "-"))
+    print(
+        "%-16s %5d %7d %10s %10.3f %12s %12s"  # noqa: UP031
+        % (
+            r["variant"],
+            r["T"],
+            r["ctx"],
+            r.get("ms_median", r.get("error", "")[:10]),
+            sp,
+            "%.2e" % r["max_abs_err_vs_f32_ref"]  # noqa: UP031
+            if "max_abs_err_vs_f32_ref" in r
+            else "-",
+            "%.2e" % r["max_abs_diff_vs_old"] if "max_abs_diff_vs_old" in r else "-",  # noqa: UP031
+        )
+    )
 path = f"/tmp/rpam_bench{('_' + A.tag) if A.tag else ''}.json"
 with open(path, "w") as f:
     json.dump(results, f, indent=1)

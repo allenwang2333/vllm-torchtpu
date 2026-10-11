@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E501
 """Low-latency Pallas ICI reduce-scatter kernel for small token batches.
 
 Uses direct remote VMEM RDMA copies and hardware barrier semaphores to minimize
@@ -24,7 +25,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
     LANES,
     barrier,
-    barrier_peers,
     call,
     push,
     split_rank,
@@ -85,16 +85,19 @@ def _hier_reduce_scatter(x, n, axis, rank, collective_id):
     dict_ids = rank is not None
 
     def kernel(*refs):
-        me, (
-            x_ref,
-            o_ref,
-            s1_recv,
-            chip_blocks,
-            s2_recv,
-            send1,
-            recv1,
-            send2,
-            recv2,
+        (
+            me,
+            (
+                x_ref,
+                o_ref,
+                s1_recv,
+                chip_blocks,
+                s2_recv,
+                send1,
+                recv1,
+                send2,
+                recv2,
+            ),
         ) = split_rank(refs, dict_ids, axis)
         barrier(n, axis, dict_ids)
 

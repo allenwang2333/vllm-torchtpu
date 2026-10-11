@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Core layer implementation for Qwen3.5 Gated DeltaNet (GDN) linear attention on TPU.
-"""
+"""Core layer implementation for Qwen3.5 Gated DeltaNet (GDN) linear attention on TPU."""  # noqa: E501
 
 import functools
 import math
@@ -27,7 +26,6 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_and_scale_state_bytes,
-    pooled_gdn_conv_state_bytes,
     pooled_gdn_ssm_state_bytes,
 )
 from vllm_torchtpu.kernels import pool_adapters

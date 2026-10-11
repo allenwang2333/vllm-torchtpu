@@ -59,8 +59,11 @@ def _provably_zero(rp) -> bool:
     try:
         pe = rp._parser_engine
         from vllm.parser.engine.parser_engine import ParserEngine
-        if (type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
-                or type(pe._engine).__name__ != "StreamingParserEngine"):
+
+        if (
+            type(pe).count_reasoning_tokens is not ParserEngine.count_reasoning_tokens
+            or type(pe._engine).__name__ != "StreamingParserEngine"
+        ):
             return False
         cfg = pe.parser_engine_config
     except Exception:
@@ -113,16 +116,23 @@ def maybe_install_lazy_reasoning_count() -> bool:
         now = time.monotonic()
         if now - _Stats.last_log >= log_s:
             _Stats.last_log = now
-            logger.warning("%s stats zero=%d skipped=%d computed=%d compute_s=%.2f", _P,
-                           _Stats.zero, _Stats.skipped, _Stats.computed, _Stats.compute_s)
+            logger.warning(
+                "%s stats zero=%d skipped=%d computed=%d compute_s=%.2f",
+                _P,
+                _Stats.zero,
+                _Stats.skipped,
+                _Stats.computed,
+                _Stats.compute_s,
+            )
 
     def count_reasoning_tokens(self, token_ids):
         skip = False
         try:
             skip = self.__dict__.pop("_qx_skip_count", False)
             rp = getattr(self, "_reasoning_parser", None)
-            if (isinstance(rp, ParserEngineReasoningAdapter)
-                    and not getattr(rp, "_streaming_count_valid", True)):
+            if isinstance(rp, ParserEngineReasoningAdapter) and not getattr(
+                rp, "_streaming_count_valid", True
+            ):
                 if _provably_zero(rp):
                     _Stats.zero += 1
                     _maybe_log()
@@ -141,7 +151,7 @@ def maybe_install_lazy_reasoning_count() -> bool:
         try:
             self._qx_last_count = n
             _maybe_log()
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         return n
 
@@ -150,6 +160,11 @@ def maybe_install_lazy_reasoning_count() -> bool:
     DelegatingParser.parse_delta = parse_delta
     DelegatingParser.count_reasoning_tokens = count_reasoning_tokens
     _INSTALLED = True
-    logger.warning("%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
-                   "patch (pid %d, %s)", _P, os.getpid(), pname)
+    logger.warning(
+        "%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
+        "patch (pid %d, %s)",
+        _P,
+        os.getpid(),
+        pname,
+    )
     return True

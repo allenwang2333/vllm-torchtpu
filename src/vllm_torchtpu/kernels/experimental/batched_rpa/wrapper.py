@@ -679,9 +679,7 @@ def ragged_paged_attention(
         native_fp8 = os.environ.get("TPU_RPA_NATIVE_FP8", "")
     if native_fp8 in ("1", "true", "True"):
         native_fp8 = "qkpv"
-    if native_fp8 not in ("", "0") and not re.fullmatch(
-        r"(qk2?)?(pv2?)?", native_fp8
-    ):
+    if native_fp8 not in ("", "0") and not re.fullmatch(r"(qk2?)?(pv2?)?", native_fp8):
         raise ValueError(
             f"native_fp8 must match (qk[2])(pv[2]), e.g. qkpv or qk2pv2; got "
             f"{native_fp8!r}"
@@ -854,9 +852,7 @@ def ragged_paged_attention(
 
                 def _do_mixed_lse(args):
                     o_in, kv_in, lse_in = args
-                    return run_rpa_kernel(
-                        configs.RpaCase.MIXED, o_in, kv_in, lse_in
-                    )
+                    return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
 
                 o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
                     distribution[1] < distribution[2],

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed HBM and VMEM memory reference descriptors for GDN v3 Pallas kernels.
-"""
+"""Typed HBM and VMEM memory reference descriptors for GDN v3 Pallas kernels."""
 
 import dataclasses
 import functools

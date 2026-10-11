@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     QWEN_GDN_ARCHITECTURES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,

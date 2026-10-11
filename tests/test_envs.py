@@ -53,6 +53,7 @@ def test_startup_accepts_the_knob_unset(
 
 def test_qwen35_dcp_cli_defaults_set_moe_v2_and_disable_reassociate(monkeypatch):
     import sys
+
     from vllm_torchtpu import env_override
 
     monkeypatch.setattr(

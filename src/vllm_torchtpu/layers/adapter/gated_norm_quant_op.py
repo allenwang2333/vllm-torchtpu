@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E501
 """GDN output projection with the gated norm and fp8 quantization fused.
 
 With ``TPU_GDN_FUSED_NORM_QUANT`` set, :func:`install` checks every
@@ -92,9 +93,7 @@ def _build_ops(eps: float) -> None:
         )
 
         def fake_out_proj(o, z, w_norm, w_proj, w_scale):
-            return o.new_empty(
-                (o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16
-            )
+            return o.new_empty((o.shape[0], w_proj.shape[-1]), dtype=torch.bfloat16)
 
         proj_op.register_fake(fake_out_proj)
         _out_proj_ops[eps] = proj_op

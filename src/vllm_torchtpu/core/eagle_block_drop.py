@@ -86,8 +86,7 @@ def patch_offload_without_eagle_groups() -> None:
         if not any(group.is_eagle_group for group in config.kv_group_configs):
             return config
         kv_group_configs = tuple(
-            group._replace(is_eagle_group=False)
-            for group in config.kv_group_configs
+            group._replace(is_eagle_group=False) for group in config.kv_group_configs
         )
         group_block_sizes = {g.tokens_per_block for g in kv_group_configs}
         has_partial_recurrent_group = any(

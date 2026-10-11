@@ -572,9 +572,7 @@ def fused_conv1d_gdn(
         # so size each checkpoint's state share for state_positions / window.
         state_positions = window + (1 if window > 1 else 0)
         rec_checkpoint_bytes = (
-            rec_region_bytes
-            if rec_region_bytes is not None
-            else n_v * d_k * d_v * 4
+            rec_region_bytes if rec_region_bytes is not None else n_v * d_k * d_v * 4
         )
         conv_checkpoint_bytes = (
             conv_region_bytes
@@ -590,9 +588,7 @@ def fused_conv1d_gdn(
             dim=dim,
             aligned_num_v_heads=aligned_num_v_heads,
             num_buffers=config.GDNConfig.__dataclass_fields__["num_buffers"].default,
-            vmem_budget=int(
-                config.GDNConfig.WINDOWED_VMEM_FRACTION * vmem_capacity
-            ),
+            vmem_budget=int(config.GDNConfig.WINDOWED_VMEM_FRACTION * vmem_capacity),
             rec_region_bytes=-(-state_positions * rec_checkpoint_bytes // window),
             conv_region_bytes=-(-state_positions * conv_checkpoint_bytes // window),
         )

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+
 import jax
 import jax.numpy as jnp
 
@@ -340,7 +341,6 @@ def recurrent_gdn_per_seq(
     kq_head_dim, v_head_dim]); with `window_size == 1` that is just the final
     state.
     """
-    import os
 
     use_fused_1dot = os.environ.get("TPU_GDN_FUSED_1DOT", "0") == "1"
     out_list = []
@@ -377,12 +377,8 @@ def recurrent_gdn_per_seq(
                 preferred_element_type=jnp.float32,
             ).astype(cfgs.dtypes.compute)
             iota_out = jax.lax.broadcasted_iota(jnp.int32, kq_dot.shape, 1)
-            k_state = jnp.where(iota_out == 0, kq_dot, 0.0).sum(
-                axis=1, keepdims=True
-            )
-            q_state = jnp.where(iota_out == 1, kq_dot, 0.0).sum(
-                axis=1, keepdims=True
-            )
+            k_state = jnp.where(iota_out == 0, kq_dot, 0.0).sum(axis=1, keepdims=True)
+            q_state = jnp.where(iota_out == 1, kq_dot, 0.0).sum(axis=1, keepdims=True)
             v_updated = k_state * gating_curr
             v_diff = v_curr - v_updated
             v_new = beta_curr * v_diff

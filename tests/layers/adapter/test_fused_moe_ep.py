@@ -1097,7 +1097,6 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 4
 
 
-
 def test_v3_rejected_contract_does_not_clobber_rank_buffer(monkeypatch):
     from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_bridge
 

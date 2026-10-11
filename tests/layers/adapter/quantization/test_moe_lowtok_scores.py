@@ -413,4 +413,3 @@ def test_apply_passes_holder_tables_when_layer_has_copies(monkeypatch):
         layer._lowtok_copy,
         layer._lowtok_hot1h,
     )
-

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ruff: noqa: E501
 """Gated RMS norm and per-token fp8 quantization in one pass.
 
 Per head ``h`` of a token: ``y = x_h * rsqrt(mean(x_h^2) + eps) * w * silu(z_h)``,
@@ -31,7 +32,7 @@ from jax.experimental.pallas import tpu as pltpu
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
 VREG_F32_LANES = 8 * 128  # 1024 fp32 lanes per TPU VREG (4 KiB)
-TARGET_VREG_BUDGET = 64   # Hardware VREG count per TPU core (256 KiB)
+TARGET_VREG_BUDGET = 64  # Hardware VREG count per TPU core (256 KiB)
 
 
 def _kernel(o_ref, z_ref, w_ref, q_ref, s_ref, *, eps: float):
