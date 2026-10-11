@@ -255,18 +255,13 @@ class BlockTableDeltaStager:
         val_out = update_buf[1]
         pos = 0
         active_cols_cache: dict[tuple[int, bool, int], int] = {}
-        prev_plan: (
-            tuple[
-                int,
-                int,
-                np.ndarray,
-                np.ndarray,
-                np.ndarray,
-                np.ndarray,
-                np.ndarray,
-            ]
-            | None
-        ) = None
+        # Append plans by geometry: groups of one block size share per-row
+        # block counts, so one plan serves all of them even when geometries
+        # interleave across the walk.
+        plans: dict[
+            tuple[int, int, int],
+            tuple[memoryview, memoryview, np.ndarray, np.ndarray, np.ndarray],
+        ] = {}
 
         for builder, (_, bt, tnb), st in zip(
             builders, entries, layout.entries, strict=True
@@ -293,14 +288,15 @@ class BlockTableDeltaStager:
                 and rewrites == st.total_rewrites
             ):
                 cur_plan: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+                src_cols = source.shape[1]
+                geom = (tnb, active_cols, src_cols)
+                plan = plans.get(geom)
                 if (
-                    prev_plan is not None
-                    and prev_plan[0] == tnb
-                    and prev_plan[1] == active_cols
-                    and np.array_equal(nblocks, prev_plan[2])
-                    and np.array_equal(st.nblocks, prev_plan[3])
+                    plan is not None
+                    and memoryview(nblocks) == plan[0]
+                    and memoryview(st.nblocks) == plan[1]
                 ):
-                    cur_plan = (prev_plan[4], prev_plan[5], prev_plan[6])
+                    cur_plan = plan[2:]
                 else:
                     changed_rows = np.flatnonzero(nblocks != st.nblocks).astype(
                         np.int32, copy=False
@@ -315,30 +311,33 @@ class BlockTableDeltaStager:
                             valid = counts == 1
                             app_rows, lo = changed_rows[valid], lo_all[valid]
                         row_offsets = app_rows * np.int32(tnb) + lo
-                        cur_plan = (app_rows, lo, row_offsets)
-                        nblocks_snap = nblocks.copy()
-                        st_nblocks_snap = st.nblocks.copy()
-                        prev_plan = (
-                            tnb,
-                            active_cols,
-                            nblocks_snap,
-                            st_nblocks_snap,
-                            app_rows,
-                            lo,
-                            row_offsets,
+                        # Flat offsets into the contiguous `source` rows.
+                        src_offsets = (
+                            row_offsets
+                            if src_cols == tnb
+                            else app_rows * np.int32(src_cols) + lo
+                        )
+                        cur_plan = (app_rows, src_offsets, row_offsets)
+                        # `nblocks` views a table no walk step writes; the
+                        # snapshot is copied since it is updated below.
+                        plans[geom] = (
+                            memoryview(nblocks),
+                            memoryview(st.nblocks.copy()),
+                            *cur_plan,
                         )
                 if cur_plan is not None:
-                    app_rows, lo, row_offsets = cur_plan
+                    app_rows, src_offsets, row_offsets = cur_plan
                     k = app_rows.size
                     if k:
                         if pos + k > cap:
                             del self._layouts[key]
                             return None
-                        flat_idx = np.int32(st.offset) + row_offsets
-                        new_vals = source[app_rows, lo]
-                        layout.mirror[flat_idx] = new_vals
-                        idx_out[pos : pos + k] = flat_idx
-                        val_out[pos : pos + k] = new_vals
+                        # The mirror takes these entries in one batched write
+                        # once the walk is done.
+                        np.add(
+                            row_offsets, np.int32(st.offset), out=idx_out[pos : pos + k]
+                        )
+                        np.take(source, src_offsets, out=val_out[pos : pos + k])
                         pos += k
                     st.nblocks[:] = nblocks
                     st.mutations = mutations
@@ -420,6 +419,7 @@ class BlockTableDeltaStager:
             st.total_rewrites = rewrites
         self._layouts.move_to_end(key)
         if pos:
+            layout.mirror[idx_out[:pos]] = val_out[:pos]
             idx_out[pos:] = idx_out[0]
             val_out[pos:] = val_out[0]
             update_dev = update_tensor.to(layout.dev.device)

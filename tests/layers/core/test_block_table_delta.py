@@ -421,12 +421,9 @@ def test_td8298_native_int32_delta_arrays(builders, monkeypatch):
     assert stager._update_buf.dtype == np.int32
 
 
-def test_td8338_try_stage_reuses_prev_plan_via_array_equal_without_tobytes(
-    monkeypatch,
-):
-    """TD8.338: Verify try_stage snapshots nblocks.copy() and st.nblocks.copy()
-    on the first group and compares subsequent groups via np.array_equal without
-    allocating .tobytes() per group."""
+def test_td8338_try_stage_reuses_append_plan_across_groups(monkeypatch):
+    """TD8.338 / TD8.373: groups whose block counts match reuse one append plan
+    (compared by value, no `.tobytes()`); a mismatch computes a fresh plan."""
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
     monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
 
@@ -441,34 +438,29 @@ def test_td8338_try_stage_reuses_prev_plan_via_array_equal_without_tobytes(
         b.bt.append_row([10], 1)
     _stage(runner, 2, [8, 4], 2)
 
-    orig_array_equal = np.array_equal
-    equal_calls: list[tuple[list[int], list[int]]] = []
+    orig_flatnonzero = np.flatnonzero
+    plan_builds: list[list[int]] = []
 
-    def tracking_array_equal(a1, a2, *args, **kwargs):
-        equal_calls.append((np.asarray(a1).tolist(), np.asarray(a2).tolist()))
-        return orig_array_equal(a1, a2, *args, **kwargs)
+    def tracking_flatnonzero(a):
+        out = orig_flatnonzero(a)
+        plan_builds.append(out.tolist())
+        return out
 
-    monkeypatch.setattr(np, "array_equal", tracking_array_equal)
+    monkeypatch.setattr(np, "flatnonzero", tracking_flatnonzero)
 
-    # 1) All 3 groups append 1 block to row 0: group 0 builds prev_plan,
-    # groups 1 and 2 hit both np.array_equal(nblocks, prev_plan[2]) and
-    # np.array_equal(st.nblocks, prev_plan[3]) (4 calls total).
+    # 1) All 3 groups append 1 block to row 0: group 0 builds the plan,
+    # groups 1 and 2 reuse it.
     for b in group_builders:
         b.bt.append_row([3], 0)
     got = _stage(runner, 2, [12, 4], 2)
     want = _reference(group_builders, 2, [12, 4], 2, 0)
     for gid in want:
         assert torch.equal(got[gid], want[gid])
-    assert equal_calls == [
-        ([3, 1], [3, 1]),
-        ([2, 1], [2, 1]),
-        ([3, 1], [3, 1]),
-        ([2, 1], [2, 1]),
-    ]
+    assert plan_builds == [[0]]
 
-    # 2) Group 0 appends to row 0, Group 1 appends to row 1 (nblocks mismatch),
-    # Group 2 appends to row 1 (matches Group 1's updated prev_plan).
-    equal_calls.clear()
+    # 2) Group 0 appends to row 0, groups 1 and 2 to row 1: group 1 builds a
+    # new plan (block counts differ) that group 2 reuses.
+    plan_builds.clear()
     group_builders[0].bt.append_row([4], 0)
     group_builders[1].bt.append_row([11], 1)
     group_builders[2].bt.append_row([11], 1)
@@ -476,4 +468,52 @@ def test_td8338_try_stage_reuses_prev_plan_via_array_equal_without_tobytes(
     want2 = _reference(group_builders, 2, [16, 8], 2, 0)
     for gid in want2:
         assert torch.equal(got2[gid], want2[gid])
-    assert len(equal_calls) == 3
+    assert plan_builds == [[0], [1]]
+
+
+class _NarrowBuilder(_Builder):
+    """Stages fewer columns than the block table holds (source width != tnb)."""
+
+    def _block_table_geometry(self, ctx):
+        return self.bt, self.bt.max_num_blocks_per_req // 2
+
+
+def test_td8373_interleaved_geometries_keep_their_append_plans(monkeypatch):
+    """Interleaved geometries each keep a plan, so a walk builds one plan per
+    geometry; staging with fewer columns than the source table stays exact."""
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    group_builders = [
+        _Builder(0, _make_block_table(4), 4),
+        _NarrowBuilder(1, _make_block_table(8), 8),
+        _Builder(2, _make_block_table(4), 4),
+        _NarrowBuilder(3, _make_block_table(8), 8),
+    ]
+    runner = _make_runner(group_builders)
+    for b in group_builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([10], 1)
+    _stage(runner, 2, [8, 4], 2)
+
+    orig_flatnonzero = np.flatnonzero
+    plan_builds: list[list[int]] = []
+
+    def tracking_flatnonzero(a):
+        out = orig_flatnonzero(a)
+        plan_builds.append(out.tolist())
+        return out
+
+    monkeypatch.setattr(np, "flatnonzero", tracking_flatnonzero)
+    for step, row in enumerate((0, 1, 0)):
+        plan_builds.clear()
+        for b in group_builders:
+            b.bt.append_row([100 + step], row)
+        lens = [8 + 4 * (step + 1), 4 + 4 * (step + 1)]
+        got = _stage(runner, 2, lens, 2)
+        want = _reference(group_builders, 2, lens, 2, 0)
+        for gid in want:
+            ref = want[gid]
+            if gid % 2:  # narrow builders stage half the columns
+                ref = ref.view(2, MAX_BLOCKS)[:, : MAX_BLOCKS // 2].reshape(-1)
+            assert torch.equal(got[gid], ref), (step, gid)
+        assert len(plan_builds) == 2, step
