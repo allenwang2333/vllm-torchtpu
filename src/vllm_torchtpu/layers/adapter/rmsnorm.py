@@ -73,6 +73,20 @@ def _get_op(eps: float, has_residual: bool):
         return op
 
 
+def keep_upstream_path(model: torch.nn.Module) -> int:
+    """Pin every TpuRMSNorm in ``model`` to the upstream path; returns the count.
+
+    For modules traced once for all token buckets (the spec-decode draft
+    model): the token-count branch in ``forward`` would specialize their graph.
+    """
+    n = 0
+    for m in model.modules():
+        if isinstance(m, TpuRMSNorm) and m._pallas_ok:
+            m._pallas_ok = False
+            n += 1
+    return n
+
+
 @RMSNorm.register_oot
 class TpuRMSNorm(RMSNorm):
     """RMSNorm whose prefill-sized calls run the one-pass Pallas kernel."""
