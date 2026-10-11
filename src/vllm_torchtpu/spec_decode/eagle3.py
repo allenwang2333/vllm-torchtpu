@@ -1410,24 +1410,29 @@ class Eagle3Proposer:
             # rejection-sampler output instead of the host num_rejected /
             # sampled_token_ids — avoiding a D2H on the critical path.
             nt = next_tokens_device[:num_reqs]
-            num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
-            last_valid_col = num_valid - 1
-            next_token_ids = (
-                nt.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
+            num_valid = (
+                (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32).clamp(min=1)
             )
+            last_valid_col = num_valid - 1
+            flat_col = (
+                torch.arange(num_reqs, dtype=torch.int32, device=nt.device)
+                * nt.shape[1]
+                + last_valid_col
+            )
+            next_token_ids = nt.reshape(-1).index_select(0, flat_col).to(torch.int32)
             # Anchor the seed position at qsl_end-1 (like the sync path) using
             # the REAL per-request draft count.
             # num_draft is read on-device from the chunk's draft_lengths snapshot
             # draft_lengths is None for a chunk with no spec metadata.
             if chunk.draft_lengths is not None:
-                num_draft_dev = chunk.draft_lengths[:num_reqs].to(torch.int64)
+                num_draft_dev = chunk.draft_lengths[:num_reqs].to(torch.int32)
             else:
                 num_draft_np = np.array(
                     [
                         len(scheduler_output.scheduled_spec_decode_tokens.get(rid, ()))
                         for rid in req_ids
                     ],
-                    dtype=np.int64,
+                    dtype=np.int32,
                 )
                 num_draft_dev = torch.from_numpy(num_draft_np).to(runner.device)
             accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
@@ -1435,8 +1440,8 @@ class Eagle3Proposer:
             # qsl_end already lives on-device in the chunk's attn context (the
             # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
             # it instead of a fresh H2D of query_start_loc_np.
-            qsl_end = chunk.attn_ctx.query_start_loc[1 : num_reqs + 1].to(torch.int64)
-            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
+            qsl_end = chunk.attn_ctx.query_start_loc[1 : num_reqs + 1].to(torch.int32)
+            last_token_indices = (qsl_end - 1 - num_rejected_out).to(torch.int64)
             # Partial-prefill (discard) requests have no sampled token; seed
             # them from the host request state (same value as the sync path).
             ov_i = [i for i in range(num_reqs) if start + i in discard_set]

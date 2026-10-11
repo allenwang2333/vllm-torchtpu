@@ -1441,3 +1441,41 @@ def test_draft_has_moe_and_dummy_draft_aux_and_mtp(monkeypatch):
     p_mtp._draft_propose_token = lambda h: torch.zeros(h.shape[0], dtype=torch.int32)
     p_mtp.run_dp_dummy_draft(1)
     assert fwd_shapes == [(3, 8), (3, 4)]
+
+
+def test_td8274_prepare_draft_inputs_async_1d_flat_int32_gather(monkeypatch):
+    select_dtypes = []
+    orig_index_select = torch.Tensor.index_select
+
+    def spy_index_select(self, dim, index):
+        select_dtypes.append((self.ndim, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+    for with_lengths in (False, True):
+        lengths = torch.tensor([2, 2, 2], dtype=torch.int64) if with_lengths else None
+        proposer, chunk, sched = _prep_setup(draft_lengths=lengths)
+        next_tokens = torch.tensor(
+            [[7, 8, -1], [9, -1, -1], [11, 12, 13]], dtype=torch.int32
+        )
+        select_dtypes.clear()
+        ids, _, gather, rej = proposer._prepare_draft_inputs(
+            chunk,
+            sampled_token_ids=None,
+            discard_sampled_tokens_req_indices=[],
+            num_rejected_tokens_np=None,
+            scheduler_output=sched,
+            next_tokens_device=next_tokens,
+        )
+        assert (1, 0, torch.int32) in select_dtypes
+        assert ids.dtype == torch.int32
+        assert rej.dtype == torch.int32
+        assert gather.dtype == torch.int64
+        if with_lengths:
+            assert rej.tolist() == [1, 2, 0]
+            assert gather.tolist() == [1, 2, 5, 0]
+            assert ids.tolist() == [1, 8, 9, 4, 5, 13, 7, 7]
+        else:
+            assert rej.tolist() == [1, 1, 0]
+            assert gather.tolist() == [1, 3, 5, 0]
+            assert ids.tolist() == [1, 8, 3, 9, 5, 13, 7, 7]
