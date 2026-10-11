@@ -724,3 +724,50 @@ def test_td8367_ced_decoder_owner_kwargs_identity_fast_path_and_single_offload_f
         torch.zeros(2, dtype=torch.int32), torch.arange(2, dtype=torch.int32)
     )
     assert out_ns.shape == (2, 4)
+    assert ctx_ns.attn_metadata == {"l0": ns_meta}
+    assert ctx_ns.additional_kwargs == {}
+    assert ctx_ns.is_padding is None
+
+    # TD8.379: plan is None reuses cached replay_starts via _get_ced_replay_starts
+    # and shallow copy(context) works with SimpleNamespace context too.
+    seen_replay_starts = []
+    ctx_plain_ns = SimpleNamespace(
+        attn_metadata={"l0": ns_meta},
+        additional_kwargs={},
+        is_padding=None,
+    )
+    monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: ctx_plain_ns)
+    monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *a: None)
+
+    def _capture_decoder_stage(*a, **kw):
+        seen_replay_starts.append(
+            v2_model.upstream.get_forward_context().additional_kwargs[
+                "deepseek_v41_replay_starts"
+            ]
+        )
+        return torch.ones((2, 4))
+
+    model.decoder_stage = _capture_decoder_stage
+    monkeypatch.setattr(
+        v2_model,
+        "override_forward_context",
+        lambda c: (
+            type(
+                "_CtxScope",
+                (),
+                {
+                    "__enter__": lambda s: monkeypatch.setattr(
+                        v2_model.upstream, "get_forward_context", lambda: c
+                    ),
+                    "__exit__": lambda s, *exc: monkeypatch.setattr(
+                        v2_model.upstream, "get_forward_context", lambda: ctx_plain_ns
+                    ),
+                },
+            )()
+        ),
+    )
+    model.forward(torch.zeros(2, dtype=torch.int32), torch.arange(2, dtype=torch.int32))
+    model.forward(torch.zeros(2, dtype=torch.int32), torch.arange(2, dtype=torch.int32))
+    assert len(seen_replay_starts) == 2
+    assert seen_replay_starts[0] is seen_replay_starts[1]
+    assert torch.equal(seen_replay_starts[0], torch.zeros(1, dtype=torch.int32))

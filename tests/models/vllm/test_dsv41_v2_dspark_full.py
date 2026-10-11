@@ -999,13 +999,6 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
             additional_kwargs={},
         ),
     )
-    monkeypatch.setattr(
-        v2_model,
-        "replace",
-        lambda obj, **kwargs: SimpleNamespace(
-            **{**getattr(obj, "__dict__", {}), **kwargs}
-        ),
-    )
     monkeypatch.setattr(v2_model, "override_forward_context", lambda ctx: nullcontext())
 
     class _MockLayer:

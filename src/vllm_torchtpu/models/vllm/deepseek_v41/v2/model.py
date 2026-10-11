@@ -3,7 +3,7 @@
 """Upstream V4.1 model assembly with TPU device operations."""
 
 import time
-from dataclasses import replace
+from copy import copy
 from itertools import islice
 
 import torch
@@ -795,13 +795,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             window_starts = DeepseekV41Model._get_ced_replay_starts(
                 self, window_hits, positions, cache_attr="_ced_window_starts_cache"
             )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
+            (encoder_context := copy(context)).additional_kwargs = {
+                **context.additional_kwargs,
+                "deepseek_v41_window_starts": window_starts,
+            }
             with override_forward_context(encoder_context):
                 encoded = self.encoder_stage(
                     input_ids,
@@ -848,8 +845,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_hidden, decoder_mix = hidden, pre_mix
             if plan is None:
                 requests = first.seq_lens.shape[0] if first is not None else 1
-                replay_starts = torch.zeros(
-                    requests, dtype=torch.int32, device=positions.device
+                replay_starts = DeepseekV41Model._get_ced_replay_starts(
+                    self, _zero_hits(requests), positions
                 )
                 decoder_padding = (
                     DeepseekV41Model._get_ced_padding_mask(
@@ -909,8 +906,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_padding = DeepseekV41Model._get_ced_padding_mask(
                 self, plan.padded_num_tokens, len(plan.indices), positions.device
             )
-        decoder_context = replace(
-            context,
+        (decoder_context := copy(context)).__dict__.update(
             attn_metadata=decoder_metadata,
             is_padding=decoder_padding,
             additional_kwargs={
