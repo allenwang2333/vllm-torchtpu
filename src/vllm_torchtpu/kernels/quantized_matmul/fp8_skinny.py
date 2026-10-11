@@ -202,12 +202,13 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
         out_specs=pl.BlockSpec((m, n), lambda g, idx: (0, 0)),
         scratch_shapes=scratch,
     )
+    sd = "_sd" if scale_dma else ""
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}{'_sd' if scale_dma else ''}_m{m}_k{k}_n{n}",
+        name=f"fp8_skinny_{split}{t}_b{nbuf}{sd}_m{m}_k{k}_n{n}",
     )
 
 
@@ -265,6 +266,16 @@ def fp8_skinny_matmul_stacked(
     if n_logical is not None and n_logical != n:
         out = out[:, :n_logical]
     return out
+
+
+def scale_dma_applies(n: int) -> bool:
+    """Where TPU_FP8_SKINNY_SCALE_DMA is used in the model: n % 1024 == 0 (o_proj
+    6144, q_b 16384/8192). There the scale's [n] -> [1, n] reshape is a bitcast of
+    the f32 T(1024) layout, so the HBM operand is the parameter itself. Elsewhere
+    (gate_up 1536, q_a 2688) the reshape is a real op, whose output XLA would write
+    to HBM for the kernel; those sites' scale copies are not exposed, so they stay
+    as they are."""
+    return n % 1024 == 0
 
 
 def padded_n(n: int, multiple: int = LANE) -> int:
