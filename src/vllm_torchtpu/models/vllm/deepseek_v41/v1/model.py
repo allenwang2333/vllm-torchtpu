@@ -176,7 +176,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         cached_pad = getattr(self, "_ced_padding_mask_cache", None)
         if cached_pad is not None and cached_pad[0] == pad_key:
             return cached_pad[1]
-        decoder_padding = torch.arange(total_tokens, device=device) >= valid_tokens
+        decoder_padding = (
+            torch.arange(total_tokens, device=device, dtype=torch.int32) >= valid_tokens
+        )
         self._ced_padding_mask_cache = (pad_key, decoder_padding)
         return decoder_padding
 
@@ -204,7 +206,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             dtype=torch.int64,
             device=positions.device,
         )
-        gather = indices.clamp(max=num_positions - 1)
+        gather = indices.to(torch.int32).clamp(max=num_positions - 1)
         bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
         result = (indices, gather, bounds)
         self._ced_non_identity_cache = (cache_key, result)
@@ -274,9 +276,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             indices, gather, bounds = DeepseekV41Model._get_ced_non_identity_tensors(
                 self, plan, positions.shape[0], positions
             )
-            decoder_positions = positions[gather]
-            decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
+            decoder_positions = positions.index_select(0, gather)
+            decoder_ids = (
+                input_ids.index_select(0, gather) if input_ids is not None else None
+            )
+            decoder_hidden = hidden.index_select(0, gather)
+            decoder_mix = pre_mix.index_select(0, gather)
             replay_starts = DeepseekV41Model._get_ced_replay_starts(
                 self, plan.replay_starts, positions
             )

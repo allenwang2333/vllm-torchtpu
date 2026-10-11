@@ -108,7 +108,8 @@ def test_ced_helper_caches_and_all_zero_vs_nonzero_replay_starts():
     assert t2 is t1
     indices, gather, bounds = t1
     assert torch.equal(indices, torch.tensor([0, 2, 4, 4], dtype=torch.int64))
-    assert torch.equal(gather, torch.tensor([0, 2, 3, 3], dtype=torch.int64))
+    assert gather.dtype == torch.int32
+    assert torch.equal(gather, torch.tensor([0, 2, 3, 3], dtype=torch.int32))
     assert torch.equal(bounds, torch.tensor([0, 1, 2], dtype=torch.int32))
 
     plan_b = v1_replay_plan.DecoderReplayPlan(

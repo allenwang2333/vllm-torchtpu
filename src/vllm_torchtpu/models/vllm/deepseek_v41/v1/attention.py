@@ -413,7 +413,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             or offsets.shape[1] != self.window_size
         ):
             offsets = torch.arange(
-                1 - self.window_size, 1, device=device, dtype=torch.int64
+                1 - self.window_size, 1, device=device, dtype=torch.int32
             )[None, :]
             self._window_offsets = offsets
         return offsets
@@ -438,14 +438,14 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         requests = cache_ops.token_requests(swa, positions).clamp(
             max=table.shape[0] - 1
         )
-        logical = positions[:, None] + self._get_window_offsets(positions.device)
+        logical = positions.int()[:, None] + self._get_window_offsets(positions.device)
         replay_starts = get_forward_context().additional_kwargs[
             "deepseek_v41_replay_starts"
         ]
         valid = (
             (logical >= 0)
             & (slots[:, None] >= 0)
-            & (logical >= replay_starts[requests, None])
+            & (logical >= replay_starts.index_select(0, requests)[:, None])
         )
         window_slots = cache_ops.row_slots(
             table,

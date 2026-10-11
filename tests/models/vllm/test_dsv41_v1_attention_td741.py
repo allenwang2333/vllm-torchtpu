@@ -391,6 +391,7 @@ def test_projections_rotate_write_global_kv_and_prepare_tpu(
     # 6. forward_mqa with _ced_decoder == True and topk_indices != None
     attn.compress_ratio = 2
     attn._static_forward_context = {"attn": attn}
+    assert attn._get_window_offsets(pos.device).dtype == torch.int32
     attn.forward_mqa(
         torch.ones((3, 2, 8), dtype=torch.bfloat16),
         kv,
