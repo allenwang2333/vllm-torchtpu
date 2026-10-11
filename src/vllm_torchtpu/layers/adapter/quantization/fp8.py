@@ -152,9 +152,12 @@ def _dequantize_fp8_linear(
             weight_f = weight_f.reshape(out_dim, in_dim)
         else:
             scales = (
-                weight_scale_inv.to(out_dtype)
-                .repeat_interleave(block_h, dim=0)
-                .repeat_interleave(block_w, dim=1)
+                weight_scale_inv.to(out_dtype)[:, None, :, None]
+                .expand(-1, block_h, -1, block_w)
+                .reshape(
+                    weight_scale_inv.shape[0] * block_h,
+                    weight_scale_inv.shape[1] * block_w,
+                )
             )
             weight_f = weight_f * scales[:out_dim, :in_dim]
     else:
@@ -167,7 +170,7 @@ def _dequantize_fp8_linear(
         ):
             scales = (
                 scales.cpu()
-                .repeat_interleave(torch.tensor(logical_widths))
+                .repeat_interleave(torch.tensor(logical_widths, dtype=torch.int32))
                 .unsqueeze(1)
                 .to(scales.device)
             )
@@ -526,7 +529,11 @@ def _process_fp8_moe_weights(
             s13 = scale.to(torch.float32)
             if s13.ndim == 2 and s13.shape[1] == 2:
                 half = w_q.shape[1] // 2
-                s13 = s13.repeat_interleave(half, dim=1).unsqueeze(-1)
+                s13 = (
+                    s13[:, :, None]
+                    .expand(-1, -1, half)
+                    .reshape(s13.shape[0], 2 * half, 1)
+                )
             elif s13.ndim == 2:
                 s13 = s13.unsqueeze(-1)
             elif s13.ndim == 1:

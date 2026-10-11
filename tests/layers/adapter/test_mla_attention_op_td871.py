@@ -940,3 +940,23 @@ def test_scaling_rope_forward_native_matches_reference(neox, head_size, with_off
 def test_scaling_rope_forward_native_requires_key():
     with pytest.raises(AssertionError):
         _rope(4, 4, True).forward_native(torch.tensor([0]), torch.zeros(1, 1, 4))
+
+
+def test_td8323_scaling_rope_gptj_avoids_repeat_interleave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rope = _rope(rotary_dim=4, head_size=6, neox=False)
+    monkeypatch.setattr(
+        torch.Tensor,
+        "repeat_interleave",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("repeat_interleave should not be called")
+        ),
+    )
+    positions = torch.tensor([0, 2, 3])
+    query = torch.randn(3, 2, 6)
+    key = torch.randn(3, 1, 6)
+    q_out, k_out = rope.forward_native(positions, query, key)
+    cos, sin = rope.cos_sin_cache[positions].chunk(2, dim=-1)
+    torch.testing.assert_close(q_out, _reference_rope(query, cos, sin, 4, False))
+    torch.testing.assert_close(k_out, _reference_rope(key, cos, sin, 4, False))

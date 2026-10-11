@@ -275,6 +275,6 @@ def quantize_online_fp8(
         grid.reshape(n_out // block_n, k_in // block_k, -1), torch.float8_e4m3fn
     )
     quantized = quantized.reshape(grid.shape).permute(0, 2, 1, 3).reshape(n_out, k_in)
-    scale = scale.squeeze(-1).repeat_interleave(block_n, dim=0)
-    scale = scale.t().unsqueeze(0).unsqueeze(2).contiguous()
+    scale = scale.squeeze(-1).t()[:, :, None].expand(-1, -1, block_n)
+    scale = scale.reshape(1, k_in // block_k, 1, n_out).contiguous()
     return quantized, scale, (block_n, block_k)

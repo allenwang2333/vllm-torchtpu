@@ -1027,3 +1027,90 @@ def test_nvfp4_adaptive_fused_moe_branches(monkeypatch):
     logits = torch.randn(4, E)
     method.apply_monolithic(layer, x, logits)
     assert len(ran_adaptive) == 1
+
+
+def test_td8323_fp8_expand_reshape_and_int32_logical_widths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orig_repeat_interleave = torch.Tensor.repeat_interleave
+    repeat_dtypes: list[torch.dtype] = []
+
+    def _spy_repeat_interleave(self: torch.Tensor, repeats, *args, **kwargs):
+        if isinstance(repeats, torch.Tensor):
+            repeat_dtypes.append(repeats.dtype)
+            return orig_repeat_interleave(self, repeats, *args, **kwargs)
+        raise AssertionError("scalar repeat_interleave should not be called in fp8.py")
+
+    monkeypatch.setattr(torch.Tensor, "repeat_interleave", _spy_repeat_interleave)
+
+    # 1. _dequantize_fp8_linear unaligned block_quant (lines 154-159)
+    w = torch.ones((100, 100), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    scale_inv = torch.tensor([[1.5, 2.5], [3.5, 4.5]], dtype=torch.float32)
+    out = fp8._dequantize_fp8_linear(
+        w,
+        weight_scale=None,
+        weight_scale_inv=scale_inv,
+        block_quant=True,
+        weight_block_size=(64, 64),
+        out_dtype=torch.float32,
+    )
+    assert out.shape == (100, 100)
+    assert torch.allclose(out[:64, :64], torch.full((64, 64), 1.5))
+    assert torch.allclose(out[:64, 64:], torch.full((64, 36), 2.5))
+    assert torch.allclose(out[64:, :64], torch.full((36, 64), 3.5))
+    assert torch.allclose(out[64:, 64:], torch.full((36, 36), 4.5))
+    assert repeat_dtypes == []
+
+    # 2. _dequantize_fp8_linear logical_widths uses dtype=torch.int32 (line 170)
+    w_lw = torch.ones((96, 64), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    scale_lw = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    out_lw = fp8._dequantize_fp8_linear(
+        w_lw,
+        weight_scale=scale_lw,
+        weight_scale_inv=None,
+        block_quant=False,
+        weight_block_size=None,
+        out_dtype=torch.float32,
+        logical_widths=[32, 32, 32],
+    )
+    assert out_lw.shape == (96, 64)
+    assert repeat_dtypes == [torch.int32]
+
+    # 3. _process_fp8_moe_weights dequantize_w13 (s13.ndim == 2 and s13.shape[1] == 2)
+    monkeypatch.setitem(vars(fp8.envs), "MOE_REQUANTIZE_WEIGHT_DTYPE", None)
+    monkeypatch.setitem(vars(fp8.envs), "MOE_REQUANTIZE_BLOCK_SIZE", None)
+    E, inter, H = 2, 128, 128
+    lyr = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.ones(E, 2 * inter, H, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.ones(E, H, inter, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.tensor([[1.0, 4.0], [2.0, 8.0]], dtype=torch.float32),
+            requires_grad=False,
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones((E, H), dtype=torch.float32),
+            requires_grad=False,
+        ),
+        moe_config=SimpleNamespace(
+            intermediate_size_per_partition=inter,
+            intermediate_size_per_partition_unpadded=inter,
+            tp_size=1,
+            tp_rank=0,
+        ),
+    )
+    _, s13_out, _, _, _, _ = fp8._process_fp8_moe_weights(
+        lyr, weight_block_size=None, activation="silu"
+    )
+    assert s13_out.shape == (E, 1, 1, 2 * inter)
+    assert torch.allclose(s13_out[0, 0, 0, :inter] * 4.0, s13_out[0, 0, 0, inter:])
+    assert torch.allclose(s13_out[1, 0, 0, :inter] * 4.0, s13_out[1, 0, 0, inter:])
+    assert repeat_dtypes == [torch.int32]
+    assert fp8.VllmFp8Config.from_config(
+        {"ignored_layers": ["proj"]}
+    ).ignored_layers == ["proj"]

@@ -608,3 +608,45 @@ class TestOnlineFp8FullCoverage:
                 _make_model_with_proj(weight=q_b, scale=s_b, block_size=(128, 128)),
                 good_cfg,  # type: ignore[arg-type]
             )
+
+    def test_td8323_quantize_online_fp8_per_block_avoids_repeat_interleave(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        Policy = online_fp8_mod.OnlineFp8Policy
+        pol = Policy(
+            targets=["proj"],
+            exclude=[],
+            weight_scheme="per_block",
+            weight_block_size=(128, 128),
+        )
+        torch.manual_seed(42)
+        w = torch.randn(256, 384, dtype=torch.bfloat16)
+        w[:128, :128] *= 2.0
+        w[:128, 128:256] *= 4.0
+        w[128:, 256:] *= 8.0
+
+        monkeypatch.setattr(
+            torch.Tensor,
+            "repeat_interleave",
+            lambda *_a, **_kw: (_ for _ in ()).throw(
+                AssertionError("repeat_interleave should not be called")
+            ),
+        )
+        q, scale, block = online_fp8_mod.quantize_online_fp8(w, pol)
+        assert q.shape == (256, 384)
+        assert scale.shape == (1, 3, 1, 256)
+        assert scale.is_contiguous()
+        assert block == (128, 128)
+        for m in range(2):
+            for k in range(3):
+                expected = (
+                    w[m * 128 : (m + 1) * 128, k * 128 : (k + 1) * 128]
+                    .float()
+                    .abs()
+                    .max()
+                    / 448.0
+                )
+                torch.testing.assert_close(
+                    scale[0, k, 0, m * 128 : (m + 1) * 128],
+                    expected.expand(128),
+                )
