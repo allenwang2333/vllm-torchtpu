@@ -1129,3 +1129,162 @@ def test_td8313_dp_coordinated_step_mm_cumsum_and_row_starts_int32(monkeypatch):
     )
     assert row_starts.dtype == np.int32
     assert row_starts.tolist() == [0, 4, 6]
+
+
+def test_td8328_sample_tokens_cached_identity_map_and_single_chunk_device_seed(
+    monkeypatch,
+) -> None:
+    """Verify TD8.328 _cached_identity_map(maxsize=256), single-chunk async decode
+    next_token_indices fast path, and single-chunk device_seed torch.cat bypass."""
+    from vllm_torchtpu.runner.tpu_runner import _cached_identity_map
+
+    assert _cached_identity_map.cache_info().maxsize == 256
+    assert _cached_identity_map(192) is _cached_identity_map(192)
+
+    stage_timing = MagicMock()
+    stage_timing.stage.return_value = contextlib.nullcontext()
+    stage_timing.host_stage.return_value = contextlib.nullcontext()
+
+    def _make_runner(*, is_async_drafter: bool):
+        r0 = SimpleNamespace(
+            req_id="req-0",
+            num_computed_tokens=0,
+            num_tokens=1,
+            output_token_ids=[],
+        )
+        r1 = SimpleNamespace(
+            req_id="req-1",
+            num_computed_tokens=0,
+            num_tokens=1,
+            output_token_ids=[],
+        )
+        runner = SimpleNamespace(
+            is_pooling_model=False,
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+            speculative_config=None,
+            _is_async_drafter=is_async_drafter,
+            _async_drafter=SimpleNamespace(draft_chunks=[]),
+            _get_sampling_generator=MagicMock(return_value=None),
+            input_batch=SimpleNamespace(
+                num_reqs=2,
+                req_ids=["req-0", "req-1"],
+                all_greedy=True,
+                generators={},
+                req_id_to_index={"req-0": 0, "req-1": 1},
+                num_tokens_no_spec=np.array([1, 1], dtype=np.int32),
+                max_num_logprobs=None,
+            ),
+            requests={"req-0": r0, "req-1": r1},
+            _stage_timing=stage_timing,
+            _update_num_xla_graphs=MagicMock(),
+            _update_mamba_slot_read_offsets=MagicMock(),
+            _greedy_sample=lambda logits: torch.arange(
+                10, 10 + logits.shape[0], dtype=torch.int32
+            ),
+            gather_logprobs=MagicMock(),
+            _modify_prev_results=MagicMock(),
+            maybe_wait_for_kv_save=MagicMock(),
+            get_finished_kv_transfers=MagicMock(
+                return_value=(None, None, None, [], 0, None)
+            ),
+            _sync_replicated_drafts_across_tp=lambda x: x,
+            max_num_reqs=2,
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=MagicMock(
+                    return_value=torch.tensor([[100], [101]], dtype=torch.int32)
+                )
+            ),
+            _assemble_async_prefill_bootstrap=MagicMock(
+                return_value=(
+                    [torch.tensor([10, 100, 11, 101], dtype=torch.int32)],
+                    _cached_identity_map(2),
+                    None,
+                    None,
+                )
+            ),
+        )
+        runner._update_placeholder = lambda d, r, n, nd: (
+            TPUModelRunner._update_placeholder(runner, d, r, n, nd)
+        )
+        return runner
+
+    so = SimpleNamespace(
+        num_scheduled_tokens={"req-0": 1, "req-1": 1},
+        has_structured_output_requests=False,
+    )
+
+    # 1. Single-chunk non-spec async decode uses _cached_identity_map(2)
+    runner_1 = _make_runner(is_async_drafter=False)
+    seen_indices: list[dict[int, int]] = []
+    orig_update_placeholder = TPUModelRunner._update_placeholder
+
+    def _spy_update_placeholder(self_r, discard, req_seq_lens, next_idx, num_draft):
+        seen_indices.append(next_idx)
+        return orig_update_placeholder(
+            self_r, discard, req_seq_lens, next_idx, num_draft
+        )
+
+    runner_1._update_placeholder = lambda d, r, n, nd: _spy_update_placeholder(
+        runner_1, d, r, n, nd
+    )
+    runner_1.execute_model_state = SimpleNamespace(
+        logits_list=[torch.zeros((4, 16))],
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[None],
+        mamba_state_indices_list=[None],
+        pooler_output_list=[],
+        draft_chunks=[],
+        scheduler_output=so,
+    )
+    with patch.object(torch, "tpu", SimpleNamespace(Event=MagicMock()), create=True):
+        TPUModelRunner.sample_tokens(runner_1, grammar_output=None)
+    assert len(seen_indices) == 1
+    assert seen_indices[0] is _cached_identity_map(2)
+    assert runner_1._pre_async_results.req_id_to_index_copy == {"req-0": 0, "req-1": 1}
+
+    # 2. Single-chunk async drafter non-spec step: device_seed bypasses torch.cat
+    runner_seed_1 = _make_runner(is_async_drafter=True)
+    runner_seed_1.execute_model_state = SimpleNamespace(
+        logits_list=[torch.zeros((4, 16))],
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[None],
+        mamba_state_indices_list=[None],
+        pooler_output_list=[],
+        draft_chunks=[],
+        scheduler_output=so,
+    )
+    orig_cat = torch.cat
+    cat_calls: list[int] = []
+
+    def _spy_cat(tensors, *args, **kwargs):
+        cat_calls.append(len(tensors))
+        return orig_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", _spy_cat)
+    with patch.object(torch, "tpu", SimpleNamespace(Event=MagicMock()), create=True):
+        TPUModelRunner.sample_tokens(runner_seed_1, grammar_output=None)
+    assert cat_calls == []
+    propose_kw_1 = (
+        runner_seed_1.spec_decode_manager.propose_draft_token_ids.call_args.kwargs
+    )
+    assert propose_kw_1["device_seed"].tolist() == [10, 11]
+
+    # 3. Multi-chunk async drafter non-spec step: populates next_token_indices with
+    # padded chunk offsets and concatenates device_seed across chunks
+    runner_seed_2 = _make_runner(is_async_drafter=True)
+    runner_seed_2.execute_model_state = SimpleNamespace(
+        logits_list=[torch.zeros((4, 16)), torch.zeros((4, 16))],
+        num_reqs_list=[1, 1],
+        spec_decode_metadata_list=[None, None],
+        mamba_state_indices_list=[None, None],
+        pooler_output_list=[],
+        draft_chunks=[],
+        scheduler_output=so,
+    )
+    with patch.object(torch, "tpu", SimpleNamespace(Event=MagicMock()), create=True):
+        TPUModelRunner.sample_tokens(runner_seed_2, grammar_output=None)
+    assert cat_calls == [2]
+    propose_kw_2 = (
+        runner_seed_2.spec_decode_manager.propose_draft_token_ids.call_args.kwargs
+    )
+    assert propose_kw_2["device_seed"].tolist() == [10, 10]

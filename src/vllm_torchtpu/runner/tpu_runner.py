@@ -613,7 +613,7 @@ _ORIG_GPU_UPDATE_STATES = GPUModelRunner._update_states
 _ARANGE_INTP: np.ndarray = np.arange(4096, dtype=np.int32)
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=256)
 def _cached_identity_map(n: int) -> dict[int, int]:
     r = range(n)
     return dict(zip(r, r))
@@ -5125,11 +5125,21 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
                     next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
-                    for req_idx in range(cur_start_idx, cur_end_idx):
-                        next_token_indices[req_idx] = (
-                            next_tokens_tpu_offset + req_idx - cur_start_idx
+                    if len(state.logits_list) == 1:
+                        next_token_indices = _cached_identity_map(cur_end_idx)
+                    else:
+                        _, next_tokens_tpu_offset = (
+                            next_token_indices.update(
+                                zip(
+                                    range(cur_start_idx, cur_end_idx),
+                                    range(
+                                        next_tokens_tpu_offset,
+                                        next_tokens_tpu_offset + num_reqs,
+                                    ),
+                                )
+                            ),
+                            next_tokens_tpu_offset + selected_token_ids.shape[0],
                         )
-                    next_tokens_tpu_offset += selected_token_ids.shape[0]
                 if needs_logprobs:
                     assert logprobs is not None
                     sliced_logprobs = LogprobsTensors(
@@ -5233,13 +5243,19 @@ class TPUModelRunner(GPUModelRunner):
                 # Seed = the just-sampled tokens, kept on-device (no D2H):
                 # propose takes the sync seed path but reads the seed from
                 # `device_seed`.
-                device_seed = torch.cat(
-                    [
-                        sel.view(-1)[:n]
-                        for sel, n in zip(
-                            combined_selected_tokens, combined_selected_tokens_real_lens
-                        )
-                    ]
+                device_seed = (
+                    combined_device_seeds[0]
+                    if len(
+                        combined_device_seeds := [
+                            sel.view(-1)[:n]
+                            for sel, n in zip(
+                                combined_selected_tokens,
+                                combined_selected_tokens_real_lens,
+                            )
+                        ]
+                    )
+                    == 1
+                    else torch.cat(combined_device_seeds, dim=0)
                 )
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
