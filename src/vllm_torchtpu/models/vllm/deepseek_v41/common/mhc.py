@@ -776,6 +776,24 @@ def pre(
     return post, comb, value, next_pre
 
 
+def _mean_hc_streams(residual: torch.Tensor) -> torch.Tensor:
+    """``residual.mean(1)`` over the ``[T, M, D]`` hyper-connection streams.
+
+    The 3-D view's reduce costs XLA a ``T(4,128)`` relayout copy of the whole
+    residual. For ``M == 4`` this sums the ``D``-wide column slices of the
+    flat ``[T, M * D]`` rows in FP32 in the order XLA's reduce applies to the
+    view, ``(s0 + s2) + (s1 + s3)`` (see `_collapse_flat`), and scales by the
+    exact power of two ``0.25`` (= ``/ 4``) before the one BF16 rounding.
+    Other ``M`` keep ``mean(1)``.
+    """
+    tokens, mult, dim = residual.shape
+    if mult != 4:
+        return residual.mean(1)
+    flat = residual.reshape(tokens, mult * dim)
+    s = [flat[:, m * dim : (m + 1) * dim].float() for m in range(mult)]
+    return (((s[0] + s[2]) + (s[1] + s[3])) * 0.25).to(residual.dtype)
+
+
 def shifted_post_pre(
     x,
     residual,
@@ -821,10 +839,10 @@ def shifted_post_pre(
         )
         if norm_weight is not None:
             value = rms_norm(value, norm_weight, norm_eps)
-        aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+        aux = _mean_hc_streams(residual) if capture_aux else x.new_empty(0, x.shape[-1])
         return residual, post_mix, comb_mix, value, next_pre, aux
     residual = post(x, residual, post_layer_mix, comb_res_mix)
-    aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+    aux = _mean_hc_streams(residual) if capture_aux else x.new_empty(0, x.shape[-1])
     return (
         residual,
         *pre(

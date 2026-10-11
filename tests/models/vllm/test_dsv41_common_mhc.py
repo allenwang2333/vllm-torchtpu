@@ -281,3 +281,43 @@ def test_collapse_flat_matches_view_sum(mult):
         np.testing.assert_array_equal(_np(got), _np(want))
     else:
         np.testing.assert_allclose(_np(got), _np(want), rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("mult", [2, 4])
+def test_mean_hc_streams_matches_mean(mult):
+    """TD8.251: slice-sum stream mean; bitwise vs ``mean(1)`` is a TPU check."""
+    rng = np.random.default_rng(5)
+    residual = torch.from_numpy(rng.standard_normal((24, mult, 256)) * 8).bfloat16()
+    got = mhc._mean_hc_streams(residual)
+    want = residual.mean(1)
+    assert got.shape == want.shape and got.dtype == torch.bfloat16
+    if mult != 4:
+        assert torch.equal(got, want)
+    else:
+        torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("tokens", [768, 1152])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_mean_hc_streams_bitwise_on_tpu(tokens, compiled, device):
+    """TD8.251: on TPU the slice sum equals BF16 ``residual.mean(1)`` bitwise."""
+    if device.type != "tpu":
+        pytest.skip("bitwise parity is defined by the TPU reduce order")
+    rng = np.random.default_rng(tokens)
+    residual = (
+        torch.from_numpy(rng.standard_normal((tokens, 4, 5120)) * 8)
+        .bfloat16()
+        .to(device)
+    )
+    mean = (
+        (lambda r: r.mean(1))
+        if not compiled
+        else torch.compile(lambda r: r.mean(1), backend="tpu", dynamic=False)
+    )
+    streams = (
+        mhc._mean_hc_streams
+        if not compiled
+        else torch.compile(mhc._mean_hc_streams, backend="tpu", dynamic=False)
+    )
+    assert torch.equal(streams(residual).cpu(), mean(residual).cpu())
