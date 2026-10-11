@@ -179,20 +179,23 @@ def _insert_context_kv(
             if cached_slots is not None:
                 _, _, _, in_window, addr, _ = cached_slots
             elif metadata.seq_lens.numel() > 0:
+                pos_i32 = positions.int()
                 requests = _token_requests(metadata, positions).clamp(
                     max=metadata.seq_lens.shape[0] - 1
                 )
-                offsets = positions - metadata.seq_lens[requests] + attn.window_size
+                offsets = pos_i32 - metadata.seq_lens[requests] + attn.window_size
                 in_window = (offsets >= 0) & (offsets < attn.window_size)
                 if block_tables is not None:
                     table = _block_table(metadata)
                     pos_col = (
-                        (positions // rows_per_page)
-                        .clamp(max=table.shape[1] - 1)
-                        .long()
+                        (pos_i32 // rows_per_page).clamp(max=table.shape[1] - 1).long()
                     )
-                    pos_rem = positions % rows_per_page
-                    rows = torch.arange(positions.shape[0], device=positions.device)
+                    pos_rem = pos_i32 % rows_per_page
+                    rows = torch.arange(
+                        positions.shape[0],
+                        dtype=torch.int32,
+                        device=positions.device,
+                    )
                     valid_token = rows < metadata.query_start_loc[-1]
                     addr = (
                         requests,

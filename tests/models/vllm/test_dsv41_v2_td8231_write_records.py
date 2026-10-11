@@ -475,6 +475,46 @@ def test_td8243_dspark_context_kv_int32_slots_match_int64(monkeypatch, geometry)
         assert torch.equal(records, v2_attn._offset_records(cache, *write64))
 
 
+@pytest.mark.parametrize("geometry", sorted(GEOMETRIES))
+def test_td8249_dspark_context_kv_int64_positions_produce_int32_slots(
+    monkeypatch, geometry
+):
+    """TD8.249: int64 positions cast to int32 so swa_slots and pos_rem stay int32."""
+    rows = 4
+    calls: list[Any] = []
+    monkeypatch.setattr(v2_dspark, "_insert", _capture(calls))
+    table = torch.tensor([[1, 2, 5], [3, 4, -1]], dtype=torch.int32)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([9, 6], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 5, 9], dtype=torch.int32),
+    )
+    positions_i64 = torch.tensor([2, 4, 6, 7, 8, 1, 3, 5, 9, 0], dtype=torch.int64)
+    positions_i32 = positions_i64.int()
+    cache = _real_cache(rows, geometry)
+    with v2_attn.stage_attention_cache_scope():
+        v2_dspark._insert_context_kv(
+            _dspark_layer(cache), torch.ones(10, 8), positions_i64, meta
+        )
+        assert v2_attn._active_stage_attn_cache is not None
+        cached_entry = next(iter(v2_attn._active_stage_attn_cache.values()))
+    _, slots_i64, valid_i64, _, addr_i64, write_i64 = cached_entry
+    assert slots_i64.dtype == torch.int32
+    assert addr_i64[2].dtype == torch.int32  # pos_rem
+
+    v2_dspark._insert_context_kv(
+        _dspark_layer(cache), torch.ones(10, 8), positions_i32, meta
+    )
+    _, slots_i32, _, valid_i32, records_i32 = calls[-1]
+    assert torch.equal(slots_i64, slots_i32)
+    assert torch.equal(valid_i64, valid_i32)
+    if write_i64 is not None:
+        assert torch.equal(
+            v2_attn._offset_records(cache, *write_i64),
+            records_i32,
+        )
+
+
 def test_td8242_write_cache_and_paged_write_zero_redundant_mask():
     """Verify write_cache skips slots slicing/masking when records is provided
     and avoids double masked_fill when records is None across all geometries.
