@@ -1522,3 +1522,159 @@ def test_td8333_heterogeneous_prepare_inputs_and_mm_cumsum_gating(
         embeds_arg, mask_arg = mm_received[-1]
         assert len(embeds_arg) == 1 and embeds_arg[0].shape == (2, 4)
         assert mask_arg.tolist() == [True, False, True]
+
+
+def test_td8336_fast_update_states_defers_prev_num_draft_len_and_hetero_subst_indices(
+    monkeypatch,
+) -> None:
+    """Verify TD8.336: (a) _update_states skips self.requests.values() iteration on
+    steady-state _try_fast_update_states fast path while resetting prev_num_draft_len
+    in the existing per-request loop, and (b) _prepare_async_token_substitution_indices
+    heterogeneous path reuses query_start_loc_np without np.concatenate."""
+
+    class _SpyRequests(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.values_calls = 0
+
+        def values(self):
+            self.values_calls += 1
+            return super().values()
+
+    runner = object.__new__(TPUModelRunner)
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._pre_async_results = None
+    runner._pp_is_last = True
+    runner.speculative_config = None
+    runner.use_async_spec_decode = False
+    runner._install_spec_token_room_guard = lambda: None
+    runner.is_unified_pool_used = lambda: False
+    runner._dense_kv_copy_supported = lambda: False
+
+    runner.requests = _SpyRequests(
+        {
+            "r0": SimpleNamespace(
+                req_id="r0",
+                num_computed_tokens=4,
+                output_token_ids=[11],
+                block_ids=([1],),
+                prev_num_draft_len=5,
+            ),
+            "r1": SimpleNamespace(
+                req_id="r1",
+                num_computed_tokens=8,
+                output_token_ids=[21],
+                block_ids=([2],),
+                prev_num_draft_len=3,
+            ),
+        }
+    )
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=np.zeros(4, dtype=np.int32),
+        num_prompt_tokens=np.array([4, 8, 0, 0], dtype=np.int32),
+        num_tokens_no_spec=np.array([5, 9, 0, 0], dtype=np.int32),
+        token_ids_cpu=np.zeros((4, 32), dtype=np.int32),
+        is_token_ids=np.zeros((4, 32), dtype=bool),
+        spec_token_ids=[[9], [8], [], []],
+        block_table=SimpleNamespace(append_row=lambda nb, idx: None),
+        update_req_spec_token_ids=lambda req, _sched: None,
+        refresh_metadata=lambda: None,
+    )
+
+    so_fast = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=None,
+        scheduled_new_reqs=[],
+        new_block_ids_to_zero=[],
+        free_encoder_mm_hashes=[],
+        kv_cache_block_copies=None,
+        num_scheduled_tokens={"r0": 1, "r1": 1},
+        scheduled_spec_decode_tokens={},
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r0", "r1"],
+            resumed_req_ids=set(),
+            num_computed_tokens=[5, 9],
+            num_output_tokens=[1, 1],
+            new_block_ids=[None, None],
+        ),
+    )
+
+    # 1. Fast path resets prev_num_draft_len = 0 without calling self.requests.values()
+    assert runner._update_states(so_fast) is None
+    assert runner.requests.values_calls == 0
+    assert runner.requests["r0"].prev_num_draft_len == 0
+    assert runner.requests["r1"].prev_num_draft_len == 0
+
+    # 2. Slow path (finished_req_ids non-empty) runs self.requests.values() reset
+    runner.requests["r1"].prev_num_draft_len = 4
+    so_slow = SimpleNamespace(
+        finished_req_ids={"r0"},
+        preempted_req_ids=None,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r1"],
+            resumed_req_ids=set(),
+            num_computed_tokens=[10],
+            num_output_tokens=[2],
+            new_block_ids=[None],
+        ),
+        kv_cache_block_copies=None,
+    )
+    with patch.object(TPUModelRunner.__bases__[0], "_update_states", return_value="ok"):
+        assert runner._update_states(so_slow) == "ok"
+    assert runner.requests.values_calls == 1
+    assert runner.requests["r1"].prev_num_draft_len == 0
+
+    # 3. Heterogeneous _prepare_async_token_substitution_indices reuses qsl_np
+    orig_concat = np.concatenate
+    concat_calls: list[int] = []
+
+    def _spy_concat(arrays, *args, **kwargs):
+        concat_calls.append(len(arrays))
+        return orig_concat(arrays, *args, **kwargs)
+
+    orig_cumsum = np.cumsum
+    cumsum_calls: list[int] = []
+
+    def _spy_cumsum(a, *args, **kwargs):
+        cumsum_calls.append(len(a))
+        return orig_cumsum(a, *args, **kwargs)
+
+    monkeypatch.setattr(np, "concatenate", _spy_concat)
+    monkeypatch.setattr(np, "cumsum", _spy_cumsum)
+
+    sched_hetero = np.array([3, 1, 2], dtype=np.int32)
+    async_runner = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy={"r0": 2, "r1": 0, "r2": 1},
+            spec_decode_num_rejected_tokens=object(),
+        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        _last_sequence_layout_plan=None,
+        input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2"]),
+        arange_np=np.arange(32, dtype=np.int32),
+        query_start_loc_np=np.array([0, 3, 4, 6, 6], dtype=np.int32),
+    )
+    cur_1, pre_1 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 3, sched_hetero
+    )
+    assert concat_calls == []
+    assert cumsum_calls == []
+    assert cur_1.tolist() == [0, 1, 2, 3, 4, 5]
+    # stride = 4: r0(pos=2)->[8,9,10], r1(pos=0)->[0], r2(pos=1)->[4,5]
+    assert pre_1.tolist() == [8, 9, 10, 0, 4, 5]
+
+    # Fallback when query_start_loc_np is None still avoids np.concatenate
+    async_runner._cached_async_subst_idx_key = None
+    async_runner.query_start_loc_np = None
+    cur_2, pre_2 = TPUModelRunner._prepare_async_token_substitution_indices(
+        async_runner, 0, 3, sched_hetero
+    )
+    assert concat_calls == []
+    assert cumsum_calls == [3]
+    assert cur_2.tolist() == [0, 1, 2, 3, 4, 5]
+    assert pre_2.tolist() == [8, 9, 10, 0, 4, 5]

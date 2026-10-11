@@ -2406,15 +2406,17 @@ class TPUModelRunner(GPUModelRunner):
                         pos_arr[:, None] * stride + sched_arange[None, :]
                     ).reshape(-1)
                 else:
-                    offsets = np.concatenate(
-                        [
-                            np.arange(int(n), dtype=np.int32)
-                            for n in num_scheduled_tokens_per_req
-                        ]
+                    qsl_prefix = (
+                        qsl_np[:num_reqs]
+                        if (qsl_np := getattr(self, "query_start_loc_np", None))
+                        is not None
+                        and len(qsl_np) > num_reqs
+                        and int(qsl_np[num_reqs]) == total_sched
+                        else np.cumsum(num_scheduled_tokens_per_req, dtype=np.int32)
+                        - num_scheduled_tokens_per_req
                     )
-                    pre_indices = (
-                        np.repeat(pos_arr * stride, num_scheduled_tokens_per_req)
-                        + offsets
+                    pre_indices = cur_indices + np.repeat(
+                        pos_arr * stride - qsl_prefix, num_scheduled_tokens_per_req
                     )
                 res = cur_indices, pre_indices.astype(np.int32, copy=False)
                 self._cached_async_subst_idx_key = subst_idx_key
@@ -2774,7 +2776,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         ):
             req_state = requests[req_id]
-            req_state.num_computed_tokens = num_comp
+            req_state.num_computed_tokens, req_state.prev_num_draft_len = num_comp, 0
             if num_out < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_out:]
                 num_tokens_no_spec[i] = num_prompt_tokens[i] + num_out
@@ -2845,17 +2847,17 @@ class TPUModelRunner(GPUModelRunner):
                     for record in self._pre_async_results.request_seq_lens
                     if record[3] not in invalidated_req_ids
                 ]
-        # Disable vLLM's native GPU async spec-decode num_computed_tokens
-        # correction. The TPU runner does its own async rejection correction,
-        # so letting the base also correct would double-count.
-        for req_state in self.requests.values():
-            req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         if not (
             finished_req_ids or preempted_req_ids or resumed_req_ids or copies
         ) and self._try_fast_update_states(scheduler_output):
             return None
+        # Disable vLLM's native GPU async spec-decode num_computed_tokens
+        # correction. The TPU runner does its own async rejection correction,
+        # so letting the base also correct would double-count.
+        for req_state in self.requests.values():
+            req_state.prev_num_draft_len = 0
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
         # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
         # prefix hits on an MLA model: copy with the same donating program.
