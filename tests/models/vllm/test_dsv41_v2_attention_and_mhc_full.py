@@ -1340,3 +1340,147 @@ def test_td8289_native_int32_index_select_and_arange(monkeypatch):
         (1, torch.float32, 0, torch.int32),
     ]
     assert all(dt == torch.int32 for dt in arange_dtypes)
+
+
+def test_td8292_save_compress_norm_and_swa_int32_index_select(monkeypatch):
+    """TD8.292: save_compress_norm and _prepare_tpu SWA use 1D int32 index_select."""
+    orig_index_select = torch.Tensor.index_select
+    orig_arange = torch.arange
+    select_calls: list[tuple[int, torch.dtype, int, torch.dtype]] = []
+    arange_dtypes: list[torch.dtype | None] = []
+
+    def _spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, self.dtype, int(dim), index.dtype))
+        return orig_index_select(self, dim, index)
+
+    def _spy_arange(*args, **kwargs):
+        arange_dtypes.append(kwargs.get("dtype"))
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", _spy_index_select)
+    monkeypatch.setattr(torch, "arange", _spy_arange)
+
+    # 1. save_compress_norm (ratio=2) uses int32 arange and 1D int32 index_select
+    kv_score = torch.tensor(
+        [
+            [1.0, 2.0, 0.5],
+            [3.0, 4.0, 1.5],
+            [5.0, 6.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    positions = torch.tensor([1, 2, 0], dtype=torch.int64)
+    state_cache = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    slot_mapping = torch.tensor([1, 2, 4], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    token_to_req_indices = torch.tensor([0, 0, 1], dtype=torch.int32)
+    norm_weight = torch.ones(2, dtype=torch.float32)
+    latent = torch.zeros((3, 2), dtype=torch.float32)
+
+    select_calls.clear()
+    arange_dtypes.clear()
+    v2_attn.save_compress_norm(
+        kv_score,
+        positions,
+        state_cache,
+        slot_mapping,
+        query_start_loc,
+        token_to_req_indices,
+        norm_weight,
+        1e-6,
+        2,
+        latent,
+    )
+    assert arange_dtypes == [torch.int32]
+    # state_cache.reshape(-1, 3).index_select(0, previous_slots.int()) is a 2D tensor
+    # indexed along dim 0 with torch.int32
+    assert (2, torch.float32, 0, torch.int32) in select_calls
+    assert all(idx_dt == torch.int32 for _, _, _, idx_dt in select_calls)
+
+    # 2. _prepare_tpu SWA (use_3page_swa=True, non_causal=True & False)
+    count = 4
+    rows_per_page = 32
+    pos_swa = torch.tensor([100, 101, 20, 21], dtype=torch.int32)
+    swa_table = torch.tensor([[5, 6, 7, 8, 9], [10, 11, 12, 13, 14]], dtype=torch.int32)
+    swa_meta = SimpleNamespace(
+        seq_lens=torch.tensor([102, 22], dtype=torch.int32),
+        block_tables=swa_table,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"swa_pfx": swa_meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+    captured_recs: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_attention",
+        lambda q, swa_c, main_c, recs, *args, **kw: (
+            captured_recs.append(recs.clone()) or torch.zeros_like(q)
+        ),
+    )
+
+    cache_mock = MagicMock(spec=v2_attn.PagedCacheRows)
+    cache_mock.numel.return_value = 1024
+    cache_mock.shape = (32, rows_per_page, 512)
+    cache_mock.page_stride = rows_per_page
+    cache_mock.row_offset = 100
+
+    for non_causal in (True, False):
+        attn = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(attn)
+        attn.prefix = "swa_pfx"
+        attn.window_size = 64
+        attn.non_causal_multi_token_decode = non_causal
+        attn.dspark_block_size = 5
+        attn.query_block_size = 5
+        attn._ced_decoder = False
+        attn._ced_global_from_encoder = False
+        attn._local_q_attn = False
+        attn.compressor = None
+        attn.indexer = None
+        attn.compress_ratio = 0
+        attn._fp8_kv = False
+        attn.n_local_heads = 2
+        attn.head_dim = 8
+        attn.scale = 0.25
+        attn.attn_sink = torch.zeros(2)
+        attn._full_attn_sink = None
+        attn._tp_rank_1d = None
+        attn._rotate = lambda x, p: x
+        attn.wq_b = lambda qr: qr
+        attn.swa_cache_layer = SimpleNamespace(prefix="swa_pfx", kv_cache=cache_mock)
+        attn.kv_cache = cache_mock
+
+        qr = torch.ones((count, 16), dtype=torch.bfloat16)
+        kv = torch.ones((count, 8), dtype=torch.bfloat16)
+        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+
+        select_calls.clear()
+        arange_dtypes.clear()
+        captured_recs.clear()
+        with v2_attn.stage_attention_cache_scope():
+            attn._prepare_tpu(None, qr, kv, None, None, None, pos_swa, out)
+            stage_cache = v2_attn._active_stage_attn_cache
+            assert stage_cache is not None
+            swa_addr_entries = [
+                v
+                for k, v in stage_cache.items()
+                if isinstance(k, tuple) and k[0] == "swa_token_addr"
+            ]
+            assert len(swa_addr_entries) == 1
+            _, _, pos_col, _, _, _, swa_3page = swa_addr_entries[0]
+            assert pos_col.dtype == torch.int32
+            assert swa_3page is not None
+            c_last, prev_cols, _, _, _ = swa_3page
+            assert c_last.dtype == torch.int32
+            assert all(col.dtype == torch.int32 for col in prev_cols)
+            assert all(dt == torch.int32 for dt in arange_dtypes)
+            assert all(
+                ndim == 1 and dim == 0 and idx_dt == torch.int32
+                for ndim, _, dim, idx_dt in select_calls
+            )
+        attn._prepare_tpu(None, qr, kv, None, None, None, pos_swa, out)
+        assert len(captured_recs) == 2
+        assert torch.equal(captured_recs[0], captured_recs[1])
