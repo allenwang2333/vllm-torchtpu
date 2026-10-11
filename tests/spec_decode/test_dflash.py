@@ -1465,3 +1465,76 @@ def test_td8252_int32_window_bounds_and_pad_layout(device):
         assert torch.equal(ids, ref_ids)
 
     assert proposer._can_reuse_staged_block_tables(None, None, 4) is None
+
+
+def test_td8270_1d_flat_base_tokens_gather_and_skip_zero_tail_pad(device, monkeypatch):
+    """TD8.270: Verify _layout_draft_block skips both tail F.pad ops when
+    tail_pad == 0 and _tpu_build_dflash_inputs_next_tokens extracts base_tokens
+    via 1D flat int32 index_select."""
+    import torch.nn.functional as F
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer._max_model_len = 4096
+
+    base_tokens = torch.tensor([101, 202, 303, 99], dtype=torch.int32, device=device)
+    base_pos = torch.tensor([[10], [20], [30], [0]], dtype=torch.int32, device=device)
+    pad_calls: list[tuple[int, ...]] = []
+    orig_pad = F.pad
+
+    def tracking_pad(tensor, pad, mode="constant", value=None):
+        pad_calls.append(tuple(pad))
+        return orig_pad(tensor, pad, mode=mode, value=value)
+
+    monkeypatch.setattr(F, "pad", tracking_pad)
+
+    # 1) tail_pad == 0 (padded_len == 20 == 4 * 5): only 1 F.pad call
+    pad_calls.clear()
+    ids_20, pos_20, sl_20 = proposer._layout_draft_block(
+        base_tokens, base_pos, block_size=5, padded_len=20, mask_token_id=99
+    )
+    assert pad_calls == [(0, 4)]
+    assert ids_20.shape == pos_20.shape == (20,)
+    assert sl_20.shape == (4,)
+
+    # 2) tail_pad > 0 (padded_len == 24 > 20): 3 F.pad calls (1 block + 2 tail)
+    pad_calls.clear()
+    ids_24, pos_24, sl_24 = proposer._layout_draft_block(
+        base_tokens, base_pos, block_size=5, padded_len=24, mask_token_id=99
+    )
+    assert pad_calls == [(0, 4), (0, 4), (0, 4)]
+    assert torch.equal(ids_24[:20], ids_20)
+    assert torch.all(ids_24[20:] == 99)
+    assert torch.equal(pos_24[:20], pos_20)
+    assert torch.all(pos_24[20:] == 0)
+    assert torch.equal(sl_24, sl_20)
+
+    # 3) _tpu_build_dflash_inputs_next_tokens 1D flat_col index_select parity
+    fn_nt = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._tpu_build_dflash_inputs_next_tokens
+    )
+    next_tokens = torch.tensor(
+        [
+            [11, 12, 13, -1],
+            [21, -1, -1, -1],
+            [31, 32, 33, 34],
+            [-1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    qsl = torch.tensor([0, 3, 4, 8, 8], dtype=torch.int32, device=device)
+    pos = torch.arange(100, 108, dtype=torch.int32, device=device)
+    dl = torch.tensor([3, 1, 3, 0], dtype=torch.int32, device=device)
+    out_ids, out_pos, out_sl = fn_nt(
+        proposer,
+        next_tokens,
+        qsl,
+        pos,
+        dl,
+        block_size=4,
+        padded_len=16,
+        mask_token_id=99,
+        invalid_token_id=-1,
+    )
+    assert out_ids[::4].tolist() == [13, 21, 34, 99]
+    assert out_ids.dtype == out_pos.dtype == out_sl.dtype == torch.int32

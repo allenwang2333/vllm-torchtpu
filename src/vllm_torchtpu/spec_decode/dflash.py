@@ -1272,22 +1272,17 @@ class DFlashProposer:
         device = base_tokens.device
 
         # Format input_ids with base tokens and MASK placeholders
-        input_ids_unpadded = F.pad(
+        input_ids = F.pad(
             base_tokens.unsqueeze(1), (0, block_size - 1), value=mask_token_id
         ).flatten()
-        input_ids = F.pad(
-            input_ids_unpadded,
-            (0, padded_len - input_ids_unpadded.shape[0]),
-            value=mask_token_id,
-        )
-
         offsets = torch.arange(
             0, block_size, dtype=torch.int32, device=device
         ).unsqueeze(0)
-        positions_unpadded = (base_pos + offsets).flatten()
-        positions = F.pad(
-            positions_unpadded, (0, padded_len - positions_unpadded.shape[0]), value=0
-        )
+        positions = (base_pos + offsets).flatten()
+        tail_pad = padded_len - input_ids.shape[0]
+        if tail_pad > 0:
+            input_ids = F.pad(input_ids, (0, tail_pad), value=mask_token_id)
+            positions = F.pad(positions, (0, tail_pad), value=0)
         # Clamp to max_model_len to prevent out-of-bounds RoPE and kernel indexing.
         positions = torch.clamp(positions, max=self._max_model_len - 1)
         seq_lens = torch.clamp(
@@ -1358,9 +1353,16 @@ class DFlashProposer:
             dim=1, dtype=torch.int32
         )
         last_valid_col = torch.clamp(num_valid, min=1) - 1
-        base_tokens = next_tokens_device_padded.gather(
-            1, last_valid_col.unsqueeze(1)
-        ).squeeze(1)
+        flat_col = (
+            torch.arange(
+                padded_num_reqs,
+                dtype=torch.int32,
+                device=next_tokens_device_padded.device,
+            )
+            * next_tokens_device_padded.shape[1]
+            + last_valid_col
+        )
+        base_tokens = next_tokens_device_padded.reshape(-1).index_select(0, flat_col)
         # Replace invalid_token_id (-1) with mask_token_id for padding rows.
         base_tokens = torch.where(
             base_tokens == invalid_token_id,
