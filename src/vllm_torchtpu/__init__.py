@@ -2369,15 +2369,22 @@ def _patch_deepseek_v41_ced_fastpaths() -> None:
 
         dp_size = self._vllm_config.parallel_config.data_parallel_size
         has_dp_meta = fwd_ctx.dp_metadata is not None and dp_size > 1
-        dec_dp_tokens = (
-            torch.tensor(
-                [plan.padded_num_tokens] * dp_size,
-                dtype=torch.int32,
-                device="cpu",
-            )
-            if has_dp_meta
-            else None
-        )
+        dec_dp_tokens = None
+        if has_dp_meta:
+            dp_cache = self.__dict__.get("_dec_dp_tokens_cache")
+            if dp_cache is None:
+                dp_cache = {}
+                self._dec_dp_tokens_cache = dp_cache
+            dp_key = (dp_size, int(plan.padded_num_tokens))
+            dec_dp_tokens = dp_cache.get(dp_key)
+            if dec_dp_tokens is None:
+                dec_dp_tokens = torch.full(
+                    (dp_size,),
+                    plan.padded_num_tokens,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                dp_cache[dp_key] = dec_dp_tokens
         with set_forward_context(
             decoder_metadata,
             self._vllm_config,
@@ -2490,7 +2497,8 @@ def _patch_vllm_ced_prefill_first_scheduler() -> None:
         @wraps(orig_process_input_queue)
         def process_input_queue_aligned(self):
             orig_process_input_queue(self)
-            if not self.has_work() or getattr(self, "step_counter", 99) > 1:
+            step_cnt = getattr(self, "step_counter", 99)
+            if not self.has_work() or step_cnt > 6:
                 return
             if _get_ced_prefill_first_mode() <= 0:
                 return
@@ -2498,7 +2506,7 @@ def _patch_vllm_ced_prefill_first_scheduler() -> None:
             import time
 
             sched = self.scheduler
-            if self.step_counter == 0 and not sched.has_requests():
+            if step_cnt == 0 and not sched.has_requests():
                 deadline = time.monotonic() + 0.500
                 while not sched.has_requests() and time.monotonic() < deadline:
                     try:
@@ -2509,15 +2517,19 @@ def _patch_vllm_ced_prefill_first_scheduler() -> None:
                     except queue.Empty:
                         pass
 
-            if sched.has_requests() and not any(
-                r.is_prefill_chunk for r in sched.running
+            if (
+                sched.has_requests()
+                and len(sched.running) < 4
+                and not any(r.is_prefill_chunk for r in sched.running)
             ):
                 target_tokens = sched.max_num_scheduled_tokens
-                deadline = time.monotonic() + 0.045
+                min_waiting = 2 if step_cnt == 0 else 1
+                wait_s = 0.400 if step_cnt == 0 else 0.120
+                deadline = time.monotonic() + wait_s
                 while (
-                    sum(r.num_prompt_tokens for r in sched.waiting) < target_tokens
-                    and time.monotonic() < deadline
-                ):
+                    len(sched.waiting) < min_waiting
+                    or sum(r.num_prompt_tokens for r in sched.waiting) < target_tokens
+                ) and time.monotonic() < deadline:
                     try:
                         req = self.input_queue.get(timeout=0.001)
                         self._handle_client_request(*req)

@@ -2777,6 +2777,27 @@ class TPUModelRunner(GPUModelRunner):
             self._calc_mrope_positions(scheduler_output)
 
         # Fast path for decode-only: all requests have exactly 1 token.
+        is_pure_decode_chunk = (
+            max_num_scheduled_tokens_all_reqs == 1
+            and start_index + num_reqs <= rpa_num_decode_reqs
+        )
+        can_direct_decode_subst = (
+            max_num_scheduled_tokens_all_reqs == 1
+            and getattr(self, "_fast_token_substitution", False)
+            and self._pre_async_results is not None
+            and self._pre_async_results.next_tokens_tpu is not None
+            and not self._pre_async_results.discard_sampled_tokens_req_indices
+            and self.speculative_config is None
+            and self._pre_async_results.spec_decode_num_rejected_tokens is None
+            and not (self._pcp_enabled and self._mtp_enabled)
+            and start_index == 0
+            and len(self._pre_async_results.req_id_to_index_copy) == num_reqs
+            and self.input_batch.req_ids[:num_reqs] == self._pre_async_results.req_ids
+            and self._pre_async_results.req_id_to_index_copy.get(
+                self.input_batch.req_ids[num_reqs - 1]
+            )
+            == num_reqs - 1
+        )
         if max_num_scheduled_tokens_all_reqs == 1:
             # Pure decode: each request schedules exactly 1 token.
             # req_indices = [0, 1, ..., num_reqs-1]
@@ -2789,16 +2810,17 @@ class TPUModelRunner(GPUModelRunner):
                     start_index : start_index + num_reqs
                 ],
             )
-            # token_indices = positions + req_index * max_model_len
-            token_indices = (
-                positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-            )
-            torch.index_select(
-                self.input_batch.token_ids_cpu_tensor.flatten(),
-                0,
-                torch.from_numpy(token_indices),
-                out=self.input_ids_cpu[:num_reqs],
-            )
+            if not can_direct_decode_subst:
+                # token_indices = positions + req_index * max_model_len
+                token_indices = (
+                    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+                )
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    torch.from_numpy(token_indices),
+                    out=self.input_ids_cpu[:num_reqs],
+                )
         else:
             # General path: mixed prefill + decode.
             # Get request indices.
@@ -2883,7 +2905,12 @@ class TPUModelRunner(GPUModelRunner):
             target_num_reqs=target_num_reqs,
             padded_num_reqs=padded_num_reqs,
         )
-        self._maybe_prefetch_engram(layout_plan, req_indices, positions_np)
+        if not is_pure_decode_chunk:
+            self._maybe_prefetch_engram(layout_plan, req_indices, positions_np)
+        elif getattr(getattr(self.model, "model", None), "_ced_enabled", False):
+            from vllm_torchtpu.models.vllm.deepseek_v41 import engram as _dsv41_engram
+
+            _dsv41_engram._ENGRAM_PREFETCH = None
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
@@ -2901,14 +2928,39 @@ class TPUModelRunner(GPUModelRunner):
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         local_token_slice = layout_plan.token_slice
-        if layout_plan.kind is SequenceLayoutKind.ALL:
-            # Zero out to avoid spurious values from prev iteration.
-            self.input_ids_cpu[
-                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-            ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
-        )
+        direct_decode_next_tpu = None
+        if (
+            can_direct_decode_subst
+            and self._pre_async_results is not None
+            and layout_plan.kind is SequenceLayoutKind.ALL
+            and local_padded_total_num_scheduled_tokens == num_reqs
+        ):
+            flat_next = self._pre_async_results.next_tokens_tpu.flatten()
+            if len(flat_next) >= num_reqs:
+                direct_decode_next_tpu = flat_next.to(self.input_ids_cpu.dtype)[
+                    :local_padded_total_num_scheduled_tokens
+                ]
+        if direct_decode_next_tpu is not None:
+            self.input_ids = direct_decode_next_tpu
+        else:
+            if can_direct_decode_subst:
+                token_indices = (
+                    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+                )
+                torch.index_select(
+                    self.input_batch.token_ids_cpu_tensor.flatten(),
+                    0,
+                    torch.from_numpy(token_indices),
+                    out=self.input_ids_cpu[:num_reqs],
+                )
+            if layout_plan.kind is SequenceLayoutKind.ALL:
+                # Zero out to avoid spurious values from prev iteration.
+                self.input_ids_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True
+            )
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[
@@ -3176,11 +3228,18 @@ class TPUModelRunner(GPUModelRunner):
             self.set_active_loras(self.input_batch, padded_num_scheduled_tokens_per_req)
 
         # Prepare token substitution indices
-        cur_input_indices, pre_next_tokens_indices = (
-            self._prepare_async_token_substitution_indices(
-                start_index, num_reqs, num_scheduled_tokens_per_req
+        if direct_decode_next_tpu is not None:
+            cur_input_indices = self.arange_np[:0]
+            pre_next_tokens_indices = self.arange_np[:0]
+        elif can_direct_decode_subst and layout_plan.kind is SequenceLayoutKind.ALL:
+            cur_input_indices = self.arange_np[:num_reqs]
+            pre_next_tokens_indices = self.arange_np[:num_reqs]
+        else:
+            cur_input_indices, pre_next_tokens_indices = (
+                self._prepare_async_token_substitution_indices(
+                    start_index, num_reqs, num_scheduled_tokens_per_req
+                )
             )
-        )
 
         self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
 
@@ -3447,12 +3506,22 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
             return None
-        return torch.full(
-            (utils.get_dp_size(self.parallel_config),),
-            num_tokens,
-            dtype=torch.int32,
-            device="cpu",
-        )
+        dp_size = utils.get_dp_size(self.parallel_config)
+        cache = self.__dict__.get("_dp_num_tokens_cache")
+        if cache is None:
+            cache = {}
+            self._dp_num_tokens_cache = cache
+        key = (dp_size, int(num_tokens))
+        t = cache.get(key)
+        if t is None:
+            t = torch.full(
+                (dp_size,),
+                num_tokens,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            cache[key] = t
+        return t
 
     @torch.no_grad()
     def execute_model(

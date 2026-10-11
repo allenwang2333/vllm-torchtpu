@@ -191,10 +191,12 @@ class TpuNgramHashState(nn.Module):
             vocab_size,
             layout.layer_ids,
         )
-        self._token_map_np = np.asarray(token_map, dtype=np.int64)
-        self._mult_np = multipliers.cpu().numpy()
-        self._primes_np = np.asarray(layout.primes, dtype=np.int64)
-        self._offsets_np = layout.offsets.cpu().numpy().astype(np.int64)
+        self._token_map_np = np.ascontiguousarray(token_map, dtype=np.int64)
+        self._mult_np = np.ascontiguousarray(multipliers.cpu().numpy(), dtype=np.int64)
+        self._primes_np = np.ascontiguousarray(layout.primes, dtype=np.int64)
+        self._offsets_np = np.ascontiguousarray(
+            layout.offsets.cpu().numpy(), dtype=np.int64
+        )
 
     def cpu_hashes(
         self, token_ids: np.ndarray, req_idx: np.ndarray, pos: np.ndarray
@@ -333,7 +335,7 @@ extern "C" void engram_gather_omp(
     const int64_t total_work = num_tokens * n_tables * n_hash_cols;
     if (total_work <= 0) return;
     const int max_t = omp_get_max_threads();
-    const int n_threads = (max_t > 0) ? max_t : 1;
+    const int n_threads = (max_t > 16) ? 16 : ((max_t > 0) ? max_t : 1);
     #pragma omp parallel num_threads(n_threads)
     {
         const int tid = omp_get_thread_num();
@@ -399,6 +401,107 @@ extern "C" void engram_gather_omp(
         }
     }
 }
+
+extern "C" void engram_hash_and_gather_omp(
+    const int32_t* __restrict__ token_ids, int64_t token_ids_stride,
+    const int32_t* __restrict__ req_idx, const int32_t* __restrict__ pos,
+    const int64_t* __restrict__ tm, int64_t tm_len, int64_t pad_id,
+    const int64_t* __restrict__ mult, const int64_t* __restrict__ primes,
+    const int64_t* __restrict__ offsets,
+    const uint8_t* const* __restrict__ w_ptrs,
+    const uint8_t* const* __restrict__ s_ptrs,
+    const int64_t* __restrict__ max_rows,
+    uint8_t* __restrict__ out,
+    int64_t num_tokens, int64_t n_tables, int64_t max_ngram,
+    int64_t n_heads, int64_t n_hash_cols,
+    int64_t val_dim, int64_t scl_dim, int64_t packed_dim
+) {
+    if (num_tokens <= 0 || n_tables <= 0 || n_hash_cols <= 0) return;
+    const int max_t = omp_get_max_threads();
+    const int n_threads = (max_t > 16) ? 16 : ((max_t > 0) ? max_t : 1);
+    #pragma omp parallel for schedule(static) num_threads(n_threads)
+    for (int64_t t = 0; t < num_tokens; ++t) {
+        const int64_t r = req_idx[t];
+        const int64_t p = pos[t];
+        const int32_t* req_tokens = token_ids + r * token_ids_stride;
+        int64_t tok[16];
+        bool blk = false;
+        for (int64_t s = 0; s < max_ngram; ++s) {
+            const int64_t lb = p - s;
+            if (lb < 0) blk = true;
+            if (blk) {
+                tok[s] = pad_id;
+            } else {
+                int64_t raw = req_tokens[lb];
+                if (raw < 0) raw = 0;
+                else if (raw >= tm_len) raw = tm_len - 1;
+                tok[s] = tm[raw];
+            }
+        }
+        for (int64_t tbl = 0; tbl < n_tables; ++tbl) {
+            const uint8_t* w_ptr = w_ptrs[tbl];
+            const uint8_t* s_ptr = s_ptrs[tbl];
+            uint8_t* dst = out + (t * n_tables + tbl) * n_hash_cols * packed_dim;
+            if (!w_ptr || !s_ptr) {
+                std::memset(dst, 0, n_hash_cols * packed_dim);
+                continue;
+            }
+            const int64_t max_row = max_rows[tbl];
+            const int64_t* m_row = mult + tbl * max_ngram;
+            const int64_t* p_tbl = primes + tbl * (max_ngram - 1) * n_heads;
+            const int64_t* off_tbl = offsets + tbl * n_hash_cols;
+            int64_t roll = static_cast<int64_t>(
+                static_cast<uint64_t>(tok[0]) * static_cast<uint64_t>(m_row[0])
+            );
+            int32_t h_arr[64];
+            int64_t col = 0;
+            for (int64_t i = 1; i < max_ngram; ++i) {
+                const int64_t prod = static_cast<int64_t>(
+                    static_cast<uint64_t>(tok[i]) * static_cast<uint64_t>(m_row[i])
+                );
+                roll ^= prod;
+                const int64_t* p_row = p_tbl + (i - 1) * n_heads;
+                for (int64_t hd = 0; hd < n_heads; ++hd, ++col) {
+                    const int64_t pv = p_row[hd];
+                    int64_t rem = roll % pv;
+                    if (rem < 0) rem += pv;
+                    h_arr[col] = static_cast<int32_t>(rem + off_tbl[col]);
+                }
+            }
+            if (h_arr[0] < 0) {
+                std::memset(dst, 0, n_hash_cols * packed_dim);
+                continue;
+            }
+            const int64_t init_pf = (n_hash_cols < 4) ? n_hash_cols : 4;
+            for (int64_t c0 = 0; c0 < init_pf; ++c0) {
+                int64_t h_pf = h_arr[c0];
+                if (h_pf >= 0) {
+                    if (h_pf > max_row) h_pf = max_row;
+                    const uint8_t* wp = w_ptr + h_pf * val_dim;
+                    for (int64_t o = 0; o < val_dim; o += 64)
+                        __builtin_prefetch(wp + o, 0, 1);
+                    __builtin_prefetch(s_ptr + h_pf * scl_dim, 0, 1);
+                }
+            }
+            for (int64_t c0 = 0; c0 < n_hash_cols; ++c0, dst += packed_dim) {
+                if (c0 + 4 < n_hash_cols) {
+                    int64_t h_pf = h_arr[c0 + 4];
+                    if (h_pf >= 0) {
+                        if (h_pf > max_row) h_pf = max_row;
+                        const uint8_t* wp = w_ptr + h_pf * val_dim;
+                        for (int64_t o = 0; o < val_dim; o += 64)
+                            __builtin_prefetch(wp + o, 0, 1);
+                        __builtin_prefetch(s_ptr + h_pf * scl_dim, 0, 1);
+                    }
+                }
+                int64_t h = h_arr[c0];
+                h = h < 0 ? 0 : (h > max_row ? max_row : h);
+                std::memcpy(dst, w_ptr + h * val_dim, val_dim);
+                std::memcpy(dst + val_dim, s_ptr + h * scl_dim, scl_dim);
+            }
+        }
+    }
+}
 """
 
 _ENGRAM_GATHER_FLAGS = ["-O3", "-march=native", "-fopenmp", "-shared", "-fPIC"]
@@ -432,6 +535,31 @@ def _get_engram_gather_lib() -> ctypes.CDLL | None:
         return None
     lib.engram_gather_omp.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int64] * 6
     lib.engram_gather_omp.restype = None
+    lib.engram_hash_and_gather_omp.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+    ]
+    lib.engram_hash_and_gather_omp.restype = None
     return lib
 
 
@@ -454,14 +582,7 @@ def _next_host_buf(nbytes: int, row_span: int) -> torch.Tensor:
     return buf
 
 
-def _gather_into(
-    lib: ctypes.CDLL,
-    hashes: np.ndarray,
-    table_ids: list[int],
-    packed_dim: int,
-    out: torch.Tensor,
-) -> None:
-    num_tokens, n_tables, n_hash_cols = hashes.shape
+def _get_table_ptrs(table_ids: list[int], n_tables: int):
     key = tuple(table_ids)
     cached = _ENGRAM_PTRS_CACHE.get(key)
     if cached is None:
@@ -479,7 +600,18 @@ def _gather_into(
         cached = (w_ptrs, s_ptrs, max_rows, val_dim, scl_dim)
         if all(p is not None for p in pairs):
             _ENGRAM_PTRS_CACHE[key] = cached
-    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = cached
+    return cached
+
+
+def _gather_into(
+    lib: ctypes.CDLL,
+    hashes: np.ndarray,
+    table_ids: list[int],
+    packed_dim: int,
+    out: torch.Tensor,
+) -> None:
+    num_tokens, n_tables, n_hash_cols = hashes.shape
+    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = _get_table_ptrs(table_ids, n_tables)
     lib.engram_gather_omp(
         hashes.ctypes.data,
         w_ptrs,
@@ -488,6 +620,58 @@ def _gather_into(
         out.data_ptr(),
         num_tokens,
         n_tables,
+        n_hash_cols,
+        val_dim,
+        scl_dim,
+        packed_dim,
+    )
+
+
+def _hash_and_gather_into(
+    lib: ctypes.CDLL,
+    hash_state: TpuNgramHashState,
+    token_ids: np.ndarray,
+    req_idx: np.ndarray,
+    pos: np.ndarray,
+    table_ids: list[int],
+    packed_dim: int,
+    out: torch.Tensor,
+) -> None:
+    num_tokens = int(pos.shape[0])
+    n_tables = len(table_ids)
+    max_ngram = int(hash_state.layout.max_ngram_size)
+    n_heads = int(hash_state.layout.n_heads)
+    n_hash_cols = int(hash_state.offsets.shape[1])
+    w_ptrs, s_ptrs, max_rows, val_dim, scl_dim = _get_table_ptrs(table_ids, n_tables)
+    req_c = (
+        req_idx
+        if (req_idx.dtype == np.int32 and req_idx.flags.c_contiguous)
+        else np.ascontiguousarray(req_idx, dtype=np.int32)
+    )
+    pos_c = (
+        pos
+        if (pos.dtype == np.int32 and pos.flags.c_contiguous)
+        else np.ascontiguousarray(pos, dtype=np.int32)
+    )
+    lib.engram_hash_and_gather_omp(
+        token_ids.ctypes.data,
+        int(token_ids.shape[1]),
+        req_c.ctypes.data,
+        pos_c.ctypes.data,
+        hash_state._token_map_np.ctypes.data,
+        int(hash_state._token_map_np.shape[0]),
+        int(hash_state.pad_id),
+        hash_state._mult_np.ctypes.data,
+        hash_state._primes_np.ctypes.data,
+        hash_state._offsets_np.ctypes.data,
+        w_ptrs,
+        s_ptrs,
+        max_rows,
+        out.data_ptr(),
+        num_tokens,
+        n_tables,
+        max_ngram,
+        n_heads,
         n_hash_cols,
         val_dim,
         scl_dim,
@@ -509,7 +693,10 @@ def engram_prefetch_prefill(
     global _ENGRAM_PREFETCH
     _ENGRAM_PREFETCH = None
     lib = _get_engram_gather_lib()
-    if lib is None or not known.any():
+    if lib is None:
+        return
+    all_known_global = bool(known.all())
+    if not all_known_global and not known.any():
         return
     num_tokens = int(pos.shape[0])
     n_tables = len(table_ids)
@@ -526,41 +713,67 @@ def engram_prefetch_prefill(
         t_end = t_start + t_per_rank
         n_real_local = max(0, min(num_tokens, t_end) - t_start)
         known_local = known[t_start : t_start + n_real_local]
-        if n_real_local > 0 and not known_local.any():
+        all_known_local = bool(known_local.all())
+        if n_real_local > 0 and not all_known_local and not known_local.any():
             return
         buf = _next_host_buf(t_per_rank * row_bytes, row_bytes)
         if n_real_local > 0:
-            hashes_local = np.full(
-                (n_real_local, n_tables, n_hash_cols), -1, dtype=np.int32
-            )
             req_local = req_idx[t_start : t_start + n_real_local]
             pos_local = pos[t_start : t_start + n_real_local]
-            hashes_local[known_local] = hash_state.cpu_hashes(
-                token_ids, req_local[known_local], pos_local[known_local]
-            )
-            _gather_into(lib, hashes_local, table_ids, packed_dim, buf)
+            if (
+                all_known_local
+                and token_ids.dtype == np.int32
+                and token_ids.flags.c_contiguous
+            ):
+                _hash_and_gather_into(
+                    lib,
+                    hash_state,
+                    token_ids,
+                    req_local,
+                    pos_local,
+                    table_ids,
+                    packed_dim,
+                    buf,
+                )
+            else:
+                hashes_local = np.full(
+                    (n_real_local, n_tables, n_hash_cols), -1, dtype=np.int32
+                )
+                hashes_local[known_local] = hash_state.cpu_hashes(
+                    token_ids, req_local[known_local], pos_local[known_local]
+                )
+                _gather_into(lib, hashes_local, table_ids, packed_dim, buf)
         _ENGRAM_PREFETCH = {
             "key": tuple(table_ids),
             "sharded": True,
             "t_per_rank": t_per_rank,
             "num_tokens": n_real_local,
-            "known": known_local.copy(),
-            "all_known": bool(known_local.all()),
+            "known": None if all_known_local else known_local.copy(),
+            "all_known": all_known_local,
             "buf": buf,
             "row_bytes": row_bytes,
         }
         return
 
-    hashes = np.full((num_tokens, n_tables, n_hash_cols), -1, dtype=np.int32)
-    hashes[known] = hash_state.cpu_hashes(token_ids, req_idx[known], pos[known])
     alloc_tokens = max(num_tokens, padded_tokens)
     buf = _next_host_buf(alloc_tokens * row_bytes, row_bytes)
-    _gather_into(lib, hashes, table_ids, packed_dim, buf)
+    if (
+        all_known_global
+        and token_ids.dtype == np.int32
+        and token_ids.flags.c_contiguous
+    ):
+        _hash_and_gather_into(
+            lib, hash_state, token_ids, req_idx, pos, table_ids, packed_dim, buf
+        )
+    else:
+        hashes = np.full((num_tokens, n_tables, n_hash_cols), -1, dtype=np.int32)
+        hashes[known] = hash_state.cpu_hashes(token_ids, req_idx[known], pos[known])
+        _gather_into(lib, hashes, table_ids, packed_dim, buf)
     _ENGRAM_PREFETCH = {
         "key": tuple(table_ids),
         "num_tokens": num_tokens,
-        "known": known.copy(),
-        "all_known": bool(known.all()),
+        "known": None if all_known_global else known.copy(),
+        "all_known": all_known_global,
         "buf": buf,
         "row_bytes": row_bytes,
     }
