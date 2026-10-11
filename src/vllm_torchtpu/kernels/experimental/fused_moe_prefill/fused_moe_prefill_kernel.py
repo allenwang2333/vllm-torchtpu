@@ -34,6 +34,7 @@ grouped GEMM path writes BF16 there too). Router top-k stays with the caller.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -81,6 +82,23 @@ def _cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _byte_transpose4(a):
+    """Byte t of result j is byte j of a[t], for four u32 arrays: a 4x4 byte
+    transpose per element, by shifts and masks only."""
+    lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+    even8, odd8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+    b0 = (a[0] & lo16) | (a[2] << 16)
+    b2 = (a[0] >> 16) | (a[2] & hi16)
+    b1 = (a[1] & lo16) | (a[3] << 16)
+    b3 = (a[1] >> 16) | (a[3] & hi16)
+    return (
+        (b0 & even8) | ((b1 & even8) << 8),
+        ((b0 >> 8) & even8) | (b1 & odd8),
+        (b2 & even8) | ((b3 & even8) << 8),
+        ((b2 >> 8) & even8) | (b3 & odd8),
+    )
+
+
 def _tile_rows(tokens):
     """Tile height for a token count. Every tile pays a fixed cost (index
     window, scale window, waits), so tall tiles win once experts hold a few
@@ -103,6 +121,21 @@ def _build_expert_kernel(
     scale_window = tile_rows // _LANES + 1
     rungs = [tile_rows * (r + 1) // _TILE_RUNGS for r in range(_TILE_RUNGS)]
     lane_blocks = h // _LANES
+    # Layouts the tile body can move as whole u32 words (compute below): 8-bit
+    # rows whose lane blocks come in fours, at rung heights of whole 32-row
+    # tiles, for the lhs; pairs of bf16 lane blocks, at rung heights of whole
+    # 8-row tiles, for the slab rows. The lhs loads have sublane stride L, and
+    # libtpu splits a strided load into gcd(stride, 32) / 4 loads (at least
+    # one) to avoid VMEM bank conflicts: 4 at L = 48, but 8 one-sublane loads
+    # at L = 32 (h = 4096), more bundles than the retile they replace, so L
+    # that are multiples of 32 keep the retile.
+    lhs_from_words = (
+        jnp.dtype(weight_dtype).itemsize == 1
+        and lane_blocks % 4 == 0
+        and tile_rows % (4 * _TILE_RUNGS * 8) == 0
+        and math.gcd(lane_blocks, 32) <= 16
+    )
+    out_by_pairs = lane_blocks % 2 == 0 and tile_rows % (8 * _TILE_RUNGS) == 0
     shared = experts  # visit-table id of the shared expert
     slab_rows = routes + tokens + tile_rows
     scale_rows = _cdiv(slab_rows, _LANES) + 1
@@ -412,11 +445,37 @@ def _build_expert_kernel(
                 out_wait(p, n_prev)
 
             def compute(rows, w1, w2, w1_scale, w2_scale):
-                # Retile the gathered rows ([rows, L, 128] blocks) into the
-                # matmul layout [rows, h] as bf16, then cast back: cheaper than
-                # retiling the packed fp8 value, and both casts are exact.
-                act = act_vmem[aslot, pl.ds(0, rows)].astype(jnp.bfloat16)
-                act = act.reshape(rows, h).astype(weight_dtype)
+                if lhs_from_words:
+                    # The matmul's 8-bit layout packs 4 consecutive rows into
+                    # each u32 word (row 4s + t in byte t of sublane s). A
+                    # gathered row is L / 4 u32 word-rows, word-row k packing
+                    # lane blocks 4k..4k+3 (block 4k + j in byte j). So load
+                    # rows t, t + 4, ... of word-row k with one sublane-strided
+                    # load per t and transpose bytes across the four loads:
+                    # the gathered bytes as they are, no relayout, no casts.
+                    wpr = lane_blocks // 4
+                    a32 = (
+                        act_vmem.at[aslot]
+                        .bitcast(jnp.uint32)
+                        .reshape(tile_rows * wpr, _LANES)
+                    )
+                    blocks = []
+                    for k in range(wpr):
+                        quads = [
+                            a32[pl.ds(t * wpr + k, rows // 4, stride=4 * wpr)]
+                            for t in range(4)
+                        ]
+                        blocks += [
+                            pltpu.bitcast(b, weight_dtype)
+                            for b in _byte_transpose4(quads)
+                        ]
+                    act = jnp.concatenate(blocks, axis=1)
+                else:
+                    # Retile the gathered rows ([rows, L, 128] blocks) into the
+                    # matmul layout [rows, h] as bf16, then cast back: cheaper
+                    # than retiling the packed fp8 value; both casts are exact.
+                    act = act_vmem[aslot, pl.ds(0, rows)].astype(jnp.bfloat16)
+                    act = act.reshape(rows, h).astype(weight_dtype)
                 act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
                 # expert_ffn_fp8 up to its down matmul, which runs in the store
                 # branch below. The weights are refs, loaded where they are used.
@@ -440,13 +499,38 @@ def _build_expert_kernel(
                         acc2 = lax.dot_general(
                             mid_q, w2[...], DN, preferred_element_type=jnp.float32
                         )
-                        # Retile into the per-row slab layout while still f32
-                        # (8x8 sublane blocks), then pack to bf16: cheaper than
-                        # retiling the packed bf16 value.
-                        out = (acc2 * mid_scale * w2_scale[...]).reshape(
-                            rows, lane_blocks, _LANES
-                        )
-                        out_vmem[par, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
+                        out = acc2 * mid_scale * w2_scale[...]
+                        if out_by_pairs:
+                            # Store straight into the per-row slab layout. In a
+                            # u32 view of out_vmem[par], word-row r * L/2 + q
+                            # holds lane blocks 2q (low half) and 2q + 1 (high
+                            # half) of row r: pack each pair to bf16 elementwise
+                            # and store it with one sublane-strided store per 8
+                            # rows. Same products and rounding, no relayout.
+                            half = lane_blocks // 2
+                            out32 = (
+                                out_vmem.at[par]
+                                .bitcast(jnp.uint32)
+                                .reshape(tile_rows * half, _LANES)
+                            )
+                            for q in range(half):
+                                pair = [
+                                    out[
+                                        :,
+                                        (2 * q + j) * _LANES : (2 * q + j + 1) * _LANES,
+                                    ]
+                                    for j in range(2)
+                                ]
+                                out32[pl.ds(q, rows, stride=half)] = (
+                                    pltpu.pack_elementwise(
+                                        pair, packed_dtype=jnp.bfloat16
+                                    )
+                                )
+                        else:
+                            # Retile into the per-row slab layout while still
+                            # f32 (8x8 sublane blocks), then pack to bf16.
+                            out = out.reshape(rows, lane_blocks, _LANES)
+                            out_vmem[par, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
 
             def compute_visit(rows):
                 @pl.when(is_shared(v))
