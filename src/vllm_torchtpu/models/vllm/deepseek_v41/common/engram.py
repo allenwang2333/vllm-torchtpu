@@ -7,6 +7,7 @@ its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 
 import dataclasses
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
@@ -187,11 +188,7 @@ class NgramHashState(upstream.NgramHashState):
             lookback_dead_mask[:active_reqs, :depth], dtype=np.bool_
         )
         hashed, rows, padded, batch, terms = tables._ensure_scratch(count)
-        reqs = np.minimum(
-            np.searchsorted(qsl_np[1:], rows, side="right"),
-            active_reqs - 1,
-        )
-        starts = np.minimum(qsl_np[reqs], count - 1)
+        reqs, starts = tables.request_rows(qsl_np, rows, count, active_reqs)
         # Offset of each token from its request's first chunk position; the
         # n-gram source `shift` back is in the chunk iff shift <= offset.
         offset = pos_np - pos_np[starts]
@@ -207,7 +204,7 @@ class NgramHashState(upstream.NgramHashState):
         # (pad_id when unknown), and column `depth` is pad_id for sources
         # beyond the window. Source `shift` of a token at chunk offset `o`
         # reads column shift - o - 1.
-        window_table = np.empty((active_reqs, depth + 1), dtype=tables.token_map.dtype)
+        window_table = tables.window_table(active_reqs, depth)
         wt_cols = window_table[:, :depth]
         np.take(tables.token_map, lb_np, out=wt_cols, mode="clip")
         wt_cols[lb_dead_np] = upstream.DEAD_ID
@@ -233,14 +230,19 @@ class NgramHashState(upstream.NgramHashState):
         # The int64 bucket ids reuse one scratch buffer: a fresh array of this
         # size is page-faulted in on every call otherwise.
         np.remainder(rolled[:, :, None, :], tables.primes, out=hashed)
-        hashed += tables.offsets
-        # Back to the device path's [T, layers, heads] layout in one
-        # narrowing copy.
-        return torch.from_numpy(
-            hashed.reshape(layers, -1, count)
-            .transpose(2, 0, 1)
-            .astype(np.int32, order="C")
+        # Add the table offsets while narrowing straight into the device
+        # path's [T, layers, heads] layout: one pass instead of an in-place
+        # int64 add plus a transposing astype copy (95 + 211 us at T=1152).
+        # The result is a fresh array each call: callers keep the tensor.
+        heads = hashed.shape[2]
+        out = np.empty((count, layers, (ngram - 1) * heads), dtype=np.int32)
+        np.add(
+            hashed,
+            tables.offsets,
+            out=out.reshape(count, layers, ngram - 1, heads).transpose(1, 2, 3, 0),
+            casting="unsafe",
         )
+        return torch.from_numpy(out)
 
     def _hash(
         self,
@@ -321,6 +323,7 @@ class _HostHashTables:
     offsets: np.ndarray  # [layers, ngram - 1, heads, 1] int64
     shifts: np.ndarray  # [ngram, 1] int64
     _scratch: list[np.ndarray] = dataclasses.field(default_factory=list)
+    _memo: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_state(cls, state) -> "_HostHashTables":
@@ -359,6 +362,39 @@ class _HostHashTables:
     def scratch(self, count: int) -> np.ndarray:
         """``[layers, ngram - 1, heads, count]`` int64 work buffer, reused."""
         return self._ensure_scratch(count)[0]
+
+    def request_rows(
+        self, qsl_np: np.ndarray, rows: np.ndarray, count: int, active_reqs: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Each token row's request and that request's first chunk row.
+
+        Memoized on the step layout: steady decode repeats the same
+        ``query_start_loc`` (e.g. ``0, 6, ..., 1152``), so the per-row
+        ``searchsorted`` runs only when it changes. Callers only read them.
+        """
+        key = (count, active_reqs, qsl_np.dtype.str, qsl_np.tobytes())
+        cached = self._memo.get("request_rows")
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        reqs = np.minimum(
+            np.searchsorted(qsl_np[1:], rows, side="right"),
+            active_reqs - 1,
+        )
+        starts = np.minimum(qsl_np[reqs], count - 1)
+        self._memo["request_rows"] = (key, reqs, starts)
+        return reqs, starts
+
+    def window_table(self, active_reqs: int, depth: int) -> np.ndarray:
+        """``[active_reqs, depth + 1]`` lookback window buffer, reused.
+
+        ``hash_on_host`` overwrites every entry before reading it.
+        """
+        shape = (active_reqs, depth + 1)
+        table = self._memo.get("window_table")
+        if table is None or table.shape != shape:
+            table = np.empty(shape, dtype=self.token_map.dtype)
+            self._memo["window_table"] = table
+        return table
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -577,15 +613,21 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             indices = indices.to(work_device)
         rows, valid = self._select_local_heads_np(np.asarray(indices))
         flat = rows.reshape(-1)
+        # The uint8 / NumPy views of the storage, rebuilt only when it changes
+        # (every step of all 4 Engram layers otherwise re-creates both).
+        views = getattr(self, "_raw_views", None)
+        if views is None or views[0] is not weight or views[1] is not scales:
+            views = (weight, scales, weight.view(torch.uint8), np.asarray(scales))
+            self._raw_views = views
         torch.index_select(
-            weight.view(torch.uint8),
+            views[2],
             0,
             torch.from_numpy(flat),
             out=raw_out.view(-1, self.dim),
         )
         blocks = self.dim // self.block_size
         scale_dst = np.asarray(scale_out)
-        np.take(np.asarray(scales), flat, axis=0, out=scale_dst.reshape(-1, blocks))
+        np.take(views[3], flat, axis=0, out=scale_dst.reshape(-1, blocks))
         if not valid.all():
             scale_dst[~valid] = _INVALID_SCALE
 
