@@ -82,14 +82,16 @@ def schedule_pairs(q_lens, kv_lens, bq: int, bkv: int) -> int:
     context, with query tile ``bq`` and KV tile ``bkv``: every query block
     attends to the KV blocks up to its own last token. The multi-sequence
     form of `chunk_pairs`."""
-    q = np.asarray(q_lens, dtype=np.int64)
-    kv = np.asarray(kv_lens, dtype=np.int64)
+    # Token counts and KV lengths are < 2**31; int32 keeps the [reqs, blocks]
+    # temporaries half-width (``sum`` still accumulates in the platform int).
+    q = np.asarray(q_lens, dtype=np.int32)
+    kv = np.asarray(kv_lens, dtype=np.int32)
     keep = q > 0
     q, kv = q[keep], kv[keep]
     if q.size == 0:
         return 0
     blocks = -(-q // bq)
-    i = np.arange(int(blocks.max()))
+    i = np.arange(int(blocks.max()), dtype=np.int32)
     q_end = np.minimum((i[None, :] + 1) * bq, q[:, None])
     k_end = -(-(kv[:, None] - q[:, None] + q_end) // bkv)
     return int(np.where(i[None, :] < blocks[:, None], k_end, 0).sum())
