@@ -506,7 +506,7 @@ class PcpSequenceLayoutPlanner:
             return None
 
         local_indices = plan.logits_local_indices_cpu.to(
-            hidden_states.device, non_blocking=True
+            hidden_states.device, dtype=torch.int32, non_blocking=True
         )
         owner_mask = plan.logits_owner_mask_cpu.to(
             hidden_states.device, non_blocking=True

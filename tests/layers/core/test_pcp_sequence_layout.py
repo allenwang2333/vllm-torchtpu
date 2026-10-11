@@ -1237,3 +1237,109 @@ def test_td8279_localize_token_tensor_and_gather_indices_int32_index_select(
             (torch.int32, 0, torch.int32),
             (torch.int32, 0, torch.int32),
         ]
+
+
+def test_td8282_int32_index_select_in_runner_logits_and_pcp_sequence_layout(
+    monkeypatch,
+):
+    from vllm_torchtpu.layers.core import pcp_sequence_layout as pcp_mod
+    from vllm_torchtpu.layers.core.sequence_layout import (
+        create_sequence_layout_planner,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    select_calls = []
+    orig_index_select = torch.index_select
+
+    def spy_index_select(t, dim, index):
+        select_calls.append((t.dtype, dim, index.dtype))
+        return orig_index_select(t, dim, index)
+
+    monkeypatch.setattr(torch, "index_select", spy_index_select)
+    monkeypatch.setattr(pcp_mod, "_pcp_all_reduce_sum", lambda x: x)
+
+    pcp_vllm_cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            cp_kv_cache_interleave_size=16,
+            decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    planner = create_sequence_layout_planner(pcp_vllm_cfg)
+    plan = SimpleNamespace(
+        logits_local_indices_cpu=torch.tensor([2, 0], dtype=torch.int64),
+        logits_owner_mask_cpu=torch.tensor([True, False], dtype=torch.bool),
+    )
+    hs = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    select_calls.clear()
+    out_hs = planner.maybe_select_logits_hidden_states(
+        hs, plan, torch.tensor([0, 1], dtype=torch.int64)
+    )
+    assert out_hs is not None
+    assert out_hs.tolist() == [[5.0, 6.0], [0.0, 0.0]]
+    assert select_calls == [(torch.float32, 0, torch.int32)]
+
+    runner = object.__new__(TPUModelRunner)
+    runner.is_pooling_model = False
+    runner.model = SimpleNamespace(
+        lm_head="head",
+        compute_logits=lambda x: x * 2.0,
+        logits_processor=SimpleNamespace(
+            get_top_tokens=lambda _h, x: x[:, 0].to(torch.int64)
+        ),
+    )
+    idx_i64 = torch.tensor([2, 0], dtype=torch.int64)
+
+    select_calls.clear()
+    sel_logits = TPUModelRunner.compute_selected_logits.__wrapped__(runner, hs, idx_i64)
+    assert sel_logits.tolist() == [[10.0, 12.0], [2.0, 4.0]]
+    assert select_calls == [(torch.float32, 0, torch.int32)]
+
+    select_calls.clear()
+    sel_top = TPUModelRunner.compute_selected_top_tokens.__wrapped__(
+        runner, hs, idx_i64
+    )
+    assert sel_top.tolist() == [5, 1]
+    assert select_calls == [(torch.float32, 0, torch.int32)]
+
+    bonus_idx = torch.tensor([2], dtype=torch.int64)
+    target_idx = torch.tensor([0, 1], dtype=torch.int64)
+
+    select_calls.clear()
+    b_ids_1d, t_ids_1d = TPUModelRunner.spec_bonus_and_target_logits.__wrapped__(
+        runner,
+        torch.tensor([10, 20, 30], dtype=torch.int64),
+        bonus_idx,
+        target_idx,
+    )
+    assert b_ids_1d.dtype == torch.int32 and b_ids_1d.tolist() == [30]
+    assert t_ids_1d.dtype == torch.int32 and t_ids_1d.tolist() == [10, 20]
+    assert select_calls == [
+        (torch.int32, 0, torch.int32),
+        (torch.int32, 0, torch.int32),
+    ]
+
+    select_calls.clear()
+    logits_2d = torch.tensor([[0.1, 0.9], [0.8, 0.2], [0.3, 0.7]], dtype=torch.float32)
+    b_ids_2d, t_ids_2d = TPUModelRunner.spec_bonus_and_target_logits.__wrapped__(
+        runner, logits_2d, bonus_idx, target_idx
+    )
+    assert b_ids_2d.dtype == torch.int32 and b_ids_2d.tolist() == [1]
+    assert t_ids_2d.dtype == torch.int32 and t_ids_2d.tolist() == [1, 0]
+    assert select_calls == [
+        (torch.int32, 0, torch.int32),
+        (torch.int32, 0, torch.int32),
+    ]
+
+    select_calls.clear()
+    b_log, t_log = TPUModelRunner.spec_gather_bonus_and_target_logits.__wrapped__(
+        runner, logits_2d, bonus_idx, target_idx
+    )
+    assert torch.equal(b_log, logits_2d[[2]])
+    assert torch.equal(t_log, logits_2d[[0, 1]])
+    assert select_calls == [
+        (torch.float32, 0, torch.int32),
+        (torch.float32, 0, torch.int32),
+    ]

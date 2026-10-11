@@ -7577,14 +7577,14 @@ class TPUModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         if self.is_pooling_model:
             return torch.empty((0,), device=hidden_states.device)
-        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        selected = torch.index_select(hidden_states, 0, indices_do_sample.int())
         return self.model.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
-        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        selected = torch.index_select(hidden_states, 0, indices_do_sample.int())
         return self.model.logits_processor.get_top_tokens(self.model.lm_head, selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7612,11 +7612,13 @@ class TPUModelRunner(GPUModelRunner):
         # token IDs (from compute_selected_top_tokens) or 2D [num_tokens,
         # vocab_size] logits, and gather 1D bonus_token_ids and target_token_ids
         # in ONE compiled region keyed on [num_tokens, num_reqs] shapes.
-        token_ids = logits if logits.ndim == 1 else torch.argmax(logits, dim=-1)
-        bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices)
-        target_token_ids = torch.index_select(token_ids, 0, target_logits_indices).to(
-            torch.int32
+        token_ids = (
+            logits.to(torch.int32)
+            if logits.ndim == 1
+            else torch.argmax(logits, dim=-1).to(torch.int32)
         )
+        bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices.int())
+        target_token_ids = torch.index_select(token_ids, 0, target_logits_indices.int())
         return bonus_token_ids, target_token_ids
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7634,8 +7636,8 @@ class TPUModelRunner(GPUModelRunner):
         # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
         # with the live per-step dispatch into per-context programs (cold
         # recompiles).index_select is value-identical to logits[indices].
-        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        bonus_logits = torch.index_select(logits, 0, bonus_logits_indices.int())
+        target_logits = torch.index_select(logits, 0, target_logits_indices.int())
         return bonus_logits, target_logits
 
     def _apply_temperature(
