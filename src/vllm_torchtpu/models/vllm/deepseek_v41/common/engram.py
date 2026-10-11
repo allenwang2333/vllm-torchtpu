@@ -185,7 +185,7 @@ class NgramHashState(upstream.NgramHashState):
         depth = int(self.lookback_depth)
         pad_id = int(self.pad_id)
         ids_np = np.asarray(input_ids)
-        pos_np = np.asarray(positions, dtype=np.int64)
+        pos_np = np.asarray(positions, dtype=np.int32)
         qsl_np = np.asarray(query_start_loc)
         dead_np = np.asarray(dead_mask, dtype=np.bool_)
         max_req_rows = max(1, qsl_np.shape[0] - (1 if int(qsl_np[-1]) >= count else 0))
@@ -349,7 +349,7 @@ class _HostHashTables:
     multipliers: np.ndarray  # [layers, ngram] int64
     primes: np.ndarray  # [layers, ngram - 1, heads, 1] int64
     offsets: np.ndarray  # [layers, ngram - 1, heads, 1] int64
-    shifts: np.ndarray  # [ngram, 1] int64
+    shifts: np.ndarray  # [ngram, 1] int32
     _scratch: list[np.ndarray] = dataclasses.field(default_factory=list)
     _memo: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -365,7 +365,7 @@ class _HostHashTables:
             multipliers=multipliers,
             primes=primes_4d,
             offsets=np.ascontiguousarray(offsets.reshape(primes_4d.shape)),
-            shifts=np.arange(multipliers.shape[1], dtype=np.int64)[:, None],
+            shifts=np.arange(multipliers.shape[1], dtype=np.int32)[:, None],
         )
 
     def _ensure_scratch(
@@ -374,7 +374,7 @@ class _HostHashTables:
         if not self._scratch or self._scratch[0].shape[-1] != count:
             layers, ngram = self.multipliers.shape
             hashed = np.empty((*self.primes.shape[:3], count), dtype=np.int64)
-            rows = np.arange(count, dtype=np.int64)
+            rows = np.arange(count, dtype=np.int32)
             padded = np.empty(count + ngram - 1, dtype=self.token_map.dtype)
             batch = np.lib.stride_tricks.sliding_window_view(padded, count)[::-1]
             terms = np.empty((layers, ngram, count), dtype=np.int64)
@@ -411,12 +411,13 @@ class _HostHashTables:
         cached = self._memo.get("request_rows")
         if cached is not None and cached[0] == key:
             return cached[1], cached[2], cached[3]
+        qsl_i32 = np.asarray(qsl_np, dtype=np.int32)
         reqs = np.minimum(
-            np.searchsorted(qsl_np[1:], rows, side="right"),
+            np.searchsorted(qsl_i32[1:], rows, side="right"),
             active_reqs - 1,
-        )
-        starts = np.minimum(qsl_np[reqs], count - 1)
-        req_base = reqs[None, :] * (depth + 1)
+        ).astype(np.int32, copy=False)
+        starts = np.minimum(qsl_i32[reqs], np.int32(count - 1))
+        req_base = reqs[None, :] * np.int32(depth + 1)
         self._memo["request_rows"] = (key, reqs, starts, req_base)
         return reqs, starts, req_base
 
@@ -424,13 +425,13 @@ class _HostHashTables:
         self, count: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Reused ``[ngram, count]`` buffers for ``hash_on_host``'s source
-        selection: (cols int64, in_chunk bool, source token-map dtype,
+        selection: (cols int32, in_chunk bool, source token-map dtype,
         blocked bool, scratch bool). Overwritten on every call."""
         bufs = self._memo.get("work")
         if bufs is None or bufs[0].shape[1] != count:
             shape = (self.multipliers.shape[1], count)
             bufs = (
-                np.empty(shape, dtype=np.int64),
+                np.empty(shape, dtype=np.int32),
                 np.empty(shape, dtype=np.bool_),
                 np.empty(shape, dtype=self.token_map.dtype),
                 np.empty(shape, dtype=np.bool_),
@@ -646,8 +647,12 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         """``_select_local_heads`` for host (NumPy) hash ids."""
         start = min(self.head_start, self.n_hash_cols)
         end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        selected = indices[:, start:end] - np.int64(self.vocab_start_idx)
-        valid = selected.view(np.uint64) < (self.vocab_end_idx - self.vocab_start_idx)
+        selected = indices[:, start:end].astype(np.int32, copy=False) - np.int32(
+            self.vocab_start_idx
+        )
+        valid = selected.view(np.uint32) < np.uint32(
+            self.vocab_end_idx - self.vocab_start_idx
+        )
         pad = self.part_n_hash_cols - (end - start)
         if pad:
             selected = np.pad(selected, ((0, 0), (0, pad)))

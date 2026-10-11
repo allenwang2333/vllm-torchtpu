@@ -180,7 +180,7 @@ def test_td8248_work_buffers_are_reused_per_count():
     first = tables.work(12)
     assert [b.shape for b in first] == [(4, 12)] * 5
     assert [b.dtype for b in first] == [
-        np.dtype(np.int64),
+        np.dtype(np.int32),
         np.dtype(np.bool_),
         tables.token_map.dtype,
         np.dtype(np.bool_),
@@ -198,3 +198,58 @@ def test_td8248_select_local_heads_np_clamps_in_place():
     rows, valid = emb._select_local_heads_np(indices)
     assert rows.tolist() == [[5, 99, 0], [0, 99, 0]]
     assert valid.tolist() == [[True, False, False], [False, True, False]]
+
+
+def test_td8294_host_hash_and_select_local_heads_np_int32_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = _state(seed=7)
+    tables = ce._HostHashTables.from_state(state)
+    assert tables.shifts.dtype == np.int32
+    _, rows, _, _, _ = tables._ensure_scratch(12)
+    assert rows.dtype == np.int32
+    qsl_i64 = np.array([0, 6, 12], dtype=np.int64)
+    reqs, starts, req_base = tables.request_rows(qsl_i64, rows, 12, 2, 3)
+    assert reqs.dtype == np.int32
+    assert starts.dtype == np.int32
+    assert req_base.dtype == np.int32
+    cols, _, _, _, _ = tables.work(12)
+    assert cols.dtype == np.int32
+
+    emb, _ = _embedding(
+        torch.arange(100 * 32, dtype=torch.int32)
+        .remainder(251)
+        .to(torch.uint8)
+        .reshape(100, 32),
+        torch.arange(200, dtype=torch.int32)
+        .remainder(250)
+        .to(torch.uint8)
+        .reshape(100, 2),
+    )
+    emb.vocab_start_idx = 10
+    emb.vocab_end_idx = 110
+    for idx_dtype in (np.int32, np.int64):
+        idx_np = np.array([[10, 50, 120, 5], [9, 109, 110, -3]], dtype=idx_dtype)
+        sel_rows, sel_valid = emb._select_local_heads_np(idx_np)
+        assert sel_rows.dtype == np.int32
+        assert sel_valid.dtype == np.bool_
+        assert sel_rows.tolist() == [[0, 40], [0, 99]]
+        assert sel_valid.tolist() == [[True, True], [False, True]]
+
+    # Verify gather_raw passes torch.int32 index tensor to torch.index_select
+    seen_index_dtypes: list[torch.dtype] = []
+    orig_index_select = torch.index_select
+
+    def spy_index_select(input_t, dim, index_t, *, out=None):
+        seen_index_dtypes.append(index_t.dtype)
+        return orig_index_select(input_t, dim, index_t, out=out)
+
+    monkeypatch.setattr(torch, "index_select", spy_index_select)
+    raw_out = torch.zeros((2, 2, 32), dtype=torch.uint8)
+    scale_out = torch.zeros((2, 2, 2), dtype=torch.uint8)
+    emb.gather_raw(
+        torch.tensor([[10, 50, 120, 5], [9, 109, 110, -3]], dtype=torch.int64),
+        raw_out,
+        scale_out,
+    )
+    assert seen_index_dtypes == [torch.int32]
