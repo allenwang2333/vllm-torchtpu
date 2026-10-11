@@ -398,7 +398,7 @@ def _reference_markov_chain(logits_full, w1, w2, ids_3d, org_vocab, sample_start
     out = []
     for i in range(sample_start, block_size):
         bias = (w1[prev] @ w2.t())[:, :org_vocab]
-        step = (logits_full[:, i] + bias).argmax(dim=-1)
+        step = (logits_full[:, i] + bias).argmax(dim=-1).to(torch.int32)
         out.append(step)
         prev = step
     return torch.stack(out, dim=1)
@@ -469,7 +469,7 @@ def test_sharded_markov_matches_full_vocab_chain(
     assert not errors
     for rank in range(tp_size):
         assert torch.equal(results[rank], expected), rank
-    assert expected.dtype == results[0].dtype == torch.int64
+    assert expected.dtype == results[0].dtype == torch.int32
 
 
 def test_sharded_markov_padding_mask_and_w2_slice(monkeypatch):
@@ -585,7 +585,7 @@ def test_select_gathered_candidate_prefers_lowest_shard_on_ties():
         [[5.0, 3.0], [2.0, 9.0], [1.0, 1.0], [4.0, 7.0], [5.0, 0.0], [4.0, 8.0]]
     )
     out = DSparkProposer._select_gathered_candidate(gathered, tp_size=3, num_reqs=2)
-    assert out.tolist() == [3, 7] and out.dtype == torch.int64
+    assert out.tolist() == [3, 7] and out.dtype == torch.int32
 
 
 def test_pack_local_candidate_adds_vocab_offset():
@@ -831,3 +831,77 @@ def test_target_aux_capture_layer_mapping(model_type, layer_fields, expected):
         {"model_type": model_type, "dspark_noise_token_id": 7, **layer_fields}
     )
     assert p._target_aux_layer_ids() == expected
+
+
+def test_td8262_int32_markov_and_dflash_draft_tokens(monkeypatch):
+    """TD8.262: Verify Markov sampling steps keep prev in uniform torch.int32
+    across all K steps and both DSpark and DFlash return int32 draft_tokens_chunk."""
+    import torch._dynamo
+
+    from vllm_torchtpu.spec_decode import dspark as dspark_mod
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    vocab, hidden, rank_r, K, num_reqs = 32, 8, 4, 3, 2
+    lm_head_weight = torch.ones((vocab, hidden), dtype=torch.float32)
+    w1 = torch.ones((vocab, rank_r), dtype=torch.float32)
+    w2 = torch.ones((vocab, rank_r), dtype=torch.float32)
+    seen_prev_dtypes: list[torch.dtype] = []
+
+    class _Draft:
+        def model(self, input_ids, positions):
+            return torch.ones((input_ids.shape[0], hidden), dtype=torch.float32)
+
+        def compute_logits(self, h):
+            return h @ lm_head_weight.t()
+
+        compute_draft_logits = compute_logits
+        compute_draft_logits_local = compute_logits
+
+        def markov_embed(self, prev):
+            seen_prev_dtypes.append(prev.dtype)
+            return w1.index_select(0, prev)
+
+        def markov_bias(self, embed):
+            return embed @ w2.t()
+
+        @staticmethod
+        def map_draft_to_target(ids):
+            return ids
+
+    input_ids = torch.zeros(num_reqs * K, dtype=torch.int32)
+    positions = torch.arange(num_reqs * K, dtype=torch.int32)
+
+    p = _make_proposer(dict(_DSPARK_HF, dspark_block_size=K), num_speculative_tokens=K)
+    p.draft_model = _Draft()
+    dspark_fn = torch._dynamo.eval_frame.innermost_fn(
+        DSparkProposer._dflash_forward_and_sample
+    )
+
+    # 1) Replicated Markov path
+    seen_prev_dtypes.clear()
+    rep_tokens, _ = dspark_fn(p, input_ids, positions, K)
+    assert rep_tokens.dtype == torch.int32
+    assert seen_prev_dtypes == [torch.int32] * K
+
+    # 2) Sharded Markov path
+    monkeypatch.setattr(
+        dspark_mod,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: torch.cat([x, x], dim=dim),
+    )
+    p._sharded_markov_tp = 2
+    p._markov_w2_local = w2
+    p._vocab_shard_offset = torch.tensor(0, dtype=torch.int32)
+    p._vocab_shard_mask = None
+    seen_prev_dtypes.clear()
+    sharded_tokens, _ = dspark_fn(p, input_ids, positions, K)
+    assert sharded_tokens.dtype == torch.int32
+    assert seen_prev_dtypes == [torch.int32] * K
+
+    # 3) DFlash base _dflash_forward_and_sample path
+    dflash_fn = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._dflash_forward_and_sample
+    )
+    dflash_tokens, _ = dflash_fn(p, input_ids, positions, K)
+    assert dflash_tokens.dtype == torch.int32
+    assert dflash_tokens.shape == (num_reqs, K - 1)

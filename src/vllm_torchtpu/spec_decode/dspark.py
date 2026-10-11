@@ -270,7 +270,7 @@ class DSparkProposer(DFlashProposer):
             better = scores[r] > best_score
             best_score = torch.where(better, scores[r], best_score)
             best_id = torch.where(better, ids[r], best_id)
-        return best_id.to(torch.int64)
+        return best_id.to(torch.int32)
 
     def _sample_markov_sharded(
         self,
@@ -342,7 +342,7 @@ class DSparkProposer(DFlashProposer):
         for i in range(num_sampled_slots):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_slot_major[i] + bias).argmax(dim=-1)
+                (logits_slot_major[i] + bias).argmax(dim=-1).to(torch.int32)
             )
             draft_tokens.append(step)
             prev = step

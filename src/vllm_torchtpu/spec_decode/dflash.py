@@ -1216,7 +1216,7 @@ class DFlashProposer:
         # 4. Compute draft logits and run greedy argmax sampling inside the XLA graph
         logits = self.draft_model.compute_logits(draft_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size - 1, logits.shape[-1])
-        draft_tokens_chunk = logits_3d.argmax(dim=-1)
+        draft_tokens_chunk = logits_3d.argmax(dim=-1).to(torch.int32)
 
         return draft_tokens_chunk, hidden
 
