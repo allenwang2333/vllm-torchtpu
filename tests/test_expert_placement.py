@@ -42,10 +42,16 @@ MTP_GATE = "mtp.layers.0.mlp.gate.weight"
 @pytest.fixture(autouse=True)
 def _fresh_table(monkeypatch):
     """Every test starts without a table and with the module's cache empty."""
+    from vllm.model_executor.layers.fused_moe import layer as fused_layer
+
     monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT", "")
+    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT_MTP", True)
+    monkeypatch.delenv("TPU_EXPERT_PLACEMENT_MTP", raising=False)
     monkeypatch.setattr(ep, "_DATA", None)
     monkeypatch.setattr(ep, "_DATA_PATH", "")
     monkeypatch.setattr(ep, "_LOGGED", set())
+    monkeypatch.setattr(fused_layer, "_tpu_placement_patch", False, raising=False)
     ep._local_ids.cache_clear()
     yield
     ep._local_ids.cache_clear()
@@ -175,6 +181,7 @@ def test_layer_index_is_anchored_to_the_backbone(name, expected):
 def test_the_mtp_router_and_experts_are_left_alone(tmp_path, monkeypatch):
     path, _ = _table(tmp_path)
     _use(monkeypatch, path)
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT_MTP", False)
     w = torch.arange(4.0).reshape(4, 1)
     assert ep.permute_router_rows(MTP_GATE, w) is w
     assert not ep.placed(MTP_PREFIX)
@@ -187,6 +194,7 @@ def test_loader_filter_keeps_the_placement_experts_and_the_mtp_contiguous_set(
 ):
     path, order = _table(tmp_path)
     _use(monkeypatch, path)
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT_MTP", False)
     monkeypatch.setattr(mlp, "_ep_rank", lambda: 1)
     contiguous = {2, 3}
     kept = {
@@ -267,12 +275,77 @@ def test_apply_expert_map_leaves_the_mtp_layer_on_the_contiguous_map(
 ):
     path, _ = _table(tmp_path)
     _use(monkeypatch, path)
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT_MTP", False)
     mgr = _Manager(1)
     before = mgr._expert_map.clone()
     assert not ep.apply_expert_map(mgr, MTP_PREFIX)
     assert mgr._local_num_experts == 2
     assert torch.equal(mgr._expert_map, before)
     assert mgr._tpu_expert_map_host == [-1, -1, 0, 1]
+
+
+def test_mtp_layer_is_placed_with_copies_when_enabled(monkeypatch):
+    from vllm.compilation import backends
+
+    c112 = DATA / "expert_placement_tp8_ep8_agentx_corr_c112_mk2p.json"
+    _use(monkeypatch, c112)
+    assert ep.mtp_enabled()
+    assert ep.placed(MTP_PREFIX)
+    assert ep.layer_index(MTP_PREFIX) == 59
+    assert ep.layer_index(MTP_GATE) == 59
+    assert ep.layer_index(MTP_NAME.format(e=5)) == 59
+    assert ep.slots() == 78 and ep.owned() == 64
+
+    w = torch.arange(512.0).reshape(512, 1)
+    out = ep.permute_router_rows(MTP_GATE, w)
+    assert out[:, 0].tolist() == [float(e) for e in ep.virtual_order(59)]
+
+    monkeypatch.setattr(mlp, "_ep_rank", lambda: 3)
+    kept_mtp = {
+        e for e in range(512) if not mlp._should_skip(MTP_NAME.format(e=e), set())
+    }
+    assert kept_mtp == set(ep.local_ids(59, 3))
+    assert len(kept_mtp) == 78
+
+    mgr = _Manager(rank=3, ranks=8, experts=512)
+    assert ep.apply_expert_map(mgr, MTP_PREFIX)
+    assert mgr._local_num_experts == 78
+    assert mgr._expert_map.tolist() == ep.expert_map(59, 3)
+
+    monkeypatch.setenv("TPU_MOE_LOWTOK", "1")
+    monkeypatch.setattr(backends, "model_tag", "eagle_head")
+    monkeypatch.setattr(lowtok_scores, "_LAYERS", [])
+    layer = SimpleNamespace(
+        renormalize=True,
+        scoring_func="softmax",
+        custom_routing_function=None,
+        use_grouped_topk=False,
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0,
+        apply_router_weight_on_input=False,
+        w13_bias=None,
+        w2_bias=None,
+        layer_name=MTP_PREFIX,
+        global_num_experts=512,
+        moe_config=SimpleNamespace(
+            experts_per_token=10,
+            ep_size=8,
+            ep_rank=3,
+            in_dtype=torch.bfloat16,
+            moe_parallel_config=SimpleNamespace(use_ep=True),
+        ),
+        hidden_size=4096,
+        w13_weight=torch.empty(78, 4096, 2048, dtype=torch.float8_e4m3fn),
+        w2_weight=torch.empty(78, 1024, 4096, dtype=torch.float8_e4m3fn),
+        w13_weight_scale_inv=torch.empty(78, 1, 1, 2048),
+        w2_weight_scale_inv=torch.empty(78, 1, 1, 4096),
+    )
+    method = SimpleNamespace(_use_adaptive_fused_moe=False)
+    op = lowtok_scores.prebuild(method, layer, "silu")
+    assert op is not None
+    assert getattr(layer, "_lowtok_has_copies", False) is True
+    assert getattr(layer, "_lowtok_owned", None) == 64
+    assert layer._lowtok_tables.shape[0] > 0
 
 
 def test_apply_expert_map_with_copies_counts_every_slot(tmp_path, monkeypatch):
@@ -346,8 +419,11 @@ def test_the_shipped_tables_load_and_cover_the_backbone(path, monkeypatch):
         if path is COPIES:
             hot = ep.hot_order(layer)
             assert len(hot) == 128 and len(set(hot)) == 128
-    assert not ep.placed(MTP_PREFIX)
+    assert ep.placed(MTP_PREFIX)
     assert ep.placed(BACKBONE_PREFIX.format(n=59))
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT_MTP", False)
+    assert not ep.placed(MTP_PREFIX)
+
 
 
 def _fp8_operands(tokens, experts, hidden=512, inter=256, topk=4):
@@ -620,18 +696,15 @@ def test_expert_slot_kv_credit_only_charges_mtp_when_placed(monkeypatch):
     m_cfg = SimpleNamespace(hf_text_config=text)
     p_cfg = SimpleNamespace(tensor_parallel_size=8, data_parallel_size=1)
 
-    # Standard 60-layer c112_mk2p table (78 slots): mtp.layers.0 is not placed,
-    # so mtp_extra_slots must be 0 and full 120-slot credit (1440 MiB/TC) is returned.
-    credit_unplaced, slots = _expert_slot_kv_credit(m_cfg, p_cfg)
+    # With TPU_EXPERT_PLACEMENT_MTP=1, mtp.layers.0 is placed via layer 59,
+    # so (slots - 64) = 14 extra slots are deducted.
+    credit_placed, slots = _expert_slot_kv_credit(m_cfg, p_cfg)
     assert slots == 78
+    assert credit_placed == ((80 - 78) * 60 - 14) * 3 * 4096 * 1024
+
+    # When mtp.layers.0 is not placed, mtp_extra_slots must be 0.
+    monkeypatch.setattr(expert_placement, "placed", lambda prefix: False)
+    credit_unplaced, _ = _expert_slot_kv_credit(m_cfg, p_cfg)
     assert credit_unplaced == (80 - 78) * 60 * 3 * 4096 * 1024
 
-    # When mtp.layers.0 is placed, (slots - 64) = 14 extra slots are deducted.
-    monkeypatch.setattr(
-        expert_placement,
-        "placed",
-        lambda prefix: prefix == "mtp.layers.0.mlp.experts",
-    )
-    credit_placed, _ = _expert_slot_kv_credit(m_cfg, p_cfg)
-    assert credit_placed == ((80 - 78) * 60 - 14) * 3 * 4096 * 1024
 

@@ -34,11 +34,15 @@ What it changes, and where:
     order at load, so the top-k it produces already names slots; nothing
     runs per token.
 
-Only the backbone's decoder layers (`language_model.model.layers.<n>` as a
+The backbone's decoder layers (`language_model.model.layers.<n>` as a
 module prefix, `model.language_model.layers.<n>` as a checkpoint name) are
-placed. The MTP drafter's layer (`mtp.layers.0`) is not in the table and
-keeps the checkpoint's contiguous placement: its expert map, expert filter
-and router rows are left exactly as without a table.
+placed from `layers[<n>]`. When `TPU_EXPERT_PLACEMENT_MTP` is enabled (the
+default), the MTP drafter's layer (`mtp.layers.<n>`) is also placed using
+`layers["mtp.layers.<n>"]` if present, else the last backbone layer's
+placement (`layers[max_n]`), giving the draft layer the same balanced
+permutation and redundant hot-expert copies (`c112` + Po2C) as layer 59.
+When `TPU_EXPERT_PLACEMENT_MTP=0`, the MTP layer keeps the checkpoint's
+contiguous placement.
 
 Numerics: each token selects the same experts with the same weights and
 runs the same expert weights; only the order the k expert contributions are
@@ -64,10 +68,11 @@ _DATA_PATH = ""
 _LOGGED: set[str] = set()
 # A backbone decoder layer, as the module prefix vLLM gives the MoE layer
 # (`language_model.model.layers.<n>.mlp.experts`) and as the checkpoint's
-# parameter name (`model.language_model.layers.<n>.mlp.gate.weight`). The MTP
-# drafter's `mtp.layers.0.` does not match on purpose: a bare `layers.(\d+).`
-# would read it as layer 0 and permute / copy the draft layer's experts.
+# parameter name (`model.language_model.layers.<n>.mlp.gate.weight`).
 _LAYER_RE = re.compile(r"(?:^|\.)language_model\.(?:model\.)?layers\.(\d+)\.")
+# The MTP drafter's MoE layer (`mtp.layers.<n>.mlp.experts` or
+# `mtp.layers.<n>.mlp.gate.weight`).
+_MTP_LAYER_RE = re.compile(r"(?:^|\.)mtp\.layers\.(\d+)(?:\.|$)")
 _ROUTER_RE = re.compile(r"\.mlp\.gate\.(weight|bias)$|e_score_correction_bias$")
 
 
@@ -78,6 +83,17 @@ def _path() -> str:
 def enabled() -> bool:
     """Whether a placement table is set (TPU_EXPERT_PLACEMENT)."""
     return bool(_path())
+
+
+def mtp_enabled() -> bool:
+    """Whether the MTP drafter's MoE layer participates in expert placement."""
+    if not enabled():
+        return False
+    raw = os.environ.get("TPU_EXPERT_PLACEMENT_MTP")
+    if raw is not None and raw.strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return bool(_envs.TPU_EXPERT_PLACEMENT_MTP)
+
 
 
 _TABLE_DIR = os.path.abspath(
@@ -181,12 +197,25 @@ def data() -> dict:
     return _DATA
 
 
+def _mtp_target_layer() -> int | None:
+    """Resolve the placement table layer index used by the MTP draft layer."""
+    layers = data()["layers"]
+    numeric = [int(k) for k in layers if str(k).isdigit()]
+    return max(numeric) if numeric else None
+
+
 def layer_index(name: str) -> int | None:
-    """The backbone MoE layer index in a parameter name or module prefix, or
-    None (a dense parameter, or a layer outside the backbone such as the MTP
-    drafter's)."""
+    """The MoE layer index in a parameter name or module prefix, or None.
+
+    When `mtp_enabled()` is True, `mtp.layers.<n>` resolves to the last
+    backbone layer in the placement table (layer 59 on Qwen3.5).
+    """
     m = _LAYER_RE.search(name)
-    return int(m.group(1)) if m else None
+    if m:
+        return int(m.group(1))
+    if mtp_enabled() and _MTP_LAYER_RE.search(name):
+        return _mtp_target_layer()
+    return None
 
 
 def placed(name: str) -> bool:

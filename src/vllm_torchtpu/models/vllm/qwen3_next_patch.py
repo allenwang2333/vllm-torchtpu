@@ -96,6 +96,7 @@ from vllm_torchtpu.layers.adapter import (
     sequence_parallel,
     small_all_reduce_op,
 )
+from vllm_torchtpu.layers.adapter.attention import batched_rpa_schedule_scope
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -1534,18 +1535,19 @@ def patched_model_forward(
         aux_hidden_states = [
             _sp_chunk(self.layers[self.start_layer], aux_hidden_states[0])
         ]
-    for layer_idx, layer in enumerate(
-        islice(self.layers, self.start_layer, self.end_layer),
-        start=self.start_layer,
-    ):
-        hidden_states, residual = layer(
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
-        self._maybe_add_hidden_state(
-            aux_hidden_states, layer_idx + 1, hidden_states, residual
-        )
+    with batched_rpa_schedule_scope():
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            )
 
     if not get_pp_group().is_last_rank:
         assert isinstance(residual, torch.Tensor)
