@@ -751,3 +751,57 @@ def test_td8286_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
     runner.gather_logprobs = spy_gather_logprobs
     TPUModelRunner._precompile_gather_logprobs(runner)
     assert seen_sampled_dtypes == [torch.int32, torch.int32]
+
+
+def test_td8296_host_arange_np_and_spec_logprobs_int32(monkeypatch):
+    """TD8.296: spec_logprobs_lists, _ensure_host_token_buffer_capacity, and
+    StructuredDecodingManager target_row_starts use np.int32."""
+    from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+        _ensure_host_token_buffer_capacity,
+    )
+    from vllm_torchtpu.runner import tpu_runner_async_output as async_mod
+
+    # 1. _ensure_host_token_buffer_capacity allocates np.int32 arange_np
+    stub_runner = SimpleNamespace(
+        arange_np=np.arange(4, dtype=np.int32),
+        input_ids_cpu=torch.zeros(16, dtype=torch.int32),
+    )
+    _ensure_host_token_buffer_capacity(stub_runner, 12)
+    assert stub_runner.arange_np.dtype == np.int32
+    assert len(stub_runner.arange_np) == 12
+
+    # 2. spec_logprobs_lists uses np.int32 for g_arr, cu_g, np.arange, and np.zeros
+    orig_np_arange = async_mod.np.arange
+    orig_np_zeros = async_mod.np.zeros
+    seen_np_dtypes: list[object] = []
+
+    def _spy_np_arange(*args, **kwargs):
+        seen_np_dtypes.append(kwargs.get("dtype"))
+        return orig_np_arange(*args, **kwargs)
+
+    def _spy_np_zeros(*args, **kwargs):
+        seen_np_dtypes.append(kwargs.get("dtype"))
+        return orig_np_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(async_mod.np, "arange", _spy_np_arange)
+    monkeypatch.setattr(async_mod.np, "zeros", _spy_np_zeros)
+
+    c_nonempty = SpecLogprobsChunk(
+        tensors=LogprobsTensors(
+            logprob_token_ids=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.1, -0.2], [-0.3, -0.4]], dtype=torch.float32),
+            selected_token_ranks=torch.tensor([0, 1], dtype=torch.int32),
+        ),
+        row_starts=np.array([0], dtype=np.int32),
+    )
+    c_empty = SpecLogprobsChunk(
+        tensors=LogprobsTensors(
+            logprob_token_ids=torch.empty((0, 2), dtype=torch.int32),
+            logprobs=torch.empty((0, 2), dtype=torch.float32),
+            selected_token_ranks=torch.empty((0,), dtype=torch.int32),
+        ),
+        row_starts=np.array([], dtype=np.int32),
+    )
+    out = spec_logprobs_lists([c_nonempty, c_empty], gen_lens=[2])
+    assert out.logprob_token_ids.tolist() == [[10, 11], [20, 21]]
+    assert seen_np_dtypes == [np.int32, np.int32]

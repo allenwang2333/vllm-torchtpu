@@ -68,14 +68,14 @@ def spec_logprobs_lists(
     for chunk in chunks:
         n = len(chunk.row_starts)
         if n:
-            g_arr = np.asarray(gen_lens[offset : offset + n], dtype=np.int64)
-            cu_g = np.cumsum(g_arr)
+            g_arr = np.asarray(gen_lens[offset : offset + n], dtype=np.int32)
+            cu_g = np.cumsum(g_arr, dtype=np.int32)
             rows = np.repeat(
-                chunk.row_starts.astype(np.int64, copy=False) - (cu_g - g_arr),
+                chunk.row_starts.astype(np.int32, copy=False) - (cu_g - g_arr),
                 g_arr,
-            ) + np.arange(int(cu_g[-1]), dtype=np.int64)
+            ) + np.arange(int(cu_g[-1]), dtype=np.int32)
         else:
-            rows = np.zeros(0, dtype=np.int64)
+            rows = np.zeros(0, dtype=np.int32)
         ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
         lps.append(chunk.tensors.logprobs.numpy()[rows])
         ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])

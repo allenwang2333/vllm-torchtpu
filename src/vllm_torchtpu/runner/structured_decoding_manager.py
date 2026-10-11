@@ -223,8 +223,8 @@ class StructuredDecodingManager:
             self.target_grammar_bitmask_cpu[:padded_target_rows].zero_()
             self.require_structured_out_target_cpu[:padded_target_rows].zero_()
             # Chunk-local start row of each request's drafts in target_logits.
-            target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
-            np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
+            target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int32)
+            np.cumsum(draft_lengths_cpu, dtype=np.int32, out=target_row_starts[1:])
 
         for req_id, local_index, num_drafts, mask_row in local_entries:
             if num_drafts:

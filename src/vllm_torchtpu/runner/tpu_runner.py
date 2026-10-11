@@ -983,7 +983,7 @@ class TPUModelRunner(GPUModelRunner):
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
-        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
+        self.arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
@@ -3395,6 +3395,7 @@ class TPUModelRunner(GPUModelRunner):
                 base_pos[:, None],
                 arange_k,
                 out=positions_np.reshape(num_reqs, k_sched),
+                casting="unsafe",
             )
             req_rows = self.arange_np[start_index : start_index + num_reqs]
             row_bases = (base_pos + req_rows * self.input_batch.token_ids_cpu.shape[1])[
@@ -3421,6 +3422,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu[req_indices],
                 arange,
                 out=positions_np,
+                casting="unsafe",
             )
             token_indices = (
                 positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]

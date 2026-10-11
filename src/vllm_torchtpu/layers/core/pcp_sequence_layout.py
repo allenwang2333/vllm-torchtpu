@@ -525,7 +525,7 @@ def _ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) ->
         return
 
     if len(runner.arange_np) < required_num_tokens:
-        runner.arange_np = np.arange(required_num_tokens, dtype=np.int64)
+        runner.arange_np = np.arange(required_num_tokens, dtype=np.int32)
 
     current_num_tokens = int(runner.input_ids_cpu.shape[0])
     if current_num_tokens >= required_num_tokens:

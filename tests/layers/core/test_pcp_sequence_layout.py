@@ -645,7 +645,7 @@ def _planner_runner_stub(*, scheduled, computed, prompt, token_paddings):
         uses_mrope=False,
         supports_mm_inputs=False,
         positions_np=None,
-        arange_np=np.arange(max_tokens * 4, dtype=np.int64),
+        arange_np=np.arange(max_tokens * 4, dtype=np.int32),
         num_tokens_paddings=list(token_paddings),
         max_num_tokens=max_tokens,
         _dp_target_bucket=None,
@@ -1072,7 +1072,7 @@ def test_sequence_layout_and_pcp_remaining_branches(monkeypatch):
     runner_grow = _planner_runner_stub(
         scheduled=[16], computed=[0], prompt=[16], token_paddings=[16]
     )
-    runner_grow.arange_np = np.arange(2, dtype=np.int64)
+    runner_grow.arange_np = np.arange(2, dtype=np.int32)
     runner_grow.input_ids_cpu = torch.ones(4, dtype=torch.int32)
     runner_grow.positions_cpu = torch.ones(4, dtype=torch.int32)
     runner_grow.supports_mm_inputs = True
@@ -1089,6 +1089,8 @@ def test_sequence_layout_and_pcp_remaining_branches(monkeypatch):
 
     _ensure_host_token_buffer_capacity(runner_grow, 0)
     created_pcp.reserve_host_token_capacity(runner_grow, 64)
+    assert runner_grow.arange_np.dtype == np.int32
+    assert len(runner_grow.arange_np) == 64
     assert runner_grow.input_ids_cpu.shape[0] == 64
     assert runner_grow.is_mm_embed_cpu.shape[0] == 64
     assert runner_grow.mrope_positions.cpu.shape == (3, 65)

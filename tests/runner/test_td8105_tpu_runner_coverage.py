@@ -131,7 +131,7 @@ def _make_bare_runner() -> TPUModelRunner:
     runner.mamba_state_indices_cpu = torch.zeros(8, dtype=torch.int32)
     runner._request_distribution_cpu = torch.zeros(3, dtype=torch.int32)
     runner._combined_request_distribution_cpu = torch.zeros(6, dtype=torch.int32)
-    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner.arange_np = np.arange(16, dtype=np.int32)
     runner.requests = {}
     return runner
 
@@ -2431,7 +2431,7 @@ def test_remaining_async_sub_and_batch_state_branches():
     # _apply_async_token_substitution with _fast_token_substitution = True (line 2443)
     # and fallthrough
     runner._fast_token_substitution = True
-    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner.arange_np = np.arange(16, dtype=np.int32)
     input_ids_tpu = torch.tensor([10, 20], dtype=torch.int32)
     next_tokens_tpu = torch.tensor([99, 88, 77], dtype=torch.int64)
     runner._pre_async_results = SimpleNamespace(next_tokens_tpu=next_tokens_tpu)
@@ -2455,7 +2455,7 @@ def test_remaining_async_sub_and_batch_state_branches():
             np.array([0], dtype=np.int32),
         )
         assert slow_out.shape == (2,)
-    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner.arange_np = np.arange(16, dtype=np.int32)
 
     # Lines 2533, 2580-2608: _install_spec_token_room_guard with list block_tables
     runner.input_batch = SimpleNamespace(_tpu_spec_room_guard=True)
@@ -2592,7 +2592,7 @@ def test_remaining_async_sub_and_batch_state_branches():
         num_tokens_no_spec=np.array([5, 6, 0, 0], dtype=np.int32),
         num_accepted_tokens_cpu=np.zeros(4, dtype=np.int64),
     )
-    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner.arange_np = np.arange(16, dtype=np.int32)
     runner._modify_prev_results()
     assert r0_state.output_token_ids == [10, 11]
     assert r1_state.output_token_ids == [20, 21, 22]
@@ -2606,7 +2606,7 @@ def test_remaining_async_sub_and_batch_state_branches():
         [[10], [20]], dtype=torch.int32
     )
     runner._modify_prev_results()
-    runner.arange_np = np.arange(16, dtype=np.int64)
+    runner.arange_np = np.arange(16, dtype=np.int32)
 
     # Lines 2839, 2862-2865, 2873-2890, 2894: _update_placeholder
     assert runner._update_placeholder([], [], {}) == {}
