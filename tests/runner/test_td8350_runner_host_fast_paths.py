@@ -259,3 +259,53 @@ def test_td8362_before_prompt_start_falls_through_to_all_minus_one():
     ids = TPUModelRunner._prepare_lookback_token_ids(runner, 2)
     assert (ids == -1).all()
     np.testing.assert_array_equal(ids.numpy(), _old_lookback(runner, 2))
+
+
+def test_td8389_attn_group_walk_cache_and_for_layers_gid_dedup():
+    """TD8.389: Verify _build_attention_metadata caches _attn_group_walk_cache
+    across steps, and build_attention_metadata_for_layers reuses frozenset
+    layer_names and deduplicates staged non-Mamba builder.build calls by gid."""
+    b = [
+        _Builder(0),
+        _Builder(0),
+        _Builder(1),
+        _Builder(0, mamba=True),
+        _Builder(7),
+        _Builder(7),
+    ]
+    staged = {0: torch.zeros(2), 1: torch.zeros(2)}
+    runner = _walk_runner(b, staged)
+
+    meta1 = _walk(runner)
+    walk_cache1 = runner._attn_group_walk_cache
+    assert walk_cache1 is not None and len(walk_cache1[1]) == 6
+    meta2 = _walk(runner)
+    assert runner._attn_group_walk_cache is walk_cache1
+    assert list(meta1) == list(meta2)
+
+    # Empty attn_groups exercises the `else 0` branches in walk_key
+    empty_runner = _walk_runner([], staged)
+    empty_runner.attn_groups = []
+    assert _walk(empty_runner) == {}
+    assert empty_runner._attn_group_walk_cache[0][2:] == (0, 0)
+
+    # build_attention_metadata_for_layers: frozenset key + gid deduplication
+    for x in b:
+        x.calls = 0
+    fset = frozenset(["l0a", "l1a", "l2a", "l3a", "l4a", "l5a"])
+    sub_meta1 = TPUModelRunner.build_attention_metadata_for_layers(runner, fset, 4)
+    assert [x.calls for x in b] == [1, 0, 1, 1, 1, 1]
+    assert sub_meta1["l0a"] is sub_meta1["l1a"]
+    assert sub_meta1["l2a"] is not sub_meta1["l0a"]
+    assert sub_meta1["l3a"].builder is b[3]
+    assert sub_meta1["l4a"] is not sub_meta1["l5a"]
+    # Verify frozenset object was used directly without re-allocating in selection_key
+    cached_key = next(iter(runner._layer_group_selection_cache))
+    assert cached_key[2] is fset
+
+    # Second call hits cached_selection and unstaged ctx calls stage_block_table_uploads
+    runner._attn_metadata_builder_ctx.staged_block_tables = None
+    with patch.object(tr_mod, "stage_block_table_uploads") as stage_fn:
+        sub_meta2 = TPUModelRunner.build_attention_metadata_for_layers(runner, fset, 4)
+    stage_fn.assert_called_once()
+    assert list(sub_meta2) == list(sub_meta1)

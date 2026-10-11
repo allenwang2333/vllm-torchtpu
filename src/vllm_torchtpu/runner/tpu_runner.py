@@ -1662,27 +1662,43 @@ class TPUModelRunner(GPUModelRunner):
         # its group's staged table (`AttentionMetadataBuilder.build` returns
         # `base.with_block_tables(staged)`), so every builder of one
         # kv_cache_group_id yields equal metadata: build it once per group.
-        staged_tables = ctx.staged_block_tables
-        built_by_gid: dict[int, AttentionMetadata] = {}
-        for group_list in self.attn_groups:
-            for group in group_list:
-                builder = group.metadata_builders[0]
-                gid = builder.kv_cache_group_id
-                shareable = (
-                    not builder.is_mamba_group
-                    and staged_tables is not None
-                    and staged_tables.get(gid) is not None
+        staged_tables, built_by_gid, walk_key, cached_walk = (
+            ctx.staged_block_tables,
+            {},
+            (
+                id(self.attn_groups),
+                len(self.attn_groups),
+                id(self.attn_groups[0]) if self.attn_groups else 0,
+                id(self.attn_groups[-1]) if self.attn_groups else 0,
+            ),
+            getattr(self, "_attn_group_walk_cache", None),
+        )
+        if cached_walk is None or cached_walk[0] != walk_key:
+            walk = tuple(
+                (b, b.kv_cache_group_id, b.is_mamba_group, tuple(group.layer_names))
+                for group_list in self.attn_groups
+                for group in group_list
+                for b in (group.metadata_builders[0],)
+            )
+            self._attn_group_walk_cache = (walk_key, walk)
+        else:
+            walk = cached_walk[1]
+        for builder, gid, is_mamba, layer_names in walk:
+            shareable = (
+                not is_mamba
+                and staged_tables is not None
+                and staged_tables.get(gid) is not None
+            )
+            built = built_by_gid.get(gid) if shareable else None
+            if built is None:
+                built = builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
                 )
-                built = built_by_gid.get(gid) if shareable else None
-                if built is None:
-                    built = builder.build(
-                        common_prefix_len=0,
-                        common_attn_metadata=common,
-                    )
-                    if shareable:
-                        built_by_gid[gid] = built
-                for layer_name in group.layer_names:
-                    per_layer_attn_metadata[layer_name] = built
+                if shareable:
+                    built_by_gid[gid] = built
+            for layer_name in layer_names:
+                per_layer_attn_metadata[layer_name] = built
         if envs.TPU_DEEPSEEK_V41_KV_SHARD:
             attach_step_owner_token_layout(
                 self,
@@ -1716,7 +1732,9 @@ class TPUModelRunner(GPUModelRunner):
         selection_key = (
             id(self.attn_groups),
             len(self.attn_groups),
-            frozenset(layer_names),
+            layer_names
+            if isinstance(layer_names, frozenset)
+            else frozenset(layer_names),
         )
         selection_cache = getattr(self, "_layer_group_selection_cache", None)
         if not isinstance(selection_cache, dict):
@@ -1748,12 +1766,33 @@ class TPUModelRunner(GPUModelRunner):
                 num_reqs_padded,
                 gids=gids,
             )
-        common = SimpleNamespace(num_reqs=num_reqs_padded)
+        common, staged_tables, built_by_gid = (
+            SimpleNamespace(num_reqs=num_reqs_padded),
+            ctx.staged_block_tables,
+            {},
+        )
         metadata: dict[str, AttentionMetadata] = {}
         for group, selected in selected_groups:
-            built = group.metadata_builders[0].build(
-                common_prefix_len=0,
-                common_attn_metadata=common,
+            built = (
+                (
+                    built_by_gid.get(
+                        gid := (b := group.metadata_builders[0]).kv_cache_group_id
+                    )
+                    or built_by_gid.setdefault(
+                        gid,
+                        b.build(
+                            common_prefix_len=0,
+                            common_attn_metadata=common,
+                        ),
+                    )
+                )
+                if not (b := group.metadata_builders[0]).is_mamba_group
+                and staged_tables is not None
+                and staged_tables.get(b.kv_cache_group_id) is not None
+                else b.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                )
             )
             for name in selected:
                 metadata[name] = built
