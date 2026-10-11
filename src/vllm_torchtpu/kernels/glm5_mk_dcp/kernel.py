@@ -1730,6 +1730,23 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                     scr["oh"][hh, TMAX:M, :] = jnp.zeros((M - TMAX, KL), F32)
             return [scr["oh"][hh] for hh in range(HR)]
 
+        def route_local_fast(wn, wsel_):
+            """This rank's ER experts are lanes [me*ER, me*ER + ER) of one 128-lane half of the [M, E]
+            routing arrays: half-select + one lane rotate -> lanes 0..ER-1 (exact: single elements;
+            was ER masked cross-lane reductions per array)."""
+            e0 = me * cfg.ER
+            hsel = e0 // 128
+            sh = (128 - e0 % 128) % 128
+
+            def local_cols(x):
+                halves = [x[:, h_ * 128:(h_ + 1) * 128] for h_ in range(cfg.E // 128)]
+                y = halves[0]
+                for h_ in range(1, len(halves)):
+                    y = jnp.where(hsel == h_, halves[h_], y)
+                return jnp.where(lane128 < cfg.ER, pltpu.roll(y, sh, 1), 0)
+            hitm = jnp.where(jnp.logical_and(wsel_ > 0, rvalid > 0), 1, 0).astype(I32)
+            return local_cols(wn), jnp.sum(local_cols(hitm), axis=0, keepdims=True)
+
         # ---------------- MoE ----------------
         def moe(l, slot):
             ER = cfg.ER
@@ -1768,15 +1785,21 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 choice = jnp.where(sel, -jnp.inf, choice)
             wsum = jnp.sum(wsel_, axis=1, keepdims=True)
             wn = bf(wsel_ / jnp.maximum(wsum, 1e-20)) * rvalid
-            wloc = jnp.zeros((M, 128), F32)
-            hitv = jnp.zeros((1, 128), I32)
-            for j in range(ER):
-                e = me * ER + j
-                col = jnp.sum(jnp.where(eio == e, wn, 0.0), axis=1, keepdims=True)
-                cnt = jnp.sum(jnp.where(eio == e, (wsel_ > 0).astype(I32), 0) * (rvalid > 0).astype(I32))
-                wloc = jnp.where(lane128 == j, col, wloc)
-                hitv = jnp.where(lane128 == j, cnt, hitv)
+            # this rank's ER experts are lanes [me*ER, me*ER + ER) of one 128-lane half: half-select +
+            # one lane rotate -> lanes 0..ER-1 (was ER masked cross-lane reductions per array)
+            if 128 % ER == 0 and cfg.E % 128 == 0:
+                wloc, hitv = route_local_fast(wn, wsel_)
+            else:                                        # TINY shapes
+                wloc = jnp.zeros((M, 128), F32)
+                hitv = jnp.zeros((1, 128), I32)
+                for j in range(ER):
+                    e = me * ER + j
+                    col = jnp.sum(jnp.where(eio == e, wn, 0.0), axis=1, keepdims=True)
+                    cnt = jnp.sum(jnp.where(eio == e, (wsel_ > 0).astype(I32), 0) * (rvalid > 0).astype(I32))
+                    wloc = jnp.where(lane128 == j, col, wloc)
+                    hitv = jnp.where(lane128 == j, cnt, hitv)
             valid_tok = rvalid > 0
+
             if KREP:
                 # replica table -> hits rows 2..7: 2-3 expert hit bits (all E), 4 rep_e, 5 rep_s,
                 # 6 per-rank distinct-expert loads, 7 moved flags. Routing is replicated, so every
