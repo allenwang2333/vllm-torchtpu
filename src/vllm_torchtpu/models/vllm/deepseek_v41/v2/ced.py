@@ -60,7 +60,13 @@ def _padded_bucket(kept: int, num_tokens: int, compile_sizes: tuple) -> int:
 
 @functools.lru_cache(maxsize=64)
 def _static_no_skip_spec(
-    bounds: tuple, prompts: tuple, hits: tuple, window: int, num_tokens, compile_sizes
+    bounds: tuple,
+    prompts: tuple,
+    hits: tuple,
+    window: int,
+    num_tokens,
+    compile_sizes,
+    owner_required_kept: int = 0,
 ):
     """``(min_lens, plan)`` for a fixed query/prompt/hit layout, else ``None``.
 
@@ -82,7 +88,9 @@ def _static_no_skip_spec(
         replay_starts.append(replay_start)
         min_lens.append(replay_start + count if count > 0 else 0)
     kept = bounds[-1]
-    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
+    padded = _padded_bucket(
+        max(kept, owner_required_kept), int(num_tokens), compile_sizes
+    )
     plan = DecoderReplayPlan(
         _identity_indices(kept),
         bounds,
@@ -127,7 +135,22 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         raise ValueError("Query boundaries exceed the input token bucket")
     if not isinstance(compile_sizes, tuple):
         compile_sizes = tuple(compile_sizes)
-    if getattr(metadata, "owner_token_layout", None) is None:
+    owner_layout = getattr(metadata, "owner_token_layout", None)
+    req_owners = getattr(owner_layout, "owners", None)
+    owner_tokens, owner_required_kept = (
+        getattr(owner_layout, "owner_tokens", None),
+        0,
+    )
+    if req_owners is None or owner_tokens is not None:
+        if (
+            owner_layout is not None
+            and req_owners is not None
+            and owner_tokens is not None
+            and bounds_list[-1] > 0
+        ):
+            owner_required_kept = int(owner_layout.query_start_loc.shape[0]) * int(
+                owner_tokens.max()
+            )
         # Steady-state decode repeats the same query/prompt/hit layout while
         # only seq_lens grow: reuse the cached all-kept plan when it applies.
         spec = _static_no_skip_spec(
@@ -137,6 +160,7 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
             window,
             num_tokens,
             compile_sizes,
+            owner_required_kept,
         )
         if spec is not None and all(map(operator.ge, lengths_list, spec[0])):
             return spec[1]
@@ -178,23 +202,17 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     # Each stage dispatches by its own token bucket. Never introduce a second,
     # independent symbolic token dimension into vLLM's guard-free full graph.
     required_kept = kept
-    owner_layout = getattr(metadata, "owner_token_layout", None)
-    req_owners = getattr(owner_layout, "owners", None)
     if kept > 0 and owner_layout is not None and req_owners is not None:
         tp_size = int(owner_layout.query_start_loc.shape[0])
-        owner_tokens = getattr(owner_layout, "owner_tokens", None)
-        if not any_skipped and owner_tokens is not None:
-            required_kept = max(kept, tp_size * int(owner_tokens.max()))
-        else:
-            owners_list = (
-                req_owners.tolist() if hasattr(req_owners, "tolist") else req_owners
-            )
-            owner_kept = [0] * tp_size
-            for owner, start, end in zip(
-                owners_list, output_bounds_tuple, output_bounds_tuple[1:]
-            ):
-                owner_kept[owner] += end - start
-            required_kept = max(kept, tp_size * max(owner_kept))
+        owners_list = (
+            req_owners.tolist() if hasattr(req_owners, "tolist") else req_owners
+        )
+        owner_kept = [0] * tp_size
+        for owner, start, end in zip(
+            owners_list, output_bounds_tuple, output_bounds_tuple[1:]
+        ):
+            owner_kept[owner] += end - start
+        required_kept = max(kept, tp_size * max(owner_kept))
     padded = _padded_bucket(required_kept, int(num_tokens), compile_sizes)
     is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(

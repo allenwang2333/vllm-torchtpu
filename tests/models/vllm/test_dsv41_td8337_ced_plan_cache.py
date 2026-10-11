@@ -107,3 +107,45 @@ def test_replay_starts_cache_identity_and_equality_hits():
     assert DeepseekV41Model._get_ced_replay_starts(owner, [0, 5, 7], pos) is t
     other = DeepseekV41Model._get_ced_replay_starts(owner, (1, 5, 7), pos)
     assert other is not t and other.tolist() == [1, 5, 7]
+
+
+def test_td8347_kv_shard_owner_token_layout_reuses_cached_plan():
+    import numpy as np
+
+    owner_fast = SimpleNamespace(
+        owners=np.array([0, 0, 1], dtype=np.int32),
+        owner_tokens=np.array([12, 6, 0, 0, 0, 0, 0, 0], dtype=np.int32),
+        query_start_loc=np.zeros((8, 4), dtype=np.int32),
+    )
+    owner_slow = SimpleNamespace(
+        owners=np.array([0, 0, 1], dtype=np.int32),
+        owner_tokens=None,
+        query_start_loc=np.zeros((8, 4), dtype=np.int32),
+    )
+    md = _md(
+        [0, 6, 12, 18],
+        [1024, 1024, 1024],
+        [512, 512, 512],
+        hits=torch.tensor([0, 0, 0], dtype=torch.int32),
+        owner=owner_fast,
+    )
+    first = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
+    md.seq_lens_cpu = [1030, 1030, 1030]
+    second = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
+    assert second is first
+    assert first.padded_num_tokens == 96
+
+    md_slow = _md([0, 6, 12, 18], [1024, 1024, 1024], [512, 512, 512], owner=owner_slow)
+    ref = ced.plan_decoder_replay(md_slow, 512, 128, (32, 64, 96, 128))
+    assert dataclasses.astuple(first) == dataclasses.astuple(ref)
+
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, swa_bounded_replay=True
+        ),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+    )
+    assert isinstance(ced.prefix_replay_enabled(cfg), bool)
+    inv = ced._ced_inverse_rows((0, 2), padded_rows=2, total_rows=4, device="cpu")
+    out = ced._scatter_decoder_rows(torch.tensor([[1.0], [2.0]]), inv)
+    assert torch.equal(out, torch.tensor([[1.0], [0.0], [2.0], [0.0]]))
