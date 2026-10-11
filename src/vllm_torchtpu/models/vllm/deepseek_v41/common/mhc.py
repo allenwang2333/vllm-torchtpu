@@ -378,7 +378,7 @@ def _post_streams_jax(
     dim = flat.shape[-1] // mult
     x_f32 = x.reshape(-1, dim).astype(flat.dtype).astype(jnp.float32)
     post = post_layer_mix.reshape(-1, mult)
-    comb = comb_res_mix.reshape(-1, mult, mult)
+    comb = comb_res_mix.reshape(-1, mult * mult)
     streams = [
         flat[:, i * dim : (i + 1) * dim].astype(jnp.float32) for i in range(mult)
     ]
@@ -386,7 +386,7 @@ def _post_streams_jax(
     for j in range(mult):
         acc = post[:, j : j + 1] * x_f32
         for i in range(mult):
-            acc = acc + comb[:, i, j : j + 1] * streams[i]
+            acc = acc + comb[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
         out_streams.append(acc.astype(flat.dtype))
     return out_streams
 
@@ -722,9 +722,9 @@ def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP
     # profile_run does not pass a SymIntArrayRef `[s0 // tp, 4]` to
     # `aten.new_zeros` in fx_to_mlir.
-    first_stream = (torch.arange(residual.shape[1], device=residual.device) == 0).to(
-        dtype=dtype
-    )
+    first_stream = (
+        torch.arange(residual.shape[1], dtype=torch.int32, device=residual.device) == 0
+    ).to(dtype=dtype)
     return torch.zeros_like(residual[:, :, 0], dtype=dtype) + first_stream
 
 

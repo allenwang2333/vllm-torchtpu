@@ -562,14 +562,14 @@ def _post_and_collapse(
     flat = residual.reshape(tokens, mult * dim)
     x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
     post_f32 = post_layer_mix.reshape(tokens, mult).float()
-    comb_f32 = comb_res_mix.reshape(tokens, mult, mult).float()
+    comb_f32 = comb_res_mix.reshape(tokens, mult * mult).float()
     pre_f32 = pre_mix.reshape(tokens, mult).float()
     streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
     terms = []
     for j in range(mult):
         acc = post_f32[:, j : j + 1] * x_f32
         for i in range(mult):
-            acc = acc + comb_f32[:, i, j : j + 1] * streams[i]
+            acc = acc + comb_f32[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
         terms.append(pre_f32[:, j : j + 1] * acc.to(residual.dtype).float())
     value = (
         (terms[0] + terms[2]) + (terms[1] + terms[3])

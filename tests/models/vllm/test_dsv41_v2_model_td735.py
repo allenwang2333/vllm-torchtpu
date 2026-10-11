@@ -528,3 +528,82 @@ def test_td8259_ced_non_identity_int32_gather_inverse_and_pad_scatter(monkeypatc
         torch.tensor([[0.0, 0.0], [6.0, 8.0], [0.0, 0.0], [14.0, 16.0]]),
     )
     assert torch.equal(out_no_ids, out_with_ids)
+
+
+def test_td8272_2d_comb_res_mix_and_int32_default_pre_mix(monkeypatch):
+    """TD8.272: Verify 2D comb_res_mix reshape/slice in v2/model.py, v2/dspark.py,
+    and common/mhc.py matches 3D [T, M, M] reference, and _default_pre_mix uses
+    int32 torch.arange."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc as common_mhc
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark as v2_dspark
+
+    tokens, mult, dim = 6, 4, 8
+    gen = torch.Generator().manual_seed(272)
+    x = torch.randn(tokens, dim, generator=gen, dtype=torch.bfloat16)
+    residual = torch.randn(tokens, mult, dim, generator=gen, dtype=torch.bfloat16)
+    post_layer_mix = torch.randn(tokens, mult, generator=gen, dtype=torch.float32)
+    comb_res_mix = torch.randn(tokens, mult, mult, generator=gen, dtype=torch.float32)
+    pre_mix = torch.randn(tokens, mult, generator=gen, dtype=torch.float32)
+
+    # Reference 3D calculation
+    flat = residual.reshape(tokens, mult * dim)
+    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
+    post_f32 = post_layer_mix.reshape(tokens, mult).float()
+    comb_3d = comb_res_mix.reshape(tokens, mult, mult).float()
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    ref_streams = []
+    for j in range(mult):
+        acc = post_f32[:, j : j + 1] * x_f32
+        for i in range(mult):
+            acc = acc + comb_3d[:, i, j : j + 1] * streams[i]
+        ref_streams.append(acc.to(residual.dtype).float())
+
+    ref_collapsed = v2_model._collapse_streams(ref_streams, pre_mix, residual.dtype)
+    ref_aux = v2_model._mean_flat_streams(ref_streams, residual.dtype)
+
+    col_model, aux_model = v2_model._post_and_collapse(
+        x, residual, post_layer_mix, comb_res_mix, pre_mix, capture_aux=True
+    )
+    assert torch.equal(col_model, ref_collapsed)
+    assert aux_model is not None and torch.equal(aux_model, ref_aux)
+
+    col_dspark = v2_dspark._post_and_collapse(
+        x, residual, post_layer_mix, comb_res_mix, pre_mix
+    )
+    assert torch.equal(col_dspark, ref_collapsed)
+
+    jax_streams = common_mhc._post_streams_jax(
+        jnp.asarray(x.float().numpy()),
+        jnp.asarray(flat.float().numpy()),
+        jnp.asarray(post_layer_mix.numpy()),
+        jnp.asarray(comb_res_mix.numpy()),
+    )
+    for j in range(mult):
+        ref_jax_j = (
+            post_f32[:, j : j + 1] * x.float()
+            + sum(
+                comb_3d[:, i, j : j + 1] * flat[:, i * dim : (i + 1) * dim].float()
+                for i in range(mult)
+            )
+        ).numpy()
+        assert torch.allclose(
+            torch.tensor(jax_streams[j].__array__()),
+            torch.from_numpy(ref_jax_j),
+            atol=1e-5,
+        )
+
+    # Verify _default_pre_mix passes dtype=torch.int32 to torch.arange
+    seen_arange_dtypes: list[torch.dtype | None] = []
+    orig_arange = torch.arange
+
+    def tracking_arange(*args, **kwargs):
+        seen_arange_dtypes.append(kwargs.get("dtype"))
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", tracking_arange)
+    default_pre = common_mhc._default_pre_mix(residual, torch.float32)
+    assert seen_arange_dtypes == [torch.int32]
+    expected_pre = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * tokens, dtype=torch.float32)
+    assert torch.equal(default_pre, expected_pre)

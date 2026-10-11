@@ -300,7 +300,7 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = ids_3d.shape[0]
         tp_size = self._sharded_markov_tp
         num_sampled_slots = block_size - sample_start
-        slot_major_hidden = self._slot_major_hidden(
+        slot_major_hidden = _slot_major_hidden(
             valid_hidden, padded_num_reqs, block_size, sample_start
         )
         logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
@@ -390,7 +390,7 @@ class DSparkProposer(DFlashProposer):
             # sample_start > 0 and each Markov step indexes a contiguous
             # [padded_num_reqs, vocab] slice, preserving 8-row alignment when
             # the input batch was padded.
-            slot_major_hidden = self._slot_major_hidden(
+            slot_major_hidden = _slot_major_hidden(
                 valid_hidden, padded_num_reqs, block_size, sample_start
             )
             num_sampled_tokens = slot_major_hidden.shape[0]
