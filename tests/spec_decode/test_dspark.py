@@ -968,3 +968,65 @@ def test_td8265_2d_slot_major_hidden_and_logits_slice(sample_start: int):
         .to(torch.int32)
     )
     assert torch.equal(out_tokens, ref_tokens)
+
+
+def test_td8268_2d_select_gathered_candidate_and_int32_index_select():
+    """TD8.268: Verify 2D _select_gathered_candidate and native int32 1D
+    .index_select(0, ...) in _request_window_bounds and
+    _tpu_build_dflash_inputs_next_tokens."""
+    import torch._dynamo
+
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    # 1) _select_gathered_candidate 2D parity across tp_size=4, num_reqs=6
+    tp_size, num_reqs = 4, 6
+    gen = torch.Generator().manual_seed(268)
+    scores = torch.randint(-3, 4, (tp_size, num_reqs), generator=gen).to(torch.float32)
+    ids = torch.arange(tp_size * num_reqs, dtype=torch.float32).view(tp_size, num_reqs)
+    gathered = torch.stack([scores.reshape(-1), ids.reshape(-1)], dim=-1)
+
+    got = DSparkProposer._select_gathered_candidate(gathered, tp_size, num_reqs)
+    best_r = scores.argmax(dim=0)
+    want = ids.gather(0, best_r.unsqueeze(0)).squeeze(0).to(torch.int32)
+    assert got.dtype == torch.int32
+    assert torch.equal(got, want)
+
+    # 2) _request_window_bounds and _tpu_build_dflash_inputs_next_tokens with
+    # both int64 and int32 query_start_loc / position_ids / draft_lengths
+    p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    p._max_model_len = 4096
+    fn_nt = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._tpu_build_dflash_inputs_next_tokens
+    )
+    next_tokens = torch.tensor(
+        [[101, 102, -1], [201, -1, -1], [-1, -1, -1], [-1, -1, -1]], dtype=torch.int32
+    )
+    qsl_i32 = torch.tensor([0, 2, 5, 5, 5], dtype=torch.int32)
+    pos_i32 = torch.tensor([10, 11, 30, 31, 32, 0, 0, 0], dtype=torch.int32)
+    dl_i32 = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
+
+    out_i32 = fn_nt(
+        p,
+        next_tokens,
+        qsl_i32,
+        pos_i32,
+        dl_i32,
+        block_size=4,
+        padded_len=16,
+        mask_token_id=7,
+        invalid_token_id=-1,
+    )
+    out_i64 = fn_nt(
+        p,
+        next_tokens.to(torch.int64),
+        qsl_i32.to(torch.int64),
+        pos_i32.to(torch.int64),
+        dl_i32.to(torch.int64),
+        block_size=4,
+        padded_len=16,
+        mask_token_id=7,
+        invalid_token_id=-1,
+    )
+    for t32, t64 in zip(out_i32, out_i64, strict=True):
+        assert t32.dtype == t64.dtype == torch.int32
+        assert torch.equal(t32, t64)

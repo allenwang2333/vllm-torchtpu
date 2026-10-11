@@ -1238,17 +1238,20 @@ class DFlashProposer:
         specialize on Python `int` `num_reqs`. Padding rows alias the last live
         request; callers zero them with the mask. Traced inline by both
         compiled input builders."""
+        qsl_i32 = query_start_loc.to(torch.int32)
+        pos_i32 = position_ids.to(torch.int32)
         req_indices = torch.arange(
-            padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
+            padded_num_reqs, dtype=torch.int32, device=qsl_i32.device
         )
-        num_reqs = (query_start_loc[1:] > query_start_loc[:-1]).sum(dtype=torch.int32)
+        num_reqs = (qsl_i32[1:] > qsl_i32[:-1]).sum(dtype=torch.int32)
         safe_req_indices = torch.minimum(req_indices, torch.clamp(num_reqs - 1, min=0))
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
-        start_positions = (
-            position_ids[query_start_loc[safe_req_indices]].to(torch.int32).unsqueeze(1)
+        start_idx = qsl_i32.index_select(0, safe_req_indices)
+        start_positions = pos_i32.index_select(0, start_idx).unsqueeze(1)
+        end_indices = torch.clamp(
+            qsl_i32.index_select(0, safe_req_indices + 1) - 1, min=0
         )
-        end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
-        last_positions = position_ids[end_indices].to(torch.int32).unsqueeze(1)
+        last_positions = pos_i32.index_select(0, end_indices).unsqueeze(1)
         return safe_req_indices, valid_mask, start_positions, last_positions
 
     def _layout_draft_block(
@@ -1368,7 +1371,9 @@ class DFlashProposer:
 
         # Anchor verify windows at start + num_accepted;
         # anchor prompt chunks at last_pos + 1.
-        num_draft = draft_lengths[safe_req_indices].unsqueeze(1)
+        num_draft = (
+            draft_lengths.to(torch.int32).index_select(0, safe_req_indices).unsqueeze(1)
+        )
         verify_base = start_positions_padded + num_accepted
         prompt_base = (last_positions + 1) * valid_mask
         base_pos = torch.where(num_draft > 0, verify_base, prompt_base)

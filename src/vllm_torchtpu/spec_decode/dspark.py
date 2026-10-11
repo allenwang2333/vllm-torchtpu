@@ -261,9 +261,8 @@ class DSparkProposer(DFlashProposer):
         the first maximum, so ties resolve to the lowest token id without an
         indirect ``gather`` across ``tp_size``.
         """
-        gathered = gathered.view(tp_size, num_reqs, 2)
-        scores = gathered[..., 0]
-        ids = gathered[..., 1]
+        scores = gathered[:, 0].view(tp_size, num_reqs)
+        ids = gathered[:, 1].view(tp_size, num_reqs)
         best_score = scores[0]
         best_id = ids[0]
         for r in range(1, tp_size):
