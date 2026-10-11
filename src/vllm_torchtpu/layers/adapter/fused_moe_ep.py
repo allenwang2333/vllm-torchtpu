@@ -433,7 +433,7 @@ def _build_op(
         g_local = e_total // ep
 
         fp4_max_t = int(
-            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "16384" if ep <= 2 else "768")
+            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "0")
         )
         use_path_c = T_global <= (fp4_max_t if weight_format == "fp4" else 512)
         if use_path_c and weight_format in ("fp8", "fp4"):
@@ -544,7 +544,7 @@ def _build_op(
             )
 
         _max_v2_t_local = int(
-            os.environ.get("VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS", "8192")
+            os.environ.get("VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS", "32768")
         )
         if t_local <= _max_v2_t_local:
             return _run_v2(x, topk_ids, topk_weights)
