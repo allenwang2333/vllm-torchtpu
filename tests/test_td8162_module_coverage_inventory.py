@@ -101,7 +101,7 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
         2060,
         "TD8.83 / TD8.105 / TD8.130 / TD8.160 / TD8.163 / TD8.165 / TD8.195"
         " / TD8.198 / TD8.207 / TD8.212 / TD8.213 / TD8.235 / TD8.276 / TD8.277"
-        " / TD8.278",
+        " / TD8.278 / TD8.286",
     ),
     "spec_decode": (
         7,

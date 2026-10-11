@@ -215,7 +215,7 @@ def _rollback_offsets_seed_impl(
 def _rollback_offsets_migrate_impl(
     read_offsets: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
 ) -> None:
-    read_offsets.index_put_((dst_t,), read_offsets[src_t])
+    read_offsets.index_put_((dst_t,), read_offsets.index_select(0, src_t.int()))
 
 
 _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -276,14 +276,14 @@ def _spec_logprob_row_tokens(
     bonus index 0 and no drafts, so their rows start at 0, while every real
     request after the first starts past the rows of the ones before it.
 
-    Returns an int64 [num_rows, 1] tensor, num_rows = len(final_logits_indices).
+    Returns an int32 [num_rows, 1] tensor, num_rows = len(final_logits_indices).
     """
     num_rows = final_logits_indices.shape[0]
     num_slots = next_tokens.shape[1]
-    slot = torch.arange(num_slots, device=next_tokens.device, dtype=torch.int64)
-    lengths = draft_lengths.to(torch.int64)
-    start = bonus_logits_indices.to(torch.int64) - lengths
-    req = torch.arange(start.shape[0], device=next_tokens.device, dtype=torch.int64)
+    slot = torch.arange(num_slots, device=next_tokens.device, dtype=torch.int32)
+    lengths = draft_lengths.to(torch.int32)
+    start = bonus_logits_indices.to(torch.int32) - lengths
+    req = torch.arange(start.shape[0], device=next_tokens.device, dtype=torch.int32)
     real_req = (req == 0) | (start > 0)
     rows = start[:, None] + slot[None, :]
     valid = (
@@ -294,9 +294,9 @@ def _spec_logprob_row_tokens(
     )
     # Invalid slots all land on one extra row that is sliced off below.
     rows = torch.where(valid, rows, num_rows)
-    tokens = torch.where(valid, next_tokens.to(torch.int64), 0)
-    out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
-    out = out.scatter(0, rows.flatten(), tokens.flatten())
+    tokens = torch.where(valid, next_tokens.to(torch.int32), 0)
+    out = torch.zeros(num_rows + 1, dtype=torch.int32, device=next_tokens.device)
+    out = out.scatter(0, rows.flatten().to(torch.int64), tokens.flatten())
     return out[:num_rows, None]
 
 
@@ -2128,13 +2128,17 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = torch.tensor(state_srcs, dtype=torch.long).to(
+        state_t = torch.tensor(state_srcs, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
         ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
             self.device, non_blocking=True
         )
-        off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
+        off = (
+            offsets.index_select(0, state_t)
+            .to(torch.int32)
+            .clamp_(0, ckpt_t.shape[1] - 1)
+        )
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
@@ -2144,7 +2148,12 @@ class TPUModelRunner(GPUModelRunner):
             self.device, non_blocking=True
         )
         off = torch.where(new_owner_t, 0, off)
-        return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
+        return ckpt_t.reshape(-1).index_select(
+            0,
+            torch.arange(ckpt_t.shape[0], device=ckpt_t.device, dtype=torch.int32)
+            * ckpt_t.shape[1]
+            + off,
+        )
 
     def _flush_mamba_state_seed_copies(self) -> None:
         if not self._pending_mamba_state_copies:
@@ -6270,7 +6279,7 @@ class TPUModelRunner(GPUModelRunner):
             for num_reqs in self.num_reqs_paddings:
                 out = self.gather_logprobs(
                     self._dummy_logits(num_reqs),
-                    torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
+                    torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device),
                 )
                 synchronize_tensors(out.logprobs)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -7698,8 +7707,17 @@ class TPUModelRunner(GPUModelRunner):
         of logprobs as an alternative to having multiple pre-compiled graphs.
         Select the number of logprobs actually demanded by each request on CPU.
         """
-        token_ids = sampled_tokens.to(torch.int64)
-        token_logits = logits.gather(-1, token_ids)
+        token_ids = sampled_tokens.to(torch.int32)
+        token_logits = (
+            logits.reshape(-1)
+            .index_select(
+                0,
+                torch.arange(logits.shape[0], device=logits.device, dtype=torch.int32)
+                * logits.shape[1]
+                + token_ids.squeeze(-1),
+            )
+            .unsqueeze(-1)
+        )
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
         log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
         token_logprobs = (token_logits - log_normalizers).to(torch.float32)
@@ -7708,14 +7726,16 @@ class TPUModelRunner(GPUModelRunner):
         if max_logprobs > 0:
             topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
             topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
-            logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
+            logprob_token_ids = torch.cat(
+                (token_ids, topk_indices.to(torch.int32)), dim=1
+            )
             logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
         else:
             logprob_token_ids = token_ids
             logprobs = token_logprobs
 
         return LogprobsTensors(
-            logprob_token_ids=logprob_token_ids.to(torch.int32),
+            logprob_token_ids=logprob_token_ids,
             logprobs=logprobs,
             selected_token_ranks=token_ranks,
         )

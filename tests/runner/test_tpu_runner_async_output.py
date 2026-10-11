@@ -226,7 +226,7 @@ def test_spec_logprob_row_tokens_places_each_slot_on_its_row():
         torch.zeros(8, dtype=torch.int32),
     )
     assert row_tokens.shape == (8, 1)
-    assert row_tokens.dtype == torch.int64
+    assert row_tokens.dtype == torch.int32
     # Rejected slots, the padded request and the padding row read token 0;
     # in particular the padded request's junk does not overwrite row 0.
     assert row_tokens.flatten().tolist() == [11, 12, 0, 0, 21, 22, 31, 0]
@@ -669,3 +669,85 @@ def test_td8276_native_int32_1d_index_select_in_async_output_helpers(monkeypatch
     extracted = extract_draft_token_ids(in_ids, logits_idx, target_idx)
     assert extracted.tolist() == [102, 104]
     assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]
+
+
+def test_td8286_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
+    monkeypatch,
+):
+    from contextlib import nullcontext
+
+    import vllm_torchtpu.runner.tpu_runner as tr_mod
+    from vllm_torchtpu.runner.tpu_runner import (
+        TPUModelRunner,
+        _rollback_offsets_migrate_impl,
+    )
+
+    select_calls = []
+    orig_index_select = torch.Tensor.index_select
+
+    def spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, self.dtype, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+
+    # 1. _rollback_offsets_migrate_impl uses int32 1D index_select
+    read_offsets = torch.tensor([0, 5, 9, 0], dtype=torch.int32)
+    src_t = torch.tensor([1, 2], dtype=torch.int64)
+    dst_t = torch.tensor([0, 3], dtype=torch.int64)
+    select_calls.clear()
+    _rollback_offsets_migrate_impl(read_offsets, src_t, dst_t)
+    assert read_offsets.tolist() == [5, 5, 9, 9]
+    assert select_calls == [(1, torch.int32, 0, torch.int32)]
+
+    # 2. _spec_seed_sources uses int32 1D index_select on offsets and ckpt_t
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.mamba_slot_read_offsets = torch.tensor([0, 2, 99, 1], dtype=torch.int32)
+    select_calls.clear()
+    srcs = TPUModelRunner._spec_seed_sources(
+        runner,
+        state_srcs=[1, 2, 3],
+        ckpt_rows=[[10, 11, 12], [20, 21, 22], [30, 31, 32]],
+        new_owners=[False, False, True],
+    )
+    assert srcs.dtype == torch.int32
+    assert srcs.tolist() == [12, 22, 30]
+    assert select_calls == [
+        (1, torch.int32, 0, torch.int32),
+        (1, torch.int32, 0, torch.int32),
+    ]
+
+    # 3. gather_logprobs uses int32 1D index_select and int32 token_ids
+    logits = torch.tensor(
+        [[1.0, 3.0, 2.0, 0.5], [4.0, 0.0, 2.0, 1.0]], dtype=torch.float32
+    )
+    sampled = torch.tensor([[1], [2]], dtype=torch.int64)
+
+    for max_lp in (2, 0):
+        runner.model_config = SimpleNamespace(max_logprobs=max_lp)
+        select_calls.clear()
+        res = TPUModelRunner.gather_logprobs.__wrapped__(runner, logits, sampled)
+        assert select_calls == [(1, torch.float32, 0, torch.int32)]
+        assert res.logprob_token_ids.dtype == torch.int32
+        assert res.selected_token_ranks.dtype == torch.int32
+        assert res.selected_token_ranks.tolist() == [1, 2]
+        if max_lp > 0:
+            assert res.logprob_token_ids.tolist() == [[1, 1, 2], [2, 0, 2]]
+        else:
+            assert res.logprob_token_ids.tolist() == [[1], [2]]
+
+    # 4. _precompile_gather_logprobs passes int32 sampled_tokens
+    seen_sampled_dtypes = []
+    runner.num_reqs_paddings = [2, 4]
+    runner._precompile_timed = lambda _name: nullcontext()
+    runner._dummy_logits = lambda n: torch.zeros((n, 8), dtype=torch.float32)
+    monkeypatch.setattr(tr_mod, "synchronize_tensors", lambda *_a, **_kw: None)
+
+    def spy_gather_logprobs(logits_in, sampled_in):
+        seen_sampled_dtypes.append(sampled_in.dtype)
+        return TPUModelRunner.gather_logprobs.__wrapped__(runner, logits_in, sampled_in)
+
+    runner.gather_logprobs = spy_gather_logprobs
+    TPUModelRunner._precompile_gather_logprobs(runner)
+    assert seen_sampled_dtypes == [torch.int32, torch.int32]
