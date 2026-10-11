@@ -613,7 +613,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         start = min(self.head_start, self.n_hash_cols)
         end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
         # Hash ids are int32 (``_hash`` / host hash); keep the rows int32.
-        selected = indices[:, start:end].int()
+        selected = (indices if indices.dtype == torch.int32 else indices.int())[
+            :, start:end
+        ]
         valid = (selected >= self.vocab_start_idx) & (selected < self.vocab_end_idx)
         pad = self.part_n_hash_cols - (end - start)
         if pad:

@@ -1085,3 +1085,64 @@ class TestAttentionMetadataBuilderPlumbing:
         _, walk_state, walk_ckpt = products
         assert torch.equal(walk_state, meta.mamba_state_indices)
         assert torch.equal(walk_ckpt, meta.mamba_ckpt_indices)
+
+    def test_td8314_seq_lens_int32_cast_guards(self):
+        """TD8.314: Verify _staged_walk_products and _mamba_row_plan guard
+        redundant .to(torch.int32) casts when seq_lens is already torch.int32."""
+        import vllm_torchtpu.layers.core.attention_metadata as am_mod
+
+        runner = self._make_runner_mock(
+            max_num_reqs=4,
+            max_num_blocks_per_req=8,
+            most_model_len=128,
+            num_groups=2,
+        )
+        b_mamba = self._make_mamba_builder(runner, kv_cache_group_id=1)
+        staged_dev = torch.arange(100, 132, dtype=torch.int32)
+
+        seq_i32 = torch.tensor([1, 17, 112, 0], dtype=torch.int32)
+        seq_i64 = seq_i32.to(torch.int64)
+
+        prod_i32 = am_mod._staged_walk_products(
+            staged_dev=staged_dev,
+            seq_lens=seq_i32,
+            table_geom=((0, 4, 8),),
+            mamba_geom=((0, 8, 16),),
+            ckpt_window=2,
+        )
+        prod_i64 = am_mod._staged_walk_products(
+            staged_dev=staged_dev,
+            seq_lens=seq_i64,
+            table_geom=((0, 4, 8),),
+            mamba_geom=((0, 8, 16),),
+            ckpt_window=2,
+        )
+        for t32, t64 in zip(prod_i32, prod_i64, strict=True):
+            assert t32.dtype == t64.dtype == torch.int32
+            assert torch.equal(t32, t64)
+
+        ctx_i32 = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_i32,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            mamba_ckpt_window=2,
+        )
+        ctx_i64 = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_i64,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            mamba_ckpt_window=2,
+        )
+        plan_i32 = b_mamba._mamba_row_plan(ctx_i32, 8)
+        plan_i64 = b_mamba._mamba_row_plan(ctx_i64, 8)
+        assert torch.equal(plan_i32[0], plan_i64[0])
+        assert plan_i32[1] is not None and plan_i64[1] is not None
+        assert torch.equal(plan_i32[1], plan_i64[1])
+        assert plan_i32[2] is not None and plan_i64[2] is not None
+        assert torch.equal(plan_i32[2], plan_i64[2])

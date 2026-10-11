@@ -243,3 +243,31 @@ def test_lookup_bitwise_matches_int64_reference(pad, idx_dtype):
     out = torch.empty(6, 3, 16, dtype=torch.bfloat16)
     emb.lookup(indices, out)
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+def test_td8314_select_local_heads_int32_cast_guard():
+    """TD8.314: Verify _select_local_heads skips .int() when indices is already
+    torch.int32 and casts before slicing when indices is torch.int64."""
+    emb = _emb(pad=0)
+    idx_i32 = torch.tensor(
+        [[40, 45, 50, 55, 60], [10, 41, 89, 95, 42]], dtype=torch.int32
+    )
+    idx_i64 = idx_i32.to(torch.int64)
+
+    class _NoIntCastI32:
+        dtype = torch.int32
+
+        def __getitem__(self, item):
+            return idx_i32[item]
+
+        def int(self):
+            raise AssertionError(".int() must not be called when dtype == torch.int32")
+
+    rows_guard, valid_guard = emb._select_local_heads(_NoIntCastI32())
+    rows_i32, valid_i32 = emb._select_local_heads(idx_i32)
+    rows_i64, valid_i64 = emb._select_local_heads(idx_i64)
+    assert rows_guard.dtype == rows_i32.dtype == rows_i64.dtype == torch.int32
+    assert torch.equal(rows_guard, rows_i32)
+    assert torch.equal(rows_i32, rows_i64)
+    assert torch.equal(valid_guard, valid_i32)
+    assert torch.equal(valid_i32, valid_i64)

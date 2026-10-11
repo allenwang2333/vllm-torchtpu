@@ -216,7 +216,9 @@ def _staged_walk_products(
     ckpts = []
     if mamba_geom:
         active = seq_lens > 0
-        seq_lens_i32 = seq_lens.to(torch.int32)
+        seq_lens_i32 = (
+            seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+        )
         for ti, t, bs in mamba_geom:
             off, n, _ = table_geom[ti]
             tbl_flat = staged_dev[off : off + n * t]
@@ -303,7 +305,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         if plan is not None:
             return plan
 
-        seq_lens_i32 = ctx.seq_lens.to(torch.int32)
+        seq_lens_i32 = (
+            ctx.seq_lens
+            if ctx.seq_lens.dtype == torch.int32
+            else ctx.seq_lens.to(torch.int32)
+        )
         num_rows = int(seq_lens_i32.shape[0])
         row_bases = (
             torch.arange(num_rows, device=seq_lens_i32.device, dtype=torch.int32)

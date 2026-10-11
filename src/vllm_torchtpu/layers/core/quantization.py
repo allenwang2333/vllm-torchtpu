@@ -462,6 +462,9 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
         float32 tensor with FP4 values.
     """
     fp4_values = _FP4_VALUES_CPU.to(indices.device)
-    return fp4_values.index_select(0, indices.to(torch.int32).reshape(-1)).reshape(
-        indices.shape
-    )
+    return fp4_values.index_select(
+        0,
+        (indices if indices.dtype == torch.int32 else indices.to(torch.int32)).reshape(
+            -1
+        ),
+    ).reshape(indices.shape)

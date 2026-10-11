@@ -38,7 +38,7 @@ def test_unpack_uint8_to_fp4_covers_every_byte():
     assert torch.equal(q.unpack_uint8_to_fp4(packed), _old_unpack(packed))
 
 
-@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int64])
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int32, torch.int64])
 def test_fp4_indices_to_float_matches_int64_lut(dtype):
     idx = torch.arange(16).repeat(3).view(2, 3, 8).to(dtype)
     out = q.fp4_indices_to_float(idx)
