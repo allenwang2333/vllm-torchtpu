@@ -374,7 +374,7 @@ def _ids_seen_by(monkeypatch, *, slots, primaries, cap, dense):
     def lowtok_probe(x, route, *a, **k):
         return x
 
-    def dense_probe(x, w1, w2, s1, s2, w, ids):
+    def dense_probe(x, w1, w2, s1, s2, w, ids, **k):
         seen["dense"] = (ids, w)
         return x
 
