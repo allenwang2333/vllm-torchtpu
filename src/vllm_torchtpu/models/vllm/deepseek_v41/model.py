@@ -1199,6 +1199,8 @@ class DeepseekV41Model(nn.Module):
             if get_pp_group().is_first_rank
             else PPMissingLayer()
         )
+        if hasattr(config, "_tpu_candidate_block_buffer"):
+            delattr(config, "_tpu_candidate_block_buffer")
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         tp_size = get_tensor_model_parallel_world_size()
@@ -1216,21 +1218,11 @@ class DeepseekV41Model(nn.Module):
         )
         self.engram_layout = EngramLayout.from_config(config)
         self.candidate_block_buffer: torch.Tensor | None = None
-        cand_blocks = getattr(config, "candidate_topk_blocks", 0) or (
-            2048
-            if os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
-            else 0
-        )
-        if (
-            getattr(config, "candidate_source_layer_id", -1) >= 0
-            or os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
-        ) and cand_blocks:
+        cand_blocks = getattr(config, "candidate_topk_blocks", 0)
+        if getattr(config, "candidate_source_layer_id", -1) >= 0 and cand_blocks:
             self.candidate_block_buffer = torch.full(
                 (max_tokens, cand_blocks), -1, dtype=torch.int32
             )
-        object.__setattr__(
-            config, "_tpu_candidate_block_buffer", self.candidate_block_buffer
-        )
 
         total_layers = int(config.num_hidden_layers)
         ced_boundary = total_layers // 2
@@ -1258,8 +1250,6 @@ class DeepseekV41Model(nn.Module):
             _build_layer,
             prefix=f"{prefix}.layers",
         )
-        if hasattr(config, "_tpu_candidate_block_buffer"):
-            delattr(config, "_tpu_candidate_block_buffer")
 
         engram_lids = (
             self.engram_layout.layer_ids if self.engram_layout is not None else ()
@@ -1319,7 +1309,7 @@ class DeepseekV41Model(nn.Module):
             ["hidden_states", "pre_mix"], config.hidden_size
         )
 
-        self._single_backbone_cond = bool(envs.VLLM_DSV41_SINGLE_BACKBONE_COND) and not pure_20l
+        self._single_backbone_cond = bool(envs.VLLM_DSV41_SINGLE_BACKBONE_COND)
         self.full_stage: nn.Module | None
         if self._single_backbone_cond:
             from vllm_torchtpu.models.vllm.deepseek_v41.cond_backbone import (

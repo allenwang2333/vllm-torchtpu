@@ -242,6 +242,8 @@ class BucketExecutables:
         ):
             pos_in_caller = {item: idx for idx, item in enumerate(caller_keys)}
             perm = tuple(pos_in_caller[item] for item in keys)
+            n_swapped = sum(1 for i, p in enumerate(perm) if i != p)
+            n_swapped = sum(1 for i, p in enumerate(perm) if i != p)
             if perm == tuple(range(len(caller_keys))):
                 return runnable
             logger.info(
