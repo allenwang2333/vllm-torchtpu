@@ -134,18 +134,22 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 176 and 32 % sublane == 0
+    # size_group > 1 and 32 <= size_m <= size_group * 256 and 32 % sublane == 0
     bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
-    assert bound == 144
+    assert bound == 256
     for size_group, size_m in (
         (48, 576),
         (48, 2304),
         (48, 3456),
         (16, 1728),
-        # DP2xTP4+EP8 verify batches T_ep = 768, 960, 1152 (M = 6 * T_ep <= 6912).
+        # DP2xTP4+EP8 high-concurrency verify batches T_ep = 768..2048
+        # (M = 6 * T_ep <= 12288).
         (48, 4608),
         (48, 5760),
         (48, 6912),
+        (48, 8064),
+        (48, 9216),
+        (48, 12288),
         (48, 48 * bound),
     ):
         match_dims = types.SimpleNamespace(
@@ -161,8 +165,7 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 144 (e.g. T_ep = 1344 -> M = 8064)
-        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
+        # size_m > size_group * 256 (M = 48 * 256 + 1 = 12289)
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
@@ -850,12 +853,12 @@ def test_ext2_2d_combine_mathematical_invariants():
 
 
 def test_low_expert_dense_limit_and_bijective_scatter(monkeypatch):
-    """Verify w1.shape[0] <= 2 dense dispatch, M > 6912 scatter, and unaligned slice."""
-    assert fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP == 144
+    """Verify w1.shape[0] <= 2 dense dispatch, M > 12288 scatter, and slice."""
+    assert fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP == 256
     assert fused_moe_gmm._DENSE_EXPERT_LOW_EXPERT_MAX_TOKENS == 576
 
     rng = np.random.default_rng(7)
-    num_tokens_big = 1344
+    num_tokens_big = 2112
     topk = 6
     x_big = jnp.ones((num_tokens_big, 128), dtype=jnp.bfloat16)
     ids_big = jnp.array(

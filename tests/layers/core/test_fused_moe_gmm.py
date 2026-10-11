@@ -978,6 +978,7 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
         (48, 3456),
         (16, 1728),
         (48, 4608),
+        (48, 8064),
         (48, 48 * bound),
     ):
         decode_dims = types.SimpleNamespace(
@@ -990,8 +991,6 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
-        # T = 1344 under EP8 (M = 8064 > 48 * 144) keeps the 64-row tiling.
-        types.SimpleNamespace(size_group=48, size_m=8064, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
         assert (
