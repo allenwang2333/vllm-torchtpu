@@ -468,7 +468,11 @@ class DFlashProposer:
             chunk_max_seq_len = (
                 int(active.max().item())
                 if isinstance(active, torch.Tensor)
-                else int(max(active))
+                else (
+                    int(active.max())
+                    if isinstance(active, np.ndarray)
+                    else int(max(active))
+                )
             )
         draft_max_seq_len = (
             min(chunk_max_seq_len + block_size, self._max_model_len)
@@ -772,11 +776,15 @@ class DFlashProposer:
             self._dp_dummy_forward()
 
         # 3. Extract K tokens from logits
+        if len(draft_logits_per_chunk) == 1:
+            logits0 = draft_logits_per_chunk[0]
+            reqs0 = chunks[0].num_reqs
+            return (
+                (logits0 if logits0.shape[0] == reqs0 else logits0[:reqs0])
+                if return_device
+                else logits0.cpu()[:reqs0].tolist()
+            )
         if return_device:
-            if len(draft_logits_per_chunk) == 1:
-                logits0 = draft_logits_per_chunk[0]
-                reqs0 = chunks[0].num_reqs
-                return logits0 if logits0.shape[0] == reqs0 else logits0[:reqs0]
             sliced_chunks = [
                 logits
                 if logits.shape[0] == chunk.num_reqs

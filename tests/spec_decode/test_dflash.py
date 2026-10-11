@@ -1640,3 +1640,140 @@ def test_td8312_dflash_2d_argmax_and_int32_guard(device):
     assert argmax_input_shapes == [(padded_num_reqs * (block_size - 1), vocab)]
     assert tokens_i32.dtype == torch.int32
     assert torch.equal(tokens_i32, tokens_i64)
+
+
+def test_td8335_dflash_vectorized_active_max_and_single_chunk_host_return(
+    device, monkeypatch
+):
+    """TD8.335: Verify _build_draft_attn_metadata uses vectorized active.max()
+    when seq_lens_cpu is a numpy ndarray (never Python builtin max(active)) and
+    propose(return_device=False) returns logits0.cpu()[:reqs0].tolist() on single
+    chunk while preserving multi-chunk extend parity."""
+    import builtins
+
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer._draft_attn_layer_names = {"dummy_layer"}
+    captured_ctxs = []
+
+    def fake_build(_names, _padded_num_reqs):
+        captured_ctxs.append(proposer.runner._attn_metadata_builder_ctx)
+        return {"dummy_layer": "md"}
+
+    proposer.runner = SimpleNamespace(
+        device=device,
+        num_tokens_paddings=[8, 16, 32],
+        max_num_reqs=16,
+        input_batch=SimpleNamespace(num_reqs=2),
+        _attn_metadata_builder_ctx=None,
+        build_attention_metadata_for_layers=fake_build,
+        mesh=None,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda _n: None,
+        _dp_step_num_chunks=0,
+    )
+
+    chunk = _make_chunk(
+        num_reqs=2,
+        start_index=0,
+        device=device,
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int32),
+        position_ids=torch.zeros(4, dtype=torch.int32, device=device),
+    )
+
+    orig_max = builtins.max
+
+    def _forbid_ndarray_builtin_max(*args, **kwargs):
+        if len(args) == 1 and isinstance(args[0], np.ndarray):
+            raise AssertionError("builtins.max called on np.ndarray")
+        return orig_max(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "max", _forbid_ndarray_builtin_max)
+
+    # 1a) Padded np.ndarray seq_lens_cpu slices [:num_reqs] and uses active.max()
+    chunk.attn_ctx.max_active_seq_len = None
+    chunk.attn_ctx.seq_lens_cpu = np.array([140, 280, 999, 999], dtype=np.int32)
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([145, 285], device=device)
+    )
+    assert captured_ctxs[-1].max_active_seq_len == 280 + proposer.block_size
+
+    # 1b) Exact-length np.ndarray seq_lens_cpu uses active.max() without slice
+    chunk.attn_ctx.max_active_seq_len = None
+    chunk.attn_ctx.seq_lens_cpu = np.array([310, 190], dtype=np.int32)
+    proposer._build_draft_attn_metadata(
+        chunk, num_tokens_padded=10, seq_lens=torch.tensor([315, 195], device=device)
+    )
+    assert captured_ctxs[-1].max_active_seq_len == 310 + proposer.block_size
+
+    # 2) propose(return_device=False) single-chunk padded vs multi-chunk host return
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(8, dtype=torch.int32, device=device),
+            torch.zeros(8, dtype=torch.int32, device=device),
+            torch.zeros(2, dtype=torch.int32, device=device),
+        )
+    )
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+
+    proposer.draft_chunks = [chunk]
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        return_value=(
+            torch.tensor(
+                [[11, 12, 13], [21, 22, 23], [99, 99, 99], [99, 99, 99]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            None,
+        )
+    )
+    single_host = proposer.propose(
+        [],
+        [],
+        None,
+        None,
+        return_device=False,
+        next_tokens_per_chunk=[torch.zeros((2, 4), dtype=torch.int32, device=device)],
+    )
+    assert single_host == [[11, 12, 13], [21, 22, 23]]
+
+    chunk2 = _make_chunk(
+        num_reqs=1,
+        start_index=2,
+        device=device,
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+        position_ids=torch.zeros(2, dtype=torch.int32, device=device),
+    )
+    proposer.draft_chunks = [chunk, chunk2]
+    proposer._dflash_forward_and_sample = mock.MagicMock(
+        side_effect=[
+            (
+                torch.tensor(
+                    [[11, 12, 13], [21, 22, 23], [99, 99, 99]],
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                None,
+            ),
+            (
+                torch.tensor(
+                    [[31, 32, 33], [99, 99, 99]],
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                None,
+            ),
+        ]
+    )
+    multi_host = proposer.propose(
+        [],
+        [],
+        None,
+        None,
+        return_device=False,
+        next_tokens_per_chunk=[
+            torch.zeros((2, 4), dtype=torch.int32, device=device),
+            torch.zeros((1, 4), dtype=torch.int32, device=device),
+        ],
+    )
+    assert multi_host == [[11, 12, 13], [21, 22, 23], [31, 32, 33]]
