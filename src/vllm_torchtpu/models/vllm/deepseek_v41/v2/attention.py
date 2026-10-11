@@ -215,16 +215,13 @@ def save_compress_norm(
     if ratio == 2:
         capacity = state_cache.shape[1]
         cache = state_cache
-        pos_i32 = positions.int()
-        rows = torch.arange(
-            kv_score.shape[0], dtype=torch.int32, device=kv_score.device
-        )
+        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
         requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
         starts = query_start_loc[requests]
         ends = query_start_loc[requests + 1]
         previous_slots = (
-            slot_mapping.int().clamp(min=0) // capacity * capacity
-            + (pos_i32 - 1) % capacity
+            slot_mapping.clamp(min=0) // capacity * capacity
+            + (positions - 1) % capacity
         )
         stored = cache[previous_slots // capacity, previous_slots % capacity]
         previous = torch.where(
@@ -236,7 +233,7 @@ def save_compress_norm(
         # All reads above refer to the old ring. Keep unique physical writes.
         publish = valid & (rows >= ends - capacity)
         write_cache(cache, slot_mapping, kv_score.float(), publish, after=stored)
-        valid = valid & (pos_i32 % 2 == 1)
+        valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
@@ -1203,18 +1200,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached_swa = stage_cache.get(swa_key)
             if cached_swa is None:
-                pos_i32 = positions.int()
-                token_rows = torch.arange(
-                    positions.shape[0], dtype=torch.int32, device=positions.device
-                )
+                token_rows = torch.arange(positions.shape[0], device=positions.device)
                 valid_token = token_rows < swa.query_start_loc[-1]
                 requests = _token_requests(swa, positions).clamp(
                     max=swa_table.shape[0] - 1
                 )
                 pos_col = (
-                    (pos_i32 // rows_per_page).clamp(max=swa_table.shape[1] - 1).long()
+                    (positions // rows_per_page)
+                    .clamp(max=swa_table.shape[1] - 1)
+                    .long()
                 )
-                pos_rem = pos_i32 % rows_per_page
+                pos_rem = (positions % rows_per_page).int()
                 if non_causal:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
                     end_pos = swa.seq_lens[req_idx]
@@ -1236,7 +1232,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 else:
                     logical = (
-                        pos_i32[:, None]
+                        positions.int()[:, None]
                         - self.window_size
                         + 1
                         + torch.arange(
@@ -1262,20 +1258,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     safe = logical.clamp(
                         min=0, max=swa_table.shape[1] * rows_per_page - 1
                     )
-                    swa_pages = safe // rows_per_page
+                    swa_pages = (safe // rows_per_page).long()
                     swa_page_rem = safe % rows_per_page
                     max_prev_pages = max(2, (swa_width - 1) // rows_per_page + 1)
-                    c_last_i32 = swa_pages[:, -1]
-                    prev_cols_i32 = tuple(
-                        (c_last_i32 - k).clamp(min=0)
-                        for k in range(1, max_prev_pages + 1)
+                    c_last = swa_pages[:, -1]
+                    prev_cols = tuple(
+                        (c_last - k).clamp(min=0) for k in range(1, max_prev_pages + 1)
                     )
-                    is_c_last = swa_pages == c_last_i32[:, None]
+                    is_c_last = swa_pages == c_last[:, None]
                     is_prev_cols = tuple(
-                        swa_pages == col[:, None] for col in prev_cols_i32[:-1]
+                        swa_pages == col[:, None] for col in prev_cols[:-1]
                     )
-                    c_last = c_last_i32.long()
-                    prev_cols = tuple(col.long() for col in prev_cols_i32)
                     swa_3page = (
                         c_last,
                         prev_cols,

@@ -140,7 +140,7 @@ def test_td8250_save_compress_norm_int32_ring_and_empty_latent_parity(monkeypatc
     )
     assert seen_indices == [
         (torch.int32, torch.int32),
-        (torch.int32, torch.int32),
+        (torch.int64, torch.int64),
     ]
     assert torch.equal(latent_dirty, latent_zero)
 
