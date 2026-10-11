@@ -1033,8 +1033,14 @@ class TestModelForward:
             replay_starts=[0, 1],
         )
         meta_entry = _FakeAttnMeta(seq_lens=torch.tensor([2, 2]))
+        meta_entry_2 = _FakeAttnMeta(seq_lens=torch.tensor([2, 2]))
         mock_ctx = _FakeForwardCtx(
-            attn_metadata={"layer_0": meta_entry, "layer_1": meta_entry}
+            attn_metadata={
+                "layer_0": meta_entry,
+                "layer_1": meta_entry,
+                "layer_2": meta_entry_2,
+                "layer_3": meta_entry,
+            }
         )
         owner_perm = torch.tensor([1, 0, 3, 2])
         seen = []
@@ -1057,11 +1063,42 @@ class TestModelForward:
         ):
             model.forward(None, torch.tensor([0, 1, 2, 3]))
         dec_meta = seen[-1].attn_metadata
-        # Shared metadata objects are replaced once and stay shared.
+        # Shared metadata objects are replaced once and stay shared
+        # (both contiguous and non-contiguous).
         assert dec_meta["layer_0"] is dec_meta["layer_1"]
+        assert dec_meta["layer_0"] is dec_meta["layer_3"]
+        assert dec_meta["layer_2"] is not dec_meta["layer_0"]
+        assert dec_meta["layer_2"].owner_perm is owner_perm
         assert dec_meta["layer_0"] is not meta_entry
         assert dec_meta["layer_0"].owner_perm is owner_perm
         assert not hasattr(meta_entry, "owner_perm")
+
+        pos = torch.tensor([0, 1, 2, 3])
+        cached_tensors = DeepseekV41Model._get_ced_non_identity_tensors(
+            model, plan, 4, pos
+        )
+        # Same plan instance -> O(1) fast_key hit
+        assert (
+            DeepseekV41Model._get_ced_non_identity_tensors(model, plan, 4, pos)
+            is cached_tensors
+        )
+        # Distinct plan instance with equal list/tuple fields -> value cache_key hit
+        plan_dup = DecoderReplayPlan(
+            indices=[1, 3],
+            padded_num_tokens=4,
+            query_start_loc=(0, 2),
+            replay_starts=(0, 1),
+        )
+        assert (
+            DeepseekV41Model._get_ced_non_identity_tensors(model, plan_dup, 4, pos)
+            is cached_tensors
+        )
+        # Different num_positions -> cache miss and recompute
+        recomputed = DeepseekV41Model._get_ced_non_identity_tensors(
+            model, plan_dup, 6, torch.arange(6)
+        )
+        assert recomputed is not cached_tensors
+        assert recomputed[0].shape == (6,)
 
     def test_get_ced_decoder_owner_kwargs_branches(self) -> None:
         import numpy as np

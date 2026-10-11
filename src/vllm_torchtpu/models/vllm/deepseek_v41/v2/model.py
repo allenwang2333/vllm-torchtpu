@@ -555,6 +555,27 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self, plan, num_positions: int, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Cached `(indices, gather, bounds)` for non-identity CED replay."""
+        cached = getattr(self, "_ced_non_identity_cache", None)
+        if cached is not None and (
+            (
+                cached[2] is plan
+                and cached[3] == num_positions
+                and cached[4] == positions.device
+            )
+            or cached[0]
+            == (
+                plan.indices
+                if isinstance(plan.indices, tuple)
+                else tuple(plan.indices),
+                plan.query_start_loc
+                if isinstance(plan.query_start_loc, tuple)
+                else tuple(plan.query_start_loc),
+                plan.padded_num_tokens,
+                num_positions,
+                positions.device,
+            )
+        ):
+            return cached[1]
         indices_tuple = (
             plan.indices if isinstance(plan.indices, tuple) else tuple(plan.indices)
         )
@@ -570,9 +591,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             num_positions,
             positions.device,
         )
-        cached = getattr(self, "_ced_non_identity_cache", None)
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
         # Padded decoder rows replay the last position; their outputs are
         # dropped because no output row maps to them in `inverse`.
         last_pos = max(num_positions - 1, 0)
@@ -585,7 +603,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
         bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
         result = (inverse, gather, bounds)
-        self._ced_non_identity_cache = (cache_key, result)
+        self._ced_non_identity_cache = (
+            cache_key,
+            result,
+            plan,
+            num_positions,
+            positions.device,
+        )
         return result
 
     @staticmethod
@@ -843,17 +867,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
             replaced_by_id: dict[int, object] = {}
             decoder_metadata = {}
+            last_val = rep = None
             for key, value in metadata.items():
-                vid = id(value)
-                rep = replaced_by_id.get(vid)
-                if rep is None:
-                    rep = replace(
-                        value,
-                        input_positions=decoder_positions,
-                        query_start_loc=bounds,
-                    )
-                    rep.__dict__.update(dec_owner_kwargs)
-                    replaced_by_id[vid] = rep
+                if (
+                    value is not last_val
+                    and (rep := replaced_by_id.get(id(value))) is None
+                ):
+                    rep = object.__new__(type(value))
+                    rep.__dict__ = {
+                        **value.__dict__,
+                        "input_positions": decoder_positions,
+                        "query_start_loc": bounds,
+                        **dec_owner_kwargs,
+                    }
+                    replaced_by_id[id(value)] = rep
+                last_val = value
                 decoder_metadata[key] = rep
             decoder_padding = DeepseekV41Model._get_ced_padding_mask(
                 self, plan.padded_num_tokens, len(plan.indices), positions.device
