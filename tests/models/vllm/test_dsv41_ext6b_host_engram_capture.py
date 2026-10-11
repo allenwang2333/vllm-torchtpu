@@ -491,3 +491,51 @@ def test_td8283_host_engram_int32_zero_copy_and_scratch_dtypes(monkeypatch):
                 ),
                 runner.input_batch.num_computed_tokens_cpu,
             )
+
+
+def test_td8342_host_engram_c_dict_fast_paths_and_lookback_dirty_tracking():
+    """TD8.342: C-level dict equality fast paths, single-pass positions subtract,
+    and _host_engram_lookback_dirty tracking."""
+    runner = _make_runner(8, k=5, depth=4, seed=99)
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+
+    # 1. Steady-state decode with num_reqs=6 < cap_rows=8
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(6)}
+    res1 = he.capture_host_engram_inputs(runner, 6)
+    assert res1 is not None and res1.host_ready is True
+    assert runner._host_engram_lookback_dirty == 6
+    assert runner._host_engram_ref_req_dict[0] == tuple(f"req-{i}" for i in range(6))
+    assert 5 in runner._host_engram_ref_drafts
+    ref_draft_5 = runner._host_engram_ref_drafts[5]
+
+    # Full 8-request step reuses _host_engram_ref_drafts[5] and caches ref_req_8
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    res_full1 = he.capture_host_engram_inputs(runner, 8)
+    ref_req_8 = runner._host_engram_ref_req_dict
+    res_full2 = he.capture_host_engram_inputs(runner, 8)
+    assert runner._host_engram_ref_drafts[5] is ref_draft_5
+    assert runner._host_engram_ref_req_dict is ref_req_8
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(res_full1.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(res_full2.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(res_full2.lookback_token_ids.numpy(), lb_ref)
+
+    # 2. Steady-state num_reqs=4 < cap_rows=8: skips tail copy on repeat
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(4)}
+    res_s1 = he.capture_host_engram_inputs(runner, 4)
+    assert runner._host_engram_lookback_dirty == 4
+    res_s1.lookback_token_ids.numpy()[4:] = -777
+    res_s2 = he.capture_host_engram_inputs(runner, 4)
+    assert np.all(res_s2.lookback_token_ids.numpy()[4:] == -777)
+
+    # 3. Identity reqs with non-uniform scheduled tokens (uniform_stride=False)
+    runner.query_start_loc_cpu[:5] = torch.tensor([0, 6, 10, 16, 22], dtype=torch.int32)
+    res_hetero = he.capture_host_engram_inputs(runner, 4)
+    assert res_hetero is not None and res_hetero.host_ready is True
+    ids_ref_h, pos_ref_h, lb_ref_h = _reference(runner, 4)
+    np.testing.assert_array_equal(res_hetero.input_ids.numpy()[:22], ids_ref_h[:22])
+    np.testing.assert_array_equal(res_hetero.positions.numpy()[:22], pos_ref_h[:22])
+    np.testing.assert_array_equal(
+        res_hetero.lookback_token_ids.numpy()[:4], lb_ref_h[:4]
+    )
