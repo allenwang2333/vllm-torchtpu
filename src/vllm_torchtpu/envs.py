@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_DCP_MLA_MIXED_LIVE: bool = False
+    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -480,6 +481,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the first top-k window (cdiv(max kv_len, 64) of 8 at cap 512) instead
     # of all 512 slots per token. Same outputs; decode buckets unaffected.
     "TPU_DCP_MLA_MIXED_LIVE": env_bool("TPU_DCP_MLA_MIXED_LIVE", default=False),
+    # With TPU_DCP_MLA_MIXED_LIVE: comma-separated ascending row widths
+    # (multiples of 128 below the cap, e.g. "256"); a 16-token grid step whose
+    # live atoms fit a width runs its attention body on that many rows per
+    # token instead of the full 512. Same outputs. Empty = off.
+    "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": lambda: os.getenv(
+        "TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
