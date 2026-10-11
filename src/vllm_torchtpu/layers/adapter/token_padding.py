@@ -29,6 +29,12 @@ class TokenPaddingState:
     local_valid_tokens: torch.Tensor | None = None
     # (valid, padded) counts the mask was last written for.
     _last_counts: tuple[int, int] | None = field(default=None, init=False)
+    _host_masks: dict[tuple[int, int], torch.Tensor] = field(
+        default_factory=dict, init=False
+    )
+    _host_valid_counts: dict[int, torch.Tensor] = field(
+        default_factory=dict, init=False
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -48,17 +54,24 @@ class TokenPaddingState:
         saves a synchronous host-to-device copy per step.
         """
         counts = (int(local_valid_tokens), int(local_padded_tokens))
-        if counts == self._last_counts:
+        prev_counts = self._last_counts
+        if counts == prev_counts:
             return
         self._last_counts = counts
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
-        if self.local_valid_tokens is not None:
-            self.local_valid_tokens.copy_(
-                torch.tensor([local_valid_tokens], dtype=torch.int32)
-            )
+        host = self._host_masks.get(counts)
+        if host is None:
+            host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+            host[counts[0] : counts[1]] = True
+            self._host_masks[counts] = host
+        self.local_padding_mask.copy_(host, non_blocking=True)
+        if self.local_valid_tokens is not None and (
+            prev_counts is None or prev_counts[0] != counts[0]
+        ):
+            valid_host = self._host_valid_counts.get(counts[0])
+            if valid_host is None:
+                valid_host = torch.tensor([counts[0]], dtype=torch.int32)
+                self._host_valid_counts[counts[0]] = valid_host
+            self.local_valid_tokens.copy_(valid_host, non_blocking=True)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
