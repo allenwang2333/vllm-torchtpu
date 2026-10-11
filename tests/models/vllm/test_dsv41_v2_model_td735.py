@@ -283,3 +283,140 @@ def test_encoder_stage_returns_encoder_aux_and_dp_shared_memory_guard(monkeypatc
         NotImplementedError, match="engram dp_shared_memory is not supported"
     ):
         DeepseekV41ForCausalLM(vllm_config=bad_cfg)
+
+
+def test_td8255_ced_replay_and_window_starts_int32_with_int64_positions(monkeypatch):
+    """TD8.255: Verify _get_ced_replay_starts, window_starts, replay_starts, and
+    _get_ced_padding_mask stay native torch.int32 even when positions is torch.int64."""
+    from dataclasses import dataclass, field
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import _zero_hits
+
+    @dataclass
+    class _FakeMeta:
+        seq_lens: torch.Tensor
+        query_start_loc: torch.Tensor
+        replay_starts_cpu: tuple[int, ...] | None = None
+        input_positions: torch.Tensor | None = None
+
+    @dataclass
+    class _FakeCtx:
+        attn_metadata: dict
+        additional_kwargs: dict = field(default_factory=dict)
+        is_padding: torch.Tensor | None = None
+
+    dummy = SimpleNamespace()
+    pos_i64 = torch.arange(8, dtype=torch.int64)
+    pos_i32 = torch.arange(8, dtype=torch.int32)
+
+    z1 = DeepseekV41Model._get_ced_replay_starts(dummy, _zero_hits(4), pos_i64)
+    z2 = DeepseekV41Model._get_ced_replay_starts(dummy, (0, 0, 0, 0), pos_i32)
+    assert z1.dtype == torch.int32
+    assert z1 is z2
+    assert torch.equal(z1, torch.zeros(4, dtype=torch.int32))
+
+    nz1 = DeepseekV41Model._get_ced_replay_starts(
+        dummy, [0, 64, 128, 0], pos_i64, cache_attr="_nz_cache"
+    )
+    nz2 = DeepseekV41Model._get_ced_replay_starts(
+        dummy, (0, 64, 128, 0), pos_i32, cache_attr="_nz_cache"
+    )
+    assert nz1.dtype == torch.int32
+    assert nz1 is nz2
+    assert torch.equal(nz1, torch.tensor([0, 64, 128, 0], dtype=torch.int32))
+
+    arange_dtypes: list[torch.dtype | None] = []
+    orig_arange = torch.arange
+
+    def spy_arange(*args, **kwargs):
+        arange_dtypes.append(kwargs.get("dtype"))
+        return orig_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", spy_arange)
+    pad = DeepseekV41Model._get_ced_padding_mask(dummy, 6, 4, pos_i64.device)
+    assert arange_dtypes == [torch.int32]
+    assert pad.dtype == torch.bool
+    assert torch.equal(pad, torch.tensor([False, False, False, False, True, True]))
+    monkeypatch.setattr(torch, "arange", orig_arange)
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    model._ced_enabled = True
+    model._ced_boundary = 1
+    model._ced_window = 512
+    model._ced_compile_sizes = (4,)
+    model._ced_dp_sync = False
+    model.start_layer = 0
+    model.end_layer = 2
+    model.layers = []
+    model.use_sequence_parallel = False
+    model.use_mega_moe = False
+    model.config = SimpleNamespace(hidden_size=8)
+    model.aux_hidden_state_layers = ()
+
+    first_meta = _FakeMeta(
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        replay_starts_cpu=(0, 32),
+    )
+    ctx = _FakeCtx(attn_metadata={"l0": first_meta})
+
+    captured_enc_win: list[torch.Tensor] = []
+    captured_dec_rep: list[torch.Tensor] = []
+
+    def fake_enc(*args):
+        c = v2_model.upstream.get_forward_context()
+        captured_enc_win.append(c.additional_kwargs["deepseek_v41_window_starts"])
+        return torch.zeros((4, 8)), torch.zeros((4, 4))
+
+    def fake_dec(*args, **kwargs):
+        c = v2_model.upstream.get_forward_context()
+        captured_dec_rep.append(c.additional_kwargs["deepseek_v41_replay_starts"])
+        return torch.ones((args[1].shape[0], 8))
+
+    model.encoder_stage = fake_enc
+    model.decoder_stage = fake_dec
+
+    with v2_model.override_forward_context(ctx):
+        # 1) plan is None with int64 positions
+        monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *a: None)
+        model.forward(torch.zeros(4, dtype=torch.int32), pos_i64[:4])
+        assert captured_enc_win[-1].dtype == torch.int32
+        assert captured_dec_rep[-1].dtype == torch.int32
+        assert torch.equal(
+            captured_enc_win[-1], torch.tensor([0, 32], dtype=torch.int32)
+        )
+        assert torch.equal(
+            captured_dec_rep[-1], torch.tensor([0, 0], dtype=torch.int32)
+        )
+
+        # 2) identity plan with int64 positions
+        id_plan = DecoderReplayPlan(
+            indices=(0, 1, 2, 3),
+            query_start_loc=(0, 2, 4),
+            replay_starts=(0, 64),
+            padded_num_tokens=4,
+            is_identity=True,
+        )
+        monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *a: id_plan)
+        model.forward(torch.zeros(4, dtype=torch.int32), pos_i64[:4])
+        assert captured_enc_win[-1].dtype == torch.int32
+        assert captured_dec_rep[-1].dtype == torch.int32
+        assert torch.equal(
+            captured_dec_rep[-1], torch.tensor([0, 64], dtype=torch.int32)
+        )
+
+        # 3) non-identity plan with int64 positions
+        non_id_plan = DecoderReplayPlan(
+            indices=(1, 3),
+            query_start_loc=(0, 1, 2),
+            replay_starts=(16, 48),
+            padded_num_tokens=2,
+            is_identity=False,
+        )
+        monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *a: non_id_plan)
+        model.forward(torch.zeros(4, dtype=torch.int32), pos_i64[:4])
+        assert captured_enc_win[-1].dtype == torch.int32
+        assert captured_dec_rep[-1].dtype == torch.int32
+        assert torch.equal(
+            captured_dec_rep[-1], torch.tensor([16, 48], dtype=torch.int32)
+        )

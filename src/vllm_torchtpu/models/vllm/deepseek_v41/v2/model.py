@@ -533,16 +533,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if isinstance(replay_starts_seq, tuple)
             else tuple(replay_starts_seq)
         )
-        replay_key = (replay_tuple, positions.dtype, positions.device)
+        replay_key = (replay_tuple, positions.device)
         cached_replay = getattr(self, cache_attr, None)
         if cached_replay is not None and cached_replay[0] == replay_key:
             return cached_replay[1]
         replay_starts = (
-            positions.new_zeros(len(replay_tuple))
+            torch.zeros(len(replay_tuple), dtype=torch.int32, device=positions.device)
             if replay_tuple is _zero_hits(len(replay_tuple)) or not any(replay_tuple)
             else torch.tensor(
                 replay_tuple,
-                dtype=positions.dtype,
+                dtype=torch.int32,
                 device=positions.device,
             )
         )
@@ -557,7 +557,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         cached_pad = getattr(self, "_ced_padding_mask_cache", None)
         if cached_pad is not None and cached_pad[0] == pad_key:
             return cached_pad[1]
-        decoder_padding = torch.arange(total_tokens, device=device) >= valid_tokens
+        decoder_padding = (
+            torch.arange(total_tokens, dtype=torch.int32, device=device) >= valid_tokens
+        )
         self._ced_padding_mask_cache = (pad_key, decoder_padding)
         return decoder_padding
 
@@ -780,7 +782,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_hidden, decoder_mix = hidden, pre_mix
             if plan is None:
                 requests = first.seq_lens.shape[0] if first is not None else 1
-                replay_starts = positions.new_zeros(requests)
+                replay_starts = torch.zeros(
+                    requests, dtype=torch.int32, device=positions.device
+                )
                 decoder_padding = (
                     DeepseekV41Model._get_ced_padding_mask(
                         self,
