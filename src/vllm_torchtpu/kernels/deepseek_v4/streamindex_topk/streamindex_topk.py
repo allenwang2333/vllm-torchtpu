@@ -1080,6 +1080,7 @@ def _effective_row_lengths(
         "return_scores",
         "skip_empty_decode",
         "topk_width_buckets",
+        "token_window_size",
     ),
 )
 def streamindex_topk(
@@ -1110,6 +1111,8 @@ def streamindex_topk(
     return_scores: bool = False,
     skip_empty_decode: bool = False,
     topk_width_buckets: int = 0,
+    token_window_size: int | None = None,
+    token_window_start: jax.Array | int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1183,6 +1186,11 @@ def streamindex_topk(
         wide table (long `max_model_len`, small DCP) and short sequences both
         mostly move padding. No row reaches past its sequence, so the result
         is identical. 0 = always the full width.
+      token_window_size, token_window_start: score and select only the token
+        rows `[start, start + size)` of the flat token axis, against the full
+        batch metadata, and return those rows. `start` may be traced. Rows
+        are independent, so the window's result equals those rows of the
+        whole call's. None = all rows.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1251,6 +1259,15 @@ def streamindex_topk(
 
     max_num_seqs = seq_lens.shape[0]
 
+    if token_window_size is not None and (
+        q.shape[0] % token_window_size or token_window_size % decode_req_batch_size
+    ):
+        raise ValueError(
+            f"token_window_size ({token_window_size}) must divide the"
+            f" {q.shape[0]} tokens and be a multiple of decode_req_batch_size"
+            f" ({decode_req_batch_size})."
+        )
+
     if topk_width_buckets:
         # Run the whole call -- scoring, every chunk's top-k and their overlap
         # -- on a page table cut to the narrowest width holding every row: the
@@ -1283,6 +1300,8 @@ def streamindex_topk(
             interleave_size=interleave_size,
             return_scores=return_scores,
             skip_empty_decode=skip_empty_decode,
+            token_window_size=token_window_size,
+            token_window_start=token_window_start,
         )
 
         def at_width(pages):
@@ -1617,10 +1636,11 @@ def streamindex_topk(
             interleave_c=interleave_c,
         )
 
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
-            num_chunks, chunk_len = 1, max_num_tokens
+        window = max_num_tokens if token_window_size is None else token_window_size
+        if chunk_tokens is None or window % chunk_tokens:
+            num_chunks, chunk_len = 1, window
         else:
-            num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+            num_chunks, chunk_len = window // chunk_tokens, chunk_tokens
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
@@ -1628,11 +1648,15 @@ def streamindex_topk(
         if num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
+        if token_window_size is not None:
+            # A window always goes through the windowed metadata, even unchunked.
+            chunk_starts = tuple(
+                token_window_start + m * chunk_len for m in range(num_chunks)
+            )
+        elif num_chunks == 1:
+            chunk_starts = (None,)
+        else:
+            chunk_starts = tuple(m * chunk_len for m in range(num_chunks))
         passes = tuple(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
             for spec in _pass_specs(decode_batch_end)
@@ -1646,7 +1670,7 @@ def streamindex_topk(
             tc_group = None if m == 0 else group_base + m - 1
             sc_group = None if m == num_chunks - 1 else group_base + m
 
-            start = m * chunk_len
+            start = 0 if chunk_starts[m] is None else chunk_starts[m]
             scores_for = functools.partial(
                 _scores_for_chunk,
                 chunk_idx=m,
@@ -1655,7 +1679,7 @@ def streamindex_topk(
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
             )
-            if skip_empty_decode and num_chunks == 1:
+            if skip_empty_decode and chunk_starts[m] is None:
                 # The DECODE passes cover [0, distribution[1]); with it empty,
                 # the MIXED pass alone allocates the buffer and writes every row
                 # it would have written behind them.
@@ -1679,7 +1703,9 @@ def streamindex_topk(
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=lax.dynamic_slice_in_dim(
+                        eff_row_lengths, start, chunk_len
+                    ),
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
@@ -1689,7 +1715,9 @@ def streamindex_topk(
                 chunk_topk_idxs = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=lax.dynamic_slice_in_dim(
+                        eff_row_lengths, start, chunk_len
+                    ),
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
@@ -1697,7 +1725,7 @@ def streamindex_topk(
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
-        out = out[:max_num_tokens, :k]
+        out = out[:window, :k]
 
         if cp_size == 1 and not return_scores:
             return out
@@ -1714,7 +1742,7 @@ def streamindex_topk(
             if len(topk_scores_list) == 1
             else jnp.concatenate(topk_scores_list)
         )
-        scores_out = scores_out[:max_num_tokens, :k]
+        scores_out = scores_out[:window, :k]
         return out, scores_out
 
     def _fast_path(_):
@@ -1764,6 +1792,7 @@ def streamindex_topk(
         "a2a_merge",
         "skip_empty_decode",
         "topk_width_buckets",
+        "replica_axis_name",
     ),
 )
 def streamindex_topk_dcp(
@@ -1791,6 +1820,7 @@ def streamindex_topk_dcp(
     a2a_merge: bool = False,
     skip_empty_decode: bool = False,
     topk_width_buckets: int = 0,
+    replica_axis_name: str | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1861,6 +1891,11 @@ def streamindex_topk_dcp(
         the candidate axis with an `all_gather`; see above. Same result.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
       topk_width_buckets: forwarded to `streamindex_topk`; see there.
+      replica_axis_name: a mesh axis over which q and the cache are replicated
+        (the TP lanes DCP does not shard). Each replica scores, selects and
+        merges only its `1 / size` block of the token axis, and an int32
+        all-gather over the axis restores every row on every replica. Rows are
+        independent, so the result is identical. None = every replica does all.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1889,6 +1924,18 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
+    num_replicas = 1 if replica_axis_name is None else mesh.shape[replica_axis_name]
+    block = q.shape[0] // num_replicas
+    if replica_axis_name is not None and (
+        q.shape[0] % num_replicas
+        or block % decode_req_batch_size
+        or (a2a_merge and block % dcp_size)
+    ):
+        raise ValueError(
+            f"padded_num_tokens={q.shape[0]} must split into {num_replicas}"
+            f" blocks that are multiples of decode_req_batch_size"
+            f" ({decode_req_batch_size}) and, with a2a_merge, of dcp_size."
+        )
 
     def _local(
         q,
@@ -1898,6 +1945,25 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+    ):
+        args = (q, indexer_weights, cache_kv, seq_lens, page_indices, cu_q_lens)
+        if replica_axis_name is None:
+            return _merged_rows(*args, distribution, None, 0)
+        replica = cp_rank_as_data(replica_axis_name, num_replicas)
+        rows = _merged_rows(*args, distribution, block, replica * block)
+        # Replica j holds token block j, so a tiled gather is token order.
+        return lax.all_gather(rows, replica_axis_name, axis=0, tiled=True)
+
+    def _merged_rows(
+        q,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        window_size,
+        window_start,
     ):
         dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
@@ -1926,6 +1992,8 @@ def streamindex_topk_dcp(
             return_scores=True,
             skip_empty_decode=skip_empty_decode,
             topk_width_buckets=topk_width_buckets,
+            token_window_size=window_size,
+            token_window_start=window_start,
         )
 
         if a2a_merge:

@@ -422,6 +422,82 @@ def test_all_to_all_round_trip_preserves_token_order(dcp_size):
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize(
+    "q_len, chunk_tokens, a2a_merge, two_seqs",
+    [
+        (256, None, False, False),
+        (256, 32, False, False),
+        (256, 32, True, False),
+        (64, None, False, False),
+        # An MTP-style 4-row sequence first, then a prefill whose rows cross
+        # every block seam.
+        (256, 32, False, True),
+        (256, None, True, True),
+    ],
+)
+def test_replica_split_matches_unsplit(q_len, chunk_tokens, a2a_merge, two_seqs):
+    """`replica_axis_name` splits the token axis over a replicated mesh axis.
+
+    Every row's scoring, top-k and DCP merge is independent of the others, so
+    the split must reproduce the unsplit result bit for bit, on every shard.
+    """
+    lanes, dcp_size = 4, 2
+    _need_devices(lanes * dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 17, q_len=q_len)
+    if two_seqs:
+        pages = args[4]
+        args = (
+            *args[:3],
+            jnp.array([KV_LEN, KV_LEN], jnp.int32),
+            jnp.concatenate([pages, pages]),
+            jnp.array([0, 4, q_len], jnp.int32),
+            jnp.array([0, 0, 2], jnp.int32),
+        )
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[: lanes * dcp_size]).reshape(lanes, dcp_size),
+        ("dcp_lane", DCP_AXIS_NAME),
+    )
+    shards = jax.device_put(
+        np.asarray(args[2]), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+    args = (*args[:2], shards, *args[3:])
+    kwargs = dict(kwargs, mesh=mesh, chunk_tokens=chunk_tokens, a2a_merge=a2a_merge)
+
+    # The split adds the lane gather of the int32 rows; without it the two
+    # calls would be the same program and the comparison would be vacuous.
+    def gathers(**extra):
+        hlo = streamindex_topk_dcp.lower(*args, **kwargs, **extra).as_text()
+        return len(re.findall(r"all-gather", hlo))
+
+    assert gathers(replica_axis_name="dcp_lane") > gathers()
+
+    unsplit = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    split = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, replica_axis_name="dcp_lane")
+    )
+    np.testing.assert_array_equal(split, unsplit)
+
+
+def test_replica_split_rejects_ragged_blocks():
+    """A bucket that does not split into decode-group blocks is refused."""
+    lanes, dcp_size = 4, 2
+    _need_devices(lanes * dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 17, q_len=40)
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()[: lanes * dcp_size]).reshape(lanes, dcp_size),
+        ("dcp_lane", DCP_AXIS_NAME),
+    )
+    shards = jax.device_put(
+        np.asarray(args[2]), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+    )
+    args = (*args[:2], shards, *args[3:])
+    with pytest.raises(ValueError, match="must split into 4 blocks"):
+        streamindex_topk_dcp(
+            *args, **dict(kwargs, mesh=mesh), replica_axis_name="dcp_lane"
+        )
+
+
+@pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4])
 @pytest.mark.parametrize("chunk_tokens", [None, 64])
 def test_dcp_width_buckets_do_not_change_the_result(chunk_tokens, dcp_size):

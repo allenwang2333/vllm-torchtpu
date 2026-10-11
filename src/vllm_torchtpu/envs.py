@@ -108,6 +108,8 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_STREAMIDX_TOPK_WIDTH_BUCKETS: int = 0
+    TPU_STREAMIDX_REPLICA_SPLIT: bool = False
+    TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS: int = 256
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -868,6 +870,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # long max_model_len over few DCP ranks they otherwise move padding. Exact.
     "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS": env_nonnegative_int(
         "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS", 0
+    ),
+    # DCP StreamIndex: split the token axis over the TP lanes DCP leaves
+    # replicated, so each lane scores and selects 1/lanes of the rows, then
+    # all-gather the int32 indices. Buckets below MIN_TOKENS keep every lane on
+    # all rows (decode streams each request's whole context per lane). Exact.
+    "TPU_STREAMIDX_REPLICA_SPLIT": env_bool(
+        "TPU_STREAMIDX_REPLICA_SPLIT", default=False
+    ),
+    "TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS": env_nonnegative_int(
+        "TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS", 256
     ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following

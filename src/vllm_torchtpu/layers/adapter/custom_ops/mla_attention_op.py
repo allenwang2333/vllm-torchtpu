@@ -45,7 +45,11 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (
+    DCP_LANE_AXIS_NAME,
+    get_dcp_group,
+    get_or_create_dcp_mesh,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -261,6 +265,28 @@ def _dcp_indexer_a2a_for_bucket(
     prefill-sized ones (>= `min_tokens`) take the all-to-all.
     """
     return enabled and num_tokens >= min_tokens
+
+
+def _replica_split_for_bucket(
+    num_tokens: int,
+    num_replicas: int,
+    enabled: bool,
+    min_tokens: int,
+    block_multiple: int,
+) -> bool:
+    """Whether this token bucket splits the DCP indexer over the TP lanes.
+
+    Static per compiled variant, like `_dcp_indexer_a2a_for_bucket`: decode
+    buckets keep every lane on all rows (a lane would still stream each
+    request's whole context), prefill-sized buckets split when they divide
+    into `num_replicas` blocks that are multiples of `block_multiple`.
+    """
+    return (
+        enabled
+        and num_replicas > 1
+        and num_tokens >= min_tokens
+        and num_tokens % (num_replicas * block_multiple) == 0
+    )
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -584,6 +610,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         topk_width_buckets = envs.TPU_STREAMIDX_TOPK_WIDTH_BUCKETS
+        replica_split = envs.TPU_STREAMIDX_REPLICA_SPLIT
+        replica_min_tokens = envs.TPU_STREAMIDX_REPLICA_SPLIT_MIN_TOKENS
+        num_replicas = mesh.shape[DCP_LANE_AXIS_NAME]
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -618,6 +647,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], small_bucket_bq, small_bucket_bkvp
             )
+            bucket_a2a = _dcp_indexer_a2a_for_bucket(
+                q.shape[0], a2a_merge, a2a_min_tokens
+            )
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -637,8 +669,18 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode=skip_empty_decode,
                 topk_width_buckets=topk_width_buckets,
                 chunk_tokens=chunk_tokens,
-                a2a_merge=_dcp_indexer_a2a_for_bucket(
-                    q.shape[0], a2a_merge, a2a_min_tokens
+                a2a_merge=bucket_a2a,
+                replica_axis_name=(
+                    DCP_LANE_AXIS_NAME
+                    if _replica_split_for_bucket(
+                        q.shape[0],
+                        num_replicas,
+                        replica_split,
+                        replica_min_tokens,
+                        # Blocks hold whole decode groups, and dcp rows for a2a.
+                        4 * (dcp_size if bucket_a2a else 1),
+                    )
+                    else None
                 ),
             )
             return cache_kv, local_topk

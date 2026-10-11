@@ -31,9 +31,9 @@ logger = init_logger(__name__)
 
 # The JAX mesh axis the DCP kernels shard the KV cache over.
 DCP_AXIS_NAME = "dcp"
-# The TP lanes DCP does not shard over. No kernel collects over it; it is
-# there so the mesh spans the world, which torch_tpu requires of a Pallas
-# kernel mesh.
+# The TP lanes DCP does not shard over. It is there so the mesh spans the
+# world, which torch_tpu requires of a Pallas kernel mesh; the DCP indexer
+# collects over it only with TPU_STREAMIDX_REPLICA_SPLIT.
 DCP_LANE_AXIS_NAME = "dcp_lane"
 
 # DCP builds its own mesh rather than going through Torchtpu-free helpers, so
