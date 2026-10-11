@@ -999,6 +999,7 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.parametrize("stage", ["full", "encoder"])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.cpu_test
 def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
     monkeypatch, stage, sequence_parallel
 ):
