@@ -203,7 +203,10 @@ class BlockTableDeltaStager:
         entries: list[tuple[int, Any, int]], num_reqs_padded: int, start_index: int
     ) -> tuple:
         return (
-            tuple((gid, ensure_tracked(bt), tnb) for gid, bt, tnb in entries),
+            tuple(
+                (gid, getattr(bt, "_bt_delta_token", None) or ensure_tracked(bt), tnb)
+                for gid, bt, tnb in entries
+            ),
             num_reqs_padded,
             start_index,
         )
@@ -254,7 +257,10 @@ class BlockTableDeltaStager:
         idx_out = update_buf[0]
         val_out = update_buf[1]
         pos = 0
-        active_cols_cache: dict[tuple[int, bool, int], int] = {}
+        active_cols_cache: dict[tuple[int, bool, int], int] = {
+            st.ac_key: b._active_block_table_columns(ctx, tnb)
+            for b, tnb, st in layout.unique_geoms
+        }
         # Append plans by geometry: groups of one block size share per-row
         # block counts, so one plan serves all of them even when geometries
         # interleave across the walk.
@@ -267,8 +273,9 @@ class BlockTableDeltaStager:
             builders, entries, layout.entries, strict=True
         ):
             ac_key = st.ac_key
-            active_cols = active_cols_cache.get(ac_key)
-            if active_cols is None:
+            if ac_key in active_cols_cache:
+                active_cols = active_cols_cache[ac_key]
+            else:
                 active_cols = builder._active_block_table_columns(ctx, tnb)
                 active_cols_cache[ac_key] = active_cols
             mutations = bt._bt_mutations

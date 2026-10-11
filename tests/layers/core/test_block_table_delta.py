@@ -517,3 +517,54 @@ def test_td8373_interleaved_geometries_keep_their_append_plans(monkeypatch):
                 ref = ref.view(2, MAX_BLOCKS)[:, : MAX_BLOCKS // 2].reshape(-1)
             assert torch.equal(got[gid], ref), (step, gid)
         assert len(plan_builds) == 2, step
+
+
+def test_td8390_layout_key_inlined_token_and_prepopulated_active_cols_cache(
+    monkeypatch,
+):
+    """layout_key reads _bt_delta_token inline without calling ensure_tracked on
+    tracked tables, and try_stage pre-populates active_cols_cache from unique_geoms
+    with fallback when unique_geoms is empty."""
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "1")
+    bt0 = _make_block_table(4)
+    bt1 = _make_block_table(4)
+    entries = [(0, bt0, MAX_BLOCKS), (1, bt1, MAX_BLOCKS)]
+    key1 = btd.BlockTableDeltaStager.layout_key(entries, 2, 0)
+    assert btd.ensure_tracked(bt0) == bt0._bt_delta_token
+
+    def fail_ensure_tracked(_bt):
+        raise AssertionError("ensure_tracked should not be called when tracked")
+
+    monkeypatch.setattr(btd, "ensure_tracked", fail_ensure_tracked)
+    key2 = btd.BlockTableDeltaStager.layout_key(entries, 2, 0)
+    assert key2 == key1
+    monkeypatch.undo()
+
+    group_builders = [_Builder(0, bt0, 4), _Builder(1, bt1, 4)]
+    runner = _make_runner(group_builders)
+    for b in group_builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([10], 1)
+    _stage(runner, 2, [8, 4], 2)
+
+    # Clear unique_geoms on the recorded layout to exercise the else fallback
+    stager = btd.get_stager(runner)
+    layout = next(iter(stager._layouts.values()))
+    saved_geoms = layout.unique_geoms
+    layout.unique_geoms = ()
+    for b in group_builders:
+        b.bt.append_row([3], 0)
+    got_fallback = _stage(runner, 2, [12, 4], 2)
+    want_fallback = _reference(group_builders, 2, [12, 4], 2, 0)
+    for gid in want_fallback:
+        assert torch.equal(got_fallback[gid], want_fallback[gid])
+
+    # Restore unique_geoms and verify normal pre-populated active_cols_cache path
+    layout.unique_geoms = saved_geoms
+    for b in group_builders:
+        b.bt.append_row([4], 0)
+    got_prepop = _stage(runner, 2, [16, 4], 2)
+    want_prepop = _reference(group_builders, 2, [16, 4], 2, 0)
+    for gid in want_prepop:
+        assert torch.equal(got_prepop[gid], want_prepop[gid])
