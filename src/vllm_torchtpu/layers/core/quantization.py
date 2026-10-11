@@ -169,13 +169,15 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
     # FP4 e2m1 lookup table mapping 4-bit index to float value
     fp4_lut = _FP4_VALUES_CPU.to(packed.device)
 
-    # Extract low and high nibbles
-    low_nibble = (packed & 0x0F).to(torch.int64)
-    high_nibble = ((packed >> 4) & 0x0F).to(torch.int64)
+    # Extract low and high nibbles (int32 indices for a 1D LUT index_select)
+    low_nibble = (packed & 0x0F).to(torch.int32)
+    high_nibble = ((packed >> 4) & 0x0F).to(torch.int32)
 
     # Convert to float using LUT
-    low_fp32 = fp4_lut[low_nibble]
-    high_fp32 = fp4_lut[high_nibble]
+    low_fp32 = fp4_lut.index_select(0, low_nibble.reshape(-1)).reshape(low_nibble.shape)
+    high_fp32 = fp4_lut.index_select(0, high_nibble.reshape(-1)).reshape(
+        high_nibble.shape
+    )
 
     # Interleave: [low0, high0, low1, high1, ...]
     result = torch.stack([low_fp32, high_fp32], dim=-1)
@@ -460,4 +462,6 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
         float32 tensor with FP4 values.
     """
     fp4_values = _FP4_VALUES_CPU.to(indices.device)
-    return fp4_values[indices.to(torch.int64)]
+    return fp4_values.index_select(0, indices.to(torch.int32).reshape(-1)).reshape(
+        indices.shape
+    )
