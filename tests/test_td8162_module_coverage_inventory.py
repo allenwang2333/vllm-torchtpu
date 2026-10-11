@@ -71,9 +71,9 @@ SUBSYSTEM_COVERAGE_INVENTORY: dict[str, tuple[int, int, int, str]] = {
     ),
     "layers/core": (
         12,
-        2134,
+        2140,
         536,
-        "TD8.81 / TD8.94 / TD8.110 / TD8.134 / TD8.175 / TD8.199",
+        "TD8.81 / TD8.94 / TD8.110 / TD8.134 / TD8.175 / TD8.199 / TD8.281",
     ),
     "models": (1, 0, 0, "TD8.155 / TD8.166"),
     "models/vllm": (4, 334, 112, "TD8.67 / TD8.154 / TD8.155 / TD8.158"),

@@ -1015,3 +1015,73 @@ class TestAttentionMetadataBuilderPlumbing:
                     5000 + gid * 200 + c_reqs - 1
                 )
         assert am_mod.envs.TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD is True
+
+    def test_td8281_int32_flat_index_select_mamba_row_plan_and_staged_walk(
+        self, monkeypatch
+    ):
+        """TD8.281: Verify _staged_walk_products, _mamba_row_plan, and build use
+        native 1D int32 flat indexing + .index_select(0, ...) without 2D
+        torch.gather or int64 index casts."""
+        import vllm_torchtpu.layers.core.attention_metadata as am_mod
+
+        def _forbid_gather(*args, **kwargs):
+            raise AssertionError("torch.gather must not be called in TD8.281")
+
+        monkeypatch.setattr(torch, "gather", _forbid_gather)
+
+        runner = self._make_runner_mock(
+            max_num_reqs=4,
+            max_num_blocks_per_req=8,
+            most_model_len=128,
+            num_groups=2,
+        )
+        runner._unified_kv_layout = True
+        b_mamba = self._make_mamba_builder(runner, kv_cache_group_id=1)
+        src_bt = runner.input_batch.block_table[1].get_cpu_tensor()
+        src_bt[:4, :8] = torch.arange(100, 132, dtype=torch.int32).reshape(4, 8)
+
+        seq_lens = torch.tensor([1, 17, 112, 0], dtype=torch.int32)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=seq_lens,
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            mamba_ckpt_window=3,
+        )
+        state_idx, ckpt_idx, in_row = b_mamba._mamba_row_plan(ctx, 8)
+        assert state_idx.dtype == torch.int32
+        assert state_idx.ndim == 1
+        assert state_idx.tolist() == [0 * 8 + 0, 1 * 8 + 1, 2 * 8 + 6, 3 * 8 + 0]
+        assert ckpt_idx is not None
+        assert ckpt_idx.dtype == torch.int32
+        assert ckpt_idx.ndim == 1
+        assert in_row is not None
+        assert in_row.dtype == torch.bool
+
+        runner._attn_metadata_builder_ctx = ctx
+        meta = b_mamba.build(0, self._make_cm(4))
+        assert meta.mamba_state_indices is not None
+        assert meta.mamba_state_indices.dtype == torch.int32
+        assert meta.mamba_state_indices.tolist() == [100, 109, 122, 0]
+        assert meta.mamba_ckpt_indices is not None
+        assert meta.mamba_ckpt_indices.dtype == torch.int32
+        assert meta.mamba_ckpt_indices.tolist() == [
+            [100, 101, 102],
+            [109, 110, 111],
+            [122, 123, 0],
+            [0, 0, 0],
+        ]
+
+        staged_dev = src_bt[:4, :8].reshape(-1).clone()
+        products = am_mod._staged_walk_products(
+            staged_dev=staged_dev,
+            seq_lens=seq_lens,
+            table_geom=((0, 4, 8),),
+            mamba_geom=((0, 8, 16),),
+            ckpt_window=3,
+        )
+        _, walk_state, walk_ckpt = products
+        assert torch.equal(walk_state, meta.mamba_state_indices)
+        assert torch.equal(walk_ckpt, meta.mamba_ckpt_indices)

@@ -216,21 +216,24 @@ def _staged_walk_products(
     ckpts = []
     if mamba_geom:
         active = seq_lens > 0
+        seq_lens_i32 = seq_lens.to(torch.int32)
         for ti, t, bs in mamba_geom:
             off, n, _ = table_geom[ti]
-            tbl = staged_dev[off : off + n * t].view(n, t)
-            state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
-                torch.int64
-            )
-            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
+            tbl_flat = staged_dev[off : off + n * t]
+            row_bases = torch.arange(n, device=seq_lens.device, dtype=torch.int32) * t
+            state_offsets = torch.clamp((seq_lens_i32 - 1) // bs, min=0, max=t - 1)
+            gathered = tbl_flat.index_select(0, row_bases + state_offsets)
             states.append(torch.where(active, gathered, torch.zeros_like(gathered)))
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
-                    ckpt_window, device=seq_lens.device, dtype=torch.int64
+                    ckpt_window, device=seq_lens.device, dtype=torch.int32
                 ).unsqueeze(0)
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
+                flat_ckpt = (row_bases.unsqueeze(1) + safe).reshape(-1)
+                ckpts.append(
+                    tbl_flat.index_select(0, flat_ckpt).view(n, ckpt_window) * in_row
+                )
     return tuple(outs) + tuple(states) + tuple(ckpts)
 
 
@@ -287,24 +290,31 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Row offsets into a mamba block table, cached and shared across groups.
+        """Flat 1D int32 row offsets into a mamba block table, cached across groups.
 
         Mamba groups share identical sequence lengths, block sizes, and checkpoint
-        geometry. Deriving row offset indices once per (block_size, target_num_blocks)
-        allows all mamba groups to share the plan, leaving only per-group gathers.
+        geometry. Deriving flat 1D int32 indices once per
+        (block_size, target_num_blocks) allows all mamba groups to share the plan,
+        leaving only per-group 1D index_select calls without 2D reshape or int64
+        gather casts.
         """
         key = (self.target_block_size, target_num_blocks)
         plan = ctx.mamba_row_plans.get(key)
         if plan is not None:
             return plan
 
-        is_active = (ctx.seq_lens > 0).unsqueeze(1)
+        seq_lens_i32 = ctx.seq_lens.to(torch.int32)
+        num_rows = int(seq_lens_i32.shape[0])
+        row_bases = (
+            torch.arange(num_rows, device=seq_lens_i32.device, dtype=torch.int32)
+            * target_num_blocks
+        )
         state_offsets = torch.clamp(
-            (ctx.seq_lens - 1) // self.target_block_size,
+            (seq_lens_i32 - 1) // self.target_block_size,
             min=0,
             max=target_num_blocks - 1,
-        ).to(torch.int64)
-        state_index = state_offsets.unsqueeze(1)
+        )
+        state_index = row_bases + state_offsets
 
         ckpt_index: torch.Tensor | None = None
         in_row: torch.Tensor | None = None
@@ -312,18 +322,20 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # Spec decoding: the manager allocates `window - 1` checkpoint
             # blocks right after the positional state block, so checkpoint t
             # is the row entry `state_offsets + t`.
-            ckpt_offsets = state_index + torch.arange(
+            is_active = (seq_lens_i32 > 0).unsqueeze(1)
+            ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
                 ctx.mamba_ckpt_window,
                 device=state_offsets.device,
-                dtype=state_offsets.dtype,
+                dtype=torch.int32,
             ).unsqueeze(0)
             # A row too short for the group would alias checkpoints onto one
             # block; clamp to the null block and let the caller zero those
             # columns via `in_row`.
             in_row = (ckpt_offsets < target_num_blocks) & is_active
-            ckpt_index = torch.where(
+            safe_offsets = torch.where(
                 in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets)
             )
+            ckpt_index = (row_bases.unsqueeze(1) + safe_offsets).reshape(-1)
 
         plan = (state_index, ckpt_index, in_row)
         ctx.mamba_row_plans[key] = plan
@@ -491,19 +503,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             else:
                 if target_num_blocks == 0:
                     _, target_num_blocks = self._block_table_geometry(ctx)
-                block_tables_2d = block_tables_dev.reshape(
-                    target_num_reqs, target_num_blocks
-                )
-                # Everything but the gathers is shared with the other mamba
-                # groups; see `_mamba_row_plan`.
+                # Everything but the 1D index_selects is shared with the other
+                # mamba groups; see `_mamba_row_plan`.
                 state_index, ckpt_index, ckpt_in_row = self._mamba_row_plan(
                     ctx, target_num_blocks
                 )
-                gathered_state_indices = torch.gather(
-                    block_tables_2d,
-                    dim=1,
-                    index=state_index,
-                ).squeeze(1)
+                gathered_state_indices = block_tables_dev.index_select(0, state_index)
                 mamba_state_indices = torch.where(
                     ctx.seq_lens > 0,
                     gathered_state_indices,
@@ -511,10 +516,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 )
                 if ckpt_index is not None:
                     mamba_ckpt_indices = (
-                        torch.gather(
-                            block_tables_2d,
-                            dim=1,
-                            index=ckpt_index,
+                        block_tables_dev.index_select(0, ckpt_index).view(
+                            target_num_reqs, -1
                         )
                         * ckpt_in_row
                     )
