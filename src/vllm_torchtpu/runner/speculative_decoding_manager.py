@@ -308,12 +308,12 @@ class SpeculativeDecodingManager:
                     -1
                 )
                 segment_ids = np.broadcast_to(
-                    req_arange.astype(np.int64)[:, None], (num_reqs, k)
+                    req_arange.astype(np.int32, copy=False)[:, None], (num_reqs, k)
                 ).reshape(-1)
             else:
                 group_indices = np.empty(0, dtype=np.int32)
                 target_logits_indices = np.empty(0, dtype=np.int32)
-                segment_ids = np.empty(0, dtype=np.int64)
+                segment_ids = np.empty(0, dtype=np.int32)
         else:
             # [num_reqs]
             num_sampled_tokens = num_draft_tokens + 1
@@ -348,7 +348,7 @@ class SpeculativeDecodingManager:
                 np.repeat(cu_sampled_starts, num_draft_tokens) + group_indices
             )
             segment_ids = np.repeat(
-                np.arange(num_reqs, dtype=np.int64), num_draft_tokens
+                np.arange(num_reqs, dtype=np.int32), num_draft_tokens
             )
 
         # The host indexing just below and the async device path both read
@@ -373,11 +373,11 @@ class SpeculativeDecodingManager:
             self.runner.num_tokens_paddings, logits_indices.shape[0]
         )
 
-        # Pack all 6 int32 metadata arrays into a single contiguous 1D buffer
-        # so cache misses issue 1 int32 H2D transfer instead of 6.
+        # Pack all 7 int32 metadata arrays (segment ids included) into a single
+        # contiguous 1D buffer so cache misses issue 1 int32 H2D transfer.
         l_len = padded_logits_length
         r_len = padded_num_reqs
-        packed_int32 = np.zeros(4 * l_len + 2 * r_len, dtype=np.int32)
+        packed_int32 = np.zeros(5 * l_len + 2 * r_len, dtype=np.int32)
         packed_int32[: draft_token_ids.shape[0]] = draft_token_ids
         packed_int32[l_len : l_len + num_reqs] = num_draft_tokens
         packed_int32[l_len + r_len : l_len + r_len + target_logits_indices.shape[0]] = (
@@ -393,8 +393,10 @@ class SpeculativeDecodingManager:
             3 * l_len + 2 * r_len : 3 * l_len + 2 * r_len + group_indices.shape[0]
         ] = group_indices
 
-        padded_segment_ids = np.full(padded_logits_length, num_reqs, dtype=np.int64)
-        padded_segment_ids[: segment_ids.shape[0]] = segment_ids
+        # Padding slots carry the out-of-batch sentinel ``num_reqs``.
+        seg_base = 4 * l_len + 2 * r_len
+        packed_int32[seg_base:] = num_reqs
+        packed_int32[seg_base : seg_base + segment_ids.shape[0]] = segment_ids
 
         # CPU -> TPU copy.
         device = self.runner.device
@@ -406,10 +408,8 @@ class SpeculativeDecodingManager:
         final_logits_indices_dev = packed_dev[
             2 * l_len + 2 * r_len : 3 * l_len + 2 * r_len
         ]
-        group_indices_dev = packed_dev[3 * l_len + 2 * r_len :]
-        segment_ids_dev = torch.from_numpy(padded_segment_ids).to(
-            device, non_blocking=True
-        )
+        group_indices_dev = packed_dev[3 * l_len + 2 * r_len : seg_base]
+        segment_ids_dev = packed_dev[seg_base:]
 
         # Copy draft_lengths_cpu and store a separate SpecDecodeMetadata in
         # _meta_cache so caller mutations (e.g. execute_model overwriting

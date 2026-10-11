@@ -164,7 +164,8 @@ def test_get_spec_decode_metadata_parity_and_packed_storage(
         np.testing.assert_array_equal(got.numpy(), expected, err_msg=key)
         assert got.is_contiguous()
 
-    # All 6 int32 tensors are views into a single packed 1D storage buffer.
+    # All 7 int32 tensors are views into a single packed 1D storage buffer
+    # (TD8.277: segment_ids joined the pack, so one H2D copy per cache miss).
     base_storage_ptr = md.draft_token_ids.untyped_storage().data_ptr()
     for field_name in (
         "draft_lengths",
@@ -172,11 +173,12 @@ def test_get_spec_decode_metadata_parity_and_packed_storage(
         "bonus_logits_indices",
         "final_logits_indices",
         "group_indices",
+        "segment_ids",
     ):
         tensor = getattr(md, field_name)
         assert tensor.dtype == torch.int32
         assert tensor.untyped_storage().data_ptr() == base_storage_ptr
-    assert md.segment_ids.dtype == torch.int64
+    assert md.group_indices.shape == md.segment_ids.shape == (padded_logits_len,)
 
 
 def test_get_spec_decode_metadata_cache_miss_isolation():

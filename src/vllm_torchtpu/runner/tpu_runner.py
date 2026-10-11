@@ -6402,7 +6402,7 @@ class TPUModelRunner(GPUModelRunner):
                 target_logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
                 )
-                segment_ids = torch.zeros(num_tokens, dtype=torch.int64).to(self.device)
+                segment_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
                     self.device
                 )
