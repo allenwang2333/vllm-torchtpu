@@ -294,9 +294,14 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
+    _rhs_blk = (
+        (rhs.shape[1] * get_packing_factor(rhs.dtype, rhs_quant_dtype)) // rhs_scale.shape[1]
+        if rhs_scale is not None else 0
+    )
+    is_fp4_w4a16 = (
         jnp.issubdtype(rhs.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+        and _rhs_blk < 128
     )
     return gmm_v2(
         lhs=lhs,
@@ -309,7 +314,7 @@ def gmm_wrapper(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=not is_fp4_weight,
+        maybe_quantize_lhs=not is_fp4_w4a16,
         rhs_quant_dtype=rhs_quant_dtype,
         lhs_scale=lhs_scale,
         out_row_scale=out_row_scale,
@@ -714,10 +719,14 @@ def moe_gmm(
 
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
-    is_w2_fp4 = rhs_quant_dtype == jnp.float4_e2m1fn or (
-        jnp.issubdtype(w2.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(w2.dtype) == 4
-    )
+    _w2_blk = ((w2.shape[1] * packing_factor) // w2_scale.shape[1]) if w2_scale is not None else 0
+    is_w2_fp4 = (
+        rhs_quant_dtype == jnp.float4_e2m1fn
+        or (
+            jnp.issubdtype(w2.dtype, jnp.floating)
+            and jax.dtypes.itemsize_bits(w2.dtype) == 4
+        )
+    ) and (_w2_blk < 128)
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     if is_w2_fp4 and lhs_scale is not None:
         x = (

@@ -148,51 +148,57 @@ def ep_device_ids() -> tuple[int, ...] | None:
     return tuple(rank_to_device_id[r] for r in ranks)
 
 
+try:
+    from torch_tpu._internal.pallas import get_pallas_mesh as _get_pallas_mesh
+except ImportError:
+    _get_pallas_mesh = None
+
+
 def ep_rank_order() -> tuple[int, ...] | None:
-    """EP rank at each mesh index -- the identity, or None when EP is off.
+    """EP rank at each mesh index, or None when EP is off.
 
-    It was not always the identity. Before google-pytorch/torch_tpu#3522 a
-    Mosaic kernel resolved a `DeviceIdType.MESH` coordinate positionally
-    against the runtime device list rather than through the device array the
-    mesh was built with, so the mesh had to be built in ascending device-id
-    order to address the right peer, and mesh index i then held the experts of
-    a different EP rank. #3522 makes partition index p bind to PyTorch rank p,
-    `build_ep_mesh` orders the mesh by rank to match, and mesh index i holds EP
-    rank i's experts again.
-
-    Kept rather than deleted so `fused_moe_ep._mesh_expert_order` keeps a
-    single place to ask, and so a future ordering change has somewhere to live.
+    When torch_tpu provides `get_pallas_mesh` (#3522+), partition indices bind to
+    PyTorch rank order so the permutation is identity. On pre-#3522 torch_tpu,
+    Mosaic resolves `DeviceIdType.MESH` positionally against ascending TPU
+    global device IDs (`[0, 1, 4, 5, 6, 7, 2, 3]` on tpu7x-8), so the mesh is
+    ordered by `sorted(device_ids)` and mesh index `i` holds the experts of
+    `ep_rank_of_group_rank[by_device[d]]`.
     """
     group = get_ep_group()
     if group is None:
         return None
-    return tuple(range(len(tuple(group.ranks))))
+    if _get_pallas_mesh is not None:
+        return tuple(range(len(tuple(group.ranks))))
+    device_ids = ep_device_ids()
+    if device_ids is None:
+        return None
+    ranks = tuple(int(r) for r in group.ranks)
+    by_device = dict(zip(device_ids, ranks))
+    if len(by_device) != len(ranks):
+        raise RuntimeError(
+            "Two EP ranks report the same TPU global device id: "
+            f"ranks={ranks}, device_ids={device_ids}"
+        )
+    ep_rank_of_group_rank = {r: i for i, r in enumerate(ranks)}
+    return tuple(ep_rank_of_group_rank[by_device[d]] for d in sorted(device_ids))
 
 
 def ep_mesh_index() -> int | None:
-    """This rank's index into the mesh `build_ep_mesh` builds, or None.
-
-    The mesh is rank-ordered since #3522, so the index is this worker's EP
-    rank rather than a position reconstructed from device ids.
-    """
+    """This rank's index into the mesh `build_ep_mesh` builds, or None."""
     group = get_ep_group()
     if group is None:
         return None
-    ranks = tuple(int(r) for r in group.ranks)
-    return ranks.index(_get_current_global_rank())
+    if _get_pallas_mesh is not None:
+        ranks = tuple(int(r) for r in group.ranks)
+        return ranks.index(_get_current_global_rank())
+    device_ids = ep_device_ids()
+    if device_ids is None:
+        return None
+    return sorted(device_ids).index(_get_tpu_global_device_id())
 
 
 def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
-    """A one-axis JAX mesh over the EP group, or None when EP is off.
-
-    Torchtpu's ``get_pallas_mesh`` orders the mesh by PyTorch rank, which is
-    what google-pytorch/torch_tpu#3522 binds partition indices to. Mesh index
-    i therefore owns EP rank i's experts, with no permutation for the caller
-    to carry.
-
-    Cached per (axis, device ids): the ids come from a collective, so this must
-    not be called for the first time inside a traced region.
-    """
+    """A one-axis JAX mesh over the EP group, or None when EP is off."""
     unordered = ep_device_ids()
     if unordered is None:
         return None
@@ -203,25 +209,44 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     if cached is not None:
         return cached
 
-    # No jax.devices() lookup: get_pallas_mesh builds abstract devices from the
-    # process group, so this worker no longer needs JAX to expose every peer.
-    import torch.distributed as dist
+    if _get_pallas_mesh is not None:
+        import torch.distributed as dist
 
-    world_size = int(dist.get_world_size())
-    if len(device_ids) != world_size:
-        raise NotImplementedError(
-            f"The EP group spans {len(device_ids)} devices inside a "
-            f"torch.distributed world of {world_size}. get_pallas_mesh builds "
-            "a mesh over the whole world, so EP alongside another parallelism "
-            "axis needs a mesh_shape factorisation that has not been worked "
-            "out."
+        world_size = int(dist.get_world_size())
+        if len(device_ids) != world_size:
+            raise NotImplementedError(
+                f"The EP group spans {len(device_ids)} devices inside a "
+                f"torch.distributed world of {world_size}."
+            )
+        mesh = _get_pallas_mesh(axis_names=(axis_name,))
+        logger.info(
+            "Built EP mesh | axis=%s | size=%d | rank-ordered", axis_name, world_size
+        )
+        _MESH_CACHE[cache_key] = mesh
+        return mesh
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    visible = {
+        int(getattr(device, "id", idx)): device
+        for idx, device in enumerate(jax.devices())
+    }
+    missing = [d for d in device_ids if d not in visible]
+    if missing:
+        raise RuntimeError(
+            "Cannot build the EP mesh: JAX does not expose every EP device in "
+            f"this worker. missing={missing}, ep_device_ids={device_ids}, "
+            f"jax_visible_ids={sorted(visible)}."
         )
 
-    from torch_tpu._internal.pallas import get_pallas_mesh
-
-    mesh = get_pallas_mesh(axis_names=(axis_name,))
+    mesh = Mesh(np.asarray([visible[d] for d in device_ids]), axis_names=(axis_name,))
     logger.info(
-        "Built EP mesh | axis=%s | size=%d | rank-ordered", axis_name, world_size
+        "Built EP mesh | axis=%s | size=%d | device_ids=%s",
+        axis_name,
+        len(device_ids),
+        list(device_ids),
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh
