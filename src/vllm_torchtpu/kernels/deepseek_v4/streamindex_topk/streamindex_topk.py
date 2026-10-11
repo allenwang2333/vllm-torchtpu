@@ -31,9 +31,6 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
 )
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
-    LANES as LANES_TOPK,
-)
-from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
@@ -1018,49 +1015,17 @@ def convert_cache_to_seq_along_lane(
     )
 
 
-def _topk_widths(n: int, k: int, num_buckets: int) -> tuple[int, ...]:
-    """Static score widths for `_width_bucketed_topk`, widest first."""
-    widths = [n]
+def _page_widths(
+    pages_per_seq: int, page_size: int, k: int, page_multiple: int, num_buckets: int
+) -> tuple[int, ...]:
+    """Pages per sequence for `topk_width_buckets`, widest first."""
+    widths = [pages_per_seq]
     while len(widths) <= num_buckets:
-        w = widths[-1] // 2
-        if w < k or w % LANES_TOPK or n % w:
+        p = widths[-1] // 2
+        if p * page_size < k or p % page_multiple or pages_per_seq % p:
             break
-        widths.append(w)
+        widths.append(p)
     return tuple(widths)
-
-
-def _width_bucketed_topk(
-    scores: jax.Array,  # i32[b, n] f32 bits
-    k: int,
-    row_lengths: jax.Array,  # i32[b]
-    *,
-    num_buckets: int,
-    scheduling_group_id: int | None,
-    return_scores: bool,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """`sparsecore_topk` over the narrowest static width holding every row."""
-
-    def topk_at(width):
-        def run(scores, row_lengths):
-            return sparsecore_topk(
-                scores if width == scores.shape[1] else scores[:, :width],
-                k,
-                row_lengths=row_lengths,
-                write_empty_rows=True,
-                scheduling_group_id=scheduling_group_id,
-                return_scores=return_scores,
-            )
-
-        return run
-
-    widths = _topk_widths(scores.shape[1], k, num_buckets)
-    if len(widths) == 1:
-        return topk_at(widths[0])(scores, row_lengths)
-    longest = jnp.max(row_lengths)
-    # Widths shrink, so the count of narrower widths that still hold the
-    # longest row indexes the narrowest one that does.
-    branch = sum((longest <= w).astype(jnp.int32) for w in widths[1:])
-    return lax.switch(branch, [topk_at(w) for w in widths], scores, row_lengths)
 
 
 def _effective_row_lengths(
@@ -1210,14 +1175,14 @@ def streamindex_topk(
         DECODE passes, which would launch over an empty range. Unchunked calls
         only. The MIXED pass writes the same rows either way, so the result is
         identical.
-      topk_width_buckets: also compile the SparseCore top-k at this many
-        narrower score widths (each half the previous, down to `k`), and pick at
-        runtime the narrowest that holds the chunk's longest row. The top-k
-        kernel streams its whole static width from HBM whatever `row_lengths`
-        says, so with a wide page table (long `max_model_len`, small DCP) and
-        short rows it is bound on reading columns it never selects from.
-        Columns past a row's length are never selected, so the result is
-        identical. 0 = always the full width.
+      topk_width_buckets: also compile the call at this many narrower
+        page-table widths (each half the previous, down to `k` positions), and
+        run at runtime the narrowest that holds the batch's longest sequence.
+        The score buffers are page-table wide and the SparseCore top-k streams
+        its whole static width from HBM whatever `row_lengths` says, so with a
+        wide table (long `max_model_len`, small DCP) and short sequences both
+        mostly move padding. No row reaches past its sequence, so the result
+        is identical. 0 = always the full width.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1285,6 +1250,70 @@ def streamindex_topk(
         )
 
     max_num_seqs = seq_lens.shape[0]
+
+    if topk_width_buckets:
+        # Run the whole call -- scoring, every chunk's top-k and their overlap
+        # -- on a page table cut to the narrowest width holding every row: the
+        # score buffers and the top-k's HBM reads shrink with it.
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            page_size = cache_kv.shape[3]
+        else:
+            page_size = cache_kv.shape[1] * cache_kv.shape[2]
+        pages_per_seq = page_indices.shape[0] // max_num_seqs
+        widths = _page_widths(
+            pages_per_seq,
+            page_size,
+            k,
+            max(num_kv_pages_per_blocks),
+            topk_width_buckets,
+        )
+        kwargs = dict(
+            k=k,
+            compression_ratio=compression_ratio,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            buffer_count=buffer_count,
+            vmem_limit_bytes=vmem_limit_bytes,
+            decode_req_batch_size=decode_req_batch_size,
+            enable_early_exit=enable_early_exit,
+            kv_layout=kv_layout,
+            chunk_tokens=chunk_tokens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            interleave_size=interleave_size,
+            return_scores=return_scores,
+            skip_empty_decode=skip_empty_decode,
+        )
+
+        def at_width(pages):
+            def run(page_indices):
+                table = page_indices.reshape(max_num_seqs, pages_per_seq)
+                return streamindex_topk(
+                    q,
+                    indexer_weights,
+                    cache_kv,
+                    seq_lens,
+                    table[:, :pages].reshape(-1),
+                    cu_q_lens,
+                    distribution,
+                    **kwargs,
+                )
+
+            return run
+
+        if len(widths) == 1:
+            return at_width(widths[0])(page_indices)
+        live = jnp.arange(max_num_seqs) < distribution[2]
+        longest = cp_local_length(
+            jnp.max(jnp.where(live, seq_lens, 0)) // compression_ratio,
+            cp_rank,
+            cp_size,
+            interleave_c,
+        )
+        # Widths shrink, so the count of narrower widths that still hold the
+        # longest row indexes the narrowest one that does.
+        branch = sum((longest <= p * page_size).astype(jnp.int32) for p in widths[1:])
+        return lax.switch(branch, [at_width(p) for p in widths], page_indices)
 
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
@@ -1646,19 +1675,25 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
-            out_m = _width_bucketed_topk(
-                scores,
-                k,
-                eff_row_lengths[start : start + chunk_len],
-                num_buckets=topk_width_buckets,
-                scheduling_group_id=sc_group,
-                return_scores=return_scores,
-            )
             if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = out_m
+                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    return_scores=True,
+                )
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = out_m
+                chunk_topk_idxs = sparsecore_topk(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    write_empty_rows=True,
+                    scheduling_group_id=sc_group,
+                    return_scores=False,
+                )
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)

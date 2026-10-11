@@ -855,10 +855,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SKIP_EMPTY_DECODE": env_bool(
         "TPU_STREAMIDX_SKIP_EMPTY_DECODE", default=False
     ),
-    # Narrower static widths (each half the last) to compile the StreamIndex
-    # SparseCore top-k at; each call runs the narrowest that holds its longest
-    # row. The kernel reads its whole width from HBM, so with a long
-    # max_model_len over few DCP ranks it otherwise pays for the padding. Exact.
+    # Narrower page-table widths (each half the last) to compile StreamIndex
+    # top-k at; each step runs the narrowest that holds its longest sequence.
+    # Score buffers and the SparseCore top-k's reads are table-wide, so with a
+    # long max_model_len over few DCP ranks they otherwise move padding. Exact.
     "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS": env_nonnegative_int(
         "TPU_STREAMIDX_TOPK_WIDTH_BUCKETS", 0
     ),

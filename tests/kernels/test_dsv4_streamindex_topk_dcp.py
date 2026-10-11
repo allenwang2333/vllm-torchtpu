@@ -422,6 +422,34 @@ def test_all_to_all_round_trip_preserves_token_order(dcp_size):
 
 
 @pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+def test_dcp_width_buckets_do_not_change_the_result(chunk_tokens, dcp_size):
+    """`topk_width_buckets` on a page table 4x wider than the sequence.
+
+    The extra entries point at page 0 and are never reached, so the full
+    width reads padding the narrow bucket skips; both must agree exactly.
+    """
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 13)
+    pages = args[4]
+    wide = jnp.concatenate([pages, jnp.zeros((3 * pages.shape[0],), jnp.int32)])
+    args = (*args[:4], wide, *args[5:])
+    kwargs = dict(kwargs, chunk_tokens=chunk_tokens)
+
+    hlo = streamindex_topk_dcp.lower(*args, **kwargs, topk_width_buckets=2).as_text()
+    widths = set(re.findall(r"sc_topk_direct_b\d+_n(\d+)_", hlo))
+    # Three table widths, plus the merge kernel at dcp_size * k.
+    assert len(widths) >= 4, f"width switch not built, top-k widths {widths}"
+
+    full = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    bucketed = np.asarray(
+        streamindex_topk_dcp(*args, **kwargs, topk_width_buckets=2)
+    )
+    np.testing.assert_array_equal(bucketed, full)
+
+
+@pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("chunk_tokens", [32, 64, 128])
 def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):

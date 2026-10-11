@@ -30,7 +30,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
-    _topk_widths,
+    _page_widths,
     convert_cache_to_seq_along_lane,
 )
 
@@ -1475,11 +1475,11 @@ class TestChunkedPipelining:
 
 
 class TestTopkWidthBuckets:
-    """`topk_width_buckets` runs the top-k at a narrower static width.
+    """`topk_width_buckets` runs the call on a narrower page table.
 
     A 16-page table of 128-token pages gives a 2048-wide score row, so with
-    k = 128 the buckets are 2048 / 1024 / 512 / 256. Columns past a row's
-    length are never selected, so every bucket must agree with the full width.
+    k = 128 the buckets are 2048 / 1024 / 512 / 256. No row reaches past its
+    sequence, so every bucket must agree with the full width.
     """
 
     _PAGES_PER_SEQ = 16
@@ -1507,7 +1507,7 @@ class TestTopkWidthBuckets:
         full_kwargs = _chunk_call_kwargs(*common, return_scores=return_scores)
         bucketed_kwargs = dict(full_kwargs, topk_width_buckets=3)
 
-        # Each width compiles its own SparseCore kernel, named by its width;
+        # Each width compiles its own SparseCore top-k, named by its width;
         # one name would mean the switch never got built and this comparison
         # would pass trivially.
         hlo = streamindex_topk.lower(**bucketed_kwargs).as_text()
@@ -1535,11 +1535,12 @@ class TestTopkWidthBuckets:
             )
 
     def test_widths_stop_at_k(self):
-        assert _topk_widths(2048, 128, 3) == (2048, 1024, 512, 256)
-        assert _topk_widths(2048, 512, 3) == (2048, 1024, 512)
-        assert _topk_widths(524288, 2048, 3) == (524288, 262144, 131072, 65536)
-        assert _topk_widths(524288, 2048, 0) == (524288,)
-
+        # (pages_per_seq, page_size, k, page_multiple, buckets)
+        assert _page_widths(16, 128, 128, 2, 3) == (16, 8, 4, 2)
+        assert _page_widths(16, 128, 512, 2, 3) == (16, 8, 4)
+        assert _page_widths(16, 128, 128, 4, 3) == (16, 8, 4)
+        assert _page_widths(512, 1024, 2048, 2, 3) == (512, 256, 128, 64)
+        assert _page_widths(512, 1024, 2048, 2, 0) == (512,)
 
 def main(argv):
     del argv
