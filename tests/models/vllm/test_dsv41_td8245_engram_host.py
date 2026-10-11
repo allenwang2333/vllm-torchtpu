@@ -382,3 +382,84 @@ def test_td8368_hash_on_host_all_valid_fast_path_and_fallbacks(
     got_mixed = state.hash_on_host(ids, pos_mixed, qsl, dead, lookback, lb_dead)
     assert greater_calls == 3 and equal_calls == 3
     assert torch.equal(got_mixed, _ref(ids, pos_mixed, qsl, dead, lookback, lb_dead))
+
+
+def test_td8374_request_rows_cols_and_hash_on_host_dead_mask_fast_paths(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """TD8.374: Verify _HostHashTables.request_rows memoizes request_rows_cols
+    (default_offset, default_cols, default_in_chunk) and hash_on_host reuses it
+    on contiguous chunk offsets while falling back on non-contiguous offsets,
+    and skips no-op dead/lb_dead/lb_np<0 mask writes when clean."""
+    state = _state(seed=74)
+    ids, pos, qsl, dead, lookback, lb_dead = _inputs(4, 6, seed=74, dead_frac=0.0)
+    pos = pos + 100
+    lookback_pos = lookback.clamp(min=0)
+    tables = (state.token_map, state.multipliers, state.primes, state.offsets)
+
+    def _ref(i_t, p_t, q_t, d_t, lb_t, lbd_t):
+        return state._hash(
+            tables,
+            i_t,
+            p_t,
+            q_t,
+            d_t,
+            lb_t,
+            lbd_t,
+            lambda past, reqs_col, window: torch.full_like(window, state.pad_id),
+        )
+
+    # First call populates _host_tables and _memo["request_rows_cols"]
+    got1 = state.hash_on_host(ids, pos, qsl, dead, lookback_pos, lb_dead)
+    assert torch.equal(got1, _ref(ids, pos, qsl, dead, lookback_pos, lb_dead))
+    host_tables = state._host_tables
+    assert "request_rows_cols" in host_tables._memo
+    rc_memo = host_tables._memo["request_rows_cols"]
+    assert len(rc_memo) == 3
+
+    # Steady-state contiguous offset: np.subtract and np.less should not be called
+    sub_calls = 0
+    less_calls = 0
+    orig_sub = np.subtract
+    orig_less = np.less
+
+    def spy_sub(*a, **kw):
+        nonlocal sub_calls
+        sub_calls += 1
+        return orig_sub(*a, **kw)
+
+    def spy_less(*a, **kw):
+        nonlocal less_calls
+        less_calls += 1
+        return orig_less(*a, **kw)
+
+    monkeypatch.setattr(ce.np, "subtract", spy_sub)
+    monkeypatch.setattr(ce.np, "less", spy_less)
+
+    got2 = state.hash_on_host(ids, pos + 6, qsl, dead, lookback_pos, lb_dead)
+    assert sub_calls == 0
+    assert less_calls == 0
+    assert torch.equal(got2, _ref(ids, pos + 6, qsl, dead, lookback_pos, lb_dead))
+
+    # Non-contiguous offset fallback: np.subtract (2x) and np.less (1x) are called
+    pos_gap = pos.clone()
+    pos_gap[5] += 2
+    got_gap = state.hash_on_host(ids, pos_gap, qsl, dead, lookback_pos, lb_dead)
+    assert sub_calls == 2
+    assert less_calls == 1
+    assert torch.equal(got_gap, _ref(ids, pos_gap, qsl, dead, lookback_pos, lb_dead))
+    # Verify memoized default_cols/default_in_chunk were not mutated by fallback
+    got3 = state.hash_on_host(ids, pos, qsl, dead, lookback_pos, lb_dead)
+    assert torch.equal(got3, got1)
+
+    # Also exercise negative lookback token (< 0) fallback with dead and lb_dead
+    lookback_neg = lookback_pos.clone()
+    lookback_neg[0, 1] = -1
+    dead_some = dead.clone()
+    dead_some[2] = True
+    lb_dead_some = lb_dead.clone()
+    lb_dead_some[2, 0] = True
+    got_neg = state.hash_on_host(ids, pos, qsl, dead_some, lookback_neg, lb_dead_some)
+    assert torch.equal(
+        got_neg, _ref(ids, pos, qsl, dead_some, lookback_neg, lb_dead_some)
+    )

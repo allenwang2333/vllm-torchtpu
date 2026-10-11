@@ -211,7 +211,11 @@ class NgramHashState(upstream.NgramHashState):
         # strided window over `padded` instead of a fresh allocation/gather.
         mapped = padded[ngram - 1 :]
         np.take(tables.token_map, ids_np, out=mapped)
-        mapped[dead_np] = upstream.DEAD_ID
+        _ = (
+            mapped.__setitem__(dead_np, upstream.DEAD_ID)
+            if (has_dead := bool(dead_np.any()))
+            else None
+        )
         padded[: ngram - 1] = mapped[0]
         # Lookback sources, resolved once per active request: column `c` of
         # `window_table` is the mapped id `c + 1` positions before the chunk
@@ -221,25 +225,50 @@ class NgramHashState(upstream.NgramHashState):
         window_table = tables.window_table(active_reqs, depth)
         wt_cols = window_table[:, :depth]
         np.take(tables.token_map, lb_np, out=wt_cols, mode="clip")
-        wt_cols[lb_dead_np] = upstream.DEAD_ID
-        wt_cols[lb_np < 0] = pad_id
+        _ = (
+            wt_cols.__setitem__(lb_dead_np, upstream.DEAD_ID)
+            if (has_lb_dead := bool(lb_dead_np.any()))
+            else None
+        )
+        _ = (
+            None
+            if lb_np.size and int(lb_np.min()) >= 0
+            else wt_cols.__setitem__(lb_np < 0, pad_id)
+        )
         window_table[:, depth] = pad_id
         # The [ngram, T] steps below write into reused buffers (`work`): same
         # values as `cols = shifts - (offset + 1)`, `np.where(in_chunk, batch,
         # window)` and `np.where(blocked, pad_id, source)`, without a fresh
         # array per step.
         cols, in_chunk, source, blocked, scratch_mask = tables.work(count)
-        np.subtract(shifts, offset[None, :], out=cols)
-        cols -= 1
-        np.less(cols, 0, out=in_chunk)
-        np.clip(cols, 0, depth, out=cols)
-        cols += req_base
+        rc_memo = tables._memo["request_rows_cols"]
+        use_default_cols = memoryview(offset) == memoryview(rc_memo[0])
+        _ = (
+            None
+            if use_default_cols
+            else (
+                np.subtract(shifts, offset[None, :], out=cols),
+                np.subtract(cols, 1, out=cols),
+            )
+        )
+        _ = (
+            None
+            if use_default_cols
+            else (
+                np.less(cols, 0, out=in_chunk),
+                np.clip(cols, 0, depth, out=cols),
+                np.add(cols, req_base, out=cols),
+            )
+        )
+        cols, in_chunk = (
+            (rc_memo[1], rc_memo[2]) if use_default_cols else (cols, in_chunk)
+        )
         np.take(window_table.reshape(-1), cols, out=source)
         np.copyto(source, batch, where=in_chunk)
         # A dead or pre-sequence source blocks every longer n-gram.
         all_valid = (
-            not dead_np.any()
-            and not lb_dead_np.any()
+            not has_dead
+            and not has_lb_dead
             and int(pos_np[0]) >= ngram - 1
             and int(pos_np.min()) >= ngram - 1
         )
@@ -445,6 +474,7 @@ class _HostHashTables:
             cached is not None
             and cached[0] == key
             and np.array_equal(qsl_np, cached[1])
+            and "request_rows_cols" in self._memo
         ):
             return cached[2], cached[3], cached[4]
         qsl_i32 = np.asarray(qsl_np, dtype=np.int32)
@@ -454,7 +484,19 @@ class _HostHashTables:
         ).astype(np.int32, copy=False)
         starts = np.minimum(qsl_i32[reqs], np.int32(count - 1))
         req_base = reqs[None, :] * np.int32(depth + 1)
-        self._memo["request_rows"] = (key, qsl_i32.copy(), reqs, starts, req_base)
+        self._memo["request_rows"], self._memo["request_rows_cols"] = (
+            (key, qsl_i32.copy(), reqs, starts, req_base),
+            (
+                default_offset := rows - starts,
+                np.clip(
+                    raw_cols := self.shifts - default_offset[None, :] - 1,
+                    0,
+                    depth,
+                )
+                + req_base,
+                raw_cols < 0,
+            ),
+        )
         return reqs, starts, req_base
 
     def work(
