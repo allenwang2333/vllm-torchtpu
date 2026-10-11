@@ -500,7 +500,7 @@ def test_td8249_dspark_context_kv_int64_positions_produce_int32_slots(
         cached_entry = next(iter(v2_attn._active_stage_attn_cache.values()))
     _, slots_i64, valid_i64, _, addr_i64, write_i64 = cached_entry
     assert slots_i64.dtype == torch.int32
-    assert addr_i64[2].dtype == torch.int32  # pos_rem
+    assert addr_i64[2].dtype == torch.int32  # pos_rem (TD8.267 addr layout)
 
     v2_dspark._insert_context_kv(
         _dspark_layer(cache), torch.ones(10, 8), positions_i32, meta
@@ -617,3 +617,25 @@ def test_td8264_dspark_context_kv_int64_metadata_keeps_int32(monkeypatch, geomet
     assert torch.equal(valid64, valid32)
     assert torch.equal(in_window64, in_window32)
     assert torch.equal(addr64[3], addr32[3])  # valid_token
+    # TD8.267: flat int32 block-table index (requests * width + pos_col).
+    assert addr64[0].dtype == torch.int32 and torch.equal(addr64[0], addr32[0])
+    assert addr64[1] == table.shape[1]
+
+
+def test_td8267_reused_address_requires_same_table_width(monkeypatch):
+    """TD8.267: a stage-reused flat block index fails fast on a wider table."""
+    monkeypatch.setattr(v2_dspark, "_insert", _capture([]))
+    positions = torch.tensor([2, 4, 6, 7, 8, 1, 3, 5, 9, 0], dtype=torch.int32)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([9, 6], dtype=torch.int32),
+        block_tables=torch.tensor([[1, 2, 5], [3, 4, -1]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 5, 9], dtype=torch.int32),
+    )
+    layer = _dspark_layer(_real_cache(4, "plain"))
+    with v2_attn.stage_attention_cache_scope():
+        v2_dspark._insert_context_kv(layer, torch.ones(10, 8), positions, meta)
+        meta.block_tables = torch.tensor(
+            [[1, 2, 5, 6], [3, 4, 7, 8]], dtype=torch.int32
+        )
+        with pytest.raises(AssertionError):
+            v2_dspark._insert_context_kv(layer, torch.ones(10, 8), positions, meta)

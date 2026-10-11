@@ -184,16 +184,25 @@ def _insert_context_kv(
                 _, _, _, in_window, addr, _ = cached_slots
             elif metadata.seq_lens.numel() > 0:
                 pos_i32 = positions.int()
-                requests = _token_requests(metadata, positions).clamp(
-                    max=metadata.seq_lens.shape[0] - 1
+                requests = (
+                    _token_requests(metadata, positions)
+                    .clamp(max=metadata.seq_lens.shape[0] - 1)
+                    .int()
                 )
-                offsets = pos_i32 - metadata.seq_lens.int()[requests] + attn.window_size
+                offsets = (
+                    pos_i32
+                    - metadata.seq_lens.int().index_select(0, requests)
+                    + attn.window_size
+                )
                 in_window = (offsets >= 0) & (offsets < attn.window_size)
                 if block_tables is not None:
                     table = _block_table(metadata)
-                    pos_col = (
-                        (pos_i32 // rows_per_page).clamp(max=table.shape[1] - 1).long()
-                    )
+                    width = table.shape[1]
+                    pos_col = (pos_i32 // rows_per_page).clamp(max=width - 1)
+                    # Flat int32 row-major index into the block table: one
+                    # 1-D index_select per layer instead of a 2-D int64
+                    # (requests, pos_col) gather.
+                    block_idx = requests * width + pos_col
                     pos_rem = pos_i32 % rows_per_page
                     rows = torch.arange(
                         positions.shape[0],
@@ -202,8 +211,8 @@ def _insert_context_kv(
                     )
                     valid_token = rows < metadata.query_start_loc[-1].int()
                     addr = (
-                        requests,
-                        pos_col,
+                        block_idx,
+                        width,
                         pos_rem,
                         valid_token,
                         valid_token & in_window,
@@ -216,12 +225,13 @@ def _insert_context_kv(
             if addr is not None:
                 if table is None:
                     table = _block_table(metadata)
-                requests, pos_col, pos_rem, valid_token, valid_in_window = addr
+                block_idx, width, pos_rem, valid_token, valid_in_window = addr
+                # A reused address must index a table of the same width.
+                assert table.shape[1] == width, (table.shape, width)
                 # int32 block / slot math (block tables and positions are
                 # int32; slots fit int32 like every PagedCacheRows record):
-                # TPU emulates int64 multiplies and adds. Only the gather
-                # indices (requests, pos_col) stay int64.
-                blocks = table[requests, pos_col].int()
+                # TPU emulates int64 multiplies and adds.
+                blocks = table.reshape(-1).index_select(0, block_idx).int()
                 swa_slots = (blocks * rows_per_page + pos_rem).masked_fill(
                     ~valid_token, -1
                 )
