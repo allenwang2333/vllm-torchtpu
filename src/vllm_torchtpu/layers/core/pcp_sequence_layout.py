@@ -202,7 +202,7 @@ class PcpSequenceLayoutEligibility:
         ) and num_scheduled_tokens_per_req.dtype.kind in ("i", "u"):
             scheduled = num_scheduled_tokens_per_req
         else:
-            scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+            scheduled = np.asarray(num_scheduled_tokens_per_req, dtype=np.int32)
         if scheduled.ndim != 1:
             raise ValueError("num_scheduled_tokens_per_req must be a 1D array.")
         if scheduled.size < num_reqs:
@@ -218,7 +218,7 @@ class PcpSequenceLayoutEligibility:
                 absolute_query_starts = absolute_query_start_offsets_per_req
             else:
                 absolute_query_starts = np.asarray(
-                    absolute_query_start_offsets_per_req, dtype=np.int64
+                    absolute_query_start_offsets_per_req, dtype=np.int32
                 )
             if absolute_query_starts.ndim != 1 or absolute_query_starts.size < num_reqs:
                 raise ValueError(
@@ -297,16 +297,16 @@ class PcpSequenceLayoutEligibility:
         )
         absolute_query_starts = np.fromiter(
             (span.absolute_query_start for span in spans),
-            dtype=np.int64,
+            dtype=np.int32,
             count=num_spans,
         )
         # Assign the current batch's request-major query rows as one flat token
         # stream. This is exactly query_start_loc[:-1]: ownership is local to
         # this runner chunk, while attention positions and KV-cache slots keep
         # using the independent request-absolute coordinates above.
-        token_owner_starts = np.zeros(q_lens.shape, dtype=np.int64)
+        token_owner_starts = np.zeros(q_lens.shape, dtype=np.int32)
         if q_lens.size > 1:
-            np.cumsum(q_lens[:-1], dtype=np.int64, out=token_owner_starts[1:])
+            np.cumsum(q_lens[:-1], dtype=np.int32, out=token_owner_starts[1:])
         local_counts = pcp_local_token_counts(
             q_lens,
             self.pcp_size,
@@ -687,10 +687,10 @@ def prepare_pcp_sequence_layout(
         token_owner_start_offsets_per_req=token_owner_start_offsets_per_req,
     )
     packed_to_request_major_token_indices = np.full(
-        padded_total_num_scheduled_tokens, -1, dtype=np.int64
+        padded_total_num_scheduled_tokens, -1, dtype=np.int32
     )
     packed_to_request_major_token_indices[request_major_to_packed_token_indices] = (
-        np.arange(request_major_to_packed_token_indices.size, dtype=np.int64)
+        np.arange(request_major_to_packed_token_indices.size, dtype=np.int32)
     )
 
     local_padded_total_num_scheduled_tokens = (

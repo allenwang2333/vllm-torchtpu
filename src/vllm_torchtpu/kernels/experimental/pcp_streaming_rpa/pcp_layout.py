@@ -22,8 +22,8 @@ def pcp_token_owner_start_offsets(
 ) -> np.ndarray:
     """Normalize the coordinate used to assign query tokens to PCP ranks."""
     if token_owner_start_offsets_per_req is None:
-        return np.zeros(num_scheduled_tokens_per_req.size, dtype=np.int64)
-    starts = np.asarray(token_owner_start_offsets_per_req, dtype=np.int64)
+        return np.zeros(num_scheduled_tokens_per_req.size, dtype=np.int32)
+    starts = np.asarray(token_owner_start_offsets_per_req, dtype=np.int32)
     if starts.size != num_scheduled_tokens_per_req.size:
         raise ValueError(
             "token_owner_start_offsets_per_req must have the same number of "
@@ -114,7 +114,7 @@ def pcp_local_token_counts(
     if interleave_size <= 0:
         raise ValueError("cp_kv_cache_interleave_size must be positive.")
 
-    tokens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+    tokens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int32)
     if tokens.size == 0:
         return np.zeros(pcp_size, dtype=np.int32)
     owner_starts = _resolve_token_owner_start_offsets(
@@ -124,7 +124,7 @@ def pcp_local_token_counts(
     )
     q_starts = owner_starts[:, None]
     q_ends = (owner_starts + np.maximum(tokens, 0))[:, None]
-    ranks = np.arange(pcp_size, dtype=np.int64)[None, :]
+    ranks = np.arange(pcp_size, dtype=np.int32)[None, :]
     per_req_counts = _rank_token_count_before_np(
         q_ends,
         ranks,
@@ -136,7 +136,7 @@ def pcp_local_token_counts(
         pcp_size=pcp_size,
         interleave_size=interleave_size,
     )
-    return np.sum(per_req_counts, axis=0, dtype=np.int64).astype(np.int32)
+    return np.sum(per_req_counts, axis=0, dtype=np.int32)
 
 
 def build_pcp_rank_major_token_order(
@@ -157,26 +157,26 @@ def build_pcp_rank_major_token_order(
     """
     if pcp_size <= 1:
         total = int(np.sum(num_scheduled_tokens_per_req))
-        token_order = np.full(padded_num_tokens, -1, dtype=np.int64)
-        token_order[:total] = np.arange(total, dtype=np.int64)
-        return token_order, np.arange(total, dtype=np.int64)
+        token_order = np.full(padded_num_tokens, -1, dtype=np.int32)
+        token_order[:total] = np.arange(total, dtype=np.int32)
+        return token_order, np.arange(total, dtype=np.int32)
     if interleave_size <= 0:
         raise ValueError("cp_kv_cache_interleave_size must be positive.")
     if padded_num_tokens % pcp_size != 0:
         raise ValueError(f"{padded_num_tokens=} must be divisible by {pcp_size=}.")
 
     local_padded_num_tokens = padded_num_tokens // pcp_size
-    token_order = np.full(padded_num_tokens, -1, dtype=np.int64)
+    token_order = np.full(padded_num_tokens, -1, dtype=np.int32)
     total_num_tokens = int(np.sum(num_scheduled_tokens_per_req))
-    inverse_order = np.full(total_num_tokens, -1, dtype=np.int64)
+    inverse_order = np.full(total_num_tokens, -1, dtype=np.int32)
     owner_starts = _resolve_token_owner_start_offsets(
-        np.asarray(num_scheduled_tokens_per_req, dtype=np.int64),
+        np.asarray(num_scheduled_tokens_per_req, dtype=np.int32),
         token_owner_start_offsets_per_req,
         token_start_offsets_per_req,
     )
 
     req_start = 0
-    rank_offsets = np.zeros(pcp_size, dtype=np.int64)
+    rank_offsets = np.zeros(pcp_size, dtype=np.int32)
     for num_tokens, token_owner_start in zip(
         num_scheduled_tokens_per_req, owner_starts
     ):
@@ -186,21 +186,21 @@ def build_pcp_rank_major_token_order(
                 num_tokens, int(token_owner_start), rank, pcp_size, interleave_size
             ):
                 chunk_len = chunk_end - chunk_start
-                dst_start = rank * local_padded_num_tokens + rank_offsets[rank]
+                dst_start = rank * local_padded_num_tokens + int(rank_offsets[rank])
                 dst_end = dst_start + chunk_len
                 if dst_end > (rank + 1) * local_padded_num_tokens:
                     raise ValueError(
                         "PCP local token count exceeds padded local capacity."
                     )
-                local_chunk_start = chunk_start - token_owner_start
-                local_chunk_end = chunk_end - token_owner_start
+                local_chunk_start = chunk_start - int(token_owner_start)
+                local_chunk_end = chunk_end - int(token_owner_start)
                 src = np.arange(
                     req_start + local_chunk_start,
                     req_start + local_chunk_end,
-                    dtype=np.int64,
+                    dtype=np.int32,
                 )
                 token_order[dst_start:dst_end] = src
-                inverse_order[src] = np.arange(dst_start, dst_end, dtype=np.int64)
+                inverse_order[src] = np.arange(dst_start, dst_end, dtype=np.int32)
                 rank_offsets[rank] += chunk_len
         req_start += num_tokens
 
@@ -266,6 +266,6 @@ def build_pcp_logits_indices(
         token_start_offsets_per_req=token_start_offsets_per_req,
     )
     if len(num_scheduled_tokens_per_req) == 0:
-        return np.empty((0,), dtype=np.int64)
-    local_request_ends = np.cumsum(num_scheduled_tokens_per_req, dtype=np.int64) - 1
-    return inverse_order[local_request_ends] + token_offset
+        return np.empty((0,), dtype=np.int32)
+    local_request_ends = np.cumsum(num_scheduled_tokens_per_req, dtype=np.int32) - 1
+    return inverse_order[local_request_ends] + np.int32(token_offset)

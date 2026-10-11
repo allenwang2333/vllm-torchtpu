@@ -397,3 +397,25 @@ def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypa
     # Also exercise multi-block append beyond active_cols in the general path
     builders[0].bt.append_row([100, 101], 0)
     _stage(runner, 1, [4, 0], 2)
+
+
+def test_td8298_native_int32_delta_arrays(builders, monkeypatch):
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    runner = _make_runner(builders)
+    for b in builders:
+        btd.ensure_tracked(b.bt)
+        assert b.bt._row_rewrite.dtype == np.int32
+        assert b.bt._row_version.dtype == np.int32
+        b.bt.append_row([1, 2], 0)
+    _stage(runner, 1, [8, 0], 2)
+    stager = runner._block_table_delta_stager
+    layout = next(iter(stager._layouts.values()))
+    for st in layout.entries:
+        assert st.rewrites.dtype == np.int32
+        assert st.nblocks.dtype == np.int32
+    for b in builders:
+        b.bt.append_row([3], 0)
+    _stage(runner, 1, [12, 0], 2)
+    assert stager._update_buf is not None
+    assert stager._update_buf.dtype == np.int32

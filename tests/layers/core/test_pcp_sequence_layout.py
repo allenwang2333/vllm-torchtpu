@@ -1345,3 +1345,68 @@ def test_td8282_int32_index_select_in_runner_logits_and_pcp_sequence_layout(
         (torch.float32, 0, torch.int32),
         (torch.float32, 0, torch.int32),
     ]
+
+
+def test_td8298_pcp_layout_and_sequence_layout_native_int32_dtypes(monkeypatch):
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import pcp_layout
+
+    starts_none = pcp_layout.pcp_token_owner_start_offsets(
+        np.array([4, 8], dtype=np.int32), None
+    )
+    assert starts_none.dtype == np.int32
+    starts_list = pcp_layout.pcp_token_owner_start_offsets(
+        np.array([4, 8], dtype=np.int32), [0, 4]
+    )
+    assert starts_list.dtype == np.int32
+
+    counts = pcp_layout.pcp_local_token_counts([4, 8], pcp_size=2, interleave_size=2)
+    assert counts.dtype == np.int32
+
+    order_1, inv_1 = pcp_layout.build_pcp_rank_major_token_order(
+        [4, 8], pcp_size=1, interleave_size=2, padded_num_tokens=16
+    )
+    assert order_1.dtype == np.int32 and inv_1.dtype == np.int32
+
+    order_2, inv_2 = pcp_layout.build_pcp_rank_major_token_order(
+        [4, 8], pcp_size=2, interleave_size=2, padded_num_tokens=16
+    )
+    assert order_2.dtype == np.int32 and inv_2.dtype == np.int32
+
+    logits_empty = pcp_layout.build_pcp_logits_indices(
+        [], pcp_size=2, interleave_size=2, padded_num_tokens=16
+    )
+    assert logits_empty.dtype == np.int32
+    logits_idx = pcp_layout.build_pcp_logits_indices(
+        [4, 8], pcp_size=2, interleave_size=2, padded_num_tokens=16, token_offset=4
+    )
+    assert logits_idx.dtype == np.int32
+
+    decision = _evaluate(computed=[0, 16], prompt=[64, 64], scheduled=[16, 16])
+    assert decision.absolute_query_start_offsets_per_req.dtype == np.int32
+    assert decision.token_owner_start_offsets_per_req.dtype == np.int32
+    assert decision.local_token_counts.dtype == np.int32
+
+    runner = _planner_runner_stub(
+        scheduled=[16, 16], computed=[0, 0], prompt=[16, 16], token_paddings=[32]
+    )
+    planner = PcpSequenceLayoutPlanner(_eligibility(pcp_size=2, interleave_size=16))
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_world_size",
+        lambda: 2,
+    )
+    plan = planner.prepare_real(
+        runner=runner,
+        scheduler_output=_scheduler_output([16, 16]),
+        start_index=0,
+        num_reqs=2,
+        num_scheduled_tokens_per_req=np.asarray([16, 16], dtype=np.int32),
+        total_num_scheduled_tokens=32,
+        use_max_model_len=True,
+        target_num_reqs=2,
+        padded_num_reqs=2,
+    )
+    assert plan._packed_to_request_major_token_indices.dtype == np.int32
+    assert plan._request_major_to_packed_token_indices.dtype == np.int32

@@ -123,7 +123,7 @@ def ensure_tracked(block_table: Any) -> int:
         cpu_tensor = block_table.get_cpu_tensor()
         num_rows = cpu_tensor.shape[0]
         block_table._bt_cpu_np = cpu_tensor.numpy()
-        block_table._row_rewrite = np.zeros(num_rows, dtype=np.int64)
+        block_table._row_rewrite = np.zeros(num_rows, dtype=np.int32)
         block_table._bt_mutations = 0
         block_table._bt_rewrites = 0
         block_table._bt_fast_append = type(
@@ -304,9 +304,11 @@ class BlockTableDeltaStager:
                 ):
                     cur_plan = (prev_plan[4], prev_plan[5], prev_plan[6])
                 else:
-                    changed_rows = np.flatnonzero(nblocks != st.nblocks)
-                    lo_all = np.minimum(st.nblocks[changed_rows], active_cols)
-                    hi_all = np.minimum(nblocks[changed_rows], active_cols)
+                    changed_rows = np.flatnonzero(nblocks != st.nblocks).astype(
+                        np.int32, copy=False
+                    )
+                    lo_all = np.minimum(st.nblocks[changed_rows], np.int32(active_cols))
+                    hi_all = np.minimum(nblocks[changed_rows], np.int32(active_cols))
                     counts = hi_all - lo_all
                     if (counts <= 1).all():
                         if (counts == 1).all():
@@ -314,7 +316,7 @@ class BlockTableDeltaStager:
                         else:
                             valid = counts == 1
                             app_rows, lo = changed_rows[valid], lo_all[valid]
-                        row_offsets = app_rows * tnb + lo
+                        row_offsets = app_rows * np.int32(tnb) + lo
                         cur_plan = (app_rows, lo, row_offsets)
                         prev_plan = (
                             tnb,
@@ -332,7 +334,7 @@ class BlockTableDeltaStager:
                         if pos + k > cap:
                             del self._layouts[key]
                             return None
-                        flat_idx = st.offset + row_offsets
+                        flat_idx = np.int32(st.offset) + row_offsets
                         new_vals = source[app_rows, lo]
                         layout.mirror[flat_idx] = new_vals
                         idx_out[pos : pos + k] = flat_idx
@@ -347,20 +349,24 @@ class BlockTableDeltaStager:
             row_rewrites = bt._row_rewrite[start:end]
             span = max(num_reqs, st.num_reqs)
             if active_cols != st.active_cols:
-                full_rows = np.arange(span)
-                app_rows = np.empty(0, dtype=np.int64)
+                full_rows = np.arange(span, dtype=np.int32)
+                app_rows = np.empty(0, dtype=np.int32)
             else:
                 common = min(num_reqs, st.num_reqs)
                 rewritten_mask = row_rewrites[:common] != st.rewrites[:common]
-                rewritten_rows = np.flatnonzero(rewritten_mask)
+                rewritten_rows = np.flatnonzero(rewritten_mask).astype(
+                    np.int32, copy=False
+                )
                 full_rows = (
-                    np.concatenate([rewritten_rows, np.arange(common, span)])
+                    np.concatenate(
+                        [rewritten_rows, np.arange(common, span, dtype=np.int32)]
+                    )
                     if common < span
                     else rewritten_rows
                 )
                 app_rows = np.flatnonzero(
                     (~rewritten_mask) & (nblocks[:common] != st.nblocks[:common])
-                )
+                ).astype(np.int32, copy=False)
             if full_rows.size:
                 # Rows rewritten in place, or entering / leaving the live range:
                 # compare their whole active width against the mirror.
