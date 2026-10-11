@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 16
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
+    TPU_STREAMIDX_MIXED_KV_PAGES: int | None = None
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -929,6 +930,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Exact.
     "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED": env_bool(
         "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED", default=False
+    ),
+    # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
+    # every bucket that does not take the small-bucket sizes (with
+    # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
+    # TPU_STREAMIDX_SMALL_BUCKET_TOKENS; with it unset, all buckets). Unset
+    # keeps the default 2 (a 512-position kv block at page 256). 4 halves the
+    # grid steps per pass: GLM-5.2 DCP16 per rank, 4096-token bucket, 30.7k
+    # local KV: -23..-25% per scoring call, 6.9k: -2..-3%, 1.8k: ~0; scores
+    # bit-identical (same per-element math).
+    "TPU_STREAMIDX_MIXED_KV_PAGES": env_positive_int_or_none(
+        "TPU_STREAMIDX_MIXED_KV_PAGES"
     ),
     # SparseCore top-k over 32+ rows of a 32K..64K-word bucket: one row per
     # subcore (P=1, all 32 busy) instead of P=2, reading each row only up to
