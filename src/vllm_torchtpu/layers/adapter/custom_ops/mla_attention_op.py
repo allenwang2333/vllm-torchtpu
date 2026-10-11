@@ -87,7 +87,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -1301,12 +1301,6 @@ class VllmTPUIndexer(Indexer):
         )
 
 
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
-
-
 # --- MLA rope in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE) ---------------
 #
 # GPT-J (interleaved) rope pairs channels (2i, 2i+1); NeoX rope pairs
@@ -1346,7 +1340,7 @@ def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
     and no dtype-specific gather support is needed on the device."""
     as_int = t.view(_SAME_WIDTH_INT[t.element_size()])
     out = torch.index_select(as_int, axis, index.to(t.device))
-    return _fresh(out.view(t.dtype))
+    return fresh_buffer(out.view(t.dtype))
 
 
 def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
@@ -1608,15 +1602,15 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
             self.W_UV = Parameter(W_UV, requires_grad=False)
             self.W_UK_T_scale = Parameter(
-                _fresh(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
             )
             self.W_UV_scale = Parameter(
-                _fresh(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
             )
 
         # move W_UK_T and W_UV into fresh contiguous buffers
-        self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
-        self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
+        self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
+        self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)
 
         # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
         # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
@@ -1638,11 +1632,11 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = _fresh(
+            self.W_UK_T_dcp_qrep = fresh_buffer(
                 dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
             )
             if hasattr(self, "W_UK_T_scale"):
-                self.W_UK_T_dcp_qrep_scale = _fresh(
+                self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
 
@@ -1662,11 +1656,11 @@ class VllmTPUMLAAttention(MLAAttention):
         self.W_UV_dcp_vspace_scale = None
         if envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
             dcp_group = get_dcp_group()
-            self.W_UV_dcp_vspace = _fresh(
+            self.W_UV_dcp_vspace = fresh_buffer(
                 dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
             )
             if hasattr(self, "W_UV_scale"):
-                self.W_UV_dcp_vspace_scale = _fresh(
+                self.W_UV_dcp_vspace_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
                 )
 
