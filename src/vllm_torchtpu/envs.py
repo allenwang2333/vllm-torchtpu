@@ -197,6 +197,9 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
+    TPU_FUSED_ADD_RMSNORM: bool = False
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
+    TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_SAMPLER_VOCAB_PARALLEL: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
@@ -1297,6 +1300,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer at decode. Applies to the sites in fp8_skinny.SCALE_DMA_SITES (o_proj).
     # Outputs are bit-identical.
     "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
+    # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
+    # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
+    # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
+    # output is bit-identical; the normalized output can differ in the last bf16 ulp
+    # (f32 summation order of the mean square).
+    "TPU_FUSED_ADD_RMSNORM": env_bool("TPU_FUSED_ADD_RMSNORM"),
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_int("TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 512),
+    "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int("TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
