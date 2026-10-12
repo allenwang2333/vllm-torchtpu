@@ -62,6 +62,8 @@ RELEASE_STAGER_POOL = _flag("VLLM_TPU_MEMDBG_RELEASE_STAGER_POOL")
 CLEAR_PRECOMPILE_CONTEXT = _flag("VLLM_TPU_MEMDBG_CLEAR_PRECOMPILE_CONTEXT")
 RELEASE_ENTRY_COPIES = _flag("VLLM_TPU_MEMDBG_RELEASE_ENTRY_COPIES")
 SHARE_EXECUTABLE_COPIES = _flag("VLLM_TPU_MEMDBG_SHARE_EXECUTABLE_COPIES")
+# Keep tracing but never return freed heap to the OS (production behaviour).
+SKIP_TRIM = _flag("VLLM_TPU_MEMDBG_SKIP_TRIM")
 
 # Resolve tcmalloc symbols from the allocator already in the process
 # (LD_PRELOAD; libtcmalloc.so.4 in our images, which carries the heap
@@ -124,16 +126,20 @@ def _share_executable_copies() -> None:
     TorchTpuCompiledExecutable.__deepcopy__ = lambda self, memo: self
 
 
-def _tcmalloc_allocated_mb() -> float:
-    """Bytes the application holds in tcmalloc (excludes allocator caches)."""
+def _tcmalloc_property_mb(name: str) -> float:
     get = getattr(_process_symbols, "MallocExtension_GetNumericProperty", None)
     if get is None:
         return -1.0
     value = ctypes.c_size_t()
     get.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]
-    if not get(b"generic.current_allocated_bytes", ctypes.byref(value)):
+    if not get(name.encode(), ctypes.byref(value)):
         return -1.0
     return value.value / 2**20
+
+
+def _tcmalloc_allocated_mb() -> float:
+    """Bytes the application holds in tcmalloc (excludes allocator caches)."""
+    return _tcmalloc_property_mb("generic.current_allocated_bytes")
 
 
 def _proc_mem_mb() -> tuple[float, float]:
@@ -307,13 +313,15 @@ def stage(name: str) -> None:
     rss, anon = _proc_mem_mb()
     logger.info(
         "[MEMDBG] stage=%s tag=%s VmRSS=%.1f MB RssAnon=%.1f MB "
-        "tcmalloc_allocated=%.1f MB compile_cache_entries=%d "
-        "live_compiled_executables=%d precompile_artifacts=%d",
+        "tcmalloc_allocated=%.1f MB tcmalloc_pageheap_free=%.1f MB "
+        "compile_cache_entries=%d live_compiled_executables=%d "
+        "precompile_artifacts=%d",
         name,
         _tag,
         rss,
         anon,
         _tcmalloc_allocated_mb(),
+        _tcmalloc_property_mb("tcmalloc.pageheap_free_bytes"),
         _compile_cache_entries(),
         _live_compiled_executables(),
         _precompile_artifacts(),
@@ -324,7 +332,7 @@ def stage(name: str) -> None:
 
 def trim_allocator(name: str) -> None:
     """Return freed heap to the OS so RSS reflects what is still live."""
-    if not TRACE:
+    if not TRACE or SKIP_TRIM:
         return
     gc.collect()
     before, _ = _proc_mem_mb()
