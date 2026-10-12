@@ -76,10 +76,13 @@ def _indices(dst_rows, num_rows, seed):
 
 
 def _packed(inp):
+    """As the wiring hands them over: 128-lane rows (rope zero-padded)."""
+    from vllm_torchtpu.layers.core import attention_interface
+
     nope_spec, rope_spec = tcw._specs()
     return (
-        kv_cache_utils.pack_tokens(inp["kv_c_normed"], nope_spec.token_bytes),
-        kv_cache_utils.pack_tokens(inp["k_pe"], rope_spec.token_bytes),
+        attention_interface._pack_lane_dense(inp["kv_c_normed"], nope_spec.token_bytes),
+        attention_interface._pack_lane_dense(inp["k_pe"], rope_spec.token_bytes),
     )
 
 
@@ -257,3 +260,21 @@ def test_flag_defaults_off():
     with mock.patch.dict(os.environ):
         os.environ.pop(FLAG, None)
         assert not envs.TPU_MLA_KV_WRITE_IN_GATHER
+
+
+@pytest.mark.parametrize("cell", _WRITE_CELLS)
+def test_lane_dense_pack_is_pack_tokens(cell):
+    """The wiring's 128-lane pack == `pack_tokens` (rope: words [0, 32),
+    zeros after), on raw random bytes."""
+    from vllm_torchtpu.layers.core import attention_interface
+
+    seqs, num_tokens = tcw._CELLS[cell]
+    inp = tcw._inputs(seqs, num_tokens)
+    for values, spec in zip(("kv_c_normed", "k_pe"), tcw._specs()):
+        want = np.asarray(kv_cache_utils.pack_tokens(inp[values], spec.token_bytes))
+        got = np.asarray(
+            attention_interface._pack_lane_dense(inp[values], spec.token_bytes)
+        )
+        assert got.shape == (num_tokens, 128)
+        np.testing.assert_array_equal(got[:, : want.shape[1]], want)
+        assert not got[:, want.shape[1] :].any()

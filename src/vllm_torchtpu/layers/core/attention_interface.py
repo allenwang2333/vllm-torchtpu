@@ -1053,6 +1053,29 @@ def _mixed_body_levers(value: str) -> tuple[str, ...]:
     return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
+def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
+    """`kv_cache_utils.pack_tokens`, bit for bit, as 128-lane u32 rows.
+
+    Word `w` = byte `w` of each `token_bytes / 4`-byte band (the SparseCore
+    cache word). Built from lane slices of the 1-byte values, so XLA emits one
+    lane-dense fusion; `pack_tokens`' [T, 4, band] reshape costs ~0.6 us of
+    relayout per layer at decode sizes. Rows narrower than 128 words (rope:
+    32) are zero-padded to 128 lanes; the gather writes only the token's words.
+    """
+    u8 = jax.lax.bitcast_convert_type(values, jnp.uint8)
+    band = token_bytes // kv_cache_utils.WORD_BYTES
+    words = None
+    for b in range(kv_cache_utils.WORD_BYTES):
+        if b * band >= u8.shape[-1]:
+            break
+        part = u8[:, b * band : (b + 1) * band].astype(jnp.uint32) << (8 * b)
+        words = part if words is None else words | part
+    assert words is not None
+    if words.shape[-1] < 128:
+        words = jnp.pad(words, ((0, 0), (0, 128 - words.shape[-1])))
+    return words
+
+
 def kv_write_in_gather_supported(
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
@@ -1254,8 +1277,8 @@ def sparse_mla_attention_dcp(
             )
             kv_write = (
                 kv_cache_utils._dst_rows(page, slot, nope_spec.page_size),
-                kv_cache_utils.pack_tokens(kv_c_normed, nope_spec.token_bytes),
-                kv_cache_utils.pack_tokens(k_pe, rope_spec.token_bytes),
+                _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),
+                _pack_lane_dense(k_pe, rope_spec.token_bytes),
             )
         else:
             kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
