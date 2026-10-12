@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_MOE_TP_DECODE_SPLIT_META: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -879,6 +880,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the usual path. Remove once the path is the default for these layers or
     # is replaced by another fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
+    # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
+    # layer, ~0.6 us in situ). Exact; default off.
+    "TPU_MOE_TP_DECODE_SPLIT_META": env_bool(
+        "TPU_MOE_TP_DECODE_SPLIT_META", default=False
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
