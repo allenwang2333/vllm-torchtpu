@@ -21,9 +21,11 @@ which ``support_torch_compile`` cannot read.
 from typing import Any, Protocol
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.sequence import IntermediateTensors
 
 
@@ -34,6 +36,42 @@ class MtpDraftModel(Protocol):
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
+
+
+def _resolve_fast_lm_head(
+    mtp: Any,
+) -> tuple[torch.Tensor, Any, int] | None:
+    lm_head = getattr(mtp, "lm_head", None)
+    weight = getattr(lm_head, "weight", None)
+    if weight is None or not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        return None
+    if getattr(lm_head, "bias", None) is not None:
+        return None
+    quant_method = getattr(lm_head, "quant_method", None)
+    if quant_method is not None and type(quant_method).__name__ not in (
+        "UnquantizedEmbeddingMethod",
+        "UnquantizedLinearMethod",
+    ):
+        return None
+    logits_proc = getattr(mtp, "logits_processor", None)
+    if (
+        getattr(logits_proc, "softcap", None) is not None
+        or getattr(logits_proc, "scale", 1.0) != 1.0
+    ):
+        return None
+    tp_group = get_tp_group()
+    tp_size = getattr(tp_group, "world_size", 1)
+    rank = getattr(tp_group, "rank_in_group", 0)
+    shard_vocab = weight.shape[0]
+    rank_offset = rank * shard_vocab
+    org_vocab_size = getattr(lm_head, "org_vocab_size", shard_vocab * tp_size)
+    valid_cols = min(shard_vocab, max(0, org_vocab_size - rank_offset))
+    effective_weight = weight[:valid_cols] if valid_cols < shard_vocab else weight
+    return (
+        effective_weight,
+        tp_group if tp_size > 1 else None,
+        rank_offset,
+    )
 
 
 class _MtpFusedLoop(nn.Module):
@@ -50,6 +88,32 @@ class _MtpFusedLoop(nn.Module):
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        self._fast_lm_head = _resolve_fast_lm_head(mtp)
+
+    def _next_token_ids(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        fast = self._fast_lm_head
+        if fast is None:
+            next_ids = self.mtp.compute_logits(last_hidden).argmax(dim=-1)
+            return (
+                next_ids if next_ids.dtype == torch.int32 else next_ids.to(torch.int32)
+            )
+        weight, tp_group, rank_offset = fast
+        shard_logits = F.linear(last_hidden, weight)
+        if tp_group is None:
+            next_ids = shard_logits.argmax(dim=-1)
+            return (
+                next_ids if next_ids.dtype == torch.int32 else next_ids.to(torch.int32)
+            )
+        local_max, local_idx = shard_logits.max(dim=-1)
+        local_idx_i32 = (
+            local_idx if local_idx.dtype == torch.int32 else local_idx.to(torch.int32)
+        ) + rank_offset
+        packed = torch.stack(
+            (local_max.to(torch.float32), local_idx_i32.to(torch.float32)), dim=-1
+        )
+        gathered = tp_group.all_gather(packed.unsqueeze(0), dim=0)
+        best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
+        return gathered[..., 1].gather(0, best_rank).squeeze(0).to(torch.int32)
 
     def forward(
         self,
@@ -62,13 +126,15 @@ class _MtpFusedLoop(nn.Module):
     ) -> tuple[torch.Tensor, ...]:
         """`positions` and `seq_lens` are step 1's. Returns the K-1 draft
         tokens, one [p] int32 tensor per step."""
+        mtp = self.mtp
+        forward_fn = type(mtp).forward
         tokens = []
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
                 seq_lens.add_(1)
-            out = type(self.mtp).forward(
-                self.mtp,
+            out = forward_fn(
+                mtp,
                 input_ids,
                 positions,
                 hidden_states,
@@ -83,15 +149,12 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            next_ids = self.mtp.compute_logits(last_hidden).argmax(dim=-1)
-            input_ids = (
-                next_ids if next_ids.dtype == torch.int32 else next_ids.to(torch.int32)
-            )
+            input_ids = self._next_token_ids(last_hidden)
             tokens.append(input_ids)
         return tuple(tokens)
 
 
-_FUSED_LOOP_CLS_CACHE: dict[str, type[_MtpFusedLoop]] = {}
+_FUSED_LOOP_CLS_CACHE: dict[tuple[tuple[str, Any], ...], type[_MtpFusedLoop]] = {}
 
 
 def build_mtp_fused_loop(
@@ -105,7 +168,7 @@ def build_mtp_fused_loop(
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
     token dimension the same way."""
-    key = repr(sorted(dynamic_arg_dims.items()))
+    key = tuple(sorted(dynamic_arg_dims.items()))
     cls = _FUSED_LOOP_CLS_CACHE.get(key)
     if cls is None:
         cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
