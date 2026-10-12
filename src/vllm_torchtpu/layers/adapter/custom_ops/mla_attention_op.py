@@ -1060,6 +1060,24 @@ def rope_half_split(rotary_emb, positions, query, key):
     )
 
 
+def mla_q_rope_table(rotary_emb, positions: torch.Tensor, query: torch.Tensor):
+    """Per-token f32 `[T, 2, 128]` table for the in-kernel q rope
+    (TPU_MLA_DECODE_PROLOGUE): row 0 C = [cos, cos, cos, cos], row 1
+    S = [-sin, sin, -sin, sin], from the same cos/sin rows `rope_half_split`
+    reads (so the gather is shared with the k_pe rope). Lanes 64:128 line up
+    with q_pe in lanes 128:256 of the raw 192 + 64 q head; the kernel forms
+    x*C + rot(x)*S there. Negation and the f32 widening are exact."""
+    if isinstance(rotary_emb, DeepseekScalingRotaryEmbedding):
+        cache = rotary_emb.cos_sin_cache
+    else:
+        cache = rotary_emb._match_cos_sin_cache_dtype(query)
+    cos, sin = cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
+    assert cos.shape[-1] == 32, f"rope half {cos.shape[-1]} != 32"
+    c = torch.cat([cos, cos, cos, cos], dim=-1).float()
+    s_ = torch.cat([-sin, sin, -sin, sin], dim=-1).float()
+    return torch.stack([c, s_], dim=1)
+
+
 def rope_half_split_leading(
     rotary_emb, positions: torch.Tensor, x: torch.Tensor, rope_dim: int
 ) -> torch.Tensor:
@@ -1318,10 +1336,17 @@ class VllmTPUMLAAttention(MLAAttention):
 
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
+        self.sparse_mla_dcp_rope_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
+            # and ropes q_pe in the attention kernel (query replication only).
+            if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
+                self.sparse_mla_dcp_rope_op = impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, impl.dcp_interleave_size, q_rope=True
+                )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention
@@ -1451,6 +1476,27 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         self.prefix = prefix
+
+        # TPU_MLA_DECODE_PROLOGUE: rope q_pe inside the DCP sparse attention
+        # kernel from the raw q head (see `mla_q_rope_table`). Only the qrep
+        # sparse DCP path consumes q that way; it also needs the NeoX
+        # half-split q layout (checked per call: set by a post-load hook).
+        self.decode_prologue = bool(
+            envs.TPU_MLA_DECODE_PROLOGUE
+            and self.is_sparse
+            and self.dcp_q_replicate
+            and self.rotary_emb is not None
+        )
+        if self.decode_prologue:
+            if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_PROLOGUE needs TPU_DCP_MLA_SPLIT_Q_LSE"
+                )
+            if (self.qk_nope_head_dim, self.qk_rope_head_dim) != (192, 64):
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_PROLOGUE assumes a 192 + 64 q head, got "
+                    f"{self.qk_nope_head_dim} + {self.qk_rope_head_dim}"
+                )
 
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
@@ -1609,7 +1655,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        if self.rotary_emb is not None:
+        q_rope_table = None
+        fold_q_rope = (
+            getattr(self, "decode_prologue", False)
+            and getattr(self, "_rope_neox_permuted", False)
+            and llama_4_scaling is None
+        )
+        if fold_q_rope:
+            # k_pe exactly as below (the unused q half is dead code to XLA);
+            # q_pe is roped in the attention kernel from the raw q head.
+            k_pe_dtype = k_pe.dtype
+            _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            k_pe = k_pe.to(dtype=k_pe_dtype)
+            q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
+        elif self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
             if getattr(self, "_rope_neox_permuted", False):
@@ -1644,7 +1703,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # all-gather the heads itself; everything else takes this rank's shard.
         q_dcp_replicated = None
         if self.dcp_q_replicate:
-            if self.is_sparse:
+            if q_rope_table is not None:
+                # The raw q head view (q_pe un-roped) + the rope table.
+                q_dcp_replicated = (q_nope, q, q_rope_table)
+            elif self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             local_view = cast(
                 DCPGroupColumnParallelLinear, self._q_proj_layer()
