@@ -937,10 +937,10 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
     monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit)
     # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) resolves
-    # to min(8 * 512 - 1, 4096) = 4095, and a 256-row block (v6e) resolves to
-    # min(2 * 256 - 1, 4096) = 511. None and -1 both select auto.
+    # to min(10 * 512 - 1, 5120) = 5119, and a 256-row block (v6e) resolves to
+    # min(2 * 256 - 1, 5120) = 511. None and -1 both select auto.
     for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 4095),
+        (_fake_sc_info(16, 2, 16), 5119),
         (_fake_sc_info(8, 2, 16), 511),
     ):
         monkeypatch.setattr(
@@ -959,7 +959,7 @@ def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
         "get_tpu_info",
         lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
     )
-    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 4096
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 5120
 
 
 def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise(

@@ -96,7 +96,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         # min(2 * (16 * 4 * 2) - 1, 2048) = min(255, 2048) = 255
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 255
 
-    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 8)
+    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 10)
     mock_sc_512 = MagicMock()
     mock_sc_512.num_lanes = 16
     mock_sc_512.num_cores = 4
@@ -107,10 +107,10 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_512,
     ):
-        # min(8 * 512 - 1, 4096) = min(4095, 4096) = 4095
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 4095
+        # min(10 * 512 - 1, 5120) = min(5119, 5120) = 5119
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 5119
 
-    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (4096)
+    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (5120)
     mock_sc_1024 = MagicMock()
     mock_sc_1024.num_lanes = 16
     mock_sc_1024.num_cores = 8
@@ -121,8 +121,8 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_1024,
     ):
-        # min(8 * 1024 - 1, 4096) = min(8191, 4096) = 4096
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 4096
+        # min(10 * 1024 - 1, 5120) = min(10239, 5120) = 5120
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 5120
 
 
 def test_moe_gmm_tiling(monkeypatch):
