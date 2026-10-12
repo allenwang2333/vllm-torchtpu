@@ -15,6 +15,7 @@
 | `Qwen/Qwen2.5-VL-7B-Instruct`, `google/gemma-3-12b-it` | `bf16` or `fp8` | `v6e-1` or `v6e-4` | `TP=1` or `TP=4` |
 | `Qwen/Qwen3-32B`, `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`, `Qwen/Qwen3.5-35B-A3B-FP8` | `fp8` (`bf16` on `v6e-4`/`v6e-8`) | `v6e-4` (4 chips, 128 GB) | `TP=4` (+ `--enable-expert-parallel` for MoE) |
 | `meta-llama/Llama-3.3-70B-Instruct`, `openai/gpt-oss-120b` | `fp8` / `mxfp4` (`bf16` on `v6e-8`) | `v6e-8` (8 chips, 256 GB) | `TP=8` (+ `--enable-expert-parallel` for MoE) |
+| `Qwen/Qwen3.5-397B-A17B-FP8` | `fp8` | `v6e-16` (2 hosts, 512 GB) | `TP=16` or `DP=2, TP=8` + EP |
 
 ---
 
