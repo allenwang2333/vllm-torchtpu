@@ -79,7 +79,10 @@ def all_gather_q_nope_pe_heads(
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    is_backbone: bool = True,
+    query_start_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -114,6 +117,10 @@ def merge_lse_partials_scatter_heads(
         trace time. Pass False from the MTP drafter,
         which is traced once for every bucket: it always takes the
         reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
+      query_start_loc: the step's `[num_reqs + 1]` query starts, padded with
+        the real token count (so its last entry is that count). With
+        TPU_DCP_LSE_MERGE_A2A_REAL_ROWS the packed all-to-all sends only the
+        real tokens' rows; None keeps every padded row.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -135,7 +142,9 @@ def merge_lse_partials_scatter_heads(
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
-        return merge_lse_partials_all_to_all(output, lse, group)
+        return merge_lse_partials_all_to_all(
+            output, lse, group, query_start_loc=query_start_loc
+        )
 
     # Same trace-time rule as above: only the backbone may split by size.
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
@@ -251,7 +260,10 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 def merge_lse_partials_all_to_all(
-    output: torch.Tensor, lse: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    query_start_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Same result as the reduce-scatter merge, via all-to-all.
 
@@ -265,7 +277,11 @@ def merge_lse_partials_all_to_all(
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
     if envs.TPU_DCP_LSE_MERGE_A2A_PACK and output.element_size() == 2:
-        o_recv, l_recv = _all_to_all_packed(o_send, l_send, group)
+        real_tokens = None
+        if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and query_start_loc is not None:
+            # Padded with the real count, so the last entry is that count.
+            real_tokens = query_start_loc[-1:].to(torch.int32)
+        o_recv, l_recv = _all_to_all_packed(o_send, l_send, group, real_tokens)
     else:
         o_recv = _all_to_all(o_send, group)
         l_recv = _all_to_all(l_send, group)
@@ -273,7 +289,10 @@ def merge_lse_partials_all_to_all(
 
 
 def _all_to_all_packed(
-    o_send: torch.Tensor, l_send: torch.Tensor, group: Any
+    o_send: torch.Tensor,
+    l_send: torch.Tensor,
+    group: Any,
+    real_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`(_all_to_all(o_send), _all_to_all(l_send))` in ONE all-to-all
     (`TPU_DCP_LSE_MERGE_A2A_PACK`).
@@ -289,6 +308,15 @@ def _all_to_all_packed(
     bits, so both halves come back bit for bit what the two separate exchanges
     return; only the f32 lse's own collective (latency-bound at a few KB) is
     gone, for `ceil(2 * T * local / V)` extra rows on the partial's.
+
+    With `real_tokens` (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`, an int32 `[1]` count
+    of real tokens, the rest of the `T` rows padding), the lse rows lead each
+    destination block and a ragged all-to-all sends only them plus the real
+    tokens' `real_tokens * local` partial rows: at decode `b1` a 16-row bucket
+    holds 4 real rows, so three quarters of the payload stays home. Received
+    rows past that are zero. Real rows come back bit for bit; a padding row's
+    partial is zero instead of whatever the kernel left there (its lse still
+    arrives whole).
     """
     world, tokens, local, vdim = o_send.shape
     rows = tokens * local
@@ -302,16 +330,98 @@ def _all_to_all_packed(
     l_words = torch.nn.functional.pad(
         torch.cat([hi, lo], dim=1), (0, extra * vdim - words)
     )
-    send = torch.cat([o_words, l_words.reshape(world, extra, vdim)], dim=1)
-    recv = _all_to_all(send, group)
-    o_recv = recv[:, :rows].reshape(world, tokens, local, vdim).view(o_send.dtype)
-    l_recv_words = recv[:, rows:].reshape(world, extra * vdim)
+    if real_tokens is not None:
+        send = torch.cat([l_words.reshape(world, extra, vdim), o_words], dim=1)
+        recv = _ragged_all_to_all(send, extra + real_tokens * local, group)
+        o_recv = recv[:, extra:].reshape(world, tokens, local, vdim)
+        o_recv = o_recv.view(o_send.dtype)
+        l_recv_words = recv[:, :extra].reshape(world, extra * vdim)
+    else:
+        send = torch.cat([o_words, l_words.reshape(world, extra, vdim)], dim=1)
+        recv = _all_to_all(send, group)
+        o_recv = recv[:, :rows].reshape(world, tokens, local, vdim).view(o_send.dtype)
+        l_recv_words = recv[:, rows:].reshape(world, extra * vdim)
     hi = l_recv_words[:, :rows].to(torch.int32)
     lo = l_recv_words[:, rows:words].to(torch.int32)
     l_recv = ((hi << 16) | (lo & 0xFFFF)).view(torch.float32).reshape(
         world, tokens, local
     )
     return o_recv, l_recv
+
+
+_RAGGED_A2A_OPS: dict = {}
+
+
+def _ragged_all_to_all(x: torch.Tensor, rows: torch.Tensor, group: Any) -> torch.Tensor:
+    """`_all_to_all(x)` for `x` `[world, R, V]`, moving only the first `rows`
+    (int32 `[1]`, the same on every rank) rows of each block; the rest of each
+    received block is zero. One `jax.lax.ragged_all_to_all` over the DCP mesh
+    axis (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`)."""
+    world, block, vdim = x.shape
+    op = _RAGGED_A2A_OPS.get(world)
+    if op is None:
+        op = _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
+    return op(x.reshape(world * block, vdim).contiguous(), rows).reshape(
+        world, block, vdim
+    )
+
+
+def prebuild_ragged_all_to_all(world: int) -> None:
+    """Build (register) the real-rows exchange op for a DCP group of `world`
+    ranks at model build, not inside a trace."""
+    if world not in _RAGGED_A2A_OPS:
+        _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
+
+
+def _build_ragged_all_to_all(world: int):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import (
+        DCP_AXIS_NAME,
+        DCP_LANE_AXIS_NAME,
+        get_or_create_dcp_mesh,
+    )
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    # Every rank (lane x DCP) holds its own block; the exchange runs per lane.
+    rank_spec = P((DCP_LANE_AXIS_NAME, DCP_AXIS_NAME))
+
+    def body(x, rows):
+        block = x.shape[0] // world
+        me = jax.lax.axis_index(DCP_AXIS_NAME).astype(jnp.int32)
+        n = jnp.clip(rows[0], 0, block).astype(jnp.int32)
+        sizes = jnp.full((world,), n, jnp.int32)
+        return jax.lax.ragged_all_to_all(
+            x,
+            jnp.zeros_like(x),
+            jnp.arange(world, dtype=jnp.int32) * block,  # block d -> rank d
+            sizes,
+            jnp.full((world,), me * block, jnp.int32),  # lands at block `me`
+            sizes,  # every rank sends the same count
+            axis_name=DCP_AXIS_NAME,
+        )
+
+    def fn(x, rows):
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P()),
+            out_specs=rank_spec,
+            check_vma=False,
+        )(x, rows)
+
+    return sharded_jax_op(
+        f"pallas::dcp_merge_ragged_all_to_all_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P()),
+        output_partition_specs=rank_spec,
+        fake=lambda x, rows: torch.empty_like(x),
+    )
 
 
 def _zero_nan(o_f32: torch.Tensor) -> torch.Tensor:

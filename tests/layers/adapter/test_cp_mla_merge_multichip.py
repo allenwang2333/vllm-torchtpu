@@ -36,6 +36,11 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      reference, or no less exact than the a2a merge compiled the same way). The
      same check fails when the packed lse rows are rotated by one rank while
      the partial rows are left alone.
+  7. Sending only the real tokens' rows (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`, a
+     ragged all-to-all sized from query_start_loc) returns the packed merge
+     bit for bit on every real row and zero on padding rows, eager and
+     compiled, at decode-sized buckets and real counts; the same check fails
+     when the exchange is sized one row short.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -66,6 +71,7 @@ _ARM_DEFAULTS = {
     "TPU_DCP_MERGE_CHUNKED": 0,
     "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
     "TPU_DCP_LSE_MERGE_A2A_PACK": False,
+    "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
@@ -76,6 +82,11 @@ ARMS = {
     "chunk8": {"TPU_DCP_MERGE_CHUNKED": 8},
     "chunk8_ag1": {"TPU_DCP_MERGE_CHUNKED": 8, "TPU_DCP_MERGE_CHUNKED_LSE_AG": True},
     "a2a_pack": {"TPU_DCP_LSE_MERGE_A2A": True, "TPU_DCP_LSE_MERGE_A2A_PACK": True},
+    "a2a_pack_real": {
+        "TPU_DCP_LSE_MERGE_A2A": True,
+        "TPU_DCP_LSE_MERGE_A2A_PACK": True,
+        "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": True,
+    },
 }
 # Arms that must return today's merge: same per-row arithmetic, other schedule.
 CHUNK_ARMS = ("chunk2", "chunk4", "chunk8", "chunk8_ag1")
@@ -207,6 +218,73 @@ def _merge_unrolled(o_recv, l_recv):
     for r in range(1, o_recv.shape[0]):
         acc = acc + o_f32[r] * w[r].unsqueeze(-1)
     return acc
+
+
+def _real_rows_checks(rank, world, cp_mla, merge):
+    """TPU_DCP_LSE_MERGE_A2A_REAL_ROWS vs the packed merge, same compile mode:
+    real rows bitwise, padding rows zero; and the one-row-short control."""
+    import torch
+
+    report = {}
+    cases = [(16, 4), (16, 8), (16, 16), (32, 12), (64, 1), (16, 0)]
+    for tokens, real in cases:
+        outputs, lses = _global_partials(world, tokens)
+        poisoned = outputs.clone()
+        poisoned[~torch.isfinite(lses)] = float("nan")
+        o_dev = poisoned[rank].to("tpu")
+        l_dev = lses[rank].to("tpu")
+        qsl = torch.tensor([0, real, real], dtype=torch.int32).to("tpu")
+        for how in ("eager", "compiled"):
+            key = f"real_rows/T{tokens}/n{real}/{how}"
+            try:
+                _set_arm(cp_mla, "a2a_pack")
+                fn = merge if how == "eager" else _compile(merge)
+                want = fn(o_dev, l_dev, query_start_loc=qsl).cpu()
+                _set_arm(cp_mla, "a2a_pack_real")
+                fn = merge if how == "eager" else _compile(merge)
+                got = fn(o_dev, l_dev, query_start_loc=qsl).cpu()
+                report[key] = {
+                    "real_rows_bitwise_vs_pack": bool(
+                        torch.equal(
+                            got[:real].view(torch.int16), want[:real].view(torch.int16)
+                        )
+                    ),
+                    "padding_rows_zero": bool((got[real:] == 0).all()),
+                    "finite": bool(torch.isfinite(got.float()).all()),
+                }
+            except Exception as exc:  # noqa: BLE001 - reported to the parent
+                traceback.print_exc()
+                report[key] = {"error": repr(exc)[:400]}
+    # Positive control: the exchange sized one row short.
+    real_ragged = cp_mla._ragged_all_to_all
+    cp_mla._ragged_all_to_all = lambda x, rows, g: real_ragged(x, rows - 1, g)
+    try:
+        tokens, real = 16, 5
+        outputs, lses = _global_partials(world, tokens)
+        o_dev, l_dev = outputs[rank].to("tpu"), lses[rank].to("tpu")
+        qsl = torch.tensor([0, real], dtype=torch.int32).to("tpu")
+        for how in ("eager", "compiled"):
+            key = f"control_short_row/a2a_pack_real/{how}"
+            try:
+                _set_arm(cp_mla, "a2a_pack")
+                fn = merge if how == "eager" else _compile(merge)
+                want = fn(o_dev, l_dev, query_start_loc=qsl).cpu()
+                _set_arm(cp_mla, "a2a_pack_real")
+                fn = merge if how == "eager" else _compile(merge)
+                got = fn(o_dev, l_dev, query_start_loc=qsl).cpu()
+                report[key] = {
+                    "real_rows_bitwise_vs_pack": bool(
+                        torch.equal(
+                            got[:real].view(torch.int16), want[:real].view(torch.int16)
+                        )
+                    )
+                }
+            except Exception as exc:  # noqa: BLE001 - reported to the parent
+                traceback.print_exc()
+                report[key] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla._ragged_all_to_all = real_ragged
+    return report
 
 
 def _nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local):
@@ -402,6 +480,8 @@ def _check(rank, world, group, cp_mla):
     finally:
         cp_mla._all_to_all = real
 
+    report.update(_real_rows_checks(rank, world, cp_mla, merge))
+
     # Positive control for the chunked merge: every chunk weighted with its
     # neighbour row's lse. The same check must now fail.
     real_rs = cp_mla.cp_lse_ag_out_rs
@@ -452,9 +532,11 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
     import torch
 
     def chain(k):
-        def run(o, lse):
+        def run(o, lse, qsl):
             for _ in range(k):
-                y = cp_mla.merge_lse_partials_scatter_heads(o, lse)
+                y = cp_mla.merge_lse_partials_scatter_heads(
+                    o, lse, query_start_loc=qsl
+                )
                 # A one-element update of both inputs: nothing is loop
                 # invariant, and the update itself costs nothing.
                 s = y.reshape(-1)[:1].float() * 0.0
@@ -470,7 +552,9 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        arms = ("today", "a2a", *PACK_ARMS, *MERGE_VARIANTS)
+        # Real rows: a b1-like step, a quarter of the bucket real.
+        qsl = torch.tensor([0, max(1, tokens // 4)], dtype=torch.int32).to("tpu")
+        arms = ("today", "a2a", *PACK_ARMS, "a2a_pack_real", *MERGE_VARIANTS)
         if tokens > 256:
             arms = ("today", *CHUNK_ARMS)
         for arm in arms:
@@ -480,12 +564,12 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
                 times = {}
                 for k in (1, 1 + reps):
                     fn = _compile(chain(k))
-                    fn(o, lse).cpu()
-                    fn(o, lse).cpu()
+                    fn(o, lse, qsl).cpu()
+                    fn(o, lse, qsl).cpu()
                     samples = []
                     for _ in range(5):
                         t0 = time.perf_counter()
-                        fn(o, lse).cpu()
+                        fn(o, lse, qsl).cpu()
                         samples.append(time.perf_counter() - t0)
                     samples.sort()
                     times[k] = samples[len(samples) // 2]
@@ -684,6 +768,22 @@ def assert_merge_results(results: list[dict]) -> None:
                     ctl,
                 )
                 assert not ctl["bitwise_vs_a2a"], (r["rank"], arm, how, ctl)
+        for how in ("eager", "compiled"):
+            keys = [k for k in check if k.startswith("real_rows/") and k.endswith(how)]
+            assert len(keys) == 6, (r["rank"], how, keys)
+            for k in keys:
+                v = check[k]
+                assert "error" not in v, (r["rank"], k, v)
+                assert v["real_rows_bitwise_vs_pack"], (r["rank"], k, v)
+                assert v["padding_rows_zero"] and v["finite"], (r["rank"], k, v)
+            ctl = check[f"control_short_row/a2a_pack_real/{how}"]
+            assert "error" not in ctl, (r["rank"], how, ctl)
+            assert not ctl["real_rows_bitwise_vs_pack"], (
+                "positive control: a one-row-short exchange must fail the check",
+                r["rank"],
+                how,
+                ctl,
+            )
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]
