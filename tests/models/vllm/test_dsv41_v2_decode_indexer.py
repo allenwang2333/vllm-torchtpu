@@ -363,7 +363,27 @@ class TestAttentionKernelsDecodeIndexer:
         )
         assert res_dec_7.shape == (7, 256)
 
-        # Branch 2: requests is not None and tokens > records.shape[0]
+        # Branch 1c: TP=4 DSpark K=5 decode where tokens = 24 > records.shape[0] = 16
+        # but eff_tokens = tokens // 6 = 4 <= records.shape[0] = 16 (uses fast
+        # _score_word_rows path instead of prefill row_step loop).
+        q_tp4 = jnp.zeros((24, heads, dim), dtype=jnp.bfloat16)
+        records_tp4 = jnp.full((16, 256), -1, dtype=jnp.int32)
+        weights_tp4 = jnp.zeros((24, heads), dtype=jnp.float32)
+        lengths_tp4 = jnp.full((24,), 10, dtype=jnp.int32)
+        requests_tp4 = jnp.repeat(jnp.arange(4, dtype=jnp.int32), 6)
+
+        res_tp4 = paged_index_scores_jax(
+            q_tp4,
+            pool,
+            records_tp4,
+            weights_tp4,
+            lengths_tp4,
+            requests=requests_tp4,
+            page_records=16,
+        )
+        assert res_tp4.shape == (24, 256)
+
+        # Branch 2: requests is not None and eff_tokens > records.shape[0]
         # (prefill row_step loop)
         q_pref = jnp.zeros((4, heads, dim), dtype=jnp.bfloat16)
         records_pref = jnp.full((2, 256), -1, dtype=jnp.int32)
@@ -381,6 +401,61 @@ class TestAttentionKernelsDecodeIndexer:
             page_records=16,
         )
         assert res_pref.shape == (4, 256)
+
+    @pytest.mark.parametrize("page_records", [None, 32])
+    @pytest.mark.parametrize("one_request", [True, False])
+    def test_verify_shaped_chunk_routes_by_active_rows(
+        self, monkeypatch, page_records, one_request
+    ):
+        """A prefill chunk with ``tokens % 6 == 0`` looks like a verify batch.
+
+        With one active request row it must take the shared-row path (one key
+        gather per row); with several it keeps the per-6-token path. Both must
+        match scoring each token against its own row.
+        """
+        import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels as ak
+
+        rng = np.random.default_rng(7)
+        heads, dim, tokens, rows, width = 2, 128, 12, 4, 1024
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        records = np.full((rows, width), -1, np.int32)
+        for r in range(rows):
+            for p in range(0, width, 32):
+                base = int(rng.integers(0, 256) // 2 * 2)
+                records[r, p : p + 32] = base + np.arange(32)
+        records = jnp.asarray(records)
+        requests = (
+            jnp.zeros((tokens,), jnp.int32)
+            if one_request
+            else jnp.repeat(jnp.arange(2, dtype=jnp.int32), 6)
+        )
+        q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+        weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+        lengths = jnp.asarray(rng.integers(100, width, tokens), dtype=jnp.int32)
+
+        taken = []
+        shared = ak.jax.lax.cond
+
+        def spy_cond(pred, true_fn, false_fn, *operands):
+            if not isinstance(pred, ak.jax.core.Tracer):
+                taken.append(bool(pred))
+            return shared(pred, true_fn, false_fn, *operands)
+
+        monkeypatch.setattr(ak.jax.lax, "cond", spy_cond)
+        got = paged_index_scores_jax(
+            q, pool, records, weights, lengths, requests, page_records
+        )
+        monkeypatch.undo()
+        want = paged_index_scores_jax(
+            q, pool, records[requests], weights, lengths, page_records=page_records
+        )
+        assert taken and taken[0] is one_request
+        visible = np.arange(width)[None, :] < np.asarray(lengths)[:, None]
+        np.testing.assert_allclose(
+            np.asarray(got)[visible], np.asarray(want)[visible], rtol=1e-5, atol=1e-5
+        )
 
     def test_visible_top_k_sparsecore_and_fallback_branches(self, monkeypatch):
         """Covers _visible_top_k unpadded rows < 16, rows >= 16, and fallback."""
@@ -956,3 +1031,281 @@ class TestAttentionSelectPagedIndicesDecode:
             assert sel3.shape == (count, 4)
             assert torch.all(index_cache_2b.raw == 1)
             assert torch.all(index_cache_2b.raw_hi == 2)
+
+    def test_prestrided_pages_and_verify_tile_192(self):
+        """Verifies prestrided_pages=True and 16K tile preservation up to tokens=192."""
+        rng = np.random.default_rng(77)
+        heads, dim = 2, 128
+        tokens, width, page_records = 6, 1024, 32
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+        records = np.zeros((tokens, width), dtype=np.int32)
+        for r in range(tokens):
+            for p in range(0, width, page_records):
+                base = int(rng.integers(0, 256) * 2)
+                records[r, p : p + page_records] = base + np.arange(page_records)
+        records[:, -page_records:] = -1
+        records_j = jnp.asarray(records)
+        first_records_j = records_j[:, ::page_records]
+
+        q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+        weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+        lengths = jnp.full((tokens,), width, dtype=jnp.int32)
+
+        scores_full = paged_index_scores_jax(
+            q, pool, records_j, weights, lengths, page_records=page_records
+        )
+        scores_prestrided = paged_index_scores_jax(
+            q,
+            pool,
+            first_records_j,
+            weights,
+            lengths,
+            page_records=page_records,
+            prestrided_pages=True,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scores_prestrided), np.asarray(scores_full)
+        )
+
+        # Verify all three eff_tokens regimes:
+        # (1) requests is not None (candidate_write): eff_tokens = tok // 6
+        #     (16K tile at tok=96, 8K tile at tok=144..192)
+        # (2) prestrided_pages=True with page_records (candidate_filter Pallas):
+        #     eff_tokens = min(tok // 6, 16) -> single-pass 4K/16K tile
+        # (3) requests=None and (not prestrided_pages or page_records is None):
+        #     eff_tokens = tok (2K/1K tile on unpaged fallback)
+        for tok in (96, 144, 168, 192):
+            n_req = tok // 6
+            q_v = jnp.zeros((tok, heads, dim), dtype=jnp.bfloat16)
+            rec_v = jnp.full((n_req, 16384), -1, dtype=jnp.int32)
+            w_v = jnp.zeros((tok, heads), dtype=jnp.float32)
+            len_v = jnp.full((tok,), 32, dtype=jnp.int32)
+            req_v = jnp.repeat(jnp.arange(n_req, dtype=jnp.int32), 6)
+            out_v = paged_index_scores_jax(
+                q_v,
+                pool,
+                rec_v,
+                w_v,
+                len_v,
+                requests=req_v,
+                page_records=page_records,
+            )
+            assert out_v.shape == (tok, 16384)
+
+            first_rec_cand = jnp.full((tok, 256), -1, dtype=jnp.int32)
+            out_cand = paged_index_scores_jax(
+                q_v,
+                pool,
+                first_rec_cand,
+                w_v,
+                len_v,
+                page_records=page_records,
+                prestrided_pages=True,
+            )
+            assert out_cand.shape == (tok, 256 * page_records)
+
+            out_unpaged_cand = paged_index_scores_jax(
+                q_v,
+                pool,
+                first_rec_cand,
+                w_v,
+                len_v,
+                page_records=None,
+            )
+            assert out_unpaged_cand.shape == (tok, 256)
+
+        # Cover pages=True with non-bfloat16 q (gather_cache_page_values step loop)
+        scores_fp32 = paged_index_scores_jax(
+            q.astype(jnp.float32),
+            pool,
+            records_j,
+            weights,
+            lengths,
+            page_records=page_records,
+        )
+        assert scores_fp32.shape == (tokens, width)
+
+    def test_paged_indexer_prestrided_candidate_and_full_context(self):
+        """Verifies pre-strided candidate_context and full_context gathers."""
+        rng = np.random.default_rng(88)
+        tokens, width, topk = 6, 1024, 64
+        heads, dim = 2, 128
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (512, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+
+        for block_size, page_records in ((8, 32), (16, 8)):
+            records = np.zeros((tokens, width), dtype=np.int32)
+            for r in range(tokens):
+                for p in range(0, width, page_records):
+                    base = int(rng.integers(0, 512) * 2)
+                    records[r, p : p + page_records] = base + np.arange(page_records)
+            records[0, -page_records:] = -1
+            records_j = jnp.asarray(records)
+
+            q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+            weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+            lengths = jnp.asarray(rng.integers(128, width, tokens), dtype=jnp.int32)
+            lengths = lengths.at[-1].set(0)
+            candidates = jnp.asarray(
+                rng.integers(-1, width // block_size + 2, (tokens, 16)),
+                dtype=jnp.int32,
+            )
+            requests = jnp.arange(tokens, dtype=jnp.int32)
+
+            for cand_filter in (False, True):
+                sel_ref, pub_ref = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    records_j,
+                    weights,
+                    lengths,
+                    candidates,
+                    requests,
+                    topk=topk,
+                    block_size=block_size,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=None,
+                )
+                sel_paged, pub_paged = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    records_j,
+                    weights,
+                    lengths,
+                    candidates,
+                    requests,
+                    topk=topk,
+                    block_size=block_size,
+                    candidate_write=not cand_filter,
+                    candidate_filter=cand_filter,
+                    unordered=False,
+                    page_records=page_records,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(sel_paged), np.asarray(sel_ref)
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(pub_paged), np.asarray(pub_ref)
+                )
+
+    def test_select_paged_indices_clamped_mine_parity_and_no_cat(self, monkeypatch):
+        """clamped_mine + masked_fill matches reference without torch.cat."""
+        orig_cat = torch.cat
+        ranks = 4
+        count = 10
+        tp_rank = 2
+        attn = self._setup_mock_attn(
+            monkeypatch, ranks=ranks, tp_rank=tp_rank, candidate_write=False
+        )
+        attn._tp_rank_1d = torch.tensor([tp_rank], dtype=torch.int32)
+        attn.candidate_block_buffer = torch.arange(128 * 8, dtype=torch.int32).reshape(
+            128, 8
+        )
+        captured_parts: list[tuple[torch.Tensor, ...]] = []
+
+        def capture_project_q(q_part, pos_part):
+            captured_parts.append((q_part, pos_part))
+            return q_part
+
+        attn._project_index_q = capture_project_q
+        captured_indexer: list[tuple[torch.Tensor, ...]] = []
+
+        def fake_paged_indexer(
+            q_part,
+            index_cache,
+            records,
+            weights_part,
+            lengths_part,
+            candidates_part,
+            write_records,
+            write_keys,
+            requests_part,
+            *args,
+            **kwargs,
+        ):
+            captured_indexer.append(
+                (weights_part, lengths_part, candidates_part, requests_part)
+            )
+            return (
+                index_cache.raw,
+                torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
+                candidates_part,
+            )
+
+        monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
+        monkeypatch.setattr(
+            v2_attn, "_gather_query_rows", lambda s: s.repeat(ranks, 1)[:count]
+        )
+
+        cat_calls: list[int] = []
+
+        def spy_cat(tensors, *args, **kwargs):
+            cat_calls.append(len(tensors))
+            return orig_cat(tensors, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "cat", spy_cat)
+
+        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
+        index_cache_mock = SimpleNamespace(raw=raw)
+        qr = torch.arange(count * 16, dtype=torch.float32).reshape(count, 16) + 1.0
+        positions = torch.arange(100, 100 + count, dtype=torch.int32)
+        records = torch.zeros(count, 32, dtype=torch.int32)
+        requests = torch.arange(20, 20 + count, dtype=torch.int32)
+        weights = torch.arange(count * 2, dtype=torch.float32).reshape(count, 2) + 0.5
+        lengths = torch.arange(1, count + 1, dtype=torch.int32)[:, None]
+        swa_slots = torch.arange(count, dtype=torch.int32)
+        swa_slots[1] = -1
+
+        part, padding = v2_attn._query_split(count, ranks)
+        ref_mine = tp_rank * part + torch.arange(part, dtype=torch.int32)
+
+        active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
+        ref_qr = orig_cat((qr, qr.new_full((padding, 16), 0))).index_select(0, ref_mine)
+        ref_pos = orig_cat((positions, positions.new_full((padding,), 0))).index_select(
+            0, ref_mine
+        )
+        ref_w = orig_cat((weights, weights.new_full((padding, 2), 0))).index_select(
+            0, ref_mine
+        )
+        ref_l = orig_cat(
+            (active_lengths, active_lengths.new_full((padding, 1), 0))
+        ).index_select(0, ref_mine)
+        ref_req = orig_cat((requests, requests.new_full((padding,), 0))).index_select(
+            0, ref_mine
+        )
+        candidates = attn.candidate_block_buffer[:count]
+        ref_cand = orig_cat(
+            (candidates, candidates.new_full((padding, 8), -1))
+        ).index_select(0, ref_mine)
+        cat_calls.clear()
+
+        with v2_attn.stage_attention_cache_scope():
+            for _ in range(2):
+                attn._select_paged_indices(
+                    qr,
+                    positions,
+                    index_cache_mock,
+                    records,
+                    requests,
+                    weights,
+                    lengths,
+                    swa_slots,
+                    None,
+                )
+
+        assert cat_calls == []
+        assert len(captured_parts) == 2
+        for (q_p, pos_p), (w_p, l_p, c_p, req_p) in zip(
+            captured_parts, captured_indexer, strict=True
+        ):
+            assert torch.equal(q_p, ref_qr)
+            assert torch.equal(pos_p, ref_pos)
+            assert torch.equal(w_p, ref_w)
+            assert torch.equal(l_p, ref_l)
+            assert torch.equal(c_p, ref_cand)
+            assert torch.equal(req_p, ref_req)

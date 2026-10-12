@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
+import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -53,11 +54,11 @@ def test_select_ragged_gather_reduce():
 def test_resolve_onehot_permute_threshold(monkeypatch):
     """Verify resolve_onehot_permute_threshold across env and TPU info branches."""
     # 1. Explicit positive threshold
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 64)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", 64)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 64
 
     # 2. Explicit negative threshold falls through
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", -1)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", -1)
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         side_effect=ValueError("Unsupported"),
@@ -65,7 +66,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
     # 3. Env unset, unsupported device kind (ValueError on CPU)
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         side_effect=ValueError("Unsupported"),
@@ -95,7 +96,7 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         # min(2 * (16 * 4 * 2) - 1, 2048) = min(255, 2048) = 255
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 255
 
-    # 6. Env unset, device info has sparse_core with block_rows >= 512 (mult = 4)
+    # 6. Env unset, device info has sparse_core with block_rows >= 512
     mock_sc_512 = MagicMock()
     mock_sc_512.num_lanes = 16
     mock_sc_512.num_cores = 4
@@ -106,10 +107,10 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_512,
     ):
-        # min(4 * 512 - 1, 2048) = min(2047, 2048) = 2047
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2047
+        assert fused_moe_gmm.resolve_onehot_permute_threshold(use_ep=True) == 4095
 
-    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (2048)
+    # 7. Env unset, oversized block rows capped at 2048 / 4096
     mock_sc_1024 = MagicMock()
     mock_sc_1024.num_lanes = 16
     mock_sc_1024.num_cores = 8
@@ -120,8 +121,8 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_1024,
     ):
-        # min(4 * 1024 - 1, 2048) = min(4095, 2048) = 2048
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2048
+        assert fused_moe_gmm.resolve_onehot_permute_threshold(use_ep=True) == 4096
 
 
 def test_moe_gmm_tiling(monkeypatch):
@@ -133,11 +134,40 @@ def test_moe_gmm_tiling(monkeypatch):
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
     # 1. Matching decode dims:
-    # size_group > 1 and 32 <= size_m <= size_group * 40 and 32 % sublane == 0
-    match_dims = types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=8)
-    assert fused_moe_gmm._moe_gmm_tiling(
-        match_dims, None, None, 64 << 20, "silu"
-    ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+    # non-EP bound = 40 rows/group; EP bound = 256 rows/group
+    assert fused_moe_gmm._NON_EP_DECODE_TILE_M32_ROWS_PER_GROUP == 40
+    bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
+    assert bound == 256
+    for size_group, size_m in (
+        (48, 576),
+        (48, 2304),
+        (48, 3456),
+        (16, 1728),
+        (48, 4608),
+        (48, 5760),
+        (48, 6912),
+        (48, 8064),
+        (48, 9216),
+        (48, 12288),
+        (48, 48 * bound),
+    ):
+        match_dims = types.SimpleNamespace(
+            size_group=size_group, size_m=size_m, size_lhs_sublane=8
+        )
+        assert fused_moe_gmm._moe_gmm_tiling_ep(
+            match_dims, None, None, 64 << 20, "silu"
+        ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+        if size_m <= size_group * fused_moe_gmm._NON_EP_DECODE_TILE_M32_ROWS_PER_GROUP:
+            assert fused_moe_gmm._moe_gmm_tiling(
+                match_dims, None, None, 64 << 20, "silu"
+            ) == fused_moe_gmm.TileSizes(
+                tile_m=32, tile_k=512, tile_n=512, bucket_base=32
+            )
+        else:
+            assert (
+                fused_moe_gmm._moe_gmm_tiling(match_dims, None, None, 64 << 20, "silu")
+                == base_tiles
+            )
 
     # 2. Non-matching branches
     for non_match in (
@@ -145,11 +175,15 @@ def test_moe_gmm_tiling(monkeypatch):
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         # size_m < 32
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        # size_m > size_group * 40
-        types.SimpleNamespace(size_group=48, size_m=48 * 40 + 1, size_lhs_sublane=8),
+        # size_m > size_group * 256 (M = 48 * 256 + 1 = 12289)
+        types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         # 32 % sublane != 0
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
+        assert (
+            fused_moe_gmm._moe_gmm_tiling_ep(non_match, None, None, 64 << 20, None)
+            == base_tiles
+        )
         assert (
             fused_moe_gmm._moe_gmm_tiling(non_match, None, None, 64 << 20, None)
             == base_tiles
@@ -240,14 +274,22 @@ def test_counting_sort_positions(monkeypatch):
 
 
 def test_pairwise_sort_positions():
-    """Verify _pairwise_sort_positions implementation (Cut a)."""
+    """Verify _pairwise_sort_positions implementation (Cut a + packed weights)."""
     sort_keys = jnp.array([2, 0, 1, 0], dtype=jnp.int32)
     tokens = jnp.array([10, 20, 30, 40], dtype=jnp.int32)
-    pos, sorted_tokens = fused_moe_gmm._pairwise_sort_positions(sort_keys, tokens)
+    weights = jnp.array([0.125, 0.25, 0.5, 0.75], dtype=jnp.bfloat16)
+    pos, sorted_tokens, sorted_weights = fused_moe_gmm._pairwise_sort_positions(
+        sort_keys, tokens, weights
+    )
     assert pos.shape == (4,)
     assert sorted_tokens.shape == (4,)
+    assert sorted_weights.shape == (4,)
     np.testing.assert_array_equal(np.asarray(pos), np.array([3, 0, 2, 1]))
     np.testing.assert_array_equal(np.asarray(sorted_tokens), np.array([20, 40, 30, 10]))
+    np.testing.assert_array_equal(
+        np.asarray(sorted_weights),
+        np.asarray(jnp.array([0.25, 0.75, 0.5, 0.125], dtype=jnp.bfloat16)),
+    )
 
 
 def test_prepare_routed_gmm_inputs():
@@ -286,14 +328,19 @@ def test_prepare_routed_gmm_inputs():
 
     # 3. non-EP, non-SC, not packable (large local_num_experts)
     big_experts = 1 << 30
-    out2b = fused_moe_gmm.prepare_routed_gmm_inputs(
+    out2b = jax.eval_shape(
+        lambda h, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+            h,
+            ti,
+            tw,
+            local_num_experts=big_experts,
+            topk=2,
+            use_ep=False,
+            use_sparse_core=False,
+        ),
         hidden,
         topk_ids,
         topk_weights,
-        local_num_experts=big_experts,
-        topk=2,
-        use_ep=False,
-        use_sparse_core=False,
     )
     assert out2b[0].shape == (8, 16)
 
@@ -328,15 +375,20 @@ def test_prepare_routed_gmm_inputs():
         assert out4a[0].shape == (8, 16)
 
         # 6. use_ep=True, use_sparse_core=True, tokens > threshold, not packable
-        out4b = fused_moe_gmm.prepare_routed_gmm_inputs(
+        out4b = jax.eval_shape(
+            lambda h, ti, tw: fused_moe_gmm.prepare_routed_gmm_inputs(
+                h,
+                ti,
+                tw,
+                local_num_experts=big_experts,
+                topk=2,
+                use_ep=True,
+                use_sparse_core=True,
+                onehot_moe_permute_threshold=0,
+            ),
             hidden,
             topk_ids,
             topk_weights,
-            local_num_experts=big_experts,
-            topk=2,
-            use_ep=True,
-            use_sparse_core=True,
-            onehot_moe_permute_threshold=0,
         )
         assert out4b[0].shape == (8, 16)
 
@@ -381,8 +433,8 @@ def test_moe_gmm(monkeypatch):
         )
         assert out1.shape == (num_tokens, hidden_size)
 
-        # Branch 2: EP + SC, size <= threshold, TPU_MOE_OWNER_OUTPUT_MODE == "off"
-        monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "off")
+        # Branch 2a: EP + SC, size <= 2304 (zero_init_gmm2=True), owner_output == "off"
+        monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "off")
         out2 = fused_moe_gmm.moe_gmm(
             x,
             w1,
@@ -406,7 +458,7 @@ def test_moe_gmm(monkeypatch):
         assert out2.shape == (num_tokens, hidden_size)
 
         # Branch 3: EP + SC, size <= threshold, owner_output == "on", blockwise
-        monkeypatch.setattr(envs, "TPU_MOE_OWNER_OUTPUT_MODE", "on")
+        monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "on")
         with (
             patch.object(
                 fused_moe_gmm,
@@ -660,3 +712,101 @@ def test_fused_moe_func(monkeypatch):
             onehot_moe_permute_threshold=0,
         )
         assert out3.shape == (num_tokens, hidden_size)
+
+
+def test_2d_combine_mathematical_invariants():
+    """Verify 2D combine invariants, CSE one-hot sharing, and numeric bounds."""
+    rng = np.random.default_rng(42)
+    num_tokens = 8
+    topk = 6
+    local_experts = 16
+    hidden_size = 32
+    total_slots = num_tokens * topk
+
+    # Generate synthetic tokens, weights, expert assignments
+    x = jnp.array(rng.standard_normal((num_tokens, hidden_size)), dtype=jnp.bfloat16)
+    topk_ids = jnp.array(
+        rng.integers(-1, local_experts, size=(num_tokens, topk)), dtype=jnp.int32
+    )
+    topk_weights = jnp.array(
+        rng.uniform(0.01, 1.0, size=(num_tokens, topk)), dtype=jnp.float32
+    )
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+
+    (
+        permuted_tokens,
+        group_sizes,
+        argsort_revert,
+        topk_weights_flat,
+        valid_mask,
+        token_indices_sorted,
+    ) = fused_moe_gmm.prepare_routed_gmm_inputs(
+        x,
+        topk_ids,
+        topk_weights,
+        local_num_experts=local_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=128,
+    )
+
+    # 1. Direct 2D combine construction
+    gated_weights = jnp.where(valid_mask, topk_weights_flat, 0).astype(jnp.bfloat16)
+    topk_weights_sorted = (
+        jnp.zeros_like(gated_weights).at[argsort_revert].set(gated_weights)
+    )
+    onehot_2d = jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=jnp.bfloat16)
+    combine_2d = onehot_2d.T * topk_weights_sorted[None, :]
+
+    # 2. Reference 3D combine construction (Previous)
+    revert_indices = argsort_revert.reshape(num_tokens, topk)
+    onehot_3d = jax.nn.one_hot(revert_indices, argsort_revert.size, dtype=jnp.bfloat16)
+    combine_3d = (
+        onehot_3d
+        * topk_weights[..., None]
+        * valid_mask.reshape(num_tokens, topk)[..., None]
+    ).sum(axis=1)
+
+    # Invariant A: Shape equivalence
+    assert combine_2d.shape == (num_tokens, total_slots)
+    assert combine_3d.shape == (num_tokens, total_slots)
+
+    # Invariant B: Numerical equivalence (within BF16 precision)
+    diff = jnp.abs(combine_2d.astype(jnp.float32) - combine_3d.astype(jnp.float32))
+    max_diff = float(jnp.max(diff))
+    assert max_diff <= 2e-3, f"max diff {max_diff} exceeds BF16 bound"
+
+    # Invariant C: Cosine similarity >= 0.99999
+    c2_flat = combine_2d.astype(jnp.float32).ravel()
+    c3_flat = combine_3d.astype(jnp.float32).ravel()
+    cos_sim = float(
+        jnp.dot(c2_flat, c3_flat)
+        / (jnp.linalg.norm(c2_flat) * jnp.linalg.norm(c3_flat))
+    )
+    assert cos_sim >= 0.99999, f"cosine similarity {cos_sim} < 0.99999"
+
+    # Invariant D: Invalid (masked) slots produce exactly 0
+    invalid_positions = jnp.where(~valid_mask)[0]
+    if invalid_positions.size > 0:
+        for inv_pos in invalid_positions:
+            inv_sorted = int(argsort_revert[inv_pos])
+            assert float(combine_2d[:, inv_sorted].sum()) == 0.0
+
+    # Invariant E: Packed pairwise sort returns topk_weights_sorted bitwise
+    # identical to scattering gated_weights by argsort_revert
+    *_, packed_weights_sorted = fused_moe_gmm._prepare_routed_gmm_inputs(
+        x,
+        topk_ids,
+        topk_weights.astype(jnp.bfloat16),
+        local_num_experts=local_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=128,
+    )
+    assert packed_weights_sorted is not None
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(packed_weights_sorted, jnp.uint16)),
+        np.asarray(jax.lax.bitcast_convert_type(topk_weights_sorted, jnp.uint16)),
+    )

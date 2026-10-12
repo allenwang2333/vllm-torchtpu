@@ -320,31 +320,29 @@ def _topk_body(
         plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
 
     cores_per_chip = num_sc_cores * num_subcores
-    buf_count = 1 if num_waves == 1 else 2
+    buf_mode = pl.Buffered(1 if num_waves == 1 else 2)
+
+    def row_index_map(w):
+        return (w * cores_per_chip + flat,)
+
     in_specs = (
         pl.BlockSpec(
             (slice_len,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
+            row_index_map,
+            pipeline_mode=buf_mode,
         ),
         pl.BlockSpec(
             (LANES,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
+            row_index_map,
+            pipeline_mode=buf_mode,
         ),
     )
-    out_specs = (
-        pl.BlockSpec(
-            (k,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
-        pl.BlockSpec(
-            (k,),
-            lambda w: (w * cores_per_chip + flat,),
-            pipeline_mode=pl.Buffered(buf_count),
-        ),
+    out_spec = pl.BlockSpec(
+        (k,),
+        row_index_map,
+        pipeline_mode=buf_mode,
     )
+    out_specs = (out_spec, out_spec)
     pltpu.emit_pipeline(
         pipeline_step,
         grid=(num_waves,),
@@ -387,6 +385,12 @@ def _topk_kernel(
     )
 
 
+_SC_COMPILER_PARAMS = pltpu.CompilerParams(
+    disable_bounds_checks=True, needs_layout_passes=False
+)
+_GLOB_SCRATCH = pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32)
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -422,7 +426,9 @@ def _sc_topk_direct(
     if pad_b > 0 or pad_n > 0:
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    lengths = row_lengths.astype(jnp.int32)
+    if pad_b > 0:
+        lengths = jnp.pad(lengths, (0, pad_b))
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
 
     mesh = plsc.VectorSubcoreMesh(
@@ -434,11 +440,8 @@ def _sc_topk_direct(
     slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
     out_type = (slot_type, slot_type)
 
-    scratch_types = (
-        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),
-        pltpu.VMEM((k + LANES,), jnp.int32),
-        pltpu.VMEM((k + LANES,), jnp.int32),
-    )
+    row_scratch = pltpu.VMEM((k + LANES,), jnp.int32)
+    scratch_types = (_GLOB_SCRATCH, row_scratch, row_scratch)
 
     out = pl.kernel(
         functools.partial(
@@ -451,9 +454,7 @@ def _sc_topk_direct(
             write_empty=write_empty,
         ),
         out_type=out_type,
-        compiler_params=pltpu.CompilerParams(
-            disable_bounds_checks=True, needs_layout_passes=False
-        ),
+        compiler_params=_SC_COMPILER_PARAMS,
         scratch_types=scratch_types,
         mesh=mesh,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}",
@@ -468,15 +469,14 @@ def _sc_topk_direct(
     return slots_2d, keys_2d
 
 
+@functools.lru_cache(maxsize=128)
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..32) per row to maximize
 
     subcore utilization across all 32 subcores while fitting in VMEM.
     """
     p_min = _cdiv(n, MAX_SLICE_WORDS)
-    p = 1
-    while p < p_min:
-        p *= 2
+    p = 1 << (p_min - 1).bit_length()
 
     max_p = 32 // b if b < 32 else 1
     while p * 2 <= max_p:

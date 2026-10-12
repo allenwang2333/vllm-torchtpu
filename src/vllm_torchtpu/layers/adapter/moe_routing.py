@@ -14,7 +14,12 @@
 """Routing helpers for TPU local MoE kernels."""
 
 import torch
+import torch.nn.functional as F
+import vllm.distributed.parallel_state as _ps
 import vllm.envs as vllm_envs
+from vllm.model_executor.layers.fused_moe.router import (
+    grouped_topk_router as _grouped_topk_router,
+)
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.router_topk import rowmax_select
@@ -27,11 +32,32 @@ logger = init_logger(__name__)
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
 
 
-def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _topk(
+    scores: torch.Tensor,
+    k: int,
+    *,
+    bias: torch.Tensor | None = None,
+    renormalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, by the configured implementation."""
     if _ROUTER_TOPK == "rowmax":
-        return rowmax_select(scores, k)
-    return torch.topk(scores, k=k, dim=-1)
+        if bias is None and not renormalize:
+            return rowmax_select(scores, k)
+        return rowmax_select(scores, k, bias=bias, renormalize=renormalize)
+    if bias is not None:
+        bias_shape = (1,) * (scores.dim() - 1) + (-1,)
+        scores_for_choice = scores + (
+            bias if bias.dtype == torch.float32 else bias.float()
+        ).view(bias_shape)
+        _, topk_ids = torch.topk(scores_for_choice, k=k, dim=-1)
+        topk_weights = _gather_expert_scores(scores, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(scores, k=k, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / torch.clamp(
+            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
+        )
+    return topk_weights, topk_ids
 
 
 def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -46,8 +72,10 @@ def _gather_expert_scores(scores: torch.Tensor, topk_ids: torch.Tensor) -> torch
     is the sign of zero (-0.0 + 0.0 is +0.0), which the scoring functions
     here cannot produce: their scores are all >= +0.
     """
-    experts = torch.arange(scores.shape[-1], device=scores.device)
-    selected = topk_ids.long().unsqueeze(-1) == experts
+    # Compare in the ids' own integer dtype: int32 ids (hash routing) stay
+    # int32 instead of widening to int64, which TPU emulates.
+    experts = torch.arange(scores.shape[-1], device=scores.device, dtype=topk_ids.dtype)
+    selected = topk_ids.unsqueeze(-1) == experts
     return torch.where(selected, scores.unsqueeze(-2), 0).sum(dim=-1)
 
 
@@ -112,12 +140,24 @@ def _uniform_random_routing(
     noise = torch.rand_like(router_logits, dtype=torch.float32)
     # Anchor the noise to the activations. Uniform shift => same argsort =>
     # identical expert choice; the point is the graph edge, not the value.
-    noise = noise + router_logits.float().mean()
+    noise = (
+        noise
+        + (
+            router_logits
+            if router_logits.dtype == torch.float32
+            else router_logits.float()
+        ).mean()
+    )
     _, topk_ids = torch.topk(noise, k=topk, dim=-1)
     topk_weights = torch.ones(
-        (router_logits.shape[0], topk), dtype=torch.float32, device=router_logits.device
+        (router_logits.shape[0], topk),
+        dtype=hidden_states.dtype,
+        device=router_logits.device,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights,
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def maybe_simulate_routing(
@@ -147,7 +187,12 @@ def maybe_simulate_routing(
         top_k=topk,
         indices_type=torch.int32,
     )
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights
+        if topk_weights.dtype == hidden_states.dtype
+        else topk_weights.to(hidden_states.dtype),
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def _gather_partitioned_topk(
@@ -158,30 +203,25 @@ def _gather_partitioned_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-gather rank-local ``(topk_weights, topk_ids)`` across ``group``.
 
-    When ``topk_weights`` is 16-bit (``bfloat16`` / ``float16``), ``topk`` is
-    even, and ``topk_ids`` is ``int32``, both tensors are bit-packed into a
-    single ``int32[T_local, topk // 2 + topk]`` tensor before ``all_gather``
-    so only one collective runs (42.7x smaller than gathering ``f32[T, 384]``
-    router logits for DeepSeek-V4.1-Flash).
+    When ``topk_weights`` is 16-bit (``bfloat16`` / ``float16``) and
+    ``topk_ids`` is ``int32``, each ``(weight, id)`` pair is bit-packed into a
+    single ``int32`` word (upper 16 bits = weight, lower 16 bits = signed
+    16-bit expert id) of shape ``int32[T_local, topk]`` before ``all_gather``.
+    This runs a single collective for both even ``topk`` (target MoE,
+    ``topk=6``, 33.3% smaller than ``[T_local, 9]``) and odd ``topk`` (drafter
+    MoE, ``topk=3``, 1 collective instead of 2), and eliminates minor-axis
+    ``cat`` and slice copies.
     """
     if (
         topk_weights.dtype in (torch.bfloat16, torch.float16)
-        and topk % 2 == 0
         and topk_ids.dtype == torch.int32
     ):
-        half_k = topk // 2
-        packed = torch.cat(
-            [
-                topk_weights.contiguous().view(torch.int32),
-                topk_ids.contiguous(),
-            ],
-            dim=-1,
-        )
+        w_shifted = topk_weights.contiguous().view(torch.int16).to(torch.int32) << 16
+        packed = w_shifted | (topk_ids.contiguous() & 0xFFFF)
         gathered = group.all_gather(packed, dim=0)
-        return (
-            gathered[:, :half_k].contiguous().view(topk_weights.dtype),
-            gathered[:, half_k:].contiguous(),
-        )
+        out_weights = (gathered >> 16).to(torch.int16).view(topk_weights.dtype)
+        out_ids = (gathered << 16) >> 16
+        return out_weights, out_ids
     return (
         group.all_gather(topk_weights.contiguous(), dim=0),
         group.all_gather(topk_ids.contiguous(), dim=0),
@@ -204,7 +244,8 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
-    topk = layer.moe_config.experts_per_token
+    moe_config = layer.moe_config
+    topk = moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
         return simulated
@@ -217,17 +258,32 @@ def route(
             renormalize=layer.renormalize,
         )
     if router_logits.shape[0] < hidden_states.shape[0]:
-        from vllm.distributed.parallel_state import get_dp_group, get_ep_group
-
-        is_sp = bool(
-            getattr(getattr(layer, "moe_config", None), "is_sequence_parallel", False)
-        )
-        group = get_ep_group() if is_sp else get_dp_group()
         local_t = router_logits.shape[0]
+        if getattr(moe_config, "is_sequence_parallel", False):
+            group = _ps.get_ep_group()
+        elif getattr(getattr(moe_config, "moe_parallel_config", None), "use_ep", False):
+            ep_group = _ps.get_ep_group()
+            if (
+                getattr(moe_config, "dp_size", 1) <= 1
+                or local_t * ep_group.world_size == hidden_states.shape[0]
+            ):
+                group = ep_group
+            else:
+                group = _ps.get_dp_group()
+        else:
+            group = _ps.get_dp_group()
         local_input_ids = input_ids
-        if input_ids is not None and input_ids.numel() == hidden_states.shape[0]:
-            rank = group.rank_in_group
-            local_input_ids = input_ids.flatten()[rank * local_t : (rank + 1) * local_t]
+        if (
+            input_ids is not None
+            and getattr(layer, "hash_indices_table", None) is not None
+        ):
+            n_ids = input_ids.numel()
+            if n_ids > local_t and n_ids % local_t == 0:
+                shards = n_ids // local_t
+                rank = group.rank_in_group % shards
+                local_input_ids = input_ids.flatten()[
+                    rank * local_t : (rank + 1) * local_t
+                ]
         local_weights, local_ids = select_experts(
             hidden_states=hidden_states[:local_t],
             router_logits=router_logits,
@@ -250,14 +306,14 @@ def route(
 
 
 def _apply_scoring_fn(scoring_fn: str, router_logits: torch.Tensor) -> torch.Tensor:
-    scores = router_logits.float()
+    scores = (
+        router_logits if router_logits.dtype == torch.float32 else router_logits.float()
+    )
     if scoring_fn == "softmax":
         return scores.softmax(dim=-1)
     if scoring_fn == "sigmoid":
         return scores.sigmoid()
     if scoring_fn == "sqrtsoftplus":
-        import torch.nn.functional as F
-
         return torch.sqrt(F.softplus(scores))
     raise NotImplementedError(
         f"FusedMoE does not support {scoring_fn} scoring function for TPU."
@@ -276,11 +332,13 @@ def _hash_moe_select(
     Routes tokens to experts based on precomputed hash_indices_table lookup indexed by
     flat input_ids rather than dynamic gating logits.
     """
-    flat_input_ids = input_ids.long().flatten()
-    topk_ids = hash_indices_table[flat_input_ids].long()
-    target_shape = list(scores.shape)
-    target_shape[-1] = topk_ids.shape[-1]
-    topk_ids = topk_ids.reshape(target_shape)
+    flat_input_ids = (
+        input_ids if input_ids.dtype == torch.int32 else input_ids.to(torch.int32)
+    ).reshape(-1)
+    # Keep the table's dtype (int32 for DeepSeek-V4); callers cast to int32.
+    topk_ids = hash_indices_table.index_select(0, flat_input_ids)
+    if scores.ndim != 2:
+        topk_ids = topk_ids.reshape(*scores.shape[:-1], topk_ids.shape[-1])
     topk_weights = _gather_expert_scores(scores, topk_ids)
 
     if renormalize:
@@ -320,12 +378,14 @@ def select_experts(
         return simulated
 
     hash_indices_table = (
-        getattr(layer, "hash_indices_table", None) if layer is not None else None
+        getattr(layer, "hash_indices_table", None)
+        if (input_ids is not None and layer is not None)
+        else None
     )
-    if hash_indices_table is not None and input_ids is not None:
-        scores = _apply_scoring_fn(scoring_fn, router_logits.float())
-        # hash_indices_table is only set when layer is not None.
-        assert layer is not None
+    if hash_indices_table is not None:
+        scores = _apply_scoring_fn(scoring_fn, router_logits)
+        # hash_indices_table requires both layer and input_ids to be non-None.
+        assert layer is not None and input_ids is not None
         routed_scaling_factor = layer.routed_scaling_factor
         topk_weights, topk_ids = _hash_moe_select(
             scores,
@@ -334,7 +394,12 @@ def select_experts(
             renormalize,
             routed_scaling_factor,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return (
+            topk_weights
+            if topk_weights.dtype == hidden_states.dtype
+            else topk_weights.to(hidden_states.dtype),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+        )
 
     use_grouped = (
         layer is not None
@@ -343,12 +408,8 @@ def select_experts(
         and layer.topk_group < layer.num_expert_group
     )
     if use_grouped:
-        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
-            grouped_topk,
-        )
-
         assert layer is not None
-        topk_weights, topk_ids = grouped_topk(
+        topk_weights, topk_ids = _grouped_topk_router.grouped_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=topk,
@@ -359,31 +420,33 @@ def select_experts(
             routed_scaling_factor=layer.routed_scaling_factor,
             e_score_correction_bias=layer.e_score_correction_bias,
         )
-        return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+        return (
+            topk_weights
+            if topk_weights.dtype == hidden_states.dtype
+            else topk_weights.to(hidden_states.dtype),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+        )
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits.float())
+    scores = _apply_scoring_fn(scoring_fn, router_logits)
     e_score_correction_bias = (
         layer.e_score_correction_bias if layer is not None else None
     )
-
-    if e_score_correction_bias is not None:
-        bias_shape = [1] * (scores.dim() - 1) + [-1]
-        bias = e_score_correction_bias.float().view(bias_shape)
-        scores_for_choice = scores + bias
-        _, topk_ids = _topk(scores_for_choice, topk)
-        topk_weights = _gather_expert_scores(scores, topk_ids)
-    else:
-        topk_weights, topk_ids = _topk(scores, topk)
-
-    if renormalize:
-        topk_weights = topk_weights / torch.clamp(
-            topk_weights.sum(dim=-1, keepdim=True), min=1e-20
-        )
+    topk_weights, topk_ids = _topk(
+        scores,
+        topk,
+        bias=e_score_correction_bias,
+        renormalize=renormalize,
+    )
     routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
     if routed_scaling_factor != 1.0:
         topk_weights = topk_weights * routed_scaling_factor
 
-    return topk_weights.to(hidden_states.dtype), topk_ids.to(torch.int32)
+    return (
+        topk_weights
+        if topk_weights.dtype == hidden_states.dtype
+        else topk_weights.to(hidden_states.dtype),
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
 
 
 def get_experts_start(layer) -> int | None:

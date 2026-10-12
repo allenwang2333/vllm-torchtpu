@@ -41,8 +41,9 @@ def _flip(t):
     return (t.view(torch.uint8) ^ 0xFF).view(t.dtype)
 
 
-def test_init_local_q_weights_gathers_rank_major_columns(monkeypatch):
-    attn = _stub(monkeypatch)
+@pytest.mark.parametrize("groups", [1, 2])
+def test_init_local_q_weights_gathers_rank_major_columns(monkeypatch, groups):
+    attn = _stub(monkeypatch, groups=groups)
     attn._init_local_q_weights()
     assert attn._local_q_attn is True
     wq, wo = attn.wq_b.weight, attn.wo_a.weight
@@ -80,7 +81,7 @@ def test_init_local_q_weights_keep_vllm_layout_disables(monkeypatch):
         ({"compress_ratio": 0}, {}),
         ({"compress_ratio": 4}, {"_fp8_kv": False}),
         ({"compress_ratio": 4}, {"_ced_decoder": True}),
-        ({"groups": 2}, {}),
+        ({"groups": 0}, {}),
     ],
 )
 def test_init_local_q_weights_disabled(monkeypatch, kwargs, extra):

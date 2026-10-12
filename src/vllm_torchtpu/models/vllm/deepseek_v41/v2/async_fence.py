@@ -26,10 +26,11 @@ def install_lookback_fence() -> None:
         fence = getattr(self, "_deepseek_v41_lookback_fence", None)
         if fence is not None:
             fence.synchronize()
+        else:
+            fence = torch.tpu.Event()
+            self._deepseek_v41_lookback_fence = fence
         ids = original(self, num_reqs)
-        fence = torch.tpu.Event()
         fence.record()
-        self._deepseek_v41_lookback_fence = fence
         return ids
 
     prepare._deepseek_v41_fenced = True  # type: ignore[attr-defined]

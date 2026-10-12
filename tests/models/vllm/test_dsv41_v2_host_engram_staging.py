@@ -180,6 +180,97 @@ class TestHostEngram:
             wait_for_copy=None, copy_state=None, next_tokens_tpu=None
         )
         assert _async_source_tokens_cpu(pre5) is None
+        assert _async_source_tokens_cpu(pre5, prefer_next_tokens_tpu=True) is None
+
+        # 6. _stage_async_next_tokens_cpu + _resolve_next_tokens_cpu + sample_tokens
+        from typing import NamedTuple
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
+            _resolve_next_tokens_cpu,
+            _stage_async_next_tokens_cpu,
+        )
+
+        class _PreAsyncTuple(NamedTuple):
+            next_tokens_tpu: torch.Tensor | None
+
+        runner_st = SimpleNamespace()
+        pre_none = _PreAsyncTuple(next_tokens_tpu=None)
+        _stage_async_next_tokens_cpu(runner_st, pre_none)
+        assert not hasattr(runner_st, "_host_engram_last_staged")
+
+        pre_cpu = _PreAsyncTuple(
+            next_tokens_tpu=torch.tensor([[7, 8]], dtype=torch.int32)
+        )
+        _stage_async_next_tokens_cpu(runner_st, pre_cpu)
+        assert _resolve_next_tokens_cpu(pre_cpu, runner=runner_st).tolist() == [7, 8]
+        assert _async_source_tokens_cpu(
+            pre_cpu, prefer_next_tokens_tpu=True, runner=runner_st
+        ).tolist() == [7, 8]
+
+        events = []
+
+        class FakeEvent:
+            def __init__(self):
+                self.recorded = False
+                self.synced = False
+                events.append(self)
+
+            def record(self):
+                self.recorded = True
+
+            def synchronize(self):
+                self.synced = True
+
+        with patch.object(torch, "tpu", SimpleNamespace(Event=FakeEvent), create=True):
+            pre_tpu1 = _PreAsyncTuple(
+                next_tokens_tpu=torch.tensor([11, 12], dtype=torch.int32)
+            )
+            with patch.object(
+                torch.Tensor,
+                "device",
+                property(lambda self: SimpleNamespace(type="tpu")),
+            ):
+                _stage_async_next_tokens_cpu(runner_st, pre_tpu1)
+                assert len(events) == 1 and events[0].recorded
+                pre_tpu2 = _PreAsyncTuple(
+                    next_tokens_tpu=torch.tensor([21, 22], dtype=torch.int32)
+                )
+                _stage_async_next_tokens_cpu(runner_st, pre_tpu2)
+                assert events[0].synced is True
+                assert len(events) == 2
+            resolved_tpu2 = _resolve_next_tokens_cpu(pre_tpu2, runner=runner_st)
+            assert events[1].synced is True
+            assert resolved_tpu2.tolist() == [21, 22]
+
+        orig_prep = TPUModelRunner._prepare_lookback_token_ids
+        orig_sample = getattr(TPUModelRunner, "sample_tokens", None)
+        try:
+            TPUModelRunner._prepare_lookback_token_ids = lambda self, n: None
+            TPUModelRunner.sample_tokens = lambda self, *a, **kw: "sampled"
+            install_host_engram_inputs()
+            runner_hook = SimpleNamespace(
+                _pre_async_results=_PreAsyncTuple(
+                    next_tokens_tpu=torch.tensor([55, 66], dtype=torch.int32)
+                )
+            )
+            with (
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD",
+                    True,
+                ),
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA",
+                    False,
+                ),
+            ):
+                assert TPUModelRunner.sample_tokens(runner_hook) == "sampled"
+                assert _resolve_next_tokens_cpu(
+                    runner_hook._pre_async_results, runner=runner_hook
+                ).tolist() == [55, 66]
+        finally:
+            TPUModelRunner._prepare_lookback_token_ids = orig_prep
+            if orig_sample is not None:
+                TPUModelRunner.sample_tokens = orig_sample
 
     def test_resolve_decode_lookback_and_capture_decode_branches(self):
         runner = _mock_runner([6, 3], [5, 5])
@@ -297,15 +388,24 @@ class TestHostEngram:
                 out_exact = gather_host_engram_hashes(hashes)
                 assert out_exact.shape == (2, 1, 2)
 
-            # 2c. ValueError when shape[0] > slot
+            # 2c. A non-positive gathered slot (dummy run) falls back to the
+            # local token count instead of raising.
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                return_value=0,
+            ):
+                out_fallback = gather_host_engram_hashes(hashes)
+                assert out_fallback.shape == (2, 1, 2)
+
+            # 2d. ValueError when shape[0] > slot > 0
             with (
                 patch(
                     "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                    return_value=0,
+                    return_value=1,
                 ),
                 pytest.raises(ValueError, match="exceeds the DP token slot"),
             ):
-                gather_host_engram_hashes(hashes)
+                gather_host_engram_hashes(torch.cat([hashes, hashes]))
 
         # 3. CPU group all_gather without forward context (dp_metadata is None)
         with (
@@ -549,7 +649,7 @@ class TestEngramModuleStagingAndEmbed:
         assert engram._host_raw.shape == (16, 16, 32)
         assert not hasattr(engram, "staged_rows")
         group = SimpleNamespace(world_size=8, cpu_group=object())
-        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
+        monkeypatch.setattr(common, "get_engram_dp_group", lambda: group)
 
         def gather(ids, raw, scales):
             assert raw.shape == (ids.shape[0], 2, 32)

@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -53,8 +53,8 @@ def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
     width = logits.shape[-1]
     if width == 0:
         return torch.zeros_like(logits, dtype=torch.bool)
-    lengths = torch.as_tensor(lengths, device=logits.device)
-    visible = torch.arange(width, device=logits.device) < lengths
+    lengths = torch.as_tensor(lengths, device=logits.device, dtype=torch.int32)
+    visible = torch.arange(width, device=logits.device, dtype=torch.int32) < lengths
     scores = F.pad(
         logits.masked_fill(~visible, -torch.inf),
         (0, -width % block_size),
@@ -63,13 +63,18 @@ def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
     scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
     last = (lengths - 1) // block_size
     scores = scores.masked_fill(
-        torch.arange(scores.shape[-1], device=scores.device) == last, torch.inf
+        torch.arange(scores.shape[-1], device=scores.device, dtype=torch.int32) == last,
+        torch.inf,
     )
     selected = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, selected.indices, selected.values > -torch.inf
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+# Flat index spaces at or above this size are addressed in int64.
+_INT32_FLAT_LIMIT = 1 << 31
 
 
 def select_compressed_indices(scores, lengths, topk, *, candidates=None):
@@ -80,14 +85,41 @@ def select_compressed_indices(scores, lengths, topk, *, candidates=None):
     """
     if topk < 0:
         raise ValueError("topk must be nonnegative")
-    valid = torch.arange(scores.shape[-1], device=scores.device) < torch.as_tensor(
-        lengths, device=scores.device
-    )
+    valid = torch.arange(
+        scores.shape[-1], device=scores.device, dtype=torch.int32
+    ) < torch.as_tensor(lengths, device=scores.device, dtype=torch.int32)
     if candidates is not None:
         valid = valid & candidates
     masked = scores.masked_fill(~valid, -torch.inf)
-    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1).indices.sort(-1).values
-    return indices.masked_fill(masked.gather(-1, indices) == -torch.inf, -1).int()
+    indices = (
+        masked.topk(min(topk, scores.shape[-1]), dim=-1)
+        .indices.to(torch.int32)
+        .sort(-1)
+        .values
+    )
+    # Flat `row * width + index` positions stay in int32 (the native
+    # index_select fast path) unless they could pass 2**31 - 1.
+    flat_dtype = torch.int64 if masked.numel() >= _INT32_FLAT_LIMIT else torch.int32
+    return indices.masked_fill(
+        masked.reshape(-1)
+        .index_select(
+            0,
+            (
+                (
+                    torch.arange(
+                        masked.reshape(-1, masked.shape[-1]).shape[0],
+                        device=masked.device,
+                        dtype=flat_dtype,
+                    )
+                    * masked.shape[-1]
+                ).reshape(*masked.shape[:-1], 1)
+                + indices.to(flat_dtype)
+            ).reshape(-1),
+        )
+        .reshape(indices.shape)
+        == -torch.inf,
+        -1,
+    )
 
 
 def sparse_attention(q, kv, sink, indices, scale):
@@ -95,8 +127,17 @@ def sparse_attention(q, kv, sink, indices, scale):
     if kv.shape[1] == 0 or indices.shape[-1] == 0:
         return torch.zeros_like(q)
     valid = (indices >= 0) & (indices < kv.shape[1])
-    batch = torch.arange(kv.shape[0], device=kv.device)[:, None, None]
-    selected = kv[batch, indices.long().clamp(0, kv.shape[1] - 1)]
+    batch = (
+        torch.arange(kv.shape[0], device=kv.device, dtype=torch.int32) * kv.shape[1]
+    )[:, None, None]
+    selected = (
+        kv.flatten(0, 1)
+        .index_select(
+            0,
+            (batch + indices.to(torch.int32).clamp(0, kv.shape[1] - 1)).reshape(-1),
+        )
+        .reshape(*indices.shape, *kv.shape[2:])
+    )
     selected = selected.masked_fill(~valid.unsqueeze(-1), 0).float()
     logits = torch.einsum("bshd,bskd->bshk", q.float(), selected) * scale
     logits = logits.masked_fill(~valid.unsqueeze(-2), -torch.inf)
@@ -130,36 +171,58 @@ def _block_table(metadata):
 
 
 def _token_requests(metadata, positions):
-    rows = torch.arange(positions.shape[0], device=positions.device)
-    return torch.bucketize(rows, metadata.query_start_loc[1:], right=True)
+    """Request index of every token row: ``bucketize(rows, qsl[1:], right=True)``.
+
+    Counts the (non-decreasing) request ends at or below each row with one
+    ``[tokens, requests]`` compare + reduce. ``torch.bucketize`` lowers on TPU
+    to a fusion taking one scalar operand per boundary, which cost 31-37 us
+    per call at 288 tokens x 48 requests (C=48 DSpark K=5 xprof).
+    """
+    rows = torch.arange(positions.shape[0], dtype=torch.int32, device=positions.device)
+    ends = metadata.query_start_loc[1:]
+    return (rows.unsqueeze(1) >= ends.unsqueeze(0)).sum(-1, dtype=torch.int32)
 
 
 def _window_starts():
     """Per-request first position holding SWA KV, or None (SWA bounded replay)."""
+    stage_cache = _active_stage_attn_cache
+    if stage_cache is not None:
+        if "window_starts" not in stage_cache:
+            stage_cache["window_starts"] = get_forward_context().additional_kwargs.get(
+                "deepseek_v41_window_starts"
+            )
+        return stage_cache["window_starts"]
     return get_forward_context().additional_kwargs.get("deepseek_v41_window_starts")
 
 
 def _replayed(metadata, positions, starts, window):
     """Tokens a prefix hit replays: their prefix-cached KV must stay as is."""
     requests = _token_requests(metadata, positions).clamp(max=starts.shape[0] - 1)
-    start = starts[requests]
-    return (start > 0) & (positions >= start) & (positions < start + window)
+    start = starts.index_select(0, requests).int()
+    pos_i32 = positions.int()
+    return (start > 0) & (pos_i32 >= start) & (pos_i32 < start + window)
 
 
 def _cache_slots(cache, metadata, positions, *, compress_ratio=1, ring=False):
     """Derive this cache's addresses from the shared TPU metadata contract."""
     if metadata.seq_lens.numel() == 0:
-        return torch.full_like(positions, -1)
+        return torch.full_like(positions, -1, dtype=torch.int32)
     table = _block_table(metadata)
     requests = _token_requests(metadata, positions).clamp(max=table.shape[0] - 1)
     rows_per_page = cache.shape[1]
-    logical = positions // compress_ratio
-    columns = torch.zeros_like(logical) if ring else logical // rows_per_page
-    blocks = table[requests, columns.clamp(max=table.shape[1] - 1).long()].long()
+    logical = positions.int() // compress_ratio
+    columns = (
+        torch.zeros_like(logical)
+        if ring
+        else (logical // rows_per_page).clamp(max=table.shape[1] - 1)
+    )
+    blocks = (
+        table.reshape(-1).index_select(0, requests * table.shape[1] + columns).int()
+    )
     slots = blocks * rows_per_page + logical % rows_per_page
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
-    rows = torch.arange(positions.shape[0], device=positions.device)
+    rows = torch.arange(positions.shape[0], dtype=torch.int32, device=positions.device)
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
 
 
@@ -168,6 +231,33 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
 
     def get_attn_backend(self):
         return AttentionBackend
+
+
+def _compress_norm_addr(
+    count,
+    positions,
+    slot_mapping,
+    query_start_loc,
+    token_to_req_indices,
+    capacity,
+):
+    """Precompute stage-invariant native int32 ring-cache addressing tensors."""
+    positions = positions[:count]
+    slot_mapping = slot_mapping[:count]
+    token_to_req_indices = token_to_req_indices[:count]
+    valid = slot_mapping >= 0
+    rows = torch.arange(count, dtype=torch.int32, device=positions.device)
+    qsl_i32 = query_start_loc.int()
+    requests = token_to_req_indices.int().clamp(max=qsl_i32.numel() - 2)
+    starts = qsl_i32.index_select(0, requests)
+    ends = qsl_i32.index_select(0, requests + 1)
+    prev_blocks = slot_mapping.clamp(min=0) // capacity
+    prev_rem = (positions - 1) % capacity
+    in_chunk = (rows > starts)[:, None]
+    prev_row_idx = (rows - 1).clamp(min=0)
+    publish = valid & (rows >= ends - capacity)
+    final_valid = valid & ((positions & 1) == 1)
+    return prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, final_valid
 
 
 def save_compress_norm(
@@ -181,6 +271,8 @@ def save_compress_norm(
     eps,
     ratio,
     latent,
+    *,
+    precomputed_addr=None,
 ):
     """Tensor implementation of the compressor_upstream fused compression operation.
 
@@ -197,31 +289,51 @@ def save_compress_norm(
     values = kv_score[:, :dim].float()
     valid = slot_mapping >= 0
     if ratio == 2:
-        capacity = state_cache.shape[1]
         cache = state_cache
-        rows = torch.arange(kv_score.shape[0], device=kv_score.device)
-        requests = token_to_req_indices.long().clamp(max=query_start_loc.numel() - 2)
-        starts = query_start_loc[requests]
-        ends = query_start_loc[requests + 1]
-        previous_slots = (
-            slot_mapping.clamp(min=0) // capacity * capacity
-            + (positions - 1) % capacity
+        addr = precomputed_addr or (
+            _active_stage_attn_cache.get("_compress_norm_addr")
+            if _active_stage_attn_cache is not None
+            else None
         )
-        stored = cache[previous_slots // capacity, previous_slots % capacity]
+        if addr is None:
+            addr = _compress_norm_addr(
+                count,
+                positions,
+                slot_mapping,
+                query_start_loc,
+                token_to_req_indices,
+                cache.shape[1],
+            )
+        prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, valid = addr
+        stored = cache[prev_blocks, prev_rem]
         previous = torch.where(
-            (rows > starts)[:, None], kv_score[(rows - 1).clamp(min=0)].float(), stored
+            in_chunk,
+            kv_score.index_select(0, prev_row_idx).float(),
+            stored,
         )
         scores = torch.stack((previous[:, dim:], kv_score[:, dim:].float()), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
-        publish = valid & (rows >= ends - capacity)
         write_cache(cache, slot_mapping, kv_score.float(), publish, after=stored)
-        valid = valid & (positions % 2 == 1)
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
     result = rms_norm(values, norm_weight, eps)
     latent.copy_(result.masked_fill(~valid[:, None], 0).to(latent.dtype))
+
+
+def _memo_stage_cache_key(obj: Any, kind: str, *parts: Any) -> tuple[Any, ...]:
+    """Return a memoized ``(kind, *parts)`` stage-cache key tuple on ``obj``."""
+    cache = obj.__dict__.get("_stage_key_memo")
+    if cache is None:
+        cache = {}
+        obj.__dict__["_stage_key_memo"] = cache
+    entry = cache.get(kind)
+    if entry is not None and entry[0] == parts:
+        return entry[1]
+    key = (kind, *parts)
+    cache[kind] = (parts, key)
+    return key
 
 
 class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
@@ -248,14 +360,16 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict):
             return None
+        stage_cache = _active_stage_attn_cache
+        if stage_cache is not None:
+            stage_cache["_compress_norm_addr"] = None
         if self.state_cache is None:
             state_cache = query_start_loc = requests = None
             cache = self._static_forward_context[self.k_cache_prefix].kv_cache
-            slots = _cache_slots(cache, metadata[self.k_cache_prefix], positions)
+            slots = _cache_slots(cache, metadata[self.k_cache_prefix], positions).int()
         else:
             state_metadata = metadata[self.state_cache.prefix]
             state_cache = self.state_cache.kv_cache
-            stage_cache = _active_stage_attn_cache
             state_rows = (
                 state_cache.shape[1]
                 if isinstance(getattr(state_cache, "shape", None), tuple)
@@ -267,15 +381,19 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                 and state_metadata.seq_lens.numel() > 0
             ):
                 table = _block_table(state_metadata)
-                state_key = ("compressor_state_addr", table.shape, state_rows)
+                state_key = _memo_stage_cache_key(
+                    self, "compressor_state_addr", table.shape, state_rows
+                )
                 cached_state = stage_cache.get(state_key)
                 if cached_state is None:
                     query_start_loc = state_metadata.query_start_loc
                     requests = _token_requests(state_metadata, positions)
                     clamped_requests = requests.clamp(max=table.shape[0] - 1)
-                    ring_rem = positions % state_rows
+                    ring_rem = positions.int() % state_rows
                     token_rows = torch.arange(
-                        positions.shape[0], device=positions.device
+                        positions.shape[0],
+                        dtype=torch.int32,
+                        device=positions.device,
                     )
                     valid_token = token_rows < query_start_loc[-1]
                     cached_state = (
@@ -294,16 +412,50 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
                         ring_rem,
                         valid_token,
                     ) = cached_state
-                blocks = table[clamped_requests, 0].long()
-                slots = (blocks * state_rows + ring_rem).masked_fill(~valid_token, -1)
+                # Every compressed layer (L2/8/14/20) of a stage gathers the
+                # same block-table column and ring offsets for the same tokens:
+                # share the slots and precomputed int32 addressing across layers.
+                slot_key = _memo_stage_cache_key(
+                    self, "compressor_write_slots", table.shape, state_rows
+                )
+                cached_slots = stage_cache.get(slot_key)
+                if (
+                    cached_slots is not None
+                    and cached_slots[0] is state_metadata.block_tables
+                ):
+                    slots, stage_cache["_compress_norm_addr"] = (
+                        cached_slots[1],
+                        cached_slots[2],
+                    )
+                else:
+                    blocks = table[:, 0].index_select(0, clamped_requests).int()
+                    slots = (blocks * state_rows + ring_rem).masked_fill(
+                        ~valid_token, -1
+                    )
+                    comp_addr = _compress_norm_addr(
+                        kv_score.shape[0],
+                        positions,
+                        slots,
+                        query_start_loc,
+                        requests,
+                        state_rows,
+                    )
+                    stage_cache[slot_key] = (
+                        state_metadata.block_tables,
+                        slots,
+                        comp_addr,
+                    )
+                    stage_cache["_compress_norm_addr"] = comp_addr
             else:
-                slots = _cache_slots(state_cache, state_metadata, positions, ring=True)
+                slots = _cache_slots(
+                    state_cache, state_metadata, positions, ring=True
+                ).int()
                 query_start_loc = state_metadata.query_start_loc
                 requests = _token_requests(state_metadata, positions)
-        latent = (
-            torch.zeros_like(positions[:, None], dtype=torch.bfloat16)
-            .expand(-1, self.head_dim)
-            .contiguous()
+        latent = torch.empty(
+            (positions.shape[0], self.head_dim),
+            dtype=torch.bfloat16,
+            device=positions.device,
         )
         save_compress_norm(
             kv_score,
@@ -345,7 +497,8 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
-        kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
+        if prefix_replay_enabled(get_current_vllm_config_or_none()):
+            kwargs["bounded_replay"] = True
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
@@ -371,8 +524,15 @@ def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
 
-def _insert(cache, slots, values, valid):
-    write_cache(cache, slots, values, valid)
+def _insert(cache, slots, values, valid, *, records=None):
+    write_cache(cache, slots, values, valid, records=records)
+
+
+def _offset_records(cache, write_slots, write_invalid):
+    """Pool rows from stage-shared ``_fast_swa_row_slots`` output for ``cache``."""
+    offset = cache.row_offset
+    records = write_slots if offset == 0 else offset + write_slots
+    return records.masked_fill(write_invalid, -1)
 
 
 def _gather_query_rows(rows):
@@ -387,10 +547,10 @@ def _gather_query_rows(rows):
 
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
-    safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
+    safe = logical.int().clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
     # Gather each token's table row, then index within it 128 columns at a
     # time. A [tokens, width] elementwise 2-D gather is 16-40x slower on TPU.
-    rows = block_table[requests]
+    rows = block_table.index_select(0, requests)
     pages = (safe // cache.shape[1]).long()
     blocks = torch.cat(
         [
@@ -398,7 +558,7 @@ def _row_slots(cache, block_table, requests, logical):
             for start in range(0, pages.shape[1], 128)
         ],
         dim=1,
-    ).long()
+    ).int()
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
@@ -446,37 +606,110 @@ def _query_split(count, ranks):
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
 
 
-def _request_row_slots(cache, block_table, width):
+def _has_fast_cache_offset(cache) -> bool:
+    return isinstance(getattr(cache, "row_offset", None), int)
+
+
+def _fast_cache_offset_key(cache):
+    return cache.page_stride
+
+
+def _fast_swa_row_slots(swa_cache, blocks, rem, invalid_window):
+    return (blocks * swa_cache.page_stride + rem).int(), invalid_window
+
+
+def _request_row_slots(cache, block_table, width, page_records: int = 0):
     """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
 
     Every token of a request scans the same capacity-wide rows, so address
-    them once per request instead of once per token.
+    them once per request instead of once per token. When ``page_records``
+    matches ``cache.shape[1]`` (> 1), returns one first-record slot per page
+    (``[requests, num_pages]``).
     """
     rows_per_page = cache.shape[1]
+    stride = cache.page_stride if _has_fast_cache_offset(cache) else rows_per_page
+    if page_records > 1 and rows_per_page == page_records:
+        num_pages = (width + rows_per_page - 1) // rows_per_page
+        table = block_table[:, :num_pages]
+        if num_pages > table.shape[1]:
+            table = torch.cat(
+                (
+                    table,
+                    table[:, -1:].expand(-1, num_pages - table.shape[1]),
+                ),
+                dim=1,
+            )
+        return table.int() * stride
+    page_bases = block_table.int() * stride
     # Logical row r lives in table column r // rows_per_page, so repeating each
     # column rows_per_page times lines blocks up with rows 0..width-1 without
     # a full-width gather (16-40x slower on TPU, see _row_slots).
-    blocks = (
-        block_table[:, :, None]
+    bases = (
+        page_bases[:, :, None]
         .expand(-1, -1, rows_per_page)
         .reshape(block_table.shape[0], -1)
-        .long()
     )
     offsets = (
-        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
+        torch.arange(width, dtype=bases.dtype, device=block_table.device).clamp(
+            max=bases.shape[1] - 1
+        )
         % rows_per_page
     )
-    if width > blocks.shape[1]:
+    if width > bases.shape[1]:
         # Match _row_slots' clamp to the table's last row.
-        blocks = torch.cat(
-            (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
+        bases = torch.cat(
+            (bases, bases[:, -1:].expand(-1, width - bases.shape[1])), dim=1
         )
-    return blocks[:, :width] * rows_per_page + offsets
+    return bases[:, :width] + offsets
 
 
 def _read_rows(cache, block_table, requests, logical):
     slots = _row_slots(cache, block_table, requests, logical)
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
+
+
+def _sp_gather_inputs(
+    qr, kv, kv_score, indexer_weights, *, local_q: bool, num_tokens: int
+):
+    """All-gather this rank's SP token shard of the input projections.
+
+    One collective per layer. ``qr`` (``q_lora_rank``), ``kv``
+    (``head_dim``) and ``indexer_weights`` (``indexer.n_head``) share the
+    activation dtype and are concatenated along the feature axis.
+    ``kv_score`` is the fp32 ``[T_local, head_dim + 1]`` compressor
+    projection; the collective only moves bytes, so it rides along as
+    ``2 * (head_dim + 1)`` activation-dtype columns through a dtype
+    bit-view and is viewed back to fp32 after the gather. That is
+    bit-exact and saves the second all-gather launch (and its barrier)
+    on every compressed-KV source layer of every prefill chunk.
+
+    Non-source layers with local_q do not consume full-token ``qr`` on
+    the host, so they gather only ``kv`` (512 cols instead of 2048).
+    """
+    gather_qr = indexer_weights is not None or not local_q
+    parts = []
+    if gather_qr:
+        parts.append(qr)
+    parts.append(kv)
+    if indexer_weights is not None:
+        parts.append(indexer_weights)
+    if kv_score is not None:
+        parts.append(kv_score.contiguous().view(kv.dtype))
+    assert all(part.dtype == kv.dtype for part in parts)
+    payload = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+    gathered = sp_all_gather(payload)[:num_tokens]
+    pieces = iter(
+        piece.contiguous()
+        for piece in gathered.split([part.shape[-1] for part in parts], dim=-1)
+    )
+    if gather_qr:
+        qr = next(pieces)
+    kv = next(pieces)
+    if indexer_weights is not None:
+        indexer_weights = next(pieces)
+    if kv_score is not None:
+        kv_score = next(pieces).view(kv_score.dtype)
+    return qr, kv, kv_score, indexer_weights
 
 
 class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
@@ -488,6 +721,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _sp_sharded_input = False
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
+    # True when that path takes the TP-replicated full ``qr`` and slices each
+    # rank's token shard itself (`TPU_DEEPSEEK_V41_DECODE_LOCAL_Q`).
+    _replicated_local_q = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -547,6 +783,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
         self._precompact_records = self._fp8_kv
         self._token_parallel_attn = self._fp8_kv
+        self._indexer_weight_scale = (
+            (self.indexer.head_dim * self.indexer.n_head) ** -0.5
+            if getattr(self, "indexer", None) is not None
+            else 1.0
+        )
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
@@ -569,23 +810,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         num_tokens = positions.shape[0]
         # Allocate o_padded from positions via zeros_like + expand so TorchTPU's
         # lowering does not call torch.empty on a compound SymInt expression.
-        o_padded = (
-            torch.zeros_like(
-                positions[:, None, None],
-                dtype=hidden_states.dtype,
-            )
-            .expand(-1, self.padded_heads, self.head_dim)
-            .contiguous()
-        )
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
             hidden_states
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        # This rank's SP token shard of qr, before the gather.
+        # This rank's SP token shard of qr, before the gather; or, for the
+        # replicated decode path, the full qr the op slices per rank.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         qr_local = (
             qr
-            if self._sp_sharded_input
+            if (self._sp_sharded_input or self._replicated_local_q)
             and getattr(self, "_local_q_attn", False)
             and (
                 swa_kv is None
@@ -594,34 +828,31 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else None
         )
         if self._sp_sharded_input:
-            if indexer_weights is not None:
-                assert qr.dtype == kv.dtype == indexer_weights.dtype
-                packed = sp_all_gather(torch.cat((qr, kv, indexer_weights), dim=-1))[
-                    :num_tokens
-                ]
-                qr, kv, indexer_weights = (
-                    t.contiguous()
-                    for t in packed.split(
-                        (self.q_lora_rank, self.head_dim, self.indexer.n_head),
-                        dim=-1,
-                    )
-                )
-            elif qr_local is not None:
-                # Non-source encoder layers with local_q do not consume
-                # full-token qr on the host; gather only kv (512 cols vs 2048).
-                kv = sp_all_gather(kv)[:num_tokens]
-            else:
-                assert qr.dtype == kv.dtype
-                packed = sp_all_gather(torch.cat((qr, kv), dim=-1))[:num_tokens]
-                qr, kv = (
-                    t.contiguous()
-                    for t in packed.split(
-                        (self.q_lora_rank, self.head_dim),
-                        dim=-1,
-                    )
-                )
-            if kv_score is not None:
-                kv_score = sp_all_gather(kv_score)[:num_tokens]
+            qr, kv, kv_score, indexer_weights = _sp_gather_inputs(
+                qr,
+                kv,
+                kv_score,
+                indexer_weights,
+                local_q=qr_local is not None,
+                num_tokens=num_tokens,
+            )
+        o_padded: Any = (
+            None
+            if (
+                qr_local is not None
+                and isinstance(swa_kv, PagedCacheRows)
+                and self._fp8_kv
+                and bool(self.compress_ratio)
+                and getattr(self._prepare_and_attn_fn, "__func__", None)
+                is DeepseekV41Attention._prepare_tpu
+            )
+            else torch.zeros_like(
+                positions[:, None, None],
+                dtype=hidden_states.dtype,
+            )
+            .expand(-1, self.padded_heads, self.head_dim)
+            .contiguous()
+        )
         args = (
             hidden_states,
             qr,
@@ -692,9 +923,69 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
         return cast(Callable, VllmDeepseekV4MLAAttention.kv_rope_op.fget)(self)
 
+    def _stage_cache_key(self, kind: str, *parts: Any) -> tuple[Any, ...]:
+        return _memo_stage_cache_key(self, kind, *parts)
+
+    def _get_stage_tp_rank(self, stage_cache: dict[Any, Any] | None = None):
+        rank = self._tp_rank
+        if stage_cache is not None and isinstance(rank, torch.Tensor):
+            return stage_cache.setdefault(
+                self._stage_cache_key("stage_tp_rank", rank.device, rank.dtype), rank
+            )
+        return rank
+
+    def _get_stage_tp_rank_1d(self, stage_cache: dict[Any, Any] | None = None):
+        rank_1d = self._tp_rank_1d
+        if stage_cache is not None and isinstance(rank_1d, torch.Tensor):
+            # Called per layer per step: rebuild the key only when the rank
+            # tensor changes.
+            entry = self.__dict__.get("_rank1d_stage_entry")
+            if entry is None or entry[0] is not rank_1d:
+                entry = self.__dict__["_rank1d_stage_entry"] = (
+                    rank_1d,
+                    self._stage_cache_key("stage_tp_rank_1d", rank_1d.device),
+                )
+            key = entry[1]
+            cached = stage_cache.get(key)
+            if cached is None:
+                cached = (
+                    rank_1d
+                    if rank_1d.shape == (1,) and rank_1d.dtype == torch.int32
+                    else rank_1d.reshape(1).int()
+                )
+                stage_cache[key] = cached
+            return cached
+        return rank_1d
+
+    def _get_stage_rope_cache(self, stage_cache: dict[Any, Any] | None = None):
+        rope_cache = self._tpu_rope_cache
+        if stage_cache is not None and isinstance(rope_cache, torch.Tensor):
+            # Same shape/dtype does not mean same values: compressed layers use
+            # compress_rope_theta (upstream deepseek_v41/common/rope.py), so the
+            # key must carry the rope config or layers read the wrong cos/sin.
+            # The config is fixed per layer, so the key is rebuilt only when
+            # the cache tensor changes (called per layer per step).
+            entry = self.__dict__.get("_rope_stage_entry")
+            if entry is None or entry[0] is not rope_cache:
+                entry = self.__dict__["_rope_stage_entry"] = (
+                    rope_cache,
+                    self._stage_cache_key(
+                        "stage_tpu_rope_cache",
+                        rope_cache.device,
+                        rope_cache.shape,
+                        rope_cache.dtype,
+                        bool(self.compress_ratio),
+                        getattr(getattr(self, "rotary_emb", None), "base", None),
+                    ),
+                )
+            return stage_cache.setdefault(entry[1], rope_cache)
+        return rope_cache
+
     def _rotate(self, values, positions, inverse=False):
         if values.device.type != "cpu" and not inverse:
-            return self.kv_rope_op(values, positions, self._tpu_rope_cache)
+            return self.kv_rope_op(
+                values, positions, self._get_stage_rope_cache(_active_stage_attn_cache)
+            )
         return rotary(
             values.unsqueeze(0),
             positions,
@@ -731,7 +1022,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ):
             kv_table = _block_table(kv_meta)
             idx_table = _block_table(idx_meta)
-            slot_key = (
+            slot_key = self._stage_cache_key(
                 "global_kv_addr",
                 kv_table.shape,
                 self.compress_ratio,
@@ -742,36 +1033,40 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached_addr = stage_cache.get(slot_key)
             if cached_addr is None:
-                requests = _token_requests(kv_meta, positions).clamp(
-                    max=kv_table.shape[0] - 1
+                pos_i32 = positions.int()
+                requests = (
+                    _token_requests(kv_meta, positions)
+                    .clamp(max=kv_table.shape[0] - 1)
+                    .int()
                 )
-                logical = positions // self.compress_ratio
-                kv_col = (logical // kv_rows).clamp(max=kv_table.shape[1] - 1).long()
+                logical = pos_i32 // self.compress_ratio
+                kv_col = (logical // kv_rows).clamp(max=kv_table.shape[1] - 1)
+                kv_idx = requests * kv_table.shape[1] + kv_col
                 kv_rem = logical % kv_rows
                 if (
                     idx_ratio == self.compress_ratio
                     and idx_rows == kv_rows
                     and idx_table.shape == kv_table.shape
                 ):
-                    idx_col = kv_col
+                    idx_idx = kv_idx
                     idx_rem = kv_rem
                 else:
-                    idx_logical = positions // idx_ratio
-                    idx_col = (
-                        (idx_logical // idx_rows)
-                        .clamp(max=idx_table.shape[1] - 1)
-                        .long()
+                    idx_logical = pos_i32 // idx_ratio
+                    idx_col = (idx_logical // idx_rows).clamp(
+                        max=idx_table.shape[1] - 1
                     )
+                    idx_idx = requests * idx_table.shape[1] + idx_col
                     idx_rem = idx_logical % idx_rows
-                token_rows = torch.arange(positions.shape[0], device=positions.device)
+                token_rows = torch.arange(
+                    positions.shape[0], dtype=torch.int32, device=positions.device
+                )
                 valid_token = token_rows < kv_meta.query_start_loc[-1]
-                valid_group = valid_token & ((positions + 1) % self.compress_ratio == 0)
+                valid_group = valid_token & ((pos_i32 + 1) % self.compress_ratio == 0)
                 group_positions = logical * self.compress_ratio
                 cached_addr = (
-                    requests,
-                    kv_col,
+                    kv_idx,
                     kv_rem,
-                    idx_col,
+                    idx_idx,
                     idx_rem,
                     valid_token,
                     valid_group,
@@ -780,51 +1075,142 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 stage_cache[slot_key] = cached_addr
             else:
                 (
-                    requests,
-                    kv_col,
+                    kv_idx,
                     kv_rem,
-                    idx_col,
+                    idx_idx,
                     idx_rem,
                     valid_token,
                     valid_group,
                     group_positions,
                 ) = cached_addr
-            kv_blocks = kv_table[requests, kv_col].long()
-            compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
-                ~valid_token, -1
+            # L2/8/14/20 all write the same token rows through the same block
+            # tables: compute their addresses (and the deferred index-cache
+            # write rows) once per stage while the block_tables are unchanged.
+            fast_idx = _has_fast_cache_offset(index_cache)
+            fast_kv = _has_fast_cache_offset(self.kv_cache)
+            write_key = self._stage_cache_key(
+                "global_kv_write_slots",
+                slot_key,
+                _fast_cache_offset_key(index_cache) if fast_idx else None,
+                _fast_cache_offset_key(self.kv_cache) if fast_kv else None,
             )
-            valid = (compressed_slots >= 0) & valid_group
-            idx_blocks = idx_table[requests, idx_col].long()
-            index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
-                ~valid_token, -1
-            )
+            kv_tables = kv_meta.block_tables
+            idx_tables = idx_meta.block_tables
+            cached_write = stage_cache.get(write_key)
+            if (
+                cached_write is not None
+                and cached_write[0] is kv_tables
+                and cached_write[1] is idx_tables
+            ):
+                (
+                    _,
+                    _,
+                    compressed_slots,
+                    valid,
+                    index_slots,
+                    idx_write_slots,
+                    idx_write_invalid,
+                    kv_write_slots,
+                    kv_write_invalid,
+                ) = cached_write
+            else:
+                kv_blocks = (
+                    (kv_table if kv_table.dtype == torch.int32 else kv_table.int())
+                    .reshape(-1)
+                    .index_select(0, kv_idx)
+                )
+                compressed_slots = (kv_blocks * kv_rows + kv_rem).masked_fill(
+                    ~valid_token, -1
+                )
+                valid = (compressed_slots >= 0) & valid_group
+                if (
+                    idx_idx is kv_idx
+                    and idx_tables is kv_tables
+                    and idx_rows == kv_rows
+                ):
+                    # Same table, column and remainder: the index cache's slots
+                    # are the compressed KV slots (no second 2-D gather).
+                    idx_blocks = kv_blocks
+                    index_slots = compressed_slots
+                else:
+                    idx_blocks = (
+                        (
+                            idx_table
+                            if idx_table.dtype == torch.int32
+                            else idx_table.int()
+                        )
+                        .reshape(-1)
+                        .index_select(0, idx_idx)
+                    )
+                    index_slots = (idx_blocks * idx_rows + idx_rem).masked_fill(
+                        ~valid_token, -1
+                    )
+                idx_write_slots = idx_write_invalid = None
+                if fast_idx:
+                    # index_cache.row_indices without the per-layer divmod.
+                    idx_write_slots, idx_write_invalid = _fast_swa_row_slots(
+                        index_cache, idx_blocks, idx_rem, ~valid | (index_slots < 0)
+                    )
+                kv_write_slots = kv_write_invalid = None
+                if fast_kv:
+                    # The kv_cache write rows, shared by L2/8/14/20 (each adds
+                    # its own row_offset) instead of a per-layer row_indices.
+                    kv_write_slots, kv_write_invalid = _fast_swa_row_slots(
+                        self.kv_cache,
+                        kv_blocks,
+                        kv_rem,
+                        ~valid | (compressed_slots < 0),
+                    )
+                stage_cache[write_key] = (
+                    kv_tables,
+                    idx_tables,
+                    compressed_slots,
+                    valid,
+                    index_slots,
+                    idx_write_slots,
+                    idx_write_invalid,
+                    kv_write_slots,
+                    kv_write_invalid,
+                )
         else:
+            pos_i32 = positions.int()
             compressed_slots = _cache_slots(
                 self.kv_cache,
                 kv_meta,
                 positions,
                 compress_ratio=self.compress_ratio,
-            )
-            valid = (compressed_slots >= 0) & (
-                (positions + 1) % self.compress_ratio == 0
-            )
-            group_positions = positions // self.compress_ratio * self.compress_ratio
+            ).int()
+            valid = (compressed_slots >= 0) & ((pos_i32 + 1) % self.compress_ratio == 0)
+            group_positions = pos_i32 // self.compress_ratio * self.compress_ratio
             index_slots = _cache_slots(
                 index_cache,
                 idx_meta,
                 positions,
                 compress_ratio=idx_ratio,
-            )
+            ).int()
+            idx_write_slots = idx_write_invalid = None
+            kv_write_slots = kv_write_invalid = None
         starts = _window_starts()
         if starts is not None:
             # Shared prefix rows must survive replay unchanged in both paths.
             valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
-        _insert(
-            self.kv_cache,
-            compressed_slots,
-            self._rotate(latent, group_positions),
-            valid,
-        )
+            if idx_write_invalid is not None:
+                idx_write_invalid = idx_write_invalid | ~valid
+            if kv_write_invalid is not None:
+                kv_write_invalid = kv_write_invalid | ~valid
+        rotated = self._rotate(latent, group_positions)
+        if kv_write_slots is not None and kv_write_invalid is not None:
+            _insert(
+                self.kv_cache,
+                compressed_slots,
+                rotated,
+                valid,
+                records=_offset_records(
+                    self.kv_cache, kv_write_slots, kv_write_invalid
+                ),
+            )
+        else:
+            _insert(self.kv_cache, compressed_slots, rotated, valid)
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._quantize_indexer(self._rotate(keys, group_positions))
         if (
@@ -833,6 +1219,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.window_size % 64 == 0
             and not self._all_indices_fit
         ):
+            if idx_write_slots is not None and idx_write_invalid is not None:
+                return (
+                    _offset_records(index_cache, idx_write_slots, idx_write_invalid),
+                    keys,
+                )
             records = index_cache.row_indices(index_slots.clamp(min=0))
             return records.masked_fill(~valid | (index_slots < 0), -1), keys
         _insert(index_cache, index_slots, keys, valid)
@@ -872,7 +1263,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         swa_cache = self.swa_cache_layer.kv_cache
         swa_table = _block_table(swa)
         tiled = isinstance(swa_cache, PagedCacheRows) and self.window_size % 64 == 0
-        has_fast_swa_offset = isinstance(getattr(swa_cache, "row_offset", None), int)
+        has_fast_swa_offset = _has_fast_cache_offset(swa_cache)
         stage_cache = _active_stage_attn_cache
         rows_per_page = (
             swa_cache.shape[1]
@@ -886,22 +1277,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             if non_causal
             else self.window_size
         )
+        swa_row_slots_masked = swa_slots_key = None
+        pos_i32 = positions.int()
         if (
             stage_cache is not None
             and rows_per_page is not None
             and swa.seq_lens.numel() > 0
         ):
             use_3page_swa = (
-                not non_causal
-                and tiled
-                and swa_table.shape[1] > 0
-                and self.window_size <= 2 * rows_per_page
+                tiled and swa_table.shape[1] > 0 and swa_width <= 6 * rows_per_page
             )
-            swa_key = (
+            swa_key = self._stage_cache_key(
                 "swa_token_addr",
                 swa_table.shape,
                 rows_per_page,
-                swa_cache.page_stride if has_fast_swa_offset else None,
+                _fast_cache_offset_key(swa_cache) if has_fast_swa_offset else None,
                 self.window_size,
                 self._ced_decoder,
                 use_3page_swa,
@@ -911,28 +1301,32 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             cached_swa = stage_cache.get(swa_key)
             if cached_swa is None:
-                token_rows = torch.arange(positions.shape[0], device=positions.device)
+                token_rows = torch.arange(
+                    positions.shape[0], dtype=torch.int32, device=positions.device
+                )
                 valid_token = token_rows < swa.query_start_loc[-1]
-                requests = _token_requests(swa, positions).clamp(
-                    max=swa_table.shape[0] - 1
+                requests = (
+                    _token_requests(swa, pos_i32)
+                    .clamp(max=swa_table.shape[0] - 1)
+                    .int()
                 )
-                pos_col = (
-                    (positions // rows_per_page)
-                    .clamp(max=swa_table.shape[1] - 1)
-                    .long()
+                pos_col = (req_base := requests * swa_table.shape[1]) + (
+                    (pos_i32 // rows_per_page).clamp(max=swa_table.shape[1] - 1)
                 )
-                pos_rem = positions % rows_per_page
+                pos_rem = pos_i32 % rows_per_page
                 if non_causal:
                     req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                    end_pos = swa.seq_lens[req_idx]
-                    query_len = (
-                        swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
-                    )
+                    end_pos = swa.seq_lens.int().index_select(0, req_idx)
+                    query_len = (qsl_i32 := swa.query_start_loc.int()).index_select(
+                        0, req_idx + 1
+                    ) - qsl_i32.index_select(0, req_idx)
                     prefix_len = (end_pos - query_len).clamp(min=0)
                     start_pos = (prefix_len - self.window_size).clamp(min=0)
                     logical = (
                         start_pos[:, None]
-                        + torch.arange(swa_width, device=positions.device)[None, :]
+                        + torch.arange(
+                            swa_width, dtype=torch.int32, device=positions.device
+                        )[None, :]
                     )
                     base_valid_window = (
                         (logical >= 0)
@@ -941,12 +1335,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 else:
                     logical = (
-                        positions[:, None]
+                        pos_i32[:, None]
                         - self.window_size
                         + 1
-                        + torch.arange(self.window_size, device=positions.device)[
-                            None, :
-                        ]
+                        + torch.arange(
+                            self.window_size,
+                            dtype=torch.int32,
+                            device=positions.device,
+                        )[None, :]
                     )
                     base_valid_window = (logical >= 0) & valid_token[:, None]
                 if self._ced_decoder:
@@ -954,20 +1350,37 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         "deepseek_v41_replay_starts"
                     ]
                     base_valid_window = base_valid_window & (
-                        logical >= replay_starts[requests, None]
+                        logical >= replay_starts.index_select(0, requests)[:, None]
+                    )
+                elif (win_starts := _window_starts()) is not None:
+                    base_valid_window = base_valid_window & (
+                        logical
+                        >= win_starts.index_select(
+                            0, requests.clamp(max=win_starts.shape[0] - 1)
+                        )[:, None]
                     )
                 if use_3page_swa:
                     safe = logical.clamp(
                         min=0, max=swa_table.shape[1] * rows_per_page - 1
                     )
-                    swa_pages = (safe // rows_per_page).long()
+                    swa_pages = safe // rows_per_page
                     swa_page_rem = safe % rows_per_page
-                    c2 = swa_pages[:, -1]
-                    c1 = (c2 - 1).clamp(min=0)
-                    c0 = (c2 - 2).clamp(min=0)
-                    is_c2 = swa_pages == c2[:, None]
-                    is_c1 = swa_pages == c1[:, None]
-                    swa_3page = (c0, c1, is_c2, is_c1, swa_page_rem)
+                    max_prev_pages = max(2, (swa_width - 1) // rows_per_page + 1)
+                    c_last = swa_pages[:, -1]
+                    prev_cols = tuple(
+                        (c_last - k).clamp(min=0) for k in range(1, max_prev_pages + 1)
+                    )
+                    is_c_last = swa_pages == c_last[:, None]
+                    is_prev_cols = tuple(
+                        swa_pages == col[:, None] for col in prev_cols[:-1]
+                    )
+                    swa_3page = (
+                        req_base + c_last if non_causal else pos_col,
+                        tuple(req_base + col for col in prev_cols),
+                        is_c_last,
+                        is_prev_cols,
+                        swa_page_rem,
+                    )
                 else:
                     swa_3page = None
                 cached_swa = (
@@ -990,27 +1403,43 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     base_valid_window,
                     swa_3page,
                 ) = cached_swa
-            swa_slots_key = ("swa_token_slots", swa_key)
+            swa_slots_key = self._stage_cache_key("swa_token_slots", *swa_key[1:])
             cached_swa_slots = stage_cache.get(swa_slots_key)
             if cached_swa_slots is None or cached_swa_slots[0] is not swa.block_tables:
-                b2 = swa_table[requests, pos_col].long()
+                flat_table = (
+                    swa_table if swa_table.dtype == torch.int32 else swa_table.int()
+                ).reshape(-1)
+                b2 = flat_table.index_select(0, pos_col)
                 swa_slots = (b2 * rows_per_page + pos_rem).masked_fill(~valid_token, -1)
                 swa_valid = swa_slots >= 0
+                swa_valid_int32 = swa_valid.int()
                 swa_invalid_3d = (~swa_valid)[:, None, None]
                 valid_window = base_valid_window & swa_valid[:, None]
+                invalid_window = ~valid_window
                 if swa_3page is not None:
-                    c0, c1, is_c2, is_c1, swa_page_rem = swa_3page
-                    b1 = swa_table[requests, c1].long()
-                    b0 = swa_table[requests, c0].long()
-                    swa_blocks = torch.where(
-                        is_c2,
-                        b2[:, None],
-                        torch.where(is_c1, b1[:, None], b0[:, None]),
-                    )
-                    swa_row_slots = (
-                        swa_blocks * swa_cache.page_stride + swa_page_rem
+                    (
+                        c_last,
+                        prev_cols,
+                        is_c_last,
+                        is_prev_cols,
+                        swa_page_rem,
+                    ) = swa_3page
+                    b_last = flat_table.index_select(0, c_last) if non_causal else b2
+                    swa_blocks = flat_table.index_select(0, prev_cols[-1])[:, None]
+                    for col, is_col in zip(
+                        reversed(prev_cols[:-1]),
+                        reversed(is_prev_cols),
+                        strict=True,
+                    ):
+                        b_col = flat_table.index_select(0, col)[:, None]
+                        swa_blocks = torch.where(is_col, b_col, swa_blocks)
+                    swa_blocks = torch.where(is_c_last, b_last[:, None], swa_blocks)
+                    swa_row_slots, invalid_window = (
+                        _fast_swa_row_slots(
+                            swa_cache, swa_blocks, swa_page_rem, invalid_window
+                        )
                         if has_fast_swa_offset
-                        else swa_blocks * rows_per_page + swa_page_rem
+                        else (swa_blocks * rows_per_page + swa_page_rem, invalid_window)
                     )
                 else:
                     raw_row_slots = (
@@ -1018,87 +1447,147 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         if tiled
                         else None
                     )
-                    swa_row_slots = (
-                        raw_row_slots // rows_per_page * swa_cache.page_stride
-                        + raw_row_slots % rows_per_page
+                    swa_row_slots, invalid_window = (
+                        _fast_swa_row_slots(
+                            swa_cache,
+                            raw_row_slots // rows_per_page,
+                            raw_row_slots % rows_per_page,
+                            invalid_window,
+                        )
                         if raw_row_slots is not None and has_fast_swa_offset
-                        else raw_row_slots
+                        else (raw_row_slots, invalid_window)
                     )
+                swa_row_slots_masked = (
+                    swa_row_slots.masked_fill(invalid_window, -1)
+                    if swa_row_slots is not None and has_fast_swa_offset
+                    else None
+                )
+                # The token write rows (b2, pos_rem) shared by every SWA layer;
+                # each layer adds its row_offset instead of re-deriving the
+                # block and remainder from swa_slots in PagedCacheRows.write.
+                swa_write = (
+                    _fast_swa_row_slots(swa_cache, b2, pos_rem, ~swa_valid)
+                    if has_fast_swa_offset
+                    else None
+                )
                 stage_cache[swa_slots_key] = (
                     swa.block_tables,
                     swa_slots,
                     swa_valid,
+                    swa_valid_int32,
                     swa_invalid_3d,
                     valid_window,
+                    invalid_window,
+                    swa_write,
                     swa_row_slots,
+                    swa_row_slots_masked,
                 )
             else:
                 (
                     _,
                     swa_slots,
                     swa_valid,
+                    swa_valid_int32,
                     swa_invalid_3d,
                     valid_window,
+                    invalid_window,
+                    swa_write,
                     swa_row_slots,
+                    swa_row_slots_masked,
                 ) = cached_swa_slots
         else:
-            swa_slots = _cache_slots(swa_cache, swa, positions)
+            swa_write = None
+            swa_slots = _cache_slots(swa_cache, swa, pos_i32).int()
             swa_valid = swa_slots >= 0
+            swa_valid_int32 = swa_valid
             swa_invalid_3d = (~swa_valid)[:, None, None]
-            requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
+            requests = (
+                _token_requests(swa, pos_i32).clamp(max=swa_table.shape[0] - 1).int()
+            )
             if non_causal and swa.seq_lens.numel() > 0:
                 req_idx = requests.clamp(max=swa.seq_lens.shape[0] - 1)
-                end_pos = swa.seq_lens[req_idx]
-                query_len = (
-                    swa.query_start_loc[req_idx + 1] - swa.query_start_loc[req_idx]
-                )
+                end_pos = swa.seq_lens.int().index_select(0, req_idx)
+                query_len = (qsl_i32 := swa.query_start_loc.int()).index_select(
+                    0, req_idx + 1
+                ) - qsl_i32.index_select(0, req_idx)
                 prefix_len = (end_pos - query_len).clamp(min=0)
                 start_pos = (prefix_len - self.window_size).clamp(min=0)
                 logical = (
                     start_pos[:, None]
-                    + torch.arange(swa_width, device=positions.device)[None, :]
+                    + torch.arange(
+                        swa_width, dtype=torch.int32, device=positions.device
+                    )[None, :]
                 )
                 valid_window = (
                     (logical >= 0) & (logical < end_pos[:, None]) & swa_valid[:, None]
                 )
             else:
                 logical = (
-                    positions[:, None]
+                    pos_i32[:, None]
                     - self.window_size
                     + 1
-                    + torch.arange(self.window_size, device=positions.device)[None, :]
+                    + torch.arange(
+                        self.window_size, dtype=torch.int32, device=positions.device
+                    )[None, :]
                 )
                 valid_window = (logical >= 0) & swa_valid[:, None]
             if self._ced_decoder:
                 replay_starts = get_forward_context().additional_kwargs[
                     "deepseek_v41_replay_starts"
                 ]
-                valid_window = valid_window & (logical >= replay_starts[requests, None])
+                valid_window = valid_window & (
+                    logical >= replay_starts.index_select(0, requests)[:, None]
+                )
+            elif (win_starts := _window_starts()) is not None:
+                valid_window = valid_window & (
+                    logical
+                    >= win_starts.index_select(
+                        0, requests.clamp(max=win_starts.shape[0] - 1)
+                    )[:, None]
+                )
+            invalid_window = ~valid_window
             raw_row_slots = (
                 _row_slots(swa_cache, swa_table, requests, logical) if tiled else None
             )
-            swa_row_slots = (
-                raw_row_slots // rows_per_page * swa_cache.page_stride
-                + raw_row_slots % rows_per_page
+            swa_row_slots, invalid_window = (
+                _fast_swa_row_slots(
+                    swa_cache,
+                    raw_row_slots // rows_per_page,
+                    raw_row_slots % rows_per_page,
+                    invalid_window,
+                )
                 if raw_row_slots is not None
                 and has_fast_swa_offset
                 and rows_per_page is not None
-                else raw_row_slots
+                else (raw_row_slots, invalid_window)
             )
-        if not self._ced_decoder and (starts := _window_starts()) is not None:
-            # Apply before records are built, including the tiled/local-Q path.
-            valid_window = valid_window & (
-                logical >= starts[requests.clamp(max=starts.shape[0] - 1), None]
+        if swa_row_slots is None:
+            records = None
+        elif has_fast_swa_offset and rows_per_page is not None:
+            if swa_cache.row_offset == 0 and swa_row_slots_masked is not None:
+                records = swa_row_slots_masked
+            elif stage_cache is not None and swa_slots_key is not None:
+                swa_rec_key = self._stage_cache_key(
+                    "swa_records", swa_cache.row_offset, *swa_slots_key[1:]
+                )
+                cached_swa_rec = stage_cache.get(swa_rec_key)
+                if cached_swa_rec is None or cached_swa_rec[0] is not swa_row_slots:
+                    records = (swa_cache.row_offset + swa_row_slots).masked_fill(
+                        invalid_window, -1
+                    )
+                    stage_cache[swa_rec_key] = (swa_row_slots, records)
+                else:
+                    records = cached_swa_rec[1]
+            else:
+                records = (
+                    swa_row_slots
+                    if swa_cache.row_offset == 0
+                    else swa_cache.row_offset + swa_row_slots
+                ).masked_fill(invalid_window, -1)
+        else:
+            records = swa_cache.row_indices(swa_row_slots).masked_fill(
+                invalid_window, -1
             )
-        records = (
-            (
-                swa_cache.row_offset + swa_row_slots
-                if has_fast_swa_offset and rows_per_page is not None
-                else swa_cache.row_indices(swa_row_slots)
-            ).masked_fill(~valid_window, -1)
-            if swa_row_slots is not None
-            else None
-        )
         # Token-local q path: q projection, attention and
         # wo_a run in one op that picks token-parallel vs head-sharded on
         # concrete shapes.
@@ -1120,26 +1609,40 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         kv = self._rotate(kv, positions)
-        _insert(swa_cache, swa_slots, kv, swa_valid)
+        if swa_write is not None:
+            _insert(
+                swa_cache,
+                swa_slots,
+                kv,
+                swa_valid,
+                records=_offset_records(swa_cache, *swa_write),
+            )
+        else:
+            _insert(swa_cache, swa_slots, kv, swa_valid)
         weights = None
         pending_index_write = None
         if self.compressor is not None and not self._ced_global_from_encoder:
             pending_index_write = self._write_global_kv(kv_score, positions)
         if self.indexer is not None and not self._all_indices_fit:
-            weights = (
-                index_weights.float()
-                * self.indexer.head_dim**-0.5
-                * self.indexer.n_head**-0.5
+            weights = index_weights.float() * getattr(
+                self,
+                "_indexer_weight_scale",
+                (self.indexer.head_dim * self.indexer.n_head) ** -0.5,
             )
         count = positions.shape[0]
         window = None if tiled else _read_rows(swa_cache, swa_table, requests, logical)
         rows = window
         valid_rows = valid_window
         main_cache = swa_cache
-        main_records = positions.new_empty((count, 0))
+        main_records = (
+            None
+            if self.compress_ratio
+            else positions.new_empty((count, 0), dtype=torch.int32)
+        )
         pages = starts = None
         if self.compress_ratio:
-            comp_key = (
+            source_meta = metadata[self.compressed_cache_prefix]
+            comp_key = self._stage_cache_key(
                 "compressed_attn",
                 self.compressed_cache_prefix,
                 getattr(self, "index_source_layer_id", None),
@@ -1155,18 +1658,29 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_cache, pages, starts, main_records = cached_comp
             else:
                 source = self._static_forward_context[self.compressed_cache_prefix]
-                source_meta = metadata[self.compressed_cache_prefix]
                 capacity = max(1, self._max_model_len // self.compress_ratio)
-                lengths = ((positions + 1) // self.compress_ratio)[:, None]
+                comp_inputs_key = self._stage_cache_key(
+                    "compressed_inputs",
+                    self.compress_ratio,
+                )
+                lengths = (
+                    stage_cache.get(comp_inputs_key)
+                    if stage_cache is not None
+                    else None
+                )
+                if lengths is None:
+                    lengths = ((pos_i32 + 1) // self.compress_ratio)[:, None]
+                    if stage_cache is not None:
+                        stage_cache[comp_inputs_key] = lengths
                 if self.indexer is not None:
                     if self._all_indices_fit:
                         logical_compressed = torch.arange(
-                            capacity, device=positions.device
+                            capacity, dtype=torch.int32, device=positions.device
                         )[None, :].expand(count, -1)
                         selected = logical_compressed.masked_fill(
                             (logical_compressed >= lengths) | (~swa_valid[:, None]),
                             -1,
-                        ).int()
+                        )
                     else:
                         indexer = self.indexer
                         weights = cast(torch.Tensor, weights)
@@ -1176,19 +1690,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             # Rows are row_indices of _row_slots(..., logical),
                             # computed per request: [requests, capacity]. The
                             # indexer shares each request's key tiles.
-                            has_fast_idx_offset = isinstance(
-                                getattr(index_cache, "row_offset", None), int
-                            )
-                            idx_req_key = (
+                            has_fast_idx_offset = _has_fast_cache_offset(index_cache)
+                            idx_page_records = _index_page_records(index_cache)
+                            idx_req_key = self._stage_cache_key(
                                 "index_req_slots",
                                 indexer.k_cache.prefix,
                                 index_cache.shape[1] if has_fast_idx_offset else None,
                                 (
-                                    index_cache.page_stride
+                                    _fast_cache_offset_key(index_cache)
                                     if has_fast_idx_offset
                                     else None
                                 ),
                                 capacity,
+                                idx_page_records,
                             )
                             cached_idx_req = (
                                 stage_cache.get(idx_req_key)
@@ -1196,24 +1710,42 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 else None
                             )
                             if cached_idx_req is None:
-                                req_slots = _request_row_slots(
-                                    index_cache, _block_table(keys_meta), capacity
-                                )
+                                idx_table = _block_table(keys_meta)
                                 cached_idx_req = (
-                                    req_slots
-                                    // index_cache.shape[1]
-                                    * index_cache.page_stride
-                                    + req_slots % index_cache.shape[1]
-                                    if has_fast_idx_offset
-                                    else req_slots
+                                    _request_row_slots(
+                                        index_cache,
+                                        idx_table,
+                                        capacity,
+                                        idx_page_records,
+                                    )
+                                    if idx_page_records > 1
+                                    else _request_row_slots(
+                                        index_cache, idx_table, capacity
+                                    )
                                 )
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = cached_idx_req
-                            index_records = (
-                                index_cache.row_offset + cached_idx_req
-                                if has_fast_idx_offset
-                                else index_cache.row_indices(cached_idx_req)
-                            )
+                            if has_fast_idx_offset:
+                                idx_rec_key = self._stage_cache_key(
+                                    "index_records",
+                                    index_cache.row_offset,
+                                    *idx_req_key[1:],
+                                )
+                                index_records = (
+                                    stage_cache.get(idx_rec_key)
+                                    if stage_cache is not None
+                                    else None
+                                )
+                                if index_records is None:
+                                    index_records = (
+                                        cached_idx_req
+                                        if index_cache.row_offset == 0
+                                        else index_cache.row_offset + cached_idx_req
+                                    )
+                                    if stage_cache is not None:
+                                        stage_cache[idx_rec_key] = index_records
+                            else:
+                                index_records = index_cache.row_indices(cached_idx_req)
                             selected = self._select_paged_indices(
                                 qr,
                                 positions,
@@ -1228,7 +1760,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         else:
                             index_q = self._project_index_q(qr, positions)
                             logical_compressed = torch.arange(
-                                capacity, device=positions.device
+                                capacity, dtype=torch.int32, device=positions.device
                             )[None, :].expand(count, -1)
                             keys = _read_rows(
                                 index_cache,
@@ -1245,6 +1777,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             selected = self._select_indices(
                                 scores, lengths, logical_compressed, count
                             )
+                    sel_count = selected.shape[0]
                     if stage_cache is None or not tiled:
                         # Keep the persistent buffer's physical shape across compile
                         # buckets when not sharing stage-scoped main_records directly.
@@ -1256,13 +1789,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     self.topk_indices_buffer.shape[-1]
                                     - selected.shape[-1],
                                     0,
-                                    self.topk_indices_buffer.shape[0] - count,
+                                    self.topk_indices_buffer.shape[0] - sel_count,
                                 ),
                                 value=-1,
                             )
                         )
                         selected = self.topk_indices_buffer[
-                            :count,
+                            :sel_count,
                             : min(capacity, self.topk_indices_buffer.shape[-1]),
                         ]
                     else:
@@ -1285,7 +1818,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if tiled:
                     if self._fp8_kv:
-                        pages_key = (
+                        pages_key = self._stage_cache_key(
                             "compressed_pages",
                             self.compressed_cache_prefix,
                         )
@@ -1297,6 +1830,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         if pages is None:
                             pages = main_cache.pages(_block_table(source_meta))
                             if stage_cache is not None and pages is not None:
+                                if pages.dtype != torch.int32:
+                                    pages = pages.int()
                                 stage_cache[pages_key] = pages
                     else:
                         pages = None
@@ -1305,12 +1840,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         # [tokens, topk] XLA gather of the block table here.
                         main_records = selected.masked_fill(~valid_compressed, -1)
                         starts = source_meta.query_start_loc
+                        if stage_cache is not None and starts.dtype != torch.int32:
+                            starts = starts.int()
                     else:
                         slots = _row_slots(
                             main_cache,
                             _block_table(source_meta),
                             requests,
-                            selected.long(),
+                            selected,
                         )
                         main_records = main_cache.row_indices(slots).masked_fill(
                             ~valid_compressed, -1
@@ -1327,12 +1864,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         source.kv_cache,
                         _block_table(source_meta),
                         requests,
-                        selected.long(),
+                        selected,
                     )
                     rows = torch.cat((window, compressed_rows), 1)
                     valid_rows = torch.cat((valid_window, valid_compressed), 1)
         if tiled:
-            assert records is not None
+            assert records is not None and main_records is not None
+            tp_rank_1d = self._get_stage_tp_rank_1d(stage_cache)
+            # Read the env flag once per stage, not once per layer.
+            fused_swa = (
+                envs.TPU_DEEPSEEK_V41_FUSED_SWA
+                if stage_cache is None
+                else stage_cache["fused_swa"]
+                if "fused_swa" in stage_cache
+                else stage_cache.setdefault(
+                    "fused_swa", envs.TPU_DEEPSEEK_V41_FUSED_SWA
+                )
+            )
             if fused_qo:
                 return sparse_fp8_attention_qo(
                     qr,
@@ -1342,25 +1890,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self._wq_b_full,
                     self._wq_b_full_scale,
                     positions,
-                    self._tpu_rope_cache,
+                    self._get_stage_rope_cache(stage_cache),
                     swa_cache,
                     main_cache,
                     records,
                     main_records,
                     self.attn_sink,
                     self._full_attn_sink,
-                    self._tp_rank_1d,
+                    tp_rank_1d,
                     self.wo_a.weight,
                     self.wo_a.weight_scale,
                     self._wo_a_full,
                     self._wo_a_full_scale,
-                    swa_valid,
+                    swa_valid_int32,
                     self.scale,
                     pages,
                     starts,
                     self._swa_max_requests,
                     self._precompact_records,
                     int(self.head_dim),
+                    replicated_qr=self._replicated_local_q,
+                    fused_swa=fused_swa,
                 )
             assert q is not None
             if self._fp8_kv and self.compress_ratio:
@@ -1378,7 +1928,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     precompacted=self._precompact_records,
                     token_parallel=self._token_parallel_attn,
                     full_sink=self._full_attn_sink,
-                    tp_rank=self._tp_rank_1d,
+                    tp_rank=tp_rank_1d,
+                    fused_swa=fused_swa,
                 )
             else:
                 result = paged_attention(
@@ -1389,6 +1940,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     main_records,
                     self.attn_sink,
                     self.scale,
+                    getattr(self, "query_block_size", 1) if non_causal else 1,
+                    token_parallel=False,
+                    full_sink=self._full_attn_sink,
+                    tp_rank=tp_rank_1d,
                 )
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None
@@ -1398,7 +1953,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         rows = cast(torch.Tensor, rows)
         q = cast(torch.Tensor, q)
         indices = (
-            torch.arange(rows.shape[1], device=rows.device)[None, :]
+            torch.arange(rows.shape[1], dtype=torch.int32, device=rows.device)[None, :]
             .expand(count, -1)
             .masked_fill(~valid_rows, -1)
         )
@@ -1416,14 +1971,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         same rank-major head/group order the token-parallel ``all_to_all``
         uses, so every per-head/per-group product is computed from identical
         weights. FP8 tensors are gathered as bytes.
+
+        ``TPU_DEEPSEEK_V41_LOCAL_Q`` serves SP-sharded (encoder) layers;
+        ``TPU_DEEPSEEK_V41_DECODE_LOCAL_Q`` serves TP-replicated layers (the
+        CED decoder at decode), where the op slices each rank's token shard
+        from the full ``qr`` instead of taking an SP shard.
         """
         tp_size = get_tensor_model_parallel_world_size()
+        replicated = bool(
+            envs.TPU_DEEPSEEK_V41_DECODE_LOCAL_Q and not self._sp_sharded_input
+        )
+        sharded = bool(
+            envs.TPU_DEEPSEEK_V41_LOCAL_Q and not getattr(self, "_ced_decoder", False)
+        )
         if (
-            not envs.TPU_DEEPSEEK_V41_LOCAL_Q
+            not (replicated or sharded)
             or tp_size <= 1
-            or getattr(self, "_ced_decoder", False)
             or not (self._fp8_kv and self.compress_ratio)
-            or self.n_local_groups != 1
+            or self.n_local_groups < 1
         ):
             return
         wq_scale = getattr(self.wq_b, "weight_scale", None)
@@ -1454,6 +2019,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         for name, value in buffers.items():
             self.register_buffer(name, value, persistent=False)
         self._local_q_attn = True
+        self._replicated_local_q = replicated
 
     def _select_paged_indices(
         self,
@@ -1474,11 +2040,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
         )
-        candidates = (
-            self.candidate_block_buffer[:count]
-            if has_candidates
-            else swa_slots.new_empty((count, 0), dtype=torch.int32)
-        )
         write_records, write_keys = (
             pending_index_write
             if pending_index_write is not None
@@ -1492,10 +2053,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # selections. Every rank still writes all index keys (replicated cache).
         # Contiguous parts of `_query_split` rows, computed rather than branched
         # on the token count, which would freeze the traced bucket's choice
-        # (compilation/shape_variants.py). A static pad (never empty: a
-        # zero-size pad guards on the count since torch.cat skips empty
-        # inputs) covers the last part; padding rows have zero length and
-        # select nothing.
+        # (compilation/shape_variants.py). Out-of-range rows in the last part
+        # are clamped for `index_select` and masked with `invalid_mine`; padding
+        # rows have zero length and select nothing.
         # A 16-row-aligned part (SparseCore top-k row tile) put a whole decode
         # batch of ``count <= 16`` on rank 0 while the other ranks scored only
         # padding (split change alone at C=16: L20 3.20 -> 1.48 ms,
@@ -1503,7 +2063,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ranks = get_tensor_model_parallel_world_size()
         split = ranks > 1
         stage_cache = _active_stage_attn_cache
-        query_split_key = (
+        query_split_key = _memo_stage_cache_key(
+            self,
             "indexer_query_split",
             getattr(self, "compress_ratio", None),
             ranks,
@@ -1516,31 +2077,40 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
             batch_max = active_lengths.max()
             if split:
-                part, padding = _query_split(count, ranks)
-                mine = self._tp_rank * part + torch.arange(
+                tp_rank = (
+                    self._get_stage_tp_rank(stage_cache)
+                    if hasattr(self, "_get_stage_tp_rank")
+                    else getattr(self, "_tp_rank", 0)
+                )
+                part, _ = _query_split(count, ranks)
+                mine = tp_rank * part + torch.arange(
                     part, dtype=torch.int32, device=qr.device
                 )
+                invalid_mine, clamped_mine = (
+                    (mine < 0) | (mine >= count),
+                    mine.clamp(min=0, max=count - 1),
+                )
+                invalid_mine_2d = invalid_mine[:, None]
                 positions_part, lengths_part, requests_part = (
-                    torch.cat(
-                        (x, x.new_full((padding, *x.shape[1:]), fill))
-                    ).index_select(0, mine)
-                    for x, fill in (
-                        (positions, 0),
-                        (active_lengths, 0),
-                        (requests, 0),
-                    )
+                    positions.index_select(0, clamped_mine).masked_fill(
+                        invalid_mine, 0
+                    ),
+                    active_lengths.index_select(0, clamped_mine).masked_fill(
+                        invalid_mine.reshape(-1, *([1] * (active_lengths.ndim - 1))), 0
+                    ),
+                    requests.index_select(0, clamped_mine).masked_fill(invalid_mine, 0),
                 )
             else:
-                padding = 0
-                mine = None
+                clamped_mine = None
+                invalid_mine_2d = None
                 positions_part = positions
                 lengths_part = active_lengths
                 requests_part = requests
             cached_query_split = (
                 active_lengths,
                 batch_max,
-                padding,
-                mine,
+                clamped_mine,
+                invalid_mine_2d,
                 positions_part,
                 lengths_part,
                 requests_part,
@@ -1551,22 +2121,67 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             (
                 active_lengths,
                 batch_max,
-                padding,
-                mine,
+                clamped_mine,
+                invalid_mine_2d,
                 positions_part,
                 lengths_part,
                 requests_part,
             ) = cached_query_split
         if split:
-            qr_part, weights_part, candidates_part = (
-                torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
-                    0, mine
-                )
-                for x, fill in ((qr, 0), (weights, 0), (candidates, -1))
+            qr_part, weights_part = (
+                qr.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
+                weights.index_select(0, clamped_mine).masked_fill(invalid_mine_2d, 0),
             )
         else:
-            qr_part, weights_part, candidates_part = qr, weights, candidates
+            qr_part, weights_part = qr, weights
+        cand_key = (
+            _memo_stage_cache_key(
+                self,
+                "indexer_candidates_part",
+                id(self.candidate_block_buffer),
+                *query_split_key[1:],
+            )
+            if stage_cache is not None and has_candidates
+            else None
+        )
+        if not has_candidates:
+            candidates_part = swa_slots.new_empty(
+                (qr_part.shape[0], 0), dtype=torch.int32
+            )
+        elif (
+            stage_cache is not None
+            and not candidate_write
+            and (cached_candidates_part := stage_cache.get(cand_key)) is not None
+        ):
+            candidates_part = cached_candidates_part
+        else:
+            if not split:
+                candidates_part = self.candidate_block_buffer[: qr_part.shape[0]]
+            else:
+                candidates_part = (
+                    self.candidate_block_buffer[:count]
+                    .index_select(0, clamped_mine)
+                    .masked_fill(invalid_mine_2d, -1)
+                )
+            if stage_cache is not None and not candidate_write:
+                stage_cache[cand_key] = candidates_part
         q_part = self._project_index_q(qr_part, positions_part)
+        page_records = _index_page_records(index_cache)
+        max_model_len = getattr(self, "_max_model_len", 0)
+        compress_ratio = getattr(self, "compress_ratio", 0)
+        capacity = (
+            max(1, max_model_len // compress_ratio)
+            if (
+                isinstance(max_model_len, int)
+                and isinstance(compress_ratio, int)
+                and max_model_len > 0
+                and compress_ratio > 0
+            )
+            else 0
+        )
+        prestrided = bool(
+            page_records > 1 and capacity > 0 and records.shape[1] < capacity
+        )
         updated_cache, selected, published = paged_indexer(
             q_part,
             index_cache,
@@ -1586,24 +2201,39 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             batch_max=batch_max,
             # Score tiles gather whole pages: one index per 512-byte pool row
             # instead of one per record.
-            page_records=_index_page_records(index_cache),
+            page_records=page_records,
+            **(
+                {"prestrided_pages": True, "logical_width": capacity}
+                if prestrided
+                else {}
+            ),
         )
         if split:
             selected = _gather_query_rows(selected)[:count]
-            if candidate_write:
+            if candidate_write and stage_cache is None:
                 published = _gather_query_rows(published)[:count]
         if isinstance(updated_cache, tuple):
             index_cache.copy_raw(updated_cache)
         else:
             index_cache.raw.copy_(updated_cache)
         if candidate_write:
-            self.candidate_block_buffer.copy_(
-                torch.nn.functional.pad(
-                    published,
-                    (0, 0, 0, self.candidate_block_buffer.shape[0] - count),
-                    value=-1,
+            if stage_cache is not None:
+                stage_cache[cand_key] = (
+                    published.masked_fill(invalid_mine_2d, -1) if split else published
                 )
-            )
+            else:
+                self.candidate_block_buffer.copy_(
+                    torch.nn.functional.pad(
+                        published,
+                        (
+                            0,
+                            0,
+                            0,
+                            self.candidate_block_buffer.shape[0] - published.shape[0],
+                        ),
+                        value=-1,
+                    )
+                )
         return selected
 
     def _select_indices(self, scores, lengths, logical_compressed, count):
@@ -1626,7 +2256,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 blocks = published[..., :: self.candidate_block_size]
                 ids = (
-                    torch.arange(blocks.shape[-1], device=blocks.device)
+                    torch.arange(
+                        blocks.shape[-1], dtype=torch.int32, device=blocks.device
+                    )
                     .expand_as(blocks)
                     .masked_fill(~blocks, -1)
                 )
@@ -1635,7 +2267,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 ).values
                 self.candidate_block_buffer.copy_(
                     torch.nn.functional.pad(
-                        selected[0].int(),
+                        selected[0],
                         (
                             0,
                             self.candidate_block_buffer.shape[-1] - selected.shape[-1],
@@ -1659,9 +2291,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 block_mask.scatter_(
                     1, ids.masked_fill(~valid_ids, num_blocks).long(), True
                 )
-                candidates = block_mask.gather(
-                    1, logical_compressed // self.candidate_block_size
-                )[None]
+                candidates = (
+                    block_mask.reshape(-1)
+                    .index_select(
+                        0,
+                        (
+                            torch.arange(count, device=ids.device, dtype=torch.int32)[
+                                :, None
+                            ]
+                            * (num_blocks + 1)
+                            + logical_compressed.to(torch.int32)
+                            // self.candidate_block_size
+                        ).reshape(-1),
+                    )
+                    .reshape(1, count, capacity)
+                )
         if candidates is not None:
             candidates = candidates | (lengths.max() <= self._config["index_topk"])
         return select_compressed_indices(
@@ -1715,7 +2359,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         projected = self.o_proj_op(
             output,
             positions,
-            self._tpu_rope_cache,
+            self._get_stage_rope_cache(_active_stage_attn_cache),
             self.wo_a.weight,
             self.wo_a.weight_scale,
         )

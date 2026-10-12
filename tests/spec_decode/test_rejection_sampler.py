@@ -801,3 +801,91 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
 
     expected = torch.tensor([[1, 9], [8, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("case", GREEDY_CASES, ids=lambda c: c.name)
+def test_rejection_sampler_greedy_1d_target_token_ids(
+    case: RejectionSamplerCase, device
+):
+    sampler = RejectionSampler()
+
+    num_draft_tokens = torch.tensor(
+        case.num_draft_per_seq, dtype=torch.int32, device=device
+    )
+    draft_token_ids = torch.tensor(case.draft_tokens, dtype=torch.int32, device=device)
+    target_token_ids = torch.tensor(
+        case.target_tokens, dtype=torch.int32, device=device
+    )
+    bonus_token_ids = torch.tensor(case.bonus_tokens, dtype=torch.int32, device=device)
+    segment_ids, group_indices = _segment_info(case.num_draft_per_seq, device)
+    max_draft = max(case.num_draft_per_seq)
+
+    output = sampler(
+        draft_token_ids=draft_token_ids,
+        num_draft_tokens=num_draft_tokens,
+        target_logits=target_token_ids,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max_draft,
+    )
+
+    expected = _expected_matrix(case.expected, max_draft, device)
+    assert torch.equal(output, expected)
+
+
+def test_rejection_sampler_validation_and_empty_random_and_segment_info(device):
+    from vllm_torchtpu.layers.adapter.sample.rejection_sampler import _get_segment_info
+
+    seg_ids, grp_idx = _get_segment_info(
+        torch.tensor([2, 1], dtype=torch.int32, device=device), total_tokens=3
+    )
+    assert seg_ids.tolist() == [0, 0, 1]
+    assert grp_idx.tolist() == [0, 1, 0]
+
+    sampler = RejectionSampler()
+    with pytest.raises(ValueError, match="Non-greedy rejection sampling requires"):
+        sampler(
+            draft_token_ids=torch.tensor([1], dtype=torch.int32, device=device),
+            num_draft_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+            target_logits=torch.zeros((1, 4), dtype=torch.float32, device=device),
+            bonus_token_ids=torch.tensor([2], dtype=torch.int32, device=device),
+            segment_ids=torch.tensor([0], dtype=torch.int64, device=device),
+            group_indices=torch.tensor([0], dtype=torch.int64, device=device),
+            max_draft_tokens=1,
+            do_sampling=True,
+        )
+
+    synth_cfg = SimpleNamespace(
+        rejection_sample_method="synthetic",
+        synthetic_acceptance_rates=[0.8, 0.5],
+    )
+    synth_sampler = RejectionSampler(speculative_config=synth_cfg, device=device)
+    with pytest.raises(ValueError, match="Synthetic rejection sampling requires"):
+        synth_sampler(
+            draft_token_ids=torch.tensor([1], dtype=torch.int32, device=device),
+            num_draft_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+            target_logits=torch.zeros((1, 4), dtype=torch.float32, device=device),
+            bonus_token_ids=torch.tensor([2], dtype=torch.int32, device=device),
+            segment_ids=torch.tensor([0], dtype=torch.int64, device=device),
+            group_indices=torch.tensor([0], dtype=torch.int64, device=device),
+            max_draft_tokens=1,
+            do_sampling=False,
+        )
+
+    out_empty_rand = sampler(
+        draft_token_ids=torch.tensor([], dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([0, 0], dtype=torch.int32, device=device),
+        target_logits=torch.zeros((0, 4), dtype=torch.float32, device=device),
+        bonus_token_ids=torch.tensor([5, 6], dtype=torch.int32, device=device),
+        segment_ids=torch.tensor([], dtype=torch.int64, device=device),
+        group_indices=torch.tensor([], dtype=torch.int64, device=device),
+        max_draft_tokens=2,
+        temperatures=torch.ones((0, 1), dtype=torch.float32, device=device),
+        top_k=torch.zeros((0, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((0, 1), dtype=torch.float32, device=device),
+        accept_u=torch.zeros((0,), dtype=torch.float32, device=device),
+        recover_u=torch.full((0, 4), 0.5, dtype=torch.float32, device=device),
+        do_sampling=True,
+    )
+    assert out_empty_rand.tolist() == [[5, -1, -1], [6, -1, -1]]

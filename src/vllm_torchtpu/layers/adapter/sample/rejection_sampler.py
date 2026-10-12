@@ -179,25 +179,81 @@ def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     # segment_ids assigns a unique ID to each token.
     # In Torch, we can use repeat_interleave.
     segment_ids = torch.repeat_interleave(
-        torch.arange(batch_size, device=device),
+        torch.arange(batch_size, dtype=torch.int32, device=device),
         num_draft_tokens,
     )
 
     # group_indices creates a within-segment index for each token.
     # E.g., [0, 1, 2, 0, 1, 0, 1, 2, 3] for sequences [3, 2, 4].
     # We can use cumsum and subtraction.
-    cum_draft_tokens = torch.cumsum(num_draft_tokens, dim=0)
-    segment_starts = torch.cat(
-        [
-            torch.zeros(1, dtype=num_draft_tokens.dtype, device=device),
-            cum_draft_tokens[:-1],
-        ]
+    cum_draft_tokens = torch.cumsum(num_draft_tokens, dim=0, dtype=torch.int32)
+    segment_starts = cum_draft_tokens - (
+        num_draft_tokens
+        if num_draft_tokens.dtype == torch.int32
+        else num_draft_tokens.to(torch.int32)
     )
     broadcast_starts = torch.repeat_interleave(segment_starts, num_draft_tokens)
-    group_indices = (torch.arange(total_tokens, device=device) - broadcast_starts).to(
-        torch.int32
+    group_indices = (
+        torch.arange(total_tokens, dtype=torch.int32, device=device) - broadcast_starts
     )
     return segment_ids, group_indices
+
+
+def _valid_slot_mask(
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """``[T]`` mask of declared draft slots: ``group_index < num_draft[segment]``.
+
+    Equals ``any(segment_ids[None] == arange(B)[:, None] & (group_indices <
+    num_draft_tokens[:, None]), 0)`` without the ``[B, T]`` intermediate.
+    Padding segment sentinels (outside ``[0, B)``) are never valid.
+    """
+    batch_size = num_draft_tokens.shape[0]
+    if batch_size == 0:
+        return torch.zeros_like(segment_ids, dtype=torch.bool)
+    in_batch = (segment_ids >= 0) & (segment_ids < batch_size)
+    # Segment ids are < 2**31: gather with a native int32 1D index_select.
+    safe_segment_ids = (
+        segment_ids if segment_ids.dtype == torch.int32 else segment_ids.int()
+    ).clamp(min=0, max=batch_size - 1)
+    limits = (
+        num_draft_tokens
+        if num_draft_tokens.dtype == group_indices.dtype
+        else num_draft_tokens.to(group_indices.dtype)
+    ).index_select(0, safe_segment_ids)
+    return in_batch & (group_indices < limits)
+
+
+def _place_bonus_tokens(
+    selected_tokens: torch.Tensor,
+    accepted_count: torch.Tensor,
+    should_get_bonus: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Write ``bonus_token_ids[b]`` at column ``accepted_count[b]`` of the rows
+    in ``should_get_bonus``; other rows are unchanged.
+
+    One ``[B, K + 1]`` select instead of a gather plus a 2D scatter.
+    """
+    columns = torch.arange(
+        selected_tokens.shape[1],
+        dtype=accepted_count.dtype,
+        device=accepted_count.device,
+    )
+    place = should_get_bonus.unsqueeze(1) & (
+        columns.unsqueeze(0) == accepted_count.unsqueeze(1)
+    )
+    return torch.where(
+        place,
+        (
+            bonus_token_ids
+            if bonus_token_ids.dtype == torch.int32
+            else bonus_token_ids.to(torch.int32)
+        ).unsqueeze(1),
+        selected_tokens,
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -218,18 +274,30 @@ def _greedy_rejection_sample_with_segment(
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
 
-    # Get target argmax
-    target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
-    draft_token_ids = draft_token_ids.to(torch.int32)
+    # Accept either 1D pre-argmax'd target token IDs (from spec_bonus_and_target_logits)
+    # or 2D [num_tokens, vocab_size] target logits.
+    target_logits_argmax = (
+        (
+            target_logits
+            if target_logits.dtype == torch.int32
+            else target_logits.to(torch.int32)
+        )
+        if target_logits.ndim == 1
+        else torch.argmax(target_logits, dim=-1).to(torch.int32)
+    )
+    draft_token_ids = (
+        draft_token_ids
+        if draft_token_ids.dtype == torch.int32
+        else draft_token_ids.to(torch.int32)
+    )
 
     # Find the first mismatch index per segment using matrix masking.
-    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    batch_indices = torch.arange(
+        batch_size, dtype=segment_ids.dtype, device=device
+    ).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
-    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
-    valid_slot_mask = torch.any(
-        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
-    )
+    valid_slot_mask = _valid_slot_mask(segment_ids, group_indices, num_draft_tokens)
 
     # Large value for positions with no mismatches
     # Create an array where mismatched positions hold their `group_index`
@@ -240,9 +308,12 @@ def _greedy_rejection_sample_with_segment(
         if synthetic_mode:
             assert accept_u is not None
             assert synthetic_conditional_rates is not None
-            conditional_rates = synthetic_conditional_rates[
-                group_indices.to(torch.int64)
-            ]
+            conditional_rates = synthetic_conditional_rates.index_select(
+                0,
+                group_indices
+                if group_indices.dtype == torch.int32
+                else group_indices.int(),
+            )
             accepted = (accept_u < conditional_rates) & (draft_token_ids >= 0)
         else:
             accepted = draft_token_ids == target_logits_argmax
@@ -268,8 +339,12 @@ def _greedy_rejection_sample_with_segment(
     # Step 3: Broadcast Mismatch Info and Generate Main Token Output
     if total_tokens > 0:
         # Clamp padding segment sentinels for a safe gather.
-        safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-        first_mismatch_idx_broadcast = first_mismatch_idx_per_segment[safe_segment_ids]
+        safe_segment_ids = (
+            segment_ids if segment_ids.dtype == torch.int32 else segment_ids.int()
+        ).clamp(min=0, max=batch_size - 1)
+        first_mismatch_idx_broadcast = first_mismatch_idx_per_segment.index_select(
+            0, safe_segment_ids
+        )
 
         before_mismatch = valid_slot_mask & (
             group_indices < first_mismatch_idx_broadcast
@@ -321,21 +396,21 @@ def _greedy_rejection_sample_with_segment(
     # ONLY if all tokens were accepted or there were no draft tokens.
     # If a mismatch occurred at k, the request's selected_tokens[k] already
     # contains target_logits_argmax[k].
+    # Counts are <= max_draft_tokens: int32 keeps `_place_bonus_tokens` in int32.
     accepted_count = torch.where(
         first_mismatch_idx_per_segment == large_value,
-        num_draft_tokens,
+        num_draft_tokens
+        if num_draft_tokens.dtype == torch.int32
+        else num_draft_tokens.to(torch.int32),
         first_mismatch_idx_per_segment,
-    ).to(torch.int64)
-
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
-        should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
     )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
-    return selected_tokens[:batch_size]
+    return _place_bonus_tokens(
+        selected_tokens[:batch_size],
+        accepted_count,
+        should_get_bonus,
+        bonus_token_ids,
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -361,6 +436,8 @@ def _random_rejection_sample_with_segment(
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
+    # Kept int64 on purpose (tpu7x-8): int32 draft ids make
+    # the fused [T, V] draft-mask compare ~2% slower on TPU, bitwise-equal.
     draft_token_ids = draft_token_ids.to(torch.int64)
     valid_draft_token_ids = draft_token_ids >= 0
     safe_draft_token_ids = draft_token_ids.clamp(min=0)
@@ -382,7 +459,12 @@ def _random_rejection_sample_with_segment(
     ).squeeze(-1)
     if synthetic_mode:
         assert synthetic_conditional_rates is not None
-        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+        conditional_rates = synthetic_conditional_rates.index_select(
+            0,
+            group_indices
+            if group_indices.dtype == torch.int32
+            else group_indices.int(),
+        )
         accepted = accept_u < conditional_rates
     else:
         accepted = target_token_probs >= accept_u
@@ -391,9 +473,11 @@ def _random_rejection_sample_with_segment(
     # On rejection, resample from the residual max(0, p - q). With q a delta at
     # x, subtracting q only touches entry x, so the residual is just p with the
     # drafted token zeroed out.
-    draft_token_mask = torch.nn.functional.one_hot(
-        safe_draft_token_ids, num_classes=vocab_size
-    ).to(torch.bool)
+    # Broadcast compare instead of `one_hot(...).to(bool)`, which builds an
+    # int64 [T, V] tensor before the cast.
+    draft_token_mask = safe_draft_token_ids.unsqueeze(-1) == torch.arange(
+        vocab_size, device=device, dtype=safe_draft_token_ids.dtype
+    )
     # Placeholder drafts have no q mass to subtract, so their recovery
     # distribution remains the full target distribution. In particular, do
     # not let the safe clamp above accidentally mask vocabulary token 0.
@@ -414,23 +498,23 @@ def _random_rejection_sample_with_segment(
         dim=-1,
     ).to(torch.int32)
     # A synthetic rejection can reject a greedy draft that matches the target
-    # argmax. In that case p and q are the same one-hot distribution, leaving
-    # no residual mass. Match upstream's greedy path by recovering the target
-    # argmax instead of letting argmax(all-zero) fall through to token 0.
-    has_recovery_mass = torch.any(recovered_dist > 0, dim=-1)
+    # argmax. In that case p and q are the same one-hot distribution at
+    # safe_draft_token_ids, leaving an all-zero residual whose argmax falls
+    # through to token 0 (with recovered_dist[:, 0] == 0). Recover
+    # safe_draft_token_ids without two extra [T, V] reductions.
+    has_recovery_mass = (recovered_token_ids != 0) | (recovered_dist[:, 0] > 0)
     recovered_token_ids = torch.where(
         has_recovery_mass,
         recovered_token_ids,
-        torch.argmax(target_probs, dim=-1).to(torch.int32),
+        safe_draft_token_ids.to(torch.int32),
     )
 
-    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
+    batch_indices = torch.arange(
+        batch_size, dtype=segment_ids.dtype, device=device
+    ).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
     # Only declared draft slots may participate in rejection sampling.
-    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
-    valid_slot_mask = torch.any(
-        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
-    )
+    valid_slot_mask = _valid_slot_mask(segment_ids, group_indices, num_draft_tokens)
     large_value = total_tokens
 
     if total_tokens > 0:
@@ -457,10 +541,12 @@ def _random_rejection_sample_with_segment(
 
     if total_tokens > 0:
         # Clamp padding segment sentinels for a safe gather.
-        safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-        first_rejection_idx_broadcast = first_rejection_idx_per_segment[
-            safe_segment_ids
-        ]
+        safe_segment_ids = (
+            segment_ids if segment_ids.dtype == torch.int32 else segment_ids.int()
+        ).clamp(min=0, max=batch_size - 1)
+        first_rejection_idx_broadcast = first_rejection_idx_per_segment.index_select(
+            0, safe_segment_ids
+        )
         before_rejection = valid_slot_mask & (
             group_indices < first_rejection_idx_broadcast
         )
@@ -505,16 +591,15 @@ def _random_rejection_sample_with_segment(
 
     accepted_count = torch.where(
         all_accepted,
-        num_draft_tokens,
+        num_draft_tokens
+        if num_draft_tokens.dtype == torch.int32
+        else num_draft_tokens.to(torch.int32),
         first_rejection_idx_per_segment,
-    ).to(torch.int64)
-
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    bonus_token_at_accepted_count = torch.where(
-        should_get_bonus,
-        bonus_token_ids.to(torch.int32),
-        selected_tokens[batch_range, accepted_count],
     )
-    selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
-    return selected_tokens[:batch_size]
+    return _place_bonus_tokens(
+        selected_tokens[:batch_size],
+        accepted_count,
+        should_get_bonus,
+        bonus_token_ids,
+    )

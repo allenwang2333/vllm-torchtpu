@@ -244,6 +244,25 @@ def test_capacity_overflow_falls_back_to_full(builders, monkeypatch):
         assert torch.equal(got[gid], want[gid])
     assert stager.num_delta == 1
 
+    # Single-block fast path capacity overflow (3 single-block appends > cap=2)
+    monkeypatch.setattr(btd, "DELTA_CAPACITY", 2)
+    for b in builders:
+        b.bt.append_row([21], 0)
+    got = _stage(runner, 1, seq, 2)
+    want = _reference(builders, 1, seq, 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    assert stager.num_full == 3
+
+    # Full-row rewrite path capacity overflow (add_row changes > cap=2 entries)
+    for b in builders:
+        b.bt.add_row([30, 31, 32], 0)
+    got = _stage(runner, 1, seq, 2)
+    want = _reference(builders, 1, seq, 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    assert stager.num_full == 4
+
 
 def test_disabled_dummy_and_single_group_paths(builders, monkeypatch):
     monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "0")
@@ -331,3 +350,221 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     assert stager._layouts[key].dev is dev
     assert btd.DELTA_CAPACITY == 8192
     assert btd.DELTA_CAPACITY >= 128 * 51
+
+
+def test_empty_append_row_cached_tables_and_active_cols_cache(builders, monkeypatch):
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    # Include two groups with identical block_size=16 to exercise cross-group
+    # active_cols_cache and prev_plan sharing on single-block decode appends.
+    same_bs_builders = builders + [_Builder(3, _make_block_table(16), 16)]
+    runner = _make_runner(same_bs_builders)
+    for b in same_bs_builders:
+        btd.ensure_tracked(b.bt)
+        b.bt.append_row([1, 2], 0)
+        mut_before = b.bt._bt_mutations
+        ver_before = int(b.bt._row_version[0])
+        b.bt.append_row([], 0)
+        assert b.bt._bt_mutations == mut_before
+        assert int(b.bt._row_version[0]) == ver_before
+
+    first = _stage(runner, 1, [8, 0], 2)
+    second = _stage(runner, 1, [8, 0], 2)
+    assert second is first
+    for b in same_bs_builders:
+        b.bt.append_row([3], 0)
+    got = _stage(runner, 1, [8, 0], 2)
+    want = _reference(same_bs_builders, 1, [8, 0], 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    stager = runner._block_table_delta_stager
+    assert stager.get_cached_tables(("missing",)) is None
+    stager.set_cached_tables(("missing",), {})
+
+    # Tuple vs Tensor seq_lens_cpu and max_active_seq_len cache reuse
+    ctx_tuple = _ctx(1, [8, 0])
+    ctx_tuple.seq_lens_cpu = (8, 0)
+    cols0 = builders[0]._active_block_table_columns(ctx_tuple, MAX_BLOCKS)
+    assert ctx_tuple.max_active_seq_len == 8
+    cols1 = builders[1]._active_block_table_columns(ctx_tuple, MAX_BLOCKS)
+    assert cols0 == 16 and cols1 == 16
+
+    # Append beyond active_cols (st.nblocks[0] >= active_cols -> hi <= lo)
+    builders[0].bt.add_row(list(range(1, 20)), 0)
+    _stage(runner, 1, [4, 0], 2)
+    builders[0].bt.append_row([99], 0)
+    _stage(runner, 1, [4, 0], 2)
+    # Also exercise multi-block append beyond active_cols in the general path
+    builders[0].bt.append_row([100, 101], 0)
+    _stage(runner, 1, [4, 0], 2)
+
+
+def test_native_int32_delta_arrays(builders, monkeypatch):
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    runner = _make_runner(builders)
+    for b in builders:
+        btd.ensure_tracked(b.bt)
+        assert b.bt._row_rewrite.dtype == np.int32
+        assert b.bt._row_version.dtype == np.int32
+        b.bt.append_row([1, 2], 0)
+    _stage(runner, 1, [8, 0], 2)
+    stager = runner._block_table_delta_stager
+    layout = next(iter(stager._layouts.values()))
+    for st in layout.entries:
+        assert st.rewrites.dtype == np.int32
+        assert st.nblocks.dtype == np.int32
+    for b in builders:
+        b.bt.append_row([3], 0)
+    _stage(runner, 1, [12, 0], 2)
+    assert stager._update_buf is not None
+    assert stager._update_buf.dtype == np.int32
+
+
+def test_try_stage_reuses_append_plan_across_groups(monkeypatch):
+    """groups whose block counts match reuse one append plan
+    (compared by value, no `.tobytes()`); a mismatch computes a fresh plan."""
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+
+    group_builders = [
+        _Builder(0, _make_block_table(16), 16),
+        _Builder(1, _make_block_table(16), 16),
+        _Builder(2, _make_block_table(16), 16),
+    ]
+    runner = _make_runner(group_builders)
+    for b in group_builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([10], 1)
+    _stage(runner, 2, [8, 4], 2)
+
+    orig_flatnonzero = np.flatnonzero
+    plan_builds: list[list[int]] = []
+
+    def tracking_flatnonzero(a):
+        out = orig_flatnonzero(a)
+        plan_builds.append(out.tolist())
+        return out
+
+    monkeypatch.setattr(np, "flatnonzero", tracking_flatnonzero)
+
+    # 1) All 3 groups append 1 block to row 0: group 0 builds the plan,
+    # groups 1 and 2 reuse it.
+    for b in group_builders:
+        b.bt.append_row([3], 0)
+    got = _stage(runner, 2, [12, 4], 2)
+    want = _reference(group_builders, 2, [12, 4], 2, 0)
+    for gid in want:
+        assert torch.equal(got[gid], want[gid])
+    assert plan_builds == [[0]]
+
+    # 2) Group 0 appends to row 0, groups 1 and 2 to row 1: group 1 builds a
+    # new plan (block counts differ) that group 2 reuses.
+    plan_builds.clear()
+    group_builders[0].bt.append_row([4], 0)
+    group_builders[1].bt.append_row([11], 1)
+    group_builders[2].bt.append_row([11], 1)
+    got2 = _stage(runner, 2, [16, 8], 2)
+    want2 = _reference(group_builders, 2, [16, 8], 2, 0)
+    for gid in want2:
+        assert torch.equal(got2[gid], want2[gid])
+    assert plan_builds == [[0], [1]]
+
+
+class _NarrowBuilder(_Builder):
+    """Stages fewer columns than the block table holds (source width != tnb)."""
+
+    def _block_table_geometry(self, ctx):
+        return self.bt, self.bt.max_num_blocks_per_req // 2
+
+
+def test_interleaved_geometries_keep_their_append_plans(monkeypatch):
+    """Interleaved geometries each keep a plan, so a walk builds one plan per
+    geometry; staging with fewer columns than the source table stays exact."""
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    group_builders = [
+        _Builder(0, _make_block_table(4), 4),
+        _NarrowBuilder(1, _make_block_table(8), 8),
+        _Builder(2, _make_block_table(4), 4),
+        _NarrowBuilder(3, _make_block_table(8), 8),
+    ]
+    runner = _make_runner(group_builders)
+    for b in group_builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([10], 1)
+    _stage(runner, 2, [8, 4], 2)
+
+    orig_flatnonzero = np.flatnonzero
+    plan_builds: list[list[int]] = []
+
+    def tracking_flatnonzero(a):
+        out = orig_flatnonzero(a)
+        plan_builds.append(out.tolist())
+        return out
+
+    monkeypatch.setattr(np, "flatnonzero", tracking_flatnonzero)
+    for step, row in enumerate((0, 1, 0)):
+        plan_builds.clear()
+        for b in group_builders:
+            b.bt.append_row([100 + step], row)
+        lens = [8 + 4 * (step + 1), 4 + 4 * (step + 1)]
+        got = _stage(runner, 2, lens, 2)
+        want = _reference(group_builders, 2, lens, 2, 0)
+        for gid in want:
+            ref = want[gid]
+            if gid % 2:  # narrow builders stage half the columns
+                ref = ref.view(2, MAX_BLOCKS)[:, : MAX_BLOCKS // 2].reshape(-1)
+            assert torch.equal(got[gid], ref), (step, gid)
+        assert len(plan_builds) == 2, step
+
+
+def test_layout_key_inlined_token_and_prepopulated_active_cols_cache(
+    monkeypatch,
+):
+    """layout_key reads _bt_delta_token inline without calling ensure_tracked on
+    tracked tables, and try_stage pre-populates active_cols_cache from unique_geoms
+    with fallback when unique_geoms is empty."""
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "1")
+    bt0 = _make_block_table(4)
+    bt1 = _make_block_table(4)
+    entries = [(0, bt0, MAX_BLOCKS), (1, bt1, MAX_BLOCKS)]
+    key1 = btd.BlockTableDeltaStager.layout_key(entries, 2, 0)
+    assert btd.ensure_tracked(bt0) == bt0._bt_delta_token
+
+    def fail_ensure_tracked(_bt):
+        raise AssertionError("ensure_tracked should not be called when tracked")
+
+    monkeypatch.setattr(btd, "ensure_tracked", fail_ensure_tracked)
+    key2 = btd.BlockTableDeltaStager.layout_key(entries, 2, 0)
+    assert key2 == key1
+    monkeypatch.undo()
+
+    group_builders = [_Builder(0, bt0, 4), _Builder(1, bt1, 4)]
+    runner = _make_runner(group_builders)
+    for b in group_builders:
+        b.bt.append_row([1, 2], 0)
+        b.bt.append_row([10], 1)
+    _stage(runner, 2, [8, 4], 2)
+
+    # Clear unique_geoms on the recorded layout to exercise the else fallback
+    stager = btd.get_stager(runner)
+    layout = next(iter(stager._layouts.values()))
+    saved_geoms = layout.unique_geoms
+    layout.unique_geoms = ()
+    for b in group_builders:
+        b.bt.append_row([3], 0)
+    got_fallback = _stage(runner, 2, [12, 4], 2)
+    want_fallback = _reference(group_builders, 2, [12, 4], 2, 0)
+    for gid in want_fallback:
+        assert torch.equal(got_fallback[gid], want_fallback[gid])
+
+    # Restore unique_geoms and verify normal pre-populated active_cols_cache path
+    layout.unique_geoms = saved_geoms
+    for b in group_builders:
+        b.bt.append_row([4], 0)
+    got_prepop = _stage(runner, 2, [16, 4], 2)
+    want_prepop = _reference(group_builders, 2, [16, 4], 2, 0)
+    for gid in want_prepop:
+        assert torch.equal(got_prepop[gid], want_prepop[gid])

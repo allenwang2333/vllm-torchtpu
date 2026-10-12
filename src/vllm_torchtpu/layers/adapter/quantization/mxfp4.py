@@ -73,11 +73,24 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
     quantize_native_fp4_kmajor,
 )
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    FUSED_MOE_EP_OP_ATTR,
+    fused_moe_ep,
+    fused_moe_ep_supported,
+    fused_moe_ep_unsupported_reason,
+    hash_topk_ids_operand,
+    prebuild_fused_moe_ep,
+    register_score_bias_buffer,
+    score_bias_operand,
+)
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedLinearMethod,
+)
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
@@ -134,20 +147,12 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
                 ignored_layers=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
-                from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedLinearMethod,
-                )
-
                 return VllmUnquantizedLinearMethod()
             # MXFP4 linear layer is not implemented - use unquantized
             logger.warning_once(
                 "MXFP4 linear layer is not implemented on TPU - "
                 "using unquantized linear method."
             )
-            from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                VllmUnquantizedLinearMethod,
-            )
-
             return VllmUnquantizedLinearMethod()
 
         elif isinstance(layer, RoutedExperts):
@@ -344,25 +349,40 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             layer, x, router_logits, input_ids=input_ids
         )
 
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale,
-            "w2_scale": layer.w2_weight_scale,
-            "w1_bias": getattr(layer, "w13_bias", None),
-            "w2_bias": getattr(layer, "w2_bias", None),
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-            "rhs_quant_dtype": self.rhs_quant_dtype,
-        }
+        w1_bias = getattr(layer, "w13_bias", None)
+        w2_bias = getattr(layer, "w2_bias", None)
         if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
+            return pipelined_fused_moe_gmm(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                experts_start=layer._experts_start,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                rhs_quant_dtype=self.rhs_quant_dtype,
+            )
 
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
+        )
 
 
 REQUANTIZED_BLOCK_SIZE = (
@@ -381,8 +401,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # An armed layer owns its own dispatch and combine, so vLLM must not
         # bracket it with an all-gather/reduce-scatter of its own.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
         return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
 
     def _prebuild_w4a8(
@@ -402,8 +420,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
-
         if not (
             envs.USE_MOE_FUSED_EP_KERNEL
             and envs.MOE_FUSED_EP_ENABLE_W4A8
@@ -637,12 +653,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         activation_str = self._set_tpu_activation(layer)
 
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            fused_moe_ep_unsupported_reason,
-            register_score_bias_buffer,
-        )
-
         (
             w13_weight_padded,
             w2_weight_padded,
@@ -755,13 +765,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep,
-            fused_moe_ep_supported,
-            hash_topk_ids_operand,
-            score_bias_operand,
-        )
-
         layer = cast("TpuRoutedExperts", layer)
         if fused_moe_ep_supported(self):
             # This rank's own tokens in and out: the kernel scores, selects,

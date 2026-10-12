@@ -62,11 +62,19 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if group.world_size == 1:
             return hidden_states, router_logits
         same = router_logits is hidden_states
+        tp_sliced_logits = (
+            not is_sequence_parallel
+            and not same
+            and router_logits.shape[0] < hidden_states.shape[0]
+        )
         hidden_states = group.all_gather(hidden_states, dim=0)
         # DeepSeek V4 routes from the hidden states themselves: gather once.
-        router_logits = (
-            hidden_states if same else group.all_gather(router_logits, dim=0)
-        )
+        # When non-SP router_logits is already TP-sliced to [T_dp // tp_size, E],
+        # keep it rank-local so moe_routing.route gathers top-k over ep_group.
+        if same:
+            router_logits = hidden_states
+        elif not tp_sliced_logits:
+            router_logits = group.all_gather(router_logits, dim=0)
         return hidden_states, router_logits
 
     def dispatch(

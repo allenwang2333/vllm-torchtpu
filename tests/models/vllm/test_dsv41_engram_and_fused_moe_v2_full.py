@@ -946,7 +946,7 @@ class TestV2ModelHostEngramStaging:
             use_slot_cache=True,
             lookback_depth=2,
             ensure_cache=lambda: True,
-            hash_on_host=lambda *h: torch.ones((2, 2, 1)),
+            hash_on_host=lambda *h, **kw: torch.ones((2, 2, 1)),
         )
         model.engram_swa_prefix = "swa"
         model._host_hash_inputs = lambda inp, seq, layer_idx: (

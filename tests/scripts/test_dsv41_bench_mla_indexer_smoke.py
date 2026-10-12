@@ -117,6 +117,31 @@ def _patch_tpu_device_to_cpu(monkeypatch):
 
 
 class TestSmokeE2E:
+    @pytest.fixture(autouse=True)
+    def _restore_smoke_hooks(self):
+        import vllm.model_executor.model_loader.dummy_loader as dummy_loader
+        import vllm.model_executor.model_loader.weight_utils as weight_utils
+
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        orig_wu_dummy = weight_utils.initialize_single_dummy_weight
+        orig_dl_dummy = dummy_loader.initialize_single_dummy_weight
+        orig_from = TPUModelRunner.compute_logits_from_hidden_states
+        orig_sel = TPUModelRunner.compute_selected_logits
+        had_hooked = hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+        orig_hooked = getattr(TPUModelRunner, "_dsv41_smoke_logits_hooked", None)
+        try:
+            yield
+        finally:
+            weight_utils.initialize_single_dummy_weight = orig_wu_dummy
+            dummy_loader.initialize_single_dummy_weight = orig_dl_dummy
+            TPUModelRunner.compute_logits_from_hidden_states = orig_from
+            TPUModelRunner.compute_selected_logits = orig_sel
+            if had_hooked:
+                TPUModelRunner._dsv41_smoke_logits_hooked = orig_hooked
+            elif hasattr(TPUModelRunner, "_dsv41_smoke_logits_hooked"):
+                delattr(TPUModelRunner, "_dsv41_smoke_logits_hooked")
+
     def test_deterministic_single_dummy_weight_branches(self):
         smoke._install_deterministic_dummy_weights()
         import vllm.model_executor.model_loader.weight_utils as wu
@@ -1676,7 +1701,7 @@ class TestBenchmarkingConfigs:
         assert cfg["DATA_PARALLELISM"] == "1"
         assert cfg["ENABLE_EP"] == "true"
         assert cfg["MAX_MODEL_LEN"] == "103424"
-        assert cfg["MAX_NUM_BATCHED_TOKENS"] == "2048"
+        assert cfg["MAX_NUM_BATCHED_TOKENS"] == "8192"
         assert cfg["MAX_NUM_SEQS"] == "1"
         assert cfg["ASYNC_SCHEDULING"] == "true"
         assert cfg["GPU_MEMORY_UTILIZATION"] == "0.85"
@@ -1701,13 +1726,13 @@ class TestBenchmarkingConfigs:
         assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
 
         extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
+        assert "--no-enable-prefix-caching" not in extra_args
         assert "--enable-ep-weight-filter" in extra_args
         assert "--safetensors-load-strategy=prefetch" in extra_args
         assert "--safetensors-prefetch-num-threads=8" in extra_args
         assert "--block-size=16" in extra_args
         assert "--kv-cache-memory-bytes=1342177280" in extra_args
-        assert '--compilation-config={"compile_sizes":[2,2048]}' in extra_args
+        assert '--compilation-config={"compile_sizes":[16,128,2048,8192]}' in extra_args
 
         assert (
             "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
@@ -1780,7 +1805,7 @@ class TestBenchmarkingConfigs:
         assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
 
         extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
+        assert "--no-enable-prefix-caching" not in extra_args
         assert "--enable-ep-weight-filter" in extra_args
         assert "--safetensors-load-strategy=prefetch" in extra_args
         assert "--safetensors-prefetch-num-threads=8" in extra_args
@@ -1822,3 +1847,40 @@ class TestBenchmarkingConfigs:
             assert (
                 "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes" in content
             )
+
+    def test_deepseek_v41_flash_100k_decode_dspark_configs(self):
+        dspark_script = "deepseek-v41-flash-tp8-ep-100k-decode-dspark.sh"
+
+        # 1. Default C<=16 DSpark K=5 config
+        cfg_default = self._source_config(dspark_script)
+        assert cfg_default["MAX_NUM_SEQS"] == "16"
+        assert cfg_default["CONCURRENCY_OPTIONS"] == "4 8 16"
+        assert "--kv-cache-memory-bytes=21474836480" in cfg_default["EXTRA_SERVE_ARGS"]
+        assert (
+            '--compilation-config={"compile_sizes":[4,8,16,24,48,96,2048]}'
+            in cfg_default["EXTRA_SERVE_ARGS"]
+        )
+        assert (
+            '--speculative-config={"method":"dspark","num_speculative_tokens":5}'
+            in cfg_default["EXTRA_SERVE_ARGS"]
+        )
+
+        # 2. High-batch OFFLOAD=1 DSpark K=5 config (C=64, 96 / B_verify=384, 576)
+        cfg_offload = self._source_config(
+            dspark_script,
+            env_overrides={
+                "OFFLOAD": "1",
+                "MODEL_URI": "gs://dummy-bucket/dsv41",
+            },
+        )
+        assert cfg_offload["MAX_NUM_SEQS"] == "96"
+        assert cfg_offload["CONCURRENCY_OPTIONS"] == "16 24 32 48 64 96"
+        assert "--kv-cache-memory-bytes=42949672960" in cfg_offload["EXTRA_SERVE_ARGS"]
+        assert (
+            '--compilation-config={"compile_sizes":[4,8,16,24,32,48,64,96,144,192,288,384,576,672,2048]}'
+            in cfg_offload["EXTRA_SERVE_ARGS"]
+        )
+        assert (
+            '--speculative-config={"method":"dspark","num_speculative_tokens":5,"model":"gs://dummy-bucket/dsv41"}'
+            in cfg_offload["EXTRA_SERVE_ARGS"]
+        )

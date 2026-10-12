@@ -63,6 +63,45 @@ def _pre_gates(
 _pre_op = None
 
 
+def _pre_mix_and_gates_jax(
+    x: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    mult: int,
+    dim: int,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Mix projection and Sinkhorn gating on ``x`` without 3D residual collapse."""
+    x_f32 = x.astype(jnp.float32)
+    if fn.dtype == jnp.bfloat16:
+        # Load-time packed weight (see `pack_mix_weight`).
+        mixes = _packed_mixes(x, fn, mult * (mult + 2))
+    else:
+        mixes = jnp.matmul(x_f32, fn.T, precision=jax.lax.Precision.HIGHEST)
+    # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
+    # Gate normalization must still use the actual projection input width.
+    squares = jnp.mean(jnp.square(x_f32), -1, keepdims=True) * (mult * dim)
+    new_pre, post, comb = _pre_gates(
+        mixes,
+        squares,
+        mult,
+        dim,
+        scale,
+        base,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        repeats,
+    )
+    return post[..., None], comb, new_pre
+
+
 def delayed_pre_jax(
     residual: jax.Array,
     x: jax.Array,
@@ -77,32 +116,23 @@ def delayed_pre_jax(
     repeats: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     mult, dim = residual.shape[-2:]
-    if fn.dtype == jnp.bfloat16:
-        # Load-time packed weight (see `pack_mix_weight`).
-        mixes = _packed_mixes(x, fn, mult * (mult + 2))
-    else:
-        mixes = jnp.matmul(
-            x.astype(jnp.float32), fn.T, precision=jax.lax.Precision.HIGHEST
-        )
-    x = x.astype(jnp.float32)
-    # Upstream's first-layer broadcast optimization folds x/fn to hidden_size.
-    # Gate normalization must still use the actual projection input width.
-    squares = jnp.mean(jnp.square(x), -1, keepdims=True) * (mult * dim)
-    new_pre, post, comb = _pre_gates(
-        mixes,
-        squares,
-        mult,
-        dim,
+    post, comb, new_pre = _pre_mix_and_gates_jax(
+        x,
+        fn,
         scale,
         base,
+        mult,
+        dim,
         rms_eps,
         pre_eps,
         sinkhorn_eps,
         post_multiplier,
         repeats,
     )
-    value = (previous_pre[..., None] * residual.astype(jnp.float32)).sum(1)
-    return post[..., None], comb, value.astype(residual.dtype), new_pre
+    # Collapse the flat [T, M * D] rows (as `_delayed_pre_flat_small` does):
+    # the [T, M, D] FP32 reduce over axis 1 costs a T(4,128) relayout copy.
+    value = _collapse_flat(residual.reshape(residual.shape[0], -1), previous_pre)
+    return post, comb, value.astype(residual.dtype), new_pre
 
 
 def _truncate_bf16(values: jax.Array) -> jax.Array:
@@ -248,22 +278,61 @@ def _delayed_pre_flat_small(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """XLA `delayed_pre_jax` on a flat residual, collapsed by `_collapse_flat`.
 
-    The value `delayed_pre_jax` derives from the ``[T, M, D]`` view is unused
-    and dead-code eliminated, so the view's relayout copy disappears.
+    Calling `_pre_mix_and_gates_jax` directly avoids materializing the
+    ``[T, M, D]`` view and its discarded 3D reduction.
     """
-    tokens, width = flat.shape
     mult = previous_pre.shape[1]
-    post, comb, _, new_pre = delayed_pre_jax(
-        flat.reshape(tokens, mult, width // mult),
+    post, comb, new_pre = _pre_mix_and_gates_jax(
         flat,
         fn,
         scale,
         base,
-        previous_pre,
+        mult,
+        flat.shape[1] // mult,
         *constants,
     )
     value = _collapse_flat(flat, previous_pre).astype(flat.dtype)
     return post, comb, value, new_pre
+
+
+# Smallest verify-sized batch (beyond the fixed sizes below) for which the
+# fused post+pre Pallas pass beats the XLA path on TPU7x (width 20480,
+# packed weight), XLA -> Pallas tile 96, in µs: 288: 41.3 -> 42.9,
+# 384: 65.7 -> 56.6, 576: 98.0 -> 71.0, 768: 118.1 -> 88.0. The pre-only pass
+# was slower than XLA at every size from 192 to 960, so it gets no new sizes.
+_POST_PRE_PALLAS_MIN_TOKENS = 384
+
+
+def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | None:
+    """Row tile for the flat Pallas passes, or None for the XLA path.
+
+    Fixed sizes: 64, 96 and 128 (tile = tokens), 256 (tile 128), and
+    ``>= 1024`` multiples of 64 (tile 64). With ``fused_post``, buckets
+    ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are multiples of 96, 64 or 80 (in
+    that order) take Pallas: DSpark verify ``C * (K + 1)`` (384, 576, 768,
+    1152, ...) and draft ``C * K`` (400, 560, 640, ...). This is checked before
+    the ``>= 1024`` tile-64 rule. On TPU7x (width 20480), median
+    µs per call: 1152: tile 64 378.4 -> 96 373.8; 400: XLA 349.3 -> tile 80
+    324.9; 560: XLA 365.6 -> 80 337.1; 640: tile 64 335.5 vs 80 346.6, so 80
+    only covers sizes 96 and 64 do not divide. On the XLA path they pay a
+    ``T(4,128)`` relayout plus extra HBM passes over ``flat``. Tile 128 is not
+    used for them: the fused kernel's VMEM overflows at T=384/768. The
+    kernels are row-independent (outputs are bitwise equal across tiles),
+    so the tile only affects speed.
+    """
+    if 3 * mixes > 128:
+        return None
+    if tokens in (64, 96, 128):
+        return tokens
+    if tokens == 256:
+        return 128
+    if fused_post and tokens >= _POST_PRE_PALLAS_MIN_TOKENS:
+        for tile in (96, 64, 80):
+            if tokens % tile == 0:
+                return tile
+    if tokens >= 1024 and tokens % 64 == 0:
+        return 64
+    return None
 
 
 def delayed_pre_flat_jax(
@@ -280,20 +349,18 @@ def delayed_pre_flat_jax(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """`delayed_pre_jax` with ``x = residual = flat [T, M*D]``.
 
-    Prefill-sized batches use one Pallas pass; viewing the flat residual as
-    ``[T, M, D]`` costs XLA a relayout copy plus an FP32 copy for the
-    projection. Small (decode) batches keep the XLA path.
+    Batches `_pallas_tile` accepts use one Pallas pass; viewing the flat
+    residual as ``[T, M, D]`` costs XLA a relayout copy plus an FP32 copy for
+    the projection. Other batches keep the XLA path.
     """
     tokens, width = flat.shape
     mult = previous_pre.shape[1]
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
-    ):
+    tile = _pallas_tile(tokens, mixes)
+    if tile is None:
         return _delayed_pre_flat_small(flat, fn, scale, base, previous_pre, *constants)
-    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     mixes, square, value = _flat_pre_sums(flat, weight, previous_pre, mixes, tile)
     new_pre, post, comb = _pre_gates(mixes, square, mult, dim, scale, base, *constants)
@@ -311,7 +378,7 @@ def _post_streams_jax(
     dim = flat.shape[-1] // mult
     x_f32 = x.reshape(-1, dim).astype(flat.dtype).astype(jnp.float32)
     post = post_layer_mix.reshape(-1, mult)
-    comb = comb_res_mix.reshape(-1, mult, mult)
+    comb = comb_res_mix.reshape(-1, mult * mult)
     streams = [
         flat[:, i * dim : (i + 1) * dim].astype(jnp.float32) for i in range(mult)
     ]
@@ -319,7 +386,7 @@ def _post_streams_jax(
     for j in range(mult):
         acc = post[:, j : j + 1] * x_f32
         for i in range(mult):
-            acc = acc + comb[:, i, j : j + 1] * streams[i]
+            acc = acc + comb[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
         out_streams.append(acc.astype(flat.dtype))
     return out_streams
 
@@ -467,9 +534,8 @@ def delayed_post_pre_flat_jax(
     dim = width // mult
     constants = (rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats)
     mixes = mult * (mult + 2)
-    if 3 * mixes > 128 or (
-        tokens not in (64, 96, 128, 256) and (tokens < 1024 or tokens % 64 != 0)
-    ):
+    tile = _pallas_tile(tokens, mixes, fused_post=True)
+    if tile is None:
         flat_new, value = jax.lax.optimization_barrier(
             _post_and_collapse_jax(
                 x,
@@ -479,17 +545,16 @@ def delayed_post_pre_flat_jax(
                 previous_pre,
             )
         )
-        post, comb, _, new_pre = delayed_pre_jax(
-            flat_new.reshape(tokens, mult, dim),
+        post, comb, new_pre = _pre_mix_and_gates_jax(
             flat_new,
             fn,
             scale,
             base,
-            previous_pre,
+            mult,
+            dim,
             *constants,
         )
         return flat_new, post, comb, value, new_pre
-    tile = tokens if tokens <= 128 else (128 if tokens == 256 else 64)
     weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
     flat_new, mixes_out, square, value = _flat_post_pre_sums(
         x.reshape(tokens, dim).astype(flat.dtype),
@@ -657,9 +722,9 @@ def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     # Avoid `new_zeros(residual.shape[:2])` and slice-scatter so SP
     # profile_run does not pass a SymIntArrayRef `[s0 // tp, 4]` to
     # `aten.new_zeros` in fx_to_mlir.
-    first_stream = (torch.arange(residual.shape[1], device=residual.device) == 0).to(
-        dtype=dtype
-    )
+    first_stream = (
+        torch.arange(residual.shape[1], dtype=torch.int32, device=residual.device) == 0
+    ).to(dtype=dtype)
     return torch.zeros_like(residual[:, :, 0], dtype=dtype) + first_stream
 
 
@@ -713,6 +778,24 @@ def pre(
     return post, comb, value, next_pre
 
 
+def _mean_hc_streams(residual: torch.Tensor) -> torch.Tensor:
+    """``residual.mean(1)`` over the ``[T, M, D]`` hyper-connection streams.
+
+    The 3-D view's reduce costs XLA a ``T(4,128)`` relayout copy of the whole
+    residual. For ``M == 4`` this sums the ``D``-wide column slices of the
+    flat ``[T, M * D]`` rows in FP32 in the order XLA's reduce applies to the
+    view, ``(s0 + s2) + (s1 + s3)`` (see `_collapse_flat`), and scales by the
+    exact power of two ``0.25`` (= ``/ 4``) before the one BF16 rounding.
+    Other ``M`` keep ``mean(1)``.
+    """
+    tokens, mult, dim = residual.shape
+    if mult != 4:
+        return residual.mean(1)
+    flat = residual.reshape(tokens, mult * dim)
+    s = [flat[:, m * dim : (m + 1) * dim].float() for m in range(mult)]
+    return (((s[0] + s[2]) + (s[1] + s[3])) * 0.25).to(residual.dtype)
+
+
 def shifted_post_pre(
     x,
     residual,
@@ -758,10 +841,10 @@ def shifted_post_pre(
         )
         if norm_weight is not None:
             value = rms_norm(value, norm_weight, norm_eps)
-        aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+        aux = _mean_hc_streams(residual) if capture_aux else x.new_empty(0, x.shape[-1])
         return residual, post_mix, comb_mix, value, next_pre, aux
     residual = post(x, residual, post_layer_mix, comb_res_mix)
-    aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+    aux = _mean_hc_streams(residual) if capture_aux else x.new_empty(0, x.shape[-1])
     return (
         residual,
         *pre(

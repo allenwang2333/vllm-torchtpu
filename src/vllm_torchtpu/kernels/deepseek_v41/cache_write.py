@@ -71,7 +71,10 @@ def _write_kernel(
             pltpu.make_async_copy(source, destination, sem).start()
             pltpu.make_async_copy(source, destination, sem).wait()
         key_bytes, scale_words = _quantize(keys_buf[...].reshape(INPUT_KEYS, HEAD_DIM))
-        mapping = records_buf[...][:, None] == (base + jnp.arange(SLAB_KEYS))[None, :]
+        mapping = (
+            records_buf[...][:, None]
+            == (base + jnp.arange(SLAB_KEYS, dtype=jnp.int32))[None, :]
+        )
         # A unique destination has exactly one source. BF16 represents every
         # byte exactly; the MXU permutation therefore preserves the FP8 bits.
         mapped = jnp.einsum(
@@ -125,9 +128,11 @@ def write_index_cache(pool, scales, records, keys, page_stride, *, interpret=Fal
     if page_stride % SLAB_KEYS:
         raise ValueError("Index pages must be 128-key aligned")
     sentinel = pool.shape[0] * 4
-    order = jnp.argsort(jnp.where(records >= 0, records, sentinel), stable=True)
-    sorted_records = jnp.where(records[order] >= 0, records[order], sentinel)
-    sorted_records = jnp.pad(sorted_records, (0, INPUT_KEYS), constant_values=sentinel)
+    sanitized = jnp.where(records >= 0, records, sentinel)
+    order = jnp.argsort(sanitized, stable=True)
+    sorted_records = jnp.pad(
+        sanitized[order], (0, INPUT_KEYS), constant_values=sentinel
+    )
     sorted_keys = jnp.pad(keys[order], ((0, INPUT_KEYS), (0, 0))).reshape(-1)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
@@ -181,7 +186,7 @@ def _word_write_kernel(
         ):
             pltpu.make_async_copy(source, destination, sem).start()
             pltpu.make_async_copy(source, destination, sem).wait()
-        columns = jnp.arange(128)[None, :]
+        columns = jnp.arange(128, dtype=jnp.int32)[None, :]
         result = row_buf[...]
         values_matrix = values_buf[...]
         for source in range(2 * per_row):
@@ -222,10 +227,11 @@ def write_cache_words(
         raise ValueError("Sub-row writes require int32 records that divide 128 words")
     per_row = 128 // width
     sentinel = cache.shape[0] * per_row
-    order = jnp.argsort(jnp.where(records >= 0, records, sentinel), stable=True)
+    sanitized = jnp.where(records >= 0, records, sentinel)
+    order = jnp.argsort(sanitized, stable=True)
     padding = -count % per_row + 2 * per_row
     sorted_records = jnp.pad(
-        jnp.where(records[order] >= 0, records[order], sentinel),
+        sanitized[order],
         (0, padding),
         constant_values=sentinel,
     )

@@ -95,7 +95,7 @@ def test_remap_dspark_name():
 def test_insert_context_kv(monkeypatch: pytest.MonkeyPatch):
     inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def fake_insert(cache, slots, kv, valid):
+    def fake_insert(cache, slots, kv, valid, **kw):
         inserted.append((slots.clone(), kv.clone(), valid.clone()))
 
     monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
@@ -255,10 +255,11 @@ def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
-    # Verify _scatter_decoder_rows (with padded extra index at total_rows=4)
+    # Verify _scatter_decoder_rows: kept rows (1, 3) of 4, one padded row
     src = torch.tensor([[10.0, 20.0], [30.0, 40.0], [99.0, 99.0]])
-    idx_tensor = torch.tensor([1, 3, 4], dtype=torch.int64)
-    scattered = v2_model._scatter_decoder_rows(src, idx_tensor, 4)
+    inverse = v2_model._ced_inverse_rows((1, 3), 3, 4, "cpu")
+    assert inverse.tolist() == [3, 0, 3, 1]
+    scattered = v2_model._scatter_decoder_rows(src, inverse)
     expected = torch.tensor([[0.0, 0.0], [10.0, 20.0], [0.0, 0.0], [30.0, 40.0]])
     assert torch.equal(scattered, expected)
 
@@ -711,6 +712,8 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     # Logits, Markov head, and Confidence head
     logits = draft_lm.compute_draft_logits(out_from_ids)
     assert logits.shape == (4, 32)
+    # Without TP the skip-gather shard is the whole (unpadded) vocab.
+    assert torch.equal(draft_lm.compute_draft_logits_local(out_from_ids), logits)
     assert torch.equal(draft_lm.map_draft_to_target(input_ids), input_ids)
 
     m_embed = draft_lm.markov_embed(input_ids)
@@ -829,3 +832,131 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert "model.confidence_head.proj.weight" in loaded2
     assert "model.layers.0.ffn.experts.w13_weight_scale_inv" in loaded2
     assert draft_lm2.model.confidence_head is not None
+
+
+def test_dspark_mhc_broadcast_and_post_and_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import collapse
+
+    _patch_dspark_env(monkeypatch)
+    vllm_cfg = _make_dspark_vllm_config()
+    draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    model = draft_lm.model
+    model.embed_tokens = nn.Embedding(32, 16)
+
+    torch.manual_seed(7)
+    for mult in (2, 4):
+        tokens, dim = 6, 16
+        x = torch.randn(tokens, dim, dtype=torch.bfloat16)
+        residual = torch.randn(tokens, mult, dim, dtype=torch.bfloat16)
+        post_mix = torch.rand(tokens, mult, 1, dtype=torch.float32)
+        comb_mix = torch.rand(tokens, mult, mult, dtype=torch.float32)
+        pre_mix = torch.rand(tokens, mult, dtype=torch.float32)
+        ref = collapse(mhc_post_torch(x, residual, post_mix, comb_mix), pre_mix)
+        got = v2_dspark._post_and_collapse(x, residual, post_mix, comb_mix, pre_mix)
+        assert torch.equal(got, ref)
+
+
+def test_insert_context_kv_int32_and_int64_guards(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify guarded .int() casts in _insert_context_kv."""
+    inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def fake_insert(cache, slots, kv, valid, **kw):
+        inserted.append((slots.clone(), kv.clone(), valid.clone()))
+
+    monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
+
+    attn = SimpleNamespace(
+        window_size=4,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        _rotate=lambda kv, pos: kv + pos.unsqueeze(-1),
+    )
+    kv = torch.ones((3, 8))
+
+    # 1. All-int32 inputs (positions, requests, seq_lens, query_start_loc, table)
+    monkeypatch.setattr(
+        v2_dspark,
+        "_cache_slots",
+        lambda cache, md, pos: torch.tensor([1, 2, 3], dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int32),
+    )
+    md_i32 = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+    pos_i32 = torch.tensor([1, 2, 5], dtype=torch.int32)
+    v2_dspark._insert_context_kv(attn, kv, pos_i32, md_i32)
+
+    # 2. All-int64 inputs
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int64),
+    )
+    md_i64 = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int64),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int64),
+    )
+    pos_i64 = torch.tensor([1, 2, 5], dtype=torch.int64)
+    v2_dspark._insert_context_kv(attn, kv, pos_i64, md_i64)
+
+    assert len(inserted) == 2
+    assert torch.equal(inserted[0][0], inserted[1][0])
+    assert torch.equal(inserted[0][1], inserted[1][1])
+    assert torch.equal(inserted[0][2], inserted[1][2])
+
+
+def test_insert_context_kv_fast_offset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify _insert_context_kv when fast_offset is enabled (line 282->283)."""
+    records_received: list[Any] = []
+
+    def fake_insert(cache, slots, kv, valid, records=None, **kw):
+        records_received.append(records)
+
+    monkeypatch.setattr(v2_dspark, "_insert", fake_insert)
+    monkeypatch.setattr(v2_attn, "_has_fast_cache_offset", lambda cache: True)
+    monkeypatch.setattr(v2_attn, "_fast_cache_offset_key", lambda cache: "fast_key")
+    monkeypatch.setattr(
+        v2_attn,
+        "_fast_swa_row_slots",
+        lambda cache, blocks, pos_rem, mask: (torch.tensor([0, 1]),),
+    )
+    monkeypatch.setattr(
+        v2_attn,
+        "_offset_records",
+        lambda cache, *write: ("records",),
+    )
+    monkeypatch.setattr(
+        v2_dspark,
+        "_token_requests",
+        lambda md, pos: torch.tensor([0, 0, 0], dtype=torch.int32),
+    )
+
+    attn = SimpleNamespace(
+        window_size=4,
+        swa_cache_layer=SimpleNamespace(kv_cache=torch.zeros((2, 4, 1, 8))),
+        _rotate=lambda kv, pos: kv,
+    )
+    kv = torch.ones((3, 8))
+    md = SimpleNamespace(
+        seq_lens=torch.tensor([6], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+    pos = torch.tensor([1, 2, 5], dtype=torch.int32)
+    v2_dspark._insert_context_kv(attn, kv, pos, md)
+    assert len(records_received) == 1
+    assert records_received[0] == ("records",)

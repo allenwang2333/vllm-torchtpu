@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     LogprobsLists,
@@ -14,7 +15,32 @@ from vllm.v1.outputs import (
 INVALID_TOKEN_ID = -1
 
 
-@dataclass
+def parse_sampled_token_ids_cpu(
+    selected_token_ids: torch.Tensor,
+) -> tuple[list[list[int]], list[int]]:
+    """Parse a 1D or 2D CPU sampled-token tensor into per-request valid token
+    lists and generated token counts using a single C++ ``.tolist()`` transfer.
+    """
+    if selected_token_ids.dim() == 1:
+        rows = [[t] for t in selected_token_ids.tolist()]
+        return rows, [1] * len(rows)
+    if (
+        selected_token_ids.shape[-1] == 1
+        or selected_token_ids.numel() == 0
+        or int(selected_token_ids.numpy().min()) != INVALID_TOKEN_ID
+    ):
+        rows = selected_token_ids.tolist()
+        return rows, [int(selected_token_ids.shape[-1])] * len(rows)
+    rows = [
+        [t for t in row if t != INVALID_TOKEN_ID]
+        if (row[-1] == INVALID_TOKEN_ID or INVALID_TOKEN_ID in row)
+        else row
+        for row in selected_token_ids.tolist()
+    ]
+    return rows, [len(row) for row in rows]
+
+
+@dataclass(slots=True)
 class SpecLogprobsChunk:
     """One chunk's logprobs in a spec-decode step, one row per logits row.
 
@@ -41,29 +67,46 @@ def spec_logprobs_lists(
     counted across all chunks before any discard, as vLLM's rejection
     sampler does.
     """
+    # One prefix sum over the whole step serves every chunk and the result's
+    # cu_num_generated_tokens.
+    gen_arr = np.asarray(gen_lens, dtype=np.int32)
+    cu_gen = np.cumsum(gen_arr, dtype=np.int32)
     ids, lps, ranks = [], [], []
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
-        take = [
-            np.arange(start, start + g, dtype=np.int64)
-            for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
-        ]
-        rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
+        if n:
+            g_arr = gen_arr[offset : offset + n]
+            cu_g = cu_gen[offset : offset + n]
+            if offset:
+                cu_g = cu_g - cu_gen[offset - 1]
+            rows = np.repeat(
+                chunk.row_starts.astype(np.int32, copy=False) - (cu_g - g_arr),
+                g_arr,
+            ) + np.arange(int(cu_g[-1]), dtype=np.int32)
+        else:
+            rows = np.zeros(0, dtype=np.int32)
         ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
         lps.append(chunk.tensors.logprobs.numpy()[rows])
         ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
         offset += n
     assert offset == len(gen_lens), (offset, len(gen_lens))
+    if len(ids) == 1:
+        # The fancy-indexed rows are already fresh arrays; skip the copy.
+        token_ids, logprobs, sampled_ranks = ids[0], lps[0], ranks[0]
+    else:
+        token_ids = np.concatenate(ids)
+        logprobs = np.concatenate(lps)
+        sampled_ranks = np.concatenate(ranks)
     return LogprobsLists(
-        logprob_token_ids=np.concatenate(ids),
-        logprobs=np.concatenate(lps),
-        sampled_token_ranks=np.concatenate(ranks),
-        cu_num_generated_tokens=np.concatenate(([0], np.cumsum(gen_lens))).tolist(),
+        logprob_token_ids=token_ids,
+        logprobs=logprobs,
+        sampled_token_ranks=sampled_ranks,
+        cu_num_generated_tokens=np.concatenate(([0], cu_gen)).tolist(),
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncTPUCopyState:
     """Async D2H copy state for sampled tokens.
 
@@ -77,8 +120,10 @@ class AsyncTPUCopyState:
     chunk_real_lens: list[int]
     copy_ready_event: Any
     chunks_tpu: list[torch.Tensor] | None = None
+    chunk_shapes: list[tuple[int, ...]] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
+    _parsed_sampled_tokens: tuple[list[list[int]], list[int]] | None = None
     # Spec-decode step with logprobs requested: per-chunk logprobs, copied
     # with the tokens and filtered to the accepted rows in `get_output`.
     spec_logprobs: list[SpecLogprobsChunk] | None = None
@@ -93,7 +138,18 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        # Flatten 2D+ chunks to 1D before D2H transfer to hit PJRT's 1D 32-bit
+        # zero-repack fast path (tpu_linearizer.cc:37); reshape back on CPU.
+        if len(chunks_tpu) == 1:
+            t0 = chunks_tpu[0]
+            chunk_shapes = [tuple(t0.shape)]
+            flat_t0 = t0.reshape(-1) if t0.ndim > 1 else t0
+            flat_chunks_tpu = [flat_t0]
+            chunks_cpu = [flat_t0.to("cpu", non_blocking=True)]
+        else:
+            chunk_shapes = [tuple(t.shape) for t in chunks_tpu]
+            flat_chunks_tpu = [t.reshape(-1) if t.ndim > 1 else t for t in chunks_tpu]
+            chunks_cpu = [t.to("cpu", non_blocking=True) for t in flat_chunks_tpu]
         spec_logprobs_tpu = None
         if spec_logprobs:
             spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
@@ -107,7 +163,8 @@ class AsyncTPUCopyState:
             chunks_cpu=chunks_cpu,
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
-            chunks_tpu=chunks_tpu,
+            chunks_tpu=flat_chunks_tpu,
+            chunk_shapes=chunk_shapes,
             spec_logprobs=spec_logprobs or None,
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
@@ -128,15 +185,51 @@ class AsyncTPUCopyState:
         length on the host (no device recompile).
         """
         if self._sampled_token_ids_cpu is None:
-            trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
-            if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
+            if len(self.chunks_cpu) == 1:
+                t = self.chunks_cpu[0]
+                if self.chunk_shapes is not None:
+                    s = self.chunk_shapes[0]
+                    if t.shape != s:
+                        t = t.reshape(s)
+                self._sampled_token_ids_cpu = t[: self.chunk_real_lens[0]]
             else:
+                if self.chunk_shapes is not None:
+                    trimmed = [
+                        (t.reshape(s) if t.shape != s else t)[:n]
+                        for t, s, n in zip(
+                            self.chunks_cpu, self.chunk_shapes, self.chunk_real_lens
+                        )
+                    ]
+                else:
+                    trimmed = [
+                        t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)
+                    ]
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
 
+    def parse_sampled_tokens(
+        self, *, copy_rows: bool = True
+    ) -> tuple[list[list[int]], list[int]]:
+        """Wait for D2H completion and return ``(valid_sampled_token_ids, gen_lens)``.
 
-@dataclass
+        Caches the parsed lists across ``_modify_prev_results`` and
+        ``AsyncTPUModelRunnerOutput.get_output`` so ``.tolist()`` and
+        ``INVALID_TOKEN_ID`` filtering run only once per step. When
+        ``copy_rows=True`` (default), returns fresh per-row shallow copies so
+        in-place caller mutations do not affect the cached rows.
+        """
+        self.wait()
+        if self._parsed_sampled_tokens is None:
+            self._parsed_sampled_tokens = parse_sampled_token_ids_cpu(
+                self.sampled_token_ids_cpu
+            )
+        rows, gen_lens = self._parsed_sampled_tokens
+        if copy_rows:
+            return [row.copy() for row in rows], gen_lens
+        return rows, gen_lens
+
+
+@dataclass(slots=True)
 class AsyncPreResults:
     req_ids: list[str]
     next_tokens_tpu: torch.Tensor
@@ -201,26 +294,20 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output
-        if selected_token_ids.dim() == 1:
-            selected_token_ids = selected_token_ids.unsqueeze(-1)
 
-        max_gen_len = selected_token_ids.shape[-1]
-        if max_gen_len == 1:
-            valid_sampled_token_ids = selected_token_ids.tolist()
+        valid_sampled_token_ids, gen_lens = self.copy_state.parse_sampled_tokens()
+        if (
+            self.copy_state.spec_logprobs
+            and selected_token_ids.dim() > 1
+            and selected_token_ids.shape[-1] > 1
+        ):
+            self._model_runner_output.logprobs = spec_logprobs_lists(
+                self.copy_state.spec_logprobs, gen_lens
+            )
+        if self.discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids = list(valid_sampled_token_ids)
             for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
-        else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
-            ]
-            if self.copy_state.spec_logprobs:
-                self._model_runner_output.logprobs = spec_logprobs_lists(
-                    self.copy_state.spec_logprobs, gen_lens
-                )
-            for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+                valid_sampled_token_ids[i] = []
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output
@@ -244,13 +331,156 @@ def assemble_spec_next_tokens(
         drafts: device proposer output ``[>=num_reqs, K]``.
         num_reqs: real request count (both inputs may be bucket-padded in dim 0).
     """
-    nt = next_tokens[:num_reqs]
-    drafts = drafts[:num_reqs]
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    if drafts.shape[0] != num_reqs:
+        drafts = drafts[:num_reqs]
     # Last non-padding column per row is the bonus.
-    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
-    bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
-    src = torch.cat([bonus.to(drafts.dtype), drafts], dim=1)  # [num_reqs, 1+K]
+    last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32).clamp(
+        min=1
+    ) - 1
+    flat_col = (
+        torch.arange(
+            num_reqs,
+            dtype=torch.int32,
+            device=nt.device if isinstance(nt.device, torch.device) else None,
+        )
+        * nt.shape[1]
+        + last_valid_col
+    )
+    bonus = nt.reshape(-1).index_select(0, flat_col).unsqueeze(1)  # [num_reqs, 1]
+    if bonus.dtype != drafts.dtype:
+        bonus = bonus.to(drafts.dtype)
+    src = torch.cat([bonus, drafts], dim=1)  # [num_reqs, 1+K]
     return src.reshape(-1)  # [num_reqs * (1 + K)]
+
+
+def _assemble_spec_next_tokens_and_num_rejected(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor | None,
+    num_reqs: int,
+    padded_src_len: int | None = None,
+    padded_num_reqs: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    if drafts.shape[0] != num_reqs:
+        drafts = drafts[:num_reqs]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    flat_col = (
+        torch.arange(
+            num_reqs,
+            dtype=torch.int32,
+            device=nt.device if isinstance(nt.device, torch.device) else None,
+        )
+        * nt.shape[1]
+        + last_valid_col
+    )
+    bonus = nt.reshape(-1).index_select(0, flat_col).unsqueeze(1)  # [num_reqs, 1]
+    if bonus.dtype != drafts.dtype:
+        bonus = bonus.to(drafts.dtype)
+    src = torch.cat([bonus, drafts], dim=1).reshape(-1)
+    if padded_src_len is not None and src.shape[0] < padded_src_len:
+        src = F.pad(src, (0, padded_src_len - src.shape[0]))
+    if num_draft is None:
+        rej_len = (
+            padded_num_reqs
+            if padded_num_reqs is not None and padded_num_reqs > num_reqs
+            else num_reqs
+        )
+        num_rejected = torch.zeros(
+            rej_len, dtype=torch.int32, device=next_tokens.device
+        )
+    else:
+        nd = num_draft if num_draft.shape[0] == num_reqs else num_draft[:num_reqs]
+        num_rejected = (nd - num_valid + 1).clamp(min=0)
+        if num_rejected.dtype != torch.int32:
+            num_rejected = num_rejected.to(torch.int32)
+        if padded_num_reqs is not None and num_rejected.shape[0] < padded_num_reqs:
+            num_rejected = F.pad(
+                num_rejected, (0, padded_num_reqs - num_rejected.shape[0])
+            )
+    return src, num_rejected
+
+
+_assemble_spec_next_tokens_and_num_rejected_compiled = torch.compile(
+    _assemble_spec_next_tokens_and_num_rejected,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+def assemble_spec_next_tokens_and_num_rejected(
+    next_tokens: torch.Tensor,
+    drafts: torch.Tensor,
+    num_draft: torch.Tensor | None,
+    num_reqs: int,
+    padded_src_len: int | None = None,
+    padded_num_reqs: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused async substitution source and per-request rejected-draft count.
+
+    Computes ``num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)``
+    once and reuses it for both bonus-column extraction and ``num_rejected``.
+    When ``next_tokens`` and ``drafts`` are at their bucketed request count on
+    TPU, dispatches a single compiled XLA graph (including optional tail
+    padding to ``padded_src_len`` / ``padded_num_reqs``).
+    """
+    if (
+        next_tokens.device.type == "tpu"
+        and next_tokens.shape[0] == num_reqs
+        and drafts.shape[0] == num_reqs
+    ):
+        return _assemble_spec_next_tokens_and_num_rejected_compiled(
+            next_tokens,
+            drafts,
+            num_draft,
+            num_reqs,
+            padded_src_len,
+            padded_num_reqs,
+        )
+    return _assemble_spec_next_tokens_and_num_rejected(
+        next_tokens,
+        drafts,
+        num_draft,
+        num_reqs,
+        padded_src_len,
+        padded_num_reqs,
+    )
+
+
+def _subtract_num_rejected_tokens(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_subtract = torch.where(
+        seq_lens_subtract_indices >= 0,
+        num_rejected.index_select(0, seq_lens_subtract_indices.clamp(min=0).int()),
+        0,
+    )
+    seq_lens = seq_lens - seq_subtract
+
+    pos_subtract = torch.where(
+        positions_subtract_indices >= 0,
+        num_rejected.index_select(0, positions_subtract_indices.clamp(min=0).int()),
+        0,
+    )
+    if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
+        pos_subtract = pos_subtract.unsqueeze(0)
+    positions = positions - pos_subtract
+    return seq_lens, positions
+
+
+_subtract_num_rejected_tokens_compiled = torch.compile(
+    _subtract_num_rejected_tokens,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)
 
 
 def subtract_num_rejected_tokens(
@@ -277,23 +507,38 @@ def subtract_num_rejected_tokens(
         positions_subtract_indices: ``[total_tokens]`` index into ``num_rejected``
             for each position slot, ``-1`` to leave it unchanged.
     """
-    zero = num_rejected.new_zeros(())
-    seq_subtract = torch.where(
-        seq_lens_subtract_indices >= 0,
-        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
-        zero,
+    if seq_lens.device.type == "tpu":
+        return _subtract_num_rejected_tokens_compiled(
+            seq_lens,
+            positions,
+            num_rejected,
+            seq_lens_subtract_indices,
+            positions_subtract_indices,
+        )
+    return _subtract_num_rejected_tokens(
+        seq_lens,
+        positions,
+        num_rejected,
+        seq_lens_subtract_indices,
+        positions_subtract_indices,
     )
-    seq_lens = seq_lens - seq_subtract
 
-    pos_subtract = torch.where(
-        positions_subtract_indices >= 0,
-        num_rejected[positions_subtract_indices.clamp(min=0)],
-        zero,
-    )
-    if positions.ndim == 2:  # mrope (out of text-MVP scope; kept for parity)
-        pos_subtract = pos_subtract.unsqueeze(0)
-    positions = positions - pos_subtract
-    return seq_lens, positions
+
+def _extract_draft_token_ids(
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    draft_rows = logits_indices.index_select(0, (target_logits_indices + 1).int()).int()
+    return input_ids.index_select(0, draft_rows)
+
+
+_extract_draft_token_ids_compiled = torch.compile(
+    _extract_draft_token_ids,
+    backend="tpu",
+    fullgraph=True,
+    dynamic=False,
+)
 
 
 def extract_draft_token_ids(
@@ -304,7 +549,11 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    if input_ids.device.type == "tpu":
+        return _extract_draft_token_ids_compiled(
+            input_ids, logits_indices, target_logits_indices
+        )
+    return _extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
 
 
 def compute_num_rejected(
@@ -318,5 +567,7 @@ def compute_num_rejected(
         num_draft: ``[num_reqs]`` scheduled draft count per request.
     """
     num_reqs = num_draft.shape[0]
-    num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
-    return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+    nt = next_tokens if next_tokens.shape[0] == num_reqs else next_tokens[:num_reqs]
+    num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
+    res = (num_draft - num_valid + 1).clamp(min=0)
+    return res if res.dtype == torch.int32 else res.to(torch.int32)

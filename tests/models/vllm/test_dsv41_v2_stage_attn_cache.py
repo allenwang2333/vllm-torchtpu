@@ -60,8 +60,8 @@ def _make_paged_cache_mock(
     else:
         if hasattr(c, "row_offset"):
             delattr(c, "row_offset")
-    c.row_indices = lambda slots, ro=(row_offset or 0): ro + (
-        slots // rows_per_page * page_stride + slots % rows_per_page
+    c.row_indices = lambda slots, ro=(row_offset or 0): (
+        ro + (slots // rows_per_page * page_stride + slots % rows_per_page)
     )
     c.pages.return_value = pages_tensor
     return c
@@ -170,37 +170,51 @@ class TestCachePiecesAndPackBf16:
         assert out1.dtype == jnp.int32
 
         # Branch 2: values is bfloat16 on TPU with shape[1] >= 2 * ROW_WORDS
-        pack_called = False
+        pack_calls = 0
         orig_pack = v2_cache._pack_bf16_words
 
         def mock_pack(v):
-            nonlocal pack_called
-            pack_called = True
+            nonlocal pack_calls
+            pack_calls += 1
             return orig_pack(v)
 
         from jax.experimental import pallas as pl
 
-        monkeypatch.setattr(pl, "pallas_call", lambda *a, **kw: lambda r, w, c: c)
+        # 1-bank call: (records, words, cache) -> cache; fused 2-bank call
+        # (_scatter_rows_2bank): (records, words, lo, hi) -> (lo, hi).
+        monkeypatch.setattr(
+            pl,
+            "pallas_call",
+            lambda *a, **kw: (
+                lambda r, w, *banks: banks[0] if len(banks) == 1 else banks
+            ),
+        )
         monkeypatch.setattr(v2_cache, "_pack_bf16_words", mock_pack)
         monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
 
         val_bf16_tpu = jnp.zeros((2, 2 * ROW_WORDS), dtype=jnp.bfloat16)
         out2 = v2_cache.scatter_cache_values(cache, records, val_bf16_tpu)
-        assert pack_called is True
+        assert pack_calls == 1
         assert out2.dtype == jnp.int32
 
+        # Branch 2b: 2-bank tuple on TPU packs BF16 words only once
+        pack_calls = 0
+        out2_2b = v2_cache.scatter_cache_values((cache, cache), records, val_bf16_tpu)
+        assert pack_calls == 1
+        assert isinstance(out2_2b, tuple) and len(out2_2b) == 2
+
         # Branch 3: values is bfloat16 on CPU -> bitcast_convert_type fallback
-        pack_called = False
+        pack_calls = 0
         monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
         out3 = v2_cache.scatter_cache_values(cache, records, val_bf16_tpu)
-        assert pack_called is False
+        assert pack_calls == 0
         assert out3.dtype == jnp.int32
 
         # Branch 4: values is bfloat16 on TPU but shape[1] not divisible
         monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
         val_bf16_small = jnp.zeros((2, 16), dtype=jnp.bfloat16)
         out4 = v2_cache.scatter_cache_values(cache, records, val_bf16_small)
-        assert pack_called is False
+        assert pack_calls == 0
         assert out4.dtype == jnp.int32
 
         # Branch 5: values is float32 -> directly passed to bitcast
@@ -522,7 +536,7 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         monkeypatch.setattr(
             v2_attn,
             "_insert",
-            lambda cache, slots, val, mask: inserted_slots.append(slots.clone()),
+            lambda cache, slots, val, mask, **kw: inserted_slots.append(slots.clone()),
         )
 
         attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
@@ -658,25 +672,45 @@ class TestSwaTokenAddressingAndFastOffsets:
             swa_meta.block_tables = swa_table
 
         # 2. use_3page_swa=True, has_fast_swa_offset=False (row_indices branch)
+        #    and 5-page span (window_size=128, rows_per_page=32) parity vs uncached
         captured_records.clear()
+        swa_table_5p = torch.tensor(
+            [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]], dtype=torch.int32
+        )
+        swa_meta.block_tables = swa_table_5p
         attn_3page_slow = _make_swa_attn(
-            window_size=128, ced_decoder=False, has_fast_swa_offset=False
+            window_size=128,
+            ced_decoder=False,
+            has_fast_swa_offset=False,
+            rows_per_page=32,
         )
         with v2_attn.stage_attention_cache_scope():
             out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
             attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
             assert len(captured_records) == 1
+            recs_5page = captured_records[0]
+        # Verify exact bitwise parity with uncached _row_slots path
+        captured_records.clear()
+        attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert torch.equal(recs_5page, captured_records[0])
+        swa_meta.block_tables = swa_table
 
-        # 3. use_3page_swa=False (window_size > 2 * rows_per_page = 256 > 128)
+        # 3. use_3page_swa=False (window_size > 4 * rows_per_page = 512 > 256)
         #    Exercises swa_3page is None and swa_row_slots calculation
         captured_records.clear()
         attn_no_3page = _make_swa_attn(
-            window_size=256, ced_decoder=False, has_fast_swa_offset=True
+            window_size=512, ced_decoder=False, has_fast_swa_offset=True
+        )
+        attn_no_3page_slow = _make_swa_attn(
+            window_size=512, ced_decoder=False, has_fast_swa_offset=False
         )
         with v2_attn.stage_attention_cache_scope():
             out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
             attn_no_3page._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
+            attn_no_3page_slow._prepare_tpu(
+                None, qr, kv, None, None, None, positions, out
+            )
+            assert len(captured_records) == 2
 
         # 4. Fallback when stage_cache is None
         captured_records.clear()
@@ -825,11 +859,18 @@ class TestCompressedAttentionAndQuerySplitCaching:
             assert len(captured_main_recs) == 2
             assert torch.equal(captured_main_recs[1], src_records)
 
-        # Subcase 2: cached_idx_req hit branch
+        # Subcase 2: cached_idx_req hit branch (stride != and == idx_page_rows)
         with v2_attn.stage_attention_cache_scope():
             source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
             # Second call runs indexer but hits cached_idx_req in stage_cache
             source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            # Also exercise stride == idx_page_rows (32 == 32) and row_offset is None
+            idx_cache_mock.page_stride = 32
+            source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            idx_cache_mock.row_offset = None
+            source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            idx_cache_mock.row_offset = 600
+            idx_cache_mock.page_stride = 64
 
         # Subcase 3: _all_indices_fit branch (lines 991-998)
         all_fit_attn = _make_swa_attn(
@@ -1115,10 +1156,8 @@ class TestCompressedAttentionAndQuerySplitCaching:
             ),
         )
         attn_tiled_bf16._project_index_q = lambda q, p: torch.zeros((count, 2, 8))
-        attn_tiled_bf16._select_indices = (
-            lambda scores, lengths, logical, c: torch.zeros(
-                (count, 2), dtype=torch.int32
-            )
+        attn_tiled_bf16._select_indices = lambda scores, lengths, logical, c: (
+            torch.zeros((count, 2), dtype=torch.int32)
         )
         attn_tiled_bf16._select_paged_indices = lambda *a, **kw: torch.zeros(
             (count, 2), dtype=torch.int32
@@ -1135,3 +1174,431 @@ class TestCompressedAttentionAndQuerySplitCaching:
 
         # 3. tiled=True outside stage_attention_cache_scope (uncached fallback)
         attn_tiled_bf16._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+
+
+class TestStageInvariantHoistingAndFullCoverage:
+    def test_stage_tp_rank_and_rope_cache_hoisting(self):
+        """Verify _get_stage_tp_rank, _get_stage_tp_rank_1d, and rope_cache."""
+        attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(attn)
+
+        rank_t = torch.tensor(2, dtype=torch.int32)
+        rank_1d_t = torch.tensor([2], dtype=torch.int32)
+        rope_t = torch.ones((16, 8), dtype=torch.bfloat16)
+        attn._tp_rank = rank_t
+        attn._tp_rank_1d = rank_1d_t
+        attn._tpu_rope_cache = rope_t
+
+        # Uncached calls return attributes directly
+        assert attn._get_stage_tp_rank(None) is rank_t
+        assert attn._get_stage_tp_rank_1d(None) is rank_1d_t
+        assert attn._get_stage_rope_cache(None) is rope_t
+
+        # Cached calls inside stage_cache reuse the first layer's tensor
+        stage_cache: dict[Any, Any] = {}
+        assert attn._get_stage_tp_rank(stage_cache) is rank_t
+        assert attn._get_stage_tp_rank(stage_cache) is rank_t
+
+        assert attn._get_stage_tp_rank_1d(stage_cache) is rank_1d_t
+        # Second call hits cached is not None (737->744)
+        assert attn._get_stage_tp_rank_1d(stage_cache) is rank_1d_t
+
+        # Test _get_stage_tp_rank_1d when rank_1d is 0D int64 (reshape(1).int() branch)
+        attn._tp_rank_1d = torch.tensor(3, dtype=torch.int64)
+        stage_cache_2: dict[Any, Any] = {}
+        r1d_cast = attn._get_stage_tp_rank_1d(stage_cache_2)
+        assert r1d_cast.shape == (1,) and r1d_cast.dtype == torch.int32
+        assert int(r1d_cast.item()) == 3
+
+        attn.compress_ratio = 0
+        attn.rotary_emb = SimpleNamespace(base=10000.0)
+        assert attn._get_stage_rope_cache(stage_cache) is rope_t
+        assert attn._get_stage_rope_cache(stage_cache) is rope_t
+
+        # A compressed layer (compress_rope_theta) has a same-shape cache with
+        # different values; it must not reuse the uncompressed layer's table.
+        other: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(other)
+        other_rope = torch.full((16, 8), 2.0, dtype=torch.bfloat16)
+        other._tpu_rope_cache = other_rope
+        other.compress_ratio = 4
+        other.rotary_emb = SimpleNamespace(base=160000.0)
+        assert other._get_stage_rope_cache(stage_cache) is other_rope
+        assert attn._get_stage_rope_cache(stage_cache) is rope_t
+
+    def test_non_causal_swa_and_int32_pages_starts_hoisting(self, monkeypatch):
+        """Cover non_causal SWA (cached & uncached) and int32 pages/int64 starts."""
+        count = 4
+        positions = torch.tensor([0, 16, 32, 48], dtype=torch.int32)
+        swa_table = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+        swa_meta = SimpleNamespace(
+            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            block_tables=swa_table,
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int64),
+        )
+        metadata = {"swa_pfx": swa_meta}
+        forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            v2_attn,
+            "sparse_fp8_attention",
+            lambda q, *a, **kw: torch.zeros_like(q),
+        )
+        monkeypatch.setattr(
+            v2_attn,
+            "paged_attention",
+            lambda q, *a, **kw: torch.zeros_like(q),
+        )
+
+        # 1. non_causal = True (non_causal_multi_token_decode=True)
+        attn_nc = _make_swa_attn(
+            window_size=64, ced_decoder=False, has_fast_swa_offset=True
+        )
+        attn_nc.non_causal_multi_token_decode = True
+        attn_nc.compress_ratio = 0
+
+        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+        qr = torch.ones((count, 16), dtype=torch.bfloat16)
+        kv = torch.ones((count, 8), dtype=torch.bfloat16)
+
+        with v2_attn.stage_attention_cache_scope():
+            attn_nc._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        # Uncached non_causal branch (lines 1138-1152)
+        attn_nc._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+
+        # 2. Compressed attention with int32 pages (1463->1465) and int64 starts (1478)
+        cache_i32 = _make_paged_cache_mock(
+            torch.tensor([[10, 11], [12, 13]], dtype=torch.int32),
+            row_offset=500,
+            rows_per_page=32,
+        )
+        attn_comp = _make_swa_attn(
+            window_size=64, ced_decoder=False, has_fast_swa_offset=True
+        )
+        attn_comp.swa_cache_layer = SimpleNamespace(
+            prefix="swa_pfx", kv_cache=cache_i32
+        )
+        attn_comp.kv_cache = cache_i32
+        attn_comp._static_forward_context = {
+            "swa_pfx": SimpleNamespace(kv_cache=cache_i32)
+        }
+        attn_comp.indexer = SimpleNamespace(
+            head_dim=8,
+            n_head=2,
+            wk=lambda x: x,
+            k_norm=lambda x: x,
+            k_cache=SimpleNamespace(
+                prefix="swa_pfx", compress_ratio=2, kv_cache=cache_i32
+            ),
+        )
+        attn_comp._select_paged_indices = lambda *a, **kw: torch.zeros(
+            (count, 2), dtype=torch.int32
+        )
+        idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
+        with v2_attn.stage_attention_cache_scope():
+            attn_comp._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+
+        # 3. Non-dict attn_metadata early exit (lines 932-934)
+        out.fill_(1.0)
+        forward_ctx.attn_metadata = None
+        assert (
+            attn_nc._prepare_tpu(None, qr, kv, None, None, None, positions, out) is None
+        )
+        assert float(out.abs().max().item()) == 0.0
+
+    def test_index_page_records_init_copy_raw_and_tpu_o_proj(self, monkeypatch):
+        """Cover _index_page_records, __init__ dtype check, copy_raw, and TPU o_proj."""
+        # 1. _index_page_records guard lines 414 and 425
+        c_bad_bytes = MagicMock(spec=PagedCacheRows)
+        c_bad_bytes.dtype = torch.bfloat16
+        c_bad_bytes.shape = (4, 64, 128)
+        c_bad_bytes.row_bytes = 300
+        assert v2_attn._index_page_records(c_bad_bytes) == 0
+
+        c_bad_offset = MagicMock(spec=PagedCacheRows)
+        c_bad_offset.dtype = torch.bfloat16
+        c_bad_offset.shape = (4, 64, 128)
+        c_bad_offset.row_bytes = 256
+        c_bad_offset.row_offset = 1
+        c_bad_offset.page_stride = 64
+        c_bad_offset.raw_hi = None
+        assert v2_attn._index_page_records(c_bad_offset) == 0
+
+        # 2. DeepseekV41Attention.__init__ invalid kv_cache_torch_dtype (line 553)
+        monkeypatch.setattr(
+            v2_attn.upstream.DeepseekV4Attention,
+            "__init__",
+            lambda self, *a, **kw: setattr(self, "kv_cache_torch_dtype", torch.float16),
+        )
+        with pytest.raises(NotImplementedError, match="TPU V4.1 supports"):
+            v2_attn.DeepseekV41Attention(SimpleNamespace())
+
+        # 3. _select_paged_indices tuple updated_cache -> copy_raw (line 1833)
+        attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+        torch.nn.Module.__init__(attn)
+        attn.compress_ratio = 2
+        attn._tp_rank = 0
+        attn._fp8_kv = True
+        attn._config = {"index_topk": 2}
+        attn.candidate_block_size = 1
+        attn.candidate_block_buffer = None
+        attn.indexer = SimpleNamespace(
+            head_dim=8,
+            n_head=2,
+            indexer_op=SimpleNamespace(candidate_blocks=None, candidate_write=False),
+        )
+        attn._project_index_q = lambda q, p: q
+        monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(
+            v2_attn,
+            "paged_indexer",
+            lambda q, c, *a, **kw: (
+                (torch.zeros(4), torch.zeros(4)),
+                torch.zeros(q.shape[0], 2, dtype=torch.int32),
+                None,
+            ),
+        )
+        idx_cache = MagicMock(spec=PagedCacheRows)
+        idx_cache.dtype = torch.int32
+        attn._select_paged_indices(
+            torch.ones((2, 8), dtype=torch.bfloat16),
+            torch.tensor([0, 1], dtype=torch.int32),
+            idx_cache,
+            torch.zeros((2, 4), dtype=torch.int32),
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.ones((2, 2), dtype=torch.float32),
+            torch.tensor([[1], [2]], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            None,
+        )
+        idx_cache.copy_raw.assert_called_once()
+
+        # 4. process_weights_after_loading TPU o_proj_op pre-registration (line 1951)
+        from vllm_torchtpu.models.vllm.deepseek_v4 import attention as dsv4_attn
+
+        monkeypatch.setattr(
+            dsv4_attn.VllmDeepseekV4MLAAttention,
+            "process_weights_after_loading",
+            lambda self, act_dtype: None,
+        )
+        monkeypatch.setattr(
+            dsv4_attn.VllmDeepseekV4MLAAttention,
+            "_assert_o_proj_supported",
+            lambda self: None,
+        )
+        o_proj_called = 0
+
+        def fake_o_proj_fget(self):
+            nonlocal o_proj_called
+            o_proj_called += 1
+            return lambda *a, **kw: None
+
+        monkeypatch.setattr(
+            dsv4_attn.VllmDeepseekV4MLAAttention,
+            "o_proj_op",
+            property(fake_o_proj_fget),
+        )
+        attn._full_attn_sink = torch.zeros(2, dtype=torch.float32)
+        attn.attn_sink = torch.zeros(2, dtype=torch.float32)
+        attn._init_local_q_weights = lambda: None
+        attn.wo_a = SimpleNamespace(
+            weight=SimpleNamespace(device=SimpleNamespace(type="tpu"))
+        )
+        attn.process_weights_after_loading(torch.bfloat16)
+        assert o_proj_called == 1
+
+    def test_compress_norm_addr_int32_bit_exact_and_paged_rows(self):
+        """Verify int32 dtypes, pos=0 wrap, PagedCacheRows safety, and bit parity."""
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
+
+        torch.manual_seed(1234)
+        capacity = 16
+        dim = 127
+        count = 6
+        # Include pos=0 wrap-around and -1 padding slots
+        positions = torch.tensor([0, 1, 15, 16, 0, 3], dtype=torch.int32)
+        slot_mapping = torch.tensor([32, 33, 47, 32, 64, -1], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, 2, 4, 5], dtype=torch.int32)
+        token_to_req = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.int32)
+
+        addr = v2_attn._compress_norm_addr(
+            count, positions, slot_mapping, query_start_loc, token_to_req, capacity
+        )
+        prev_blocks, prev_rem, in_chunk, prev_row_idx, publish, final_valid = addr
+        assert prev_blocks.dtype == torch.int32
+        assert prev_rem.dtype == torch.int32
+        assert prev_row_idx.dtype == torch.int32
+        assert in_chunk.dtype == torch.bool
+        assert publish.dtype == torch.bool
+        assert final_valid.dtype == torch.bool
+        # Verify pos=0 wraps to capacity - 1 == 15
+        assert prev_rem[0].item() == capacity - 1
+        assert prev_rem[4].item() == capacity - 1
+
+        record_dim = 128
+        kv_score = torch.randn(count, record_dim, dtype=torch.float32)
+        norm_weight = torch.ones(dim, dtype=torch.float32)
+        init_pool = torch.randn(6, capacity, record_dim, dtype=torch.float32)
+        raw_pool = init_pool.view(torch.int32).reshape(6 * capacity, v2_cache.ROW_WORDS)
+
+        # Reference int64 computation (legacy formula)
+        ref_cache = init_pool.clone()
+        rows64 = torch.arange(count)
+        reqs = token_to_req.int().clamp(max=query_start_loc.numel() - 2)
+        starts = query_start_loc.index_select(0, reqs)
+        ends = query_start_loc.index_select(0, reqs + 1)
+        prev_slots = (
+            slot_mapping.clamp(min=0) // capacity * capacity
+            + (positions - 1) % capacity
+        )
+        stored_ref = ref_cache[prev_slots // capacity, prev_slots % capacity]
+        prev_ref = torch.where(
+            (rows64 > starts)[:, None],
+            kv_score.index_select(0, (rows64 - 1).clamp(min=0).int()).float(),
+            stored_ref,
+        )
+        scores_ref = torch.stack((prev_ref[:, dim:], kv_score[:, dim:].float()), 1)
+        pair_ref = torch.stack((prev_ref[:, :dim], kv_score[:, :dim].float()), 1)
+        vals_ref = (pair_ref * scores_ref.softmax(1)).sum(1)
+        valid_ref = slot_mapping >= 0
+        pub_ref = valid_ref & (rows64 >= ends - capacity)
+        v2_cache.write_cache(
+            ref_cache, slot_mapping, kv_score.float(), pub_ref, after=stored_ref
+        )
+        valid_ref = valid_ref & (positions % 2 == 1)
+        lat_ref = (
+            v2_attn.rms_norm(vals_ref, norm_weight, 1e-6)
+            .masked_fill(~valid_ref[:, None], 0)
+            .to(torch.bfloat16)
+        )
+
+        # 1. Dense tensor (torch.Tensor) default precomputed_addr=None path
+        cache_u = init_pool.clone()
+        lat_u = torch.empty((count, dim), dtype=torch.bfloat16)
+        v2_attn.save_compress_norm(
+            kv_score,
+            positions,
+            cache_u,
+            slot_mapping,
+            query_start_loc,
+            token_to_req,
+            norm_weight,
+            1e-6,
+            2,
+            lat_u,
+        )
+        assert torch.equal(lat_u, lat_ref)
+        assert torch.equal(cache_u, ref_cache)
+
+        # 2. PagedCacheRows with explicit precomputed_addr
+        raw_backed = raw_pool.clone()
+        layout = (
+            (6, capacity, record_dim),
+            torch.float32,
+            capacity * record_dim * 4,
+            0,
+        )
+        cache_paged = v2_cache.PagedCacheRows(raw_backed, layout)
+        lat_p = torch.empty((count, dim), dtype=torch.bfloat16)
+        v2_attn.save_compress_norm(
+            kv_score,
+            positions,
+            cache_paged,
+            slot_mapping,
+            query_start_loc,
+            token_to_req,
+            norm_weight,
+            1e-6,
+            2,
+            lat_p,
+            precomputed_addr=addr,
+        )
+        assert torch.equal(lat_p, lat_ref)
+        assert torch.equal(
+            raw_backed.view(torch.float32).reshape(6, capacity, record_dim), ref_cache
+        )
+
+    def test_four_layer_compressor_stage_reuse_l2_l8_l14_l20(self, monkeypatch):
+        """Verify L2/L8/L14/L20 compressors compute _compress_norm_addr once."""
+        table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        state_meta = SimpleNamespace(
+            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            block_tables=table,
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+        )
+        state_cache = torch.randn(6, 16, 9, dtype=torch.float32)
+        forward_ctx = SimpleNamespace(
+            attn_metadata={"state_prefix": state_meta}, additional_kwargs={}
+        )
+        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+
+        real_addr_fn = v2_attn._compress_norm_addr
+        call_count = 0
+
+        def counting_addr(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return real_addr_fn(*args, **kwargs)
+
+        monkeypatch.setattr(v2_attn, "_compress_norm_addr", counting_addr)
+
+        compressors = []
+        for _layer_idx in (2, 8, 14, 20):
+            comp: Any = object.__new__(v2_attn.DeepseekCompressor)
+            torch.nn.Module.__init__(comp)
+            comp.head_dim = 8
+            comp.compress_ratio = 2
+            comp.rms_norm_eps = 1e-6
+            comp.norm = SimpleNamespace(weight=torch.ones(8, dtype=torch.float32))
+            comp.state_cache = SimpleNamespace(
+                prefix="state_prefix", kv_cache=state_cache.clone()
+            )
+            compressors.append(comp)
+
+        positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        kv_score = torch.randn(4, 9, dtype=torch.float32)
+
+        with v2_attn.stage_attention_cache_scope():
+            outs = [c.forward(kv_score, positions) for c in compressors]
+        assert call_count == 1
+        for out in outs[1:]:
+            assert torch.equal(out, outs[0])
+
+
+def test_stage_keys_memoized_per_tensor(monkeypatch):
+    """The rope / tp-rank stage keys are built once per tensor and reused for
+    every later stage cache; replacing the tensor rebuilds the key."""
+    attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    rope_t = torch.ones((16, 8), dtype=torch.bfloat16)
+    rank_1d_t = torch.tensor([1], dtype=torch.int32)
+    attn._tpu_rope_cache = rope_t
+    attn._tp_rank_1d = rank_1d_t
+    attn.compress_ratio = 4
+    attn.rotary_emb = SimpleNamespace(base=160000.0)
+
+    first: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(first) is rope_t
+    assert attn._get_stage_tp_rank_1d(first) is rank_1d_t
+    rope_key = attn.__dict__["_rope_stage_entry"][1]
+    rank_key = attn.__dict__["_rank1d_stage_entry"][1]
+    assert first == {rope_key: rope_t, rank_key: rank_1d_t}
+
+    # Next step: a fresh stage cache, no key rebuild.
+    def no_rebuild(*a, **k):
+        raise AssertionError("stage key rebuilt")
+
+    monkeypatch.setattr(attn, "_stage_cache_key", no_rebuild)
+    second: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(second) is rope_t
+    assert attn._get_stage_tp_rank_1d(second) is rank_1d_t
+    assert second == first
+    monkeypatch.undo()
+
+    # A replaced tensor gets its own (equal-config) entry.
+    new_rope = torch.zeros((16, 8), dtype=torch.bfloat16)
+    attn._tpu_rope_cache = new_rope
+    third: dict[Any, Any] = {}
+    assert attn._get_stage_rope_cache(third) is new_rope
+    assert attn.__dict__["_rope_stage_entry"][0] is new_rope

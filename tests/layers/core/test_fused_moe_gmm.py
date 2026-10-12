@@ -318,6 +318,7 @@ def _require_tpu() -> None:
         "t300-k10-h5120",
     ],
 )
+@pytest.mark.usefixtures("requires_tpu")
 def test_moe_gmm_non_ep_prefill_ragged_combine_matches_reference(
     monkeypatch, masked, num_tokens, topk, hidden, uses_v3
 ):
@@ -541,6 +542,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     assert call.kwargs == {"num_tokens": 2}
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_local_routing_matches_reference():
     _require_tpu()
 
@@ -705,6 +707,7 @@ def _make_ep_inputs(num_local_experts, seed=0):
         (20, 60),  # rank 3 of 8-way EP (Qwen3-480B-FP8 shape: 160 / 8 = 20 local)
     ],
 )
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_start):
     """Global ids + experts_start must produce the same output as local ids."""
     _require_tpu()
@@ -746,6 +749,7 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_star
     )
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_global_id_remap_masks_out_of_range():
     """Non-local global ids must contribute zero (range check + jnp.where)."""
     _require_tpu()
@@ -793,6 +797,7 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+@pytest.mark.usefixtures("requires_tpu")
 def test_fused_moe_func_int4_packed_matches_reference():
     _require_tpu()
 
@@ -924,30 +929,34 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
         raise AssertionError("get_tpu_info must not be called")
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", 0)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
 @pytest.mark.parametrize("explicit", [None, -1])
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
-    # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) resolves
-    # to min(4 * 512 - 1, 2048) = 2047, and a 256-row block (v6e) resolves to
-    # min(2 * 256 - 1, 2048) = 511. None and -1 both select auto.
-    for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 2047),
-        (_fake_sc_info(8, 2, 16), 511),
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit)
+    # 16 lanes x 2 cores x 16 subcores = 512-row block (TPU7x geometry) resolves
+    # to min(4 * 512 - 1, 2048) = 2047 by default and min(8 * 512 - 1, 4096) =
+    # 4095 under EP, and a 256-row block (v6e) resolves to min(2 * 256 - 1,
+    # cap) = 511. None and -1 both select auto.
+    for sc_info, expected_default, expected_ep in (
+        (_fake_sc_info(16, 2, 16), 2047, 4095),
+        (_fake_sc_info(8, 2, 16), 511, 511),
     ):
         monkeypatch.setattr(
             fused_moe_gmm.pltpu,
             "get_tpu_info",
             lambda info=sc_info: _fake_tpu_info(info),
         )
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected_default
+        assert (
+            fused_moe_gmm.resolve_onehot_permute_threshold(use_ep=True) == expected_ep
+        )
 
 
 def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     # A hypothetical 1024-row block exceeds the cap, so the cap wins.
     monkeypatch.setattr(
         fused_moe_gmm.pltpu,
@@ -955,6 +964,7 @@ def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
         lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
     )
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 2048
+    assert fused_moe_gmm.resolve_onehot_permute_threshold(use_ep=True) == 4096
 
 
 def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise(
@@ -966,24 +976,61 @@ def test_moe_gmm_tiling_selects_32_for_sparse_decode_and_keeps_default_otherwise
     monkeypatch.setattr(
         fused_moe_gmm, "calculate_tiling", lambda *args, **kwargs: base_tiles
     )
-    decode_dims = types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=8)
-    assert fused_moe_gmm._moe_gmm_tiling(
-        decode_dims, None, None, 64 << 20, "silu"
-    ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+    non_ep_bound = fused_moe_gmm._NON_EP_DECODE_TILE_M32_ROWS_PER_GROUP
+    bound = fused_moe_gmm._DECODE_TILE_M32_ROWS_PER_GROUP
+    for size_group, size_m in (
+        (48, 576),
+        (48, 48 * non_ep_bound),
+    ):
+        decode_dims = types.SimpleNamespace(
+            size_group=size_group, size_m=size_m, size_lhs_sublane=8
+        )
+        assert fused_moe_gmm._moe_gmm_tiling(
+            decode_dims, None, None, 64 << 20, "silu"
+        ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
+    assert (
+        fused_moe_gmm._moe_gmm_tiling(
+            types.SimpleNamespace(
+                size_group=48, size_m=48 * non_ep_bound + 1, size_lhs_sublane=8
+            ),
+            None,
+            None,
+            64 << 20,
+            None,
+        )
+        == base_tiles
+    )
+    for size_group, size_m in (
+        (48, 576),
+        (48, 2304),
+        (48, 3456),
+        (16, 1728),
+        (48, 4608),
+        (48, 8064),
+        (48, 48 * bound),
+    ):
+        decode_dims = types.SimpleNamespace(
+            size_group=size_group, size_m=size_m, size_lhs_sublane=8
+        )
+        assert fused_moe_gmm._moe_gmm_tiling_ep(
+            decode_dims, None, None, 64 << 20, "silu"
+        ) == fused_moe_gmm.TileSizes(tile_m=32, tile_k=512, tile_n=512, bucket_base=32)
     for non_matching_dims in (
         types.SimpleNamespace(size_group=1, size_m=576, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=16, size_lhs_sublane=8),
-        types.SimpleNamespace(size_group=48, size_m=48 * 40 + 1, size_lhs_sublane=8),
+        types.SimpleNamespace(size_group=48, size_m=48 * bound + 1, size_lhs_sublane=8),
         types.SimpleNamespace(size_group=48, size_m=576, size_lhs_sublane=12),
     ):
         assert (
-            fused_moe_gmm._moe_gmm_tiling(non_matching_dims, None, None, 64 << 20, None)
+            fused_moe_gmm._moe_gmm_tiling_ep(
+                non_matching_dims, None, None, 64 << 20, None
+            )
             == base_tiles
         )
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
     monkeypatch.setattr(
         fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
     )
@@ -991,7 +1038,7 @@ def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
 
 
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
-    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    monkeypatch.setitem(vars(envs), "ONEHOT_MOE_PERMUTE_THRESHOLD", None)
 
     def _raise():
         raise ValueError("Unsupported TPU device kind: cpu")
@@ -1268,18 +1315,24 @@ def test_moe_gmm_onehot_combine_keeps_operand_dtype(monkeypatch):
 def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     # gmm output rows past the valid prefix (non-local experts under EP, or
     # skipped padded tokens) are never written and may hold NaN; the one-hot
-    # combine must zero them before the matmul, without any flag, or they
-    # would spread to every token in the batch.
+    # combine must not let them spread to every token in the batch. For the
+    # small one-hot shapes the second GMM is asked to zero-initialize those
+    # rows (`zero_init_gmm2`, b48ec6313), so the fake GMM below honors that
+    # contract: unwritten rows are zero when requested and NaN otherwise.
     kwargs = _small_moe_gmm_kwargs()
     rows = kwargs["argsort_revert_indices"].size
     valid_rows = rows - 2
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
-    gmm2 = jnp.ones((rows, 8), dtype=jnp.bfloat16)
-    gmm2 = gmm2.at[valid_rows:].set(jnp.nan)
-    outputs = iter([jnp.ones((rows, 8), dtype=jnp.bfloat16), gmm2])
-    monkeypatch.setattr(
-        fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(outputs)
-    )
+    zero_init_requests = []
+
+    def fake_gmm(*args, zero_initialize=False, **kwargs):
+        zero_init_requests.append(zero_initialize)
+        out = jnp.ones((rows, 8), dtype=jnp.bfloat16)
+        if len(zero_init_requests) == 2:  # gmm2: tail rows are never written
+            out = out.at[valid_rows:].set(0 if zero_initialize else jnp.nan)
+        return out
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", fake_gmm)
     # Mark the slots whose routed rows fall in the NaN tail as invalid, as
     # prepare_routed_gmm_inputs does for padded tokens.
     revert = kwargs["argsort_revert_indices"]
@@ -1293,4 +1346,128 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
         }
     )
 
+    assert zero_init_requests[1] is True
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def test_fused_moe_func_ep_gating_and_dense_expert_guards(monkeypatch):
+    """Verify FP4 guard, env=0 opt-out via envs.is_set, and monkeypatch path."""
+    fn = fused_moe_gmm.fused_moe_func.__wrapped__
+    h = jnp.ones((4, 8), dtype=jnp.bfloat16)
+    w1_2exp = jnp.ones((2, 8, 16), dtype=jnp.bfloat16)
+    w2_2exp = jnp.ones((2, 8, 8), dtype=jnp.bfloat16)
+    tw6 = jnp.ones((4, 6), dtype=jnp.float32) / 6.0
+    ti6 = jnp.zeros((4, 6), dtype=jnp.int32)
+
+    # 1. Auto low-expert dense fallback when use_ep=True, local_num_experts=2, env unset
+    monkeypatch.delenv("TPU_MOE_DENSE_EXPERT_THRESHOLD", raising=False)
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD_EXPLICIT", False)
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    monkeypatch.setattr(fused_moe_gmm, "can_use_dense_expert", lambda *a, **kw: True)
+    dense_calls = []
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "dense_expert_moe",
+        lambda x_in, *a, **kw: dense_calls.append(1) or jnp.full_like(x_in, 2.0),
+    )
+    out_dense = fn(
+        h,
+        w1_2exp,
+        w2_2exp,
+        None,
+        None,
+        None,
+        None,
+        tw6,
+        ti6,
+        topk=6,
+        use_ep=True,
+        use_sparse_core=False,
+    )
+    assert len(dense_calls) == 1
+    assert float(out_dense[0, 0]) == 2.0
+
+    # 2. Explicit TPU_MOE_DENSE_EXPERT_THRESHOLD=0 via envs.is_set disables fallback
+    dense_calls.clear()
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "moe_gmm",
+        lambda x_in, *a, **kw: jnp.zeros((4, 8), dtype=jnp.bfloat16),
+    )
+    monkeypatch.setenv("TPU_MOE_DENSE_EXPERT_THRESHOLD", "0")
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "_DENSE_EXPERT_THRESHOLD_EXPLICIT",
+        envs.is_set("TPU_MOE_DENSE_EXPERT_THRESHOLD"),
+    )
+    assert fused_moe_gmm._DENSE_EXPERT_THRESHOLD_EXPLICIT
+    out_env_zero = fn(
+        h,
+        w1_2exp,
+        w2_2exp,
+        None,
+        None,
+        None,
+        None,
+        tw6,
+        ti6,
+        topk=6,
+        use_ep=True,
+        use_sparse_core=False,
+    )
+    assert len(dense_calls) == 0
+    assert out_env_zero.shape == (4, 8)
+
+    # 4. FP4 weights (float4_e2m1fn) never route to dense_expert_moe
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 64)
+    w1_fp4 = jnp.zeros((2, 8, 16), dtype=jnp.float4_e2m1fn)
+    w2_fp4 = jnp.zeros((2, 8, 8), dtype=jnp.float4_e2m1fn)
+    out_fp4 = fn(
+        h,
+        w1_fp4,
+        w2_fp4,
+        None,
+        None,
+        None,
+        None,
+        tw6,
+        ti6,
+        topk=6,
+        use_ep=True,
+        use_sparse_core=False,
+    )
+    assert len(dense_calls) == 0
+    assert out_fp4.shape == (4, 8)
+
+    # 5. Monkeypatched prepare_routed_gmm_inputs + padded_hidden_size != hidden_size
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    monkeypatch.delenv("TPU_MOE_DENSE_EXPERT_THRESHOLD", raising=False)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "prepare_routed_gmm_inputs",
+        lambda hs, ti, tw, **kw: fused_moe_gmm._DEFAULT_PREPARE_ROUTED_GMM_INPUTS(
+            hs, ti, tw, **kw
+        ),
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "moe_gmm",
+        lambda x_in, *a, **kw: jnp.ones((4, 12), dtype=jnp.bfloat16),
+    )
+    w1_pad = jnp.ones((4, 12, 16), dtype=jnp.bfloat16)
+    w2_pad = jnp.ones((4, 8, 12), dtype=jnp.bfloat16)
+    out_pad = fn(
+        h,
+        w1_pad,
+        w2_pad,
+        None,
+        None,
+        None,
+        None,
+        tw6,
+        ti6,
+        topk=6,
+        use_ep=False,
+        use_sparse_core=False,
+    )
+    assert out_pad.shape == (4, 8)

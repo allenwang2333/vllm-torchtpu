@@ -58,6 +58,30 @@ from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 
+try:
+    torch.device("tpu")
+except RuntimeError:
+    torch.utils.rename_privateuse1_backend("tpu")
+if not hasattr(torch, "tpu"):
+    import types
+
+    _tpu_mod = types.ModuleType("torch.tpu")
+    _tpu_mod.is_available = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.is_initialized = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.device_count = lambda: 0  # type: ignore[attr-defined]
+    _tpu_mod.current_device = lambda: 0  # type: ignore[attr-defined]
+    _tpu_mod.set_device = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.synchronize = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.empty_cache = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod.manual_seed_all = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+    _tpu_mod._is_in_bad_fork = lambda: False  # type: ignore[attr-defined]
+    _tpu_mod.Event = (  # type: ignore[attr-defined]
+        lambda *_a, **_kw: SimpleNamespace(
+            record=lambda: None, synchronize=lambda: None, query=lambda: True
+        )
+    )
+    torch._register_device_module("tpu", _tpu_mod)
+
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
@@ -680,6 +704,12 @@ class TestStartStopPhasedProfiling:
 
 class TestTPURunner:
     def setup_method(self):
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            # The VllmConfig built below resolves DeviceConfig to
+            # torch.device("tpu"), which raises on a host with no TPU.
+            pytest.skip("requires an attached TPU chip")
         self.mock_device = torch.device("cpu")
 
         model_config = ModelConfig(
@@ -789,6 +819,7 @@ class TestTPURunner:
                 side_effect=lambda: contextlib.nullcontext(),
             ),
             patch("vllm_torchtpu.runner.tpu_runner._validate_libtpu_version"),
+            patch("vllm_torchtpu.runner.tpu_runner.RunnerStageTiming"),
             patch.object(
                 TPUModelRunner, "_create_mesh_for_parallelism", return_value=MagicMock()
             ),
@@ -2530,3 +2561,557 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     runner._init_num_reqs_caps()
     assert runner.num_reqs_max_model_len == 20
     assert runner.num_reqs_most_model_len is None
+
+
+def test_async_sub_indices_non_uniform_and_all_new():
+    cur_zero, src_zero = _sub_indices({"r0": 0}, [], [], spec_k=3)
+    assert cur_zero == []
+    assert src_zero == []
+
+    cur_empty, src_empty = _sub_indices({}, ["r0", "r1"], [2, 3], spec_k=3)
+    assert cur_empty == []
+    assert src_empty == []
+
+    cur, src = _sub_indices({"r0": 1, "r1": 0}, ["r0", "r1"], [2, 4], spec_k=3)
+    assert cur == [0, 1, 2, 3, 4, 5]
+    assert src == [4, 5, 0, 1, 2, 3]
+
+
+def test_apply_async_token_substitution_caches_indices():
+    fake = SimpleNamespace(
+        _pre_async_results=SimpleNamespace(
+            next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int32),
+        ),
+        _fast_token_substitution=False,
+        device=torch.device("cpu"),
+    )
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    cur_idx = np.array([0, 2], dtype=np.int32)
+    pre_idx = np.array([1, 3], dtype=np.int32)
+
+    with patch.object(
+        tpu_runner,
+        "_substitute_placeholder_token",
+        side_effect=tpu_runner._substitute_placeholder_token.__wrapped__,
+    ):
+        out1 = TPUModelRunner._apply_async_token_substitution(
+            fake, input_ids, cur_idx, pre_idx
+        )
+        cached_cur = fake._cached_cur_input_indices
+        cached_pre = fake._cached_pre_next_tokens_indices
+        out2 = TPUModelRunner._apply_async_token_substitution(
+            fake, input_ids, cur_idx, pre_idx
+        )
+
+    assert out1.tolist() == [102, 2, 104, 4]
+    assert out2.tolist() == [102, 2, 104, 4]
+    assert fake._cached_cur_input_indices is cached_cur
+    assert fake._cached_pre_next_tokens_indices is cached_pre
+
+
+def test_assemble_async_spec_substitution_single_and_multi_chunk():
+    runner = object.__new__(TPUModelRunner)
+    drafts = torch.tensor([[201, 202], [211, 212], [221, 222]], dtype=torch.int32)
+    nt_chunk0 = torch.tensor([[11, 99, -1], [77, -1, -1]], dtype=torch.int32)
+    md0 = SimpleNamespace(
+        draft_lengths=torch.tensor([2, 2], dtype=torch.int32),
+        draft_lengths_cpu=np.array([2, 2], dtype=np.int32),
+    )
+    state_single = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[md0],
+    )
+    chunks, idx_map, num_rejected, num_draft = runner._assemble_async_spec_substitution(
+        drafts[:2], [nt_chunk0], state_single
+    )
+    assert len(chunks) == 1
+    assert chunks[0].tolist() == [99, 201, 202, 77, 211, 212]
+    assert idx_map == {0: 0, 1: 1}
+    assert num_rejected.tolist() == [1, 2]
+    assert num_draft == {0: 2, 1: 2}
+
+    nt_chunk1 = torch.tensor([[55, -1, -1]], dtype=torch.int32)
+    state_multi = SimpleNamespace(
+        num_reqs_list=[2, 1],
+        spec_decode_metadata_list=[md0, None],
+    )
+    chunks_m, idx_map_m, num_rejected_m, num_draft_m = (
+        runner._assemble_async_spec_substitution(
+            drafts, [nt_chunk0, nt_chunk1], state_multi
+        )
+    )
+    assert len(chunks_m) == 2
+    assert idx_map_m == {0: 0, 1: 1, 2: 2}
+    assert num_rejected_m.tolist() == [1, 2, 0]
+    assert num_draft_m == {0: 2, 1: 2}
+
+
+def test_spec_bonus_and_target_logits():
+    runner = object.__new__(TPUModelRunner)
+    logits = torch.tensor(
+        [
+            [0.1, 0.9, 0.2, 0.0],
+            [0.8, 0.1, 0.0, 0.2],
+            [0.0, 0.2, 0.7, 0.1],
+            [0.1, 0.0, 0.2, 0.95],
+        ],
+        dtype=torch.float32,
+    )
+    bonus_idx = torch.tensor([1, 3], dtype=torch.int32)
+    target_idx = torch.tensor([0, 2], dtype=torch.int32)
+
+    bonus_ids, target_ids = TPUModelRunner.spec_bonus_and_target_logits.__wrapped__(
+        runner, logits, bonus_idx, target_idx
+    )
+    assert bonus_ids.tolist() == [0, 3]
+    assert target_ids.dtype == torch.int32
+    assert target_ids.tolist() == [1, 2]
+
+
+def test_prepare_inputs_uniform_multi_token_and_reject_subtract_cache():
+    from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+
+    max_num_reqs = 2
+    max_model_len = 32
+    token_ids_cpu = np.arange(max_num_reqs * max_model_len, dtype=np.int32).reshape(
+        max_num_reqs, max_model_len
+    )
+    positions_cpu = torch.full((max_model_len,), -1, dtype=torch.int32)
+    query_start_loc_cpu = torch.zeros(max_num_reqs + 1, dtype=torch.int32)
+    seq_lens_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+
+    runner = SimpleNamespace(
+        reorder_batch_threshold=1,
+        sequence_layout_planner=AllSequenceLayoutPlanner(),
+        _dp_target_bucket=None,
+        input_batch=SimpleNamespace(
+            num_reqs=2,
+            req_ids=["req-0", "req-1"],
+            req_id_to_index={"req-0": 0, "req-1": 1},
+            num_computed_tokens_cpu=np.array([4, 8], dtype=np.int32),
+            token_ids_cpu=token_ids_cpu,
+            token_ids_cpu_tensor=torch.from_numpy(token_ids_cpu),
+            num_prompt_tokens=np.full(max_num_reqs, 16, dtype=np.int32),
+        ),
+        _wait_input_staging_fence=lambda: None,
+        most_model_len=None,
+        num_reqs_max_model_len=max_num_reqs,
+        num_reqs_most_model_len=max_num_reqs,
+        max_num_reqs=max_num_reqs,
+        uses_mrope=False,
+        arange_np=np.arange(max_model_len, dtype=np.int32),
+        positions_cpu=positions_cpu,
+        positions_np=positions_cpu.numpy(),
+        input_ids_cpu=torch.full((max_model_len,), -1, dtype=torch.int32),
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_np=query_start_loc_cpu.numpy(),
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_np=seq_lens_cpu.numpy(),
+        _check_attention_schedule=lambda *a: None,
+        _pcp_enabled=False,
+        _mtp_enabled=False,
+        device=torch.device("cpu"),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        _pre_async_results=SimpleNamespace(
+            req_id_to_index_copy={"req-0": 0, "req-1": 1},
+            spec_decode_num_rejected_tokens=torch.tensor([1, 2], dtype=torch.int32),
+            next_tokens_tpu=None,
+        ),
+        _decode_device_cache_key=None,
+        _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
+        _has_mamba_state=False,
+        mamba_slot_read_offsets=None,
+        _mamba_ckpt_window=1,
+        _unified_kv_layout=False,
+        _replay_starts={},
+        empty_slot_mappings=None,
+        _build_attention_metadata=lambda **kw: ({}, None),
+        lora_config=None,
+        _prepare_async_token_substitution_indices=lambda *a: (
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.int32),
+        ),
+        _apply_async_token_substitution=lambda ids, *a: ids,
+        _collect_mamba_state_seed_copies=lambda *a: None,
+        num_tokens_paddings=[8, 16, 32],
+        pcp_size=1,
+        dcp_size=1,
+    )
+    sched = SimpleNamespace(
+        total_num_scheduled_tokens=6,
+        num_scheduled_tokens={"req-0": 3, "req-1": 3},
+        scheduled_spec_decode_tokens={},
+    )
+
+    TPUModelRunner._prepare_inputs(runner, sched, start_index=0, num_decode_reqs=0)
+    cached_seq_idx = runner._cached_reject_seq_idx
+    cached_pos_idx = runner._cached_reject_pos_idx
+    assert runner.position_ids[:6].tolist() == [3, 4, 5, 6, 7, 8]
+
+    TPUModelRunner._prepare_inputs(runner, sched, start_index=0, num_decode_reqs=0)
+    assert runner._cached_reject_seq_idx is cached_seq_idx
+    assert runner._cached_reject_pos_idx is cached_pos_idx
+
+
+def test_sample_tokens_dispatches_drafter_before_modify_prev_results():
+    call_order = []
+    state = SimpleNamespace(
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={"req-0": 2},
+            has_structured_output_requests=False,
+        ),
+        spec_decode_metadata_list=[
+            SimpleNamespace(
+                draft_lengths=torch.tensor([1], dtype=torch.int32),
+                draft_lengths_cpu=np.array([1], dtype=np.int32),
+            )
+        ],
+        mamba_state_indices_list=None,
+        logits_list=[torch.zeros((2, 8), dtype=torch.float32)],
+        num_reqs_list=[1],
+        pooler_output_list=[],
+        draft_chunks=[],
+    )
+    runner = SimpleNamespace(
+        execute_model_state=state,
+        _get_sampling_generator=lambda: None,
+        _async_drafter=SimpleNamespace(draft_chunks=None),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-0"],
+            req_id_to_index={"req-0": 0},
+            all_greedy=True,
+            max_num_logprobs=None,
+            generators={},
+            num_tokens_no_spec=[4],
+        ),
+        requests={
+            "req-0": SimpleNamespace(
+                req_id="req-0",
+                num_computed_tokens=2,
+                num_tokens=4,
+                output_token_ids=[10, 11],
+            )
+        },
+        is_pooling_model=False,
+        _stage_timing=SimpleNamespace(
+            stage=lambda _name: contextlib.nullcontext(),
+            host_stage=lambda _name: contextlib.nullcontext(),
+        ),
+        _sample_spec_verify_chunk=lambda *a: torch.tensor(
+            [[12, 13]], dtype=torch.int32
+        ),
+        _update_mamba_slot_read_offsets=lambda *a: None,
+        _update_num_xla_graphs=lambda *a: None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        _is_async_drafter=True,
+        spec_decode_manager=SimpleNamespace(
+            propose_draft_token_ids=lambda **kw: (
+                call_order.append("propose") or torch.tensor([[21]], dtype=torch.int32)
+            )
+        ),
+        _modify_prev_results=lambda: call_order.append("modify_prev"),
+        maybe_wait_for_kv_save=lambda: None,
+        get_finished_kv_transfers=lambda _so: (None, None, None, set(), None, None),
+        _sync_replicated_drafts_across_tp=lambda d: d,
+        _assemble_async_spec_substitution=lambda d, nt, st: (
+            [torch.tensor([13, 21], dtype=torch.int32)],
+            {0: 0},
+            torch.tensor([0], dtype=torch.int32),
+            {0: 1},
+        ),
+        _update_placeholder=lambda *a: {"req-0": 0},
+        max_num_reqs=2,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        _pre_async_results=None,
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+
+    assert call_order == ["propose", "modify_prev"]
+    assert runner._pre_async_results.next_tokens_tpu.shape[0] == 4
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens.shape[0] == 2
+
+    # Already-padded single-chunk outputs skip the fallback F.pad branches.
+    runner.execute_model_state = state
+    runner._assemble_async_spec_substitution = lambda d, nt, st: (
+        [torch.tensor([13, 21, 0, 0], dtype=torch.int32)],
+        {0: 0},
+        torch.tensor([0, 0], dtype=torch.int32),
+        {0: 1},
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._pre_async_results.next_tokens_tpu.tolist() == [13, 21, 0, 0]
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens.tolist() == [0, 0]
+
+    # Non-spec / empty spec_num_rejected skips spec padding completely.
+    runner.execute_model_state = state
+    runner._assemble_async_spec_substitution = lambda d, nt, st: (
+        [torch.tensor([13, 21], dtype=torch.int32)],
+        {0: 0},
+        None,
+        {},
+    )
+    with patch.object(
+        tpu_runner.AsyncTPUCopyState,
+        "from_device_chunks",
+        return_value=SimpleNamespace(),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._pre_async_results.spec_decode_num_rejected_tokens is None
+
+    # the all-None prompt_logprobs_dict comes from a cached template
+    # keyed by a private copy of req_ids; each output gets its own copy.
+    template_ids, template = runner._prompt_logprobs_template
+    assert template_ids == ["req-0"] and template == {"req-0": None}
+    real_output = tpu_runner.ModelRunnerOutput
+    outputs = []
+
+    def capture(**kwargs):
+        out = real_output(**kwargs)
+        outputs.append(out)
+        return out
+
+    runner.execute_model_state = state
+    with (
+        patch.object(
+            tpu_runner.AsyncTPUCopyState,
+            "from_device_chunks",
+            return_value=SimpleNamespace(),
+        ),
+        patch.object(tpu_runner, "ModelRunnerOutput", side_effect=capture),
+    ):
+        TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert runner._prompt_logprobs_template[1] is template  # hit
+    (out,) = outputs
+    assert out.prompt_logprobs_dict == dict.fromkeys(out.req_ids)
+    assert out.prompt_logprobs_dict is not template
+    assert out.req_ids is not template_ids
+
+
+def test_modify_prev_results_uses_cached_copy_state_and_handles_discard_or_removed():
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+
+    runner = SimpleNamespace(
+        _pre_async_results=None,
+        input_batch=SimpleNamespace(
+            req_id_to_index={"req-1": 0},
+            num_tokens_no_spec=[14],
+            token_ids_cpu=np.zeros((1, 32), dtype=np.int32),
+        ),
+    )
+    # 1) _pre_async_results is None -> early return
+    TPUModelRunner._modify_prev_results(runner)
+
+    # 2) copy_state with parse_sampled_tokens, req-0 discarded, req-1 committed,
+    #    req-2 removed from input_batch.req_id_to_index.
+    req0 = SimpleNamespace(req_id="req-0", output_token_ids=[0, 0])
+    req1 = SimpleNamespace(req_id="req-1", output_token_ids=[0, 0])
+    req2 = SimpleNamespace(req_id="req-2", output_token_ids=[0, 0])
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[
+            torch.tensor(
+                [[10, 11], [20, INVALID_TOKEN_ID], [30, 31], [99, 99]],
+                dtype=torch.int32,
+            )
+        ],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-0", "req-1", "req-2"],
+        request_seq_lens=[
+            (0, req0, 10, "req-0"),
+            (1, req1, 12, "req-1"),
+            (2, req2, 8, "req-2"),
+        ],
+        discard_sampled_tokens_req_indices=[0],
+        num_draft_per_req={0: 1, 1: 1, 2: 1},
+        copy_state=copy_state,
+    )
+    TPUModelRunner._modify_prev_results(runner)
+    assert req0.output_token_ids == [0, 0]
+    assert req1.output_token_ids == [20]
+    assert req2.output_token_ids == [30, 31]
+    assert runner.input_batch.num_tokens_no_spec[0] == 13
+    assert runner.input_batch.token_ids_cpu[0, 12] == 20
+
+    # 3) copy_state is None -> falls back to wait_for_copy()
+    #    plus parse_sampled_token_ids_cpu
+    req_fallback = SimpleNamespace(req_id="req-fb", output_token_ids=[0, 0])
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-fb"],
+        request_seq_lens=[(0, req_fallback, 15, "req-fb")],
+        discard_sampled_tokens_req_indices=[],
+        num_draft_per_req={0: 1},
+        copy_state=None,
+        wait_for_copy=lambda: torch.tensor([[42, INVALID_TOKEN_ID]], dtype=torch.int32),
+    )
+    runner.input_batch.req_id_to_index = {"req-fb": 0}
+    runner.input_batch.num_tokens_no_spec = [17]
+    TPUModelRunner._modify_prev_results(runner)
+    assert req_fallback.output_token_ids == [42]
+    assert runner.input_batch.num_tokens_no_spec[0] == 16
+    assert runner.input_batch.token_ids_cpu[0, 15] == 42
+
+
+def test_assemble_async_spec_substitution_padded_single_chunk_and_prefill_bootstrap():
+    runner = object.__new__(TPUModelRunner)
+    runner.max_num_reqs = 4
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=2)
+
+    drafts = torch.tensor([[201, 202], [211, 212]], dtype=torch.int32)
+    nt_chunk0 = torch.tensor([[11, 99, -1], [77, -1, -1]], dtype=torch.int32)
+    md0 = SimpleNamespace(
+        draft_lengths=torch.tensor([2, 2], dtype=torch.int32),
+        draft_lengths_cpu=np.array([2, 2], dtype=np.int32),
+    )
+    state_single = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[md0],
+    )
+    chunks, idx_map, num_rejected, num_draft = runner._assemble_async_spec_substitution(
+        drafts, [nt_chunk0], state_single
+    )
+    assert len(chunks) == 1
+    assert chunks[0].tolist() == [99, 201, 202, 77, 211, 212, 0, 0, 0, 0, 0, 0]
+    assert idx_map == {0: 0, 1: 1}
+    assert num_rejected.tolist() == [1, 2, 0, 0]
+    assert num_draft == {0: 2, 1: 2}
+
+    # md=None in spec_decode_metadata_list skips num_draft_per_req
+    state_none_md = SimpleNamespace(
+        num_reqs_list=[2],
+        spec_decode_metadata_list=[None],
+    )
+    chunks_no_md, _, _, num_draft_no_md = runner._assemble_async_spec_substitution(
+        drafts, [nt_chunk0], state_none_md
+    )
+    assert len(chunks_no_md) == 1
+    assert num_draft_no_md == {}
+
+    # Empty chunk list returns spec_num_rejected = None
+    empty_state = SimpleNamespace(num_reqs_list=[], spec_decode_metadata_list=[])
+    chunks_e, _, rej_e, _ = runner._assemble_async_spec_substitution(
+        drafts, [], empty_state
+    )
+    assert chunks_e == []
+    assert rej_e is None
+
+    # Prefill bootstrap pads spec_num_rejected to max(req_offset, max_num_reqs)
+    boot_chunks, boot_idx, boot_rej, boot_draft = (
+        runner._assemble_async_prefill_bootstrap(
+            drafts,
+            [torch.tensor([[99], [77]], dtype=torch.int32)],
+            [2],
+        )
+    )
+    assert len(boot_chunks) == 1
+    assert boot_chunks[0].tolist() == [99, 201, 202, 77, 211, 212]
+    assert boot_idx == {0: 0, 1: 1}
+    assert boot_rej is not None and boot_rej.tolist() == [0, 0, 0, 0]
+    assert boot_draft == {0: 0, 1: 0}
+
+    # Empty prefill bootstrap returns spec_num_rejected = None
+    _, _, boot_rej_empty, _ = runner._assemble_async_prefill_bootstrap(drafts, [], [])
+    assert boot_rej_empty is None
+
+
+def test_modify_prev_results_vectorized_skips_when_req_ids_exceed_seq_lens():
+    """req_ids may list more rows than request_seq_lens (a request left the
+    batch); the vectorized commit must fall back instead of broadcasting
+    gen_lens (len 3) against the committed rows (len 2)."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+
+    req0 = SimpleNamespace(req_id="req-0", output_token_ids=[0, 0])
+    req1 = SimpleNamespace(req_id="req-1", output_token_ids=[0, 0])
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={"req-0": 0, "req-1": 1},
+            num_tokens_no_spec=np.array([14, 20], dtype=np.int32),
+            token_ids_cpu=np.zeros((2, 32), dtype=np.int32),
+        ),
+    )
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([[10, 11], [20, 21], [30, 31]], dtype=torch.int32)],
+        chunk_real_lens=[3],
+        copy_ready_event=None,
+        completed=True,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_ids=["req-0", "req-1", "req-gone"],
+        request_seq_lens=[(0, req0, 10, "req-0"), (1, req1, 12, "req-1")],
+        discard_sampled_tokens_req_indices=[],
+        num_draft_per_req={0: 1, 1: 1},
+        copy_state=copy_state,
+    )
+    TPUModelRunner._modify_prev_results(runner)
+    assert req0.output_token_ids == [10, 11]
+    assert req1.output_token_ids == [20, 21]
+    assert runner.input_batch.num_tokens_no_spec.tolist() == [14, 20]
+    assert runner.input_batch.token_ids_cpu[0, 12:14].tolist() == [10, 11]
+    assert runner.input_batch.token_ids_cpu[1, 18:20].tolist() == [20, 21]
+
+
+@pytest.mark.parametrize("num_reqs", [64, 96, 112, 128])
+def test_high_conc_spec_decode_host_fast_paths(num_reqs: int):
+    """Verify speculative decode K=5 host fast paths at C=64/96/112/128."""
+    k = 5
+    tokens_per_req = k + 1
+    req_ids = [f"req-{i}" for i in range(num_reqs)]
+    num_scheduled = {rid: tokens_per_req for rid in req_ids}
+    sched = SimpleNamespace(
+        total_num_scheduled_tokens=num_reqs * tokens_per_req,
+        num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens={rid: [1] * k for rid in req_ids},
+    )
+    swap_calls = 0
+
+    def swap_states(i1: int, i2: int) -> None:
+        nonlocal swap_calls
+        swap_calls += 1
+
+    runner = object.__new__(TPUModelRunner)
+    runner.reorder_batch_threshold = 1
+    runner.most_model_len = 4096
+    runner.num_reqs_most_model_len = 64
+    runner.num_reqs_max_model_len = 8
+    runner.input_batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        req_ids=list(req_ids),
+        req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        num_computed_tokens_cpu=np.full(num_reqs, 128, dtype=np.int32),
+        swap_states=swap_states,
+    )
+    runner._pre_async_results = SimpleNamespace(
+        req_id_to_index_copy={rid: i for i, rid in enumerate(req_ids)}
+    )
+
+    # 1) _flush_disjoint_async_results: overlapping req_ids does not flush
+    runner._flush_disjoint_async_results()
+    assert runner._pre_async_results is not None
+
+    # 2) _reorder_batch_for_rpa: uniform K=5 verify batch short-circuits swaps
+    num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+    assert num_decode == 0
+    assert num_windowed == num_reqs
+    assert swap_calls == 0
+
+    # 3) _count_input_chunks: single-pass fast exit when all requests <= most_model_len
+    expected_chunks = (num_reqs + 63) // 64
+    assert runner._count_input_chunks(sched) == (expected_chunks, min(64, num_reqs))
+
+    # Also verify most_model_len=None O(1) fast path
+    runner.most_model_len = None
+    assert runner._count_input_chunks(sched) == (num_reqs // 8, 8)

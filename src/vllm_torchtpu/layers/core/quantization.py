@@ -33,6 +33,8 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
+import functools
+
 import jax.numpy as jnp
 import torch
 
@@ -52,19 +54,43 @@ E8M0_MAX_EXP = 127
 # Same value as jnp.finfo(jnp.float8_e4m3fn).max (448.0).
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
+# FP4 e2m1 lookup table mapping 4-bit index (0-15) to float32 value.
+_FP4_VALUES_CPU = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
 
+
+@functools.cache
 def dtype_max(dtype: jnp.dtype) -> float:
     info = jnp.iinfo(dtype) if jnp.issubdtype(dtype, jnp.integer) else jnp.finfo(dtype)
     return float(info.max)
 
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:
-    return torch.is_floating_point(torch.empty((), dtype=dtype))
+    return dtype.is_floating_point
 
 
 def _safe_inverse_scale(scale: torch.Tensor) -> torch.Tensor:
     """Return 1 / scale while keeping zero-scale blocks exactly zero."""
-    return torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)
+    return torch.where(scale == 0, 0.0, 1.0 / scale)
 
 
 def static_per_tensor_quantize_tensor(
@@ -141,36 +167,17 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
         float32 tensor of shape [..., N] with unpacked FP4 values.
     """
     # FP4 e2m1 lookup table mapping 4-bit index to float value
-    FP4_LUT = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=packed.device,
-    )
+    fp4_lut = _FP4_VALUES_CPU.to(packed.device)
 
-    # Extract low and high nibbles
-    low_nibble = (packed & 0x0F).to(torch.int64)
-    high_nibble = ((packed >> 4) & 0x0F).to(torch.int64)
+    # Extract low and high nibbles (int32 indices for a 1D LUT index_select)
+    low_nibble = (packed & 0x0F).to(torch.int32)
+    high_nibble = ((packed >> 4) & 0x0F).to(torch.int32)
 
     # Convert to float using LUT
-    low_fp32 = FP4_LUT[low_nibble]
-    high_fp32 = FP4_LUT[high_nibble]
+    low_fp32 = fp4_lut.index_select(0, low_nibble.reshape(-1)).reshape(low_nibble.shape)
+    high_fp32 = fp4_lut.index_select(0, high_nibble.reshape(-1)).reshape(
+        high_nibble.shape
+    )
 
     # Interleave: [low0, high0, low1, high1, ...]
     result = torch.stack([low_fp32, high_fp32], dim=-1)
@@ -204,9 +211,11 @@ def dequantize_tensor(
 
     if tensor_q.ndim == scale.ndim:
         # Block quantized - need to reshape for broadcasting
+        axis_normalized = sorted(a % tensor_q.ndim for a in axis)
+        axis_set = set(axis_normalized)
         blocked_shape = []
         for i, dim in enumerate(orig_shape):
-            if i in [(a + tensor_q.ndim) % tensor_q.ndim for a in axis]:
+            if i in axis_set:
                 num_blocks = scale.shape[i]
                 block_size = dim // num_blocks
                 blocked_shape.extend([num_blocks, block_size])
@@ -214,7 +223,6 @@ def dequantize_tensor(
                 blocked_shape.append(dim)
 
         # Calculate the axis positions after reshaping
-        axis_normalized = sorted([(a + tensor_q.ndim) % tensor_q.ndim for a in axis])
         expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
 
         tensor_q = tensor_q.reshape(blocked_shape)
@@ -258,10 +266,8 @@ def quantize_tensor(
             f"block_size={block_size}."
         )
 
-    if torch.empty((), dtype=quant_dtype).is_floating_point():
-        dtype_info = torch.finfo(quant_dtype)
-    else:
-        dtype_info = torch.iinfo(quant_dtype)
+    is_floating = quant_dtype.is_floating_point
+    dtype_info = torch.finfo(quant_dtype) if is_floating else torch.iinfo(quant_dtype)
 
     axis = axis % tensor.ndim
     moved = tensor.movedim(axis, -1)
@@ -305,7 +311,7 @@ def quantize_tensor(
     blocked_q = torch.clamp(
         blocked * scale_inv, min=float(dtype_info.min), max=float(dtype_info.max)
     )
-    if not is_floating_dtype(quant_dtype):
+    if not is_floating:
         # A float->int cast truncates toward zero, biasing every element by
         # half an LSB; float dtypes already round in the cast. Half-to-even,
         # matching `quantized_matmul.util.quantize_block`.
@@ -366,37 +372,18 @@ def quantize_tensor_to_fp4(
         axis = [axis]
 
     # FP4 e2m1 representable values
-    FP4_VALUES = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=tensor.device,
-    )
+    fp4_values = _FP4_VALUES_CPU.to(tensor.device)
     FP4_MAX = 6.0  # Maximum representable magnitude
     FP4_MIN = -6.0
 
     orig_shape = tensor.shape
 
     # Reshape to expose block structure
+    axis_normalized = sorted(a % tensor.ndim for a in axis)
+    axis_set = set(axis_normalized)
     blocked_shape = []
     for i, dim in enumerate(orig_shape):
-        if i in [(a + tensor.ndim) % tensor.ndim for a in axis]:
+        if i in axis_set:
             if dim % block_size != 0:
                 raise ValueError(
                     f"Dimension {i} of size {dim} is not divisible by "
@@ -407,7 +394,6 @@ def quantize_tensor_to_fp4(
         else:
             blocked_shape.append(dim)
 
-    axis_normalized = sorted([a % tensor.ndim for a in axis])
     expanded_axis = [1 + n + a for n, a in enumerate(axis_normalized)]
 
     tensor_blocked = tensor.reshape(blocked_shape)
@@ -426,7 +412,7 @@ def quantize_tensor_to_fp4(
 
     # Find nearest FP4 value (quantize by finding closest in LUT)
     tensor_for_compare = tensor_clipped.unsqueeze(-1)
-    fp4_for_compare = FP4_VALUES.view([1] * tensor_clipped.ndim + [16])
+    fp4_for_compare = fp4_values.view([1] * tensor_clipped.ndim + [16])
 
     distances = (tensor_for_compare - fp4_for_compare).abs()
     indices = distances.argmin(dim=-1).to(torch.int8)
@@ -475,27 +461,10 @@ def fp4_indices_to_float(indices: torch.Tensor) -> torch.Tensor:
     Returns:
         float32 tensor with FP4 values.
     """
-    FP4_VALUES = torch.tensor(
-        [
-            0.0,
-            0.5,
-            1.0,
-            1.5,
-            2.0,
-            3.0,
-            4.0,
-            6.0,
-            -0.0,
-            -0.5,
-            -1.0,
-            -1.5,
-            -2.0,
-            -3.0,
-            -4.0,
-            -6.0,
-        ],
-        dtype=torch.float32,
-        device=indices.device,
-    )
-
-    return FP4_VALUES[indices.to(torch.int64)]
+    fp4_values = _FP4_VALUES_CPU.to(indices.device)
+    return fp4_values.index_select(
+        0,
+        (indices if indices.dtype == torch.int32 else indices.to(torch.int32)).reshape(
+            -1
+        ),
+    ).reshape(indices.shape)

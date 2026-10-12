@@ -1,15 +1,32 @@
 """V4.1 model bindings for the shared DeepSeek V4 TPU quantization path."""
 
-from vllm.distributed.parallel_state import get_ep_group
+import functools
+import inspect
+
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
 
+from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
 )
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+
+# Marks a layer whose gate-slice plan has not been resolved yet; ``None`` is a
+# valid cached plan meaning "never slice".
+_UNRESOLVED = object()
+
+
+@functools.lru_cache(maxsize=8)
+def _accepts_mega_gate_metadata(fn) -> bool:
+    params = tuple(inspect.signature(fn).parameters.values())
+    return len(params) >= 4 or any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL or p.name == "mega_gate_metadata"
+        for p in params
+    )
 
 
 @register_quantization_config("tpu-deepseek_v41_fp8")
@@ -32,6 +49,10 @@ class DeepseekV41MoE(DeepseekV4MoE):
         def v4_factory(**options):
             # Match the native TPU V4 model's scaling and shared-expert combine.
             options["apply_routed_scale_to_output"] = True
+            # Run self.gate in _forward_fused_moe so non-SP EP layers (CED=1
+            # decoder_stage and speculative draft layers) can slice gate input
+            # to [T // ep_size, H] before MoERunner._forward_impl executes.
+            options["gate"] = None
             return factory(**options)
 
         with device_hooks(
@@ -40,6 +61,63 @@ class DeepseekV41MoE(DeepseekV4MoE):
             FusedMoEFactory=v4_factory,
         ):
             super().__init__(vllm_config, *args, **kwargs)
+
+    def _resolve_gate_slice_plan(self):
+        """Return ``(group_size, rank)`` for gate slicing, or ``None``.
+
+        Everything checked here is fixed once the layer and the process
+        groups are built, so the answer is cached per layer by the caller.
+        """
+        experts = getattr(self, "experts", None)
+        moe_config = getattr(experts, "moe_config", None)
+        if getattr(moe_config, "pcp_size", 1) > 1 or not getattr(
+            getattr(moe_config, "moe_parallel_config", None), "use_ep", False
+        ):
+            return None
+        routed_experts = getattr(experts, "routed_experts", None)
+        quant_method = getattr(routed_experts, "quant_method", None)
+        if (
+            not getattr(quant_method, "is_monolithic", False)
+            or getattr(quant_method, "supports_internal_mk", False)
+            or getattr(routed_experts, "custom_routing_function", None) is not None
+        ):
+            return None
+        slice_group = (
+            get_tp_group() if getattr(moe_config, "dp_size", 1) > 1 else get_ep_group()
+        )
+        group_size = slice_group.world_size
+        if group_size <= 1:
+            return None
+        return group_size, slice_group.rank_in_group
+
+    def _maybe_slice_gate_input(self, hidden_states):
+        # use_sequence_parallel and the simulation strategy can be toggled at
+        # runtime (tests, simulation harness), so they stay per-call checks.
+        if self.use_sequence_parallel or moe_routing._SIMULATION_STRATEGY is not None:
+            return hidden_states
+        # Bypass nn.Module.__getattr__/__setattr__: the plan is a plain cache.
+        state = self.__dict__
+        plan = state.get("_gate_slice_plan", _UNRESOLVED)
+        if plan is _UNRESOLVED:
+            plan = state["_gate_slice_plan"] = self._resolve_gate_slice_plan()
+        if plan is None:
+            return hidden_states
+        group_size, rank = plan
+        num_tokens = hidden_states.shape[0]
+        if num_tokens % group_size != 0:
+            return hidden_states
+        chunk = num_tokens // group_size
+        return hidden_states[rank * chunk : (rank + 1) * chunk]
+
+    def _forward_fused_moe(self, hidden_states, input_ids=None):
+        org_shape = hidden_states.shape
+        router_logits, _ = self.gate(self._maybe_slice_gate_input(hidden_states))
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+        )
+        return final_hidden_states.view(org_shape)
 
     def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
         if (
@@ -53,4 +131,8 @@ class DeepseekV41MoE(DeepseekV4MoE):
             # the runner gathers those over the EP group (TpuDeviceCommunicator)
             # but passes input_ids through as this rank's shard.
             input_ids = get_ep_group().all_gather(input_ids, dim=0)
+        if mega_gate_metadata is None or not _accepts_mega_gate_metadata(
+            DeepseekV4MoE.forward
+        ):
+            return super().forward(hidden_states, input_ids)
         return super().forward(hidden_states, input_ids, mega_gate_metadata)

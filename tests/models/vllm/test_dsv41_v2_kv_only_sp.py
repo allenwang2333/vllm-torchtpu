@@ -410,11 +410,12 @@ class TestSpAllGatherRoutingKvOnly:
             torch.zeros(tokens_local, 8),
         )
 
-        assert len(gathered_tensors) == 2
-        # Gathered concatenated (qr, kv, indexer_weights) = 16 + 128 + 8 = 152 cols
-        assert gathered_tensors[0].shape == (tokens_local, 16 + 128 + 8)
-        # Gathered kv_score
-        assert gathered_tensors[1].shape == (tokens_local, 1)
+        # One collective: (qr, kv, indexer_weights) = 16 + 128 + 8 cols
+        # plus kv_score bit-viewed into kv's dtype. Everything is fp32 here, so
+        # kv_score adds its 1 column as-is (2 bf16 cols per fp32 in production).
+        assert len(gathered_tensors) == 1
+        assert gathered_tensors[0].shape == (tokens_local, 16 + 128 + 8 + 1)
+        assert gathered_tensors[0].dtype == kv.dtype
         assert seen_args["qr"].shape == (tokens_global, 16)
         assert seen_args["kv"].shape == (tokens_global, 128)
         assert seen_args["kv_score"].shape == (tokens_global, 1)
@@ -593,9 +594,17 @@ class TestInitLocalQWeightsCedDecoderAndCompressRatio:
         attn = _setup_mock_attn(
             monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=4
         )
-        attn.n_local_groups = 2
+        attn.n_local_groups = 0
         v2_attn.DeepseekV41Attention._init_local_q_weights(attn)
         assert not hasattr(attn, "_wq_b_full")
+
+        attn_tp4 = _setup_mock_attn(
+            monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=4, tp_size=4
+        )
+        attn_tp4.n_local_groups = 2
+        v2_attn.DeepseekV41Attention._init_local_q_weights(attn_tp4)
+        assert hasattr(attn_tp4, "_wq_b_full")
+        assert attn_tp4._local_q_attn is True
 
     def test_missing_scale_or_vllm_layout_skips_allocation(
         self, monkeypatch: pytest.MonkeyPatch
@@ -668,7 +677,7 @@ class TestPrepareTpuAssertQNotNone:
             "_read_rows",
             lambda cache, table, reqs, logical: torch.zeros((4, 64, 128)),
         )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *args: None)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *args, **kw: None)
         attn._rotate = lambda q, pos: q
         monkeypatch.setattr(
             v2_attn,
@@ -740,7 +749,7 @@ class TestPrepareTpuAssertQNotNone:
             "_read_rows",
             lambda cache, table, reqs, logical: torch.zeros((4, 64, 128)),
         )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *args: None)
+        monkeypatch.setattr(v2_attn, "_insert", lambda *args, **kw: None)
         attn._rotate = lambda q, pos: q
         monkeypatch.setattr(
             v2_attn,

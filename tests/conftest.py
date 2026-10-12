@@ -84,9 +84,41 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _drop_pinned_lazy_envs():
+    """Undo env knobs a test pinned onto `vllm_torchtpu.envs` by accident.
+
+    `envs` resolves knobs through a module `__getattr__`, so a knob normally
+    has no module attribute. `monkeypatch.setattr(envs, KNOB, v)` reads the
+    old value through `__getattr__` and, on undo, writes it back as a real
+    attribute, which then shadows every later `setenv` for the rest of the
+    session. Drop any knob attribute that did not exist before the test
+    (this fixture is set up before `monkeypatch`, so it tears down after).
+    """
+    import vllm_torchtpu.envs as tpu_envs
+
+    namespace = vars(tpu_envs)
+    before = {name for name in tpu_envs.environment_variables if name in namespace}
+    yield
+    for name in tpu_envs.environment_variables:
+        if name in namespace and name not in before:
+            del namespace[name]
+
+
 @pytest.fixture
-def vllm_config_context():
+def vllm_config_context(request):
     """Run backend helpers with the same resolved layout as worker startup."""
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        if "--use-tpu" in request.config.invocation_params.args:
+            pytest.fail(
+                "TPU requested via --use-tpu, but no attached TPU chip was found "
+                "(get_num_chips() == 0)"
+            )
+        # VllmConfig() resolves DeviceConfig to torch.device("tpu"), which
+        # raises on a host with no TPU attached.
+        pytest.skip("requires an attached TPU chip")
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
@@ -101,11 +133,20 @@ def device(request):
     """Get the device to run tests on (CPU or TPU).
 
     Usage:
-        pytest tests/ -v              # Run on CPU
-        pytest tests/ -v --use-tpu    # Run on TPU
+        pytest tests/ -v              # Run on TPU when available, skip when no TPU
+        pytest tests/ -v --use-tpu    # Run on TPU (fails if no TPU is attached)
     """
     use_tpu = request.config.getoption("--use-tpu")
     if use_tpu:
+        from vllm_torchtpu.tpu_info import get_num_chips
+
+        if get_num_chips() == 0:
+            if "--use-tpu" in request.config.invocation_params.args:
+                pytest.fail(
+                    "TPU requested via --use-tpu, but no attached TPU chip was found "
+                    "(get_num_chips() == 0)"
+                )
+            pytest.skip("requires an attached TPU chip")
         try:
             import torch_tpu  # noqa: F401
 
@@ -115,6 +156,25 @@ def device(request):
         except Exception as e:
             pytest.fail(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
+
+
+@pytest.fixture
+def requires_tpu(request):
+    """Skip at setup when no TPU chip is attached.
+
+    A fixture, not a module-level `skipif`, so nothing probes the accelerator
+    during collection (see `pytest_collection_finish`). `get_num_chips` only
+    inspects /dev, so it never builds a PJRT client.
+    """
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        if "--use-tpu" in request.config.invocation_params.args:
+            pytest.fail(
+                "TPU requested via --use-tpu, but no attached TPU chip was found "
+                "(get_num_chips() == 0)"
+            )
+        pytest.skip("requires an attached TPU chip")
 
 
 def pytest_collection_finish(session):

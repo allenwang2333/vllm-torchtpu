@@ -277,7 +277,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -298,6 +298,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        fused_swa: bool = False,
     ):
         sparse_fp8_called.append(
             {
@@ -416,7 +417,7 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -437,6 +438,7 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        fused_swa: bool = False,
     ):
         captured_records.append(main_records)
         return torch.zeros(
@@ -527,13 +529,27 @@ def test_prepare_tpu_tiled_paged_attention_dispatch_bfloat16(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
     paged_attn_called = []
 
-    def fake_paged_attn(q, swa_cache, main_cache, records, main_records, sink, scale):
+    def fake_paged_attn(
+        q,
+        swa_cache,
+        main_cache,
+        records,
+        main_records,
+        sink,
+        scale,
+        block=1,
+        *,
+        token_parallel: bool = False,
+        full_sink=None,
+        tp_rank=None,
+    ):
+        assert block == 1  # target (causal) layers keep per-token windows
         paged_attn_called.append(True)
         return torch.zeros(
             count, attn.n_local_heads, attn.head_dim, dtype=torch.bfloat16
@@ -605,7 +621,7 @@ def test_prepare_tpu_untiled_fp8_kv_raises_not_implemented(monkeypatch):
         "_read_rows",
         lambda cache, table, reqs, log: torch.zeros((count, log.shape[1], 16)),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
 
@@ -706,7 +722,7 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
         "_row_slots",
         lambda cache, table, reqs, log: torch.zeros_like(log, dtype=torch.int64),
     )
-    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask: None)
+    monkeypatch.setattr(v2_attn, "_insert", lambda cache, slots, val, mask, **kw: None)
     attn.wq_b = lambda qr: qr
     attn._rotate = lambda x, pos: x
     attn._quantize_indexer = lambda x: x
@@ -785,3 +801,173 @@ def test_write_encoder_global_kv_empty_metadata(monkeypatch):
 
     # With empty kv_cache or None metadata, does nothing
     attn.write_encoder_global_kv(torch.randn(2, 10), torch.tensor([0, 1]))
+
+
+@pytest.mark.parametrize(
+    "lens",
+    [
+        [6] * 48,  # C=48 verify step
+        [5] * 45 + [0] * 3,  # draft step with trailing padded requests
+        [1, 7, 0, 3, 2048 - 11],  # mixed prefill / decode / empty request
+    ],
+)
+def test_token_requests_matches_bucketize(lens):
+    qsl = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.tensor(lens).cumsum(0).int()]
+    )
+    tokens = int(qsl[-1]) + 5  # rows past the last request map to len(lens)
+    metadata = SimpleNamespace(query_start_loc=qsl)
+    out = v2_attn._token_requests(metadata, torch.zeros(tokens, dtype=torch.int32))
+    rows = torch.arange(tokens)
+    ref = torch.bucketize(rows, qsl[1:], right=True, out_int32=True)
+    assert out.dtype == ref.dtype
+    assert torch.equal(out, ref)
+
+
+def test_compressor_write_slots_memo_key_omits_dynamic_token_count(monkeypatch):
+    """Verify DeepseekCompressor.forward keys compressor_write_slots by
+    ('compressor_write_slots', table.shape, state_rows) without kv_score.shape[0]
+    (1-line Dynamo fix preventing non-tensor FX graph output break)."""
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    state_meta = SimpleNamespace(
+        seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    )
+    state_cache = torch.randn(6, 16, 9, dtype=torch.float32)
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"state_prefix": state_meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+
+    comp = object.__new__(v2_attn.DeepseekCompressor)
+    torch.nn.Module.__init__(comp)
+    comp.head_dim = 8
+    comp.compress_ratio = 2
+    comp.rms_norm_eps = 1e-6
+    comp.norm = SimpleNamespace(weight=torch.ones(8, dtype=torch.float32))
+    comp.state_cache = SimpleNamespace(
+        prefix="state_prefix", kv_cache=state_cache.clone()
+    )
+
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    kv_score = torch.randn(4, 9, dtype=torch.float32)
+
+    with v2_attn.stage_attention_cache_scope():
+        stage_cache = v2_attn._active_stage_attn_cache
+        assert stage_cache is not None
+        out = comp.forward(kv_score, positions)
+        expected_key = ("compressor_write_slots", table.shape, 16)
+        assert expected_key in stage_cache
+        assert len(expected_key) == 3
+        assert len(stage_cache[expected_key]) == 3
+        assert out.shape == (4, 8)
+
+
+def test_forward_skips_o_padded_on_fused_qo_path(monkeypatch):
+    """Verify DeepseekV41Attention.forward skips allocating o_padded when
+    guaranteed to take the fused_qo (sparse_fp8_attention_qo) return path in
+    _prepare_tpu, and still allocates o_padded on non-fused_qo paths."""
+    count = 4
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    hidden = torch.ones((count, 8), dtype=torch.bfloat16)
+    qr = torch.ones((count, 4), dtype=torch.bfloat16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+
+    swa_cache = MagicMock(spec=PagedCacheRows)
+    swa_cache.numel.return_value = 128
+    swa_cache.shape = (8, 16, 512)
+    swa_cache.page_stride = 16
+    swa_cache.row_offset = 0
+    swa_cache.sharded = False
+    swa_cache.pages.return_value = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+    )
+    forward_ctx = SimpleNamespace(
+        attn_metadata={"swa": meta, "comp": meta}, additional_kwargs={}
+    )
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+
+    attn = object.__new__(v2_attn.DeepseekV41Attention)
+    torch.nn.Module.__init__(attn)
+    attn.padded_heads = 2
+    attn.n_local_heads = 2
+    attn.head_dim = 4
+    attn.q_lora_rank = 4
+    attn.window_size = 64
+    attn.compress_ratio = 2
+    attn._max_model_len = 64
+    attn._fp8_kv = True
+    attn._sp_sharded_input = False
+    attn._replicated_local_q = True
+    attn._local_q_attn = True
+    attn._ced_decoder = False
+    attn._ced_global_from_encoder = False
+    attn.compressor = None
+    attn.indexer = None
+    attn.scale = 0.25
+    attn.attn_sink = torch.zeros(2, dtype=torch.float32)
+    attn._full_attn_sink = torch.zeros(4, dtype=torch.float32)
+    attn._tp_rank_1d = torch.zeros(1, dtype=torch.int32)
+    attn._tpu_rope_cache = torch.zeros(8, 4, dtype=torch.float32)
+    attn._swa_max_requests = 4
+    attn._precompact_records = True
+    attn._token_parallel_attn = True
+    attn.compressed_cache_prefix = "comp"
+    attn.topk_indices_buffer = torch.zeros((count, 8), dtype=torch.int32)
+    attn.swa_cache_layer = SimpleNamespace(prefix="swa", kv_cache=swa_cache)
+    attn._static_forward_context = {"comp": SimpleNamespace(kv_cache=swa_cache)}
+    attn.wq_b = SimpleNamespace(weight=torch.zeros(1), weight_scale=torch.ones(1))
+    attn.wo_a = SimpleNamespace(weight=torch.zeros(1), weight_scale=torch.ones(1))
+    attn._wq_b_full = torch.zeros(1)
+    attn._wq_b_full_scale = torch.ones(1)
+    attn._wo_a_full = torch.zeros(1)
+    attn._wo_a_full_scale = torch.ones(1)
+    attn._run_parallel_input_projections = lambda h: (None, None, None)
+    attn._split_qkv_and_norm = lambda x: (qr, None, kv)
+    attn._rotate = lambda x, pos: x
+    attn.wo_b = lambda x: (x * 2, None)
+    attn._prepare_and_attn_fn = attn._prepare_tpu
+
+    projected = torch.full((count, 6), 3.0, dtype=torch.bfloat16)
+    qo_calls = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention_qo",
+        lambda *a, **kw: qo_calls.append(True) or projected,
+    )
+
+    zeros_like_calls = []
+    orig_zeros_like = torch.zeros_like
+
+    def spy_zeros_like(t, *a, **kw):
+        zeros_like_calls.append(t.shape)
+        return orig_zeros_like(t, *a, **kw)
+
+    monkeypatch.setattr(torch, "zeros_like", spy_zeros_like)
+
+    # 1. Fused QO path skips allocating o_padded (0 zeros_like calls)
+    out = attn.forward(positions, hidden)
+    assert qo_calls == [True]
+    assert zeros_like_calls == []
+    assert torch.equal(out, projected * 2)
+
+    # 2. Non-fused_qo path (e.g. compress_ratio == 0 on L0/L1) allocates o_padded
+    attn.compress_ratio = 0
+    attn.wq_b = lambda q_in: torch.zeros(
+        (count, attn.n_local_heads * attn.head_dim), dtype=torch.bfloat16
+    )
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_attention",
+        lambda q, *a, **kw: torch.ones_like(q),
+    )
+    attn._o_proj = lambda o, pos: o.sum(dim=1)
+    out_uncompressed = attn.forward(positions, hidden)
+    assert zeros_like_calls == [(count, 1, 1)]
+    assert out_uncompressed.shape == (count, attn.head_dim)

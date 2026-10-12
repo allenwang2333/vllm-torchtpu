@@ -238,6 +238,11 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
     @parameterized.parameters((16, 16), (128, 125), (256, 204), (272, 257), (256, 0))
     def test_two_bank_prefetch_preserves_attention(self, tokens, valid):
         """Lookahead keeps each chunk's KV and tail bounds paired with its query."""

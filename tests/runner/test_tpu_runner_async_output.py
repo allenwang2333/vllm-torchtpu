@@ -12,22 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
+from vllm_torchtpu.runner import tpu_runner_async_output
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
+    AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
     assemble_spec_next_tokens,
+    assemble_spec_next_tokens_and_num_rejected,
     compute_num_rejected,
     extract_draft_token_ids,
+    parse_sampled_token_ids_cpu,
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
 )
+
+
+@pytest.fixture
+def device():
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        return torch.device("cpu")
+    try:
+        import torch_tpu  # noqa: F401
+
+        return torch.device("tpu")
+    except Exception:
+        return torch.device("cpu")
 
 
 def test_assemble_spec_next_tokens(device):
@@ -52,6 +74,36 @@ def test_assemble_spec_next_tokens(device):
         [99, 201, 202, 203, 77, 211, 212, 213], dtype=torch.int32, device=device
     )
     assert torch.equal(src, expected)
+
+
+def test_assemble_spec_next_tokens_and_num_rejected(device):
+    next_tokens = torch.tensor(
+        [
+            [11, 12, 99, INVALID_TOKEN_ID],
+            [77, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [0, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    drafts = torch.tensor(
+        [[201, 202, 203], [211, 212, 213], [999, 999, 999]],
+        dtype=torch.int32,
+        device=device,
+    )
+    num_draft = torch.tensor([3, 3, 3], dtype=torch.int32, device=device)
+
+    src, num_rejected = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, num_draft, num_reqs=2
+    )
+    assert torch.equal(src, assemble_spec_next_tokens(next_tokens, drafts, num_reqs=2))
+    assert num_rejected.tolist() == [1, 3]
+
+    src_no_draft, num_rejected_no_draft = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, None, num_reqs=2
+    )
+    assert torch.equal(src_no_draft, src)
+    assert num_rejected_no_draft.tolist() == [0, 0]
 
 
 def test_assemble_spec_next_tokens_ignores_padded_rows(device):
@@ -174,7 +226,7 @@ def test_spec_logprob_row_tokens_places_each_slot_on_its_row():
         torch.zeros(8, dtype=torch.int32),
     )
     assert row_tokens.shape == (8, 1)
-    assert row_tokens.dtype == torch.int64
+    assert row_tokens.dtype == torch.int32
     # Rejected slots, the padded request and the padding row read token 0;
     # in particular the padded request's junk does not overwrite row 0.
     assert row_tokens.flatten().tolist() == [11, 12, 0, 0, 21, 22, 31, 0]
@@ -257,3 +309,485 @@ def test_get_output_skips_wait_when_all_requests_discarded():
     ).get_output()
     assert out.sampled_token_ids == [[]]
     assert out.logprobs is None
+
+
+class _FakeTPUTensor(torch.Tensor):
+    @property
+    def device(self):  # type: ignore[override]
+        return SimpleNamespace(type="tpu")
+
+
+def _as_fake_tpu(t: torch.Tensor) -> torch.Tensor:
+    return t.as_subclass(_FakeTPUTensor)
+
+
+def test_parse_sampled_token_ids_cpu_shapes():
+    rows_1d, lens_1d = parse_sampled_token_ids_cpu(
+        torch.tensor([11, 22], dtype=torch.int32)
+    )
+    assert rows_1d == [[11], [22]]
+    assert lens_1d == [1, 1]
+
+    rows_col1, lens_col1 = parse_sampled_token_ids_cpu(
+        torch.tensor([[33], [44]], dtype=torch.int32)
+    )
+    assert rows_col1 == [[33], [44]]
+    assert lens_col1 == [1, 1]
+
+    rows_spec, lens_spec = parse_sampled_token_ids_cpu(
+        torch.tensor([[55, INVALID_TOKEN_ID], [66, 77]], dtype=torch.int32)
+    )
+    assert rows_spec == [[55], [66, 77]]
+    assert lens_spec == [1, 2]
+
+
+def test_spec_logprobs_lists_empty_chunk():
+    empty_chunk = SpecLogprobsChunk(
+        _row_logprobs(2), row_starts=np.zeros(0, dtype=np.int64)
+    )
+    out = spec_logprobs_lists([empty_chunk], gen_lens=[])
+    assert out.cu_num_generated_tokens == [0]
+    assert out.logprob_token_ids.shape[0] == 0
+
+
+def test_async_tpu_copy_state_lifecycle_and_caching():
+    t0 = torch.tensor([[10, 11, INVALID_TOKEN_ID], [99, 99, 99]], dtype=torch.int32)
+    t1 = torch.tensor([[20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]], dtype=torch.int32)
+    lp_tensors = _row_logprobs(4)
+    spec_chunk = SpecLogprobsChunk(lp_tensors, row_starts=np.array([0, 2]))
+
+    fake_event = MagicMock()
+    with patch.object(
+        torch,
+        "tpu",
+        SimpleNamespace(Event=MagicMock(return_value=fake_event)),
+        create=True,
+    ):
+        state_no_lp = AsyncTPUCopyState.from_device_chunks(
+            [t0], [1], spec_logprobs=None
+        )
+        assert state_no_lp.spec_logprobs is None
+        fake_event.record.assert_called_once()
+
+        state = AsyncTPUCopyState.from_device_chunks(
+            [t0, t1], [1, 1], spec_logprobs=[spec_chunk]
+        )
+        assert state.spec_logprobs is not None
+        assert not state.completed
+
+    state.wait()
+    assert state.completed
+    assert state.chunks_tpu is None
+    assert state._spec_logprobs_tpu is None
+    fake_event.synchronize.assert_called_once()
+
+    # Second wait() is a no-op.
+    state.wait()
+    fake_event.synchronize.assert_called_once()
+
+    # Multi-chunk concatenation + caching on sampled_token_ids_cpu.
+    cpu_ids_first = state.sampled_token_ids_cpu
+    cpu_ids_second = state.sampled_token_ids_cpu
+    assert cpu_ids_first is cpu_ids_second
+    assert cpu_ids_first.tolist() == [
+        [10, 11, INVALID_TOKEN_ID],
+        [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+    ]
+
+    # parse_sampled_tokens caches the parsed result and returns defensive row copies.
+    rows_a, lens_a = state.parse_sampled_tokens()
+    assert rows_a == [[10, 11], [20]]
+    assert lens_a == [2, 1]
+    rows_a[0].clear()
+
+    rows_b, lens_b = state.parse_sampled_tokens()
+    assert rows_b == [[10, 11], [20]]
+    assert lens_b is lens_a
+
+
+def test_async_pre_results_wait_for_copy():
+    pre_none = AsyncPreResults(
+        req_ids=[],
+        next_tokens_tpu=torch.empty(0, dtype=torch.int32),
+        request_seq_lens=[],
+        discard_sampled_tokens_req_indices=[],
+        req_id_to_index_copy={},
+        copy_state=None,
+    )
+    assert pre_none.wait_for_copy() is None
+
+    copy_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([[7]], dtype=torch.int32)],
+        chunk_real_lens=[1],
+        copy_ready_event=None,
+        completed=True,
+    )
+    pre_with_copy = AsyncPreResults(
+        req_ids=["r0"],
+        next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
+        request_seq_lens=[],
+        discard_sampled_tokens_req_indices=[],
+        req_id_to_index_copy={"r0": 0},
+        copy_state=copy_state,
+    )
+    out = pre_with_copy.wait_for_copy()
+    assert out is not None and out.tolist() == [[7]]
+
+
+def test_async_tpu_model_runner_output_edge_branches():
+    # 1) copy_state is None, all requests discarded -> [[] for _ in range(num_reqs)]
+    out_discard_all = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0", "r1"],
+            req_id_to_index={"r0": 0, "r1": 1},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=None,
+        discard_sampled_tokens_req_indices=[0, 1],
+    ).get_output()
+    assert out_discard_all.sampled_token_ids == [[], []]
+
+    # 2) copy_state is None, not all requests discarded -> []
+    out_none = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0"],
+            req_id_to_index={"r0": 0},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=None,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+    assert out_none.sampled_token_ids == []
+
+    # 3) copy_state has 0 elements -> []
+    empty_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.empty((0, 1), dtype=torch.int32)],
+        chunk_real_lens=[0],
+        copy_ready_event=None,
+        completed=True,
+    )
+    out_empty = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0"],
+            req_id_to_index={"r0": 0},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=empty_state,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+    assert out_empty.sampled_token_ids == []
+
+    # 4) copy_state without spec_logprobs, partial discard
+    normal_state = AsyncTPUCopyState(
+        chunks_cpu=[torch.tensor([[11], [22]], dtype=torch.int32)],
+        chunk_real_lens=[2],
+        copy_ready_event=None,
+        completed=True,
+        spec_logprobs=None,
+    )
+    out_partial = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0", "r1"],
+            req_id_to_index={"r0": 0, "r1": 1},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=normal_state,
+        discard_sampled_tokens_req_indices=[0],
+    ).get_output()
+    assert out_partial.sampled_token_ids == [[], [22]]
+
+    # 5) copy_state without spec_logprobs, no discard
+    out_no_discard = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["r0", "r1"],
+            req_id_to_index={"r0": 0, "r1": 1},
+            sampled_token_ids=[],
+            logprobs=None,
+        ),
+        copy_state=normal_state,
+        discard_sampled_tokens_req_indices=[],
+    ).get_output()
+    assert out_no_discard.sampled_token_ids == [[11], [22]]
+
+
+def test_compiled_helpers_padding_mrope_and_tpu_dispatch(monkeypatch):
+    next_tokens = torch.tensor(
+        [[11, 99, INVALID_TOKEN_ID], [77, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+        dtype=torch.int32,
+    )
+    drafts = torch.tensor([[201, 202], [211, 212]], dtype=torch.int32)
+    num_draft = torch.tensor([2, 2], dtype=torch.int32)
+
+    # Padding branches (padded_src_len > src.shape[0] and padded_num_reqs > num_reqs)
+    src_pad, rej_pad = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens,
+        drafts,
+        num_draft,
+        num_reqs=2,
+        padded_src_len=12,
+        padded_num_reqs=4,
+    )
+    assert src_pad.tolist() == [99, 201, 202, 77, 211, 212, 0, 0, 0, 0, 0, 0]
+    assert rej_pad.tolist() == [1, 2, 0, 0]
+
+    # Exact-length branches (padded_src_len == src.shape[0] and
+    # padded_num_reqs == num_reqs)
+    src_exact, rej_exact = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens,
+        drafts,
+        num_draft,
+        num_reqs=2,
+        padded_src_len=6,
+        padded_num_reqs=2,
+    )
+    assert src_exact.tolist() == [99, 201, 202, 77, 211, 212]
+    assert rej_exact.tolist() == [1, 2]
+
+    # num_draft=None with padded_num_reqs > num_reqs
+    _, rej_none_pad = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens,
+        drafts,
+        None,
+        num_reqs=2,
+        padded_src_len=6,
+        padded_num_reqs=4,
+    )
+    assert rej_none_pad.tolist() == [0, 0, 0, 0]
+
+    # TPU dispatch branch for assemble_spec_next_tokens_and_num_rejected
+    monkeypatch.setattr(
+        tpu_runner_async_output,
+        "_assemble_spec_next_tokens_and_num_rejected_compiled",
+        tpu_runner_async_output._assemble_spec_next_tokens_and_num_rejected,
+    )
+    src_tpu, rej_tpu = assemble_spec_next_tokens_and_num_rejected(
+        _as_fake_tpu(next_tokens),
+        _as_fake_tpu(drafts),
+        num_draft,
+        num_reqs=2,
+    )
+    assert torch.equal(src_tpu, src_exact)
+    assert torch.equal(rej_tpu, rej_exact)
+
+    # Non-bucketed shape on TPU falls back to uncompiled helper
+    src_tpu_unbucketed, _ = assemble_spec_next_tokens_and_num_rejected(
+        _as_fake_tpu(next_tokens),
+        _as_fake_tpu(drafts),
+        num_draft,
+        num_reqs=1,
+    )
+    assert src_tpu_unbucketed.tolist() == [99, 201, 202]
+
+    # 2D mrope positions in subtract_num_rejected_tokens + TPU dispatch
+    monkeypatch.setattr(
+        tpu_runner_async_output,
+        "_subtract_num_rejected_tokens_compiled",
+        tpu_runner_async_output._subtract_num_rejected_tokens,
+    )
+    seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+    positions_2d = torch.tensor([[6, 7], [6, 7], [6, 7]], dtype=torch.int32)
+    num_rejected = torch.tensor([2, 1], dtype=torch.int32)
+    seq_idx = torch.tensor([0, 1], dtype=torch.int32)
+    pos_idx = torch.tensor([0, 1], dtype=torch.int32)
+    new_seq, new_pos_2d = subtract_num_rejected_tokens(
+        _as_fake_tpu(seq_lens),
+        positions_2d,
+        num_rejected,
+        seq_idx,
+        pos_idx,
+    )
+    assert new_seq.tolist() == [8, 19]
+    assert new_pos_2d.tolist() == [[4, 6], [4, 6], [4, 6]]
+
+    # TPU dispatch for extract_draft_token_ids
+    monkeypatch.setattr(
+        tpu_runner_async_output,
+        "_extract_draft_token_ids_compiled",
+        tpu_runner_async_output._extract_draft_token_ids,
+    )
+    input_ids = _as_fake_tpu(torch.tensor([10, 11, 12, 13], dtype=torch.int32))
+    logits_idx = torch.tensor([0, 1, 2], dtype=torch.int32)
+    target_idx = torch.tensor([0, 1], dtype=torch.int32)
+    assert extract_draft_token_ids(input_ids, logits_idx, target_idx).tolist() == [
+        11,
+        12,
+    ]
+
+
+def test_native_int32_1d_index_select_in_async_output_helpers(monkeypatch):
+    select_calls = []
+    orig_index_select = torch.Tensor.index_select
+
+    def spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+    next_tokens = torch.tensor(
+        [[11, 99, INVALID_TOKEN_ID], [77, INVALID_TOKEN_ID, INVALID_TOKEN_ID]],
+        dtype=torch.int32,
+    )
+    drafts = torch.tensor([[201, 202], [211, 212]], dtype=torch.int32)
+    num_draft = torch.tensor([2, 2], dtype=torch.int32)
+
+    select_calls.clear()
+    out1 = tpu_runner_async_output.assemble_spec_next_tokens(
+        next_tokens, drafts, num_reqs=2
+    )
+    assert out1.tolist() == [99, 201, 202, 77, 211, 212]
+    assert select_calls == [(1, 0, torch.int32)]
+
+    select_calls.clear()
+    out2, rej2 = assemble_spec_next_tokens_and_num_rejected(
+        next_tokens, drafts, num_draft, num_reqs=2
+    )
+    assert torch.equal(out2, out1)
+    assert rej2.tolist() == [1, 2]
+    assert select_calls == [(1, 0, torch.int32)]
+
+    select_calls.clear()
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    positions = torch.tensor([5, 6, 15, 16, 25], dtype=torch.int32)
+    num_rej = torch.tensor([2, 1], dtype=torch.int64)
+    seq_idx = torch.tensor([0, 1, -1], dtype=torch.int64)
+    pos_idx = torch.tensor([0, 0, 1, 1, -1], dtype=torch.int64)
+    new_seq, new_pos = subtract_num_rejected_tokens(
+        seq_lens, positions, num_rej, seq_idx, pos_idx
+    )
+    assert new_seq.tolist() == [8, 19, 30]
+    assert new_pos.tolist() == [3, 4, 14, 15, 25]
+    assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]
+
+    select_calls.clear()
+    in_ids = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int32)
+    logits_idx = torch.tensor([0, 2, 4], dtype=torch.int64)
+    target_idx = torch.tensor([0, 1], dtype=torch.int64)
+    extracted = extract_draft_token_ids(in_ids, logits_idx, target_idx)
+    assert extracted.tolist() == [102, 104]
+    assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]
+
+
+def test_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
+    monkeypatch,
+):
+    from contextlib import nullcontext
+
+    import vllm_torchtpu.runner.tpu_runner as tr_mod
+    from vllm_torchtpu.runner.tpu_runner import (
+        TPUModelRunner,
+        _rollback_offsets_migrate_impl,
+    )
+
+    select_calls = []
+    orig_index_select = torch.Tensor.index_select
+
+    def spy_index_select(self, dim, index):
+        select_calls.append((self.ndim, self.dtype, dim, index.dtype))
+        return orig_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", spy_index_select)
+
+    # 1. _rollback_offsets_migrate_impl uses int32 1D index_select
+    read_offsets = torch.tensor([0, 5, 9, 0], dtype=torch.int32)
+    src_t = torch.tensor([1, 2], dtype=torch.int64)
+    dst_t = torch.tensor([0, 3], dtype=torch.int64)
+    select_calls.clear()
+    _rollback_offsets_migrate_impl(read_offsets, src_t, dst_t)
+    assert read_offsets.tolist() == [5, 5, 9, 9]
+    assert select_calls == [(1, torch.int32, 0, torch.int32)]
+
+    # 2. _spec_seed_sources uses int32 1D index_select on offsets and ckpt_t
+    runner = object.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.mamba_slot_read_offsets = torch.tensor([0, 2, 99, 1], dtype=torch.int32)
+    select_calls.clear()
+    srcs = TPUModelRunner._spec_seed_sources(
+        runner,
+        state_srcs=[1, 2, 3],
+        ckpt_rows=[[10, 11, 12], [20, 21, 22], [30, 31, 32]],
+        new_owners=[False, False, True],
+    )
+    assert srcs.dtype == torch.int32
+    assert srcs.tolist() == [12, 22, 30]
+    assert select_calls == [
+        (1, torch.int32, 0, torch.int32),
+        (1, torch.int32, 0, torch.int32),
+    ]
+
+    # 3. gather_logprobs uses int32 1D index_select and int32 token_ids
+    logits = torch.tensor(
+        [[1.0, 3.0, 2.0, 0.5], [4.0, 0.0, 2.0, 1.0]], dtype=torch.float32
+    )
+    sampled = torch.tensor([[1], [2]], dtype=torch.int64)
+
+    for max_lp in (2, 0):
+        runner.model_config = SimpleNamespace(max_logprobs=max_lp)
+        select_calls.clear()
+        res = TPUModelRunner.gather_logprobs.__wrapped__(runner, logits, sampled)
+        assert select_calls == [(1, torch.float32, 0, torch.int32)]
+        assert res.logprob_token_ids.dtype == torch.int32
+        assert res.selected_token_ranks.dtype == torch.int32
+        assert res.selected_token_ranks.tolist() == [1, 2]
+        if max_lp > 0:
+            assert res.logprob_token_ids.tolist() == [[1, 1, 2], [2, 0, 2]]
+        else:
+            assert res.logprob_token_ids.tolist() == [[1], [2]]
+
+    # 4. _precompile_gather_logprobs passes int32 sampled_tokens
+    seen_sampled_dtypes = []
+    runner.num_reqs_paddings = [2, 4]
+    runner._precompile_timed = lambda _name: nullcontext()
+    runner._dummy_logits = lambda n: torch.zeros((n, 8), dtype=torch.float32)
+    monkeypatch.setattr(tr_mod, "synchronize_tensors", lambda *_a, **_kw: None)
+
+    def spy_gather_logprobs(logits_in, sampled_in):
+        seen_sampled_dtypes.append(sampled_in.dtype)
+        return TPUModelRunner.gather_logprobs.__wrapped__(runner, logits_in, sampled_in)
+
+    runner.gather_logprobs = spy_gather_logprobs
+    TPUModelRunner._precompile_gather_logprobs(runner)
+    assert seen_sampled_dtypes == [torch.int32, torch.int32]
+
+
+def test_spec_logprobs_int32(monkeypatch):
+    """spec_logprobs_lists uses np.int32 for g_arr, cu_g, np.arange, and np.zeros."""
+    from vllm_torchtpu.runner import tpu_runner_async_output as async_mod
+
+    orig_np_arange = async_mod.np.arange
+    orig_np_zeros = async_mod.np.zeros
+    seen_np_dtypes: list[object] = []
+
+    def _spy_np_arange(*args, **kwargs):
+        seen_np_dtypes.append(kwargs.get("dtype"))
+        return orig_np_arange(*args, **kwargs)
+
+    def _spy_np_zeros(*args, **kwargs):
+        seen_np_dtypes.append(kwargs.get("dtype"))
+        return orig_np_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(async_mod.np, "arange", _spy_np_arange)
+    monkeypatch.setattr(async_mod.np, "zeros", _spy_np_zeros)
+
+    c_nonempty = SpecLogprobsChunk(
+        tensors=LogprobsTensors(
+            logprob_token_ids=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            logprobs=torch.tensor([[-0.1, -0.2], [-0.3, -0.4]], dtype=torch.float32),
+            selected_token_ranks=torch.tensor([0, 1], dtype=torch.int32),
+        ),
+        row_starts=np.array([0], dtype=np.int32),
+    )
+    c_empty = SpecLogprobsChunk(
+        tensors=LogprobsTensors(
+            logprob_token_ids=torch.empty((0, 2), dtype=torch.int32),
+            logprobs=torch.empty((0, 2), dtype=torch.float32),
+            selected_token_ranks=torch.empty((0,), dtype=torch.int32),
+        ),
+        row_starts=np.array([], dtype=np.int32),
+    )
+    out = spec_logprobs_lists([c_nonempty, c_empty], gen_lens=[2])
+    assert out.logprob_token_ids.tolist() == [[10, 11], [20, 21]]
+    assert seen_np_dtypes == [np.int32, np.int32]

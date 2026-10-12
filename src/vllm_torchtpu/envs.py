@@ -10,8 +10,11 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
+    TPU_DEEPSEEK_V41_FUSED_SWA: bool = True
+    TPU_DEEPSEEK_V41_DECODE_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -210,10 +213,10 @@ def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
 
     def _get_bool_env() -> bool:
         value = os.getenv(env_name)
-        if value is None or value.strip() == "":
+        if value is None or (stripped := value.strip()) == "":
             return default
 
-        value_lower = value.strip().lower()
+        value_lower = stripped.lower()
         if value_lower in _TRUE_STRINGS:
             return True
         if value_lower in _FALSE_STRINGS:
@@ -374,11 +377,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
+    # With ENGRAM_CPU_OFFLOAD: after loading, move the Host-DRAM Engram rows
+    # into TPU pinned_host memory and gather them inside the compiled graph
+    # with a Pallas host DMA (kernels/deepseek_v41/host_row_gather.py), so
+    # decode needs no host hash/gather/H2D between steps. Scales go to HBM.
+    "TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", default=False
+    ),
     # Under V4.1 SP token-parallel FP8 attention, project q only for this
     # rank's token shard with an all-gathered wq_b and run wo_a for every
     # o_group on that shard, shrinking both attention all_to_alls.
     # Costs replicated wq_b/wo_a HBM per rank.
     "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
+    # Fold the sliding-window attention into the SparseMLA Pallas kernel for
+    # small decode batches, replacing the XLA gather and partial softmax.
+    "TPU_DEEPSEEK_V41_FUSED_SWA": env_bool("TPU_DEEPSEEK_V41_FUSED_SWA", default=True),
+    # Same token-local q / wo_a path for TP-replicated layers (the CED decoder
+    # at decode): each rank projects q for its contiguous T/tp token shard of
+    # the replicated qr with the all-gathered wq_b, so the q all_to_all
+    # disappears and the return all_to_all carries [T/tp, groups, o_lora_rank]
+    # instead of [T/tp, heads, head_dim]. Applies under the token-parallel
+    # attention gate (tokens >= 6 * tp). Costs replicated wq_b/wo_a HBM per
+    # rank on every such layer.
+    "TPU_DEEPSEEK_V41_DECODE_LOCAL_Q": env_bool(
+        "TPU_DEEPSEEK_V41_DECODE_LOCAL_Q", default=False
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only
@@ -938,6 +961,11 @@ def enable_envs_cache() -> None:
     # Cache all environment variables
     for key in environment_variables:
         __getattr__(key)
+
+
+def is_set(name: str) -> bool:
+    """Return whether `name` is explicitly set in `os.environ` or `envs.__dict__`."""
+    return name in globals() or name in os.environ
 
 
 def __dir__() -> list[str]:

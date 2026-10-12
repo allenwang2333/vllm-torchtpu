@@ -1,8 +1,9 @@
 """Checks for the DeepSeek V4.1 delayed mHC shared by the v1 and v2 paths.
 
 The oracle is vLLM's ``mhc_pre_delayed_torch``. ``delayed_pre_flat_jax``
-takes the XLA path below 64 tokens (or off a multiple of 64) and the Pallas
-pass otherwise; the Pallas cases need TPU hardware.
+and ``delayed_post_pre_flat_jax`` take the Pallas pass for the token counts
+`_pallas_tile` accepts and the XLA path otherwise; the Pallas cases need TPU
+hardware.
 """
 
 import jax
@@ -101,10 +102,22 @@ def _check_post_pre(tokens, dim, packed):
         _jax(previous_pre),
         *CONSTANTS,
     )
+    #    when both take the same path. From `_POST_PRE_PALLAS_MIN_TOKENS` the
+    #    fused pass may take Pallas while the pre-only pass stays on XLA; the
+    #    two differ only in accumulation order.
     flat_new, post, comb, value, new_pre = got
     np.testing.assert_array_equal(_np(flat_new), _np(step_flat))
-    for g, s in zip((post, comb, value, new_pre), step_pre):
-        np.testing.assert_array_equal(_np(g), _np(s))
+    same_path = mhc._pallas_tile(tokens, MIXES) == mhc._pallas_tile(
+        tokens, MIXES, fused_post=True
+    )
+    #    ``value`` is BF16, so a one-ulp rounding flip needs the BF16 tolerance.
+    tolerances = ((GATE_RTOL, GATE_ATOL),) * 2 + ((BF16_RTOL, BF16_ATOL),)
+    tolerances += ((GATE_RTOL, GATE_ATOL),)
+    for g, s, (rtol, atol) in zip((post, comb, value, new_pre), step_pre, tolerances):
+        if same_path:
+            np.testing.assert_array_equal(_np(g), _np(s))
+        else:
+            np.testing.assert_allclose(_np(g), _np(s), rtol=rtol, atol=atol)
 
     # 2. Close agreement with vLLM PyTorch reference
     want_res = mhc_post_torch(x, residual, post_mix, comb_mix)
@@ -141,12 +154,50 @@ def test_torch_and_jax_packing_agree():
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
-    "tokens", [1, 8, 16, 24, 32, 48, 63, 100, 144, 192, 288, 384, 512]
+    "tokens", [1, 8, 16, 24, 32, 48, 63, 100, 144, 192, 200, 288, 520]
 )
 def test_xla_path_matches_torch_reference(tokens, packed):
-    """Token counts the Pallas pass does not take."""
+    """Token counts neither Pallas pass takes."""
+    assert mhc._pallas_tile(tokens, MIXES) is None
+    assert mhc._pallas_tile(tokens, MIXES, fused_post=True) is None
     _check(tokens, 256, packed)
     _check_post_pre(tokens, 256, packed)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "tokens,pre_tile,post_tile",
+    [
+        (63, None, None),
+        (64, 64, 64),
+        (96, 96, 96),
+        (100, None, None),
+        (128, 128, 128),
+        (144, None, None),
+        (192, None, None),
+        (256, 128, 128),
+        (288, None, None),
+        (320, None, None),
+        (384, None, 96),
+        (400, None, 80),  # C=80 DSpark draft (C * K)
+        (512, None, 64),
+        (520, None, None),
+        (560, None, 80),  # C=112 DSpark draft
+        (576, None, 96),
+        (640, None, 64),  # tile 64 beat 80 here
+        (768, None, 96),
+        (960, None, 96),
+        (1024, 64, 64),
+        (1056, None, 96),
+        (1152, 64, 96),  # C=192 verify, was 64 (18 -> 12 grid steps)
+        (2048, 64, 64),
+        (4096, 64, 64),
+    ],
+)
+def test_pallas_tile(tokens, pre_tile, post_tile):
+    assert mhc._pallas_tile(tokens, MIXES) == pre_tile
+    assert mhc._pallas_tile(tokens, MIXES, fused_post=True) == post_tile
+    assert mhc._pallas_tile(tokens, 3 * 128, fused_post=True) is None
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -156,8 +207,18 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (64, 256),
         (96, 256),
         (256, 256),
+        (384, 256),
+        (512, 256),
+        (576, 256),
+        (960, 256),
         (1024, 256),
+        (400, 256),
+        (640, 256),
+        (1152, 256),
         (128, 5120),
+        (384, 5120),
+        (768, 5120),
+        (1152, 5120),
     ],
 )
 def test_pallas_path_matches_torch_reference(tokens, dim, packed):
@@ -165,6 +226,36 @@ def test_pallas_path_matches_torch_reference(tokens, dim, packed):
         pytest.skip("Pallas TPU kernel needs TPU hardware")
     _check(tokens, dim, packed)
     _check_post_pre(tokens, dim, packed)
+
+
+@pytest.mark.parametrize("tokens", [960, 1152])
+def test_fused_post_pre_tile_is_bitwise_invariant(tokens, monkeypatch):
+    """the fused pass gives the same bits at tiles 96, 80 and 64."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Pallas TPU kernel needs TPU hardware")
+    residual, fn, scale, base, previous_pre = _inputs(tokens, 5120)
+    x, post_mix, comb_mix = _post_inputs(tokens, 5120)
+    args = (
+        _jax(x),
+        _jax(residual.flatten(1)),
+        _jax(post_mix),
+        _jax(comb_mix),
+        _jax(mhc.pack_mix_weight(fn)),
+        _jax(scale),
+        _jax(base),
+        _jax(previous_pre),
+        *CONSTANTS,
+    )
+    outs = []
+    for tile in (96, 80, 64):
+        if tokens % tile:
+            continue
+        monkeypatch.setattr(mhc, "_pallas_tile", lambda *a, t=tile, **k: t)
+        outs.append(mhc.delayed_post_pre_flat_jax(*args))
+    assert len(outs) >= 2
+    for got in outs[1:]:
+        for g, w in zip(got, outs[0]):
+            np.testing.assert_array_equal(_np(g), _np(w))
 
 
 @pytest.mark.cpu_test
@@ -190,3 +281,71 @@ def test_collapse_flat_matches_view_sum(mult):
         np.testing.assert_array_equal(_np(got), _np(want))
     else:
         np.testing.assert_allclose(_np(got), _np(want), rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("mult", [2, 4])
+def test_mean_hc_streams_matches_mean(mult):
+    """slice-sum stream mean; bitwise vs ``mean(1)`` is a TPU check."""
+    rng = np.random.default_rng(5)
+    residual = torch.from_numpy(rng.standard_normal((24, mult, 256)) * 8).bfloat16()
+    got = mhc._mean_hc_streams(residual)
+    want = residual.mean(1)
+    assert got.shape == want.shape and got.dtype == torch.bfloat16
+    if mult != 4:
+        assert torch.equal(got, want)
+    else:
+        torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("tokens", [768, 1152])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_mean_hc_streams_bitwise_on_tpu(tokens, compiled, device):
+    """on TPU the slice sum equals BF16 ``residual.mean(1)`` bitwise."""
+    if device.type != "tpu":
+        pytest.skip("bitwise parity is defined by the TPU reduce order")
+    rng = np.random.default_rng(tokens)
+    residual = (
+        torch.from_numpy(rng.standard_normal((tokens, 4, 5120)) * 8)
+        .bfloat16()
+        .to(device)
+    )
+    mean = (
+        (lambda r: r.mean(1))
+        if not compiled
+        else torch.compile(lambda r: r.mean(1), backend="tpu", dynamic=False)
+    )
+    streams = (
+        mhc._mean_hc_streams
+        if not compiled
+        else torch.compile(mhc._mean_hc_streams, backend="tpu", dynamic=False)
+    )
+    assert torch.equal(streams(residual).cpu(), mean(residual).cpu())
+
+
+@pytest.mark.parametrize("tokens", [16, 1152])
+def test_delayed_pre_jax_value_matches_view_reduce(tokens):
+    """`delayed_pre_jax` collapses the flat rows (`_collapse_flat`).
+
+    Bitwise on TPU, where ``(s0 + s2) + (s1 + s3)`` is XLA's reduce order for
+    the ``[T, M, D]`` view; CPU XLA may sum in another order.
+    """
+    dim = 256
+    residual, fn, scale, base, previous_pre = _inputs(tokens, dim, seed=tokens)
+    res = _jax(residual)
+    pre = _jax(previous_pre)
+    got = mhc.delayed_pre_jax(
+        res,
+        res.reshape(tokens, -1),
+        _jax(fn),
+        _jax(scale),
+        _jax(base),
+        pre,
+        *CONSTANTS,
+    )[2]
+    want = (pre[..., None] * res.astype(jnp.float32)).sum(1).astype(res.dtype)
+    assert got.dtype == jnp.bfloat16 and got.shape == (tokens, dim)
+    if jax.default_backend() == "tpu":
+        np.testing.assert_array_equal(_np(got), _np(want))
+    else:
+        np.testing.assert_allclose(_np(got), _np(want), rtol=BF16_RTOL, atol=BF16_ATOL)

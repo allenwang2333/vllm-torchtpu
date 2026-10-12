@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Upstream V4.1 model assembly with TPU device operations."""
 
+import time
+from copy import copy
 from dataclasses import replace
 from itertools import islice
 
 import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
@@ -17,7 +20,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
-    collapse,
     initialize_delayed_mhc,
     initialize_mhc_post,
     pack_mix_weights,
@@ -34,9 +36,13 @@ from .attention import (
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
+    _ced_inverse_rows,
+    _scatter_decoder_rows,
+    _zero_hits,
     coordinate_decoder_replay,
     plan_decoder_replay,
     prefix_replay_enabled,
+    sync_decoder_replay_plan,
 )
 from .engram import Engram, NgramHashState
 from .host_engram import (
@@ -71,24 +77,80 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
-def _scatter_decoder_rows(
-    tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
+def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
+    if len(terms) == 4:
+        return (terms[0] + terms[2]) + (terms[1] + terms[3])
+    return torch.stack(terms, dim=0).sum(dim=0)
+
+
+def _mean_flat_streams(
+    streams: list[torch.Tensor],
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
-    return result.index_copy_(0, indices, tensor)[:-1]
+    return (_sum_hc_terms(streams) * (1.0 / len(streams))).to(dtype)
 
 
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
-    # Unroll the small static HC stream axis (hc_mult=4) instead of emitting a
-    # second HLO reduce over dim=1 alongside collapse(hidden_states, pre_mix).
-    # XLA MultiOutputFusion otherwise fuses the bf16 mean reduce and f32
-    # collapse reduce into a mixed-type tuple reduce fusion that aborts in
-    # libtpu FusionEmitter::ComputeWindowConfigInternal at N=2048.
-    streams = hidden_states.float().unbind(dim=1)
-    acc = streams[0]
-    for s in streams[1:]:
-        acc = acc + s
-    return (acc * (1.0 / len(streams))).to(hidden_states.dtype)
+    # Slice the flattened [tokens, mult * dim] representation into 2D [tokens, dim]
+    # streams instead of reducing over dim=1 of a 3D [tokens, mult, dim] view,
+    # avoiding XLA T(4, 128) relayout copies and mixed-type MultiOutputFusion.
+    tokens = hidden_states.shape[0]
+    mult = hidden_states.shape[1]
+    flat = hidden_states.reshape(tokens, -1)
+    dim = flat.shape[1] // mult
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    return _mean_flat_streams(streams, hidden_states.dtype)
+
+
+def _collapse_streams(
+    streams: list[torch.Tensor],
+    pre_mix: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    mult = len(streams)
+    pre_f32 = pre_mix.reshape(streams[0].shape[0], mult).float()
+    terms = [pre_f32[:, m : m + 1] * streams[m] for m in range(mult)]
+    return _sum_hc_terms(terms).to(dtype)
+
+
+def collapse(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    # Collapse HC streams directly from 2D [tokens, dim] slices of the flattened
+    # [tokens, mult * dim] buffer so XLA keeps T(8, 128) layout without a 3D
+    # dim=-2 reduction relayout copy.
+    tokens, mult = pre_mix.shape
+    flat = hidden_states.reshape(tokens, -1)
+    dim = flat.shape[1] // mult
+    streams = [flat[:, m * dim : (m + 1) * dim].float() for m in range(mult)]
+    return _collapse_streams(streams, pre_mix, hidden_states.dtype)
+
+
+def _post_and_collapse(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor,
+    *,
+    capture_aux: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # Fuse the final layer's mHC post-mix and pre-mix collapse in 2D [tokens, dim]
+    # register slices so the intermediate [tokens, mult, dim] post output is never
+    # materialized to HBM or padded to the standalone mhc_post Pallas tile size.
+    tokens, mult, dim = residual.shape
+    flat = residual.reshape(tokens, mult * dim)
+    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
+    post_f32 = post_layer_mix.reshape(tokens, mult).float()
+    comb_f32 = comb_res_mix.reshape(tokens, mult * mult).float()
+    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
+    out_streams = []
+    for j in range(mult):
+        acc = post_f32[:, j : j + 1] * x_f32
+        for i in range(mult):
+            acc = acc + comb_f32[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
+        out_streams.append(acc.to(residual.dtype).float())
+    collapsed = _collapse_streams(out_streams, pre_mix, residual.dtype)
+    aux = _mean_flat_streams(out_streams, residual.dtype) if capture_aux else None
+    return collapsed, aux
 
 
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
@@ -119,11 +181,14 @@ _upstream_use_sequence_parallel = upstream._use_sequence_parallel
 
 def _use_sequence_parallel(vllm_config) -> bool:
     """Upstream gate, plus an opt-in TP+EP sequence-parallel path at DP1."""
-    if _upstream_use_sequence_parallel(vllm_config):
-        return True
     parallel = vllm_config.parallel_config
+    if getattr(parallel, "data_parallel_size", 1) == 1 and (
+        _upstream_use_sequence_parallel(vllm_config)
+    ):
+        return True
     return bool(
         envs.TPU_DEEPSEEK_V41_SP
+        and getattr(parallel, "data_parallel_size", 1) == 1
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and parallel.tensor_parallel_size > 1
@@ -209,14 +274,133 @@ class DeepseekV41DecoderStage(_StageBase):
 
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
+    def _engram_modules(self, end_layer: int | None = None) -> tuple:
+        """Cached tuple of active Engram modules in `[start_layer, end_layer)`."""
+        layers = getattr(self, "layers", ())
+        start = getattr(self, "start_layer", 0)
+        end = (
+            getattr(self, "end_layer", len(layers)) if end_layer is None else end_layer
+        )
+        cache = getattr(self, "_engram_modules_cache", None)
+        if cache is None:
+            cache = {}
+            self._engram_modules_cache = cache
+        key = (id(layers), len(layers), start, end)
+        engrams = cache.get(key)
+        if engrams is None:
+            engrams = tuple(
+                engram
+                for layer in islice(layers, start, end)
+                if (engram := getattr(layer, "engram", None)) is not None
+            )
+            cache[key] = engrams
+        return engrams
+
+    def _engram_host_col_slice(self) -> tuple[int, int] | None:
+        """Hash columns ``[start, end)`` every local Engram shard reads, or None.
+
+        Without a DP gather of the hashes (shared-memory tables or DP size 1),
+        only this rank's shards read the host hashes, so ``hash_on_host`` can
+        skip the other columns when all local shards read the same slice.
+        """
+        cached = self.__dict__.get("_engram_host_col_slice")
+        if cached is None:
+            # A shard without the head-split fields (None) disables slicing.
+            slices = {
+                (
+                    min(embed.head_start, embed.n_hash_cols),
+                    min(embed.head_start + embed.part_n_hash_cols, embed.n_hash_cols),
+                )
+                if (embed := getattr(engram, "embed_tokens", None)) is not None
+                and hasattr(embed, "head_start")
+                else None
+                for engram in DeepseekV41Model._engram_modules(self)
+            }
+            shared = (
+                getattr(self, "engram_dp_shared_memory", False)
+                or upstream.get_engram_dp_size() == 1
+            )
+            cached = (next(iter(slices)) if shared and len(slices) == 1 else None,)
+            self.__dict__["_engram_host_col_slice"] = cached
+        return cached[0]
+
+    def _engram_offload_flags(self) -> tuple[bool, bool]:
+        """Cached `(has_cpu_offload, has_host_dma)` across active Engram modules."""
+        has_custom = (
+            "_has_cpu_offloaded_engram" in self.__dict__
+            or getattr(
+                type(self),
+                "_has_cpu_offloaded_engram",
+                DeepseekV41Model._has_cpu_offloaded_engram,
+            )
+            is not DeepseekV41Model._has_cpu_offloaded_engram
+        )
+        if has_custom or not (engrams := DeepseekV41Model._engram_modules(self)):
+            return (
+                (bool(self._has_cpu_offloaded_engram()), False)
+                if has_custom
+                else (False, False)
+            )
+        first_embed = engrams[0].embed_tokens
+        last_embed = engrams[-1].embed_tokens
+        key = (
+            engrams,
+            getattr(
+                first_embed, "host_offload", getattr(first_embed, "cpu_offload", False)
+            ),
+            getattr(first_embed, "host_dma", False),
+            getattr(
+                last_embed, "host_offload", getattr(last_embed, "cpu_offload", False)
+            ),
+            getattr(last_embed, "host_dma", False),
+        )
+        cached = getattr(self, "_engram_offload_flags_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        has_cpu_offload = any(
+            (
+                getattr(engram.embed_tokens, "host_offload", False)
+                or getattr(engram.embed_tokens, "cpu_offload", False)
+            )
+            and getattr(engram.embed_tokens, "host_dma", False) is not True
+            for engram in engrams
+        )
+        has_host_dma = any(
+            getattr(engram.embed_tokens, "host_dma", False) is True
+            for engram in engrams
+        )
+        flags = (has_cpu_offload, has_host_dma)
+        self._engram_offload_flags_cache = (key, flags)
+        return flags
+
     def _has_cpu_offloaded_engram(self) -> bool:
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            engram = getattr(layer, "engram", None)
-            if engram is not None and getattr(
-                engram.embed_tokens, "host_offload", False
-            ):
-                return True
-        return False
+        """Whether an Engram table is gathered on the host each step.
+
+        ``host_dma`` tables also load into Host DRAM but are gathered on
+        device (`_move_engram_rows_to_pinned_host`), like HBM tables.
+        """
+        return DeepseekV41Model._engram_offload_flags(self)[0]
+
+    def _has_host_dma_engram(self) -> bool:
+        """Whether an Engram table uses TPU ``pinned_host`` DMA on device."""
+        return DeepseekV41Model._engram_offload_flags(self)[1]
+
+    def _move_engram_rows_to_pinned_host(self) -> None:
+        """One-time ``host_dma`` conversion once weights are loaded."""
+        if getattr(self, "_engram_rows_pinned", False):
+            return
+        start = time.perf_counter()
+        chunks = 0
+        for engram in DeepseekV41Model._engram_modules(self):
+            engram.embed_tokens.move_rows_to_pinned_host(engram.staged_rows.device)
+            rows = engram.embed_tokens._host_rows
+            chunks += 0 if rows is None else len(rows.chunks)
+        self._engram_rows_pinned = True
+        logger.info(
+            "Engram rows moved to TPU pinned_host (%d chunks) in %.1fs",
+            chunks,
+            time.perf_counter() - start,
+        )
 
     def _host_hash_inputs(self, input_ids, swa_metadata, lookback_token_ids):
         """CPU ``hash_on_host`` arguments for this step, or None.
@@ -295,8 +479,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     input_ids, swa_metadata, lookback_token_ids
                 )
                 if host is not None:
-                    engram_hashes = self.engram_hash.hash_on_host(*host)
-                    engram_mask = ~upstream.image_sentinel_mask(host[0])
+                    engram_hashes = self.engram_hash.hash_on_host(
+                        *host,
+                        col_slice=DeepseekV41Model._engram_host_col_slice(self),
+                    )
+                    host_image_mask = (
+                        host[3]
+                        if len(host) > 3 and host[3] is not None
+                        else upstream.image_sentinel_mask(host[0])
+                    )
+                    engram_mask = ~host_image_mask
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
                     engram_mask = ~image_mask
@@ -321,7 +513,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
-                if self._has_cpu_offloaded_engram():
+                cpu_offload, host_dma = DeepseekV41Model._engram_offload_flags(self)
+                if cpu_offload and not torch.compiler.is_compiling():
                     # Idle/decode replicas may hash on device while a prefill
                     # replica hashes on host. All must use the CPU collective.
                     engram_hashes = engram_hashes.to("cpu")
@@ -330,20 +523,140 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     dp_shared_memory=self.engram_dp_shared_memory,
                     gather_fn=upstream.gather_engram_hashes,
                 )
-                if self._has_cpu_offloaded_engram():
+                if cpu_offload:
                     gathered_hashes = gathered_hashes.to("cpu")
+                elif host_dma and gathered_hashes.device.type == "tpu":
+                    # Flush engram_hash (which contains HBM token_map/slot_cache
+                    # gathers offloaded to SparseCore) into its own executable
+                    # before launching any pinned_host DMA custom call.
+                    synchronize_tensors((gathered_hashes,), wait=False)
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
                     if stage == "encoder"
                     else self.end_layer
                 )
-                for layer in islice(self.layers, self.start_layer, end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+                for engram in DeepseekV41Model._engram_modules(self, end_layer):
+                    engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
+                    if not cpu_offload and host_dma:
+                        staged = getattr(engram, "_active_rows", None)
+                        if staged is not None and staged.device.type == "tpu":
+                            synchronize_tensors((staged,), wait=False)
         return engram_hashes, engram_mask
+
+    def _get_ced_replay_starts(
+        self,
+        replay_starts_seq,
+        positions: torch.Tensor,
+        *,
+        cache_attr: str = "_ced_replay_starts_cache",
+    ) -> torch.Tensor:
+        """Cached device tensor for CED `replay_starts` / `window_starts`."""
+        replay_tuple = (
+            replay_starts_seq
+            if isinstance(replay_starts_seq, tuple)
+            else tuple(replay_starts_seq)
+        )
+        replay_key = (replay_tuple, positions.device)
+        cached_replay = getattr(self, cache_attr, None)
+        # The runner re-sends the same cached tuple every steady-state step:
+        # identity hits skip the O(requests) tuple comparison.
+        if (
+            cached_replay is not None
+            and (
+                cached_replay[0][0] is replay_tuple
+                or cached_replay[0][0] == replay_tuple
+            )
+            and cached_replay[0][1] == positions.device
+        ):
+            return cached_replay[1]
+        replay_starts = (
+            torch.zeros(len(replay_tuple), dtype=torch.int32, device=positions.device)
+            if replay_tuple is _zero_hits(len(replay_tuple)) or not any(replay_tuple)
+            else torch.tensor(
+                replay_tuple,
+                dtype=torch.int32,
+                device=positions.device,
+            )
+        )
+        setattr(self, cache_attr, (replay_key, replay_starts))
+        return replay_starts
+
+    def _get_ced_padding_mask(
+        self, total_tokens: int, valid_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Cached boolean padding mask `[total_tokens]` with `>= valid_tokens` True."""
+        pad_key = (total_tokens, valid_tokens, device)
+        cached_pad = getattr(self, "_ced_padding_mask_cache", None)
+        if cached_pad is not None and cached_pad[0] == pad_key:
+            return cached_pad[1]
+        decoder_padding = (
+            torch.arange(total_tokens, dtype=torch.int32, device=device) >= valid_tokens
+        )
+        self._ced_padding_mask_cache = (pad_key, decoder_padding)
+        return decoder_padding
+
+    def _get_ced_non_identity_tensors(
+        self, plan, num_positions: int, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cached `(indices, gather, bounds)` for non-identity CED replay."""
+        cached = getattr(self, "_ced_non_identity_cache", None)
+        if cached is not None and (
+            (
+                cached[2] is plan
+                and cached[3] == num_positions
+                and cached[4] == positions.device
+            )
+            or cached[0]
+            == (
+                plan.indices
+                if isinstance(plan.indices, tuple)
+                else tuple(plan.indices),
+                plan.query_start_loc
+                if isinstance(plan.query_start_loc, tuple)
+                else tuple(plan.query_start_loc),
+                plan.padded_num_tokens,
+                num_positions,
+                positions.device,
+            )
+        ):
+            return cached[1]
+        indices_tuple = (
+            plan.indices if isinstance(plan.indices, tuple) else tuple(plan.indices)
+        )
+        qsl_tuple = (
+            plan.query_start_loc
+            if isinstance(plan.query_start_loc, tuple)
+            else tuple(plan.query_start_loc)
+        )
+        cache_key = (
+            indices_tuple,
+            qsl_tuple,
+            plan.padded_num_tokens,
+            num_positions,
+            positions.device,
+        )
+        # Padded decoder rows replay the last position; their outputs are
+        # dropped because no output row maps to them in `inverse`.
+        last_pos = max(num_positions - 1, 0)
+        gather_tuple = tuple(min(i, last_pos) for i in indices_tuple) + (last_pos,) * (
+            plan.padded_num_tokens - len(indices_tuple)
+        )
+        gather = torch.tensor(gather_tuple, dtype=torch.int32, device=positions.device)
+        inverse = _ced_inverse_rows(
+            indices_tuple, plan.padded_num_tokens, num_positions, positions.device
+        )
+        bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
+        result = (inverse, gather, bounds)
+        self._ced_non_identity_cache = (
+            cache_key,
+            result,
+            plan,
+            num_positions,
+            positions.device,
+        )
+        return result
 
     def forward(
         self,
@@ -357,7 +670,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             inputs_embeds is None
             and input_ids is not None
             and input_ids.device.type == "tpu"
-            and self.parallel_config.data_parallel_size > 1
+            and getattr(getattr(self, "parallel_config", None), "data_parallel_size", 1)
+            > 1
         ):
             # TP1/DP8 full-graph compilation can misinterpret the BF16 tiles
             # of the unsharded embedding lookup. The same lookup is exact
@@ -367,11 +681,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Enqueue the lookup without blocking CPU Engram preparation behind
             # the previous chunk. The compiled stage consumes its device buffer.
             synchronize_tensors((inputs_embeds,), wait=False)
-        offload_engram = self._has_cpu_offloaded_engram()
+        offload_engram = any(DeepseekV41Model._engram_offload_flags(self))
         if offload_engram:
             input_ids_prep = (
                 input_ids.to(torch.int64)
-                if self.use_native_mega_moe
+                if getattr(
+                    self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)
+                )
                 and input_ids is not None
                 and input_ids.device.type == "cpu"
                 else input_ids
@@ -407,26 +723,38 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else None
             )
-            if context.dp_metadata is not None:
+            if getattr(context, "dp_metadata", None) is not None:
                 plan = coordinate_decoder_replay(plan, positions.shape[0])
+            elif getattr(self, "_ced_dp_sync", False):
+                plan = sync_decoder_replay_plan(
+                    plan,
+                    first,
+                    positions.shape[0],
+                    get_dp_group().cpu_group,
+                )
             # SWA bounded replay: the encoder reads no SWA row below a prefix
             # hit's replay start and leaves cached KV of replayed tokens. The
             # input exists in every CED step so the compiled graph does not
             # depend on whether prefix caching is on.
             requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
+            raw_hits = getattr(first, "replay_starts_cpu", None)
+            if isinstance(raw_hits, tuple) and len(raw_hits) == requests:
+                # Pass the runner's cached tuple through for identity hits.
+                window_hits = raw_hits
+            else:
+                hits = tuple(raw_hits or ())[:requests]
+                window_hits = (
+                    _zero_hits(requests)
+                    if not hits
+                    else hits + _zero_hits(requests - len(hits))
+                )
+            window_starts = DeepseekV41Model._get_ced_replay_starts(
+                self, window_hits, positions, cache_attr="_ced_window_starts_cache"
             )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
+            (encoder_context := copy(context)).additional_kwargs = {
+                **context.additional_kwargs,
+                "deepseek_v41_window_starts": window_starts,
+            }
             with override_forward_context(encoder_context):
                 encoded = self.encoder_stage(
                     input_ids,
@@ -467,49 +795,74 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # DEFER_AND_FUSE does not fuse both stages across the boundary.
                 synchronize_tensors((hidden, pre_mix))
 
-        if plan is None:
+        if plan is None or (
+            getattr(plan, "is_identity", False)
+            and plan.padded_num_tokens == positions.shape[0]
+            and bool(plan.indices)
+        ):
             decoder_metadata = metadata
             decoder_positions, decoder_ids = positions, input_ids
             decoder_hidden, decoder_mix = hidden, pre_mix
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            replay_starts = positions.new_zeros(requests)
-            indices = None
-            decoder_padding = (
-                torch.arange(positions.shape[0], device=positions.device)
-                >= first.query_start_loc[-1]
-                if first is not None
-                else torch.zeros_like(positions, dtype=torch.bool)
-            )
-        else:
-            # The extra output row absorbs padded scatter writes. Reusing row
-            # zero for padding would overwrite a real request's first result.
-            indices = torch.tensor(
-                plan.indices
-                + (positions.shape[0],) * (plan.padded_num_tokens - len(plan.indices)),
-                dtype=torch.int64,
-                device=positions.device,
-            )
-            gather = indices.clamp(max=positions.shape[0] - 1)
-            decoder_positions = positions[gather]
-            decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
-            bounds = torch.tensor(
-                plan.query_start_loc, dtype=torch.int32, device=positions.device
-            )
-            replay_starts = torch.tensor(
-                plan.replay_starts, dtype=positions.dtype, device=positions.device
-            )
-            decoder_metadata = {
-                key: replace(
-                    value, input_positions=decoder_positions, query_start_loc=bounds
+            if plan is None:
+                requests = first.seq_lens.shape[0] if first is not None else 1
+                replay_starts = DeepseekV41Model._get_ced_replay_starts(
+                    self, _zero_hits(requests), positions
                 )
-                for key, value in metadata.items()
-            }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
-        decoder_context = replace(
-            context,
+                decoder_padding = (
+                    DeepseekV41Model._get_ced_padding_mask(
+                        self,
+                        positions.shape[0],
+                        int(first.query_start_loc[-1]),
+                        positions.device,
+                    )
+                    if first is not None
+                    else torch.zeros_like(positions, dtype=torch.bool)
+                )
+            else:
+                replay_starts = DeepseekV41Model._get_ced_replay_starts(
+                    self, plan.replay_starts, positions
+                )
+                decoder_padding = DeepseekV41Model._get_ced_padding_mask(
+                    self, positions.shape[0], len(plan.indices), positions.device
+                )
+            indices = None
+        else:
+            indices, gather, bounds = DeepseekV41Model._get_ced_non_identity_tensors(
+                self, plan, positions.shape[0], positions
+            )
+            decoder_positions = positions.index_select(0, gather)
+            decoder_ids = (
+                input_ids.index_select(0, gather) if input_ids is not None else None
+            )
+            decoder_hidden, decoder_mix = (
+                hidden.index_select(0, gather),
+                pre_mix.index_select(0, gather),
+            )
+            replay_starts = DeepseekV41Model._get_ced_replay_starts(
+                self, plan.replay_starts, positions
+            )
+            replaced_by_id: dict[int, object] = {}
+            decoder_metadata = {}
+            last_val = rep = None
+            for key, value in metadata.items():
+                if (
+                    value is not last_val
+                    and (rep := replaced_by_id.get(id(value))) is None
+                ):
+                    new = value.__new__
+                    rep = new(type(value))
+                    rep.__dict__.update(
+                        value.__dict__,
+                        input_positions=decoder_positions,
+                        query_start_loc=bounds,
+                    )
+                    replaced_by_id[id(value)] = rep
+                last_val = value
+                decoder_metadata[key] = rep
+            decoder_padding = DeepseekV41Model._get_ced_padding_mask(
+                self, plan.padded_num_tokens, len(plan.indices), positions.device
+            )
+        (decoder_context := copy(context)).__dict__.update(
             dp_metadata=(
                 replace(
                     context.dp_metadata,
@@ -519,7 +872,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     ),
                     local_sizes=None,
                 )
-                if context.dp_metadata is not None
+                if getattr(context, "dp_metadata", None) is not None
                 else None
             ),
             attn_metadata=decoder_metadata,
@@ -546,25 +899,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if encoder_aux:
                 return output, list(encoder_aux)
             return output
-        total_rows = positions.shape[0]
         if isinstance(output, (list, tuple)) and len(output) == 2:
             dec_hidden, dec_aux = output
             return (
-                _scatter_decoder_rows(dec_hidden, indices, total_rows),
+                _scatter_decoder_rows(dec_hidden, indices),
                 [
                     *encoder_aux,
-                    *[
-                        _scatter_decoder_rows(aux, indices, total_rows)
-                        for aux in dec_aux
-                    ],
+                    *[_scatter_decoder_rows(aux, indices) for aux in dec_aux],
                 ],
             )
         if encoder_aux:
             return (
-                _scatter_decoder_rows(output, indices, total_rows),
+                _scatter_decoder_rows(output, indices),
                 list(encoder_aux),
             )
-        return _scatter_decoder_rows(output, indices, total_rows)
+        return _scatter_decoder_rows(output, indices)
 
     def _stage_uses_sequence_parallel(self, stage: str) -> bool:
         # Under CED=1, encoder_stage (L0..L19) runs SP while decoder_stage
@@ -598,11 +947,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        if self.use_native_mega_moe:
+        if getattr(self, "use_native_mega_moe", getattr(self, "use_mega_moe", False)):
             input_ids = input_ids.to(torch.int64)
 
         skip_lookup = getattr(self, "_engram_prepared_outside_stage", False) or (
-            torch.compiler.is_compiling() and self._has_cpu_offloaded_engram()
+            torch.compiler.is_compiling()
+            and any(DeepseekV41Model._engram_offload_flags(self))
         )
         engram_hashes, engram_mask = self._prepare_engram(
             input_ids,
@@ -652,6 +1002,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if stage_sp:
                 aux_hidden = upstream.sp_all_gather(aux_hidden)[:full_num_tokens]
             aux_hidden_by_layer[start_layer] = aux_hidden
+        collapsed_final = False
         with stage_attention_cache_scope():
             for idx, layer in enumerate(
                 islice(self.layers, start_layer, end_layer),
@@ -687,12 +1038,34 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     aux_hidden_by_layer[idx] = previous_aux
             if layer is not None:
                 # The last layer has no successor to fold its post into.
-                hidden_states = post(hidden_states, residual, post_mix, res_mix)
-                if (
+                capture_final_aux = (
                     stage != "encoder"
                     and self.end_layer in self.aux_hidden_state_layers
+                )
+                if (
+                    stage != "encoder"
+                    and post_mix is not None
+                    and res_mix is not None
+                    and upstream.get_pp_group().is_last_rank
+                    and self._mtp_hidden_buffer is None
                 ):
-                    final_aux = _mean_hc_streams(hidden_states)
+                    assert residual is not None
+                    assert pre_mix is not None
+                    hidden_states, final_aux = _post_and_collapse(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        pre_mix,
+                        capture_aux=capture_final_aux,
+                    )
+                    collapsed_final = True
+                else:
+                    hidden_states = post(hidden_states, residual, post_mix, res_mix)
+                    final_aux = (
+                        _mean_hc_streams(hidden_states) if capture_final_aux else None
+                    )
+                if final_aux is not None:
                     if stage_sp:
                         final_aux = upstream.sp_all_gather(final_aux)[:full_num_tokens]
                     aux_hidden_by_layer[self.end_layer] = final_aux
@@ -738,8 +1111,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
-        assert pre_mix is not None
-        hidden_states = collapse(hidden_states, pre_mix)
+        if not collapsed_final:
+            assert pre_mix is not None
+            hidden_states = collapse(hidden_states, pre_mix)
         hidden_states = self.norm(hidden_states)
         if stage_sp and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
@@ -807,6 +1181,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             for n in (vllm_config.compilation_config.compile_sizes or [])
             if isinstance(n, int)
         )
+        self._ced_dp_sync = (
+            int(getattr(vllm_config.parallel_config, "data_parallel_size", 1) or 1) > 1
+        )
         if self._ced_enabled:
             if (
                 getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
@@ -873,13 +1250,35 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # vLLM's guard-free graph replays at every decode step.
         if self.model.engram_hash is not None:
             self.model.engram_hash.ensure_cache()
+        if not getattr(self.model, "_engram_rows_pinned", False):
+            if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+                # Normally done by process_weights_after_loading; this covers
+                # loaders that skip load_weights (e.g. dummy weights). The
+                # compiled graph must see the pinned_host chunks, not the
+                # Host-DRAM tables.
+                self.model._move_engram_rows_to_pinned_host()
+            self.model._engram_rows_pinned = True
         return super().forward(*args, **kwargs)
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+            # Before the memory profile, so its HBM scales and staging are
+            # accounted for ahead of KV-cache sizing.
+            self.model._move_engram_rows_to_pinned_host()
 
     def __init__(self, *, vllm_config, prefix=""):
         # Limit DP to the node-local host-sharded topology implemented here.
         parallel = vllm_config.parallel_config
         if parallel.pipeline_parallel_size != 1:
             raise NotImplementedError("V4.1 TPU currently requires PP1")
+        engram_config = getattr(vllm_config, "engram_config", None)
+        if getattr(engram_config, "dp_shared_memory", False) is True:
+            raise NotImplementedError(
+                "V4.1 TPU DP uses head-sharded host Engram tables; "
+                "engram dp_shared_memory is not supported; "
+                "set engram_config.dp_shared_memory=False"
+            )
         if parallel.data_parallel_size > 1:
             if (
                 parallel.tensor_parallel_size != 1
@@ -888,11 +1287,6 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             ):
                 raise NotImplementedError(
                     "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
-                )
-            if vllm_config.engram_config.dp_shared_memory:
-                raise NotImplementedError(
-                    "V4.1 TPU DP uses head-sharded host Engram tables; "
-                    "set engram_config.dp_shared_memory=False"
                 )
             if upstream.get_engram_dp_size() != parallel.data_parallel_size:
                 raise NotImplementedError(
@@ -913,7 +1307,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             from .async_fence import install_lookback_fence
 
             install_lookback_fence()
-        if envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+        if (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+            and not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+        ):
             # Host-DRAM Engram tables: hash on the host from the runner's host
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()

@@ -13,20 +13,29 @@ editing the shared runner: ``forward_model`` calls
 ``input_ids_cpu``, ``positions_cpu`` and ``query_start_loc_cpu`` are final.
 """
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import repeat
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.distributed import get_dp_group, get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.models.deepseek_v41.common.engram import (
-    DEAD_ID,
-)
-from vllm.models.deepseek_v41.common.engram import (
-    engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
-)
+from vllm.models.deepseek_v41.common.engram import DEAD_ID
+
+try:
+    from vllm.models.deepseek_v41.common.engram import (
+        engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
+    )
+except ImportError:
+    from vllm.models.deepseek_v41.nvidia.engram import (
+        engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
+    )
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
@@ -56,58 +65,471 @@ class HostEngramInputs:
         return self.all_prompt if self.host_ready is None else self.host_ready
 
 
-def _async_source_tokens_cpu(pre_async: Any) -> torch.Tensor | None:
-    """Resolve the previous step's sampled tokens on CPU for async substitution."""
-    wait_for_copy = getattr(pre_async, "wait_for_copy", None)
-    waited: Any = wait_for_copy() if callable(wait_for_copy) else None
-    copy_state = getattr(pre_async, "copy_state", None)
-    chunks_cpu = getattr(copy_state, "chunks_cpu", None)
-    if chunks_cpu:
-        flat_chunks = [c.reshape(-1) for c in chunks_cpu]
-        return (
-            flat_chunks[0] if len(flat_chunks) == 1 else torch.cat(flat_chunks, dim=0)
+def _stage_async_next_tokens_cpu(runner: Any, pre_async: Any) -> None:
+    """Stage non-blocking D2H copy of ``next_tokens_tpu`` and record a TPU event."""
+    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+    if not isinstance(next_tpu, torch.Tensor):
+        return
+    if next_tpu.device.type == "cpu":
+        runner._host_engram_last_staged = (
+            pre_async,
+            next_tpu.reshape(-1),
+            int(next_tpu.numel()),
+            None,
         )
-    if isinstance(waited, torch.Tensor):
-        return waited.reshape(-1)
+        return
+    prev_staged = getattr(runner, "_host_engram_last_staged", None)
+    if prev_staged is not None and prev_staged[3] is not None:
+        prev_staged[3].synchronize()
+        runner._host_engram_last_staged = None
+    num_tokens = int(next_tpu.numel())
+    buf: Any = getattr(runner, "_host_engram_next_tokens_cpu_buf", None)
+    if (
+        not isinstance(buf, torch.Tensor)
+        or buf.dtype != next_tpu.dtype
+        or int(buf.numel()) < num_tokens
+    ):
+        buf = torch.empty(max(num_tokens, 8192), dtype=next_tpu.dtype, device="cpu")
+        runner._host_engram_next_tokens_cpu_buf = buf
+    dst = buf[:num_tokens]
+    dst.copy_(next_tpu.reshape(-1), non_blocking=True)
+    event = torch.tpu.Event()
+    event.record()
+    runner._host_engram_last_staged = (pre_async, dst, num_tokens, event)
+
+
+def _resolve_next_tokens_cpu(pre_async: Any, runner: Any = None) -> torch.Tensor | None:
+    staged = getattr(runner, "_host_engram_last_staged", None)
+    if staged is not None and staged[0] is pre_async:
+        _, dst, num_tokens, event = staged
+        if event is not None:
+            event.synchronize()
+            runner._host_engram_last_staged = (pre_async, dst, num_tokens, None)
+        return dst[:num_tokens]
     next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
     if isinstance(next_tpu, torch.Tensor):
         return next_tpu.to("cpu").reshape(-1)
     return None
 
 
+def _async_source_tokens_cpu(
+    pre_async: Any, *, prefer_next_tokens_tpu: bool = False, runner: Any = None
+) -> torch.Tensor | None:
+    """Resolve the previous step's sampled tokens on CPU for async substitution."""
+    if prefer_next_tokens_tpu:
+        resolved = _resolve_next_tokens_cpu(pre_async, runner=runner)
+        if resolved is not None:
+            return resolved
+    wait_for_copy = getattr(pre_async, "wait_for_copy", None)
+    waited: Any = wait_for_copy() if callable(wait_for_copy) else None
+    copy_state = getattr(pre_async, "copy_state", None)
+    chunks_cpu = getattr(copy_state, "chunks_cpu", None)
+    if chunks_cpu:
+        c0 = chunks_cpu[0]
+        return (
+            (c0 if c0.ndim == 1 else c0.reshape(-1))
+            if len(chunks_cpu) == 1
+            else torch.cat([c.reshape(-1) for c in chunks_cpu], dim=0)
+        )
+    if isinstance(waited, torch.Tensor):
+        return waited.reshape(-1)
+    return _resolve_next_tokens_cpu(pre_async, runner=runner)
+
+
+@dataclass(frozen=True)
+class _AsyncSpecState:
+    """Previous-step speculative results, indexed by the previous step's
+    request position (``pre_idx``), as flat NumPy arrays.
+
+    ``tokens[pre_idx, :lengths[pre_idx]]`` are the accepted tokens of that
+    request in order (``row[row != -1]`` of the sampled copy, empty for
+    discarded requests), ``rejected`` the draft count rolled back for it
+    (``compute_num_rejected``) and ``num_draft`` its scheduled drafts.
+    """
+
+    stride: int
+    tokens: np.ndarray
+    lengths: np.ndarray
+    rejected: np.ndarray
+    num_draft: np.ndarray
+
+
+def _resolve_async_spec_state(
+    runner: Any, pre_async: Any, *, identity_num_reqs: int = 0
+) -> _AsyncSpecState | None:
+    """Resolve async speculative stride, rejection counts, and committed tokens."""
+    num_spec, req_id_to_index = (
+        getattr(
+            getattr(runner, "speculative_config", None), "num_speculative_tokens", None
+        ),
+        getattr(pre_async, "req_id_to_index_copy", None),
+    )
+    if not isinstance(num_spec, int) or num_spec <= 0 or not req_id_to_index:
+        return None
+    wait_for_copy = getattr(pre_async, "wait_for_copy", None)
+    sampled_cpu: Any = wait_for_copy() if callable(wait_for_copy) else None
+    if not isinstance(sampled_cpu, torch.Tensor):
+        return None
+    sampled = sampled_cpu.numpy()
+    sampled = sampled[:, None] if sampled.ndim == 1 else sampled
+    num_rows = int(sampled.shape[0])
+    if not (
+        0 < identity_num_reqs <= num_rows
+        or (min(pre_vals := req_id_to_index.values()) >= 0 and max(pre_vals) < num_rows)
+    ):
+        return None
+    spec_num_rejected = getattr(pre_async, "spec_decode_num_rejected_tokens", None)
+    stride = 1 + num_spec if spec_num_rejected is not None else 1
+    ws = getattr(runner, "_host_engram_spec_ws", None)
+    if ws is None or ws[0] != num_rows:
+        ws = (
+            num_rows,
+            np.empty(num_rows, dtype=np.int32),
+            np.empty(num_rows, dtype=np.int32),
+            np.empty(num_rows, dtype=np.int32),
+        )
+        runner._host_engram_spec_ws, runner._host_engram_ref_drafts = ws, {}
+    _, lengths, num_draft, rejected = ws
+    all_valid, unif_v0, rej_val = (
+        sampled.size == 0 or int(sampled.min()) != -1,
+        -1,
+        -1,
+    )
+    if all_valid:
+        lengths.fill(sampled.shape[1])
+        tokens = sampled
+    else:
+        (valid := sampled != -1).sum(axis=1, dtype=np.int32, out=lengths)
+        # Compact each row's valid tokens to its front, preserving their order.
+        tokens = (
+            sampled
+            if valid.shape[1] <= 1 or bool((valid[:, :-1] >= valid[:, 1:]).all())
+            else np.take_along_axis(
+                sampled, np.argsort(~valid, axis=1, kind="stable"), axis=1
+            )
+        )
+    num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
+    if not num_draft_per_req:
+        num_draft.fill(unif_v0 := 0)
+    elif (
+        len(num_draft_per_req) == num_rows
+        and (v0 := num_draft_per_req.get(0)) is not None
+        and (
+            num_draft_per_req
+            is (
+                ref_draft := (ref_drafts := runner._host_engram_ref_drafts).get(v0)
+                or ref_drafts.setdefault(
+                    v0,
+                    getattr(
+                        sys.modules.get("vllm_torchtpu.runner.tpu_runner"),
+                        "_cached_uniform_draft_map",
+                        lambda n, k: dict.fromkeys(range(n), k),
+                    )(num_rows, v0),
+                )
+            )
+            or num_draft_per_req == ref_draft
+        )
+    ):
+        num_draft.fill(unif_v0 := int(v0))
+    else:
+        num_draft.fill(0)
+        draft_pos = np.fromiter(
+            num_draft_per_req.keys(), dtype=np.int32, count=len(num_draft_per_req)
+        )
+        draft_cnt = np.fromiter(
+            num_draft_per_req.values(), dtype=np.int32, count=len(num_draft_per_req)
+        )
+        in_range = (draft_pos >= 0) & (draft_pos < num_rows)
+        num_draft[draft_pos[in_range]] = draft_cnt[in_range]
+    if spec_num_rejected is None or (all_valid and unif_v0 >= 0):
+        rejected.fill(
+            rej_val := (
+                max(0, unif_v0 - int(sampled.shape[1]) + 1)
+                if spec_num_rejected is not None and unif_v0 > 0
+                else 0
+            )
+        )
+    else:
+        np.subtract(num_draft, lengths, out=rejected)
+        rejected += 1
+        np.maximum(rejected, 0, out=rejected)
+        rejected[num_draft <= 0] = 0
+    discard, runner._host_engram_spec_unif = (
+        getattr(pre_async, "discard_sampled_tokens_req_indices", None) or (),
+        (unif_v0, rej_val, int(rejected.ctypes.data)),
+    )
+    if discard:
+        discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int32)
+        discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
+        if discard_idx.size:
+            lengths[discard_idx] = 0
+    return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft)
+
+
+@dataclass(frozen=True)
+class _SampledOverlay:
+    """Tokens committed in the previous step, per local request row.
+
+    ``tokens[i, :lengths[i]]`` were written at positions ``starts[i] ..
+    starts[i] + lengths[i]`` of request ``i`` after ``token_ids_cpu`` was
+    snapshotted, so lookback positions in that range read from here.
+    """
+
+    tokens: np.ndarray
+    starts: np.ndarray
+    lengths: np.ndarray
+
+
+def _acquire_host_scratch(
+    runner: Any,
+    attr: str,
+    template: torch.Tensor,
+    active_len: int,
+    *,
+    full_overwrite: bool = False,
+) -> torch.Tensor:
+    """Return a reusable host scratch tensor synced over ``[:active_len]``."""
+    scratch: Any = getattr(runner, attr, None)
+    dirty_attr = f"{attr}_dirty"
+    if (
+        not isinstance(scratch, torch.Tensor)
+        or scratch.shape != template.shape
+        or scratch.dtype != template.dtype
+    ):
+        scratch = template.clone()
+        setattr(runner, attr, scratch)
+        setattr(runner, dirty_attr, active_len)
+        return scratch
+    sync_len = min(
+        int(template.shape[0]),
+        max(active_len, int(getattr(runner, dirty_attr, int(template.shape[0])))),
+    )
+    sync_start = active_len if full_overwrite else 0
+    if sync_start < sync_len:
+        scratch.numpy()[sync_start:sync_len] = template.numpy()[sync_start:sync_len]
+    setattr(runner, dirty_attr, active_len)
+    return scratch
+
+
 def _resolve_decode_lookback_cpu(
-    runner, batch, num_reqs: int, start_index: int
+    runner,
+    batch,
+    num_reqs: int,
+    start_index: int,
+    *,
+    rejected_by_req: np.ndarray | None = None,
+    sampled_overlay: _SampledOverlay | None = None,
+    raw_starts: np.ndarray | None = None,
 ) -> torch.Tensor:
     """Fill lookback_token_ids on CPU for both prompt and generated positions."""
-    lookback = runner.lookback_token_ids.cpu.clone()
+    src_lookback = runner.lookback_token_ids.cpu
     if num_reqs <= 0:
+        return src_lookback.clone()
+    lookback: Any = getattr(runner, "_host_engram_lookback_scratch", None)
+    if (
+        not isinstance(lookback, torch.Tensor)
+        or lookback.shape != src_lookback.shape
+        or lookback.dtype != src_lookback.dtype
+    ):
+        lookback = torch.empty_like(src_lookback)
+        runner._host_engram_lookback_scratch = lookback
+        cap_rows, depth = int(src_lookback.shape[0]), int(src_lookback.shape[1])
+        runner._host_engram_lookback_dirty = cap_rows
+        runner._host_engram_lookback_offsets = np.arange(1, depth + 1, dtype=np.int32)[
+            None, :
+        ]
+        runner._host_engram_local_rows = np.arange(cap_rows, dtype=np.int32)[:, None]
+        runner._host_engram_lookback_ws = (
+            np.empty((cap_rows, depth), dtype=np.int32),
+            np.empty((cap_rows, depth), dtype=np.int32),
+            np.empty((cap_rows, depth), dtype=np.bool_),
+            np.empty((cap_rows, depth), dtype=np.bool_),
+            lookback.numpy(),
+        )
+    pos_buf, clipped_buf, valid_buf, tmp_b_buf, lookback_np = (
+        runner._host_engram_lookback_ws
+    )
+    sync_rows = min(
+        int(lookback.shape[0]),
+        int(getattr(runner, "_host_engram_lookback_dirty", int(lookback.shape[0]))),
+    )
+    if num_reqs < sync_rows:
+        lookback_np[num_reqs:sync_rows] = src_lookback.numpy()[num_reqs:sync_rows]
+    runner._host_engram_lookback_dirty = num_reqs
+    offsets, local, out_slice, depth = (
+        runner._host_engram_lookback_offsets,
+        runner._host_engram_local_rows[:num_reqs],
+        lookback_np[:num_reqs],
+        int(runner._host_engram_lookback_offsets.shape[1]),
+    )
+    pos, clipped, valid, tmp_b = (
+        pos_buf[:num_reqs],
+        clipped_buf[:num_reqs],
+        valid_buf[:num_reqs],
+        tmp_b_buf[:num_reqs],
+    )
+    raw_starts = (
+        np.asarray(
+            batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
+            dtype=np.int32,
+        )
+        if raw_starts is None
+        else raw_starts
+    )
+    starts_1d = (
+        raw_starts
+        if rejected_by_req is None
+        or (
+            spec_unif[1] == 0
+            if (spec_unif := getattr(runner, "_host_engram_spec_unif", (-1, -1, 0)))[1]
+            >= 0
+            and int(rejected_by_req.ctypes.data) == spec_unif[2]
+            else rejected_by_req.size == 0 or not rejected_by_req.any()
+        )
+        else raw_starts
+        - (
+            rejected_by_req
+            if rejected_by_req.dtype == np.int32
+            else rejected_by_req.astype(np.int32)
+        )
+    )
+    if (
+        sampled_overlay is not None
+        and (
+            d_min := int(
+                (
+                    delta := starts_1d
+                    - (
+                        ov_starts
+                        if (ov_starts := sampled_overlay.starts).dtype == np.int32
+                        else ov_starts.astype(np.int32)
+                    )
+                ).min()
+            )
+        )
+        >= depth
+        and bool((delta <= sampled_overlay.lengths).all())
+    ):
+        is_unif_d = int(delta.max()) == d_min
+        if not is_unif_d:
+            np.subtract(delta[:, None], offsets, out=pos)
+        out_slice[:] = (
+            sampled_overlay.tokens[
+                :num_reqs,
+                d_min - 1 : (d_min - 1 - depth if d_min > depth else None) : -1,
+            ]
+            if is_unif_d
+            else sampled_overlay.tokens[local, pos]
+        )
         return lookback
-    depth = int(lookback.shape[1])
-    starts = np.asarray(
-        batch.num_computed_tokens_cpu[start_index : start_index + num_reqs],
-        dtype=np.int64,
-    )[:, None]
-    pos = starts - np.arange(1, depth + 1, dtype=np.int64)
+    np.subtract(starts_1d[:, None], offsets, out=pos)
     token_ids_cpu = np.asarray(batch.token_ids_cpu)
     max_cols = int(token_ids_cpu.shape[1])
-    valid = (pos >= 0) & (pos < max_cols)
-    rows = np.arange(start_index, start_index + num_reqs, dtype=np.int64)[:, None]
-    clipped = np.clip(pos, 0, max(max_cols - 1, 0))
-    gathered = np.where(valid, token_ids_cpu[rows, clipped], -1)
-    lookback[:num_reqs] = torch.from_numpy(
-        np.ascontiguousarray(gathered, dtype=np.int64)
-    ).to(dtype=lookback.dtype)
+    rows = local + start_index if start_index else local
+    if (
+        int(starts_1d.min()) >= int(offsets.shape[1])
+        and int(starts_1d.max()) <= max_cols
+    ):
+        out_slice[:] = token_ids_cpu[rows, pos]
+    else:
+        np.greater_equal(pos, 0, out=valid)
+        np.less(pos, max_cols, out=tmp_b)
+        np.logical_and(valid, tmp_b, out=valid)
+        np.multiply(pos, valid, out=clipped)
+        out_slice[:] = token_ids_cpu[rows, clipped]
+        np.logical_not(valid, out=tmp_b)
+        np.copyto(out_slice, -1, where=tmp_b)
+    if sampled_overlay is not None:
+        np.subtract(delta[:, None], offsets, out=pos)
+        np.greater_equal(pos, 0, out=valid)
+        np.less(pos, sampled_overlay.lengths[:, None], out=tmp_b)
+        np.logical_and(valid, tmp_b, out=valid)
+        if valid.any():
+            np.multiply(pos, valid, out=clipped)
+            np.copyto(
+                out_slice,
+                sampled_overlay.tokens[local, clipped],
+                where=valid,
+            )
     return lookback
 
 
-def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None:
-    """Snapshot the runner's host hash inputs, or None if they do not apply."""
-    from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+def _ragged_arange(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Concatenation of ``range(starts[i], starts[i] + lengths[i])``."""
+    if lengths.size and bool((lengths == lengths[0]).all()):
+        return (
+            np.asarray(starts, dtype=np.int32)[:, None]
+            + np.arange(int(lengths[0]), dtype=np.int32)
+        ).reshape(-1)
+    offsets = np.repeat(
+        np.cumsum(lengths, dtype=np.int32) - np.asarray(lengths, dtype=np.int32),
+        lengths,
+    )
+    return (
+        np.arange(offsets.shape[0], dtype=np.int32)
+        - offsets
+        + np.repeat(np.asarray(starts, dtype=np.int32), lengths)
+    )
 
+
+def _unresolved_host_inputs(runner, all_prompt: bool) -> HostEngramInputs:
+    return HostEngramInputs(
+        input_ids=runner.input_ids_cpu,
+        positions=runner.positions_cpu,
+        query_start_loc=runner.query_start_loc_cpu,
+        lookback_token_ids=runner.lookback_token_ids.cpu,
+        all_prompt=all_prompt,
+        host_ready=False,
+    )
+
+
+def _dummy_host_inputs(runner, ctx) -> HostEngramInputs:
+    pos_override = ctx.position_ids_override
+    num_tokens = max(
+        int(pos_override.shape[-1]),
+        int(getattr(runner, "max_num_tokens", 0) or 0),
+    )
+    qsl = getattr(ctx, "query_start_loc", None)
+    qsl_len = max(
+        int(qsl.shape[0]) if qsl is not None else int(getattr(ctx, "num_reqs", 0)) + 1,
+        int(getattr(runner, "max_num_reqs", 0) or 0) + 1,
+    )
+    lb_cpu = runner.lookback_token_ids.cpu
+    lb_rows = max(int(lb_cpu.shape[0]), int(getattr(ctx, "num_reqs", 0)))
+    depth = int(lb_cpu.shape[1])
+    key = (num_tokens, qsl_len, lb_rows, depth)
+    cached = getattr(runner, "_dummy_host_engram_inputs", None)
+    if cached is None or cached[0] != key:
+        inputs = HostEngramInputs(
+            input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+            positions=torch.zeros(num_tokens, dtype=torch.int32),
+            query_start_loc=torch.zeros(qsl_len, dtype=torch.int32),
+            lookback_token_ids=torch.full((lb_rows, depth), -1, dtype=torch.int32),
+            all_prompt=True,
+            host_ready=True,
+        )
+        runner._dummy_host_engram_inputs = (key, inputs)
+        return inputs
+    return cached[1]
+
+
+def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None:
+    """Snapshot the runner's host hash inputs, or None if they do not apply.
+
+    This runs on the host between the previous step's completion and the
+    next step's launch under ``OFFLOAD=1``, so everything per request is
+    expressed as NumPy array operations over the chunk rather than per-request
+    tensor ops.
+    """
+    ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+    if getattr(ctx, "position_ids_override", None) is not None:
+        desc = getattr(ctx, "sequence_layout_descriptor", None)
+        if getattr(desc, "kind", SequenceLayoutKind.ALL) is not SequenceLayoutKind.ALL:
+            return None
+        return _dummy_host_inputs(runner, ctx)
     plan = getattr(runner, "_last_sequence_layout_plan", None)
     if plan is None or plan.kind is not SequenceLayoutKind.ALL:
         return None
-    ctx = getattr(runner, "_attn_metadata_builder_ctx", None)
     start_index = int(getattr(ctx, "start_index", getattr(plan, "start_index", 0)))
     chunk_num_reqs = min(
         num_reqs,
@@ -116,7 +538,9 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
     batch = runner.input_batch
     seq_lens = runner.seq_lens_np[:chunk_num_reqs]
     prompt_lens = batch.num_prompt_tokens[start_index : start_index + chunk_num_reqs]
-    all_prompt = bool(np.all(seq_lens <= prompt_lens))
+    all_prompt = (
+        chunk_num_reqs == 0 or int(seq_lens[0]) <= int(prompt_lens[0])
+    ) and bool((seq_lens <= prompt_lens).all())
     if all_prompt and start_index == 0:
         return HostEngramInputs(
             input_ids=runner.input_ids_cpu,
@@ -127,65 +551,265 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             host_ready=True,
         )
 
-    pre_async = getattr(runner, "_pre_async_results", None)
     if (
-        pre_async is not None
-        and (
-            getattr(pre_async, "spec_decode_num_rejected_tokens", None) is not None
-            or getattr(runner, "speculative_config", None) is not None
-        )
-    ) or (
         getattr(batch, "num_computed_tokens_cpu", None) is None
         or getattr(batch, "token_ids_cpu", None) is None
     ):
-        return HostEngramInputs(
-            input_ids=runner.input_ids_cpu,
-            positions=runner.positions_cpu,
-            query_start_loc=runner.query_start_loc_cpu,
-            lookback_token_ids=runner.lookback_token_ids.cpu,
-            all_prompt=all_prompt,
-            host_ready=False,
-        )
+        return _unresolved_host_inputs(runner, all_prompt)
 
-    lookback = _resolve_decode_lookback_cpu(runner, batch, chunk_num_reqs, start_index)
-    ids = runner.input_ids_cpu
-    req_id_to_index = (
-        getattr(pre_async, "req_id_to_index_copy", None)
-        if pre_async is not None
+    pre_async = getattr(runner, "_pre_async_results", None)
+    req_id_to_index: Any = getattr(pre_async, "req_id_to_index_copy", None)
+    req_ids: Any = getattr(batch, "req_ids", None)
+    chunk_req_ids = (
+        (
+            req_ids
+            if start_index == 0 and len(req_ids) == chunk_num_reqs
+            else req_ids[start_index : start_index + chunk_num_reqs]
+        )
+        if req_id_to_index and req_ids is not None
         else None
     )
-    req_ids = getattr(batch, "req_ids", None)
-    if req_id_to_index and req_ids is not None:
-        dst_idx: list[int] = []
-        src_idx: list[int] = []
-        qsl = runner.query_start_loc_cpu[: chunk_num_reqs + 1].tolist()
-        for i in range(chunk_num_reqs):
-            req_id = req_ids[start_index + i]
-            if req_id in req_id_to_index:
-                q_start = int(qsl[i])
-                q_end = int(qsl[i + 1])
-                if q_end > q_start:
-                    n_sched = q_end - q_start
-                    src_start = int(req_id_to_index[req_id])
-                    dst_idx.extend(range(q_start, q_end))
-                    src_idx.extend(range(src_start, src_start + n_sched))
-        if dst_idx:
-            ids = runner.input_ids_cpu.clone()
-            flat_src = _async_source_tokens_cpu(pre_async)
-            if flat_src is None:
-                return HostEngramInputs(
-                    input_ids=runner.input_ids_cpu,
-                    positions=runner.positions_cpu,
-                    query_start_loc=runner.query_start_loc_cpu,
-                    lookback_token_ids=runner.lookback_token_ids.cpu,
-                    all_prompt=all_prompt,
-                    host_ready=False,
-                )
-            ids[dst_idx] = flat_src[src_idx].to(dtype=ids.dtype)
+    can_check_id = (
+        chunk_req_ids is not None
+        and start_index == 0
+        and len(req_id_to_index) == chunk_num_reqs
+    )
+    ref_req: Any = getattr(runner, "_host_engram_ref_req_dict", None)
+    runner._host_engram_ref_req_dict = ref_req = (
+        ref_req
+        if not can_check_id or (ref_req is not None and ref_req[2] == chunk_req_ids)
+        else [
+            tuple(chunk_req_ids or ()),
+            (ref_d := {r: i for i, r in enumerate(chunk_req_ids or ())}),
+            list(chunk_req_ids or ()),
+            ref_d,
+        ]
+    )
+    is_identity_reqs = False
+    if can_check_id:
+        if req_id_to_index is ref_req[3]:
+            is_identity_reqs = True
+        elif req_id_to_index == ref_req[1]:
+            ref_req[3] = req_id_to_index
+            is_identity_reqs = True
+    is_async_spec = pre_async is not None and (
+        getattr(pre_async, "spec_decode_num_rejected_tokens", None) is not None
+        or getattr(runner, "speculative_config", None) is not None
+    )
+    spec_state = (
+        _resolve_async_spec_state(
+            runner,
+            pre_async,
+            identity_num_reqs=chunk_num_reqs if is_identity_reqs else 0,
+        )
+        if is_async_spec
+        else None
+    )
+    if is_async_spec and spec_state is None:
+        return _unresolved_host_inputs(runner, all_prompt)
 
+    stride = spec_state.stride if spec_state is not None else 1
+    ids, positions, rejected_by_req, sampled_overlay = (
+        runner.input_ids_cpu,
+        runner.positions_cpu,
+        None,
+        None,
+    )
+    raw_starts = (
+        nct[:chunk_num_reqs]
+        if start_index == 0
+        and isinstance(nct := batch.num_computed_tokens_cpu, np.ndarray)
+        and nct.dtype == np.int32
+        else np.asarray(
+            batch.num_computed_tokens_cpu[start_index : start_index + chunk_num_reqs],
+            dtype=np.int32,
+        )
+    )
+    if chunk_req_ids is not None:
+        qsl = runner.query_start_loc_cpu.numpy()[: chunk_num_reqs + 1]
+        ref_qsl: Any = getattr(runner, "_host_engram_ref_qsl", None)
+        runner._host_engram_ref_qsl = ref_qsl = (
+            ref_qsl
+            if ref_qsl is not None
+            and ref_qsl[:3] == (chunk_num_reqs, stride, qsl.dtype)
+            else (
+                chunk_num_reqs,
+                stride,
+                qsl.dtype,
+                np.arange(0, (chunk_num_reqs + 1) * stride, stride, dtype=qsl.dtype),
+            )
+        )
+        fast_qsl = is_identity_reqs and memoryview(qsl) == memoryview(ref_qsl[3])
+        q_start, n_sched = (qsl, qsl) if fast_qsl else (qsl[:-1], qsl[1:] - qsl[:-1])
+        q0, active_len, span_len, is_uniform_stride = (
+            (0, chunk_num_reqs * stride, chunk_num_reqs * stride, True)
+            if fast_qsl
+            else (
+                (q0 := int(qsl[0])),
+                (active_len := int(qsl[-1])),
+                (span_len := active_len - q0),
+                span_len == chunk_num_reqs * stride and bool((n_sched == stride).all()),
+            )
+        )
+        fast_id = fast_qsl or (
+            is_identity_reqs and (is_uniform_stride or bool((n_sched > 0).all()))
+        )
+        pre_pos: Any = (
+            None
+            if fast_id
+            else np.fromiter(
+                map(req_id_to_index.get, chunk_req_ids or (), repeat(-1)),
+                dtype=np.int32,
+                count=chunk_num_reqs,
+            )
+        )
+        matched: Any = None if fast_id else (pre_pos >= 0) & (n_sched > 0)
+        all_matched = fast_id or (chunk_num_reqs > 0 and bool(matched.all()))
+        is_identity = fast_id or (
+            all_matched
+            and int(pre_pos[0]) == 0
+            and int(pre_pos[-1]) == chunk_num_reqs - 1
+            and bool((pre_pos[1:] == pre_pos[:-1] + 1).all())
+        )
+        if spec_state is not None:
+            # Rows this step did not carry over keep zero rejections and no
+            # overlay; the lookback then reads token_ids_cpu as-is.
+            num_tokens_no_spec = getattr(batch, "num_tokens_no_spec", None)
+            if is_identity:
+                rejected_by_req = spec_state.rejected[:chunk_num_reqs]
+                n_draft = spec_state.num_draft[:chunk_num_reqs]
+                ov_tokens = spec_state.tokens[:chunk_num_reqs]
+                ov_lengths = spec_state.lengths[:chunk_num_reqs]
+            else:
+                safe_pos = np.where(matched, pre_pos, np.int32(0))
+                rejected_by_req = np.where(
+                    matched, spec_state.rejected[safe_pos], np.int32(0)
+                )
+                n_draft = spec_state.num_draft[safe_pos]
+                ov_tokens = spec_state.tokens[safe_pos]
+                ov_lengths = np.where(
+                    matched, spec_state.lengths[safe_pos], np.int32(0)
+                )
+            if num_tokens_no_spec is not None:
+                write_start = (
+                    num_tokens_no_spec[:chunk_num_reqs]
+                    if start_index == 0
+                    and isinstance(num_tokens_no_spec, np.ndarray)
+                    and num_tokens_no_spec.dtype == np.int32
+                    else np.asarray(
+                        num_tokens_no_spec[start_index : start_index + chunk_num_reqs],
+                        dtype=np.int32,
+                    )
+                ) - (
+                    1 + unif_v0
+                    if is_identity
+                    and (
+                        unif_v0 := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[0]
+                    )
+                    >= 0
+                    else 1 + n_draft
+                )
+            else:
+                write_start = raw_starts - (
+                    unif_v0
+                    if is_identity
+                    and (
+                        unif_v0 := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[0]
+                    )
+                    >= 0
+                    else n_draft
+                )
+            sampled_overlay = _SampledOverlay(
+                tokens=ov_tokens,
+                starts=write_start,
+                lengths=ov_lengths,
+            )
+        if all_matched or matched.any():
+            m_len, uniform_stride = (
+                n_sched if all_matched else n_sched[matched],
+                is_identity and is_uniform_stride,
+            )
+            dst_idx: slice | np.ndarray = (
+                slice(q0, active_len)
+                if all_matched
+                else _ragged_arange(q_start[matched], m_len)
+            )
+            if uniform_stride:
+                src_idx: slice | np.ndarray = slice(0, span_len)
+                max_src_idx = span_len - 1
+            else:
+                src_rows = (
+                    np.arange(chunk_num_reqs, dtype=np.int32)
+                    if is_identity
+                    else pre_pos[matched]
+                )
+                src_idx = _ragged_arange(src_rows * stride, m_len)
+                max_src_idx = int(src_idx.max())
+            flat_src = _async_source_tokens_cpu(
+                pre_async,
+                prefer_next_tokens_tpu=(spec_state is not None),
+                runner=runner,
+            )
+            if flat_src is None or int(flat_src.numel()) <= max_src_idx:
+                return _unresolved_host_inputs(runner, all_prompt)
+            ids = _acquire_host_scratch(
+                runner,
+                "_host_engram_ids_scratch",
+                runner.input_ids_cpu,
+                active_len,
+                full_overwrite=(all_matched and q0 == 0),
+            )
+            ids.numpy()[dst_idx] = flat_src.numpy()[src_idx]
+            if rejected_by_req is not None:
+                m_rej = rejected_by_req if all_matched else rejected_by_req[matched]
+                if (
+                    rej_val != 0
+                    if (
+                        rej_val := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[1]
+                    )
+                    >= 0
+                    else m_rej.any()
+                ):
+                    positions = _acquire_host_scratch(
+                        runner,
+                        "_host_engram_pos_scratch",
+                        runner.positions_cpu,
+                        active_len,
+                        full_overwrite=(all_matched and q0 == 0),
+                    )
+                    if uniform_stride:
+                        np.subtract(
+                            runner.positions_cpu.numpy()[dst_idx].reshape(
+                                chunk_num_reqs, stride
+                            ),
+                            m_rej[:, None],
+                            out=positions.numpy()[dst_idx].reshape(
+                                chunk_num_reqs, stride
+                            ),
+                        )
+                    else:
+                        positions.numpy()[dst_idx] = runner.positions_cpu.numpy()[
+                            dst_idx
+                        ] - np.repeat(m_rej, m_len)
+
+    lookback = _resolve_decode_lookback_cpu(
+        runner,
+        batch,
+        chunk_num_reqs,
+        start_index,
+        rejected_by_req=rejected_by_req,
+        sampled_overlay=sampled_overlay,
+        raw_starts=raw_starts,
+    )
     return HostEngramInputs(
         input_ids=ids,
-        positions=runner.positions_cpu,
+        positions=positions,
         query_start_loc=runner.query_start_loc_cpu,
         lookback_token_ids=lookback,
         all_prompt=all_prompt,
@@ -196,7 +820,9 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
 def engram_gathered_num_tokens() -> int:
     """Read the host snapshot, before any work waiting on the device stream."""
     context = get_forward_context()
-    sizes = context.additional_kwargs.get("tpu_num_tokens_across_dp_cpu")
+    sizes = getattr(context, "additional_kwargs", {}).get(
+        "tpu_num_tokens_across_dp_cpu"
+    )
     if sizes is None:
         return upstream_engram_gathered_num_tokens()
     group = get_engram_dp_group()
@@ -213,41 +839,50 @@ def gather_host_engram_hashes(
     gather_fn: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Gather Engram hashes across DP, using ``dp_group.cpu_group`` on CPU."""
-    if engram_hashes.device.type == "cpu" and not dp_shared_memory:
+    if not dp_shared_memory:
         dp_group = get_engram_dp_group()
-        if (
-            dp_group is not None
-            and getattr(dp_group, "world_size", 1) > 1
-            and getattr(dp_group, "cpu_group", None) is not None
-        ):
+        if dp_group is not None and getattr(dp_group, "world_size", 1) > 1:
             dp_metadata = (
                 getattr(get_forward_context(), "dp_metadata", None)
                 if is_forward_context_available()
                 else None
             )
-            slot = (
-                engram_gathered_num_tokens()
-                if dp_metadata is not None
-                else int(engram_hashes.shape[0])
-            )
-            if engram_hashes.shape[0] > slot:
-                raise ValueError("Engram token count exceeds the DP token slot")
-            if engram_hashes.shape[0] < slot:
-                pad = engram_hashes.new_full(
-                    (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
-                    DEAD_ID,
+            raw_slot = engram_gathered_num_tokens() if dp_metadata is not None else 0
+            slot = raw_slot if raw_slot > 0 else int(engram_hashes.shape[0])
+            dp_cpu_group = getattr(dp_group, "cpu_group", None)
+            if (
+                dp_cpu_group is not None
+                and engram_hashes.device.type != "cpu"
+                and envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+                and not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+                and not torch.compiler.is_compiling()
+            ):
+                engram_hashes = engram_hashes.to("cpu")
+            cpu_group = dp_cpu_group if engram_hashes.device.type == "cpu" else None
+            if cpu_group is not None:
+                if engram_hashes.shape[0] > slot:
+                    raise ValueError("Engram token count exceeds the DP token slot")
+                if engram_hashes.shape[0] < slot:
+                    pad = engram_hashes.new_full(
+                        (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
+                        DEAD_ID,
+                    )
+                    engram_hashes = torch.cat((engram_hashes, pad))
+                out = engram_hashes.new_empty(
+                    (dp_group.world_size * slot, *engram_hashes.shape[1:])
                 )
-                engram_hashes = torch.cat((engram_hashes, pad))
-            out = engram_hashes.new_empty(
-                (dp_group.world_size * slot, *engram_hashes.shape[1:])
-            )
-            torch.distributed.all_gather_into_tensor(
-                out, engram_hashes.contiguous(), group=dp_group.cpu_group
-            )
-            return out
+                torch.distributed.all_gather_into_tensor(
+                    out, engram_hashes.contiguous(), group=cpu_group
+                )
+                return out
+            if raw_slot <= 0 and gather_fn is None:
+                return dp_group.all_gather(engram_hashes, dim=0)
     if gather_fn is not None:
         return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
-    from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
+    try:
+        from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
+    except ImportError:
+        from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes
 
     return gather_engram_hashes(engram_hashes, dp_shared_memory=dp_shared_memory)
 
@@ -269,3 +904,22 @@ def install_host_engram_inputs() -> None:
 
     prepare._deepseek_v41_host_engram = True  # type: ignore[attr-defined]
     TPUModelRunner._prepare_lookback_token_ids = prepare  # type: ignore[method-assign]
+
+    orig_sample_tokens = getattr(TPUModelRunner, "sample_tokens", None)
+    if callable(orig_sample_tokens) and not getattr(
+        orig_sample_tokens, "_deepseek_v41_host_engram", False
+    ):
+
+        def sample_tokens(self, *args: Any, **kwargs: Any) -> Any:
+            res = orig_sample_tokens(self, *args, **kwargs)
+            if (
+                envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+                and not envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+            ):
+                pre_async = getattr(self, "_pre_async_results", None)
+                if pre_async is not None:
+                    _stage_async_next_tokens_cpu(self, pre_async)
+            return res
+
+        sample_tokens._deepseek_v41_host_engram = True  # type: ignore[attr-defined]
+        TPUModelRunner.sample_tokens = sample_tokens  # type: ignore[method-assign]

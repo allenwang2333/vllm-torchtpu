@@ -86,9 +86,11 @@ class TestAsyncFence:
         res2 = patched_fn(runner, 2)
         assert torch.equal(res2, torch.tensor([1, 2, 3]))
         assert called_original == [4, 2]
+        # One event per runner: the second call waits on it, then re-records.
         mock_event.synchronize.assert_called_once()
-        mock_event2.record.assert_called_once()
-        assert runner._deepseek_v41_lookback_fence is mock_event2
+        mock_event.record.assert_called_once()
+        mock_event2.record.assert_not_called()
+        assert runner._deepseek_v41_lookback_fence is mock_event
 
 
 # ==============================================================================
@@ -531,10 +533,24 @@ class TestPagedCacheRows:
         paged = v2_cache.PagedCacheRows(raw, layout)
 
         assert paged.numel() == 16 * 4 * 128
+        # Upstream Engram.ensure_cache reads kv_cache.device.
+        assert paged.device == raw.device
         slots = torch.tensor([0, 1, 4, 7])
         # row_offset = 512 // 256 = 2, page_stride = 1024 // 256 = 4
         # slots // 4 * 4 + slots % 4 + 2 -> slot + 2
         assert torch.equal(paged.row_indices(slots), slots + 2)
+
+        # Unsharded with page_stride (8) != shape[1] (4)
+        layout_strided = ((8, 4, 128), torch.bfloat16, 2048, 256)
+        paged_strided = v2_cache.PagedCacheRows(raw, layout_strided)
+        assert torch.equal(
+            paged_strided.row_indices(slots),
+            torch.tensor([1, 2, 9, 12]),
+        )
+        paged_strided.write(
+            torch.tensor([0, -1, 4], dtype=torch.int32),
+            torch.ones(3, 128, dtype=torch.bfloat16),
+        )
 
         # Aligned pages
         # rows = shape[1] = 4, rows % 4 == 0, row_offset % 4 == 2 != 0 -> returns None
@@ -649,9 +665,10 @@ class TestPagedCacheRows:
         assert out_2b.shape == (2, 128)
         mock_read_2b.assert_called_once()
 
-        mock_write.reset_mock()
+        mock_write_2b = MagicMock(return_value=(torch.zeros(1), torch.zeros(1)))
+        monkeypatch.setattr(v2_cache, "_write_values_2bank_op", mock_write_2b)
         paged_2b.write(torch.tensor([0, 20]), torch.zeros(2, 128, dtype=torch.bfloat16))
-        assert mock_write.call_count == 2
+        mock_write_2b.assert_called_once()
         paged_2b.raw.copy_.assert_called_once()
         paged_2b.raw_hi.copy_.assert_called_once()
 
@@ -728,16 +745,14 @@ class TestPagedCacheRows:
         mock_encode.reset_mock()
         mock_write_val_2b = MagicMock(
             side_effect=[
-                torch.zeros(1),
-                torch.zeros(1),
-                torch.zeros(1),
-                torch.zeros(1),
+                (torch.zeros(1), torch.zeros(1)),
+                (torch.zeros(1), torch.zeros(1)),
             ]
         )
-        monkeypatch.setattr(v2_cache, "_write_values_op", mock_write_val_2b)
+        monkeypatch.setattr(v2_cache, "_write_values_2bank_op", mock_write_val_2b)
         paged_2b.write(slots_2b, latents)
         mock_encode.assert_called_once()
-        assert mock_write_val_2b.call_count == 4
+        assert mock_write_val_2b.call_count == 2
         paged_2b.raw.copy_.assert_called_once()
         paged_2b.raw_hi.copy_.assert_called_once()
         paged_2b.rope.copy_.assert_called_once()
@@ -767,13 +782,20 @@ class TestNativeCacheView:
         adapter.bind_kv_cache(bound_tensor)
         assert adapter.kv_cache is bound_tensor
 
-        # 2. Compiling with raw_cache present -> returns PagedCacheRows
+        # 2. Compiling with raw_cache present -> returns cached PagedCacheRows
         raw_cpu = torch.zeros(64, ROW_WORDS, dtype=torch.int32)
         adapter.bind_kv_cache(bound_tensor, raw_cache=raw_cpu)
 
         monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
         view_result = adapter.kv_cache
         assert isinstance(view_result, v2_cache.PagedCacheRows)
+        assert adapter.kv_cache is view_result
+
+        # Lazy fallback when _tpu_paged_cache_rows is cleared
+        adapter._tpu_paged_cache_rows = None
+        rebuilt = adapter.kv_cache
+        assert isinstance(rebuilt, v2_cache.PagedCacheRows)
+        assert adapter.kv_cache is rebuilt
 
         # 3. Setter
         new_tensor = torch.zeros(8, 4, 128)
@@ -986,6 +1008,12 @@ class TestCacheMutationOps:
         res_rv2b = rv2b(c_jax, c_jax, r_jax, 64, False)
         assert res_rv2b.shape == (2, 64)
 
+        wv2b = captured_ops.get("pallas::dsv41v2_cache_write_values_2bank")
+        assert wv2b is not None
+        res_wv2b_lo, res_wv2b_hi = wv2b(c_jax, c_jax, r_jax, v_jax)
+        assert res_wv2b_lo.shape == c_jax.shape
+        assert res_wv2b_hi.shape == c_jax.shape
+
         # Exercise registered fake handlers
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -1008,9 +1036,14 @@ class TestCacheMutationOps:
             out_write = v2_cache._write_op(c_fake, r_fake, val_fake)
             assert out_write.shape == c_fake.shape
 
-            # _write_values_op fake
+            # _write_values_op and _write_values_2bank_op fakes
             out_wv = v2_cache._write_values_op(c_fake, r_fake, val_fake)
             assert out_wv.shape == c_fake.shape
+            out_wv2b_lo, out_wv2b_hi = v2_cache._write_values_2bank_op(
+                c_fake, c_fake, r_fake, val_fake
+            )
+            assert out_wv2b_lo.shape == c_fake.shape
+            assert out_wv2b_hi.shape == c_fake.shape
 
             # _write_values_after_op fake
             out_wva = v2_cache._write_values_after_op(

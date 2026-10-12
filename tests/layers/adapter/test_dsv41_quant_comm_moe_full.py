@@ -884,12 +884,19 @@ class TestMoeRouting:
         layer.custom_routing_function = None
 
         # 3. Partitioned: router_logits.shape[0] < hidden_states.shape[0]
-        # 3a. SP=True, input_ids matches numel
+        # 3a. SP=True, input_ids matches numel (both hash-routed and standard)
         fake_ep = _FakeDistGroup(world_size=2, rank=1)
         monkeypatch.setattr(
             "vllm.distributed.parallel_state.get_ep_group", lambda: fake_ep
         )
         input_ids = torch.arange(8)
+        layer.hash_indices_table = torch.zeros((8, 4), dtype=torch.int32)
+        w_part_hash, i_part_hash = moe_routing.route(
+            layer, hidden, logits_local, input_ids=input_ids
+        )
+        assert w_part_hash.shape == (8, 4)
+        assert i_part_hash.shape == (8, 4)
+        layer.hash_indices_table = None
         w_part, i_part = moe_routing.route(
             layer, hidden, logits_local, input_ids=input_ids
         )

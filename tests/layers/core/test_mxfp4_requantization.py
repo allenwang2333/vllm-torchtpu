@@ -47,6 +47,12 @@ from vllm_torchtpu.layers.core.quantization import (  # isort: skip
     unpack_uint8_to_fp4,
 )
 
+
+@pytest.fixture
+def device():
+    return torch.device("cpu")
+
+
 # ============================================================================
 # JAX REFERENCE IMPLEMENTATION (from legacy vllm_torchtpu)
 # These are copied here ONLY for comparison in tests.
