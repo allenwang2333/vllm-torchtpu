@@ -58,6 +58,10 @@ spec:
                       value: /ckpt/k3
                     - name: K3_PRESHARD_DIR
                       value: /cache/hf/hub/presharded/kimi-k3-tp32
+                    - name: K3_DSPARK_DIR
+                      value: /cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark/snapshots/38a88101e0d46bb22134b9da340f381b954d40d4
+                    - name: K3_PRESHARD_COMMIT
+                      value: ${BUILDKITE_COMMIT}
                     - name: TMPDIR
                       value: /dev/shm
                   resources:

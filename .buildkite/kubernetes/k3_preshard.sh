@@ -19,11 +19,14 @@
 # the host from SLURM_NODEID and re-launches itself with srun unless it is
 # told it already is a worker. Here each indexed pod is one host: it converts
 # the eight ranks of its index, and index 0 also writes the prefill
-# projection cache. Nothing touches the chips; the pod holds them only to
-# land on a TPU host, which is where the gcsfuse mounts are.
+# projection cache and the DSpark speculator's shards, then verifies a
+# sample rank against the checkpoints. Nothing touches the chips; the pod
+# holds them only to land on a TPU host, which is where the gcsfuse mounts
+# are.
 #
 # Resumable: a rank whose index.json exists is skipped, so a run that hits
-# the deadline is finished by submitting the same workload again.
+# the deadline is finished by submitting the same workload again; the same
+# resubmission adds a missing prefill cache or DSpark directory.
 
 set -euo pipefail
 
@@ -32,6 +35,11 @@ cd /workspace/vllm-torchtpu
 K3_CHECKPOINT="${K3_CHECKPOINT:-/ckpt/k3}"
 K3_PRESHARD_DIR="${K3_PRESHARD_DIR:-/cache/hf/hub/presharded/kimi-k3-tp32}"
 K3_PRESHARD_IN_FLIGHT="${K3_PRESHARD_IN_FLIGHT:-4}"
+# The DSpark head's snapshot; the loader names the shard directory after the
+# first 8 characters of this directory's name, so it must be the revision.
+K3_DSPARK_DIR="${K3_DSPARK_DIR:-/cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark/snapshots/38a88101e0d46bb22134b9da340f381b954d40d4}"
+K3_DSPARK_REV=$(basename "${K3_DSPARK_DIR}")
+export K3_DSPARK_REV
 INDEX="${JOB_COMPLETION_INDEX:-0}"
 
 # Skip the srun re-launch; no TPU for a host-side conversion.
@@ -86,9 +94,34 @@ if [[ "${INDEX}" == "0" ]]; then
       --checkpoint "${K3_CHECKPOINT}" \
       --output "${K3_PRESHARD_DIR}"
   fi
+  if [[ ! -f "${K3_DSPARK_DIR}/model.safetensors" ]]; then
+    log "ERROR: no model.safetensors under ${K3_DSPARK_DIR}" >&2
+    ls -la "${K3_DSPARK_DIR}" >&2 || true
+    exit 2
+  fi
+  dspark_out="${K3_PRESHARD_DIR}/dspark-${K3_DSPARK_REV:0:8}"
+  if [[ -f "${dspark_out}/index.json" ]]; then
+    log "${dspark_out} present, skipping"
+  else
+    # save_kernel_shards rewrites every rank file and writes index.json
+    # last, so a directory without it is a partial attempt.
+    log "writing DSpark shards from ${K3_DSPARK_DIR}"
+    python -m tools.megakernel preshard dspark \
+      --draft "${K3_DSPARK_DIR}" \
+      --output "${K3_PRESHARD_DIR}"
+  fi
+  # Rebuilds rank 5 (layers 1, 46, 92 and the DSpark shards) from the two
+  # checkpoints and compares it byte for byte with what is on disk.
+  log "verifying rank 5 against the checkpoints"
+  python -m tools.megakernel preshard verify \
+    --against "${K3_PRESHARD_DIR}" \
+    --checkpoint "${K3_CHECKPOINT}" \
+    --draft "${K3_DSPARK_DIR}"
   {
-    echo "source checkpoint: ${K3_CHECKPOINT}"
-    echo "vllm-torchtpu commit: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "source checkpoint: ${K3_CHECKPOINT} (gs://tpu-commons-ci/moonshootai/kimi/k3)"
+    echo "dspark checkpoint: ${K3_DSPARK_DIR} (RedHatAI/Kimi-K3-speculator.dspark @ ${K3_DSPARK_REV})"
+    echo "tool: python -m tools.megakernel preshard k3 / prefill / dspark / verify"
+    echo "vllm-torchtpu commit: ${K3_PRESHARD_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
     echo "buildkite build: ${BUILDKITE_BUILD_URL:-unknown}"
     echo "written: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "${K3_PRESHARD_DIR}/PROVENANCE.txt"
@@ -136,6 +169,16 @@ if index == 0:
             bad += 1
             print(f"prefill-sp-cache {name}: {size} bytes, want {want}")
     print(f"prefill-sp-cache: {len(layout['families'])} families checked")
+    dspark = os.path.join(root, "dspark-" + os.environ["K3_DSPARK_REV"][:8])
+    index_json = json.load(open(os.path.join(dspark, "index.json")))
+    want = int(index_json["bytes_per_rank"])
+    for rank in range(int(index_json["ranks"])):
+        size = os.path.getsize(os.path.join(dspark, f"rank{rank:02d}.bin"))
+        if size != want:
+            bad += 1
+            print(f"{dspark} rank{rank:02d}.bin: {size} bytes, want {want}")
+    print(f"{os.path.basename(dspark)}: {index_json['ranks']} ranks x {want} bytes, "
+          f"{len(index_json['arrays'])} arrays checked")
 sys.exit(1 if bad else 0)
 PY
 
