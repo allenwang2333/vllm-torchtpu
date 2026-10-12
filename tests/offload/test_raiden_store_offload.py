@@ -66,6 +66,14 @@ class FakeBlockStatus(enum.Enum):
     HOST_AND_HBM = 4
 
 
+@dataclass(frozen=True)
+class FakeRaidenId:
+    job_name: str = "peer"
+    job_replica_id: str = ""
+    data_name: str = ""
+    data_replica_idx: int = 0
+
+
 class FakeRaidenBlockId:
     def __init__(
         self,
@@ -112,6 +120,7 @@ class FakeKVCacheStore:
         self.fail_save = False
         self.fail_load = False
         self.fail_read_remote = False
+        self.fail_read_remote_peers: set[FakeRaidenId] = set()
         self.raiden_id = object()
         # Global registry entries: maps sub-hash -> peer REMOTE slice.
         # Queried on local miss when enable_global=True. registry_down simulates
@@ -247,8 +256,12 @@ class FakeKVCacheStore:
         for h, sl in zip(block_hashes, slices):
             if sl is None or sl.status != FakeBlockStatus.REMOTE:
                 return False
+            if sl.raiden_id != slices[0].raiden_id:
+                return False
             if h in self._remote_reading:
                 return False
+        if slices and slices[0].raiden_id in self.fail_read_remote_peers:
+            return False
         self._remote_reading.extend(block_hashes)
         for h, d in zip(block_hashes, device_block_ids):
             self._remote_device_ids[h] = d
@@ -383,12 +396,14 @@ def seed_global_entries(
     device_block_size_factor: int = 4,
     key_namespace: bytes = b"",
     ns: bytes = b"",
+    raiden_id: FakeRaidenId | None = None,
 ) -> None:
     """Publish a peer's REMOTE slices for `key` in the fake registry."""
     prefix = key_namespace or ns
+    raiden_id = raiden_id or FakeRaidenId()
     for i, sub_hash in enumerate(sub_hashes(key, device_block_size_factor, prefix)):
         store.global_entries[sub_hash] = FakeRaidenBlockId(
-            raiden_id=object(), host_block_id=100 + i, status=FakeBlockStatus.REMOTE
+            raiden_id=raiden_id, host_block_id=100 + i, status=FakeBlockStatus.REMOTE
         )
 
 
@@ -1714,6 +1729,95 @@ class TestRemoteReadFlow(unittest.TestCase):
         self.store.complete_remote_read(sub_hashes(remote_key))
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertTrue(finished_job.success)
+
+    def test_remote_reads_group_interleaved_sub_hashes_by_peer(self):
+        local_key, remote_key = _key(1), _key(2)
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        remote_hashes = sub_hashes(remote_key)
+        for i, sub_hash in enumerate(remote_hashes):
+            self.store.global_entries[sub_hash].raiden_id = FakeRaidenId(
+                data_replica_idx=i % 2
+            )
+        for key in (local_key, remote_key):
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load([local_key, remote_key], _ctx())
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "req")
+
+        first, second = self.store.calls_named("read_remote")
+        self.assertEqual(first.args[0], remote_hashes[::2])
+        self.assertEqual(first.args[2], [24, 26])
+        self.assertEqual(second.args[0], remote_hashes[1::2])
+        self.assertEqual(second.args[2], [25, 27])
+        self.assertEqual(
+            self.manager.lookup(remote_key, _ctx()), LookupResult.HIT_PENDING
+        )
+
+        self.store.complete_remote_read(second.args[0])
+        self.store.complete_load(sub_hashes(local_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(first.args[0])
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished_job.success)
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
+
+    def test_later_peer_launch_failure_waits_for_started_transfers(self):
+        keys = [_key(i) for i in range(1, 5)]
+        seed_host_entries(self.store, keys[0])
+        peers = [FakeRaidenId(job_replica_id=str(i)) for i in range(3)]
+        for key, peer in zip(keys[1:], peers):
+            seed_global_entries(self.store, key, raiden_id=peer)
+        for key in keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(keys, _ctx())
+        self.store.fail_read_remote_peers.add(peers[1])
+        self.manager.submit_load_job(7, keys, [5, 6, 7, 8], "req")
+
+        self.assertEqual(len(self.store.calls_named("read_remote")), 2)
+        self.assertEqual(self.store._remote_reading, sub_hashes(keys[1]))
+        self.assertEqual(
+            self.manager._admissions[7].pending,
+            set(sub_hashes(keys[0]) + sub_hashes(keys[1])),
+        )
+        self.assertEqual(
+            set(self.manager._admissions[7].failed_sub_hashes),
+            set(sub_hashes(keys[2]) + sub_hashes(keys[3])),
+        )
+        for key in keys[1:]:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_load(sub_hashes(keys[0]))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store.complete_remote_read(sub_hashes(keys[1]))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6, 7, 8])
+        self.assertEqual(self.store.pinned_hashes(), {})
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+
+    def test_remote_failure_waits_for_other_peer(self):
+        keys = [_key(1), _key(2)]
+        for i, key in enumerate(keys):
+            seed_global_entries(
+                self.store, key, raiden_id=FakeRaidenId(job_replica_id=str(i))
+            )
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(keys, _ctx())
+        self.manager.submit_load_job(7, keys, [5, 6], "req")
+
+        self.store.complete_remote_read(sub_hashes(keys[0]), success=False)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.assertTrue(self.manager.has_pending_work())
+        self.store.complete_remote_read(sub_hashes(keys[1]))
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(finished_job.failed_device_block_ids, [5, 6])
+        self.assertEqual(self.manager._hash_to_admission, {})
+        self.assertFalse(self.manager.has_pending_work())
 
     def test_remote_failure_leaves_nothing_behind(self):
         key = _key(1)

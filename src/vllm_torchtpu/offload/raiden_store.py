@@ -72,7 +72,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
@@ -886,21 +886,23 @@ class RaidenOffloadingManager(OffloadingManager):
         # in the local host pool. The slice is the only record of a peer block
         # — read_remote writes nothing to the local directory, so no live probe
         # could rediscover it. Only the BYTES are remote: every destination is
-        # one of this instance's HBM blocks. The two destination lists are
+        # one of this instance's HBM blocks. The destination lists are
         # disjoint subsequences of `device_ids`, each preserving its batch's
         # hash-to-block pairing, because load() and read_remote() both require
         # block_hashes[i] to line up with device_block_ids[i].
         remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        remote_batches: dict[object, tuple[list[bytes], list[object], list[int]]] = {}
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
             block = self._pending_remote_slices.pop(sub_hash, None)
             if block is not None:
                 remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
+                peer = cast(Any, block).raiden_id
+                batch = remote_batches.setdefault(peer, ([], [], []))
+                batch[0].append(sub_hash)
+                batch[1].append(block)
+                batch[2].append(dev_id)
             else:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
@@ -908,7 +910,7 @@ class RaidenOffloadingManager(OffloadingManager):
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes includes rejected and unlaunched batches.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -931,17 +933,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
+                # Earlier launches succeeded: the job must stay
+                # non-terminal until their transfers resolve, then the
                 # finalizer runs the failure cleanup exactly once.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
-            # Nothing in flight: immediately terminal. The finalizer keeps
-            # HOST entries intact, deletes freshly installed REMOTE entries
-            # (landing blocks freed, the registry keeps the peer mapping),
-            # matching a polled failure.
             self._finalize(admission)
 
         if local_hashes and not self._store.load(
@@ -949,11 +947,17 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for peer_hashes, peer_slices, peer_device_ids in remote_batches.values():
+            if not self._store.read_remote(peer_hashes, peer_slices, peer_device_ids):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(peer_hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
