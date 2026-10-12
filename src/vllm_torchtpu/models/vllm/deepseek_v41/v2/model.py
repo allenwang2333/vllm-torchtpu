@@ -866,7 +866,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Outside the compiled stages: the replay plan indexes full rows.
             hidden = upstream.sp_all_gather(hidden)[: positions.shape[0]]
             pre_mix = upstream.sp_all_gather(pre_mix)[: positions.shape[0]]
-            if hidden.device.type == "tpu":
+            if hidden.device.type == "tpu" and not getattr(plan, "is_identity", False):
                 # Materialize the eager inter-stage SP all-gather before
                 # slicing and launching the compiled decoder stage so
                 # DEFER_AND_FUSE does not fuse both stages across the boundary.

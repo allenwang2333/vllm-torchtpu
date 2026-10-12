@@ -567,3 +567,167 @@ def test_prebuild_refusals_and_env_helpers():
 
     with patch.object(pltpu, "get_tpu_info", side_effect=RuntimeError("no tpu")):
         assert bridge._smem_capacity_bytes() == 1024 * 1024
+
+
+def test_tp91_static_token_threshold_dispatch_and_gmm_ep_moe_v2(monkeypatch):
+    import jax
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+    from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+    from vllm_torchtpu.layers.core import fused_moe_gmm
+
+    # 1. _tokens_per_ep_rank helper
+    assert bridge._tokens_per_ep_rank(jnp.zeros((8, 4)), None, None) is None
+    stub_mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
+    # v41_encoder(8192) SP=1: x.shape[0] = 8 * 1024 = 8192 -> t_ep = 1024
+    assert bridge._tokens_per_ep_rank(jnp.zeros((8192, 4)), stub_mesh, None) == 1024
+    # v41_decoder(512) SP=0: x.shape[0] = 8 * 512 = 4096 -> t_ep = 64
+    rep_groups = (tuple(range(8)),)
+    assert bridge._tokens_per_ep_rank(jnp.zeros((4096, 4)), stub_mesh, rep_groups) == 64
+
+    # 2. _build_op static threshold dispatch: T_ep >= 256 -> fused, < 256 -> gmm_v2
+    monkeypatch.setattr(bridge, "_OPS", {})
+    captured = []
+    monkeypatch.setattr(
+        bridge, "jax_op", lambda name, fn, **kw: captured.append(fn) or Mock()
+    )
+    fused_calls = []
+    gmm_ep_calls = []
+    monkeypatch.setattr(
+        v2, "fused_ep_moe_v2", lambda x, *a, **kw: fused_calls.append(x.shape[0]) or x
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_gmm_ep_moe_v2",
+        lambda x, *a, **kw: gmm_ep_calls.append(x.shape[0]) or x,
+    )
+    bridge._build_op(
+        stub_mesh,
+        2,
+        True,
+        "silu",
+        None,
+        False,
+        token_replica_groups=rep_groups,
+    )
+    fn_op = captured[0]
+    w_dummy = jnp.ones((8, 4, 8), dtype=jnp.float8_e4m3fn)
+    s_dummy = jnp.ones((8, 8), dtype=jnp.float32)
+    r_dummy = jnp.zeros((8, 1), dtype=jnp.int32)
+    # Encoder (T=8192 replicated across 8 -> global x.shape[0]=65536, t_ep=1024 >= 256)
+    x_enc = jnp.ones((65536, 4), dtype=jnp.bfloat16)
+    g_enc = jnp.zeros((65536, 8), dtype=jnp.bfloat16)
+    assert fn_op(x_enc, w_dummy, w_dummy, s_dummy, s_dummy, g_enc, r_dummy) is x_enc
+    assert fused_calls == [65536] and gmm_ep_calls == []
+    # Decoder (T=512 replicated across 8 -> global x.shape[0]=4096, t_ep=64 < 256)
+    x_dec = jnp.ones((4096, 4), dtype=jnp.bfloat16)
+    g_dec = jnp.zeros((4096, 8), dtype=jnp.bfloat16)
+    assert fn_op(x_dec, w_dummy, w_dummy, s_dummy, s_dummy, g_dec, r_dummy) is x_dec
+    assert fused_calls == [65536] and gmm_ep_calls == [4096]
+
+    # 3. Direct execution of _gmm_ep_moe_v2 across all branches on 1-device mesh
+    monkeypatch.undo()
+    mesh_1d = jax.sharding.Mesh(jax.devices()[:1], (bridge.EP_AXIS_NAME,))
+    T, hidden, e_total, inter = 16, 8, 4, 8
+    x = jnp.ones((T, hidden), dtype=jnp.bfloat16)
+    w1_fp8 = jnp.ones((e_total, hidden, 2 * inter), dtype=jnp.float8_e4m3fn)
+    w2_fp8 = jnp.ones((e_total, inter, hidden), dtype=jnp.float8_e4m3fn)
+    s1_2d = jnp.ones((e_total, 2 * inter), dtype=jnp.float32)
+    s2_2d = jnp.ones((e_total, hidden), dtype=jnp.float32)
+    s1_3d = jnp.ones((e_total, 1, 2 * inter), dtype=jnp.float32)
+    s2_3d = jnp.ones((e_total, 1, hidden), dtype=jnp.float32)
+    gating = jnp.ones((T, e_total), dtype=jnp.float32).at[0].set(jnp.nan)
+    rank = jnp.zeros((1, 1), dtype=jnp.int32)
+
+    seen_scales = []
+
+    def fake_fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        **kwargs,
+    ):
+        seen_scales.append((w1_scale.ndim, kwargs["rhs_quant_dtype"]))
+        return hidden_states + topk_weights.sum(axis=-1, keepdims=True).astype(
+            hidden_states.dtype
+        )
+
+    with (
+        patch.object(fused_moe_gmm, "fused_moe_func", side_effect=fake_fused_moe_func),
+        patch(
+            "vllm_torchtpu.kernels.fused_moe.v2.router_ops.pallas_select",
+            side_effect=lambda *a, **kw: pallas_select(*a, **{**kw, "interpret": True}),
+        ),
+    ):
+        # 3a. Plain top-k, fp8 (2D scale), renormalize=True, routed_scaling_factor=2.0
+        out_plain = bridge._gmm_ep_moe_v2(
+            x,
+            w1_fp8,
+            w2_fp8,
+            s1_2d,
+            s2_2d,
+            gating,
+            rank=rank,
+            topk=2,
+            renormalize=True,
+            mesh=mesh_1d,
+            weight_format="fp8",
+            act_fn="silu",
+            mesh_ep_ranks=None,
+            scoring_fn="softmax",
+            routed_scaling_factor=2.0,
+            token_replica_groups=None,
+        )
+        assert out_plain.shape == (T, hidden)
+        assert seen_scales[-1] == (4, None)
+
+        # 3b. Score bias, fp4 (3D scale), renormalize=False, routed_scaling_factor=1.0
+        out_bias = bridge._gmm_ep_moe_v2(
+            x,
+            w1_fp8,
+            w2_fp8,
+            s1_3d,
+            s2_3d,
+            gating,
+            rank=rank,
+            topk=2,
+            renormalize=False,
+            mesh=mesh_1d,
+            weight_format="fp4",
+            act_fn="silu",
+            mesh_ep_ranks=(0,),
+            scoring_fn="sigmoid",
+            routed_scaling_factor=1.0,
+            token_replica_groups=((0,),),
+            score_bias=jnp.zeros((e_total,), dtype=jnp.float32),
+        )
+        assert out_bias.shape == (T, hidden)
+        assert seen_scales[-1] == (3, jnp.float4_e2m1fn)
+
+        # 3c. Hash routing ids
+        out_hash = bridge._gmm_ep_moe_v2(
+            x,
+            w1_fp8,
+            w2_fp8,
+            s1_3d,
+            s2_3d,
+            gating,
+            rank=rank,
+            topk=2,
+            renormalize=True,
+            mesh=mesh_1d,
+            weight_format="fp4",
+            act_fn="silu",
+            mesh_ep_ranks=None,
+            scoring_fn="softmax",
+            routed_scaling_factor=1.0,
+            token_replica_groups=None,
+            hash_topk_ids=jnp.zeros((T, 2), dtype=jnp.int32),
+        )
+        assert out_hash.shape == (T, hidden)

@@ -161,6 +161,160 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
+# Minimum per-rank token count (`t_ep`) at or above which `_build_op` dispatches
+# to `fused_ep_moe_v2`. Below this threshold (e.g. `v41_decoder(512)` with
+# `t_ep = 64`, or decode buckets `T <= 1152` with `t_ep <= 144`), `_build_op`
+# dispatches to `_gmm_ep_moe_v2` (`fused_moe_func` / `gmm_v2`) to avoid the
+# `_TILE_M = 128` padding and W4A8/routing-plan overhead on small token counts.
+_FUSED_EP_MIN_TOKENS_PER_RANK = 256
+
+
+def _tokens_per_ep_rank(
+    x: Any,
+    mesh: Any,
+    token_replica_groups: tuple[tuple[int, ...], ...] | None,
+) -> int | None:
+    """Return the static per-rank token count ``t_ep``, or ``None`` if unknown."""
+    if mesh is None or not hasattr(mesh, "shape") or not hasattr(x, "shape"):
+        return None
+    ep = int(mesh.shape[EP_AXIS_NAME])
+    input_rows = int(x.shape[0]) // ep
+    replica_width = len(token_replica_groups[0]) if token_replica_groups else 1
+    return (input_rows + replica_width - 1) // replica_width
+
+
+def _gmm_ep_moe_v2(
+    x: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    gating: jax.Array,
+    *,
+    rank: jax.Array,
+    topk: int,
+    renormalize: bool,
+    mesh: Any,
+    weight_format: str,
+    act_fn: str,
+    mesh_ep_ranks: tuple[int, ...] | None,
+    scoring_fn: str,
+    routed_scaling_factor: float,
+    token_replica_groups: tuple[tuple[int, ...], ...] | None,
+    score_bias: jax.Array | None = None,
+    hash_topk_ids: jax.Array | None = None,
+) -> jax.Array:
+    """Serve small-batch EP MoE (`t_ep < 256`) via `fused_moe_func` (`gmm_v2`)."""
+    from jax import lax
+
+    from vllm_torchtpu.kernels.fused_moe.v2.host import MAX_ROUTING_BLOCK
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import (
+        _apply_scoring_fn,
+        _relabel_expert_ids_to_mesh_order,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+    from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+    from vllm_torchtpu.layers.core.fused_moe_gmm import (
+        fused_moe_func,
+        resolve_onehot_permute_threshold,
+    )
+
+    (ax,) = mesh.axis_names
+    ep = int(mesh.shape[ax])
+    T = int(x.shape[0])
+    e_total = int(w1.shape[0])
+    g_local = e_total // ep
+    token_layout = TokenReplicaLayout.create(
+        ep=ep,
+        input_rows=T // ep,
+        groups=token_replica_groups,
+        row_alignment=U32_SUBLANE_TILE,
+    )
+    t_local = token_layout.local_rows
+    select_rows = min(MAX_ROUTING_BLOCK, t_local & -t_local)
+    has_score_bias = score_bias is not None
+    has_hash_ids = hash_topk_ids is not None
+    onehot_threshold = resolve_onehot_permute_threshold()
+    use_sparse_core = bool(envs.USE_MOE_SPARSE_CORE)
+    skip_padded_tokens = bool(envs.TPU_MOE_SKIP_PADDED_TOKENS)
+    rhs_quant_dtype = jnp.float4_e2m1fn if weight_format == "fp4" else None
+
+    def local_fn(x_l, rank_l, w1_l, w2_l, w1s_l, w2s_l, gate_l, *extra):
+        me = rank_l[0, 0]
+        x_l = token_layout.split(x_l, me)
+        gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
+        scores = _apply_scoring_fn(gate_l, scoring_fn)
+        if has_hash_ids:
+            topk_idx = token_layout.split(extra[0], me).astype(jnp.int32)
+            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+        elif has_score_bias:
+            topk_weights, topk_idx = pallas_select(
+                scores + extra[0].astype(jnp.float32)[None, :],
+                topk=topk,
+                block_rows=select_rows,
+                weight_scores=scores,
+            )
+        else:
+            topk_weights, topk_idx = pallas_select(
+                scores, topk=topk, block_rows=select_rows
+            )
+        topk_idx = _relabel_expert_ids_to_mesh_order(
+            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        )
+        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        if renormalize:
+            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
+            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
+        topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+
+        x_g = lax.all_gather(x_l, ax, axis=0, tiled=True)
+        topk_idx_g = lax.all_gather(topk_idx.astype(jnp.int32), ax, axis=0, tiled=True)
+        topk_weights_g = lax.all_gather(topk_weights, ax, axis=0, tiled=True)
+        if w1s_l.ndim == 2:
+            w1s_l = w1s_l[:, None, None, :]
+            w2s_l = w2s_l[:, None, None, :]
+        local_out = fused_moe_func(
+            x_g,
+            w1_l,
+            w2_l,
+            w1s_l,
+            w2s_l,
+            None,
+            None,
+            topk_weights_g,
+            topk_idx_g,
+            experts_start=me * jnp.int32(g_local),
+            topk=topk,
+            activation=act_fn,
+            use_ep=True,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_threshold,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+        combined = lax.psum_scatter(local_out, ax, scatter_dimension=0, tiled=True)
+        return token_layout.restore(combined, ax)
+
+    spec = PartitionSpec(ax)
+    extra_specs = (
+        (PartitionSpec(),) if has_score_bias else ((spec,) if has_hash_ids else ())
+    )
+    extra_args = (
+        (score_bias,) if has_score_bias else ((hash_topk_ids,) if has_hash_ids else ())
+    )
+    in_specs = (spec,) * 7 + extra_specs
+    sm = jax.shard_map(
+        local_fn,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=spec,
+        check_vma=False,
+    )
+    return sm(x, rank, w1, w2, w1_scale, w2_scale, gating, *extra_args)
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -212,6 +366,26 @@ def _build_op(
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
+        t_ep = _tokens_per_ep_rank(x, mesh, token_replica_groups)
+        if t_ep is not None and w1 is not None and t_ep < _FUSED_EP_MIN_TOKENS_PER_RANK:
+            return _gmm_ep_moe_v2(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating.astype(jnp.float32),
+                rank=rank,
+                topk=topk,
+                renormalize=renormalize,
+                mesh=mesh,
+                weight_format=weight_format,
+                act_fn=activation,
+                mesh_ep_ranks=mesh_expert_order,
+                token_replica_groups=token_replica_groups,
+                **bias_kw,
+                **routing_kw,
+            )
         return fused_ep_moe_v2(
             x,
             w1,

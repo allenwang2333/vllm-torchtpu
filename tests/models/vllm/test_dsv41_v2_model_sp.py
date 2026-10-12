@@ -495,6 +495,20 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     assert out_plan.shape == (4, 16)
     assert len(synced) == 1
 
+    # 3b. CED enabled with plan.is_identity=True on TPU -> skips synchronize_tensors
+    plan_identity = SimpleNamespace(
+        indices=(0, 1, 2, 3),
+        padded_num_tokens=4,
+        query_start_loc=(0, 4),
+        replay_starts=(0,),
+        is_identity=True,
+    )
+    monkeypatch.setattr(v2_model, "plan_decoder_replay", lambda *args: plan_identity)
+    synced.clear()
+    out_identity_tpu = v2_model.DeepseekV41Model.forward(model, ids, pos)
+    assert out_identity_tpu.shape == (4, 16)
+    assert len(synced) == 0
+
     # 4. CED enabled with empty plan.indices -> early return zeros
     plan_empty = SimpleNamespace(
         indices=(),
@@ -986,3 +1000,120 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         NotImplementedError, match="does not support speculative method"
     ):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+
+
+def test_engram_host_dma_model_hooks(monkeypatch: pytest.MonkeyPatch):
+    moved: list[Any] = []
+    engram_mod = SimpleNamespace(
+        embed_tokens=SimpleNamespace(
+            cpu_offload=True,
+            host_dma=True,
+            _host_rows=SimpleNamespace(chunks=[1, 2]),
+            move_rows_to_pinned_host=lambda dev: moved.append(dev),
+        ),
+        staged_rows=torch.zeros(1),
+        layer_hash_index=0,
+        prepare_embeddings=lambda h: None,
+        _active_rows=SimpleNamespace(device=SimpleNamespace(type="tpu")),
+    )
+    model = object.__new__(v2_model.DeepseekV41Model)
+    model.__dict__.update(
+        layers=[SimpleNamespace(engram=engram_mod)],
+        start_layer=0,
+        end_layer=1,
+    )
+    model._move_engram_rows_to_pinned_host()
+    model._move_engram_rows_to_pinned_host()
+    assert len(moved) == 1
+
+    synced: list[Any] = []
+    monkeypatch.setattr(
+        v2_model,
+        "synchronize_tensors",
+        lambda tensors, wait=True: synced.append((tuple(tensors), wait)),
+    )
+    monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "swa": SimpleNamespace(
+                    query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+                    seq_lens=torch.tensor([2], dtype=torch.int32),
+                )
+            },
+            additional_kwargs={},
+        ),
+    )
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "image_sentinel_mask",
+        lambda t: torch.zeros_like(t, dtype=torch.bool),
+    )
+    monkeypatch.setattr(v2_model, "_cache_slots", lambda kv, meta, pos: None)
+    monkeypatch.setattr(v2_model, "_block_table", lambda meta: None)
+
+    class _FakeTpuHashes:
+        device = SimpleNamespace(type="tpu")
+        shape = (2, 1, 2)
+
+        def __getitem__(self, idx: Any) -> torch.Tensor:
+            return torch.zeros((2, 2), dtype=torch.int32)
+
+    class _FakeEngramHash:
+        use_slot_cache = True
+        lookback_depth = 2
+        multipliers = torch.ones(2, 3, dtype=torch.int64)
+        swa_cache_module = SimpleNamespace(kv_cache=torch.ones(1))
+
+        def ensure_cache(self) -> bool:
+            return True
+
+        def __call__(self, *a: Any) -> torch.Tensor:
+            return torch.zeros((2, 1, 2), dtype=torch.int32)
+
+    tpu_hashes = _FakeTpuHashes()
+    monkeypatch.setattr(
+        v2_model,
+        "gather_host_engram_hashes",
+        lambda h, dp_shared_memory, gather_fn: tpu_hashes,
+    )
+    model.__dict__.update(
+        engram_hash=_FakeEngramHash(),
+        engram_swa_prefix="swa",
+        engram_dp_shared_memory=True,
+    )
+    model._engram_offload_flags_cache = (False, True)
+    model._prepare_engram(
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        None,
+    )
+    assert len(synced) == 2
+
+    tpu_hashes.device = SimpleNamespace(type="cpu")
+    engram_mod._active_rows = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+    model._prepare_engram(
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        None,
+    )
+    assert len(synced) == 2
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", "1")
+    monkeypatch.setattr(
+        v2_model.upstream.DeepseekV41LLMForCausalLM,
+        "process_weights_after_loading",
+        lambda self: None,
+    )
+    pinned_calls: list[int] = []
+    lm = object.__new__(v2_model.DeepseekV41ForCausalLM)
+    lm.__dict__["model"] = SimpleNamespace(
+        _move_engram_rows_to_pinned_host=lambda: pinned_calls.append(1)
+    )
+    lm.process_weights_after_loading()
+    assert pinned_calls == [1]
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", "0")
+    lm.process_weights_after_loading()
+    assert pinned_calls == [1]
