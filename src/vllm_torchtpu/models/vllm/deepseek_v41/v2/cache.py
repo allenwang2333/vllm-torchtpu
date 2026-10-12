@@ -820,11 +820,16 @@ def _permute(x: jax.Array, source: jax.Array) -> jax.Array:
     import jax.numpy as jnp
 
     permutation = (jnp.arange(x.shape[-1])[:, None] == source[None]).astype(x.dtype)
+    precision = (
+        jax.lax.Precision.DEFAULT
+        if x.dtype == jnp.bfloat16
+        else jax.lax.Precision.HIGHEST
+    )
     return jnp.einsum(
         "...d,de->...e",
         x,
         permutation,
-        precision=jax.lax.Precision.HIGHEST,
+        precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
 
@@ -867,11 +872,16 @@ def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
     dim = x.shape[-1]
     order = piece_order(dim)
     perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, dim // pieces)
+    precision = (
+        jax.lax.Precision.DEFAULT
+        if x.dtype == jnp.bfloat16
+        else jax.lax.Precision.HIGHEST
+    )
     return jnp.einsum(
         "...d,dpe->p...e",
         x,
         perm.astype(x.dtype),
-        precision=jax.lax.Precision.HIGHEST,
+        precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
 
@@ -885,11 +895,16 @@ def merge_pieces(x: jax.Array) -> jax.Array:
     dim = pieces * piece_dim
     order = piece_order(dim)
     perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, piece_dim)
+    precision = (
+        jax.lax.Precision.DEFAULT
+        if x.dtype == jnp.bfloat16
+        else jax.lax.Precision.HIGHEST
+    )
     return jnp.einsum(
         "p...e,dpe->...d",
         x,
         perm.astype(x.dtype),
-        precision=jax.lax.Precision.HIGHEST,
+        precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
 

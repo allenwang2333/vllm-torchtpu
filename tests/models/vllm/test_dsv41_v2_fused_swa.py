@@ -686,8 +686,10 @@ class TestFusedSwaHelpers:
             (24, 192, 48, True),  # decode verify batch, tokens < 128
             (200, 128, 48, True),  # not a 64 multiple
             (192, 128, None, True),  # DSpark verify multiple of 6 without bound
-            (128, 192, None, True),  # power-of-two multi-request verify shard (w!=128)
-            (256, 192, None, True),  # B=2048 multi-request verify shard (w!=128)
+            (128, 192, None, True),  # power-of-two multi-request verify shard (w>128)
+            (256, 192, None, True),  # B=2048 multi-request verify shard (w>128)
+            (128, 192, 4, True),  # bounded decode/verify batch at width=192
+            (256, 192, 4, True),  # bounded high-conc decode batch at width=192
             (256, 128, None, False),  # 2048-token prefill chunk keeps shared union
             (192, 128, 48, False),  # prefill tile with bound: shared union
             (128, 64, 48, False),
@@ -767,6 +769,14 @@ class TestFusedSwaHelpers:
         natural = gather_cache_values(pool, records[0, :2], dim)
         assert jnp.array_equal(kv[0, :2], natural)
         assert not jnp.array_equal(split_halves(natural), natural)
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+    def test_permute_and_pieces_bf16_vs_fp32(self, dtype):
+        x = jnp.arange(4 * 512, dtype=dtype).reshape(4, 512)
+        assert jnp.array_equal(attention_kernels.merge_halves(split_halves(x)), x)
+        pieces = attention_kernels.split_pieces(x, 4)
+        assert pieces.shape == (4, 4, 128)
+        assert jnp.array_equal(attention_kernels.merge_pieces(pieces), x)
 
     @pytest.mark.parametrize("tokens", [50, 96, 144, 192, 256, 384])
     def test_fused_swa_inputs_two_banks_and_wide_window(self, tokens):

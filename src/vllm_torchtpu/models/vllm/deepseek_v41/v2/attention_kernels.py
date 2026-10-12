@@ -998,6 +998,7 @@ def fused_swa_eligible(tokens: int, width: int, max_requests: int | None) -> boo
         tokens % 64 != 0
         or tokens < 128
         or (max_requests is None and (tokens % 6 == 0 or width != 128))
+        or 128 < width <= 256
         or width % 64 != 0
         or width > 512
     )
