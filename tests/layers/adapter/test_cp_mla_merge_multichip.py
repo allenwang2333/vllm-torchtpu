@@ -25,6 +25,10 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      no per-row arithmetic: it is reported bit for bit against the unchunked
      merge compiled the same way, must be no less exact, and the same check
      fails when every chunk is weighted with its neighbour row's lse.
+  5. Collapsing the chunked merge's per-chunk lse gathers into one
+     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`) returns the per-chunk-gather merge bit
+     for bit, eager and compiled, and the same check fails when the collapsed
+     gather's rows are shifted by one.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -53,6 +57,7 @@ LAUNCH_TIMEOUT_SECONDS = 900
 _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A": False,
     "TPU_DCP_MERGE_CHUNKED": 0,
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
@@ -61,9 +66,12 @@ ARMS = {
     "chunk2": {"TPU_DCP_MERGE_CHUNKED": 2},
     "chunk4": {"TPU_DCP_MERGE_CHUNKED": 4},
     "chunk8": {"TPU_DCP_MERGE_CHUNKED": 8},
+    "chunk8_ag1": {"TPU_DCP_MERGE_CHUNKED": 8, "TPU_DCP_MERGE_CHUNKED_LSE_AG": True},
 }
 # Arms that must return today's merge: same per-row arithmetic, other schedule.
-CHUNK_ARMS = ("chunk2", "chunk4", "chunk8")
+CHUNK_ARMS = ("chunk2", "chunk4", "chunk8", "chunk8_ag1")
+# Collapsed lse gathers (`TPU_DCP_MERGE_CHUNKED_LSE_AG`): bitwise chunk8.
+LSE_AG_ARMS = ("chunk8_ag1",)
 
 
 def _worker_command(result_dir: Path, extra: list[str]) -> list[str]:
@@ -241,6 +249,7 @@ def _set_arm(cp_mla, arm):
         setattr(cp_mla.envs, name, value)
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
     cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 0
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS = 0
 
 
 def _compile(fn):
@@ -275,8 +284,17 @@ def _check(rank, world, group, cp_mla):
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
                 }
+                if arm in ("today", "chunk8"):
+                    got_today[(arm, how)] = got
                 if arm == "today":
                     got_today[how] = got
+                if arm in LSE_AG_ARMS and ("chunk8", how) in got_today:
+                    report[f"{arm}/{how}"]["bitwise_vs_chunk8"] = bool(
+                        torch.equal(
+                            got.view(torch.int16),
+                            got_today[("chunk8", how)].view(torch.int16),
+                        )
+                    )
                 elif how in got_today and got.shape == got_today[how].shape:
                     same = got.view(torch.int16) == got_today[how].view(torch.int16)
                     report[f"{arm}/{how}"]["frac_bitwise_vs_today"] = float(
@@ -347,6 +365,31 @@ def _check(rank, world, group, cp_mla):
                 report[f"control_misaligned/chunk4/{how}"] = {"error": repr(exc)[:400]}
     finally:
         cp_mla.cp_lse_ag_out_rs = real_rs
+
+    # Positive control for the collapsed gathers: the gathered lse rows
+    # shifted by one, so every chunk is weighted with a neighbour's lse.
+    real_ag = cp_mla._gather_lse
+    cp_mla._gather_lse = lambda x, g: torch.roll(real_ag(x, g), 1, dims=1)
+    try:
+        for arm in LSE_AG_ARMS:
+            _set_arm(cp_mla, arm)
+            for how in ("eager", "compiled"):
+                key = f"control_misaligned/{arm}/{how}"
+                try:
+                    fn = merge if how == "eager" else _compile(merge)
+                    got = fn(o_dev, l_dev).cpu()
+                    report[key] = _error_stats(got, ref)
+                    report[key]["bitwise_vs_chunk8"] = bool(
+                        torch.equal(
+                            got.view(torch.int16),
+                            got_today[("chunk8", how)].view(torch.int16),
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    traceback.print_exc()
+                    report[key] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla._gather_lse = real_ag
     return report
 
 
@@ -543,6 +586,20 @@ def assert_merge_results(results: list[dict]) -> None:
                 how,
                 ctl,
             )
+        for arm in LSE_AG_ARMS:
+            for how in ("eager", "compiled"):
+                c = check[f"{arm}/{how}"]
+                assert c.get("bitwise_vs_chunk8") is True, (r["rank"], arm, how, c)
+                ctl = check[f"control_misaligned/{arm}/{how}"]
+                assert "error" not in ctl, (r["rank"], arm, how, ctl)
+                assert not ctl["within_1ulp"], (
+                    "positive control: shifted collapsed lse must fail the check",
+                    r["rank"],
+                    arm,
+                    how,
+                    ctl,
+                )
+                assert not ctl["bitwise_vs_chunk8"], (r["rank"], arm, how, ctl)
         for how in ("eager", "compiled"):
             c = check[f"control_misaligned/chunk4/{how}"]
             assert "error" not in c, (r["rank"], how, c)
