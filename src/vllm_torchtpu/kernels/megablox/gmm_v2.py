@@ -180,8 +180,13 @@ class WeightsRef(RhsRef):
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if replicate_size is not None:
-            # Perform zero-stride load for efficient broadcasting across sublanes.
-            return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            if self.scale.shape[-1] <= 128:
+                # Perform zero-stride load for efficient broadcasting across sublanes.
+                return self.scale[:, pl.ds(0, replicate_size, 0), :]
+            return jnp.broadcast_to(
+                self.scale[...],
+                (self.scale.shape[0], replicate_size, self.scale.shape[2]),
+            )
         return self.scale[...]
 
     def get_bias(self) -> jax.Array:
@@ -505,6 +510,31 @@ def inner_kernel(
                 dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
                 preferred_element_type = jnp.int32
 
+            # Precompute per-k-block quantized activations and load per-tile RHS
+            # scales once before the outer N-loop to eliminate redundant VPU
+            # dynamic quantization and sublane interleaving across N tiles.
+            lhs_blocks = []
+            for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
+                block_lhs = tiled_lhs[:, start_k:end_k]
+                # Perform lhs quantization once per k-block rather than repeating
+                # across every mxu_size N slice.
+                block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+                block_scale = block_abs_max / dtype_max
+                # If block_scale=0, it will cause division by zero and return either
+                # NaN or Inf. Since this can cause numeric issue when downcasting to
+                # quantized value, we convert them into 0.
+                block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+                # Convert lhs into quantized dtype.
+                block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                lhs_blocks.append((block_lhs_q, block_scale.astype(acc_ref.dtype)))
+
+            rhs_scales_tile = (
+                tiled_rhs_ref.get_scale(replicate_size=bucket_m)
+                if cfgs.rhs_cfgs.should_dequantize_after_matmul
+                else None
+            )
+
             # Without n outer loop, result of quantized matmul becomes available only
             # at the last iteration of the loop. This means [tile_m, tile_n] value
             # needs to be stored until the last iteration. By adding n outer loop,
@@ -516,24 +546,12 @@ def inner_kernel(
                 col_size = end_n - start_n
 
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
+                for block_idx, start_k in enumerate(
+                    range(0, cfgs.tiles.tile_k, q_block_size)
+                ):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    block_lhs_q, block_scale_cast = lhs_blocks[block_idx]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
 
                     # Unlike unquantized path, compiler may not perform implicit type
                     # conversion due to numeric concerns. As this can cause unsupported
@@ -547,14 +565,14 @@ def inner_kernel(
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                    block_acc *= block_scale_cast
 
                     # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    if rhs_scales_tile is not None:
                         b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
+                        rhs_scale_replicated = rhs_scales_tile[
+                            b_id, :, start_n : start_n + col_size
+                        ]
                         block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
                     acc_n += block_acc

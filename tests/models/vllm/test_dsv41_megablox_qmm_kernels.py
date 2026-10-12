@@ -697,6 +697,9 @@ class TestMegabloxGmmV2:
         assert w_ref.get_weight().shape == (4, 4)
         assert w_ref.get_scale().shape == (2, 1, 4)
         assert w_ref.get_scale(replicate_size=2).shape == (2, 2, 4)
+        s_wide = MockBuffer(np.ones((2, 1, 256), dtype=np.float32))
+        w_wide = mb_gmm.WeightsRef(weight=w, scale=s_wide, bias=b)
+        assert w_wide.get_scale(replicate_size=2).shape == (2, 2, 256)
         assert w_ref.get_bias().shape == (1, 4)
 
         with mock.patch(

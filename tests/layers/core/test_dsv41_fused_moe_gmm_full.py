@@ -107,10 +107,10 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_512,
     ):
-        # min(10 * 512 - 1, 5120) = min(5119, 5120) = 5119
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 5119
+        # min(14 * 512 - 1, 6912) = min(7167, 6912) = 6912
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 6912
 
-    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (5120)
+    # 7. Env unset, oversized block rows capped at _ONEHOT_AUTO_CAP (6912)
     mock_sc_1024 = MagicMock()
     mock_sc_1024.num_lanes = 16
     mock_sc_1024.num_cores = 8
@@ -121,8 +121,8 @@ def test_resolve_onehot_permute_threshold(monkeypatch):
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=mock_info_sc_1024,
     ):
-        # min(10 * 1024 - 1, 5120) = min(10239, 5120) = 5120
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 5120
+        # min(14 * 1024 - 1, 6912) = min(14335, 6912) = 6912
+        assert fused_moe_gmm.resolve_onehot_permute_threshold() == 6912
 
 
 def test_moe_gmm_tiling(monkeypatch):

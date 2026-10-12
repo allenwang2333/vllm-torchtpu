@@ -65,7 +65,7 @@ def _select_ragged_gather_reduce(version: str):
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 5120
+_ONEHOT_AUTO_CAP = 6912
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -75,7 +75,7 @@ def resolve_onehot_permute_threshold() -> int:
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(mult * SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 10`` for 512-row TPU7x
+    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 14`` for 512-row TPU7x
     blocks and ``mult = 2`` for smaller blocks) and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
@@ -91,7 +91,7 @@ def resolve_onehot_permute_threshold() -> int:
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    mult = 10 if block_rows >= 512 else 2
+    mult = 14 if block_rows >= 512 else 2
     threshold = min(mult * block_rows - 1, _ONEHOT_AUTO_CAP)
 
     return threshold
@@ -394,28 +394,28 @@ def _prepare_routed_gmm_inputs(
             token_indices_sorted,
             topk_weights_sorted,
         ) = _pairwise_sort_positions(sort_keys, token_indices_flat, gated_weights)
-    elif pairwise_sort or ragged_permute:
+    elif pairwise_sort:
+        # Pack (sort_key, row_idx) as composite key and (gated_weight_u16, token_id)
+        # as payload into a single key-value sort to avoid counting-sort overhead
+        # and dynamic VPU scatters (.at[argsort_revert_indices].set).
+        row_idx = jnp.arange(total_routed, dtype=jnp.int32)
+        comp_key = jax.lax.shift_left(sort_keys, 16) | row_idx
+        gated_bf16 = jnp.where(valid_mask, topk_weights_flat, 0).astype(jnp.bfloat16)
+        w_u16 = jax.lax.bitcast_convert_type(gated_bf16, jnp.uint16).astype(jnp.int32)
+        payload = jax.lax.shift_left(w_u16, 16) | (
+            token_indices_flat & jnp.int32(0xFFFF)
+        )
+        _, packed_sorted = jax.lax.sort([comp_key, payload], dimension=0, num_keys=1)
+        token_indices_sorted = packed_sorted & jnp.int32(0xFFFF)
+        topk_weights_sorted = jax.lax.bitcast_convert_type(
+            jax.lax.shift_right_logical(packed_sorted, 16).astype(jnp.uint16),
+            jnp.bfloat16,
+        )
+        argsort_revert_indices = token_indices_sorted
+    elif ragged_permute:
         argsort_revert_indices, bucket_counts = _counting_sort_positions(
             sort_keys, local_num_experts + 1
         )
-        if pairwise_sort:
-            gated_bf16 = jnp.where(valid_mask, topk_weights_flat, 0).astype(
-                jnp.bfloat16
-            )
-            w_u16 = jax.lax.bitcast_convert_type(gated_bf16, jnp.uint16).astype(
-                jnp.int32
-            )
-            payload = jax.lax.shift_left(w_u16, 16) | (
-                token_indices_flat & jnp.int32(0xFFFF)
-            )
-            packed_sorted = (
-                jnp.empty_like(payload).at[argsort_revert_indices].set(payload)
-            )
-            token_indices_sorted = packed_sorted & jnp.int32(0xFFFF)
-            topk_weights_sorted = jax.lax.bitcast_convert_type(
-                jax.lax.shift_right_logical(packed_sorted, 16).astype(jnp.uint16),
-                jnp.bfloat16,
-            )
     else:
         argsort_revert_indices = None
     token_bits = max(1, (num_tokens_local - 1).bit_length())
