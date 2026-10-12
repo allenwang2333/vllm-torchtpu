@@ -649,6 +649,339 @@ def prepare_capped_window_live(
     )(jnp.reshape(live_windows, (1,)).astype(jnp.int32), tab, windows, topk_indices)
 
 
+def mixed_fused_prep_supported(
+    num_tokens: int, topk: int, chunk_size: int, kernel_batch_size: int, topk_cap: int
+) -> bool:
+    """Whether `prepare_capped_window_live_fused` serves a mixed bucket: the
+    live-group layout holds, and kv_lens fits whole 128-lane rows per chunk."""
+    return (
+        live_group_supported(chunk_size, kernel_batch_size, topk_cap)
+        and num_tokens % chunk_size == 0
+        and chunk_size % 128 == 0
+        and topk % topk_cap == 0
+        and topk % 128 == 0
+    )
+
+
+def _capped_window_live_fused_kernel(
+    token_end_ref,  # SMEM i32[1] (scalar prefetch) end of real tokens
+    windows_ref,  # VMEM i32[chunk, padded_pps] page-table row per token (chunk c)
+    topk_ref,  # VMEM i32[chunk * topk // 128, 128] chunk c's top-k, 128-lane rows
+    *refs,
+    bz: int,
+    chunk_size: int,
+    topk: int,
+    topk_cap: int,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+    num_chunks: int,
+    fault: str | None,
+):
+    """kv_lens + `live_group_table` + `prepare_capped_window_live`, one chunk
+    per grid step, reading the top-k in its 128-lane row form.
+
+    Row ``t * (topk / 128) + j`` of the top-k operand holds slots
+    ``[128 j, 128 j + 128)`` of token t: the SparseCore top-k's flat output
+    as a bitcast, so no [T, topk] relayout feeds this call. Per chunk:
+
+    1. kv_lens (live slots per token) over all `topk` slots, exact in f32;
+    2. the group table (A(g), off(g)) and the chunk's gather bound exactly as
+       `live_group_table` computes them, into SMEM outputs;
+    3. window 0 in live-group order, exactly as `_capped_window_live_kernel`
+       lays it out, and windows 1 .. W(c) - 1 token-major, where W(c) is the
+       chunk's own window bound -- the only windows its gather reads
+       (`live_group_table`'s `num_live`);
+    4. one output array per chunk, so the chunk's gather takes it whole (no
+       per-chunk slice copy of the [chunks * W * C * cap / 128, 128] array).
+
+    Windows at or past W(c) stay unwritten; the gather never reads them.
+    """
+    outs = refs[:num_chunks]
+    kv_ref, tab_ref, live_ref = refs[num_chunks : num_chunks + 3]
+    stage_ref, phys_ref, cw_ref, ab_ref, sems = refs[num_chunks + 3 :]
+    c = pl.program_id(0)
+    gpc = chunk_size // bz
+    atom = GATHER_ATOM_ROWS
+    atoms_w = topk_cap // atom
+    num_windows = topk // topk_cap
+    lane_rows = topk_cap // 128  # 128-lane rows per (token, window)
+    row_stride = topk // 128  # 128-lane rows per token in the top-k operand
+    tile_rows = bz * atom // 128
+    region_rows = chunk_size * topk_cap // 128
+    region_tiles = region_rows // tile_rows
+    num_groups = num_chunks * gpc
+    slot = lax.rem(c, 2)
+    token_end = token_end_ref[0]
+
+    def region_copy(chunk_out, w, slot_, sem):
+        return pltpu.make_async_copy(
+            stage_ref.at[slot_, pl.ds(w * region_rows, region_rows)],
+            chunk_out.at[pl.ds(w * region_rows, region_rows)],
+            sems.at[sem],
+        )
+
+    def wait_chunk(cc, slot_):
+        # Waits only need the semaphore and the byte count: any chunk output.
+        region_copy(outs[0], 0, slot_, slot_ * num_windows).wait()
+        for w in range(1, num_windows):
+
+            @pl.when(w < cw_ref[cc])
+            def _():
+                region_copy(outs[0], w, slot_, slot_ * num_windows + w).wait()
+
+    @pl.when(c >= 2)
+    def _reuse():
+        wait_chunk(c - 2, slot)
+
+    # 1. kv_lens: tokens on sublanes, one strided load per 128-slot column.
+    acc = jnp.zeros((chunk_size, 128), jnp.float32)
+    for j in range(row_stride):
+        acc = acc + (topk_ref[pl.ds(j, chunk_size, stride=row_stride), :] != -1).astype(
+            jnp.float32
+        )
+    kv_col = jnp.sum(acc, axis=1, keepdims=True)  # f32[chunk, 1], exact
+    for h in range(chunk_size // 128):
+        blk = jnp.broadcast_to(kv_col[h * 128 : (h + 1) * 128, :], (128, 128))
+        kv_row = jnp.transpose(blk)[0:1, :].astype(jnp.int32)
+        if fault == "kv":  # test-only positive control
+            kv_row = kv_row + (lax.broadcasted_iota(jnp.int32, kv_row.shape, 1) == 5).astype(jnp.int32)
+        kv_ref[pl.ds(c * (chunk_size // 128) + h, 1), :] = kv_row
+    kv_i = kv_col.astype(jnp.int32)
+
+    # 2. Group table and the chunk's gather bound (`live_group_table`).
+    chunk_start = c * chunk_size
+    valid_rows = jnp.clip(token_end - chunk_start, 0, chunk_size)
+    grid_rows = (valid_rows + bz - 1) // bz * bz
+    local = lax.broadcasted_iota(jnp.int32, (chunk_size, 1), 0)
+    token_windows = jnp.where(
+        local < grid_rows, (jnp.maximum(kv_i, 1) + topk_cap - 1) // topk_cap, 1
+    )
+    chunk_windows = jnp.clip(jnp.max(token_windows), 1, num_windows)
+    cw_ref[c] = chunk_windows
+    off = jnp.int32(0)
+    for tb in range(gpc):
+        kv_max = jnp.max(kv_i[tb * bz : (tb + 1) * bz, :])
+        gridded = chunk_start + tb * bz < token_end
+        a_live = jnp.where(
+            gridded, jnp.minimum((kv_max + atom - 1) // atom, atoms_w), 0
+        )
+        g = c * gpc + tb
+        tab_ref[g] = a_live
+        tab_ref[num_groups + g] = off
+        ab_ref[tb] = a_live
+        ab_ref[gpc + tb] = off
+        off = off + a_live
+        if fault == "off" and tb == 0:  # test-only positive control
+            off = off + 1
+    live_ref[c] = jnp.where(
+        chunk_windows == 1,
+        off * (bz * atom),
+        (chunk_windows - 1) * chunk_size * topk_cap + grid_rows * topk_cap,
+    )
+
+    def translate(tb, w, jj):
+        idx = topk_ref[pl.ds(tb * bz * row_stride + w * lane_rows + jj, bz, stride=row_stride), :]
+        row = chunk_start + tb * bz + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+        col = w * topk_cap + jj * 128 + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+        return _window_physical_rows(
+            idx,
+            windows_ref.at[pl.ds(pl.multiple_of(tb * bz, bz), bz)],
+            row * topk + col,
+            page_size=page_size,
+            pages_per_seq=pages_per_seq,
+            total_num_pages=total_num_pages,
+        )
+
+    # 3a. Window 0 in live-group order (`_capped_window_live_kernel`).
+    def group_body(tb, carry):
+        live = ab_ref[tb]
+        goff = ab_ref[gpc + tb]
+        dead_before = tb * atoms_w - goff
+        for jj in range(lane_rows):
+            phys_ref[pl.ds(jj * bz, bz), :] = translate(tb, 0, jj)
+
+        @pl.when(live == atoms_w)
+        def _whole_group():
+            start = pl.multiple_of(goff * tile_rows, tile_rows)
+            for jj in range(lane_rows):
+                stage_ref[slot, pl.ds(start + jj, bz, stride=lane_rows), :] = phys_ref[
+                    pl.ds(jj * bz, bz), :
+                ]
+
+        @pl.when(live < atoms_w)
+        def _blocks():
+            lane = lax.broadcasted_iota(jnp.int32, (bz // 2, 128), 1)
+            for a in range(atoms_w):
+                j, hh = divmod(a * atom, 128)
+                even = phys_ref[pl.ds(j * bz, bz // 2, stride=2), :]
+                odd = phys_ref[pl.ds(j * bz + 1, bz // 2, stride=2), :]
+                if hh == 0:
+                    tile = jnp.where(lane < atom, even, pltpu.roll(odd, atom, 1))
+                else:
+                    tile = jnp.where(lane < atom, pltpu.roll(even, atom, 1), odd)
+                pos = jnp.where(
+                    a < live, goff + a, region_tiles - 1 - (dead_before + a - live)
+                )
+                start = pl.multiple_of(pos * tile_rows, tile_rows)
+                stage_ref[slot, pl.ds(start, tile_rows), :] = tile
+
+        return carry
+
+    lax.fori_loop(0, gpc, group_body, 0)
+
+    # 3b. Windows 1 .. W(c) - 1, token-major (overflowing chunks only).
+    for w in range(1, num_windows if fault != "win1" else 1):
+
+        @pl.when(w < chunk_windows)
+        def _window():
+            def body(tb, carry):
+                start = w * region_rows + tb * bz * lane_rows
+                for jj in range(lane_rows):
+                    stage_ref[slot, pl.ds(start + jj, bz, stride=lane_rows), :] = (
+                        translate(tb, w, jj)
+                    )
+                return carry
+
+            lax.fori_loop(0, gpc, body, 0)
+
+    # 4. This chunk's own output: start its live windows' DMAs.
+    for cc in range(num_chunks):
+
+        @pl.when(c == cc)
+        def _flush():
+            region_copy(outs[cc], 0, slot, slot * num_windows).start()
+            for w in range(1, num_windows):
+
+                @pl.when(w < chunk_windows)
+                def _():
+                    region_copy(outs[cc], w, slot, slot * num_windows + w).start()
+
+    @pl.when(c == num_chunks - 1)
+    def _drain():
+        wait_chunk(c, slot)
+        if num_chunks >= 2:
+            wait_chunk(c - 1, 1 - slot)
+
+
+def prepare_capped_window_live_fused(
+    topk_indices: jax.Array,  # i32[num_tokens, topk], -1 = empty slot
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    token_end: jax.Array,  # i32[]
+    *,
+    chunk_size: int,
+    kernel_batch_size: int,
+    topk_cap: int,
+    page_size: int,
+    total_num_pages: int,
+    _fault: str | None = None,
+) -> tuple[tuple[jax.Array, ...], jax.Array, jax.Array, jax.Array]:
+    """kv_lens, `live_group_table` and `prepare_capped_window_live` in one call.
+
+    Reads the top-k as 128-lane rows (a bitcast of the SparseCore top-k's flat
+    output, so the [T, topk] relayout, the kv_lens reduce and the group-table
+    fusions all go) and writes one window array per chunk (so the per-chunk
+    slice fusion goes too).
+
+    Returns:
+      rows: per chunk, i32[W * chunk * topk_cap // 128, 128], the chunk's rows
+        of `prepare_capped_window_live` on every window its gather reads
+        (window 0 always; windows < W(c) when the chunk overflows).
+      kv_lens: i32[num_tokens], `sum(topk_indices != -1, -1)`.
+      tab, num_live: `live_group_table(kv_lens, token_end, ...)`.
+
+    `_fault` is a test-only positive control ("kv", "off", "win1").
+    """
+    num_tokens, topk = topk_indices.shape
+    bz = kernel_batch_size
+    if not mixed_fused_prep_supported(num_tokens, topk, chunk_size, bz, topk_cap):
+        raise ValueError(
+            f"mixed fused prep unsupported: tokens {num_tokens}, topk {topk}, "
+            f"chunk {chunk_size}, batch {bz}, cap {topk_cap}"
+        )
+    num_windows = topk // topk_cap
+    num_chunks = num_tokens // chunk_size
+    gpc = chunk_size // bz
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    padded_pps = align_to(pages_per_seq, _GATHER_PAGE_CHUNK)
+    page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
+    if padded_pps != pages_per_seq:
+        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    )
+    windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
+    region_rows = chunk_size * topk_cap // 128
+    row_stride = topk // 128
+    kernel = functools.partial(
+        _capped_window_live_fused_kernel,
+        bz=bz,
+        chunk_size=chunk_size,
+        topk=topk,
+        topk_cap=topk_cap,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        total_num_pages=total_num_pages,
+        num_chunks=num_chunks,
+        fault=_fault,
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    outs = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec((chunk_size, padded_pps), lambda c, te: (c, 0)),
+                pl.BlockSpec((chunk_size * row_stride, 128), lambda c, te: (c, 0)),
+            ],
+            out_specs=[
+                *([hbm] * num_chunks),
+                pl.BlockSpec((num_tokens // 128, 128), lambda c, te: (0, 0)),
+                smem,
+                smem,
+            ],
+            scratch_shapes=[
+                pltpu.VMEM((2, num_windows * region_rows, 128), jnp.int32),
+                pltpu.VMEM((topk_cap // 128 * bz, 128), jnp.int32),
+                pltpu.SMEM((num_chunks,), jnp.int32),
+                pltpu.SMEM((2 * gpc,), jnp.int32),
+                pltpu.SemaphoreType.DMA((2 * num_windows,)),
+            ],
+            grid=(num_chunks,),
+        ),
+        out_shape=[
+            *(
+                [
+                    jax.ShapeDtypeStruct(
+                        (num_windows * region_rows, 128), jnp.int32
+                    )
+                ]
+                * num_chunks
+            ),
+            jax.ShapeDtypeStruct((num_tokens // 128, 128), jnp.int32),
+            jax.ShapeDtypeStruct((2 * num_tokens // bz,), jnp.int32),
+            jax.ShapeDtypeStruct((num_chunks,), jnp.int32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=32 * 1024 * 1024,
+        ),
+        name="capped_window_indices_live_fused",
+    )(
+        jnp.reshape(token_end, (1,)).astype(jnp.int32),
+        windows,
+        topk_indices.reshape(num_tokens * row_stride, 128),
+    )
+    rows = tuple(outs[:num_chunks])
+    kv_lens, tab, num_live = outs[num_chunks:]
+    return rows, kv_lens.reshape(num_tokens), tab, num_live
+
+
 # Decode buckets the fused window prep serves (one chunk, whole top-k block in
 # VMEM: 32 tokens x 2048 x i32 = 256 KiB).
 FUSED_PREP_MAX_TOKENS = 32
@@ -1998,6 +2331,7 @@ def prepare_outputs(
         "lse_in_kernel",
         "prologue_fault",
         "kv_write_fault",
+        "mixed_fused_prep",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -2042,6 +2376,7 @@ def sparse_ragged_paged_attention(
     prologue_fault: str | None = None,
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
+    mixed_fused_prep: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -2146,6 +2481,11 @@ def sparse_ragged_paged_attention(
         `native_sc_gather.dsa_gather_native_sc`), and the updated caches are
         returned after the other outputs.
       kv_write_fault: test-only (`native_sc_gather.WRITE_FAULTS`).
+      mixed_fused_prep: With `mixed_live_gather` taken and
+        `mixed_fused_prep_supported`: build kv_lens, the group table and the
+        live-group window rows in one call that reads the top-k as 128-lane
+        rows and writes one window array per chunk
+        (`prepare_capped_window_live_fused`). Same rows, kv_lens and table.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -2353,34 +2693,51 @@ def sparse_ragged_paged_attention(
             small_chunk_batch_size,
         )
         token_end = cu_q_lens[distribution[2]]
-        live_windows = capped_live_windows(
-            kv_lens,
-            token_end,
-            chunk_size=uniform_chunk,
-            kernel_batch_size=prep_batch,
-            topk_cap=topk_cap,
-            num_windows=topk // topk_cap,
-        )
-        group_tab, group_num_live = live_group_table(
-            kv_lens,
-            token_end,
-            chunk_size=uniform_chunk,
-            kernel_batch_size=prep_batch,
-            topk_cap=topk_cap,
-            num_windows=topk // topk_cap,
-        )
-        window_indices_all = prepare_capped_window_live(
-            topk_indices,
-            page_indices,
-            cu_q_lens,
-            live_windows,
-            group_tab,
-            chunk_size=uniform_chunk,
-            kernel_batch_size=prep_batch,
-            topk_cap=topk_cap,
-            page_size=page_size,
-            total_num_pages=cache_kv_nope.shape[0],
-        )
+        if mixed_fused_prep and mixed_fused_prep_supported(
+            q.shape[0], topk, uniform_chunk, prep_batch, topk_cap
+        ):
+            window_indices_all, kv_lens, group_tab, group_num_live = (
+                prepare_capped_window_live_fused(
+                    topk_indices,
+                    page_indices,
+                    cu_q_lens,
+                    token_end,
+                    chunk_size=uniform_chunk,
+                    kernel_batch_size=prep_batch,
+                    topk_cap=topk_cap,
+                    page_size=page_size,
+                    total_num_pages=cache_kv_nope.shape[0],
+                )
+            )
+        else:
+            live_windows = capped_live_windows(
+                kv_lens,
+                token_end,
+                chunk_size=uniform_chunk,
+                kernel_batch_size=prep_batch,
+                topk_cap=topk_cap,
+                num_windows=topk // topk_cap,
+            )
+            group_tab, group_num_live = live_group_table(
+                kv_lens,
+                token_end,
+                chunk_size=uniform_chunk,
+                kernel_batch_size=prep_batch,
+                topk_cap=topk_cap,
+                num_windows=topk // topk_cap,
+            )
+            window_indices_all = prepare_capped_window_live(
+                topk_indices,
+                page_indices,
+                cu_q_lens,
+                live_windows,
+                group_tab,
+                chunk_size=uniform_chunk,
+                kernel_batch_size=prep_batch,
+                topk_cap=topk_cap,
+                page_size=page_size,
+                total_num_pages=cache_kv_nope.shape[0],
+            )
     elif window_prep:
         assert topk_cap is not None
         chunk_window_rows = topk // topk_cap * uniform_chunk
@@ -2466,6 +2823,8 @@ def sparse_ragged_paged_attention(
             window_indices=(
                 window_indices_all
                 if fused_prep or window_indices_all is None
+                else window_indices_all[i]
+                if isinstance(window_indices_all, tuple)
                 else window_indices_all[
                     i * chunk_window_rows : (i + 1) * chunk_window_rows
                 ]
