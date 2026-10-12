@@ -32,14 +32,14 @@ inside JAX instead, where each bucket is exported at its concrete shape: the
 kernel up to the row cap, XLA's all-reduce (``psum``) above it. Without the
 flag, and in eager mode, they keep vLLM's collective.
 
-With TPU_SMALL_ALL_REDUCE_VALID_ROWS a backbone block whose rows are a
-multiple of the bf16 row tile goes instead to moe_tp_decode's in-kernel
-all-reduce run standalone, handed the step's valid-row count from the
-token-padding mask: only valid rows travel (up to ``fold_rows`` of them folded
-into one row tile), padding rows come out +0, valid rows bitwise as the
-two-shot kernel's (both sum the bf16 slots in f32 in rank order). The count is
-replicated over the TP group, as that kernel requires. The drafter traces keep
-the sized op: the mask describes the target step's rows.
+With TPU_SMALL_ALL_REDUCE_VALID_ROWS a backbone block that has the two-shot
+kernel's fold path (``all_reduce.fold_geometry``) is handed the step's
+valid-row count from the token-padding mask: up to ``fold_rows`` valid rows
+are folded into one row tile and only that moves, padding rows coming out +0;
+more valid rows run the plain two-shot. Valid rows are bitwise the plain
+kernel's either way. The count is the same on every TP rank (the ranks share
+the step's tokens). The drafter traces keep the sized op: the mask describes
+the target step's rows.
 """
 
 import jax
@@ -58,9 +58,6 @@ from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_reduce,
     reduce_scatter,
-)
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import (
-    all_reduce as valid_rows_all_reduce,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
 from vllm_torchtpu.layers.adapter import token_padding
@@ -87,7 +84,7 @@ _AR_OP = None
 _AR_SIZED_OP = None
 _RS_OP = None
 # The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
-# tile its blocks must be a multiple of.
+# tile its fold path folds into.
 _AR_VALID_OP = None
 _VALID_TILE_ROWS = 0
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
@@ -134,15 +131,16 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
     )
 
 
-def _build_valid_rows_all_reduce(mesh):
+def _build_valid_rows_all_reduce(mesh, tile_rows: int):
     """The all-reduce op over ``mesh`` that moves only a block's valid rows:
     fn(x [rows, hidden], meta int32 [2] = (n_valid, mesh index)) per core."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(block, meta):
-        ar_spec = valid_rows_all_reduce.make_spec(n, block.shape[0], block.shape[1])
-        return valid_rows_all_reduce.standalone(ar_spec)(meta, block)
+        return all_reduce.small_all_reduce_valid_rows(
+            block, meta, num_cores=n, axis=EP_AXIS_NAME, tile_rows=tile_rows
+        )
 
     def fn(x: jax.Array, meta: jax.Array) -> jax.Array:
         return jax.shard_map(
@@ -217,7 +215,7 @@ def prebuild() -> None:
 
         info = pltpu.get_tpu_info()
         _VALID_TILE_ROWS = int(info.get_sublane_tiling(jax.numpy.bfloat16))
-        _AR_VALID_OP = _build_valid_rows_all_reduce(mesh)
+        _AR_VALID_OP = _build_valid_rows_all_reduce(mesh, _VALID_TILE_ROWS)
     # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
     # is the mesh, DP rank r's rows go to mesh core r.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
@@ -235,7 +233,7 @@ def prebuild() -> None:
         "kernel to max_rows, psum above (MTP drafter)"
         if _AR_SIZED_OP is not None
         else "vLLM's collectives (MTP drafter, eager)",
-        f"rows multiple of {_VALID_TILE_ROWS} (needs the token-padding mask)"
+        f"fold into {_VALID_TILE_ROWS}-row tiles (needs the token-padding mask)"
         if _AR_VALID_OP is not None
         else "off",
     )
@@ -284,14 +282,15 @@ def _valid_rows_meta(rows: int, mask: torch.Tensor) -> torch.Tensor:
 
 def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
     """A block of at most max_rows rows inside the warmup: the valid-rows
-    all-reduce when armed and the rows fill whole row tiles, else the
+    all-reduce when armed and the block has a fold path, else the
     two-shot/one-shot kernel (with the mask read, so every bucket lifts the
     same buffers)."""
     mask = _padding_mask()
     if mask is None:
         return _AR_OP(x, _RANK)
-    if x.shape[0] % _VALID_TILE_ROWS == 0:
-        return _AR_VALID_OP(x, _valid_rows_meta(x.shape[0], mask))
+    rows, hidden = x.shape
+    if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
+        return _AR_VALID_OP(x, _valid_rows_meta(rows, mask))
     return _AR_OP(retain(x), _RANK)
 
 
