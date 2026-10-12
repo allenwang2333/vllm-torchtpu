@@ -754,33 +754,38 @@ def _capped_window_live_fused_kernel(
         (chunk_windows - 1) * chunk_size * topk_cap + grid_rows * topk_cap,
     )
 
-    def translate(tb, w, jj):
-        idx = topk_ref[pl.ds(tb * bz * row_stride + w * lane_rows + jj, bz, stride=row_stride), :]
-        row = chunk_start + tb * bz + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+    def translate(w, jj):
+        # Column tile jj of window w for every token of the chunk: one wide
+        # vector pass (tokens on sublanes), not one per 16-token group.
+        idx = topk_ref[pl.ds(w * lane_rows + jj, chunk_size, stride=row_stride), :]
+        row = chunk_start + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
         col = w * topk_cap + jj * 128 + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
         return _window_physical_rows(
             idx,
-            windows_ref.at[pl.ds(pl.multiple_of(tb * bz, bz), bz)],
+            windows_ref,
             row * topk + col,
             page_size=page_size,
             pages_per_seq=pages_per_seq,
             total_num_pages=total_num_pages,
         )
 
-    # 3a. Window 0 in live-group order (`_capped_window_live_kernel`).
+    # 3a. Window 0 in live-group order (`_capped_window_live_kernel`); phys
+    # column tile jj of token t at row jj * chunk + t.
+    for jj in range(lane_rows):
+        phys_ref[pl.ds(jj * chunk_size, chunk_size), :] = translate(0, jj)
+
     def group_body(tb, carry):
         live = ab_ref[tb]
         goff = ab_ref[gpc + tb]
         dead_before = tb * atoms_w - goff
-        for jj in range(lane_rows):
-            phys_ref[pl.ds(jj * bz, bz), :] = translate(tb, 0, jj)
+        g0 = pl.multiple_of(tb * bz, bz)
 
         @pl.when(live == atoms_w)
         def _whole_group():
             start = pl.multiple_of(goff * tile_rows, tile_rows)
             for jj in range(lane_rows):
                 stage_ref[slot, pl.ds(start + jj, bz, stride=lane_rows), :] = phys_ref[
-                    pl.ds(jj * bz, bz), :
+                    pl.ds(jj * chunk_size + g0, bz), :
                 ]
 
         @pl.when(live < atoms_w)
@@ -788,8 +793,8 @@ def _capped_window_live_fused_kernel(
             lane = lax.broadcasted_iota(jnp.int32, (bz // 2, 128), 1)
             for a in range(atoms_w):
                 j, hh = divmod(a * atom, 128)
-                even = phys_ref[pl.ds(j * bz, bz // 2, stride=2), :]
-                odd = phys_ref[pl.ds(j * bz + 1, bz // 2, stride=2), :]
+                even = phys_ref[pl.ds(j * chunk_size + g0, bz // 2, stride=2), :]
+                odd = phys_ref[pl.ds(j * chunk_size + g0 + 1, bz // 2, stride=2), :]
                 if hh == 0:
                     tile = jnp.where(lane < atom, even, pltpu.roll(odd, atom, 1))
                 else:
@@ -809,15 +814,10 @@ def _capped_window_live_fused_kernel(
 
         @pl.when(w < chunk_windows)
         def _window():
-            def body(tb, carry):
-                start = w * region_rows + tb * bz * lane_rows
-                for jj in range(lane_rows):
-                    stage_ref[slot, pl.ds(start + jj, bz, stride=lane_rows), :] = (
-                        translate(tb, w, jj)
-                    )
-                return carry
-
-            lax.fori_loop(0, gpc, body, 0)
+            for jj in range(lane_rows):
+                stage_ref[
+                    slot, pl.ds(w * region_rows + jj, chunk_size, stride=lane_rows), :
+                ] = translate(w, jj)
 
     # 4. This chunk's own output: start its live windows' DMAs.
     for cc in range(num_chunks):
@@ -920,7 +920,7 @@ def prepare_capped_window_live_fused(
             ],
             scratch_shapes=[
                 pltpu.VMEM((2, num_windows * region_rows, 128), jnp.int32),
-                pltpu.VMEM((topk_cap // 128 * bz, 128), jnp.int32),
+                pltpu.VMEM((topk_cap // 128 * chunk_size, 128), jnp.int32),
                 pltpu.SMEM((num_chunks,), jnp.int32),
                 pltpu.SMEM((2 * gpc,), jnp.int32),
                 pltpu.SemaphoreType.DMA((2 * num_windows,)),
