@@ -553,6 +553,10 @@ class Glm5MKD:
                 return False, "prefill"
         if scheduler_output.total_num_scheduled_tokens > cfg.TMAX or len(ns) > cfg.TMAX:
             return False, "decode_over_tmax"
+        if os.environ.get("GLM5_MKD_ALT") == "1":    # debug A/B: every other eligible step on the stock path
+            self._alt = not getattr(self, "_alt", False)
+            if not self._alt:
+                return False, "alt_stock"
         return True, "mk"
 
     def _metadata(self) -> AttentionMetadata:
