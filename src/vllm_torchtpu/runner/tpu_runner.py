@@ -2054,13 +2054,12 @@ class TPUModelRunner(GPUModelRunner):
         mla_dispatch.maybe_order_prefills_by_kv_len(
             self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
         )
-        if (
-            swapped
-            and getattr(self.input_batch, "batch_update_builder", None) is not None
-        ):
-            refresh = getattr(self.input_batch, "refresh_metadata", None)
-            if callable(refresh):
-                refresh()
+        if swapped:
+            self._cached_output_req_ids_key = None
+            if getattr(self.input_batch, "batch_update_builder", None) is not None:
+                refresh = getattr(self.input_batch, "refresh_metadata", None)
+                if callable(refresh):
+                    refresh()
         return num_decode, num_windowed
 
     def _build_attention_metadata(
@@ -3301,8 +3300,20 @@ class TPUModelRunner(GPUModelRunner):
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
-        for req_state in self.requests.values():
-            req_state.prev_num_draft_len = 0
+        if (
+            self.speculative_config is not None
+            and self.scheduler_config.async_scheduling
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            for req_id in scheduler_output.scheduled_spec_decode_tokens:
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    req_state.prev_num_draft_len = 0
+        if (
+            invalidated_req_ids
+            or scheduler_output.scheduled_new_reqs
+        ):
+            self._cached_output_req_ids_key = None
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
@@ -3903,14 +3914,30 @@ class TPUModelRunner(GPUModelRunner):
                 else:
                     end_index = num_reqs
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
+        min_num_scheduled_tokens_all_reqs = min(num_scheduled_tokens_per_req)
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_scheduled_tokens_per_req_list = num_scheduled_tokens_per_req
-        num_scheduled_tokens_per_req = np.array(
-            num_scheduled_tokens_per_req_list, dtype=np.int32
-        )
-        assert max_num_scheduled_tokens_all_reqs > 0
-
         num_reqs = len(num_scheduled_tokens_per_req_list)
+        is_uniform_scheduled = (
+            min_num_scheduled_tokens_all_reqs == max_num_scheduled_tokens_all_reqs
+        )
+        if is_uniform_scheduled:
+            uni_arr_cache = getattr(self, "_uniform_sched_arr_cache", None)
+            if uni_arr_cache is None:
+                uni_arr_cache = {}
+                self._uniform_sched_arr_cache = uni_arr_cache
+            uni_arr_key = (num_reqs, max_num_scheduled_tokens_all_reqs)
+            num_scheduled_tokens_per_req = uni_arr_cache.get(uni_arr_key)
+            if num_scheduled_tokens_per_req is None:
+                num_scheduled_tokens_per_req = np.full(
+                    num_reqs, max_num_scheduled_tokens_all_reqs, dtype=np.int32
+                )
+                uni_arr_cache[uni_arr_key] = num_scheduled_tokens_per_req
+        else:
+            num_scheduled_tokens_per_req = np.array(
+                num_scheduled_tokens_per_req_list, dtype=np.int32
+            )
+        assert max_num_scheduled_tokens_all_reqs > 0
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
@@ -3962,14 +3989,18 @@ class TPUModelRunner(GPUModelRunner):
                 idx_cache = {}
                 self._prepare_inputs_idx_cache = idx_cache
             idx_cache_key = (
-                start_index,
-                num_reqs,
-                token_ids_stride,
-                num_scheduled_tokens_per_req.tobytes(),
+                (start_index, num_reqs, token_ids_stride, max_num_scheduled_tokens_all_reqs)
+                if is_uniform_scheduled
+                else (
+                    start_index,
+                    num_reqs,
+                    token_ids_stride,
+                    num_scheduled_tokens_per_req.tobytes(),
+                )
             )
             cached_idx = idx_cache.get(idx_cache_key)
             if cached_idx is not None:
-                req_indices, arange, req_row_offsets = cached_idx
+                req_indices, arange, req_row_offsets, token_indices = cached_idx
             else:
                 # Get request indices.
                 req_indices = np.repeat(
@@ -3984,12 +4015,16 @@ class TPUModelRunner(GPUModelRunner):
                 req_row_offsets = (req_indices * token_ids_stride).astype(
                     np.int64, copy=False
                 )
+                token_indices = np.empty(
+                    total_num_scheduled_tokens, dtype=np.int64
+                )
                 if len(idx_cache) >= 32:
                     idx_cache.pop(next(iter(idx_cache)))
                 idx_cache[idx_cache_key] = (
                     req_indices,
                     arange,
                     req_row_offsets,
+                    token_indices,
                 )
 
             # Get positions.
@@ -4000,8 +4035,8 @@ class TPUModelRunner(GPUModelRunner):
                 out=positions_np,
             )
 
-            # Get token indices.
-            token_indices = positions_np + req_row_offsets
+            # Get token indices in-place without per-step heap allocation.
+            np.add(positions_np, req_row_offsets, out=token_indices)
             if total_num_scheduled_tokens <= 512:
                 input_ids_np = getattr(self, "input_ids_np", None)
                 if input_ids_np is None:
@@ -4999,6 +5034,15 @@ class TPUModelRunner(GPUModelRunner):
         top_tokens = self._greedy_top_tokens_this_step()
         topk_candidates_packed = not top_tokens and self._topk_candidates_this_step()
 
+        from vllm_torchtpu.runner import lightweight_step_stats
+
+        _stats_on = lightweight_step_stats.is_enabled() and getattr(
+            self, "is_driver_worker", True
+        )
+        _kv_setup_ns = 0
+        _step_prep_ns = 0
+        self._step_last_dispatch = None
+
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
         if has_kv_transfer_group() or "maybe_setup_kv_connector" in getattr(
@@ -5010,11 +5054,14 @@ class TPUModelRunner(GPUModelRunner):
             # threads while this step's forward computes; the request stays in
             # WAITING_FOR_REMOTE_KVS until every rank reports done_recving.
             raiden_inline = dist_utils.get_raiden_inline_load()
+            _kv_t0 = time.perf_counter_ns() if _stats_on else 0
             self.maybe_setup_kv_connector(
                 scheduler_output,
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+            if _stats_on:
+                _kv_setup_ns = time.perf_counter_ns() - _kv_t0
 
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
@@ -5023,6 +5070,7 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_index += 1
                 continue
 
+            _prep_t0 = time.perf_counter_ns() if _stats_on else 0
             (
                 attn_metadata,
                 logits_indices,
@@ -5037,6 +5085,8 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
+            if _stats_on:
+                _step_prep_ns += time.perf_counter_ns() - _prep_t0
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -5326,6 +5376,7 @@ class TPUModelRunner(GPUModelRunner):
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
+                qsl_slice = self.query_start_loc_np[: num_reqs + 1]
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
                         request_major_input_ids
@@ -5333,7 +5384,9 @@ class TPUModelRunner(GPUModelRunner):
                         else draft_input_ids_src
                     ),
                     position_ids=self.position_ids,
-                    query_start_loc_np=self.query_start_loc_np[: num_reqs + 1].copy(),
+                    query_start_loc_np=(
+                        qsl_slice.copy() if target_num_chunks > 1 else qsl_slice
+                    ),
                     attn_ctx=self._attn_metadata_builder_ctx,
                     start_index=start_index,
                     num_reqs=num_reqs,
@@ -5353,6 +5406,15 @@ class TPUModelRunner(GPUModelRunner):
 
             start_index = end_index
             chunk_index += 1
+
+        if _stats_on:
+            _disp = getattr(self, "_step_last_dispatch", None)
+            lightweight_step_stats.get_step_stats_recorder().record_worker_step(
+                prepare_inputs_ns=_step_prep_ns,
+                is_mk_backbone=_disp[0] if _disp is not None else None,
+                padded_tokens=_disp[1] if _disp is not None else 0,
+                kv_setup_ns=_kv_setup_ns,
+            )
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
@@ -6565,13 +6627,26 @@ class TPUModelRunner(GPUModelRunner):
                     pooler_output.extend(out)
 
         with self._stage_timing.host_stage("output_assembly"):
+            req_ids_key = (
+                tuple(req_ids),
+                len(self.input_batch.req_id_to_index),
+            )
+            if getattr(self, "_cached_output_req_ids_key", None) == req_ids_key:
+                req_id_to_index_snap = self._cached_req_id_to_index_snap
+                prompt_logprobs_dict = self._cached_prompt_logprobs_dict
+            else:
+                req_id_to_index_snap = dict(self.input_batch.req_id_to_index)
+                prompt_logprobs_dict = {req_id: None for req_id in req_ids}
+                self._cached_output_req_ids_key = req_ids_key
+                self._cached_req_id_to_index_snap = req_id_to_index_snap
+                self._cached_prompt_logprobs_dict = prompt_logprobs_dict
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
-                req_id_to_index=dict(self.input_batch.req_id_to_index),
+                req_id_to_index=req_id_to_index_snap,
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=logprobs,
-                prompt_logprobs_dict={req_id: None for req_id in req_ids},
+                prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )
@@ -9503,6 +9578,7 @@ class TPUModelRunner(GPUModelRunner):
             synchronize_device()
             ab_t0 = time.perf_counter()
         if use_mk:
+            self._step_last_dispatch = (True, int(positions.shape[-1]))
             out = mk(
                 input_ids,
                 positions,
@@ -9517,6 +9593,23 @@ class TPUModelRunner(GPUModelRunner):
                     padded_tokens=int(positions.shape[-1]),
                 )
             return out, None
+        orig_stock_rows = 0
+        pad_to = int(getattr(self, "_mk_stock_prefill_pad_bucket", 0) or 0)
+        if (
+            mk is not None
+            and not in_precompile
+            and os.environ.get("VLLM_TPU_SKIP_STOCK_T4_HIGH_BUCKETS", "1") != "0"
+            and pad_to > 128
+            and input_ids is not None
+            and 64 < int(input_ids.shape[0]) <= 128
+        ):
+            orig_stock_rows = int(input_ids.shape[0])
+            pad_len = pad_to - orig_stock_rows
+            input_ids = torch.nn.functional.pad(input_ids, (0, pad_len))
+            if positions.ndim == 2:
+                positions = torch.nn.functional.pad(positions, (0, pad_len))
+            else:
+                positions = torch.nn.functional.pad(positions, (0, pad_len))
         if (
             os.environ.get("VLLM_TPU_MTP_OPT", "1") != "0"
             and mk is not None
@@ -9536,6 +9629,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        if not in_precompile:
+            self._step_last_dispatch = (False, int(positions.shape[-1]))
         out = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -9562,6 +9657,14 @@ class TPUModelRunner(GPUModelRunner):
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
+        if orig_stock_rows > 0:
+            if isinstance(out, torch.Tensor):
+                out = out[:orig_stock_rows]
+            if isinstance(aux_hidden_states, (list, tuple)):
+                aux_hidden_states = [
+                    a[:orig_stock_rows] if isinstance(a, torch.Tensor) else a
+                    for a in aux_hidden_states
+                ]
         if ab_timing:
             synchronize_tensors([out])
             synchronize_device()
