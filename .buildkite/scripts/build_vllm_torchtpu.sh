@@ -99,13 +99,15 @@ METADATA_FILES=(
 usage() {
     echo "Usage: $0 <version>"
     echo ""
-    echo "  <version>   Published vllm-torchtpu-core version to pin (must be on PyPI)"
-    echo "              and version stamped onto the produced vllm-torchtpu wheel."
+    echo "  <version>   The already-published vllm-torchtpu-core version. Used to"
+    echo "              pin core (vllm-torchtpu-core==<version>) and as vllm-torchtpu's"
+    echo "              own version, e.g. 0.29.0rc1 -> both are 0.29.0rc1."
     echo ""
-    echo "vLLM is built at the ref pinned in pyproject.toml"
+    echo "vLLM is built at the ref pinned in pyproject.toml (tag or full commit SHA)"
     echo "(VLLM_REF_OVERRIDE=<ref> for dev builds only)."
     echo ""
-    echo "Example: $0 0.29.0"
+    echo "Examples: $0 0.29.0"
+    echo "          $0 0.29.0rc1"
 }
 
 die() {
