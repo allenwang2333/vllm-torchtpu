@@ -2009,7 +2009,7 @@ def sparse_ragged_paged_attention(
     q_rope_table: jax.Array | None = None,
     lse_in_kernel: bool = False,
     prologue_fault: str | None = None,
-    kv_write: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
@@ -2109,7 +2109,8 @@ def sparse_ragged_paged_attention(
       prologue_fault: test-only fault injection (`PROLOGUE_FAULTS`).
       kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
-        step's tokens packed for the SparseCore caches. The SparseCore gather
+        step's tokens packed for the SparseCore caches, or the same in
+        `native_sc_gather.pack_write_rows`' one-operand u32[T, 384] form. The SparseCore gather
         writes them into both caches in place before it gathers (see
         `native_sc_gather.dsa_gather_native_sc`), and the updated caches are
         returned after the other outputs.
@@ -2568,7 +2569,7 @@ def sparse_attention_chunk(
     q_rope_table: jax.Array | None = None,
     lse_fill: bool = False,
     prologue_fault: str | None = None,
-    kv_write: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
