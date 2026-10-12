@@ -338,6 +338,9 @@ def kernel(
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            compression_ratio=compression_ratio,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
         )
     else:
         kv_alloc = bref_override.StreamIndexKVBufferedRef.input(
@@ -629,7 +632,13 @@ def kernel(
             pipeline_fn(
                 (q_hbm_ref, *window_refs),
                 (indexer_weights_hbm_ref, *window_refs),
-                (cache_kv_hbm_ref, page_indices_ref, metadata_ref),
+                (
+                    cache_kv_hbm_ref,
+                    page_indices_ref,
+                    metadata_ref,
+                    seq_lens_ref,
+                    cp_rank_ref,
+                ),
                 (scores_hbm_ref, *window_refs),
                 allocations=(q_buf, weights_buf, kv_buf, o_buf),
             )
@@ -994,15 +1003,18 @@ def streamindex_topk(
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
-      distribution: (i, j, k) represents that sequences[0:i] are decode-only,
-        sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
-        k is also the total number of sequences. The leading prefill-only
-        sequences with at most `num_queries_per_block[1]` tokens, such as
-        speculative-decoding verify windows, are scored with the prefill block
-        sizes; every later one goes to the mixed pass. Passing `(i, k, k)` lets
-        short multi-token sequences after the decodes skip the mixed pass's large
-        q block. If the prefill and mixed block sizes are equal, all prefill-only
-        sequences go to the mixed pass.
+      distribution: (i, j, k) sequence boundaries. sequences[0:i] are decodes
+        and must have exactly one query token each; k is the total number of
+        sequences. sequences[i:k] are split between two passes. The prefill pass
+        takes the run of sequences starting at i that each have at most
+        `num_queries_per_block[1]` tokens, such as speculative-decoding verify
+        windows, and stops at the first longer sequence or at j, whichever comes
+        first. The mixed pass takes the rest, of any length, so a short sequence
+        after a long one goes there too. `(i, k, k)` lets the short sequences
+        right after the decodes skip the mixed pass's large q block, and
+        `(i, i, k)` sends everything after the decodes to the mixed pass. When
+        the prefill and mixed passes have the same block sizes and buffer count,
+        the prefill pass is skipped and j is ignored.
       k: Number of top-K elements to retrieve.
       compression_ratio: KV cache compression ratio.
       num_kv_pages_per_block: number of kv pages to be processed in one block in
