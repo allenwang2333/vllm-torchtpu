@@ -799,7 +799,7 @@ def forward_with_pcp(
 
     page_size = (
         kv_cache.shape[4]
-        if kv_layout == KVLayout.SEQ_ALONG_LANE
+        if kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
         else kv_cache.shape[1]
     )
     if torch.compiler.is_compiling():
