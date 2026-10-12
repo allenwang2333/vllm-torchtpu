@@ -459,9 +459,7 @@ def _pallas_rpa_kernel_pcp_cache(
             distribution_local,
             kv_new_lens_local,
         ):
-            cp_rank_arr = jnp.reshape(
-                lax.axis_index(pcp_ring_axis_name), (1,)
-            ).astype(jnp.int32)
+            cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
             output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
                 queries=query_local,
                 keys=key_local,
@@ -682,12 +680,8 @@ def build_pcp_kernels(
     if cached_cache is not None and cached_new is not None:
         return cached_cache, cached_new
 
-    try:
-        mesh = get_or_create_pcp_mesh(axis_name="pcp")
-    except Exception:
-        mesh = None
-
-    mesh_axis_names = tuple(mesh.axis_names) if mesh is not None else None
+    cache_mesh = None
+    mesh_axis_names = None
 
     if cached_cache is None:
         fn = functools.partial(
@@ -700,17 +694,21 @@ def build_pcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            pcp_ring_axis_name="pcp",
+            pcp_ring_axis_name="pcp" if cache_mesh is not None else None,
             pcp_ring_mesh_axis_names=mesh_axis_names,
-            mesh=mesh,
+            mesh=cache_mesh,
             kv_layout=kv_layout,
         )
         cached_cache = _PCP_KERNEL_REGISTRY[cache_key] = _build_pcp_kernel_op(
             f"pallas::rpa_pcp_cache_{_alloc_pcp_instance_id()}",
             fn,
-            mesh=mesh,
-            input_partition_specs=_PCP_CACHE_INPUT_PARTITION_SPECS,
-            output_partition_specs=_PCP_CACHE_OUTPUT_PARTITION_SPECS,
+            mesh=cache_mesh,
+            input_partition_specs=(
+                _PCP_CACHE_INPUT_PARTITION_SPECS if cache_mesh is not None else None
+            ),
+            output_partition_specs=(
+                _PCP_CACHE_OUTPUT_PARTITION_SPECS if cache_mesh is not None else None
+            ),
         )
 
     if cached_new is None:
@@ -898,21 +896,64 @@ def forward_with_pcp(
         block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
         kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
 
-        ctx_output, ctx_lse = cache_kernel(
-            kv_cache,
-            query,
-            key,
-            value,
-            seq_lens_req,
-            block_tables_req,
-            cu_cache,
-            dist_cache,
-            kv_new_lens_req,
-        )
-        if is_decode:
-            pcp_group = get_pcp_group()
-            ctx_output, ctx_lse = dcp_allgather_lse_combine(
-                ctx_output, ctx_lse, pcp_group, pcp_world_size
+        pcp_group = get_pcp_group()
+        if pcp_group is not None and pcp_world_size > 1:
+            if is_decode:
+                ctx_output, ctx_lse = cache_kernel(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    seq_lens_req,
+                    block_tables_req,
+                    cu_cache,
+                    dist_cache,
+                    kv_new_lens_req,
+                )
+                ctx_output, ctx_lse = dcp_allgather_lse_combine(
+                    ctx_output, ctx_lse, pcp_group, pcp_world_size
+                )
+            else:
+                q_all = all_gather_equal_tokens(query, dim=0)
+                q_all = torch.nan_to_num(q_all, nan=0.0, posinf=0.0, neginf=0.0)
+                q_chunks = q_all.chunk(pcp_world_size, dim=0)
+                out_chunks_local = []
+                lse_chunks_local = []
+                for q_chunk in q_chunks:
+                    c_out, c_lse = cache_kernel(
+                        kv_cache,
+                        q_chunk.contiguous(),
+                        key,
+                        value,
+                        seq_lens_req,
+                        block_tables_req,
+                        cu_cache,
+                        dist_cache,
+                        kv_new_lens_req,
+                    )
+                    out_chunks_local.append(c_out)
+                    lse_chunks_local.append(c_lse)
+                out_all_local = torch.cat(out_chunks_local, dim=0)
+                lse_all_local = torch.cat(lse_chunks_local, dim=0)
+                combined_out_all, combined_lse_all = dcp_allgather_lse_combine(
+                    out_all_local, lse_all_local, pcp_group, pcp_world_size
+                )
+                t_local = query.shape[0]
+                q_start = pcp_rank * t_local
+                q_end = q_start + t_local
+                ctx_output = combined_out_all[q_start:q_end]
+                ctx_lse = combined_lse_all[q_start:q_end]
+        else:
+            ctx_output, ctx_lse = cache_kernel(
+                kv_cache,
+                query,
+                key,
+                value,
+                seq_lens_req,
+                block_tables_req,
+                cu_cache,
+                dist_cache,
+                kv_new_lens_req,
             )
 
     # ---- 2. NEW_TOKENS_ONLY pass ----
@@ -1044,7 +1085,11 @@ def pcp_forward_batched(
         pcp_q_pos_offsets_local,
         pcp_update_kv_cache_local,
     ):
-        cp_rank = jnp.reshape(lax.axis_index(pcp_axis), (1,)).astype(jnp.int32)
+        ranks = jnp.arange(pcp_size, dtype=jnp.int32)
+        exchanged = lax.all_to_all(
+            ranks, pcp_axis, split_axis=0, concat_axis=0, tiled=True
+        )
+        cp_rank = lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)
         kv_new_lens = kv_lens_local - kv_cache_lens_local
 
         def all_gather_tokens(x):
