@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -36,6 +38,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 # async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
 # the async runner's INVALID_TOKEN_ID.
 INVALID_TOKEN_ID = -1
+_MAX_EXACT_FLOAT32_INT = 1 << 24
 
 
 def _static_shape_args(fn):
@@ -221,6 +224,13 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        self._sharded_eagle3_tp: int = 1
+        self._eagle3_vocab_shard_offset: torch.Tensor | None = None
+        self._eagle3_vocab_shard_mask: torch.Tensor | None = None
+        self._loop_static_tensors_cache: dict[
+            tuple[torch.device, int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._loop_zero_rej_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -267,6 +277,7 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        self._init_sharded_eagle3_sampling()
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -947,6 +958,74 @@ class Eagle3Proposer:
             indexer_names,
         )
 
+    def _init_sharded_eagle3_sampling(self) -> None:
+        """Prepare TP-sharded local argmax state for _draft_propose_token."""
+        self._sharded_eagle3_tp = 1
+        self._eagle3_vocab_shard_offset = None
+        self._eagle3_vocab_shard_mask = None
+
+        draft = self.draft_model
+        lm_head = getattr(draft, "lm_head", None)
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        tp_size = getattr(lm_head, "tp_size", 1)
+        weight = getattr(lm_head, "weight", None)
+        if (
+            not self._draft_replicated
+            and lm_head is not None
+            and shard_indices is not None
+            and weight is not None
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and shard_indices.num_added_elements_padded == 0
+            and isinstance(weight, torch.Tensor)
+            and weight.ndim == 2
+            and weight.is_floating_point()
+            and getattr(lm_head, "bias", None) is None
+            and lm_head.num_embeddings_padded < _MAX_EXACT_FLOAT32_INT
+        ):
+            self._eagle3_vocab_shard_offset = torch.tensor(
+                shard_indices.padded_org_vocab_start_index,
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            if lm_head.num_embeddings_padded != lm_head.org_vocab_size:
+                mask = torch.zeros(
+                    lm_head.num_embeddings_per_partition,
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                mask[shard_indices.num_org_elements :] = float("-inf")
+                self._eagle3_vocab_shard_mask = mask
+            self._sharded_eagle3_tp = tp_size
+
+    def _get_loop_static_tensors(
+        self, kernel_num_reqs: int, num_reqs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (self.runner.device, kernel_num_reqs, num_reqs)
+        cached = self._loop_static_tensors_cache.get(key)
+        if cached is None:
+            qsl_np = np.minimum(
+                np.arange(kernel_num_reqs + 1, dtype=np.int32), num_reqs
+            )
+            cached = (
+                torch.from_numpy(qsl_np).to(self.runner.device),
+                torch.tensor(
+                    [num_reqs] * 3, dtype=torch.int32, device=self.runner.device
+                ),
+            )
+            self._loop_static_tensors_cache[key] = cached
+        return cached
+
+    def _get_zero_rejected_dev(self, kernel_num_reqs: int) -> torch.Tensor:
+        key = (self.runner.device, kernel_num_reqs)
+        cached = self._loop_zero_rej_cache.get(key)
+        if cached is None:
+            cached = torch.zeros(
+                kernel_num_reqs, dtype=torch.int32, device=self.runner.device
+            )
+            self._loop_zero_rej_cache[key] = cached
+        return cached
+
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_propose_token(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -958,18 +1037,58 @@ class Eagle3Proposer:
         # them makes a fixed, bucketed program per [n, hidden] shape.
         assert self.draft_model is not None
         d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
-        if d2t is None:
+        if self._sharded_eagle3_tp > 1:
+            assert self._eagle3_vocab_shard_offset is not None
+            logits_local = F.linear(hidden, self.draft_model.lm_head.weight)
+            if self._eagle3_vocab_shard_mask is not None:
+                logits_local = logits_local + self._eagle3_vocab_shard_mask
+            local_idx = logits_local.argmax(dim=-1, keepdim=True)
+            local_max = logits_local.gather(-1, local_idx)
+            packed = torch.cat(
+                (
+                    local_max.to(torch.float32),
+                    (local_idx.to(torch.int32) + self._eagle3_vocab_shard_offset).to(
+                        torch.float32
+                    ),
+                ),
+                dim=-1,
+            )
+            gathered_3d = tensor_model_parallel_all_gather(packed, dim=0).view(
+                self._sharded_eagle3_tp, hidden.shape[0], 2
+            )
+            scores = gathered_3d[..., 0]
+            ids = gathered_3d[..., 1]
+            while scores.shape[0] > 1:
+                half = scores.shape[0] // 2
+                lhs_s, rhs_s, tail_s = (
+                    scores[0 : 2 * half : 2],
+                    scores[1 : 2 * half : 2],
+                    scores[2 * half :],
+                )
+                lhs_i, rhs_i, tail_i = (
+                    ids[0 : 2 * half : 2],
+                    ids[1 : 2 * half : 2],
+                    ids[2 * half :],
+                )
+                better = rhs_s > lhs_s
+                scores = torch.cat((torch.where(better, rhs_s, lhs_s), tail_s), dim=0)
+                ids = torch.cat((torch.where(better, rhs_i, lhs_i), tail_i), dim=0)
+            draft_id = ids[0].to(torch.int32)
+        elif d2t is None:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
             return (
                 self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
             )
-        draft_id = (
-            self.draft_model.logits_processor(self.draft_model.lm_head, hidden)
-            .argmax(dim=-1)
-            .int()
-        )
+        else:
+            draft_id = (
+                self.draft_model.logits_processor(self.draft_model.lm_head, hidden)
+                .argmax(dim=-1)
+                .int()
+            )
+        if d2t is None:
+            return draft_id
         return draft_id + (
             d2t if d2t.dtype == torch.int32 else d2t.to(torch.int32)
         ).index_select(0, draft_id)
@@ -1236,13 +1355,9 @@ class Eagle3Proposer:
                     )
                 else:
                     rejected_dev_per_chunk.append(None)
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c_num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
-                loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c_num_reqs] * 3, dtype=torch.int32, device=runner.device
-                    )
-                )
+                qsl_dev, reqdist_dev = self._get_loop_static_tensors(knr, c_num_reqs)
+                loop_qsl_per_chunk.append(qsl_dev)
+                loop_reqdist_per_chunk.append(reqdist_dev)
 
             def run_draft_step(ci: int, step: int) -> None:
                 """One separate draft step for chunk `ci`: a draft forward
@@ -1620,12 +1735,14 @@ class Eagle3Proposer:
             # query_start_loc / request_distribution depend only on num_reqs;
             # the loop hoists them across steps. Fall back to building them here
             # when not supplied (keeps this helper usable standalone).
-            if loop_query_start_loc is not None:
-                query_start_loc = loop_query_start_loc
-            else:
-                qsl_np = np.arange(kernel_num_reqs + 1, dtype=np.int32)
-                qsl_np = np.minimum(qsl_np, num_reqs)
-                query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
+            default_qsl, default_reqdist = self._get_loop_static_tensors(
+                kernel_num_reqs, num_reqs
+            )
+            query_start_loc = (
+                loop_query_start_loc
+                if loop_query_start_loc is not None
+                else default_qsl
+            )
             # Full-length ops on the padded [kernel_num_reqs] seq_lens: the tail
             # [num_reqs:] gets the same delta / a zero subtraction but is ignored
             # by the kernel (query_start_loc caps queries at num_reqs), so this
@@ -1647,20 +1764,19 @@ class Eagle3Proposer:
             # pre-padded; the tail [num_reqs:] is zeros and ignored by the kernel
             # (query_start_loc caps queries at num_reqs).
             if num_rejected_dev is None:
-                padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
-                if num_rejected_np is not None:
+                if num_rejected_np is not None and np.any(num_rejected_np):
+                    padded_rej = np.zeros(kernel_num_reqs, dtype=np.int32)
                     padded_rej[:num_reqs] = num_rejected_np
-                num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
+                    num_rejected_dev = torch.from_numpy(padded_rej).to(runner.device)
+                else:
+                    num_rejected_dev = self._get_zero_rejected_dev(kernel_num_reqs)
             seq_lens = seq_lens - num_rejected_dev
             # Pure decode distribution; matches precompile loop-step shape.
-            if loop_request_distribution is not None:
-                request_distribution = loop_request_distribution
-            else:
-                request_distribution = torch.tensor(
-                    [num_reqs, num_reqs, num_reqs],
-                    dtype=torch.int32,
-                    device=runner.device,
-                )
+            request_distribution = (
+                loop_request_distribution
+                if loop_request_distribution is not None
+                else default_reqdist
+            )
             max_query_len = 1
 
         effective_num_tokens = num_tokens_padded if num_tokens_padded else num_tokens
@@ -2098,11 +2214,8 @@ class Eagle3Proposer:
         )
         loop_hidden = torch.zeros((p, draft_hidden), dtype=dtype, device=runner.device)
         # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
-        loop_qsl = torch.from_numpy(
-            np.minimum(np.arange(num_reqs + 1, dtype=np.int32), actual_num_reqs)
-        ).to(runner.device)
-        loop_reqdist = torch.tensor(
-            [actual_num_reqs] * 3, dtype=torch.int32, device=runner.device
+        loop_qsl, loop_reqdist = self._get_loop_static_tensors(
+            num_reqs, actual_num_reqs
         )
         uses_aux = self._draft_uses_aux_hidden_state()
         # Mirror propose()'s branch exactly: only eagle3 runs the plain
