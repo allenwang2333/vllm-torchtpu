@@ -1391,6 +1391,16 @@ def streamindex_topk(
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
         for spec, pass_meta in passes:
+            # A pass with a `static_q_len` holds sequences of at most that many
+            # tokens, behind only sequences no longer, so its tokens all fall in
+            # the first `max_num_seqs * static_q_len`. A chunk past them would
+            # launch it empty, which costs 2-9us a pass, so it is not launched.
+            if (
+                chunk_token_start is not None
+                and spec["static_q_len"] is not None
+                and chunk_token_start >= max_num_seqs * spec["static_q_len"]
+            ):
+                continue
             scores = run_scores_kernel(
                 q,
                 prepared_indexer_weights,

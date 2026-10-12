@@ -1304,6 +1304,35 @@ def test_short_prefill_pass_matches_the_naive_reference(
     )
 
 
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_chunked_short_prefill_pass_matches_unchunked(kv_layout):
+    """Chunks past the decodes and verify windows do not launch those passes.
+
+    The verify windows fill tokens 4-67, nine 8-token chunks, and the prefill
+    the rest. The short pass may only skip the chunks from 13 sequences * 8
+    tokens = 104 on, and the decode passes those from 13 on; skipping any
+    earlier would drop rows, and chunking must not change the selection.
+    """
+    T_list = (1,) * 4 + (8,) * 8 + (60,)
+    S_list = (300, 512, 260, 500, 333, 480, 390, 420, 512, 300, 250, 400, 512)
+    page_size, H_I, D = 128, 4, 128
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+
+    def topk(chunk_tokens):
+        kwargs = _chunk_call_kwargs(
+            inputs, T_list, S_list, 128, 1, 8, 2, kv_layout, chunk_tokens
+        )
+        kwargs.update(
+            distribution=(4, len(T_list), len(T_list)),
+            num_queries_per_block=(1, 8, 32),
+            num_kv_pages_per_block=(2, 4, 2),
+        )
+        return np.array(streamindex_topk(**kwargs))
+
+    np.testing.assert_array_equal(topk(8), topk(None))
+
+
 class TestChunkedPipelining:
     """Chunking the token axis must not change which candidates are selected.
 
