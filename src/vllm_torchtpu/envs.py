@@ -105,6 +105,13 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS: int = 0
+    TPU_PREFILL_CHUNK_FLOOR: int = 1024
+    GLM53_SP_MIN_TOKENS: int = 0
+    GLM53_SP_ALL_HEADS: bool = True
+    GLM53_DENSE_DSA: bool = False
+    GLM53_INDEXER_V1: bool = False
+    GLM53_INDEX_SCORE_BUDGET: int = 128 * 1024 * 1024
+    GLM53_DEBUG_KEEP_TOPK: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -823,6 +830,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS": lambda: int(
         os.getenv("TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS") or "0"
     ),
+    # SharedPrefillBudgetScheduler: smallest per-prompt chunk when the step's
+    # token budget is split among prefilling prompts (256-aligned).
+    "TPU_PREFILL_CHUNK_FLOOR": lambda: int(
+        os.getenv("TPU_PREFILL_CHUNK_FLOOR") or "1024"
+    ),
+    # GLM-5.3-Flash (glm5_next): smallest step run sequence-parallel under TP
+    # (residual stream token-sharded, see models/vllm/glm5_next/sp.py). 0 = off.
+    "GLM53_SP_MIN_TOKENS": lambda: int(os.getenv("GLM53_SP_MIN_TOKENS") or "0"),
+    # GLM-5.3-Flash, with SP on: DSA layers attend with every head from
+    # replicated q_b/o_proj (no all-to-all; decode reads the full weights).
+    "GLM53_SP_ALL_HEADS": env_bool("GLM53_SP_ALL_HEADS", True),
+    # GLM-5.3-Flash: build the DSA layers as plain dense MLA (A/B the indexer).
+    "GLM53_DENSE_DSA": env_bool("GLM53_DENSE_DSA", False),
+    # GLM-5.3-Flash: the XLA reference indexer (paged member cache) instead of
+    # the fp8 pool-key cache + streamindex_topk one.
+    "GLM53_INDEXER_V1": env_bool("GLM53_INDEXER_V1", False),
+    # GLM-5.3-Flash v1 indexer: largest scoring intermediate (bytes) before it
+    # falls back to narrower strategies; 0 forces them (tests).
+    "GLM53_INDEX_SCORE_BUDGET": lambda: int(
+        os.getenv("GLM53_INDEX_SCORE_BUDGET") or str(128 * 1024 * 1024)
+    ),
+    # GLM-5.3-Flash: keep each indexer's last selection on the module (eager
+    # measurement only).
+    "GLM53_DEBUG_KEEP_TOPK": env_bool("GLM53_DEBUG_KEEP_TOPK", False),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(

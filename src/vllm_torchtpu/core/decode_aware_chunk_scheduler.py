@@ -27,15 +27,14 @@ together, so their decodes then run without prefill chunks in between.
 Measured at 200K on one TPU7x host: a fixed 2048 cap took c4 TPOT from 111 ms
 to 7 ms but cost 32% TTFT at c1, which this avoids.
 
-Select it with
-``--scheduler-cls vllm_torchtpu.core.decode_aware_chunk_scheduler.SharedPrefillBudgetScheduler``.
+Select it with ``--scheduler-cls`` set to
+``vllm_torchtpu.core.decode_aware_chunk_scheduler.SharedPrefillBudgetScheduler``.
 """
-
-import os
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -45,7 +44,7 @@ class SharedPrefillBudgetScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._configured_threshold = self.scheduler_config.long_prefill_token_threshold
-        self._floor = int(os.environ.get("TPU_PREFILL_CHUNK_FLOOR", "1024"))
+        self._floor = envs.TPU_PREFILL_CHUNK_FLOOR
         self._align = self.cache_config.block_size
         logger.info(
             "SharedPrefillBudgetScheduler: step budget %d split over prefilling "

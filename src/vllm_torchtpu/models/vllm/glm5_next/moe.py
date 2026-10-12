@@ -47,7 +47,8 @@ class Glm5NextMoE(nn.Module):
         if self.n_routed_experts % tp_size:
             raise ValueError(
                 f"n_routed_experts={self.n_routed_experts} must divide "
-                f"TP size {tp_size}")
+                f"TP size {tp_size}"
+            )
 
         self.gate = GateLinear(
             input_size=config.hidden_size,
@@ -66,8 +67,7 @@ class Glm5NextMoE(nn.Module):
         # but the shared expert plumbing below still reads the attribute.
         self.gate.tid2eid = None
 
-        intermediate_size = (config.moe_intermediate_size *
-                             config.n_shared_experts)
+        intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = Glm5NextMLP(
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
@@ -103,6 +103,5 @@ class Glm5NextMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         org_shape = hidden_states.shape
         # FusedMoEFactory gives the runner our gate, so it computes the logits.
-        out = self.experts(hidden_states=hidden_states,
-                           router_logits=hidden_states)
+        out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         return out.view(org_shape)

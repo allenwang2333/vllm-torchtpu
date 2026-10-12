@@ -28,15 +28,17 @@ the structure it was traced with.
 from __future__ import annotations
 
 import functools
-import os
 
 import jax
 import torch
-from torch_tpu._internal import pallas
 from jax.sharding import PartitionSpec as P
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+from torch_tpu._internal import pallas
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 
+from vllm_torchtpu import envs
 
 _AXIS = "glm_sp"
 
@@ -45,7 +47,7 @@ def sp_min_tokens() -> int:
     """``GLM53_SP_MIN_TOKENS``: smallest step run sequence-parallel; 0 = off."""
     if get_tensor_model_parallel_world_size() == 1:
         return 0
-    return int(os.environ.get("GLM53_SP_MIN_TOKENS", "0"))
+    return envs.GLM53_SP_MIN_TOKENS
 
 
 def sp_all_heads() -> bool:
@@ -53,8 +55,7 @@ def sp_all_heads() -> bool:
     q / the output with every head from replicated weights, for this rank's
     tokens in an SP step and for all tokens otherwise (see
     `_ZeroRopeMLAWrapper._forward_all_heads`). 200K TTFT -11%, decode -8%."""
-    return bool(sp_min_tokens()) and os.environ.get("GLM53_SP_ALL_HEADS",
-                                                    "1") != "0"
+    return bool(sp_min_tokens()) and envs.GLM53_SP_ALL_HEADS
 
 
 def use_sp(num_tokens: int) -> bool:
@@ -63,7 +64,7 @@ def use_sp(num_tokens: int) -> bool:
     return bool(min_tokens) and num_tokens >= min_tokens and num_tokens % tp == 0
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _token_op(gather: bool):
     """All-gather or reduce-scatter of token shards over the TP world.
 
@@ -77,34 +78,28 @@ def _token_op(gather: bool):
     world = dist.get_world_size()
     if get_tensor_model_parallel_world_size() != world:
         raise NotImplementedError("GLM SP prefill needs TP to span the world")
-    mesh = get_pallas_mesh(axis_names=(_AXIS, ))
+    mesh = get_pallas_mesh(axis_names=(_AXIS,))
 
     def collective(x: jax.Array) -> jax.Array:
-
         def local(part):
             if gather:
                 return jax.lax.all_gather(part, _AXIS, axis=0, tiled=True)
-            return jax.lax.psum_scatter(part,
-                                        _AXIS,
-                                        scatter_dimension=0,
-                                        tiled=True)
+            return jax.lax.psum_scatter(part, _AXIS, scatter_dimension=0, tiled=True)
 
         # Specs say "replicated" on both sides although neither side is:
         # with P() the global shape is this rank's shape, so the torch
         # tensors the op hands back are sized for the rank (a sharded spec
         # gets the output placeholder sized for the global array).
-        return jax.shard_map(local,
-                             mesh=mesh,
-                             in_specs=P(),
-                             out_specs=P(),
-                             check_vma=False)(x)
+        return jax.shard_map(
+            local, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False
+        )(x)
 
     op = pallas.jax_op(
         f"pallas::glm5_next_sp_{'ag' if gather else 'rs'}",
         collective,
         mesh=mesh,
-        input_partition_specs=(P(), ),
-        output_partition_specs=(P(), ),
+        input_partition_specs=(P(),),
+        output_partition_specs=(P(),),
     )
 
     def fake(x):
@@ -136,5 +131,6 @@ class TokenShards:
 
     def local_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows of a replicated `[T, ...]` tensor."""
-        return x.reshape(self.world_size, -1,
-                         *x.shape[1:])[self.rank_in_group].contiguous()
+        return x.reshape(self.world_size, -1, *x.shape[1:])[
+            self.rank_in_group
+        ].contiguous()

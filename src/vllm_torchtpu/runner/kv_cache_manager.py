@@ -373,8 +373,9 @@ class KVCacheManager:
                     # DeepSeek's own indexer spec is uint8 and is protected by
                     # the non-floating-point check in the normalizer instead.
                     fixed_dtype_layers.add(layer_name)
-                if self.runner._hybrid_uniform_page_size_bytes is not None and isinstance(
-                    spec, AttentionSpec
+                if (
+                    self.runner._hybrid_uniform_page_size_bytes is not None
+                    and isinstance(spec, AttentionSpec)
                 ):
                     # Same reason as the attention branches above: on a hybrid
                     # model every layer must report the *same* page size up
@@ -385,7 +386,8 @@ class KVCacheManager:
                     # pinned to the indexer's own page behind, which trips
                     # `page_size_padded >= unpadded_page_size_bytes`.
                     spec = dataclasses.replace(
-                        spec, page_size_padded=self.runner._hybrid_uniform_page_size_bytes
+                        spec,
+                        page_size_padded=self.runner._hybrid_uniform_page_size_bytes,
                     )
                 elif (
                     layer_name in fixed_dtype_layers
@@ -400,7 +402,10 @@ class KVCacheManager:
                     spec = dataclasses.replace(
                         spec,
                         page_size_padded=attn_module.get_attn_backend().get_kv_cache_page_size_bytes(
-                            spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+                            spec.block_size,
+                            spec.num_kv_heads,
+                            spec.head_size,
+                            spec.dtype,
                         ),
                     )
                 kv_cache_spec[layer_name] = spec
@@ -854,9 +859,7 @@ class KVCacheManager:
         group_size = max_count if max_count < min_count * 1.5 else min_count
 
         num_attn_groups = (num_attn + group_size - 1) // group_size
-        num_mamba_groups = sum(
-            (n + group_size - 1) // group_size for n in mamba_counts
-        )
+        num_mamba_groups = sum((n + group_size - 1) // group_size for n in mamba_counts)
         # Bytes one recurrent slot costs across the mamba layers backed by a
         # KVCacheTensor; with a single kind this is groups x page.
         mamba_bytes_per_slot = sum(

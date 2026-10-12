@@ -49,15 +49,18 @@ from __future__ import annotations
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.attention.attention import \
-    get_attention_context
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.mla import MLAModules
 
 # Subclass the TPU wrapper, not vLLM's `MultiHeadLatentAttentionWrapper`.
@@ -65,12 +68,15 @@ from vllm.model_executor.layers.mla import MLAModules
 # `cls.__name__`, so a subclass of the in-tree base is *not* redirected: it
 # would build the CUDA `MLAAttention`, which on TPU dies importing the
 # FlashAttention MLA prefill backend.
-from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import \
-    VllmTPUMultiHeadLatentAttentionWrapper
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+    VllmTPUMultiHeadLatentAttentionWrapper,
+)
 from vllm_torchtpu.models.vllm.glm5_next.indexer import Glm5NextIndexer
 from vllm_torchtpu.models.vllm.glm5_next.sp import sp_all_heads
-from vllm_torchtpu.models.vllm.kimi_k3.attention import (KimiDeltaAttention,
-                                                         kda_state_dtype)
+from vllm_torchtpu.models.vllm.kimi_k3.attention import (
+    KimiDeltaAttention,
+    kda_state_dtype,
+)
 
 Glm5NextLinearAttention = KimiDeltaAttention
 glm5_next_kda_state_dtype = kda_state_dtype
@@ -112,14 +118,15 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
         mla_modules = kwargs.get("mla_modules")
         if mla_modules is None:
             mla_modules = next(a for a in args if isinstance(a, MLAModules))
-        object.__setattr__(self, "glm_indexer",
-                           getattr(mla_modules, "glm_indexer", None))
+        object.__setattr__(
+            self, "glm_indexer", getattr(mla_modules, "glm_indexer", None)
+        )
         # Replicated twins of q_b_proj / o_proj for sequence-parallel steps;
         # owned (registered) by `Glm5NextMLA`, like the indexer.
-        object.__setattr__(self, "q_b_proj_sp",
-                           getattr(mla_modules, "q_b_proj_sp", None))
-        object.__setattr__(self, "o_proj_sp",
-                           getattr(mla_modules, "o_proj_sp", None))
+        object.__setattr__(
+            self, "q_b_proj_sp", getattr(mla_modules, "q_b_proj_sp", None)
+        )
+        object.__setattr__(self, "o_proj_sp", getattr(mla_modules, "o_proj_sp", None))
         if self.q_b_proj_sp is not None:
             self.mla_attn.build_full_heads = True
         # Every k_pe this layer writes is zero and the cache starts zeroed,
@@ -141,8 +148,7 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
         if prefill_group is not None:
             hidden_states = prefill_group.all_gather(hidden_states, dim=0)
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-        q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank],
-                                   dim=-1)
+        q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
         q_c = self.q_a_layernorm(q_c)
 
         # The indexer scores the *post-layernorm* q LoRA residual, the same
@@ -151,8 +157,9 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
         # the candidate list has to already exist.
         topk_indices = None
         if self.glm_indexer is not None:
-            topk_indices = self.glm_indexer(
-                hidden_states, q_c)[:hidden_states.shape[0]]
+            topk_indices = self.glm_indexer(hidden_states, q_c)[
+                : hidden_states.shape[0]
+            ]
 
         q = self.q_b_proj(q_c)[0]
         kv_c_normed = self.kv_a_layernorm(kv_c)
@@ -172,8 +179,7 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
             (q_nope, q_pe),
             kv_c_normed,
             k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_heads * self.v_head_dim),
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
         )
         out = self.o_proj(attn_out)[0]
@@ -181,9 +187,9 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
             return prefill_group.reduce_scatter(out, dim=0)
         return tensor_model_parallel_all_reduce(out)
 
-
-    def _forward_all_heads(self, hidden_states: torch.Tensor,
-                           prefill_group) -> torch.Tensor:
+    def _forward_all_heads(
+        self, hidden_states: torch.Tensor, prefill_group
+    ) -> torch.Tensor:
         """Attend with every head, from the replicated twins.
 
         With `prefill_group` (a sequence-parallel step) `hidden_states` is
@@ -204,33 +210,38 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
         re-tile those weights every step.
         """
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-        q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank],
-                                   dim=-1)
+        q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
         q_c = self.q_a_layernorm(q_c)
         kv_c_normed = self.kv_a_layernorm(kv_c)
         k_idx, gate_idx = self.glm_indexer.key_inputs(hidden_states)
         if prefill_group is not None:
-            gathered = prefill_group.all_gather(torch.cat(
-                [kv_c_normed.to(k_idx.dtype), k_idx, gate_idx], dim=-1),
-                                                dim=0)
+            gathered = prefill_group.all_gather(
+                torch.cat([kv_c_normed.to(k_idx.dtype), k_idx, gate_idx], dim=-1), dim=0
+            )
             kv_c_normed, k_idx, gate_idx = gathered.split(
-                [self.kv_lora_rank, k_idx.shape[-1], gate_idx.shape[-1]],
-                dim=-1)
+                [self.kv_lora_rank, k_idx.shape[-1], gate_idx.shape[-1]], dim=-1
+            )
             kv_c_normed = kv_c_normed.contiguous()
         topk_indices = self.glm_indexer.forward_given_keys(
-            hidden_states, q_c, k_idx, gate_idx,
-            sequence_parallel=prefill_group is not None)
+            hidden_states,
+            q_c,
+            k_idx,
+            gate_idx,
+            sequence_parallel=prefill_group is not None,
+        )
 
         q_nope = self.q_b_proj_sp(q_c)[0].view(
-            -1, self.q_b_proj_sp.output_size // self.qk_nope_head_dim,
-            self.qk_nope_head_dim)
+            -1,
+            self.q_b_proj_sp.output_size // self.qk_nope_head_dim,
+            self.qk_nope_head_dim,
+        )
         attn = self.mla_attn
         attn_metadata, _, kv_cache, _ = get_attention_context(attn.layer_name)
         if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
             # Memory probe before the caches are bound; see the backend.
             out = torch.zeros_like(
-                q_nope.flatten(1)[:, :1].expand(-1, q_nope.shape[1] *
-                                                self.v_head_dim))
+                q_nope.flatten(1)[:, :1].expand(-1, q_nope.shape[1] * self.v_head_dim)
+            )
         else:
             out = attn.impl.forward_sparse_all_heads(
                 attn,
@@ -262,14 +273,14 @@ class Glm5NextMLA(nn.Module):
             raise ValueError(
                 "Glm5NextMLA assumes the released qk_rope_head_dim=0 layout; "
                 f"got {config.qk_rope_head_dim}. A checkpoint with real rope "
-                "dimensions needs the rotary path, not this zero lane.")
+                "dimensions needs the rotary path, not this zero lane."
+            )
         if config.q_lora_rank is None:
             raise ValueError("GLM-5.3-Flash MLA always uses a q LoRA")
 
         tp_size = get_tensor_model_parallel_world_size()
         if config.num_attention_heads % tp_size:
-            raise ValueError(
-                "num_attention_heads must be divisible by TP size")
+            raise ValueError("num_attention_heads must be divisible by TP size")
         num_heads = config.num_attention_heads // tp_size
         quant_config = vllm_config.quant_config
 
@@ -310,8 +321,7 @@ class Glm5NextMLA(nn.Module):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
-            config.num_attention_heads *
-            (self.qk_nope_head_dim + self.v_head_dim),
+            config.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
@@ -404,7 +414,8 @@ class Glm5NextMLA(nn.Module):
         return self.mla_attn(
             positions,
             hidden_states,
-            prefill_group=self.prefill_group if sequence_parallel else None)
+            prefill_group=self.prefill_group if sequence_parallel else None,
+        )
 
 
 __all__ = [

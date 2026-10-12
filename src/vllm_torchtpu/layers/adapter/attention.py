@@ -2330,9 +2330,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         every rank. Returns `[T_q, H * v_head_dim]`.
         """
         input_dtype = q_nope.dtype
-        ql_nope = torch.bmm(
-            q_nope.transpose(0, 1), layer.W_UK_T_full.to(input_dtype)
-        ).transpose(0, 1).contiguous()
+        ql_nope = (
+            torch.bmm(q_nope.transpose(0, 1), layer.W_UK_T_full.to(input_dtype))
+            .transpose(0, 1)
+            .contiguous()
+        )
         q_pe = torch.zeros_like(ql_nope[..., : layer.qk_rope_head_dim])
         _, k_scale, _ = self._get_kv_scales(layer)
         if layer.kv_cache_quantized_dtype is not None:
@@ -2343,7 +2345,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             k_pe, _ = quantize_kv(
                 layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
             )
-        op = layer.sparse_mla_local_op if sequence_parallel else layer.sparse_mla_full_op
+        op = (
+            layer.sparse_mla_local_op if sequence_parallel else layer.sparse_mla_full_op
+        )
         outputs = op(
             kv_cache,
             ql_nope,
@@ -2356,9 +2360,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             attn_metadata.query_start_loc,
             attn_metadata.request_distribution,
         )
-        out_proj = torch.bmm(
-            outputs.transpose(0, 1), layer.W_UV_full.to(outputs.dtype)
-        )
+        out_proj = torch.bmm(outputs.transpose(0, 1), layer.W_UV_full.to(outputs.dtype))
         # `-1` rather than `flatten`: torch-tpu's exporter rejects a view whose
         # shape spells out the symbolic token count.
         return (

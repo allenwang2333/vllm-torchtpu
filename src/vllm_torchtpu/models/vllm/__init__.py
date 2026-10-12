@@ -23,7 +23,9 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
-_GLM5_NEXT_MODEL = "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForConditionalGeneration"
+_GLM5_NEXT_MODEL = (
+    "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForConditionalGeneration"
+)
 _GLM5_NEXT_TEXT_MODEL = "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForCausalLM"
 
 

@@ -1075,7 +1075,9 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T_full = fresh_buffer(
                 tp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
             )
-            self.W_UV_full = fresh_buffer(tp_group.all_gather(self.W_UV.contiguous(), dim=0))
+            self.W_UV_full = fresh_buffer(
+                tp_group.all_gather(self.W_UV.contiguous(), dim=0)
+            )
             synchronize_tensors([self.W_UK_T_full, self.W_UV_full])
             self.sparse_mla_local_op = impl._build_sparse_mla_local_op(self)
             self.sparse_mla_full_op = impl._build_sparse_mla_op(self, plain=True)

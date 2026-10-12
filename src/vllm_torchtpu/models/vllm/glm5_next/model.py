@@ -37,14 +37,17 @@ import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.layers.fused_moe import \
-    fused_moe_make_expert_params_mapping
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc, MambaStateCopyFuncCalculator)
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
@@ -52,21 +55,28 @@ from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
-    MHCOps, get_mhc_ops, get_mhc_post_op)
+    MHCOps,
+    get_mhc_ops,
+    get_mhc_post_op,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.model import _HostStagedParams
 from vllm_torchtpu.models.vllm.glm5_next.attention import (
-    Glm5NextLinearAttention, Glm5NextMLA, glm5_next_kda_state_dtype)
+    Glm5NextLinearAttention,
+    Glm5NextMLA,
+    glm5_next_kda_state_dtype,
+)
 from vllm_torchtpu.models.vllm.glm5_next.indexer import dense_dsa_fallback
 from vllm_torchtpu.models.vllm.glm5_next.layers import Glm5NextMLP
 from vllm_torchtpu.models.vllm.glm5_next.moe import Glm5NextMoE
-from vllm_torchtpu.models.vllm.glm5_next.sp import (TokenShards, sp_min_tokens,
-                                                    use_sp)
+from vllm_torchtpu.models.vllm.glm5_next.sp import TokenShards, sp_min_tokens, use_sp
 
 logger = init_logger(__name__)
 
-_SP_TWINS = ((".self_attn.q_b_proj.", ".self_attn.q_b_proj_sp."),
-             (".self_attn.o_proj.", ".self_attn.o_proj_sp."))
+_SP_TWINS = (
+    (".self_attn.q_b_proj.", ".self_attn.q_b_proj_sp."),
+    (".self_attn.o_proj.", ".self_attn.o_proj_sp."),
+)
 
 # GLM's HyperConnection multiplies the post gate by 2 (``2 * sigmoid(...)``);
 # the shared mHC kernel takes that factor as a constant.
@@ -91,13 +101,15 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if config.layer_types[self.layer_idx] == "linear_attention":
             self.self_attn = Glm5NextLinearAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn")
+                config, vllm_config, prefix=f"{prefix}.self_attn"
+            )
         else:
             self.self_attn = Glm5NextMLA(
                 config,
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
-                topk_indices_buffer=topk_indices_buffer)
+                topk_indices_buffer=topk_indices_buffer,
+            )
 
         if self.layer_idx < config.first_k_dense_replace:
             self.mlp = Glm5NextMLP(
@@ -113,8 +125,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mlp = Glm5NextMoE(vllm_config, prefix=f"{prefix}.mlp")
 
         self.input_layernorm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(self.hidden_size,
-                                                self.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, self.rms_norm_eps)
 
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
@@ -123,24 +134,24 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_dim = self.hc_mult * self.hidden_size
         # Checkpoint stores `fn` in bf16 and the rest in fp32; the gate math is
         # fp32 throughout, so declare all of them fp32 and let the loader cast.
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc,
-                                                   hc_dim,
-                                                   dtype=torch.float32),
-                                       requires_grad=False)
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc,
-                                                  hc_dim,
-                                                  dtype=torch.float32),
-                                      requires_grad=False)
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc,
-                                                     dtype=torch.float32),
-                                         requires_grad=False)
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc,
-                                                    dtype=torch.float32),
-                                        requires_grad=False)
-        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32),
-                                          requires_grad=False)
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32),
-                                         requires_grad=False)
+        self.hc_attn_fn = nn.Parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_ffn_fn = nn.Parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_attn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_ffn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_attn_scale = nn.Parameter(
+            torch.empty(3, dtype=torch.float32), requires_grad=False
+        )
+        self.hc_ffn_scale = nn.Parameter(
+            torch.empty(3, dtype=torch.float32), requires_grad=False
+        )
 
     @property
     def mhc_ops(self) -> MHCOps:
@@ -153,8 +164,13 @@ class Glm5NextDecoderLayer(nn.Module):
         """
         ops = self.__dict__.get("_mhc_ops_instance")
         if ops is None:
-            ops = get_mhc_ops(self.rms_norm_eps, self.hc_eps, self.hc_eps,
-                              HC_POST_MULT, self.hc_sinkhorn_iters)
+            ops = get_mhc_ops(
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                HC_POST_MULT,
+                self.hc_sinkhorn_iters,
+            )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
 
@@ -166,8 +182,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Collapse the residual streams into this sublayer's input."""
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(
-            x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -191,20 +206,32 @@ class Glm5NextDecoderLayer(nn.Module):
         """
         if residual is None:
             residual = x
-            x, post_mix, res_mix = self.hc_pre(x, self.hc_attn_fn,
-                                               self.hc_attn_scale,
-                                               self.hc_attn_base)
+            x, post_mix, res_mix = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
-                x, residual, post_mix, res_mix, self.hc_attn_fn,
-                self.hc_attn_scale, self.hc_attn_base)
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
 
         x = self.input_layernorm(x)
         x = self.self_attn(positions, x, sequence_parallel=sp is not None)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
-            x, residual, post_mix, res_mix, self.hc_ffn_fn, self.hc_ffn_scale,
-            self.hc_ffn_base)
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+        )
         x = self.post_attention_layernorm(x)
         if sp is not None:
             x = sp.reduce_scatter(self.mlp(sp.all_gather(x)))
@@ -213,11 +240,13 @@ class Glm5NextDecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-@support_torch_compile(dynamic_arg_dims={
-    "input_ids": 0,
-    "positions": 0,
-    "inputs_embeds": 0,
-})
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+    }
+)
 class Glm5NextModel(nn.Module):
     """GLM-5.3-Flash backbone: embedding, 45 mHC decoder layers, final norm."""
 
@@ -243,8 +272,11 @@ class Glm5NextModel(nn.Module):
         # sparse kernel.
         self.topk_indices_buffer = None
         if not dense_dsa_fallback() and getattr(config, "index_topk", 0):
-            width = config.index_topk + (config.index_kpool - 1 if getattr(
-                config, "index_kpool_always_select_tail", False) else 0)
+            width = config.index_topk + (
+                config.index_kpool - 1
+                if getattr(config, "index_kpool_always_select_tail", False)
+                else 0
+            )
             # Pad to a multiple of 256. The sparse MLA kernel needs a multiple
             # of 4 at minimum, but its SparseCore gather runs in batches of
             # 16384 indices: at 2052 a 64-token prefill chunk (131328 indices)
@@ -260,13 +292,17 @@ class Glm5NextModel(nn.Module):
                 dtype=torch.int32,
                 device=vllm_config.device_config.device,
             )
-        self.layers = nn.ModuleList([
-            Glm5NextDecoderLayer(config,
-                                 vllm_config,
-                                 prefix=f"{prefix}.layers.{layer_idx}",
-                                 topk_indices_buffer=self.topk_indices_buffer)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                Glm5NextDecoderLayer(
+                    config,
+                    vllm_config,
+                    prefix=f"{prefix}.layers.{layer_idx}",
+                    topk_indices_buffer=self.topk_indices_buffer,
+                )
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         self.sp = TokenShards() if sp_min_tokens() else None
@@ -306,8 +342,11 @@ class Glm5NextModel(nn.Module):
         # A large step keeps the residual stream token-sharded (`sp.py`).
         # Branching on the token count is fine here: the backbone is traced
         # per bucket group.
-        sp = self.sp if (self.sp is not None
-                         and use_sp(hidden_states.shape[0])) else None
+        sp = (
+            self.sp
+            if (self.sp is not None and use_sp(hidden_states.shape[0]))
+            else None
+        )
         if sp is not None:
             hidden_states = sp.local_tokens(hidden_states)
         # One embedding broadcast into hc_mult parallel residual streams.
@@ -325,8 +364,7 @@ class Glm5NextModel(nn.Module):
             )
 
         if post_mix is not None:
-            hidden_states = self.mhc_post_op(hidden_states, residual, post_mix,
-                                             res_mix)
+            hidden_states = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
 
         # Glm5NextTextHyperHead: an unweighted mean over the streams. DeepSeek
         # -V4 learns gates for this collapse; GLM does not, and the checkpoint
@@ -343,7 +381,8 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
     # `model.language_model.` -> `model.`; the vision tower keeps its
     # `model.visual.` prefix and falls out as an unknown parameter below.
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."})
+        orig_to_new_prefix={"model.language_model.": "model."}
+    )
 
     # The checkpoint's `modules_to_not_convert` is written per unfused tensor,
     # one entry per layer. It excludes every KDA projection (those layers are
@@ -388,8 +427,9 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
         sys.setrecursionlimit(50000)
         config = vllm_config.model_config.hf_text_config
         self.config = config
-        self.model = Glm5NextModel(vllm_config=vllm_config,
-                                   prefix=maybe_prefix(prefix, "model"))
+        self.model = Glm5NextModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -412,8 +452,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
             raise ValueError("The TPU GLM-5.3 model does not support PP")
         return self.model(input_ids, positions, inputs_embeds)
 
-    def compute_logits(self,
-                       hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
     @classmethod
@@ -430,17 +469,23 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
     ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
         config = vllm_config.model_config.hf_text_config
         kda_config = config.linear_attn_config
-        local_heads = (kda_config["num_heads"] //
-                       vllm_config.parallel_config.tensor_parallel_size)
+        local_heads = (
+            kda_config["num_heads"] // vllm_config.parallel_config.tensor_parallel_size
+        )
         return (
-            (kda_config["short_conv_kernel_size"] - 1, 3, local_heads,
-             kda_config["head_dim"]),
+            (
+                kda_config["short_conv_kernel_size"] - 1,
+                3,
+                local_heads,
+                kda_config["head_dim"],
+            ),
             (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
         )
 
     @classmethod
     def get_mamba_state_copy_func(
-        cls, ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -452,8 +497,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
             num_experts=self.config.n_routed_experts,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the checkpoint into stacked, expert and plain parameters.
 
         Anything with no home in ``params_dict`` is dropped on the floor: that
@@ -475,8 +519,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 if name.startswith("model.visual."):
                     continue
 
-                for param_name, weight_name, shard_id in (
-                        self.stacked_params_mapping):
+                for param_name, weight_name, shard_id in self.stacked_params_mapping:
                     if weight_name not in name:
                         continue
                     if ".experts." in name:
@@ -490,8 +533,12 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     break
                 else:
                     if ".experts." in name:
-                        for (param_name, weight_name, expert_id,
-                             expert_shard_id) in expert_mapping:
+                        for (
+                            param_name,
+                            weight_name,
+                            expert_id,
+                            expert_shard_id,
+                        ) in expert_mapping:
                             if weight_name not in name:
                                 continue
                             mapped = name.replace(weight_name, param_name)
@@ -499,21 +546,25 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                                 continue
                             param = staged.stage(mapped, params_dict[mapped])
                             weight_loader = typing.cast(
-                                Callable[..., bool], param.weight_loader)
-                            if weight_loader(param,
-                                             loaded_weight,
-                                             mapped,
-                                             shard_id=expert_shard_id,
-                                             expert_id=expert_id,
-                                             return_success=True):
+                                Callable[..., bool], param.weight_loader
+                            )
+                            if weight_loader(
+                                param,
+                                loaded_weight,
+                                mapped,
+                                shard_id=expert_shard_id,
+                                expert_id=expert_id,
+                                return_success=True,
+                            ):
                                 loaded_params.add(mapped)
                                 break
                         continue
                     if name not in params_dict:
                         continue
                     param = staged.stage(name, params_dict[name])
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                     # The sequence-parallel twins (`Glm5NextMLA`) take the
@@ -522,9 +573,9 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         twin = name.replace(tp_name, sp_name)
                         if tp_name in name and twin in params_dict:
                             param = staged.stage(twin, params_dict[twin])
-                            getattr(param, "weight_loader",
-                                    default_weight_loader)(param,
-                                                           loaded_weight)
+                            getattr(param, "weight_loader", default_weight_loader)(
+                                param, loaded_weight
+                            )
                             loaded_params.add(twin)
         finally:
             staged.flush_all()

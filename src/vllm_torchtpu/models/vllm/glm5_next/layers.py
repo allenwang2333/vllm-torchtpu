@@ -18,8 +18,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 
@@ -45,7 +47,8 @@ class Glm5NextMLP(nn.Module):
         super().__init__()
         if hidden_act != "silu":
             raise ValueError(
-                f"GLM-5.3 only supports the silu activation, got {hidden_act}")
+                f"GLM-5.3 only supports the silu activation, got {hidden_act}"
+            )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,

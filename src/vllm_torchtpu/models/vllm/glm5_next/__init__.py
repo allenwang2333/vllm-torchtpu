@@ -14,6 +14,8 @@
 """GLM-5.3-Flash (``glm5_next``) for TPU."""
 
 from vllm_torchtpu.models.vllm.glm5_next.model import (
-    Glm5NextForCausalLM, Glm5NextForConditionalGeneration)
+    Glm5NextForCausalLM,
+    Glm5NextForConditionalGeneration,
+)
 
 __all__ = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]

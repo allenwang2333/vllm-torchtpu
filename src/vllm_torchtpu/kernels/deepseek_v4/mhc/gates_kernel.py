@@ -71,7 +71,10 @@ def _gates_kernel(
     ]
 
     comb = [
-        [row(2 * m + i * m + j) * scale_comb + bias(2 * m + i * m + j) for j in range(m)]
+        [
+            row(2 * m + i * m + j) * scale_comb + bias(2 * m + i * m + j)
+            for j in range(m)
+        ]
         for i in range(m)
     ]
     # softmax over the last axis, then + eps: matches `utils.mhc_pre_gates`.
@@ -83,7 +86,9 @@ def _gates_kernel(
 
     def normalize_cols(c):
         for j in range(m):
-            inv = 1.0 / (functools.reduce(jnp.add, [c[i][j] for i in range(m)]) + hc_sinkhorn_eps)
+            inv = 1.0 / (
+                functools.reduce(jnp.add, [c[i][j] for i in range(m)]) + hc_sinkhorn_eps
+            )
             for i in range(m):
                 c[i][j] = c[i][j] * inv
         return c
