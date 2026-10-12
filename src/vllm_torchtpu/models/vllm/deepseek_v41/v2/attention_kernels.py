@@ -2715,6 +2715,7 @@ def select_indices_jax(
     candidate_filter: bool,
     unordered: bool = False,
     batch_max: jax.Array | None = None,
+    requests: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Source publishes candidates without filtering its own selection.
 
@@ -2757,14 +2758,43 @@ def select_indices_jax(
                 jnp.arange(blocks)[None] == last[:, None], jnp.inf, block_scores
             )
             cand_k = candidates.shape[1]
-            if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
-                block_lengths = (lengths + block_size - 1) // block_size
-                published = _sparsecore_top_k(
-                    block_scores, cand_k, jnp.minimum(block_lengths, blocks)
-                ).astype(jnp.int32)
+            block_lengths = (lengths + block_size - 1) // block_size
+
+            def _publish_candidates(b_scores, b_lengths):
+                if (
+                    unordered
+                    and blocks >= 2048
+                    and blocks % 16 == 0
+                    and cand_k % 16 == 0
+                ):
+                    return _sparsecore_top_k(
+                        b_scores, cand_k, jnp.minimum(b_lengths, blocks)
+                    ).astype(jnp.int32)
+                values, ids = jax.lax.top_k(b_scores, cand_k)
+                return jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+
+            if requests is not None and count >= 6 and count % 6 == 0:
+                group_tokens = 6
+                groups = count // group_tokens
+                can_group = jnp.all(
+                    requests.reshape(groups, group_tokens)
+                    == requests[::group_tokens, None]
+                )
+                published = jax.lax.cond(
+                    can_group,
+                    lambda _: jnp.repeat(
+                        _publish_candidates(
+                            block_scores.reshape(groups, group_tokens, blocks).max(1),
+                            block_lengths.reshape(groups, group_tokens).max(1),
+                        ),
+                        group_tokens,
+                        axis=0,
+                    ),
+                    lambda _: _publish_candidates(block_scores, block_lengths),
+                    None,
+                )
             else:
-                values, ids = jax.lax.top_k(block_scores, cand_k)
-                published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+                published = _publish_candidates(block_scores, block_lengths)
         else:
             # One extra column absorbs invalid candidate IDs; no 3-D membership
             # tensor and no dependence on the order of candidate IDs.
@@ -2864,21 +2894,46 @@ def paged_indexer_jax(
             candidate_filter,
             unordered,
             batch_max,
+            requests if q.shape[0] // 6 <= records.shape[0] else None,
         )
 
     if not candidate_filter or candidates.shape[1] * block_size >= width:
         return full_context(None)
 
     def candidate_context(_):
-        # Candidates differ per token, so this path reads per-token records.
         # Sort before expanding so equal-score ties retain the full-context
         # top_k's logical ordering. Duplicate and invalid blocks cannot select
         # the same key twice or read outside this request's causal history.
+        # In speculative decode (6 verify tokens per request), all 6 tokens of
+        # a request share the same published candidate blocks from L20, so sort
+        # and gather key segments once per 6-token group (`group_tokens = 6`).
         blocks = (width + block_size - 1) // block_size
-        ids = jnp.sort(
-            jnp.where((candidates >= 0) & (candidates < blocks), candidates, blocks),
-            axis=-1,
+        tokens = q.shape[0]
+        raw_ids = jnp.where(
+            (candidates >= 0) & (candidates < blocks), candidates, blocks
         )
+        can_group = None
+        if tokens >= 6 and tokens % 6 == 0:
+            group_tokens = 6
+            groups = tokens // group_tokens
+            can_group = jnp.all(
+                requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
+            ) & jnp.all(
+                raw_ids.reshape(groups, group_tokens, -1)
+                == raw_ids[::group_tokens, None, :]
+            )
+            ids = jax.lax.cond(
+                can_group,
+                lambda _: jnp.repeat(
+                    jnp.sort(raw_ids[::group_tokens], axis=-1),
+                    group_tokens,
+                    axis=0,
+                ),
+                lambda _: jnp.sort(raw_ids, axis=-1),
+                None,
+            )
+        else:
+            ids = jnp.sort(raw_ids, axis=-1)
         unique = jnp.concatenate(
             (jnp.ones_like(ids[:, :1], dtype=jnp.bool_), ids[:, 1:] != ids[:, :-1]),
             axis=-1,
@@ -2888,8 +2943,8 @@ def paged_indexer_jax(
         valid = (
             (logical_3d < jnp.minimum(lengths, width)[:, None, None])
             & unique_valid[..., None]
-        ).reshape(q.shape[0], -1)
-        logical = logical_3d.reshape(q.shape[0], -1)
+        ).reshape(tokens, -1)
+        logical = logical_3d.reshape(tokens, -1)
         # This bounds both key reads and QK work by the candidate pool size;
         # zero-length padding rows do not trigger key reads.
         compact_lengths = jnp.where(lengths > 0, logical.shape[1], 0)
@@ -2904,56 +2959,82 @@ def paged_indexer_jax(
             and q.dtype == jnp.bfloat16
         ):
             per_block = block_size // segment
-            seg_ids = (
-                ids
-                if per_block == 1
-                else (ids[..., None] * per_block + jnp.arange(per_block)).reshape(
-                    q.shape[0], -1
+
+            def _score_segments(ids_in, unique_valid_in, req_in, len_in):
+                rows = ids_in.shape[0]
+                seg_ids = (
+                    ids_in
+                    if per_block == 1
+                    else (
+                        ids_in[..., None] * per_block + jnp.arange(per_block)
+                    ).reshape(rows, -1)
                 )
-            )
-            if prestrided_pages and page_records:
-                segs_per_page = page_records // segment
-                clamped_seg = jnp.minimum(seg_ids, (width + segment - 1) // segment - 1)
-                page_bases = records[
-                    requests[:, None],
-                    jnp.minimum(clamped_seg // segs_per_page, records.shape[1] - 1),
-                ]
-                seg_records = (
-                    page_bases
-                    if segs_per_page == 1
-                    else jnp.where(
-                        page_bases >= 0,
-                        page_bases + (clamped_seg % segs_per_page) * segment,
-                        -1,
+                if prestrided_pages and page_records:
+                    segs_per_page = page_records // segment
+                    clamped_seg = jnp.minimum(
+                        seg_ids, (width + segment - 1) // segment - 1
                     )
+                    page_bases = records[
+                        req_in[:, None],
+                        jnp.minimum(clamped_seg // segs_per_page, records.shape[1] - 1),
+                    ]
+                    seg_records = (
+                        page_bases
+                        if segs_per_page == 1
+                        else jnp.where(
+                            page_bases >= 0,
+                            page_bases + (clamped_seg % segs_per_page) * segment,
+                            -1,
+                        )
+                    )
+                else:
+                    seg_table = records[:, ::segment]
+                    seg_records = seg_table[
+                        req_in[:, None],
+                        jnp.minimum(seg_ids, seg_table.shape[1] - 1),
+                    ]
+                seg_valid_rows = (
+                    unique_valid_in[..., None]
+                    & (seg_records.reshape(*ids_in.shape, per_block) >= 0)
+                ).reshape(rows, -1)
+                first_records = jnp.where(
+                    seg_valid_rows
+                    & (seg_ids * segment < jnp.minimum(len_in[:, None], width)),
+                    seg_records,
+                    -1,
                 )
-            else:
-                seg_table = records[:, ::segment]
-                seg_records = seg_table[
-                    requests[:, None], jnp.minimum(seg_ids, seg_table.shape[1] - 1)
-                ]
-            seg_valid = (
-                unique_valid[..., None]
-                & (seg_records.reshape(*ids.shape, per_block) >= 0)
-            ).reshape(q.shape[0], -1)
-            first_records = jnp.where(
-                seg_valid & (seg_ids * segment < jnp.minimum(lengths[:, None], width)),
-                seg_records,
-                -1,
-            )
-            scores = paged_index_scores_jax(
-                q,
-                pool,
-                first_records,
-                weights,
-                compact_lengths,
-                page_records=segment,
-                prestrided_pages=True,
+                raw_scores = paged_index_scores_jax(
+                    q,
+                    pool,
+                    first_records,
+                    weights,
+                    compact_lengths,
+                    page_records=segment,
+                    prestrided_pages=True,
+                )
+                if rows < tokens:
+                    seg_valid_rows = jnp.repeat(seg_valid_rows, tokens // rows, axis=0)
+                return raw_scores, seg_valid_rows
+
+            scores, seg_valid = (
+                jax.lax.cond(
+                    can_group,
+                    lambda _: _score_segments(
+                        ids[::group_tokens],
+                        unique_valid[::group_tokens],
+                        requests[::group_tokens],
+                        lengths.reshape(groups, group_tokens).max(-1),
+                    ),
+                    lambda _: _score_segments(ids, unique_valid, requests, lengths),
+                    None,
+                )
+                if can_group is not None
+                else _score_segments(ids, unique_valid, requests, lengths)
             )
             scores = jnp.where(
                 (
                     valid.reshape(*seg_valid.shape, segment) & seg_valid[..., None]
-                ).reshape(q.shape[0], -1),
+                ).reshape(tokens, -1),
                 scores,
                 -jnp.inf,
             )

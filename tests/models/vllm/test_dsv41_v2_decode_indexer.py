@@ -1272,3 +1272,204 @@ class TestAttentionSelectPagedIndicesDecode:
             assert torch.equal(l_p, ref_l)
             assert torch.equal(c_p, ref_cand)
             assert torch.equal(req_p, ref_req)
+
+    def test_td91_request_grouped_candidate_indexer(self, monkeypatch):
+        """TD9.1: Verify group_tokens=6 request grouping in select_indices_jax
+        (L20 candidate_write) and paged_indexer_jax candidate_context
+        (L24/28/32/36 candidate_filter)."""
+        rng = np.random.default_rng(9101)
+        tokens = 12
+        groups = tokens // 6
+        heads = 4
+        dim = 128
+        page_records = 16
+        width = 256
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (512, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+
+        # Build 3 request rows where row 0 and row 2 are identical so we can
+        # toggle can_group=True ([0]*6 + [1]*6) vs can_group=False
+        # ([0,0,0,0,0,2] + [1]*6) with identical underlying records.
+        records_np = np.zeros((3, width), dtype=np.int32)
+        for r in (0, 1):
+            for p in range(0, width, page_records):
+                base = int(rng.integers(0, 256) * 2)
+                records_np[r, p : p + page_records] = base + np.arange(page_records)
+        records_np[0, 2 * page_records : 3 * page_records] = -1
+        records_np[2] = records_np[0]
+        records_full = jnp.asarray(records_np)
+        records_page = records_full[:, ::page_records]
+
+        q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+        weights = jnp.asarray(rng.standard_normal((tokens, heads)), jnp.float32)
+        # Group 0 has decode verify lengths 180..185; group 1 has lengths 210..215
+        lengths = jnp.asarray(
+            [180, 181, 182, 183, 184, 185, 210, 211, 212, 213, 214, 215],
+            dtype=jnp.int32,
+        )
+        req_grouped = jnp.asarray([0] * 6 + [1] * 6, dtype=jnp.int32)
+        req_ungrouped = jnp.asarray([0, 0, 0, 0, 0, 2] + [1] * 6, dtype=jnp.int32)
+        init_cands = jnp.full((tokens, 4), -1, dtype=jnp.int32)
+
+        # 1. End-to-end L20 candidate_write -> L24 candidate_filter with group_tokens=6
+        sel_l20, pub_l20 = v2_kernels.paged_indexer_jax(
+            q,
+            pool,
+            records_page,
+            weights,
+            lengths,
+            init_cands,
+            req_grouped,
+            topk=32,
+            block_size=16,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=False,
+            page_records=page_records,
+            prestrided_pages=True,
+            logical_width=width,
+        )
+        pub_np = np.asarray(pub_l20)
+        for g in range(groups):
+            for t in range(1, 6):
+                np.testing.assert_array_equal(pub_np[g * 6 + t], pub_np[g * 6])
+
+        # Verify select_indices_jax candidate_write with unordered SparseCore path
+        scores_2048 = jnp.asarray(
+            rng.standard_normal((tokens, 2048 * 16)), dtype=jnp.float32
+        )
+        cands_16 = jnp.full((tokens, 16), -1, dtype=jnp.int32)
+        sc_calls: list[int] = []
+
+        def spy_sc_topk(s, k, lens):
+            sc_calls.append(int(s.shape[0]))
+            vals, idx = jax.lax.top_k(s, k)
+            return jnp.where(vals > -jnp.inf, idx, -1).astype(jnp.int32)
+
+        monkeypatch.setattr(v2_kernels, "_sparsecore_top_k", spy_sc_topk)
+        _, pub_sc_grp = v2_kernels.select_indices_jax(
+            scores_2048,
+            lengths,
+            cands_16,
+            topk=32,
+            block_size=16,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=True,
+            requests=req_grouped,
+        )
+        assert groups in sc_calls
+        assert pub_sc_grp.shape == (tokens, 16)
+        _, pub_sc_ungrp = v2_kernels.select_indices_jax(
+            scores_2048,
+            lengths,
+            cands_16,
+            topk=32,
+            block_size=16,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=True,
+            requests=req_ungrouped,
+        )
+        assert pub_sc_ungrp.shape == (tokens, 16)
+
+        # 2. Verify candidate_context (L24/28/32/36) bitwise parity between
+        # grouped (n_rows = 2) and ungrouped (n_rows = 12) across block sizes
+        # and prestrided_pages modes, and assert gather_cache_page_words sees n_rows=2.
+        gather_rows: list[int] = []
+        orig_gather = v2_kernels.gather_cache_page_words
+
+        def spy_gather(p, first_rec, pr, d):
+            gather_rows.append(int(first_rec.shape[0]))
+            return orig_gather(p, first_rec, pr, d)
+
+        monkeypatch.setattr(v2_kernels, "gather_cache_page_words", spy_gather)
+
+        for blk_size in (16, 32, 8):
+            cands_grp = jnp.asarray(
+                [[0, 2, 3, 5, 7, 11, -1, 99]] * 6 + [[1, 2, 4, 6, 8, 10, -1, 99]] * 6,
+                dtype=jnp.int32,
+            )
+            for prestrided, rec_arg in ((False, records_full), (True, records_page)):
+                gather_rows.clear()
+                sel_grp, pub_grp = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    rec_arg,
+                    weights,
+                    lengths,
+                    cands_grp,
+                    req_grouped,
+                    topk=32,
+                    block_size=blk_size,
+                    candidate_write=False,
+                    candidate_filter=True,
+                    unordered=False,
+                    page_records=page_records,
+                    prestrided_pages=prestrided,
+                    logical_width=width if prestrided else 0,
+                )
+                assert groups in gather_rows
+                sel_ungrp, pub_ungrp = v2_kernels.paged_indexer_jax(
+                    q,
+                    pool,
+                    rec_arg,
+                    weights,
+                    lengths,
+                    cands_grp,
+                    req_ungrouped,
+                    topk=32,
+                    block_size=blk_size,
+                    candidate_write=False,
+                    candidate_filter=True,
+                    unordered=False,
+                    page_records=page_records,
+                    prestrided_pages=prestrided,
+                    logical_width=width if prestrided else 0,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(sel_grp), np.asarray(sel_ungrp)
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(pub_grp), np.asarray(pub_ungrp)
+                )
+
+        # 3. Also exercise tokens=4 (< 6) ungrouped fallback in both modes
+        sel_4w, pub_4w = v2_kernels.paged_indexer_jax(
+            q[:4],
+            pool,
+            records_page,
+            weights[:4],
+            lengths[:4],
+            init_cands[:4],
+            req_grouped[:4],
+            topk=32,
+            block_size=16,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=False,
+            page_records=page_records,
+            prestrided_pages=True,
+            logical_width=width,
+        )
+        sel_4f, pub_4f = v2_kernels.paged_indexer_jax(
+            q[:4],
+            pool,
+            records_page,
+            weights[:4],
+            lengths[:4],
+            pub_4w,
+            req_grouped[:4],
+            topk=32,
+            block_size=16,
+            candidate_write=False,
+            candidate_filter=True,
+            unordered=False,
+            page_records=page_records,
+            prestrided_pages=True,
+            logical_width=width,
+        )
+        assert sel_4w.shape == (4, 32)
+        assert sel_4f.shape == (4, 32)
+        assert pub_4f.shape == (4, 4)
