@@ -1,5 +1,6 @@
 """V4.1 paged cache allocation, row addressing and mutation."""
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
@@ -612,13 +613,35 @@ def _gather_words(cache, records, record_words):
     per_row = ROW_WORDS // record_words
     words = _gather_raw_rows(cache, records // per_row)
     selected = words[:, :record_words]
+    seg = (records % per_row)[:, None]
     for segment in range(1, per_row):
         selected = jnp.where(
-            (records % per_row == segment)[:, None],
+            seg == segment,
             words[:, segment * record_words : (segment + 1) * record_words],
             selected,
         )
     return selected
+
+
+@functools.cache
+def _static_piece_order(elements: int):
+    import numpy as np
+
+    width = min(elements // 2, ROW_WORDS)
+    return np.concatenate(
+        [
+            start + 2 * np.arange(width, dtype=np.int32) + parity
+            for start in range(0, elements, 2 * width)
+            for parity in (0, 1)
+        ]
+    )
+
+
+@functools.cache
+def _static_inv_piece_order(elements: int):
+    import numpy as np
+
+    return np.argsort(_static_piece_order(elements)).astype(np.int32)
 
 
 def _permute(x: jax.Array, source: jax.Array) -> jax.Array:
@@ -647,14 +670,7 @@ def piece_order(elements: int) -> jax.Array:
     """Element order of `gather_cache_pieces`: per word row, even then odd."""
     import jax.numpy as jnp
 
-    width = min(elements // 2, ROW_WORDS)
-    return jnp.concatenate(
-        [
-            start + 2 * jnp.arange(width) + parity
-            for start in range(0, elements, 2 * width)
-            for parity in (0, 1)
-        ]
-    )
+    return jnp.asarray(_static_piece_order(elements))
 
 
 def split_halves(x: jax.Array) -> jax.Array:
@@ -666,7 +682,7 @@ def merge_halves(x: jax.Array) -> jax.Array:
     """Inverse of `split_halves`."""
     import jax.numpy as jnp
 
-    return _permute(x, jnp.argsort(piece_order(x.shape[-1])))
+    return _permute(x, jnp.asarray(_static_inv_piece_order(x.shape[-1])))
 
 
 def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
@@ -679,8 +695,12 @@ def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
     import jax.numpy as jnp
 
     dim = x.shape[-1]
-    order = piece_order(dim)
-    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, dim // pieces)
+    source = piece_order(dim)
+    perm = (
+        (jnp.arange(dim)[:, None] == source[None])
+        .astype(x.dtype)
+        .reshape(dim, pieces, dim // pieces)
+    )
     precision = (
         jax.lax.Precision.DEFAULT
         if x.dtype == jnp.bfloat16
@@ -689,7 +709,7 @@ def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
     return jnp.einsum(
         "...d,dpe->p...e",
         x,
-        perm.astype(x.dtype),
+        perm,
         precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
@@ -700,10 +720,13 @@ def merge_pieces(x: jax.Array) -> jax.Array:
     import jax.numpy as jnp
 
     pieces = x.shape[0]
-    piece_dim = x.shape[-1]
-    dim = pieces * piece_dim
-    order = piece_order(dim)
-    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, piece_dim)
+    dim = pieces * x.shape[-1]
+    source = piece_order(dim)
+    perm = (
+        (jnp.arange(dim)[:, None] == source[None])
+        .astype(x.dtype)
+        .reshape(dim, pieces, x.shape[-1])
+    )
     precision = (
         jax.lax.Precision.DEFAULT
         if x.dtype == jnp.bfloat16
@@ -712,7 +735,7 @@ def merge_pieces(x: jax.Array) -> jax.Array:
     return jnp.einsum(
         "p...e,dpe->...d",
         x,
-        perm.astype(x.dtype),
+        perm,
         precision=precision,
         preferred_element_type=jnp.float32,
     ).astype(x.dtype)
@@ -876,12 +899,15 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
     amax = jnp.abs(nope_3d).max(axis=1)
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     exponent = jnp.ceil(jnp.log2(jnp.maximum(amax, 1e-4) / fp8_max)).astype(jnp.int32)
-    # Build the power of two from its bits: exp2 is approximate on some
-    # backends, and a scale off by one ulp flips e4m3 rounding at ties.
+    # Build the power of two and its exact reciprocal from exponent bits:
+    # exp2 is approximate on some backends, and a scale off by one ulp flips
+    # e4m3 rounding at ties. Multiplying by 2**(-exponent) is IEEE-754 exact.
     biased = exponent + 127
-    scales = jax.lax.bitcast_convert_type(biased << 23, jnp.float32)
+    inv_scales = jax.lax.bitcast_convert_type((127 - exponent) << 23, jnp.float32)
     values = (
-        (nope_3d / scales[:, None, :]).reshape(-1, NOPE_DIM).astype(jnp.float8_e4m3fn)
+        (nope_3d * inv_scales[:, None, :])
+        .reshape(-1, NOPE_DIM)
+        .astype(jnp.float8_e4m3fn)
     )
     record = jnp.concatenate(
         (jax.lax.bitcast_convert_type(values, jnp.uint8), biased.astype(jnp.uint8)),

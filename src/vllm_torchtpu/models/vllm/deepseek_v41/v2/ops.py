@@ -74,21 +74,29 @@ def compact_rope_caches(attentions, max_model_len):
         attention._tpu_rope_cache = compact[key]
 
 
-def rotary(x, positions, config, *, compressed, inverse=False):
-    dim = config["qk_rope_head_dim"]
-    if dim < 2 or dim % 2 or dim > x.shape[-1]:
-        raise ValueError("invalid rotary dimension")
-    base = config["compress_rope_theta"] if compressed else config["rope_theta"]
-    frequencies = 1 / base ** (
-        torch.arange(0, dim, 2, device=x.device, dtype=torch.float32) / dim
-    )
-    yarn = (
-        (config.get("rope_scaling") or config.get("rope_parameters"))
-        if compressed
+_rotary_freq_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_rotary_frequencies(dim: int, base: float, yarn, device: torch.device):
+    yarn_key = (
+        (
+            yarn["original_max_position_embeddings"],
+            yarn["beta_fast"],
+            yarn["beta_slow"],
+            yarn["factor"],
+        )
+        if yarn and yarn["original_max_position_embeddings"] > 0
         else None
     )
-    if yarn and yarn["original_max_position_embeddings"] > 0:
-        original = yarn["original_max_position_embeddings"]
+    cache_key = (dim, base, device, yarn_key)
+    cached = _rotary_freq_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    frequencies = 1 / base ** (
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+    )
+    if yarn_key is not None:
+        original, beta_fast, beta_slow, factor = yarn_key
 
         def correction(rotations):
             return (
@@ -97,13 +105,28 @@ def rotary(x, positions, config, *, compressed, inverse=False):
                 / (2 * math.log(base))
             )
 
-        low = max(math.floor(correction(yarn["beta_fast"])), 0)
-        high = min(math.ceil(correction(yarn["beta_slow"])), dim - 1)
+        low = max(math.floor(correction(beta_fast)), 0)
+        high = min(math.ceil(correction(beta_slow)), dim - 1)
         ramp = (
-            (torch.arange(dim // 2, device=x.device, dtype=torch.float32) - low)
+            (torch.arange(dim // 2, device=device, dtype=torch.float32) - low)
             / max(high - low, 1e-3)
         ).clamp(0, 1)
-        frequencies = frequencies * (1 - ramp + ramp / yarn["factor"])
+        frequencies = frequencies * (1 - ramp + ramp / factor)
+    _rotary_freq_cache[cache_key] = frequencies
+    return frequencies
+
+
+def rotary(x, positions, config, *, compressed, inverse=False):
+    dim = config["qk_rope_head_dim"]
+    if dim < 2 or dim % 2 or dim > x.shape[-1]:
+        raise ValueError("invalid rotary dimension")
+    base = config["compress_rope_theta"] if compressed else config["rope_theta"]
+    yarn = (
+        (config.get("rope_scaling") or config.get("rope_parameters"))
+        if compressed
+        else None
+    )
+    frequencies = _get_rotary_frequencies(dim, base, yarn, x.device)
     pos_f32 = (
         positions
         if positions.device == x.device and positions.dtype == torch.float32
@@ -132,11 +155,13 @@ def round_fp8_activation(x, block_size=32):
         raise ValueError("FP8 block size must divide contraction dimension")
     x_f32 = x if x.dtype == torch.float32 else x.float()
     blocks = x_f32.unflatten(-1, (-1, block_size))
-    scales = torch.pow(
-        2.0, torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448))
-    )
-    values = (blocks / scales.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-    dequant = (values.float() * scales.unsqueeze(-1)).flatten(-2)
+    exp = torch.ceil(
+        torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448)
+    ).to(torch.int32)
+    inv_scales = ((127 - exp) << 23).view(torch.float32)
+    scales = ((exp + 127) << 23).view(torch.float32)
+    values = (blocks * inv_scales).clamp(-448, 448).to(torch.float8_e4m3fn)
+    dequant = (values.float() * scales).flatten(-2)
     return dequant if x.dtype == torch.float32 else dequant.to(x.dtype)
 
 
