@@ -607,3 +607,40 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
+
+
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    def malloc_trim(pad):
+        calls.append(pad)
+
+    malloc_trim.argtypes = None
+
+    class FakeProcess:
+        pass
+
+    process = FakeProcess()
+    process.malloc_trim = malloc_trim
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: process)
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
