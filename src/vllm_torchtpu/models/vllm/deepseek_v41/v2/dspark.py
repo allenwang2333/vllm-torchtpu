@@ -121,8 +121,8 @@ def _embed_draft_blocks(
     num_blocks = tokens // block
     if block <= 1 or num_blocks == 0:
         return embed(input_ids)
-    tail = tokens - num_blocks * block
-    ids_2d = input_ids[: num_blocks * block].view(num_blocks, block)
+    total = num_blocks * block
+    ids_2d = input_ids[:total].view(num_blocks, block)
     base = ids_2d[:, 0]
     noise = input_ids[1:2]
     rows = embed(torch.cat([base, noise]))
@@ -130,21 +130,18 @@ def _embed_draft_blocks(
     noise_row = rows[num_blocks:]
     # Pure 2-D [num_blocks * block, hidden] selection: a [num_blocks, block,
     # hidden] build pads the middle `block` dim to 8 sublanes on TPU.
-    total = num_blocks * block
-    idx = torch.arange(total, dtype=torch.int32, device=input_ids.device)
-    is_base = (idx % block) == 0
-    base_rows = rows[:num_blocks].index_select(0, idx // block)
-    blocks = torch.where(
-        is_base.unsqueeze(-1), base_rows, noise_row.expand(total, hidden)
-    ).masked_fill(
-        (~is_base & (ids_2d.reshape(-1) != noise)).unsqueeze(-1), float("nan")
-    )
-    if tail:
-        tail_rows = noise_row.expand(tail, hidden).masked_fill(
-            (input_ids[num_blocks * block :] != noise).unsqueeze(-1), float("nan")
+    idx = torch.arange(tokens, dtype=torch.int32, device=input_ids.device)
+    if tokens == total:
+        is_base = (idx % block) == 0
+        base_rows = rows[:num_blocks].index_select(0, idx // block)
+    else:
+        is_base = (idx < total) & ((idx % block) == 0)
+        base_rows = rows[:num_blocks].index_select(
+            0, (idx // block).clamp(max=num_blocks - 1)
         )
-        blocks = torch.cat([blocks, tail_rows])
-    return blocks
+    return torch.where(
+        is_base.unsqueeze(-1), base_rows, noise_row.expand(tokens, hidden)
+    ).masked_fill((~is_base & (input_ids != noise)).unsqueeze(-1), float("nan"))
 
 
 def _insert_context_kv(
@@ -263,7 +260,7 @@ def _insert_context_kv(
                 # and remainder from swa_slots in PagedCacheRows.write.
                 if fast_offset:
                     write = v2_attn._fast_swa_row_slots(
-                        swa_cache, blocks, pos_rem, ~swa_valid | (swa_slots < 0)
+                        swa_cache, blocks, pos_rem, ~swa_valid
                     )
             else:
                 swa_slots = _cache_slots(swa_cache, metadata, positions)
@@ -504,7 +501,7 @@ class DSparkDeepseekV41Model(nn.Module):
                 kv_normed = (
                     x_f32
                     * torch.rsqrt(
-                        x_f32.pow(2).mean(dim=-1, keepdim=True)
+                        (x_f32 * x_f32).mean(dim=-1, keepdim=True)
                         + layers[0].attn.kv_norm.variance_epsilon
                     )
                     * w_norm
@@ -581,22 +578,17 @@ def _post_and_collapse(
     and ``_collapse_flat`` accumulation order.
     """
     tokens, mult, dim = residual.shape
-    flat = residual.reshape(tokens, mult * dim)
-    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
-    post_f32 = post_layer_mix.reshape(tokens, mult).float()
-    comb_f32 = comb_res_mix.reshape(tokens, mult * mult).float()
-    pre_f32 = pre_mix.reshape(tokens, mult).float()
-    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
-    terms = []
-    for j in range(mult):
-        acc = post_f32[:, j : j + 1] * x_f32
-        for i in range(mult):
-            acc = acc + comb_f32[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
-        terms.append(pre_f32[:, j : j + 1] * acc.to(residual.dtype).float())
+    res_f32 = residual.float()
+    x_f32 = x.reshape(tokens, 1, dim).to(residual.dtype).float()
+    acc = post_layer_mix.reshape(tokens, mult, 1).float() * x_f32
+    comb_f32 = comb_res_mix.reshape(tokens, mult, mult, 1).float()
+    for i in range(mult):
+        acc = acc + comb_f32[:, i] * res_f32[:, i : i + 1]
+    weighted = pre_mix.reshape(tokens, mult, 1).float() * acc.to(residual.dtype).float()
     value = (
-        (terms[0] + terms[2]) + (terms[1] + terms[3])
+        (weighted[:, 0] + weighted[:, 2]) + (weighted[:, 1] + weighted[:, 3])
         if mult == 4
-        else torch.stack(terms, dim=0).sum(dim=0)
+        else weighted.sum(dim=1)
     )
     return value.to(residual.dtype)
 
