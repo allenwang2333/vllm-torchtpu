@@ -436,7 +436,7 @@ def _random_rejection_sample_with_segment(
     device = draft_token_ids.device
     vocab_size = target_logits.shape[-1]
 
-    # Kept int64 on purpose (TD8.275, c7x8 Jobs 1326-1328): int32 draft ids make
+    # Kept int64 on purpose (TD8.275, tpu7x-8 Jobs 1326-1328): int32 draft ids make
     # the fused [T, V] draft-mask compare ~2% slower on TPU, bitwise-equal.
     draft_token_ids = draft_token_ids.to(torch.int64)
     valid_draft_token_ids = draft_token_ids >= 0

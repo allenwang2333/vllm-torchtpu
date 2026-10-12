@@ -365,7 +365,7 @@ def _mark_token_dim_dynamic(*tensors: torch.Tensor) -> None:
 
     Left static, the first traced bucket's length (e.g. 288) unifies with the
     dynamic ``input_ids`` dim through ``_unpermute_owner_tokens_torch`` and
-    dynamo raises ConstraintViolationError (KV_SHARD 40L, c7x8 Job 1250).
+    dynamo raises ConstraintViolationError (KV_SHARD 40L, tpu7x-8 Job 1250).
     """
     for tensor in tensors:
         if tensor.shape[0] >= 2:

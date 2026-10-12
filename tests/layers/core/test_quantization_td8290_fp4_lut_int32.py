@@ -2,8 +2,8 @@
 """TD8.290: FP4 LUT lookups via int32 1D ``index_select`` equal int64 indexing.
 
 ``unpack_uint8_to_fp4`` and ``fp4_indices_to_float`` gather the 16-entry FP4
-LUT with a flat int32 ``index_select`` (was int64 advanced indexing); c7x8 Job
-1334 measured ``unpack_uint8_to_fp4`` 4245-4260 us -> 1212-1384 us.
+LUT with a flat int32 ``index_select`` (was int64 advanced indexing); tpu7x-8
+Job 1334 measured ``unpack_uint8_to_fp4`` 4245-4260 us -> 1212-1384 us.
 """
 
 from __future__ import annotations
