@@ -67,24 +67,6 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-_GATHER_PAGE_CHUNK = 128
-
-
-def _gather_page_ids_kernel(windows_ref, logical_ref, out_ref, *, num_chunks):
-    logical = logical_ref[...]  # i32[block_tokens, topk]
-    out = jnp.zeros_like(logical)
-    for c in range(num_chunks):
-        window_chunk = windows_ref[
-            :, c * _GATHER_PAGE_CHUNK : (c + 1) * _GATHER_PAGE_CHUNK
-        ]  # i32[block_tokens, 128]
-        local = logical - c * _GATHER_PAGE_CHUNK
-        gathered = jnp.take_along_axis(
-            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
-        )
-        out = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, out)
-    out_ref[...] = out
-
-
 def gather_page_ids(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     seq_page_ids: jax.Array,  # i32[num_tokens, topk]  (logical page within seq)
@@ -93,44 +75,12 @@ def gather_page_ids(
     *,
     block_tokens: int = 8,
 ) -> jax.Array:
-    """Gathers physical page ids for the CSA top-k tokens."""
-    num_tokens, topk = seq_page_ids.shape
+    """Gather only the selected pages, without scanning every page-table chunk."""
+    del block_tokens
     pages_per_seq = page_indices.shape[0] // max_num_seqs
-    num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
-    padded_pps = num_chunks * _GATHER_PAGE_CHUNK
-
-    page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
-    if padded_pps != pages_per_seq:
-        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
-    # Per-token page-table window. This is a whole-row gather.
-    windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
-
-    padded_tokens = align_to(num_tokens, block_tokens)
-    if padded_tokens != num_tokens:
-        pad = padded_tokens - num_tokens
-        windows = jnp.pad(windows, ((0, pad), (0, 0)))
-        logical = jnp.pad(logical, ((0, pad), (0, 0)))
-
-    out = pl.pallas_call(
-        functools.partial(_gather_page_ids_kernel, num_chunks=num_chunks),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=[
-                pl.BlockSpec((block_tokens, padded_pps), lambda t: (t, 0)),
-                pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            ],
-            out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
-        ),
-        out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            disable_bounds_checks=True,
-        ),
-        name="gather_page_ids",
-    )(windows, logical)
-    return out[:num_tokens]
+    flat_indices = seq_ids_segment[:, None] * pages_per_seq + logical
+    return page_indices[flat_indices]
 
 
 # DSV4 FP8 nope layout: 448 e4m3 values, then one e8m0 scale per lane of a

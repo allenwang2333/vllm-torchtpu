@@ -819,11 +819,36 @@ class TestCompressedAttentionAndQuerySplitCaching:
             source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
             assert len(captured_main_recs) == 1
             src_records = captured_main_recs[0]
+            torch.testing.assert_close(
+                src_records,
+                torch.tensor(
+                    [
+                        [-1, -1, -1, -1],
+                        [320, 322, -1, -1],
+                        [385, 386, -1, -1],
+                        [384, 385, -1, -1],
+                    ],
+                    dtype=src_records.dtype,
+                ),
+            )
 
             # Consumer layer runs: reuses main_records from stage cache!
             consumer_attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
             assert len(captured_main_recs) == 2
             assert torch.equal(captured_main_recs[1], src_records)
+            assert cache_mock.pages.call_count == 1
+
+        # A new step must resolve the current page table again.
+        original_pages = cache_mock.pages.return_value
+        cache_mock.pages.return_value = original_pages + 7
+        with v2_attn.stage_attention_cache_scope():
+            source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+            consumer_attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+            expected = torch.where(src_records >= 0, src_records + 7 * 32, -1)
+            torch.testing.assert_close(captured_main_recs[-1], expected)
+            torch.testing.assert_close(captured_main_recs[-2], expected)
+            assert cache_mock.pages.call_count == 2
+        cache_mock.pages.return_value = original_pages
 
         # Subcase 2: cached_idx_req hit branch
         with v2_attn.stage_attention_cache_scope():

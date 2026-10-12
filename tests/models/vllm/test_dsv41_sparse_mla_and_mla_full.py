@@ -255,63 +255,20 @@ class TestCommonHelpersAndEdgeCases:
 
 
 class TestSparseMlaGatherPageIds:
-    """Tests 100% lines and branches in gather_page_ids and _gather_page_ids_kernel."""
+    """Check request ownership and clipping at page-table chunk boundaries."""
 
-    def test_gather_page_ids_kernel_direct(self):
-        windows_np = np.arange(8 * 128, dtype=np.int32).reshape(8, 128)
-        logical_np = np.zeros((8, 16), dtype=np.int32)
-        logical_np[:, 0] = 5
-        logical_np[:, 1] = 130
-
-        windows_ref = MockArrayRef(windows_np)
-        logical_ref = MockArrayRef(logical_np)
-        out_ref = MockArrayRef(np.zeros((8, 16), dtype=np.int32))
-
-        sparse_mla._gather_page_ids_kernel(
-            windows_ref, logical_ref, out_ref, num_chunks=1
+    @pytest.mark.parametrize("pages_per_seq", [1, 100, 128, 129, 257, 2049])
+    @pytest.mark.parametrize("tokens", [5, 8])
+    def test_selected_pages(self, pages_per_seq, tokens):
+        rng = np.random.default_rng(42)
+        table = rng.integers(0, 8192, (3, pages_per_seq), dtype=np.int32)
+        logical = rng.integers(-2, pages_per_seq + 2, (tokens, 512), dtype=np.int32)
+        requests = np.arange(tokens, dtype=np.int32) % 3
+        expected = table[requests[:, None], np.clip(logical, 0, pages_per_seq - 1)]
+        actual = jax.jit(sparse_mla.gather_page_ids, static_argnums=(3,))(
+            jnp.asarray(table.ravel()), jnp.asarray(logical), jnp.asarray(requests), 3
         )
-        assert out_ref.arr.shape == (8, 16)
-        assert out_ref.arr[0, 0] == 5
-
-    def test_gather_page_ids_outer_padded_and_unpadded(self):
-        def fake_pallas_call_gather(kernel, out_shape=None, *args, **kwargs):
-            return lambda *call_args: jnp.zeros(out_shape.shape, dtype=out_shape.dtype)
-
-        with patch.object(
-            sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call_gather
-        ):
-            # Branch 1: padded_pps != pages_per_seq (pages_per_seq=100)
-            # and padded_tokens != num_tokens (num_tokens=5)
-            max_num_seqs = 2
-            pages_per_seq = 100
-            page_indices = jnp.arange(max_num_seqs * pages_per_seq, dtype=jnp.int32)
-            seq_page_ids = jnp.zeros((5, 16), dtype=jnp.int32)
-            seq_ids_segment = jnp.zeros((5,), dtype=jnp.int32)
-
-            out1 = sparse_mla.gather_page_ids(
-                page_indices,
-                seq_page_ids,
-                seq_ids_segment,
-                max_num_seqs,
-                block_tokens=8,
-            )
-            assert out1.shape == (5, 16)
-
-            # Branch 2: padded_pps == pages_per_seq (pages_per_seq=128)
-            # and padded_tokens == num_tokens (num_tokens=8)
-            pages_per_seq = 128
-            page_indices = jnp.arange(max_num_seqs * pages_per_seq, dtype=jnp.int32)
-            seq_page_ids = jnp.zeros((8, 16), dtype=jnp.int32)
-            seq_ids_segment = jnp.zeros((8,), dtype=jnp.int32)
-
-            out2 = sparse_mla.gather_page_ids(
-                page_indices,
-                seq_page_ids,
-                seq_ids_segment,
-                max_num_seqs,
-                block_tokens=8,
-            )
-            assert out2.shape == (8, 16)
+        np.testing.assert_array_equal(actual, expected)
 
 
 class TestSparseMlaAttentionKernelDirect:

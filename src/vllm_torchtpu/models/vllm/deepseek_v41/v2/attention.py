@@ -385,6 +385,16 @@ def _gather_query_rows(rows):
     return rows[:, :width].contiguous() if padding else rows
 
 
+def _physical_row_indices(pages, logical, requests, page_size, valid):
+    """Resolve selected rows with one flat lookup per address."""
+    safe = logical.clamp(min=0, max=pages.shape[1] * page_size - 1)
+    page_slots = requests[:, None] * pages.shape[1] + safe // page_size
+    physical_pages = pages.flatten()[page_slots.flatten().long()]
+    return (
+        physical_pages.reshape_as(logical) * page_size + safe % page_size
+    ).masked_fill(~valid, -1)
+
+
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
     safe = logical.clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
@@ -1301,10 +1311,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     else:
                         pages = None
                     if pages is not None:
-                        # SparseMLA resolves pages itself (Pallas), avoiding a
-                        # [tokens, topk] XLA gather of the block table here.
-                        main_records = selected.masked_fill(~valid_compressed, -1)
-                        starts = source_meta.query_start_loc
+                        # Resolve once per source/reindex layer and share physical
+                        # rows with Reuse layers through the step's stage cache.
+                        main_records = _physical_row_indices(
+                            pages,
+                            selected,
+                            requests,
+                            main_cache.shape[1],
+                            valid_compressed,
+                        )
+                        # The raw-row entry uses an identity table over the pool.
+                        pages = starts = None
                     else:
                         slots = _row_slots(
                             main_cache,
