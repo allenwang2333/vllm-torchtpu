@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EP16/TP2 MoE: packed latent dispatch, indexed GU, fused weighted down/ring.
+"""EP16/TP2 BF16-reduction MoE and prepared-route overflow consumers.
 
 The 8K metadata fast path fits local routes into 256 KiB of SMEM. Overflow
 streams bounded metadata tiles instead, with a uniform decision on all ranks.
@@ -15,6 +15,7 @@ from ..prefill_megakernel import (
     MOE_FAMILIES,
     _moe_sp_shared_rows,
     _moe_sp_tail,
+    expert_family_slot,
     gmm_v2,
     ring_tables,
     sp_token_index,
@@ -96,6 +97,39 @@ def routed_experts(
     sorted_pairs = jnp.sort(packed, stable=False) & ((1 << pair_bits) - 1)
     sorted_tokens = sorted_pairs // topk
     sorted_probs = topk_probabilities.reshape(-1)[sorted_pairs]
+    return routed_experts_prepared(
+        latent,
+        sorted_tokens,
+        sorted_probs,
+        counts,
+        expert_gate_up,
+        expert_gate_up_scales,
+        expert_down,
+        expert_down_scales,
+        reduce_tables=reduce_tables,
+        expert_layer=expert_layer,
+        global_route_max=global_route_max,
+    )
+
+
+def routed_experts_prepared(
+    latent,
+    sorted_tokens,
+    sorted_probs,
+    counts,
+    expert_gate_up,
+    expert_gate_up_scales,
+    expert_down,
+    expert_down_scales,
+    *,
+    reduce_tables,
+    expert_layer=None,
+    global_route_max=None,
+):
+    """Consume prepared expert-major metadata with the existing GU/down path."""
+    if expert_layer is not None:
+        expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
+    tokens = latent.shape[0]
     # The E8M0 exponent bytes go to the GMM as they are (it converts each
     # tile in VMEM): an FP32 [E, blocks, 1, N] copy pads 8x in HBM.
     gu_scale = expert_gate_up_scales.astype(jnp.uint8)

@@ -201,6 +201,49 @@ def pack_windows(
     return packed
 
 
+# Expert families follow the first (layers 1..3), eleven regular groups, and
+# final layer. Keeping those resident banks separate avoids addressing a 92-layer
+# expert operand in every fused MoE call. No padding or device-side copies.
+_EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+_EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
+
+
+def _bank_expert_weights(iterator):
+    """Stream checkpoint parts into exactly one resident copy of each expert."""
+    state: dict[str, list[Any]] = {}
+    for group, name, value in iterator:
+        family, marker, suffix = name.partition("@")
+        if group != "moe" or family not in _EXPERT_FAMILIES:
+            yield group, name, value
+            continue
+        part, parts = map(int, suffix.split("/")) if marker else (0, 1)
+        entry = state.setdefault(family, [0, 0, 0, None])
+        expected_part, bank, used, buffer = entry
+        if part != expected_part:
+            raise ValueError(f"Out-of-order expert checkpoint part: {name}")
+        offset = 0
+        while offset < value.shape[0]:
+            if bank == len(_EXPERT_BANK_SIZES):
+                raise ValueError(f"Too many expert layers for {family}")
+            capacity = _EXPERT_BANK_SIZES[bank]
+            if buffer is None:
+                buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
+            count = min(capacity - used, value.shape[0] - offset)
+            buffer[used : used + count] = value[offset : offset + count]
+            used += count
+            offset += count
+            if used == capacity:
+                yield group, f"{family}#bank{bank}", buffer
+                bank, used, buffer = bank + 1, 0, None
+        state[family] = [part + 1, bank, used, buffer]
+        if part + 1 == parts and (bank != len(_EXPERT_BANK_SIZES) or used):
+            raise ValueError(f"Incomplete expert checkpoint: {family}")
+    if set(state) != set(_EXPERT_FAMILIES) or any(
+        bank != len(_EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+    ):
+        raise ValueError("Missing expert checkpoint parts")
+
+
 class PrefillProgram:
     """The prefill stack's device weights and packed-window ops.
 
@@ -226,6 +269,7 @@ class PrefillProgram:
             "moe": tuple(self._kernels.MOE_FAMILIES),
         }
         self.weights: dict[str, dict[str, torch.Tensor]] = {}
+        self._expert_banks: list[dict[str, torch.Tensor]] = []
         self._ops: dict[Any, dict[str, Any]] = {}
         self._pairs: list[torch.Tensor] = []
         self._state_ops: dict[tuple[str, int], Any] = {}
@@ -233,19 +277,42 @@ class PrefillProgram:
     # ------------------------------------------------------------ weights
     def load_weights(self, presharded) -> None:
         cache = presharded / "prefill-sp-cache"
-        stats = stream_to_device(
-            self._rank_loader.iter_prefill_rank(
-                presharded, cache, self.rank, split_experts=True
-            ),
-            lambda group, name, tensor: self.weights.setdefault(group, {}).__setitem__(
-                name, tensor
-            ),
+        from .config import active
+
+        iterator = self._rank_loader.iter_prefill_rank(
+            presharded, cache, self.rank, split_experts=True
         )
+        self._expert_banks = []
+        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+            self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
+            iterator = _bank_expert_weights(iterator)
+
+        def store(group, name, tensor):
+            family, marker, index = name.partition("#bank")
+            if marker:
+                bank = int(index)
+                self._expert_banks[bank][family] = tensor
+                # The default dictionary retains handles to bank zero so common
+                # shape/introspection code still sees every named family.
+                if bank != 0:
+                    return
+                name = family
+            self.weights.setdefault(group, {})[name] = tensor
+
+        stats = stream_to_device(iterator, store)
+        if self._expert_banks and any(
+            set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
+        ):
+            raise RuntimeError("K3 prefill: incomplete resident expert banks")
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
                 raise RuntimeError(f"K3 prefill: missing {group} weights {missing}")
-        materialize(self.weights["moe"]["expert_ds"])
+        materialize(
+            self._expert_banks[-1]["expert_ds"]
+            if self._expert_banks
+            else self.weights["moe"]["expert_ds"]
+        )
         if self.rank == 0:
             logger.info(
                 "K3 prefill: rank 0 weights resident (%.1f GiB) in %.1f s "
@@ -257,8 +324,13 @@ class PrefillProgram:
             )
         report_load_stats("prefill", self.rank, stats)
 
-    def _flat(self, *groups: str) -> list[torch.Tensor]:
-        return [self.weights[g][n] for g in groups for n in self.names[g]]
+    def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
+        experts = self._expert_banks[expert_bank] if self._expert_banks else {}
+        return [
+            experts[n] if g == "moe" and n in experts else self.weights[g][n]
+            for g in groups
+            for n in self.names[g]
+        ]
 
     def _unflat(self, args, *groups: str) -> tuple[dict, list]:
         out, index = {}, 0
@@ -476,6 +548,7 @@ class PrefillProgram:
         return repr(
             (
                 "prefill",
+                "moe-bank8" if self._expert_banks else "moe-global",
                 op,
                 window,
                 self.capacity,
@@ -519,7 +592,6 @@ class PrefillProgram:
             *tail,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
-        weights = self._flat("common", "kda", "mla", "moe")
         middle = None
         for p, pair in enumerate(self._pairs):
             *state, middle = ops["group"](
@@ -530,7 +602,7 @@ class PrefillProgram:
                 pools[2 * p + 1],
                 pools[2 * p + 2],
                 *tail,
-                *weights,
+                *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
         prefix, blocks, rec, hist, rec_at, hist_at, latents = state
         if ring is not None:
@@ -543,7 +615,7 @@ class PrefillProgram:
             segments,
             pools[MLA_LAYERS - 1],
             *tail,
-            *self._flat("io", "common", "mla", "moe"),
+            *self._flat("io", "common", "mla", "moe", expert_bank=12),
         )
         return logits, latents, rec, hist, rec_at, hist_at
 

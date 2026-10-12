@@ -4912,6 +4912,19 @@ def _counting_sort_positions(keys, buckets):
     return positions.reshape(-1)[:size].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def expert_family_slot(family_count, slot):
+    """Map a global MoE slot to the resident first/group/final expert bank.
+
+    Dense families keep their global slots. Only the expert weights are split
+    into banks; the legacy complete family and replay-only shapes stay global.
+    """
+    if family_count == 8:
+        return (slot - 3) % 8
+    if family_count == 1:
+        return jnp.zeros_like(slot)
+    return slot
+
+
 def routed_experts(
     latent,
     topk_ids,
@@ -4936,6 +4949,8 @@ def routed_experts(
     order, ``ragged_gather_reduce`` back, weighting and summing each token's
     top-k contributions in FP32.
     """
+    if expert_layer is not None:
+        expert_layer = expert_family_slot(expert_gate_up.shape[0], expert_layer)
     tokens, input_width = latent.shape
     local_experts = expert_gate_up.shape[-3]
     if topk_ids.shape != topk_probabilities.shape or topk_ids.shape[0] != tokens:
@@ -5126,7 +5141,7 @@ def _moe_sp_shared_reduce(partial, axis_name):
 
 
 def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
-                 axis_name, eps):
+                 axis_name, eps, shared_reduced=False):
     """Finish the routed branch from local reduced MoE rows and add the
     shared expert's rows."""
     rank = jax.lax.axis_index(axis_name)
@@ -5137,7 +5152,8 @@ def _moe_sp_tail(routed, shared, prefix_local, length, weights, *,
     routed *= jax.lax.rsqrt(jnp.mean(routed*routed, axis=1, keepdims=True)+eps)
     routed = (routed * weights["latent_norm"][:, :3584]).astype(jnp.bfloat16)
     up = routed @ weights["latent_up"]
-    shared = _moe_sp_shared_reduce(shared, axis_name)
+    if not shared_reduced:
+        shared = _moe_sp_shared_reduce(shared, axis_name)
     output = (up + shared).astype(jnp.bfloat16)
     output = jnp.where(valid_rows[:, None], output, 0)
     return (prefix_local + output).astype(jnp.bfloat16)
@@ -5290,9 +5306,19 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     from ..config import active
 
     cfg = active()
-    if cfg.prefill_fused_moe and cfg.prefill_expert_parallel == 16 and seq_len in (4096, 8192):
-        from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
-
+    if (
+        cfg.prefill_fused_moe
+        and cfg.prefill_expert_parallel == 16
+        and (
+            seq_len in (4096, 8192)
+            or (cfg.moe_reduce_dtype == "float32" and seq_len in (512, 1024, 2048))
+        )
+    ):
+        if cfg.moe_reduce_dtype == "float32":
+            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
+        else:
+            # Preserve the supported per-hop BF16 reduction implementation.
+            from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 

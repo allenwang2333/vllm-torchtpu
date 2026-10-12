@@ -65,7 +65,8 @@ class KernelConfig:
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
-    # EP16 4K/8K windows only; False: the unfused SparseCore gather/combine.
+    # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
+    # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
