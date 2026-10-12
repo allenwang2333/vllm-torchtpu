@@ -2868,6 +2868,29 @@ class TPUModelRunner(GPUModelRunner):
         num_prompt_tokens = input_batch.num_prompt_tokens
         num_tokens_no_spec = input_batch.num_tokens_no_spec
         append_row = input_batch.block_table.append_row
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        spec_list = (
+            [scheduled_spec_tokens[rid] for rid in req_ids]
+            if scheduled_spec_tokens and len(scheduled_spec_tokens) == n_reqs
+            else (
+                list(map(scheduled_spec_tokens.get, req_ids))
+                if scheduled_spec_tokens
+                else ()
+            )
+        )
+        first_spec = spec_list[0] if spec_list else None
+        k = (
+            len(first_spec)
+            if first_spec
+            and 0 < len(first_spec) <= _ARANGE_INTP.size
+            and (
+                (same_spec := spec_list.count(first_spec) == n_reqs)
+                or all(
+                    ids is not None and len(ids) == len(first_spec) for ids in spec_list
+                )
+            )
+            else 0
+        )
         req_states = []
         for i, (req_id, num_comp, num_out, new_blocks) in enumerate(
             zip(
@@ -2879,7 +2902,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             req_state = requests[req_id]
             req_states.append(req_state)
-            req_state.num_computed_tokens, req_state.prev_num_draft_len = num_comp, 0
+            req_state.num_computed_tokens, req_state.prev_num_draft_len = num_comp, k
             if num_out < len(req_state.output_token_ids):
                 del req_state.output_token_ids[num_out:]
                 num_tokens_no_spec[i] = num_prompt_tokens[i] + num_out
@@ -2888,25 +2911,17 @@ class TPUModelRunner(GPUModelRunner):
                     block_ids.extend(new_ids)
                 append_row(new_blocks, i)
 
-        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not scheduled_spec_tokens:
             for spec_ids in input_batch.spec_token_ids[:n_reqs]:
                 spec_ids.clear()
         else:
-            spec_list = [scheduled_spec_tokens.get(rid) for rid in req_ids]
-            first_spec = spec_list[0]
-            k = len(first_spec) if first_spec else 0
             starts = num_tokens_no_spec[:n_reqs]
             max_len = input_batch.token_ids_cpu.shape[1]
-            if (
-                0 < k <= _ARANGE_INTP.size
-                and all(ids is not None and len(ids) == k for ids in spec_list)
-                and int(starts.max()) + k <= max_len
-            ):
+            if k > 0 and int(starts.max()) + k <= max_len:
                 rows = _ARANGE_INTP[:n_reqs]
                 k_off = _ARANGE_INTP[:k]
                 idx = (rows * max_len + starts)[:, None] + k_off
-                if spec_list.count(first_spec) == n_reqs:
+                if same_spec:
                     # Every request drafts the same ids (async scheduling's
                     # placeholder rows): broadcast one row over the
                     # [n_reqs, k] index instead of flattening n_reqs lists.
@@ -2920,12 +2935,14 @@ class TPUModelRunner(GPUModelRunner):
                         count=n_reqs * k,
                     )
                 input_batch.is_token_ids.ravel()[idx.ravel()] = True
-                for req_state, cur_spec, ids in zip(
-                    req_states, input_batch.spec_token_ids[:n_reqs], spec_list
+                cur_specs = input_batch.spec_token_ids[:n_reqs]
+                for cur_spec, ids in (
+                    ()
+                    if same_spec and cur_specs.count(first_spec) == n_reqs
+                    else zip(cur_specs, spec_list)
                 ):
                     if cur_spec != ids:
                         cur_spec[:] = ids
-                    req_state.prev_num_draft_len = k
                 # Every req_ids entry was just verified to draft exactly k
                 # tokens; `_prepare_inputs` reuses this instead of re-reading
                 # the n_reqs lengths.
@@ -2934,6 +2951,7 @@ class TPUModelRunner(GPUModelRunner):
                     req_ids,
                     k,
                     set(scheduler_output.num_scheduled_tokens.values()) == {1 + k},
+                    req_states,
                 )
             else:
                 update_spec = input_batch.update_req_spec_token_ids
@@ -5372,8 +5390,23 @@ class TPUModelRunner(GPUModelRunner):
         requests = self.requests
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
-        request_seq_lens = []
-        for i, req_id in enumerate(req_ids):
+        request_seq_lens = (
+            list(
+                zip(
+                    range(num_reqs),
+                    fast_spec[4]
+                    if len(fast_spec) > 4
+                    else map(requests.__getitem__, req_ids),
+                    itertools.repeat(0, num_reqs),
+                    req_ids,
+                )
+            )
+            if (fast_spec := getattr(self, "_fast_uniform_spec_k", None)) is not None
+            and fast_spec[2] > 0
+            and fast_spec[1] == req_ids
+            else []
+        )
+        for i, req_id in enumerate(() if request_seq_lens else req_ids):
             assert req_id is not None
             req_state = requests[req_id]
             seq_len = req_state.num_computed_tokens + num_scheduled_tokens[req_id]

@@ -441,7 +441,7 @@ def test_td8395_fast_uniform_spec_schedule_across_reorder_chunks_and_prepare(
         total_num_scheduled_tokens=6,
     )
     assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
-    assert runner._fast_uniform_spec_k == (spec_tokens, ["r0", "r1"], 2, True)
+    assert runner._fast_uniform_spec_k[:4] == (spec_tokens, ["r0", "r1"], 2, True)
 
     # Poison num_scheduled_tokens to prove all 3 consumers skip dict indexing
     sched_out.num_scheduled_tokens = None
@@ -473,9 +473,174 @@ def test_td8395_fast_uniform_spec_schedule_across_reorder_chunks_and_prepare(
     sched_out.num_scheduled_tokens = {"r0": 3, "r1": 2}
     sched_out.total_num_scheduled_tokens = 5
     assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
-    assert runner._fast_uniform_spec_k == (spec_tokens, ["r0", "r1"], 2, False)
+    assert runner._fast_uniform_spec_k[:4] == (spec_tokens, ["r0", "r1"], 2, False)
     assert TPUModelRunner._reorder_batch_for_rpa(runner, sched_out) == (0, 2)
     assert TPUModelRunner._count_input_chunks(runner, sched_out) == (1, 2)
     with pytest.raises(_StopPlanner):
         TPUModelRunner._prepare_inputs(runner, sched_out, 0, 0)
     assert seen_totals == [6, 5]
+
+
+def test_td8397_sample_tokens_fast_request_seq_lens_and_fast_update_states_spec():
+    """TD8.397: (1) _try_fast_update_states uses direct indexing when
+    len(scheduled_spec_tokens) == n_reqs, short-circuits all(...) when
+    spec_list.count(first_spec) == n_reqs, sets prev_num_draft_len = k in the
+    main request loop, and skips the spec_token_ids update loop when cur_specs
+    already equal first_spec; (2) sample_tokens builds request_seq_lens in O(N)
+    without dict lookups or req_state.num_tokens on speculative decode steps."""
+    import contextlib
+
+    req0 = SimpleNamespace(
+        req_id="r0",
+        num_computed_tokens=0,
+        prev_num_draft_len=0,
+        output_token_ids=[1, 2],
+        block_ids=[[]],
+    )
+    req1 = SimpleNamespace(
+        req_id="r1",
+        num_computed_tokens=0,
+        prev_num_draft_len=0,
+        output_token_ids=[3, 4],
+        block_ids=[[]],
+    )
+    updated_fallback = []
+    runner = object.__new__(TPUModelRunner)
+    runner.requests = {"r0": req0, "r1": req1}
+    runner.input_batch = SimpleNamespace(
+        num_reqs=2,
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=np.zeros(2, dtype=np.int32),
+        num_prompt_tokens=np.array([4, 4], dtype=np.int32),
+        num_tokens_no_spec=np.array([6, 6], dtype=np.int32),
+        token_ids_cpu=np.zeros((2, 16), dtype=np.int32),
+        is_token_ids=np.zeros((2, 16), dtype=bool),
+        spec_token_ids=[[], []],
+        block_table=SimpleNamespace(append_row=lambda *a: None),
+        refresh_metadata=lambda: None,
+        update_req_spec_token_ids=lambda rs, st: updated_fallback.append(rs.req_id),
+        all_greedy=True,
+        max_num_logprobs=None,
+        generators={},
+    )
+
+    # Step 1: identical placeholder drafts [-1, -1] populate spec_token_ids
+    same_tokens = {"r0": [-1, -1], "r1": [-1, -1]}
+    sched_out = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["r0", "r1"],
+            num_computed_tokens=[6, 6],
+            num_output_tokens=[2, 2],
+            new_block_ids=[None, None],
+        ),
+        scheduled_spec_decode_tokens=same_tokens,
+        num_scheduled_tokens={"r0": 3, "r1": 3},
+        has_structured_output_requests=False,
+    )
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert runner.input_batch.spec_token_ids == [[-1, -1], [-1, -1]]
+    assert (req0.prev_num_draft_len, req1.prev_num_draft_len) == (2, 2)
+    assert runner._fast_uniform_spec_k == (
+        same_tokens,
+        ["r0", "r1"],
+        2,
+        True,
+        [req0, req1],
+    )
+
+    # Step 2: cur_specs already equal first_spec -> skips loop, prev_num_draft_len=2
+    req0.prev_num_draft_len = 0
+    req1.prev_num_draft_len = 0
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert (req0.prev_num_draft_len, req1.prev_num_draft_len) == (2, 2)
+
+    # Extra key in scheduled_spec_tokens exercises map(scheduled_spec_tokens.get, ...)
+    # and distinct spec lists exercise cur_spec == ids vs != ids, plus num_out / blocks
+    sched_out.scheduled_spec_decode_tokens = {
+        "r0": [-1, -1],
+        "r1": [-2, -2],
+        "extra": [-1, -1],
+    }
+    sched_out.scheduled_cached_reqs.num_output_tokens = [1, 2]
+    sched_out.scheduled_cached_reqs.new_block_ids = [[[5]], [[]]]
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert req0.output_token_ids == [1]
+    assert req0.block_ids == [[5]]
+    assert runner.input_batch.spec_token_ids == [[-1, -1], [-2, -2]]
+
+    # Heterogeneous spec lengths exercise k=0 -> update_req_spec_token_ids fallback
+    sched_out.scheduled_spec_decode_tokens = {"r0": [-1, -1], "r1": [-1]}
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert updated_fallback == ["r0", "r1"]
+    assert (req0.prev_num_draft_len, req1.prev_num_draft_len) == (0, 0)
+
+    # Empty scheduled_spec_decode_tokens clears spec_token_ids and sets k=0
+    sched_out.scheduled_spec_decode_tokens = {}
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    assert runner.input_batch.spec_token_ids == [[], []]
+
+    # Part (2): sample_tokens fast request_seq_lens construction (5-tuple and 3-tuple)
+    sched_out.scheduled_spec_decode_tokens = same_tokens
+    assert TPUModelRunner._try_fast_update_states(runner, sched_out) is True
+    # Poison num_scheduled_tokens; req0/req1 also have no .num_tokens attribute
+    sched_out.num_scheduled_tokens = None
+
+    def _make_exec_state():
+        return SimpleNamespace(
+            scheduler_output=sched_out,
+            spec_decode_metadata_list=[None],
+            mamba_state_indices_list=None,
+            logits_list=[],
+            num_reqs_list=[],
+            pooler_output_list=[],
+            draft_chunks=[],
+        )
+
+    runner._get_sampling_generator = lambda: None
+    runner.speculative_config = None
+    runner.is_pooling_model = False
+    runner._stage_timing = SimpleNamespace(
+        stage=lambda _n: contextlib.nullcontext(),
+        host_stage=lambda _n: contextlib.nullcontext(),
+    )
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._modify_prev_results = lambda: None
+    runner.maybe_wait_for_kv_save = lambda: None
+    runner.get_finished_kv_transfers = lambda _so: (None, None, None, set(), None, None)
+    runner._sync_replicated_drafts_across_tp = lambda d: d
+    seen_req_seq_lens = []
+    runner._update_placeholder = (
+        lambda _disc, rsl, _nti, _nd: seen_req_seq_lens.append(rsl) or {}
+    )
+
+    runner.execute_model_state = _make_exec_state()
+    TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert seen_req_seq_lens[-1] == [(0, req0, 0, "r0"), (1, req1, 0, "r1")]
+
+    # 3-tuple _fast_uniform_spec_k exercises map(requests.__getitem__, req_ids)
+    runner._fast_uniform_spec_k = (same_tokens, ["r0", "r1"], 2)
+    runner.execute_model_state = _make_exec_state()
+    TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert seen_req_seq_lens[-1] == [(0, req0, 0, "r0"), (1, req1, 0, "r1")]
+
+    # _fast_uniform_spec_k = None falls back to per-request loop (incl. partial prefill)
+    runner._fast_uniform_spec_k = None
+    sched_out.num_scheduled_tokens = {"r0": 3, "r1": 1}
+    req0.num_tokens = 9
+    req1.num_tokens = 20
+    gen_offsets = [12]
+    runner.input_batch.generators = {
+        1: SimpleNamespace(
+            get_offset=lambda: gen_offsets[0],
+            set_offset=lambda v: gen_offsets.__setitem__(0, v),
+        )
+    }
+    runner.execute_model_state = _make_exec_state()
+    TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert seen_req_seq_lens[-1] == [(0, req0, 9, "r0")]
+    assert gen_offsets == [8]
+    runner.input_batch.generators = {}
+    runner.execute_model_state = _make_exec_state()
+    TPUModelRunner.sample_tokens(runner, grammar_output=None)
+    assert seen_req_seq_lens[-1] == [(0, req0, 9, "r0")]
