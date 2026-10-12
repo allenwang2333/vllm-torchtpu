@@ -36,6 +36,7 @@ from __future__ import annotations
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu import envs
@@ -146,6 +147,17 @@ def merge_lse_partials_scatter_heads(
         return merge_lse_partials_all_to_all(
             output, lse, group, query_start_loc=query_start_loc
         )
+
+    # The drafter cannot compare the token count in torch, but JAX exports
+    # each of its buckets at a concrete shape: one op picks the exchange
+    # there (TPU_MTP_DCP_MERGE_SIZED).
+    if (
+        envs.TPU_MTP_DCP_MERGE_SIZED
+        and not is_backbone
+        and output.element_size() == 2
+        and int(group.world_size) in _SIZED_MERGE_OPS
+    ):
+        return _SIZED_MERGE_OPS[int(group.world_size)](output, lse)
 
     # Same trace-time rule as above: only the backbone may split by size.
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
@@ -519,4 +531,140 @@ def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
     w_lo = weights - w_hi
     return (o_f32 * w_hi.unsqueeze(-1)).sum(dim=0) + (o_f32 * w_lo.unsqueeze(-1)).sum(
         dim=0
+    )
+
+
+# ===================================================================== #
+# The MTP drafter's sized merge (TPU_MTP_DCP_MERGE_SIZED).
+# ===================================================================== #
+
+# world -> the torch op over the DCP mesh; built at model build
+# (`prebuild_sized_merge`), never inside a trace.
+_SIZED_MERGE_OPS: dict = {}
+
+
+def _rs_weighted(o: jax.Array, own_lse: jax.Array, lses: jax.Array) -> jax.Array:
+    """`cp_lse_ag_out_rs`'s per-element arithmetic before its sum: `o` `[..., V]`
+    a partial, `own_lse` `[...]` its lse, `lses` `[world, ...]` every rank's
+    lse for the same rows. f32 `o * exp(own_lse - logsumexp(lses))`, zero where
+    the weight is not positive (a zero-weight partial may be NaN)."""
+    merged = jax.nn.logsumexp(lses, axis=0)
+    weight = jnp.exp(own_lse - merged)[..., None]
+    weighted = o.astype(jnp.float32) * weight
+    return jnp.where(weight > 0, weighted, jnp.zeros_like(weighted))
+
+
+def _pack_words(o_send: jax.Array, l_send: jax.Array) -> tuple[jax.Array, int]:
+    """`[world, T, local, V]` 2-byte partial and f32 `[world, T, local]` lse ->
+    int16 `[world, T*local + extra, V]` (`_all_to_all_packed`'s layout): the
+    partial's words, then each destination's lse high halves and low halves,
+    zero padded to whole V-wide rows. Integer ops only, so every bit moves."""
+    world, tokens, local, vdim = o_send.shape
+    rows = tokens * local
+    words = rows * 2
+    extra = -(-words // vdim)
+    o_words = jax.lax.bitcast_convert_type(o_send, jnp.int16).reshape(world, rows, vdim)
+    bits = jax.lax.bitcast_convert_type(l_send, jnp.int32).reshape(world, rows)
+    hi = (bits >> 16).astype(jnp.int16)
+    lo = (((bits & 0xFFFF) ^ 0x8000) - 0x8000).astype(jnp.int16)
+    l_words = jnp.pad(jnp.concatenate([hi, lo], axis=1), ((0, 0), (0, extra * vdim - words)))
+    return jnp.concatenate([o_words, l_words.reshape(world, extra, vdim)], axis=1), extra
+
+
+def _unpack_words(recv: jax.Array, tokens: int, local: int, dtype) -> tuple[jax.Array, jax.Array]:
+    """Inverse of `_pack_words` on the received blocks: `[world, T, local, V]`
+    partials in `dtype` and the f32 `[world, T, local]` lse, bit for bit."""
+    world, _, vdim = recv.shape
+    rows = tokens * local
+    o_recv = jax.lax.bitcast_convert_type(recv[:, :rows], dtype).reshape(
+        world, tokens, local, vdim
+    )
+    l_words = recv[:, rows:].reshape(world, -1)
+    hi = l_words[:, :rows].astype(jnp.int32)
+    lo = l_words[:, rows : 2 * rows].astype(jnp.int32)
+    l_recv = jax.lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+    return o_recv, l_recv.reshape(world, tokens, local)
+
+
+def sized_merge_local(
+    o: jax.Array, lse: jax.Array, *, world: int, a2a_max_tokens: int, axis_name: str
+) -> jax.Array:
+    """One rank's merge inside a `shard_map` over the DCP axis.
+
+    `o` `[T, H, V]` (2-byte dtype) and `lse` `[T, H]` are this rank's partial
+    and lse over all `H = world * local` heads; returns this rank's merged head
+    block `[T, local, V]` in `o.dtype`. `T` is concrete here, so the exchange is
+    chosen per bucket:
+
+    - `T <= a2a_max_tokens`: head block `d` of the partial and lse goes to rank
+      `d` in one packed all-to-all; each rank weights the received partials as
+      the reduce-scatter merge would (same lse gather values, logsumexp, exp,
+      multiply, zero select) and adds them in rank order 0..world-1.
+    - otherwise: the reduce-scatter merge, op for op (`cp_lse_ag_out_rs`): lse
+      all-gather, weight, f32 reduce-scatter over heads.
+
+    The two differ only in the order the `world` weighted f32 terms are summed.
+    """
+    tokens, heads, vdim = o.shape
+    local = heads // world
+    lse = lse.astype(jnp.float32)
+    if tokens > a2a_max_tokens:
+        lses = jax.lax.all_gather(lse, axis_name, axis=0)
+        weighted = _rs_weighted(o, lse, lses)
+        merged = jax.lax.psum_scatter(weighted, axis_name, scatter_dimension=1, tiled=True)
+        return merged.astype(o.dtype)
+    o_send = o.reshape(tokens, world, local, vdim).transpose(1, 0, 2, 3)
+    l_send = lse.reshape(tokens, world, local).transpose(1, 0, 2)
+    send, _ = _pack_words(o_send, l_send)
+    recv = jax.lax.all_to_all(send, axis_name, 0, 0, tiled=True)
+    o_recv, l_recv = _unpack_words(recv, tokens, local, o.dtype)
+    # Rank r's weight reads every rank's lse for this rank's heads, which is
+    # exactly l_recv `[world, T, local]`.
+    terms = _rs_weighted(o_recv, l_recv, l_recv)
+    # An explicit chain of adds (a reduce over the rank axis may be lowered to
+    # a default-precision dot that rounds its f32 operands to bf16).
+    acc = terms[0]
+    for r in range(1, world):
+        acc = acc + terms[r]
+    return acc.astype(o.dtype)
+
+
+def prebuild_sized_merge(world: int) -> None:
+    """Register the drafter's sized merge op for a DCP group of `world` ranks
+    (TPU_MTP_DCP_MERGE_SIZED). Call at model build, outside any trace."""
+    if not envs.TPU_MTP_DCP_MERGE_SIZED or world <= 1 or world in _SIZED_MERGE_OPS:
+        return
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    cap = int(envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS)
+    # Each rank's own rows, as the DCP attention op lays out its partials
+    # (`_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS`).
+    spec = P(DCP_AXIS_NAME)
+
+    def body(o, lse):
+        return sized_merge_local(
+            o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME
+        )
+
+    def fn(output: jax.Array, lse: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+        )(output, lse)
+
+    def fake(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        tokens, heads, vdim = output.shape
+        return output.new_empty((tokens, heads // world, vdim))
+
+    _SIZED_MERGE_OPS[world] = sharded_jax_op(
+        f"pallas::mtp_dcp_merge_sized_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
     )
