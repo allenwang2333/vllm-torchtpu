@@ -16,7 +16,8 @@ steps:
   # A release is a build of releases/X.Y.Z started by hand and only work on releases branch. This block holds the step below until someone approves.
   - block: ":rotating_light: Approve vllm-torchtpu release"
     key: "approve_release"
-    if: 'build.branch =~ /^releases\//'
+    # TODO(test-only): drop the jefft/img_upgrade_test condition before merge.
+    if: 'build.branch =~ /^releases\// || (build.branch == "jefft/img_upgrade_test" && build.env("TEST_BRANCH_AS") =~ /^releases\//)'
     prompt: "Did the vllm-torchtpu-ci build of this commit pass? Build and publish this release?"
     # TODO(release-approvers): limit who can unblock to a Buildkite team.
     fields:

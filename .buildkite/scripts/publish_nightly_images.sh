@@ -33,6 +33,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
+# TODO(test-only): remove before merge. The test branch runs as main, or as
+# the branch named by TEST_BRANCH_AS (e.g. releases/0.0.0-test) if the test
+# build sets it.
+if [[ "${BRANCH}" == "jefft/img_upgrade_test" ]]; then
+  BRANCH="${TEST_BRANCH_AS:-main}"
+fi
 case "${BRANCH}" in
   main)
     DATE_TAG="nightly-${DATE}"
@@ -49,7 +55,7 @@ case "${BRANCH}" in
     LATEST_TAG="${VERSION}"
     ;;
   *)
-    echo "ERROR: nightly images are published from main or release/X.Y.Z, not '${BRANCH}'." >&2
+    echo "ERROR: nightly images are published from main or releases/X.Y.Z, not '${BRANCH}'." >&2
     exit 1
     ;;
 esac
@@ -112,13 +118,14 @@ for TARGET in "${TARGETS[@]}"; do
   docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
   docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
 
+  # TODO(test-only): restore the four GAR docker push lines before merge.
   echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Artifact Registry"
-  docker push "${DATE_IMAGE}"
-  docker push "${LATEST_IMAGE}"
+  echo "[SIMULATED] docker push ${DATE_IMAGE}"
+  echo "[SIMULATED] docker push ${LATEST_IMAGE}"
 
   echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
-  docker push "${EXTRA_DATE_IMAGE}"
-  docker push "${EXTRA_LATEST_IMAGE}"
+  echo "[SIMULATED] docker push ${EXTRA_DATE_IMAGE}"
+  echo "[SIMULATED] docker push ${EXTRA_LATEST_IMAGE}"
 
   # The same image goes to Docker Hub; nothing is rebuilt.
   if [[ "${PUBLISH_DOCKERHUB}" == "1" && "${TARGET}" == "${DOCKERHUB_TARGET}" ]]; then
