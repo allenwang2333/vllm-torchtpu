@@ -13,9 +13,10 @@ writes (`T4_COMB_DUMP`): per step, every rank's partial output and lse from the
 all-flags-off and the all-flags-on attention runs. On 8 ranks, with the s23
 merge env (a2a merge for <= 64 tokens, chunk8 + collapsed lse gather above),
 each rank merges the off partials with TPU_DCP_LSE_MERGE_A2A_PACK off and the
-on partials with it on, eager and compiled. Eager must be bit for bit; compiled
-may differ by at most one bf16 ulp (the pack's known compiled tolerance); the
-count is reported. Positive control: the on partials with every rank's lse
+on partials with PACK + REAL_ROWS on (query_start_loc [0, real]), eager and
+compiled. On the real rows eager must be bit for bit and compiled within one
+bf16 ulp (the pack's known compiled tolerance); the count is reported. With
+real rows the padding rows of the on merge are zero. Positive control: the on partials with every rank's lse
 rolled by one token must fail the same check.
 """
 
@@ -71,6 +72,7 @@ def _partials(z, step, tag, rank, dcp, roll=False):
 
 def _check(rank, cp_mla, path):
     import numpy as np
+    import torch
 
     z = np.load(path)
     dcp = int(z["dcp"])
@@ -84,25 +86,36 @@ def _check(rank, cp_mla, path):
             key = f"s{step}/{how}"
             try:
                 res = {}
-                for tag, pack, roll in (
+                real = int(z[f"s{step}_real"])
+                qsl = torch.tensor([0, real], dtype=torch.int32).to("tpu")
+                for tag, on, roll in (
                     ("off", False, False),
                     ("on", True, False),
                     ("on", True, True),
                 ):
-                    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_PACK = pack
-                    fn = merge if how == "eager" else mm._compile(merge)
+                    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_PACK = on
+                    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS = on
+
+                    def fn0(o, lse, qsl=qsl):
+                        return merge(o, lse, query_start_loc=qsl)
+
+                    fn = fn0 if how == "eager" else mm._compile(fn0)
                     o, lse = _partials(z, step, tag, rank, dcp, roll)
                     res[(tag, roll)] = fn(o.to("tpu"), lse.to("tpu")).cpu()
                 want, got = res[("off", False)], res[("on", False)]
-                u = _ulp(got, want)
-                c = _ulp(res[("on", True)], want)
+                u = _ulp(got[:real], want[:real])
+                c = _ulp(res[("on", True)][:real], want[:real])
+                a2a = want.shape[0] <= S23_MERGE_ENV["TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS"]
                 report[key] = {
                     "tokens": int(want.shape[0]),
+                    "real": real,
                     "elements": int(u.numel()),
                     "n_diff": int((u > 0).sum()),
-                    "max_ulp": int(u.max()),
+                    "max_ulp": int(u.max()) if u.numel() else 0,
+                    # Real rows only apply on the a2a (decode) merge.
+                    "pad_zero": bool((got[real:] == 0).all()) if a2a else None,
                     "control_n_diff": int((c > 0).sum()),
-                    "control_max_ulp": int(c.max()),
+                    "control_max_ulp": int(c.max()) if c.numel() else 0,
                 }
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
@@ -144,6 +157,12 @@ def _run_worker(result_dir: Path, path: str) -> None:
             group_name="t4c_merge",
         )
         cp_mla.get_dcp_group = lambda: group
+        # The real-rows exchange is a JAX op on the DCP mesh, which reads the
+        # group from `distributed.dcp`; register it before any trace.
+        from vllm_torchtpu.distributed import dcp as dcp_mod
+
+        dcp_mod.get_dcp_group = lambda: group
+        cp_mla.prebuild_ragged_all_to_all(world)
         result["check"] = _check(rank, cp_mla, path)
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -191,7 +210,11 @@ def test_merge_of_composed_partials_on_real_collectives(tmp_path):
     for r in results:
         for key, c in r["check"].items():
             assert "error" not in c, (r["rank"], key, c)
-            t = total.setdefault(key, dict(elements=0, n_diff=0, max_ulp=0, ctl=0))
+            t = total.setdefault(
+                key, dict(elements=0, n_diff=0, max_ulp=0, ctl=0, pad_zero=True)
+            )
+            if c["pad_zero"] is not None:
+                t["pad_zero"] = t["pad_zero"] and c["pad_zero"]
             t["elements"] += c["elements"]
             t["n_diff"] += c["n_diff"]
             t["max_ulp"] = max(t["max_ulp"], c["max_ulp"])
@@ -201,6 +224,7 @@ def test_merge_of_composed_partials_on_real_collectives(tmp_path):
         if key.endswith("eager"):
             assert t["n_diff"] == 0, (key, t)
         assert t["max_ulp"] <= 1, (key, t)
+        assert t["pad_zero"], (key, t)
         assert t["ctl"] > 0, ("rolled lse not caught", key, t)
 
 
