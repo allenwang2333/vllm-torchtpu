@@ -1349,7 +1349,15 @@ def capped_live_windows(
 Q_ROPE_DIM = 64
 Q_ROPE_HEAD_DIM = 256
 # Test-only faults for the in-kernel q rope / kernel-owned lse.
-PROLOGUE_FAULTS = (None, "skip_q_rope", "rope_swap", "rope_f32", "skip_lse_fill")
+PROLOGUE_FAULTS = (
+    None,
+    "skip_q_rope",
+    "rope_swap",
+    "rope_f32",
+    "skip_lse_fill",
+    # `row_widths`: attend one width below what the batch needs (test-only).
+    "row_width_undersize",
+)
 
 
 def rope_q_block(x: jax.Array, tab: jax.Array, fault: str | None = None) -> jax.Array:
@@ -1423,7 +1431,17 @@ def _attention_kernel(
     q_rope: bool = False,
     lse_fill: bool = False,
     fault: str | None = None,
+    row_widths: tuple[int, ...] = (),
 ):
+    # Row widths (`row_widths`, TPU_MLA_DECODE_ROW_WIDTHS; not live-group):
+    # ascending static row counts (multiples of 128 below bkv_sz). A grid step
+    # whose tokens all have kv_len <= w fetches only the first w rows of each
+    # gathered tile and runs its body on them -- unpack, zero, QK, mask,
+    # softmax and PV -- instead of all bkv_sz. Rows past kv_len are zeroed and
+    # masked either way, so every result is the same bit for bit (the dropped
+    # rows only ever add exact zeros). The width is chosen from the scalar
+    # kv_lens, identically for a batch's fetch, wait and body.
+    #
     # In-kernel q rope (`q_rope`, split-q only; TPU_MLA_DECODE_PROLOGUE):
     # `q_pe_hbm_ref` is the raw (un-roped) q head view `[tokens, heads, 256]`
     # (nope 192 | rope 64) and a second input `tab_hbm_ref` f32[tokens, 2, 128]
@@ -1505,6 +1523,7 @@ def _attention_kernel(
     # bkv_sz; rows past a token's kv_len are zero / masked either way, so the
     # result is the same. Steps wider than every width run the full body.
     assert not live_widths or group_tab_ref is not None
+    assert not row_widths or group_tab_ref is None
     # Body levers (`body_levers`, live-group mode only; `MIXED_BODY_LEVERS`):
     #   "tr"     unpack the NOPE words with four stride-4 row loads and a 4x4
     #            byte transpose on 32-bit words, then a native bitcast to fp8,
@@ -1593,7 +1612,9 @@ def _attention_kernel(
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim) or (
-            live_widths and kv.shape[1] == head_dim and kv.shape[0] in live_widths
+            (live_widths or row_widths)
+            and kv.shape[1] == head_dim
+            and kv.shape[0] in (*live_widths, *row_widths)
         )
 
         # Single-block softmax: each query attends exactly one gathered kv
@@ -1652,7 +1673,7 @@ def _attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[3, bkv_sem_idx]
 
@@ -1662,6 +1683,24 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
+        if rows is not None:
+            # `row_widths`: only the first `rows` rows of each token's tile.
+            rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
+            nope_src = cache_kv_nope_hbm_ref.at[
+                pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+            ]
+            rope_src = cache_kv_rope_hbm_ref.at[
+                pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows)
+            ]
+            nope_dst = bkv_nope_vmem_ref.at[:, pl.ds(0, rows)]
+            rope_dst = bkv_rope_vmem_ref.at[:, pl.ds(0, rope_rows)]
+            if wait:
+                _async_copy(nope_dst, nope_dst, sem_nope, True)
+                _async_copy(rope_dst, rope_dst, sem_rope, True)
+            else:
+                _async_copy(nope_src, nope_dst, sem_nope, False)
+                _async_copy(rope_src, rope_dst, sem_rope, False)
+            return
         if group_tab_ref is not None:
             _fetch_live_blocks(
                 seq_idx_start,
@@ -1815,11 +1854,37 @@ def _attention_kernel(
     def fill_copy():
         return pltpu.make_async_copy(fill_ref, lse_hbm_ref, fill_sem)
 
-    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
-        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx)
+    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=None):
+        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=rows)
 
-    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
-        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True)
+    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=None):
+        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True, rows=rows)
+
+    def with_row_width(seq_idx_start, fn):
+        """`fn(rows)` for the batch at `seq_idx_start`: `rows` the smallest
+        of `row_widths` covering every token's kv_len, None (all bkv_sz rows)
+        when none does or there are no widths."""
+        if not row_widths:
+            fn(None)
+            return
+        need = kv_lens_ref[seq_idx_start]
+        for b in range(1, batch_size):
+            need = jnp.maximum(need, kv_lens_ref[seq_idx_start + b])
+        widths = tuple(row_widths) + (None,)
+        if fault == "row_width_undersize":
+            # Positive control: every bucket above the first attends the
+            # next-narrower width, dropping live rows.
+            widths = (row_widths[0], *row_widths)
+        lower = None
+        for upper, width in zip((*row_widths, None), widths):
+            if lower is None:
+                fits = need <= upper
+            elif upper is None:
+                fits = need > lower
+            else:
+                fits = (need > lower) & (need <= upper)
+            pl.when(fits)(functools.partial(fn, width))
+            lower = upper
 
     def start_fetch_bq_batch(seq_idx_start, bq_sem_idx):
         return _fetch_bq_batch(seq_idx_start, bq_sem_idx)
@@ -2096,7 +2161,10 @@ def _attention_kernel(
         def prefetch_next_seq():
             sem_ids_ref[0] = next_bi_sem_idx
             start_fetch_bq_batch(next_seq_idx, next_bi_sem_idx)
-            start_fetch_bkv_batch(next_seq_idx, next_bi_sem_idx)
+            with_row_width(
+                next_seq_idx,
+                functools.partial(start_fetch_bkv_batch, next_seq_idx, next_bi_sem_idx),
+            )
 
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
@@ -2123,7 +2191,8 @@ def _attention_kernel(
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
-        wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+        if not row_widths:
+            wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
@@ -2194,6 +2263,13 @@ def _attention_kernel(
                     )
                 )
                 lower = width
+        elif row_widths:
+
+            def wait_and_run(rows):
+                wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
+                run_steps(rows, tuple(body_levers))
+
+            with_row_width(batch_start_seq_idx, wait_and_run)
         else:
             run_steps(None, tuple(body_levers))
         if capped_windows is not None:
@@ -2231,7 +2307,10 @@ def _attention_kernel(
     @pl.when(jnp.logical_and(batch_start_seq_idx == start_seq_idx, has_work))
     def prologue():
         start_fetch_bq_batch(batch_start_seq_idx, 0)
-        start_fetch_bkv_batch(batch_start_seq_idx, 0)
+        with_row_width(
+            batch_start_seq_idx,
+            functools.partial(start_fetch_bkv_batch, batch_start_seq_idx, 0),
+        )
 
     if lse_fill:
         pl.when(has_work)(process)
@@ -2332,6 +2411,7 @@ def prepare_outputs(
         "prologue_fault",
         "kv_write_fault",
         "mixed_fused_prep",
+        "decode_row_widths",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -2377,8 +2457,15 @@ def sparse_ragged_paged_attention(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
     mixed_fused_prep: bool = False,
+    decode_row_widths: tuple[int, ...] = (),
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
+
+    `decode_row_widths` (TPU_MLA_DECODE_ROW_WIDTHS; capped path, chunks that
+    do not take the live-group prep): ascending multiples of 128 below
+    `topk_cap`; each grid step fetches and attends only the first w rows of
+    its tokens' window-0 tiles, w the smallest width covering the batch's
+    largest kv_len (all rows when none does). Same results bit for bit.
 
     Args:
       q: concatenated all sequences' queries.
@@ -2609,6 +2696,15 @@ def sparse_ragged_paged_attention(
             f"mixed_live_widths {mixed_live_widths} must be ascending multiples of "
             f"128 below topk_cap ({topk_cap})"
         )
+    if decode_row_widths and (
+        topk_cap is None
+        or list(decode_row_widths) != sorted(set(decode_row_widths))
+        or any(w % 128 or not 0 < w < topk_cap for w in decode_row_widths)
+    ):
+        raise ValueError(
+            f"decode_row_widths {decode_row_widths} must be ascending multiples of "
+            f"128 below topk_cap ({topk_cap})"
+        )
     if not set(mixed_body_levers) <= set(MIXED_BODY_LEVERS):
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
@@ -2836,6 +2932,7 @@ def sparse_ragged_paged_attention(
             group_tab=group_tab,
             group_num_live=None if group_num_live is None else group_num_live[i],
             group_widths=mixed_live_widths if group_tab is not None else (),
+            row_widths=decode_row_widths if group_tab is None else (),
             group_levers=(
                 mixed_body_levers
                 if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
@@ -2964,6 +3061,7 @@ def sparse_attention_chunk(
     prologue_fault: str | None = None,
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
+    row_widths: tuple[int, ...] = (),
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -3164,6 +3262,7 @@ def sparse_attention_chunk(
             q_rope=q_rope,
             lse_fill=lse_fill,
             fault=prologue_fault,
+            row_widths=tuple(row_widths) if capped_windows is not None else (),
         )
         if live_views is not None:
             group_body = functools.partial(
