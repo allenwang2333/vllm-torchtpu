@@ -4,6 +4,8 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import ctypes
+import functools
 import os
 import time
 from collections.abc import Iterator
@@ -83,6 +85,41 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _anon_rss_mib() -> float:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) / 1024
+    return 0.0
+
+
+def _release_free_host_heap() -> None:
+    """Return the heap that startup freed to the OS.
+
+    Loading and compiling free GiBs of transient host memory (staging
+    buffers, serialized artifacts, throwaway programs). tcmalloc keeps freed
+    pages mapped and releases them only slowly, so without this they stay in
+    the worker's anonymous RSS for the life of the process. glibc's
+    ``malloc_trim`` does nothing for a tcmalloc heap; use tcmalloc's own
+    release when it is the process allocator (the images LD_PRELOAD it).
+    """
+    process = ctypes.CDLL(None)
+    release = getattr(process, "MallocExtension_ReleaseFreeMemory", None)
+    if release is None:
+        release = getattr(process, "malloc_trim", None)
+        if release is None:
+            return
+        release.argtypes = [ctypes.c_size_t]
+        release = functools.partial(release, 0)
+    before = _anon_rss_mib()
+    release()
+    logger.info(
+        "Released free host heap after warmup: RssAnon %.0f -> %.0f MiB",
+        before,
+        _anon_rss_mib(),
+    )
 
 
 class TPUWorker(WorkerBase):
@@ -724,6 +761,7 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        _release_free_host_heap()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
