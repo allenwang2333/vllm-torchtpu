@@ -36,22 +36,42 @@ def _bf16(bits: jax.Array) -> jax.Array:
 def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
     words = words_ref[0]
     rows, half = words.shape[0], ROW_WORDS // 2
-    # Record SLOTS * r + s (slot s of row r) on sublane SLOTS * r + s, its
-    # words rolled to lanes [0, 64): scores then leave in record order, with
-    # no [slots, rows] -> [rows, slots] relayout in XLA (0.27 ms/step).
-    keys_ref[pl.ds(0, rows, stride=SLOTS), :] = words
-    keys_ref[pl.ds(1, rows, stride=SLOTS), :] = pltpu.roll(words, half, 1)
-    words = keys_ref[...]
-    lo, hi = _bf16(words << 16), _bf16(words & jnp.int32(-65536))
-    first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
-    # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
-    # elements), i.e. q's split element order.
-    key = jnp.where(first, lo, pltpu.roll(hi, half, 1))
-    for t in range(q_ref.shape[0]):
+    if q_ref.shape[0] == 1:
+        # Record SLOTS * r + s (slot s of row r) on sublane SLOTS * r + s, its
+        # words rolled to lanes [0, 64): scores then leave in record order, with
+        # no [slots, rows] -> [rows, slots] relayout in XLA (0.27 ms/step).
+        keys_ref[pl.ds(0, rows, stride=SLOTS), :] = words
+        keys_ref[pl.ds(1, rows, stride=SLOTS), :] = pltpu.roll(words, half, 1)
+        words = keys_ref[...]
+        lo, hi = _bf16(words << 16), _bf16(words & jnp.int32(-65536))
+        first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
+        # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
+        # elements), i.e. q's split element order.
+        key = jnp.where(first, lo, pltpu.roll(hi, half, 1))
         logits = jax.lax.dot_general(
-            q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+            q_ref[0], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
         )
-        out_ref[t, 0] = (jnp.maximum(logits, 0) * w_ref[t]).sum(0)
+        out_ref[0, 0] = (jnp.maximum(logits, 0) * w_ref[0]).sum(0)
+    else:
+        rolled = pltpu.roll(words, half, 1)
+        first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
+        keys_ref[pl.ds(0, rows, stride=SLOTS), :] = jnp.where(
+            first, words << 16, rolled & jnp.int32(-65536)
+        )
+        keys_ref[pl.ds(1, rows, stride=SLOTS), :] = jnp.where(
+            first, rolled << 16, words & jnp.int32(-65536)
+        )
+        key = _bf16(keys_ref[...])
+        heads = q_ref.shape[1]
+        all_logits = jax.lax.dot_general(
+            q_ref[...].reshape(q_ref.shape[0] * heads, DIM),
+            key,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        for t in range(q_ref.shape[0]):
+            logits = all_logits[t * heads : (t + 1) * heads]
+            out_ref[t, 0] = (jnp.maximum(logits, 0) * w_ref[t]).sum(0)
 
 
 # Jitted: the memory-space constraint below cannot run eagerly.

@@ -1054,7 +1054,13 @@ def fused_swa_inputs(
         bias = jnp.pad(
             bias, ((0, 0), (0, pad)), constant_values=jnp.finfo(jnp.float32).min
         )
-    elif group_tokens == 6 and width == 128 and 48 < tokens <= 192 and tokens % 6 == 0:
+    elif (
+        group_tokens == 6
+        and width == 128
+        and tokens > 48
+        and (tokens <= 192 or tokens % 192 == 0)
+        and tokens % 6 == 0
+    ):
         # One window union per 6-token group, handed to the kernel as is:
         # token ``j`` of a group attends union columns ``[j, j + 128)``, which
         # its bias row selects; the other columns (and the pad to 256) are
@@ -1156,6 +1162,8 @@ def sparse_fp8_attention_jax(
     chunk_size = max(128, num_tokens) if num_tokens <= 192 else 128
     if fused_swa and fused_swa_eligible(num_tokens, swa_records.shape[1], max_requests):
         swa_kv, swa_bias = fused_swa_inputs(swa_pool, swa_records, q.shape[-1])
+        if num_tokens > 192 and swa_kv.shape[0] < num_tokens:
+            chunk_size = 192
         return sparse_ragged_paged_attention_union_gather(
             q,
             nope_3d,

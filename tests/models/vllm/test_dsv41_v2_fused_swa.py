@@ -800,7 +800,7 @@ class TestFusedSwaHelpers:
         single_kv, _ = attention_kernels.fused_swa_inputs(pool, records, dim)
         assert jnp.array_equal(kv, single_kv)
 
-    @pytest.mark.parametrize("tokens", [54, 96, 144, 192])
+    @pytest.mark.parametrize("tokens", [54, 96, 144, 192, 384, 576])
     def test_fused_swa_inputs_group6_union_gather_exactness(self, tokens):
         rng = np.random.default_rng(7)
         dim = 256
@@ -1122,6 +1122,26 @@ class TestFusedSwaDriver:
                     assert kw["swa_kv"].shape == (tokens, 128, 64)
                     assert kw["swa_bias"].shape == (tokens, 1, 128)
                     assert union.call_args.args[8:11] == (None, None, None)
+
+        for tokens, want_kv0, want_chunk in ((240, 240, 128), (384, 64, 192)):
+            a128 = self._jax_args(tokens=tokens, width=128)
+            with mock.patch.object(
+                attention_kernels,
+                "sparse_ragged_paged_attention_union_gather",
+                return_value=a128["q"],
+            ) as union128:
+                out128 = attention_kernels.sparse_fp8_attention_jax(
+                    *a128.values(),
+                    scale=0.125,
+                    page_size=16,
+                    max_requests=None,
+                    union_gather=False,
+                    fused_swa=True,
+                )
+                assert out128 is a128["q"]
+                kw128 = union128.call_args.kwargs
+                assert kw128["gather_and_attention_chunk_size"] == want_chunk
+                assert kw128["swa_kv"].shape[0] == want_kv0
 
         # 4D rank-major Q routing in sparse_fp8_attention_jax
         a4 = self._jax_args(tokens=24, width=64)
