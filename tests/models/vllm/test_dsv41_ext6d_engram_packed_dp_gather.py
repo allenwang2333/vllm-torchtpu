@@ -202,3 +202,60 @@ def test_packed_dp_gather_rejects_bad_shapes(monkeypatch: pytest.MonkeyPatch):
         _dp_gather_packed_rows(torch.zeros(3, 5, dtype=torch.int32), 1, **kw)
     with pytest.raises(AssertionError):
         _dp_gather_packed_rows(torch.zeros(4, 5, dtype=torch.int32), 3, **kw)
+
+
+@pytest.mark.parametrize("num_tokens", [8, 7])
+def test_sp_gather_packed_rows_matches_dequant_then_gather(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+):
+    tp, cols, head_dim, block = 4, 2, 16, 8
+    n_hash_cols = tp * cols - 1
+    engrams = []
+    hashes = torch.arange(num_tokens * cols, dtype=torch.int32).view(num_tokens, cols)
+    for rank in range(tp):
+        e = _bare_engram(_fake_embed(dp_size=1, cols=cols, block=block, seed=rank))
+        e.embed_tokens.tp_size = tp
+        e.embed_tokens.n_hash_cols = n_hash_cols
+        Engram._init_staging(e, max_tokens=num_tokens, head_dim=head_dim)
+        e.prepare_embeddings(hashes)
+        engrams.append(e)
+
+    dequant_by_rank = [Engram._ready_rows(e, num_tokens) for e in engrams]
+    packed_by_rank = [e._active_raw for e in engrams]
+    chunk = -(-num_tokens // tp)
+    pad = chunk * tp - num_tokens
+
+    for rank, engram in enumerate(engrams):
+        monkeypatch.setattr(
+            common_engram.upstream, "get_tensor_model_parallel_rank", lambda r=rank: r
+        )
+        ref_parts = [
+            torch.nn.functional.pad(r_rows, (0, 0, 0, 0, 0, pad)) if pad else r_rows
+            for r_rows in dequant_by_rank
+        ]
+        gathered_bf16 = torch.cat(ref_parts, dim=0).unflatten(0, (tp, chunk * tp))
+        expected = (
+            gathered_bf16[:, rank * chunk : (rank + 1) * chunk]
+            .transpose(0, 1)
+            .flatten(1, 2)[:, :n_hash_cols]
+            .contiguous()
+        )
+
+        calls: list[tuple[tuple[int, ...], torch.dtype, int]] = []
+
+        def fake_tp_all_gather(tensor, dim=0, _calls=calls):
+            _calls.append((tuple(tensor.shape), tensor.dtype, dim))
+            return torch.cat(packed_by_rank, dim=dim)
+
+        monkeypatch.setattr(
+            common_engram.upstream,
+            "tensor_model_parallel_all_gather",
+            fake_tp_all_gather,
+        )
+        hash_ids = torch.zeros((num_tokens, n_hash_cols), dtype=torch.int64)
+        actual = engram._sp_embed(hash_ids)
+        assert actual.shape == (chunk, n_hash_cols, head_dim)
+        assert actual.dtype == torch.bfloat16 and actual.is_contiguous()
+        assert _bits_equal(actual, expected)
+        assert len(calls) == 1
+        assert calls[0][1] == torch.int32

@@ -1200,3 +1200,132 @@ class TestModelDecodeEngram:
                 skip_lookup=False,
             )
             assert h3 is not None
+
+    def test_td95_stage_and_resolve_async_next_tokens_cpu(self):
+        """Covers _stage_async_next_tokens_cpu, _resolve_next_tokens_cpu,
+        copy_state.wait() in _async_source_tokens_cpu, and sample_tokens hook."""
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
+            _async_source_tokens_cpu,
+            _resolve_next_tokens_cpu,
+            _stage_async_next_tokens_cpu,
+            install_host_engram_inputs,
+        )
+
+        runner = SimpleNamespace()
+        # 1. Early return when next_tokens_tpu is None or CPU tensor
+        _stage_async_next_tokens_cpu(runner, SimpleNamespace(next_tokens_tpu=None))
+        assert runner._host_engram_staged_next is None
+        _stage_async_next_tokens_cpu(
+            runner, SimpleNamespace(next_tokens_tpu=torch.tensor([1, 2]))
+        )
+        assert runner._host_engram_staged_next is None
+
+        # 2. Non-CPU tensor (1D and 2D) staging with Event
+        class FakeDeviceTensor(torch.Tensor):
+            @property
+            def device(self):
+                return SimpleNamespace(type="xla")
+
+            def to(self, device, non_blocking=False):
+                return torch.tensor(self.tolist(), dtype=torch.int32)
+
+        t2d = FakeDeviceTensor([[10, 20], [30, 40]]).to(torch.int32)
+        t2d = FakeDeviceTensor._make_subclass(
+            FakeDeviceTensor, torch.tensor([[10, 20], [30, 40]], dtype=torch.int32)
+        )
+        pre_async = SimpleNamespace(next_tokens_tpu=t2d)
+        sync_calls = []
+
+        class FakeEvent:
+            def record(self):
+                sync_calls.append("record")
+
+            def synchronize(self):
+                sync_calls.append("sync")
+
+        with patch.object(torch, "tpu", SimpleNamespace(Event=FakeEvent), create=True):
+            _stage_async_next_tokens_cpu(runner, pre_async)
+
+        assert runner._host_engram_staged_next is not None
+        assert sync_calls == ["record"]
+
+        # First resolve synchronizes the event and clears ready_event
+        resolved1 = _resolve_next_tokens_cpu(pre_async, runner=runner)
+        assert resolved1 is not None
+        assert resolved1.tolist() == [10, 20, 30, 40]
+        assert sync_calls == ["record", "sync"]
+        assert runner._host_engram_staged_next[2] is None
+
+        # Second resolve returns cached CPU tensor without re-synchronizing
+        resolved2 = _resolve_next_tokens_cpu(pre_async, runner=runner)
+        assert resolved2 is resolved1
+        assert sync_calls == ["record", "sync"]
+
+        # Unstaged fallback: 2D and 1D CPU/device tensors and None
+        pre_unstaged_2d = SimpleNamespace(
+            next_tokens_tpu=torch.tensor([[5, 6]], dtype=torch.int32)
+        )
+        assert _resolve_next_tokens_cpu(pre_unstaged_2d, runner=runner).tolist() == [
+            5,
+            6,
+        ]
+        t1d_dev = FakeDeviceTensor._make_subclass(
+            FakeDeviceTensor, torch.tensor([7, 8], dtype=torch.int32)
+        )
+        pre_unstaged_dev = SimpleNamespace(next_tokens_tpu=t1d_dev)
+        assert _resolve_next_tokens_cpu(pre_unstaged_dev, runner=runner).tolist() == [
+            7,
+            8,
+        ]
+        assert (
+            _resolve_next_tokens_cpu(
+                SimpleNamespace(next_tokens_tpu=None), runner=runner
+            )
+            is None
+        )
+
+        # 3. _async_source_tokens_cpu with copy_state.wait() when waited is None
+        wait_called = []
+        copy_state = SimpleNamespace(
+            chunks_cpu=[torch.tensor([11, 22], dtype=torch.int32)],
+            wait=lambda: wait_called.append(True),
+        )
+        pre_copy = SimpleNamespace(copy_state=copy_state, next_tokens_tpu=None)
+        out_copy = _async_source_tokens_cpu(pre_copy, waited=None, runner=runner)
+        assert wait_called == [True]
+        assert out_copy.tolist() == [11, 22]
+
+        # When prefer_next_tokens_tpu=True but next_tokens_tpu is None, falls through
+        wait_called.clear()
+        out_fallthrough = _async_source_tokens_cpu(
+            pre_copy, prefer_next_tokens_tpu=True, waited=None, runner=runner
+        )
+        assert wait_called == [True]
+        assert out_fallthrough.tolist() == [11, 22]
+
+        # 4. install_host_engram_inputs wraps TPUModelRunner.sample_tokens
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+        orig_prepare = TPUModelRunner._prepare_lookback_token_ids
+        orig_sample = TPUModelRunner.sample_tokens
+        try:
+            if hasattr(orig_prepare, "_deepseek_v41_host_engram"):
+                delattr(orig_prepare, "_deepseek_v41_host_engram")
+            sample_calls = []
+
+            def dummy_sample(self_runner, grammar_output):
+                sample_calls.append(grammar_output)
+                return "sampled_out"
+
+            TPUModelRunner.sample_tokens = dummy_sample
+            install_host_engram_inputs()
+            fake_runner = SimpleNamespace(
+                _pre_async_results=SimpleNamespace(next_tokens_tpu=None)
+            )
+            res = TPUModelRunner.sample_tokens(fake_runner, "g_out")
+            assert res == "sampled_out"
+            assert sample_calls == ["g_out"]
+            assert fake_runner._host_engram_staged_next is None
+        finally:
+            TPUModelRunner._prepare_lookback_token_ids = orig_prepare
+            TPUModelRunner.sample_tokens = orig_sample

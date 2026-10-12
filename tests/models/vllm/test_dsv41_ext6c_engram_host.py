@@ -296,7 +296,6 @@ def _engram(embed, max_tokens):
     engram = object.__new__(ce.Engram)
     nn.Module.__init__(engram)
     engram.embed_tokens = embed
-    ce.upstream.Engram._init_staging(engram, max_tokens, embed.dim)
     engram._init_staging(max_tokens, embed.dim)
     return engram
 

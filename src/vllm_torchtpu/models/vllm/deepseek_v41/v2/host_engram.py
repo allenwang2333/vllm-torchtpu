@@ -23,16 +23,10 @@ import numpy as np
 import torch
 from vllm.distributed import get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.models.deepseek_v41.common.engram import DEAD_ID
-
-try:
-    from vllm.models.deepseek_v41.common.engram import (
-        engram_gathered_num_tokens,
-    )
-except ImportError:
-    from vllm.models.deepseek_v41.nvidia.engram import (
-        engram_gathered_num_tokens,
-    )
+from vllm.models.deepseek_v41.common.engram import (
+    DEAD_ID,
+    engram_gathered_num_tokens,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
@@ -65,18 +59,55 @@ class HostEngramInputs:
         return self.all_prompt if self.host_ready is None else self.host_ready
 
 
+def _stage_async_next_tokens_cpu(runner: Any, pre_async: Any) -> None:
+    """Kick off a non-blocking 1-D D2H copy of ``pre_async.next_tokens_tpu``."""
+    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+    if not isinstance(next_tpu, torch.Tensor) or next_tpu.device.type == "cpu":
+        runner._host_engram_staged_next = None
+        return
+    flat_tpu = next_tpu.reshape(-1) if next_tpu.ndim > 1 else next_tpu
+    next_cpu = flat_tpu.to("cpu", non_blocking=True)
+    ready_event = torch.tpu.Event()
+    ready_event.record()
+    runner._host_engram_staged_next = (pre_async, next_cpu, ready_event, flat_tpu)
+
+
+def _resolve_next_tokens_cpu(pre_async: Any, runner: Any = None) -> torch.Tensor | None:
+    """Return ``pre_async.next_tokens_tpu`` as a 1-D CPU tensor."""
+    staged = getattr(runner, "_host_engram_staged_next", None)
+    if staged is not None and staged[0] is pre_async:
+        _, next_cpu, ready_event, _ = staged
+        if ready_event is not None:
+            ready_event.synchronize()
+            runner._host_engram_staged_next = (pre_async, next_cpu, None, None)
+        return next_cpu
+    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
+    if isinstance(next_tpu, torch.Tensor):
+        flat = next_tpu.reshape(-1) if next_tpu.ndim > 1 else next_tpu
+        return flat if flat.device.type == "cpu" else flat.to("cpu")
+    return None
+
+
 def _async_source_tokens_cpu(
-    pre_async: Any, *, prefer_next_tokens_tpu: bool = False
+    pre_async: Any,
+    *,
+    prefer_next_tokens_tpu: bool = False,
+    waited: Any = None,
+    runner: Any = None,
 ) -> torch.Tensor | None:
     """Resolve the previous step's sampled tokens on CPU for async substitution."""
     if prefer_next_tokens_tpu:
-        next_tpu_spec: Any = getattr(pre_async, "next_tokens_tpu", None)
-        if isinstance(next_tpu_spec, torch.Tensor):
-            return next_tpu_spec.to("cpu").reshape(-1)
-    wait_for_copy = getattr(pre_async, "wait_for_copy", None)
-    waited: Any = wait_for_copy() if callable(wait_for_copy) else None
+        next_cpu = _resolve_next_tokens_cpu(pre_async, runner=runner)
+        if next_cpu is not None:
+            return next_cpu
     copy_state = getattr(pre_async, "copy_state", None)
     chunks_cpu = getattr(copy_state, "chunks_cpu", None)
+    if waited is None:
+        if chunks_cpu and callable(copy_wait := getattr(copy_state, "wait", None)):
+            copy_wait()
+        else:
+            wait_for_copy = getattr(pre_async, "wait_for_copy", None)
+            waited = wait_for_copy() if callable(wait_for_copy) else None
     if chunks_cpu:
         c0 = chunks_cpu[0]
         return (
@@ -86,10 +117,7 @@ def _async_source_tokens_cpu(
         )
     if isinstance(waited, torch.Tensor):
         return waited.reshape(-1)
-    next_tpu: Any = getattr(pre_async, "next_tokens_tpu", None)
-    if isinstance(next_tpu, torch.Tensor):
-        return next_tpu.to("cpu").reshape(-1)
-    return None
+    return _resolve_next_tokens_cpu(pre_async, runner=runner)
 
 
 @dataclass(frozen=True)
@@ -108,6 +136,7 @@ class _AsyncSpecState:
     lengths: np.ndarray
     rejected: np.ndarray
     num_draft: np.ndarray
+    sampled_cpu: torch.Tensor | None = None
 
 
 def _resolve_async_spec_state(
@@ -219,7 +248,7 @@ def _resolve_async_spec_state(
         discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
         if discard_idx.size:
             lengths[discard_idx] = 0
-    return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft)
+    return _AsyncSpecState(stride, tokens, lengths, rejected, num_draft, sampled_cpu)
 
 
 @dataclass(frozen=True)
@@ -708,7 +737,10 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 src_idx = _ragged_arange(src_rows * stride, m_len)
                 max_src_idx = int(src_idx.max())
             flat_src = _async_source_tokens_cpu(
-                pre_async, prefer_next_tokens_tpu=(spec_state is not None)
+                pre_async,
+                prefer_next_tokens_tpu=(spec_state is not None),
+                waited=spec_state.sampled_cpu if spec_state is not None else None,
+                runner=runner,
             )
             if flat_src is None or int(flat_src.numel()) <= max_src_idx:
                 return _unresolved_host_inputs(runner, all_prompt)
@@ -820,10 +852,7 @@ def gather_host_engram_hashes(
                 return dp_group.all_gather(engram_hashes, dim=0)
     if gather_fn is not None:
         return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
-    try:
-        from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
-    except ImportError:
-        from vllm.models.deepseek_v41.nvidia.engram import gather_engram_hashes
+    from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
 
     return gather_engram_hashes(engram_hashes, dp_shared_memory=dp_shared_memory)
 
@@ -845,3 +874,17 @@ def install_host_engram_inputs() -> None:
 
     prepare._deepseek_v41_host_engram = True  # type: ignore[attr-defined]
     TPUModelRunner._prepare_lookback_token_ids = prepare  # type: ignore[method-assign]
+
+    orig_sample = getattr(
+        getattr(TPUModelRunner, "sample_tokens", None),
+        "__wrapped__",
+        getattr(TPUModelRunner, "sample_tokens", lambda *_, **__: None),
+    )
+
+    def sample_tokens(self, grammar_output):
+        result = orig_sample(self, grammar_output)
+        _stage_async_next_tokens_cpu(self, getattr(self, "_pre_async_results", None))
+        return result
+
+    sample_tokens.__wrapped__ = orig_sample  # type: ignore[attr-defined]
+    TPUModelRunner.sample_tokens = sample_tokens  # type: ignore[method-assign]

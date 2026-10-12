@@ -14,30 +14,10 @@ import torch
 from vllm.distributed import get_engram_dp_group, get_engram_dp_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common import engram as upstream
-
-try:
-    from vllm.models.deepseek_v41.common.engram import (
-        engram_gathered_num_tokens,
-        engram_head_shard_rank,
-    )
-except ImportError:
-    from vllm.models.deepseek_v41.nvidia.engram import (
-        engram_gathered_num_tokens,
-        engram_head_shard_rank,
-    )
-
-if not hasattr(upstream, "gather_engram_hashes"):
-    try:
-        from vllm.models.deepseek_v41.nvidia import engram as _nvidia_engram
-
-        upstream.gather_engram_hashes = getattr(
-            _nvidia_engram, "gather_engram_hashes", None
-        )
-    except ImportError:
-        pass
-
-if not hasattr(upstream, "engram_gathered_num_tokens"):
-    upstream.engram_gathered_num_tokens = engram_gathered_num_tokens
+from vllm.models.deepseek_v41.common.engram import (
+    engram_gathered_num_tokens,
+    engram_head_shard_rank,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
@@ -663,7 +643,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             else bool(cpu_offload)
         )
         self.cpu_offload = self.host_offload
-        self.dp_shared_memory = bool(kwargs.pop("dp_shared_memory", False))
+        self._dp_shared_memory = bool(kwargs.pop("dp_shared_memory", False))
+        self.dp_shared_memory = self._dp_shared_memory
         self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
         # Rows load into Host DRAM as with cpu_offload, then
         # `move_rows_to_pinned_host` hands them to the TPU's pinned_host
@@ -679,12 +660,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            try:
-                super().__init__(
-                    num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
-                )
-            except TypeError:
-                super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
+            super().__init__(
+                num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
+            )
         self.cpu_offload = self.host_offload
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:
@@ -693,9 +671,14 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
-        if getattr(self, "dp_size", 1) == 1:
+        self.dp_shared_memory = self._dp_shared_memory
+        self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
+        if self.dp_size == 1:
             return super()._get_shard_info()
         return self.tp_size * self.dp_size, engram_head_shard_rank()
+
+    def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.weight.data, self.weight_scale_inv.data
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.host_offload:
@@ -915,7 +898,7 @@ def _gather_engram_rows(rows, dim):
     # This does not fix the native Engram NaN: it also reproduces at width
     # 128, while an isolated 3-D BF16 gather passes. Released heads are 256.
     width = rows.shape[-1]
-    padding = (-width) % 128
+    padding = 0 if rows.dtype == torch.int32 else (-width) % 128
     if padding:
         rows = torch.nn.functional.pad(rows, (0, padding))
     result = upstream.tensor_model_parallel_all_gather(rows, dim=dim)
@@ -1021,6 +1004,56 @@ def _dp_gather_packed_rows(
     ).contiguous()
 
 
+def _sp_gather_packed_rows(
+    active_raw: torch.Tensor,
+    num_tokens: int,
+    *,
+    tp: int,
+    rank: int,
+    n_hash_cols: int,
+    cols: int,
+    head_dim: int,
+    blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """SP token-for-heads exchange on the packed int32 staging words.
+
+    Same result as dequantizing every staged token and calling
+    ``_gather_engram_rows(..., dim=0)`` on the bf16 rows in ``_sp_embed``,
+    but the collective moves the packed FP8 + E8M0 int32 words (1.94x less
+    bandwidth, without 128-lane bf16 trailing padding) and only this rank's
+    ``chunk = -(-num_tokens // tp)`` token window is unpacked and dequantized.
+    """
+    chunk = -(-num_tokens // tp)
+    pad = chunk * tp - num_tokens
+    raw_words_per_tok = (cols * head_dim) // 4
+    raw_words = num_tokens * raw_words_per_tok
+    start = rank * chunk
+    gathered = _gather_engram_rows(active_raw, dim=0).view(tp, -1)
+    raw_all = gathered[:, :raw_words].reshape(tp, num_tokens, -1)
+    scale_words = gathered[:, raw_words:]
+    scale_all = (
+        _unpack_bytes(scale_words, scale_words.numel() * 4)
+        .reshape(tp, -1)[:, : num_tokens * cols * blocks]
+        .reshape(tp, num_tokens, cols, blocks)
+    )
+    if pad:
+        raw_all = torch.nn.functional.pad(raw_all, (0, 0, 0, pad))
+        scale_all = torch.nn.functional.pad(
+            scale_all, (0, 0, 0, 0, 0, pad), value=_INVALID_SCALE
+        )
+    raw_sel = raw_all[:, start : start + chunk]
+    raw = _unpack_bytes(raw_sel, tp * chunk * cols * head_dim).reshape(
+        tp, chunk, cols, head_dim
+    )
+    scale = scale_all[:, start : start + chunk]
+    return dequant_fp8_rows(
+        raw.transpose(0, 1).reshape(chunk, tp * cols, head_dim)[:, :n_hash_cols],
+        scale.transpose(0, 1).reshape(chunk, tp * cols, blocks)[:, :n_hash_cols],
+        block_size,
+    ).contiguous()
+
+
 def _embed_dp_size(engram: object) -> int:
     embed = getattr(engram, "embed_tokens", None)
     dp_size = getattr(embed, "dp_size", 1)
@@ -1053,7 +1086,15 @@ class Engram(upstream.Engram):
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         dp_tokens = max_tokens * _embed_dp_size(self)
-        super()._init_staging(dp_tokens, head_dim)
+        self._prefetch_stream = None
+        with device_hooks(
+            torch.cuda,
+            Stream=lambda *_, **__: None,
+            Event=lambda *_, **__: None,
+        ):
+            super()._init_staging(dp_tokens, head_dim)
+        if getattr(self, "staged_rows", None) is not None:
+            self.staged_rows = self.staged_rows[:dp_tokens]
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._active_rows: torch.Tensor | None = None
@@ -1325,20 +1366,39 @@ class Engram(upstream.Engram):
         token-axis all-gather yields ``[tp, T_pad, local_heads, dim]`` whose
         rank-major head order matches upstream's non-SP ``dim=1`` gather.
         """
-        rows = self._ready_rows(hash_ids.shape[0])
-        cols = self.embed_tokens.n_hash_cols
+        n_hash_cols = self.embed_tokens.n_hash_cols
         tp = self.embed_tokens.tp_size
+        rank = upstream.get_tensor_model_parallel_rank()
+        if (
+            tp > 1
+            and _embed_dp_size(self) == 1
+            and getattr(self, "_active_rows", None) is None
+            and getattr(self, "_staged_raw", None) is not None
+        ):
+            assert self._active_raw is not None
+            _, cols, head_dim = self._host_raw.shape
+            return _sp_gather_packed_rows(
+                self._active_raw,
+                hash_ids.shape[0],
+                tp=tp,
+                rank=rank,
+                n_hash_cols=n_hash_cols,
+                cols=cols,
+                head_dim=head_dim,
+                blocks=self._scale_blocks,
+                block_size=self.embed_tokens.block_size,
+            )
+        rows = self._ready_rows(hash_ids.shape[0])
+        if tp == 1:
+            return rows[:, :n_hash_cols]
         num_tokens = rows.shape[0]
         chunk = -(-num_tokens // tp)
-        rank = upstream.get_tensor_model_parallel_rank()
-        if tp == 1:
-            return rows[:, :cols]
         pad = chunk * tp - num_tokens
         if pad:
             rows = torch.nn.functional.pad(rows, (0, 0, 0, 0, 0, pad))
         gathered = _gather_engram_rows(rows, dim=0).unflatten(0, (tp, chunk * tp))
         local = gathered[:, rank * chunk : (rank + 1) * chunk]
-        return local.transpose(0, 1).flatten(1, 2)[:, :cols]
+        return local.transpose(0, 1).flatten(1, 2)[:, :n_hash_cols]
 
     def forward(self, hidden_states, hash_ids, token_mask=None):
         if self.use_sequence_parallel:
