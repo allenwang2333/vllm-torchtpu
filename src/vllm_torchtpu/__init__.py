@@ -2077,41 +2077,21 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     )
 
 
-def _patch_decode_bench_connector_zero_temp() -> None:
-    """Coalesce and slice-fill KV blocks in DecodeBenchConnectorWorker (`0 B` temp HBM, `40.9x` faster)."""
+def _patch_decode_bench_connector_safe_main_end() -> None:
+    """Restrict DecodeBenchConnectorWorker fills to [1 : _main_end) blocks only."""
     from vllm.distributed.kv_transfer.kv_connector.v1 import (
         decode_bench_connector as _dbc,
     )
 
     cls = getattr(_dbc, "DecodeBenchConnectorWorker", None)
-    if cls is None or getattr(cls, "_tpu_zero_temp_fill_patch", False):
+    if cls is None or getattr(cls, "_tpu_safe_main_end_patch", False):
         return
 
-    def _start_load_kv(self, forward_context) -> None:
-        attn_metadata = forward_context.attn_metadata
-        if attn_metadata is None:
-            return
-        metadata = self._get_connector_metadata()
-        if not metadata or not metadata.reqs_to_fill:
-            return
-        assert self.kv_caches is not None, "KV caches must be registered before filling"
-        assert self.group_to_layers is not None, "Group mapping must be initialized"
-        merged_per_group: dict[int, list[int]] = {}
-        total_tokens = 0
-        for _req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            total_tokens += num_tokens
-            for group_idx, block_ids in enumerate(block_ids_per_group):
-                merged_per_group.setdefault(group_idx, []).extend(block_ids)
-        for group_idx, block_ids in merged_per_group.items():
-            self._fill_blocks(group_idx, block_ids, total_tokens)
-
-    def _fill_kv_tensor(
-        self, kv_cache: torch.Tensor, block_ids: list[int], num_tokens: int
-    ) -> None:
-        max_blk = kv_cache.shape[0]
-        valid = sorted({b for b in block_ids if 0 <= b < max_blk})
+    def _safe_runs(kv_cache: torch.Tensor, block_ids: list[int]) -> list[tuple[int, int]]:
+        max_blk = getattr(kv_cache, "_main_end", kv_cache.shape[0])
+        valid = sorted({b for b in block_ids if 1 <= b < max_blk})
         if not valid:
-            return
+            return []
         lo = valid[0]
         hi = lo + 1
         runs: list[tuple[int, int]] = []
@@ -2123,7 +2103,12 @@ def _patch_decode_bench_connector_zero_temp() -> None:
                 lo = b
                 hi = b + 1
         runs.append((lo, hi))
-        for r_lo, r_hi in runs:
+        return runs
+
+    def _fill_kv_tensor(
+        self, kv_cache: torch.Tensor, block_ids: list[int], num_tokens: int
+    ) -> None:
+        for r_lo, r_hi in _safe_runs(kv_cache, block_ids):
             if self.fill_std > 0:
                 kv_cache[r_lo:r_hi] = torch.normal(
                     mean=self.fill_mean,
@@ -2135,12 +2120,60 @@ def _patch_decode_bench_connector_zero_temp() -> None:
             else:
                 kv_cache[r_lo:r_hi] = self.fill_mean
 
-    cls.start_load_kv = _start_load_kv
+    def _fill_block_tensor(
+        self,
+        kv_cache: torch.Tensor,
+        block_ids: list[int],
+        fill_mean: float,
+        fill_std: float,
+    ) -> None:
+        for r_lo, r_hi in _safe_runs(kv_cache, block_ids):
+            view = kv_cache[r_lo:r_hi]
+            if fill_std > 0:
+                view.normal_(mean=fill_mean, std=fill_std)
+            else:
+                view.fill_(fill_mean)
+
+    def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int) -> None:
+        if not block_ids:
+            return
+        assert self.kv_caches is not None
+        fill_mean, fill_std = (
+            (0.0, 0.0)
+            if group_idx in self._zero_fill_group_ids
+            else (self.fill_mean, self.fill_std)
+        )
+        for layer_name in self.group_to_layers.get(group_idx, []):
+            kv_cache = self.kv_caches.get(layer_name)
+            if kv_cache is None:
+                continue
+            if isinstance(kv_cache, torch.Tensor):
+                self._fill_block_tensor(kv_cache, block_ids, fill_mean, fill_std)
+            elif isinstance(kv_cache, (list, tuple)) and all(
+                isinstance(t, torch.Tensor) for t in kv_cache
+            ):
+                for t in kv_cache:
+                    if hasattr(t, "_main_end"):
+                        self._fill_block_tensor(t, block_ids, fill_mean, fill_std)
+                    else:
+                        self._fill_state_tensor(t, fill_mean, fill_std)
+
     cls._fill_kv_tensor = _fill_kv_tensor
-    cls._tpu_zero_temp_fill_patch = True
+    cls._fill_block_tensor = _fill_block_tensor
+    cls._fill_blocks = _fill_blocks
+    cls._tpu_safe_main_end_patch = True
 
 
 try:
-    _patch_decode_bench_connector_zero_temp()
+    _patch_decode_bench_connector_safe_main_end()
+except Exception:
+    pass
+
+try:
+    from vllm_torchtpu.distributed.kv_transfer.decode_bench_seeding import (
+        patch_decode_bench_seeding,
+    )
+
+    patch_decode_bench_seeding()
 except Exception:
     pass

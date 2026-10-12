@@ -230,7 +230,7 @@ class DeepseekV4MoE(nn.Module):
         skip_shared = getattr(self.experts, "_skip_shared", None)
         skip_gate = getattr(self.experts, "_skip_gate", None)
         if (
-            _TOKEN_SHARD_MIN_TOKENS > 0
+            _TOKEN_SHARD_MIN_TOKENS >= 0
             and self.tp_size > 1
             and self.shared_experts is not None
             and "_tp_gate_up_w" in self.shared_experts._buffers
@@ -512,18 +512,6 @@ class DeepseekV4MoE(nn.Module):
                 )
                 skip_gate[0] = True
         shared_local_out: torch.Tensor | None = None
-        fuse_shared_into_single_ar = (
-            not run_local_shared
-            and self.tp_size > 1
-            and self.shared_experts is not None
-            and skip_shared is not None
-            and getattr(
-                getattr(self.experts, "moe_config", None),
-                "skip_final_all_reduce",
-                False,
-            )
-            and self.shared_experts._can_fuse_quantized_mlp()
-        )
         if run_local_shared:
             assert self.shared_experts is not None and skip_shared is not None
             skip_shared[0] = True
@@ -533,15 +521,6 @@ class DeepseekV4MoE(nn.Module):
                     hidden_states_fp8=hidden_states_fp8,
                     hidden_states_scale=hidden_states_scale,
                 )
-        elif fuse_shared_into_single_ar:
-            assert self.shared_experts is not None and skip_shared is not None
-            skip_shared[0] = True
-            shared_local_out = self.shared_experts(
-                hidden_states,
-                hidden_states_fp8=hidden_states_fp8 if not input_is_token_sharded else None,
-                hidden_states_scale=hidden_states_scale if not input_is_token_sharded else None,
-                skip_all_reduce=True,
-            )
         elif (
             self.shared_experts is not None
             and hidden_states_fp8 is not None
@@ -571,10 +550,6 @@ class DeepseekV4MoE(nn.Module):
             if self.shared_experts is not None and hidden_states_fp8 is not None:
                 self.shared_experts.set_prequant_hidden(None, None)
         if self.experts.moe_config.skip_final_all_reduce and self.tp_size > 1:
-            if fuse_shared_into_single_ar and shared_local_out is not None:
-                final_hidden_states = final_hidden_states + shared_local_out.view_as(
-                    final_hidden_states
-                )
             if return_token_sharded:
                 if defer_shared_to_rs and self.shared_experts is not None:
                     xla_ops = getattr(torch.ops, "xla", None)
@@ -593,7 +568,7 @@ class DeepseekV4MoE(nn.Module):
                     final_hidden_states = tp_reduce_scatter(
                         final_hidden_states, dim=0
                     )
-                if not fuse_shared_into_single_ar and shared_local_out is not None:
+                if shared_local_out is not None:
                     final_hidden_states = (
                         final_hidden_states
                         + shared_local_out.view_as(final_hidden_states)

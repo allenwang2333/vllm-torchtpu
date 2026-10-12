@@ -638,7 +638,7 @@ def _run_engram_prelude_and_layers(
     bool,
 ]:
     tp_size = get_tensor_model_parallel_world_size()
-    if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS > 0:
+    if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS >= 0:
         # The threshold splits the bucket ladder into replicated and
         # token-sharded shape_variants traces; lift tp_rank_idx first in both
         # so their FX placeholder signatures agree (the alias is DCE'd).
@@ -1106,7 +1106,7 @@ class DeepseekV41DecoderStage(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         positions = torch.ops.aten.alias.default(positions)
         num_tokens = positions.shape[0]
-        if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS > 0:
+        if tp_size > 1 and _TOKEN_SHARD_MIN_TOKENS >= 0:
             # Canonical tp_rank_idx lift (see _run_engram_prelude_and_layers).
             _ = torch.ops.aten.alias.default(self.tp_rank_idx)
         token_sharded_mhc = tp_token_shard_ok(num_tokens, tp_size)
@@ -1519,6 +1519,7 @@ class DeepseekV41Model(nn.Module):
                         _ = attn._get_attn_op(True)
                         if supports_ced:
                             _ = attn._get_attn_op(False, ced_decoder=True)
+                            _ = attn._get_attn_op(True, ced_decoder=True)
                     else:
                         all_real = False
                 elif supports_ced:
@@ -1549,35 +1550,11 @@ class DeepseekV41Model(nn.Module):
             )
             if engram_hashes is not None:
                 self._engram_buf_dirty = True
-            else:
-                tp_size = get_tensor_model_parallel_world_size()
-                t_local = (
-                    num_tokens // tp_size
-                    if tp_token_shard_ok(num_tokens, tp_size)
-                    else num_tokens
-                )
-                if buf_1d is not None:
-                    if getattr(self, "_engram_buf_dirty", False):
-                        if buf_1d.ndim == 2:
-                            buf_1d[: min(max(t_local, 32), buf_1d.shape[0])].zero_()
-                        else:
-                            n_bytes = (
-                                t_local
-                                * n_tables
-                                * _engram_table_bytes(
-                                    n_hash_cols, self._engram_packed_dim
-                                )
-                            )
-                            buf_1d[:n_bytes].zero_()
-                        self._engram_buf_dirty = False
-                    engram_hashes = buf_1d
-                else:
-                    cols_flat = (t_local * n_tables * n_hash_cols) // num_tokens
-                    engram_hashes = torch.zeros(
-                        (num_tokens, cols_flat, self._engram_packed_dim),
-                        dtype=torch.uint8,
-                        device=positions.device,
-                    )
+            elif buf_1d is not None:
+                if getattr(self, "_engram_buf_dirty", False):
+                    buf_1d.zero_()
+                    self._engram_buf_dirty = False
+                engram_hashes = buf_1d
 
         if self._single_backbone_cond:
             assert self.full_stage is not None
@@ -1690,20 +1667,12 @@ class DeepseekV41Model(nn.Module):
             if hidden_states.shape[0] != num_tokens:
                 pm_cols = int(pre_mix.shape[-1])
                 pm_pad = ((pm_cols + 127) // 128) * 128
-                pm_aligned = torch.nn.functional.pad(
-                    pre_mix.to(hidden_states.dtype), (0, pm_pad - pm_cols)
+                hidden_states = tp_all_gather(hidden_states, dim=0)
+                pm_gathered = tp_all_gather(
+                    torch.nn.functional.pad(pre_mix, (0, pm_pad - pm_cols)), dim=0
                 )
-                hs_flat = hidden_states.reshape(hidden_states.shape[0], -1)
-                hs_cols = hs_flat.shape[-1]
-                gathered_seam = tp_all_gather(
-                    torch.cat([hs_flat, pm_aligned], dim=-1), dim=0
-                )
-                hidden_states = gathered_seam[:, :hs_cols].reshape(
-                    num_tokens, *hidden_states.shape[1:]
-                )
-                pre_mix = gathered_seam[:, hs_cols : hs_cols + pm_cols].to(
-                    pre_mix.dtype
-                )
+                pre_mix = pm_gathered[:, :pm_cols] + 0.0
+                synchronize_tensors([hidden_states, pre_mix], wait=True)
             return self.decoder_stage(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1733,30 +1702,20 @@ class DeepseekV41Model(nn.Module):
                 pre_mix[local_idx],
                 torch.zeros_like(pre_mix[local_idx]),
             )
-            hs_flat = hs_sel.reshape(hs_sel.shape[0], -1)
-            hs_cols = hs_flat.shape[-1]
             pm_cols = int(pm_sel.shape[-1])
             pm_pad = ((pm_cols + 127) // 128) * 128
-            reduced_seam = tensor_model_parallel_all_reduce(
-                torch.cat(
-                    [
-                        hs_flat,
-                        torch.nn.functional.pad(
-                            pm_sel.to(hs_flat.dtype), (0, pm_pad - pm_cols)
-                        ),
-                    ],
-                    dim=-1,
-                )
+            dec_hidden = tensor_model_parallel_all_reduce(hs_sel)
+            dec_pm_pad = tensor_model_parallel_all_reduce(
+                torch.nn.functional.pad(pm_sel, (0, pm_pad - pm_cols))
             )
-            dec_hidden = reduced_seam[:, :hs_cols].reshape(hs_sel.shape)
-            dec_pre_mix = reduced_seam[:, hs_cols : hs_cols + pm_cols].to(
-                pm_sel.dtype
-            )
+            dec_pre_mix = dec_pm_pad[:, :pm_cols] + 0.0
             dec_positions = positions.index_select(0, gather_idx)
+            synchronize_tensors([dec_hidden, dec_pre_mix, dec_positions], wait=True)
         else:
             dec_hidden, dec_pre_mix, dec_positions = _ced_gather_inputs(
                 hidden_states, pre_mix, positions, gather_idx
             )
+            synchronize_tensors([dec_hidden, dec_pre_mix, dec_positions], wait=True)
 
         if isinstance(attn_metadata, dict):
             decoder_metadata: Any = {

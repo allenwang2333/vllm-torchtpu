@@ -531,6 +531,23 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
+        hf_arch = getattr(
+            getattr(self.vllm_config.model_config, "hf_config", None),
+            "architectures",
+            (),
+        )
+        if any("DeepseekV41" in a for a in hf_arch):
+            from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+
+            page_size = int(self.cache_config.block_size) // 4
+            row_bytes = csa_cache_layout.ROW_WORDS * 4
+            mla_bpb = 3 * (
+                page_size * row_bytes
+                + (page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW) * row_bytes
+                + 33 * 4 * page_size
+            )
+            swa_extra_bpb = (15 - 3) * page_size * row_bytes
+            available = (available * mla_bpb) // (mla_bpb + swa_extra_bpb)
         return available
 
     def execute_model(self, scheduler_output):

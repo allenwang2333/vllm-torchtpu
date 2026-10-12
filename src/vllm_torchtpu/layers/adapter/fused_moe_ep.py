@@ -210,12 +210,6 @@ def _build_op(
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
         w1_scale = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
         w2_scale = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
-        _cap = int(
-            os.environ.get(
-                "VLLM_DSV41_MOE_V2_CAPACITY",
-                "32" if x.shape[0] <= 128 else ("64" if x.shape[0] <= 1024 else str(_TILE_M)),
-            )
-        )
         return fused_ep_moe_v2(
             x,
             w1,
@@ -227,7 +221,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_cap,
+            capacity=_TILE_M,
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -529,12 +523,6 @@ def _build_op(
             )
 
         def _run_v2(x_s, ids_s, w_s):
-            _cap_s = int(
-                os.environ.get(
-                    "VLLM_DSV41_MOE_V2_CAPACITY",
-                    "32" if x_s.shape[0] <= 128 else ("64" if x_s.shape[0] <= 1024 else str(_TILE_M)),
-                )
-            )
             return fused_ep_moe_v2(
                 x_s,
                 w1,
@@ -546,7 +534,7 @@ def _build_op(
                 topk=topk,
                 renormalize=False,
                 mesh=mesh,
-                capacity=_cap_s,
+                capacity=int(os.environ.get("VLLM_DSV41_MOE_V2_CAPACITY", "32" if x_s.shape[0] <= 128 else ("64" if x_s.shape[0] <= 1536 else str(_TILE_M)))),
                 block=None,
                 ragged_stride=None,
                 weight_format=WeightFormat(weight_format),
@@ -557,7 +545,7 @@ def _build_op(
                 hash_topk_ids=ids_s.astype(jnp.int32),
                 topk_weights_override=w_s.astype(jnp.float32),
                 routed_scaling_factor=1.0,
-                token_replica_groups=token_replica_groups,
+                token_replica_groups=None,
             )
 
         _max_v2_t_local = int(
@@ -885,9 +873,13 @@ def prebuild_fused_moe_ep(
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
-    sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
-    token_replica_groups = ep_token_replica_groups(
-        is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+    sharded_plan = bool(os.environ.get("VLLM_DSV41_MOE_V2_SHARDED_PLAN", "1") == "1")
+    token_replica_groups = (
+        None
+        if precomputed_routing
+        else ep_token_replica_groups(
+            is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+        )
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None

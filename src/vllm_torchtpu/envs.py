@@ -155,7 +155,6 @@ if TYPE_CHECKING:
     VLLM_DSV41_TP_INDEXER_MIN_TOKENS: int = 64
     VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS: int = 0
     VLLM_DSV41_TP_ATTN_LOCAL_TOPK: bool = False
-    VLLM_DSV41_ENGRAM_H2D_PREFIX: bool = True
 
 
 def env_with_choices(
@@ -920,9 +919,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the indexer layer and every layer reusing its top-k rows run
     # token-parallel attention, which reads only this rank's T/tp rows.
     "VLLM_DSV41_TP_ATTN_LOCAL_TOPK": env_bool("VLLM_DSV41_TP_ATTN_LOCAL_TOPK", False),
-    # Enable host Engram prefetch and active-bucket prefix H2D upload across
-    # 1+K speculative verify tokens.
-    "VLLM_DSV41_ENGRAM_H2D_PREFIX": env_bool("VLLM_DSV41_ENGRAM_H2D_PREFIX", True),
 }
 
 

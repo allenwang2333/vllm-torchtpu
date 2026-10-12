@@ -87,15 +87,11 @@ def _prepare_swa_metadata(
     # Trim oversized page tables BEFORE ring-mapping so scalar prefetch into
     # SMEM and modulo mapping operate on ~16 pages/seq instead of 2048.
     if pages_per_seq > window_pages * 2:
-        eff_span_packed = swa_kv_lens >> 20
-        raw_kv_lens = swa_kv_lens & 0xFFFFF
         q_lens = swa_cu_q_lens[1:] - swa_cu_q_lens[:-1]
-        eff_span = jnp.maximum(q_lens, eff_span_packed)
         base_pages = (
-            jnp.maximum(0, raw_kv_lens - eff_span - sliding_window) // logical_page_size
+            jnp.maximum(0, swa_kv_lens - q_lens - sliding_window) // logical_page_size
         )
-        raw_kv_lens = jnp.maximum(0, raw_kv_lens - base_pages * logical_page_size)
-        swa_kv_lens = raw_kv_lens | (eff_span_packed << 20)
+        swa_kv_lens = jnp.maximum(0, swa_kv_lens - base_pages * logical_page_size)
         page_table_2d = swa_page_indices.reshape(max_num_seqs, pages_per_seq)
         col_idx = jnp.minimum(
             base_pages[:, None] + jnp.arange(window_pages, dtype=jnp.int32)[None, :],
@@ -229,7 +225,7 @@ def _resolve_verify_q_len(q_tokens: int, non_causal_block: bool) -> int:
     if q_tokens > 1536:
         return 0
     try:
-        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        from vllm_torchtpu.layers.adapter.utils import (
             get_vllm_model_wrapper_context,
         )
 
@@ -238,7 +234,7 @@ def _resolve_verify_q_len(q_tokens: int, non_causal_block: bool) -> int:
         num_spec = getattr(spec_cfg, "num_speculative_tokens", None)
         if isinstance(num_spec, int) and num_spec >= 1:
             expected_q = num_spec if non_causal_block else (num_spec + 1)
-            if 2 <= expected_q <= 8:
+            if 2 <= expected_q <= 8 and q_tokens % expected_q == 0:
                 return expected_q
         if vllm_cfg is not None:
             return 0
@@ -246,7 +242,7 @@ def _resolve_verify_q_len(q_tokens: int, non_causal_block: bool) -> int:
         pass
     candidates = (5, 3, 4) if non_causal_block else (6, 5, 4)
     for cand in candidates:
-        if q_tokens >= cand:
+        if q_tokens % cand == 0:
             return cand
     return 0
 
@@ -317,10 +313,8 @@ def _attention_csa(
     union_gather_indices: jax.Array | None = None,
     cand_bits_tiled: jax.Array | None = None,
     n_unique: jax.Array | None = None,
-    pre_gathered_nope: jax.Array | None = None,
-    pre_gathered_rope: jax.Array | None = None,
     *,
-    precomputed_union: tuple[jax.Array, ...]
+    precomputed_union: tuple[jax.Array, jax.Array, jax.Array]
     | None = None,
     sm_scale: float,
     sliding_window: int,
@@ -332,9 +326,7 @@ def _attention_csa(
     non_causal_block: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: SWA pass, then sparse attention over the indexer's top-k rows."""
-    if (
-        sw_cache.shape[0] if two_caches_same_buffer else main_cache_kv.shape[0]
-    ) == 0 or main_cache_rope.shape[0] == 0:
+    if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
@@ -362,26 +354,11 @@ def _attention_csa(
         main_cache_kv = updated_sw_cache
 
     eff_union = (
-        (
-            union_gather_indices,
-            cand_bits_tiled,
-            n_unique,
-            pre_gathered_nope,
-            pre_gathered_rope,
-        )
-        if not two_caches_same_buffer
-        and union_gather_indices is not None
+        (union_gather_indices, cand_bits_tiled, n_unique)
+        if union_gather_indices is not None
         and cand_bits_tiled is not None
         and n_unique is not None
-        and pre_gathered_nope is not None
-        and pre_gathered_rope is not None
-        else (
-            (union_gather_indices, cand_bits_tiled, n_unique)
-            if union_gather_indices is not None
-            and cand_bits_tiled is not None
-            and n_unique is not None
-            else precomputed_union
-        )
+        else precomputed_union
     )
 
     output = sparse_ragged_paged_attention(

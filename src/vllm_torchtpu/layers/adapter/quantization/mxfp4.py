@@ -48,7 +48,6 @@ scaling.
 import os
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -585,136 +584,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             orig_intermediate_size,
         )
 
-    _mxfp4_tpu_chunk_ops: dict[tuple[int, bool], Any] = {}
-
-    @staticmethod
-    def _jax_dequant_mxfp4_bf16(w_u8: Any, s_u8: Any) -> Any:
-        import jax
-
-        fp4 = jax.lax.bitcast_convert_type(w_u8, jnp.float4_e2m1fn)
-        fp4 = fp4.reshape(*w_u8.shape[:-1], -1).astype(jnp.float32)
-        scale_f32 = jnp.ldexp(
-            jnp.ones_like(s_u8, dtype=jnp.float32),
-            s_u8.astype(jnp.int32) - 127,
-        )
-        num_blocks = s_u8.shape[-1]
-        blocked = fp4.reshape(*w_u8.shape[:-1], num_blocks, 32)
-        return (
-            (blocked * scale_f32[..., None])
-            .astype(jnp.bfloat16)
-            .reshape(*w_u8.shape[:-1], num_blocks * 32)
-        )
-
-    @staticmethod
-    def _jax_dequant_pad_requant_chunk(
-        w13_packed: jax.Array,
-        w13_scale: jax.Array,
-        w2_packed: jax.Array,
-        w2_scale: jax.Array,
-        *,
-        w13_block_size: int,
-        pack: bool,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        from vllm_torchtpu.layers.core.fused_moe_gmm import (
-            quantize_to_native_fp4_kmajor,
-        )
-
-        inter_in = w13_packed.shape[1] // 2
-        orig_hidden_size = w2_packed.shape[1]
-        orig_intermediate_size = w2_packed.shape[2] * 2
-
-        w2_pad_align = min(
-            w13_block_size,
-            max(128, -(-orig_intermediate_size // 128) * 128),
-        )
-        intermediate_padded = -(-orig_intermediate_size // w2_pad_align) * w2_pad_align
-        hidden_padded = -(-orig_hidden_size // w13_block_size) * w13_block_size
-        pad_intermediate = intermediate_padded - orig_intermediate_size
-        pad_hidden = hidden_padded - orig_hidden_size
-        w2_block_size = min(w13_block_size, intermediate_padded)
-
-        w1_u8 = w13_packed[:, :inter_in, :]
-        w3_u8 = w13_packed[:, inter_in:, :]
-        w1_s = w13_scale[:, :inter_in, :]
-        w3_s = w13_scale[:, inter_in:, :]
-
-        w1_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w1_u8, w1_s)
-        w3_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w3_u8, w3_s)
-        w2_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w2_packed, w2_scale)
-
-        w13_w = jnp.concatenate([w1_dq, w3_dq], axis=1).swapaxes(1, 2)
-        w2_w = w2_dq.swapaxes(1, 2)
-
-        w1_w = w13_w[:, :, :orig_intermediate_size]
-        w3_w = w13_w[:, :, orig_intermediate_size:]
-        if pad_hidden > 0 or pad_intermediate > 0:
-            w1_w = jnp.pad(w1_w, ((0, 0), (0, pad_hidden), (0, pad_intermediate)))
-            w3_w = jnp.pad(w3_w, ((0, 0), (0, pad_hidden), (0, pad_intermediate)))
-            w2_w = jnp.pad(w2_w, ((0, 0), (0, pad_intermediate), (0, pad_hidden)))
-        w13_pad = jnp.concatenate([w1_w, w3_w], axis=2)
-
-        q13_u8, s13 = quantize_to_native_fp4_kmajor(
-            w13_pad, block=w13_block_size, pack=True
-        )
-        q2_u8, s2 = quantize_to_native_fp4_kmajor(
-            w2_w, block=w2_block_size, pack=True
-        )
-        return q13_u8, q2_u8, s13, s2
-
-    @classmethod
-    def _get_mxfp4_tpu_chunk_op(cls, block: int, pack: bool):
-        key = (block, pack)
-        op = cls._mxfp4_tpu_chunk_ops.get(key)
-        if op is None:
-            import functools
-            from torch_tpu._internal import pallas
-
-            fn = functools.partial(
-                cls._jax_dequant_pad_requant_chunk,
-                w13_block_size=block,
-                pack=pack,
-            )
-            op = pallas.jax_op(
-                f"pallas::mxfp4_dequant_pad_requant_b{block}"
-                f"{'_packed' if pack else ''}",
-                fn,
-            )
-            cls._mxfp4_tpu_chunk_ops[key] = op
-        return op
-
-    def _fast_dequant_pad_requant_tpu(
-        self,
-        w13_packed: torch.Tensor,
-        w13_scale: torch.Tensor,
-        w2_packed: torch.Tensor,
-        w2_scale: torch.Tensor,
-        pack: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        op = self._get_mxfp4_tpu_chunk_op(REQUANTIZED_BLOCK_SIZE, pack)
-        n_exp = w13_packed.shape[0]
-        step = 8 if n_exp % 8 == 0 else (4 if n_exp % 4 == 0 else n_exp)
-        q13_list, q2_list, s13_list, s2_list = [], [], [], []
-        for s in range(0, n_exp, step):
-            q13, q2, s13, s2 = op(
-                w13_packed[s : s + step],
-                w13_scale[s : s + step],
-                w2_packed[s : s + step],
-                w2_scale[s : s + step],
-            )
-            synchronize_tensors([q13, q2, s13, s2])
-            q13_list.append(q13)
-            q2_list.append(q2)
-            s13_list.append(s13)
-            s2_list.append(s2)
-        out_dt = torch.float4_e2m1fn_x2 if not pack else torch.uint8
-        q13_u8 = torch.cat(q13_list, dim=0)
-        q2_u8 = torch.cat(q2_list, dim=0)
-        s13_cat = torch.cat(s13_list, dim=0)
-        s2_cat = torch.cat(s2_list, dim=0)
-        del q13_list, q2_list, s13_list, s2_list
-        synchronize_tensors([q13_u8, q2_u8, s13_cat, s2_cat])
-        return q13_u8.view(out_dt), q2_u8.view(out_dt), s13_cat, s2_cat
-
     def _requantize_native_fp4(
         self,
         w13_weight_padded: torch.Tensor,
@@ -723,37 +592,65 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         device: torch.device,
         pack: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize padded tensors to native FP4 K-major layout on TPU."""
+        """Quantize padded tensors to native FP4 K-major layout on TPU.
+
+        `pack=False` leaves the fp4 pairs unpacked as `float4_e2m1fn_x2`,
+        which is what the fused EP kernel reads; the GMM path wants the uint8
+        packing its `should_unpack` step undoes. Same values either way.
+        """
         del orig_intermediate_size
         w13_block_size = REQUANTIZED_BLOCK_SIZE
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, w2_weight_padded.shape[1])
 
         def _chunked_quant(w_pad: torch.Tensor, blk: int):
+            import gc, hashlib
             n_exp = w_pad.shape[0]
+            cache_dir = "/dev/shm/dsv41_fp4_cache"
+            os.makedirs(cache_dir, exist_ok=True)
+            sig_bytes = w_pad.reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
+            hkey = hashlib.md5(sig_bytes + f"_{tuple(w_pad.shape)}_{blk}_{pack}".encode()).hexdigest()[:16]
+            cpath = os.path.join(cache_dir, f"fp4_{hkey}.pt")
             out_dt = torch.float4_e2m1fn_x2 if not pack else torch.uint8
-            step = (
-                16
-                if n_exp % 16 == 0
-                else (8 if n_exp % 8 == 0 else (4 if n_exp % 4 == 0 else n_exp))
-            )
-            qw_list, qs_list = [], []
-            for s in range(0, n_exp, step):
-                w_sub = w_pad[s : s + step].to(device)
-                qw, qs = quantize_native_fp4_kmajor(w_sub, block=blk, pack=pack)
+            self._last_quant_cpath = cpath
+            if os.path.exists(cpath + ".done"):
+                saved = torch.load(cpath, map_location="cpu", weights_only=True)
+                qw_cat = saved["qw_u8"].view(out_dt).to(device)
+                qs_cat = saved["qs"].to(device)
+                synchronize_tensors([qw_cat, qs_cat])
+                del saved
+                return qw_cat, qs_cat
+            qw_cpu_list, qs_cpu_list = [], []
+            for s in range(0, n_exp, 6):
+                w_sub = w_pad[s : s + 6].to(device)
+                qw, qs = quantize_native_fp4_kmajor(
+                    w_sub, block=blk, pack=pack
+                )
                 synchronize_tensors([qw, qs])
-                qw_list.append(qw.view(torch.uint8))
-                qs_list.append(qs)
-            qw_cat = torch.cat(qw_list, dim=0).view(out_dt)
-            qs_cat = torch.cat(qs_list, dim=0)
+                qw_cpu_list.append(qw.view(torch.uint8).cpu())
+                qs_cpu_list.append(qs.cpu())
+                del w_sub, qw, qs
+            qw_u8 = torch.cat(qw_cpu_list, dim=0)
+            qs_cpu = torch.cat(qs_cpu_list, dim=0)
+            del qw_cpu_list, qs_cpu_list
+            tmp_p = cpath + f".tmp.{os.getpid()}"
+            torch.save({"qw_u8": qw_u8, "qs": qs_cpu}, tmp_p)
+            os.replace(tmp_p, cpath)
+            open(cpath + ".done", "w").close()
+            qw_cat = qw_u8.view(out_dt).to(device)
+            qs_cat = qs_cpu.to(device)
             synchronize_tensors([qw_cat, qs_cat])
+            del qw_u8, qs_cpu
+            gc.collect()
             return qw_cat, qs_cat
 
         w13_weight_processed, w13_weight_scale = _chunked_quant(
             w13_weight_padded, w13_block_size
         )
+        self._last_w13_cpath = self._last_quant_cpath
         w2_weight_processed, w2_weight_scale = _chunked_quant(
             w2_weight_padded, w2_block_size
         )
+        self._last_w2_cpath = self._last_quant_cpath
 
         return (
             w13_weight_processed,
@@ -769,8 +666,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             del layer.w13_bias, layer.w2_bias
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        # TODO(upstream): Extract generic on-disk quantization cache to a
+        # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
+        _warm_slice = os.environ.get("VLLM_CACHE_WARM_SLICE", "")
+        if _warm_slice:
+            _w_idx, _w_tot = (int(v) for v in _warm_slice.split("/"))
+            _l_seq = getattr(self, "_cache_warm_counter", 0)
+            VllmDeepseekV4Mxfp4MoEMethod._cache_warm_counter = _l_seq + 1
+            if (_l_seq % _w_tot) != _w_idx:
+                self._release_source_weights(layer)
+                return
         device = layer.w13_weight.device
+
         activation_str = self._set_tpu_activation(layer)
 
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
@@ -779,60 +687,32 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             register_score_bias_buffer,
         )
 
-        n_exp = layer.w13_weight.shape[0]
-        orig_hidden_size = layer.w2_weight.shape[1]
-        orig_intermediate = layer.w2_weight.shape[2] * 2
-        w13_block_size = REQUANTIZED_BLOCK_SIZE
-        w2_pad_align = min(
-            REQUANTIZED_BLOCK_SIZE,
-            max(128, -(-orig_intermediate // 128) * 128),
-        )
-        intermediate_padded = -(-orig_intermediate // w2_pad_align) * w2_pad_align
-        hidden_padded = -(-orig_hidden_size // w13_block_size) * w13_block_size
-        pad_intermediate = intermediate_padded - orig_intermediate
-        pad_hidden = hidden_padded - orig_hidden_size
-
-        if device.type == "tpu":
+        import hashlib
+        _raw_sig = layer.w13_weight.data.cpu().reshape(-1)[:4096].contiguous().view(torch.uint8).numpy().tobytes()
+        _meta_key = hashlib.md5(_raw_sig + f"_{tuple(layer.w13_weight.shape)}".encode()).hexdigest()[:16]
+        _meta_path = f"/dev/shm/dsv41_fp4_cache/meta_{_meta_key}.pt"
+        if os.path.exists(_meta_path + ".done"):
+            _m = torch.load(_meta_path, map_location="cpu", weights_only=True)
+            _s13 = torch.load(_m["w13_cpath"], map_location="cpu", weights_only=True)
+            _s2 = torch.load(_m["w2_cpath"], map_location="cpu", weights_only=True)
+            _e, _h, _n13_half = _s13["qw_u8"].shape
+            _inter = _s2["qw_u8"].shape[1]
             op = self._prebuild_w4a8(
                 layer,
                 activation_str,
-                torch.empty(
-                    (n_exp, hidden_padded, 2 * intermediate_padded), device="meta"
-                ),
-                torch.empty((n_exp, intermediate_padded, hidden_padded), device="meta"),
-                orig_intermediate,
-            )
-            _w13_b_src = getattr(layer, "w13_bias", None)
-            _w2_b_src = getattr(layer, "w2_bias", None)
-            w13_bias_padded = w2_bias_padded = None
-            if _w13_b_src is not None:
-                b1 = _w13_b_src.data[:, :orig_intermediate]
-                b3 = _w13_b_src.data[:, orig_intermediate:]
-                w13_bias_padded = torch.cat(
-                    [
-                        torch.nn.functional.pad(b1, (0, pad_intermediate)),
-                        torch.nn.functional.pad(b3, (0, pad_intermediate)),
-                    ],
-                    dim=1,
-                ).unsqueeze(1)
-            if _w2_b_src is not None:
-                w2_bias_padded = torch.nn.functional.pad(
-                    _w2_b_src.data, (0, pad_hidden)
-                ).unsqueeze(1)
-
-            (
-                w13_weight_processed,
-                w2_weight_processed,
-                w13_weight_scale,
-                w2_weight_scale,
-            ) = self._fast_dequant_pad_requant_tpu(
-                layer.w13_weight.data,
-                layer.w13_weight_scale.data,
-                layer.w2_weight.data,
-                layer.w2_weight_scale.data,
-                pack=False,
+                torch.empty((_e, _h, _n13_half * 2), device="meta"),
+                torch.empty((_e, _inter, _h), device="meta"),
+                _inter,
             )
             self._release_source_weights(layer)
+            w13_weight_processed = _s13["qw_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w2_weight_processed = _s2["qw_u8"].view(torch.float4_e2m1fn_x2).to(device)
+            w13_weight_scale = _s13["qs"].to(device)
+            w2_weight_scale = _s2["qs"].to(device)
+            w13_bias_padded = _m["w13_b"]
+            w2_bias_padded = _m["w2_b"]
+            w13_weight_padded = w2_weight_padded = None
+            del _m, _s13, _s2
         else:
             (
                 w13_weight_padded,
@@ -844,8 +724,8 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             op = self._prebuild_w4a8(
                 layer,
                 activation_str,
-                torch.empty_like(w13_weight_padded, device="meta"),
-                torch.empty_like(w2_weight_padded, device="meta"),
+                w13_weight_padded,
+                w2_weight_padded,
                 orig_intermediate,
             )
             self._release_source_weights(layer)
@@ -861,7 +741,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 device,
                 pack=False,
             )
-            del w13_weight_padded, w2_weight_padded
+            _tmp_m = _meta_path + f".tmp.{os.getpid()}"
+            torch.save({
+                "w13_cpath": self._last_w13_cpath,
+                "w2_cpath": self._last_w2_cpath,
+                "w13_b": w13_bias_padded.cpu() if w13_bias_padded is not None else None,
+                "w2_b": w2_bias_padded.cpu() if w2_bias_padded is not None else None,
+            }, _tmp_m)
+            os.replace(_tmp_m, _meta_path)
+            open(_meta_path + ".done", "w").close()
 
         layer.w13_weight = torch.nn.Parameter(w13_weight_processed, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight_processed, requires_grad=False)
@@ -877,7 +765,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 w2_bias_padded.to(device), requires_grad=False
             )
 
-        del w13_bias_padded, w2_bias_padded
+        del w13_weight_padded, w2_weight_padded, w13_bias_padded, w2_bias_padded
         to_sync = [
             layer.w13_weight,
             layer.w2_weight,
@@ -889,6 +777,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         if hasattr(layer, "w2_bias") and layer.w2_bias is not None:
             to_sync.append(layer.w2_bias)
         synchronize_tensors(to_sync)
+        import gc
+
+        gc.collect()
 
         logger.info(
             "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
@@ -930,17 +821,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # Materialize via host C-contiguous transfer so PJRT allocates canonical
-            # {2,1,0:T(8,128)} device layout instead of preserving {2,0,1:T(8,128)}
-            # reduction layout, eliminating 80 per-step HBM transpose copies across 40 layers.
+            # The kernel takes [E, K/block, N]; do the squeeze once here
+            # rather than per layer per step inside the compiled forward.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).to("cpu", dtype=torch.float32).contiguous().to(device),
+                layer.w13_weight_scale.squeeze(2).contiguous(),
                 persistent=False,
             )
             layer.register_buffer(
                 "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).to("cpu", dtype=torch.float32).contiguous().to(device),
+                layer.w2_weight_scale.squeeze(2).contiguous(),
                 persistent=False,
             )
             logger.info_once(
