@@ -45,14 +45,16 @@ def test_released_engram_shapes_lower_to_one_tpu_call(tokens):
         lowered = export.export(fn, platforms=("tpu",))(*inputs)
     assert lowered.out_avals[0].shape == (tokens, streams, dim)
     assert lowered.out_avals[0].dtype == jnp.bfloat16
-    assert lowered.mlir_module().count("stablehlo.custom_call @tpu_custom_call") == 1
+    module = lowered.mlir_module()
+    assert module.count("stablehlo.custom_call @tpu_custom_call") == 1
+    assert "stablehlo.transpose" not in module
 
 
 @pytest.mark.parametrize("tp", [1, 2, 8])
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("tile_m", [32, 64])
 def test_fused_engram_matches_torch_offload(tp, masked, tile_m, monkeypatch):
-    tokens, local_width, streams, dim = tile_m, 128, 4, 128
+    tokens, local_width, streams, dim = 2 * tile_m, 128, 4, 128
     width = tp * local_width
     monkeypatch.setitem(
         tuned_block_sizes.BLOCK_SIZES, (width, streams, dim), (tile_m, 128)

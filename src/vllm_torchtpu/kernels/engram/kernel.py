@@ -166,7 +166,7 @@ def fused_engram(
         """Process M=tile_m tokens, one output group and tile_k input columns.
 
         Ref shapes: raw_ref [P,M,C/4], scale_ref [P,M,C/(4*B)], h_ref and
-        out_ref [M,D], w_ref [tile_k,D], ws_ref [D], q_ref/k_ref [1,D],
+        out_ref [M,S,D], w_ref [tile_k,D], ws_ref [D], q_ref/k_ref [1,D],
         mask_ref [M,1]. VMEM: x_scratch FP8 [M,K], xs_scratch FP32 [M,1],
         acc_scratch FP32 [M,D], values_scratch BF16 [M,D].
         """
@@ -207,8 +207,9 @@ def fused_engram(
                 @pl.when(output_block != 0)
                 def apply_gate():
                     kv = jnp.concatenate((projection, values_scratch[tile, :]), axis=-1)
-                    out_ref[tile, :] = gated_residual(
-                        h_ref[tile, :][:, None, :],
+                    stream = output_block - 1
+                    out_ref[tile, stream, :] = gated_residual(
+                        h_ref[tile, stream, :][:, None, :],
                         kv,
                         q_ref[...],
                         k_ref[...],
@@ -230,23 +231,25 @@ def fused_engram(
         return jnp.where(j == 0, streams, j - 1)
 
     def local_block(i, j, k):
-        return stream_index(j), i, 0
+        return i, 0, 0
 
+    # Keep all streams in each token tile and select one stream inside VMEM.
+    # TPU BlockSpecs cannot squeeze the sublane dimension at the HBM boundary.
     result = pl.pallas_call(
         kernel,
         grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
             pl.BlockSpec((tp, tile_m, raw_words), token_block),
             pl.BlockSpec((tp, tile_m, scales.shape[-1]), token_block),
-            pl.BlockSpec((None, tile_m, dim), local_block),
+            pl.BlockSpec((tile_m, streams, dim), local_block),
             pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
             pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
             pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
             pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
             pl.BlockSpec((tile_m, 1), lambda i, j, k: (i, 0)),
         ],
-        out_specs=pl.BlockSpec((None, tile_m, dim), local_block),
-        out_shape=jax.ShapeDtypeStruct((streams, tokens, dim), hidden.dtype),
+        out_specs=pl.BlockSpec((tile_m, streams, dim), local_block),
+        out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
         scratch_shapes=[
             pltpu.VMEM((tile_m, in_features), weight.dtype),
             pltpu.VMEM((tile_m, 1), jnp.float32),
@@ -266,11 +269,11 @@ def fused_engram(
     )(
         raw,
         scales,
-        hidden.transpose(1, 0, 2),
+        hidden,
         weight,
         weight_scale,
         query_weight[:, None, :],
         key_weight[:, None, :],
         token_mask.reshape(tokens, 1),
     )
-    return result.transpose(1, 0, 2)
+    return result
