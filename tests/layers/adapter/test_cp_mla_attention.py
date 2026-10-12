@@ -564,7 +564,7 @@ def test_packed_all_to_all_merge_is_bitwise_the_two_exchange_merge(
     monkeypatch.setattr(
         cp_mla,
         "_all_to_all_packed",
-        lambda o, lse, g: calls.append(1) or real(o, lse, g),
+        lambda o, lse, g, *rest: calls.append(1) or real(o, lse, g, *rest),
     )
     one = _a2a_merge_whole(outputs, lses, monkeypatch)
     assert len(calls) == dcp_size  # every rank took the packed exchange
