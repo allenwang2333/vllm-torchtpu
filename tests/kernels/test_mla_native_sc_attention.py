@@ -1247,6 +1247,169 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                         num_live[c], tab[c * gpc : (c + 1) * gpc].sum() * bz * 64
                     )
 
+    def _live_fused_case(self, rng, num_tokens, real, overflow, pps=256):
+        page_size, total_pages, topk = 256, 2085, 2048
+        page_table = jnp.asarray(rng.integers(0, total_pages, size=8 * pps), jnp.int32)
+        # Ragged: several short sequences then one long one (a mixed step).
+        seq = [4, 4, 4, 4]
+        seq.append(real - sum(seq))
+        seq += [0] * (8 - len(seq))
+        cu_q_lens = jnp.asarray(np.r_[0, np.cumsum(seq)], jnp.int32)
+        counts = rng.integers(0, 300, size=num_tokens)
+        counts[0] = 0  # an empty row
+        counts[16:32] = 0  # a whole 16-token group owns nothing
+        counts[32:48] = 512  # a whole group with every atom live
+        counts[48] = 64  # exact atom edge
+        if overflow:
+            counts[min(real, num_tokens) - 1] = 1500  # last gridded token overflows
+            counts[50] = 513
+        else:
+            counts = np.minimum(counts, 512)
+        logical = rng.integers(0, pps * page_size, size=(num_tokens, topk))
+        topk_idx = jnp.asarray(
+            np.where(np.arange(topk)[None] < counts[:, None], logical, -1), jnp.int32
+        )
+        return page_table, cu_q_lens, jnp.int32(real), topk_idx, page_size, total_pages
+
+    def _live_fused_check(self, num_tokens, real, overflow, fault=None):
+        rng = np.random.default_rng(7 * num_tokens + real + int(overflow))
+        page_table, cu_q_lens, token_end, topk_idx, page_size, total_pages = (
+            self._live_fused_case(rng, num_tokens, real, overflow)
+        )
+        topk, cap, bz = 2048, 512, 16
+        chunk = min(256, num_tokens)
+        kw = dict(chunk_size=chunk, kernel_batch_size=bz, topk_cap=cap)
+        kv = jnp.sum(topk_idx != -1, axis=-1)
+        lw = sparse_mla.capped_live_windows(
+            kv, token_end, num_windows=topk // cap, **kw
+        )
+        tab, num_live = sparse_mla.live_group_table(
+            kv, token_end, num_windows=topk // cap, **kw
+        )
+        want = sparse_mla.prepare_capped_window_live(
+            topk_idx, page_table, cu_q_lens, lw, tab, page_size=page_size,
+            total_num_pages=total_pages, **kw,
+        )
+        rows, got_kv, got_tab, got_live = sparse_mla.prepare_capped_window_live_fused(
+            topk_idx, page_table, cu_q_lens, token_end, page_size=page_size,
+            total_num_pages=total_pages, _fault=fault, **kw,
+        )
+        np.testing.assert_array_equal(np.asarray(got_kv), np.asarray(kv))
+        np.testing.assert_array_equal(np.asarray(got_tab), np.asarray(tab))
+        np.testing.assert_array_equal(np.asarray(got_live), np.asarray(num_live))
+        nc = num_tokens // chunk
+        region = chunk * cap // 128
+        want = np.asarray(want).reshape(nc, 4 * region, 128)
+        kv_np, te = np.asarray(kv), int(token_end)
+        overflowed = 0
+        for c in range(nc):
+            got = np.asarray(rows[c])
+            self.assertEqual(got.shape, (4 * region, 128))
+            # The chunk's own window bound, as its gather reads it.
+            grid = min(max(te - c * chunk, 0), chunk)
+            grid = -(-grid // bz) * bz
+            tw = np.where(
+                np.arange(chunk) < grid,
+                -(-np.maximum(kv_np[c * chunk : (c + 1) * chunk], 1) // cap),
+                1,
+            )
+            cw = int(np.clip(tw.max(), 1, 4))
+            overflowed += cw > 1
+            np.testing.assert_array_equal(
+                got[: cw * region], want[c, : cw * region], err_msg=f"chunk {c} cw {cw}"
+            )
+        if overflow:
+            self.assertGreater(overflowed, 0)
+        return topk_idx
+
+    @parameterized.product(
+        shape=((128, 100), (256, 200), (512, 300), (1024, 1000), (1024, 77),
+               (2048, 2048), (4096, 3000)),
+        overflow=(False, True),
+    )
+    def test_capped_window_live_fused_matches_live(self, shape, overflow):
+        """TPU_DCP_MLA_MIXED_FUSED_PREP: `prepare_capped_window_live_fused` ==
+        kv_lens + `live_group_table` + `prepare_capped_window_live` bit for bit:
+        kv_lens, the group table, the gather bound, window 0 of every chunk and
+        every window < W(c) the chunk's gather reads."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        self._live_fused_check(*shape, overflow)
+
+    def test_capped_window_live_fused_faults_caught(self):
+        """Positive controls: each injected fault fails the bitwise check."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        for fault in ("kv", "off", "win1"):
+            with self.assertRaises(AssertionError, msg=fault):
+                self._live_fused_check(1024, 1000, True, fault=fault)
+
+    @parameterized.parameters(
+        {"query_tokens": 64, "seq_q": (4, 4, 49)},
+        {"query_tokens": 512, "seq_q": (4, 4, 300)},
+        {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        {"query_tokens": 2048, "seq_q": (4, 4, 2040)},
+    )
+    def test_mixed_fused_prep_bit_identical(self, query_tokens, seq_q):
+        """TPU_DCP_MLA_MIXED_FUSED_PREP through `sparse_ragged_paged_attention`
+        on the served mixed config (raw top-k, in-kernel mask, live gather,
+        widths, body levers): every real row's output and lse bit for bit."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261013 + query_tokens)
+        problem, _, _, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        counts[16:32] = 0
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=sparse_mla.MIXED_BODY_DEFAULT,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run(topk_raw))
+        out, lse = jax.block_until_ready(run(topk_raw, mixed_fused_prep=True))
+        np.testing.assert_array_equal(bits(out)[:real_tokens], bits(ref)[:real_tokens])
+        np.testing.assert_array_equal(
+            np.asarray(lse)[:real_tokens].view(np.uint32),
+            np.asarray(ref_lse)[:real_tokens].view(np.uint32),
+        )
+        # Positive control: one moved live entry of the longest row moves it.
+        row = int(np.argmax(counts[:real_tokens]))
+        moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(run(moved, mixed_fused_prep=True))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
     @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
     def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):
         """`prepare_capped_window_fused` rows == `prepare_capped_window_indices`
