@@ -1602,3 +1602,120 @@ def test_td8383_stage_keys_memoized_per_tensor(monkeypatch):
     third: dict[Any, Any] = {}
     assert attn._get_stage_rope_cache(third) is new_rope
     assert attn.__dict__["_rope_stage_entry"][0] is new_rope
+
+
+def test_tp93_token_parallel_segmented_and_prepadded_main_records(monkeypatch):
+    """TP9.3: verify token-parallel segmented main_records, segment_only=True in
+    _select_paged_indices, and 128-column pre-padding on source layers."""
+    count = 16
+    capacity = 256
+    positions = torch.arange(count, dtype=torch.int32)
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 8, 16], dtype=torch.int32),
+    )
+    metadata = {"src_pfx": meta, "idx_pfx": meta}
+    forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    captured_main_recs: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, swa_c, main_c, recs, main_recs, *args, **kw: (
+            captured_main_recs.append(main_recs.clone()) or torch.zeros_like(q)
+        ),
+    )
+
+    cache_mock = _make_paged_cache_mock(
+        torch.tensor([[10, 11], [12, 13]], dtype=torch.int32),
+        row_offset=500,
+        rows_per_page=32,
+    )
+    idx_cache_mock = _make_paged_cache_mock(
+        torch.tensor([[20, 21], [22, 23]], dtype=torch.int32),
+        row_offset=600,
+        rows_per_page=32,
+    )
+    idx_cache_mock.raw = MagicMock()
+
+    source_attn = _make_swa_attn(
+        window_size=64, ced_decoder=False, has_fast_swa_offset=True
+    )
+    source_attn.prefix = "src_pfx"
+    source_attn.compressed_cache_prefix = "src_pfx"
+    source_attn.index_source_layer_id = 0
+    source_attn._max_model_len = capacity * 2
+    source_attn._config = {"index_topk": 64}
+    source_attn._precompact_records = True
+    source_attn._token_parallel_attn = True
+    source_attn._tp_rank = torch.tensor(1, dtype=torch.int32)
+    source_attn._tp_rank_1d = torch.tensor([1], dtype=torch.int32)
+    source_attn.topk_indices_buffer = torch.full((32, 64), -1, dtype=torch.int32)
+    source_attn.candidate_block_size = 1
+    source_attn.candidate_block_buffer = None
+    source_attn.swa_cache_layer = SimpleNamespace(prefix="src_pfx", kv_cache=cache_mock)
+    source_attn.kv_cache = cache_mock
+    source_attn._static_forward_context = {
+        "src_pfx": SimpleNamespace(kv_cache=cache_mock)
+    }
+    source_attn.indexer = SimpleNamespace(
+        head_dim=8,
+        n_head=2,
+        wk=lambda lat: lat,
+        k_norm=lambda k: k,
+        indexer_op=SimpleNamespace(candidate_blocks=None, candidate_write=False),
+        k_cache=SimpleNamespace(
+            prefix="idx_pfx", compress_ratio=2, kv_cache=idx_cache_mock
+        ),
+    )
+    source_attn._project_index_q = lambda q, p: q
+
+    gather_calls = 0
+
+    def counting_gather(x):
+        nonlocal gather_calls
+        gather_calls += 1
+        return torch.cat([x, x], dim=0)
+
+    monkeypatch.setattr(v2_attn, "_gather_query_rows", counting_gather)
+    monkeypatch.setattr(
+        v2_attn,
+        "paged_indexer",
+        lambda q, c, *a, **kw: (
+            c.raw,
+            torch.zeros((q.shape[0], kw["topk"]), dtype=torch.int32),
+            None,
+        ),
+    )
+
+    out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+    qr = torch.ones((count, 16), dtype=torch.bfloat16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+    idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
+
+    # 1. token_parallel_main=True, topk=64 -> segment_only=True & 128-col padded
+    with v2_attn.stage_attention_cache_scope():
+        source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+        assert gather_calls == 0
+        assert captured_main_recs[-1].shape == (count // 2, 128)
+        assert torch.all(captured_main_recs[-1][:, 64:] == -1)
+
+        # Second call hits cached_comp_inputs; also test width == 128 (no F.pad)
+        source_attn._config = {"index_topk": 128}
+        source_attn.topk_indices_buffer = torch.full((32, 128), -1, dtype=torch.int32)
+        source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+        assert gather_calls == 0
+        assert captured_main_recs[-1].shape == (count // 2, 128)
+
+    # 2. owner_perm is not None inside segmented_main branch
+    meta.owner_perm = torch.arange(count, dtype=torch.int32)
+    meta.owner_inv = torch.arange(count, dtype=torch.int32)
+    meta.owner_q_loc = torch.tensor([[0, 4, 8], [0, 4, 8]], dtype=torch.int32)
+    with v2_attn.stage_attention_cache_scope():
+        source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+        assert captured_main_recs[-1].shape == (count // 2, 128)

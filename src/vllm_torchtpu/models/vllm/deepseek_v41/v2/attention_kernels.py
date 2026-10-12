@@ -1106,11 +1106,14 @@ def sparse_fp8_attention_jax(
     # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
     # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA
     # gathers after SWA instead so they pipeline with the SparseMLA chunks.
-    # Without the conditional (``max_requests``) this ordering still measured
-    # faster at 100k (16.0K vs 15.7K tok/s).
-    (maximum, denominator, numerator), nope_3d, rope_3d = jax.lax.optimization_barrier(
-        (state, nope_3d, rope_3d)
-    )
+    # When ``max_requests`` is set, `_attend_window` is branch-free so no
+    # barrier is needed and CSA gathers pipeline with TensorCore SWA.
+    if max_requests is None:
+        (maximum, denominator, numerator), nope_3d, rope_3d = (
+            jax.lax.optimization_barrier((state, nope_3d, rope_3d))
+        )
+    else:
+        maximum, denominator, numerator = state
     if union_gather or isinstance(main_pool, tuple):
         return sparse_ragged_paged_attention_union_gather(
             q,

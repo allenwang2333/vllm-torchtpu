@@ -1067,3 +1067,70 @@ class TestAttentionKernelsLocalQ:
                     wo_b_full_scale,
                 )
                 assert res_sharded_wob_pad.shape == (64, 5120)
+
+    def test_sparse_fp8_attention_jax_barrier_gated_on_max_requests(self):
+        """TP9.3: optimization_barrier runs only when max_requests is None."""
+        q = jnp.zeros((8, 2, 128), dtype=jnp.bfloat16)
+        swa_pool = jnp.zeros((64, 128), dtype=jnp.int32)
+        main_pool = jnp.zeros((64, 128), dtype=jnp.int32)
+        rope_pool = jnp.zeros((16, 32), dtype=jnp.int32)
+        swa_records = jnp.zeros((8, 64), dtype=jnp.int32)
+        main_records_aligned = jnp.zeros((8, 128), dtype=jnp.int32)
+        main_records_unaligned = jnp.zeros((8, 64), dtype=jnp.int32)
+        pages = jnp.zeros((2, 2), dtype=jnp.int32)
+        query_start_loc = jnp.array([0, 4, 8], dtype=jnp.int32)
+        sink = jnp.zeros((2,), dtype=jnp.float32)
+
+        barrier_calls = 0
+        orig_barrier = jax.lax.optimization_barrier
+
+        def counting_barrier(x):
+            nonlocal barrier_calls
+            barrier_calls += 1
+            return orig_barrier(x)
+
+        with (
+            mock.patch.object(
+                jax.lax, "optimization_barrier", side_effect=counting_barrier
+            ),
+            mock.patch(
+                "vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla.sparse_ragged_paged_attention",
+                side_effect=lambda q_in, *args, **kwargs: q_in,
+            ),
+        ):
+            out_none = attention_kernels.sparse_fp8_attention_jax(
+                q,
+                swa_pool,
+                main_pool,
+                rope_pool,
+                swa_records,
+                main_records_aligned,
+                pages,
+                query_start_loc,
+                sink,
+                scale=0.125,
+                page_size=16,
+                max_requests=None,
+                precompacted=True,
+            )
+            assert out_none.shape == q.shape
+            assert barrier_calls == 1
+
+            barrier_calls = 0
+            out_bounded = attention_kernels.sparse_fp8_attention_jax(
+                q,
+                swa_pool,
+                main_pool,
+                rope_pool,
+                swa_records,
+                main_records_unaligned,
+                pages,
+                query_start_loc,
+                sink,
+                scale=0.125,
+                page_size=16,
+                max_requests=2,
+                precompacted=True,
+            )
+            assert out_bounded.shape == q.shape
+            assert barrier_calls == 0
