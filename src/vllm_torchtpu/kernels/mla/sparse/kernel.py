@@ -1409,10 +1409,15 @@ def send_layout_supported(
         return False
     per = num_heads // world
     rows = num_tokens * per
+    lanes = send_layout_lanes(num_tokens, num_heads, world)
     return (
         per & (per - 1) == 0
+        and rows & (rows - 1) == 0
+        and lanes & (lanes - 1) == 0
         and 2 * rows <= vdim
-        and send_layout_lanes(num_tokens, num_heads, world) <= vdim
+        and lanes <= vdim
+        # The word build's strided roll shifts sublane d by d*L < a vreg.
+        and (world - 1) * per < 128
         and num_tokens % batch_size == 0
         and (batch_size * per) % SEND_PAD_ROWS == 0
     )
@@ -2006,23 +2011,29 @@ def _attention_kernel(
                 (lane >= send_rows) & (lane < send_rows + num_q_heads), lo_src, 0
             ),
         )
-        wl = lax.broadcasted_iota(jnp.int32, (send_world, lanes), 1)
-        acc = jnp.zeros((send_world, lanes), jnp.int32)
+        # Sublane d of the result is rolled by d*L once at the end (one
+        # strided roll, shifts below a vreg width); before it, lane j of
+        # sublane d holds what lands at J = (j + d*L) mod lanes. Token t's
+        # source row, rolled by t*L - (W-1)*L, puts head d*L+l (lane
+        # (W-1-d)*L + l) at J = t*L + l and its lo half at rows + t*L + l, so
+        # each lane takes the token whose words cover its J.
+        shape = (send_world, lanes)
+        big_j = (
+            lax.broadcasted_iota(jnp.int32, shape, 1)
+            + lax.broadcasted_iota(jnp.int32, shape, 0) * send_per
+        ) & (lanes - 1)
+        tok = lax.shift_right_logical(
+            big_j & (send_rows - 1), jnp.int32(send_per.bit_length() - 1)
+        )
+        tok = jnp.where(big_j < 2 * send_rows, tok, -1)
+        acc = jnp.zeros(shape, jnp.int32)
         for t in range(num_tokens):
-            # Sublane d rolled by t*L - (W-1)*L + d*L: lane (W-1-d)*L + l
-            # (head d*L+l) lands at t*L + l, and its lo half at rows + t*L + l.
-            y = pltpu.roll(
-                jnp.broadcast_to(src[t : t + 1, :], (send_world, lanes)),
-                (t * send_per - (send_world - 1) * send_per) % lanes,
-                1,
-                stride=send_per,
-                stride_axis=0,
-            )
-            lo_t = send_rows + t * send_per
-            m = ((wl >= t * send_per) & (wl < (t + 1) * send_per)) | (
-                (wl >= lo_t) & (wl < lo_t + send_per)
-            )
-            acc = jnp.where(m, y, acc)
+            shift = (t * send_per - (send_world - 1) * send_per) % lanes
+            row = src[t : t + 1, :]
+            if shift:
+                row = pltpu.roll(row, shift, 1)
+            acc = jnp.where(tok == t, jnp.broadcast_to(row, shape), acc)
+        acc = pltpu.roll(acc, 0, 1, stride=send_per, stride_axis=0)
         if lanes < o_dim:
             acc = jnp.concatenate(
                 [acc, jnp.zeros((send_world, o_dim - lanes), jnp.int32)], axis=1
