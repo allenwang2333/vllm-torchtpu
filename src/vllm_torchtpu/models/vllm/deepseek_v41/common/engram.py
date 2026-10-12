@@ -809,10 +809,8 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._shared_memory is not None:
-            return self._shared_memory.get_views(
-                self.weight.data, self.weight_scale_inv.data
-            )
-        return self.weight.data, self.weight_scale_inv.data
+            return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
+        return self.weight, self.weight_scale_inv
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.host_offload:
@@ -920,12 +918,17 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             weight.index_select(0, flat_rows)
             .view(*rows.shape, *weight.shape[1:])
             .unflatten(-1, (-1, self.block_size))
-            .float()
+            .to(torch.bfloat16)
         )
         scale_bits = scales.index_select(0, flat_rows).view(
             *rows.shape, *scales.shape[1:]
         )
-        scale = (scale_bits.to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
+        scale = (
+            (scale_bits.to(torch.int32) << 23)
+            .view(torch.float32)
+            .to(torch.bfloat16)
+            .unsqueeze(-1)
+        )
         out.copy_(
             (values * scale)
             .flatten(-2)
@@ -1027,11 +1030,14 @@ def dequant_fp8_rows(raw, scale, block_size):
     Byte 255 (``_INVALID_SCALE``) yields +0 whatever the raw bytes are,
     including FP8 NaN.
     """
-    values = raw.view(torch.float8_e4m3fn).unflatten(-1, (-1, block_size)).float()
-    power = (scale.to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
-    invalid = (scale == _INVALID_SCALE).unsqueeze(-1)
-    dequant = torch.where(invalid, 0.0, values * power).flatten(-2)
-    return dequant.to(torch.bfloat16)
+    values = (
+        raw.view(torch.float8_e4m3fn).unflatten(-1, (-1, block_size)).to(torch.bfloat16)
+    )
+    s_i32 = scale.to(torch.int32)
+    power = (s_i32 << 23).view(torch.float32).to(torch.bfloat16).unsqueeze(-1)
+    invalid = (s_i32 == _INVALID_SCALE).unsqueeze(-1)
+    zero = torch.zeros((), dtype=torch.bfloat16, device=raw.device)
+    return torch.where(invalid, zero, values * power).flatten(-2)
 
 
 def _unpack_bytes(words, num_bytes):
@@ -1041,9 +1047,7 @@ def _unpack_bytes(words, num_bytes):
     little-endian host. Staging crosses H2D as 1-D int32 because TorchTPU only
     takes the fast linearizer path for 1-D 32-bit tensors.
     """
-    shifts = torch.arange(0, 32, 8, dtype=torch.int32, device=words.device)
-    unpacked = (words.unsqueeze(-1) >> shifts) & 0xFF
-    return unpacked.to(torch.uint8).reshape(-1)[:num_bytes]
+    return words.contiguous().view(torch.uint8).reshape(-1)[:num_bytes]
 
 
 def _gather_engram_rows(rows, dim):
