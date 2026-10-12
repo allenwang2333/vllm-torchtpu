@@ -628,6 +628,12 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
             group_name="dcp_merge_test",
         )
         cp_mla.get_dcp_group = lambda: group
+        # The real-rows exchange is a JAX op on the DCP mesh, which reads the
+        # group from `distributed.dcp`; register it before any trace.
+        from vllm_torchtpu.distributed import dcp as dcp_mod
+
+        dcp_mod.get_dcp_group = lambda: group
+        cp_mla.prebuild_ragged_all_to_all(world)
         result["check"] = _check(rank, world, group, cp_mla)
         if bench_tokens:
             result["bench"] = _bench(rank, cp_mla, bench_tokens)
