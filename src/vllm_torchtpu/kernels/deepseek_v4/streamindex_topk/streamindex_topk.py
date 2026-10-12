@@ -931,11 +931,10 @@ def _short_prefill_end(
     max_num_seqs = cu_q_lens.shape[0] - 1
     seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    stops = (seq_ids >= distribution[0]) & (
-        (seq_ids >= distribution[1]) | (q_lens > max_q_len)
-    )
-    # Every stop is at or after distribution[0], and distribution[1] is one.
-    return jnp.min(jnp.where(stops, seq_ids, distribution[1]))
+    # The first sequence after the decodes that is too long for the pass, or
+    # distribution[1] if that comes first.
+    too_long = (seq_ids >= distribution[0]) & (q_lens > max_q_len)
+    return jnp.min(jnp.where(too_long, seq_ids, distribution[1]))
 
 
 @functools.partial(
@@ -1291,78 +1290,65 @@ def streamindex_topk(
             )
         return scores
 
-    # With the same block sizes as the mixed pass, a separate prefill pass would
-    # only add an empty kernel launch and its schedule (8-15us) to every call, so
-    # the prefill-only sequences then go to the mixed pass.
-    use_short_prefill_pass = (
-        num_kv_pages_per_blocks[1],
-        num_queries_per_blocks[1],
-        buffer_counts[1],
-    ) != (num_kv_pages_per_blocks[2], num_queries_per_blocks[2], buffer_counts[2])
+    def _case_blocks(case):
+        """The block-size kwargs of `case`'s pass, from the per-case tuples."""
+        return dict(
+            num_kv_pages_per_block=num_kv_pages_per_blocks[case.value],
+            num_queries_per_block=num_queries_per_blocks[case.value],
+            buffer_count=buffer_counts[case.value],
+        )
+
+    # Short prefill-only sequences, e.g. speculative-decoding verify windows, get
+    # a pass of their own in which each fits one q block: a 4-token window in the
+    # mixed pass's 128-row q block would spend 97% of its work on padding. With
+    # the same block sizes as the mixed pass, that pass would only add an empty
+    # kernel launch and its schedule (8-15us) to every call, so it is skipped.
+    use_short_prefill_pass = _case_blocks(MlaCase.PREFILL) != _case_blocks(
+        MlaCase.MIXED
+    )
+    max_short_q_len = num_queries_per_blocks[MlaCase.PREFILL.value]
 
     def _pass_specs(decode_batch_end, short_end):
-        """`run_scores_kernel` kwargs for the passes over the batch."""
-        decode_cfg = dict(
-            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-            num_queries_per_block=num_queries_per_blocks[0],
-            buffer_count=buffer_counts[0],
-            static_q_len=1,
-            case=MlaCase.DECODE,
-        )
-        batched_decode = (
-            ()
-            if max_num_seqs < decode_req_batch_size
-            else (
-                dict(
-                    start_seq_idx=jnp.array(0),
-                    end_seq_idx=decode_batch_end,
+        """`run_scores_kernel` kwargs for the passes over the batch, in order."""
+
+        def spec(case, start_seq_idx, end_seq_idx, static_q_len, seq_batch_size=1):
+            return dict(
+                case=case,
+                start_seq_idx=start_seq_idx,
+                end_seq_idx=end_seq_idx,
+                static_q_len=static_q_len,
+                seq_batch_size=seq_batch_size,
+                **_case_blocks(case),
+            )
+
+        specs = []
+        if max_num_seqs >= decode_req_batch_size:
+            specs.append(
+                spec(
+                    MlaCase.DECODE,
+                    jnp.array(0),
+                    decode_batch_end,
+                    static_q_len=1,
                     seq_batch_size=decode_req_batch_size,
-                    **decode_cfg,
-                ),
+                )
             )
+        # The decodes past the last full group of `decode_req_batch_size`.
+        specs.append(
+            spec(MlaCase.DECODE, decode_batch_end, distribution[0], static_q_len=1)
         )
-        # Short prefill-only sequences, e.g. speculative-decoding verify windows,
-        # each fit in one q block of the prefill size: a 4-token window in the
-        # mixed pass's 128-row q block would spend 97% of its work on padding.
-        # `static_q_len` is that one block, which bounds the schedule by the
-        # number of sequences instead of tokens.
-        short_prefill = (
-            (
-                dict(
-                    num_kv_pages_per_block=num_kv_pages_per_blocks[1],
-                    num_queries_per_block=num_queries_per_blocks[1],
-                    buffer_count=buffer_counts[1],
-                    start_seq_idx=distribution[0],
-                    end_seq_idx=short_end,
-                    static_q_len=num_queries_per_blocks[1],
-                    seq_batch_size=1,
-                    case=MlaCase.PREFILL,
-                ),
+        if use_short_prefill_pass:
+            # `static_q_len` is the one q block, which bounds the schedule by the
+            # number of sequences instead of tokens.
+            specs.append(
+                spec(
+                    MlaCase.PREFILL,
+                    distribution[0],
+                    short_end,
+                    static_q_len=max_short_q_len,
+                )
             )
-            if use_short_prefill_pass
-            else ()
-        )
-        return (
-            *batched_decode,
-            # Handle num_decode_seqs % decode_req_batch_size != 0 case.
-            dict(
-                start_seq_idx=decode_batch_end,
-                end_seq_idx=distribution[0],
-                seq_batch_size=1,
-                **decode_cfg,
-            ),
-            *short_prefill,
-            dict(
-                num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-                num_queries_per_block=num_queries_per_blocks[2],
-                buffer_count=buffer_counts[2],
-                start_seq_idx=short_end,
-                end_seq_idx=distribution[2],
-                static_q_len=None,
-                seq_batch_size=1,
-                case=MlaCase.MIXED,
-            ),
-        )
+        specs.append(spec(MlaCase.MIXED, short_end, distribution[2], static_q_len=None))
+        return specs
 
     def _pass_metadata(spec, chunk_starts, chunk_tokens):
         """One schedule per pass, holding every chunk's steps back to back."""
@@ -1441,9 +1427,7 @@ def streamindex_topk(
         )
 
         short_end = (
-            _short_prefill_end(
-                cu_q_lens, distribution, max_q_len=num_queries_per_blocks[1]
-            )
+            _short_prefill_end(cu_q_lens, distribution, max_q_len=max_short_q_len)
             if use_short_prefill_pass
             else distribution[0]
         )
@@ -1484,40 +1468,34 @@ def streamindex_topk(
                 (spec, _pass_metadata(spec, chunk_starts, chunk_len)) for spec in specs
             )
 
-        if num_chunks == 1 and use_short_prefill_pass:
-            # During speculative decoding every sequence is usually a short verify
-            # window, which leaves the prefill pass as the only one with work.
-            # Branching around the others skips their schedules and launches,
-            # which dominate a small batch's latency.
-            short_specs = tuple(
-                spec for spec in pass_specs if spec["case"] == MlaCase.PREFILL
-            )
+        # During speculative decoding every sequence is usually a short verify
+        # window, which leaves the prefill pass as the only one with work. A
+        # single chunk then branches around the other passes, skipping their
+        # schedules and launches, which dominate a small batch's latency.
+        branch_on_short_only = num_chunks == 1 and use_short_prefill_pass
+        passes = () if branch_on_short_only else with_schedules(pass_specs)
 
-            def single_chunk_scores(specs):
+        def score_chunk(m, scheduling_group_id):
+            def score(scheduled):
                 return _scores_for_chunk(
-                    with_schedules(specs), 0, None, chunk_len, out_dtype, None
-                )
-
-            def score_chunk(m, scheduling_group_id):
-                del m, scheduling_group_id  # One chunk, no partner group.
-                return lax.cond(
-                    (distribution[0] == 0) & (short_end == distribution[2]),
-                    lambda: single_chunk_scores(short_specs),
-                    lambda: single_chunk_scores(pass_specs),
-                )
-
-        else:
-            passes = with_schedules(pass_specs)
-
-            def score_chunk(m, scheduling_group_id):
-                return _scores_for_chunk(
-                    passes,
+                    scheduled,
                     m,
                     chunk_starts[m],
                     chunk_len,
                     out_dtype,
                     scheduling_group_id,
                 )
+
+            if not branch_on_short_only:
+                return score(passes)
+            # Each branch builds its own schedules, so the short-only one skips
+            # the others'.
+            short_specs = [s for s in pass_specs if s["case"] == MlaCase.PREFILL]
+            return lax.cond(
+                (distribution[0] == 0) & (short_end == distribution[2]),
+                lambda: score(with_schedules(short_specs)),
+                lambda: score(with_schedules(pass_specs)),
+            )
 
         topk_idxs = []
         topk_scores_list = []

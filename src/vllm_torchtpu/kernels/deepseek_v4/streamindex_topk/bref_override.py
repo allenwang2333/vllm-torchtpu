@@ -31,25 +31,6 @@ def _step_offset(meta_ref: Any, chunk_idx: int):
     return sum(meta_ref.num_steps[m] for m in range(chunk_idx))
 
 
-def local_kv_len(
-    seq_lens_ref: Any,
-    cp_rank_ref: Any,
-    seq_idx: int | jax.Array,
-    *,
-    compression_ratio: int,
-    cp_size: int,
-    interleave_c: int,
-):
-    """Compressed KV positions of sequence `seq_idx` that this rank holds."""
-    seq_idx = jnp.minimum(seq_idx, seq_lens_ref.shape[0] - 1)
-    return cp_local_length(
-        seq_lens_ref[seq_idx] // compression_ratio,
-        cp_rank_ref[0],
-        cp_size,
-        interleave_c,
-    )
-
-
 def _token_window(
     refs: tuple[Any, ...],
     p_id: int | jax.Array,
@@ -337,13 +318,15 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     def num_pages(self, src_ref: tuple[Any, ...], p_id, batch_idx: int):
         """Pages of step `p_id`'s KV block holding sequence `batch_idx`'s keys."""
         _, _, meta_ref, seq_lens_ref, cp_rank_ref = src_ref
-        kv_len = local_kv_len(
-            seq_lens_ref,
-            cp_rank_ref,
-            meta_ref.batch_tile_idx[p_id] + batch_idx,
-            compression_ratio=self.compression_ratio,
-            cp_size=self.cp_size,
-            interleave_c=self.interleave_c,
+        seq_idx = jnp.minimum(
+            meta_ref.batch_tile_idx[p_id] + batch_idx, seq_lens_ref.shape[0] - 1
+        )
+        # This rank's share of the sequence's compressed keys.
+        kv_len = cp_local_length(
+            seq_lens_ref[seq_idx] // self.compression_ratio,
+            cp_rank_ref[0],
+            self.cp_size,
+            self.interleave_c,
         )
         first_page = meta_ref.bkv_idx[p_id] * self.bkv_p
         return jnp.clip(pl.cdiv(kv_len, self.page_size) - first_page, 0, self.bkv_p)
