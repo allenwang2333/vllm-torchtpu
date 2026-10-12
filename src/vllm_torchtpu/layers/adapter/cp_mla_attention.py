@@ -380,9 +380,11 @@ def prebuild_ragged_all_to_all(world: int) -> None:
     ranks at model build, not inside a trace."""
     global _DCP_RANK
     if world not in _RAGGED_A2A_OPS:
-        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
 
-        _DCP_RANK = torch.tensor([get_dcp_rank()], dtype=torch.int32, device="tpu")
+        # The same per-device int32 [1] rank buffer TPU_DCP_RANK_OPERAND hands
+        # the DCP attention and indexer ops: one buffer for every consumer.
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
         _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
 
 
