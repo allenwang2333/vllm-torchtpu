@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
+    TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -615,6 +616,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_KV_WRITE_IN_GATHER": env_bool(
         "TPU_MLA_KV_WRITE_IN_GATHER", default=False
     ),
+    # Run the MLA q_b projection inside the DCP indexer op, in the local
+    # SparseCore top-k's XLA scheduling group, so decode issues it while the TC
+    # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
+    # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
+    "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")
