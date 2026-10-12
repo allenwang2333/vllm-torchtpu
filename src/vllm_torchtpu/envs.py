@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
+    TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
+    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -444,6 +446,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 0),
     "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": env_int(
         "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 1024
+    ),
+    # The chunked merge (TPU_DCP_MERGE_CHUNKED) gathers every chunk's lse in
+    # one all-gather up front instead of one synchronous all-gather per chunk
+    # (the scheduler issues most of those ahead of chunk 0's weights, so each
+    # one's fixed cost delays the first SparseCore reduce-scatter). Bitwise
+    # the same merge. Only for buckets of at most
+    # TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS tokens (0 = every chunked
+    # bucket): the one gather moves all the bytes the per-chunk gathers did,
+    # so on wide DCP groups and large buckets it is bandwidth-bound and the
+    # fixed costs it saves no longer pay for it.
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG": env_bool(
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG", default=False
+    ),
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS", 0
     ),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
