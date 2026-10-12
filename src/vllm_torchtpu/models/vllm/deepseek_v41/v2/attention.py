@@ -87,30 +87,10 @@ def select_compressed_indices(scores, lengths, topk, *, candidates=None):
     if candidates is not None:
         valid = valid & candidates
     masked = scores.masked_fill(~valid, -torch.inf)
-    indices = (
-        masked.topk(min(topk, scores.shape[-1]), dim=-1)
-        .indices.to(torch.int32)
-        .sort(-1)
-        .values
-    )
-    return indices.masked_fill(
-        masked.reshape(-1)
-        .index_select(
-            0,
-            (
-                (
-                    torch.arange(
-                        masked.reshape(-1, masked.shape[-1]).shape[0],
-                        device=masked.device,
-                        dtype=torch.int32,
-                    )
-                    * masked.shape[-1]
-                ).reshape(*masked.shape[:-1], 1)
-                + indices
-            ).reshape(-1),
-        )
-        .reshape(indices.shape)
-        == -torch.inf,
+    top = masked.topk(min(topk, scores.shape[-1]), dim=-1)
+    sorted_idx = top.indices.to(torch.int32).sort(-1)
+    return sorted_idx.values.masked_fill(
+        top.values.gather(-1, sorted_idx.indices) == -torch.inf,
         -1,
     )
 
@@ -280,7 +260,11 @@ def save_compress_norm(
         token_to_req_indices = token_to_req_indices[:count]
     dim = norm_weight.numel()
     values = kv_score[:, :dim].float()
-    valid = slot_mapping >= 0
+    valid = (
+        slot_mapping >= 0
+        if slot_mapping is not None
+        else torch.zeros(count, dtype=torch.bool, device=kv_score.device)
+    )
     if ratio == 2:
         cache = state_cache
         addr = precomputed_addr or (
@@ -524,8 +508,11 @@ def _insert(cache, slots, values, valid, *, records=None):
 def _offset_records(cache, write_slots, write_invalid):
     """Pool rows from stage-shared ``_fast_swa_row_slots`` output for ``cache``."""
     offset = cache.row_offset
-    records = write_slots if offset == 0 else offset + write_slots
-    return records.masked_fill(write_invalid, -1)
+    return (
+        write_slots.masked_fill(write_invalid, -1)
+        if offset == 0
+        else torch.where(write_invalid, -1, offset + write_slots)
+    )
 
 
 def _gather_query_rows(rows):
@@ -540,19 +527,23 @@ def _gather_query_rows(rows):
 
 def _row_slots(cache, block_table, requests, logical):
     """Gather fixed-width token rows without inspecting device values on host."""
-    safe = logical.int().clamp(min=0, max=block_table.shape[1] * cache.shape[1] - 1)
-    # Gather each token's table row, then index within it 128 columns at a
-    # time. A [tokens, width] elementwise 2-D gather is 16-40x slower on TPU.
-    rows = block_table.index_select(0, requests)
-    pages = (safe // cache.shape[1]).long()
-    blocks = torch.cat(
-        [
-            rows.gather(1, pages[:, start : start + 128])
-            for start in range(0, pages.shape[1], 128)
-        ],
-        dim=1,
-    ).int()
-    return blocks * cache.shape[1] + safe % cache.shape[1]
+    rows_per_page = cache.shape[1]
+    num_cols = block_table.shape[1]
+    safe = (logical if logical.dtype == torch.int32 else logical.int()).clamp(
+        min=0, max=num_cols * rows_per_page - 1
+    )
+    # Gather each token's table row, then index within it via 1-D int32 offsets.
+    # A [tokens, width] elementwise 2-D gather is 16-40x slower on TPU.
+    req_offsets = (requests if requests.dtype == torch.int32 else requests.int())[
+        :, None
+    ] * num_cols
+    flat_table = (
+        block_table if block_table.dtype == torch.int32 else block_table.int()
+    ).reshape(-1)
+    blocks = flat_table.index_select(
+        0, (req_offsets + safe // rows_per_page).reshape(-1)
+    ).reshape(safe.shape)
+    return blocks * rows_per_page + safe % rows_per_page
 
 
 def _index_page_records(index_cache):
@@ -691,10 +682,7 @@ def _sp_gather_inputs(
     assert all(part.dtype == kv.dtype for part in parts)
     payload = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
     gathered = sp_all_gather(payload)[:num_tokens]
-    pieces = iter(
-        piece.contiguous()
-        for piece in gathered.split([part.shape[-1] for part in parts], dim=-1)
-    )
+    pieces = iter(gathered.split([part.shape[-1] for part in parts], dim=-1))
     if gather_qr:
         qr = next(pieces)
     kv = next(pieces)
@@ -822,12 +810,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
             else None
         )
-        can_fuse_qo = (
-            qr_local is not None
-            and isinstance(swa_kv, PagedCacheRows)
-            and self._fp8_kv
-            and bool(self.compress_ratio)
-            and getattr(self._prepare_and_attn_fn, "__func__", None)
+        use_direct_o = (
+            getattr(self._prepare_and_attn_fn, "__func__", None)
             is DeepseekV41Attention._prepare_tpu
         )
         if self._sp_sharded_input:
@@ -841,7 +825,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             )
         o_padded: Any = (
             None
-            if can_fuse_qo
+            if use_direct_o
             else torch.zeros_like(
                 positions[:, None, None],
                 dtype=hidden_states.dtype,
@@ -861,14 +845,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         if qr_local is not None:
             projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
-            if projected is not None:
+            if projected is not None and projected.ndim != 3:
                 if getattr(self, "_local_wo_b", False):
                     return projected
                 # The fused q/attention/wo_a op already produced wo_b's input.
                 return _value(self.wo_b(projected))
+            o = (
+                projected
+                if projected is not None
+                else o_padded[:, : self.n_local_heads, :]
+            )
         else:
-            self._prepare_and_attn_fn(*args)
-        o = o_padded[:, : self.n_local_heads, :]
+            direct = self._prepare_and_attn_fn(*args)
+            o = direct if direct is not None else o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
     def _run_parallel_input_projections(self, hidden_states):
@@ -1255,6 +1244,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         q/attention/``wo_a`` op (``qr_local``) ran; else ``None``."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
+            if output is None:
+                return torch.zeros_like(
+                    positions[:, None, None],
+                    dtype=hidden_states.dtype,
+                ).expand(-1, self.n_local_heads, self.head_dim)
             output.zero_()
             return None
         swa = metadata[self.swa_cache_layer.prefix]
@@ -1575,18 +1569,20 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 cached_swa_rec = stage_cache.get(swa_rec_key)
                 if cached_swa_rec is None or cached_swa_rec[0] is not swa_row_slots:
-                    records = (swa_cache.row_offset + swa_row_slots).masked_fill(
-                        invalid_window, -1
+                    records = torch.where(
+                        invalid_window, -1, swa_cache.row_offset + swa_row_slots
                     )
                     stage_cache[swa_rec_key] = (swa_row_slots, records)
                 else:
                     records = cached_swa_rec[1]
             else:
                 records = (
-                    swa_row_slots
+                    swa_row_slots.masked_fill(invalid_window, -1)
                     if swa_cache.row_offset == 0
-                    else swa_cache.row_offset + swa_row_slots
-                ).masked_fill(invalid_window, -1)
+                    else torch.where(
+                        invalid_window, -1, swa_cache.row_offset + swa_row_slots
+                    )
+                )
         else:
             records = swa_cache.row_indices(swa_row_slots).masked_fill(
                 invalid_window, -1
@@ -1964,7 +1960,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.scale,
                     getattr(self, "query_block_size", 1) if non_causal else 1,
                 )
-            output.copy_(result.masked_fill(swa_invalid_3d, 0))
+            masked = result.masked_fill(swa_invalid_3d, 0)
+            if output is None:
+                return masked
+            output.copy_(masked)
             return None
         if self._fp8_kv and self.compress_ratio:
             raise NotImplementedError("FP8 V4.1 KV cache requires the tiled path")
@@ -1980,7 +1979,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         result = sparse_attention(
             q[:, None], rows, self.attn_sink, indices[:, None], self.scale
         )[:, 0]
-        output.copy_(result.masked_fill(swa_invalid_3d, 0))
+        masked = result.masked_fill(swa_invalid_3d, 0)
+        if output is None:
+            return masked
+        output.copy_(masked)
         return None
 
     def _init_local_q_weights(self):
