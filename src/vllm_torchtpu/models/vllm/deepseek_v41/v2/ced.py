@@ -138,9 +138,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     # Steady-state decode repeats the same query/prompt/hit layout while
     # only seq_lens grow: reuse the cached all-kept plan when it applies.
     if (
-        bounds_list is (last := _LAST_NO_SKIP_CACHE)[0]
-        and prompts_list is last[1]
-        and hits_list is last[2]
+        bounds_list == (last := _LAST_NO_SKIP_CACHE)[0]
+        and prompts_list == last[1]
+        and hits_list == last[2]
         and (window, num_tokens, compile_sizes) == last[3]
     ):
         spec = last[4]
@@ -220,6 +220,9 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     )
 
 
+_SYNC_STATE_BUF = torch.zeros(2, dtype=torch.int32, device="cpu")
+
+
 def sync_decoder_replay_plan(
     plan: DecoderReplayPlan | None,
     metadata,
@@ -234,20 +237,14 @@ def sync_decoder_replay_plan(
     """
     if dp_cpu_group is None:
         return plan
-    state = torch.tensor(
-        [
-            1 if plan is not None else 0,
-            plan.padded_num_tokens if plan is not None else 0,
-        ],
-        dtype=torch.int32,
-        device="cpu",
-    )
+    _SYNC_STATE_BUF[0] = 1 if plan is not None else 0
+    _SYNC_STATE_BUF[1] = plan.padded_num_tokens if plan is not None else 0
     torch.distributed.all_reduce(
-        state, op=torch.distributed.ReduceOp.MAX, group=dp_cpu_group
+        _SYNC_STATE_BUF, op=torch.distributed.ReduceOp.MAX, group=dp_cpu_group
     )
-    if int(state[0].item()) == 0:
+    active, target_padded = _SYNC_STATE_BUF.tolist()
+    if active == 0:
         return None
-    target_padded = int(state[1].item())
     if plan is None:
         seq_lens = getattr(metadata, "seq_lens", None)
         requests = int(seq_lens.shape[0]) if seq_lens is not None else 1
@@ -277,15 +274,38 @@ def sync_decoder_replay_plan(
     )
 
 
+@functools.lru_cache(maxsize=64)
+def _ced_inverse_rows_cpu(
+    indices: tuple[int, ...], padded_rows: int, total_rows: int
+) -> torch.Tensor:
+    inverse = [padded_rows] * total_rows
+    for k, r in enumerate(indices):
+        inverse[r] = k
+    return torch.tensor(inverse, dtype=torch.int32, device="cpu")
+
+
+_CED_INVERSE_DEVICE_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def _ced_inverse_rows(
     indices: tuple[int, ...], padded_rows: int, total_rows: int, device
 ) -> torch.Tensor:
     """Row map for `_scatter_decoder_rows`: output row r reads decoder row
     ``k`` when ``indices[k] == r``, else the appended zero row ``padded_rows``."""
-    inverse = [padded_rows] * total_rows
-    for k, r in enumerate(indices):
-        inverse[r] = k
-    return torch.tensor(inverse, dtype=torch.int32, device=device)
+    dev = torch.device(device)
+    if dev.type == "cpu":
+        return _ced_inverse_rows_cpu(indices, padded_rows, total_rows)
+    cache_key = (indices, padded_rows, total_rows, dev)
+    cached = _CED_INVERSE_DEVICE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    dev_tensor = _ced_inverse_rows_cpu(indices, padded_rows, total_rows).to(
+        device=dev, non_blocking=True
+    )
+    if len(_CED_INVERSE_DEVICE_CACHE) >= 64:
+        _CED_INVERSE_DEVICE_CACHE.clear()
+    _CED_INVERSE_DEVICE_CACHE[cache_key] = dev_tensor
+    return dev_tensor
 
 
 def _scatter_decoder_rows(tensor: torch.Tensor, inverse: torch.Tensor) -> torch.Tensor:
