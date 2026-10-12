@@ -409,6 +409,10 @@ def _ragged_all_to_all(x: torch.Tensor, rows: torch.Tensor, group: Any) -> torch
     )
 
 
+def _ragged_fake(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 def prebuild_ragged_all_to_all(world: int) -> None:
     """Build (register) the real-rows exchange op for a DCP group of `world`
     ranks at model build, not inside a trace."""
@@ -448,7 +452,7 @@ def _build_ragged_all_to_all(world: int):
             axis_name=DCP_AXIS_NAME,
         )
 
-    def fn(x, rows):
+    def fn(x: jax.Array, rows: jax.Array) -> jax.Array:
         return jax.shard_map(
             body,
             mesh=mesh,
@@ -463,7 +467,7 @@ def _build_ragged_all_to_all(world: int):
         mesh=mesh,
         input_partition_specs=(rank_spec, P()),
         output_partition_specs=rank_spec,
-        fake=lambda x, rows: torch.empty_like(x),
+        fake=_ragged_fake,
     )
 
 
