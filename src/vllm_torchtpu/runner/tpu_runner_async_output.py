@@ -26,7 +26,8 @@ def parse_sampled_token_ids_cpu(
         return rows, [1] * len(rows)
     if (
         selected_token_ids.shape[-1] == 1
-        or not (selected_token_ids.numpy() == INVALID_TOKEN_ID).any()
+        or selected_token_ids.numel() == 0
+        or int(selected_token_ids.numpy().min()) != INVALID_TOKEN_ID
     ):
         rows = selected_token_ids.tolist()
         return rows, [int(selected_token_ids.shape[-1])] * len(rows)

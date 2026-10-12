@@ -252,8 +252,11 @@ class SpeculativeDecodingManager:
             and key[2] == padded_num_reqs
             # memoryview equality compares buffers element-wise in C (shape and
             # values, like np.array_equal) without its Python-level overhead.
-            and memoryview(num_draft_tokens) == memoryview(key[0])
-            and memoryview(cu_num_scheduled_tokens) == memoryview(key[1])
+            and (num_draft_tokens is key[0] or memoryview(num_draft_tokens) == key[3])
+            and (
+                cu_num_scheduled_tokens is key[1]
+                or memoryview(cu_num_scheduled_tokens) == key[4]
+            )
         ):
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
@@ -421,8 +424,10 @@ class SpeculativeDecodingManager:
         cached_draft_lengths_cpu = num_draft_tokens.copy()
         self._meta_cache_key = (
             cached_draft_lengths_cpu,
-            cu_num_scheduled_tokens.copy(),
+            (cu_copy := cu_num_scheduled_tokens.copy()),
             padded_num_reqs,
+            memoryview(cached_draft_lengths_cpu),
+            memoryview(cu_copy),
         )
         self._meta_cache = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids_dev,

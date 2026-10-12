@@ -183,3 +183,42 @@ def test_td8387_meta_cache_key_memoryview_compare(num_draft, cu_sched, hit):
     assert (md2.target_logits_indices is md1.target_logits_indices) is hit
     if not hit:
         assert md2.draft_lengths_cpu.tolist() == num_draft.tolist()
+
+
+def test_td8398_parse_sampled_min_and_meta_cache_key_pre_cached_memoryviews() -> None:
+    """TD8.398: Verify parse_sampled_token_ids_cpu empty/min() fast path and
+    pre-cached memoryview + object identity hits in SpeculativeDecodingManager."""
+    from vllm_torchtpu.runner.speculative_decoding_manager import (
+        SpeculativeDecodingManager,
+    )
+
+    empty_2d = torch.empty((0, 6), dtype=torch.int32)
+    rows_e, lens_e = ao.parse_sampled_token_ids_cpu(empty_2d)
+    assert rows_e == [] and lens_e == []
+
+    runner = SimpleNamespace(
+        max_num_tokens=64,
+        input_ids_cpu=torch.arange(100, 164, dtype=torch.int32),
+        arange_np=np.arange(64, dtype=np.int32),
+        num_tokens_paddings=[8, 16, 32, 64],
+        device=torch.device("cpu"),
+    )
+    mgr = SpeculativeDecodingManager(runner)
+    md1 = mgr.get_spec_decode_metadata(
+        np.array([3, 3], dtype=np.int32),
+        np.array([4, 8], dtype=np.int32),
+        padded_num_reqs=4,
+        skip_host_draft_tokens=True,
+    )
+    assert mgr._meta_cache_key is not None and len(mgr._meta_cache_key) == 5
+    assert isinstance(mgr._meta_cache_key[3], memoryview)
+    assert isinstance(mgr._meta_cache_key[4], memoryview)
+
+    # Passing key[0] and key[1] directly hits via `is` without constructing memoryviews
+    md2 = mgr.get_spec_decode_metadata(
+        mgr._meta_cache_key[0],
+        mgr._meta_cache_key[1],
+        padded_num_reqs=4,
+        skip_host_draft_tokens=True,
+    )
+    assert md2.target_logits_indices is md1.target_logits_indices
