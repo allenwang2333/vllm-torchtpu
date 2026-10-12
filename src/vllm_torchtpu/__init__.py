@@ -9,6 +9,30 @@ logger = init_logger(__name__)
 
 import os as _qx_os  # noqa: E402
 
+_vllm_cache_root = _qx_os.environ.get("VLLM_CACHE_ROOT", "")
+if _vllm_cache_root and _vllm_cache_root.startswith("/compile-cache"):
+    _cc_parent = _qx_os.path.dirname(_vllm_cache_root.rstrip("/"))
+    _jax_cc = _qx_os.path.join(_cc_parent, "jax_cache")
+    _tt_cc = _qx_os.path.join(_cc_parent, "torch_tpu_cache")
+    for _d in (_jax_cc, _tt_cc):
+        try:
+            _qx_os.makedirs(_d, exist_ok=True)
+        except OSError:
+            pass
+    _qx_os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _jax_cc)
+    _qx_os.environ.setdefault("JAX_COMPILER_CACHE_DIR", _jax_cc)
+    _qx_os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    _qx_os.environ.setdefault("TORCH_TPU_CACHE_DIR", _tt_cc)
+    if _qx_os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") in (None, "", "disabled"):
+        _qx_os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _tt_cc
+    try:
+        import jax as _cc_jax
+        _cc_jax.config.update("jax_compilation_cache_dir", _jax_cc)
+        _cc_jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    except Exception:
+        pass
+
+
 _qx_fast = _qx_os.environ.get("QX_FAST_COMPILED_CALL", "1") == "1"
 _qx_drop_gs = _qx_os.environ.get("QX_TPU_DROP_GLOBAL_STATE_GUARD", "1") == "1"
 if _qx_fast or _qx_drop_gs:
