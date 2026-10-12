@@ -627,9 +627,11 @@ def test_dcp_prologue_partials_through_packed_merge_bit_identical():
         o, lse = _rank_partials(b, dcp)
         one = _merge_every_rank(o, lse, pack=True)
         assert torch.equal(one.view(torch.int16), want.view(torch.int16)), f"step {i}"
-        # Non-vacuous: sentinel rows ride the pack, and real rows merge > 1 rank.
+        # Non-vacuous: on the padded decode buckets the kernel's sentinel rows
+        # ride the pack, and real rows merge > 1 rank.
         sentinel = ~torch.isfinite(lse) | (lse == torch.finfo(torch.float32).min)
-        assert sentinel.any(), f"step {i}"
+        if b["real"] < lse.shape[1]:
+            assert sentinel[:, b["real"] :].all(), f"step {i}"
         assert ((~sentinel).sum(0)[: b["real"]] > 1).any(), f"step {i}"
         assert torch.isfinite(one.float()).all(), f"step {i}"
 
