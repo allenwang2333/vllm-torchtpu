@@ -58,6 +58,9 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v5 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v5 import (
     supported as ragged_gather_reduce_v5_supported,
 )
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v6 import (
+    ragged_gather_reduce_v6,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
 
@@ -82,6 +85,8 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _SC_COMBINE_TILED = envs.TPU_MOE_SC_COMBINE_TILED
 # Fixed at import: v5 (route-count grouped) where it applies, ahead of v4.
 _SC_COMBINE_V5 = envs.TPU_MOE_SC_COMBINE_V5
+# Fixed at import: with v5 selected, run it gridless (v6, same bits).
+_SC_COMBINE_V6 = envs.TPU_MOE_SC_COMBINE_V6
 
 
 def _sc_combine_size_ok(x: jax.Array) -> bool:
@@ -690,7 +695,8 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(x.dtype)
         if _use_sc_combine_v5(gmm2_res, argsort_revert_indices, topk):
-            return ragged_gather_reduce_v5(
+            combine = ragged_gather_reduce_v6 if _SC_COMBINE_V6 else ragged_gather_reduce_v5
+            return combine(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
