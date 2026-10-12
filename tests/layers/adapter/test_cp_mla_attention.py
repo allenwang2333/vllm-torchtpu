@@ -742,6 +742,8 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_LSE_MERGE_A2A": False,
         "TPU_DCP_MERGE_CHUNKED": 0,
         "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -798,6 +800,75 @@ def test_positive_control_misaligned_chunk_weights_are_caught(monkeypatch):
     outputs, lses = _hard_partials(np.random.default_rng(37), 4, tokens=32)
     got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=4)
     assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("chunks", [2, 4])
+def test_collapsed_lse_gather_is_bitwise_the_chunked_merge(
+    dcp_size, chunks, monkeypatch
+):
+    """`TPU_DCP_MERGE_CHUNKED_LSE_AG` gathers the lse of every chunk in one
+    call instead of one per chunk; it returns the per-chunk-gather merge (and
+    so the unchunked one) bit for bit."""
+    outputs, lses = _hard_partials(np.random.default_rng(41), dcp_size, tokens=32)
+    calls = []
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
+    )
+    today = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=chunks)
+    assert calls == []
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=chunks,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+    )
+    assert len(calls) == dcp_size
+    assert sum(calls) == 32 * dcp_size  # every row gathered exactly once
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    unchunked = _rs_merge_whole(outputs, lses, monkeypatch)
+    torch.testing.assert_close(got, unchunked, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_misaligned_collapsed_lse_gather_is_caught(monkeypatch):
+    """The checks above must fail when the collapsed gather hands a chunk lse
+    rows that are not its own (gathered rows shifted by one)."""
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla, "_gather_lse", lambda x, g: torch.roll(real(x, g), 1, dims=1)
+    )
+    outputs, lses = _hard_partials(np.random.default_rng(43), 4, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+    )
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize(
+    "flag,cap,tokens,expect",
+    [
+        (False, 0, 4096, False),
+        (True, 0, 4096, True),
+        (True, 2048, 2048, True),
+        (True, 2048, 4096, False),  # above the cap: per-chunk gathers
+    ],
+)
+def test_collapsed_lse_gather_per_bucket(flag, cap, tokens, expect, monkeypatch):
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_LSE_AG", flag, raising=False
+    )
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS", cap, raising=False
+    )
+    assert cp_mla._lse_gathered_once(tokens) is expect
 
 
 @pytest.mark.parametrize(
