@@ -103,6 +103,16 @@ def test_flush_all_writes_incomplete_parameters():
     assert torch.equal(w13.data[0], torch.full((8, 4), 5.0))
 
 
+def test_release_pool_drops_the_buffers_flushes_left_behind():
+    stager = ExpertParamStager()
+    w13 = _param(3, 8, 4)
+    stager.host_param(w13)
+    stager.flush_all()
+    # The flushed stand-in stays pooled for reuse until released.
+    assert stager.release_pool() == 3 * 8 * 4 * 4
+    assert stager.release_pool() == 0
+
+
 def test_flush_uploads_in_chunks(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 
