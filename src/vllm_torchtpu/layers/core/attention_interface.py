@@ -1053,6 +1053,33 @@ def _mixed_body_levers(value: str) -> tuple[str, ...]:
     return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
+def kv_write_in_gather_supported(
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    num_tokens: int,
+    topk: int,
+) -> bool:
+    """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this decode step.
+
+    The fused-prep capped gather must run (SparseCore caches, a top-k wider
+    than TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a
+    rope token one 32-word SparseCore row, and the step at most 32 tokens
+    (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
+    """
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    return (
+        0 < num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        and bool(topk_cap)
+        and topk > topk_cap
+        and nope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
+        and rope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
+        and nope_spec.token_bytes // kv_cache_utils.WORD_BYTES == 128
+        and nope_spec.shape[-1] == 128
+        and rope_spec.token_bytes // kv_cache_utils.WORD_BYTES == 32
+        and rope_spec.shape[-1] % 32 == 0
+    )
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1076,6 +1103,7 @@ def sparse_mla_attention_dcp(
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
     q_rope_table: jax.Array | None = None,
     prologue_fault: str | None = None,
+    kv_write_fault: str | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1097,6 +1125,14 @@ def sparse_mla_attention_dcp(
         `[num_tokens, 2, 128]` rope table (`sparse_ragged_paged_attention`):
         the kernel ropes q_pe in VMEM, and on decode buckets also owns the lse
         sentinel. Requires TPU_DCP_MLA_SPLIT_Q_LSE.
+      kv_write_fault: test-only positive controls for
+        TPU_MLA_KV_WRITE_IN_GATHER: `"wrong_owner"` (rows addressed as the
+        next DCP rank's) or one of `native_sc_gather.WRITE_FAULTS`.
+
+    TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
+    write is not a kernel of its own; the SparseCore gather that feeds the
+    attention kernel writes the packed rows (same owner mask, same bytes)
+    and fences before it gathers.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1189,25 +1225,57 @@ def sparse_mla_attention_dcp(
         rope_table_=None,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
-            kv_cache_nope,
-            kv_cache_rope,
-            kv_c_normed,
-            k_pe,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            dcp_rank,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size,
+        decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        kv_in_gather = (
+            envs.TPU_MLA_KV_WRITE_IN_GATHER
+            and envs.TPU_DCP_MLA_MASK_IN_KERNEL
+            and envs.TPU_DCP_MLA_FUSED_PREP
+            and decode_bucket
+            and kv_write_in_gather_supported(
+                nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
+            )
         )
+        kv_write = None
+        if kv_in_gather:
+            # The gather writes the rows; only their addresses and packed
+            # bytes are built here (what `tc_scatter` computed in-kernel).
+            write_rank = dcp_rank
+            if kv_write_fault == "wrong_owner":
+                write_rank = (dcp_rank + 1) % dcp_size
+            page, slot = kv_cache_utils._get_dcp_page_and_slot(
+                kv_c_normed.shape[0],
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                write_rank,
+                nope_spec=nope_spec,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+            kv_write = (
+                kv_cache_utils._dst_rows(page, slot, nope_spec.page_size),
+                kv_cache_utils.pack_tokens(kv_c_normed, nope_spec.token_bytes),
+                kv_cache_utils.pack_tokens(k_pe, rope_spec.token_bytes),
+            )
+        else:
+            kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                dcp_rank,
+                nope_spec=nope_spec,
+                rope_spec=rope_spec,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
 
         # Decode buckets with TPU_DCP_MLA_MASK_IN_KERNEL: the kernel takes the
         # true kv_len (0 = this rank owns none of the token's top-k) and writes
         # that token's lse as -inf itself, so none of the glue below runs.
-        decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         mask_in_kernel = envs.TPU_DCP_MLA_MASK_IN_KERNEL and decode_bucket
         fused_prep = mask_in_kernel and envs.TPU_DCP_MLA_FUSED_PREP
         # Mixed / prefill buckets with TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: the
@@ -1269,7 +1337,7 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
             )
-        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+        attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
             kv_cache_rope,
@@ -1297,9 +1365,14 @@ def sparse_mla_attention_dcp(
                 int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
             ),
             mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
+            kv_write=kv_write,
+            kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             **chunk_kwargs,
             **split_kwargs,
         )
+        output, lse = attn[:2]
+        if kv_write is not None:
+            kv_cache_nope, kv_cache_rope = attn[2:]
         if not mask_in_kernel:
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

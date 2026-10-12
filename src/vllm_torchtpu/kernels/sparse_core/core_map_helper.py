@@ -61,7 +61,12 @@ def kernel(
 
     @api.jit
     def run(*operands):
-        arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
+        # An operand that is already a Ref is handed to the body as is, so the
+        # kernel can write it in place (the caller freezes it afterwards).
+        arg_refs = [
+            op if isinstance(op, jax_core.Ref) else jax_core.new_ref(op)
+            for op in operands
+        ]
         out_refs = tree_util.tree_map(_empty_out_ref, out_types)
 
         @pl_core.core_map(
