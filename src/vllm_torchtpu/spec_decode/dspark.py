@@ -145,9 +145,12 @@ class DSparkProposer(DFlashProposer):
     # in device tensors so the compiled graph is identical across TP ranks.
 
     def _init_sharded_markov_sampling(self) -> None:
-        """Pre-slice the Markov head for this rank's lm_head vocab shard."""
+        """Pre-slice and pre-transpose weights for this rank's lm_head vocab shard."""
         self._sharded_markov_tp = 1
+        self._markov_w1_full: torch.Tensor | None = None
         self._markov_w2_local = None
+        self._markov_w2_local_t: torch.Tensor | None = None
+        self._lm_head_weight_t: torch.Tensor | None = None
         self._vocab_shard_offset = None
         self._vocab_shard_mask = None
 
@@ -160,7 +163,9 @@ class DSparkProposer(DFlashProposer):
 
         lm_head = draft.lm_head
         shard_indices = lm_head.shard_indices
-        markov_w2 = draft.model.markov_head.markov_w2
+        markov_head = draft.model.markov_head
+        markov_w1 = getattr(markov_head, "markov_w1", None)
+        markov_w2 = markov_head.markov_w2
         logits_processor = resolve_draft_logits_processor(draft)
         head_dtype = getattr(logits_processor, "head_dtype", None)
 
@@ -172,6 +177,30 @@ class DSparkProposer(DFlashProposer):
         if head_dtype is not None:
             rows = rows.to(head_dtype)
         self._markov_w2_local = rows.contiguous().clone()
+        self._markov_w2_local_t = self._markov_w2_local.t().contiguous()
+
+        w1_weight = getattr(markov_w1, "weight", None)
+        if w1_weight is not None and getattr(markov_w1, "tp_size", 1) > 1:
+            self._markov_w1_full = (
+                tensor_model_parallel_all_gather(w1_weight.detach(), dim=0)
+                .to(rows.dtype)
+                .contiguous()
+            )
+
+        lm_weight = getattr(lm_head, "weight", None)
+        if (
+            lm_weight is not None
+            and getattr(logits_processor, "scale", 1.0) == 1.0
+            and callable(getattr(draft.model, "norm", None))
+            and isinstance(
+                getattr(lm_head, "quant_method", None),
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
+            )
+        ):
+            self._lm_head_weight_t = (
+                lm_weight.detach().to(head_dtype or lm_weight.dtype).t().contiguous()
+            )
+
         # int32: TPU emulates int64 adds; start < 2**24 (checked above).
         self._vocab_shard_offset = torch.tensor(
             start, dtype=torch.int32, device=rows.device
@@ -227,10 +256,16 @@ class DSparkProposer(DFlashProposer):
         assert self.draft_model is not None
         w2_local = self._markov_w2_local
         assert w2_local is not None
-        embed = self.draft_model.markov_embed(prev)
+        w1_full = getattr(self, "_markov_w1_full", None)
+        embed = (
+            w1_full.index_select(0, prev)
+            if w1_full is not None
+            else self.draft_model.markov_embed(prev)
+        )
         if embed.dtype != w2_local.dtype:
             embed = embed.to(w2_local.dtype)
-        return F.linear(embed, w2_local)
+        w2_t = getattr(self, "_markov_w2_local_t", None)
+        return embed @ w2_t if w2_t is not None else F.linear(embed, w2_local)
 
     @staticmethod
     def _pack_local_candidate(
@@ -285,23 +320,19 @@ class DSparkProposer(DFlashProposer):
         block_size: int,
         sample_start: int,
     ) -> torch.Tensor:
-        is_empty = sample_start >= block_size or padded_num_reqs == 0
-        is_passthrough = not is_empty and block_size == 1 and sample_start == 0
-        h3d = (
-            valid_hidden
-            if (is_empty or is_passthrough)
-            else valid_hidden.view(padded_num_reqs, block_size, -1)
+        if sample_start >= block_size or padded_num_reqs == 0:
+            return valid_hidden[:0]
+        if block_size == 1:
+            return valid_hidden
+        req_bases = (
+            torch.arange(padded_num_reqs, dtype=torch.int32, device=valid_hidden.device)
+            * block_size
         )
-        return (
-            valid_hidden[:0]
-            if is_empty
-            else valid_hidden
-            if is_passthrough
-            else (h3d[:, sample_start:, :] if sample_start > 0 else h3d)
-            .transpose(0, 1)
-            .contiguous()
-            .view(-1, valid_hidden.shape[-1])
+        slot_offsets = torch.arange(
+            sample_start, block_size, dtype=torch.int32, device=valid_hidden.device
         )
+        slot_order = (slot_offsets.unsqueeze(1) + req_bases.unsqueeze(0)).reshape(-1)
+        return valid_hidden.index_select(0, slot_order)
 
     def _sample_markov_sharded(
         self,
@@ -318,7 +349,12 @@ class DSparkProposer(DFlashProposer):
         slot_major_hidden = _slot_major_hidden(
             valid_hidden, padded_num_reqs, block_size, sample_start
         )
-        logits = self.draft_model.compute_draft_logits_local(slot_major_hidden)
+        lm_w_t = getattr(self, "_lm_head_weight_t", None)
+        logits = (
+            self.draft_model.model.norm(slot_major_hidden) @ lm_w_t
+            if lm_w_t is not None
+            else self.draft_model.compute_draft_logits_local(slot_major_hidden)
+        )
         mask = self._vocab_shard_mask
 
         prev = ids_3d[:, 0]

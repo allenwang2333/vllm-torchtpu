@@ -1173,3 +1173,62 @@ def test_td8361_slot_major_hidden_fast_paths_and_gathered_candidate_3d_view():
     best = DSparkProposer._select_gathered_candidate(gathered, tp_size=3, num_reqs=2)
     assert best.dtype == torch.int32
     assert best.tolist() == [100, 201]
+
+
+def test_r11_sharded_markov_pretransposed_and_replicated_w1(monkeypatch):
+    """Verify _init_sharded_markov_sampling pre-caches _markov_w1_full,
+    _markov_w2_local_t, and _lm_head_weight_t with exact bit parity across TP ranks."""
+    import torch._dynamo
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+
+    from vllm_torchtpu.spec_decode import dspark as dspark_mod
+
+    vocab, tp_size, hidden, rank_r, K, num_reqs = 64, 2, 8, 4, 3, 2
+    part_vocab = vocab // tp_size
+    torch.manual_seed(11)
+    lm_w_full = torch.randn(vocab, hidden, dtype=torch.float32)
+    w1_full = torch.randn(vocab, rank_r, dtype=torch.bfloat16)
+    w2_full = torch.randn(vocab, rank_r, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        dspark_mod,
+        "tensor_model_parallel_all_gather",
+        lambda x, dim=0: (
+            w1_full if x.shape == (part_vocab, rank_r) else torch.cat([x, x], dim=dim)
+        ),
+    )
+
+    p = _make_proposer(dict(_DSPARK_HF, dspark_block_size=K), num_speculative_tokens=K)
+    p._draft_replicated = False
+    draft = _ShardedDraft(lm_w_full, w1_full.float(), w2_full, vocab, 0, tp_size)
+    draft.lm_head.weight = draft._shard
+    draft.lm_head.quant_method = UnquantizedEmbeddingMethod()
+    draft.model.markov_head.markov_w1 = SimpleNamespace(
+        weight=w1_full[:part_vocab], tp_size=tp_size
+    )
+    draft.model.norm = lambda x: x * 1.0
+    p.draft_model = draft
+    p._init_sharded_markov_sampling()
+
+    assert p._markov_w1_full is not None
+    assert p._markov_w1_full.dtype == torch.float32
+    assert p._markov_w2_local_t is not None
+    assert p._lm_head_weight_t is not None
+    assert p._lm_head_weight_t.shape == (hidden, part_vocab)
+
+    valid_hidden = torch.randn(num_reqs * K, hidden, dtype=torch.float32)
+    ids_3d = torch.zeros((num_reqs, K), dtype=torch.int32)
+    tokens_fast = torch.stack(
+        p._sample_markov_sharded(valid_hidden, ids_3d, K, 0), dim=1
+    )
+
+    # Compare against uncached fallback path (w1_full=None, w2_t=None, lm_head_t=None)
+    p._markov_w1_full = None
+    p._markov_w2_local_t = None
+    p._lm_head_weight_t = None
+    tokens_fallback = torch.stack(
+        p._sample_markov_sharded(valid_hidden, ids_3d, K, 0), dim=1
+    )
+    assert torch.equal(tokens_fast, tokens_fallback)
