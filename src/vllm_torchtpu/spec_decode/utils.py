@@ -439,9 +439,9 @@ def vocab_parallel_argmax(
     pair = torch.cat(
         [local_max.float(), (local_idx + info.org_vocab_start).float()], dim=-1
     )
-    gathered = tensor_model_parallel_all_gather(pair, dim=0).view(info.tp_size, rows, 2)
+    gathered = tensor_model_parallel_all_gather(pair, dim=0).view(info.tp_size, -1, 2)
     best_rank = torch.argmax(gathered[..., 0], dim=0, keepdim=True)
-    return torch.gather(gathered[..., 1], 0, best_rank).view(rows).to(torch.int32)
+    return torch.gather(gathered[..., 1], 0, best_rank).view(-1).to(torch.int32)
 
 
 # Noise-token id resolution order, mirroring upstream
