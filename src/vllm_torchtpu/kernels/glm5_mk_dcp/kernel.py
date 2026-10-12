@@ -752,11 +752,19 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 return view(kind, 0)
 
             @pl.when(st[0] <= st[1])
-            def _():
-                pump(kind if kind in SID else "exp", allowed={KSEG[kind]})
+            def _():                             # the tile was never issued ahead: a pipeline bubble
+                if tiles.trace:
+                    with jax.named_scope("W_late"):
+                        pump(kind if kind in SID else "exp", allowed={KSEG[kind]})
+                else:
+                    pump(kind if kind in SID else "exp", allowed={KSEG[kind]})
             slot = st[1] % NB
             ref0 = next(iter(W[kind].values()))
-            copy(kind, src_of(kind, ref0, 0, 0), slot).wait()
+            if tiles.trace:                      # exposed weight DMA (issued, not yet landed)
+                with jax.named_scope("W_wait"):
+                    copy(kind, src_of(kind, ref0, 0, 0), slot).wait()
+            else:
+                copy(kind, src_of(kind, ref0, 0, 0), slot).wait()
             return view(kind, slot)
 
         def give(kind):
@@ -863,10 +871,17 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 desc = pltpu.make_async_remote_copy(
                     src_ref=src_fn(0), dst_ref=dst_fn(0), send_sem=scr[ss], recv_sem=scr[rs],
                     device_id=(me,), device_id_type=pl.DeviceIdType.MESH)
-                for _ in range(R - 1):
-                    desc.wait_recv()
-                for _ in range(R - 1):
-                    desc.wait_send()
+
+                def waits():
+                    for _ in range(R - 1):
+                        desc.wait_recv()
+                    for _ in range(R - 1):
+                        desc.wait_send()
+                if tiles.trace:                  # exposed collective latency
+                    with jax.named_scope("X_wait"):
+                        waits()
+                else:
+                    waits()
             if not wait:
                 return finish
             finish()

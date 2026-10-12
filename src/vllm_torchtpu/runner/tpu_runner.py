@@ -4319,6 +4319,8 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                     topk_candidates=topk_candidates,
                 ).view(-1)
+        if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+            self._specdbg(md, target_logits, all_greedy, req_temperatures)
         accept_u = None
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
@@ -7044,9 +7046,39 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
+    def _specdbg(self, md, target_logits, all_greedy, req_temperatures) -> None:
+        """GLM5_MKD_SPECDBG=1 (debug, host sync): per verify step, the drafts' target probability
+        (temperature-scaled softmax, no top-p) and argmax agreement, accumulated separately for
+        megakernel and stock forwards; rank 0 logs every 50 steps per path."""
+        try:
+            path = "mk" if getattr(self, "_fwd_was_mkd", False) else "stock"
+            d = md.draft_token_ids.to(torch.int64)
+            ok = d >= 0
+            if not bool(ok.any()):
+                return
+            tl = target_logits.float()
+            t = (req_temperatures[md.segment_ids].float().unsqueeze(-1)
+                 if req_temperatures is not None else torch.ones_like(tl[:, :1]))
+            p = torch.softmax(tl / (t + 1e-9), -1).gather(-1, d.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+            am = tl.argmax(-1) == d
+            st = self.__dict__.setdefault("_specdbg_st", {})
+            a = st.setdefault(path, [0, 0.0, 0, 0])
+            a[0] += 1
+            a[1] += float(p[ok].mean())
+            a[2] += int((am & ok).sum())
+            a[3] += int(ok.sum())
+            import torch.distributed as _dist
+            r0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
+            if a[0] % 50 == 0 and r0:
+                logger.info("SPECDBG %s steps %d mean p(draft) %.3f argmax==draft %.3f (n=%d, greedy=%s)",
+                            path, a[0], a[1] / a[0], a[2] / max(a[3], 1), a[3], all_greedy)
+        except Exception as e:                   # noqa: BLE001
+            logger.warning("SPECDBG failed: %r", e)
+
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        self._fwd_was_mkd = bool(getattr(self, "_mkd_step", False))
         if getattr(self, "_mkd_step", False):
             return self.glm5_mkd(self, input_ids, positions), None
         # @support_torch_compile annotations will be put on the vLLM model if it
