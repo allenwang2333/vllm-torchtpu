@@ -1989,6 +1989,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     "let a contiguous run of winners land on fewer ranks."
                 )
             self._dcp_mesh = get_or_create_dcp_mesh()
+            if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS:
+                # Register the merge's ragged exchange op before any trace.
+                _cp_mla_attention.prebuild_ragged_all_to_all(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -2660,6 +2663,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     lse,
                     is_backbone=is_backbone,
                     wire_dtype=wire_dtype,
+                    query_start_loc=attn_metadata.query_start_loc,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
