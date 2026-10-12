@@ -792,7 +792,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         plan = host_split.current_plan()
         if plan is not None and fingerprint is not None and size is not None:
             assert key is not None
-            with host_split.splitting(plan, key, self, str(compile_range)):
+            with host_split.splitting(plan, key, self, str(compile_range), fingerprint):
                 compiled_fn, entry = self._run_backend(graph, example_inputs)
         else:
             compiled_fn, entry = self._run_backend(graph, example_inputs)

@@ -790,6 +790,33 @@ class TestHostSplit:
         assert ids[a] == ids[coll] == ids[wait] == ids[safe] == 0
         assert ids[b] == 1
 
+    def test_a_piece_fingerprint_reads_no_tensor_values(self, monkeypatch):
+        """Pieces are fingerprinted inside torch_tpu's FX trace, where reading
+        a device tensor fails; constants count by dtype and shape, and the
+        whole graph's fingerprint pins their values."""
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        root = torch.nn.Module()
+        root.register_buffer("const", torch.ones(4))
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        c = graph.get_attr("const")
+        graph.output(graph.call_function(torch.add, (x, c)))
+        gm = torch.fx.GraphModule(root, graph)
+        inputs = [torch.zeros(4)]
+
+        def no_read(*args, **kwargs):
+            raise RuntimeError("cannot record EventSnapshot during an FX trace")
+
+        monkeypatch.setattr(torch.Tensor, "to", no_read)
+        monkeypatch.setattr(torch.Tensor, "numpy", no_read)
+        a = host_split.piece_fingerprint(gm, inputs, "graph-a")
+        assert a == host_split.piece_fingerprint(gm, inputs, "graph-a")
+        assert a != host_split.piece_fingerprint(gm, inputs, "graph-b")
+        assert a != host_split.piece_fingerprint(gm, [torch.zeros(8)], "graph-a")
+
     @staticmethod
     def _model_graph(layers=4):
         """A Dynamo graph of a small decoder stack, as vLLM hands it over."""
@@ -963,7 +990,7 @@ class TestHostSplit:
         monkeypatch.setattr(
             host_split,
             "piece_fingerprint",
-            lambda gm, inputs: "rank-0:" + real(gm, inputs),
+            lambda gm, inputs, graph_fp: real(gm, inputs, "rank-0:" + graph_fp),
         )
 
         lowered.clear()

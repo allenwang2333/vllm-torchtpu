@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import os
 import pickle
 import re
@@ -229,14 +230,35 @@ def _inputs_fingerprint(example_inputs: Any) -> str:
     return "|".join(parts)
 
 
-def piece_fingerprint(gm: fx.GraphModule, example_inputs: Any) -> str | None:
-    """What a piece was built from: its graph and its inputs' metadata."""
-    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+def piece_fingerprint(
+    gm: fx.GraphModule, example_inputs: Any, graph_fingerprint: str
+) -> str:
+    """What a piece was built from: the whole bucket's graph, the piece's
+    code and its inputs' metadata.
 
-    graph_fp = _graph_fingerprint(gm)
-    if graph_fp is None:
-        return None
-    return f"{graph_fp}:{_inputs_fingerprint(example_inputs)}"
+    Constants are taken by dtype and shape only. Their values are pinned by
+    `graph_fingerprint`, the fingerprint of the whole graph the pieces are cut
+    from, which `TpuCompilerAdaptor.compile` takes before tracing -- reading a
+    device tensor here, inside torch_tpu's FX trace, would fail.
+    """
+    h = hashlib.sha256(graph_fingerprint.encode())
+    for name, module in gm.named_modules():
+        if not isinstance(module, fx.GraphModule):
+            continue
+        h.update(f"{name}\n{module.code}".encode())
+        for node in module.graph.nodes:
+            if node.op != "get_attr":
+                continue
+            value: Any = module
+            for atom in str(node.target).split("."):
+                value = getattr(value, atom, None)
+            if isinstance(value, torch.Tensor):
+                desc = f"{value.dtype}{tuple(value.shape)}"
+            else:
+                desc = type(value).__qualname__
+            h.update(f"{node.target}:{desc}".encode())
+    h.update(_inputs_fingerprint(example_inputs).encode())
+    return h.hexdigest()
 
 
 @dataclasses.dataclass
@@ -250,11 +272,22 @@ class _Pending:
 class _Split:
     """One bucket being compiled across the host (see module docstring)."""
 
-    def __init__(self, plan: Plan, key: str, adaptor: TpuCompilerAdaptor, label: str):
+    def __init__(
+        self,
+        plan: Plan,
+        key: str,
+        adaptor: TpuCompilerAdaptor,
+        label: str,
+        graph_fingerprint: str = "",
+    ):
         self.plan = plan
         self.key = key
         self.adaptor = adaptor
         self.label = label
+        self.graph_fingerprint = graph_fingerprint
+        # torch_tpu's eager mode outside the backend: pieces are serialized
+        # and loaded in it, as the compile cache does, not inside the FX trace.
+        self.outer_mode = _eager_mode()
         # The piece of each partition, in the order torch_tpu compiles them.
         # None until split_module ran; then [] if the graph could not be cut.
         self.partition_pieces: list[int | None] | None = None
@@ -311,7 +344,11 @@ class _Split:
         index = self.calls
         self.calls += 1
         piece = pieces[index] if index < len(pieces) else None
-        fingerprint = piece_fingerprint(gm, inputs) if piece is not None else None
+        fingerprint = (
+            piece_fingerprint(gm, inputs, self.graph_fingerprint)
+            if piece is not None
+            else None
+        )
         owner = None if piece is None else piece % self.plan.pieces
 
         if owner is None or fingerprint is None or owner == self.plan.piece:
@@ -348,6 +385,14 @@ class _Split:
             self.resolve(original)
         return artifact
 
+    def outside_trace(self):
+        """torch_tpu's eager mode as it was outside the backend."""
+        if self.outer_mode is None:
+            return contextlib.nullcontext()
+        from torch_tpu._internal import execution_mode
+
+        return execution_mode.set_eager_mode(self.outer_mode)
+
     def piece_key(self, index: int, total: int) -> str:
         return f"{self.key}.part{index}of{total}"
 
@@ -356,7 +401,8 @@ class _Split:
         assert self.adaptor.cache_dir is not None
         path = os.path.join(self.adaptor.cache_dir, self.piece_key(index, total))
         try:
-            data = pickle.dumps(artifact)
+            with self.outside_trace():
+                data = pickle.dumps(artifact)
         except Exception as e:
             # Tell the peers not to wait for it rather than leave them waiting.
             logger.warning(
@@ -410,7 +456,7 @@ class _Split:
             try:
                 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
-                with unset_fake_temporarily():
+                with unset_fake_temporarily(), self.outside_trace():
                     artifact = pickle.loads(payload.artifact)
             except Exception as e:
                 logger.warning(
@@ -464,6 +510,15 @@ class _Split:
                 raise
             self.compiled.append(pending.index)
         self.pending = []
+
+
+def _eager_mode() -> Any:
+    try:
+        from torch_tpu._internal import execution_mode
+
+        return execution_mode.eager_mode
+    except Exception:
+        return None
 
 
 def _active() -> _Split | None:
@@ -527,12 +582,16 @@ def _install() -> None:
 
 @contextlib.contextmanager
 def splitting(
-    plan: Plan, key: str, adaptor: TpuCompilerAdaptor, label: str
+    plan: Plan,
+    key: str,
+    adaptor: TpuCompilerAdaptor,
+    label: str,
+    graph_fingerprint: str = "",
 ) -> Iterator[_Split]:
     """Compile the bucket the backend builds inside this block across the
     host, per `plan`."""
     _install()
-    split = _Split(plan, key, adaptor, label)
+    split = _Split(plan, key, adaptor, label, graph_fingerprint)
     _state.split = split
     start = time.monotonic()
     try:
