@@ -9,11 +9,19 @@ from itertools import islice
 import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
+from vllm.distributed import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute,
+)
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -21,9 +29,11 @@ from vllm_torchtpu.utils import synchronize_tensors
 from ..common.mhc import (
     initialize_delayed_mhc,
     initialize_mhc_post,
+    is_sharded_residual,
     pack_mix_weights,
     post,
     pre,
+    sharded_mhc_enabled,
     shifted_post_pre,
 )
 from .attention import (
@@ -151,6 +161,70 @@ def _post_and_collapse(
     return collapsed, aux
 
 
+def _reduce_post_and_collapse(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor,
+    *,
+    deferred_reduce: bool,
+    capture_aux: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """`_post_and_collapse` of a last layer whose all-reduce may be deferred.
+
+    With ``deferred_reduce`` the last sublayer left ``x`` unreduced. Post and
+    collapse are column-local, so a D-sharded residual takes this rank's
+    columns of ``x`` by reduce-scatter and only the collapsed rows (and aux)
+    are gathered; a full residual reduces ``x`` first.
+    """
+    if not deferred_reduce:
+        return _post_and_collapse(
+            x, residual, post_layer_mix, comb_res_mix, pre_mix, capture_aux=capture_aux
+        )
+    if not is_sharded_residual(residual, x.shape[-1]):
+        return _post_and_collapse(
+            tensor_model_parallel_all_reduce(x),
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            pre_mix,
+            capture_aux=capture_aux,
+        )
+    collapsed, aux = _post_and_collapse(
+        tensor_model_parallel_reduce_scatter(x, dim=-1),
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        pre_mix,
+        capture_aux=capture_aux,
+    )
+    collapsed = tensor_model_parallel_all_gather(collapsed, dim=-1)
+    if aux is not None:
+        aux = tensor_model_parallel_all_gather(aux, dim=-1)
+    return collapsed, aux
+
+
+def _sharded_seam(*args, reduce_results=False, **kwargs):
+    """`shifted_post_pre` for a layer whose sublayers leave x unreduced.
+
+    Upstream versions that pass their own ``reduce_results`` are overridden:
+    this layer deferred the reduction, so the seam always owns it.
+    """
+    del reduce_results
+    return shifted_post_pre(*args, reduce_results=True, **kwargs)
+
+
+def _reduce_then_post(x, residual, post_layer_mix, comb_res_mix):
+    """`post` of a deferred sublayer output (the Engram-layer seam)."""
+    return post(
+        tensor_model_parallel_all_reduce(x), residual, post_layer_mix, comb_res_mix
+    )
+
+
+_upstream_layer_forward = upstream.DeepseekV4DecoderLayer.forward
+
+
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
     def __init__(self, vllm_config, prefix: str = "", **kwargs) -> None:
         layer_idx = upstream.extract_layer_index(prefix)
@@ -164,14 +238,40 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
             self.attn._sp_sharded_input = bool(
                 getattr(self, "use_sequence_parallel", False)
             )
+        self.defers_seam_all_reduce = _shards_mhc_residual(vllm_config, layer_idx)
+        if self.defers_seam_all_reduce:
+            # wo_b's and the MoE's all-reduce move into the next mHC seam,
+            # which splits them around a D-sharded seam.
+            self.attn.wo_b.reduce_results = False
+            self.ffn.experts.moe_config.skip_final_all_reduce = True
+            logger.info_once(
+                "DeepSeek V4.1 sharded mHC: main-model layers keep the hyper-"
+                "connection residual sharded along the hidden dimension; wo_b "
+                "and MoE outputs stay unreduced and each mHC seam reduce-"
+                "scatters them, runs on 1/TP of the columns and all-gathers "
+                "the normalized sublayer input (TPU_DEEPSEEK_V41_SHARDED_MHC)."
+            )
 
-    forward = bind_device_ops(
-        upstream.DeepseekV4DecoderLayer.forward,
+    _replicated_forward = bind_device_ops(
+        _upstream_layer_forward,
         mhc_pre_delayed_tilelang=pre,
         mhc_post_tilelang=post,
         mhc_shifted_post_pre=shifted_post_pre,
         sp_all_gather=lambda x: x,
     )
+    _sharded_forward = bind_device_ops(
+        _upstream_layer_forward,
+        namespace_suffix="_sharded_mhc",
+        mhc_pre_delayed_tilelang=pre,
+        mhc_post_tilelang=_reduce_then_post,
+        mhc_shifted_post_pre=_sharded_seam,
+        sp_all_gather=lambda x: x,
+    )
+
+    def forward(self, *args, **kwargs):
+        if getattr(self, "defers_seam_all_reduce", False):
+            return self._sharded_forward(*args, **kwargs)
+        return self._replicated_forward(*args, **kwargs)
 
 
 _upstream_use_sequence_parallel = upstream._use_sequence_parallel
@@ -190,6 +290,31 @@ def _use_sequence_parallel(vllm_config) -> bool:
         and parallel.pipeline_parallel_size == 1
         and parallel.enable_expert_parallel
         and parallel.tensor_parallel_size > 1
+    )
+
+
+def _shards_mhc_residual(vllm_config, layer_idx: int) -> bool:
+    """Whether layer ``layer_idx`` keeps its mHC residual sharded along D.
+
+    Main-model layers only: DSpark draft layers (indices past
+    ``num_hidden_layers``) keep the replicated residual their final collapse
+    expects; pipeline stages hand off the full residual. Sequence
+    parallelism already shards the residual by token. The
+    seam takes over the MoE's all-reduce, so MoE paths that reduce inside
+    their own program (the fused EP kernel, the pipelined collective) are
+    excluded.
+    """
+    if not envs.TPU_DEEPSEEK_V41_SHARDED_MHC:
+        return False
+    parallel = vllm_config.parallel_config
+    hf_config = vllm_config.model_config.hf_config
+    return (
+        sharded_mhc_enabled(parallel.tensor_parallel_size)
+        and parallel.pipeline_parallel_size == 1
+        and layer_idx < hf_config.num_hidden_layers
+        and not _use_sequence_parallel(vllm_config)
+        and not envs.USE_MOE_FUSED_EP_KERNEL
+        and not enable_pipelined_collective_and_compute()
     )
 
 
@@ -1003,6 +1128,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     stage != "encoder"
                     and self.end_layer in self.aux_hidden_state_layers
                 )
+                # The layer left its last sublayer output unreduced for a seam
+                # that has no successor here.
+                deferred_reduce = (
+                    getattr(layer, "defers_seam_all_reduce", False) is True
+                )
                 if (
                     stage != "encoder"
                     and post_mix is not None
@@ -1012,16 +1142,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 ):
                     assert residual is not None
                     assert pre_mix is not None
-                    hidden_states, final_aux = _post_and_collapse(
+                    hidden_states, final_aux = _reduce_post_and_collapse(
                         hidden_states,
                         residual,
                         post_mix,
                         res_mix,
                         pre_mix,
+                        deferred_reduce=deferred_reduce,
                         capture_aux=capture_final_aux,
                     )
                     collapsed_final = True
                 else:
+                    if deferred_reduce:
+                        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states = post(hidden_states, residual, post_mix, res_mix)
                     final_aux = (
                         _mean_hc_streams(hidden_states) if capture_final_aux else None

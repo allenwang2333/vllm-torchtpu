@@ -22,18 +22,20 @@ def device_hooks(module, **replacements):
                 setattr(module, name, value)
 
 
-def bind_device_ops(function, **operations):
+def bind_device_ops(function, *, namespace_suffix="", **operations):
     """Reuse upstream bytecode with per-adapter device function bindings.
 
     Unlike runtime module monkeypatches, bindings are immutable during forward
-    and TorchDynamo can trace them without locks or global mutation.
+    and TorchDynamo can trace them without locks or global mutation. A second
+    binding of the same function needs its own ``namespace_suffix``: the
+    namespace is registered by name, and Dynamo guards resolve through it.
     """
     import sys
     from types import FunctionType, ModuleType
 
     # Dynamo guards resolve global functions by module name. A copied globals
     # dict with the upstream name would make guards inspect the GPU operation.
-    name = f"{__name__}.{function.__qualname__.replace('.', '_')}"
+    name = f"{__name__}.{function.__qualname__.replace('.', '_')}{namespace_suffix}"
     namespace = ModuleType(name)
     namespace.__dict__.update(function.__globals__ | operations | {"__name__": name})
     sys.modules[name] = namespace

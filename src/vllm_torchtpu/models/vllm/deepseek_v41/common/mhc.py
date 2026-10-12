@@ -4,13 +4,21 @@ Shared by the v1 and v2 DeepSeek V4.1 implementations.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 import torch
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.normalization import rms_norm
 
 
@@ -572,6 +580,114 @@ def delayed_post_pre_flat_jax(
     return flat_new, post[..., None], comb, value, new_pre
 
 
+# Partial sums one D-sharded seam rank contributes per token: the mix logits,
+# the residual square sum the gates normalize by, and the collapsed value's
+# square sum the sublayer RMSNorm normalizes by.
+_SHARDED_STATS = ("mixes", "residual_squares", "value_squares")
+
+
+def _sharded_tile(tokens: int) -> int | None:
+    """Row tile for the 1/8-width seam pass, or None for the XLA path.
+
+    A rank's residual is ``[T, M * D / tp]`` (2560 wide at TP8), so a tile
+    holds 8x more rows in the same VMEM as the full-width pass. On TPU7x the
+    largest dividing tile was fastest: T=1152 runs 13.7 us at tile 384
+    against 15.9 us at 96.
+    """
+    for tile in (384, 256, 128, 96, 64):
+        if tokens % tile == 0:
+            return tile
+    return None
+
+
+def delayed_post_pre_partial_flat_jax(
+    x: jax.Array,
+    flat: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn: jax.Array,
+    previous_pre: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One rank's slice of `delayed_post_pre_flat_jax` on D-sharded streams.
+
+    ``x [T, D/tp]``, ``flat [T, M * D/tp]`` and the packed ``fn`` rows are this
+    rank's columns of every stream. Post and collapse are column-local, so
+    ``flat_new`` and ``value`` come out final; the per-token reductions over D
+    come out as this rank's partial sums ``[T, mixes + 2]`` (see
+    `_SHARDED_STATS`) for the caller to all-reduce.
+    """
+    tokens, width = flat.shape
+    mult = previous_pre.shape[1]
+    dim = width // mult
+    mixes = mult * (mult + 2)
+    weight = fn if fn.dtype == jnp.bfloat16 else _pack_mix_weight(fn)
+    tile = _sharded_tile(tokens)
+    if tile is None:
+        flat_new, value = _post_and_collapse_jax(
+            x, flat, post_layer_mix, comb_res_mix, previous_pre
+        )
+        mix = _packed_mixes(flat_new, weight, mixes)
+        flat_f32 = flat_new.astype(jnp.float32)
+        square = jnp.sum(flat_f32 * flat_f32, axis=-1, keepdims=True)
+    else:
+        flat_new, mix, square, value = _flat_post_pre_sums(
+            x.reshape(tokens, dim).astype(flat.dtype),
+            flat,
+            post_layer_mix.reshape(tokens, mult),
+            comb_res_mix.reshape(tokens, mult * mult),
+            weight,
+            previous_pre,
+            mixes,
+            tile,
+        )
+    value_f32 = value.astype(jnp.float32)
+    stats = jnp.concatenate(
+        [mix, square, jnp.sum(value_f32 * value_f32, axis=-1, keepdims=True)], -1
+    )
+    return flat_new, value, stats
+
+
+def sharded_gates_norm_jax(
+    stats: jax.Array,
+    value: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    norm_weight: jax.Array,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    repeats: int,
+    dim: int,
+    norm_eps: float,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Gates from all-reduced partial sums, and this rank's normalized value.
+
+    ``stats`` is `delayed_post_pre_partial_flat_jax`'s output summed over the
+    ranks; ``dim`` is the full hidden size both RMS denominators use.
+    ``value`` and ``norm_weight`` are this rank's columns.
+    """
+    mixes = stats.shape[1] - 2
+    mult = math.isqrt(mixes + 1) - 1
+    new_pre, post, comb = _pre_gates(
+        stats[:, :mixes],
+        stats[:, mixes : mixes + 1],
+        mult,
+        dim,
+        scale,
+        base,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        repeats,
+    )
+    value_f32 = value.astype(jnp.float32)
+    inv_rms = jax.lax.rsqrt(stats[:, mixes + 1 : mixes + 2] / dim + norm_eps)
+    normed = value_f32 * inv_rms * norm_weight.astype(jnp.float32)
+    return post[..., None], comb, normed.astype(value.dtype), new_pre
+
+
 def initialize_delayed_mhc():
     global _pre_op
     if _pre_op is not None:
@@ -654,9 +770,48 @@ def initialize_delayed_mhc():
 
     _post_pre_flat_op.register_fake(fake_post_pre_flat)
 
+    global _post_pre_partial_flat_op, _sharded_gates_op
+    _post_pre_partial_flat_op = pallas.jax_op(
+        "pallas::deepseek_v41_delayed_mhc_post_pre_partial_flat",
+        delayed_post_pre_partial_flat_jax,
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(),) * 6,
+    )
+
+    def fake_partial(x, flat, post_layer_mix, comb_res_mix, fn, previous_pre):
+        tokens, mult = previous_pre.shape
+        return (
+            torch.empty_like(flat),
+            flat.new_empty((tokens, flat.shape[1] // mult)),
+            previous_pre.new_empty((tokens, mult * (mult + 2) + 2)),
+        )
+
+    _post_pre_partial_flat_op.register_fake(fake_partial)
+
+    _sharded_gates_op = pallas.jax_op(
+        "pallas::deepseek_v41_sharded_mhc_gates_norm",
+        sharded_gates_norm_jax,
+        mesh=get_vllm_model_wrapper_context().mesh,
+        input_partition_specs=(P(),) * 5 + (None,) * 7,
+    )
+
+    def fake_gates(stats, value, scale, base, norm_weight, *args):
+        tokens = stats.shape[0]
+        mult = math.isqrt(stats.shape[1] - 1) - 1
+        return (
+            stats.new_empty((tokens, mult, 1)),
+            stats.new_empty((tokens, mult, mult)),
+            torch.empty_like(value),
+            stats.new_empty((tokens, mult)),
+        )
+
+    _sharded_gates_op.register_fake(fake_gates)
+
 
 _pre_flat_op = None
 _post_pre_flat_op = None
+_post_pre_partial_flat_op = None
+_sharded_gates_op = None
 
 
 def delayed_pre(residual, x, fn, scale, base, previous_pre, *constants):
@@ -706,7 +861,126 @@ def initialize_mhc_post():
     _post_op = get_mhc_post_op()
 
 
+def sharded_mhc_enabled(tp_size: int | None = None) -> bool:
+    """Whether seams keep the residual sharded along D across the TP ranks.
+
+    Opt-in (``TPU_DEEPSEEK_V41_SHARDED_MHC``) and only meaningful with TP > 1.
+    """
+    if not envs.TPU_DEEPSEEK_V41_SHARDED_MHC:
+        return False
+    size = get_tensor_model_parallel_world_size() if tp_size is None else tp_size
+    return size > 1
+
+
+def _rank_columns(dim: int) -> slice:
+    """This rank's contiguous block of the hidden dimension.
+
+    The block a ``reduce_scatter(dim=-1)`` hands this rank, and the one an
+    ``all_gather(dim=-1)`` puts back in place.
+    """
+    width = dim // get_tensor_model_parallel_world_size()
+    rank = get_tensor_model_parallel_rank()
+    return slice(rank * width, (rank + 1) * width)
+
+
+def is_sharded_residual(residual: torch.Tensor, dim: int) -> bool:
+    """Whether ``residual [T, M, D_local]`` holds only this rank's columns."""
+    return residual.shape[-1] != dim
+
+
+def full_residual(residual: torch.Tensor, dim: int) -> torch.Tensor:
+    """The full ``[T, M, D]`` streams, gathering a D-sharded residual."""
+    if not is_sharded_residual(residual, dim):
+        return residual
+    return tensor_model_parallel_all_gather(residual.contiguous(), dim=-1)
+
+
+def _local_residual(residual: torch.Tensor, dim: int) -> torch.Tensor:
+    """This rank's ``[T, M, D / tp]`` columns of a residual of either width."""
+    if is_sharded_residual(residual, dim):
+        return residual
+    return residual[..., _rank_columns(dim)].contiguous()
+
+
+def _local_mix_weight(fn: torch.Tensor, dim: int, mult: int) -> torch.Tensor:
+    """This rank's rows of the mix projection, stream by stream.
+
+    ``fn`` is either the load-time packed BF16 ``[M * D, 128]`` weight or the
+    FP32 ``[mixes, M * D]`` one; both index streams as ``s * D + column``.
+    """
+    cols = _rank_columns(dim)
+    blocks = [slice(s * dim + cols.start, s * dim + cols.stop) for s in range(mult)]
+    if fn.dtype == torch.bfloat16:
+        return torch.cat([fn[b] for b in blocks], dim=0)
+    return torch.cat([fn[:, b] for b in blocks], dim=1)
+
+
+def _sharded_post_pre(
+    x,
+    residual,
+    post_layer_mix,
+    comb_res_mix,
+    fn,
+    hc_scale,
+    hc_base,
+    constants,
+    pre_mix,
+    norm_weight,
+    norm_eps,
+    capture_aux,
+):
+    """`shifted_post_pre` with the residual sharded along D.
+
+    ``x`` is the sublayer's unreduced partial sum. Its all-reduce is split
+    around the seam: the reduce-scatter hands each rank its columns, the seam
+    runs on those 1/tp columns, one ``[T, mixes + 2]`` FP32 all-reduce
+    completes the per-token sums the gates and the norm need, and the
+    all-gather of the normalized value is the second half of the original
+    all-reduce. The returned residual stays sharded.
+    """
+    assert _post_pre_partial_flat_op is not None and _sharded_gates_op is not None
+    dim = x.shape[-1]
+    mult = residual.shape[1]
+    cols = _rank_columns(dim)
+    x_local = tensor_model_parallel_reduce_scatter(x, dim=-1)
+    residual = _local_residual(residual, dim)
+    flat_new, value, stats = _post_pre_partial_flat_op(
+        x_local,
+        residual.flatten(1),
+        post_layer_mix,
+        comb_res_mix,
+        _local_mix_weight(fn, dim, mult),
+        pre_mix,
+    )
+    stats = tensor_model_parallel_all_reduce(stats)
+    weight = (
+        norm_weight[cols]
+        if norm_weight is not None
+        else torch.ones_like(value[0], dtype=torch.float32)
+    )
+    post_mix, comb_mix, normed, next_pre = _sharded_gates_op(
+        stats, value, hc_scale, hc_base, weight, *constants, dim, norm_eps
+    )
+    value = tensor_model_parallel_all_gather(
+        normed if norm_weight is not None else value, dim=-1
+    )
+    residual = flat_new.view_as(residual)
+    aux = (
+        tensor_model_parallel_all_gather(_mean_hc_streams(residual), dim=-1)
+        if capture_aux
+        else x.new_empty(0, dim)
+    )
+    return residual, post_mix, comb_mix, value, next_pre, aux
+
+
 def post(x, residual, post_layer_mix, comb_res_mix):
+    """The full ``[T, M, D]`` streams after the post-mix.
+
+    A D-sharded residual is gathered first: the callers (Engram injection and
+    the encoder/decoder stage boundary) consume the full streams.
+    """
+    if envs.TPU_DEEPSEEK_V41_SHARDED_MHC:
+        residual = full_residual(residual, x.shape[-1])
     if residual.device.type == "tpu":
         assert _post_op is not None
         return _post_op(x, residual, post_layer_mix, comb_res_mix)
@@ -743,6 +1017,8 @@ def pre(
     norm_weight=None,
     norm_eps=1e-6,
 ):
+    if envs.TPU_DEEPSEEK_V41_SHARDED_MHC and norm_weight is not None:
+        residual = full_residual(residual, norm_weight.shape[-1])
     if residual.device.type == "tpu":
         if pre_mix is None:
             pre_mix = _default_pre_mix(residual, hc_scale.dtype)
@@ -819,11 +1095,27 @@ def shifted_post_pre(
 ):
     if stream is not None:
         raise ValueError("TPU mHC does not use CUDA streams")
+    on_tpu = residual.device.type == "tpu" and _post_pre_flat_op is not None
+    if on_tpu and pre_mix is None:
+        pre_mix = _default_pre_mix(residual, hc_scale.dtype)
+    if reduce_results and on_tpu and sharded_mhc_enabled():
+        return _sharded_post_pre(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat),
+            pre_mix,
+            norm_weight,
+            norm_eps,
+            capture_aux,
+        )
     if reduce_results:
         x = tensor_model_parallel_all_reduce(x)
-    if residual.device.type == "tpu" and _post_pre_flat_op is not None:
-        if pre_mix is None:
-            pre_mix = _default_pre_mix(residual, hc_scale.dtype)
+    if on_tpu:
         residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
             x,
             residual,

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
+    TPU_DEEPSEEK_V41_SHARDED_MHC: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_FUSED_SWA: bool = True
     TPU_DEEPSEEK_V41_DECODE_LOCAL_Q: bool = False
@@ -366,6 +367,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.
     # Upstream enables it only with DP>1 or MegaMoE.
     "TPU_DEEPSEEK_V41_SP": env_bool("TPU_DEEPSEEK_V41_SP"),
+    # Keep the V4.1 mHC residual sharded along the hidden dimension across TP
+    # ranks (non-SP layers of the main model): each sublayer's all-reduce is
+    # split into a reduce-scatter and an all-gather around a 1/TP-width mHC.
+    "TPU_DEEPSEEK_V41_SHARDED_MHC": env_bool("TPU_DEEPSEEK_V41_SHARDED_MHC"),
     # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
