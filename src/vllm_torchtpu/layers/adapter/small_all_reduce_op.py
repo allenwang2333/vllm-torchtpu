@@ -133,28 +133,32 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
 
 def _build_valid_rows_all_reduce(mesh, tile_rows: int):
     """The all-reduce op over ``mesh`` that moves only a block's valid rows:
-    fn(x [rows, hidden], meta int32 [2] = (n_valid, mesh index)) per core."""
+    fn(x [rows, hidden], n_valid int32 [1], rank int32 [1]) per core."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
-    def body(block, meta):
+    def body(block, n_valid, rank):
         return all_reduce.small_all_reduce_valid_rows(
-            block, meta, num_cores=n, axis=EP_AXIS_NAME, tile_rows=tile_rows
+            block, n_valid, rank, num_cores=n, axis=EP_AXIS_NAME, tile_rows=tile_rows
         )
 
-    def fn(x: jax.Array, meta: jax.Array) -> jax.Array:
+    def fn(x: jax.Array, n_valid: jax.Array, rank: jax.Array) -> jax.Array:
         return jax.shard_map(
-            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
-        )(x, meta)
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(x, n_valid, rank)
 
-    def fake(x, meta):
+    def fake(x, n_valid, rank):
         return torch.empty_like(x)
 
     return sharded_jax_op(
         "pallas::small_all_reduce_valid_rows",
         fn,
         mesh=mesh,
-        input_partition_specs=(spec, spec),
+        input_partition_specs=(spec, spec, spec),
         output_partition_specs=spec,
         fake=fake,
     )
@@ -272,12 +276,11 @@ def retain(out: torch.Tensor) -> torch.Tensor:
     return out + (value - value)
 
 
-def _valid_rows_meta(rows: int, mask: torch.Tensor) -> torch.Tensor:
-    """int32 [2] = (valid rows of this block, mesh index): the mask marks
-    rows [n_valid, padded) as padding, the same on every TP rank."""
+def _valid_rows(rows: int, mask: torch.Tensor) -> torch.Tensor:
+    """int32 [1], the valid rows of this block: the mask marks rows
+    [n_valid, padded) as padding, the same on every TP rank."""
     padding = mask[:rows].to(torch.int32).sum()
-    n_valid = (rows - padding).reshape(1).to(torch.int32)
-    return torch.cat([n_valid, _RANK])
+    return (rows - padding).reshape(1).to(torch.int32)
 
 
 def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -290,7 +293,7 @@ def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
         return _AR_OP(x, _RANK)
     rows, hidden = x.shape
     if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
-        return _AR_VALID_OP(x, _valid_rows_meta(rows, mask))
+        return _AR_VALID_OP(x, _valid_rows(rows, mask), _RANK)
     return _AR_OP(retain(x), _RANK)
 
 
