@@ -437,11 +437,10 @@ def _patch_vllm_compile_all_ranges() -> None:
         # Biggest first, dealt out in a snake: local rank 0 starts on the
         # biggest range, which takes far longer than the others and so bounds
         # startup, and a rank whose first range is small gets the next one.
-        entries = sorted(
-            (e for e in self.range_entries.values() if not e.compiled),
-            key=lambda e: e.compile_range.end,
-            reverse=True,
-        )
+        # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
+        entries = [e for e in self.range_entries.values() if not e.compiled]
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            entries.sort(key=lambda e: e.compile_range.end, reverse=True)
         mine, others = [], []
         for i, range_entry in enumerate(entries):
             turn, slot = divmod(i, ranks)

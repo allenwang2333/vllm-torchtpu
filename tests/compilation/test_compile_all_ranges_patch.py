@@ -140,3 +140,13 @@ def test_no_wait_when_the_host_size_is_unknown(compile_all_ranges, monkeypatch):
     calls = _compile(compile_all_ranges, monkeypatch, 1, ranks_per_host=None)
     assert all(wait == 0.0 for _, wait in calls)
     assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_biggest_first_off_deals_in_vllm_order(compile_all_ranges, monkeypatch):
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "0")
+    owned = [_owned(_compile(compile_all_ranges, monkeypatch, r)) for r in range(8)]
+    # vLLM's order, smallest first: local rank 0 starts on the smallest range.
+    assert owned == [[16], [32], [64], [128], [256], [512], [1024], [2048, 4096]]
+    for rank in range(8):
+        calls = _compile(compile_all_ranges, monkeypatch, rank)
+        assert sorted(end for end, _ in calls) == SIZES
