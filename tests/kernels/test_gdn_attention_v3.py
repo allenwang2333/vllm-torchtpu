@@ -860,3 +860,233 @@ class GDNAttentionTest(parameterized.TestCase):
         # reference; Step B (continuation) must match the second half.
         np.testing.assert_allclose(output_a, output_ref[:half], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(output_b, output_ref[half:], rtol=2e-2, atol=2e-2)
+
+    def test_bf16_qkv_modes_match_bit_exact(self):
+        """Verify bf16 qkv modes (0: f32, 1: 3D bf16, 2: 2D bf16) are bit-exact."""
+        kq_head_dim = 128
+        v_head_dim = 128
+        n_kq = 2
+        n_v = 8
+        kernel_size = 4
+        lengths = [1, 1, 1, 37, 128]
+        q_loc = jnp.array([0, 1, 2, 3, 40, 168], dtype=jnp.int32)
+        seq_lens = jnp.array([10, 20, 5, 37, 128], dtype=jnp.int32)
+        distribution = jnp.array([3, 5, 5], dtype=jnp.int32)
+        state_indices = jnp.arange(1, 6, dtype=jnp.int32)
+        num_tokens = sum(lengths)
+        num_blocks = 8
+        conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+
+        rngs = iter(jax.random.split(jax.random.key(42), 10))
+        qkv = jax.random.normal(next(rngs), (num_tokens, conv_dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, conv_dim), dtype=jnp.bfloat16
+        )
+        recurrent_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim), dtype=jnp.bfloat16
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (conv_dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (conv_dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.bfloat16)
+
+        def run_mode(mode: int):
+            @jax.jit
+            def _fn(qkv, b, a, cs, rs):
+                return wrapper.fused_conv1d_gdn(
+                    qkv,
+                    b,
+                    a,
+                    cs,
+                    rs,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    dt_bias,
+                    q_loc,
+                    state_indices,
+                    distribution,
+                    seq_lens,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=kq_head_dim,
+                    d_v=v_head_dim,
+                    kernel_size=kernel_size,
+                    bf16_qkv_mode=mode,
+                )
+
+            return _fn(qkv, b, a, conv_state, recurrent_state)
+
+        (cs_0, rs_0), out_0 = run_mode(0)
+        for mode in (1, 2):
+            (cs_m, rs_m), out_m = run_mode(mode)
+            np.testing.assert_array_equal(
+                np.asarray(out_m, np.float32), np.asarray(out_0, np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(cs_m, np.float32), np.asarray(cs_0, np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(rs_m, np.float32), np.asarray(rs_0, np.float32)
+            )
+
+    def test_bf16_qkv_mode2_spec_window_w4_tile8(self):
+        """Verify bf16_qkv_mode=2 compiles and matches mode=0 for batched_w4 (seq_tile_size=8)."""
+        kq_head_dim = 128
+        v_head_dim = 128
+        n_kq = 2
+        n_v = 8
+        kernel_size = 4
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        num_seqs = 24
+        lengths = [window] * 22 + [37, 128]
+        q_loc = jnp.array(np.cumsum([0] + lengths), dtype=jnp.int32)
+        seq_lens = jnp.array([20] * 22 + [37, 128], dtype=jnp.int32)
+        distribution = jnp.array([22, 24, 24], dtype=jnp.int32)
+        state_indices = jnp.arange(1, num_seqs + 1, dtype=jnp.int32) * window
+        read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
+        num_tokens = sum(lengths)
+        num_blocks = (num_seqs + 2) * window
+        conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+
+        rngs = iter(jax.random.split(jax.random.key(43), 10))
+        qkv = jax.random.normal(next(rngs), (num_tokens, conv_dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, conv_dim), dtype=jnp.bfloat16
+        )
+        recurrent_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim), dtype=jnp.bfloat16
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (conv_dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (conv_dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.bfloat16)
+
+        def run_mode(mode: int):
+            @jax.jit
+            def _fn(qkv, b, a, cs, rs):
+                return wrapper.fused_conv1d_gdn(
+                    qkv,
+                    b,
+                    a,
+                    cs,
+                    rs,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    dt_bias,
+                    q_loc,
+                    state_indices,
+                    distribution,
+                    seq_lens,
+                    read_offsets,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=kq_head_dim,
+                    d_v=v_head_dim,
+                    kernel_size=kernel_size,
+                    num_spec_tokens=num_spec_tokens,
+                    decode_tile_size=8,
+                    bf16_qkv_mode=mode,
+                )
+
+            return _fn(qkv, b, a, conv_state, recurrent_state)
+
+        (cs_0, rs_0), out_0 = run_mode(0)
+        (cs_2, rs_2), out_2 = run_mode(2)
+        np.testing.assert_array_equal(
+            np.asarray(out_2, np.float32), np.asarray(out_0, np.float32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(cs_2, np.float32), np.asarray(cs_0, np.float32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(rs_2, np.float32), np.asarray(rs_0, np.float32)
+        )
+
+    def test_bf16_qkv_mode2_small_batch_per_seq_fallback(self):
+        """Verify batch_size=4 with distribution=[0, 0, 1] (spec warmup) falls back cleanly from mode=2."""
+        kq_head_dim = 128
+        v_head_dim = 128
+        n_kq = 2
+        n_v = 8
+        kernel_size = 4
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        num_seqs = 1
+        num_tokens = 4
+        q_loc = jnp.array([0, 4], dtype=jnp.int32)
+        seq_lens = jnp.array([4], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+        state_indices = jnp.array([window], dtype=jnp.int32)
+        read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
+        num_blocks = 3 * window
+        conv_dim = (n_kq * kq_head_dim) * 2 + n_v * v_head_dim
+
+        rngs = iter(jax.random.split(jax.random.key(44), 10))
+        qkv = jax.random.normal(next(rngs), (num_tokens, conv_dim), dtype=jnp.bfloat16)
+        b = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        a = jax.random.normal(next(rngs), (num_tokens, n_v), dtype=jnp.bfloat16)
+        conv_state = jax.random.normal(
+            next(rngs), (num_blocks, kernel_size - 1, conv_dim), dtype=jnp.bfloat16
+        )
+        recurrent_state = jax.random.normal(
+            next(rngs), (num_blocks, n_v, kq_head_dim, v_head_dim), dtype=jnp.bfloat16
+        )
+        conv_weight = jax.random.normal(
+            next(rngs), (conv_dim, 1, kernel_size), dtype=jnp.bfloat16
+        )
+        conv_bias = jax.random.normal(next(rngs), (conv_dim,), dtype=jnp.bfloat16)
+        a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
+        dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.bfloat16)
+
+        def run_mode(mode: int):
+            @jax.jit
+            def _fn(qkv, b, a, cs, rs):
+                return wrapper.fused_conv1d_gdn(
+                    qkv,
+                    b,
+                    a,
+                    cs,
+                    rs,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    dt_bias,
+                    q_loc,
+                    state_indices,
+                    distribution,
+                    seq_lens,
+                    read_offsets,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=kq_head_dim,
+                    d_v=v_head_dim,
+                    kernel_size=kernel_size,
+                    num_spec_tokens=num_spec_tokens,
+                    bf16_qkv_mode=mode,
+                )
+
+            return _fn(qkv, b, a, conv_state, recurrent_state)
+
+        (cs_0, rs_0), out_0 = run_mode(0)
+        (cs_2, rs_2), out_2 = run_mode(2)
+        np.testing.assert_array_equal(
+            np.asarray(out_2, np.float32), np.asarray(out_0, np.float32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(cs_2, np.float32), np.asarray(cs_0, np.float32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(rs_2, np.float32), np.asarray(rs_0, np.float32)
+        )
+
