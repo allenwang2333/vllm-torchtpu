@@ -619,7 +619,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rank_operand = envs.TPU_DCP_RANK_OPERAND
         rank_tensor = dcp_rank_operand() if rank_operand else None
 
-        def _streamidx_topk_dcp_jax(
+        def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
             weights: jax.Array,  # replicated
             cache_kv: jax.Array,  # this rank's position shard
@@ -628,9 +628,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices: jax.Array,  # virtual page ordinals
             cu_q_lens: jax.Array,
             distribution: jax.Array,
-            *rank_ids: jax.Array,  # TPU_DCP_RANK_OPERAND: i32[dcp], sharded
+            rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
         ) -> tuple[jax.Array, jax.Array]:
-            rank_ids_arg = rank_ids[0] if rank_ids else None
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
@@ -682,6 +681,57 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
             return cache_kv, local_topk
 
+        # The op's signature is the schema torch infers: no varargs, and the
+        # flag-off op keeps exactly the eight operands it always had.
+        if rank_operand:
+
+            def _streamidx_topk_dcp_jax(
+                q_bytes: jax.Array,
+                weights: jax.Array,
+                cache_kv: jax.Array,
+                k_packed: jax.Array,
+                seq_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                distribution: jax.Array,
+                rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            ) -> tuple[jax.Array, jax.Array]:
+                return _streamidx_topk_dcp_impl(
+                    q_bytes,
+                    weights,
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    distribution,
+                    rank_ids,
+                )
+
+        else:
+
+            def _streamidx_topk_dcp_jax(
+                q_bytes: jax.Array,
+                weights: jax.Array,
+                cache_kv: jax.Array,
+                k_packed: jax.Array,
+                seq_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                distribution: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                return _streamidx_topk_dcp_impl(
+                    q_bytes,
+                    weights,
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    distribution,
+                    None,
+                )
+
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
         op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
@@ -722,7 +772,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
-            *rank_ids,
+            rank_ids=None,
             **kwargs,
         ):
             del (
