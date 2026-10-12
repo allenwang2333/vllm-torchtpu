@@ -635,8 +635,8 @@ class PcpSequenceLayoutPlanner:
                 gdn_rm_to_packed=torch.zeros((max_tokens_cap * self.eligibility.pcp_size,), dtype=torch.int32, device=dev),
                 gdn_packed_to_local=torch.zeros((max_tokens_cap,), dtype=torch.int32, device=dev),
                 gdn_query_start_loc=torch.zeros((n_off + 1,), dtype=torch.int32, device=dev),
-                cache_pages=1,
-                is_decode=bool(num_tokens < (2 * block_size)),
+                cache_pages=0,
+                is_decode=False,
             )
             return SequenceLayoutPlan(
                 descriptor=PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,

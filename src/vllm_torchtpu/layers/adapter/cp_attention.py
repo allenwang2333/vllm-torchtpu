@@ -803,10 +803,7 @@ def forward_with_pcp(
         else kv_cache.shape[1]
     )
     if torch.compiler.is_compiling():
-        is_decode = bool(
-            getattr(pcp_meta, "is_decode", False)
-            or (query.shape[0] < (2 * int(page_size)))
-        )
+        is_decode = bool(query.shape[0] < (2 * int(page_size)))
     else:
         is_decode = bool(getattr(pcp_meta, "is_decode", False))
 
