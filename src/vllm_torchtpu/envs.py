@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = True
+    TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_EP_TP_SIZE: int = 4
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -840,6 +841,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group sizes by int32 compare-and-count instead of three comparison
     # sorts. Outputs are bit-identical to the sorted form.
     "TPU_MOE_ONEHOT_SORTFREE": env_bool("TPU_MOE_ONEHOT_SORTFREE", True),
+    # EP MoE combine on SparseCore: run the destination-tiled bf16 kernel
+    # (ragged_gather_reduce_v4) instead of v2. v2 scatters a float32 partial
+    # per source row and leaves the bf16 cast to a TensorCore pass; v4 owns
+    # token tiles, accumulates in VMEM and writes bf16 rows. Bit-identical to
+    # v2. Falls back to v2 where v4 does not apply.
+    "TPU_MOE_SC_COMBINE_TILED": env_bool("TPU_MOE_SC_COMBINE_TILED"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
