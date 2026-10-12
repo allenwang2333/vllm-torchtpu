@@ -21,60 +21,16 @@ env:
   WORKLOAD_IMAGE: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:kube-disagg-${BUILDKITE_BUILD_NUMBER}"
 
 steps:
-  # TODO: drop this step and point WORKLOAD_IMAGE at :latest once a nightly is
-  # published from a Dockerfile carrying buildkite-agent; until then the pod
-  # cannot publish its own results.
   - label: ":docker: Build the benchmark image"
     key: "build_kube_disagg_image"
     agents:
       queue: cpu_64_core
     commands:
-      # dev, not ci: a pod has nothing to bind-mount, so it needs the package
-      # installed as well as the CI tooling.
       - ./docker/build_image.sh --target dev -t "$$WORKLOAD_IMAGE"
       - docker push "$$WORKLOAD_IMAGE"
 
-  - label: ":kubernetes: :tpu: Kube P/D Disaggregated Benchmark"
-    depends_on: "build_kube_disagg_image"
-    # Covers queueing as well as running, so that the launcher's own limits are
-    # what stop a step and not this.
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    plugins:
-      - kubernetes:
-          # Carries the launcher and the service account that may submit a
-          # workload.
-          podTemplate: tpu-launcher
-    env:
-      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
-      # The same parse_gke_results.py the GKE lane uses, so rows land in the
-      # same table. CI_RUNNER tags them runner=kube in the config JSON, which
-      # tells the two lanes apart - but does not stop a reader that expects one
-      # row a night from seeing two while pipeline_disagg_gke.yml also runs.
-      # Retire that lane, or teach the readers to filter, before relying on it.
-      #
-      # BigQuery only: Spanner is written by upload_results.py, which this lane
-      # does not use.
-      BQ_UPLOAD: "1"
-      CI_RUNNER: "kube"
-    commands:
-      # --env forwards by name into every container called `workload`. The
-      # BUILDKITE_* the agent CLI needs to attach an artifact are swept by the
-      # launcher itself, so only what it cannot infer is named here.
-      - >-
-        /opt/launcher/launch
-        --manifest .buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml
-        --env BQ_UPLOAD
-        --env CI_RUNNER
-        --env CREATED_BY
-
-  # Kimi-K3 1P1D on two 2x2x4 slices, 32 chips, beside the Qwen benchmark
-  # above: the two use different queues and together fill the v7x fleet. The
-  # pipeline is scheduled once a day, at 02:00 PT, ahead of the 03:00 Kimi-K3
-  # step in pipeline_perf_kube.yml, which needs one of the same slices; the
-  # slices also serve Kimi-K3 development, so CI keeps to that window.
-  - label: ":kubernetes: :tpu: Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
+  # One-off: write the Kimi-K3 megakernel pre-shard into the model bucket.
+  - label: ":kubernetes: :tpu: Kimi-K3 megakernel pre-shard (TPU v7x 2x2x4)"
     depends_on: "build_kube_disagg_image"
     timeout_in_minutes: 1440
     agents:
@@ -83,4 +39,4 @@ steps:
       - kubernetes:
           podTemplate: tpu-launcher
     commands:
-      - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d.yaml
+      - /opt/launcher/launch --manifest .buildkite/kubernetes/manifests/workloads/kimi-k3-preshard.yaml

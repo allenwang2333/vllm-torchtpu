@@ -1,0 +1,80 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 megakernel pre-shard: `python -m tools.megakernel preshard` over the
+# four hosts of one 2x2x4 slice, eight ranks per host, as the tool lays it out
+# on Slurm. See k3_preshard.sh. A one-off: it writes the TP32 pre-shard the
+# megakernel backend loads (`--model-loader-extra-config '{"presharded": DIR}'`)
+# into the fleet's model bucket, where every chip pod already has it mounted
+# at /cache/hf/hub.
+#
+# The source checkpoint lives in a bucket the fleet does not mount, so each pod
+# adds its own read-only gcsfuse volume for it; the sidecar comes with the
+# standard defaults. No file cache on that mount: the conversion streams
+# every 16 GB layer shard once, and the node's cache would only churn.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission. Every
+# container is named `workload`.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    tpu-ci.google.com/defaults: standard
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  replicatedJobs:
+    - name: preshard
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          # 1.5 TB read and written through gcsfuse; resumable if it runs out.
+          activeDeadlineSeconds: 43200
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_preshard.sh"]
+                  env:
+                    - name: K3_CHECKPOINT
+                      value: /ckpt/k3
+                    - name: K3_PRESHARD_DIR
+                      value: /cache/hf/hub/presharded/kimi-k3-tp32
+                    - name: TMPDIR
+                      value: /dev/shm
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
+              volumes:
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,read_ahead_kb=16384"
+                      skipCSIBucketAccessCheck: "true"
