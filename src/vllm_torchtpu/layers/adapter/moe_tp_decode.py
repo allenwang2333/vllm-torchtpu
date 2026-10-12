@@ -379,6 +379,31 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
+        m = kernel.ROW_BUCKETS[0]
+        if n < m:
+            # A decode bucket below the kernel's smallest row bucket
+            # (TPU_TOKEN_BUCKET_EXTRA=4,8): run the kernel on `m` rows, the
+            # extra rows trailing padding. The kernel skips rows >= n_valid
+            # (admission requires TPU_MOE_SKIP_PADDED_TOKENS) and every row is
+            # independent, so the first n rows are bit for bit the m-row
+            # bucket's; the plain-XLA fallback below costs far more.
+            xp = jnp.pad(x, ((0, m - n), (0, 0)))
+            sp = jnp.pad(scores, ((0, m - n), (0, 0)))
+            if kernel.can_use_moe_tp_decode(
+                xp, sp, bias, *weights, topk=statics.topk, n_ranks=n_ranks
+            ):
+                return kernel.moe_tp_decode(
+                    xp,
+                    sp,
+                    bias,
+                    n_valid,
+                    rank.reshape(()),
+                    *weights,
+                    e0.reshape(()),
+                    routed_scale=statics.routed_scale,
+                    topk=statics.topk,
+                    n_ranks=n_ranks,
+                )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):
