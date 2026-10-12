@@ -21,9 +21,21 @@
 
 Both forms start with a barrier so remote scratch is ready, sum in float32 and
 round once to the input dtype.
+
+Valid rows (``n_valid``, data): a padded decode block (a batch-1 MTP step pads
+4 rows to 16) need not move its padding. With ``n_valid`` the two-shot form
+gets a fold path: when n_valid <= fold_rows the valid rows are folded into one
+row tile, q[j * fold_rows + r, c] = x[r, j * hidden / k + c] with k the lane
+groups of an owner's column chunk, q is all-reduced (1/k of the bytes, every
+DMA whole row tiles) and unfolded; rows >= n_valid come out +0. Above
+fold_rows it is the two-shot above, unchanged. Either way an element's sum is
+the same float32 sum over the cores in core order, so valid rows are bitwise
+the plain two-shot's.
 """
 
+import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -142,6 +154,149 @@ def _twoshot(x, n, axis, rank, collective_id):
         collective_id,
         f"small_all_reduce_twoshot_r{rows}",
     )
+
+
+def fold_geometry(rows, hidden, num_cores, tile_rows):
+    """(k, fold_rows) of the fold path, or None when it does not exist: k lane
+    groups per owner chunk (>= 2), fold_rows = tile_rows // k (>= 1)."""
+    own = hidden // num_cores
+    if own % LANES or rows < tile_rows:
+        return None
+    k = own // LANES
+    fold_rows = tile_rows // k
+    return (k, fold_rows) if k >= 2 and fold_rows >= 1 else None
+
+
+def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
+    """Two-shot with the fold path; operands (meta int32 [2] = (n_valid,
+    rank) in SMEM, x). The full path is _twoshot's protocol."""
+    rows, hidden = x.shape
+    own = hidden // n
+    k, fr = fold_geometry(rows, hidden, n, tile_rows)
+    hk = hidden // k  # folded width
+    own_q = hk // n  # = LANES: a core's chunk of the folded tile
+
+    def exchange(chunk_of, rows_x, width, me, slices, gathered, sems, write_out):
+        """_twoshot's rounds on the [rows_x, width]-per-owner chunks
+        chunk_of(j), into gathered; write_out() then reads gathered."""
+        send1, recv1, send2, recv2 = sems
+
+        def slot(buf, j):
+            return buf.at[j, pl.ds(0, rows_x), pl.ds(0, width)]
+
+        def slots(buf):
+            return buf.at[pl.ds(0, n - 1), pl.ds(0, rows_x), pl.ds(0, width)]
+
+        for j in range(n):
+
+            @pl.when(jnp.int32(j) != me)
+            def _(j=j):
+                push(chunk_of(j), slot(slices, me), send1, recv1, j, axis, True)
+
+        slices[me, pl.ds(0, rows_x), pl.ds(0, width)] = chunk_of(me)[...]
+        wait_bytes_of(slots(slices), recv1)
+        acc = slices[0, pl.ds(0, rows_x), pl.ds(0, width)].astype(jnp.float32)
+        for j in range(1, n):
+            acc = acc + slices[j, pl.ds(0, rows_x), pl.ds(0, width)].astype(jnp.float32)
+        gathered[me, pl.ds(0, rows_x), pl.ds(0, width)] = acc.astype(gathered.dtype)
+        for j in range(n):
+
+            @pl.when(jnp.int32(j) != me)
+            def _(j=j):
+                push(slot(gathered, me), slot(gathered, me), send2, recv2, j, axis, True)
+
+        wait_bytes_of(slots(gathered), recv2)
+        write_out()
+        wait_bytes_of(slots(slices), send1)
+        wait_bytes_of(slots(gathered), send2)
+
+    def kernel(meta_ref, x_ref, o_ref, q, slices, gathered, *sems):
+        n_valid = meta_ref[0]
+        me = meta_ref[1]
+        barrier(n, axis, True)
+
+        @pl.when(n_valid <= fr)
+        def _fold():
+            row = lax.broadcasted_iota(jnp.int32, (tile_rows, hk), 0)
+            p = x_ref[pl.ds(0, tile_rows), :].astype(jnp.float32)
+            p = jnp.where(lax.broadcasted_iota(jnp.int32, p.shape, 0) < n_valid, p, 0.0)
+            folded = jnp.zeros((tile_rows, hk), jnp.float32)
+            for j in range(k):
+                blk = p[:, j * hk : (j + 1) * hk]
+                if j:
+                    blk = pltpu.roll(blk, j * fr, 0)
+                folded = jnp.where((row >= j * fr) & (row < (j + 1) * fr), blk, folded)
+            q[...] = folded.astype(q.dtype)
+
+            def write_out():
+                summed = jnp.concatenate(
+                    [gathered[j, pl.ds(0, tile_rows), pl.ds(0, own_q)] for j in range(n)],
+                    axis=1,
+                ).astype(jnp.float32)
+                for j in range(k):
+                    blk = summed if j == 0 else pltpu.roll(summed, tile_rows - j * fr, 0)
+                    o_ref[pl.ds(0, tile_rows), pl.ds(j * hk, hk)] = jnp.where(
+                        row < n_valid, blk, 0.0
+                    ).astype(o_ref.dtype)
+                if rows > tile_rows:
+                    o_ref[pl.ds(tile_rows, rows - tile_rows), :] = jnp.zeros(
+                        (rows - tile_rows, hidden), o_ref.dtype
+                    )
+
+            exchange(
+                lambda j: q.at[:, pl.ds(j * own_q, own_q)],
+                tile_rows, own_q, me, slices, gathered, sems, write_out,
+            )
+
+        @pl.when(n_valid > fr)
+        def _full():
+            def write_out():
+                for j in range(n):
+                    o_ref[:, pl.ds(j * own, own)] = gathered[j]
+
+            exchange(
+                lambda j: x_ref.at[:, pl.ds(j * own, own)],
+                rows, own, me, slices, gathered, sems, write_out,
+            )
+
+    scratch = [
+        pltpu.VMEM((tile_rows, hk), x.dtype),
+        pltpu.VMEM((n, rows, own), x.dtype),
+        pltpu.VMEM((n, rows, own), x.dtype),
+        *[pltpu.SemaphoreType.DMA] * 4,
+    ]
+    return scratch, kernel, f"small_all_reduce_twoshot_valid_r{rows}"
+
+
+def small_all_reduce_valid_rows(
+    x, meta, *, num_cores, axis, tile_rows, collective_id=COLLECTIVE_ID
+):
+    """The sum of ``x`` over the ``num_cores`` cores of mesh axis ``axis``,
+    moving only its first n_valid rows; rows >= n_valid come out +0 when the
+    fold path runs (n_valid <= fold_rows) and as the plain two-shot otherwise.
+
+    Args:
+      x: [rows, hidden], this core's block; hidden a multiple of
+        num_cores * LANES, rows >= tile_rows, and ``fold_geometry`` not None.
+      meta: int32 [2] = (n_valid, this core's index on the axis), as data;
+        n_valid the same on every core.
+      tile_rows: the bf16 sublane tiling (16 on TPU v7).
+    """
+    rows, hidden = x.shape
+    if hidden % (num_cores * LANES) or fold_geometry(rows, hidden, num_cores, tile_rows) is None:
+        raise ValueError(
+            f"[{rows}, {hidden}] over {num_cores} cores has no fold path "
+            f"(tile_rows={tile_rows})"
+        )
+    scratch, kernel, name = _twoshot_valid_rows(x, num_cores, axis, collective_id, tile_rows)
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec()],
+        scratch_shapes=scratch,
+        compiler_params=pltpu.CompilerParams(collective_id=collective_id),
+        name=name,
+    )(meta.astype(jnp.int32), x)
 
 
 def small_all_reduce(
