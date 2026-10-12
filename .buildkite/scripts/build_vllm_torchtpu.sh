@@ -81,6 +81,8 @@ VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 OUTPUT_DIR="${OUTPUT_DIR:-${TORCHTPU_ROOT}/dist}"
 KEEP_VLLM_SRC="${KEEP_VLLM_SRC:-0}"
 PYTHON="${PYTHON:-python3}"
+# Use own build deps under requirements/build/tpu.txt
+BUILD_REQUIREMENTS_FILE="${TORCHTPU_ROOT}/requirements/build/tpu.txt"
 
 # Linux x86_64 with glibc >= 2.28, the same baseline as upstream vLLM.
 WHEEL_PLATFORM_TAG="manylinux_2_28_x86_64"
@@ -223,8 +225,7 @@ echo "vLLM commit            : $(git rev-parse HEAD)"
 
 PYPROJECT_FILE="pyproject.toml"
 REQUIREMENTS_FILE="requirements/common.txt"
-BUILD_REQUIREMENTS_FILE="requirements/build/tpu.txt"
-for f in "$PYPROJECT_FILE" "$REQUIREMENTS_FILE" "$BUILD_REQUIREMENTS_FILE"; do
+for f in "$PYPROJECT_FILE" "$REQUIREMENTS_FILE"; do
     [[ -f "$f" ]] || die "${f} not found in vLLM ref '${VLLM_REF}'."
 done
 
@@ -275,7 +276,8 @@ echo "$REQUIRED_LINE" >> "$REQUIREMENTS_FILE"
 
 # --- Step 4: Build -----------------------------------------------------------
 # setup.py imports torch, setuptools-rust and setuptools-scm, so they must be
-# installed for a --no-isolation build. tpu.txt is just build tools + CPU torch.
+# installed for a --no-isolation build. Our requirements/build/tpu.txt is just
+# build tools + CPU torch; `build` fails if it no longer fits vLLM's [build-system].
 echo "Installing build dependencies..."
 "$PY" -m pip install -r "$BUILD_REQUIREMENTS_FILE" build wheel
 
