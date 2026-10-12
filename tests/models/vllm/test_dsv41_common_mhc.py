@@ -178,13 +178,16 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (256, 128, 128),
         (288, None, None),
         (320, None, None),
-        (384, None, 96),
-        (400, None, 80),  # TD8.237: C=80 DSpark draft (C * K)
-        (512, None, 64),
+        (384, None, None),
+        (400, None, None),
+        (512, None, None),
         (520, None, None),
-        (560, None, 80),  # TD8.237: C=112 DSpark draft
+        (560, None, None),
         (576, None, 96),
-        (640, None, 64),  # tile 64 beat 80 here (Job 1314)
+        (580, None, None),
+        (640, None, 128),
+        (704, None, 64),
+        (720, None, 80),
         (768, None, 96),
         (960, None, 96),
         (1024, 128, 128),

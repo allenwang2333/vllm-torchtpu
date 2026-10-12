@@ -381,8 +381,8 @@ class TestCommonMHCFull:
         assert p128.shape == (128, mult, 1)
         assert len(captured_kernel_calls) == 1
 
-        # Case B: tokens = 64, 96, 256, 384, 512, 576, 1024, fn is FP32
-        for t_pallas in (64, 96, 256, 384, 512, 576, 1024):
+        # Case B: tokens = 64, 96, 256, 576, 640, 720, 1024, fn is FP32
+        for t_pallas in (64, 96, 256, 576, 640, 720, 1024):
             fp, pp, _, _, _ = mhc.delayed_post_pre_flat_jax(
                 jnp.ones((t_pallas, dim), dtype=jnp.bfloat16),
                 jnp.ones((t_pallas, mult * dim), dtype=jnp.bfloat16),

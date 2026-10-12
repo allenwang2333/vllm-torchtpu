@@ -1042,7 +1042,7 @@ def fused_swa_inputs(
     tokens, width = swa_records.shape
     padded = max(128, -(-width // 128) * 128)
     pad = padded - width
-    if pad and 48 < tokens <= 192:
+    if pad and tokens > 48:
         live = swa_records >= 0
         rows = gather_cache_values(
             cast(Any, swa_pool), swa_records.reshape(-1), dim, split=True
@@ -2586,7 +2586,7 @@ def paged_index_scores_jax(
         if (
             (requests is not None or (prestrided_pages and page_records is not None))
             and tokens // 6 <= records.shape[0]
-            and 6 <= tokens <= 1536
+            and tokens >= 6
             and tokens % 6 == 0
         )
         else tokens

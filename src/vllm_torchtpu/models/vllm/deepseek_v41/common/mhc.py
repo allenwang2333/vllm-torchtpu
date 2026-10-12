@@ -301,7 +301,7 @@ def _delayed_pre_flat_small(
 # packed weight), XLA -> Pallas tile 96, in µs: 288: 41.3 -> 42.9,
 # 384: 65.7 -> 56.6, 576: 98.0 -> 71.0, 768: 118.1 -> 88.0. The pre-only pass
 # was slower than XLA at every size from 192 to 960, so it gets no new sizes.
-_POST_PRE_PALLAS_MIN_TOKENS = 384
+_POST_PRE_PALLAS_MIN_TOKENS = 576
 
 
 def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | None:
@@ -311,14 +311,11 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
     ``>= 1024`` multiples of 64 (tile 128 when divisible by 128, else 64). With
     ``fused_post``, buckets ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are
     multiples of 96, 128 (when ``>= 1024``), 64 or 80 (in that order) take
-    Pallas: DSpark verify ``C * (K + 1)`` (384, 576, 768, 1152, ...) and draft
-    ``C * K`` (400, 560, 640, ...). This is checked before the ``>= 1024``
-    rule. Job 1314 (tpu7x, width 20480), median µs per call: 1152: tile 64
-    378.4 -> 96 373.8; 400: XLA 349.3 -> tile 80 324.9; 560: XLA 365.6 -> 80
-    337.1; 640: tile 64 335.5 vs 80 346.6, so 80 only covers sizes 96 and 64 do
-    not divide. Job 1372 (TD9.3a, tpu7x, width 20480): tile 128 with 56 MB VMEM
-    at T=8192 cuts 80x call time from 61.86 ms to 55.39 ms (-6.47 ms), while
-    verify sizes (384..1152) keep tile 96 with 48 MB VMEM.
+    Pallas: DSpark verify ``C * (K + 1)`` (576, 768, 1152, ...) and draft
+    ``C * K`` (640, ...), with tile 128 at 640. Smaller sizes (384, 512) stay
+    on the XLA Megacore path. Job 1372 (TD9.3a, tpu7x, width 20480): tile 128
+    with 56 MB VMEM at T=8192 cuts 80x call time from 61.86 ms to 55.39 ms
+    (-6.47 ms), while verify sizes (576..1152) keep tile 96 with 48 MB VMEM.
     """
     if 3 * mixes > 128:
         return None
@@ -327,6 +324,8 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
     if tokens == 256:
         return 128
     if fused_post and tokens >= _POST_PRE_PALLAS_MIN_TOKENS:
+        if tokens == 640:
+            return 128
         for tile in (96, 128, 64, 80) if tokens >= 1024 else (96, 64, 80):
             if tokens % tile == 0:
                 return tile

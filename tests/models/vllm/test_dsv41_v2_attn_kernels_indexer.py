@@ -719,6 +719,16 @@ class TestPagedIndexScoresJax:
         )
         assert scores.shape == (8, 512)
 
+    def test_high_concurrency_verify_tokens_gt_1536(self):
+        rng = np.random.default_rng(404)
+        pool, records, requests, lengths, q, weights = _request_inputs(
+            rng, requests_count=288, tokens=1728, width=128
+        )
+        scores = paged_index_scores_jax(
+            q, pool, jnp.asarray(records), weights, lengths, jnp.asarray(requests)
+        )
+        assert scores.shape == (1728, 128)
+
 
 class TestPagedIndexerJax:
     """Comprehensive tests for paged_indexer_jax routing and context branches."""
