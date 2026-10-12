@@ -68,6 +68,7 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    linear_indices: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -90,6 +91,11 @@ def _kernel(
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
 
         def values(atom, stream):
+            if linear_indices:
+                # 1-D operand, one logical batch per block (dsa_gather.py's form).
+                return indices_ref[
+                    pl.ds(atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES, NUM_LANES)
+                ]
             return indices_ref[0, atom, stream, :]
 
         def destinations(atom, stream):
@@ -179,10 +185,16 @@ def _kernel(
         else:
             run_inner()
 
-    indices_spec = pl.BlockSpec(
-        (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-        lambda batch: (owner + batch * num_owners, 0, 0, 0),
-    )
+    if linear_indices:
+        indices_spec = pl.BlockSpec(
+            (atoms_per_batch * OCCURRENCES_PER_ATOM,),
+            lambda batch: (owner + batch * num_owners,),
+        )
+    else:
+        indices_spec = pl.BlockSpec(
+            (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+            lambda batch: (owner + batch * num_owners, 0, 0, 0),
+        )
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
@@ -209,52 +221,15 @@ def _kernel(
             )(indices_hbm_ref)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "out_size",
-        "atoms_per_batch",
-        "wait_mode",
-        "serve_pipelined",
-        "live_multiple",
-    ),
-)
-def dsa_gather_native_sc(
-    nope_cache: jax.Array,
-    rope_cache: jax.Array,
-    indices: jax.Array,
-    *,
-    out_size: int,
-    atoms_per_batch: int = 16,
-    wait_mode: str = "overlap_rope",
-    serve_pipelined: bool = True,
-    num_live_indices: jax.Array | None = None,
-    live_multiple: int = 1,
-) -> tuple[jax.Array, jax.Array]:
-    """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
+def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
+    """Static gather geometry exactly as `dsa_gather_native_sc` resolves it.
 
-    ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
-    128-word row per group of four tokens; each token owns a consecutive
-    32-word quarter. The returned ROPE is register-transposed into the grouped
-    TensorCore format expected by the shared attention consumer.
-
-    ``num_live_indices`` (traced i32 scalar, optional) gathers only the logical
-    batches covering the first ``num_live_indices`` rows; later rows are left
-    unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
-    is a multiple of it; when that multiple covers whole owner rounds the
-    per-owner tail guard is dropped.
+    Returns ``(num_cores, num_subcores, atoms_per_batch, occurrences_per_batch,
+    num_batches)``: `atoms_per_batch` after the clamp to what `out_size` can
+    feed every owner, and the logical-batch count. A caller building
+    ``live_vec`` itself uses these, so its live bound cannot drift from the
+    one this module would derive from ``num_live_indices``.
     """
-    if wait_mode not in ("overlap_rope", "before_rope"):
-        raise ValueError(f"unknown {wait_mode=}")
-    if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
-        raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
-    if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
-        raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
-    if indices.dtype != jnp.int32 or indices.ndim != 2:
-        raise ValueError("indices must be int32[query, topk]")
-    if indices.size != out_size:
-        raise ValueError(f"indices has {indices.size} values, expected {out_size}")
-
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
     num_cores = sc_info.num_cores if sc_info is not None else NUM_CORES
@@ -278,16 +253,123 @@ def dsa_gather_native_sc(
             f"occurrences_per_batch ({owner_batch_size})"
         )
     num_batches = out_size // occurrences_per_batch
+    return num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "out_size",
+        "atoms_per_batch",
+        "wait_mode",
+        "serve_pipelined",
+        "live_multiple",
+        "linear_indices",
+        "live_vec_offset",
+    ),
+)
+def dsa_gather_native_sc(
+    nope_cache: jax.Array,
+    rope_cache: jax.Array,
+    indices: jax.Array,
+    *,
+    out_size: int,
+    atoms_per_batch: int = 16,
+    wait_mode: str = "overlap_rope",
+    serve_pipelined: bool = True,
+    num_live_indices: jax.Array | None = None,
+    live_multiple: int = 1,
+    live_vec: jax.Array | None = None,
+    linear_indices: bool = False,
+    live_vec_offset: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
+
+    ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
+    128-word row per group of four tokens; each token owns a consecutive
+    32-word quarter. The returned ROPE is register-transposed into the grouped
+    TensorCore format expected by the shared attention consumer.
+
+    ``num_live_indices`` (traced i32 scalar, optional) gathers only the logical
+    batches covering the first ``num_live_indices`` rows; later rows are left
+    unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
+    is a multiple of it; when that multiple covers whole owner rounds the
+    per-owner tail guard is dropped.
+
+    ``live_vec`` (traced i32[2 * NUM_LANES], optional; exclusive with
+    ``num_live_indices``) is that live bound already in the kernel's own
+    operand form -- lanes [0, 16) the live logical-batch count, [16, 32) the
+    per-owner trip count, as `live_vec_geometry` defines them -- for a caller
+    that computes it inside its own kernel (`prepare_capped_window_fused`).
+
+    ``linear_indices`` hands the indices to the kernel as one flat i32[out_size]
+    operand instead of [batches, atoms, 4, 16]. XLA lays a 1-D i32 array out
+    linearly, which is the SparseCore operand layout, and a 128-lane 2-D
+    [n, 128] producer output reshapes to it as a bitcast; the 4-D reshape
+    otherwise costs two relayout copies (T(4,128), then linear). Same rows.
+
+    ``live_vec_offset`` (static, with ``linear_indices``; exclusive with the
+    other live forms): ``live_vec`` is read from the flat ``indices`` operand
+    itself, at ``[live_vec_offset, live_vec_offset + 2 * NUM_LANES)``, past
+    the ``out_size`` gathered indices -- the layout
+    `prepare_capped_window_fused` writes, so its single output carries both.
+    """
+    if wait_mode not in ("overlap_rope", "before_rope"):
+        raise ValueError(f"unknown {wait_mode=}")
+    if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
+        raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
+    if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
+        raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
+    if indices.dtype != jnp.int32 or indices.ndim != 2:
+        raise ValueError("indices must be int32[query, topk]")
+    if live_vec_offset is None:
+        if indices.size != out_size:
+            raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+    else:
+        if not linear_indices:
+            raise ValueError("live_vec_offset requires linear_indices")
+        if live_vec_offset < out_size or indices.size < live_vec_offset + 2 * NUM_LANES:
+            raise ValueError(
+                f"live_vec_offset ({live_vec_offset}) must place the live vector "
+                f"past the {out_size} indices, inside {indices.size} values"
+            )
+
+    if sum(x is not None for x in (num_live_indices, live_vec, live_vec_offset)) > 1:
+        raise ValueError("pass one of num_live_indices, live_vec, live_vec_offset")
+    num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches = (
+        live_vec_geometry(out_size, atoms_per_batch)
+    )
+    num_owners = num_cores * num_subcores
+    owner_batch_size = num_owners * occurrences_per_batch
     batches_per_owner = num_batches // num_owners
-    live = num_live_indices is not None
+    live = (
+        num_live_indices is not None
+        or live_vec is not None
+        or live_vec_offset is not None
+    )
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     operands = [
         nope_cache.reshape(-1, 128),
         rope_cache.reshape(-1, 32),
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        (
+            indices.reshape(-1)
+            if linear_indices
+            else indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES)
+        ),
     ]
     guard_tail = False
-    if live:
+    if live_vec_offset is not None:
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
+        guard_tail = live_multiple % owner_batch_size != 0
+    elif live_vec is not None:
+        if live_vec.shape != (2 * NUM_LANES,) or live_vec.dtype != jnp.int32:
+            raise ValueError(f"live_vec must be int32[{2 * NUM_LANES}]")
+        operands.append(live_vec)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
+        guard_tail = live_multiple % owner_batch_size != 0
+    elif live:
         # Live logical batches = cdiv(num_live_indices, occurrences/batch),
         # clamped to the static count; per-owner trip = cdiv(live, num_owners).
         live_b = jnp.clip(
@@ -328,8 +410,16 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        linear_indices=linear_indices,
     )
-    if live:
+    if live_vec_offset is not None:
+        inner = body
+
+        def body(nope, rope, idx, nope_o, rope_o, **scr):
+            live_hbm = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
+            return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
+
+    elif live:
         inner = body
 
         def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):

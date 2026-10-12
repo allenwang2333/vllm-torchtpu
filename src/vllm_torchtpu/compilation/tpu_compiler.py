@@ -150,6 +150,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
+    "TPU_PRECOMPILE_SPEC_MIXED",
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
@@ -190,6 +191,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Same for the TP decode MoE op, whose body this module builds.
+    "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
