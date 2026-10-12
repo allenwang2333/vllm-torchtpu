@@ -1060,9 +1060,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bytes_accessed cost hint on decode-sized (b <= 32) SparseCore top-k
     # kernels, for XLA's latency-hiding scheduler; 0 = none. Same values.
     "TPU_SC_TOPK_COST_BYTES": env_nonnegative_int("TPU_SC_TOPK_COST_BYTES", 0),
-    # DCP indexer layers: the indexer op also computes the layer's q_b_proj
-    # (the op q_b_proj would call, same operands), pinned by optimization
-    # barriers inside the cross-rank SparseCore merge's window at decode, so
+    # DCP indexer layers at decode (rows <= 16): the indexer op also computes
+    # the layer's q_b_proj (same fp8 Pallas kernel, same operands), pinned by
+    # optimization barriers inside the cross-rank SparseCore merge's window, so
     # the TensorCore runs it instead of waiting on the merge. Same values.
     "TPU_IDX_QB_UNDER_TOPK": env_bool("TPU_IDX_QB_UNDER_TOPK"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
