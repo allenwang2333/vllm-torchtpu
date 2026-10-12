@@ -796,12 +796,17 @@ def sparse_ragged_paged_attention_union_gather(
     from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 
     fused_swa = swa_kv is not None
-    _, actual_num_q_heads, actual_head_dim = q.shape
+    if q.ndim == 4:
+        tp_groups, num_tokens, g_heads, actual_head_dim = q.shape
+        actual_num_q_heads = tp_groups * g_heads
+    else:
+        num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     q = sparse_mla.prepare_q_inputs(q)
     head_dim = q.shape[-1]
+    num_q_heads = q.shape[0] * q.shape[2] if q.ndim == 4 else q.shape[1]
     attention_sinks = jnp.pad(
         attention_sinks,
-        (0, q.shape[1] - actual_num_q_heads),
+        (0, num_q_heads - actual_num_q_heads),
         constant_values=jnp.finfo(attention_sinks.dtype).min,
     )
     if fused_swa:
@@ -814,7 +819,6 @@ def sparse_ragged_paged_attention_union_gather(
         )
 
     total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
-    _, num_q_heads, _ = q.shape
     topk = topk_indices.shape[-1]
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
     union_cap_aligned = max(topk, sparse_mla.align_to(union_cap, topk))
@@ -823,10 +827,10 @@ def sparse_ragged_paged_attention_union_gather(
     seq_ids_segment = jnp.repeat(
         jnp.arange(max_num_seqs, dtype=jnp.int32),
         tokens_per_seq,
-        total_repeat_length=q.shape[0],
+        total_repeat_length=num_tokens,
     )
 
-    num_chunks = sparse_mla.cdiv(q.shape[0], gather_and_attention_chunk_size)
+    num_chunks = sparse_mla.cdiv(num_tokens, gather_and_attention_chunk_size)
     if union_gather:
         union_phys, inv_idx_all, num_unique_all = compute_chunk_union_gather_indices(
             topk_indices,
@@ -847,12 +851,12 @@ def sparse_ragged_paged_attention_union_gather(
     valid_total = cu_q_lens[distribution[2]]
     # Group-shared windows (`fused_swa_inputs`): one `swa_kv` block per
     # `swa_group` tokens, so chunks and kernel batches stay group aligned.
-    swa_group = q.shape[0] // swa_kv.shape[0] if swa_kv is not None else 1
-    assert swa_group >= 1 and q.shape[0] % swa_group == 0
+    swa_group = num_tokens // swa_kv.shape[0] if swa_kv is not None else 1
+    assert swa_group >= 1 and num_tokens % swa_group == 0
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        end_pos = min(start_pos + gather_and_attention_chunk_size, num_tokens)
         chunk_size = end_pos - start_pos
         kbs = _group_aligned_batch(chunk_size, attention_kernel_batch_size, swa_group)
         batch_end = start_pos + (
@@ -1148,8 +1152,9 @@ def sparse_fp8_attention_jax(
     nope_3d = _reshape_paged_pool(main_pool, page_size)
     rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
     distribution = jnp.array([0, 0, pages.shape[0]], jnp.int32)
-    chunk_size = max(128, q.shape[0]) if q.shape[0] <= 192 else 128
-    if fused_swa and fused_swa_eligible(q.shape[0], swa_records.shape[1], max_requests):
+    num_tokens = q.shape[1] if q.ndim == 4 else q.shape[0]
+    chunk_size = max(128, num_tokens) if num_tokens <= 192 else 128
+    if fused_swa and fused_swa_eligible(num_tokens, swa_records.shape[1], max_requests):
         swa_kv, swa_bias = fused_swa_inputs(swa_pool, swa_records, q.shape[-1])
         return sparse_ragged_paged_attention_union_gather(
             q,
@@ -1588,18 +1593,36 @@ def initialize_paged_attention():
             tokens_local = tokens // tp_size
             padded_local = -(-tokens_local // 8) * 8
             pad_rows = padded_local - tokens_local
+            rank_major_q = (
+                fused_swa
+                and fused_swa_eligible(padded_local, swa_records.shape[1], max_requests)
+                and q.shape[1] >= 8
+                and q.shape[1] % 8 == 0
+            )
 
             def _token_parallel_body(
                 q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id
             ):
-                q_tok = jax.lax.all_to_all(
-                    q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
-                )
+                if rank_major_q:
+                    q_tok = jax.lax.all_to_all(
+                        q_l.reshape(tp_size, tokens_local, q_l.shape[1], q_l.shape[2]),
+                        axis_name="tp",
+                        split_axis=0,
+                        concat_axis=0,
+                        tiled=True,
+                    )
+                    if pad_rows:
+                        q_tok = jnp.pad(q_tok, ((0, 0), (0, pad_rows), (0, 0), (0, 0)))
+                else:
+                    q_tok = jax.lax.all_to_all(
+                        q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
+                    )
+                    if pad_rows:
+                        q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
                 )
                 if pad_rows:
-                    q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
                     s_r_tok = jnp.pad(
                         s_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
                     )
@@ -1624,6 +1647,16 @@ def initialize_paged_attention():
                     union_cap=union_cap,
                     fused_swa=fused_swa,
                 )
+                if rank_major_q:
+                    if pad_rows:
+                        out_tok = out_tok[:, :-pad_rows]
+                    return jax.lax.all_to_all(
+                        out_tok,
+                        axis_name="tp",
+                        split_axis=0,
+                        concat_axis=0,
+                        tiled=True,
+                    ).reshape(tokens, q_l.shape[1], q_l.shape[2])
                 if pad_rows:
                     out_tok = out_tok[:-pad_rows]
                 return jax.lax.all_to_all(

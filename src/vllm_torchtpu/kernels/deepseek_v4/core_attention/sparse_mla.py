@@ -589,7 +589,14 @@ def _attention_kernel_fused_swa(
     """
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
-    num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    rank_major_q = len(q_hbm_ref.shape) == 4
+    if rank_major_q:
+        tp_groups, num_tokens, g_heads, head_dim = q_hbm_ref.shape
+        num_q_heads = tp_groups * g_heads
+        assert g_heads % 8 == 0
+    else:
+        tp_groups, g_heads = 1, 0
+        num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
     cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
@@ -654,6 +661,11 @@ def _attention_kernel_fused_swa(
 
     def _fetch_inputs(seq_idx_start, sem_idx, *, wait=False):
         page_idx_start = seq_idx_start - start_seq_idx
+        q_slice = (
+            q_hbm_ref.at[:, pl.ds(seq_idx_start, batch_size)]
+            if rank_major_q
+            else q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)]
+        )
         copies = (
             (
                 cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
@@ -661,7 +673,7 @@ def _attention_kernel_fused_swa(
                 sems.at[0, sem_idx],
             ),
             (
-                q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                q_slice,
                 bq_x2_ref.at[sem_idx, :],
                 sems.at[1, sem_idx],
             ),
@@ -692,10 +704,19 @@ def _attention_kernel_fused_swa(
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         sz = jnp.clip(num_valid_tokens - seq_idx_start, 1, batch_size)
-        vmem_ref = bo_x2_ref.at[bo_sem_idx, pl.ds(0, sz)]
+        vmem_ref = (
+            bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, sz)]
+            if rank_major_q
+            else bo_x2_ref.at[bo_sem_idx, pl.ds(0, sz)]
+        )
         if not wait:
             bo_ids_ref[bo_sem_idx] = seq_idx_start
-            _async_copy(vmem_ref, o_hbm_ref.at[pl.ds(seq_idx_start, sz)], sem, wait)
+            o_slice = (
+                o_hbm_ref.at[:, pl.ds(seq_idx_start, sz)]
+                if rank_major_q
+                else o_hbm_ref.at[pl.ds(seq_idx_start, sz)]
+            )
+            _async_copy(vmem_ref, o_slice, sem, wait)
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
@@ -734,6 +755,23 @@ def _attention_kernel_fused_swa(
             return swa_kv_x2_ref.at[sem_idx, group][...], bias
         return swa_kv_x2_ref[sem_idx, group, pl.ds(offset, window), :], bias
 
+    def load_bq(sem_idx, batch_idx):
+        if rank_major_q:
+            return jnp.concatenate(
+                [bq_x2_ref[sem_idx, g, batch_idx] for g in range(tp_groups)],
+                axis=0,
+            )
+        return bq_x2_ref.at[sem_idx, batch_idx][...]
+
+    def store_bo(sem_idx, batch_idx, out):
+        if rank_major_q:
+            for g in range(tp_groups):
+                bo_x2_ref.at[sem_idx, g, batch_idx][...] = out[
+                    g * g_heads : (g + 1) * g_heads
+                ]
+        else:
+            bo_x2_ref.at[sem_idx, batch_idx][...] = out
+
     def process():
         bi_sem_idx = sem_ids_ref[0]
         next_seq_idx = batch_start_seq_idx + batch_size
@@ -759,7 +797,7 @@ def _attention_kernel_fused_swa(
         for batch_idx in range(batch_size):
             bkv = load_bkv(bi_sem_idx, batch_idx)
             k_swa, swa_bias = load_swa(bi_sem_idx, batch_idx)
-            bq = bq_x2_ref.at[bi_sem_idx, batch_idx][...]
+            bq = load_bq(bi_sem_idx, batch_idx)
             if prev_out is not None:
                 # Artificial dependency limiting LLO's QK run-ahead, as in
                 # `_attention_kernel`.
@@ -774,12 +812,12 @@ def _attention_kernel_fused_swa(
             )
             if prev is not None:
                 out = pv(*prev)
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
+                store_bo(bo_sem_idx, batch_idx - 1, out)
                 prev_out = out
             prev = (p.astype(jnp.bfloat16), k_swa, bkv, l_total)
 
         assert prev is not None
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = pv(*prev)
+        store_bo(bo_sem_idx, batch_size - 1, pv(*prev))
         _send_bo_batch(batch_start_seq_idx, bo_sem_idx)
 
     @pl.when(batch_start_seq_idx == start_seq_idx)
@@ -798,7 +836,7 @@ def _attention_kernel_fused_swa(
 
 
 def fused_swa_attention_call(
-    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], padded
+    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim] or 4D rank-major
     cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
     cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
     swa_kv: jax.Array,  # bf16[max_num_tokens // group_tokens, window, head_dim]
@@ -820,7 +858,12 @@ def fused_swa_attention_call(
     chunk start and the kernel batch must then be group aligned.
     """
     batch_size = kernel_batch_size
-    num_tokens, num_q_heads, head_dim = q.shape
+    if q.ndim == 4:
+        tp_groups, num_tokens, g_heads, head_dim = q.shape
+        q_scratch_shape = (2, tp_groups, batch_size, g_heads, head_dim)
+    else:
+        num_tokens, num_q_heads, head_dim = q.shape
+        q_scratch_shape = (2, batch_size, num_q_heads, head_dim)
     _, topk_rows, lanes = cache_kv_nope.shape
     _, rope_rows, _ = cache_kv_rope.shape
     window = swa_bias.shape[1] * 128
@@ -844,8 +887,8 @@ def fused_swa_attention_call(
     scratch_shapes = [
         pltpu.VMEM((2, batch_size, topk_rows * 4, lanes), jnp.uint8),
         pltpu.VMEM((2, batch_size, rope_rows * 2, lanes), jnp.bfloat16),
-        pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
-        pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
+        pltpu.VMEM(q_scratch_shape, q.dtype),
+        pltpu.VMEM(q_scratch_shape, q.dtype),
         pltpu.VMEM((2, batch_size // group_tokens, union, head_dim), swa_kv.dtype),
         pltpu.VMEM((2, batch_size, window // 128, 128), jnp.float32),
         pltpu.SemaphoreType.DMA((6, 2)),
@@ -899,8 +942,18 @@ def fused_swa_attention_call(
 
 
 def prepare_q_inputs(
-    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim] or 4D
 ):
+    if q.ndim == 4:
+        actual_head_dim = q.shape[-1]
+        head_dim = align_to(actual_head_dim, 128)
+        if head_dim == actual_head_dim:
+            return q
+        return jnp.pad(
+            q,
+            ((0, 0), (0, 0), (0, 0), (0, head_dim - actual_head_dim)),
+            constant_values=0,
+        )
     _, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
@@ -956,10 +1009,12 @@ def prepare_swa_inputs(
 
 
 def prepare_outputs(
-    out,  # [max_num_tokens, num_q_heads, head_dim]
+    out,  # [max_num_tokens, num_q_heads, head_dim] or 4D
     actual_num_q_heads: int,
     actual_head_dim: int,
 ):
+    if out.ndim == 4:
+        return out[..., :actual_head_dim]
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 

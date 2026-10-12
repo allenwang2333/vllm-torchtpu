@@ -244,7 +244,12 @@ def _run_fused_kernel(
 
     ``swa_kv`` has one row block per token, or per ``group_tokens`` tokens.
     """
-    tokens, heads, dim = q.shape
+    if q.ndim == 4:
+        tp_groups, tokens, g_heads, dim = q.shape
+        q_scratch = (2, tp_groups, batch_size, g_heads, dim)
+    else:
+        tokens, heads, dim = q.shape
+        q_scratch = (2, batch_size, heads, dim)
     topk = nope_words.shape[1]
     window = swa_kv.shape[1]
     swa_bias = _kernel_bias(swa_bias)
@@ -265,8 +270,8 @@ def _run_fused_kernel(
         o_hbm_ref=_Ref(out),
         bkv_nope_x2_ref=_Ref(np.zeros((2, batch_size, topk * 4, 128), np.uint8)),
         bkv_rope_x2_ref=_Ref(np.zeros((2, batch_size, topk // 2, 128), jnp.bfloat16)),
-        bq_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
-        bo_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
+        bq_x2_ref=_Ref(np.zeros(q_scratch, q.dtype)),
+        bo_x2_ref=_Ref(np.zeros(q_scratch, q.dtype)),
         swa_kv_x2_ref=_Ref(
             np.zeros((2, batch_size // group_tokens, window, dim), jnp.bfloat16)
         ),
@@ -464,6 +469,41 @@ class TestFusedSwaKernel:
         assert not jnp.isnan(out).any()
         np.testing.assert_allclose(out, want, rtol=1e-3, atol=1e-3)
 
+    def test_rank_major_4d_q_matches_token_major_and_partial_batch(self):
+        """4D rank-major Q/O ``[tp_groups, tokens, g_heads, dim]`` matches 3D."""
+        rng = np.random.default_rng(11)
+        tp_groups, tokens, g_heads = 2, 6, 8
+        heads = tp_groups * g_heads
+        topk, window, batch_size, scale = 16, 128, 3, 0.1
+        q_3d = jnp.asarray(rng.standard_normal((tokens, heads, HEAD_DIM)), jnp.float32)
+        q_4d = jnp.swapaxes(q_3d.reshape(tokens, tp_groups, g_heads, HEAD_DIM), 0, 1)
+        nope_words = _fp8_rows(rng, tokens, topk)
+        rope = jnp.asarray(rng.standard_normal((tokens, topk, ROPE_DIM)), jnp.bfloat16)
+        rope_words = _rope_words(np.asarray(rope))
+        keys = _dequant_rows(nope_words, rope)
+        swa_kv = jnp.asarray(
+            rng.standard_normal((tokens, window, HEAD_DIM)), jnp.bfloat16
+        )
+        swa_bias = jnp.zeros((tokens, window), jnp.float32)
+        kv_lens = jnp.asarray([topk, 4, topk, topk, 7, -1], jnp.int32)
+        sinks = jnp.asarray(rng.standard_normal(heads), jnp.float32)
+
+        out_4d = _run_fused_kernel(
+            q_4d,
+            nope_words,
+            rope_words,
+            swa_kv,
+            swa_bias,
+            kv_lens,
+            sinks,
+            scale=scale,
+            batch_size=batch_size,
+        )
+        out_3d = jnp.swapaxes(out_4d, 0, 1).reshape(tokens, heads, HEAD_DIM)
+        want = _reference(q_3d, keys, kv_lens, swa_kv, swa_bias, sinks, scale)
+        np.testing.assert_allclose(out_3d[:5], want[:5], rtol=1e-3, atol=1e-3)
+        assert jnp.all(out_4d[:, 5] == 0)
+
     def test_rejects_mismatched_shapes(self):
         q = _Ref(np.zeros((4, 8, HEAD_DIM), np.float32))
         good = dict(
@@ -534,9 +574,39 @@ class TestFusedSwaAttentionCall:
         assert len(grid_spec.in_specs) == 6
         scratch = grid_spec.scratch_shapes
         assert len(scratch) == 7
+        assert scratch[2].shape == (2, 8, heads, HEAD_DIM)
         assert scratch[4].shape == (2, 8, window, HEAD_DIM)
         assert scratch[5].shape == (2, 8, window // 128, 128)
         assert int(grid_spec.grid[0]) == 3
+
+        # 4D rank-major Q/O layout: [tp_groups, tokens, g_heads, HEAD_DIM]
+        q_4d = jnp.zeros((2, tokens, heads, HEAD_DIM), jnp.bfloat16)
+        with mock.patch.object(
+            sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call
+        ):
+            out_4d = sparse_mla.fused_swa_attention_call(
+                q_4d,
+                jnp.zeros((tokens, topk, 128), jnp.int32),
+                jnp.zeros((tokens, topk // 4, 128), jnp.int32),
+                jnp.zeros((tokens, window, HEAD_DIM), jnp.bfloat16),
+                jnp.zeros((tokens, window // 128, 128), jnp.float32),
+                jnp.zeros((tokens,), jnp.int32),
+                jnp.zeros((2 * heads,), jnp.float32),
+                start_seq_idx=0,
+                end_seq_idx=jnp.int32(tokens),
+                num_valid_tokens=jnp.int32(tokens),
+                kernel_batch_size=8,
+                sm_scale=0.5,
+            )
+        assert out_4d is q_4d
+        assert captured["out_shape"].shape == q_4d.shape
+        assert captured["grid_spec"].scratch_shapes[2].shape == (
+            2,
+            2,
+            8,
+            heads,
+            HEAD_DIM,
+        )
 
     def test_builds_group_shared_window_call(self):
         captured = {}
@@ -961,6 +1031,45 @@ class TestFusedSwaDriver:
                 None,
             )
 
+    def test_union_gather_4d_rank_major_q(self):
+        q_4d_aligned = jnp.ones((2, 24, 8, 128), jnp.bfloat16)
+        assert sparse_mla.prepare_q_inputs(q_4d_aligned) is q_4d_aligned
+        q_4d_unaligned = jnp.ones((2, 24, 8, 64), jnp.bfloat16)
+        q_4d_padded = sparse_mla.prepare_q_inputs(q_4d_unaligned)
+        assert q_4d_padded.shape == (2, 24, 8, 128)
+        assert sparse_mla.prepare_outputs(q_4d_padded, 16, 64).shape == (2, 24, 8, 64)
+
+        i = self._inputs(tokens=24, heads=16)
+        calls = []
+
+        def fake_fused(q, nope, rope, swa_kv, swa_bias, kv_lens, sinks, **kw):
+            calls.append((q.shape, swa_kv.shape, swa_bias.shape, sinks.shape))
+            return q
+
+        with mock.patch.object(
+            sparse_mla, "fused_swa_attention_call", side_effect=fake_fused
+        ):
+            out = attention_kernels.sparse_ragged_paged_attention_union_gather(
+                q_4d_unaligned,
+                i["cache_nope"],
+                i["cache_rope"],
+                i["topk_indices"],
+                i["page_indices"],
+                i["cu_q_lens"],
+                i["distribution"],
+                i["sinks"],
+                None,
+                None,
+                None,
+                sm_scale=0.25,
+                union_gather=True,
+                gather_and_attention_chunk_size=24,
+                swa_kv=i["swa_kv"],
+                swa_bias=i["swa_bias"],
+            )
+        assert out.shape == (2, 24, 8, 64)
+        assert calls == [((2, 24, 8, 128), (24, 128, 128), (24, 1, 128), (16,))]
+
     def _jax_args(self, tokens, width):
         return dict(
             q=jnp.ones((tokens, 4, 64), jnp.bfloat16),
@@ -1003,6 +1112,26 @@ class TestFusedSwaDriver:
                     assert kw["swa_kv"].shape == (tokens, 128, 64)
                     assert kw["swa_bias"].shape == (tokens, 1, 128)
                     assert union.call_args.args[8:11] == (None, None, None)
+
+        # 4D rank-major Q routing in sparse_fp8_attention_jax
+        a4 = self._jax_args(tokens=24, width=64)
+        a4["q"] = jnp.ones((2, 24, 8, 64), jnp.bfloat16)
+        a4["sink"] = jnp.zeros((16,), jnp.float32)
+        with mock.patch.object(
+            attention_kernels,
+            "sparse_ragged_paged_attention_union_gather",
+            return_value=a4["q"],
+        ) as union4:
+            out4 = attention_kernels.sparse_fp8_attention_jax(
+                *a4.values(),
+                scale=0.125,
+                page_size=16,
+                max_requests=48,
+                union_gather=True,
+                fused_swa=True,
+            )
+            assert out4 is a4["q"]
+            assert union4.call_args.kwargs["gather_and_attention_chunk_size"] == 128
 
     def test_sparse_fp8_attention_jax_keeps_prefill_path(self):
         for tokens, want_chunk in ((128, 128), (192, 192), (256, 128)):
@@ -1084,13 +1213,22 @@ class TestFusedSwaPlumbing:
         assert specs_2b[-8:] == (None,) * 8 and len(specs_2b) == 22
 
         seen = []
+        seen_shapes = []
 
         def fake_jax(q, *args, **kw):
             seen.append(kw["fused_swa"])
+            seen_shapes.append(q.shape)
             return q
 
-        tensors = lambda tokens: (  # noqa: E731
-            jnp.zeros((tokens, 4, 64)),
+        def fake_a2a(x, *, split_axis, concat_axis, **kw):
+            if split_axis == 0 and concat_axis == 0:
+                return x
+            if split_axis == 0 and concat_axis == 1:
+                return x.reshape(x.shape[0] // 2, x.shape[1] * 2, x.shape[2])
+            return x.reshape(x.shape[0] * 2, x.shape[1] // 2, x.shape[2])
+
+        tensors = lambda tokens, heads=4: (  # noqa: E731
+            jnp.zeros((tokens, heads, 64)),
             jnp.zeros((256, 64)),
             jnp.zeros((256, 64)),
             jnp.zeros((64, 128)),
@@ -1098,19 +1236,22 @@ class TestFusedSwaPlumbing:
             jnp.zeros((tokens, 128), jnp.int32),
             jnp.zeros((1, 1), jnp.int32),
             jnp.zeros((2,), jnp.int32),
-            jnp.zeros((4,)),
-            jnp.zeros((4,)),
+            jnp.zeros((heads,)),
+            jnp.zeros((heads * 2,)),
             jnp.zeros((1,), jnp.int32),
         )
         tail = (0.125, 16, None, False)
         with (
             mock.patch("jax.shard_map", side_effect=lambda fn, **kw: lambda *a: fn(*a)),
-            mock.patch("jax.lax.all_to_all", side_effect=lambda x, **kw: x),
+            mock.patch("jax.lax.all_to_all", side_effect=fake_a2a),
             mock.patch.object(
                 attention_kernels, "sparse_fp8_attention_jax", side_effect=fake_jax
             ),
         ):
-            fn(*tensors(256), *tail, True, False, 4096, True)  # token parallel
+            fn(*tensors(256, 4), *tail, True, False, 4096, True)  # 3D TP, pad_rows=0
+            fn(*tensors(52, 4), *tail, True, False, 4096, False)  # 3D TP, pad_rows=6
+            fn(*tensors(48, 8), *tail, True, False, 4096, True)  # 4D TP, pad_rows=0
+            fn(*tensors(52, 8), *tail, True, False, 4096, True)  # 4D TP, pad_rows=6
             fn(*tensors(64), *tail, False, False, 4096, True)
             fn(*tensors(64), *tail, False, False, 4096)  # default
             t = tensors(64)
@@ -1129,7 +1270,13 @@ class TestFusedSwaPlumbing:
                 4096,
                 True,
             )
-        assert seen == [True, True, False, True]
+        assert seen == [True, False, True, True, True, False, True]
+        assert seen_shapes[:4] == [
+            (128, 8, 64),
+            (32, 8, 64),
+            (2, 24, 8, 64),
+            (2, 32, 8, 64),
+        ]
 
     def test_torch_wrapper_appends_fused_swa(self, monkeypatch):
         op = mock.MagicMock(return_value=torch.zeros(4, 2, 64))
