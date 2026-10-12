@@ -29,17 +29,16 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
 BLOCKS = 16
 WIDTH = 256  # bf16 elements per 512-byte record
 
-# name -> (page_stride multiplier, row_offset in pages, sharded, rep, off)
+# name -> (page_stride multiplier, row_offset in pages)
 GEOMETRIES = {
-    "plain": (1, 0, False, 0, 0),
-    "offset": (1, 2, False, 0, 0),
-    "strided": (2, 1, False, 0, 0),
-    "sharded": (1, 1, True, 1, 3),
+    "plain": (1, 0),
+    "offset": (1, 2),
+    "strided": (2, 1),
 }
 
 
 def _real_cache(rows, geometry, *, offset_pages=None):
-    stride_mul, pages, sharded, rep, off = GEOMETRIES[geometry]
+    stride_mul, pages = GEOMETRIES[geometry]
     if offset_pages is not None:
         pages = offset_pages
     stride = stride_mul * rows
@@ -52,9 +51,6 @@ def _real_cache(rows, geometry, *, offset_pages=None):
             torch.bfloat16,
             stride * 512,
             offset * 512,
-            off,
-            sharded,
-            rep,
         ),
     )
 
@@ -67,9 +63,6 @@ def _mock_cache(rows, geometry, *, offset_pages=None):
     cache.shape = real.shape
     cache.row_offset = real.row_offset
     cache.page_stride = real.page_stride
-    cache.sharded = real.sharded
-    cache.replicated_blocks = real.replicated_blocks
-    cache.block_offset = real.block_offset
     cache.row_indices = real.row_indices
     cache.pages.return_value = None
     cache.real = real
@@ -92,9 +85,6 @@ def _replay_parity(call, *, expect_records: bool = True):
             real.dtype,
             real.page_stride * 512,
             real.row_offset * 512,
-            real.block_offset,
-            real.sharded,
-            real.replicated_blocks,
         ),
     )
     got = PagedCacheRows(
@@ -104,9 +94,6 @@ def _replay_parity(call, *, expect_records: bool = True):
             real.dtype,
             real.page_stride * 512,
             real.row_offset * 512,
-            real.block_offset,
-            real.sharded,
-            real.replicated_blocks,
         ),
     )
     count = slots.shape[0]
@@ -563,29 +550,6 @@ def test_td8242_write_cache_and_paged_write_zero_redundant_mask():
         # without pre-masking slots in write_cache
         write_cache(got_valid_cache, slots, values, valid)
         assert torch.equal(got_valid_cache.raw, ref_cache.raw)
-
-    # Also test pure-sharded (replicated_blocks == 0) with block_offset == 0 and > 0
-    for block_offset in (0, 2):
-        raw_ref = torch.zeros(BLOCKS * rows, 128, dtype=torch.int32)
-        raw_got = torch.zeros(BLOCKS * rows, 128, dtype=torch.int32)
-        layout = (
-            (BLOCKS, rows, WIDTH),
-            torch.bfloat16,
-            rows * 512,
-            0,
-            block_offset,
-            True,
-            0,
-        )
-        c_ref = PagedCacheRows(raw_ref, layout)
-        c_got = PagedCacheRows(raw_got, layout)
-        c_ref.write(slots.masked_fill(~valid, -1), values)
-        write_cache(c_got, slots, values, valid)
-        assert torch.equal(c_got.raw, c_ref.raw)
-        assert torch.equal(
-            c_got.row_indices(slots, valid=valid),
-            c_ref.row_indices(slots.masked_fill(~valid, -1)),
-        )
 
 
 @pytest.mark.parametrize("geometry", sorted(GEOMETRIES))

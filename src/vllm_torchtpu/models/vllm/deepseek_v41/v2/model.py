@@ -652,106 +652,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         )
         return result
 
-    @staticmethod
-    def _get_ced_decoder_owner_kwargs(
-        first: object | None,
-        plan,
-        bounds: torch.Tensor,
-        owner: object | None = None,
-        *,
-        cache_attr: str = "_ced_decoder_owner_cache",
-    ) -> dict[str, object]:
-        """Build ``owner_perm`` / ``owner_inv`` / ``owner_q_loc`` for a
-        non-identity CED decoder replay bucket when ``KV_SHARD`` is active."""
-        if first is None or getattr(first, "owner_perm", None) is None:
-            return {}
-        enc_q_loc, enc_layout, target = (
-            getattr(first, "owner_q_loc", None),
-            getattr(first, "owner_token_layout", None),
-            DeepseekV41Model if owner is None else owner,
-        )
-        tp_size = (
-            int(enc_q_loc.shape[0])
-            if enc_q_loc is not None
-            else upstream.get_tensor_model_parallel_world_size()
-        )
-        cached = getattr(target, cache_attr, None)
-        if cached is not None and (
-            (
-                cached[2] is plan
-                and cached[3] is enc_layout
-                and cached[4] == tp_size
-                and cached[5] == bounds.device
-            )
-            or cached[0]
-            == (
-                id(enc_layout) if enc_layout is not None else None,
-                tp_size,
-                qsl if isinstance((qsl := plan.query_start_loc), tuple) else tuple(qsl),
-                len(plan.indices) > 0
-                and getattr(enc_layout, "owners", None) is not None,
-                int(plan.padded_num_tokens),
-                int(bounds.shape[0]) - 1,
-                bounds.device,
-            )
-        ):
-            return cached[1]
-        from vllm_torchtpu.runner.owner_token_layout import (
-            _positional_layout,
-            build_owner_token_layout,
-            owner_layout_tensors,
-        )
-
-        req_owners, qsl, padded = (
-            getattr(enc_layout, "owners", None),
-            qsl if isinstance((qsl := plan.query_start_loc), tuple) else tuple(qsl),
-            int(plan.padded_num_tokens),
-        )
-        cache_key = (
-            id(enc_layout) if enc_layout is not None else None,
-            tp_size,
-            qsl,
-            len(plan.indices) > 0 and req_owners is not None,
-            padded,
-            int(bounds.shape[0]) - 1,
-            bounds.device,
-        )
-        if len(plan.indices) > 0 and req_owners is not None:
-            dec_layout = build_owner_token_layout(
-                req_owners,
-                [qsl[i + 1] - qsl[i] for i in range(int(req_owners.shape[0]))],
-                tp_size,
-                (padded,),
-                num_padded_tokens=padded,
-                num_reqs_padded=int(bounds.shape[0]) - 1,
-                scale_paddings=True,
-            )
-            perm_t, inv_t, q_loc_t = owner_layout_tensors(
-                dec_layout, device=bounds.device
-            )
-            result = {
-                "owner_token_layout": dec_layout,
-                "owner_perm": perm_t,
-                "owner_inv": inv_t,
-                "owner_q_loc": q_loc_t,
-            }
-        else:
-            perm_t, inv_t, q_loc_t = _positional_layout(
-                bounds, padded, tp_size, (padded,)
-            )
-            result = {
-                "owner_token_layout": None,
-                "owner_perm": perm_t,
-                "owner_inv": inv_t,
-                "owner_q_loc": q_loc_t,
-            }
-        setattr(
-            target,
-            cache_attr,
-            (cache_key, result, plan, enc_layout, tp_size, bounds.device),
-        )
-        return result
-
     def forward(
         self,
         input_ids,
@@ -914,9 +814,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             replay_starts = DeepseekV41Model._get_ced_replay_starts(
                 self, plan.replay_starts, positions
             )
-            dec_owner_kwargs = DeepseekV41Model._get_ced_decoder_owner_kwargs(
-                first, plan, bounds, self
-            )
             replaced_by_id: dict[int, object] = {}
             decoder_metadata = {}
             last_val = rep = None
@@ -931,7 +828,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         value.__dict__,
                         input_positions=decoder_positions,
                         query_start_loc=bounds,
-                        **dec_owner_kwargs,
                     )
                     replaced_by_id[id(value)] = rep
                 last_val = value

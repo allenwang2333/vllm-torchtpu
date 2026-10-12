@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TD8.337: cached steady-state CED replay plan and O(1) replay-start hits.
+"""cached steady-state CED replay plan and O(1) replay-start hits.
 
 ``plan_decoder_replay`` reuses a cached all-kept plan for a fixed
 query/prompt/hit layout while only ``seq_lens`` grow (CPU timeit, N=256:
@@ -21,24 +21,25 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
 COMPILE_SIZES = (16, 32, 64, 128, 256, 512)
 
 
-def _md(bounds, lengths, prompts, hits=None, owner=None, tensors=False):
+def _md(bounds, lengths, prompts, hits=None, tensors=False):
     conv = (lambda x: torch.tensor(x, dtype=torch.int32)) if tensors else list
     return SimpleNamespace(
         query_start_loc_cpu=conv(bounds),
         seq_lens_cpu=conv(lengths),
         prompt_lens_cpu=conv(prompts),
         replay_starts_cpu=hits,
-        owner_token_layout=owner,
     )
 
 
 def _full(md, window, num_tokens):
-    # owner_token_layout without owners forces the full path with the same
-    # required_kept (= kept) as the owner-free fast path.
-    slow = SimpleNamespace(
-        **{**vars(md), "owner_token_layout": SimpleNamespace(owners=None)}
-    )
-    return ced.plan_decoder_replay(slow, window, num_tokens, list(COMPILE_SIZES))
+    orig = ced._static_no_skip_spec
+    try:
+        ced._static_no_skip_spec = lambda *_args, **_kwargs: None
+        ced._LAST_NO_SKIP_CACHE[:] = [None, None, None, None, None]
+        return ced.plan_decoder_replay(md, window, num_tokens, list(COMPILE_SIZES))
+    finally:
+        ced._static_no_skip_spec = orig
+        ced._LAST_NO_SKIP_CACHE[:] = [None, None, None, None, None]
 
 
 @pytest.mark.parametrize("tensors", [False, True])
@@ -109,36 +110,7 @@ def test_replay_starts_cache_identity_and_equality_hits():
     assert other is not t and other.tolist() == [1, 5, 7]
 
 
-def test_td8347_kv_shard_owner_token_layout_reuses_cached_plan():
-    import numpy as np
-
-    owner_fast = SimpleNamespace(
-        owners=np.array([0, 0, 1], dtype=np.int32),
-        owner_tokens=np.array([12, 6, 0, 0, 0, 0, 0, 0], dtype=np.int32),
-        query_start_loc=np.zeros((8, 4), dtype=np.int32),
-    )
-    owner_slow = SimpleNamespace(
-        owners=np.array([0, 0, 1], dtype=np.int32),
-        owner_tokens=None,
-        query_start_loc=np.zeros((8, 4), dtype=np.int32),
-    )
-    md = _md(
-        [0, 6, 12, 18],
-        [1024, 1024, 1024],
-        [512, 512, 512],
-        hits=torch.tensor([0, 0, 0], dtype=torch.int32),
-        owner=owner_fast,
-    )
-    first = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
-    md.seq_lens_cpu = [1030, 1030, 1030]
-    second = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
-    assert second is first
-    assert first.padded_num_tokens == 96
-
-    md_slow = _md([0, 6, 12, 18], [1024, 1024, 1024], [512, 512, 512], owner=owner_slow)
-    ref = ced.plan_decoder_replay(md_slow, 512, 128, (32, 64, 96, 128))
-    assert dataclasses.astuple(first) == dataclasses.astuple(ref)
-
+def test_prefix_replay_and_scatter_helpers():
     cfg = SimpleNamespace(
         cache_config=SimpleNamespace(
             enable_prefix_caching=True, swa_bounded_replay=True
@@ -151,34 +123,15 @@ def test_td8347_kv_shard_owner_token_layout_reuses_cached_plan():
     assert torch.equal(out, torch.tensor([[1.0], [0.0], [2.0], [0.0]]))
 
 
-def test_td8364_last_no_skip_identity_cache_and_tuple_reuse(monkeypatch):
-    import numpy as np
-
+def test_last_no_skip_identity_cache_and_tuple_reuse(monkeypatch):
     bounds = (0, 6, 12, 18)
     prompts = (512, 512, 512)
     hits = (0, 0, 0)
-
-    class _TrackedArray:
-        def __init__(self, arr):
-            self._arr = arr
-            self.max_calls = 0
-
-        def max(self):
-            self.max_calls += 1
-            return self._arr.max()
-
-    tracked_tokens = _TrackedArray(np.array([12, 6, 0, 0, 0, 0, 0, 0], dtype=np.int32))
-    owner = SimpleNamespace(
-        owners=np.array([0, 0, 1], dtype=np.int32),
-        owner_tokens=tracked_tokens,
-        query_start_loc=np.zeros((8, 4), dtype=np.int32),
-    )
     md = SimpleNamespace(
         query_start_loc_cpu=bounds,
         seq_lens_cpu=(1024, 1024, 1024),
         prompt_lens_cpu=prompts,
         replay_starts_cpu=hits,
-        owner_token_layout=owner,
     )
     orig_spec = ced._static_no_skip_spec
     spec_calls = []
@@ -188,48 +141,35 @@ def test_td8364_last_no_skip_identity_cache_and_tuple_reuse(monkeypatch):
         return orig_spec(*args, **kwargs)
 
     monkeypatch.setattr(ced, "_static_no_skip_spec", _wrapped_spec)
-    ced._LAST_NO_SKIP_CACHE[:] = [None, None, None, None, None, None]
+    ced._LAST_NO_SKIP_CACHE[:] = [None, None, None, None, None]
 
     p1 = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
     assert len(spec_calls) == 1
-    assert tracked_tokens.max_calls == 1
     assert spec_calls[0][0] is bounds
     assert spec_calls[0][1] is prompts
     assert spec_calls[0][2] is hits
 
     # Second steady-state decode step: _LAST_NO_SKIP_CACHE hits by identity,
-    # skipping both owner_tokens.max() and _static_no_skip_spec lookup.
+    # skipping _static_no_skip_spec lookup.
     md.seq_lens_cpu = (1030, 1030, 1030)
     p2 = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
     assert p2 is p1
     assert len(spec_calls) == 1
-    assert tracked_tokens.max_calls == 1
 
     # Changing scalar/bucket parameters misses _LAST_NO_SKIP_CACHE.
     p3 = ced.plan_decoder_replay(md, 256, 128, (32, 64, 96, 128))
     assert len(spec_calls) == 2
-    assert tracked_tokens.max_calls == 2
     assert p3.replay_starts == (256, 256, 256)
 
     # Full-path no-skip with tuple bounds reuses the tuple directly.
-    owner_slow = SimpleNamespace(
-        owners=np.array([0, 0, 1], dtype=np.int32),
-        owner_tokens=None,
-        query_start_loc=np.zeros((8, 4), dtype=np.int32),
-    )
-    md_slow = SimpleNamespace(
-        query_start_loc_cpu=bounds,
-        seq_lens_cpu=(1030, 1030, 1030),
-        prompt_lens_cpu=prompts,
-        replay_starts_cpu=hits,
-        owner_token_layout=owner_slow,
-    )
-    p_slow = ced.plan_decoder_replay(md_slow, 512, 128, (32, 64, 96, 128))
+    monkeypatch.setattr(ced, "_static_no_skip_spec", lambda *_a, **_kw: None)
+    ced._LAST_NO_SKIP_CACHE[:] = [None, None, None, None, None]
+    p_slow = ced.plan_decoder_replay(md, 512, 128, (32, 64, 96, 128))
     assert p_slow.query_start_loc is bounds
 
 
-def test_td8380_max_min_len_short_circuit_and_heterogeneous_fallback(monkeypatch):
-    """TD8.380: Verify _static_no_skip_spec returns (min_lens, plan, max_min_len)
+def test_max_min_len_short_circuit_and_heterogeneous_fallback(monkeypatch):
+    """Verify _static_no_skip_spec returns (min_lens, plan, max_min_len)
     and plan_decoder_replay short-circuits via min(lengths_list, default=0) >= spec[2]
     while falling back to all(map(operator.ge, ...)) on heterogeneous lengths."""
     import operator
@@ -237,7 +177,7 @@ def test_td8380_max_min_len_short_circuit_and_heterogeneous_fallback(monkeypatch
     bounds = (0, 6, 12, 18)
     prompts = (100, 1024, 512)  # window=512 -> replay_starts=(0, 512, 0)
     # min_lens = (6, 518, 6), max_min_len = 518
-    spec = ced._static_no_skip_spec(bounds, prompts, (0, 0, 0), 512, 32, (18, 32), 0)
+    spec = ced._static_no_skip_spec(bounds, prompts, (0, 0, 0), 512, 32, (18, 32))
     assert spec is not None and len(spec) == 3
     assert spec[0] == (6, 518, 6)
     assert spec[2] == 518
@@ -258,7 +198,6 @@ def test_td8380_max_min_len_short_circuit_and_heterogeneous_fallback(monkeypatch
         seq_lens_cpu=(600, 700, 800),
         prompt_lens_cpu=prompts,
         replay_starts_cpu=(0, 0, 0),
-        owner_token_layout=None,
     )
     p_fast = ced.plan_decoder_replay(md, 512, 32, (18, 32))
     assert p_fast is spec[1]

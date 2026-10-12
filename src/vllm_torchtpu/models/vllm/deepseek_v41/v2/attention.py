@@ -600,36 +600,15 @@ def _query_split(count, ranks):
 
 
 def _has_fast_cache_offset(cache) -> bool:
-    return isinstance(getattr(cache, "row_offset", None), int) and not getattr(
-        cache, "sharded", False
-    )
+    return isinstance(getattr(cache, "row_offset", None), int)
 
 
 def _fast_cache_offset_key(cache):
     return cache.page_stride
 
 
-def _map_cache_blocks(cache, blocks):
-    if not getattr(cache, "sharded", False):
-        return blocks * cache.page_stride, None
-    rep = cache.replicated_blocks
-    sharded_blocks = cache.shape[0] - rep
-    sharded_local = blocks - cache.block_offset
-    in_rep = (blocks >= 0) & (blocks < rep)
-    in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
-    owned = (blocks >= 0) & (in_rep | in_sharded)
-    local_blocks = torch.where(in_rep, blocks, rep + sharded_local).clamp(
-        min=0, max=max(cache.shape[0] - 1, 0)
-    )
-    return local_blocks * cache.page_stride, ~owned
-
-
 def _fast_swa_row_slots(swa_cache, blocks, rem, invalid_window):
-    mapped_blocks, swa_unowned = _map_cache_blocks(swa_cache, blocks)
-    return (
-        (mapped_blocks + rem).int(),
-        invalid_window if swa_unowned is None else invalid_window | swa_unowned,
-    )
+    return (blocks * swa_cache.page_stride + rem).int(), invalid_window
 
 
 def _request_row_slots(cache, block_table, width, page_records: int = 0):
@@ -796,11 +775,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # capacity, 63 tokens per extra request, stays small. Measured
         # (tpu7x-2): max_num_seqs 1 +4.6%, 4 +1.6%, 8 -4.3% prefill.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._swa_max_requests = (
-            None
-            if envs.TPU_DEEPSEEK_V41_KV_SHARD
-            else (max_num_seqs if max_num_seqs <= 4 else None)
-        )
+        self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
         self._precompact_records = self._fp8_kv
         self._token_parallel_attn = self._fp8_kv
         self._indexer_weight_scale = (
@@ -1584,165 +1559,37 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and rows_per_page is not None
                 else (raw_row_slots, invalid_window)
             )
-        swa_is_sharded = bool(
-            getattr(swa_cache, "sharded", False)
-            and getattr(swa_cache, "replicated_blocks", 0) == 0
-        )
-        use_owner_layout = bool(self.compress_ratio or swa_is_sharded)
         source_meta = (
             metadata[self.compressed_cache_prefix] if self.compress_ratio else None
         )
-        owner_layout = (
-            (
-                getattr(swa, "owner_token_layout", None)
-                or getattr(source_meta, "owner_token_layout", None)
-            )
-            if use_owner_layout
-            else None
-        )
-        owner_perm = (
-            (
-                perm
-                if (
-                    perm := getattr(
-                        swa, "owner_perm", getattr(owner_layout, "perm", None)
-                    )
-                )
-                is not None
-                else getattr(source_meta, "owner_perm", None)
-            )
-            if use_owner_layout
-            else None
-        )
-        owner_inv = (
-            (
-                inv
-                if (
-                    inv := getattr(swa, "owner_inv", getattr(owner_layout, "inv", None))
-                )
-                is not None
-                else getattr(source_meta, "owner_inv", None)
-            )
-            if use_owner_layout
-            else None
-        )
-        owner_q_loc = (
-            (
-                q_loc
-                if (
-                    q_loc := getattr(
-                        swa,
-                        "owner_q_loc",
-                        getattr(owner_layout, "query_start_loc", None),
-                    )
-                )
-                is not None
-                else getattr(source_meta, "owner_q_loc", None)
-            )
-            if use_owner_layout
-            else None
-        )
-        segmented_swa = False
-        seg_idx = seg_valid = None
-        positions_perm = positions
-        valid_perm = swa_valid_int32
-        active_swa_slots = swa_row_slots
-        active_invalid_window = invalid_window
-        active_swa_masked = swa_row_slots_masked
-        if (
-            stage_cache is not None
-            and swa_slots_key is not None
-            and swa_row_slots is not None
-            and owner_perm is not None
-            and tiled
-            and has_fast_swa_offset
-            and rows_per_page is not None
-            and (tp_ranks_swa := get_tensor_model_parallel_world_size()) > 1
-        ):
-            swa_seg_key = self._stage_cache_key(
-                "swa_owner_seg",
-                id(owner_perm),
-                tp_ranks_swa,
-                *swa_slots_key[1:],
-            )
-            cached_swa_seg = stage_cache.get(swa_seg_key)
-            if cached_swa_seg is None or cached_swa_seg[0] is not swa_row_slots:
-                seg_count = owner_perm.shape[0] // tp_ranks_swa
-                seg_perm = (
-                    owner_perm[: tp_ranks_swa * seg_count]
-                    .reshape(tp_ranks_swa, seg_count)
-                    .index_select(0, self._get_stage_tp_rank_1d(stage_cache))
-                    .squeeze(0)
-                )
-                seg_valid = seg_perm >= 0
-                seg_idx = seg_perm.clamp(min=0)
-                active_swa_slots = swa_row_slots.index_select(0, seg_idx)
-                active_invalid_window = (
-                    invalid_window.index_select(0, seg_idx) | ~seg_valid[:, None]
-                )
-                active_swa_masked = active_swa_slots.masked_fill(
-                    active_invalid_window, -1
-                )
-                perm_valid = owner_perm >= 0
-                perm_idx = owner_perm.clamp(min=0)
-                positions_perm = positions.index_select(0, perm_idx).masked_fill(
-                    ~perm_valid, 0
-                )
-                valid_perm = swa_valid_int32.index_select(0, perm_idx).masked_fill(
-                    ~perm_valid, 0
-                )
-                stage_cache[swa_seg_key] = (
-                    swa_row_slots,
-                    seg_idx,
-                    seg_valid,
-                    active_swa_slots,
-                    active_invalid_window,
-                    active_swa_masked,
-                    positions_perm,
-                    valid_perm,
-                )
-            else:
-                (
-                    _,
-                    seg_idx,
-                    seg_valid,
-                    active_swa_slots,
-                    active_invalid_window,
-                    active_swa_masked,
-                    positions_perm,
-                    valid_perm,
-                ) = cached_swa_seg
-            segmented_swa = True
-        if active_swa_slots is None:
+        if swa_row_slots is None:
             records = None
         elif has_fast_swa_offset and rows_per_page is not None:
-            if swa_cache.row_offset == 0 and active_swa_masked is not None:
-                records = active_swa_masked
+            if swa_cache.row_offset == 0 and swa_row_slots_masked is not None:
+                records = swa_row_slots_masked
             elif stage_cache is not None and swa_slots_key is not None:
                 swa_rec_key = self._stage_cache_key(
                     "swa_records",
                     swa_cache.row_offset,
-                    segmented_swa,
-                    id(owner_perm) if segmented_swa else None,
                     *swa_slots_key[1:],
                 )
                 cached_swa_rec = stage_cache.get(swa_rec_key)
-                if cached_swa_rec is None or cached_swa_rec[0] is not active_swa_slots:
-                    records = (swa_cache.row_offset + active_swa_slots).masked_fill(
-                        active_invalid_window, -1
+                if cached_swa_rec is None or cached_swa_rec[0] is not swa_row_slots:
+                    records = (swa_cache.row_offset + swa_row_slots).masked_fill(
+                        invalid_window, -1
                     )
-                    stage_cache[swa_rec_key] = (active_swa_slots, records)
+                    stage_cache[swa_rec_key] = (swa_row_slots, records)
                 else:
                     records = cached_swa_rec[1]
             else:
                 records = (
-                    active_swa_slots
+                    swa_row_slots
                     if swa_cache.row_offset == 0
-                    else swa_cache.row_offset + active_swa_slots
-                ).masked_fill(active_invalid_window, -1)
+                    else swa_cache.row_offset + swa_row_slots
+                ).masked_fill(invalid_window, -1)
         else:
-            records = swa_cache.row_indices(active_swa_slots).masked_fill(
-                active_invalid_window, -1
+            records = swa_cache.row_indices(swa_row_slots).masked_fill(
+                invalid_window, -1
             )
         # Token-local q path: q projection, attention and
         # wo_a run in one op that picks token-parallel vs head-sharded on
@@ -1796,27 +1643,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else positions.new_empty((count, 0), dtype=torch.int32)
         )
         pages = starts = None
-        segmented_main = False
         if self.compress_ratio:
             assert source_meta is not None
             source = self._static_forward_context[self.compressed_cache_prefix]
             main_cache = source.kv_cache
-            tp_ranks = (
-                get_tensor_model_parallel_world_size() if owner_perm is not None else 1
-            )
-            segmented_main = bool(
-                owner_perm is not None
-                and tiled
-                and tp_ranks > 1
-                and (self.indexer is None or not self._all_indices_fit)
-            )
             comp_key = self._stage_cache_key(
                 "compressed_attn",
                 self.compressed_cache_prefix,
                 getattr(self, "index_source_layer_id", None),
                 tiled,
                 self._fp8_kv,
-                segmented_main,
             )
             cached_comp = (
                 stage_cache.get(comp_key)
@@ -1830,58 +1666,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 comp_inputs_key = self._stage_cache_key(
                     "compressed_inputs",
                     self.compress_ratio,
-                    segmented_main,
-                    tp_ranks,
-                    id(owner_perm) if segmented_main else None,
                 )
-                cached_comp_inputs = (
+                lengths = (
                     stage_cache.get(comp_inputs_key)
                     if stage_cache is not None
                     else None
                 )
-                if cached_comp_inputs is None:
+                if lengths is None:
                     lengths = ((pos_i32 + 1) // self.compress_ratio)[:, None]
-                    if segmented_main and owner_perm is not None:
-                        if seg_idx is None or seg_valid is None:
-                            seg_count = owner_perm.shape[0] // tp_ranks
-                            # index_select, not a tensor-bound slice: slicing calls
-                            # Tensor.__index__ (.item()), creating unbacked SymInts
-                            # that break stage-cache reuse under compile (KV_SHARD).
-                            seg_perm = (
-                                owner_perm[: tp_ranks * seg_count]
-                                .reshape(tp_ranks, seg_count)
-                                .index_select(
-                                    0, self._get_stage_tp_rank_1d(stage_cache)
-                                )
-                                .squeeze(0)
-                            )
-                            seg_valid = seg_perm >= 0
-                            seg_idx = seg_perm.clamp(min=0)
-                        lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
-                            ~seg_valid[:, None], 0
-                        )
-                        swa_valid_comp = swa_valid.index_select(0, seg_idx) & seg_valid
-                        requests_comp = requests.index_select(0, seg_idx).masked_fill(
-                            ~seg_valid, 0
-                        )
-                    else:
-                        lengths_comp = lengths
-                        swa_valid_comp = swa_valid
-                        requests_comp = requests
                     if stage_cache is not None:
-                        stage_cache[comp_inputs_key] = (
-                            lengths,
-                            lengths_comp,
-                            swa_valid_comp,
-                            requests_comp,
-                        )
-                else:
-                    (
-                        lengths,
-                        lengths_comp,
-                        swa_valid_comp,
-                        requests_comp,
-                    ) = cached_comp_inputs
+                        stage_cache[comp_inputs_key] = lengths
                 if self.indexer is not None:
                     if self._all_indices_fit:
                         logical_compressed = torch.arange(
@@ -1966,11 +1760,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 lengths,
                                 swa_slots,
                                 pending_index_write,
-                                **(
-                                    {"owner_perm": owner_perm}
-                                    if owner_perm is not None
-                                    else {}
-                                ),
                             )
                         else:
                             index_q = self._project_index_q(qr, positions)
@@ -2024,18 +1813,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         else:
                             selected = selected[:, :target_width]
                 else:
-                    sel_count = (
-                        owner_perm.shape[0] // tp_ranks
-                        if segmented_main and owner_perm is not None
-                        else count
-                    )
                     selected = self.topk_indices_buffer[
-                        :sel_count, : min(capacity, self.topk_indices_buffer.shape[-1])
+                        :count, : min(capacity, self.topk_indices_buffer.shape[-1])
                     ]
                 valid_compressed = (
-                    (selected >= 0)
-                    & (selected < lengths_comp)
-                    & swa_valid_comp[:, None]
+                    (selected >= 0) & (selected < lengths) & swa_valid[:, None]
                 )
                 if tiled:
                     if self._fp8_kv:
@@ -2069,18 +1851,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     (0, padded_width - width),
                                     value=-1,
                                 )
-                        starts = (
-                            owner_q_loc
-                            if owner_q_loc is not None
-                            else source_meta.query_start_loc
-                        )
+                        starts = source_meta.query_start_loc
                         if stage_cache is not None and starts.dtype != torch.int32:
                             starts = starts.int()
                     else:
                         slots = _row_slots(
                             main_cache,
                             _block_table(source_meta),
-                            requests_comp,
+                            requests,
                             selected,
                         )
                         main_records = main_cache.row_indices(slots).masked_fill(
@@ -2104,33 +1882,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if tiled:
             assert records is not None and main_records is not None
             tp_rank_1d = self._get_stage_tp_rank_1d(stage_cache)
-            if owner_perm is not None or owner_inv is not None:
-                if stage_cache is not None:
-                    owner_kw_key = self._stage_cache_key(
-                        "owner_kwargs",
-                        id(owner_perm),
-                        id(owner_inv),
-                        segmented_main,
-                        segmented_swa,
-                    )
-                    owner_kwargs = stage_cache.get(owner_kw_key)
-                    if owner_kwargs is None:
-                        owner_kwargs = {
-                            "owner_perm": owner_perm,
-                            "owner_inv": owner_inv,
-                            "main_records_segmented": segmented_main,
-                            "swa_records_segmented": segmented_swa,
-                        }
-                        stage_cache[owner_kw_key] = owner_kwargs
-                else:
-                    owner_kwargs = {
-                        "owner_perm": owner_perm,
-                        "owner_inv": owner_inv,
-                        "main_records_segmented": segmented_main,
-                        "swa_records_segmented": segmented_swa,
-                    }
-            else:
-                owner_kwargs = {}
             # Read the env flag once per stage, not once per layer.
             fused_swa = (
                 envs.TPU_DEEPSEEK_V41_FUSED_SWA
@@ -2152,30 +1903,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     if getattr(self, "_local_wo_b", False)
                     else {}
                 )
-                seg_qr_local = bool(self._replicated_local_q and segmented_swa)
-                qr_local_in = (
-                    qr_local.index_select(0, seg_idx).masked_fill(
-                        ~seg_valid[:, None], 0
-                    )
-                    if seg_qr_local and seg_idx is not None and seg_valid is not None
-                    else qr_local
-                )
-                seg_qo_kwargs = (
-                    {
-                        "qr_local_segmented": seg_qr_local,
-                        "owner_inputs_permuted": True,
-                    }
-                    if segmented_swa
-                    else {}
-                )
                 return sparse_fp8_attention_qo(
                     qr,
-                    qr_local_in,
+                    qr_local,
                     self.wq_b.weight,
                     self.wq_b.weight_scale,
                     self._wq_b_full,
                     self._wq_b_full_scale,
-                    positions_perm,
+                    positions,
                     self._get_stage_rope_cache(stage_cache),
                     swa_cache,
                     main_cache,
@@ -2188,7 +1923,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.wo_a.weight_scale,
                     self._wo_a_full,
                     self._wo_a_full_scale,
-                    valid_perm,
+                    swa_valid_int32,
                     self.scale,
                     pages,
                     starts,
@@ -2197,8 +1932,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     int(self.head_dim),
                     replicated_qr=self._replicated_local_q,
                     fused_swa=fused_swa,
-                    **seg_qo_kwargs,
-                    **owner_kwargs,
                     **wob_kwargs,
                 )
             assert q is not None
@@ -2219,16 +1952,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     full_sink=self._full_attn_sink,
                     tp_rank=tp_rank_1d,
                     fused_swa=fused_swa,
-                    **owner_kwargs,
                 )
             else:
-                main_is_sharded = bool(
-                    getattr(main_cache, "sharded", False)
-                    and (
-                        self.compress_ratio
-                        or getattr(main_cache, "replicated_blocks", 0) == 0
-                    )
-                )
                 result = paged_attention(
                     q,
                     swa_cache,
@@ -2238,20 +1963,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.attn_sink,
                     self.scale,
                     getattr(self, "query_block_size", 1) if non_causal else 1,
-                    token_parallel=bool(
-                        main_is_sharded or swa_is_sharded or owner_perm is not None
-                    ),
-                    full_sink=self._full_attn_sink,
-                    tp_rank=tp_rank_1d,
-                    **owner_kwargs,
                 )
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None
-        if (
-            self._fp8_kv
-            or envs.TPU_DEEPSEEK_V41_KV_SHARD
-            or getattr(main_cache, "sharded", False)
-        ) and self.compress_ratio:
+        if self._fp8_kv and self.compress_ratio:
             raise NotImplementedError("FP8 V4.1 KV cache requires the tiled path")
         assert q is not None
         rows = cast(torch.Tensor, rows)
@@ -2285,11 +2000,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         replicated = bool(
             envs.TPU_DEEPSEEK_V41_DECODE_LOCAL_Q and not self._sp_sharded_input
         )
-        sharded = bool(
+        sp_local_q = bool(
             envs.TPU_DEEPSEEK_V41_LOCAL_Q and not getattr(self, "_ced_decoder", False)
         )
         if (
-            not (replicated or sharded)
+            not (replicated or sp_local_q)
             or tp_size <= 1
             or not (self._fp8_kv and self.compress_ratio)
             or self.n_local_groups < 1
@@ -2321,7 +2036,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             ),
         }
         wob = (
-            getattr(self, "wo_b", None) if sharded and self._sp_sharded_input else None
+            getattr(self, "wo_b", None)
+            if sp_local_q and self._sp_sharded_input
+            else None
         )
         wob_weight = getattr(wob, "weight", None)
         wob_scale = getattr(wob, "weight_scale", None)
@@ -2358,7 +2075,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         lengths,
         swa_slots,
         pending_index_write,
-        owner_perm=None,
     ):
         """Publish explicit index-cache and logical-selection outputs."""
         indexer = self.indexer
@@ -2395,7 +2111,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             "indexer_query_split",
             getattr(self, "compress_ratio", None),
             ranks,
-            owner_perm is not None,
         )
         cached_query_split = (
             stage_cache.get(query_split_key) if stage_cache is not None else None
@@ -2410,20 +2125,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     if hasattr(self, "_get_stage_tp_rank")
                     else getattr(self, "_tp_rank", 0)
                 )
-                if owner_perm is not None:
-                    part = owner_perm.shape[0] // ranks
-                    mine = (
-                        owner_perm[: ranks * part]
-                        .reshape(ranks, part)
-                        .index_select(0, self._get_stage_tp_rank_1d(stage_cache))
-                        .squeeze(0)
-                        .to(torch.int32)
-                    )
-                else:
-                    part, _ = _query_split(count, ranks)
-                    mine = tp_rank * part + torch.arange(
-                        part, dtype=torch.int32, device=qr.device
-                    )
+                part, _ = _query_split(count, ranks)
+                mine = tp_rank * part + torch.arange(
+                    part, dtype=torch.int32, device=qr.device
+                )
                 invalid_mine, clamped_mine = (
                     (mine < 0) | (mine >= count),
                     mine.clamp(min=0, max=count - 1),
@@ -2493,7 +2198,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ):
             candidates_part = cached_candidates_part
         else:
-            if not split or owner_perm is not None:
+            if not split:
                 candidates_part = self.candidate_block_buffer[: qr_part.shape[0]]
             else:
                 candidates_part = (
@@ -2546,7 +2251,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 else {}
             ),
         )
-        if split and owner_perm is None:
+        if split:
             selected = _gather_query_rows(selected)[:count]
             if candidate_write and stage_cache is None:
                 published = _gather_query_rows(published)[:count]
@@ -2557,9 +2262,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if candidate_write:
             if stage_cache is not None:
                 stage_cache[cand_key] = (
-                    published.masked_fill(invalid_mine_2d, -1)
-                    if (split and owner_perm is None)
-                    else published
+                    published.masked_fill(invalid_mine_2d, -1) if split else published
                 )
             else:
                 self.candidate_block_buffer.copy_(

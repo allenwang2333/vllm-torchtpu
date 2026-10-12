@@ -660,10 +660,9 @@ def test_sample_tokens_logprobs_and_chunks():
     assert out3.copy_state is None
 
 
-def test_replay_starts_and_owner_token_layout_step_caches(monkeypatch):
-    """Verify _record_replay_starts, _prepare_lookback_token_ids, _prepare_inputs
-    replay_starts_cpu caching, and step_owner_required_tokens /
-    attach_step_owner_token_layout owner cache reuse."""
+def test_replay_starts_step_caches(monkeypatch):
+    """Verify _record_replay_starts, _prepare_lookback_token_ids, and _prepare_inputs
+    replay_starts_cpu caching."""
     runner = object.__new__(TPUModelRunner)
     spec = SimpleNamespace(prefix_replay_tokens=128)
     runner.kv_cache_config = SimpleNamespace(
@@ -843,48 +842,7 @@ def test_replay_starts_and_owner_token_layout_step_caches(monkeypatch):
         fake_runner._cached_replay_starts_cpu
     )
 
-    # 8. step_owner_required_tokens cache hit and _kv_shard_owners_cache reuse
-    from vllm_torchtpu import envs
-    from vllm_torchtpu.core.owner_affine_block_pool import OwnerLayout
-    from vllm_torchtpu.runner.owner_token_layout import (
-        attach_step_owner_token_layout,
-        step_owner_required_tokens,
-    )
-
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", True, raising=False)
-    owner_layout = OwnerLayout(num_replicated=8, num_owners=4, blocks_per_owner=14)
-    bt_arr = np.array([[10], [24]], dtype=np.int32)
-    kv_runner = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=4),
-        kv_cache_config=SimpleNamespace(
-            kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace())]
-        ),
-        _kv_shard_group_cache=(None, 0),
-        _kv_shard_owner_layout=owner_layout,
-        input_batch=SimpleNamespace(
-            block_table=SimpleNamespace(
-                block_tables=[SimpleNamespace(_bt_cpu_np=bt_arr)]
-            )
-        ),
-        num_tokens_padded=16,
-        num_tokens_paddings=[16, 32],
-        _attn_metadata_builder_ctx=SimpleNamespace(
-            num_reqs=2,
-            start_index=0,
-            req_indices=None,
-            position_ids_override=None,
-            query_start_loc_cpu=np.array([0, 1, 2], dtype=np.int64),
-        ),
-    )
-    kv_runner._kv_shard_group_cache = (id(kv_runner.kv_cache_config), 0)
-    req1 = step_owner_required_tokens(kv_runner, 0, 2, [1, 1])
-    req2 = step_owner_required_tokens(kv_runner, 0, 2, [1, 1])
-    assert req1 == req2 == 4
-    meta = SimpleNamespace(query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32))
-    layout = attach_step_owner_token_layout(kv_runner, {"l0": meta})
-    assert layout is not None
-
-    # 9. _prepare_async_token_substitution_indices memoization hit & miss
+    # 8. _prepare_async_token_substitution_indices memoization hit & miss
     async_runner = SimpleNamespace(
         _pre_async_results=SimpleNamespace(
             req_id_to_index_copy={"req-0": 0, "req-1": 1},

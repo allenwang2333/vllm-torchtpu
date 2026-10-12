@@ -1138,10 +1138,7 @@ class TestAttentionSelectPagedIndicesDecode:
                     np.asarray(pub_paged), np.asarray(pub_ref)
                 )
 
-    @pytest.mark.parametrize("use_owner_perm", [False, True])
-    def test_td8221_select_paged_indices_clamped_mine_parity_and_no_cat(
-        self, monkeypatch, use_owner_perm
-    ):
+    def test_select_paged_indices_clamped_mine_parity_and_no_cat(self, monkeypatch):
         """TD8.221: clamped_mine + masked_fill matches reference without torch.cat."""
         orig_cat = torch.cat
         ranks = 4
@@ -1209,18 +1206,8 @@ class TestAttentionSelectPagedIndicesDecode:
         swa_slots = torch.arange(count, dtype=torch.int32)
         swa_slots[1] = -1
 
-        if use_owner_perm:
-            owner_perm = torch.tensor(
-                [0, 1, 2, -1, 3, 4, -1, 5, 9, -1, 0, 1, 6, 7, 8, -1],
-                dtype=torch.int32,
-            )
-            part = 4
-            padding = 1
-            ref_mine = torch.tensor([9, count, 0, 1], dtype=torch.int32)
-        else:
-            owner_perm = None
-            part, padding = v2_attn._query_split(count, ranks)
-            ref_mine = tp_rank * part + torch.arange(part, dtype=torch.int32)
+        part, padding = v2_attn._query_split(count, ranks)
+        ref_mine = tp_rank * part + torch.arange(part, dtype=torch.int32)
 
         active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
         ref_qr = orig_cat((qr, qr.new_full((padding, 16), 0))).index_select(0, ref_mine)
@@ -1237,13 +1224,9 @@ class TestAttentionSelectPagedIndicesDecode:
             0, ref_mine
         )
         candidates = attn.candidate_block_buffer[:count]
-        ref_cand = (
-            attn.candidate_block_buffer[:part]
-            if use_owner_perm
-            else orig_cat(
-                (candidates, candidates.new_full((padding, 8), -1))
-            ).index_select(0, ref_mine)
-        )
+        ref_cand = orig_cat(
+            (candidates, candidates.new_full((padding, 8), -1))
+        ).index_select(0, ref_mine)
         cat_calls.clear()
 
         with v2_attn.stage_attention_cache_scope():
@@ -1258,7 +1241,6 @@ class TestAttentionSelectPagedIndicesDecode:
                     lengths,
                     swa_slots,
                     None,
-                    owner_perm=owner_perm,
                 )
 
         assert cat_calls == []

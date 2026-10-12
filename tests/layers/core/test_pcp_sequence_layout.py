@@ -1174,32 +1174,6 @@ def test_sequence_layout_and_pcp_remaining_branches(monkeypatch):
     _ensure_host_token_buffer_capacity(runner_no_mm, 128)
     assert runner_no_mm.input_ids_cpu.shape[0] == 128
 
-    import vllm_torchtpu.runner.owner_token_layout as owner_token_layout
-
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_KV_SHARD", True)
-    monkeypatch.setattr(
-        owner_token_layout,
-        "step_owner_required_tokens",
-        lambda *_args, **_kwargs: 24,
-    )
-    all_planner = AllSequenceLayoutPlanner()
-    kv_shard_runner = SimpleNamespace(
-        num_tokens_paddings=[16, 32, 64],
-        _dp_target_bucket=None,
-    )
-    plan_kv_shard = all_planner.prepare_real(
-        runner=kv_shard_runner,
-        scheduler_output=SimpleNamespace(),
-        start_index=0,
-        num_reqs=1,
-        num_scheduled_tokens_per_req=np.array([8], dtype=np.int32),
-        total_num_scheduled_tokens=8,
-        use_max_model_len=False,
-        target_num_reqs=1,
-        padded_num_reqs=1,
-    )
-    assert plan_kv_shard.local_padded_num_tokens == 32
-
 
 def test_td8279_localize_token_tensor_and_gather_indices_int32_index_select(
     monkeypatch,
@@ -1482,8 +1456,6 @@ def test_td8325_pcp_logits_indices_reuses_precomputed_inverse_order(monkeypatch)
 def test_td8355_all_sequence_layout_plan_cache_and_protocol_short_circuit(
     monkeypatch,
 ):
-    import vllm_torchtpu.runner.owner_token_layout as owner_token_layout
-
     planner = AllSequenceLayoutPlanner()
     dummy_1 = planner.prepare_dummy(
         num_tokens=16, num_reqs=4, kv_cache_initialized=True
@@ -1521,40 +1493,6 @@ def test_td8355_all_sequence_layout_plan_cache_and_protocol_short_circuit(
     )
     assert real_1 is real_2
     assert real_1.local_padded_num_tokens == 16
-
-    # Verify _owner_layout_mod lazy initialization and reuse under KV_SHARD.
-    monkeypatch.setattr(sequence_layout, "_owner_layout_mod", None)
-    monkeypatch.setattr(sequence_layout.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True)
-    monkeypatch.setattr(
-        owner_token_layout,
-        "step_owner_required_tokens",
-        lambda *_args, **_kwargs: 28,
-    )
-    kv_plan_1 = planner.prepare_real(
-        runner=runner,
-        scheduler_output=SimpleNamespace(),
-        start_index=0,
-        num_reqs=2,
-        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
-        total_num_scheduled_tokens=8,
-        use_max_model_len=False,
-        target_num_reqs=2,
-        padded_num_reqs=2,
-    )
-    assert sequence_layout._owner_layout_mod is owner_token_layout
-    kv_plan_2 = planner.prepare_real(
-        runner=runner,
-        scheduler_output=SimpleNamespace(),
-        start_index=0,
-        num_reqs=2,
-        num_scheduled_tokens_per_req=np.asarray([4, 4], dtype=np.int32),
-        total_num_scheduled_tokens=8,
-        use_max_model_len=False,
-        target_num_reqs=2,
-        padded_num_reqs=2,
-    )
-    assert kv_plan_1 is kv_plan_2
-    assert kv_plan_1.local_padded_num_tokens == 32
 
     # Short-circuit on protocol != PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
     # avoids coercing kind via str().

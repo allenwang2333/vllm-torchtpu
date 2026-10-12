@@ -1042,7 +1042,6 @@ class TestModelForward:
                 "layer_3": meta_entry,
             }
         )
-        owner_perm = torch.tensor([1, 0, 3, 2])
         seen = []
 
         @contextlib.contextmanager
@@ -1055,11 +1054,6 @@ class TestModelForward:
             patch(f"{mod}.upstream.get_forward_context", return_value=mock_ctx),
             patch(f"{mod}.plan_decoder_replay", return_value=plan),
             patch(f"{mod}.override_forward_context", side_effect=_capture),
-            patch.object(
-                DeepseekV41Model,
-                "_get_ced_decoder_owner_kwargs",
-                return_value={"owner_perm": owner_perm},
-            ),
         ):
             model.forward(None, torch.tensor([0, 1, 2, 3]))
         dec_meta = seen[-1].attn_metadata
@@ -1068,10 +1062,7 @@ class TestModelForward:
         assert dec_meta["layer_0"] is dec_meta["layer_1"]
         assert dec_meta["layer_0"] is dec_meta["layer_3"]
         assert dec_meta["layer_2"] is not dec_meta["layer_0"]
-        assert dec_meta["layer_2"].owner_perm is owner_perm
         assert dec_meta["layer_0"] is not meta_entry
-        assert dec_meta["layer_0"].owner_perm is owner_perm
-        assert not hasattr(meta_entry, "owner_perm")
 
         pos = torch.tensor([0, 1, 2, 3])
         cached_tensors = DeepseekV41Model._get_ced_non_identity_tensors(
@@ -1099,73 +1090,6 @@ class TestModelForward:
         )
         assert recomputed is not cached_tensors
         assert recomputed[0].shape == (6,)
-
-    def test_get_ced_decoder_owner_kwargs_branches(self) -> None:
-        import numpy as np
-
-        plan = DecoderReplayPlan(
-            indices=(1, 3),
-            padded_num_tokens=4,
-            query_start_loc=[0, 1, 2],
-            replay_starts=[0, 1],
-        )
-        bounds = torch.tensor([0, 1, 2], dtype=torch.int32)
-
-        # 1. first is None or owner_perm is None -> {}
-        assert DeepseekV41Model._get_ced_decoder_owner_kwargs(None, plan, bounds) == {}
-        assert (
-            DeepseekV41Model._get_ced_decoder_owner_kwargs(
-                SimpleNamespace(owner_perm=None), plan, bounds
-            )
-            == {}
-        )
-
-        # 2. req_owners present + enc_q_loc present -> build_owner_token_layout branch
-        first_with_owners = SimpleNamespace(
-            owner_perm=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
-            owner_q_loc=torch.zeros((2, 2), dtype=torch.int32),
-            owner_token_layout=SimpleNamespace(owners=np.array([0, 1], dtype=np.int32)),
-        )
-        owner_holder = SimpleNamespace()
-        out_owners = DeepseekV41Model._get_ced_decoder_owner_kwargs(
-            first_with_owners, plan, bounds, owner_holder
-        )
-        assert out_owners["owner_token_layout"] is not None
-        assert out_owners["owner_perm"].shape == (4,)
-        plan_tuple = DecoderReplayPlan(
-            indices=(1, 3),
-            padded_num_tokens=4,
-            query_start_loc=(0, 1, 2),
-            replay_starts=(0, 1),
-        )
-        assert (
-            DeepseekV41Model._get_ced_decoder_owner_kwargs(
-                first_with_owners, plan_tuple, bounds, owner_holder
-            )
-            is out_owners
-        )
-
-        # 3. req_owners is None + enc_q_loc is None -> _positional_layout fallback
-        first_no_owners = SimpleNamespace(
-            owner_perm=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
-            owner_q_loc=None,
-            owner_token_layout=None,
-        )
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_tensor_model_parallel_world_size",
-            return_value=2,
-        ):
-            out_pos = DeepseekV41Model._get_ced_decoder_owner_kwargs(
-                first_no_owners, plan, bounds
-            )
-            assert (
-                DeepseekV41Model._get_ced_decoder_owner_kwargs(
-                    first_no_owners, plan, bounds
-                )
-                is out_pos
-            )
-        assert out_pos["owner_token_layout"] is None
-        assert out_pos["owner_perm"].shape == (4,)
 
     def test_forward_ced_with_active_replay_plan_and_scatter(self) -> None:
         model = self._create_model(ced_enabled=True, sp_enabled=True)

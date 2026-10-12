@@ -2365,7 +2365,7 @@ class TestKVCacheManagerFullCoverage(TestKVCacheManager):
         )
         assert self.runner.cache_config.num_gpu_blocks_override is not None
 
-    def test_prewarm_and_owner_token_layout_helpers(self):
+    def test_prewarm_helpers(self):
         mgr = self.runner.kv_cache_manager
         with patch(
             "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
@@ -2410,22 +2410,6 @@ class TestKVCacheManagerFullCoverage(TestKVCacheManager):
             assert mgr.get_kv_prewarm_shapes() == [16, 32]
             mgr.prewarm_kv_offload_shape(64)
             assert prewarmed == [64]
-
-        self.runner._kv_shard_owner_layout = None
-        assert mgr.prepare_owner_token_layout({}, [4]) is None
-
-        self.runner._kv_shard_owner_layout = SimpleNamespace()
-        self.runner.num_tokens_paddings = (8,)
-        with patch(
-            "vllm_torchtpu.runner.owner_token_layout.prepare_kv_shard_owner_token_layout",
-            return_value="layout_ok",
-        ) as mock_prep:
-            assert mgr.prepare_owner_token_layout({}, [4]) == "layout_ok"
-            assert (
-                mgr.prepare_owner_token_layout({}, [4], token_paddings=(16,))
-                == "layout_ok"
-            )
-            assert mock_prep.call_count == 2
 
     def test_unified_kv_cache_and_block_major_pool_methods(self):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -2773,14 +2757,9 @@ class TestKVCacheManagerFullCoverage(TestKVCacheManager):
             native_raw_cache="raw_cache",
             native_cache_layouts="layouts",
         )
-        for impl_val, shard_val in (("v2", True), ("v2", False), ("v1", False)):
+        for impl_val in ("v2", "v1"):
             monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_IMPL", impl_val)
-            monkeypatch.setitem(vars(envs), "TPU_DEEPSEEK_V41_KV_SHARD", shard_val)
             with (
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.cache.resolve_worker_owner_layout",
-                    return_value=SimpleNamespace(num_replicated=1, num_blocks=4),
-                ),
                 patch(
                     "vllm_torchtpu.models.vllm.deepseek_v41.v2.cache.materialize_upstream_kv_cache",
                     return_value=fake_mat,

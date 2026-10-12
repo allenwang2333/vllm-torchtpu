@@ -47,10 +47,9 @@ def _walk_runner(builders, staged):
 
 
 def _walk(runner):
-    with patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False):
-        meta, spec = TPUModelRunner._build_attention_metadata(
-            runner, num_tokens=8, num_reqs=4, num_reqs_padded=4
-        )
+    meta, spec = TPUModelRunner._build_attention_metadata(
+        runner, num_tokens=8, num_reqs=4, num_reqs_padded=4
+    )
     assert spec is None
     return meta
 

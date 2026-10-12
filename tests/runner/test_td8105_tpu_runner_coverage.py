@@ -160,32 +160,7 @@ def test_module_helpers_and_compiled_unwrapped():
         ],
     )
     runner.parallel_config.tensor_parallel_size = 1
-    with patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False):
-        assert tr_mod._spec_warmup_request_block_ids(runner, [2, 1], 0, 1) is None
-
-    # Sharded branch
-    runner.parallel_config.tensor_parallel_size = 2
-    fake_layout_small = SimpleNamespace(
-        num_owners=2, num_replicated=2, blocks_per_owner=2
-    )
-    fake_layout_ok = SimpleNamespace(
-        num_owners=2, num_replicated=10, blocks_per_owner=10
-    )
-    with (
-        patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True),
-        patch(
-            "vllm_torchtpu.core.owner_affine_block_pool.worker_owner_layout",
-            return_value=fake_layout_small,
-        ),
-        patch(
-            "vllm_torchtpu.core.owner_affine_block_pool.is_replicated_spec",
-            side_effect=lambda spec: spec.block_size == 8,
-        ),
-    ):
-        assert tr_mod._spec_warmup_request_block_ids(runner, [2, 2], 0, 2) is None
-        runner._kv_shard_owner_layout = fake_layout_ok
-        bids = tr_mod._spec_warmup_request_block_ids(runner, [2, 2], 1, 2)
-        assert bids is not None and len(bids) == 2
+    assert tr_mod._spec_warmup_request_block_ids(runner, [2, 1], 0, 1) is None
 
     # _build_kv_connector_output when _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP
     # is False
@@ -575,26 +550,19 @@ def test_metadata_mamba_and_cow_copies():
         [SimpleNamespace(metadata_builders=[builder], layer_names=["l0"])]
     ]
     runner._attn_metadata_builder_ctx = SimpleNamespace(staged_block_tables=None)
-    with (
-        patch.object(tr_mod, "stage_block_table_uploads") as mock_stage,
-        patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True),
-        patch.object(tr_mod, "attach_step_owner_token_layout") as mock_attach,
-    ):
+    with patch.object(tr_mod, "stage_block_table_uploads") as mock_stage:
         meta, _ = runner._build_attention_metadata(
             num_tokens=8, num_reqs=4, num_tokens_padded=None, num_reqs_padded=None
         )
         assert meta == {"l0": "built_meta"}
         mock_stage.assert_called_once()
-        mock_attach.assert_called_once()
 
-    # Also test when staged_block_tables is already set and TPU_DEEPSEEK_V41_KV_SHARD is
-    # False
+    # Also test when staged_block_tables is already set
     runner._attn_metadata_builder_ctx = SimpleNamespace(staged_block_tables="staged")
-    with patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False):
-        meta2, _ = runner._build_attention_metadata(
-            num_tokens=8, num_reqs=4, num_tokens_padded=8, num_reqs_padded=4
-        )
-        assert meta2 == {"l0": "built_meta"}
+    meta2, _ = runner._build_attention_metadata(
+        num_tokens=8, num_reqs=4, num_tokens_padded=8, num_reqs_padded=4
+    )
+    assert meta2 == {"l0": "built_meta"}
 
     # get_kv_prewarm_shapes & prewarm_kv_offload_shape
     runner.kv_cache_manager.get_kv_prewarm_shapes.return_value = [16, 32]
@@ -1868,45 +1836,38 @@ def test_warmup_spec_decode_and_cleanup():
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))],
     )
     runner.parallel_config.tensor_parallel_size = 1
-    with patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False):
-        runner._warmup_spec_batch(2, 8, greedy=True)  # not enough kv blocks
+    runner._warmup_spec_batch(2, 8, greedy=True)  # not enough kv blocks
 
-        runner.kv_cache_config.num_blocks = 20
-        runner.execute_model = MagicMock(return_value=None)
-        runner.sample_tokens = MagicMock()
-        runner.take_draft_token_ids = MagicMock()
-        runner._warmup_spec_decode_cleanup = MagicMock(return_value=True)
-        runner._warmup_spec_batch(2, 8, greedy=True)
+    runner.kv_cache_config.num_blocks = 20
+    runner.execute_model = MagicMock(return_value=None)
+    runner.sample_tokens = MagicMock()
+    runner.take_draft_token_ids = MagicMock()
+    runner._warmup_spec_decode_cleanup = MagicMock(return_value=True)
+    runner._warmup_spec_batch(2, 8, greedy=True)
 
-        # kv_shard=True + exception in try
-        runner.parallel_config.tensor_parallel_size = 2
-        with (
-            patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True),
-            patch.object(tr_mod, "_spec_warmup_request_block_ids", return_value=([1],)),
-        ):
-            runner.execute_model = MagicMock(side_effect=RuntimeError("batch fail"))
-            runner._warmup_spec_batch(2, 8, greedy=False)
+    # exception in try
+    runner.execute_model = MagicMock(side_effect=RuntimeError("batch fail"))
+    runner._warmup_spec_batch(2, 8, greedy=False)
 
     # _warmup_one_spec_request
     runner.parallel_config.tensor_parallel_size = 1
-    with patch.object(tr_mod.envs, "TPU_DEEPSEEK_V41_KV_SHARD", False):
-        runner.kv_cache_config.num_blocks = 1
-        assert runner._warmup_one_spec_request(8, 0) is False
+    runner.kv_cache_config.num_blocks = 1
+    assert runner._warmup_one_spec_request(8, 0) is False
 
-        runner.kv_cache_config.num_blocks = 20
-        runner.execute_model = MagicMock(return_value=None)
-        runner.take_draft_token_ids = MagicMock(
-            side_effect=[
-                SimpleNamespace(draft_token_ids=[[5]]),
-                None,
-            ]
-            + [SimpleNamespace(draft_token_ids=[[6]])] * 10
-        )
-        assert runner._warmup_one_spec_request(8, 0, greedy=True) is True
+    runner.kv_cache_config.num_blocks = 20
+    runner.execute_model = MagicMock(return_value=None)
+    runner.take_draft_token_ids = MagicMock(
+        side_effect=[
+            SimpleNamespace(draft_token_ids=[[5]]),
+            None,
+        ]
+        + [SimpleNamespace(draft_token_ids=[[6]])] * 10
+    )
+    assert runner._warmup_one_spec_request(8, 0, greedy=True) is True
 
-        runner.execute_model = MagicMock(side_effect=RuntimeError("req fail"))
-        assert runner._warmup_one_spec_request(8, 0, quiet=True) is False
-        assert runner._warmup_one_spec_request(8, 0, quiet=False) is False
+    runner.execute_model = MagicMock(side_effect=RuntimeError("req fail"))
+    assert runner._warmup_one_spec_request(8, 0, quiet=True) is False
+    assert runner._warmup_one_spec_request(8, 0, quiet=False) is False
 
     # _warmup_spec_decode_cleanup (restore real method on instance)
     del runner._warmup_spec_decode_cleanup

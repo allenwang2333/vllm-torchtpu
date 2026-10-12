@@ -883,7 +883,6 @@ class TestAttentionMetadataBuilderPlumbing:
         from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
         monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_KV_SHARD", "0")
         num_groups = 51
         max_blocks = 256
         active_blocks = 120

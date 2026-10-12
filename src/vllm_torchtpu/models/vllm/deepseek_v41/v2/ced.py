@@ -66,7 +66,6 @@ def _static_no_skip_spec(
     window: int,
     num_tokens,
     compile_sizes,
-    owner_required_kept: int = 0,
 ):
     """``(min_lens, plan, max_min_len)`` for a fixed layout, else ``None``.
 
@@ -88,9 +87,7 @@ def _static_no_skip_spec(
         replay_starts.append(replay_start)
         min_lens.append(replay_start + count if count > 0 else 0)
     kept = bounds[-1]
-    padded = _padded_bucket(
-        max(kept, owner_required_kept), int(num_tokens), compile_sizes
-    )
+    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
     plan = DecoderReplayPlan(
         _identity_indices(kept),
         bounds,
@@ -101,7 +98,7 @@ def _static_no_skip_spec(
     return tuple(min_lens), plan, max(min_lens, default=0)
 
 
-_LAST_NO_SKIP_CACHE: list = [None, None, None, None, None, None]
+_LAST_NO_SKIP_CACHE: list = [None, None, None, None, None]
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
@@ -138,56 +135,41 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         raise ValueError("Query boundaries exceed the input token bucket")
     if not isinstance(compile_sizes, tuple):
         compile_sizes = tuple(compile_sizes)
-    owner_layout = getattr(metadata, "owner_token_layout", None)
-    req_owners, owner_tokens = (
-        getattr(owner_layout, "owners", None),
-        getattr(owner_layout, "owner_tokens", None),
-    )
-    if req_owners is None or owner_tokens is not None:
-        # Steady-state decode repeats the same query/prompt/hit layout while
-        # only seq_lens grow: reuse the cached all-kept plan when it applies.
-        if (
-            bounds_list is (last := _LAST_NO_SKIP_CACHE)[0]
-            and prompts_list is last[1]
-            and hits_list is last[2]
-            and owner_layout is last[3]
-            and (window, num_tokens, compile_sizes) == last[4]
-        ):
-            spec = last[5]
-        else:
-            last[:] = (
-                bounds_list,
-                prompts_list,
-                hits_list,
-                owner_layout,
-                (window, num_tokens, compile_sizes),
-                (
-                    spec := _static_no_skip_spec(
-                        bounds_list
-                        if isinstance(bounds_list, tuple)
-                        else tuple(bounds_list),
-                        prompts_list
-                        if isinstance(prompts_list, tuple)
-                        else tuple(prompts_list),
-                        hits_list if isinstance(hits_list, tuple) else tuple(hits_list),
-                        window,
-                        num_tokens,
-                        compile_sizes,
-                        int(owner_layout.query_start_loc.shape[0])
-                        * int(owner_tokens.max())
-                        if owner_layout is not None
-                        and req_owners is not None
-                        and owner_tokens is not None
-                        and bounds_list[-1] > 0
-                        else 0,
-                    )
-                ),
-            )
-        if spec is not None and (
-            min(lengths_list, default=0) >= spec[2]
-            or all(map(operator.ge, lengths_list, spec[0]))
-        ):
-            return spec[1]
+    # Steady-state decode repeats the same query/prompt/hit layout while
+    # only seq_lens grow: reuse the cached all-kept plan when it applies.
+    if (
+        bounds_list is (last := _LAST_NO_SKIP_CACHE)[0]
+        and prompts_list is last[1]
+        and hits_list is last[2]
+        and (window, num_tokens, compile_sizes) == last[3]
+    ):
+        spec = last[4]
+    else:
+        last[:] = (
+            bounds_list,
+            prompts_list,
+            hits_list,
+            (window, num_tokens, compile_sizes),
+            (
+                spec := _static_no_skip_spec(
+                    bounds_list
+                    if isinstance(bounds_list, tuple)
+                    else tuple(bounds_list),
+                    prompts_list
+                    if isinstance(prompts_list, tuple)
+                    else tuple(prompts_list),
+                    hits_list if isinstance(hits_list, tuple) else tuple(hits_list),
+                    window,
+                    num_tokens,
+                    compile_sizes,
+                )
+            ),
+        )
+    if spec is not None and (
+        min(lengths_list, default=0) >= spec[2]
+        or all(map(operator.ge, lengths_list, spec[0]))
+    ):
+        return spec[1]
     replay_starts = []
     any_skipped = False
     for start, end, length, prompt, hit in zip(
@@ -227,19 +209,7 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         output_bounds_tuple = tuple(output_bounds)
     # Each stage dispatches by its own token bucket. Never introduce a second,
     # independent symbolic token dimension into vLLM's guard-free full graph.
-    required_kept = kept
-    if kept > 0 and owner_layout is not None and req_owners is not None:
-        tp_size = int(owner_layout.query_start_loc.shape[0])
-        owners_list = (
-            req_owners.tolist() if hasattr(req_owners, "tolist") else req_owners
-        )
-        owner_kept = [0] * tp_size
-        for owner, start, end in zip(
-            owners_list, output_bounds_tuple, output_bounds_tuple[1:]
-        ):
-            owner_kept[owner] += end - start
-        required_kept = max(kept, tp_size * max(owner_kept))
-    padded = _padded_bucket(required_kept, int(num_tokens), compile_sizes)
+    padded = _padded_bucket(kept, int(num_tokens), compile_sizes)
     is_identity = kept > 0 and kept == bounds_list[-1] and padded == num_tokens
     return DecoderReplayPlan(
         indices_tuple,

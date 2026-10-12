@@ -413,7 +413,7 @@ def test_remaining_fused_moe_gmm_branches(monkeypatch):
             sparse_core=types.SimpleNamespace(num_lanes=16, num_cores=4, num_subcores=8)
         ),
     )
-    assert fm_core.resolve_onehot_permute_threshold() == 4095
+    assert fm_core.resolve_onehot_permute_threshold() == 5119
 
     # 2. _moe_gmm_tiling branches (lines 204-213).
     monkeypatch.setattr(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TD8.78: vLLM-version import fallbacks and CED owner-balanced padding.
+"""vLLM-version import fallbacks.
 
 The import fallbacks run at module import time, so they are exercised by
 re-executing the module source with ``runpy.run_path`` into a throwaway
@@ -11,14 +11,13 @@ subclasses bound to their classes) untouched.
 import runpy
 import sys
 import types
-from types import SimpleNamespace
 
 import torch
 import vllm.models.deepseek_v41.common as upstream_common_pkg
 import vllm.models.deepseek_v41.nvidia as upstream_nvidia_pkg
 
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced, host_engram
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import host_engram
 
 _COMMON = "vllm.models.deepseek_v41.common.engram"
 _NVIDIA = "vllm.models.deepseek_v41.nvidia.engram"
@@ -55,7 +54,7 @@ def test_common_engram_v031_without_nvidia_gather(monkeypatch):
     fake.engram_gathered_num_tokens = "v031_tokens"
     fake.engram_head_shard_rank = "v031_rank"
     _install(monkeypatch, common=fake, nvidia=None)
-    ns = runpy.run_path(common_engram.__file__, run_name="_td878_common_v031")
+    ns = runpy.run_path(common_engram.__file__, run_name="_common_v031")
     assert ns["engram_gathered_num_tokens"] == "v031_tokens"
     assert ns["engram_head_shard_rank"] == "v031_rank"
     assert not hasattr(fake, "gather_engram_hashes")
@@ -70,7 +69,7 @@ def test_common_engram_v030_backfills_from_nvidia(monkeypatch):
     nvidia.engram_head_shard_rank = "v030_rank"
     nvidia.gather_engram_hashes = "v030_gather"
     _install(monkeypatch, common=fake, nvidia=nvidia)
-    ns = runpy.run_path(common_engram.__file__, run_name="_td878_common_v030")
+    ns = runpy.run_path(common_engram.__file__, run_name="_common_v030")
     assert ns["engram_gathered_num_tokens"] == "v030_tokens"
     assert ns["engram_head_shard_rank"] == "v030_rank"
     assert fake.gather_engram_hashes == "v030_gather"
@@ -87,7 +86,7 @@ def test_host_engram_v030_imports_from_nvidia(monkeypatch):
     nvidia = types.ModuleType(_NVIDIA)
     nvidia.engram_gathered_num_tokens = "v030_tokens"
     _install(monkeypatch, common=fake, nvidia=nvidia)
-    ns = runpy.run_path(host_engram.__file__, run_name="_td878_host_v030")
+    ns = runpy.run_path(host_engram.__file__, run_name="_host_v030")
     assert ns["engram_gathered_num_tokens"] == "v030_tokens"
 
 
@@ -106,41 +105,3 @@ def test_host_engram_gather_falls_back_to_nvidia(monkeypatch):
     out = host_engram.gather_host_engram_hashes(hashes, dp_shared_memory=True)
     torch.testing.assert_close(out, hashes * 2)
     assert seen == [True]
-
-
-def _ced_metadata(owners, tp_size):
-    return SimpleNamespace(
-        query_start_loc_cpu=[0, 3, 4],
-        seq_lens_cpu=[3, 1],
-        prompt_lens_cpu=[3, 1],
-        owner_token_layout=SimpleNamespace(
-            owners=owners, query_start_loc=torch.zeros(tp_size)
-        ),
-    )
-
-
-def test_ced_plan_pads_for_the_busiest_owner():
-    # Both requests (3 + 1 kept tokens) land on owner 0 of 2, so every owner
-    # slot must hold 4 rows: 2 * 4 = 8, the smallest compile size >= 8.
-    plan = ced.plan_decoder_replay(_ced_metadata([0, 0], 2), 128, 16, (4, 8, 16))
-    assert plan.indices == (0, 1, 2, 3)
-    assert plan.query_start_loc == (0, 3, 4)
-    assert plan.padded_num_tokens == 8
-    assert plan.is_identity is False
-
-
-def test_ced_plan_balanced_owners_keep_the_tight_bucket():
-    # Owners 0 and 1 hold 3 and 1 rows: max(4, 2 * 3) = 6 -> bucket 8; with
-    # no owners listed the requirement stays at kept=4 -> bucket 4.
-    assert (
-        ced.plan_decoder_replay(
-            _ced_metadata([0, 1], 2), 128, 16, (4, 8, 16)
-        ).padded_num_tokens
-        == 8
-    )
-    assert (
-        ced.plan_decoder_replay(
-            _ced_metadata([], 2), 128, 16, (4, 8, 16)
-        ).padded_num_tokens
-        == 4
-    )

@@ -468,7 +468,7 @@ class TestSelectIndicesJax:
             )
             assert sel_sc.shape == (count, 16)
             assert pub_sc.shape == (count, 16)
-            assert mock_sc.call_count == 2
+            assert mock_sc.call_count == 3
 
     def test_candidate_filter_branch_and_128_aligned_scatter(self):
         rng = np.random.default_rng(456)

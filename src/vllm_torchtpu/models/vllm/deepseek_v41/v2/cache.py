@@ -74,67 +74,12 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
     return pages[:, page_offset : page_offset + page_bytes].view(dtype).reshape(shape)
 
 
-def resolve_kv_block_shard(
-    num_blocks: int,
-    tp_size: int | None = None,
-    tp_rank: int | None = None,
-    *,
-    kv_shard: bool | None = None,
-    replicated_blocks: int = 0,
-) -> tuple[int, int, bool]:
-    """Return ``(local_blocks, block_offset, sharded)`` for owner-sharded KV pools.
-
-    Enforces ``N = R + tp * P`` (`(num_blocks - replicated_blocks) % tp_size == 0`):
-    - Pure sharding (``R = 0``): ``per_owner = N // tp``, ``local_blocks = P``,
-      ``block_offset = r * P``.
-    - Hybrid Id contract v2 (``R > 0``): global ``[0, R)`` is replicated at local
-      ``[0, R)`` and owner ``r``'s ``[R + r*P, R + (r+1)*P)`` maps to ``[R, R + P)``.
-    """
-    from vllm.distributed import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-    )
-
-    from vllm_torchtpu import envs
-
-    if kv_shard is None:
-        kv_shard = bool(envs.TPU_DEEPSEEK_V41_KV_SHARD)
-    if tp_size is None:
-        tp_size = get_tensor_model_parallel_world_size() if kv_shard else 1
-    if tp_rank is None:
-        tp_rank = get_tensor_model_parallel_rank() if kv_shard and tp_size > 1 else 0
-    if not (kv_shard and tp_size > 1):
-        return num_blocks, 0, False
-    sharded_blocks = num_blocks - replicated_blocks
-    if replicated_blocks < 0 or sharded_blocks <= 0 or sharded_blocks % tp_size != 0:
-        raise ValueError(
-            f"KV sharding requires num_blocks ({num_blocks}) == "
-            f"replicated_blocks ({replicated_blocks}) + tp_size ({tp_size}) * P"
-        )
-    per_owner = sharded_blocks // tp_size
-    local_blocks = replicated_blocks + per_owner
-    block_offset = replicated_blocks + tp_rank * per_owner
-    return local_blocks, block_offset, True
-
-
-def resolve_worker_owner_layout(vllm_config, kv_cache_config):
-    """Derive the scheduler's `OwnerLayout` from a worker's `kv_cache_config`."""
-    from vllm_torchtpu.core import owner_affine_block_pool as oabp
-
-    return oabp.worker_owner_layout(vllm_config, kv_cache_config)
-
-
 def materialize_upstream_kv_cache(
     kv_cache_config,
     device,
     layout,
     *,
     word_rows=False,
-    kv_shard: bool | None = None,
-    tp_size: int | None = None,
-    tp_rank: int | None = None,
-    replicated_blocks: int | None = None,
-    scheduler_blocks: int | None = None,
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -142,27 +87,7 @@ def materialize_upstream_kv_cache(
     views = allocate_upstream_kv_cache(kv_cache_config, torch.device("meta"), layout)
     if not views:
         return MaterializedNativeKVCache({}, [])
-    replicated_blocks = int(
-        getattr(kv_cache_config, "replicated_blocks", 0)
-        if replicated_blocks is None
-        else replicated_blocks
-    )
-    global_blocks = kv_cache_config.num_blocks
-    resolved_total_blocks = (
-        global_blocks if scheduler_blocks is None else int(scheduler_blocks)
-    )
-    local_blocks, block_offset, sharded = resolve_kv_block_shard(
-        resolved_total_blocks,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        kv_shard=kv_shard,
-        replicated_blocks=replicated_blocks,
-    )
-    if scheduler_blocks is not None and sharded and local_blocks != global_blocks:
-        raise ValueError(
-            f"Worker local_blocks ({local_blocks}) must match per-rank "
-            f"kv_cache_config.num_blocks ({global_blocks})"
-        )
+    num_blocks = kv_cache_config.num_blocks
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1
     backing_bytes = sizes.pop()
@@ -171,26 +96,25 @@ def materialize_upstream_kv_cache(
         # path. Overlaid groups keep one owner, while unrelated layers no
         # longer functionalize mutations of the entire model cache.
         pool_indices = layer_to_pool_index(kv_cache_config)
-        pool_bytes = global_blocks * max(
+        pool_bytes = num_blocks * max(
             group.kv_cache_spec.page_size_bytes
             for group in kv_cache_config.kv_cache_groups
         )
     else:
         pool_indices = dict.fromkeys(views, 0)
         pool_bytes = backing_bytes
-    block_stride_bytes = pool_bytes // global_blocks
-    local_pool_bytes = local_blocks * block_stride_bytes if sharded else pool_bytes
+    block_stride_bytes = pool_bytes // num_blocks
     # Use DSV4's native 128-word rows at the kernel boundary. Allocate
     # in that layout: reshaping a flat byte pool inside XLA copies the
     # entire pool on every read, even when only a few rows are requested.
     if word_rows:
-        assert local_pool_bytes % ROW_BYTES == 0, local_pool_bytes
+        assert pool_bytes % ROW_BYTES == 0, pool_bytes
     num_pools = backing_bytes // pool_bytes
-    split_banks = word_rows and local_pool_bytes > SPARSECORE_MAX_POOL_BYTES
+    split_banks = word_rows and pool_bytes > SPARSECORE_MAX_POOL_BYTES
     if split_banks:
         block_rows = block_stride_bytes // ROW_BYTES
         lo_blocks = SPARSECORE_MAX_POOL_BYTES // block_stride_bytes
-        hi_blocks = local_blocks - lo_blocks
+        hi_blocks = num_blocks - lo_blocks
         lo_rows = lo_blocks * block_rows
         hi_rows = hi_blocks * block_rows
         assert max(lo_rows, hi_rows) * ROW_BYTES <= SPARSECORE_MAX_POOL_BYTES
@@ -209,9 +133,7 @@ def materialize_upstream_kv_cache(
     else:
         raw_tensors = [
             torch.zeros(
-                (local_pool_bytes // ROW_BYTES, ROW_WORDS)
-                if word_rows
-                else (local_pool_bytes,),
+                (pool_bytes // ROW_BYTES, ROW_WORDS) if word_rows else (pool_bytes,),
                 dtype=torch.int32 if word_rows else torch.int8,
                 device=device,
             )
@@ -228,33 +150,16 @@ def materialize_upstream_kv_cache(
         pool_index = pool_indices[name]
         stride_bytes = view.stride(0) * itemsize
         offset_bytes = view.storage_offset() * itemsize - pool_index * pool_bytes
-        if sharded and layout.is_layer_compact:
-            offset_bytes = (offset_bytes // global_blocks) * local_blocks
         owner = pool_owners[pool_index]
         native_raw_cache[name] = owner
-        if sharded:
-            base_layout = (
-                (local_blocks, *view.shape[2:]),
-                view.dtype,
-                stride_bytes,
-                offset_bytes,
-                block_offset,
-                True,
-            )
-            native_cache_layouts[name] = (
-                (*base_layout, replicated_blocks)
-                if replicated_blocks > 0
-                else base_layout
-            )
-        else:
-            native_cache_layouts[name] = (
-                (view.shape[0], *view.shape[2:]),
-                view.dtype,
-                stride_bytes,
-                offset_bytes,
-            )
-        if isinstance(owner, tuple) or sharded:
-            first_bank = owner[0] if isinstance(owner, tuple) else owner
+        native_cache_layouts[name] = (
+            (view.shape[0], *view.shape[2:]),
+            view.dtype,
+            stride_bytes,
+            offset_bytes,
+        )
+        if isinstance(owner, tuple):
+            first_bank = owner[0]
             single_page = native_cache_view(
                 first_bank.view(torch.int8).flatten(),
                 (1, *view.shape[1:]),
@@ -340,16 +245,7 @@ class PagedCacheRows:
     record units, before any device arithmetic or int32 index conversion.
     """
 
-    def __init__(
-        self,
-        raw,
-        layout,
-        rope=None,
-        *,
-        block_offset: int = 0,
-        sharded: bool = False,
-        replicated_blocks: int = 0,
-    ):
+    def __init__(self, raw, layout, rope=None):
         if isinstance(raw, tuple):
             if len(raw) != 2:
                 raise ValueError("Split native cache requires exactly two banks")
@@ -362,32 +258,7 @@ class PagedCacheRows:
             self.rope, self.rope_hi = rope
         else:
             self.rope, self.rope_hi = rope, None
-        if len(layout) == 7:
-            (
-                self.shape,
-                self.dtype,
-                stride_bytes,
-                offset_bytes,
-                block_offset,
-                sharded,
-                replicated_blocks,
-            ) = layout
-        elif len(layout) == 6:
-            (
-                self.shape,
-                self.dtype,
-                stride_bytes,
-                offset_bytes,
-                block_offset,
-                sharded,
-            ) = layout
-        else:
-            self.shape, self.dtype, stride_bytes, offset_bytes = layout
-        self.block_offset = int(block_offset)
-        self.replicated_blocks = int(replicated_blocks)
-        self.sharded = bool(
-            sharded or self.block_offset != 0 or self.replicated_blocks != 0
-        )
+        self.shape, self.dtype, stride_bytes, offset_bytes = layout
         self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
         banks = (self.raw,) if self.raw_hi is None else (self.raw, self.raw_hi)
         if any(
@@ -453,46 +324,17 @@ class PagedCacheRows:
 
     @property
     def device(self):
-        # Upstream Engram.ensure_cache allocates its slot cache on
-        # ``kv_cache.device``; eager KV_SHARD returns this view, not a tensor.
         return self.raw.device
 
-    def row_indices(self, slots, valid=None):
+    def row_indices(self, slots):
         slots, rows = (
             slots if slots.dtype == torch.int32 else slots.int(),
             self.shape[1],
         )
-        if not self.sharded and self.page_stride == rows:
+        if self.page_stride == rows:
             return slots if self.row_offset == 0 else self.row_offset + slots
-        if not self.sharded:
-            base = slots + (slots // rows) * (self.page_stride - rows)
-            return base if self.row_offset == 0 else self.row_offset + base
-        if self.replicated_blocks == 0:
-            owned = (slots >= max(0, self.block_offset * rows)) & (
-                slots < (self.block_offset + self.shape[0]) * rows
-            )
-            base = (
-                slots
-                if self.page_stride == rows
-                else slots + (slots // rows) * (self.page_stride - rows)
-            )
-            row_delta = self.row_offset - self.block_offset * self.page_stride
-        else:
-            blocks = slots // rows
-            sharded_blocks = self.shape[0] - self.replicated_blocks
-            sharded_local = blocks - self.block_offset
-            in_rep = (blocks >= 0) & (blocks < self.replicated_blocks)
-            in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
-            owned = (slots >= 0) & (in_rep | in_sharded)
-            local_blocks = torch.where(
-                in_rep, blocks, self.replicated_blocks + sharded_local
-            )
-            base = local_blocks * self.page_stride + (slots - blocks * rows)
-            row_delta = self.row_offset
-        if valid is not None:
-            owned = owned & valid
-        indices = base if row_delta == 0 else row_delta + base
-        return indices.masked_fill(~owned, -1)
+        base = slots + (slots // rows) * (self.page_stride - rows)
+        return base if self.row_offset == 0 else self.row_offset + base
 
     def pages(self, block_table):
         """``block_table`` as pages of ``shape[1]`` raw rows, or None if unaligned.
@@ -505,33 +347,8 @@ class PagedCacheRows:
         block_table = (
             block_table if block_table.dtype == torch.int32 else block_table.int()
         )
-        if not self.sharded:
-            pages = (
-                block_table if self.page_scale == 1 else block_table * self.page_scale
-            )
-            return pages if self.page_offset == 0 else pages + self.page_offset
-        if self.replicated_blocks == 0:
-            local_blocks, page_delta = (
-                block_table,
-                self.page_offset - self.block_offset * self.page_scale,
-            )
-            owned = (block_table >= max(0, self.block_offset)) & (
-                block_table < self.block_offset + self.shape[0]
-            )
-        else:
-            sharded_blocks = self.shape[0] - self.replicated_blocks
-            sharded_local = block_table - self.block_offset
-            in_rep = (block_table >= 0) & (block_table < self.replicated_blocks)
-            in_sharded = (sharded_local >= 0) & (sharded_local < sharded_blocks)
-            owned = (block_table >= 0) & (in_rep | in_sharded)
-            local_blocks = torch.where(
-                in_rep, block_table, self.replicated_blocks + sharded_local
-            )
-            page_delta = self.page_offset
-        pages = local_blocks if self.page_scale == 1 else local_blocks * self.page_scale
-        if page_delta != 0:
-            pages = pages + page_delta
-        return pages.masked_fill(~owned, 0)
+        pages = block_table if self.page_scale == 1 else block_table * self.page_scale
+        return pages if self.page_offset == 0 else pages + self.page_offset
 
     def copy_raw(self, updated):
         if self.raw_hi is None:
@@ -549,7 +366,6 @@ class PagedCacheRows:
         records = self.row_indices(blocks * self.shape[1] + rows)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
-            valid = records >= 0
             rec = records.clamp(min=0)
             if self.raw_hi is None:
                 selected = pool.index_select(0, rec.reshape(-1)).reshape(
@@ -565,8 +381,6 @@ class PagedCacheRows:
                     pool_hi.index_select(0, hi_idx).reshape(*rec.shape, self.row_bytes),
                     pool.index_select(0, lo_idx).reshape(*rec.shape, self.row_bytes),
                 )
-            if self.sharded:
-                selected = selected.masked_fill(~valid.unsqueeze(-1), 0)
             return (
                 selected.contiguous()
                 .view(self.dtype)
@@ -602,9 +416,7 @@ class PagedCacheRows:
         ``records`` is None; avoids a separate pre-mask of ``slots``.
         """
         if records is None:
-            if self.sharded:
-                records = self.row_indices(slots, valid=valid)
-            elif self.page_stride == self.shape[1]:
+            if self.page_stride == self.shape[1]:
                 if valid is not None:
                     slots = slots.masked_fill(~valid, -1)
                 records = (
@@ -711,9 +523,7 @@ class NativeCacheView:
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
-        if (
-            torch.compiler.is_compiling() or getattr(self, "_tpu_kv_shard", False)
-        ) and raw is not None:
+        if torch.compiler.is_compiling() and raw is not None:
             paged = getattr(self, "_tpu_paged_cache_rows", None)
             if paged is None:
                 paged = PagedCacheRows(
@@ -731,7 +541,6 @@ class NativeCacheView:
         cast(_CacheBinding, super()).bind_kv_cache(cache)
         self._tpu_raw_cache = raw_cache
         self._tpu_rope_pool = rope_pool
-        self._tpu_kv_shard = bool(layout is not None and len(layout) >= 6 and layout[5])
         if layout is not None:
             self._tpu_cache_layout = layout
         else:

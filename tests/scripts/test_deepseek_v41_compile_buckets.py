@@ -126,12 +126,6 @@ def _eval_config(script_name: str, env_overrides: dict[str, str]) -> dict[str, s
             {"MAX_NUM_SEQS": "64"},
             "[4,8,16,32,48,64,96,128,192,224,2048]",
         ),
-        # TP8 owner-sharded wrapper (drops 4 since TP=8 requires multiples of 8)
-        (
-            "deepseek-v41-flash-tp8-ep-100k-decode-dspark-kvshard.sh",
-            {},
-            "[8,16,24,32,48,64,96,144,192,288,384,576,768,1152,1344,1536,2048]",
-        ),
         # PR #1794 dedicated C=64 DSpark offload wrapper
         (
             "deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload.sh",

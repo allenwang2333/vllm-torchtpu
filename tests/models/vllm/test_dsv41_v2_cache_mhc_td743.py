@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Wave 7 Track TD7.43:
+"""Unit tests for DeepSeek-V4.1 cache and mHC:
 - `vllm_torchtpu.models.vllm.deepseek_v41.v2.cache`:
   `PagedCacheRows` static geometry precomputation (`elem_count`, `is_fp32`,
   `pages_aligned`, `page_scale`, `page_offset`), zero-overhead identity fast
@@ -30,7 +30,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import ROW_WORDS, PagedCach
 
 
 @pytest.mark.cpu_test
-class TestPagedCacheRowsTD743:
+class TestPagedCacheRows:
     def test_precomputed_attributes_and_pages_alignment(self):
         raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
         # Aligned BF16 layout: rows=4, page_stride=4 (scale=1), row_offset=0 (offset=0)
@@ -86,30 +86,7 @@ class TestPagedCacheRowsTD743:
         assert torch.equal(paged_strided_off.row_indices(slots), expected_strided + 4)
         assert torch.equal(paged_strided_off.pages(block_table), block_table * 2 + 1)
 
-        # 4. Sharded: (scale=1, offset=0) vs (scale=2, offset=1)
-        paged_sharded_id = PagedCacheRows(
-            raw,
-            ((8, 4, 256), torch.bfloat16, 2048, 0),
-            block_offset=4,
-            replicated_blocks=2,
-            sharded=True,
-        )
-        sharded_slots = torch.tensor([1, 16, 40, -1], dtype=torch.int32)
-        sharded_idx = paged_sharded_id.row_indices(sharded_slots)
-        assert sharded_idx.tolist() == [1, 8, -1, -1]
-        bt_sharded = torch.tensor([0, 4, 10, -1], dtype=torch.int32)
-        assert paged_sharded_id.pages(bt_sharded).tolist() == [0, 2, 0, 0]
-
-        paged_sharded_scaled = PagedCacheRows(
-            raw,
-            ((6, 4, 256), torch.bfloat16, 4096, 2048),
-            block_offset=4,
-            replicated_blocks=2,
-            sharded=True,
-        )
-        assert paged_sharded_scaled.pages(bt_sharded).tolist() == [1, 5, 0, 0]
-
-        # 5. TD8.266: int64 inputs to row_indices and pages coerce natively to int32
+        # 4. int64 inputs to row_indices and pages coerce natively to int32
         slots_i64 = slots.long()
         bt_i64 = block_table.long()
         for p_cache in (
@@ -117,8 +94,6 @@ class TestPagedCacheRowsTD743:
             paged_off,
             paged_strided_zero,
             paged_strided_off,
-            paged_sharded_id,
-            paged_sharded_scaled,
         ):
             ri = p_cache.row_indices(slots_i64)
             pg = p_cache.pages(bt_i64)
@@ -156,13 +131,9 @@ class TestPagedCacheRowsTD743:
         out_off = paged_off[torch.tensor([0]), torch.tensor([0])]
         assert torch.allclose(out_off, torch.full((1, 256), 3.0, dtype=torch.bfloat16))
 
-        # CPU write with strided pages and sharded pages
+        # CPU write with strided pages
         paged_strided = PagedCacheRows(raw, ((4, 4, 256), torch.bfloat16, 4096, 0))
         paged_strided.write(slots_i32, vals_bf16)
-        paged_sharded = PagedCacheRows(
-            raw, layout, block_offset=0, replicated_blocks=2, sharded=True
-        )
-        paged_sharded.write(slots_i32, vals_bf16)
 
         # Non-CPU __getitem__ and write: test both int32 and int64
         paged.raw = SimpleNamespace(
@@ -218,7 +189,7 @@ class TestPagedCacheRowsTD743:
         paged.write(torch.tensor([0, 1], dtype=torch.int64), vals_bf16)
         assert write_rec_dtypes == [torch.int32, torch.int32]
 
-    def test_td8291_paged_cache_rows_cpu_getitem_int32_index_select(
+    def test_paged_cache_rows_cpu_getitem_int32_index_select(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         layout = ((8, 4, 256), torch.bfloat16, 2048, 0)
@@ -355,96 +326,9 @@ class TestPagedCacheRowsTD743:
         )
         assert write_op_dtypes == [torch.int32, torch.int32]
 
-    def test_sharded_kv_resolution_and_materialization(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        import vllm.distributed as vllm_dist
-
-        from vllm_torchtpu.core import owner_affine_block_pool as oabp
-
-        monkeypatch.setattr(
-            vllm_dist, "get_tensor_model_parallel_world_size", lambda: 2
-        )
-        monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank", lambda: 1)
-
-        local_blocks, block_offset, sharded = v2_cache.resolve_kv_block_shard(
-            10, kv_shard=True, replicated_blocks=2
-        )
-        assert (local_blocks, block_offset, sharded) == (6, 6, True)
-
-        with pytest.raises(ValueError, match="KV sharding requires"):
-            v2_cache.resolve_kv_block_shard(
-                10, tp_size=2, tp_rank=0, kv_shard=True, replicated_blocks=1
-            )
-
-        monkeypatch.setattr(oabp, "worker_owner_layout", lambda vc, kc: "owner_layout")
-        assert v2_cache.resolve_worker_owner_layout(None, None) == "owner_layout"
-
-        raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
-        paged_6 = PagedCacheRows(raw, ((4, 4, 256), torch.bfloat16, 2048, 0, 2, True))
-        paged_7 = PagedCacheRows(
-            raw, ((6, 4, 256), torch.bfloat16, 2048, 0, 4, True, 2)
-        )
-        assert paged_6.sharded and paged_6.replicated_blocks == 0
-        assert paged_7.sharded and paged_7.replicated_blocks == 2
-        got_sharded = paged_7[torch.tensor([0, 20]), torch.tensor([0, 0])]
-        assert got_sharded.shape == (2, 256)
-        assert torch.all(got_sharded[1] == 0)
-
-        fake_view = torch.zeros((4, 1, 4, 256), dtype=torch.bfloat16)
-        monkeypatch.setattr(
-            v2_cache,
-            "allocate_upstream_kv_cache",
-            lambda cfg, dev, lay: {"l0": fake_view},
-        )
-        import vllm_torchtpu.kv_cache_materializer as kv_mat
-
-        monkeypatch.setattr(kv_mat, "layer_to_pool_index", lambda cfg: {"l0": 0})
-        fake_cfg = SimpleNamespace(
-            num_blocks=4,
-            kv_cache_tensors=[SimpleNamespace(size=4 * 2048)],
-            kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(page_size_bytes=2048))
-            ],
-        )
-        fake_layout = SimpleNamespace(is_layer_compact=True)
-        with pytest.raises(ValueError, match="Worker local_blocks"):
-            v2_cache.materialize_upstream_kv_cache(
-                fake_cfg,
-                torch.device("cpu"),
-                fake_layout,
-                word_rows=True,
-                kv_shard=True,
-                tp_size=2,
-                tp_rank=0,
-                scheduler_blocks=4,
-            )
-        mat_rep0 = v2_cache.materialize_upstream_kv_cache(
-            fake_cfg,
-            torch.device("cpu"),
-            fake_layout,
-            word_rows=True,
-            kv_shard=True,
-            tp_size=2,
-            tp_rank=0,
-            replicated_blocks=0,
-        )
-        assert len(mat_rep0.native_cache_layouts["l0"]) == 6
-        mat_rep1 = v2_cache.materialize_upstream_kv_cache(
-            fake_cfg,
-            torch.device("cpu"),
-            fake_layout,
-            word_rows=True,
-            kv_shard=True,
-            tp_size=2,
-            tp_rank=0,
-            replicated_blocks=2,
-        )
-        assert len(mat_rep1.native_cache_layouts["l0"]) == 7
-
 
 @pytest.mark.cpu_test
-class TestMhcPreMixAndGatesTD743:
+class TestMhcPreMixAndGates:
     @pytest.mark.parametrize("packed", [False, True])
     def test_pre_mix_and_gates_jax_and_no_3d_residual_on_flat_xla_paths(
         self, monkeypatch: pytest.MonkeyPatch, packed: bool
@@ -571,10 +455,8 @@ class TestMhcPreMixAndGatesTD743:
         )
 
 
-def test_td8302_paged_cache_rows_and_attn_kernels_int32_guards():
-    """Verify TD8.302 int32 cast guards in PagedCacheRows and attention_kernels."""
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
-
+def test_paged_cache_rows_and_attn_kernels_int32_guards():
+    """Verify int32 cast guards in PagedCacheRows."""
     raw = torch.arange(16 * ROW_WORDS, dtype=torch.int32).reshape(16, ROW_WORDS)
     paged = PagedCacheRows(raw, ((4, 4, 256), torch.bfloat16, 2048, 0))
 
@@ -593,15 +475,3 @@ def test_td8302_paged_cache_rows_and_attn_kernels_int32_guards():
     out_i32 = paged[b_i32, r_i32]
     out_i64 = paged[b_i32.to(torch.int64), r_i32.to(torch.int64)]
     assert torch.equal(out_i32.view(torch.int16), out_i64.view(torch.int16))
-
-    x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
-    perm_i32 = torch.tensor([2, -1, 0, 5], dtype=torch.int32)
-    perm_i64 = perm_i32.to(torch.int64)
-    assert torch.equal(
-        ak._permute_owner_tokens_torch(x, perm_i32),
-        ak._permute_owner_tokens_torch(x, perm_i64),
-    )
-    assert torch.equal(
-        ak._unpermute_owner_tokens_torch(x, perm_i32),
-        ak._unpermute_owner_tokens_torch(x, perm_i64),
-    )
