@@ -1152,6 +1152,7 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         sched._raiden_manager = manager
         sched._fence_pending = {}
         sched._req_status = {}
+        sched._mixed_partial_tail = False
         sched._jobs = {}
         sched._job_counter = 0
         sched._block_id_to_pending_jobs = {}
