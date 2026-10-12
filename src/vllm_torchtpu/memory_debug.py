@@ -391,3 +391,32 @@ def maybe_drop_serialize_refs(compiled_fn: Any) -> None:
             del obj.serialize
             dropped += 1
     logger.debug("[MEMDBG] dropped %d serialize closure(s)", dropped)
+
+
+def start_periodic_sampler() -> None:
+    """Log RSS and tcmalloc state every VLLM_TPU_MEMDBG_PERIODIC_S seconds.
+
+    Serving-time view (growth under traffic, allocator release behaviour).
+    No gc.collect here: it would stall the engine loop.
+    """
+    period = float(os.environ.get("VLLM_TPU_MEMDBG_PERIODIC_S", "0"))
+    if period <= 0:
+        return
+    import threading
+    import time
+
+    def _loop() -> None:
+        while True:
+            time.sleep(period)
+            rss, anon = _proc_mem_mb()
+            logger.info(
+                "[MEMDBG] periodic tag=%s VmRSS=%.1f MB RssAnon=%.1f MB "
+                "tcmalloc_allocated=%.1f MB tcmalloc_pageheap_free=%.1f MB",
+                _tag,
+                rss,
+                anon,
+                _tcmalloc_allocated_mb(),
+                _tcmalloc_property_mb("tcmalloc.pageheap_free_bytes"),
+            )
+
+    threading.Thread(target=_loop, name="memdbg-sampler", daemon=True).start()

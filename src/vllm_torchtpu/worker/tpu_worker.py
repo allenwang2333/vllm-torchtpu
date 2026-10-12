@@ -739,6 +739,7 @@ class TPUWorker(WorkerBase):
         memory_debug.trim_allocator("post_capture")
         memory_debug.stage("final")
         memory_debug.log_executable_holders("final")
+        memory_debug.start_periodic_sampler()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
