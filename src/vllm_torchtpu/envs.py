@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_IDX_TOPK_SCHED_GROUPS: bool = False
+    TPU_DCP_RANK_OPERAND: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -954,6 +955,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one XLA scheduling group (fixed per-layer id), so the scheduler can run
     # q_b_proj while the TensorCore waits on the top-k. Same values.
     "TPU_IDX_TOPK_SCHED_GROUPS": env_bool("TPU_IDX_TOPK_SCHED_GROUPS"),
+    # DCP Pallas ops (indexer K write + top-k, sparse MLA) take this rank's
+    # DCP index as a sharded int32 operand instead of learning it from an
+    # all_to_all of an iota once per program (~8 us on 2x2x2 TP16xDCP16,
+    # backbone and every drafter pass). Same values.
+    "TPU_DCP_RANK_OPERAND": env_bool("TPU_DCP_RANK_OPERAND"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
