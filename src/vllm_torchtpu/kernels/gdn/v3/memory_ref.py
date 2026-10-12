@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed HBM and VMEM memory reference descriptors for GDN v3 Pallas kernels.
-"""
+"""Typed HBM and VMEM memory reference descriptors for GDN v3 Pallas kernels."""
 
 import dataclasses
 import functools
@@ -188,6 +187,22 @@ class InBufferedRef(BaseBufferedRef):
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
 
+        if src_ref.ndim == 2:
+            for idx in range(self.cfg.seq_tile_size):
+                r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                r_base_aligned = pl.multiple_of((r_base // 16) * 16, 16)
+                r_prefix = r_base - r_base_aligned
+                dma_rows = pl.multiple_of(
+                    jnp.where(r_size > 0, pl.cdiv(r_prefix + r_size, 16) * 16, 0), 16
+                )
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(r_base_aligned, dma_rows)],
+                    vmem_ref.at[idx, pl.ds(0, dma_rows)],
+                    sem,
+                ).start()
+            return
+
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
@@ -204,6 +219,19 @@ class InBufferedRef(BaseBufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_ref = self.window_ref.at[slot]
         p_id = grid_indices[0]
+
+        if src_ref.ndim == 2:
+            for idx in range(self.cfg.seq_tile_size):
+                r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
+                r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+                r_base_aligned = pl.multiple_of((r_base // 16) * 16, 16)
+                r_prefix = r_base - r_base_aligned
+                dma_rows = pl.multiple_of(
+                    jnp.where(r_size > 0, pl.cdiv(r_prefix + r_size, 16) * 16, 0), 16
+                )
+                ref = vmem_ref.at[idx, pl.ds(0, dma_rows)]
+                pltpu.make_async_copy(ref, ref, sem).wait()
+            return
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
@@ -675,7 +703,14 @@ def create_allocs(
             f"windows, got window_size={cfg.window_size}."
         )
 
-    qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
+    if qkv_ref.ndim == 2:
+        aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
+        qkv_rows = aligned_chunk + 16
+        qkv_shape = (cfg.seq_tile_size, qkv_rows, cfg.dim_size)
+    elif qkv_ref.shape[-2] == 2:
+        qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 2, cfg.dim_size // 2)
+    else:
+        qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     b_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
     # Same shape as b under GDN; under KDA the gate is per-channel, so it is
     # d_k times wider (see GDNConfig.gate_dim).

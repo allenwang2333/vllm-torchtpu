@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet (GDN) v3.
-"""
+"""Configuration dataclasses and hardware tiling constants for Gated DeltaNet v3."""
 
 import dataclasses
 import enum
@@ -138,6 +137,7 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    qkv_2d: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -302,7 +302,17 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        act_scratch = None
+        if self.dtypes.act_in == jnp.bfloat16.dtype:
+            scratch_chunk = (
+                pl.cdiv(self.chunk_size, 16) * 16 if self.qkv_2d else self.chunk_size
+            )
+            act_scratch = pltpu.VMEM(
+                (self.seq_tile_size, scratch_chunk, 1, self.dim_size), jnp.float32
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            act_scratch_ref=act_scratch,
         )

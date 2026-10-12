@@ -34,6 +34,15 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 )
 
 
+def hoist_schedule_enabled() -> bool:
+    """Whether cross-layer hoisting of `rpa_metadata_schedule_kernel` is enabled."""
+    return os.environ.get("TPU_RPA_HOIST_SCHEDULE", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+
+
 def prepare_inputs(
     q: jax.Array,
     k: jax.Array,
@@ -226,7 +235,7 @@ def calculate_block_sizes(
     concurrently; 8 is the experimentally chosen default.
     """
 
-    tpu_info = pltpu.get_tpu_info()
+    tpu_info = configs._get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
@@ -443,7 +452,7 @@ def calculate_block_sizes(
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
+        tpu_info = configs._get_tpu_info()
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
             kv_bytes == 1 and not serve_cfgs.return_lse
         )
@@ -492,6 +501,202 @@ def calculate_block_sizes(
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     return decode_block_sizes, prefill_block_sizes
+
+
+def get_rpa_schedule_shapes(
+    total_q_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_num_seqs: int,
+    num_page_indices: int,
+    dtype_q: jnp.dtype,
+    dtype_kv: jnp.dtype,
+    *,
+    sliding_window: int | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
+    decode_batch_size: int = 8,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]:
+    """Return the 14 1D int32 array shapes for `(decode_sched, mixed_sched)`."""
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = configs._get_tpu_info().vmem_capacity_bytes
+    model_cfgs = configs.ModelConfigs(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        sliding_window=sliding_window,
+        mask_value=float(jnp.finfo(dtype_q).min),
+    )
+    serve_cfgs = configs.ServingConfigs(
+        num_seqs=max_num_seqs,
+        num_page_indices=num_page_indices,
+        total_q_tokens=total_q_tokens,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+        dtype_out=dtype_q,
+        page_size=page_size,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+    )
+    default_decode, default_prefill = calculate_block_sizes(
+        model_cfgs,
+        serve_cfgs,
+        vmem_limit_bytes,
+        decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
+    )
+    effective_decode = decode_block_sizes or default_decode
+    effective_prefill = prefill_block_sizes or default_prefill
+
+    def _leaf_shapes(mode: configs.RpaCase, blk: configs.BlockSizes):
+        cfgs = configs.RpaConfigs(
+            block=blk,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            mode=mode,
+        )
+        sched_template = schedule.BaseMetadataComputer.get_rpa_schedule(
+            cfgs, multiplier=cfgs.max_schedule_size_multiplier
+        )
+        return tuple(
+            tuple(leaf.shape) for leaf in jax.tree_util.tree_leaves(sched_template)
+        )
+
+    decode_shapes = _leaf_shapes(configs.RpaCase.DECODE, effective_decode)
+    mixed_shapes = _leaf_shapes(configs.RpaCase.MIXED, effective_prefill)
+    return decode_shapes, mixed_shapes
+
+
+@jax.jit(
+    static_argnames=(
+        "total_q_tokens",
+        "num_q_heads",
+        "num_kv_heads",
+        "head_dim",
+        "page_size",
+        "num_page_indices",
+        "dtype_q",
+        "dtype_kv",
+        "sliding_window",
+        "kv_layout",
+        "decode_query_size",
+        "decode_batch_size",
+        "decode_block_sizes",
+        "prefill_block_sizes",
+        "vmem_limit_bytes",
+    ),
+)
+def build_rpa_schedules(
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    total_q_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    num_page_indices: int,
+    dtype_q: jnp.dtype,
+    dtype_kv: jnp.dtype,
+    sliding_window: int | None = None,
+    kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
+    decode_query_size: int = 1,
+    decode_batch_size: int = 8,
+    decode_block_sizes: configs.BlockSizes | None = None,
+    prefill_block_sizes: configs.BlockSizes | None = None,
+    vmem_limit_bytes: int | None = None,
+) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+    """Precompute `(decode_schedule_leaves, mixed_schedule_leaves)` once per step."""
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = configs._get_tpu_info().vmem_capacity_bytes
+    max_num_seqs = kv_lens.shape[0]
+    model_cfgs = configs.ModelConfigs(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        sliding_window=sliding_window,
+        mask_value=float(jnp.finfo(dtype_q).min),
+    )
+    serve_cfgs = configs.ServingConfigs(
+        num_seqs=max_num_seqs,
+        num_page_indices=num_page_indices,
+        total_q_tokens=total_q_tokens,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+        dtype_out=dtype_q,
+        page_size=page_size,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
+    )
+    default_decode, default_prefill = calculate_block_sizes(
+        model_cfgs,
+        serve_cfgs,
+        vmem_limit_bytes,
+        decode_query_size=decode_query_size,
+        decode_batch_size=decode_batch_size,
+    )
+    effective_decode = decode_block_sizes or default_decode
+    effective_prefill = prefill_block_sizes or default_prefill
+
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    kv_cache_lens = kv_lens - q_lens
+    kv_new_lens = q_lens
+    q_offsets = kv_cache_lens
+
+    def _gen_leaves(
+        mode: configs.RpaCase,
+        blk: configs.BlockSizes,
+        dist: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        cfgs = configs.RpaConfigs(
+            block=blk,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            mode=mode,
+        )
+        sched = schedule.generate_rpa_metadata(
+            cu_q_lens,
+            q_offsets,
+            kv_cache_lens,
+            kv_new_lens,
+            dist,
+            cfgs=cfgs,
+            computer_cls=schedule.BaseMetadataComputer,
+        )
+        return tuple(jax.tree_util.tree_leaves(sched))
+
+    if total_q_tokens <= min(decode_query_size, effective_decode.bq_sz):
+        decode_dist = jnp.repeat(distribution[2:3], 3)
+        decode_leaves = _gen_leaves(
+            configs.RpaCase.DECODE, effective_decode, decode_dist
+        )
+        mixed_cfgs = configs.RpaConfigs(
+            block=effective_prefill,
+            model=model_cfgs,
+            serve=serve_cfgs,
+            vmem_limit_bytes=vmem_limit_bytes,
+            mode=configs.RpaCase.MIXED,
+        )
+        mixed_template = schedule.BaseMetadataComputer.get_rpa_schedule(
+            mixed_cfgs, multiplier=mixed_cfgs.max_schedule_size_multiplier
+        )
+        mixed_leaves = tuple(
+            jnp.zeros(leaf.shape, dtype=leaf.dtype)
+            for leaf in jax.tree_util.tree_leaves(mixed_template)
+        )
+        return decode_leaves, mixed_leaves
+
+    decode_leaves = _gen_leaves(configs.RpaCase.DECODE, effective_decode, distribution)
+    mixed_leaves = _gen_leaves(configs.RpaCase.MIXED, effective_prefill, distribution)
+    return decode_leaves, mixed_leaves
 
 
 @jax.jit(
@@ -563,6 +768,9 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     native_fp8: str | None = None,
+    precomputed_schedules: (
+        tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]] | None
+    ) = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:
@@ -803,16 +1011,30 @@ def ragged_paged_attention(
         else:
             computer_cls = schedule.BaseMetadataComputer
             extra_scalars = ()
-        schedule_hbm = schedule.generate_rpa_metadata(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            dist,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-            extra_scalars=extra_scalars,
-        )
+        if precomputed_schedules is not None and cp_group_size is None:
+            precomputed_leaves = (
+                precomputed_schedules[0]
+                if mode == configs.RpaCase.DECODE
+                else precomputed_schedules[1]
+            )
+            schedule_template = computer_cls.get_rpa_schedule(
+                cfgs, multiplier=cfgs.max_schedule_size_multiplier
+            )
+            schedule_hbm = jax.tree_util.tree_unflatten(
+                jax.tree_util.tree_structure(schedule_template),
+                list(precomputed_leaves),
+            )
+        else:
+            schedule_hbm = schedule.generate_rpa_metadata(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                dist,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+                extra_scalars=extra_scalars,
+            )
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,
