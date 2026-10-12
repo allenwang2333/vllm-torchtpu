@@ -172,10 +172,21 @@ fi
 # vllm-torchtpu-core and the combined vllm-torchtpu wheel. PR builds never
 # release. Uploaded before the CI lanes so Buildkite places it after them; its
 # block step waits until the whole CI run has passed.
-if [[ "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
-      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+# TODO: TEST ONLY: `|| jayen/test-release/*` lets e.g. jayen/test-release/v0.0.1
+# upload the release steps. Never merge this part.
+if [[ ( "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
+        && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ) \
+      || "${BUILDKITE_BRANCH:-}" == jayen/test-release/* ]]; then
   echo "Release branch ${BUILDKITE_BRANCH}: uploading release fragment"
   upload_with_priority .buildkite/pipeline_release_pypi.yml "$JOB_PRIORITY"
+fi
+
+# TODO: TEST ONLY: skip the CI lanes and the Docker build so only the release
+# steps run. Set RELEASE_TEST_FULL_CI=1 in the New Build env to run the normal
+# CI too. Never merge this.
+if [[ "${RELEASE_TEST_FULL_CI:-0}" != "1" ]]; then
+  echo "--- TEST ONLY: skipping CI lanes and Docker build"
+  exit 0
 fi
 
 # The suite's lanes, in upload order. Lane <lane> is

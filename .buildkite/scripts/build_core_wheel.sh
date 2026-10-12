@@ -60,6 +60,12 @@ if [[ -n "${RELEASE_VERSION:-}" ]]; then
     echo "Pre-release: version ${VERSION} from ${VERSION_SOURCE}"
 else
     BRANCH="${BUILDKITE_BRANCH:-}"
+    # TODO: TEST ONLY: treat jayen/test-release/v0.0.1 as releases/v0.0.1 so
+    # the real release-branch logic below is what gets tested. Never merge this.
+    if [[ "${BRANCH}" == jayen/test-release/* ]]; then
+        BRANCH="releases/${BRANCH#jayen/test-release/}"
+        echo "TEST ONLY: ${BUILDKITE_BRANCH} treated as ${BRANCH}"
+    fi
     [[ "${BRANCH}" =~ ${RELEASE_BRANCH_REGEX} ]] \
         || die "not a release branch: '${BRANCH}' is not releases/vX.Y.Z" \
                "(e.g. releases/v0.29.0). For an rc, set RELEASE_VERSION."
