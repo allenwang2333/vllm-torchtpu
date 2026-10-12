@@ -14,7 +14,8 @@
 """The MTP drafter's sized DCP merge (`TPU_MTP_DCP_MERGE_SIZED`) over real
 collectives, beside the reduce-scatter merge the drafter runs today.
 
-On one host (8 ranks), eager and compiled (static and dynamic token axis):
+On one host (8 ranks), eager and compiled (the test backend compiles static
+shapes only; the drafter's dynamic-bucket trace is exercised by the twin/mirror runs):
 
   1. The op lowers and runs; both branches (packed all-to-all at <= the cap,
      lse all-gather + reduce-scatter above) are within one bf16 ulp of the f64
@@ -47,12 +48,12 @@ VDIM = base.VDIM
 CAP = 64
 
 
-def _compile(fn, dynamic=False):
+def _compile(fn):
     import torch
     from torch_tpu._internal import compile as tpu_compile
 
     torch._dynamo.reset()
-    return torch.compile(fn, fullgraph=True, dynamic=dynamic, backend=tpu_compile.TpuBackend())
+    return torch.compile(fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend())
 
 
 def _check(rank, world, group, cp_mla):
@@ -71,10 +72,10 @@ def _check(rank, world, group, cp_mla):
         got = {}
         for arm, flag in (("today", False), ("sized", True)):
             cp_mla.envs.TPU_MTP_DCP_MERGE_SIZED = flag
-            for how in ("eager", "compiled", "dynamic"):
+            for how in ("eager", "compiled"):
                 key = f"{arm}/{how}@{tokens}"
                 try:
-                    fn = today if how == "eager" else _compile(today, how == "dynamic")
+                    fn = today if how == "eager" else _compile(today)
                     y = fn(o_dev, l_dev).cpu()
                     yp = fn(p_dev, l_dev).cpu()
                     got[(arm, how)] = y
