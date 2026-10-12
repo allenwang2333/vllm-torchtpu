@@ -287,12 +287,23 @@ def _merge_chunked_lse_gathered(
     """
     step = output.shape[0] // chunks
     lse_f32 = lse.to(torch.float32)
-    gathered = _gather_lse(lse_f32, group)
+    if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
+        # Chunk 0's rows alone, then the rest: chunk 0's reduce-scatter need
+        # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
+        # same rows, so the same gathered values.
+        head = _gather_lse(lse_f32[:step], group)
+        rest = _gather_lse(lse_f32[step:], group)
+        rows = [head] + [
+            rest[:, (c - 1) * step : c * step] for c in range(1, chunks)
+        ]
+    else:
+        gathered = _gather_lse(lse_f32, group)
+        rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
     pieces = [
         _weighted_reduce_scatter(
             output[c * step : (c + 1) * step],
             lse_f32[c * step : (c + 1) * step],
-            gathered[:, c * step : (c + 1) * step],
+            rows[c],
             group,
         )
         for c in range(chunks)

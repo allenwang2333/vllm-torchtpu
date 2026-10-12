@@ -1357,6 +1357,20 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
             )
+        # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
+        # merge's reduce-scatter k waits only for the attention chunks that
+        # produce its rows (mixed buckets with the in-kernel lse mask).
+        merge_pieces = 0
+        if (
+            envs.TPU_DCP_MLA_MERGE_PIECES
+            and not decode_bucket
+            and mask_in_kernel
+            and split_q_lse
+            and topk_cap
+        ):
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
+
+            merge_pieces = _merge_chunks(topk_idx.shape[0])
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1393,6 +1407,7 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            out_pieces=merge_pieces,
             **chunk_kwargs,
             **split_kwargs,
         )

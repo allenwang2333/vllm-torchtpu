@@ -667,6 +667,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
         "TPU_DCP_MERGE_RS_BF16": 0,
+        "TPU_DCP_MLA_MERGE_PIECES": 0,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -756,6 +757,59 @@ def test_collapsed_lse_gather_is_bitwise_the_chunked_merge(
     unchunked = _rs_merge_whole(outputs, lses, monkeypatch)
     torch.testing.assert_close(got, unchunked, rtol=0, atol=0)
     assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8, 16])
+@pytest.mark.parametrize("chunks", [2, 4, 8])
+def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(
+    dcp_size, chunks, monkeypatch
+):
+    """`TPU_DCP_MLA_MERGE_PIECES=2` gathers chunk 0's lse rows alone and the
+    rest in one call; every row is still gathered exactly once and the merge
+    is the collapsed-gather merge bit for bit."""
+    outputs, lses = _hard_partials(np.random.default_rng(47), dcp_size, tokens=32)
+    on = dict(TPU_DCP_MERGE_CHUNKED=chunks, TPU_DCP_MERGE_CHUNKED_LSE_AG=True)
+    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
+    calls = []
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
+    )
+    got = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=2, **on
+    )
+    step = 32 // chunks
+    assert calls == [step, 32 - step] * dcp_size or sorted(calls) == sorted(
+        [step, 32 - step] * dcp_size
+    )
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+    # MERGE_PIECES=1 leaves the merge (and its one gather) alone.
+    calls.clear()
+    one = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=1, **on)
+    assert calls == [32] * dcp_size
+    torch.testing.assert_close(one, today, rtol=0, atol=0)
+
+
+def test_positive_control_head_split_rest_misaligned_is_caught(monkeypatch):
+    """The check above must fail when the rest gather hands chunks 1.. rows
+    that are not their own (rest rows shifted by one)."""
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla,
+        "_gather_lse",
+        lambda x, g: real(x, g) if x.shape[0] == 8 else torch.roll(real(x, g), 1, 1),
+    )
+    outputs, lses = _hard_partials(np.random.default_rng(53), 4, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+        TPU_DCP_MLA_MERGE_PIECES=2,
+    )
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
 def test_positive_control_misaligned_collapsed_lse_gather_is_caught(monkeypatch):
