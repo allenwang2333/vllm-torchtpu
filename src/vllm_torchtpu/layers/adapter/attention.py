@@ -1999,6 +1999,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     _cp_mla_attention.prebuild_ragged_all_to_all(
                         self.dcp_size, SEND_PAD_ROWS - 1
                     )
+                    if envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE:
+                        _cp_mla_attention.prebuild_send_merge(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any

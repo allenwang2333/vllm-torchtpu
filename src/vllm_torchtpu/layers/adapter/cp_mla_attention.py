@@ -467,6 +467,14 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
+    if envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE:
+        # The exchange, the unpack and the merge as one JAX op: plain slices
+        # and bitcasts of the received buffer instead of torch view copies.
+        prebuild_send_merge(world)
+        merged = _SEND_MERGE_OPS[world](
+            send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
+        )
+        return merged.reshape(num_tokens, local, vdim)
     recv = _ragged_all_to_all(send, 1 + real * local, group, skip=SEND_PAD_ROWS - 1)
     o_recv = recv[:, SEND_PAD_ROWS:].reshape(world, num_tokens, local, vdim)
     o_recv = o_recv.view(torch.bfloat16)
@@ -580,6 +588,102 @@ def _build_ragged_all_to_all(world: int, skip: int = 0):
         input_partition_specs=(rank_spec, P(), rank_spec),
         output_partition_specs=rank_spec,
         fake=_ragged_fake,
+    )
+
+
+_SEND_MERGE_OPS: dict = {}
+
+
+def prebuild_send_merge(world: int) -> None:
+    """Build (register) the send-layout exchange + merge op
+    (`TPU_DCP_MLA_SEND_LAYOUT_MERGE`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_MERGE_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_MERGE_OPS[world] = _build_send_merge(world)
+
+
+def _send_merge_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    world = int(get_dcp_group().world_size)
+    tl = x.shape[0] // world - SEND_PAD_ROWS
+    return x.new_empty((tl, x.shape[1]), dtype=torch.bfloat16)
+
+
+def merge_received_jax(o, l):
+    """`_merge_received` in jnp, op for op, on `[R, n, V]` bf16 partials and
+    `[R, n]` f32 lse (rows flattened): the f32 `[n, V]` merge."""
+    import jax.numpy as jnp
+
+    finite = jnp.isfinite(l)
+    shift = jnp.where(finite, l, -jnp.inf).max(axis=0)
+    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+    weights = jnp.where(finite, jnp.exp(l - shift[None]), 0.0)
+    denom = weights.sum(axis=0)
+    weights = weights / jnp.where(denom > 0, denom, 1.0)
+    of = o.astype(jnp.float32)
+    of = jnp.where(jnp.isnan(of), 0.0, of)
+    w_hi = weights.astype(jnp.bfloat16).astype(jnp.float32)
+    w_lo = weights - w_hi
+    return (of * w_hi[..., None]).sum(axis=0) + (of * w_lo[..., None]).sum(axis=0)
+
+
+def _build_send_merge(world: int):
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+    skip = SEND_PAD_ROWS - 1
+
+    def body(x, rows, rank):
+        block = x.shape[0] // world
+        vdim = x.shape[1]
+        me = rank[0].astype(jnp.int32)
+        n = jnp.clip(rows[0], 0, block - skip).astype(jnp.int32)
+        sizes = jnp.full((world,), n, jnp.int32)
+        recv = jax.lax.ragged_all_to_all(
+            x,
+            jnp.zeros_like(x),
+            jnp.arange(world, dtype=jnp.int32) * block + skip,
+            sizes,
+            jnp.full((world,), me * block + skip, jnp.int32),
+            sizes,
+            axis_name=DCP_AXIS_NAME,
+        ).reshape(world, block, vdim)
+        tl = block - SEND_PAD_ROWS
+        o = lax.bitcast_convert_type(recv[:, SEND_PAD_ROWS:], jnp.bfloat16)
+        words = recv[:, SEND_PAD_ROWS - 1]
+        hi = words[:, :tl].astype(jnp.int32)
+        lo = words[:, tl : 2 * tl].astype(jnp.int32)
+        l = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+        return merge_received_jax(o, l).astype(jnp.bfloat16)
+
+    def fn(x: jax.Array, rows: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec),
+            out_specs=rank_spec,
+            check_vma=False,
+        )(x, rows, rank)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_merge_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec),
+        output_partition_specs=rank_spec,
+        fake=_send_merge_fake,
     )
 
 

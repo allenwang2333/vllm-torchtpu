@@ -368,3 +368,47 @@ def test_sparse_mla_dcp_send_op_schema(rank):
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
     assert len(schema.arguments) == 12 + int(rank), schema
+
+
+@pytest.mark.parametrize("world,tokens,per", [(16, 16, 4), (16, 32, 4), (8, 16, 8), (8, 32, 8)])
+def test_jax_merge_matches_torch_merge(world, tokens, per):
+    """TPU_DCP_MLA_SEND_LAYOUT_MERGE's jnp merge == `_merge_received` compiled
+    by torch on one device, bit for bit, at the mirror (W=16) and twin (W=8)
+    geometries -- the multichip check covers only W=8."""
+    prologue._require_tpu()
+    import torch
+    import torch_tpu  # noqa: F401
+    from torch_tpu._internal import compile as tpu_compile
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+
+    rng = np.random.default_rng(world * 1000 + tokens)
+    n = tokens * per
+    o = rng.normal(size=(world, n, 512)).astype(np.float32)
+    o *= rng.choice([1e-3, 1.0, 30.0], size=(world, n, 1))
+    lse = (rng.normal(size=(world, n)) * 5).astype(np.float32)
+    lse[rng.random((world, n)) < 0.3] = -np.inf
+    lse[:, 3] = -np.inf  # a row no rank owns
+    o[1, :, :7] = np.nan  # a rank's NaN partial (weight 0 where lse is -inf)
+    lse[1, :] = -np.inf
+    o_bf = jnp.asarray(o, jnp.bfloat16)
+    want_j = np.asarray(
+        jax.jit(lambda a, b: cp_mla.merge_received_jax(a, b).astype(jnp.bfloat16))(
+            o_bf, jnp.asarray(lse)
+        )
+    ).view(np.int16)
+    ot = torch.from_numpy(np.asarray(o_bf).view(np.int16).copy()).view(torch.bfloat16)
+    lt = torch.from_numpy(lse.copy())
+    fn = torch.compile(
+        lambda a, b: cp_mla._merge_received(a.unsqueeze(2), b.unsqueeze(2))
+        .squeeze(1)
+        .to(torch.bfloat16),
+        fullgraph=True,
+        dynamic=False,
+        backend=tpu_compile.TpuBackend(),
+    )
+    got_t = fn(ot.to("tpu"), lt.to("tpu")).cpu().view(torch.int16).numpy()
+    nd = int((got_t != want_j).sum())
+    print(f"W={world} T={tokens} L={per}: jax vs torch merge diffs {nd} / {want_j.size}")
+    assert nd == 0
+    assert np.isfinite(np.asarray(want_j.view(jnp.bfloat16), np.float32)).all()
