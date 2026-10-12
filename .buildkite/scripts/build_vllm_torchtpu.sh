@@ -29,6 +29,7 @@
 #   4. Build the wheel and sdist into OUTPUT_DIR.
 #   5. Retag the wheel linux_<arch> -> manylinux_2_28_x86_64, since PyPI
 #      rejects linux_<arch>. Refused if the wheel contains native binaries.
+#   6. `twine check --strict` the wheel and sdist (metadata PyPI would reject).
 #
 # Usage:
 #   ./build_vllm_torchtpu.sh <version>
@@ -279,7 +280,7 @@ echo "$REQUIRED_LINE" >> "$REQUIREMENTS_FILE"
 # installed for a --no-isolation build. Our requirements/build/tpu.txt is just
 # build tools + CPU torch; `build` fails if it no longer fits vLLM's [build-system].
 echo "Installing build dependencies..."
-"$PY" -m pip install -r "$BUILD_REQUIREMENTS_FILE" build wheel
+"$PY" -m pip install -r "$BUILD_REQUIREMENTS_FILE" build wheel twine
 
 # Remove old wrapper files only; `vllm_torchtpu-` never matches core files
 # (`vllm_torchtpu_core-`).
@@ -336,6 +337,11 @@ case "$(basename "$BUILT_WHEEL")" in
         FINAL_WHEEL="${OUTPUT_DIR}/${NEW_NAME}" ;;
 esac
 [[ -f "$FINAL_WHEEL" ]] || die "retagged wheel not found at ${FINAL_WHEEL}."
+
+# --- Step 6: Check metadata --------------------------------------------------
+# Same check as the core wheel: catch metadata PyPI would reject before upload.
+echo "--- Checking metadata ---"
+"$PY" -m twine check --strict "$FINAL_WHEEL" "$BUILT_SDIST"
 
 echo "--- Build complete! ---"
 ls -lh "$FINAL_WHEEL" "$BUILT_SDIST"

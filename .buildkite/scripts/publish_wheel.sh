@@ -180,13 +180,15 @@ unset API_TOKEN
 # --- Wait until PyPI serves it -----------------------------------------------
 # New uploads can take a moment to appear. The next step (or users) needs the
 # release to be installable, so poll for up to 5 minutes.
-#   --ignore-requires-python: only check the file exists, whatever Python
-#                             this agent has (core requires 3.12).
-#   --only-binary :all:       check the wheel; never build the sdist.
+#   --python-version/--platform: look for the wheel the build makes (cp312,
+#                                manylinux_2_28_x86_64), whatever Python this
+#                                agent has. Pure-Python core wheels match too.
+#   --only-binary :all:          check the wheel; never build the sdist.
 echo "--- :hourglass: Waiting for ${PUBLISH_PYPI}==${VERSION} on PyPI"
 for attempt in $(seq 1 20); do
     if "$PY" -m pip download --quiet --no-deps --no-cache-dir \
-        --ignore-requires-python --only-binary :all: \
+        --python-version 3.12 --platform manylinux_2_28_x86_64 \
+        --only-binary :all: \
         --index-url "${INDEX_BASE}/simple/" --dest "${WORK_DIR}/verify" \
         "${PUBLISH_PYPI}==${VERSION}" >/dev/null 2>&1; then
         echo "Available after ${attempt} check(s)."
