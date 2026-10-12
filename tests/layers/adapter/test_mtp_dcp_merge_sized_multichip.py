@@ -62,7 +62,7 @@ def _check(rank, world, group, cp_mla):
     report = {}
     local = HEADS // world
     today = lambda o, l: cp_mla.merge_lse_partials_scatter_heads(o, l, is_backbone=False)
-    for tokens in (16, 4, 128):
+    for tokens in (16, 8, 128):
         outputs, lses = base._global_partials(world, tokens)
         poisoned = outputs.clone()
         poisoned[~torch.isfinite(lses)] = float("nan")
