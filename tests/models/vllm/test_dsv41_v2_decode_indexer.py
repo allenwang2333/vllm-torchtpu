@@ -1219,7 +1219,7 @@ class TestAttentionSelectPagedIndicesDecode:
             ref_mine = torch.tensor([9, count, 0, 1], dtype=torch.int32)
         else:
             owner_perm = None
-            part, padding = v2_attn._query_split(count, ranks, kv_shard=False)
+            part, padding = v2_attn._query_split(count, ranks)
             ref_mine = tp_rank * part + torch.arange(part, dtype=torch.int32)
 
         active_lengths = lengths.masked_fill(swa_slots[:, None] < 0, 0)
@@ -1473,3 +1473,224 @@ class TestAttentionSelectPagedIndicesDecode:
         assert sel_4w.shape == (4, 32)
         assert sel_4f.shape == (4, 32)
         assert pub_4f.shape == (4, 4)
+
+    def test_two_stage_block_filtered_topk_and_prefill_shared_fastpath(
+        self, monkeypatch
+    ):
+        """Verify two-stage block-filtered top-k, fused masking, and prefill tile."""
+        rng = np.random.default_rng(9401)
+        heads, dim = 2, 128
+        page_records = 16
+        pool = jnp.asarray(
+            rng.integers(-(2**31), 2**31, (512, ROW_WORDS)), dtype=jnp.int32
+        ) & jnp.int32(0x3FFF3FFF)
+
+        # 1. Prefill shared-row scoring: single_row_branch vs multi_row_branch
+        # and pages=True (prestrided and full) vs pages=False, with width > 4096.
+        tokens_pref = 4
+        width_pref = 4128
+        records_np = np.zeros((2, width_pref), dtype=np.int32)
+        for p in range(0, width_pref, page_records):
+            base = int(rng.integers(0, 256) * 2)
+            records_np[0, p : p + page_records] = base + np.arange(page_records)
+        records_np[0, -page_records:] = -1
+        records_np[1] = records_np[0]
+        records_full = jnp.asarray(records_np)
+        records_page = records_full[:, ::page_records]
+
+        q_pref = jnp.asarray(
+            rng.standard_normal((tokens_pref, heads, dim)), jnp.bfloat16
+        )
+        w_pref = jnp.asarray(rng.standard_normal((tokens_pref, heads)), jnp.float32)
+        len_pref = jnp.asarray([4100, 4096, 3000, 2048], dtype=jnp.int32)
+        req_single = jnp.zeros((tokens_pref,), dtype=jnp.int32)
+        req_multi = jnp.asarray([0, 0, 1, 1], dtype=jnp.int32)
+
+        scores_single_paged = paged_index_scores_jax(
+            q_pref,
+            pool,
+            records_full,
+            w_pref,
+            len_pref,
+            requests=req_single,
+            page_records=page_records,
+        )
+        scores_multi_paged = paged_index_scores_jax(
+            q_pref,
+            pool,
+            records_full,
+            w_pref,
+            len_pref,
+            requests=req_multi,
+            page_records=page_records,
+        )
+        scores_single_prestrided = paged_index_scores_jax(
+            q_pref,
+            pool,
+            records_page,
+            w_pref,
+            len_pref,
+            requests=req_single,
+            page_records=page_records,
+            prestrided_pages=True,
+            logical_width=width_pref,
+        )
+        scores_single_unpaged = paged_index_scores_jax(
+            q_pref,
+            pool,
+            records_full,
+            w_pref,
+            len_pref,
+            requests=req_single,
+            page_records=None,
+        )
+        scores_multi_unpaged = paged_index_scores_jax(
+            q_pref,
+            pool,
+            records_full,
+            w_pref,
+            len_pref,
+            requests=req_multi,
+            page_records=None,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scores_single_paged), np.asarray(scores_multi_paged)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scores_single_prestrided), np.asarray(scores_single_paged)
+        )
+        np.testing.assert_allclose(
+            np.asarray(scores_single_paged[:, :-page_records]),
+            np.asarray(scores_single_unpaged[:, :-page_records]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(scores_single_unpaged), np.asarray(scores_multi_unpaged)
+        )
+
+        # 2. Two-stage block-filtered top-k in select_indices_jax (candidate_write=True,
+        # unordered=True, blocks >= 2048): exact bitwise parity against unordered=False
+        # across full, underfull (0 < len < topk), zero-length, and tied-score rows.
+        count = 4
+        blocks = 2048
+        block_size = 8
+        width_2s = blocks * block_size
+        topk_2s = 32
+        cand_k = 16
+        raw_scores = rng.standard_normal((count, width_2s)).astype(np.float32)
+        # Inject exact score ties within and across blocks on row 0
+        raw_scores[0, 10:26] = 7.5
+        raw_scores[0, 100:116] = 7.5
+        scores_j = jnp.asarray(raw_scores)
+        # Row 0: full; Row 1: mid; Row 2: underfull (< topk); Row 3: 0 length
+        lengths_2s = jnp.asarray([width_2s, 5000, 12, 0], dtype=jnp.int32)
+        cands_2s = jnp.full((count, cand_k), -1, dtype=jnp.int32)
+
+        sc_shapes: list[tuple[tuple[int, int], int]] = []
+
+        def ref_sc_topk(s, k, lens):
+            sc_shapes.append((s.shape, k))
+            col = jnp.arange(s.shape[1])[None, :]
+            masked = jnp.where(col < lens[:, None], s, -jnp.inf)
+            vals, idx = jax.lax.top_k(masked, k)
+            return jnp.where(vals > -jnp.inf, idx, -1).astype(jnp.int32)
+
+        monkeypatch.setattr(v2_kernels, "_sparsecore_top_k", ref_sc_topk)
+
+        sel_2s, pub_2s = v2_kernels.select_indices_jax(
+            scores_j,
+            lengths_2s,
+            cands_2s,
+            topk=topk_2s,
+            block_size=block_size,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=True,
+        )
+        sel_ref, pub_ref = v2_kernels.select_indices_jax(
+            scores_j,
+            lengths_2s,
+            cands_2s,
+            topk=topk_2s,
+            block_size=block_size,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=False,
+        )
+        assert sc_shapes == [
+            ((count, blocks), cand_k),
+            ((count, blocks), topk_2s),
+            ((count, topk_2s * block_size), topk_2s),
+        ]
+        np.testing.assert_array_equal(np.asarray(sel_2s), np.asarray(sel_ref))
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(pub_2s), axis=-1),
+            np.sort(np.asarray(pub_ref), axis=-1),
+        )
+
+        # Verify _premasked=True parity in select_indices_jax
+        premasked_scores = jnp.where(
+            jnp.arange(width_2s)[None, :] < lengths_2s[:, None],
+            scores_j,
+            -jnp.inf,
+        )
+        sel_pre, pub_pre = v2_kernels.select_indices_jax(
+            premasked_scores,
+            lengths_2s,
+            cands_2s,
+            topk=topk_2s,
+            block_size=block_size,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=True,
+            _premasked=True,
+        )
+        np.testing.assert_array_equal(np.asarray(sel_pre), np.asarray(sel_2s))
+        np.testing.assert_array_equal(np.asarray(pub_pre), np.asarray(pub_2s))
+
+        # Verify non-candidate_write unordered=True (width >= 2048 and < 2048)
+        sel_nw_wide, _ = v2_kernels.select_indices_jax(
+            scores_j[:, :2048],
+            lengths_2s,
+            cands_2s,
+            topk=topk_2s,
+            block_size=block_size,
+            candidate_write=False,
+            candidate_filter=False,
+            unordered=True,
+        )
+        assert sel_nw_wide.shape == (count, topk_2s)
+        sel_nw_narrow, _ = v2_kernels.select_indices_jax(
+            scores_j[:, :256],
+            lengths_2s,
+            cands_2s,
+            topk=topk_2s,
+            block_size=block_size,
+            candidate_write=False,
+            candidate_filter=False,
+            unordered=True,
+        )
+        assert sel_nw_narrow.shape == (count, topk_2s)
+
+        # 3. End-to-end paged_indexer_jax full_context (exercises _run_word_loop
+        # and fused row_valid & visible masking + _premasked=True)
+        sel_fc, pub_fc = v2_kernels.paged_indexer_jax(
+            q_pref[:2],
+            pool,
+            records_page[:, :16],
+            w_pref[:2],
+            jnp.asarray([200, 128], dtype=jnp.int32),
+            jnp.full((2, 4), -1, dtype=jnp.int32),
+            jnp.asarray([0, 1], dtype=jnp.int32),
+            topk=16,
+            block_size=8,
+            candidate_write=True,
+            candidate_filter=False,
+            unordered=False,
+            page_records=page_records,
+            prestrided_pages=True,
+            logical_width=256,
+        )
+        assert sel_fc.shape == (2, 16)
+        assert pub_fc.shape == (2, 4)

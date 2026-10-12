@@ -2558,8 +2558,12 @@ def paged_index_scores_jax(
         )
         else tokens
     )
+    is_prefill_shared = requests is not None and eff_tokens > records.shape[0]
     budget = min(
-        max(512, min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(eff_tokens, 1))),
+        max(
+            4096 if is_prefill_shared else 512,
+            min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(eff_tokens, 1)),
+        ),
         1 << (max(width, 128) - 1).bit_length(),
     )
     tile = 1 << (budget.bit_length() - 1)
@@ -2578,7 +2582,7 @@ def paged_index_scores_jax(
         and (page_records * dim // 2) % ROW_WORDS == 0
     )
 
-    if requests is not None and eff_tokens > records.shape[0]:
+    if is_prefill_shared:
         # One request row at a time, each bounded by its own longest token:
         # all tokens score the row's shared key tile, and only that row's
         # tokens keep the result. Rows without tokens (padding) run no tiles,
@@ -2589,52 +2593,80 @@ def paged_index_scores_jax(
             else 1
         )
         rec_tile = tile // rec_stride
-        rec_pad = padded_width // rec_stride - records.shape[1]
-        records = jnp.pad(records, ((0, 0), (0, rec_pad)), constant_values=-1)
+        rec_cols = padded_width // rec_stride
+        rec_pad = max(0, rec_cols - records.shape[1])
+        records = jnp.pad(
+            records[:, :rec_cols], ((0, 0), (0, rec_pad)), constant_values=-1
+        )
         row_lengths = (
             jnp.zeros((records.shape[0],), jnp.int32)
             .at[requests]
             .max(jnp.maximum(lengths, 0))
         )
 
-        def row_step(row, result):
-            mine = (requests == row)[:, None]
+        def _score_row_tile(row, index):
+            addresses = jax.lax.dynamic_slice(
+                records, (row, index * rec_tile), (1, rec_tile)
+            ).reshape(-1)
+            if pages:
+                keys = gather_cache_page_values(
+                    pool,
+                    addresses if prestrided_pages else addresses[::page_records],
+                    page_records,
+                    dim,
+                )
+            else:
+                keys = gather_cache_values(pool, addresses, dim, split=True)
+            return head_sum(
+                jnp.einsum(
+                    "thd,cd->thc",
+                    q,
+                    keys.reshape(tile, dim),
+                    preferred_element_type=jnp.float32,
+                )
+            )
 
-            def step(index, result):
-                addresses = jax.lax.dynamic_slice(
-                    records, (row, index * rec_tile), (1, rec_tile)
-                ).reshape(-1)
-                if pages:
-                    keys = gather_cache_page_values(
-                        pool,
-                        addresses if prestrided_pages else addresses[::page_records],
-                        page_records,
-                        dim,
-                    )
-                else:
-                    keys = gather_cache_values(pool, addresses, dim, split=True)
-                values = head_sum(
-                    jnp.einsum(
-                        "thd,cd->thc",
-                        q,
-                        keys.reshape(tile, dim),
-                        preferred_element_type=jnp.float32,
-                    )
-                )
-                current = jax.lax.dynamic_slice_in_dim(
-                    result, index * tile, tile, axis=1
-                )
-                return jax.lax.dynamic_update_slice_in_dim(
-                    result, jnp.where(mine, values, current), index * tile, axis=1
-                )
+        scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
 
+        def single_row_branch(_):
+            row = requests[0]
             trips = jnp.minimum(
                 (row_lengths[row] + tile - 1) // tile, padded_width // tile
             )
-            return jax.lax.fori_loop(0, trips, step, result)
 
-        scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
-        return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
+            def single_step(index, result):
+                return jax.lax.dynamic_update_slice_in_dim(
+                    result, _score_row_tile(row, index), index * tile, axis=1
+                )
+
+            return jax.lax.fori_loop(0, trips, single_step, scores)[:, :width]
+
+        def multi_row_branch(_):
+            def row_step(row, result):
+                mine = (requests == row)[:, None]
+
+                def step(index, result):
+                    values = _score_row_tile(row, index)
+                    current = jax.lax.dynamic_slice_in_dim(
+                        result, index * tile, tile, axis=1
+                    )
+                    return jax.lax.dynamic_update_slice_in_dim(
+                        result, jnp.where(mine, values, current), index * tile, axis=1
+                    )
+
+                trips = jnp.minimum(
+                    (row_lengths[row] + tile - 1) // tile, padded_width // tile
+                )
+                return jax.lax.fori_loop(0, trips, step, result)
+
+            return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
+
+        return jax.lax.cond(
+            jnp.all(requests == requests[0]),
+            single_row_branch,
+            multi_row_branch,
+            None,
+        )
 
     trips = jnp.minimum(
         (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, padded_width // tile
@@ -2650,10 +2682,13 @@ def paged_index_scores_jax(
         page_tile = tile // page
         rows = tile // index_word_scores.SLOTS
         page_rec_all = records if prestrided_pages else records[:, ::page]
-        page_pad = padded_width // page - page_rec_all.shape[1]
+        page_cols = padded_width // page
+        page_pad = max(0, page_cols - page_rec_all.shape[1])
 
         def _run_word_loop(page_rec):
-            page_rec = jnp.pad(page_rec, ((0, 0), (0, page_pad)), constant_values=-1)
+            page_rec = jnp.pad(
+                page_rec[:, :page_cols], ((0, 0), (0, page_pad)), constant_values=-1
+            )
             n_rows = page_rec.shape[0]
             if padded_width == tile:
                 words = gather_cache_page_words(pool, page_rec, page, dim)
@@ -2887,6 +2922,8 @@ def select_indices_jax(
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     requests: jax.Array | None = None,
+    *,
+    _premasked: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Source publishes candidates without filtering its own selection.
 
@@ -2906,16 +2943,20 @@ def select_indices_jax(
     batch_max = (
         lengths.max() if batch_max is None else jnp.clip(batch_max.max(), 0, width)
     )
-    logical = jnp.arange(width)[None, :]
-    visible = logical < lengths[:, None]
-    scores = jnp.where(visible, scores, -jnp.inf)
+    if not _premasked:
+        logical = jnp.arange(width)[None, :]
+        visible = logical < lengths[:, None]
+        scores = jnp.where(visible, scores, -jnp.inf)
     published = candidates
+    blocks = (width + block_size - 1) // block_size
+    raw_block_scores = None
+    scores_3d = None
+    block_lengths = None
     # When the candidate buffer covers every block, publication/filtering are
     # identities. Keep the caller's buffer untouched in this static case.
     if (candidate_write or candidate_filter) and candidates.shape[
         1
     ] * block_size < width:
-        blocks = (width + block_size - 1) // block_size
         if candidate_write:
             pad = blocks * block_size - width
             padded_scores = (
@@ -2923,10 +2964,13 @@ def select_indices_jax(
                 if pad
                 else scores
             )
-            block_scores = padded_scores.reshape(count, blocks, block_size).max(-1)
+            scores_3d = padded_scores.reshape(count, blocks, block_size)
+            raw_block_scores = scores_3d.max(-1)
             last = (lengths - 1) // block_size
             block_scores = jnp.where(
-                jnp.arange(blocks)[None] == last[:, None], jnp.inf, block_scores
+                jnp.arange(blocks)[None] == last[:, None],
+                jnp.inf,
+                raw_block_scores,
             )
             cand_k = candidates.shape[1]
             block_lengths = (lengths + block_size - 1) // block_size
@@ -2984,6 +3028,46 @@ def select_indices_jax(
             scores = jnp.where(allowed | (batch_max <= topk), scores, -jnp.inf)
     # Ascending: preserves V4.1's logical, hence attention accumulation, order.
     k = min(topk, width)
+    if (
+        raw_block_scores is not None
+        and scores_3d is not None
+        and block_lengths is not None
+        and unordered
+        and blocks >= 2048
+        and blocks % 16 == 0
+        and k % 16 == 0
+        and (k * block_size) % 16 == 0
+    ):
+        # Exact two-stage block-filtered top-k: the top-k blocks by block max
+        # (tie-broken by lowest block index) are guaranteed to contain all global
+        # top-k elements. Reusing `raw_block_scores` avoids the multi-partition
+        # SparseCore pass over `width > 32768`.
+        top_blks = _compact_selected(
+            _sparsecore_top_k(
+                raw_block_scores, k, jnp.minimum(block_lengths, blocks)
+            ).astype(jnp.int32)
+        )
+        valid_blk = top_blks >= 0
+        safe_blks = jnp.where(valid_blk, top_blks, 0)
+        cand_scores = jnp.where(
+            valid_blk[:, :, None],
+            scores_3d[jnp.arange(count)[:, None], safe_blks],
+            -jnp.inf,
+        ).reshape(count, k * block_size)
+        cand_len = jnp.where(lengths > 0, k * block_size, 0)
+        local_idx = _sparsecore_top_k(cand_scores, k, cand_len).astype(jnp.int32)
+        valid_local = local_idx >= 0
+        safe_local = jnp.maximum(local_idx, 0)
+        blk_pos = safe_local // block_size
+        in_blk = safe_local % block_size
+        chosen_blk = jnp.take_along_axis(safe_blks, blk_pos, axis=1)
+        chosen_blk_valid = jnp.take_along_axis(valid_blk, blk_pos, axis=1)
+        global_idx = jnp.where(
+            valid_local & chosen_blk_valid,
+            chosen_blk * block_size + in_blk,
+            -1,
+        ).astype(jnp.int32)
+        return _compact_selected(global_idx), published
     indices = _visible_top_k(scores, k, lengths.max(), lengths, unordered)
     if unordered and width >= 2048 and width % 16 == 0 and k % 16 == 0:
         return _compact_selected(indices.astype(jnp.int32)), published
@@ -3054,7 +3138,10 @@ def paged_indexer_jax(
             ).reshape(page_valid.shape[0], -1)[:, :width]
         else:
             row_valid = jnp.take(records >= 0, requests, axis=0)
-        scores = jnp.where(row_valid, scores, -jnp.inf)
+        visible = jnp.arange(width)[None, :] < jnp.clip(
+            lengths.reshape(q.shape[0], 1), 0, width
+        )
+        scores = jnp.where(row_valid & visible, scores, -jnp.inf)
         return select_indices_jax(
             scores,
             lengths,
@@ -3066,6 +3153,7 @@ def paged_indexer_jax(
             unordered,
             batch_max,
             requests if q.shape[0] // 6 <= records.shape[0] else None,
+            _premasked=True,
         )
 
     if not candidate_filter or candidates.shape[1] * block_size >= width:
