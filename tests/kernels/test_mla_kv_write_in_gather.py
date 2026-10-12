@@ -152,7 +152,10 @@ def test_gather_write_positive_control_fails(cell, fault):
     seqs, num_tokens = tcw._CELLS[cell]
     inp = tcw._inputs(seqs, num_tokens)
     owning = caught = gathered_caught = 0
-    for rank in range(tcw.DCP_SIZE):
+    # no_fence is a race (hit on 0-2 of ~10 owning ranks per pass, j-a5040f59
+    # / j-04b743b8): repeat it so a pass that never reads stale is unlikely.
+    reps = 8 if fault == "no_fence" else 1
+    for rank in [r for r in range(tcw.DCP_SIZE) for _ in range(reps)]:
         got, want, dst = _run_rank(inp, rank, OUT_SIZE, fault)
         ok = _compare(got, want, OUT_SIZE)
         owns = bool(jnp.any(dst >= 0))
@@ -162,7 +165,7 @@ def test_gather_write_positive_control_fails(cell, fault):
             owning += 1
             caught += not all(ok)
             gathered_caught += not (ok[0] and ok[1])
-    assert owning > 1
+    assert owning > reps
     if fault in ("no_fence", "late_write"):
         # Caches end right; only the gathered rows can show the ordering.
         print(f"{fault}: gathered rows differ on {gathered_caught}/{owning} ranks")

@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
     update_sparse_mla_kv_cache,
@@ -1275,7 +1276,8 @@ def sparse_mla_attention_dcp(
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
             )
-            kv_write = (
+            # One u32[T, 384] operand: one TensorCore producer for the gather.
+            kv_write = native_sc_gather.pack_write_rows(
                 kv_cache_utils._dst_rows(page, slot, nope_spec.page_size),
                 _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),
                 _pack_lane_dense(k_pe, rope_spec.token_bytes),
