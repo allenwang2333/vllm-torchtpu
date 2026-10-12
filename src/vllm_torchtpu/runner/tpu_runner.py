@@ -240,6 +240,11 @@ _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 # the multi-candidate passes cost more than the passes they save (top-p-only
 # verify + bonus: 204 us at 1 bit, 257 at 2, 288 at 3, 464 at 4).
 _SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 1
+# TPU_SAMPLER_VERIFY_TRIM: target rows the fused verify chain keeps when a
+# chunk's drafts fit (one f32 sublane tile), and the largest padded logits
+# length it trims (the variants _precompile_spec_sample_verify_fused warms).
+_VERIFY_TRIM_ROWS = 8
+_VERIFY_TRIM_MAX_LEN = 32
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -942,6 +947,9 @@ class TPUModelRunner(GPUModelRunner):
         self._sampler_fast_top_p = bool(envs.TPU_SAMPLER_FAST_TOP_P)
         # TPU_SAMPLER_FUSED_CHAIN: one compiled non-greedy verify program.
         self._sampler_fused_chain = bool(envs.TPU_SAMPLER_FUSED_CHAIN)
+        # TPU_SAMPLER_VERIFY_TRIM: the fused chain's target work on 8 rows
+        # when the chunk's drafts fit (see _verify_trim_rows).
+        self._sampler_verify_trim = bool(envs.TPU_SAMPLER_VERIFY_TRIM)
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -4328,6 +4336,11 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
+            trim_kwargs = {}
+            if rows := self._verify_trim_rows(
+                md.target_logits_indices.shape[0], md.draft_lengths_cpu
+            ):
+                trim_kwargs["verify_rows"] = rows
             return self.spec_sample_verify_fused(
                 logits,
                 md.bonus_logits_indices,
@@ -4344,6 +4357,7 @@ class TPUModelRunner(GPUModelRunner):
                 recover_u,
                 self.speculative_config.num_speculative_tokens,
                 **self._sampler_kwargs(),
+                **trim_kwargs,
             )
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
@@ -6091,25 +6105,32 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.zeros((num_tokens, vocab), dtype=torch.float32).to(
             self.device
         )
-        for light_kwargs in self._sampler_light_variants() or [{}]:
-            out = self.spec_sample_verify_fused(
-                dummy_logits,
-                bonus_logits_indices,
-                target_logits_indices,
-                temps,
-                top_k,
-                top_p,
-                draft_token_ids,
-                draft_lengths,
-                segment_ids,
-                group_indices,
-                bonus_u,
-                accept_u,
-                recover_u,
-                k,
-                **light_kwargs,
-            )
-            synchronize_tensors(out)
+        trim_variants: list[dict[str, Any]] = [{}]
+        if self._sampler_verify_trim and (
+            _VERIFY_TRIM_ROWS < num_tokens <= _VERIFY_TRIM_MAX_LEN
+        ):
+            trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
+        for trim_kwargs in trim_variants:
+            for light_kwargs in self._sampler_light_variants() or [{}]:
+                out = self.spec_sample_verify_fused(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    bonus_u,
+                    accept_u,
+                    recover_u,
+                    k,
+                    **light_kwargs,
+                    **trim_kwargs,
+                )
+                synchronize_tensors(out)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7575,6 +7596,25 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _verify_trim_rows(
+        self, padded_logits_length: int, draft_lengths_cpu: np.ndarray
+    ) -> int:
+        """TPU_SAMPLER_VERIFY_TRIM: the target rows the fused verify chain
+        keeps for this chunk, or 0 to keep all ``padded_logits_length``.
+
+        get_spec_decode_metadata lays the chunk's real draft slots out first
+        (request-major) and pads after them; a padding slot is never a valid
+        slot of any request, so its target row reaches no output. Trimming to
+        _VERIFY_TRIM_ROWS is exact when every real slot fits.
+        """
+        if not self._sampler_verify_trim:
+            return 0
+        if not (_VERIFY_TRIM_ROWS < padded_logits_length <= _VERIFY_TRIM_MAX_LEN):
+            return 0
+        if int(np.sum(draft_lengths_cpu)) > _VERIFY_TRIM_ROWS:
+            return 0
+        return _VERIFY_TRIM_ROWS
+
     def _sampler_kwargs(self) -> dict[str, Any]:
         """Static kwargs of the non-greedy sampler / verify graphs for the
         sampling params last staged by _build_padded_sampling_params."""
@@ -7652,13 +7692,26 @@ class TPUModelRunner(GPUModelRunner):
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        verify_rows: int = 0,
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
         _sample_spec_verify_chunk as one program -- the logits gathers, bonus
         sampling, the per-token param gathers and the rejection sampler. The
         uniforms come in drawn by the caller (Dynamo cannot take a
-        torch.Generator into the graph), same shapes and order as unfused."""
+        torch.Generator into the graph), same shapes and order as unfused.
+
+        ``verify_rows`` (static, TPU_SAMPLER_VERIFY_TRIM): keep only the first
+        that many draft slots -- the caller guarantees every real slot is
+        among them (_verify_trim_rows). The uniforms are drawn at the full
+        shape and sliced here, so the generator stream is unchanged."""
         assert self.rejection_sampler is not None
+        if verify_rows:
+            target_logits_indices = target_logits_indices[:verify_rows]
+            draft_token_ids = draft_token_ids[:verify_rows]
+            segment_ids = segment_ids[:verify_rows]
+            group_indices = group_indices[:verify_rows]
+            accept_u = accept_u[:verify_rows]
+            recover_u = recover_u[:verify_rows]
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         bonus_token_ids = _sample_from_logits_impl(
