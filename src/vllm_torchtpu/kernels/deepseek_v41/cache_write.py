@@ -18,12 +18,12 @@ def _quantize(values):
     values = values.astype(jnp.float32)
     amax = jnp.maximum(jnp.abs(values).max(axis=-1), 1e-4)
     exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
-    scale_bytes = (exponent + 127).astype(jnp.uint8)
-    scale = pltpu.bitcast(
-        (scale_bytes.astype(jnp.uint32) << 23)[None, :], jnp.float32
-    ).reshape(-1)
-    quantized = (values / scale[:, None]).astype(jnp.float8_e4m3fn)
-    return pltpu.bitcast(quantized, jnp.uint8), scale_bytes.astype(jnp.int32)
+    scale_u32 = (exponent + 127).astype(jnp.uint32)
+    inv_scale = pltpu.bitcast(((254 - scale_u32) << 23)[None, :], jnp.float32).reshape(
+        -1
+    )
+    quantized = (values * inv_scale[:, None]).astype(jnp.float8_e4m3fn)
+    return pltpu.bitcast(quantized, jnp.uint8), scale_u32.astype(jnp.int32)
 
 
 def _write_kernel(
@@ -69,6 +69,7 @@ def _write_kernel(
         )
         for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).start()
+        for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).wait()
         key_bytes, scale_words = _quantize(keys_buf[...].reshape(INPUT_KEYS, HEAD_DIM))
         mapping = (
@@ -83,22 +84,24 @@ def _write_kernel(
             key_bytes.astype(jnp.bfloat16),
             preferred_element_type=jnp.float32,
         ).astype(jnp.int32)
-        mapped_scale_matrix = jnp.einsum(
-            "ik,id->kd",
-            mapping.astype(jnp.bfloat16),
-            jnp.broadcast_to(scale_words[:, None], (INPUT_KEYS, HEAD_DIM)).astype(
-                jnp.bfloat16
-            ),
-            preferred_element_type=jnp.float32,
+        mapped_scales = jnp.sum(
+            jnp.where(mapping, scale_words[:, None], 0), axis=0
         ).astype(jnp.int32)
-        mapped_scales = mapped_scale_matrix[:, 0]
         mapped = mapped.reshape(SLAB_KEYS // 4, 4, HEAD_DIM)
-        lane_present = mapped_scale_matrix.reshape(SLAB_KEYS // 4, 4, HEAD_DIM) > 0
-        words = words_buf[...]
-        for lane in range(4):
-            mask = jnp.where(lane_present[:, lane], jnp.int32(255) << (8 * lane), 0)
-            words = (words & ~mask) | ((mapped[:, lane] << (8 * lane)) & mask)
-        words_buf[...] = words
+        lane_present = mapped_scales.reshape(SLAB_KEYS // 4, 4, 1) > 0
+        new_word = (
+            mapped[:, 0]
+            | (mapped[:, 1] << 8)
+            | (mapped[:, 2] << 16)
+            | (mapped[:, 3] << 24)
+        )
+        keep_mask = (
+            jnp.where(lane_present[:, 0], 0, 0xFF)
+            | jnp.where(lane_present[:, 1], 0, 0xFF00)
+            | jnp.where(lane_present[:, 2], 0, 0xFF0000)
+            | jnp.where(lane_present[:, 3], 0, jnp.int32(-16777216))
+        )
+        words_buf[...] = (words_buf[...] & keep_mask) | new_word
         scales_buf[...] = jnp.where(mapped_scales > 0, mapped_scales, scales_buf[...])
         copies = (
             (words_buf, pool_out.at[pl.ds(base // 4, SLAB_KEYS // 4), :]),
@@ -111,6 +114,7 @@ def _write_kernel(
         )
         for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).start()
+        for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).wait()
 
 
@@ -180,21 +184,21 @@ def _word_write_kernel(
     @pl.when(first & (record >= 0) & (row < output.shape[0]))
     def publish():
         start = index // per_row * per_row
-        for source, destination in (
+        copies = (
             (values.at[pl.ds(start, 2 * per_row), :], values_buf),
             (output.at[pl.ds(row, 1), :], row_buf),
-        ):
+        )
+        for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).start()
+        for source, destination in copies:
             pltpu.make_async_copy(source, destination, sem).wait()
-        columns = jnp.arange(128, dtype=jnp.int32)[None, :]
+        col_slots = (jnp.arange(128, dtype=jnp.int32) // width)[None, :]
+        row_base = row * per_row
         result = row_buf[...]
         values_matrix = values_buf[...]
         for source in range(2 * per_row):
-            source_record = records[start + source]
             updates = values_matrix[source : source + 1]
-            present = (source_record // per_row == row) & (
-                columns // width == source_record % per_row
-            )
+            present = col_slots == (records[start + source] - row_base)
             result = jnp.where(present, updates, result)
         row_buf[...] = result
         pltpu.make_async_copy(row_buf, output.at[pl.ds(row, 1), :], sem).start()
