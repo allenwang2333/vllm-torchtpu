@@ -2005,3 +2005,79 @@ def test_td8363_dflash_forward_and_sample_3d_view_slice_without_arange(monkeypat
         .view(padded_num_reqs, block_size - 1)
     )
     assert torch.equal(tokens, ref_tokens)
+
+
+def test_r13_tp_sharded_dflash_sampling_parity(monkeypatch):
+    """Verify _init_sharded_dflash_sampling and TP-sharded _dflash_forward_and_sample
+    match full-vocab argmax bit-for-bit with and without trailing vocab padding."""
+    import torch._dynamo
+
+    sample_fn = torch._dynamo.eval_frame.innermost_fn(
+        DFlashProposer._dflash_forward_and_sample
+    )
+    padded_num_reqs, block_size, hidden = 3, 4, 8
+    full_w = torch.randn(64, hidden)
+    full_hidden = torch.randn(padded_num_reqs * block_size, hidden)
+    ids_in = torch.zeros(padded_num_reqs * block_size, dtype=torch.int32)
+    pos_in = torch.arange(padded_num_reqs * block_size, dtype=torch.int32)
+
+    for use_mask, org_vocab in ((False, 64), (True, 60)):
+        ref_logits = (
+            full_hidden.view(padded_num_reqs, block_size, hidden)[:, 1:, :].reshape(
+                -1, hidden
+            )
+            @ full_w.t()
+        )
+        if use_mask:
+            ref_logits[:, org_vocab:] = float("-inf")
+        expected_tokens = (
+            ref_logits.argmax(dim=-1)
+            .to(torch.int32)
+            .view(padded_num_reqs, block_size - 1)
+        )
+
+        packed_per_rank = []
+        for r in range(4):
+            w_r = full_w[r * 16 : (r + 1) * 16]
+            dh = full_hidden.view(padded_num_reqs, block_size, hidden)[
+                :, 1:, :
+            ].reshape(-1, hidden)
+            loc = dh @ w_r.t()
+            if use_mask and r == 3:
+                loc[:, 12:] = float("-inf")
+            lmax, lidx = loc.max(dim=-1)
+            packed_per_rank.append(
+                torch.stack(
+                    [
+                        lmax.to(torch.float32),
+                        (lidx.to(torch.int32) + r * 16).to(torch.float32),
+                    ],
+                    dim=-1,
+                )
+            )
+        all_gathered = torch.cat(packed_per_rank, dim=0)
+
+        monkeypatch.setattr(
+            "vllm_torchtpu.spec_decode.dflash.tensor_model_parallel_all_gather",
+            lambda _t, dim=0, ag=all_gathered: ag,
+        )
+        prop_sh = _make_proposer(draft_tp=4, target_tp=4)
+        prop_sh.draft_model = SimpleNamespace(
+            model=lambda **_kw: full_hidden,
+            lm_head=SimpleNamespace(
+                shard_indices=SimpleNamespace(
+                    padded_org_vocab_start_index=48,
+                    num_org_elements=12 if use_mask else 16,
+                    num_added_elements_padded=0,
+                ),
+                tp_size=4,
+                weight=full_w[48:64],
+                bias=None,
+                num_embeddings_padded=64,
+                org_vocab_size=org_vocab,
+                num_embeddings_per_partition=16,
+            ),
+        )
+        prop_sh._init_sharded_dflash_sampling()
+        got_tokens, _ = sample_fn(prop_sh, ids_in, pos_in, block_size)
+        assert torch.equal(got_tokens, expected_tokens)

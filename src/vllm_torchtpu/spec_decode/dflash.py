@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -40,6 +41,8 @@ if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+_MAX_EXACT_FLOAT32_INT = 1 << 24
 
 
 class DFlashProposer:
@@ -128,6 +131,9 @@ class DFlashProposer:
         self._draft_paddings_cache: (
             tuple[list[int], list[int], dict[int, int]] | None
         ) = None
+        self._sharded_dflash_tp: int = 1
+        self._dflash_vocab_shard_offset: torch.Tensor | None = None
+        self._dflash_vocab_shard_mask: torch.Tensor | None = None
 
     @property
     def block_size(self) -> int:
@@ -219,6 +225,7 @@ class DFlashProposer:
             self._draft_tp_matches_target,
             force_share=self._force_share_target_embeddings,
         )
+        self._init_sharded_dflash_sampling()
 
         if hasattr(self.draft_model, "get_draft_attn_causal"):
             layer_causal_list = self.draft_model.get_draft_attn_causal()
@@ -242,6 +249,45 @@ class DFlashProposer:
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
                     attn_impl.initialize_kernel(attn_obj)
+
+    def _init_sharded_dflash_sampling(self) -> None:
+        """Prepare TP-sharded local argmax state for _dflash_forward_and_sample."""
+        self._sharded_dflash_tp = 1
+        self._dflash_vocab_shard_offset = None
+        self._dflash_vocab_shard_mask = None
+
+        draft = self.draft_model
+        lm_head = getattr(draft, "lm_head", None)
+        shard_indices = getattr(lm_head, "shard_indices", None)
+        tp_size = getattr(lm_head, "tp_size", 1)
+        weight = getattr(lm_head, "weight", None)
+        if (
+            not self._draft_replicated
+            and lm_head is not None
+            and shard_indices is not None
+            and isinstance(tp_size, int)
+            and tp_size > 1
+            and shard_indices.num_added_elements_padded == 0
+            and weight is not None
+            and weight.dim() == 2
+            and weight.is_floating_point()
+            and getattr(lm_head, "bias", None) is None
+            and lm_head.num_embeddings_padded < _MAX_EXACT_FLOAT32_INT
+        ):
+            self._dflash_vocab_shard_offset = torch.tensor(
+                shard_indices.padded_org_vocab_start_index,
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            if lm_head.num_embeddings_padded != lm_head.org_vocab_size:
+                mask = torch.zeros(
+                    lm_head.num_embeddings_per_partition,
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                mask[shard_indices.num_org_elements :] = float("-inf")
+                self._dflash_vocab_shard_mask = mask
+            self._sharded_dflash_tp = tp_size
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -1307,11 +1353,42 @@ class DFlashProposer:
         draft_hidden = hidden_3d[:, 1:, :].reshape(-1, valid_hidden.shape[-1])
 
         # 4. Compute draft logits and run 2D greedy argmax sampling inside the XLA graph
-        logits = self.draft_model.compute_logits(draft_hidden)
-        raw_ids = logits.argmax(dim=-1)
-        draft_tokens_chunk = (
-            raw_ids if raw_ids.dtype == torch.int32 else raw_ids.to(torch.int32)
-        ).view(padded_num_reqs, block_size - 1)
+        if self._sharded_dflash_tp > 1:
+            assert self._dflash_vocab_shard_offset is not None
+            logits_local = F.linear(draft_hidden, self.draft_model.lm_head.weight)
+            if self._dflash_vocab_shard_mask is not None:
+                logits_local = logits_local + self._dflash_vocab_shard_mask
+            local_max, local_idx = logits_local.max(dim=-1)
+            packed = torch.stack(
+                [
+                    local_max.to(torch.float32),
+                    (local_idx.to(torch.int32) + self._dflash_vocab_shard_offset).to(
+                        torch.float32
+                    ),
+                ],
+                dim=-1,
+            )
+            gathered = tensor_model_parallel_all_gather(packed, dim=0)
+            gathered_3d = gathered.view(
+                self._sharded_dflash_tp, draft_hidden.shape[0], 2
+            )
+            scores = gathered_3d[..., 0]
+            ids = gathered_3d[..., 1]
+            best_score = scores[0]
+            best_id = ids[0]
+            for r in range(1, self._sharded_dflash_tp):
+                better = scores[r] > best_score
+                best_score = torch.where(better, scores[r], best_score)
+                best_id = torch.where(better, ids[r], best_id)
+            draft_tokens_chunk = best_id.to(torch.int32).view(
+                padded_num_reqs, block_size - 1
+            )
+        else:
+            logits = self.draft_model.compute_logits(draft_hidden)
+            raw_ids = logits.argmax(dim=-1)
+            draft_tokens_chunk = (
+                raw_ids if raw_ids.dtype == torch.int32 else raw_ids.to(torch.int32)
+            ).view(padded_num_reqs, block_size - 1)
 
         return draft_tokens_chunk, hidden
 
