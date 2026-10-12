@@ -802,6 +802,23 @@ class TpuPlatform(Platform):
                 "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
             )
         kv_cache_layout = get_flashinfer_layout_string(layout)
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_producer"
+            and parallel_config.prefill_context_parallel_size > 1
+            and vllm_config.speculative_config.num_speculative_tokens != 1
+        ):
+            logger.info(
+                "Clamping prefill (kv_producer, pcp=%d) speculative_config.num_speculative_tokens "
+                "from %d to 1 and resetting synthetic rejection sampling.",
+                parallel_config.prefill_context_parallel_size,
+                vllm_config.speculative_config.num_speculative_tokens,
+            )
+            vllm_config.speculative_config.num_speculative_tokens = 1
+            vllm_config.speculative_config.rejection_sample_method = "standard"
+            vllm_config.speculative_config.synthetic_acceptance_rates = None
+            vllm_config.speculative_config.synthetic_acceptance_length = None
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
