@@ -280,7 +280,9 @@ def ragged_gather_reduce_v6(
     if col_chunk is None:
         col_chunk = pick_col_chunk(hidden, tile_tokens, nslots)
     else:
-        col_chunk = _col_chunk(hidden, col_chunk)
+        # A requested chunk that does not fit the deeper ring is narrowed
+        # (column chunking never changes the arithmetic).
+        col_chunk = _col_chunk(hidden, min(col_chunk, pick_col_chunk(hidden, tile_tokens, nslots)))
     num_tiles = num_tokens // tile_tokens
     e2 = tile_tokens * k + lanes
     gpad = _max_groups(tile_tokens, k) + lanes
