@@ -245,20 +245,25 @@ def fused_engram(
 
     # Keep all streams in each token tile and select one stream inside VMEM.
     # TPU BlockSpecs cannot squeeze the sublane dimension at the HBM boundary.
+    # Reuse one hidden/output buffer across the projection groups. Double
+    # buffering these full-stream tiles would exceed the VMEM budget.
+    hidden_spec = pl.BlockSpec(
+        (tile_m, streams, dim), local_block, pipeline_mode=pl.Buffered(1)
+    )
     result = pl.pallas_call(
         kernel,
         grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
             pl.BlockSpec((tp, tile_m, raw_words), token_block),
             pl.BlockSpec((tp, tile_m, scales.shape[-1]), token_block),
-            pl.BlockSpec((tile_m, streams, dim), local_block),
+            hidden_spec,
             pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
             pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
             pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
             pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
             pl.BlockSpec((tile_m, 1), lambda i, j, k: (i, 0)),
         ],
-        out_specs=pl.BlockSpec((tile_m, streams, dim), local_block),
+        out_specs=hidden_spec,
         out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
         scratch_shapes=[
             pltpu.VMEM((tile_m, in_features), weight.dtype),
