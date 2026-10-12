@@ -557,7 +557,7 @@ def _attention_kernel_fused_swa(
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
     cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
-    swa_kv_hbm_ref,  # bf16[max_num_tokens, window, head_dim]
+    swa_kv_hbm_ref,  # bf16[max_num_tokens // group_tokens, window, head_dim]
     swa_bias_hbm_ref,  # float32[max_num_tokens, window // 128, 128]
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -566,22 +566,26 @@ def _attention_kernel_fused_swa(
     bkv_rope_x2_ref,  # [2, batch_size, topk // 2, 128] bf16
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
-    swa_kv_x2_ref,  # [2, batch_size, window, head_dim] bf16
+    swa_kv_x2_ref,  # [2, batch_size // group_tokens, window, head_dim] bf16
     swa_bias_x2_ref,  # [2, batch_size, window // 128, 128] float32
     sems,  # [6, 2]
     *,
     sm_scale: float,
     batch_size: int = 1,
+    group_tokens: int = 1,
 ):
     """`_attention_kernel` with the sliding window folded into the softmax.
 
-    The window rows of every token arrive gathered in natural BF16 order
-    (``swa_kv``, dead records zeroed) with an additive column bias
-    (``swa_bias``: 0 for a live record, ``finfo.min`` for a ``-1`` record,
-    one sublane row per 128 window columns so the token axis stays untiled).
-    One token's scores are the lane concatenation ``[window | top-k]`` of two
-    MXU products, one softmax over both, and two PV products summed; there is
-    no SWA pre-pass state.
+    The window rows arrive gathered in natural BF16 order (``swa_kv``, dead
+    records zeroed) with a per-token additive column bias (``swa_bias``: 0
+    for a live record, ``finfo.min`` for a ``-1`` record, one sublane row per
+    128 window columns so the token axis stays untiled). With ``group_tokens
+    > 1`` every ``group_tokens`` consecutive tokens share one ``swa_kv`` row
+    block (their window union, see `fused_swa_inputs`), DMA'd once per
+    group; the bias selects each token's own window inside it. One token's
+    scores are the lane concatenation ``[window | top-k]`` of two MXU
+    products, one softmax over both, and two PV products summed; there is no
+    SWA pre-pass state.
     """
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -590,9 +594,16 @@ def _attention_kernel_fused_swa(
     cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
     bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
-    window = swa_kv_hbm_ref.shape[1]
-    assert swa_kv_hbm_ref.shape == (num_tokens, window, head_dim)
+    # ``window`` scores per token; a group block may hold more rows
+    # (``union``), of which token ``j`` of its group reads ``[j, j + window)``.
+    window = swa_bias_hbm_ref.shape[1] * 128
+    union = swa_kv_hbm_ref.shape[1]
+    assert group_tokens >= 1 and batch_size % group_tokens == 0
+    groups_per_batch = batch_size // group_tokens
+    assert swa_kv_hbm_ref.shape == (num_tokens // group_tokens, union, head_dim)
     assert swa_bias_hbm_ref.shape == (num_tokens, window // 128, 128)
+    assert window <= union and (union == window or union >= window + group_tokens - 1)
+    assert swa_kv_x2_ref.shape[1:] == (groups_per_batch, union, head_dim)
 
     q_dtype = q_hbm_ref.dtype
     assert o_hbm_ref.dtype == q_dtype
@@ -655,7 +666,9 @@ def _attention_kernel_fused_swa(
                 sems.at[1, sem_idx],
             ),
             (
-                swa_kv_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                swa_kv_hbm_ref.at[
+                    pl.ds(seq_idx_start // group_tokens, groups_per_batch)
+                ],
                 swa_kv_x2_ref.at[sem_idx, :],
                 sems.at[3, sem_idx],
             ),
@@ -716,7 +729,10 @@ def _attention_kernel_fused_swa(
             for i in range(window // 128)
         ]
         bias = rows[0] if len(rows) == 1 else jnp.concatenate(rows, axis=1)
-        return swa_kv_x2_ref.at[sem_idx, batch_idx][...], bias
+        group, offset = divmod(batch_idx, group_tokens)
+        if union == window:
+            return swa_kv_x2_ref.at[sem_idx, group][...], bias
+        return swa_kv_x2_ref[sem_idx, group, pl.ds(offset, window), :], bias
 
     def process():
         bi_sem_idx = sem_ids_ref[0]
@@ -785,7 +801,7 @@ def fused_swa_attention_call(
     q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], padded
     cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
     cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
-    swa_kv: jax.Array,  # bf16[max_num_tokens, window, head_dim]
+    swa_kv: jax.Array,  # bf16[max_num_tokens // group_tokens, window, head_dim]
     swa_bias: jax.Array,  # float32[max_num_tokens, window // 128, 128]
     kv_lens: jax.Array,  # i32[max_num_tokens]
     attention_sinks: jax.Array,  # float32[num_q_heads], padded
@@ -797,12 +813,29 @@ def fused_swa_attention_call(
     sm_scale: float,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> jax.Array:
-    """One chunk of `_attention_kernel_fused_swa`; returns the updated ``q``."""
+    """One chunk of `_attention_kernel_fused_swa`; returns the updated ``q``.
+
+    ``swa_kv`` holds one window row block per token, or one per group of
+    ``group_tokens = tokens // swa_kv.shape[0]`` consecutive tokens; the
+    chunk start and the kernel batch must then be group aligned.
+    """
     batch_size = kernel_batch_size
-    _, num_q_heads, head_dim = q.shape
+    num_tokens, num_q_heads, head_dim = q.shape
     _, topk_rows, lanes = cache_kv_nope.shape
     _, rope_rows, _ = cache_kv_rope.shape
-    window = swa_kv.shape[1]
+    window = swa_bias.shape[1] * 128
+    union = swa_kv.shape[1]
+    group_tokens = num_tokens // swa_kv.shape[0]
+    if (
+        group_tokens < 1
+        or num_tokens % swa_kv.shape[0]
+        or start_seq_idx % group_tokens
+        or batch_size % group_tokens
+    ):
+        raise ValueError(
+            f"swa_kv rows {swa_kv.shape[0]} must divide {num_tokens} tokens with "
+            f"group-aligned chunk start {start_seq_idx} and batch {batch_size}"
+        )
     end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
     grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
     in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [
@@ -813,7 +846,7 @@ def fused_swa_attention_call(
         pltpu.VMEM((2, batch_size, rope_rows * 2, lanes), jnp.bfloat16),
         pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
         pltpu.VMEM((2, batch_size, num_q_heads, head_dim), q.dtype),
-        pltpu.VMEM((2, batch_size, window, head_dim), swa_kv.dtype),
+        pltpu.VMEM((2, batch_size // group_tokens, union, head_dim), swa_kv.dtype),
         pltpu.VMEM((2, batch_size, window // 128, 128), jnp.float32),
         pltpu.SemaphoreType.DMA((6, 2)),
     ]
@@ -827,12 +860,15 @@ def fused_swa_attention_call(
         f"SparseMLA-fswa_{window}-p_{topk_rows}-bz_{batch_size}"
         f"-gcz_{cache_kv_nope.shape[0]}"
     )
+    if group_tokens > 1:
+        scope_name += f"-g_{group_tokens}" + (f"u_{union}" if union != window else "")
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(
                 _attention_kernel_fused_swa,
                 sm_scale=sm_scale,
                 batch_size=batch_size,
+                group_tokens=group_tokens,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),

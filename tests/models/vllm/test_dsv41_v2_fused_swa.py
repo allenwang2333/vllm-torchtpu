@@ -228,9 +228,22 @@ def _kernel_bias(swa_bias):
 
 
 def _run_fused_kernel(
-    q, nope_words, rope_words, swa_kv, swa_bias, kv_lens, sinks, *, scale, batch_size
+    q,
+    nope_words,
+    rope_words,
+    swa_kv,
+    swa_bias,
+    kv_lens,
+    sinks,
+    *,
+    scale,
+    batch_size,
+    group_tokens=1,
 ):
-    """Drive `_attention_kernel_fused_swa` over its whole grid on CPU."""
+    """Drive `_attention_kernel_fused_swa` over its whole grid on CPU.
+
+    ``swa_kv`` has one row block per token, or per ``group_tokens`` tokens.
+    """
     tokens, heads, dim = q.shape
     topk = nope_words.shape[1]
     window = swa_kv.shape[1]
@@ -254,7 +267,9 @@ def _run_fused_kernel(
         bkv_rope_x2_ref=_Ref(np.zeros((2, batch_size, topk // 2, 128), jnp.bfloat16)),
         bq_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
         bo_x2_ref=_Ref(np.zeros((2, batch_size, heads, dim), q.dtype)),
-        swa_kv_x2_ref=_Ref(np.zeros((2, batch_size, window, dim), jnp.bfloat16)),
+        swa_kv_x2_ref=_Ref(
+            np.zeros((2, batch_size // group_tokens, window, dim), jnp.bfloat16)
+        ),
         swa_bias_x2_ref=_Ref(np.zeros((2, batch_size, window // 128, 128), np.float32)),
         sems=_Ref(np.zeros((6, 2), np.int32)),
     )
@@ -270,9 +285,21 @@ def _run_fused_kernel(
             mock.patch.object(sparse_mla.pl, "num_programs", return_value=grid),
         ):
             sparse_mla._attention_kernel_fused_swa(
-                *refs.values(), sm_scale=scale, batch_size=batch_size
+                *refs.values(),
+                sm_scale=scale,
+                batch_size=batch_size,
+                group_tokens=group_tokens,
             )
     return jnp.asarray(out)
+
+
+def _expand_group_windows(union_kv, bias):
+    """Per-token ``[tokens, U, dim]`` view of group-shared ``[groups, U, dim]``."""
+    groups, _, _ = union_kv.shape
+    tokens = bias.shape[0]
+    per_token = jnp.repeat(union_kv, tokens // groups, axis=0)
+    live = bias > jnp.finfo(jnp.float32).min
+    return jnp.where(live[..., None], per_token, 0)
 
 
 # ==============================================================================
@@ -354,6 +381,89 @@ class TestFusedSwaKernel:
         np.testing.assert_allclose(out[:5], want[:5], rtol=1e-3, atol=1e-3)
         assert jnp.all(out[5] == 0)  # never sent to HBM
 
+    @pytest.mark.parametrize("batch_size", [6, 12])
+    def test_group_shared_windows_match_per_token(self, batch_size):
+        """6-token groups share one 256-row union block; bias picks the window."""
+        rng = np.random.default_rng(3)
+        tokens, heads, topk, union = 24, 8, 16, 256
+        groups, scale = tokens // 6, 0.1
+        q = jnp.asarray(rng.standard_normal((tokens, heads, HEAD_DIM)), jnp.float32)
+        nope_words = _fp8_rows(rng, tokens, topk)
+        rope = jnp.asarray(rng.standard_normal((tokens, topk, ROPE_DIM)), jnp.bfloat16)
+        rope_words = _rope_words(np.asarray(rope))
+        keys = _dequant_rows(nope_words, rope)
+        union_kv = rng.standard_normal((groups, union, HEAD_DIM)).astype(np.float32)
+        union_kv[:, 133:] = 0  # pad rows beyond the 133-row union
+        union_kv[2, :40] = np.nan  # dead rows a short request never opens
+        # Token j of a group opens union columns [j, j + 128); group 2 is a
+        # short request whose first 40 window records are dead.
+        col = np.arange(union)[None, None, :] - np.arange(6)[None, :, None]
+        in_window = (col >= 0) & (col < 128)
+        live = np.broadcast_to(in_window, (groups, 6, union)).copy()
+        live[2, :, :40] = False
+        live[3, 5] = False  # a token with no live window row at all
+        union_kv[2, :40] = 0  # `fused_swa_inputs` zeroes dead union rows
+        union_kv = jnp.asarray(union_kv, jnp.bfloat16)
+        bias = jnp.where(live.reshape(tokens, union), 0.0, jnp.finfo(jnp.float32).min)
+        kv_lens = jnp.asarray(([topk, 1, 5, topk, 9, topk] * 4)[:tokens], jnp.int32)
+        sinks = jnp.asarray(rng.standard_normal(heads), jnp.float32)
+
+        out = _run_fused_kernel(
+            q,
+            nope_words,
+            rope_words,
+            union_kv,
+            bias,
+            kv_lens,
+            sinks,
+            scale=scale,
+            batch_size=batch_size,
+            group_tokens=6,
+        )
+        per_token = _expand_group_windows(union_kv, bias)
+        want = _reference(q, keys, kv_lens, per_token, bias, sinks, scale)
+        assert not jnp.isnan(out).any()
+        np.testing.assert_allclose(out, want, rtol=1e-3, atol=1e-3)
+
+    def test_group_union_sliced_per_token_matches_per_token(self):
+        """A 144-row union block; token j scores rows [j, j + 128) only."""
+        rng = np.random.default_rng(5)
+        tokens, heads, topk, union, window = 12, 8, 16, 144, 128
+        groups, scale = tokens // 6, 0.1
+        q = jnp.asarray(rng.standard_normal((tokens, heads, HEAD_DIM)), jnp.float32)
+        nope_words = _fp8_rows(rng, tokens, topk)
+        rope = jnp.asarray(rng.standard_normal((tokens, topk, ROPE_DIM)), jnp.bfloat16)
+        rope_words = _rope_words(np.asarray(rope))
+        keys = _dequant_rows(nope_words, rope)
+        union_kv = rng.standard_normal((groups, union, HEAD_DIM)).astype(np.float32)
+        union_kv[:, 133:] = 0
+        union_kv[1, :20] = 0  # dead records of a short request, zeroed upstream
+        union_kv = jnp.asarray(union_kv, jnp.bfloat16)
+        live = np.ones((groups, 6, window), bool)
+        live[1, :, :20] = False
+        bias = jnp.where(live.reshape(tokens, window), 0.0, jnp.finfo(jnp.float32).min)
+        kv_lens = jnp.asarray([topk, 1, 5, topk, 9, topk] * 2, jnp.int32)
+        sinks = jnp.asarray(rng.standard_normal(heads), jnp.float32)
+
+        out = _run_fused_kernel(
+            q,
+            nope_words,
+            rope_words,
+            union_kv,
+            bias,
+            kv_lens,
+            sinks,
+            scale=scale,
+            batch_size=6,
+            group_tokens=6,
+        )
+        per_token = jnp.stack(
+            [union_kv[t // 6, t % 6 : t % 6 + window] for t in range(tokens)]
+        )
+        want = _reference(q, keys, kv_lens, per_token, bias, sinks, scale)
+        assert not jnp.isnan(out).any()
+        np.testing.assert_allclose(out, want, rtol=1e-3, atol=1e-3)
+
     def test_rejects_mismatched_shapes(self):
         q = _Ref(np.zeros((4, 8, HEAD_DIM), np.float32))
         good = dict(
@@ -414,7 +524,11 @@ class TestFusedSwaAttentionCall:
         assert captured["input_output_aliases"] == {5: 0}
         assert captured["name"] == f"SparseMLA-fswa_{window}-p_{topk}-bz_8-gcz_{tokens}"
         assert captured["out_shape"].shape == q.shape
-        assert captured["kernel"].keywords == {"sm_scale": 0.5, "batch_size": 8}
+        assert captured["kernel"].keywords == {
+            "sm_scale": 0.5,
+            "batch_size": 8,
+            "group_tokens": 1,
+        }
         grid_spec = captured["grid_spec"]
         assert grid_spec.num_scalar_prefetch == 4
         assert len(grid_spec.in_specs) == 6
@@ -423,6 +537,71 @@ class TestFusedSwaAttentionCall:
         assert scratch[4].shape == (2, 8, window, HEAD_DIM)
         assert scratch[5].shape == (2, 8, window // 128, 128)
         assert int(grid_spec.grid[0]) == 3
+
+    def test_builds_group_shared_window_call(self):
+        captured = {}
+
+        def fake_pallas_call(kernel, **kwargs):
+            captured.update(kwargs)
+            captured["kernel"] = kernel
+            return lambda *args: args[5]
+
+        tokens, heads, topk, union = 24, 8, 128, 256
+        q = jnp.zeros((tokens, heads, HEAD_DIM), jnp.bfloat16)
+        args = (
+            q,
+            jnp.zeros((tokens, topk, 128), jnp.int32),
+            jnp.zeros((tokens, topk // 4, 128), jnp.int32),
+            jnp.zeros((tokens // 6, union, HEAD_DIM), jnp.bfloat16),
+            jnp.zeros((tokens, union // 128, 128), jnp.float32),
+            jnp.zeros((tokens,), jnp.int32),
+            jnp.zeros((heads,), jnp.float32),
+        )
+        kw = dict(
+            start_seq_idx=0,
+            end_seq_idx=jnp.int32(tokens),
+            num_valid_tokens=jnp.int32(tokens),
+            sm_scale=0.5,
+        )
+        with mock.patch.object(
+            sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call
+        ):
+            sparse_mla.fused_swa_attention_call(*args, kernel_batch_size=12, **kw)
+        assert (
+            captured["name"]
+            == f"SparseMLA-fswa_{union}-p_{topk}-bz_12-gcz_{tokens}-g_6"
+        )
+        assert captured["kernel"].keywords["group_tokens"] == 6
+        scratch = captured["grid_spec"].scratch_shapes
+        assert scratch[4].shape == (2, 2, union, HEAD_DIM)  # 2 groups per batch
+        assert scratch[5].shape == (2, 12, union // 128, 128)  # bias stays per token
+        # Sliced layout: 144 union rows, 128 scored columns per token.
+        sliced = (
+            args[:3]
+            + (
+                jnp.zeros((tokens // 6, 144, HEAD_DIM), jnp.bfloat16),
+                jnp.zeros((tokens, 1, 128), jnp.float32),
+            )
+            + args[5:]
+        )
+        with mock.patch.object(
+            sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call
+        ):
+            sparse_mla.fused_swa_attention_call(*sliced, kernel_batch_size=6, **kw)
+        assert (
+            captured["name"]
+            == f"SparseMLA-fswa_128-p_{topk}-bz_6-gcz_{tokens}-g_6u_144"
+        )
+        scratch = captured["grid_spec"].scratch_shapes
+        assert scratch[4].shape == (2, 1, 144, HEAD_DIM)
+        assert scratch[5].shape == (2, 6, 1, 128)
+        # Batches and chunk starts must hold whole groups.
+        with pytest.raises(ValueError, match="group-aligned"):
+            sparse_mla.fused_swa_attention_call(*args, kernel_batch_size=8, **kw)
+        with pytest.raises(ValueError, match="group-aligned"):
+            sparse_mla.fused_swa_attention_call(
+                *args, kernel_batch_size=6, **dict(kw, start_seq_idx=4)
+            )
 
 
 # ==============================================================================
@@ -570,10 +749,61 @@ class TestFusedSwaHelpers:
         kv_ref, bias_ref = attention_kernels.fused_swa_inputs(
             pool, records, dim, group_tokens=0
         )
-        assert kv_grp.shape == (tokens, 128, dim)
-        assert bias_grp.shape == (tokens, 1, 128)
-        assert jnp.array_equal(kv_grp, kv_ref)
-        assert jnp.array_equal(bias_grp, bias_ref)
+        assert kv_ref.shape == (tokens, 128, dim) and bias_ref.shape == (tokens, 1, 128)
+        bias_ref = bias_ref.reshape(tokens, 128)
+        closed = jnp.finfo(jnp.float32).min
+        if attention_kernels.FUSED_SWA_UNION_SLICE:
+            # The kernel slices token j's rows [j, j + 128) itself; the bias
+            # is the plain per-token one.
+            assert kv_grp.shape == (groups, attention_kernels.FUSED_SWA_UNION_ROWS, dim)
+            assert bias_grp.shape == (tokens, 1, 128)
+            assert jnp.array_equal(bias_grp.reshape(tokens, 128), bias_ref)
+            for t in range(tokens):
+                g, j = divmod(t, 6)
+                open_cols = bias_ref[t] > closed
+                assert jnp.array_equal(
+                    kv_grp[g, j : j + 128][open_cols], kv_ref[t][open_cols]
+                )
+        else:
+            # Token j of a group reads union columns [j, j + 128): the same
+            # rows and the same bias the per-token path produces; every other
+            # column is closed.
+            union = attention_kernels.FUSED_SWA_UNION_WINDOW
+            assert kv_grp.shape == (groups, union, dim)
+            assert bias_grp.shape == (tokens, union // 128, 128)
+            bias_grp = bias_grp.reshape(tokens, union)
+            for t in range(tokens):
+                g, j = divmod(t, 6)
+                assert jnp.array_equal(bias_grp[t, j : j + 128], bias_ref[t])
+                assert jnp.all(bias_grp[t, :j] == closed)
+                assert jnp.all(bias_grp[t, j + 128 :] == closed)
+                open_cols = bias_ref[t] > closed
+                assert jnp.array_equal(
+                    kv_grp[g, j : j + 128][open_cols], kv_ref[t][open_cols]
+                )
+        assert jnp.all(kv_grp[:, 136:] == 0)  # pad rows past the 133-row union
+        assert not jnp.isnan(kv_grp.astype(jnp.float32)).any()
+
+    def test_fused_swa_inputs_group6_both_layouts_agree(self, monkeypatch):
+        """The 256-column union layout and the sliced layout carry the same rows."""
+        dim = 256
+        rows = jnp.asarray(
+            np.random.default_rng(9).standard_normal((512, dim)), jnp.bfloat16
+        )
+        bits = jax.lax.bitcast_convert_type(rows, jnp.uint16).astype(jnp.uint32)
+        pool = (bits[:, 0::2] | (bits[:, 1::2] << 16)).astype(jnp.int32)
+        records = jnp.arange(96, dtype=jnp.int32)[:, None] * 3 + jnp.arange(128)[None]
+        records = jnp.where(records < 300, records, -1)
+        monkeypatch.setattr(attention_kernels, "FUSED_SWA_UNION_SLICE", True)
+        kv_s, bias_s = attention_kernels.fused_swa_inputs(pool, records, dim)
+        monkeypatch.setattr(attention_kernels, "FUSED_SWA_UNION_SLICE", False)
+        kv_u, bias_u = attention_kernels.fused_swa_inputs(pool, records, dim)
+        assert kv_s.shape == (16, 144, dim) and kv_u.shape == (16, 256, dim)
+        assert jnp.array_equal(kv_s[:, :136], kv_u[:, :136])
+        assert bias_s.shape == (96, 1, 128) and bias_u.shape == (96, 2, 128)
+        for t in range(96):
+            j = t % 6
+            assert jnp.array_equal(bias_u[t].reshape(256)[j : j + 128], bias_s[t, 0])
 
 
 class TestFusedSwaDriver:
@@ -640,6 +870,64 @@ class TestFusedSwaDriver:
         assert kw["sm_scale"] == 0.25 and kw["kernel_batch_size"] == 16
         assert calls[1][3]["start_seq_idx"] == 16
         assert calls[1][3]["kernel_batch_size"] == 8
+
+    def test_union_gather_group_shared_windows(self):
+        """Group-shared `swa_kv` forces group-aligned kernel batches."""
+        i = self._inputs()
+        calls = []
+
+        def fake_fused(q, nope, rope, swa_kv, swa_bias, kv_lens, sinks, **kw):
+            calls.append((swa_kv.shape, kw["kernel_batch_size"], kw["start_seq_idx"]))
+            return q
+
+        grouped = dict(
+            swa_kv=jnp.ones((4, 256, 64), jnp.bfloat16),
+            swa_bias=jnp.zeros((24, 2, 128), jnp.float32),
+        )
+        with mock.patch.object(
+            sparse_mla, "fused_swa_attention_call", side_effect=fake_fused
+        ):
+            attention_kernels.sparse_ragged_paged_attention_union_gather(
+                i["q"],
+                i["cache_nope"],
+                i["cache_rope"],
+                i["topk_indices"],
+                i["page_indices"],
+                i["cu_q_lens"],
+                i["distribution"],
+                i["sinks"],
+                None,
+                None,
+                None,
+                gather_and_attention_chunk_size=24,
+                **grouped,
+            )
+        assert calls == [((4, 256, 128), 12, 0)]  # 16 -> 12, the 6-multiple
+        with pytest.raises(ValueError, match="not a multiple of group"):
+            attention_kernels.sparse_ragged_paged_attention_union_gather(
+                i["q"],
+                i["cache_nope"],
+                i["cache_rope"],
+                i["topk_indices"],
+                i["page_indices"],
+                i["cu_q_lens"],
+                i["distribution"],
+                i["sinks"],
+                None,
+                None,
+                None,
+                gather_and_attention_chunk_size=16,
+                **grouped,
+            )
+
+    def test_group_aligned_batch(self):
+        f = attention_kernels._group_aligned_batch
+        assert f(96, 16, 1) == 16 and f(100, 16, 1) == 10
+        assert f(96, 16, 6) == 12 and f(144, 16, 6) == 12 and f(96, 24, 6) == 24
+        assert f(6, 16, 6) == 6
+        assert f(12, 4, 6) == 6  # cap below the group: one group per batch
+        with pytest.raises(ValueError):
+            f(100, 16, 6)
 
     def test_union_gather_requires_both_fused_inputs(self):
         i = self._inputs()

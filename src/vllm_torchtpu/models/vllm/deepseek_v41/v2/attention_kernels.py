@@ -845,12 +845,16 @@ def sparse_ragged_paged_attention_union_gather(
         num_unique_all = jnp.zeros((num_chunks,), dtype=jnp.int32)
 
     valid_total = cu_q_lens[distribution[2]]
+    # Group-shared windows (`fused_swa_inputs`): one `swa_kv` block per
+    # `swa_group` tokens, so chunks and kernel batches stay group aligned.
+    swa_group = q.shape[0] // swa_kv.shape[0] if swa_kv is not None else 1
+    assert swa_group >= 1 and q.shape[0] % swa_group == 0
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
-        kbs = sparse_mla._largest_divisor(chunk_size, attention_kernel_batch_size)
+        kbs = _group_aligned_batch(chunk_size, attention_kernel_batch_size, swa_group)
         batch_end = start_pos + (
             sparse_mla.cdiv(
                 jnp.maximum(0, jnp.minimum(valid_total, end_pos) - start_pos),
@@ -962,6 +966,20 @@ def sparse_ragged_paged_attention_union_gather(
     return sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
 
 
+def _group_aligned_batch(chunk_size: int, cap: int, group: int) -> int:
+    """Largest divisor of ``chunk_size`` at most ``cap`` that ``group`` divides.
+
+    ``group == 1`` is `sparse_mla._largest_divisor`; otherwise the kernel batch
+    must hold whole token groups (and ``chunk_size`` must, too).
+    """
+    if chunk_size % group:
+        raise ValueError(f"chunk {chunk_size} is not a multiple of group {group}")
+    for batch in range(min(cap, chunk_size), 0, -1):
+        if chunk_size % batch == 0 and batch % group == 0:
+            return batch
+    return group
+
+
 def fused_swa_eligible(tokens: int, width: int, max_requests: int | None) -> bool:
     """Shapes `_attend_window` hands to the per-token `_attend`: decode-sized.
 
@@ -982,6 +1000,17 @@ def fused_swa_eligible(tokens: int, width: int, max_requests: int | None) -> boo
     return per_token and 0 < width <= 512
 
 
+# Row block of a 6-token group's shared window: the 133-row union of six
+# 128-wide windows. ``FUSED_SWA_UNION_SLICE`` pads it to 144 rows (one BF16
+# sublane tile past 133) and the kernel slices token ``j``'s 128 rows
+# ``[j, j + 128)`` from it in VMEM, scoring 128 window columns per token;
+# otherwise it is padded to 256 rows and every token scores all 256 columns
+# with its bias opening ``[j, j + 128)``.
+FUSED_SWA_UNION_SLICE = True
+FUSED_SWA_UNION_WINDOW = 256
+FUSED_SWA_UNION_ROWS = 144
+
+
 def fused_swa_inputs(
     swa_pool: jax.Array | tuple[jax.Array, jax.Array],
     swa_records: jax.Array,
@@ -999,9 +1028,11 @@ def fused_swa_inputs(
     ``0 * NaN`` out of the PV product, and zero/min-pads the trailing
     ``padded - width`` columns afterward. When ``group_tokens == 6`` and
     ``width == 128`` on ``48 < tokens <= 192`` with ``tokens % 6 == 0``, each
-    6-token group gathers its 133-row window union padded to 136 sublanes and
-    expands to ``[tokens, 128, dim]`` on the MXU. ``bias`` is ``finfo.min`` for
-    invalid/padded columns, laid out as one 128-lane row per 128 window
+    6-token group gathers its 133-row window union once and ``kv`` is
+    ``[tokens // 6, FUSED_SWA_UNION_WINDOW, dim]``: the kernel DMAs one block
+    per group and each token's ``bias`` row (``[tokens, 2, 128]``) opens its
+    own 128 columns ``[j, j + 128)`` of the union. ``bias`` is ``finfo.min``
+    for invalid/padded columns, laid out as one 128-lane row per 128 window
     columns so the kernel's per-batch DMA slices an untiled token axis.
     """
     tokens, width = swa_records.shape
@@ -1020,6 +1051,11 @@ def fused_swa_inputs(
             bias, ((0, 0), (0, pad)), constant_values=jnp.finfo(jnp.float32).min
         )
     elif group_tokens == 6 and width == 128 and 48 < tokens <= 192 and tokens % 6 == 0:
+        # One window union per 6-token group, handed to the kernel as is:
+        # token ``j`` of a group attends union columns ``[j, j + 128)``, which
+        # its bias row selects; the other columns (and the pad to 256) are
+        # ``finfo.min``. No per-token expansion, so the gathered rows are
+        # written and read once at 1/6 of the per-token volume.
         groups = tokens // 6
         grp = swa_records.reshape(groups, 6, 128)
         union_rec = jnp.pad(
@@ -1034,27 +1070,27 @@ def fused_swa_inputs(
         union_kv = jnp.where(
             (union_rec >= 0)[..., None], union_kv, jnp.zeros((), union_kv.dtype)
         )
-        basis = (
-            (
-                (jnp.arange(6)[:, None, None] + jnp.arange(128)[None, :, None])
-                == jnp.arange(136)[None, None, :]
-            )
-            .astype(union_kv.dtype)
-            .reshape(6 * 128, 136)
-        )
-        kv = (
-            jnp.einsum(
-                "mk,gkd->gmd",
-                basis,
-                union_kv,
-                preferred_element_type=jnp.float32,
-            )
-            .astype(union_kv.dtype)
-            .reshape(tokens, 128, dim)
-        )
         live = swa_records >= 0
-        kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
-        bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+        if FUSED_SWA_UNION_SLICE:
+            kv = jnp.pad(union_kv, ((0, 0), (0, FUSED_SWA_UNION_ROWS - 136), (0, 0)))
+            bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
+            padded = 128
+        else:
+            kv = jnp.pad(union_kv, ((0, 0), (0, FUSED_SWA_UNION_WINDOW - 136), (0, 0)))
+            # Token j's live mask shifted to union columns [j, j + 128): static
+            # pads, not a gather (an XLA gather on a pred array is a scalar
+            # loop).
+            live = live.reshape(groups, 6, 128)
+            live_col = jnp.stack(
+                [
+                    jnp.pad(live[:, j], ((0, 0), (j, FUSED_SWA_UNION_WINDOW - 128 - j)))
+                    for j in range(6)
+                ],
+                axis=1,
+            )
+            bias = jnp.where(live_col, 0.0, jnp.finfo(jnp.float32).min)
+            bias = bias.astype(jnp.float32).reshape(tokens, FUSED_SWA_UNION_WINDOW)
+            padded = FUSED_SWA_UNION_WINDOW
     else:
         swa_records = jnp.pad(swa_records, ((0, 0), (0, pad)), constant_values=-1)
         live = swa_records >= 0
