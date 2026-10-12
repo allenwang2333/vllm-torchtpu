@@ -203,14 +203,14 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
     dim = width // mult
 
     def kernel(x_ref, w_ref, pre_ref, mix_ref, square_ref, value_ref):
-        pre = pre_ref[...]
-        terms, sums = [], []
-        for m in range(mult):
+        pre, x = pre_ref[...], x_ref[:, :dim].astype(jnp.float32)
+        val_acc, sq_acc = pre[:, :1] * x, x * x
+        for m in range(1, mult):
             x = x_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
-            terms.append(pre[:, m : m + 1] * x)
-            sums.append(jnp.sum(x * x, axis=1, keepdims=True))
-        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
-        square_ref[...] = functools.reduce(jnp.add, sums)
+            val_acc = val_acc + pre[:, m : m + 1] * x
+            sq_acc = sq_acc + x * x
+        value_ref[...] = val_acc.astype(value_ref.dtype)
+        square_ref[...] = jnp.sum(sq_acc, axis=1, keepdims=True)
         parts = jnp.dot(x_ref[...], w_ref[...], preferred_element_type=jnp.float32)
         mix_ref[...] = (
             parts[:, :mixes]
@@ -240,7 +240,8 @@ def _flat_pre_sums(flat, weight, previous_pre, mixes, tile):
             jax.ShapeDtypeStruct((tokens, dim), flat.dtype),
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",), vmem_limit_bytes=48 * 1024 * 1024
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=(56 if tile > 96 else 48) * 1024 * 1024,
         ),
     )(flat, weight, previous_pre)
 
@@ -307,18 +308,17 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
     """Row tile for the flat Pallas passes, or None for the XLA path.
 
     Fixed sizes: 64, 96 and 128 (tile = tokens), 256 (tile 128), and
-    ``>= 1024`` multiples of 64 (tile 64). With ``fused_post``, buckets
-    ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are multiples of 96, 64 or 80 (in
-    that order) take Pallas: DSpark verify ``C * (K + 1)`` (384, 576, 768,
-    1152, ...) and draft ``C * K`` (400, 560, 640, ...). This is checked before
-    the ``>= 1024`` tile-64 rule. Job 1314 (tpu7x, width 20480), median
-    µs per call: 1152: tile 64 378.4 -> 96 373.8; 400: XLA 349.3 -> tile 80
-    324.9; 560: XLA 365.6 -> 80 337.1; 640: tile 64 335.5 vs 80 346.6, so 80
-    only covers sizes 96 and 64 do not divide. On the XLA path they pay a
-    ``T(4,128)`` relayout plus extra HBM passes over ``flat``. Tile 128 is not
-    used for them: the fused kernel's VMEM overflows at T=384/768. The
-    kernels are row-independent (outputs were bitwise equal across tiles in
-    Job 1314), so the tile only affects speed.
+    ``>= 1024`` multiples of 64 (tile 128 when divisible by 128, else 64). With
+    ``fused_post``, buckets ``>= _POST_PRE_PALLAS_MIN_TOKENS`` that are
+    multiples of 96, 128 (when ``>= 1024``), 64 or 80 (in that order) take
+    Pallas: DSpark verify ``C * (K + 1)`` (384, 576, 768, 1152, ...) and draft
+    ``C * K`` (400, 560, 640, ...). This is checked before the ``>= 1024``
+    rule. Job 1314 (tpu7x, width 20480), median µs per call: 1152: tile 64
+    378.4 -> 96 373.8; 400: XLA 349.3 -> tile 80 324.9; 560: XLA 365.6 -> 80
+    337.1; 640: tile 64 335.5 vs 80 346.6, so 80 only covers sizes 96 and 64 do
+    not divide. Job 1372 (TD9.3a, tpu7x, width 20480): tile 128 with 56 MB VMEM
+    at T=8192 cuts 80x call time from 61.86 ms to 55.39 ms (-6.47 ms), while
+    verify sizes (384..1152) keep tile 96 with 48 MB VMEM.
     """
     if 3 * mixes > 128:
         return None
@@ -327,11 +327,11 @@ def _pallas_tile(tokens: int, mixes: int, fused_post: bool = False) -> int | Non
     if tokens == 256:
         return 128
     if fused_post and tokens >= _POST_PRE_PALLAS_MIN_TOKENS:
-        for tile in (96, 64, 80):
+        for tile in (96, 128, 64, 80) if tokens >= 1024 else (96, 64, 80):
             if tokens % tile == 0:
                 return tile
     if tokens >= 1024 and tokens % 64 == 0:
-        return 64
+        return 128 if tokens % 128 == 0 else 64
     return None
 
 
@@ -464,14 +464,14 @@ def _flat_post_pre_sums(
                 k = i * mult + j
                 acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
             out_res_ref[:, j * dim : (j + 1) * dim] = acc.astype(out_res_ref.dtype)
-        pre = pre_ref[...]
-        terms, sums = [], []
-        for m in range(mult):
+        pre, x = pre_ref[...], out_res_ref[:, :dim].astype(jnp.float32)
+        val_acc, sq_acc = pre[:, :1] * x, x * x
+        for m in range(1, mult):
             x = out_res_ref[:, m * dim : (m + 1) * dim].astype(jnp.float32)
-            terms.append(pre[:, m : m + 1] * x)
-            sums.append(jnp.sum(x * x, axis=1, keepdims=True))
-        value_ref[...] = functools.reduce(jnp.add, terms).astype(value_ref.dtype)
-        square_ref[...] = functools.reduce(jnp.add, sums)
+            val_acc = val_acc + pre[:, m : m + 1] * x
+            sq_acc = sq_acc + x * x
+        value_ref[...] = val_acc.astype(value_ref.dtype)
+        square_ref[...] = jnp.sum(sq_acc, axis=1, keepdims=True)
         parts = jnp.dot(
             out_res_ref[...], w_ref[...], preferred_element_type=jnp.float32
         )
@@ -508,7 +508,8 @@ def _flat_post_pre_sums(
             jax.ShapeDtypeStruct((tokens, dim), flat.dtype),
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",), vmem_limit_bytes=48 * 1024 * 1024
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=(56 if tile > 96 else 48) * 1024 * 1024,
         ),
     )(sub_x, flat, post_layer_mix, comb_res_mix, weight, previous_pre)
 

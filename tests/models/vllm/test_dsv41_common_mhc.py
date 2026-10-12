@@ -187,11 +187,13 @@ def test_xla_path_matches_torch_reference(tokens, packed):
         (640, None, 64),  # tile 64 beat 80 here (Job 1314)
         (768, None, 96),
         (960, None, 96),
-        (1024, 64, 64),
+        (1024, 128, 128),
         (1056, None, 96),
-        (1152, 64, 96),  # TD8.237: C=192 verify, was 64 (18 -> 12 grid steps)
-        (2048, 64, 64),
-        (4096, 64, 64),
+        (1088, 64, 64),
+        (1152, 128, 96),  # TD8.237: C=192 verify keeps tile 96 for fused_post
+        (2048, 128, 128),
+        (4096, 128, 128),
+        (8192, 128, 128),
     ],
 )
 def test_pallas_tile(tokens, pre_tile, post_tile):
