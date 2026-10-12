@@ -171,6 +171,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
+    "TPU_PRECOMPILE_PEER_REPLAY",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -753,8 +754,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         # replay its artifact instead of tracing, lowering and compiling it
         # again. The artifact is the one vLLM's compile cache already holds for
         # that rank; this rank's cache entry becomes a hard link to it.
+        # With peer replay off, nothing replays another rank's artifact, so
+        # none records a fingerprint either: `load` replays a rank's own
+        # artifact without one, and a peer with replay on refuses it.
         peer = None
-        fingerprint = _graph_fingerprint(graph) if caching else None
+        fingerprint = (
+            _graph_fingerprint(graph)
+            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            else None
+        )
         if fingerprint is not None:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
@@ -859,7 +867,9 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
-            fingerprint = _graph_fingerprint(graph)
+            fingerprint = (
+                _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
+            )
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.

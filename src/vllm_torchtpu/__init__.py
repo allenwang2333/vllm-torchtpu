@@ -367,8 +367,13 @@ def _patch_vllm_compile_all_ranges() -> None:
     tracing and compiling the range again (see TpuCompilerAdaptor.compile).
     Startup then takes about as long as the slowest single range instead of
     the sum over ranges.
+
+    TPU_PRECOMPILE_PEER_REPLAY=0 turns that off: each rank compiles every
+    range itself, starting on a different one, and the ranks share only
+    through the Tier-2 cache.
     """
     import os
+    from collections import deque
 
     from vllm.compilation.piecewise_backend import (
         PiecewiseBackend,
@@ -415,6 +420,34 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         range_entry.compiled = True
 
+    def compile_rotated(self, local_rank: int) -> None:
+        """Compile every range here, each local rank starting on a different
+        one: the order without peer replay."""
+        range_entry_list = list(self.range_entries.values())
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            # Biggest first: local rank 0 starts on the biggest range, which
+            # takes far longer than the others and so bounds startup, instead
+            # of reaching it only after the smallest one.
+            range_entry_list.sort(key=lambda e: e.compile_range.end, reverse=True)
+
+        range_entry_len = len(range_entry_list)
+
+        expanded_indexes = list(range((range_entry_len + 7) // 8 * 8))
+        d = deque(sorted(expanded_indexes, key=lambda x: (x % 8, x)))
+        d.rotate(-local_rank * (len(d) // 8))
+        indexes = list(d)
+
+        for i in indexes:
+            if i >= len(range_entry_list):
+                continue
+
+            range_entry = range_entry_list[i]
+
+            if range_entry.compiled:
+                continue
+
+            compile_entry(self, range_entry)
+
     def compile_all_ranges(self) -> None:
         """Compile all range entries for this piecewise subgraph up front."""
         assert self.graph is not None, (
@@ -422,12 +455,16 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called."
         )
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if not envs.TPU_PRECOMPILE_PEER_REPLAY:
+            compile_rotated(self, local_rank)
+            return
+
         from vllm_torchtpu.compilation.tpu_compiler import (
             PEER_WAIT_S,
             wait_for_peer_artifact,
         )
 
-        local_rank = int(os.environ["LOCAL_RANK"])
         ranks = ranks_per_host()
         # Unknown: assume a full host, but do not wait on owners that may not
         # exist; a range nobody saved yet is then compiled here.

@@ -150,3 +150,24 @@ def test_biggest_first_off_deals_in_vllm_order(compile_all_ranges, monkeypatch):
     for rank in range(8):
         calls = _compile(compile_all_ranges, monkeypatch, rank)
         assert sorted(end for end, _ in calls) == SIZES
+
+
+@pytest.mark.parametrize(
+    "biggest_first, firsts",
+    [
+        ("1", [4096, 2048, 1024, 512, 256, 128, 64, 32]),
+        ("0", SIZES[:8]),
+    ],
+)
+def test_peer_replay_off_compiles_every_range_without_waiting(
+    compile_all_ranges, monkeypatch, biggest_first, firsts
+):
+    """TPU_PRECOMPILE_PEER_REPLAY=0: no owners and no waits; each local rank
+    starts on a different range and compiles every range itself."""
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", biggest_first)
+    runs = [_compile(compile_all_ranges, monkeypatch, r) for r in range(8)]
+    assert [calls[0][0] for calls in runs] == firsts
+    for calls in runs:
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES

@@ -612,3 +612,37 @@ class TestTpuCompilerCache:
         compile(a)
         compile(b)
         assert compiled == [0, 1]
+
+    def test_peer_replay_off_compiles_every_rank_itself(self, tmp_path, monkeypatch):
+        """TPU_PRECOMPILE_PEER_REPLAY=0: no peer lookup, no wait, no link,
+        and no fingerprint recorded; each rank compiles and saves its own."""
+        import pickle
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilerAdaptor,
+            wait_for_peer_artifact,
+        )
+
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+
+        def no_peer_lookup(*args, **kwargs):
+            raise AssertionError("looked for a peer artifact")
+
+        monkeypatch.setattr(TpuCompilerAdaptor, "_peer_paths", no_peer_lookup)
+        monkeypatch.setattr(TpuCompilerAdaptor, "_link_artifact", no_peer_lookup)
+        monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", no_peer_lookup)
+
+        compile(a)
+        with wait_for_peer_artifact(30.0):
+            _, handle = compile(b)
+
+        assert compiled == [0, 1]
+        assert replayed == []
+        key, path, _ = handle
+        assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
+        with open(path, "rb") as f:
+            assert pickle.load(f).fingerprint is None
