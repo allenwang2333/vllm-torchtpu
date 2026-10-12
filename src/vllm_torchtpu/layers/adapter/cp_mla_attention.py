@@ -382,17 +382,15 @@ def _build_ragged_all_to_all(world: int):
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
 
-    from vllm_torchtpu.distributed.dcp import (
-        DCP_AXIS_NAME,
-        DCP_LANE_AXIS_NAME,
-        get_or_create_dcp_mesh,
-    )
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
     from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 
     mesh = get_or_create_dcp_mesh()
     assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
-    # Every rank (lane x DCP) holds its own block; the exchange runs per lane.
-    rank_spec = P((DCP_LANE_AXIS_NAME, DCP_AXIS_NAME))
+    # Each rank's own block, as the DCP attention op lays out its per-rank
+    # partials (`_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS`); the exchange runs
+    # within each lane's DCP group.
+    rank_spec = P(DCP_AXIS_NAME)
 
     def body(x, rows):
         block = x.shape[0] // world
