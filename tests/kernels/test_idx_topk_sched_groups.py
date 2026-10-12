@@ -147,7 +147,15 @@ def _topk_group_ids(monkeypatch, group, chunk_tokens=256):
     args = (
         S((T, H_IDX, D_IDX), jnp.float8_e4m3fn),
         S((T, H_IDX), jnp.float32),
-        S((DCP * 16, 64, 4, 256), jnp.uint8),
+        # The cache is the one DCP-sharded input (in_specs P(dcp)); newer JAX
+        # checks the spec against the argument's sharding.
+        S(
+            (DCP * 16, 64, 4, 256),
+            jnp.uint8,
+            sharding=jax.sharding.NamedSharding(
+                mesh, jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+            ),
+        ),
         S((8,), jnp.int32),
         S((8 * 16,), jnp.int32),
         S((9,), jnp.int32),
@@ -166,7 +174,8 @@ def _topk_group_ids(monkeypatch, group, chunk_tokens=256):
         chunk_tokens=chunk_tokens,
         **({} if group == "default" else dict(global_scheduling_group_id=group)),
     )
-    text = _asm(_export(fn, *args))
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = _asm(_export(fn, *args))
     return seen, text
 
 
