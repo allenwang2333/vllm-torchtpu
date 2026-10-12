@@ -540,7 +540,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ones. Every merged row is bit-identical. 2 also splits the one lse
     # gather of TPU_DCP_MERGE_CHUNKED_LSE_AG into chunk 0's rows and the rest,
     # so chunk 0's reduce-scatter need not wait for the last attention chunk
-    # (same gathered rows). 0 = off.
+    # (same gathered rows). 3 also issues every attention chunk's SparseCore
+    # gather first and ties the later chunks' gathers to piece 0's buffers
+    # (`out_pieces_gather_first`), so the schedule closes the gathers before
+    # piece 0's reduce-scatter instead of holding them open under the
+    # attention calls. 0 = off.
     "TPU_DCP_MLA_MERGE_PIECES": env_int("TPU_DCP_MLA_MERGE_PIECES", 0),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate

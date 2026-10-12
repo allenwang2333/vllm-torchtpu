@@ -2604,6 +2604,7 @@ def prepare_outputs(
         "send_world",
         "out_pieces",
         "out_pieces_fault",
+        "out_pieces_gather_first",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -2653,6 +2654,7 @@ def sparse_ragged_paged_attention(
     send_world: int = 0,
     out_pieces: int = 0,
     out_pieces_fault: str | None = None,
+    out_pieces_gather_first: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -2787,6 +2789,9 @@ def sparse_ragged_paged_attention(
         exactly that piece (the chunked DCP merge's reduce-scatter k) need not
         wait for the later chunks.
       out_pieces_fault: test-only: "swap" exchanges pieces 0 and 1.
+      out_pieces_gather_first: With `out_pieces` taken: issue every chunk's
+        gather before any attention and tie the gathers of the chunks after
+        piece 0 to piece 0's buffers with an optimization barrier. Same values.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3140,28 +3145,16 @@ def sparse_ragged_paged_attention(
     piece_outs: list[jax.Array] = []
     piece_lses: list[jax.Array] = []
 
-    for i in range(num_chunks):
+    def run_chunk(i, chunk_lse, **extra):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        out_piece = None
-        piece_lse = lse
-        if piece_rows:
-            offset = start_pos // piece_rows * piece_rows
-            carried = None
-            if start_pos == offset:
-                # The piece's first chunk: fresh output, fresh -inf lse rows.
-                piece_lse = jnp.full((piece_rows, num_q_heads), -jnp.inf, jnp.float32)
-            else:
-                piece_lse = piece_lses.pop()
-                carried = piece_outs.pop()
-            out_piece = (piece_rows, offset, carried)
-        result = sparse_attention_chunk(
+        return sparse_attention_chunk(
             q,
             cache_kv_nope,
             cache_kv_rope,
             kv_lens,
             physical_indices,
-            piece_lse,
+            chunk_lse,
             start_pos=start_pos,
             end_pos=end_pos,
             token_end=cu_q_lens[distribution[2]],
@@ -3208,8 +3201,45 @@ def sparse_ragged_paged_attention(
             kv_write=kv_write,
             kv_write_fault=kv_write_fault,
             send_world=send_world,
-            out_piece=out_piece,
+            **extra,
         )
+
+    # Merge pieces, gathers first (`out_pieces_gather_first`): every chunk's
+    # SparseCore gather is issued up front, and the attention of the chunks
+    # after piece 0 waits on all of them together with piece 0's buffers (one
+    # optimization barrier). The gathers then end on the schedule before piece
+    # 0's merge can begin, instead of each just ahead of its own attention
+    # call, so the merge's SparseCore reduce-scatter is not queued behind
+    # gathers the schedule still holds open.
+    pre = [None] * num_chunks
+    gather_first = bool(piece_rows) and out_pieces_gather_first
+    if gather_first:
+        pre = [run_chunk(i, None, gather_only=True) for i in range(num_chunks)]
+    chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
+
+    for i in range(num_chunks):
+        start_pos = i * gather_and_attention_chunk_size
+        out_piece = None
+        piece_lse = lse
+        if piece_rows:
+            if gather_first and i == chunks_per_piece and i < num_chunks:
+                rest, piece_outs, piece_lses = lax.optimization_barrier(
+                    (pre[i:], piece_outs, piece_lses)
+                )
+                pre[i:] = rest
+            offset = start_pos // piece_rows * piece_rows
+            carried = None
+            if start_pos == offset:
+                # The piece's first chunk: fresh output, fresh -inf lse rows.
+                piece_lse = jnp.full((piece_rows, num_q_heads), -jnp.inf, jnp.float32)
+            else:
+                piece_lse = piece_lses.pop()
+                carried = piece_outs.pop()
+            out_piece = (piece_rows, offset, carried)
+        extra = {"out_piece": out_piece}
+        if pre[i] is not None:
+            extra["pre_gathered"] = pre[i]
+        result = run_chunk(i, piece_lse, **extra)
         if kv_write is not None:
             result, (cache_kv_nope, cache_kv_rope) = result
         if piece_rows:
@@ -3339,6 +3369,8 @@ def sparse_attention_chunk(
     row_widths: tuple[int, ...] = (),
     send_world: int = 0,
     out_piece: tuple[int, int, jax.Array | None] | None = None,
+    gather_only: bool = False,
+    pre_gathered: tuple | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -3379,6 +3411,9 @@ def sparse_attention_chunk(
     offset + rows)` -- `carried`, the piece's buffer from its previous chunk,
     or a fresh one when None -- and `lse` is that piece's `[rows, heads]`
     buffer. `q` is then only read. Returns `(piece_out, piece_lse)`.
+    `gather_only`: issue the chunk's gather and return its buffers
+    `(nope, rope, live_views)` instead of attending; `pre_gathered` is that
+    tuple, handed back to attend without gathering again.
     """
     if kv_write is not None and not gather_live_in_indices:
         raise ValueError("kv_write rides the fused-prep capped gather only")
@@ -3711,124 +3746,132 @@ def sparse_attention_chunk(
     live_views = None
     if group_tab is not None and topk_cap is None:
         raise ValueError("group_tab requires topk_cap")
-    if topk_cap is not None:
-        # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
-        # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
-        # slice. The live bound reaches the last window any gridded row needs
-        # (always window 0's live rows, so a chunk without overflow gathers
-        # exactly `(batch_end - start) * topk_cap` rows).
-        assert capped_windows is not None
-        gather_atoms = sparsecore_atoms_per_batch
-        if small_chunk and small_chunk_live_gather:
-            gather_atoms = small_chunk_gather_atoms
-        if gather_live_in_indices:
-            # `window_indices` is then the fused prep's 128-lane form: hand it
-            # to the gather flat (a bitcast, no relayout); its live vector
-            # sits right after the chunk's rows.
-            live_kwargs = dict(live_vec_offset=chunk_size * topk, linear_indices=True)
-        elif group_tab is not None:
-            # Live-group prep: 128-lane linear rows, bound from the table.
-            assert window_indices is not None and group_num_live is not None
-            live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
-        else:
-            live_tokens = batch_end - start_pos
-            token_windows = jnp.where(
-                jnp.arange(chunk_size) < live_tokens,
-                (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
-                1,
-            )
-            live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
-            num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
-                0, live_tokens
-            ) * topk_cap
-            live_kwargs = dict(num_live_indices=num_live_capped)
-        if window_indices is None:
-            assert indices is not None
-            window_indices = (
-                indices.reshape(chunk_size, capped_windows, topk_cap)
-                .transpose(1, 0, 2)
-                .reshape(capped_windows * chunk_size, topk_cap)
-            )
-        gathered = native_sc_gather.dsa_gather_native_sc(
-            cache_kv_nope,
-            cache_kv_rope,
-            window_indices,
-            out_size=chunk_size * topk,
-            atoms_per_batch=gather_atoms,
-            wait_mode=sparsecore_gather_wait_mode,
-            serve_pipelined=sparsecore_gather_pipelined,
-            live_multiple=kernel_batch_size
-            * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
-            kv_write=kv_write,
-            write_fault=kv_write_fault,
-            **live_kwargs,
-        )
-        gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
+    if pre_gathered is not None:
+        # Merge pieces with the gathers issued first (`gather_only` pass).
+        gathered_nope_buffer, gathered_rope_buffer, live_views = pre_gathered
         if kv_write is not None:
-            cache_kv_nope, cache_kv_rope = gathered[2:]
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap, 128
-        )
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
-        )
-        if group_tab is not None:
-            block = kernel_batch_size * GATHER_ATOM_ROWS
-            live_views = (
-                gathered_nope_buffer.reshape(
-                    chunk_size * topk // block, kernel_batch_size, GATHER_ATOM_ROWS, 128
-                ),
-                gathered_rope_buffer.reshape(
-                    chunk_size * topk // block,
-                    kernel_batch_size,
-                    GATHER_ATOM_ROWS // native_sc_gather.ROPE_PACKING,
-                    128,
-                ),
-            )
-    elif sparsecore_layout:
-        live_kwargs = {}
-        gather_atoms = sparsecore_atoms_per_batch
-        if small_chunk and small_chunk_live_gather:
-            gather_atoms = small_chunk_gather_atoms
-            live_kwargs = dict(
-                num_live_indices=num_valid_indices,
-                live_multiple=kernel_batch_size * topk,
-            )
-        elif live_gather_all_chunks:
-            live_kwargs = dict(
-                num_live_indices=num_valid_indices,
-                live_multiple=kernel_batch_size * topk,
-            )
-        gathered_nope_buffer, gathered_rope_buffer = (
-            native_sc_gather.dsa_gather_native_sc(
+            raise ValueError("pre_gathered does not carry kv_write caches")
+    else:
+        if topk_cap is not None:
+            # Window-major: window w of the chunk's top-k is rows [w*C, (w+1)*C)
+            # of a [W*C, topk_cap] index array; window 0 is the plain `topk_cap`
+            # slice. The live bound reaches the last window any gridded row needs
+            # (always window 0's live rows, so a chunk without overflow gathers
+            # exactly `(batch_end - start) * topk_cap` rows).
+            assert capped_windows is not None
+            gather_atoms = sparsecore_atoms_per_batch
+            if small_chunk and small_chunk_live_gather:
+                gather_atoms = small_chunk_gather_atoms
+            if gather_live_in_indices:
+                # `window_indices` is then the fused prep's 128-lane form: hand it
+                # to the gather flat (a bitcast, no relayout); its live vector
+                # sits right after the chunk's rows.
+                live_kwargs = dict(live_vec_offset=chunk_size * topk, linear_indices=True)
+            elif group_tab is not None:
+                # Live-group prep: 128-lane linear rows, bound from the table.
+                assert window_indices is not None and group_num_live is not None
+                live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
+            else:
+                live_tokens = batch_end - start_pos
+                token_windows = jnp.where(
+                    jnp.arange(chunk_size) < live_tokens,
+                    (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
+                    1,
+                )
+                live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
+                num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
+                    0, live_tokens
+                ) * topk_cap
+                live_kwargs = dict(num_live_indices=num_live_capped)
+            if window_indices is None:
+                assert indices is not None
+                window_indices = (
+                    indices.reshape(chunk_size, capped_windows, topk_cap)
+                    .transpose(1, 0, 2)
+                    .reshape(capped_windows * chunk_size, topk_cap)
+                )
+            gathered = native_sc_gather.dsa_gather_native_sc(
                 cache_kv_nope,
                 cache_kv_rope,
-                indices,
+                window_indices,
                 out_size=chunk_size * topk,
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                live_multiple=kernel_batch_size
+                * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
+                kv_write=kv_write,
+                write_fault=kv_write_fault,
                 **live_kwargs,
             )
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(
-            chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
-        )
-    else:
-        assert indices is not None
-        gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
-            cache_kv_nope,
-            cache_kv_rope,
-            indices.reshape(-1),
-            num_valid_indices=num_valid_indices,
-        )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(
-            chunk_size,
-            topk * kv_cache_utils.WORD_BYTES,
-            kv_cache_utils.TILE_LANE_BYTES,
-        )
-        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk, -1)
+            gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
+            if kv_write is not None:
+                cache_kv_nope, cache_kv_rope = gathered[2:]
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                capped_windows * chunk_size, topk_cap, 128
+            )
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
+            )
+            if group_tab is not None:
+                block = kernel_batch_size * GATHER_ATOM_ROWS
+                live_views = (
+                    gathered_nope_buffer.reshape(
+                        chunk_size * topk // block, kernel_batch_size, GATHER_ATOM_ROWS, 128
+                    ),
+                    gathered_rope_buffer.reshape(
+                        chunk_size * topk // block,
+                        kernel_batch_size,
+                        GATHER_ATOM_ROWS // native_sc_gather.ROPE_PACKING,
+                        128,
+                    ),
+                )
+        elif sparsecore_layout:
+            live_kwargs = {}
+            gather_atoms = sparsecore_atoms_per_batch
+            if small_chunk and small_chunk_live_gather:
+                gather_atoms = small_chunk_gather_atoms
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            elif live_gather_all_chunks:
+                live_kwargs = dict(
+                    num_live_indices=num_valid_indices,
+                    live_multiple=kernel_batch_size * topk,
+                )
+            gathered_nope_buffer, gathered_rope_buffer = (
+                native_sc_gather.dsa_gather_native_sc(
+                    cache_kv_nope,
+                    cache_kv_rope,
+                    indices,
+                    out_size=chunk_size * topk,
+                    atoms_per_batch=gather_atoms,
+                    wait_mode=sparsecore_gather_wait_mode,
+                    serve_pipelined=sparsecore_gather_pipelined,
+                    **live_kwargs,
+                )
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+            gathered_rope_buffer = gathered_rope_buffer.reshape(
+                chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
+            )
+        else:
+            assert indices is not None
+            gathered_nope_buffer, gathered_rope_buffer = dsa_gather.dsa_gather(
+                cache_kv_nope,
+                cache_kv_rope,
+                indices.reshape(-1),
+                num_valid_indices=num_valid_indices,
+            )
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                chunk_size,
+                topk * kv_cache_utils.WORD_BYTES,
+                kv_cache_utils.TILE_LANE_BYTES,
+            )
+            gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk, -1)
+    if gather_only:
+        return gathered_nope_buffer, gathered_rope_buffer, live_views
     # We treat each query token as a one independent sequence, attend to their
     # respective gathered kv tokens in the `gathered_kv_buffer`.
     # -1 in topk_indices is padded elements at the end of each row.

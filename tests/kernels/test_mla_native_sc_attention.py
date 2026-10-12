@@ -1473,6 +1473,14 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
         ref, ref_lse = jax.block_until_ready(run())
         out, lse = jax.block_until_ready(run(out_pieces=8))
+        # Gathers first (TPU_DCP_MLA_MERGE_PIECES=3): the same buffers.
+        out_gf, lse_gf = jax.block_until_ready(
+            run(out_pieces=8, out_pieces_gather_first=True)
+        )
+        np.testing.assert_array_equal(bits(out_gf), bits(out))
+        np.testing.assert_array_equal(
+            np.asarray(lse_gf).view(np.uint32), np.asarray(lse).view(np.uint32)
+        )
         self.assertEqual(out.shape, ref.shape)
         self.assertEqual(lse.shape, ref_lse.shape)
         np.testing.assert_array_equal(bits(out)[:real], bits(ref)[:real])

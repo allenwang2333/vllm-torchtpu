@@ -1408,6 +1408,7 @@ def sparse_mla_attention_dcp(
                 else ()
             ),
             out_pieces=merge_pieces,
+            out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
             **split_kwargs,
         )
