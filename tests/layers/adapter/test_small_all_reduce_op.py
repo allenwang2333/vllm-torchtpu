@@ -386,10 +386,10 @@ def test_valid_rows_op_takes_blocks_with_a_fold_path_with_the_mask_count(
     ar, _ = armed
     x = _block(rows)
     assert op.all_reduce_or(x, MESH, _fallback) is valid_rows.return_value
-    (block, meta), _ = valid_rows.call_args
-    assert block is x
-    assert meta.dtype == torch.int32
-    assert meta.tolist() == [5, 3]  # (valid rows, mesh index)
+    (block, n_valid, rank), _ = valid_rows.call_args
+    assert block is x and rank is op._RANK
+    assert n_valid.dtype == torch.int32
+    assert n_valid.tolist() == [5]
     ar.assert_not_called()
 
 
@@ -400,8 +400,8 @@ def test_valid_rows_count_is_the_whole_block_without_padding(
 
     token_padding._padding_state.update(64, 64)
     op.all_reduce_or(_block(32), MESH, _fallback)
-    (_, meta), _ = valid_rows.call_args
-    assert meta.tolist() == [32, 3]
+    (_, n_valid, _), _ = valid_rows.call_args
+    assert n_valid.tolist() == [32]
 
 
 @pytest.mark.parametrize("rows", [1, 8])
