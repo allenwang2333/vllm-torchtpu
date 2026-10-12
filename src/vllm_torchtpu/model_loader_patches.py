@@ -827,6 +827,22 @@ class ExpertParamStager:
         for param, _ in list(self._staged.values()):
             self.flush(param)
 
+    def release_pool(self) -> int:
+        """Drop the reusable host buffers; returns the bytes released.
+
+        The pool only serves later stand-ins of the same shape, so once
+        loading is done it is dead weight -- one buffer per staged shape,
+        GiBs per worker for large MoE models. A later load (e.g. a drafter)
+        allocates afresh.
+        """
+        released = sum(
+            buffer.numel() * buffer.element_size()
+            for buffers in self._pool.values()
+            for buffer in buffers
+        )
+        self._pool.clear()
+        return released
+
     def __len__(self) -> int:
         return len(self._staged)
 
@@ -909,11 +925,14 @@ def patch_moe_expert_write_staging() -> None:
     def process_weights_after_loading(model, model_config, target_device):
         during_load = stager.flushed
         stager.flush_all()
+        released = stager.release_pool()
         logger.info(
             "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.",
+            "expert landed, %d at the end of loading; released %.1f MiB of "
+            "host staging buffers.",
             during_load,
             stager.flushed - during_load,
+            released / 2**20,
         )
         return orig_process(model, model_config, target_device)
 
