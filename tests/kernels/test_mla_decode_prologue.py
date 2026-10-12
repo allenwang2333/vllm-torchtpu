@@ -304,7 +304,7 @@ def _causal_rows(positions, topk, rng):
     return rows
 
 
-def _dcp_run(dcp, *, candidate, fault=None):
+def _dcp_run(dcp, *, candidate, fault=None, **dcp_kwargs):
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
@@ -380,6 +380,7 @@ def _dcp_run(dcp, *, candidate, fault=None):
             dcp_size=dcp,
             interleave_size=INTERLEAVE,
             **extra,
+            **dcp_kwargs,
         )
 
     def finite_words(shape):

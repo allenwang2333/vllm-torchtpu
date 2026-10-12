@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
+    TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -565,6 +566,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # XLA-initialised aliased lse). Needs TPU_DCP_MLA_SPLIT_Q_LSE and
     # TPU_MLA_ROPE_NEOX_PERMUTE.
     "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
+    # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
+    # SparseCore gather feeding the attention kernel writes the step's KV rows
+    # into both caches itself (then fences), instead of a separate cache
+    # writer kernel (tc_scatter / scatter_rows). Same bytes, same owner mask.
+    "TPU_MLA_KV_WRITE_IN_GATHER": env_bool(
+        "TPU_MLA_KV_WRITE_IN_GATHER", default=False
+    ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")
