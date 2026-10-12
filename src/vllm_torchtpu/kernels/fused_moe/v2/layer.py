@@ -218,7 +218,9 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total, n_act_sca
     scale_bits = (
         None
         if scale_at == count_at
-        else lax.slice(exchange, (0, scale_at), (ep, scale_at + t_local * n_act_scales)).reshape(-1, n_act_scales)
+        else lax.slice(
+            exchange, (0, scale_at), (ep, scale_at + t_local * n_act_scales)
+        ).reshape(-1, n_act_scales)
     )
     counts = lax.slice(exchange, (0, count_at), (ep, count_at + e_total))
     return pairs, scale_bits, counts
@@ -297,6 +299,7 @@ def fused_ep_moe_v2(
     subchannel_fp8=None,
     requantize_mid=None,
     wire_bf16=None,
+    coalesce_peer_push=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -498,7 +501,7 @@ def fused_ep_moe_v2(
     if wire_bf16 is None:
         wire_bf16 = bool(
             form.wire_dtype is FP8
-            and T <= int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS)
+            and int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS) >= T
         )
     else:
         wire_bf16 = bool(wire_bf16)
@@ -521,6 +524,10 @@ def fused_ep_moe_v2(
         else None
     )
 
+    coalesce_peer_push = (
+        T <= 1024 if coalesce_peer_push is None else bool(coalesce_peer_push)
+    )
+
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -537,6 +544,7 @@ def fused_ep_moe_v2(
         act_block_size=act_block_size,
         wire_block_size=wire_block_size,
         wire_dtype=wire_dtype,
+        coalesce_peer_push=coalesce_peer_push,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -721,9 +729,7 @@ def fused_ep_moe_v2(
             else:
                 scale_bits = jnp.repeat(scale_bits_g, topk, axis=0).T
                 scale_slab = lax.bitcast_convert_type(
-                    jnp.zeros(
-                        (n_act_scales, scale_rows * HIDDEN_LANE_BLOCK), jnp.int32
-                    )
+                    jnp.zeros((n_act_scales, scale_rows * HIDDEN_LANE_BLOCK), jnp.int32)
                     .at[:, slab_row]
                     .add(scale_bits, mode="drop"),
                     jnp.float32,
@@ -820,13 +826,7 @@ def fused_ep_moe_v2(
     topk_w_args = (topk_weights_override,) if has_topk_weights_override else ()
     in_specs = (
         (P(ax),)
-        * (
-            4
-            + len(scale_args)
-            + len(gating_args)
-            + len(hash_args)
-            + len(topk_w_args)
-        )
+        * (4 + len(scale_args) + len(gating_args) + len(hash_args) + len(topk_w_args))
         + (P(),) * len(score_bias_args)
         + (P(ax),) * len(bias_args)
     )
@@ -876,6 +876,7 @@ def fused_ep_moe_v2(
         act_block_size,
         wire_block_size,
         wire_dtype,
+        coalesce_peer_push,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

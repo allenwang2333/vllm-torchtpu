@@ -641,6 +641,7 @@ def _build_fused_ep_moe_kernel(
     act_block_size=None,
     wire_block_size=None,
     wire_dtype=None,
+    coalesce_peer_push=None,
 ):
     """Build the pallas_call and the function that invokes it."""
     if act_fn not in ACT_FNS:
@@ -878,9 +879,18 @@ def _build_fused_ep_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
+    if coalesce_peer_push is None:
+        coalesce_peer_push = ragged_rows_alloc <= host.ragged_stride_bound(
+            1024, 8, ep * g_local, capacity
+        )
+    else:
+        coalesce_peer_push = bool(coalesce_peer_push)
     push_from_vmem = (
         False
-        if host.os.environ.get("VLLM_DSV41_MOE_V2_COALESCED_PUSH", "0") == "1"
+        if (
+            coalesce_peer_push
+            or host.os.environ.get("VLLM_DSV41_MOE_V2_COALESCED_PUSH", "0") == "1"
+        )
         else ragged_rows_alloc <= ep * g_local * tile_m
     )
     ls_window_rows = host.act_scale_window_rows(tile_m)
@@ -2023,9 +2033,7 @@ def _build_fused_ep_moe_kernel(
                         contrib_hbm.at[
                             pl.ds(src_block0 * ROWBLK, total_blocks * ROWBLK)
                         ],
-                        recv_hbm.at[
-                            pl.ds(dst_block0 * ROWBLK, total_blocks * ROWBLK)
-                        ],
+                        recv_hbm.at[pl.ds(dst_block0 * ROWBLK, total_blocks * ROWBLK)],
                         mehop_sem,
                     ).start()
 
@@ -2036,14 +2044,17 @@ def _build_fused_ep_moe_kernel(
             lax.fori_loop(0, n_visit, _push_scl_step, jnp.int32(0))
 
         def visit_step(visit_i, carry):
-            """Compute expert tiles without flushing pipeline between experts."""
+            """Compute expert tiles, overlapping per-expert push when uncoalesced."""
             e = visit_sm[visit_i]
             carry = expert_tiles(e, visit_i, carry)
+            if not push_from_vmem and not coalesce_peer_push:
+                carry = drain_commits(carry)
+                push_expert(e)
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
         carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
-        if not push_from_vmem:
+        if not push_from_vmem and coalesce_peer_push:
             drain_commits(carry_end)
             push_all_peers_coalesced()
 
@@ -2054,15 +2065,24 @@ def _build_fused_ep_moe_kernel(
                 _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
                 _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
                 return
-            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ALIGNED_ROWS))
-            _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ALIGNED_ROWS))
+            if coalesce_peer_push:
+                _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ALIGNED_ROWS))
+                _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ALIGNED_ROWS))
+            else:
+                _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ROWS))
+                _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
             _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
             _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
-            self_blocks = (
-                contrib_off_sm[g_local - 1, me]
-                + commit_len_sm[g_local - 1, me]
-                - contrib_off_sm[0, me]
-            )
+            if coalesce_peer_push:
+                self_blocks = (
+                    contrib_off_sm[g_local - 1, me]
+                    + commit_len_sm[g_local - 1, me]
+                    - contrib_off_sm[0, me]
+                )
+            else:
+                self_blocks = commit_len_sm[0, me]
+                for g in range(1, g_local):
+                    self_blocks = self_blocks + commit_len_sm[g, me]
             _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
@@ -2330,6 +2350,13 @@ def build_fused_ep_moe_kernel(**kwargs):
     the size is logged on every insert so a boot that is accumulating
     programs says so, rather than being read off host memory afterwards.
     """
+    coalesce = kwargs.get("coalesce_peer_push")
+    if coalesce is None:
+        cap = min(int(kwargs["capacity"]), HIDDEN_LANE_BLOCK)
+        coalesce = kwargs["ragged_rows_alloc"] <= host.ragged_stride_bound(
+            1024, 8, kwargs["ep"] * kwargs["g_local"], cap
+        )
+    kwargs = {**kwargs, "coalesce_peer_push": bool(coalesce)}
     key = tuple(sorted(kwargs.items()))
     fn = _BUILD_CACHE.get(key)
     if fn is None:
@@ -2570,9 +2597,7 @@ def _build_combine_kernel(
     )
 
     def fn(arrivals, coef, pos):
-        want_coef = (
-            (t_local, topk) if not per_block else (t_local, topk, n_wire_scales)
-        )
+        want_coef = (t_local, topk) if not per_block else (t_local, topk, n_wire_scales)
         if pos.shape != (t_local, topk) or coef.shape != want_coef:
             raise ValueError(
                 f"the combine takes token-major "
