@@ -1478,7 +1478,11 @@ def _resolve_fp8_pages(main, main_records, tokens):
         pages = torch.arange(
             total_pages, device=main_records.device, dtype=torch.int32
         ).unsqueeze(0)
-    starts = main_records.new_tensor([0, tokens])
+    # Keep the boundary in the lazy graph when called inside an attention op.
+    # new_tensor materializes an untracked buffer during TorchTPU traversal.
+    starts = (
+        torch.arange(2, device=main_records.device, dtype=main_records.dtype) * tokens
+    )
     return page_size, pages, starts
 
 
