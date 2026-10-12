@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax
 import torch
 
 from vllm_torchtpu import envs
@@ -421,7 +422,6 @@ def prebuild_ragged_all_to_all(world: int) -> None:
 
 
 def _build_ragged_all_to_all(world: int):
-    import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
 
