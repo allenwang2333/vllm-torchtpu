@@ -42,13 +42,16 @@ def _score_kernel(
     """Score one request's rows; keep other rows in the donated score tile."""
     rows, heads, _ = q_ref.shape
     request = request_ref[0]
-    max_length = jnp.int32(0)
-    for row in range(rows):
-        max_length = jnp.maximum(
-            max_length,
-            jnp.where(requests_ref[row] == request, lengths_ref[row], 0),
-        )
+    row_lengths = jnp.stack([lengths_ref[row] for row in range(rows)])[:, None]
+    row_is_req = (
+        jnp.stack([requests_ref[row] for row in range(rows)])[:, None] == request
+    )
+    max_length = jnp.max(jnp.where(row_is_req, row_lengths, 0))
     steps = pl.cdiv(max_length, KEY_TILE)
+    q_flat = q_ref[...].reshape(rows * heads, HEAD_DIM)
+    weights = weights_ref[...].astype(jnp.float32)
+    head_weights = [weights[:, head : head + 1] for head in range(heads)]
+    tile_iota = jnp.arange(KEY_TILE, dtype=jnp.int32)
 
     def physical_page(step):
         return pages_ref[step * KEY_TILE // page_size]
@@ -69,7 +72,7 @@ def _score_kernel(
         words = words_ref[...]
         # Byte b of each word holds channel d of key 4*r+b.
         key_bytes = jnp.stack(
-            [((words >> (8 * b)) & 255).astype(jnp.uint8) for b in range(4)],
+            [(words >> (8 * b)).astype(jnp.uint8) for b in range(4)],
             axis=1,
         ).reshape(KEY_TILE, HEAD_DIM)
         keys = pltpu.bitcast(key_bytes, jnp.float8_e4m3fn)
@@ -81,29 +84,22 @@ def _score_kernel(
         )
         similarities = jnp.einsum(
             "nd,kd->nk",
-            q_ref[...].reshape(rows * heads, HEAD_DIM),
+            q_flat,
             keys,
             preferred_element_type=jnp.float32,
         ).reshape(rows, heads, KEY_TILE)
-        weights = weights_ref[...].astype(jnp.float32)
-        values = jnp.maximum(similarities[:, 0], 0) * weights[:, 0:1]
+        relu_sim = jnp.maximum(similarities, 0)
+        values = relu_sim[:, 0] * head_weights[0]
         for head in range(1, heads):
-            values = (
-                values
-                + jnp.maximum(similarities[:, head], 0) * weights[:, head : head + 1]
-            )
+            values = values + relu_sim[:, head] * head_weights[head]
         values = values * key_scales
-        logical = step * KEY_TILE + jnp.arange(KEY_TILE, dtype=jnp.int32)
-        page_valid = (physical_page(step) >= 0) & (
-            physical_page(step) < scales_ref.shape[0]
+        logical = step * KEY_TILE + tile_iota
+        phys = physical_page(step)
+        page_valid = (phys >= 0) & (phys < scales_ref.shape[0])
+        value = jnp.where(
+            (logical[None, :] < row_lengths) & page_valid, values, -jnp.inf
         )
-        for row in range(rows):
-            value = jnp.where(
-                (logical < lengths_ref[row]) & page_valid, values[row], -jnp.inf
-            )
-            scores_ref[row] = jnp.where(
-                requests_ref[row] == request, value, old_ref[row]
-            )
+        scores_ref[...] = jnp.where(row_is_req, value, old_ref[...])
 
     pltpu.emit_pipeline(
         score,
@@ -163,13 +159,15 @@ def paged_scores(
     lengths = jnp.clip(lengths, 0, min(capacity, block_table.shape[1] * page_size))
     scores = jnp.full((rows, width), -jnp.inf, jnp.float32)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    iota = jnp.arange(rows, dtype=jnp.int32)
+    same_req = requests[:, None] == requests[None, :]
+    run_mask = (~jnp.any(same_req & (iota[None, :] < iota[:, None]), axis=1)) & jnp.any(
+        same_req & (lengths > 0)[None, :], axis=1
+    )
 
     def request_scores(row, result):
         request = requests[row]
         # This supports repeated and permuted request IDs, not just packed rows.
-        first = ~jnp.any(
-            (jnp.arange(rows, dtype=jnp.int32) < row) & (requests == request)
-        )
 
         def run(previous):
             pages = block_table[request]
@@ -213,8 +211,7 @@ def paged_scores(
                 previous,
             )
 
-        active = jnp.any((requests == request) & (lengths > 0))
-        return lax.cond(first & active, run, lambda x: x, result)
+        return lax.cond(run_mask[row], run, lambda x: x, result)
 
     return lax.fori_loop(0, rows, request_scores, scores)[:, :capacity]
 
