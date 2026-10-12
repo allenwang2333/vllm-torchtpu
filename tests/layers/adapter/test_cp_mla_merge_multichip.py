@@ -41,6 +41,12 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      bit for bit on every real row and zero on padding rows, eager and
      compiled, at decode-sized buckets and real counts; the same check fails
      when the exchange is sized one row short.
+  8. Sending the chunked merge's weighted partial in bf16
+     (`TPU_DCP_MERGE_RS_BF16`; 1 = bf16 reduce-scatter, 2 = bf16 all-to-all
+     plus a local f32 sum) is not bitwise: it is held to a max error in bf16
+     ulps of sum_r w_r |o_r| against the f64 reference (1.5 for mode 2, a
+     proof; 7 for mode 1) on hard and on spread partials, eager and compiled,
+     and the same bound fails when one rank's weight is 25 % too large.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -73,6 +79,7 @@ _ARM_DEFAULTS = {
     "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
     "TPU_DCP_LSE_MERGE_A2A_PACK": False,
     "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
+    "TPU_DCP_MERGE_RS_BF16": 0,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
@@ -88,7 +95,29 @@ ARMS = {
         "TPU_DCP_LSE_MERGE_A2A_PACK": True,
         "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": True,
     },
+    "chunk8_rsbf16": {"TPU_DCP_MERGE_CHUNKED": 8, "TPU_DCP_MERGE_RS_BF16": 1},
+    "chunk8_ag1_rsbf16": {
+        "TPU_DCP_MERGE_CHUNKED": 8,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": True,
+        "TPU_DCP_MERGE_RS_BF16": 1,
+    },
+    "chunk8_a2abf16": {"TPU_DCP_MERGE_CHUNKED": 8, "TPU_DCP_MERGE_RS_BF16": 2},
+    "chunk8_ag1_a2abf16": {
+        "TPU_DCP_MERGE_CHUNKED": 8,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": True,
+        "TPU_DCP_MERGE_RS_BF16": 2,
+    },
 }
+# bf16 wire (`TPU_DCP_MERGE_RS_BF16`): arm -> mode; held to a max error in bf16
+# ulps of sum_r w_r |o_r| (mode 2: 1.5, a proof; mode 1: 7, 1.5x the CPU
+# emulation's worst), not to today's merge.
+RS_BF16_ARMS = {
+    "chunk8_rsbf16": 1,
+    "chunk8_ag1_rsbf16": 1,
+    "chunk8_a2abf16": 2,
+    "chunk8_ag1_a2abf16": 2,
+}
+RS_BF16_MAX_ULP = {1: 7.0, 2: 1.5}
 # Arms that must return today's merge: same per-row arithmetic, other schedule.
 CHUNK_ARMS = ("chunk2", "chunk4", "chunk8", "chunk8_ag1")
 # Collapsed lse gathers (`TPU_DCP_MERGE_CHUNKED_LSE_AG`): bitwise chunk8.
@@ -212,6 +241,93 @@ def _error_stats(got, ref):
         "frac_over_1ulp": float((err > tol).mean()),
         "max_abs_err": float(np.nan_to_num(err, nan=np.inf).max()),
     }
+
+
+def _scale_ulp_stats(got, outputs, lses, rank, world):
+    """|got - f64| in bf16 ulps of sum_r w_r |o_r| over this rank's heads."""
+    import numpy as np
+
+    local = outputs.shape[2] // world
+    sl = slice(rank * local, (rank + 1) * local)
+    out = outputs[:, :, sl].float().numpy().astype(np.float64)
+    lse = lses[:, :, sl].numpy().astype(np.float64)
+    fin = np.isfinite(lse)
+    shift = np.where(fin, lse, -np.inf).max(axis=0)
+    shift = np.where(np.isfinite(shift), shift, 0.0)
+    w = np.where(fin, np.exp(lse - shift[None]), 0.0)
+    den = w.sum(axis=0)
+    w = w / np.where(den > 0.0, den, 1.0)
+    ref = (out * w[..., None]).sum(axis=0)
+    scale = (np.abs(out) * w[..., None]).sum(axis=0)
+    g = got.float().numpy().astype(np.float64)
+    err = np.abs(g - ref)
+    ulp = np.exp2(np.floor(np.log2(np.where(scale > 0, scale, 1.0))) - 7)
+    e = np.where(scale > 0, err / ulp, np.where(err == 0, 0.0, np.inf))
+    e = np.nan_to_num(e, nan=np.inf)
+    return {
+        "finite": bool(np.isfinite(g).all()),
+        "max_ulp": float(e.max()),
+        "mean_ulp": float(e[np.isfinite(e)].mean()) if np.isfinite(e).any() else 0.0,
+        "frac_over_1ulp": float((e > 1.0).mean()),
+    }
+
+
+def _rs_bf16_checks(rank, world, cp_mla, merge):
+    """TPU_DCP_MERGE_RS_BF16 arms (and today's chunk8 for scale) vs the f64
+    reference on hard and on spread partials; the wrong-weight control."""
+    import torch
+
+    report = {}
+    g = torch.Generator().manual_seed(4242)
+    cases = {"hard": _global_partials(world, CHECK_TOKENS)}
+    for spread in (0.5, 4.0):
+        outputs = torch.randn(world, 256, HEADS, VDIM, generator=g).to(torch.bfloat16)
+        lses = torch.randn(world, 256, HEADS, generator=g) * spread + 3
+        cases[f"spread{spread}"] = (outputs, lses)
+    for case, (outputs, lses) in cases.items():
+        o_dev, l_dev = outputs[rank].to("tpu"), lses[rank].to("tpu")
+        for arm in ("chunk8", "chunk8_ag1", *RS_BF16_ARMS):
+            for how in ("eager", "compiled"):
+                key = f"rsbf16/{case}/{arm}/{how}"
+                try:
+                    _set_arm(cp_mla, arm)
+                    fn = merge if how == "eager" else _compile(merge)
+                    got = fn(o_dev, l_dev).cpu()
+                    report[key] = {
+                        "dtype": str(got.dtype),
+                        **_scale_ulp_stats(got, outputs, lses, rank, world),
+                    }
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    traceback.print_exc()
+                    report[key] = {"error": repr(exc)[:400]}
+    # Positive control: rank 1 weighs its partial 25 % too heavily.
+    import math
+
+    real = cp_mla._weighted_reduce_scatter
+
+    def wrong(output, lse_f32, lses_g, group):
+        if int(group.rank_in_group) == 1:
+            lse_f32 = lse_f32 + math.log(1.25)
+        return real(output, lse_f32, lses_g, group)
+
+    cp_mla._weighted_reduce_scatter = wrong
+    try:
+        outputs, lses = cases["spread4.0"]
+        o_dev, l_dev = outputs[rank].to("tpu"), lses[rank].to("tpu")
+        for arm in RS_BF16_ARMS:
+            for how in ("eager", "compiled"):
+                key = f"control_wrong_weight/{arm}/{how}"
+                try:
+                    _set_arm(cp_mla, arm)
+                    fn = merge if how == "eager" else _compile(merge)
+                    got = fn(o_dev, l_dev).cpu()
+                    report[key] = _scale_ulp_stats(got, outputs, lses, rank, world)
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    traceback.print_exc()
+                    report[key] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla._weighted_reduce_scatter = real
+    return report
 
 
 def _weights(l_recv):
@@ -534,6 +650,7 @@ def _check(rank, world, group, cp_mla):
         cp_mla._all_to_all = real
 
     report.update(_real_rows_checks(rank, world, cp_mla, merge))
+    report.update(_rs_bf16_checks(rank, world, cp_mla, merge))
 
     # Positive control for the chunked merge: every chunk weighted with its
     # neighbour row's lse. The same check must now fail.
@@ -611,7 +728,8 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         qsl = torch.tensor([0, max(1, tokens // 4)], dtype=torch.int32).to("tpu")
         arms = ("today", "a2a", *PACK_ARMS, "a2a_pack_real", *MERGE_VARIANTS)
         if tokens > 256:
-            arms = ("today", *CHUNK_ARMS)
+            arms = os.environ.get("DCP_MERGE_BENCH_ARMS", "").split(",")
+            arms = tuple(a for a in arms if a) or ("today", *CHUNK_ARMS, *RS_BF16_ARMS)
         for arm in arms:
             _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else arm)
             cp_mla._merge_received = MERGE_VARIANTS.get(arm, real_merge)
@@ -911,6 +1029,24 @@ def assert_merge_results(results: list[dict]) -> None:
                 how,
                 ctl,
             )
+        for arm, mode in RS_BF16_ARMS.items():
+            bound = RS_BF16_MAX_ULP[mode]
+            for how in ("eager", "compiled"):
+                for case in ("hard", "spread0.5", "spread4.0"):
+                    c = check[f"rsbf16/{case}/{arm}/{how}"]
+                    assert "error" not in c, (r["rank"], case, arm, how, c)
+                    assert c["dtype"] == "torch.bfloat16", (r["rank"], arm, how, c)
+                    assert c["finite"], (r["rank"], case, arm, how, c)
+                    assert c["max_ulp"] <= bound, (r["rank"], case, arm, how, c)
+                ctl = check[f"control_wrong_weight/{arm}/{how}"]
+                assert "error" not in ctl, (r["rank"], arm, how, ctl)
+                assert ctl["max_ulp"] > bound, (
+                    "positive control: a 25 % wrong weight must exceed the bound",
+                    r["rank"],
+                    arm,
+                    how,
+                    ctl,
+                )
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]
