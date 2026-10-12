@@ -211,6 +211,11 @@ def retain(out: torch.Tensor) -> torch.Tensor:
     if _RANK is None or not shape_variants.in_warmup():
         return out
     value = _RANK[0].to(out.dtype)
+    if envs.TPU_FUSED_ADD_RMSNORM and out.dim() == 2 and out.shape[0] > 1:
+        # Only the first row carries the zero (an in-place one-row update): a
+        # full-size add cannot fuse into a Pallas consumer (the fused RMSNorm
+        # reads this all-reduce output) and would cost a whole extra pass.
+        return torch.slice_scatter(out, out[:1] + (value - value), dim=0, start=0, end=1)
     return out + (value - value)
 
 
