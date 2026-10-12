@@ -125,6 +125,12 @@ class TpuRMSNorm(RMSNorm):
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
         if not self._use_pallas(x, residual):
             return super().forward(x, residual)
+        if x.dim() == 2:
+            # No view ops on the 2-D residual stream: a view the backend
+            # lowers as a relayout would cost a full pass at these sizes.
+            if residual is None:
+                return self._op_nores(x, self.weight.data)
+            return self._op_res(x, residual, self.weight.data)
         shape = x.shape
         x2 = x.reshape(-1, self.hidden_size)
         if residual is None:

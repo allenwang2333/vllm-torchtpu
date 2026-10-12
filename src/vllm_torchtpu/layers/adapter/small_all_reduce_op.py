@@ -211,11 +211,6 @@ def retain(out: torch.Tensor) -> torch.Tensor:
     if _RANK is None or not shape_variants.in_warmup():
         return out
     value = _RANK[0].to(out.dtype)
-    if envs.TPU_FUSED_ADD_RMSNORM and out.dim() == 2 and out.shape[0] > 1:
-        # Only the first row carries the zero (an in-place one-row update): a
-        # full-size add cannot fuse into a Pallas consumer (the fused RMSNorm
-        # reads this all-reduce output) and would cost a whole extra pass.
-        return torch.slice_scatter(out, out[:1] + (value - value), dim=0, start=0, end=1)
     return out + (value - value)
 
 
@@ -231,6 +226,12 @@ def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
         return fallback(x)
     if x.shape[0] <= max_rows():
         return _AR_OP(x, _RANK)
+    if envs.TPU_FUSED_ADD_RMSNORM:
+        # The zero rides on the all-reduce INPUT, where XLA fuses it into the
+        # producer's epilogue (sum of zeros is zero). On the output it cannot
+        # fuse into the Pallas RMSNorm that reads it, and costs a full pass
+        # (plus a relayout to the kernel's operand tiling).
+        return fallback(retain(x))
     return retain(fallback(x))
 
 
