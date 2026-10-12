@@ -231,6 +231,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
+    TPU_SAMPLER_VERIFY_TRIM: bool = False
 
 
 def env_with_choices(
@@ -1475,6 +1476,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # three uniform draws stay eager: same generator, shapes and order).
     "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN", True),
     "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", True),
+    # With TPU_SAMPLER_FUSED_CHAIN: a verify chunk whose drafts fit in 8 rows
+    # runs the rejection sampler's full-vocab target work (softmax, top-p
+    # bisection, recovery argmax) on 8 target rows instead of the padded
+    # logits length (16 at 1-2 requests with MTP k=3). The dropped rows are
+    # padding slots; the uniforms are drawn at the full shape and sliced, so
+    # tokens and accept decisions are unchanged.
+    "TPU_SAMPLER_VERIFY_TRIM": env_bool("TPU_SAMPLER_VERIFY_TRIM"),
     # With TPU_FP8_LINEAR_PALLAS: the skinny kernel takes its per-channel weight
     # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
     # ring. Without it XLA stages the scale (o_proj f32[6144]) into VMEM with a copy
