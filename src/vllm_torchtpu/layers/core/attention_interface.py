@@ -1240,7 +1240,7 @@ def sparse_mla_attention_dcp(
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
             )
-            # One u32[T, 384] operand: one TensorCore producer for the gather.
+            # One u32[3 * Tp, 128] operand: one TensorCore producer for the gather.
             kv_write = native_sc_gather.pack_write_rows(
                 kv_cache_utils._dst_rows(page, slot, nope_spec.page_size),
                 _pack_lane_dense(kv_c_normed, nope_spec.token_bytes),

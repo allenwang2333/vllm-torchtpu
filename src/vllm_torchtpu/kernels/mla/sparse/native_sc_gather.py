@@ -45,8 +45,8 @@ ROPE_PACKING = 4
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
 ROPE_WORDS = 32  # one rope token on the SparseCore view of the rope cache
-# `write_rows` (the write phase's one operand) word offsets, u32[T, 384].
-WRITE_NOPE_WORD, WRITE_ROPE_WORD, WRITE_DST_WORD, WRITE_ROW_WORDS = 0, 128, 256, 384
+# `write_rows` (the write phase's one operand), u32[3 * T, 128]: row blocks.
+WRITE_NOPE_PART, WRITE_ROPE_PART, WRITE_DST_PART, WRITE_PARTS = 0, 1, 2, 3
 
 
 def _delta_swap(x, y, shift, mask):
@@ -303,14 +303,16 @@ def _write_phase(
     `rope_cache.reshape(-1, 32)`), so unlike the TensorCore writer there is no
     read-modify-write of the shared 512 B row.
 
-    Everything arrives in one operand, `write_rows` u32[tokens, 384] (see
-    `pack_write_rows`): words [0, 128) the packed nope token, [128, 160) the
-    packed rope token, [256, 384) `dst + 1` broadcast (0 = skip: padding, or a
-    row another DCP rank owns). One operand because every TensorCore-produced
-    SparseCore operand costs the producer ~0.6 us at decode sizes (measured:
-    twin j-488b9087 / j-44074daf, one such op per operand per layer), and a
-    128-lane row needs no relayout. A SparseCore scalar comes from lane 0 of a
-    VMEM vector.
+    Everything arrives in one operand, `write_rows` u32[3 * tokens, 128] (see
+    `pack_write_rows`): row `t` the packed nope token, row `tokens + t` the
+    packed rope token in words [0, 32), row `2 * tokens + t` `dst + 1`
+    broadcast (0 = skip: padding, or a row another DCP rank owns). One operand
+    because every TensorCore-produced SparseCore operand costs the producer
+    ~0.6 us at decode sizes (twin j-488b9087 / j-44074daf: one such op per
+    operand per layer); 128-lane rows so the TensorCore (8, 128) tiling is
+    already the SparseCore's linear layout (a [T, 384] operand cost a 0.6 us
+    relayout, j-241c6f15). A SparseCore scalar comes from lane 0 of a VMEM
+    vector.
     """
     (rows_src,) = write_refs
     dst_vmem, dst_sem, write_sem = write_scratch
@@ -322,7 +324,7 @@ def _write_phase(
         token = jnp.int32(k) if single_writer else subcore + k * NUM_SUBCORES
         cp = pltpu.make_async_copy(
             rows_src.bitcast(jnp.int32).at[
-                pl.ds(token, 1), pl.ds(WRITE_DST_WORD, NUM_LANES)
+                pl.ds(WRITE_DST_PART * num_tokens + token, 1), pl.ds(0, NUM_LANES)
             ],
             dst_vmem.at[pl.ds(k, 1), :],
             # The single-writer control shares one semaphore set (SparseCore
@@ -342,12 +344,14 @@ def _write_phase(
             write = jnp.logical_and(write, subcore == 0)
         row = jnp.clip(dst, 0, num_rows - 1)
         nope_cp = pltpu.make_async_copy(
-            rows_src.at[pl.ds(token, 1), pl.ds(WRITE_NOPE_WORD, 128)],
+            rows_src.at[pl.ds(WRITE_NOPE_PART * num_tokens + token, 1)],
             nope_cache_ref.at[pl.ds(row, 1)],
             write_sem.at[0 if single_writer else 2 * k],
         )
         rope_cp = pltpu.make_async_copy(
-            rows_src.at[pl.ds(token, 1), pl.ds(WRITE_ROPE_WORD, ROPE_WORDS)],
+            rows_src.at[
+                pl.ds(WRITE_ROPE_PART * num_tokens + token, 1), pl.ds(0, ROPE_WORDS)
+            ],
             rope_cache_ref.at[pl.ds(row, 1)],
             write_sem.at[1 if single_writer else 2 * k + 1],
         )
@@ -381,13 +385,16 @@ def _write_phase(
 def pack_write_rows(
     dst_rows: jax.Array, nope_rows: jax.Array, rope_rows: jax.Array
 ) -> jax.Array:
-    """The write phase's single operand, u32[T, 384] (see `_write_phase`).
+    """The write phase's single operand, u32[3 * Tp, 128] (see `_write_phase`).
 
     `dst_rows` i32[T] (negative = skip), `nope_rows` u32[T, 128] and
     `rope_rows` u32[T, 32 or 128] (token in words [0, 32), rest zero), packed
-    for the SparseCore cache (`kv_cache_utils.pack_tokens`).
+    for the SparseCore cache (`kv_cache_utils.pack_tokens`). Tokens are padded
+    to `Tp`, a whole number of subcore rounds (16); padding rows are skipped.
     """
     t = dst_rows.shape[0]
+    if not 0 < t <= 2 * NUM_SUBCORES:
+        raise ValueError(f"kv_write takes 1..{2 * NUM_SUBCORES} tokens")
     if nope_rows.shape != (t, 128) or nope_rows.dtype != jnp.uint32:
         raise ValueError(f"nope_rows must be uint32[{t}, 128]")
     if rope_rows.shape not in ((t, ROPE_WORDS), (t, 128)) or (
@@ -396,10 +403,10 @@ def pack_write_rows(
         raise ValueError(f"rope_rows must be uint32[{t}, 32 or 128]")
     if rope_rows.shape[1] != 128:
         rope_rows = jnp.pad(rope_rows, ((0, 0), (0, 128 - ROPE_WORDS)))
+    tp = pl.cdiv(t, NUM_SUBCORES) * NUM_SUBCORES
     enc = jnp.where(dst_rows >= 0, dst_rows + 1, 0).astype(jnp.uint32)
-    return jnp.concatenate(
-        [nope_rows, rope_rows, jnp.broadcast_to(enc[:, None], (t, 128))], axis=1
-    )
+    parts = [nope_rows, rope_rows, jnp.broadcast_to(enc[:, None], (t, 128))]
+    return jnp.concatenate([jnp.pad(x, ((0, tp - t), (0, 0))) for x in parts], 0)
 
 
 def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
@@ -504,7 +511,8 @@ def dsa_gather_native_sc(
     for the SparseCore cache (`kv_cache_utils.pack_tokens`; a 128-wide rope
     operand carries the token in words [0, 32) and avoids a relayout), or
     those three already in the kernel's one-operand form, `pack_write_rows`'s
-    u32[T, 384] (what the serving path hands over: one TensorCore producer). They are written into
+    u32[3 * Tp, 128] (what the serving path hands over: one TensorCore
+    producer). They are written into
     both caches in place before anything is gathered, and the call then also
     returns the updated ``(nope_cache, rope_cache)``. Bytes identical to
     `scatter.scatter` / `tc_scatter.scatter_caches` with the same rows.
@@ -610,17 +618,19 @@ def dsa_gather_native_sc(
         write_rows = (
             kv_write if isinstance(kv_write, jax.Array) else pack_write_rows(*kv_write)
         )
-        write_tokens = write_rows.shape[0]
         if num_subcores != NUM_SUBCORES:
             raise ValueError(f"kv_write assumes {NUM_SUBCORES} subcores per core")
-        if not 0 < write_tokens <= 2 * NUM_SUBCORES:
-            raise ValueError(f"kv_write takes 1..{2 * NUM_SUBCORES} tokens")
-        if write_rows.shape[1] != WRITE_ROW_WORDS or write_rows.dtype != jnp.uint32:
-            raise ValueError(f"write_rows must be uint32[T, {WRITE_ROW_WORDS}]")
-        # Pad to whole subcore rounds; padding rows say dst + 1 = 0: skip.
-        padded = pl.cdiv(write_tokens, NUM_SUBCORES) * NUM_SUBCORES
-        if padded != write_tokens:
-            write_rows = jnp.pad(write_rows, ((0, padded - write_tokens), (0, 0)))
+        padded = write_rows.shape[0] // WRITE_PARTS
+        if (
+            write_rows.shape != (WRITE_PARTS * padded, 128)
+            or write_rows.dtype != jnp.uint32
+            or not 0 < padded <= 2 * NUM_SUBCORES
+            or padded % NUM_SUBCORES
+        ):
+            raise ValueError(
+                f"write_rows must be uint32[3 * Tp, 128], Tp in (16, 32); got "
+                f"{write_rows.shape} {write_rows.dtype}"
+            )
         operands.append(write_rows)
         rounds = write_slots(padded, write_fault)
         scratch_types["write_dst_vmem"] = pltpu.VMEM((rounds, NUM_LANES), jnp.int32)
