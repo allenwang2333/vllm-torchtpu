@@ -17,6 +17,11 @@ An optional traced live-row count (``num_live_indices``) bounds the outer
 emit_pipeline grid so only the logical batches holding live rows are gathered;
 rows beyond are left unwritten (the attention grid never reads them). Without
 it every row is gathered.
+
+An optional write phase (``kv_write``, TPU_MLA_KV_WRITE_IN_GATHER) first DMAs
+this step's packed new tokens into both caches in place, then fences, so the
+gather reads them: the decode step's KV-cache write rides the gather's launch
+instead of a TensorCore kernel of its own.
 """
 
 from __future__ import annotations
@@ -69,8 +74,23 @@ def _kernel(
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
     linear_indices: bool = False,
+    write_refs: tuple[Any, ...] | None = None,
+    write_scratch: tuple[Any, ...] | None = None,
+    write_tokens: int = 0,
+    write_fault: str | None = None,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
+    late_drain = None
+    if write_refs is not None and write_fault != "late_write":
+        late_drain = _write_phase(
+            write_refs,
+            write_scratch,
+            nope_hbm_ref,
+            rope_hbm_ref,
+            subcore=lax.axis_index(subcore_axis_name),
+            num_tokens=write_tokens,
+            fault=write_fault,
+        )
     live_batches = None
     if live_hbm_ref is not None:
         # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
@@ -220,6 +240,132 @@ def _kernel(
                 in_specs=(indices_spec,),
             )(indices_hbm_ref)
 
+    if late_drain is not None:
+        late_drain()
+    if write_refs is not None and write_fault == "late_write":
+        # Positive control: the write lands after the gather (stale reads).
+        _write_phase(
+            write_refs,
+            write_scratch,
+            nope_hbm_ref,
+            rope_hbm_ref,
+            subcore=lax.axis_index(subcore_axis_name),
+            num_tokens=write_tokens,
+            fault=None,
+        )
+
+
+# Test-only faults of the write phase (positive controls).
+WRITE_FAULTS = (
+    None,
+    "skip_write",
+    "wrong_row",
+    "ignore_owner",
+    # Subcore 0 of each core writes every token and nobody waits or fences
+    # before gathering (a single-writer design without its fence).
+    "no_fence",
+    # The writes are issued only after the gather (write/gather misordered).
+    "late_write",
+)
+
+
+def write_slots(num_tokens: int, fault: str | None) -> int:
+    """Write-phase scratch slots (dst vectors) for a padded token count."""
+    return num_tokens if fault == "no_fence" else num_tokens // NUM_SUBCORES
+
+
+def _write_phase(
+    write_refs: tuple[Any, ...],
+    write_scratch: tuple[Any, ...],
+    nope_cache_ref: Any,
+    rope_cache_ref: Any,
+    *,
+    subcore: jax.Array,
+    num_tokens: int,
+    fault: str | None,
+) -> Any:
+    """Write this step's packed tokens into both caches, then fence.
+
+    Every SparseCore core writes every token: its `NUM_SUBCORES` subcores
+    split the tokens (subcore s takes tokens s, s + 16, ...), wait their own
+    DMAs, and meet at `subcore_barrier`. So every row a core's gather reads
+    was written -- and completed -- by that core before its first gather DMA
+    (the write-then-barrier-then-read pattern of upstream
+    tests/pallas/tpu_sparsecore_pallas_test.py:2227-2240 @ce57049). The other
+    core writes the same rows with identical bytes, so the race between the
+    two cores' writes and either core's reads cannot change a byte, and no
+    cross-core fence is needed.
+
+    On a SparseCore view a rope token is its own 32-word row (the gather's
+    `rope_cache.reshape(-1, 32)`), so unlike the TensorCore writer there is no
+    read-modify-write of the shared 512 B row.
+
+    `dst` is broadcast over 16 lanes per token (`dst_hbm` i32[tokens * 16]):
+    a SparseCore scalar comes from lane 0 of a VMEM vector. `dst < 0` is
+    `SKIP_ROW` (padding, or a row another DCP rank owns).
+    """
+    dst_hbm, nope_src, rope_src = write_refs
+    dst_vmem, dst_sem, write_sem = write_scratch
+    num_rows = nope_cache_ref.shape[0]
+    single_writer = fault == "no_fence"
+    rounds = num_tokens if single_writer else pl.cdiv(num_tokens, NUM_SUBCORES)
+    copies = []
+    for k in range(rounds):
+        token = jnp.int32(k) if single_writer else subcore + k * NUM_SUBCORES
+        cp = pltpu.make_async_copy(
+            dst_hbm.at[pl.ds(token * NUM_LANES, NUM_LANES)],
+            dst_vmem.at[pl.ds(k * NUM_LANES, NUM_LANES)],
+            # The single-writer control shares one semaphore set (SparseCore
+            # has ~59 words of semaphores); each wait names its own copy.
+            dst_sem.at[0 if single_writer else k],
+        )
+        cp.start()
+        cp.wait()
+        dst = dst_vmem[pl.ds(k * NUM_LANES, NUM_LANES)][0]
+        if fault == "wrong_row":
+            dst = dst + 1
+        write = jnp.logical_and(dst >= 0, dst < num_rows)
+        if fault == "ignore_owner":
+            # A non-owned token written anyway (to row 0 of this shard).
+            write = jnp.logical_and(token < num_tokens, dst < num_rows)
+        if single_writer:
+            write = jnp.logical_and(write, subcore == 0)
+        row = jnp.clip(dst, 0, num_rows - 1)
+        nope_cp = pltpu.make_async_copy(
+            nope_src.at[pl.ds(token, 1)],
+            nope_cache_ref.at[pl.ds(row, 1)],
+            write_sem.at[0 if single_writer else 2 * k],
+        )
+        rope_cp = pltpu.make_async_copy(
+            rope_src.at[pl.ds(token, 1)],
+            rope_cache_ref.at[pl.ds(row, 1)],
+            write_sem.at[1 if single_writer else 2 * k + 1],
+        )
+        if fault == "skip_write":
+            continue
+
+        @pl.when(write)
+        def _(nope_cp=nope_cp, rope_cp=rope_cp):
+            nope_cp.start()
+            rope_cp.start()
+
+        copies.append((write, nope_cp, rope_cp))
+
+    def drain():
+        for write, nope_cp, rope_cp in copies:
+
+            @pl.when(write)
+            def _(nope_cp=nope_cp, rope_cp=rope_cp):
+                nope_cp.wait()
+                rope_cp.wait()
+
+    if fault == "no_fence":
+        # Gather while the writes are still in flight: no wait, no barrier
+        # before the gather; the caller drains at the end of the kernel.
+        return drain
+    drain()
+    plsc.subcore_barrier()
+    return None
 
 def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
     """Static gather geometry exactly as `dsa_gather_native_sc` resolves it.
@@ -266,6 +412,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "live_multiple",
         "linear_indices",
         "live_vec_offset",
+        "write_fault",
     ),
 )
 def dsa_gather_native_sc(
@@ -282,7 +429,9 @@ def dsa_gather_native_sc(
     live_vec: jax.Array | None = None,
     linear_indices: bool = False,
     live_vec_offset: int | None = None,
-) -> tuple[jax.Array, jax.Array]:
+    kv_write: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    write_fault: str | None = None,
+) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
     ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
@@ -313,6 +462,14 @@ def dsa_gather_native_sc(
     itself, at ``[live_vec_offset, live_vec_offset + 2 * NUM_LANES)``, past
     the ``out_size`` gathered indices -- the layout
     `prepare_capped_window_fused` writes, so its single output carries both.
+
+    ``kv_write`` (TPU_MLA_KV_WRITE_IN_GATHER) = ``(dst_rows, nope_rows,
+    rope_rows)``: i32[T] flattened cache rows (`page * page_size + slot`,
+    negative = skip), u32[T, 128] and u32[T, 32] tokens already packed for
+    the SparseCore cache (`kv_cache_utils.pack_tokens`). They are written into
+    both caches in place before anything is gathered, and the call then also
+    returns the updated ``(nope_cache, rope_cache)``. Bytes identical to
+    `scatter.scatter` / `tc_scatter.scatter_caches` with the same rows.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -348,9 +505,19 @@ def dsa_gather_native_sc(
         or live_vec_offset is not None
     )
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
+    if write_fault not in WRITE_FAULTS:
+        raise ValueError(f"unknown {write_fault=}")
+    nope_rows_view = nope_cache.reshape(-1, 128)
+    rope_rows_view = rope_cache.reshape(-1, 32)
+    write_tokens = 0
+    if kv_write is not None:
+        # The caches become refs the kernel writes in place (as
+        # `scatter_utils.scatter_rows` does); frozen back after the call.
+        nope_rows_view = jax.new_ref(nope_rows_view)
+        rope_rows_view = jax.new_ref(rope_rows_view)
     operands = [
-        nope_cache.reshape(-1, 128),
-        rope_cache.reshape(-1, 32),
+        nope_rows_view,
+        rope_rows_view,
         (
             indices.reshape(-1)
             if linear_indices
@@ -400,7 +567,34 @@ def dsa_gather_native_sc(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    body = functools.partial(
+    num_base = len(operands)  # nope, rope, indices[, live_vec]
+    if kv_write is not None:
+        dst_rows, nope_rows, rope_rows = kv_write
+        write_tokens = dst_rows.shape[0]
+        if num_subcores != NUM_SUBCORES:
+            raise ValueError(f"kv_write assumes {NUM_SUBCORES} subcores per core")
+        if not 0 < write_tokens <= 2 * NUM_SUBCORES:
+            raise ValueError(f"kv_write takes 1..{2 * NUM_SUBCORES} tokens")
+        if nope_rows.shape != (write_tokens, 128) or nope_rows.dtype != jnp.uint32:
+            raise ValueError(f"nope_rows must be uint32[{write_tokens}, 128]")
+        if rope_rows.shape != (write_tokens, 32) or rope_rows.dtype != jnp.uint32:
+            raise ValueError(f"rope_rows must be uint32[{write_tokens}, 32]")
+        # Pad to whole subcore rounds; padding is SKIP_ROW (-1), never written.
+        padded = pl.cdiv(write_tokens, NUM_SUBCORES) * NUM_SUBCORES
+        pad = padded - write_tokens
+        dst_rows = jnp.pad(dst_rows.astype(jnp.int32), (0, pad), constant_values=-1)
+        operands += [
+            jnp.repeat(dst_rows, NUM_LANES),
+            jnp.pad(nope_rows, ((0, pad), (0, 0))),
+            jnp.pad(rope_rows, ((0, pad), (0, 0))),
+        ]
+        rounds = write_slots(padded, write_fault)
+        scratch_types["write_dst_vmem"] = pltpu.VMEM((rounds * NUM_LANES,), jnp.int32)
+        sems = 1 if write_fault == "no_fence" else rounds
+        scratch_types["write_dst_sem"] = pltpu.SemaphoreType.DMA((sems,))
+        scratch_types["write_sem"] = pltpu.SemaphoreType.DMA((2 * sems,))
+        write_tokens = padded
+    inner = functools.partial(
         _kernel,
         core_axis_name=mesh.core_axis_name,
         subcore_axis_name=mesh.subcore_axis_name,
@@ -411,21 +605,24 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         linear_indices=linear_indices,
+        write_tokens=write_tokens,
+        write_fault=write_fault,
     )
-    if live_vec_offset is not None:
-        inner = body
 
-        def body(nope, rope, idx, nope_o, rope_o, **scr):
-            live_hbm = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
-            return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
+    def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
+        ins, (nope_o, rope_o) = refs[:-2], refs[-2:]
+        nope, rope, idx = ins[:3]
+        kw = {}
+        if live_vec_offset is not None:
+            kw["live_hbm_ref"] = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
+        elif live:
+            kw["live_hbm_ref"] = ins[3]
+        if kv_write is not None:
+            kw["write_refs"] = tuple(ins[num_base:])
+            kw["write_scratch"] = (write_dst_vmem, write_dst_sem, write_sem)
+        return inner(nope, rope, idx, nope_o, rope_o, **kw, **scr)
 
-    elif live:
-        inner = body
-
-        def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):
-            return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
-
-    return core_map_helper.kernel(
+    outs = core_map_helper.kernel(
         body,
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
@@ -441,5 +638,13 @@ def dsa_gather_native_sc(
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
+            f"{'_kvw' if kv_write is not None else ''}"
         ),
     )(*operands)
+    if kv_write is None:
+        return outs
+    return (
+        *outs,
+        jax.freeze(nope_rows_view).reshape(nope_cache.shape),
+        jax.freeze(rope_rows_view).reshape(rope_cache.shape),
+    )
