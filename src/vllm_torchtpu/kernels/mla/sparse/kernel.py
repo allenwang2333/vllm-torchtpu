@@ -3145,11 +3145,11 @@ def sparse_ragged_paged_attention(
     piece_outs: list[jax.Array] = []
     piece_lses: list[jax.Array] = []
 
-    def run_chunk(i, chunk_lse, **extra):
+    def run_chunk(i, chunk_lse, q_in=None, **extra):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         return sparse_attention_chunk(
-            q,
+            q if q_in is None else q_in,
             cache_kv_nope,
             cache_kv_rope,
             kv_lens,
@@ -3239,7 +3239,14 @@ def sparse_ragged_paged_attention(
         extra = {"out_piece": out_piece}
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
+        if piece_rows and i:
+            # Merge pieces leave the attention calls independent, and XLA is
+            # then free to run them in any order (it reversed them). Keep the
+            # incumbent's order -- the merge's chunk order -- by handing call
+            # i its (read-only) q through a barrier with call i-1's output.
+            extra["q_in"], _ = lax.optimization_barrier((q, prev_out))
         result = run_chunk(i, piece_lse, **extra)
+        prev_out = result[0]
         if kv_write is not None:
             result, (cache_kv_nope, cache_kv_rope) = result
         if piece_rows:
