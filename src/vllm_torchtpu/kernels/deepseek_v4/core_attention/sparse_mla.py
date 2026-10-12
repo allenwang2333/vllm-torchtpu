@@ -96,6 +96,14 @@ def gather_page_ids(
     """Gathers physical page ids for the CSA top-k tokens."""
     num_tokens, topk = seq_page_ids.shape
     pages_per_seq = page_indices.shape[0] // max_num_seqs
+    padded_tokens = align_to(num_tokens, block_tokens)
+    if num_tokens * pages_per_seq > 655360 or (
+        block_tokens < 8 and padded_tokens > block_tokens
+    ):
+        flat_idx = seq_ids_segment[:, None] * pages_per_seq + jnp.clip(
+            seq_page_ids, 0, pages_per_seq - 1
+        )
+        return page_indices[flat_idx]
     num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
     padded_pps = num_chunks * _GATHER_PAGE_CHUNK
 
@@ -106,7 +114,6 @@ def gather_page_ids(
     windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
     logical = jnp.clip(seq_page_ids, 0, pages_per_seq - 1)
 
-    padded_tokens = align_to(num_tokens, block_tokens)
     if padded_tokens != num_tokens:
         pad = padded_tokens - num_tokens
         windows = jnp.pad(windows, ((0, pad), (0, 0)))
@@ -154,6 +161,41 @@ def _dequant_dsv4_fp8(bkv_nope: jax.Array):
     )
     nope_scales = jnp.concatenate([tile] * 4, axis=1)[:, :NOPE_DIM]
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
+
+
+def _dequant_union_kv_kernel(u_nope_ref, u_rope_ref, out_ref, *, topk: int):
+    """Dequantize one period of unique KV rows to packed BF16 [topk, 512]."""
+    pid = pl.program_id(0)
+    bkv_nope = u_nope_ref.bitcast(jnp.uint8).at[pl.ds(pid * topk * 4, topk * 4), :][...]
+    deq_nope = _dequant_dsv4_fp8(bkv_nope.reshape(topk, 512))
+    bkv_rope = u_rope_ref.bitcast(jnp.bfloat16).at[
+        pl.ds(pid * (topk // 2), topk // 2), :
+    ][...]
+    bkv_rope = jnp.concatenate([bkv_rope[:, :64], bkv_rope[:, 64:]], axis=0)
+    out_ref[pl.ds(pid * topk, topk), :] = jnp.concatenate([deq_nope, bkv_rope], axis=-1)
+
+
+def dequant_union_kv(u_nope: jax.Array, u_rope: jax.Array, topk: int) -> jax.Array:
+    """Dequantize unique union KV rows once to BF16 ``[union_cap, 512]``."""
+    union_cap = u_nope.shape[0]
+    return pl.pallas_call(
+        functools.partial(_dequant_union_kv_kernel, topk=topk),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            grid=(union_cap // topk,),
+        ),
+        out_shape=jax.ShapeDtypeStruct((union_cap, 512), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            disable_bounds_checks=True,
+        ),
+        name="dequant_union_kv",
+    )(u_nope, u_rope)
 
 
 def _attention_kernel(
@@ -598,9 +640,13 @@ def _attention_kernel_fused_swa(
         tp_groups, g_heads = 1, 0
         num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
-    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
-    cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
-    bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
+    predequant_kv = cache_kv_nope_hbm_ref.dtype == jnp.bfloat16
+    if predequant_kv:
+        bkv_sz = cache_kv_nope_hbm_ref.shape[1]
+    else:
+        cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+        cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
+        bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
     # ``window`` scores per token; a group block may hold more rows
     # (``union``), of which token ``j`` of its group reads ``[j, j + window)``.
     window = swa_bias_hbm_ref.shape[1] * 128
@@ -666,7 +712,7 @@ def _attention_kernel_fused_swa(
             if rank_major_q
             else q_hbm_ref.at[pl.ds(seq_idx_start, batch_size)]
         )
-        copies = (
+        base_copies = (
             (
                 cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
                 bkv_nope_x2_ref.at[sem_idx, :],
@@ -689,11 +735,18 @@ def _attention_kernel_fused_swa(
                 swa_bias_x2_ref.at[sem_idx, :],
                 sems.at[4, sem_idx],
             ),
-            (
-                cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
-                bkv_rope_x2_ref.at[sem_idx, :],
-                sems.at[5, sem_idx],
-            ),
+        )
+        copies = (
+            base_copies
+            if predequant_kv
+            else (
+                *base_copies,
+                (
+                    cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                    bkv_rope_x2_ref.at[sem_idx, :],
+                    sems.at[5, sem_idx],
+                ),
+            )
         )
         for src, dst, sem in copies:
             if wait:
@@ -728,15 +781,18 @@ def _attention_kernel_fused_swa(
             _send_bo_batch(old_seq_idx_start, bo_sem_idx, wait=True)
 
     def load_bkv(sem_idx, batch_idx):
-        bkv_nope = bkv_nope_x2_ref.at[sem_idx, batch_idx][...]
-        bkv_nope = _dequant_dsv4_fp8(bkv_nope.reshape(bkv_sz, -1))
-        bkv_rope = bkv_rope_x2_ref.at[sem_idx, batch_idx][...]
-        bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
-        rope_dim = bkv_rope.shape[-1] // 2
-        bkv_rope = jnp.concatenate(
-            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
-        )
-        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if predequant_kv:
+            bkv = bkv_nope_x2_ref.at[sem_idx, batch_idx][...]
+        else:
+            bkv_nope = bkv_nope_x2_ref.at[sem_idx, batch_idx][...]
+            bkv_nope = _dequant_dsv4_fp8(bkv_nope.reshape(bkv_sz, -1))
+            bkv_rope = bkv_rope_x2_ref.at[sem_idx, batch_idx][...]
+            bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
+            rope_dim = bkv_rope.shape[-1] // 2
+            bkv_rope = jnp.concatenate(
+                [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
+            )
+            bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
         kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
         return jnp.where(k_span < kv_len, bkv, 0)
@@ -837,8 +893,8 @@ def _attention_kernel_fused_swa(
 
 def fused_swa_attention_call(
     q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim] or 4D rank-major
-    cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
-    cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
+    cache_kv_nope: jax.Array,  # int32[chunk, topk, 128] or bf16[chunk, topk, D]
+    cache_kv_rope: jax.Array | None,  # int32[chunk_size, topk // 4, 128] or None
     swa_kv: jax.Array,  # bf16[max_num_tokens // group_tokens, window, head_dim]
     swa_bias: jax.Array,  # float32[max_num_tokens, window // 128, 128]
     kv_lens: jax.Array,  # i32[max_num_tokens]
@@ -864,8 +920,9 @@ def fused_swa_attention_call(
     else:
         num_tokens, num_q_heads, head_dim = q.shape
         q_scratch_shape = (2, batch_size, num_q_heads, head_dim)
+    predequant_kv = cache_kv_nope.dtype == jnp.bfloat16
     _, topk_rows, lanes = cache_kv_nope.shape
-    _, rope_rows, _ = cache_kv_rope.shape
+    rope_rows = 1 if predequant_kv or cache_kv_rope is None else cache_kv_rope.shape[1]
     window = swa_bias.shape[1] * 128
     union = swa_kv.shape[1]
     group_tokens = num_tokens // swa_kv.shape[0]
@@ -884,14 +941,24 @@ def fused_swa_attention_call(
     in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)] + [
         pl.BlockSpec(memory_space=pltpu.HBM)
     ] * 5
+    bkv_nope_scratch = (
+        pltpu.VMEM((2, batch_size, topk_rows, lanes), jnp.bfloat16)
+        if predequant_kv
+        else pltpu.VMEM((2, batch_size, topk_rows * 4, lanes), jnp.uint8)
+    )
+    bkv_rope_scratch = (
+        pltpu.VMEM((2, 1, 8, 128), jnp.bfloat16)
+        if predequant_kv
+        else pltpu.VMEM((2, batch_size, rope_rows * 2, lanes), jnp.bfloat16)
+    )
     scratch_shapes = [
-        pltpu.VMEM((2, batch_size, topk_rows * 4, lanes), jnp.uint8),
-        pltpu.VMEM((2, batch_size, rope_rows * 2, lanes), jnp.bfloat16),
+        bkv_nope_scratch,
+        bkv_rope_scratch,
         pltpu.VMEM(q_scratch_shape, q.dtype),
         pltpu.VMEM(q_scratch_shape, q.dtype),
         pltpu.VMEM((2, batch_size // group_tokens, union, head_dim), swa_kv.dtype),
         pltpu.VMEM((2, batch_size, window // 128, 128), jnp.float32),
-        pltpu.SemaphoreType.DMA((6, 2)),
+        pltpu.SemaphoreType.DMA((5, 2) if predequant_kv else (6, 2)),
     ]
     scalar_prefetches = (
         kv_lens,
@@ -930,12 +997,13 @@ def fused_swa_attention_call(
             name=scope_name,
         )
     )
+    rope_arg = cache_kv_nope if cache_kv_rope is None else cache_kv_rope
     return kernel(
         *scalar_prefetches,
         attention_sinks,
         q,
         cache_kv_nope,
-        cache_kv_rope,
+        rope_arg,
         swa_kv,
         swa_bias,
     )
@@ -1253,11 +1321,17 @@ def sparse_ragged_paged_attention(
 
     assert page_ids.shape == (q.shape[0], topk)
     gather_indices = (page_ids * page_size + token_offset).reshape(-1)
-    num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
+    eff_chunk_size = (
+        align_to(q.shape[0] // 2, attention_kernel_batch_size)
+        if q.shape[0] >= 2 * attention_kernel_batch_size
+        and q.shape[0] <= gather_and_attention_chunk_size
+        else gather_and_attention_chunk_size
+    )
+    num_chunks = cdiv(q.shape[0], eff_chunk_size)
 
     for i in range(num_chunks):
-        start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        start_pos = i * eff_chunk_size
+        end_pos = min(start_pos + eff_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
         indices = gather_indices[start_pos * topk : end_pos * topk]
 

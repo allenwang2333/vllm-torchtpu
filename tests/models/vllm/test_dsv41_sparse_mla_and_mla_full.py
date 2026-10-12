@@ -313,6 +313,244 @@ class TestSparseMlaGatherPageIds:
             )
             assert out2.shape == (8, 16)
 
+            # Branch 3: num_tokens * pages_per_seq > 655360 direct 1D fast path
+            out3 = sparse_mla.gather_page_ids(
+                jnp.arange(max_num_seqs * 1024, dtype=jnp.int32),
+                jnp.zeros((768, 16), dtype=jnp.int32),
+                jnp.zeros((768,), dtype=jnp.int32),
+                max_num_seqs,
+                block_tokens=8,
+            )
+            assert out3.shape == (768, 16)
+
+            # Branch 4: unaligned block_tokens < 8 direct 1D fast path
+            out4 = sparse_mla.gather_page_ids(
+                page_indices,
+                jnp.zeros((6, 16), dtype=jnp.int32),
+                jnp.zeros((6,), dtype=jnp.int32),
+                max_num_seqs,
+                block_tokens=4,
+            )
+            assert out4.shape == (6, 16)
+
+    def test_dequant_union_kv_direct_and_outer(self):
+        topk = 4
+        u_nope_ref = MockArrayRef(np.ones((topk * 4, 128), dtype=np.uint8))
+        u_rope_ref = MockArrayRef(np.ones((topk // 2, 128), dtype=jnp.bfloat16))
+        out_ref = MockArrayRef(np.zeros((topk, 512), dtype=jnp.bfloat16))
+        with (
+            patch.object(sparse_mla.pltpu, "bitcast", side_effect=fake_bitcast),
+            patch.object(
+                sparse_mla.pltpu,
+                "roll",
+                side_effect=lambda x, s, a: jnp.roll(x, s, a),
+            ),
+            patch.object(sparse_mla.pl, "program_id", return_value=0),
+        ):
+            sparse_mla._dequant_union_kv_kernel(
+                u_nope_ref, u_rope_ref, out_ref, topk=topk
+            )
+        assert out_ref.arr.shape == (topk, 512)
+
+        def fake_pallas_call(kernel, out_shape=None, *args, **kwargs):
+            return lambda *call_args: jnp.zeros(out_shape.shape, dtype=out_shape.dtype)
+
+        with patch.object(sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call):
+            deq = sparse_mla.dequant_union_kv(
+                jnp.zeros((16, 128), dtype=jnp.int32),
+                jnp.zeros((4, 128), dtype=jnp.int32),
+                topk=16,
+            )
+            assert deq.shape == (16, 512)
+
+    def test_attention_kernel_fused_swa_and_call_full_coverage(self):
+        for rank_major, q_dtype, predequant in (
+            (False, jnp.float32, False),
+            (True, jnp.bfloat16, True),
+        ):
+            batch_size = 4
+            group_tokens = 2 if rank_major else 1
+            topk = 16
+            head_dim = 512
+            window = 256 if rank_major else 128
+            union = 272 if rank_major else 128
+            num_tokens = 16
+            start_seq = 0
+            end_seq = 16
+
+            kv_lens_ref = MockArrayRef(np.array([10] * num_tokens, dtype=np.int32))
+            start_end_seq_idx_ref = MockArrayRef(
+                np.array([start_seq, end_seq, num_tokens], dtype=np.int32)
+            )
+            sem_ids_ref = MockArrayRef(np.zeros((2,), dtype=np.int32))
+            bo_ids_ref = MockArrayRef(
+                np.array([-1, 0] if rank_major else [0, -1], dtype=np.int32)
+            )
+            q_shape = (
+                (2, num_tokens, 8, head_dim)
+                if rank_major
+                else (num_tokens, 16, head_dim)
+            )
+            np_dt = np.float32 if q_dtype == jnp.float32 else jnp.bfloat16
+            q_hbm_ref = MockArrayRef(np.ones(q_shape, dtype=np_dt))
+            o_hbm_ref = MockArrayRef(np.zeros(q_shape, dtype=np_dt))
+            sinks_ref = MockArrayRef(np.zeros((16,), dtype=np.float32))
+            cache_kv_nope_ref = MockArrayRef(
+                np.zeros((num_tokens, topk, head_dim), dtype=jnp.bfloat16)
+                if predequant
+                else np.zeros((num_tokens, topk, 128), dtype=np.int32)
+            )
+            cache_kv_rope_ref = MockArrayRef(
+                np.zeros((num_tokens, topk // 4, 128), dtype=np.int32)
+            )
+            swa_kv_ref = MockArrayRef(
+                np.zeros(
+                    (num_tokens // group_tokens, union, head_dim), dtype=jnp.bfloat16
+                )
+            )
+            swa_bias_ref = MockArrayRef(
+                np.zeros((num_tokens, window // 128, 128), dtype=np.float32)
+            )
+            bkv_nope_x2_ref = MockArrayRef(
+                np.zeros((2, batch_size, topk, head_dim), dtype=jnp.bfloat16)
+                if predequant
+                else np.zeros((2, batch_size, topk * 4, 128), dtype=np.uint8)
+            )
+            bkv_rope_x2_ref = MockArrayRef(
+                np.zeros((2, batch_size, (topk // 4) * 2, 64), dtype=np.float16)
+            )
+            q_scr = (
+                (2, 2, batch_size, 8, head_dim)
+                if rank_major
+                else (2, batch_size, 16, head_dim)
+            )
+            bq_x2_ref = MockArrayRef(np.zeros(q_scr, dtype=np_dt))
+            bo_x2_ref = MockArrayRef(np.zeros(q_scr, dtype=np_dt))
+            swa_kv_x2_ref = MockArrayRef(
+                np.zeros(
+                    (2, batch_size // group_tokens, union, head_dim),
+                    dtype=jnp.bfloat16,
+                )
+            )
+            swa_bias_x2_ref = MockArrayRef(
+                np.zeros((2, batch_size, window // 128, 128), dtype=np.float32)
+            )
+            sems = MockArrayRef(np.zeros((6, 2), dtype=np.int32))
+
+            with (
+                patch.object(
+                    sparse_mla.pltpu,
+                    "make_async_copy",
+                    return_value=MockAsyncCopy(),
+                ),
+                patch.object(sparse_mla.pltpu, "bitcast", side_effect=fake_bitcast),
+                patch.object(
+                    sparse_mla.pltpu,
+                    "roll",
+                    side_effect=lambda x, s, a: jnp.roll(x, s, a),
+                ),
+                patch.object(
+                    sparse_mla.pl,
+                    "reciprocal",
+                    side_effect=lambda x, approx=True: 1.0 / x,
+                ),
+                patch.object(sparse_mla.pl, "when", side_effect=fake_when),
+                patch.object(
+                    sparse_mla.pl, "program_id", return_value=2 if rank_major else 0
+                ),
+                patch.object(
+                    sparse_mla.pl, "num_programs", return_value=2 if rank_major else 1
+                ),
+            ):
+                sparse_mla._attention_kernel_fused_swa(
+                    kv_lens_ref,
+                    start_end_seq_idx_ref,
+                    sem_ids_ref,
+                    bo_ids_ref,
+                    sinks_ref,
+                    q_hbm_ref,
+                    cache_kv_nope_ref,
+                    cache_kv_rope_ref,
+                    swa_kv_ref,
+                    swa_bias_ref,
+                    o_hbm_ref,
+                    bkv_nope_x2_ref,
+                    bkv_rope_x2_ref,
+                    bq_x2_ref,
+                    bo_x2_ref,
+                    swa_kv_x2_ref,
+                    swa_bias_x2_ref,
+                    sems,
+                    sm_scale=0.125,
+                    batch_size=batch_size,
+                    group_tokens=group_tokens,
+                )
+
+        def fake_pallas_call(kernel, out_shape=None, *args, **kwargs):
+            return lambda *call_args: jnp.zeros(out_shape.shape, dtype=out_shape.dtype)
+
+        with patch.object(sparse_mla.pl, "pallas_call", side_effect=fake_pallas_call):
+            q3 = jnp.ones((8, 16, 512), dtype=jnp.bfloat16)
+            q4 = jnp.ones((2, 8, 8, 512), dtype=jnp.bfloat16)
+            assert sparse_mla.prepare_q_inputs(q4).shape == (2, 8, 8, 512)
+            assert sparse_mla.prepare_q_inputs(
+                jnp.ones((2, 8, 8, 500), dtype=jnp.bfloat16)
+            ).shape == (
+                2,
+                8,
+                8,
+                512,
+            )
+            assert sparse_mla.prepare_outputs(q4, 16, 500).shape == (2, 8, 8, 500)
+
+            res3 = sparse_mla.fused_swa_attention_call(
+                q3,
+                jnp.zeros((8, 16, 128), dtype=jnp.int32),
+                jnp.zeros((8, 4, 128), dtype=jnp.int32),
+                jnp.zeros((8, 128, 512), dtype=jnp.bfloat16),
+                jnp.zeros((8, 1, 128), dtype=jnp.float32),
+                jnp.full((8,), 16, dtype=jnp.int32),
+                jnp.zeros((16,), dtype=jnp.float32),
+                start_seq_idx=0,
+                end_seq_idx=jnp.int32(8),
+                num_valid_tokens=jnp.int32(8),
+                kernel_batch_size=4,
+                sm_scale=0.125,
+            )
+            assert res3.shape == (8, 16, 512)
+
+            res4 = sparse_mla.fused_swa_attention_call(
+                q4,
+                jnp.zeros((8, 16, 512), dtype=jnp.bfloat16),
+                None,
+                jnp.zeros((4, 144, 512), dtype=jnp.bfloat16),
+                jnp.zeros((8, 1, 128), dtype=jnp.float32),
+                jnp.full((8,), 16, dtype=jnp.int32),
+                jnp.zeros((16,), dtype=jnp.float32),
+                start_seq_idx=0,
+                end_seq_idx=jnp.int32(8),
+                num_valid_tokens=jnp.int32(8),
+                kernel_batch_size=4,
+                sm_scale=0.125,
+            )
+            assert res4.shape == (2, 8, 8, 512)
+
+            with pytest.raises(ValueError, match="swa_kv rows"):
+                sparse_mla.fused_swa_attention_call(
+                    q3,
+                    jnp.zeros((8, 16, 128), dtype=jnp.int32),
+                    jnp.zeros((8, 4, 128), dtype=jnp.int32),
+                    jnp.zeros((3, 128, 512), dtype=jnp.bfloat16),
+                    jnp.zeros((8, 1, 128), dtype=jnp.float32),
+                    jnp.full((8,), 16, dtype=jnp.int32),
+                    jnp.zeros((16,), dtype=jnp.float32),
+                    start_seq_idx=0,
+                    end_seq_idx=jnp.int32(8),
+                    num_valid_tokens=jnp.int32(8),
+                    kernel_batch_size=4,
+                    sm_scale=0.125,
+                )
+
 
 class TestSparseMlaAttentionKernelDirect:
     """Tests 100% lines and branches in sparse_mla._attention_kernel."""
