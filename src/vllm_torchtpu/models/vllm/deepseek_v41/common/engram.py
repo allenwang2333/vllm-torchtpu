@@ -14,10 +14,30 @@ import torch
 from vllm.distributed import get_engram_dp_group, get_engram_dp_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common import engram as upstream
-from vllm.models.deepseek_v41.common.engram import (
-    engram_gathered_num_tokens,
-    engram_head_shard_rank,
-)
+
+try:
+    from vllm.models.deepseek_v41.common.engram import (
+        engram_gathered_num_tokens,
+        engram_head_shard_rank,
+    )
+except ImportError:  # vLLM 0.30 keeps these in the nvidia module.
+    from vllm.models.deepseek_v41.nvidia.engram import (
+        engram_gathered_num_tokens,
+        engram_head_shard_rank,
+    )
+
+if not hasattr(upstream, "gather_engram_hashes"):
+    try:
+        from vllm.models.deepseek_v41.nvidia import engram as _nvidia_engram
+
+        upstream.gather_engram_hashes = getattr(
+            _nvidia_engram, "gather_engram_hashes", None
+        )
+    except ImportError:
+        pass
+
+if not hasattr(upstream, "engram_gathered_num_tokens"):
+    upstream.engram_gathered_num_tokens = engram_gathered_num_tokens
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
@@ -660,9 +680,12 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(
-                num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
-            )
+            try:
+                super().__init__(
+                    num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
+                )
+            except TypeError:  # vLLM 0.30's __init__ has no cpu_offload.
+                super().__init__(num_embeddings, dim, head_sizes, *args, **kwargs)
         self.cpu_offload = self.host_offload
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
         if self.weight_scale_inv is not None:

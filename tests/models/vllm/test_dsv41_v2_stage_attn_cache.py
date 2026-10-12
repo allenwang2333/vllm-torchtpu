@@ -1604,9 +1604,9 @@ def test_td8383_stage_keys_memoized_per_tensor(monkeypatch):
     assert attn.__dict__["_rope_stage_entry"][0] is new_rope
 
 
-def test_tp93_token_parallel_segmented_and_prepadded_main_records(monkeypatch):
-    """TP9.3: verify token-parallel segmented main_records, segment_only=True in
-    _select_paged_indices, and 128-column pre-padding on source layers."""
+def test_owner_segmented_and_prepadded_main_records_compile_safe(monkeypatch):
+    """Verify owner-segmented main_records, 128-column pre-padding on source
+    layers, 3-tuple stage_cache[comp_key], and zero bool FX graph outputs."""
     count = 16
     capacity = 256
     positions = torch.arange(count, dtype=torch.int32)
@@ -1698,27 +1698,73 @@ def test_tp93_token_parallel_segmented_and_prepadded_main_records(monkeypatch):
     kv = torch.ones((count, 8), dtype=torch.bfloat16)
     idx_w = torch.ones((count, 2), dtype=torch.bfloat16)
 
-    # 1. token_parallel_main=True, topk=64 -> segment_only=True & 128-col padded
+    # 1. owner_perm is None, topk=64 -> full rows gathered & 128-col pre-padded
     with v2_attn.stage_attention_cache_scope():
         source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
-        assert gather_calls == 0
-        assert captured_main_recs[-1].shape == (count // 2, 128)
+        assert gather_calls == 1
+        assert captured_main_recs[-1].shape == (count, 128)
         assert torch.all(captured_main_recs[-1][:, 64:] == -1)
+        assert v2_attn._active_stage_attn_cache is not None
+        for k, v in v2_attn._active_stage_attn_cache.items():
+            if isinstance(k, tuple) and k[0] == "compressed_attn":
+                assert len(v) == 3
 
         # Second call hits cached_comp_inputs; also test width == 128 (no F.pad)
         source_attn._config = {"index_topk": 128}
         source_attn.topk_indices_buffer = torch.full((32, 128), -1, dtype=torch.int32)
         source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
-        assert gather_calls == 0
-        assert captured_main_recs[-1].shape == (count // 2, 128)
+        assert gather_calls == 2
+        assert captured_main_recs[-1].shape == (count, 128)
 
-    # 2. owner_perm is not None inside segmented_main branch
+    # 2. owner_perm is not None -> segmented_main=True, gather_calls unchanged
+    gather_calls = 0
     meta.owner_perm = torch.arange(count, dtype=torch.int32)
     meta.owner_inv = torch.arange(count, dtype=torch.int32)
     meta.owner_q_loc = torch.tensor([[0, 4, 8], [0, 4, 8]], dtype=torch.int32)
     with v2_attn.stage_attention_cache_scope():
         source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
+        assert gather_calls == 0
         assert captured_main_recs[-1].shape == (count // 2, 128)
+    # Also exercise segmented_main when has_fast_swa_offset is False (seg_idx is None)
+    source_attn_no_fast = _make_swa_attn(
+        window_size=64, ced_decoder=False, has_fast_swa_offset=False
+    )
+    source_attn_no_fast.prefix = "src_pfx"
+    source_attn_no_fast.swa_cache_layer.prefix = "src_pfx"
+    source_attn_no_fast.compressed_cache_prefix = "src_pfx"
+    source_attn_no_fast.index_source_layer_id = 0
+    source_attn_no_fast._max_model_len = capacity * 2
+    source_attn_no_fast._config = {"index_topk": 64}
+    source_attn_no_fast._precompact_records = True
+    source_attn_no_fast._token_parallel_attn = True
+    source_attn_no_fast._tp_rank = torch.tensor(1, dtype=torch.int32)
+    source_attn_no_fast._tp_rank_1d = torch.tensor([1], dtype=torch.int32)
+    source_attn_no_fast.topk_indices_buffer = torch.full(
+        (32, 64), -1, dtype=torch.int32
+    )
+    source_attn_no_fast.candidate_block_size = 1
+    source_attn_no_fast.candidate_block_buffer = None
+    source_attn_no_fast.kv_cache = cache_mock
+    source_attn_no_fast._static_forward_context = {
+        "src_pfx": SimpleNamespace(kv_cache=cache_mock)
+    }
+    source_attn_no_fast.indexer = source_attn.indexer
+    source_attn_no_fast._project_index_q = lambda q, p: q
+    with v2_attn.stage_attention_cache_scope():
+        source_attn_no_fast._prepare_tpu(
+            None, qr, kv, None, None, idx_w, positions, out
+        )
+        assert captured_main_recs[-1].shape == (count // 2, 128)
+        # Consumer layer without indexer inside segmented_main branch
+        source_attn_no_fast.indexer = None
+        source_attn_no_fast.index_source_layer_id = 1
+        source_attn_no_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_main_recs[-1].shape == (count // 2, 128)
+        # Consumer layer without indexer when segmented_main is False
+        meta.owner_perm = None
+        source_attn_no_fast.index_source_layer_id = 2
+        source_attn_no_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_main_recs[-1].shape == (count, 128)
 
 
 def test_owner_segmented_swa_records_and_replicated_qr_local(monkeypatch):

@@ -587,7 +587,7 @@ def _index_page_records(index_cache):
     return per_page
 
 
-def _query_split(count, ranks, *, kv_shard: bool = False):
+def _query_split(count, ranks):
     """``(part, padding)``: rows per TP rank and the static pad that covers them.
 
     ``part`` is ``ceil(count / ranks)`` rounded up to even, so never 1: a part
@@ -595,12 +595,7 @@ def _query_split(count, ranks, *, kv_shard: bool = False):
     trace a second encoder/decoder graph for those buckets.
     ``ranks * part - count`` is at most ``2 * ranks - 1``, so
     ``padding = 2 * ranks`` rows always cover it.
-    Under ``kv_shard``, when ``count >= ranks`` and ``count % ranks == 0``,
-    each rank owns the exact contiguous slice ``part = count // ranks`` matching
-    `slice_token_parallel_attention_inputs`.
     """
-    if kv_shard and count >= ranks and count % ranks == 0:
-        return count // ranks, ranks
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
 
 
@@ -1804,13 +1799,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         segmented_main = False
         if self.compress_ratio:
             assert source_meta is not None
+            source = self._static_forward_context[self.compressed_cache_prefix]
+            main_cache = source.kv_cache
+            tp_ranks = (
+                get_tensor_model_parallel_world_size() if owner_perm is not None else 1
+            )
+            segmented_main = bool(
+                owner_perm is not None
+                and tiled
+                and tp_ranks > 1
+                and (self.indexer is None or not self._all_indices_fit)
+            )
             comp_key = self._stage_cache_key(
                 "compressed_attn",
                 self.compressed_cache_prefix,
                 getattr(self, "index_source_layer_id", None),
                 tiled,
                 self._fp8_kv,
-                owner_perm is not None,
+                segmented_main,
             )
             cached_comp = (
                 stage_cache.get(comp_key)
@@ -1818,61 +1824,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 else None
             )
             if cached_comp is not None and tiled:
-                main_cache, pages, starts, main_records, segmented_main = cached_comp
+                pages, starts, main_records = cached_comp
             else:
-                source = self._static_forward_context[self.compressed_cache_prefix]
                 capacity = max(1, self._max_model_len // self.compress_ratio)
-                tp_ranks = (
-                    get_tensor_model_parallel_world_size()
-                    if (
-                        owner_perm is not None
-                        or (
-                            stage_cache is not None
-                            and tiled
-                            and self._fp8_kv
-                            and self.indexer is not None
-                            and not self._all_indices_fit
-                            and (fused_qo or self._token_parallel_attn)
-                        )
-                    )
-                    else 1
-                )
-                kv_shard = bool(envs.TPU_DEEPSEEK_V41_KV_SHARD)
-                part_rows = (
-                    _query_split(count, tp_ranks, kv_shard=kv_shard)[0]
-                    if tp_ranks > 1
-                    else count
-                )
-                min_tp_tokens = tp_ranks if kv_shard else 6 * tp_ranks
-                min_qo_tokens = tp_ranks if kv_shard else 128 * tp_ranks
-                token_parallel_main = bool(
-                    owner_perm is None
-                    and tp_ranks > 1
-                    and part_rows * tp_ranks == count
-                    and (
-                        (
-                            count >= min_tp_tokens
-                            if self._replicated_local_q
-                            else (
-                                qr_local is not None
-                                and qr_local.shape[0] == part_rows
-                                and count >= min_qo_tokens
-                                and count % min_qo_tokens == 0
-                            )
-                        )
-                        if fused_qo
-                        else count >= min_tp_tokens
-                    )
-                )
-                segmented_main = bool(
-                    (
-                        owner_perm is not None
-                        and tiled
-                        and tp_ranks > 1
-                        and (self.indexer is None or not self._all_indices_fit)
-                    )
-                    or token_parallel_main
-                )
                 comp_inputs_key = self._stage_cache_key(
                     "compressed_inputs",
                     self.compress_ratio,
@@ -1887,41 +1841,29 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 if cached_comp_inputs is None:
                     lengths = ((pos_i32 + 1) // self.compress_ratio)[:, None]
-                    if segmented_main:
-                        if owner_perm is not None:
-                            if seg_idx is None or seg_valid is None:
-                                seg_count = owner_perm.shape[0] // tp_ranks
-                                # index_select, not a tensor-bound slice: slicing calls
-                                # Tensor.__index__ (.item()), creating unbacked SymInts
-                                # that break stage-cache reuse under compile (KV_SHARD).
-                                seg_perm = (
-                                    owner_perm[: tp_ranks * seg_count]
-                                    .reshape(tp_ranks, seg_count)
-                                    .index_select(
-                                        0, self._get_stage_tp_rank_1d(stage_cache)
-                                    )
-                                    .squeeze(0)
+                    if segmented_main and owner_perm is not None:
+                        if seg_idx is None or seg_valid is None:
+                            seg_count = owner_perm.shape[0] // tp_ranks
+                            # index_select, not a tensor-bound slice: slicing calls
+                            # Tensor.__index__ (.item()), creating unbacked SymInts
+                            # that break stage-cache reuse under compile (KV_SHARD).
+                            seg_perm = (
+                                owner_perm[: tp_ranks * seg_count]
+                                .reshape(tp_ranks, seg_count)
+                                .index_select(
+                                    0, self._get_stage_tp_rank_1d(stage_cache)
                                 )
-                                seg_valid = seg_perm >= 0
-                                seg_idx = seg_perm.clamp(min=0)
-                            lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
-                                ~seg_valid[:, None], 0
+                                .squeeze(0)
                             )
-                            swa_valid_comp = (
-                                swa_valid.index_select(0, seg_idx) & seg_valid
-                            )
-                            requests_comp = requests.index_select(
-                                0, seg_idx
-                            ).masked_fill(~seg_valid, 0)
-                        else:
-                            seg_idx_tp = self._get_stage_tp_rank(
-                                stage_cache
-                            ) * part_rows + torch.arange(
-                                part_rows, dtype=torch.int32, device=positions.device
-                            )
-                            lengths_comp = lengths.index_select(0, seg_idx_tp)
-                            swa_valid_comp = swa_valid.index_select(0, seg_idx_tp)
-                            requests_comp = requests.index_select(0, seg_idx_tp)
+                            seg_valid = seg_perm >= 0
+                            seg_idx = seg_perm.clamp(min=0)
+                        lengths_comp = lengths.index_select(0, seg_idx).masked_fill(
+                            ~seg_valid[:, None], 0
+                        )
+                        swa_valid_comp = swa_valid.index_select(0, seg_idx) & seg_valid
+                        requests_comp = requests.index_select(0, seg_idx).masked_fill(
+                            ~seg_valid, 0
+                        )
                     else:
                         lengths_comp = lengths
                         swa_valid_comp = swa_valid
@@ -2027,9 +1969,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 **(
                                     {"owner_perm": owner_perm}
                                     if owner_perm is not None
-                                    else (
-                                        {"segment_only": True} if segmented_main else {}
-                                    )
+                                    else {}
                                 ),
                             )
                         else:
@@ -2092,7 +2032,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     selected = self.topk_indices_buffer[
                         :sel_count, : min(capacity, self.topk_indices_buffer.shape[-1])
                     ]
-                main_cache = source.kv_cache
                 valid_compressed = (
                     (selected >= 0)
                     & (selected < lengths_comp)
@@ -2149,11 +2088,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         )
                     if stage_cache is not None:
                         stage_cache[comp_key] = (
-                            main_cache,
                             pages,
                             starts,
                             main_records,
-                            segmented_main,
                         )
                 else:
                     compressed_rows = _read_rows(
@@ -2422,8 +2359,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         swa_slots,
         pending_index_write,
         owner_perm=None,
-        *,
-        segment_only: bool = False,
     ):
         """Publish explicit index-cache and logical-selection outputs."""
         indexer = self.indexer
@@ -2453,10 +2388,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # padding (split change alone at C=16: L20 3.20 -> 1.48 ms,
         # L24 0.75 -> 0.31 ms).
         ranks = get_tensor_model_parallel_world_size()
-        # A sharded cache already answers this without the env read.
-        kv_shard = bool(
-            getattr(index_cache, "sharded", False) or envs.TPU_DEEPSEEK_V41_KV_SHARD
-        )
         split = ranks > 1
         stage_cache = _active_stage_attn_cache
         query_split_key = _memo_stage_cache_key(
@@ -2464,7 +2395,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             "indexer_query_split",
             getattr(self, "compress_ratio", None),
             ranks,
-            kv_shard,
             owner_perm is not None,
         )
         cached_query_split = (
@@ -2490,7 +2420,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         .to(torch.int32)
                     )
                 else:
-                    part, _ = _query_split(count, ranks, kv_shard=kv_shard)
+                    part, _ = _query_split(count, ranks)
                     mine = tp_rank * part + torch.arange(
                         part, dtype=torch.int32, device=qr.device
                     )
@@ -2616,7 +2546,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 else {}
             ),
         )
-        if split and owner_perm is None and not segment_only:
+        if split and owner_perm is None:
             selected = _gather_query_rows(selected)[:count]
             if candidate_write and stage_cache is None:
                 published = _gather_query_rows(published)[:count]

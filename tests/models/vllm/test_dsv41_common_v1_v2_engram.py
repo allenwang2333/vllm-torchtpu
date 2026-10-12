@@ -417,7 +417,12 @@ class TestParallelEngramEmbedding:
         assert w2 is not None
 
     def test_init_weight_scale_inv_none(self, monkeypatch: pytest.MonkeyPatch):
+        seen_kwargs: list[dict[str, object]] = []
+
         def fake_upstream_init(self, *args, **kwargs):
+            seen_kwargs.append(dict(kwargs))
+            if "cpu_offload" in kwargs:
+                raise TypeError("unexpected keyword argument 'cpu_offload'")
             nn.Module.__init__(self)
             self.weight = nn.Parameter(torch.empty(1))
             self.weight_scale_inv = None
@@ -429,6 +434,9 @@ class TestParallelEngramEmbedding:
         )
         emb = common_engram.ParallelEngramEmbedding(64, 32, (8, 8))
         assert emb.weight_scale_inv is None
+        assert len(seen_kwargs) == 2
+        assert seen_kwargs[0] == {"cpu_offload": False}
+        assert seen_kwargs[1] == {}
 
     def test_lookup_device_transfer_and_computation(self):
         emb = object.__new__(common_engram.ParallelEngramEmbedding)

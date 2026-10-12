@@ -671,7 +671,7 @@ def test_td8276_native_int32_1d_index_select_in_async_output_helpers(monkeypatch
     assert select_calls == [(1, 0, torch.int32), (1, 0, torch.int32)]
 
 
-def test_td8286_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
+def test_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
     monkeypatch,
 ):
     from contextlib import nullcontext
@@ -718,20 +718,26 @@ def test_td8286_int32_index_select_in_gather_logprobs_seed_sources_and_migrate(
         (1, torch.int32, 0, torch.int32),
     ]
 
-    # 3. gather_logprobs uses int32 1D index_select and int32 token_ids
+    # 3. gather_logprobs uses int32 1D index_select and fp32 normalizer
     logits = torch.tensor(
-        [[1.0, 3.0, 2.0, 0.5], [4.0, 0.0, 2.0, 1.0]], dtype=torch.float32
+        [[1.0, 3.0, 2.0, 0.5], [4.0, 0.0, 2.0, 1.0]], dtype=torch.bfloat16
     )
     sampled = torch.tensor([[1], [2]], dtype=torch.int64)
+    ref_lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
 
     for max_lp in (2, 0):
         runner.model_config = SimpleNamespace(max_logprobs=max_lp)
         select_calls.clear()
         res = TPUModelRunner.gather_logprobs.__wrapped__(runner, logits, sampled)
-        assert select_calls == [(1, torch.float32, 0, torch.int32)]
+        assert select_calls == [(1, torch.bfloat16, 0, torch.int32)]
+        assert res.logprobs.dtype == torch.float32
         assert res.logprob_token_ids.dtype == torch.int32
         assert res.selected_token_ranks.dtype == torch.int32
         assert res.selected_token_ranks.tolist() == [1, 2]
+        torch.testing.assert_close(
+            res.logprobs[:, :1],
+            logits.float().gather(1, sampled) - ref_lse,
+        )
         if max_lp > 0:
             assert res.logprob_token_ids.tolist() == [[1, 1, 2], [2, 0, 2]]
         else:

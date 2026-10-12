@@ -2030,12 +2030,12 @@ def test_td8263_embed_draft_blocks_2d_matches_3d_bitwise(tokens, block, bad):
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
 
 
-def test_td8382_embed_draft_blocks_idx_cache_and_insert_context_kv_req_i32(
+def test_embed_draft_blocks_compile_safe_and_insert_context_kv_req_i32(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """TD8.382: Verify _embed_draft_blocks caches (key, is_base_col, block_idx)
-    on _draft_block_idx_cache and _insert_context_kv passes pos_i32 to
-    _token_requests and casts requests to int32 once."""
+    """Verify _embed_draft_blocks is stateless (no setattr on bound method owner
+    under torch.compile) and _insert_context_kv passes pos_i32 to _token_requests
+    and casts requests to int32 once."""
     weight = torch.randn(32, 16, generator=torch.Generator().manual_seed(82))
 
     class _DummyDraftModel:
@@ -2047,33 +2047,24 @@ def test_td8382_embed_draft_blocks_idx_cache_and_insert_context_kv_req_i32(
     ids1[::5] = torch.tensor([2, 5, 9], dtype=torch.int32)
     out1 = v2_dspark._embed_draft_blocks(dummy_model.embed_input_ids, ids1, 5)
     assert torch.equal(out1, weight[ids1.long()])
-    cache1 = getattr(dummy_model, "_draft_block_idx_cache", None)
-    assert cache1 is not None and cache1[0] == (15, 5, ids1.device)
+    assert not hasattr(dummy_model, "_draft_block_idx_cache")
 
-    arange_calls = 0
-    orig_arange = torch.arange
-
-    def spy_arange(*a, **kw):
-        nonlocal arange_calls
-        arange_calls += 1
-        return orig_arange(*a, **kw)
-
-    monkeypatch.setattr(v2_dspark.torch, "arange", spy_arange)
+    compiled_fn = torch.compile(
+        lambda x: v2_dspark._embed_draft_blocks(dummy_model.embed_input_ids, x, 5),
+        backend="eager",
+        fullgraph=True,
+    )
     ids2 = torch.full((15,), 7, dtype=torch.int32)
     ids2[::5] = torch.tensor([4, 8, 12], dtype=torch.int32)
-    out2 = v2_dspark._embed_draft_blocks(dummy_model.embed_input_ids, ids2, 5)
-    assert arange_calls == 0
-    assert dummy_model._draft_block_idx_cache is cache1
+    out2 = compiled_fn(ids2)
     assert torch.equal(out2, weight[ids2.long()])
+    assert not hasattr(dummy_model, "_draft_block_idx_cache")
 
-    # Changing block/total invalidates cache and calls torch.arange once
     ids3 = torch.full((12,), 7, dtype=torch.int32)
     ids3[::4] = torch.tensor([1, 3, 6], dtype=torch.int32)
     out3 = v2_dspark._embed_draft_blocks(dummy_model.embed_input_ids, ids3, 4)
-    assert arange_calls == 1
-    assert dummy_model._draft_block_idx_cache[0] == (12, 4, ids3.device)
     assert torch.equal(out3, weight[ids3.long()])
-    monkeypatch.setattr(v2_dspark.torch, "arange", orig_arange)
+    assert not hasattr(dummy_model, "_draft_block_idx_cache")
 
     # Verify _insert_context_kv passes pos_i32 and casts requests once
     seen_pos_dtypes: list[torch.dtype] = []

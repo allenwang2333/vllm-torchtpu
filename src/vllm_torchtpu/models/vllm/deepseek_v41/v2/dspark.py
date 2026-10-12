@@ -130,39 +130,15 @@ def _embed_draft_blocks(
     noise_row = rows[num_blocks:]
     # Pure 2-D [num_blocks * block, hidden] selection: a [num_blocks, block,
     # hidden] build pads the middle `block` dim to 8 sublanes on TPU.
-    total, owner = num_blocks * block, getattr(embed, "__self__", embed)
-    key, cache = (
-        (total, block, input_ids.device),
-        getattr(owner, "_draft_block_idx_cache", None),
-    )
-    _, is_base_col, block_idx = (
-        cache
-        if cache is not None and cache[0] == key
-        else setattr(
-            owner,
-            "_draft_block_idx_cache",
-            (
-                cache := (
-                    key,
-                    (
-                        (
-                            idx := torch.arange(
-                                total, dtype=torch.int32, device=input_ids.device
-                            )
-                        )
-                        % block
-                        == 0
-                    )[:, None],
-                    idx // block,
-                )
-            ),
-        )
-        or cache
-    )
-    base_rows = rows[:num_blocks].index_select(0, block_idx)
+    total = num_blocks * block
+    idx = torch.arange(total, dtype=torch.int32, device=input_ids.device)
+    is_base = (idx % block) == 0
+    base_rows = rows[:num_blocks].index_select(0, idx // block)
     blocks = torch.where(
-        is_base_col, base_rows, noise_row.expand(total, hidden)
-    ).masked_fill(~is_base_col & (ids_2d.reshape(-1) != noise)[:, None], float("nan"))
+        is_base.unsqueeze(-1), base_rows, noise_row.expand(total, hidden)
+    ).masked_fill(
+        (~is_base & (ids_2d.reshape(-1) != noise)).unsqueeze(-1), float("nan")
+    )
     if tail:
         tail_rows = noise_row.expand(tail, hidden).masked_fill(
             (input_ids[num_blocks * block :] != noise).unsqueeze(-1), float("nan")

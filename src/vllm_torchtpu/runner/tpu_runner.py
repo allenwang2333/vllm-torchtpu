@@ -8017,13 +8017,17 @@ class TPUModelRunner(GPUModelRunner):
             .unsqueeze(-1)
         )
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-        log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
-        token_logprobs = (token_logits - log_normalizers).to(torch.float32)
+        # Normalize in float32. On TPU a bf16 logsumexp over the vocab depends
+        # on the row count: on near-flat logits it returns 10.375 for <= 64 rows
+        # but 11.75 for >= 256 rows (true value ln(129280) = 11.77), so the same
+        # token got a different logprob from small and large logits tensors.
+        log_normalizers = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+        token_logprobs = token_logits.float() - log_normalizers
 
         max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
             topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
-            topk_logprobs = (topk_logits - log_normalizers).to(torch.float32)
+            topk_logprobs = topk_logits.float() - log_normalizers
             logprob_token_ids = torch.cat(
                 (token_ids, topk_indices.to(torch.int32)), dim=1
             )

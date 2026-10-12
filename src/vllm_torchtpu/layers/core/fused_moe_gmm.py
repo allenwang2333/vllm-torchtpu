@@ -66,6 +66,7 @@ def _select_ragged_gather_reduce(version: str):
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 5120
+_ONEHOT_KV_SHARD_AUTO_CAP = 4096
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 
@@ -75,10 +76,11 @@ def resolve_onehot_permute_threshold() -> int:
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(mult * SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs (with ``mult = 10`` for 512-row v7x
-    blocks and ``2`` for smaller blocks) and 0 elsewhere. An explicit
-    ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
-    positive value forces that threshold.
+    cap)`` on SparseCore TPUs (with ``mult = 8`` and ``cap = 4096`` when
+    ``TPU_DEEPSEEK_V41_KV_SHARD`` is enabled, ``mult = 10`` and ``cap = 5120``
+    for 512-row TPU7x blocks otherwise, and ``mult = 2`` for smaller blocks)
+    and 0 elsewhere. An explicit ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0
+    disables the one-hot path, a positive value forces that threshold.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
@@ -91,8 +93,10 @@ def resolve_onehot_permute_threshold() -> int:
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    mult = 10 if block_rows >= 512 else 2
-    threshold = min(mult * block_rows - 1, _ONEHOT_AUTO_CAP)
+    kv_shard = bool(envs.TPU_DEEPSEEK_V41_KV_SHARD)
+    mult = (8 if kv_shard else 10) if block_rows >= 512 else 2
+    cap = _ONEHOT_KV_SHARD_AUTO_CAP if kv_shard else _ONEHOT_AUTO_CAP
+    threshold = min(mult * block_rows - 1, cap)
 
     return threshold
 
