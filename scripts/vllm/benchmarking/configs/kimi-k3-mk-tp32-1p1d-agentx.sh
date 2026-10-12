@@ -3,9 +3,9 @@
 # Kimi-K3 1P1D on the megakernel backend, served as the "Kimi-K3 on TPU7x: 1P1D
 # prefill/decode recipes" doc serves it - each role TP32 on its own 2x2x4 slice,
 # presharded TP32 weights, FP8 KV in 512-token blocks, Raiden prefill-to-decode
-# transfer and a host-memory KV store - and driven by the AgentX lane's own
-# client (k3_agentx_client_pod.sh: the toy proxy and the InferenceX replay), not
-# the doc's router, Rust frontend and aiperf build.
+# transfer and a host-memory KV store, behind vLLM's Rust frontend - and driven
+# by the AgentX lane's own client (k3_agentx_client_pod.sh: the toy proxy and the
+# InferenceX replay), not the doc's router and aiperf build.
 #
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
@@ -78,11 +78,16 @@ DSPARK_DIR="$HF_HUB_CACHE_DIR/models--RedHatAI--Kimi-K3-speculator.dspark/snapsh
 # Both roles on the port the AgentX client and its proxy address.
 K3_MK_PORT=8000
 
-# ---- environment shared by both roles (all points), less the Rust frontend ----
+# ---- environment shared by both roles (all points) -----------------------------
 export PYTHONPATH="$PLUGIN_SRC"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
-export VLLM_ENGINE_READY_TIMEOUT_S=3600
+# vLLM's Rust frontend, which the engine image carries from #1884 on.
+export VLLM_USE_RUST_FRONTEND=1
+export VLLM_RUST_FRONTEND_PATH="${VLLM_RS_BIN:-/usr/local/bin/vllm-rs}"
+# The doc's 3600 assumes local storage. Here each host reads ~420 GB of
+# pre-shard through gcsfuse before it compiles, so the K3 lanes' 4 h bound.
+export VLLM_ENGINE_READY_TIMEOUT_S=14400
 export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
 export HF_HOME="$HF_HOME_DIR"
 export HF_HUB_CACHE="$HF_HUB_CACHE_DIR"

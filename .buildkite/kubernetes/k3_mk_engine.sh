@@ -81,6 +81,12 @@ export MEGASCALE_SLICE_ID='' TPU_PROCESS_ADDRESSES='' TPU_PROCESS_PORT=''
 export TPU_WORKER_HOSTNAMES=''
 
 SERVE=(vllm serve "$MODEL_DIR" --port "$K3_MK_PORT" "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}")
+# With --nnodes every host but node 0 runs headless: vLLM's multi-node docs
+# (docs/serving/parallelism_scaling.md) and the plugin (tpu_mp_multihost.py) both
+# launch the other hosts that way, and vLLM does not infer it. The doc's command
+# omits it; without it hosts 1-3 would each start an API server and an engine
+# core. Only node 0 serves, so only node 0 runs the Rust frontend.
+[ "$NODE_RANK" = 0 ] || SERVE+=(--headless)
 log "point $K3_MK_POINT ($DECODE_MODE), host $NODE_RANK/4, head $HEAD_IP, cache $CACHE_ROOT"
 if [ "${K3_MK_DRY_RUN:-0}" = 1 ]; then
   printf '[cmd]'; printf ' %q' "${SERVE[@]}"; echo
@@ -92,6 +98,13 @@ fi
 for p in "$MODEL_DIR/config.json" "$PRESHARDED_DIR/layout.json" "$PRESHARDED_DIR/prefill-sp-cache/layout.json"; do
   [ -f "$p" ] || { log "FATAL: $p is missing"; exit 2; }
 done
+if [ "$NODE_RANK" = 0 ] && [ ! -x "$VLLM_RUST_FRONTEND_PATH" ]; then
+  log "FATAL: no Rust frontend at $VLLM_RUST_FRONTEND_PATH; the engine image predates" \
+      "#1884 (vllm-rs in the image) - rebuild it from the branch head"
+  exit 2
+fi
+log "vllm_torchtpu from $(python3 -c 'import vllm_torchtpu, os; print(os.path.dirname(vllm_torchtpu.__file__))' 2>&1 | tail -1);" \
+    "megakernel: $(python3 -c 'import vllm_torchtpu.megakernel' >/dev/null 2>&1 && echo yes || echo NO)"
 if [ "$DECODE_MODE" != dp2_dcp16 ]; then
   _d="$PRESHARDED_DIR/dspark-${K3_MK_DSPARK_REVISION:0:8}"
   [ -f "$DSPARK_DIR/config.json" ] && [ -d "$_d" ] || { log "FATAL: $DSPARK_DIR or $_d is missing"; exit 2; }
