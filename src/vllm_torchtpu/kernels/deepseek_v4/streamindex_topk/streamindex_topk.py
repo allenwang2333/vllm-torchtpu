@@ -1704,6 +1704,7 @@ def streamindex_topk(
         "a2a_merge",
         "skip_empty_decode",
         "skip_empty_decode_chunked",
+        "global_scheduling_group_id",
     ),
 )
 def streamindex_topk_dcp(
@@ -1731,6 +1732,7 @@ def streamindex_topk_dcp(
     a2a_merge: bool = False,
     skip_empty_decode: bool = False,
     skip_empty_decode_chunked: bool = False,
+    global_scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1801,6 +1803,10 @@ def streamindex_topk_dcp(
         the candidate axis with an `all_gather`; see above. Same result.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
+      global_scheduling_group_id: XLA scheduling group of the cross-rank
+        SparseCore merge (stage 2), which the layer's independent TensorCore
+        work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
+        no group. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1907,6 +1913,7 @@ def streamindex_topk_dcp(
             k,
             dcp_rank=dcp_rank,
             dcp_size=dcp_size,
+            scheduling_group_id=global_scheduling_group_id,
         )
 
     replicated = P()
