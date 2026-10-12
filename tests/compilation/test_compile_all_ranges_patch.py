@@ -27,9 +27,12 @@ from vllm.config.utils import Range
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu import _patch_vllm_compile_all_ranges
-from vllm_torchtpu.compilation import tpu_compiler
+from vllm_torchtpu.compilation import host_split, tpu_compiler
 
 SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+# (range end, pieces, this rank's piece) of each bucket the last _compile
+# built inside host_split.split_across_host.
+splits = []
 
 
 @pytest.fixture
@@ -65,21 +68,25 @@ def _host(monkeypatch, ranks_per_host):
     monkeypatch.setattr(parallel_state, "get_node_count", lambda: 2)
 
 
-def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8):
+def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8, graph=None):
     """(range end, peer wait in seconds) per compile, in order."""
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     calls = []
+    splits.clear()
 
     def compile(graph, args, *rest, compile_range, **kwargs):
         calls.append(
             (compile_range.end, getattr(tpu_compiler._peer_wait, "timeout_s", 0.0))
         )
+        plan = host_split.current_plan()
+        if plan is not None:
+            splits.append((compile_range.end, plan.pieces, plan.piece))
         return lambda *a: a
 
     # In vLLM's order: smallest range first.
     backend = SimpleNamespace(
-        graph=object(),
+        graph=object() if graph is None else graph,
         range_entries={
             Range(s, s): piecewise_backend.RangeEntry(compile_range=Range(s, s))
             for s in SIZES
@@ -171,3 +178,64 @@ def test_peer_replay_off_compiles_every_range_without_waiting(
     for calls in runs:
         assert all(wait == 0.0 for _, wait in calls)
         assert sorted(end for end, _ in calls) == SIZES
+
+
+def _decoder_graph(layers=8):
+    """A traced graph with `layers` decoder layers, as Dynamo records them."""
+    import torch
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    for layer in range(layers):
+        x = graph.call_function(torch.relu, (x,))
+        x.meta["nn_module_stack"] = {"k": (f"L['self'].layers.{layer}", None)}
+    graph.output(x)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+def test_big_buckets_are_compiled_by_every_rank_together(
+    compile_all_ranges, monkeypatch
+):
+    """TPU_PRECOMPILE_SPLIT_MIN_TOKENS=1024: every rank starts on 4096, 2048
+    and 1024, one piece each, and only then deals out the rest."""
+    monkeypatch.setenv("TPU_PRECOMPILE_SPLIT_MIN_TOKENS", "1024")
+    owned = []
+    for rank in range(8):
+        calls = _compile(compile_all_ranges, monkeypatch, rank, graph=_decoder_graph())
+        assert [end for end, _ in calls[:3]] == [4096, 2048, 1024]
+        assert splits == [(4096, 8, rank), (2048, 8, rank), (1024, 8, rank)]
+        assert sorted(end for end, _ in calls) == SIZES
+        owned.append(_owned(calls[3:]))
+    assert owned == [[512], [256], [128], [64], [32], [16], [], []]
+
+
+def test_a_graph_without_layers_is_dealt_out_whole(compile_all_ranges, monkeypatch):
+    monkeypatch.setenv("TPU_PRECOMPILE_SPLIT_MIN_TOKENS", "1024")
+    owned = [
+        _owned(_compile(compile_all_ranges, monkeypatch, r, graph=_decoder_graph(1)))
+        for r in range(8)
+    ]
+    assert splits == []
+    assert owned == [[4096], [2048], [1024], [512], [256], [128], [64], [32, 16]]
+
+
+def test_no_split_when_the_host_size_is_unknown(compile_all_ranges, monkeypatch):
+    monkeypatch.setenv("TPU_PRECOMPILE_SPLIT_MIN_TOKENS", "1024")
+    calls = _compile(
+        compile_all_ranges,
+        monkeypatch,
+        0,
+        ranks_per_host=None,
+        graph=_decoder_graph(),
+    )
+    assert splits == []
+    assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_split_off_by_default(compile_all_ranges, monkeypatch):
+    owned = [
+        _owned(_compile(compile_all_ranges, monkeypatch, r, graph=_decoder_graph()))
+        for r in range(8)
+    ]
+    assert splits == []
+    assert owned == [[4096], [2048], [1024], [512], [256], [128], [64], [32, 16]]

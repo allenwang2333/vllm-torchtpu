@@ -646,3 +646,377 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+
+def _graph_with_layers(layers, nodes_per_layer=2, path="L['self'].layers.{}"):
+    """An FX graph whose nodes carry the nn_module_stack Dynamo records, with
+    `nodes_per_layer[i]` (or the same count for every) nodes in layer i."""
+    import torch
+
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    for layer in range(layers):
+        count = (
+            nodes_per_layer[layer]
+            if isinstance(nodes_per_layer, list)
+            else nodes_per_layer
+        )
+        for _ in range(count):
+            x = graph.call_function(torch.relu, (x,))
+            x.meta["nn_module_stack"] = {
+                f"L__self___layers_{layer}": (path.format(layer), torch.nn.Module)
+            }
+    graph.output(x)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+def _eager_artifact(gm):
+    """A torch_tpu CompiledArtifact that runs `gm` on the CPU, picklable like
+    a real executable."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        CompiledArtifact,
+    )
+
+    global _EagerArtifact
+    if "_EagerArtifact" not in globals():
+
+        class _EagerArtifact(CompiledArtifact):
+            def __init__(self, gm):
+                self.gm = gm
+
+            def __call__(self, *args, **kwargs):
+                if len(args) == 1 and isinstance(args[0], list):
+                    args = args[0]
+                return self.gm(*args)
+
+            def __reduce__(self):
+                return (_eager_artifact, (self.gm,))
+
+            @property
+            def updates_default_generator_state(self):
+                return False
+
+            def fingerprint(self):
+                return ""
+
+    return _EagerArtifact(gm)
+
+
+class TestHostSplit:
+    """TPU_PRECOMPILE_SPLIT_MIN_TOKENS: one bucket compiled by every rank of
+    a host, one piece each, cut between decoder layers."""
+
+    @pytest.mark.parametrize(
+        "path, layer",
+        [
+            ("L['self'].layers.12", 12),
+            ("L['self'].model.layers[12].mlp", 12),
+            ("getattr(L['self'].layers, '12')", 12),
+            ("L['self']._modules['layers']._modules['12']", 12),
+            ("L['self'].players.12", None),
+            ("L['self'].norm", None),
+        ],
+    )
+    def test_node_layer_reads_the_decoder_layer(self, path, layer):
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        node = SimpleNamespace(meta={"nn_module_stack": {"k": (path, torch.nn.Module)}})
+        assert host_split.node_layer(node) == layer
+
+    def test_layers_are_dealt_in_contiguous_runs_of_about_equal_size(self):
+        from vllm_torchtpu.compilation import host_split
+
+        gm = _graph_with_layers(6)
+        assert host_split.layer_groups(gm.graph, 2) == {
+            0: 0,
+            1: 0,
+            2: 0,
+            3: 1,
+            4: 1,
+            5: 1,
+        }
+        # Balanced by node count, not by layer count.
+        gm = _graph_with_layers(4, nodes_per_layer=[6, 1, 1, 4])
+        assert host_split.layer_groups(gm.graph, 2) == {0: 0, 1: 1, 2: 1, 3: 1}
+        # Never more pieces than layers.
+        gm = _graph_with_layers(3)
+        assert sorted(set(host_split.layer_groups(gm.graph, 8).values())) == [0, 1, 2]
+
+    def test_a_graph_without_layers_is_not_split(self):
+        from vllm_torchtpu.compilation import host_split
+
+        assert host_split.layer_groups(_graph_with_layers(1).graph, 8) == {}
+        assert not host_split.can_split(_graph_with_layers(1), 8)
+        assert not host_split.can_split(object(), 8)
+        assert host_split.can_split(_graph_with_layers(2), 8)
+
+    def test_a_wait_stays_with_its_collective(self):
+        """A cut never separates a collective's wait_tensor from it, and the
+        piece never moves inside an SPMD safe region."""
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+
+        def at(node, layer, safe=False):
+            node.meta["nn_module_stack"] = {"k": (f"layers.{layer}", None)}
+            if safe:
+                node.meta["custom"] = {"spmd_safe": True}
+            return node
+
+        a = at(graph.call_function(torch.relu, (x,)), 0)
+        coll = at(
+            graph.call_function(
+                torch.ops._c10d_functional.all_reduce.default, (a, "sum", "0")
+            ),
+            0,
+        )
+        wait = at(
+            graph.call_function(
+                torch.ops._c10d_functional.wait_tensor.default, (coll,)
+            ),
+            1,
+        )
+        safe = at(graph.call_function(torch.relu, (wait,)), 1, safe=True)
+        b = at(graph.call_function(torch.relu, (safe,)), 1)
+        graph.output(b)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        ids = host_split.piece_partitions(gm, lambda node: 0, {0: 0, 1: 1})
+        assert ids[a] == ids[coll] == ids[wait] == ids[safe] == 0
+        assert ids[b] == 1
+
+    @staticmethod
+    def _model_graph(layers=4):
+        """A Dynamo graph of a small decoder stack, as vLLM hands it over."""
+        import torch
+
+        class Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(8, 8)
+
+            def forward(self, x):
+                return torch.relu(self.proj(x)) + x
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer() for _ in range(layers)])
+                self.norm = torch.nn.LayerNorm(8)
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return self.norm(x)
+
+        torch.manual_seed(0)
+        model = Model()
+        captured = []
+
+        def capture(gm, example_inputs):
+            captured.append((gm, example_inputs))
+            return gm.forward
+
+        x = torch.randn(4, 8)
+        with torch.no_grad():
+            torch._dynamo.reset()
+            torch.compile(model, backend=capture, dynamic=False)(x)
+            expected = model(x)
+        gm, example_inputs = captured[0]
+        return gm, list(example_inputs), expected
+
+    @staticmethod
+    def _fake_lowering(monkeypatch):
+        """torch_tpu's whole pipeline -- aot_autograd, SplitCompiler,
+        serialization -- with only FX->MLIR->PjRt replaced by running the
+        partition on the CPU. Returns the node counts of what was lowered."""
+        from torch_tpu._internal.compile import compiler
+
+        lowered = []
+
+        def lower(self, gm, example_inputs, *args, **kwargs):
+            lowered.append(len(gm.graph.nodes))
+            return _eager_artifact(gm)
+
+        monkeypatch.setattr(compiler.StaticCompiler, "_compile", lower)
+        return lowered
+
+    @staticmethod
+    def _compile(tmp_path, rank, gm, example_inputs, wait_s, pieces=2):
+        """Rank `rank` of a host of `pieces` compiles the bucket in a split.
+
+        Under no_grad, as vLLM serves: aot_autograd then traces an inference
+        graph, whose artifact can be saved.
+        """
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import host_split
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(
+            cache_dir=str(tmp_path / "hash" / f"rank_{rank}_0" / "backbone")
+        )
+        with torch.no_grad(), host_split.split_across_host(pieces, rank, wait_s):
+            fn, handle = compiler.compile(
+                gm, example_inputs, {}, Range(4, 4), key="artifact_bucket"
+            )
+        return compiler, fn, handle
+
+    @staticmethod
+    def _out(result):
+        return result if not isinstance(result, (tuple, list)) else result[0]
+
+    def test_each_rank_compiles_its_piece_and_replays_the_others(
+        self, tmp_path, monkeypatch
+    ):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import host_split
+
+        monkeypatch.setattr(host_split, "_POLL_S", 0.01)
+        lowered = self._fake_lowering(monkeypatch)
+        gm, example_inputs, expected = self._model_graph()
+
+        # Rank 1 first, with no wait: it compiles its own piece, then piece 0
+        # too, since rank 0 has not saved it.
+        _, fn1, handle1 = self._compile(tmp_path, 1, gm, example_inputs, 0.0)
+        assert len(lowered) == 2
+        assert torch.allclose(self._out(fn1(*example_inputs)), expected)
+        # Its whole bucket is in its cache dir as always; hide it so rank 0
+        # cannot replay the bucket whole and has to assemble it from pieces.
+        os.remove(handle1[1])
+
+        lowered.clear()
+        compiler0, fn0, handle0 = self._compile(tmp_path, 0, gm, example_inputs, 30.0)
+        assert len(lowered) == 1, "rank 0 lowered more than its own piece"
+        assert torch.allclose(self._out(fn0(*example_inputs)), expected)
+        assert sorted(os.listdir(compiler0.cache_dir)) == [
+            "artifact_bucket",
+            "artifact_bucket.part0of2",
+        ]
+
+        # A warm start loads the assembled bucket unchanged.
+        lowered.clear()
+        loaded = compiler0.load(handle0, gm, example_inputs, 0, Range(4, 4))
+        assert lowered == []
+        assert torch.allclose(self._out(loaded(*example_inputs)), expected)
+
+    def test_a_rank_waits_for_the_piece_a_peer_compiles(self, tmp_path, monkeypatch):
+        import threading
+
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        monkeypatch.setattr(host_split, "_POLL_S", 0.01)
+        self._fake_lowering(monkeypatch)
+        gm, example_inputs, expected = self._model_graph()
+
+        # Rank 1 publishes its piece only once rank 0 is already waiting.
+        started = threading.Event()
+        original_resolve = host_split._Split.resolve
+
+        def resolve(self, original):
+            started.set()
+            return original_resolve(self, original)
+
+        monkeypatch.setattr(host_split._Split, "resolve", resolve)
+        result = {}
+
+        def rank0():
+            result["fn"] = self._compile(tmp_path, 0, gm, example_inputs, 30.0)[1]
+
+        thread = threading.Thread(target=rank0)
+        thread.start()
+        assert started.wait(30.0)
+        assert thread.is_alive()
+        self._compile(tmp_path, 1, gm, example_inputs, 0.0)
+        thread.join(30.0)
+
+        assert not thread.is_alive()
+        assert torch.allclose(self._out(result["fn"](*example_inputs)), expected)
+
+    def test_a_piece_of_another_graph_is_compiled_here(self, tmp_path, monkeypatch):
+        """A peer's piece built from a different graph is not replayed, and
+        is not waited on either."""
+        import time
+
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        monkeypatch.setattr(host_split, "_POLL_S", 0.01)
+        lowered = self._fake_lowering(monkeypatch)
+        gm, example_inputs, expected = self._model_graph()
+        _, _, handle1 = self._compile(tmp_path, 1, gm, example_inputs, 0.0)
+        os.remove(handle1[1])
+        # Rank 0 sees its pieces as built from another graph than rank 1's.
+        real = host_split.piece_fingerprint
+        monkeypatch.setattr(
+            host_split,
+            "piece_fingerprint",
+            lambda gm, inputs: "rank-0:" + real(gm, inputs),
+        )
+
+        lowered.clear()
+        start = time.monotonic()
+        _, fn0, _ = self._compile(tmp_path, 0, gm, example_inputs, 30.0)
+        assert time.monotonic() - start < 20.0
+        assert len(lowered) == 2
+        assert torch.allclose(self._out(fn0(*example_inputs)), expected)
+
+    def test_a_piece_its_owner_could_not_save_is_compiled_here(
+        self, tmp_path, monkeypatch
+    ):
+        import pickle
+        import time
+
+        from vllm_torchtpu.compilation import host_split
+
+        monkeypatch.setattr(host_split, "_POLL_S", 0.01)
+        lowered = self._fake_lowering(monkeypatch)
+        gm, example_inputs, _ = self._model_graph()
+        real_dumps = pickle.dumps
+
+        def unpicklable(obj, *args, **kwargs):
+            raise pickle.PicklingError("no")
+
+        monkeypatch.setattr(host_split.pickle, "dumps", unpicklable)
+        _, _, handle1 = self._compile(tmp_path, 1, gm, example_inputs, 0.0)
+        monkeypatch.setattr(host_split.pickle, "dumps", real_dumps)
+        os.remove(handle1[1])
+
+        lowered.clear()
+        start = time.monotonic()
+        self._compile(tmp_path, 0, gm, example_inputs, 30.0)
+        assert time.monotonic() - start < 20.0
+        assert len(lowered) == 2
+
+    def test_outside_a_split_the_backend_is_untouched(self, tmp_path, monkeypatch):
+        """Once installed, the hooks do nothing for a bucket built outside
+        split_across_host: one partition, one executable, no pieces."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import host_split
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        lowered = self._fake_lowering(monkeypatch)
+        gm, example_inputs, _ = self._model_graph()
+        host_split._install()
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(
+            cache_dir=str(tmp_path / "hash" / "rank_0_0" / "backbone")
+        )
+        with torch.no_grad():
+            compiler.compile(gm, example_inputs, {}, Range(4, 4), key="artifact_bucket")
+        assert len(lowered) == 1
+        assert os.listdir(compiler.cache_dir) == ["artifact_bucket"]

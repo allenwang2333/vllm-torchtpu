@@ -34,7 +34,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import host_split, shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -786,7 +786,16 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        # Inside host_split.split_across_host (TPU_PRECOMPILE_SPLIT_MIN_TOKENS),
+        # every rank of the host builds this bucket together: each compiles
+        # one piece and replays the others' (see host_split).
+        plan = host_split.current_plan()
+        if plan is not None and fingerprint is not None and size is not None:
+            assert key is not None
+            with host_split.splitting(plan, key, self, str(compile_range)):
+                compiled_fn, entry = self._run_backend(graph, example_inputs)
+        else:
+            compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the

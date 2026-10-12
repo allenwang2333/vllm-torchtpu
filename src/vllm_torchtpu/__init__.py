@@ -478,6 +478,28 @@ def _patch_vllm_compile_all_ranges() -> None:
         entries = [e for e in self.range_entries.values() if not e.compiled]
         if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
             entries.sort(key=lambda e: e.compile_range.end, reverse=True)
+
+        # TPU_PRECOMPILE_SPLIT_MIN_TOKENS: buckets that big are compiled by
+        # every rank of the host together, one piece each (see host_split),
+        # biggest first and before the rest are dealt out.
+        shared = []
+        split_min = envs.TPU_PRECOMPILE_SPLIT_MIN_TOKENS
+        if split_min > 0 and wait_s > 0 and ranks > 1:
+            from vllm_torchtpu.compilation import host_split
+
+            if host_split.can_split(self.graph, ranks):
+                shared = [
+                    e
+                    for e in entries
+                    if e.compile_range.is_single_size()
+                    and e.compile_range.end >= split_min
+                ]
+                shared.sort(key=lambda e: e.compile_range.end, reverse=True)
+                entries = [e for e in entries if all(e is not x for x in shared)]
+            for range_entry in shared:
+                with host_split.split_across_host(ranks, local_rank, wait_s):
+                    compile_entry(self, range_entry)
+
         mine, others = [], []
         for i, range_entry in enumerate(entries):
             turn, slot = divmod(i, ranks)

@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = True
     TPU_PRECOMPILE_PEER_REPLAY: bool = True
+    TPU_PRECOMPILE_SPLIT_MIN_TOKENS: int = 0
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -679,6 +680,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. 0 compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=True),
+    # Split each bucket of at least this many tokens into one piece per rank
+    # of the host, cut between decoder layers, so all the host's ranks compile
+    # it together instead of one rank compiling it alone; every rank then
+    # replays the pieces the others compiled. Needs TPU_PARALLEL_PRECOMPILE
+    # and TPU_PRECOMPILE_PEER_REPLAY. 0 (default) splits nothing. A split
+    # bucket runs as one TPU program per piece, so it stays in the cache key.
+    "TPU_PRECOMPILE_SPLIT_MIN_TOKENS": env_int(
+        "TPU_PRECOMPILE_SPLIT_MIN_TOKENS", default=0
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
