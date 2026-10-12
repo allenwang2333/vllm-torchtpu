@@ -821,8 +821,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
         op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
-        if with_q_b:
-            op_name += "_qb"  # its own torch op: the plain one stays registered
         # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
         # once the mesh and the specs are arguments, and the reason it exists --
         # `jax_placeholders` specializing the dynamic token dim while scaling
