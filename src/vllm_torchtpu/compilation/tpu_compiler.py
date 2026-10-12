@@ -168,6 +168,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # MTP fused draft loop uses its own dedicated compile-cache prefix
+    # (mtp_fused_loop_k{K} / mtp_fused_loop_k{K}_indexshare) and does not alter
+    # the target backbone or step-0 draft graphs.
+    "VLLM_TPU_FUSED_DRAFT_LOOP",
+    "VLLM_TPU_MTP_FUSED_INDEXSHARE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
