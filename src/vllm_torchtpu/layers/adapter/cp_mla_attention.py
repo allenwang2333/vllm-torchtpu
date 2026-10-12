@@ -150,8 +150,8 @@ def merge_lse_partials_scatter_heads(
     # Same trace-time rule as above: only the backbone may split by size.
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
     if chunks > 1:
-        return _merge_chunked(output, lse, group, chunks)
-    return cp_lse_ag_out_rs(output, lse, group)
+        return _retain_rank(_merge_chunked(output, lse, group, chunks))
+    return _retain_rank(cp_lse_ag_out_rs(output, lse, group))
 
 
 def _merge_chunks(num_tokens: int) -> int:
@@ -351,6 +351,9 @@ def _all_to_all_packed(
 
 
 _RAGGED_A2A_OPS: dict = {}
+# This rank's DCP index as an int32 [1] device tensor: the exchange takes it
+# as data (XLA's SPMD export refuses `axis_index`'s partition-id).
+_DCP_RANK: torch.Tensor | None = None
 
 
 def _ragged_all_to_all(x: torch.Tensor, rows: torch.Tensor, group: Any) -> torch.Tensor:
@@ -359,23 +362,42 @@ def _ragged_all_to_all(x: torch.Tensor, rows: torch.Tensor, group: Any) -> torch
     received block is zero. One `jax.lax.ragged_all_to_all` over the DCP mesh
     axis (`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`)."""
     world, block, vdim = x.shape
-    op = _RAGGED_A2A_OPS.get(world)
-    if op is None:
-        op = _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
-    return op(x.reshape(world * block, vdim).contiguous(), rows).reshape(
+    prebuild_ragged_all_to_all(world)
+    op = _RAGGED_A2A_OPS[world]
+    return op(x.reshape(world * block, vdim).contiguous(), rows, _DCP_RANK).reshape(
         world, block, vdim
     )
 
 
-def _ragged_fake(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+def _ragged_fake(
+    x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor
+) -> torch.Tensor:
     return torch.empty_like(x)
 
 
 def prebuild_ragged_all_to_all(world: int) -> None:
     """Build (register) the real-rows exchange op for a DCP group of `world`
     ranks at model build, not inside a trace."""
+    global _DCP_RANK
     if world not in _RAGGED_A2A_OPS:
+        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+
+        _DCP_RANK = torch.tensor([get_dcp_rank()], dtype=torch.int32, device="tpu")
         _RAGGED_A2A_OPS[world] = _build_ragged_all_to_all(world)
+
+
+def _retain_rank(out: torch.Tensor) -> torch.Tensor:
+    """`out` plus a zero read from the rank buffer, on the merge branch that
+    does not run the ragged exchange: the backbone warmup hands a bucket over
+    only between traces that lift the same buffers (as
+    `small_all_reduce_op.retain`). A dead read would be eliminated, so the
+    zero rides on `out`."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    if _DCP_RANK is None or not shape_variants.in_warmup():
+        return out
+    value = _DCP_RANK[0].to(out.dtype)
+    return out + (value - value)
 
 
 def _build_ragged_all_to_all(world: int):
@@ -392,9 +414,9 @@ def _build_ragged_all_to_all(world: int):
     # within each lane's DCP group.
     rank_spec = P(DCP_AXIS_NAME)
 
-    def body(x, rows):
+    def body(x, rows, rank):
         block = x.shape[0] // world
-        me = jax.lax.axis_index(DCP_AXIS_NAME).astype(jnp.int32)
+        me = rank[0].astype(jnp.int32)
         n = jnp.clip(rows[0], 0, block).astype(jnp.int32)
         sizes = jnp.full((world,), n, jnp.int32)
         return jax.lax.ragged_all_to_all(
@@ -407,20 +429,20 @@ def _build_ragged_all_to_all(world: int):
             axis_name=DCP_AXIS_NAME,
         )
 
-    def fn(x: jax.Array, rows: jax.Array) -> jax.Array:
+    def fn(x: jax.Array, rows: jax.Array, rank: jax.Array) -> jax.Array:
         return jax.shard_map(
             body,
             mesh=mesh,
-            in_specs=(rank_spec, P()),
+            in_specs=(rank_spec, P(), rank_spec),
             out_specs=rank_spec,
             check_vma=False,
-        )(x, rows)
+        )(x, rows, rank)
 
     return sharded_jax_op(
         f"pallas::dcp_merge_ragged_all_to_all_{world}",
         fn,
         mesh=mesh,
-        input_partition_specs=(rank_spec, P()),
+        input_partition_specs=(rank_spec, P(), rank_spec),
         output_partition_specs=rank_spec,
         fake=_ragged_fake,
     )
