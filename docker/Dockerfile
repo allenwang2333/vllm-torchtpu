@@ -109,7 +109,8 @@ COPY --from=buildkite/agent:3 /usr/local/bin/buildkite-agent /usr/local/bin/buil
 # Install tools needed for CI (gcloud, gcsfuse, lsof, fuser). CI calls
 # `gcloud storage`, never gsutil or bq, so those are removed, along with the
 # ~290 MB of precompiled bytecode the package ships; gcloud recompiles what it
-# imports on first use.
+# imports on first use. Their commands go too: left behind, `command -v gsutil`
+# finds a wrapper with nothing to run.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg lsof psmisc lsb-release && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
@@ -117,6 +118,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     apt-get update && apt-get install -y --no-install-recommends google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /usr/lib/google-cloud-sdk/platform/gsutil /usr/lib/google-cloud-sdk/platform/bq && \
+    rm -f /usr/bin/gsutil /usr/bin/bq /usr/lib/google-cloud-sdk/bin/gsutil /usr/lib/google-cloud-sdk/bin/bq && \
     find /usr/lib/google-cloud-sdk -name __pycache__ -type d -prune -exec rm -rf {} +
 
 # Start from an empty PYTHONPATH; the dev stage sets its own.
