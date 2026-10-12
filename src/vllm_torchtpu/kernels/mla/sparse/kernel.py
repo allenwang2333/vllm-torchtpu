@@ -985,6 +985,48 @@ def capped_live_windows(
 
 
 # `body_levers` the live-group body accepts (`TPU_DCP_MLA_MIXED_BODY`).
+# In-kernel q rope (TPU_MLA_DECODE_PROLOGUE): the raw q head is nope 192 |
+# rope 64 = 256 lanes; lanes 128:256 (one vreg column) hold q_pe at 64:128.
+Q_ROPE_DIM = 64
+Q_ROPE_HEAD_DIM = 256
+# Test-only faults for the in-kernel q rope / kernel-owned lse.
+PROLOGUE_FAULTS = (None, "skip_q_rope", "rope_swap", "rope_f32", "skip_lse_fill")
+
+
+def rope_q_block(x: jax.Array, tab: jax.Array, fault: str | None = None) -> jax.Array:
+    """NeoX rope of the q_pe lanes of one raw head block, as `[q_pe | 0]`.
+
+    `x` is `[heads, 128]` = lanes 128:256 of the raw q head (q_nope[128:192]
+    at lanes 0:64, q_pe at 64:128), `tab` f32 `[2, 128]` = (C, S) with
+    C[64:128] = [cos, cos] and S[64:128] = [-sin, sin]. Returns `[heads, 128]`
+    in x's dtype: the roped q_pe in lanes 0:64 and zeros in 64:128 -- exactly
+    `pad(concat(o1, o2))` with o1 = x1*cos - x2*sin, o2 = x2*cos + x1*sin.
+    XLA on TPU evaluates that bf16 expression op by op -- each product is
+    rounded to bf16 before the add (measured: 0 of 131k elements differ, vs
+    32 % for a single rounding of the f32 sum) -- so the kernel does the same.
+    """
+    xf = x.astype(jnp.float32)
+    lane = lax.broadcasted_iota(jnp.int32, xf.shape, 1)
+    # rot(x)[64:96] = x2 = x[96:128] (roll by 96 == by -32);
+    # rot(x)[96:128] = x1 = x[64:96] (roll by 32).
+    lo, hi = (32, 96) if fault == "rope_swap" else (96, 32)
+    rot = jnp.where(lane < 96, pltpu.roll(xf, lo, 1), pltpu.roll(xf, hi, 1))
+    c = tab[0:1, :]
+    s = tab[1:2, :]
+    if fault == "skip_q_rope":
+        r = xf
+    elif fault == "rope_f32":
+        # Positive control: one rounding of the f32 sum (excess precision).
+        r = xf * c + rot * s
+    else:
+        # Each product rounded to x's dtype, then the add (rounded below).
+        a = (xf * c).astype(x.dtype).astype(jnp.float32)
+        b = (rot * s).astype(x.dtype).astype(jnp.float32)
+        r = a + b
+    r = pltpu.roll(r, 64, 1)
+    return jnp.where(lane < 64, r, 0.0).astype(x.dtype)
+
+
 MIXED_BODY_LEVERS = ("tr", "zu", "pv512", "noinf", "pbf16")
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
@@ -1019,7 +1061,27 @@ def _attention_kernel(
     group_tab_ref=None,
     live_widths: tuple[int, ...] = (),
     body_levers: tuple[str, ...] = (),
+    q_rope: bool = False,
+    lse_fill: bool = False,
+    fault: str | None = None,
 ):
+    # In-kernel q rope (`q_rope`, split-q only; TPU_MLA_DECODE_PROLOGUE):
+    # `q_pe_hbm_ref` is the raw (un-roped) q head view `[tokens, heads, 256]`
+    # (nope 192 | rope 64) and a second input `tab_hbm_ref` f32[tokens, 2, 128]
+    # holds per-token C = [cos, cos, cos, cos], S = [-sin, sin, -sin, sin]
+    # (each with its own VMEM double buffer, the scratch ref before q_pe's).
+    # `load_bq` takes lanes 128:256 of each head (q_nope[128:192] | q_pe),
+    # rotates the NeoX halves of q_pe with lane rolls, forms x*C + rot(x)*S
+    # in f32 (bf16 products are exact there; one add, one RNE rounding) and
+    # rolls the result down into the `[q_pe | 0]` block the caller's rope +
+    # concat + pad used to build.
+    #
+    # Kernel-owned lse (`lse_fill`, lane-dense only): there is no aliased lse
+    # input; grid step 0 DMAs the sentinel over every row of the output
+    # (`fill_ref` / `fill_sem`, after the capped fix-up scratch) and waits for
+    # it before its own first lse store. The grid is never empty (the caller
+    # rounds it up to one step); a step past the live rows does nothing else.
+    #
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -1043,10 +1105,23 @@ def _attention_kernel(
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
+    tab_hbm_ref = None
+    bq_tab_x2_ref = None
     if split_q:
         q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim]
         bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
         refs = refs[1:-1]
+        if q_rope:
+            tab_hbm_ref = refs[0]  # f32[max_num_tokens, 2, 128]
+            bq_tab_x2_ref = refs[-1]  # f32[2, bsz, 2, 128]
+            refs = refs[1:-1]
+    assert not q_rope or split_q
+    fill_ref = None
+    fill_sem = None
+    if lse_fill:
+        assert return_lse and lse_lane_dense
+        fill_ref, fill_sem = refs[-2], refs[-1]
+        refs = refs[:-2]
     # Live-group mode (`group_tab_ref` given; capped only): window 0 of the
     # gathered buffers is in live-group order (`prepare_capped_window_live`)
     # and arrives also as atom-block views (the two inputs after q_pe). Grid
@@ -1085,6 +1160,9 @@ def _attention_kernel(
         assert sparsecore_layout
         fix_refs = refs[-6:]
         refs = refs[:-6]
+    if lse_fill:
+        # No aliased lse input: the kernel defines every row itself.
+        refs = (None, *refs)
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
@@ -1115,7 +1193,8 @@ def _attention_kernel(
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
     if split_q:
-        head_dim = align_to(head_dim + q_pe_hbm_ref.shape[-1], 128)
+        pe_dim = Q_ROPE_DIM if q_rope else q_pe_hbm_ref.shape[-1]
+        head_dim = align_to(head_dim + pe_dim, 128)
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
@@ -1311,11 +1390,23 @@ def _attention_kernel(
                     sem,
                     wait,
                 )
+            if q_rope:
+                _async_copy(
+                    tab_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                    bq_tab_x2_ref.at[bq_sem_idx, :],
+                    sem,
+                    wait,
+                )
         else:
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
             if split_q:
                 bq_pe_vmem_ref = bq_pe_x2_ref.at[bq_sem_idx, :]
                 _async_copy(src=bq_pe_vmem_ref, dst=bq_pe_vmem_ref, sem=sem, wait=True)
+            if q_rope:
+                bq_tab_vmem_ref = bq_tab_x2_ref.at[bq_sem_idx, :]
+                _async_copy(
+                    src=bq_tab_vmem_ref, dst=bq_tab_vmem_ref, sem=sem, wait=True
+                )
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -1357,6 +1448,9 @@ def _attention_kernel(
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
+    def fill_copy():
+        return pltpu.make_async_copy(fill_ref, lse_hbm_ref, fill_sem)
+
     def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
         return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx)
 
@@ -1377,7 +1471,13 @@ def _attention_kernel(
 
     def load_bq(bq_sem_idx, batch_idx):
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
-        if split_q:
+        if q_rope:
+            # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
+            # 128:256 of the raw head are one aligned vreg column.
+            raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
+            tab = bq_tab_x2_ref.at[bq_sem_idx, batch_idx][...]
+            q = jnp.concatenate([q, rope_q_block(raw, tab, fault)], -1)
+        elif split_q:
             # The caller's concat + zero pad, rebuilt in VMEM.
             q = jnp.concatenate([q, bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]], -1)
             if q.shape[-1] < head_dim:
@@ -1735,19 +1835,46 @@ def _attention_kernel(
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+        if lse_fill:
+            # The sentinel fill must land before this step's rows overwrite it.
+            @pl.when(pl.program_id(0) == 0)
+            def _():
+                fill_copy().wait()
+
         if return_lse:
             _send_blse_batch(batch_start_seq_idx, bo_sem_idx)
 
     ### ------- Kernel start ------- ###
 
-    @pl.when(batch_start_seq_idx == start_seq_idx)
+    # With `lse_fill` the grid has at least one step even when no row is
+    # live; such a step only lays down the sentinel.
+    has_work = end_seq_idx > start_seq_idx if lse_fill else True
+
+    if lse_fill:
+
+        @pl.when(pl.program_id(0) == 0)
+        def _fill_lse():
+            sentinel = -jnp.inf if lse_mask_empty else jnp.finfo(jnp.float32).min
+            if fault == "skip_lse_fill":
+                sentinel = 0.0  # positive control: a wrong sentinel
+            fill_ref[...] = jnp.full(fill_ref.shape, sentinel, jnp.float32)
+            fill_copy().start()
+
+            @pl.when(jnp.logical_not(has_work))
+            def _():
+                fill_copy().wait()
+
+    @pl.when(jnp.logical_and(batch_start_seq_idx == start_seq_idx, has_work))
     def prologue():
         start_fetch_bq_batch(batch_start_seq_idx, 0)
         start_fetch_bkv_batch(batch_start_seq_idx, 0)
 
-    process()
+    if lse_fill:
+        pl.when(has_work)(process)
+    else:
+        process()
 
-    @pl.when(batch_end_seq_idx == end_seq_idx - 1)
+    @pl.when(jnp.logical_and(batch_end_seq_idx == end_seq_idx - 1, has_work))
     def epilogue():
         # Partial stores must wait for the same byte count as their send.
         last_even = (pl.num_programs(0) - 1) // 2 * 2
@@ -1837,6 +1964,8 @@ def prepare_outputs(
         "mixed_live_gather",
         "mixed_live_widths",
         "mixed_body_levers",
+        "lse_in_kernel",
+        "prologue_fault",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1876,6 +2005,9 @@ def sparse_ragged_paged_attention(
     mixed_live_gather: bool = False,
     mixed_live_widths: tuple[int, ...] = (),
     mixed_body_levers: tuple[str, ...] = (),
+    q_rope_table: jax.Array | None = None,
+    lse_in_kernel: bool = False,
+    prologue_fault: str | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1962,6 +2094,16 @@ def sparse_ragged_paged_attention(
       mixed_body_levers: With `mixed_live_gather` taken: attention-body
         rewrites of the live grid steps (`MIXED_BODY_LEVERS`, documented at
         `_attention_kernel`). `MIXED_BODY_DEFAULT` is bitwise-identical.
+      q_rope_table: In-kernel q rope (TPU_MLA_DECODE_PROLOGUE; split q only).
+        `q_pe` is then the raw, un-roped q head view `[tokens, heads, 256]`
+        (nope 192 | rope 64, NeoX half-split rope order) and this is f32
+        `[tokens, 2, 128]`: C = [cos, cos, cos, cos], S = [-sin, sin, -sin,
+        sin] of each token's position. The kernel ropes q_pe in VMEM; same
+        scores and outputs as the caller roping q_pe in bf16.
+      lse_in_kernel: With `return_lse`, `lse_lane_dense` and a single chunk:
+        the kernel owns the lse output and lays the sentinel down itself (no
+        XLA-initialised aliased input). Same values on every row.
+      prologue_fault: test-only fault injection (`PROLOGUE_FAULTS`).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -2022,6 +2164,21 @@ def sparse_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
+    if prologue_fault not in PROLOGUE_FAULTS:
+        raise ValueError(f"unknown prologue_fault {prologue_fault}")
+    if q_rope_table is not None:
+        if q_pe is None or q_pe.shape[-1] != Q_ROPE_HEAD_DIM:
+            raise ValueError(
+                "q_rope_table needs the raw q head view as q_pe, "
+                f"[tokens, heads, {Q_ROPE_HEAD_DIM}]"
+            )
+        if q_rope_table.shape != (q.shape[0], 2, 128) or (
+            q_rope_table.dtype != jnp.float32
+        ):
+            raise ValueError(
+                f"q_rope_table {q_rope_table.shape}/{q_rope_table.dtype} must be "
+                f"f32[{q.shape[0]}, 2, 128]"
+            )
     if q_pe is not None:
         if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
             raise ValueError(
@@ -2220,6 +2377,7 @@ def sparse_ragged_paged_attention(
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
+    lse_fill = bool(lse_in_kernel and return_lse and lse_lane_dense and num_chunks == 1)
     lse = (
         jnp.full(
             (q.shape[0], num_q_heads)
@@ -2228,7 +2386,7 @@ def sparse_ragged_paged_attention(
             -jnp.inf if lse_mask_empty else jnp.finfo(jnp.float32).min,
             dtype=jnp.float32,
         )
-        if return_lse
+        if return_lse and not lse_fill
         else None
     )
 
@@ -2279,6 +2437,9 @@ def sparse_ragged_paged_attention(
                 if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
                 else ()
             ),
+            q_rope_table=q_rope_table,
+            lse_fill=lse_fill,
+            prologue_fault=prologue_fault,
         )
         if return_lse:
             q, lse = result
@@ -2386,6 +2547,9 @@ def sparse_attention_chunk(
     group_num_live: jax.Array | None = None,
     group_widths: tuple[int, ...] = (),
     group_levers: tuple[str, ...] = (),
+    q_rope_table: jax.Array | None = None,
+    lse_fill: bool = False,
+    prologue_fault: str | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -2417,7 +2581,10 @@ def sparse_attention_chunk(
     live atom blocks. `group_widths` (with `group_tab`): static row widths the
     kernel specializes its body to per grid step (see `_attention_kernel`).
     """
-    return_lse = lse is not None
+    return_lse = lse is not None or lse_fill
+    assert not (lse_fill and lse is not None), "lse_fill owns the lse buffer"
+    q_rope = q_rope_table is not None
+    assert not q_rope or q_pe is not None, "q_rope_table needs split q"
     if topk_override is not None:
         topk = topk_override
     else:
@@ -2438,7 +2605,9 @@ def sparse_attention_chunk(
     _, num_q_heads, head_dim = q.shape
     split_q = q_pe is not None
     if split_q:
-        head_dim = align_to(head_dim + q_pe.shape[-1], 128)
+        head_dim = align_to(
+            head_dim + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128
+        )
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 
@@ -2455,8 +2624,16 @@ def sparse_attention_chunk(
         live_views: tuple[jax.Array, jax.Array] | None = None,
     ):
         batch_size = kernel_batch_size
+        lse_shape = (
+            (q.shape[0], num_q_heads)
+            if lse_fill
+            else (None if lse is None else lse.shape)
+        )
         end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
         grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+        if lse_fill:
+            # Never empty: step 0 lays down the lse sentinel.
+            grid = (jnp.maximum(grid[0], 1),)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
@@ -2464,6 +2641,8 @@ def sparse_attention_chunk(
         ]
         if split_q:
             in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # q_pe
+        if q_rope:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # rope table
         if live_views is not None:
             in_specs += [pl.BlockSpec(memory_space=pltpu.HBM)] * 2  # block views
 
@@ -2472,7 +2651,8 @@ def sparse_attention_chunk(
         # the lse buffer is threaded through as an aliased in/out to carry
         # earlier chunks' rows forward.
         if return_lse:
-            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
+            if not lse_fill:
+                in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
 
         # One batch entry's worth of gathered top-k rows, per cache.
@@ -2523,6 +2703,17 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ]
+        if lse_fill:
+            # The sentinel tile for the whole lse output, and its DMA semaphore.
+            scratch_shapes += [
+                pltpu.VMEM(lse_shape, jnp.float32),
+                pltpu.SemaphoreType.DMA(()),
+            ]
+        if q_rope:
+            # Rope table double buffer; just before q_pe's.
+            scratch_shapes.append(
+                pltpu.VMEM((2, batch_size, *q_rope_table.shape[1:]), jnp.float32)
+            )
         if split_q:
             # q_pe double buffer; always the last scratch ref.
             scratch_shapes.append(
@@ -2552,6 +2743,9 @@ def sparse_attention_chunk(
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
             lse_mask_empty=lse_mask_empty,
+            q_rope=q_rope,
+            lse_fill=lse_fill,
+            fault=prologue_fault,
         )
         if live_views is not None:
             group_body = functools.partial(
@@ -2590,17 +2784,20 @@ def sparse_attention_chunk(
                 out_shape=(
                     [
                         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                        jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
+                        jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
                     ]
                     if return_lse
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
                 ),
                 input_output_aliases=(
-                    {
+                    {num_prefetch: 0}
+                    if lse_fill
+                    else {
                         num_prefetch: 0,
                         num_prefetch
                         + 3
                         + int(split_q)
+                        + int(q_rope)
                         + 2 * int(live_views is not None): 1,
                     }
                     if return_lse
@@ -2616,9 +2813,11 @@ def sparse_attention_chunk(
         operands = [q, cache_kv_nope, cache_kv_rope]
         if split_q:
             operands.append(q_pe)
+        if q_rope:
+            operands.append(q_rope_table)
         if live_views is not None:
             operands += list(live_views)
-        if return_lse:
+        if return_lse and not lse_fill:
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)
 

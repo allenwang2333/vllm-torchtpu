@@ -1038,6 +1038,8 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+    q_rope_table: jax.Array | None = None,
+    prologue_fault: str | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1054,6 +1056,11 @@ def sparse_mla_attention_dcp(
         sequence coordinates, replicated. `block_tables` holds virtual page
         ordinals, resolved per rank exactly as on the indexer side.
       dcp_size, interleave_size: the shard layout.
+      q_rope_table: TPU_MLA_DECODE_PROLOGUE. `q_pe` is then the raw, un-roped
+        q head view `[num_tokens, num_heads, 256]` and this the per-token f32
+        `[num_tokens, 2, 128]` rope table (`sparse_ragged_paged_attention`):
+        the kernel ropes q_pe in VMEM, and on decode buckets also owns the lse
+        sentinel. Requires TPU_DCP_MLA_SPLIT_Q_LSE.
 
     Returns:
       `(kv_cache_nope, kv_cache_rope, output, lse)`. `output` is
@@ -1111,6 +1118,11 @@ def sparse_mla_attention_dcp(
         P(None),  # query_start_loc
         P(None),  # request_distribution
     )
+    q_rope = q_rope_table is not None
+    if q_rope:
+        if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+            raise ValueError("q_rope_table requires TPU_DCP_MLA_SPLIT_Q_LSE")
+        in_specs = in_specs + (P(None, None, None),)  # q_rope_table
     out_specs = (
         P(dcp_axis_name),  # nope cache shard
         P(dcp_axis_name),  # rope cache shard
@@ -1138,6 +1150,7 @@ def sparse_mla_attention_dcp(
         block_tables_,
         query_start_loc_,
         request_distribution_,
+        rope_table_=None,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
@@ -1182,6 +1195,14 @@ def sparse_mla_attention_dcp(
         split_q_lse = envs.TPU_DCP_MLA_SPLIT_Q_LSE
         if split_q_lse:
             q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
+            if q_rope:
+                # TPU_MLA_DECODE_PROLOGUE: rope q_pe in the kernel; on decode
+                # buckets the kernel also lays down the lse sentinel itself.
+                split_kwargs.update(
+                    q_rope_table=rope_table_,
+                    lse_in_kernel=mask_in_kernel and decode_bucket,
+                    prologue_fault=prologue_fault,
+                )
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1264,4 +1285,5 @@ def sparse_mla_attention_dcp(
         block_tables,
         query_start_loc,
         request_distribution,
+        *((q_rope_table,) if q_rope else ()),
     )
