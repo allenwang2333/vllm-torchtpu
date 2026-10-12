@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = True
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
+    TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
@@ -1343,6 +1344,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and loop-step programs. The row choice is taken per compiled bucket inside
     # the JAX op (XLA's all-reduce above the cap), so no trace forks.
     "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT", True),
+    # With TPU_SMALL_ALL_REDUCE and the token-padding mask (TPU_MOE_SKIP_PADDED_
+    # TOKENS), backbone TP all-reduces of a 16-row-multiple block move only the
+    # step's valid rows (moe_tp_decode's in-kernel all-reduce, standalone:
+    # valid rows <= 5 folded into one row tile); padding rows come out +0.
+    # A batch-1 MTP decode step pads 4 rows to 16. Valid rows are bitwise the
+    # same as TPU_SMALL_ALL_REDUCE's (same f32 sum in rank order).
+    "TPU_SMALL_ALL_REDUCE_VALID_ROWS": env_bool("TPU_SMALL_ALL_REDUCE_VALID_ROWS"),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
