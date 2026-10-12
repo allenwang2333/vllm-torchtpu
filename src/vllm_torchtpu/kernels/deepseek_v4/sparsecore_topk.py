@@ -863,6 +863,16 @@ def _sc_topk_direct(
         def body_fn(scores, lengths, idx, *rest):
             return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
 
+    # TPU_SC_TOPK_COST_BYTES: a cost hint for XLA's latency-hiding scheduler on
+    # decode-sized calls (b <= 32), which otherwise sizes the SparseCore call's
+    # window far below its ~10 us and leaves independent TensorCore work (q_b)
+    # outside it. Scheduling only; same values.
+    cost_bytes = envs.TPU_SC_TOPK_COST_BYTES
+    cost = (
+        pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=cost_bytes)
+        if cost_bytes > 0 and b <= 32
+        else None
+    )
     out = pl.kernel(
         body_fn,
         out_type=out_type,
@@ -871,6 +881,7 @@ def _sc_topk_direct(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
+        cost_estimate=cost,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{'_cap' if row_cap else ''}",
     )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
     if scheduling_group_id is not None:
