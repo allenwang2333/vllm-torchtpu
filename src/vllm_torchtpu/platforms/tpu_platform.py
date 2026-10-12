@@ -1002,7 +1002,19 @@ class TpuPlatform(Platform):
             keep = requested is not None and os.environ.get(
                 "TPU_KV_BYTES_EXPLICIT", "0"
             ).strip().lower() in ("1", "true", "yes", "on")
-            if keep or requested != safe_kv:
+            # The budget is calibrated for a mixed engine. A disagg prefill leg
+            # (PCP shards, prefill-sized activations) OOMs at it, so leave that
+            # leg on gpu_memory_utilization.
+            kv_cfg = vllm_config.kv_transfer_config
+            if kv_cfg is not None and kv_cfg.kv_role == "kv_producer":
+                logger.info(
+                    "Qwen3.5-397B kv_cache_memory_bytes left to the prefill "
+                    "leg (requested %s; mixed-engine auto would be %d).",
+                    requested,
+                    safe_kv,
+                )
+                keep = True
+            elif keep or requested != safe_kv:
                 logger.warning(
                     "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
                     "auto %d (slots=%s, dcp=%d, seqs=%d).",
