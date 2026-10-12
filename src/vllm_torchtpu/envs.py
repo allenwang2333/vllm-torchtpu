@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
+    TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS: int = 0
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -815,6 +816,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
+    # Sparse MLA under TP (no DCP): batches of at least this many tokens
+    # exchange q from head shards to token shards so each rank gathers top-k
+    # rows for 1/tp of the tokens instead of all of them. 0 disables.
+    "TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS") or "0"
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

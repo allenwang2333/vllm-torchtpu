@@ -49,10 +49,14 @@ from __future__ import annotations
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.attention.attention import \
+    get_attention_context
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
+                                               ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.mla import MLAModules
 
@@ -64,6 +68,7 @@ from vllm.model_executor.layers.mla import MLAModules
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import \
     VllmTPUMultiHeadLatentAttentionWrapper
 from vllm_torchtpu.models.vllm.glm5_next.indexer import Glm5NextIndexer
+from vllm_torchtpu.models.vllm.glm5_next.sp import sp_all_heads
 from vllm_torchtpu.models.vllm.kimi_k3.attention import (KimiDeltaAttention,
                                                          kda_state_dtype)
 
@@ -109,13 +114,32 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
             mla_modules = next(a for a in args if isinstance(a, MLAModules))
         object.__setattr__(self, "glm_indexer",
                            getattr(mla_modules, "glm_indexer", None))
+        # Replicated twins of q_b_proj / o_proj for sequence-parallel steps;
+        # owned (registered) by `Glm5NextMLA`, like the indexer.
+        object.__setattr__(self, "q_b_proj_sp",
+                           getattr(mla_modules, "q_b_proj_sp", None))
+        object.__setattr__(self, "o_proj_sp",
+                           getattr(mla_modules, "o_proj_sp", None))
+        if self.q_b_proj_sp is not None:
+            self.mla_attn.build_full_heads = True
+        # Every k_pe this layer writes is zero and the cache starts zeroed,
+        # so the sparse op may skip the rope-cache scatter (~1 ms a layer for
+        # an 8K chunk; it is an XLA scatter on the TensorCore layout).
+        self.mla_attn.zero_rope = True
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prefill_group=None,
     ) -> torch.Tensor:
+        """`prefill_group` set: a sequence-parallel step (see `sp.py`), so
+        `hidden_states` is this rank's token shard and so is the result."""
+        if self.q_b_proj_sp is not None:
+            return self._forward_all_heads(hidden_states, prefill_group)
+        if prefill_group is not None:
+            hidden_states = prefill_group.all_gather(hidden_states, dim=0)
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
         q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank],
                                    dim=-1)
@@ -152,7 +176,73 @@ class _ZeroRopeMLAWrapper(VllmTPUMultiHeadLatentAttentionWrapper):
                           self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
         )
-        return self.o_proj(attn_out)[0]
+        out = self.o_proj(attn_out)[0]
+        if prefill_group is not None:
+            return prefill_group.reduce_scatter(out, dim=0)
+        return tensor_model_parallel_all_reduce(out)
+
+
+    def _forward_all_heads(self, hidden_states: torch.Tensor,
+                           prefill_group) -> torch.Tensor:
+        """Attend with every head, from the replicated twins.
+
+        With `prefill_group` (a sequence-parallel step) `hidden_states` is
+        this rank's token shard: every per-query projection -- q LoRA, q_b,
+        the absorbed W_UK/W_UV, o_proj -- runs on the shard, so the output is
+        already this rank's rows; no all-to-all and no reduce-scatter. Only
+        what every token's attention reads is gathered: the KV latent and the
+        indexer's key/gate rows, 768 columns instead of the 4096-wide hidden
+        state.
+
+        Without it (decode buckets) every rank does the same for every token.
+        That reads the full q_b/o_proj (~0.4 ms a step over the TP shards) and
+        drops the all-reduce, but above all both cases are one code path over
+        one set of weights, read in one order: the runner hands compiled
+        buckets between the two traces only if they take identical inputs
+        (`compilation.shape_variants`), and anything that reads the other
+        path's weights in the decode graph only to satisfy that makes XLA
+        re-tile those weights every step.
+        """
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank],
+                                   dim=-1)
+        q_c = self.q_a_layernorm(q_c)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        k_idx, gate_idx = self.glm_indexer.key_inputs(hidden_states)
+        if prefill_group is not None:
+            gathered = prefill_group.all_gather(torch.cat(
+                [kv_c_normed.to(k_idx.dtype), k_idx, gate_idx], dim=-1),
+                                                dim=0)
+            kv_c_normed, k_idx, gate_idx = gathered.split(
+                [self.kv_lora_rank, k_idx.shape[-1], gate_idx.shape[-1]],
+                dim=-1)
+            kv_c_normed = kv_c_normed.contiguous()
+        topk_indices = self.glm_indexer.forward_given_keys(
+            hidden_states, q_c, k_idx, gate_idx,
+            sequence_parallel=prefill_group is not None)
+
+        q_nope = self.q_b_proj_sp(q_c)[0].view(
+            -1, self.q_b_proj_sp.output_size // self.qk_nope_head_dim,
+            self.qk_nope_head_dim)
+        attn = self.mla_attn
+        attn_metadata, _, kv_cache, _ = get_attention_context(attn.layer_name)
+        if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
+            # Memory probe before the caches are bound; see the backend.
+            out = torch.zeros_like(
+                q_nope.flatten(1)[:, :1].expand(-1, q_nope.shape[1] *
+                                                self.v_head_dim))
+        else:
+            out = attn.impl.forward_sparse_all_heads(
+                attn,
+                q_nope,
+                kv_c_normed,
+                torch.zeros_like(kv_c_normed[..., :ROPE_LANE]),
+                kv_cache,
+                attn_metadata,
+                topk_indices,
+                sequence_parallel=prefill_group is not None,
+            )
+        return self.o_proj_sp(out)[0]
 
 
 class Glm5NextMLA(nn.Module):
@@ -231,8 +321,35 @@ class Glm5NextMLA(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            # Reduced by `_ZeroRopeMLAWrapper.forward`: all-reduce, or
+            # reduce-scatter in a sequence-parallel step.
+            reduce_results=False,
             prefix=f"{prefix}.o_proj",
         )
+
+        # Sequence-parallel steps project q and the output for this rank's
+        # tokens with every head, so they need full copies of q_b_proj and
+        # o_proj (~96 MB a layer in fp8). Same prefixes as the TP layers, so
+        # the quantization config treats them alike; `load_weights` feeds
+        # both from the same checkpoint tensors.
+        q_b_proj_sp = o_proj_sp = None
+        if self.indexer is not None and sp_all_heads():
+            q_b_proj_sp = ReplicatedLinear(
+                self.q_lora_rank,
+                config.num_attention_heads * self.qk_nope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_b_proj",
+            )
+            o_proj_sp = ReplicatedLinear(
+                config.num_attention_heads * self.v_head_dim,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        self.q_b_proj_sp = q_b_proj_sp
+        self.o_proj_sp = o_proj_sp
 
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -255,6 +372,9 @@ class Glm5NextMLA(nn.Module):
         mla_modules.g_proj = None
         mla_modules.gate_is_fused = False
         mla_modules.glm_indexer = self.indexer
+        mla_modules.q_b_proj_sp = q_b_proj_sp
+        mla_modules.o_proj_sp = o_proj_sp
+        self.prefill_group = None  # set by Glm5NextModel when SP is on
         self.mla_attn = _ZeroRopeMLAWrapper(
             config.hidden_size,
             num_heads,
@@ -276,8 +396,15 @@ class Glm5NextMLA(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        # The two paths read different weights (sharded vs the replicated
+        # twins), so their traces take different inputs; the runner keeps
+        # each bucket with the trace that serves it (`shape_variants`).
+        return self.mla_attn(
+            positions,
+            hidden_states,
+            prefill_group=self.prefill_group if sequence_parallel else None)
 
 
 __all__ = [

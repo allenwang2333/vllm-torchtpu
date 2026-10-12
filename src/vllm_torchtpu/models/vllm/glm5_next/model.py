@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import \
     fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -59,8 +60,13 @@ from vllm_torchtpu.models.vllm.glm5_next.attention import (
 from vllm_torchtpu.models.vllm.glm5_next.indexer import dense_dsa_fallback
 from vllm_torchtpu.models.vllm.glm5_next.layers import Glm5NextMLP
 from vllm_torchtpu.models.vllm.glm5_next.moe import Glm5NextMoE
+from vllm_torchtpu.models.vllm.glm5_next.sp import (TokenShards, sp_min_tokens,
+                                                    use_sp)
 
 logger = init_logger(__name__)
+
+_SP_TWINS = ((".self_attn.q_b_proj.", ".self_attn.q_b_proj_sp."),
+             (".self_attn.o_proj.", ".self_attn.o_proj_sp."))
 
 # GLM's HyperConnection multiplies the post gate by 2 (``2 * sigmoid(...)``);
 # the shared mHC kernel takes that factor as a constant.
@@ -100,6 +106,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 swiglu_limit=config.swiglu_limit,
                 quant_config=vllm_config.quant_config,
+                reduce_results=False,  # reduced in `forward`, like the MoE
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -170,6 +177,7 @@ class Glm5NextDecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        sp: TokenShards | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
 
@@ -177,6 +185,9 @@ class Glm5NextDecoderLayer(nn.Module):
         carries `(residual, post_mix, res_mix)` -- the recombine that output
         still owes. The chain is opened by the layer-0 attention pre, which has
         no preceding post, and closed by the caller.
+
+        With `sp`, everything here is this rank's token shard; the sublayers
+        gather their input and scatter their output (see `sp.py`).
         """
         if residual is None:
             residual = x
@@ -189,13 +200,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_scale, self.hc_attn_base)
 
         x = self.input_layernorm(x)
-        x = self.self_attn(positions, x)
+        x = self.self_attn(positions, x, sequence_parallel=sp is not None)
 
         residual, post_mix, res_mix, x = self.mhc_ops.fused(
             x, residual, post_mix, res_mix, self.hc_ffn_fn, self.hc_ffn_scale,
             self.hc_ffn_base)
         x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
+        if sp is not None:
+            x = sp.reduce_scatter(self.mlp(sp.all_gather(x)))
+        else:
+            x = tensor_model_parallel_all_reduce(self.mlp(x))
         return x, residual, post_mix, res_mix
 
 
@@ -255,6 +269,13 @@ class Glm5NextModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
+        self.sp = TokenShards() if sp_min_tokens() else None
+        if self.sp is not None:
+            for layer in self.layers:
+                # KDA (Kimi's layer) all-gathers / reduce-scatters through
+                # `prefill_group` when called with `sequence_parallel=True`.
+                layer.self_attn.prefill_group = self.sp
+
     @property
     def mhc_post_op(self):
         """Settles the post that the last decoder layer deferred.
@@ -282,6 +303,13 @@ class Glm5NextModel(nn.Module):
         else:
             assert input_ids is not None
             hidden_states = self.embed_input_ids(input_ids)
+        # A large step keeps the residual stream token-sharded (`sp.py`).
+        # Branching on the token count is fine here: the backbone is traced
+        # per bucket group.
+        sp = self.sp if (self.sp is not None
+                         and use_sp(hidden_states.shape[0])) else None
+        if sp is not None:
+            hidden_states = sp.local_tokens(hidden_states)
         # One embedding broadcast into hc_mult parallel residual streams.
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
@@ -293,6 +321,7 @@ class Glm5NextModel(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                sp,
             )
 
         if post_mix is not None:
@@ -302,8 +331,10 @@ class Glm5NextModel(nn.Module):
         # Glm5NextTextHyperHead: an unweighted mean over the streams. DeepSeek
         # -V4 learns gates for this collapse; GLM does not, and the checkpoint
         # correspondingly ships no `hc_head_*` tensors.
-        hidden_states = hidden_states.mean(dim=-2)
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states.mean(dim=-2))
+        if sp is not None:
+            hidden_states = sp.all_gather(hidden_states)
+        return hidden_states
 
 
 class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -485,6 +516,16 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid):
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
+                    # The sequence-parallel twins (`Glm5NextMLA`) take the
+                    # same checkpoint tensors, whole.
+                    for tp_name, sp_name in _SP_TWINS:
+                        twin = name.replace(tp_name, sp_name)
+                        if tp_name in name and twin in params_dict:
+                            param = staged.stage(twin, params_dict[twin])
+                            getattr(param, "weight_loader",
+                                    default_weight_loader)(param,
+                                                           loaded_weight)
+                            loaded_params.add(twin)
         finally:
             staged.flush_all()
 

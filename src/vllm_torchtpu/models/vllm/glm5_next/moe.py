@@ -95,6 +95,9 @@ class Glm5NextMoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
+            # The decoder layer reduces: all-reduce, or reduce-scatter in a
+            # sequence-parallel step (see `sp.py`).
+            reduce_results=False,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

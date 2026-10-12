@@ -45,7 +45,9 @@ import functools
 import os
 
 import jax
+import jax.experimental.shard_map
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 import torch
 from torch import nn
 from torch_tpu._internal import pallas
@@ -58,6 +60,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     scatter_rows, streamindex_topk)
+from vllm_torchtpu.layers.core.attention_interface import token_shard_start
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend, VllmTPUDeepseekV32IndexerBackend)
@@ -593,6 +596,10 @@ def _kpool_index_v3_jax(
         kpool: int,
         select_k: int,
         width: int,
+        shard_axis: str | None = None,
+        num_shards: int = 1,
+        shard_min_tokens: int = 0,
+        update_only: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The serving indexer: fp8 pool keys scored by `streamindex_topk`.
 
@@ -611,6 +618,11 @@ def _kpool_index_v3_jax(
     the slot otherwise (it was produced in an earlier step, and the pool was
     that request's trailing pool then). Afterwards each request writes the
     rows of its new trailing incomplete pool, if any, into its slot.
+
+    With ``shard_axis`` set (inside a shard_map over the TP world), a step of
+    at least ``shard_min_tokens`` tokens selects for this rank's token slice
+    only; see `sparse_mla_attention_token_sharded`. Both states are still
+    updated from every token, identically on every rank.
 
     Dropping the paged member cache matters more than its 512 B/token
     suggests: TPU's non-unified hybrid layout gives every paged cache kind a
@@ -658,7 +670,48 @@ def _kpool_index_v3_jax(
                              _pool_key_records(new_keys, key_cache.shape[-1]),
                              dst_rows)
 
-    head_dim = k_new.shape[-1]
+    if update_only:  # the caller selects (`_build_kpool_index_v3_sp_op`)
+        return member_state, key_cache, None
+    if (shard_axis is None or num_tokens < shard_min_tokens
+            or num_tokens % num_shards):
+        topk_indices = _select_pools(q, weights, key_cache, seq_lens,
+                                     cu_q_lens, distribution,
+                                     key_page_indices, pos, live,
+                                     kpool=kpool, select_k=select_k,
+                                     width=width)
+        return member_state, key_cache, topk_indices
+
+    # Token-sharded step: this rank selects for its slice of the tokens
+    # only, the slice the token-sharded sparse MLA attends here (both take
+    # `shard_min_tokens` from the same flag). The other rows stay -1.
+    local_tokens = num_tokens // num_shards
+    start = token_shard_start(shard_axis, num_shards, local_tokens)
+    local = _select_pools_slice(q, weights, key_cache, seq_lens, cu_q_lens,
+                                distribution, key_page_indices, pos, live,
+                                start, local_tokens, kpool=kpool,
+                                select_k=select_k, width=width)
+    topk_indices = jax.lax.dynamic_update_slice_in_dim(
+        jnp.full((num_tokens, width), -1, jnp.int32), local, start, 0)
+    return member_state, key_cache, topk_indices
+
+
+def _select_pools(
+        q: jax.Array,  # f32 [tokens, heads, head_dim]
+        weights: jax.Array,  # f32 [tokens, heads]
+        key_cache: jax.Array,
+        seq_lens: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        key_page_indices: jax.Array,
+        pos: jax.Array,
+        live: jax.Array,
+        *,
+        kpool: int,
+        select_k: int,
+        width: int,
+) -> jax.Array:
+    """`streamindex_topk` over the pool key cache -> sparse MLA rows."""
+    head_dim = q.shape[-1]
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     qf = q.astype(jnp.float32) * jnp.float32(head_dim**-0.5)
     q_scale = jnp.maximum(jnp.max(jnp.abs(qf), axis=-1), 1e-12) / fp8_max
@@ -677,15 +730,148 @@ def _kpool_index_v3_jax(
         num_queries_per_block=_STREAMINDEX_QUERIES_PER_BLOCK,
         complete_rows_only=True,
     )
-    topk_indices = _expand_selected_pools(selected, selected >= 0, pos, live,
-                                          kpool=kpool, select_k=select_k,
-                                          width=width)
-    return member_state, key_cache, topk_indices
+    return _expand_selected_pools(selected, selected >= 0, pos, live,
+                                  kpool=kpool, select_k=select_k, width=width)
+
+
+def _select_pools_slice(q, weights, key_cache, seq_lens, cu_q_lens,
+                        distribution, key_page_indices, pos, live,
+                        start: jax.Array, local_tokens: int, *, kpool: int,
+                        select_k: int, width: int,
+                        q_is_local: bool = False) -> jax.Array:
+    """`_select_pools` for tokens ``[start, start + local_tokens)`` only.
+
+    The batch is re-described as if the step ended at the slice: request
+    boundaries are clipped to it, and each request's length drops by its
+    tokens past the slice, so every query keeps its position (and causal
+    view). With `q_is_local`, `q` and `weights` hold the slice's rows only. All requests go through the mixed pass -- a decode request whose
+    token is not in the slice has no query here, which the decode passes
+    (one query per request, unconditionally) do not allow.
+    """
+    end = start + local_tokens
+    after = cu_q_lens[1:] - jnp.maximum(cu_q_lens[:-1],
+                                        jnp.minimum(cu_q_lens[1:], end))
+    zero = jnp.zeros((), distribution.dtype)
+    local = functools.partial(jax.lax.dynamic_slice_in_dim,
+                              start_index=start,
+                              slice_size=local_tokens)
+    if not q_is_local:
+        q, weights = local(q), local(weights)
+    return _select_pools(q, weights, key_cache,
+                         seq_lens - after,
+                         jnp.clip(cu_q_lens - start, 0, local_tokens),
+                         jnp.stack([zero, zero, distribution[2]]),
+                         key_page_indices, local(pos), local(live),
+                         kpool=kpool, select_k=select_k, width=width)
+
+
+_TOKEN_SHARD_AXIS = "glm_index_tokens"
 
 
 @functools.lru_cache(maxsize=None)
-def _build_kpool_index_v3_op(kpool: int, select_k: int, width: int):
+def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
+    """The v3 indexer for a sequence-parallel step (see `sp.py`).
+
+    `k_new`/`gate_new` cover the whole step and update both states exactly as
+    `_kpool_index_v3_jax` does, identically on every rank; `q`/`weights` are
+    this rank's `T / tp` tokens, and so is the returned selection.
+    """
+    import torch.distributed as dist
+    from torch_tpu._internal.pallas import get_pallas_mesh
+    mesh = get_pallas_mesh(axis_names=(_TOKEN_SHARD_AXIS, ))
+    num_shards = dist.get_world_size()
+
+    def _local(member_state, key_cache, k_new, gate_new, q, weights, ape,
+               seq_lens, cu_q_lens, distribution, state_indices,
+               key_page_indices):
+        num_tokens = k_new.shape[0]
+        local_tokens = q.shape[0]
+        assert num_tokens == local_tokens * num_shards
+        member_state, key_cache, _ = _kpool_index_v3_jax(
+            member_state, key_cache, k_new, gate_new,
+            jnp.zeros((0, ) + q.shape[1:], q.dtype), weights[:0], ape,
+            seq_lens, cu_q_lens, distribution, state_indices,
+            key_page_indices, kpool=kpool, select_k=select_k, width=width,
+            update_only=True)
+        _, pos, live = _step_positions(seq_lens, cu_q_lens, num_tokens)
+        start = token_shard_start(_TOKEN_SHARD_AXIS, num_shards, local_tokens)
+        topk = _select_pools_slice(q, weights, key_cache, seq_lens, cu_q_lens,
+                                   distribution, key_page_indices, pos, live,
+                                   start, local_tokens, kpool=kpool,
+                                   select_k=select_k, width=width,
+                                   q_is_local=True)
+        return member_state, key_cache, topk
+
+    def _bound(member_state: jax.Array, key_cache: jax.Array,
+               k_new: jax.Array, gate_new: jax.Array, q: jax.Array,
+               weights: jax.Array, ape: jax.Array, seq_lens: jax.Array,
+               cu_q_lens: jax.Array, distribution: jax.Array,
+               state_indices: jax.Array, key_page_indices: jax.Array
+               ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        args = (member_state, key_cache, k_new, gate_new, q, weights, ape,
+                seq_lens, cu_q_lens, distribution, state_indices,
+                key_page_indices)
+        return jax.jit(
+            jax.experimental.shard_map.shard_map(
+                _local, mesh=mesh, in_specs=(P(), ) * len(args),
+                out_specs=(P(), P(), P()), check_rep=False))(*args)
+
+    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v3_sp",
+                           _bound,
+                           donate_argnums=(0, 1),
+                           mesh=mesh,
+                           input_partition_specs=(P(), ) * 12,
+                           output_partition_specs=(P(), P(), P()))
+
+    def _fake(member_state, key_cache, k_new, gate_new, q, *args, **kwargs):
+        return (torch.empty_like(member_state), torch.empty_like(key_cache),
+                torch.empty((q.shape[0], width),
+                            dtype=torch.int32,
+                            device=q.device))
+
+    jax_op.register_fake(_fake)
+
+    def op(member_state, key_cache, *args):
+        new_state, new_key_cache, topk_indices = jax_op(
+            member_state, key_cache, *args)
+        member_state.copy_(new_state)
+        key_cache.copy_(new_key_cache)
+        return topk_indices
+
+    return op
+
+
+def _token_shard_min_tokens() -> int:
+    """The token-sharded sparse MLA threshold, or 0 when it is off.
+
+    The indexer has to follow it exactly: on the sharded path the MLA reads
+    only its own rows, and this op then fills only those.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    from vllm_torchtpu import envs
+    if get_tensor_model_parallel_world_size() == 1:
+        return 0
+    return envs.TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS
+
+
+@functools.lru_cache(maxsize=None)
+def _build_kpool_index_v3_op(kpool: int, select_k: int, width: int,
+                             shard_min_tokens: int = 0):
     """`_kpool_index_v3_jax` as a torch op; both states updated in place."""
+    mesh = None
+    num_shards = 1
+    if shard_min_tokens:
+        import torch.distributed as dist
+        from torch_tpu._internal.pallas import get_pallas_mesh
+        mesh = get_pallas_mesh(axis_names=(_TOKEN_SHARD_AXIS, ))
+        num_shards = dist.get_world_size()
+
+    def _call(*args):
+        return _kpool_index_v3_jax(
+            *args, kpool=kpool, select_k=select_k, width=width,
+            shard_axis=_TOKEN_SHARD_AXIS if mesh is not None else None,
+            num_shards=num_shards, shard_min_tokens=shard_min_tokens)
 
     # `pallas.jax_op` reads the annotations to build the torch schema.
     def _bound(member_state: jax.Array, key_cache: jax.Array,
@@ -694,15 +880,29 @@ def _build_kpool_index_v3_op(kpool: int, select_k: int, width: int):
                cu_q_lens: jax.Array, distribution: jax.Array,
                state_indices: jax.Array, key_page_indices: jax.Array
                ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        return _kpool_index_v3_jax(member_state, key_cache, k_new, gate_new,
-                                   q, weights, ape, seq_lens, cu_q_lens,
-                                   distribution, state_indices,
-                                   key_page_indices, kpool=kpool,
-                                   select_k=select_k, width=width)
+        args = (member_state, key_cache, k_new, gate_new, q, weights, ape,
+                seq_lens, cu_q_lens, distribution, state_indices,
+                key_page_indices)
+        if mesh is None:
+            return _call(*args)
+        # Every input is replicated; the topk output differs per rank (each
+        # fills its own rows) but has the replicated shape.
+        return jax.jit(
+            jax.experimental.shard_map.shard_map(
+                _call, mesh=mesh, in_specs=(P(), ) * len(args),
+                out_specs=(P(), P(), P()), check_rep=False))(*args)
 
-    jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v3",
-                           _bound,
-                           donate_argnums=(0, 1))
+    if mesh is None:
+        jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v3",
+                               _bound,
+                               donate_argnums=(0, 1))
+    else:
+        jax_op = pallas.jax_op("pallas::glm5_next_kpool_index_v3_tok",
+                               _bound,
+                               donate_argnums=(0, 1),
+                               mesh=mesh,
+                               input_partition_specs=(P(), ) * 12,
+                               output_partition_specs=(P(), P(), P()))
 
     def _fake(member_state, key_cache, k_new, *args, **kwargs):
         return (torch.empty_like(member_state), torch.empty_like(key_cache),
@@ -720,6 +920,9 @@ def _build_kpool_index_v3_op(kpool: int, select_k: int, width: int):
         return topk_indices
 
     return op
+
+
+_DEBUG_KEEP_TOPK = os.environ.get("GLM53_DEBUG_KEEP_TOPK", "0") == "1"
 
 
 def use_v1_indexer() -> bool:
@@ -826,8 +1029,68 @@ class Glm5NextIndexer(nn.Module):
                 Glm5NextMemberState(self.kpool, self.head_dim,
                                     prefix=f"{prefix}.member_state",
                                     vllm_config=vllm_config))
-            self.index_op = _build_kpool_index_v3_op(self.kpool,
-                                                     self.select_k, self.width)
+            self.index_op = _build_kpool_index_v3_op(
+                self.kpool, self.select_k, self.width,
+                _token_shard_min_tokens())
+            from vllm_torchtpu.models.vllm.glm5_next.sp import sp_min_tokens
+            self.index_op_sp = (_build_kpool_index_v3_sp_op(
+                self.kpool, self.select_k, self.width)
+                                if sp_min_tokens() else None)
+
+    def key_inputs(
+            self,
+            hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token ``(k, gate)`` rows: what every rank needs for all tokens
+        in a sequence-parallel step, so they are computed on the token shard
+        and gathered."""
+        k = self.k_norm(self.wk(hidden_states)[0]).to(torch.bfloat16)
+        gate = torch.nn.functional.linear(
+            hidden_states, self.index_kpool_compress_gate).to(torch.bfloat16)
+        return k, gate
+
+    def forward_given_keys(self, hidden_states: torch.Tensor,
+                           q_resid: torch.Tensor, k: torch.Tensor,
+                           gate: torch.Tensor,
+                           sequence_parallel: bool) -> torch.Tensor:
+        """`forward` with `key_inputs` already computed (for the whole step).
+
+        In a sequence-parallel step `hidden_states` / `q_resid` are this
+        rank's token shard and so is the selection; otherwise every token.
+        Both cases read the same weights in the same order (see
+        `_ZeroRopeMLAWrapper._forward_all_heads`).
+        """
+        num_tokens = hidden_states.shape[0]
+        metadatas = self._bound_metadatas()
+        if metadatas is None:
+            return self.topk_indices_buffer[:num_tokens]
+        key_md, member_md = metadatas
+        q = self.wq_b(q_resid)[0].view(num_tokens, self.n_heads, self.head_dim)
+        weights = self.weights_proj(hidden_states)[0].float() * (
+            self.n_heads**-0.5)
+        op = self.index_op_sp if sequence_parallel else self.index_op
+        return op(self.member_state.kv_cache[0], self.key_cache.kv_cache, k,
+                  gate, q.float(), weights,
+                  self.index_kpool_compress_ape.float(), key_md.seq_lens,
+                  key_md.query_start_loc, key_md.request_distribution,
+                  member_md.mamba_state_indices, key_md.block_tables)
+
+    def _bound_metadatas(self):
+        """Per-cache metadata, or None before the caches are bound."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            attn_metadata = {}
+        layers = ((self.k_cache, ) if self.key_cache is None else
+                  (self.key_cache, self.member_state))
+        metadatas = []
+        for layer in layers:
+            md = attn_metadata.get(layer.prefix)
+            caches = layer.kv_cache
+            first = caches[0] if isinstance(caches, (list, tuple)) else caches
+            if (not isinstance(md, AttentionMetadata) or first is None
+                    or first.numel() == 0):
+                return None
+            metadatas.append(md)
+        return metadatas
 
     def forward(self, hidden_states: torch.Tensor,
                 q_resid: torch.Tensor) -> torch.Tensor:
@@ -880,6 +1143,11 @@ class Glm5NextIndexer(nn.Module):
                                          key_md.request_distribution,
                                          member_md.mamba_state_indices,
                                          key_md.block_tables)
+
+        if _DEBUG_KEEP_TOPK:
+            # Measurement hook (eager mode only): keep the latest selection
+            # so a `collective_rpc` can read it back. Never set in serving.
+            self.debug_last_topk = topk_indices
 
         # Returned directly rather than written into `topk_indices_buffer`:
         # the GLM MLA consumes this tensor itself, and updating the shared
