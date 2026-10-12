@@ -220,7 +220,8 @@ def test_sparse_mla_attention_dcp_rank_operand(dcp_size):
     local_topk = jax.device_put(
         jnp.asarray(local_topk), NS(mesh, P(DCP_AXIS_NAME, None))
     )
-    # Decode step: positions 60 and 90; the new rows land on ranks 60 % n, 90 % n.
+    # Decode step at positions 60 and 90: rows land on ranks (60 // 4) % n and
+    # (90 // 4) % n, at local slots inside every rank's first 40.
     seq_lens = jnp.array([61, 91], jnp.int32)
     block_tables = jnp.arange(num_seqs * t.PAGES_PER_SEQ, dtype=jnp.int32)
     query_start_loc = jnp.array([0, 1, 2], jnp.int32)
@@ -245,7 +246,9 @@ def test_sparse_mla_attention_dcp_rank_operand(dcp_size):
             sm_scale=0.05,
             k_scale=1.0,
             dcp_size=dcp_size,
-            interleave_size=1,
+            # A rope tile packs WORD_BYTES (4) tokens; the interleave must not
+            # split one across ranks.
+            interleave_size=4,
             dcp_rank_ids=rank_ids,
         )
 

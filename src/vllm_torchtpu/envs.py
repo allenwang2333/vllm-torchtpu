@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     TPU_IDX_TOPK_SCHED_GROUPS: bool = False
     TPU_DCP_RANK_OPERAND: bool = False
+    TPU_SC_TOPK_COST_BYTES: int = 0
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
@@ -1032,6 +1033,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all_to_all of an iota once per program (~8 us on 2x2x2 TP16xDCP16,
     # backbone and every drafter pass). Same values.
     "TPU_DCP_RANK_OPERAND": env_bool("TPU_DCP_RANK_OPERAND"),
+    # bytes_accessed cost hint on decode-sized (b <= 32) SparseCore top-k
+    # kernels, for XLA's latency-hiding scheduler; 0 = none. Same values.
+    "TPU_SC_TOPK_COST_BYTES": env_nonnegative_int("TPU_SC_TOPK_COST_BYTES", 0),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
