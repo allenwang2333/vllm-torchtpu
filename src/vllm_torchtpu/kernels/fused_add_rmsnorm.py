@@ -35,8 +35,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-# Rows per grid step. One [rows, 6144] bf16 tile is 1.5 MiB at 128 rows.
-DEFAULT_BLOCK_ROWS = 128
+# Rows per grid step. One [rows, 6144] bf16 tile is 3 MiB at 256 rows; measured
+# 74 us vs 81 us at 128 rows for 4096 x 6144 on v7x (j-97d7757a).
+DEFAULT_BLOCK_ROWS = 256
 
 
 def _kernel(*refs, eps: float, has_residual: bool):
@@ -100,7 +101,8 @@ def fused_add_rms_norm(
         out_specs=out_specs,
         out_shape=out_shape,
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",), vmem_limit_bytes=vmem_limit
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit,
         ),
         name=f"fused_add_rmsnorm_r{int(has_residual)}_b{block_rows}_h{hidden}",
         interpret=interpret,
