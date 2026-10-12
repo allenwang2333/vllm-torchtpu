@@ -555,3 +555,102 @@ def test_torch_wrapper_rope_matches_kernel_rope_semantics():
     np.testing.assert_array_equal(
         tab_np.view(np.uint32), _bits32(rope_table(pos_j, cache))
     )
+
+
+# --- composition: prologue partials/lse through the packed a2a merge ---------
+
+
+def _merge_every_rank(outputs, lses, pack):
+    """`merge_lse_partials_all_to_all` on every DCP rank (CPU, lockstep threads
+    standing in for the exchange); returns the [T, H, V] merge over all heads."""
+    import concurrent.futures
+    import threading
+
+    import torch
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+
+    world = outputs.shape[0]
+    slots = [None] * world
+    barrier = threading.Barrier(world)
+
+    class _Group:
+        def __init__(self, rank):
+            self.world_size, self.rank_in_group, self.device_group = world, rank, None
+
+    def exchange(x, group):
+        slots[group.rank_in_group] = x
+        barrier.wait()
+        recv = torch.stack([slots[s][group.rank_in_group] for s in range(world)])
+        barrier.wait()
+        return recv
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _Group(rank)
+        )
+
+    with (
+        mock.patch.object(cp_mla, "_all_to_all", exchange),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", pack, create=True),
+    ):
+        with concurrent.futures.ThreadPoolExecutor(world) as pool:
+            return torch.cat(list(pool.map(run, range(world))), dim=1)
+
+
+def _rank_partials(step, dcp):
+    import torch
+
+    n = step["out"].shape[0] // dcp
+    out = torch.from_numpy(step["out"].view(np.int16).copy()).view(torch.bfloat16)
+    lse = torch.from_numpy(step["lse"].view(np.float32).copy())
+    return out.reshape(dcp, n, HEADS, -1), lse.reshape(dcp, n, HEADS)
+
+
+@pytest.mark.usefixtures("prod_env")
+def test_dcp_prologue_partials_through_packed_merge_bit_identical():
+    """TPU_MLA_DECODE_PROLOGUE + TPU_DCP_LSE_MERGE_A2A_PACK compose: the
+    kernel-owned lse (its in-kernel sentinel included) and partials, merged
+    through the one-exchange packed a2a, equal bit for bit the incumbent's
+    (XLA rope, aliased lse) merged through the two-exchange a2a -- every rank's
+    heads, every row, mixed 256 and decode 16 / 32 buckets."""
+    _require_tpu()
+    dcp = _dcp_size()
+    if dcp < 2:
+        pytest.skip("DCP needs at least 2 devices")
+    import torch
+
+    ref = _dcp_run(dcp, candidate=False)
+    got = _dcp_run(dcp, candidate=True)
+    for i, (a, b) in enumerate(zip(ref, got)):
+        want = _merge_every_rank(*_rank_partials(a, dcp), pack=False)
+        o, lse = _rank_partials(b, dcp)
+        one = _merge_every_rank(o, lse, pack=True)
+        assert torch.equal(one.view(torch.int16), want.view(torch.int16)), f"step {i}"
+        # Non-vacuous: sentinel rows ride the pack, and real rows merge > 1 rank.
+        sentinel = ~torch.isfinite(lse) | (lse == torch.finfo(torch.float32).min)
+        assert sentinel.any(), f"step {i}"
+        assert ((~sentinel).sum(0)[: b["real"]] > 1).any(), f"step {i}"
+        assert torch.isfinite(one.float()).all(), f"step {i}"
+
+
+@pytest.mark.usefixtures("prod_env")
+def test_dcp_prologue_packed_merge_positive_control_fails():
+    """The same comparison must fail when the kernel lays a wrong lse sentinel
+    (0.0) down: the packed merge then weights rows no rank owns."""
+    _require_tpu()
+    dcp = _dcp_size()
+    if dcp < 2:
+        pytest.skip("DCP needs at least 2 devices")
+    import torch
+
+    ref = _dcp_run(dcp, candidate=False)
+    bad = _dcp_run(dcp, candidate=True, fault="skip_lse_fill")
+    same = all(
+        torch.equal(
+            _merge_every_rank(*_rank_partials(b, dcp), pack=True).view(torch.int16),
+            _merge_every_rank(*_rank_partials(a, dcp), pack=False).view(torch.int16),
+        )
+        for a, b in zip(ref, bad)
+    )
+    assert not same, "wrong lse sentinel not caught through the packed merge"
