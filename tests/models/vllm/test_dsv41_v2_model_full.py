@@ -25,21 +25,283 @@ import torch
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
-from vllm.config import CompilationMode
+from pathlib import Path
+from types import ModuleType
 
-from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (
+_SRC_DIR = str(Path(__file__).resolve().parents[3] / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+try:
+    import vllm  # noqa: F401
+except ModuleNotFoundError:
+    import abc
+    import importlib.abc
+    import importlib.machinery
+    from contextlib import contextmanager
+
+    class _StubMeta(abc.ABCMeta):
+        def __getattr__(cls, attr: str) -> Any:
+            if attr.startswith("__") and attr.endswith("__"):
+                raise AttributeError(attr)
+
+            def _stub_method(*args: Any, **kwargs: Any) -> Any:
+                return args[0] if args else None
+
+            _stub_method.__name__ = attr
+            _stub_method.__qualname__ = f"{cls.__name__}.{attr}"
+            _stub_method.fget = _stub_method  # type: ignore[attr-defined]
+            setattr(cls, attr, _stub_method)
+            return _stub_method
+
+        def __class_getitem__(cls, item: Any) -> Any:
+            return cls
+
+    class _StubBase(metaclass=_StubMeta):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+
+    class _StubMod(ModuleType):
+        __path__ = []  # type: ignore[assignment]
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            return MagicMock()
+
+        def __getattr__(self, name: str) -> Any:
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            if self.__name__ == "vllm.envs":
+                return None
+            if name.isupper():
+                val: Any = MagicMock()
+            elif name[:1].isupper():
+                val = _StubMeta(name, (_StubBase,), {})
+            else:
+                full = f"{self.__name__}.{name}"
+                val = sys.modules.get(full)
+                if val is None:
+                    val = _StubMod(full)
+                    sys.modules[full] = val
+            setattr(self, name, val)
+            return val
+
+    if "tpu" not in torch._dynamo.list_backends():
+        torch._dynamo.register_backend(name="tpu")(lambda gm, _: gm)
+
+    _STUB_PKGS = (
+        "compressed_tensors",
+        "einops",
+        "fastapi",
+        "google",
+        "pathwaysutils",
+        "portpicker",
+        "ray",
+        "requests",
+        "runai_model_streamer",
+        "safetensors",
+        "torch_tpu",
+        "tpu_inference",
+        "tpu_sync",
+        "tqdm",
+        "transformers",
+        "vllm",
+        "vllm_omni",
+        "zmq",
+    )
+
+    class _AutoStubFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+            if fullname.rsplit(".", 1)[-1][:1].isupper():
+                return None
+            if fullname in _STUB_PKGS or any(
+                fullname.startswith(p + ".") for p in _STUB_PKGS
+            ):
+                return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+            return None
+
+        def create_module(self, spec: Any) -> ModuleType:
+            mod = sys.modules.get(spec.name)
+            if mod is None:
+                mod = _StubMod(spec.name)
+                sys.modules[spec.name] = mod
+            return mod
+
+        def exec_module(self, module: Any) -> None:
+            return None
+
+    sys.meta_path.append(_AutoStubFinder())
+
+    for _m in (
+        "torch_tpu",
+        "torch_tpu._internal",
+        "torch_tpu._internal.pallas",
+        "vllm",
+        "vllm.config",
+        "vllm.compilation",
+        "vllm.compilation.backends",
+        "vllm.compilation.decorators",
+        "vllm.distributed",
+        "vllm.distributed.parallel_state",
+        "vllm.forward_context",
+        "vllm.models",
+        "vllm.models.deepseek_v41",
+        "vllm.models.deepseek_v41.nvidia",
+        "vllm.models.deepseek_v41.nvidia.model",
+    ):
+        sys.modules[_m] = _StubMod(_m)
+        if "." in _m:
+            _p, _c = _m.rsplit(".", 1)
+            setattr(sys.modules[_p], _c, sys.modules[_m])
+
+    @contextmanager
+    def _ctx_noop(*_a: Any, **_kw: Any):
+        yield
+
+    sys.modules["vllm.compilation.backends"].set_model_tag = _ctx_noop  # type: ignore[attr-defined]
+    sys.modules["vllm.compilation.decorators"].support_torch_compile = (  # type: ignore[attr-defined]
+        lambda **_kw: (lambda cls: cls)
+    )
+    sys.modules["vllm.forward_context"].override_forward_context = _ctx_noop  # type: ignore[attr-defined]
+    sys.modules["vllm.distributed"].tensor_model_parallel_all_gather = (
+        lambda x, dim=-1: x
+    )  # type: ignore[attr-defined]
+    sys.modules["vllm.distributed"].tensor_model_parallel_all_reduce = lambda x: x  # type: ignore[attr-defined]
+    sys.modules["vllm.distributed"].tensor_model_parallel_reduce_scatter = (
+        lambda x, dim=-1: x
+    )  # type: ignore[attr-defined]
+    sys.modules["vllm.distributed"].get_tp_group = lambda: SimpleNamespace(
+        size=lambda: 1
+    )  # type: ignore[attr-defined]
+
+    class _FakeIntermediateTensors:
+        def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
+            self.tensors = tensors
+
+        def __getitem__(self, key: str) -> torch.Tensor:
+            return self.tensors[key]
+
+    class _FakeUpstreamLayer(torch.nn.Module):
+        def __init__(self, vllm_config: Any, prefix: str = "", **kwargs: Any) -> None:
+            super().__init__()
+            self.vllm_config = vllm_config
+            self.prefix = prefix
+            self.use_sequence_parallel = False
+            self.attn = SimpleNamespace(
+                _sp_sharded_input=False,
+                wo_b=SimpleNamespace(reduce_results=True),
+                window_size=128,
+                compressor=None,
+            )
+            self.ffn = SimpleNamespace(
+                experts=SimpleNamespace(
+                    moe_config=SimpleNamespace(skip_final_all_reduce=False)
+                )
+            )
+
+        def forward(self, *args: Any, **kwargs: Any) -> Any:
+            return args[0]
+
+    class _FakeUpstreamModel(torch.nn.Module):
+        def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+            super().__init__()
+            self.vllm_config = vllm_config
+            self.config = vllm_config.model_config.hf_config
+            self.start_layer = 0
+            self.end_layer = self.config.num_hidden_layers
+            self.use_sequence_parallel = _up._use_sequence_parallel(vllm_config)
+            self.engram_hash = None
+            self.engram_swa_prefix = None
+            self.engram_dp_shared_memory = False
+            self._mtp_hidden_buffer = None
+            self.aux_hidden_state_layers = ()
+            self.layers = torch.nn.ModuleList(
+                [
+                    _FakeUpstreamLayer(vllm_config, f"{prefix}.layers.{i}")
+                    for i in range(self.end_layer)
+                ]
+            )
+            if self.end_layer >= 2:
+                self.layers[self.end_layer // 2 - 1].attn.compressor = SimpleNamespace(
+                    forward=MagicMock()
+                )
+
+        def finalize_mhc_broadcast_weights(self) -> None:
+            return None
+
+    class _FakeUpstreamCausalLM(torch.nn.Module):
+        model_cls: Any = _FakeUpstreamModel
+
+        def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+            super().__init__()
+            self.config = vllm_config.model_config.hf_config
+            self.model = self.model_cls(
+                vllm_config=vllm_config, prefix=f"{prefix}.model"
+            )
+            self.hf_to_vllm_mapper = _up._make_deepseek_v4_weights_mapper(self.config)
+
+        def process_weights_after_loading(self) -> None:
+            return None
+
+        def forward(self, *args: Any, **kwargs: Any) -> Any:
+            return self.model(*args, **kwargs)
+
+    _up = sys.modules["vllm.models.deepseek_v41.nvidia.model"]
+    _up.DeepseekV4DecoderLayer = _FakeUpstreamLayer  # type: ignore[attr-defined]
+    _up.DeepseekV4Model = _FakeUpstreamModel  # type: ignore[attr-defined]
+    _up.DeepseekV41LLMForCausalLM = _FakeUpstreamCausalLM  # type: ignore[attr-defined]
+    _up._use_sequence_parallel = lambda cfg: False  # type: ignore[attr-defined]
+    _up.extract_layer_index = (
+        lambda prefix: int(prefix.split(".")[-1])
+        if prefix and prefix.split(".")[-1].isdigit()
+        else 0
+    )  # type: ignore[attr-defined]
+    _up.IntermediateTensors = _FakeIntermediateTensors  # type: ignore[attr-defined]
+    _up.get_pp_group = lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True)  # type: ignore[attr-defined]
+    _up.get_tensor_model_parallel_world_size = lambda: 1  # type: ignore[attr-defined]
+    _up.is_forward_context_available = lambda: False  # type: ignore[attr-defined]
+    _up.get_forward_context = lambda: SimpleNamespace(
+        attn_metadata={}, is_padding=None, additional_kwargs={}
+    )  # type: ignore[attr-defined]
+    _up.image_sentinel_mask = lambda x: torch.zeros_like(x, dtype=torch.bool)  # type: ignore[attr-defined]
+    _up.get_engram_dp_size = lambda: 1  # type: ignore[attr-defined]
+    _up.collapse = (
+        lambda hs, pm: (hs.float() * pm.unsqueeze(-1).float()).sum(dim=1).to(hs.dtype)
+    )  # type: ignore[attr-defined]
+    _up._make_deepseek_v4_weights_mapper = MagicMock(return_value="base_mapper")  # type: ignore[attr-defined]
+
+    sys.modules["vllm.distributed"].get_engram_dp_group = lambda: None  # type: ignore[attr-defined]
+    _mhc_torch = _StubMod("vllm.model_executor.kernels.mhc.torch")
+    sys.modules["vllm.model_executor.kernels.mhc.torch"] = _mhc_torch
+    _mhc_torch.mhc_post_torch = lambda x, res, pm, rm: (  # type: ignore[attr-defined]
+        pm.float() * x.unsqueeze(1).float()
+        + torch.einsum("tij,tid->tjd", rm.float(), res.float())
+    ).to(res.dtype)
+
+    from vllm_torchtpu.models.vllm import vllm_model_wrapper_context
+
+    vllm_model_wrapper_context._vllm_model_wrapper_context = (
+        vllm_model_wrapper_context.VllmModelWrapperContext(
+            mesh=MagicMock(), vllm_config=MagicMock()
+        )
+    )
+
+from vllm.config import CompilationMode  # noqa: E402
+
+from vllm_torchtpu.layers.core.sequence_layout import (  # noqa: E402
+    SequenceLayoutKind,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.ced import (  # noqa: E402
     DecoderReplayPlan,
     plan_decoder_replay,
     sync_decoder_replay_plan,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (  # noqa: E402
     HOST_ENGRAM_KEY,
     HostEngramInputs,
     capture_host_engram_inputs,
     install_host_engram_inputs,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (  # noqa: E402
     DeepseekV41DecoderLayer,
     DeepseekV41DecoderStage,
     DeepseekV41EncoderStage,
@@ -50,7 +312,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     _StageBase,
     _use_sequence_parallel,
 )
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner  # noqa: E402
 
 # ==============================================================================
 # Helper Mock Factories
@@ -2468,3 +2730,407 @@ class TestMhcFlatSliceAndPostCollapseFusion:
             sys.settrace(orig_trace)
         assert torch.equal(out_off, torch.ones(2))
         assert torch.equal(out_hbm, torch.zeros(2))
+
+
+from tests.models.vllm.test_dsv41_v2_model_sharded_mhc import *  # noqa: E402, F401, F403
+
+
+class TestFullModuleBranchCompletion:
+    """Covers remaining host-DMA, CED scatter, encoder aux, and LM branches."""
+
+    def test_engram_host_dma_and_cached_col_slice_branches(self) -> None:
+        m = DeepseekV41Model.__new__(DeepseekV41Model)
+        torch.nn.Module.__init__(m)
+        m.__dict__["_engram_host_col_slice"] = ((0, 4),)
+        assert DeepseekV41Model._engram_host_col_slice(m) == (0, 4)
+
+        mock_engram = SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                cpu_offload=False,
+                host_dma=True,
+                move_rows_to_pinned_host=MagicMock(),
+                _host_rows=SimpleNamespace(chunks=[1, 2]),
+            ),
+            staged_rows=SimpleNamespace(device=torch.device("cpu")),
+            layer_hash_index=0,
+            prepare_embeddings=MagicMock(),
+            _active_rows=SimpleNamespace(device=SimpleNamespace(type="tpu")),
+        )
+        m.layers = [SimpleNamespace(engram=mock_engram)]
+        m.start_layer = 0
+        m.end_layer = 1
+        m.engram_swa_prefix = "swa.0"
+        m.engram_dp_shared_memory = False
+        assert m._has_host_dma_engram() is True
+        m._move_engram_rows_to_pinned_host()
+        assert m._engram_rows_pinned is True
+        mock_engram.embed_tokens.move_rows_to_pinned_host.assert_called_once()
+        # Second call hits early return when already pinned
+        m._move_engram_rows_to_pinned_host()
+        assert mock_engram.embed_tokens.move_rows_to_pinned_host.call_count == 1
+
+        # Cover host_dma device.type == "tpu" and staged.device.type == "tpu" / "cpu"
+        m.engram_hash = MagicMock(
+            use_slot_cache=True,
+            ensure_cache=MagicMock(return_value=True),
+            return_value=torch.zeros((2, 2), dtype=torch.int64),
+        )
+        tpu_fake = MagicMock(device=SimpleNamespace(type="tpu"))
+        cpu_fake = MagicMock(device=SimpleNamespace(type="cpu"))
+        swa_meta = {
+            "swa.0": SimpleNamespace(
+                query_start_loc=torch.tensor([0, 2]),
+                max_seq_len=2,
+                seq_lens=torch.tensor([2]),
+            )
+        }
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_metadata=swa_meta, is_padding=None, additional_kwargs={}
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
+                return_value=tpu_fake,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.synchronize_tensors"
+            ) as mock_sync,
+        ):
+            m._prepare_engram(
+                torch.tensor([1, 2]), torch.tensor([0, 1]), None, stage="full"
+            )
+            assert mock_sync.call_count == 2
+
+        mock_engram._active_rows = SimpleNamespace(device=SimpleNamespace(type="cpu"))
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_metadata=swa_meta, is_padding=None, additional_kwargs={}
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._block_table",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._cache_slots",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
+                return_value=cpu_fake,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.synchronize_tensors"
+            ) as mock_sync2,
+        ):
+            m._prepare_engram(
+                torch.tensor([1, 2]), torch.tensor([0, 1]), None, stage="full"
+            )
+            mock_sync2.assert_not_called()
+
+    def test_ced_non_cpu_device_and_forward_aux_branches(self) -> None:
+        m = DeepseekV41Model.__new__(DeepseekV41Model)
+        torch.nn.Module.__init__(m)
+        m.config = SimpleNamespace(hidden_size=4)
+        m._ced_enabled = True
+        m._ced_boundary = 1
+        m._ced_window = 128
+        m._ced_block_size = 16
+        m._ced_buckets = (2, 4)
+        m._ced_compile_sizes = (2, 4)
+        m._ced_swa_prefix = "k"
+        m._ced_replay_starts_cache = None
+        m.layers = [
+            SimpleNamespace(),
+            SimpleNamespace(attn=SimpleNamespace(write_encoder_global_kv=MagicMock())),
+        ]
+        m.start_layer = 0
+        m.end_layer = 2
+        m.engram_hash = None
+        m.engram_swa_prefix = None
+        m.engram_dp_shared_memory = False
+        m.use_sequence_parallel = False
+        m.aux_hidden_state_layers = (1,)
+        m._ced_non_identity_cache = None
+
+        plan_non_id = SimpleNamespace(
+            indices=(0, 2),
+            query_start_loc=(0, 2),
+            padded_num_tokens=2,
+            replay_starts=(0,),
+            is_identity=False,
+        )
+        # Exercise non-CPU branch in _get_ced_non_identity_tensors using meta device
+        meta_pos = torch.empty(3, dtype=torch.int32, device="meta")
+        inv, gat, bnd = m._get_ced_non_identity_tensors(plan_non_id, 3, meta_pos)
+        assert gat.device.type == "meta" and bnd.device.type == "meta"
+
+        # 1. Incomplete prefill (padded_num_tokens == 0) with aux layers set
+        m.encoder_stage = lambda *a, **kw: (
+            torch.zeros(3, 2, 4),
+            torch.ones(3, 2),
+            [torch.zeros(3, 4)],
+        )
+        m.decoder_stage = lambda *a, **kw: (
+            torch.ones(2, 4),
+            [torch.ones(2, 4)],
+        )
+        meta_obj = SimpleNamespace(
+            seq_lens=torch.tensor([3]),
+            replay_starts_cpu=(0,),
+            input_positions=torch.tensor([0, 1, 2]),
+            query_start_loc=torch.tensor([0, 3]),
+        )
+        plan_zero = SimpleNamespace(
+            indices=(0,),
+            query_start_loc=(0, 0),
+            padded_num_tokens=0,
+            replay_starts=(0,),
+            is_identity=False,
+        )
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_metadata={"k": meta_obj}, is_padding=None, additional_kwargs={}
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan_zero,
+            ),
+        ):
+            zh, zaux = m.forward(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), None)
+            assert zh.shape == (3, 4) and len(zaux) == 1
+
+        # 2. Identity replay (indices is None) returning 2-tuple (dec_hidden, dec_aux)
+        plan_id = SimpleNamespace(
+            indices=(0, 1),
+            query_start_loc=(0, 2),
+            padded_num_tokens=2,
+            replay_starts=(0,),
+            is_identity=True,
+        )
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_metadata={"k": meta_obj}, is_padding=None, additional_kwargs={}
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan_id,
+            ),
+        ):
+            dh, daux = m.forward(torch.tensor([1, 2]), torch.tensor([0, 1]), None)
+            assert dh.shape == (2, 4) and len(daux) == 2
+
+        # 3. Non-identity replay returning 2-tuple (dec_hidden, dec_aux)
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=SimpleNamespace(
+                    attn_metadata={"k": meta_obj}, is_padding=None, additional_kwargs={}
+                ),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan_non_id,
+            ),
+        ):
+            dh2, daux2 = m.forward(
+                torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]), None
+            )
+            assert dh2.shape == (3, 4) and len(daux2) == 2
+
+    def test_encoder_stage_aux_and_causal_lm_host_dma_branches(self) -> None:
+        # Encoder stage returning 3-tuple when encoder_aux is non-empty
+        m = DeepseekV41Model.__new__(DeepseekV41Model)
+        torch.nn.Module.__init__(m)
+        m.config = SimpleNamespace(hidden_size=4)
+        m.start_layer = 0
+        m.end_layer = 2
+        m._ced_boundary = 1
+        m.engram_hash = None
+        m.engram_swa_prefix = None
+        m.engram_dp_shared_memory = False
+        m.use_sequence_parallel = False
+        m.aux_hidden_state_layers = (0,)
+        m.embed_input_ids = lambda ids: torch.ones((ids.shape[0], 4))
+
+        enc_layer = MagicMock(
+            return_value=(
+                torch.ones(2, 4),
+                torch.ones(2, 2, 4),
+                torch.ones(2, 2, 1),
+                torch.ones(2, 2, 2),
+                torch.ones(2, 2),
+                torch.ones(2, 4),
+            )
+        )
+        enc_layer.attn = SimpleNamespace(
+            _sp_sharded_input=False, wo_b=SimpleNamespace(reduce_results=True)
+        )
+        enc_layer.ffn = SimpleNamespace(
+            experts=SimpleNamespace(
+                moe_config=SimpleNamespace(skip_final_all_reduce=False)
+            )
+        )
+        dec_layer = SimpleNamespace(
+            attn_norm=lambda x: x,
+            attn=SimpleNamespace(
+                write_encoder_global_kv=MagicMock(),
+                _sp_sharded_input=False,
+                wo_b=SimpleNamespace(reduce_results=True),
+            ),
+            ffn=SimpleNamespace(
+                experts=SimpleNamespace(
+                    moe_config=SimpleNamespace(skip_final_all_reduce=False)
+                )
+            ),
+        )
+        m.layers = [enc_layer, dec_layer]
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_pp_group",
+                return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.post",
+                return_value=torch.ones(2, 2, 4),
+            ),
+        ):
+            hs, pm, aux = m._forward_stage(
+                torch.tensor([1, 2]), torch.tensor([0, 1]), None, stage="encoder"
+            )
+            assert len(aux) == 1
+
+        # CausalLM forward with HOST_DMA pinning and dp_shared_memory
+        lm = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+        pin_fn = MagicMock()
+        lm.model = SimpleNamespace(
+            engram_hash=None,
+            _engram_rows_pinned=False,
+            _move_engram_rows_to_pinned_host=pin_fn,
+            layers=[],
+        )
+        with (
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", True),
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.forward",
+                return_value="ok",
+            ),
+        ):
+            assert lm.forward("x") == "ok"
+            pin_fn.assert_called_once()
+            # Second call with _engram_rows_pinned=True skips branch
+            assert lm.forward("x") == "ok"
+            assert pin_fn.call_count == 1
+            lm.process_weights_after_loading()
+            assert pin_fn.call_count == 2
+
+        with patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", False):
+            lm.process_weights_after_loading()
+            assert pin_fn.call_count == 2
+
+        cfg_shm = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(num_hidden_layers=2), max_model_len=128
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=False,
+            ),
+            engram_config=SimpleNamespace(dp_shared_memory=True),
+            compilation_config=SimpleNamespace(
+                mode=CompilationMode.NONE, compile_sizes=[]
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+        with (
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", True),
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", False),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_cache_ops"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_delayed_mhc"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
+            ),
+            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.compact_rope_caches"
+            ),
+        ):
+            lm1 = DeepseekV41ForCausalLM(vllm_config=cfg_shm)
+            assert cfg_shm.engram_config.dp_shared_memory is False
+            assert lm1 is not None
+
+        cfg_shm2 = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(num_hidden_layers=2), max_model_len=128
+            ),
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                enable_expert_parallel=False,
+            ),
+            engram_config=SimpleNamespace(dp_shared_memory=True),
+            compilation_config=SimpleNamespace(
+                mode=CompilationMode.NONE, compile_sizes=[]
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+        with (
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", False),
+            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", True),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_cache_ops"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_delayed_mhc"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_mhc_post"
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
+            ),
+            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.compact_rope_caches"
+            ),
+        ):
+            lm2 = DeepseekV41ForCausalLM(vllm_config=cfg_shm2)
+            assert cfg_shm2.engram_config.dp_shared_memory is True
+            assert lm2 is not None

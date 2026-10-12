@@ -85,17 +85,17 @@ def _ced_config(
     return ced_enabled, ced_boundary
 
 
-def _sum_hc_terms(terms: list[torch.Tensor]) -> torch.Tensor:
-    if len(terms) == 4:
-        return (terms[0] + terms[2]) + (terms[1] + terms[3])
-    return torch.stack(terms, dim=0).sum(dim=0)
+def _sum_hc_terms(terms: torch.Tensor) -> torch.Tensor:
+    if terms.shape[1] == 4:
+        return (terms[:, 0] + terms[:, 2]) + (terms[:, 1] + terms[:, 3])
+    return terms.sum(dim=1)
 
 
 def _mean_flat_streams(
-    streams: list[torch.Tensor],
+    streams: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    return (_sum_hc_terms(streams) * (1.0 / len(streams))).to(dtype)
+    return (_sum_hc_terms(streams) * (1.0 / streams.shape[1])).to(dtype)
 
 
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -104,21 +104,18 @@ def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
     # avoiding XLA T(4, 128) relayout copies and mixed-type MultiOutputFusion.
     tokens = hidden_states.shape[0]
     mult = hidden_states.shape[1]
-    flat = hidden_states.reshape(tokens, -1)
-    dim = flat.shape[1] // mult
-    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
-    return _mean_flat_streams(streams, hidden_states.dtype)
+    streams_f32 = hidden_states.reshape(tokens, mult, -1).float()
+    return _mean_flat_streams(streams_f32, hidden_states.dtype)
 
 
 def _collapse_streams(
-    streams: list[torch.Tensor],
+    streams_f32: torch.Tensor,
     pre_mix: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    mult = len(streams)
-    pre_f32 = pre_mix.reshape(streams[0].shape[0], mult).float()
-    terms = [pre_f32[:, m : m + 1] * streams[m] for m in range(mult)]
-    return _sum_hc_terms(terms).to(dtype)
+    tokens, mult = pre_mix.shape
+    weighted = streams_f32 * pre_mix.reshape(tokens, mult, 1).float()
+    return _sum_hc_terms(weighted).to(dtype)
 
 
 def collapse(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
@@ -126,10 +123,8 @@ def collapse(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor
     # [tokens, mult * dim] buffer so XLA keeps T(8, 128) layout without a 3D
     # dim=-2 reduction relayout copy.
     tokens, mult = pre_mix.shape
-    flat = hidden_states.reshape(tokens, -1)
-    dim = flat.shape[1] // mult
-    streams = [flat[:, m * dim : (m + 1) * dim].float() for m in range(mult)]
-    return _collapse_streams(streams, pre_mix, hidden_states.dtype)
+    streams_f32 = hidden_states.reshape(tokens, mult, -1).float()
+    return _collapse_streams(streams_f32, pre_mix, hidden_states.dtype)
 
 
 def _post_and_collapse(
@@ -145,19 +140,15 @@ def _post_and_collapse(
     # register slices so the intermediate [tokens, mult, dim] post output is never
     # materialized to HBM or padded to the standalone mhc_post Pallas tile size.
     tokens, mult, dim = residual.shape
-    flat = residual.reshape(tokens, mult * dim)
-    x_f32 = x.reshape(tokens, dim).to(residual.dtype).float()
-    post_f32 = post_layer_mix.reshape(tokens, mult).float()
-    comb_f32 = comb_res_mix.reshape(tokens, mult * mult).float()
-    streams = [flat[:, i * dim : (i + 1) * dim].float() for i in range(mult)]
-    out_streams = []
-    for j in range(mult):
-        acc = post_f32[:, j : j + 1] * x_f32
-        for i in range(mult):
-            acc = acc + comb_f32[:, (i * mult + j) : (i * mult + j + 1)] * streams[i]
-        out_streams.append(acc.to(residual.dtype).float())
-    collapsed = _collapse_streams(out_streams, pre_mix, residual.dtype)
-    aux = _mean_flat_streams(out_streams, residual.dtype) if capture_aux else None
+    res_f32 = residual.float()
+    x_f32 = x.reshape(tokens, 1, dim).to(residual.dtype).float()
+    acc = post_layer_mix.reshape(tokens, mult, 1).float() * x_f32
+    comb_f32 = comb_res_mix.reshape(tokens, mult, mult, 1).float()
+    for i in range(mult):
+        acc = acc + comb_f32[:, i] * res_f32[:, i : i + 1]
+    out_f32 = acc.to(residual.dtype).float()
+    collapsed = _collapse_streams(out_f32, pre_mix, residual.dtype)
+    aux = _mean_flat_streams(out_f32, residual.dtype) if capture_aux else None
     return collapsed, aux
 
 
@@ -759,14 +750,20 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # Padded decoder rows replay the last position; their outputs are
         # dropped because no output row maps to them in `inverse`.
         last_pos = max(num_positions - 1, 0)
-        gather_tuple = tuple(min(i, last_pos) for i in indices_tuple) + (last_pos,) * (
-            plan.padded_num_tokens - len(indices_tuple)
-        )
-        gather = torch.tensor(gather_tuple, dtype=torch.int32, device=positions.device)
+        gather_cpu = torch.tensor(
+            indices_tuple + (last_pos,) * (plan.padded_num_tokens - len(indices_tuple)),
+            dtype=torch.int32,
+            device="cpu",
+        ).clamp_max_(last_pos)
+        bounds_cpu = torch.tensor(qsl_tuple, dtype=torch.int32, device="cpu")
+        if positions.device.type == "cpu":
+            gather, bounds = gather_cpu, bounds_cpu
+        else:
+            gather = gather_cpu.to(device=positions.device, non_blocking=True)
+            bounds = bounds_cpu.to(device=positions.device, non_blocking=True)
         inverse = _ced_inverse_rows(
             indices_tuple, plan.padded_num_tokens, num_positions, positions.device
         )
-        bounds = torch.tensor(qsl_tuple, dtype=torch.int32, device=positions.device)
         result = (inverse, gather, bounds)
         self._ced_non_identity_cache = (
             cache_key,
@@ -940,20 +937,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 self, plan.replay_starts, positions
             )
             replaced_by_id: dict[int, object] = {}
-            decoder_metadata = {}
+            decoder_metadata = metadata.copy()
             last_val = rep = None
-            for key, value in metadata.items():
+            for key, value in decoder_metadata.items():
                 if (
                     value is not last_val
                     and (rep := replaced_by_id.get(id(value))) is None
                 ):
-                    new = value.__new__
-                    rep = new(type(value))
-                    rep.__dict__.update(
-                        value.__dict__,
-                        input_positions=decoder_positions,
-                        query_start_loc=bounds,
-                    )
+                    rep = copy(value)
+                    rep.input_positions = decoder_positions
+                    rep.query_start_loc = bounds
                     replaced_by_id[id(value)] = rep
                 last_val = value
                 decoder_metadata[key] = rep
