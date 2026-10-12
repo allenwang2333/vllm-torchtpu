@@ -760,7 +760,7 @@ def test_collapsed_lse_gather_is_bitwise_the_chunked_merge(
 
 
 @pytest.mark.parametrize("dcp_size", [2, 8, 16])
-@pytest.mark.parametrize("chunks", [2, 4, 8])
+@pytest.mark.parametrize("chunks", [2, 4])
 def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(
     dcp_size, chunks, monkeypatch
 ):

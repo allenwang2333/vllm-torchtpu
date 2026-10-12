@@ -1479,15 +1479,13 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         np.testing.assert_array_equal(
             np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
         )
-        tail = np.asarray(lse)[real:]
-        live_tail = np.isfinite(tail).any(axis=-1)
-        # Grid rounding may write a few rows past the real tokens: those are
-        # compared above through lse; their outputs match too.
-        n_live = int(live_tail.sum())
-        np.testing.assert_array_equal(
-            bits(out)[real : real + n_live], bits(ref)[real : real + n_live]
-        )
-        self.assertTrue(np.all(tail[n_live:] == -np.inf))
+        # Every row a merge can weight above 0 (any finite lse) matches bit for
+        # bit, padding rows the grid wrote included; the rest have lse -inf on
+        # both paths, weight 0 in the merge's `where` whatever they hold.
+        weighted = np.isfinite(np.asarray(lse)).any(axis=-1)
+        np.testing.assert_array_equal(bits(out)[weighted], bits(ref)[weighted])
+        self.assertTrue(np.all(np.asarray(lse)[~weighted] == -np.inf))
+        self.assertGreater(int((~weighted).sum()), 0)
         # Positive control: swapping two pieces is caught.
         bad, _ = jax.block_until_ready(run(out_pieces=8, out_pieces_fault="swap"))
         self.assertFalse(np.array_equal(bits(bad)[:real], bits(ref)[:real]))
