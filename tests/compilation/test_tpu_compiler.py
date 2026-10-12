@@ -1027,6 +1027,45 @@ class TestHostSplit:
         assert time.monotonic() - start < 20.0
         assert len(lowered) == 2
 
+    def test_the_cache_entry_is_pickled_outside_the_fx_trace(
+        self, tmp_path, monkeypatch
+    ):
+        """aot_autograd pickles the entry of a split executable, device
+        constants included, in torch_tpu's eager mode from outside the
+        backend: inside the FX trace a device-to-host copy fails."""
+        import contextlib
+
+        from torch._functorch._aot_autograd import autograd_cache
+
+        from vllm_torchtpu.compilation import host_split
+
+        host_split._install()
+        pickled_outside = []
+        state = {"outside": False}
+
+        @contextlib.contextmanager
+        def outside_trace(self):
+            state["outside"] = True
+            try:
+                yield
+            finally:
+                state["outside"] = False
+
+        monkeypatch.setattr(host_split._Split, "outside_trace", outside_trace)
+
+        def original(*args, **kwargs):
+            pickled_outside.append(state["outside"])
+            return b""
+
+        monkeypatch.setitem(host_split._originals, "pickle_entry", original)
+        installed = autograd_cache.AOTAutogradCache._pickle_entry
+
+        installed(None, False)
+        split = host_split._Split(host_split.Plan(2, 0, 0.0), "k", None, "r")
+        monkeypatch.setattr(host_split._state, "split", split, raising=False)
+        installed(None, False)
+        assert pickled_outside == [False, True]
+
     def test_outside_a_split_the_backend_is_untouched(self, tmp_path, monkeypatch):
         """Once installed, the hooks do nothing for a bucket built outside
         split_across_host: one partition, one executable, no pieces."""

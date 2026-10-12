@@ -385,13 +385,19 @@ class _Split:
             self.resolve(original)
         return artifact
 
-    def outside_trace(self):
-        """torch_tpu's eager mode as it was outside the backend."""
-        if self.outer_mode is None:
-            return contextlib.nullcontext()
-        from torch_tpu._internal import execution_mode
+    @contextlib.contextmanager
+    def outside_trace(self) -> Iterator[None]:
+        """Run as outside the backend: torch_tpu's eager mode from there, and
+        no fake mode, so device tensors can be copied to the host."""
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
 
-        return execution_mode.set_eager_mode(self.outer_mode)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unset_fake_temporarily())
+            if self.outer_mode is not None:
+                from torch_tpu._internal import execution_mode
+
+                stack.enter_context(execution_mode.set_eager_mode(self.outer_mode))
+            yield
 
     def piece_key(self, index: int, total: int) -> str:
         return f"{self.key}.part{index}of{total}"
@@ -454,9 +460,7 @@ class _Split:
                 )
                 continue
             try:
-                from torch._subclasses.fake_tensor import unset_fake_temporarily
-
-                with unset_fake_temporarily(), self.outside_trace():
+                with self.outside_trace():
                     artifact = pickle.loads(payload.artifact)
             except Exception as e:
                 logger.warning(
@@ -527,6 +531,8 @@ def _active() -> _Split | None:
 
 _install_lock = threading.Lock()
 _installed = False
+# What `_install` replaced, by name.
+_originals: dict[str, Callable] = {}
 
 
 def _install() -> None:
@@ -574,6 +580,23 @@ def _install() -> None:
                 original_call, self, graph_module, example_inputs, args, kwargs
             )
 
+        from torch._functorch._aot_autograd import autograd_cache
+
+        _originals["pickle_entry"] = autograd_cache.AOTAutogradCache._pickle_entry
+
+        def pickle_entry(*args, **kwargs):
+            # A split executable keeps the constants SplitCompiler sank into
+            # its pieces as device tensors, and aot_autograd pickles its cache
+            # entry inside torch_tpu's FX trace, where copying a device tensor
+            # to the host fails. Pickle it in the eager mode from outside.
+            original = _originals["pickle_entry"]
+            split = _active()
+            if split is None:
+                return original(*args, **kwargs)
+            with split.outside_trace():
+                return original(*args, **kwargs)
+
+        autograd_cache.AOTAutogradCache._pickle_entry = staticmethod(pickle_entry)
         _backend.make_backend_compiler = make_backend_compiler
         split_compiler.split_module = split_module
         compiler.StaticCompiler.__call__ = static_call
