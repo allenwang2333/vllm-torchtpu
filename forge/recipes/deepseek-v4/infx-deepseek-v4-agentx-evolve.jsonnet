@@ -220,6 +220,14 @@ local libtpuInitArgs = cdk.var('LIBTPU_INIT_ARGS', std.join(' ', [
   '--deepsea_slice_builder_heartbeat_interval=%s' % sliceBuilderHeartbeatInterval,
 ]));
 local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
+// SERVER_EXTRA_ENV=K1=V1,K2=V2 sets more environment variables on the server pods and copies them
+// into the Ray workers, for knobs this recipe has no variable of its own for (e.g. TPU_TOKEN_BUCKET_EXTRA,
+// whose own value holds commas: write those as ':', e.g. TPU_TOKEN_BUCKET_EXTRA=96:192).
+local serverExtraEnv = {
+  [std.splitLimit(kv, '=', 1)[0]]: std.strReplace(std.splitLimit(kv, '=', 1)[1], ':', ',')
+  for kv in std.split(cdk.var('SERVER_EXTRA_ENV', ''), ',')
+  if kv != ''
+};
 
 // --- Speculative decoding ------------------------------------------------------
 // SPEC_METHOD=dspark serves the DSpark draft that ships in the target checkpoint (mtp.0-2.*, config.json
@@ -716,7 +724,7 @@ local serverJob = cdk.job(
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
           'VLLM_SERVER_DEV_MODE',
-        ] + (if torchLogs != '' then ['TORCH_LOGS'] else [])),
+        ] + (if torchLogs != '' then ['TORCH_LOGS'] else []) + std.objectFields(serverExtraEnv)),
         TORCH_DIST_TIMEOUT: '1200',
         VLLM_RPC_TIMEOUT: '1200000',
         VLLM_SHM_BROADCAST_TIMEOUT_S: '1200',
@@ -758,7 +766,7 @@ local serverJob = cdk.job(
         VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1',
         RAY_memory_usage_threshold: '0.99',
         RAY_memory_monitor_refresh_ms: '0',
-      } + cdk.jobSetNameEnv + agentx.megascaleOff,
+      } + serverExtraEnv + cdk.jobSetNameEnv + agentx.megascaleOff,
       resources=cdk.tpuResources(chipsPerHost, cpu='32', memory='900Gi'),
       volumeMounts=serverVolumeMounts,
     ),
