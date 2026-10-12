@@ -147,6 +147,8 @@ def fused_engram(
     assert tokens % tile_m == 0 and in_features % tile_k == 0
     assert tile_m % vector_m == 0
     steps = in_features // tile_k
+    chunks = tile_m // vector_m
+    buffer_count = min(2, chunks)
 
     def kernel(
         raw_ref,
@@ -161,20 +163,45 @@ def fused_engram(
         x_scratch,
         xs_scratch,
         acc_scratch,
-        values_scratch,
+        projection_scratch,
+        hidden_buffers,
+        output_buffers,
+        hidden_sems,
+        output_sems,
     ):
         """Process M=tile_m tokens, one output group and tile_k input columns.
 
         Ref shapes: raw_ref [P,M,C/4], scale_ref [P,M,C/(4*B)], h_ref and
-        out_ref [M,S,D], w_ref [tile_k,D], ws_ref [D], q_ref/k_ref [1,D],
+        out_ref HBM [t,S,D], w_ref [tile_k,D], ws_ref [D], q_ref/k_ref [S,D],
         mask_ref [M,1]. VMEM: x_scratch FP8 [M,K], xs_scratch FP32 [M,1],
-        acc_scratch FP32 [M,D], values_scratch BF16 [M,D].
+        acc_scratch FP32 [M,D], projection_scratch BF16 [M,(S+1)*D], and
+        hidden_buffers/output_buffers BF16 [N,vector_m,S,D], N=min(2,M/vector_m).
+        DMA semaphores hidden_sems/output_sems each have shape [N].
         """
         output_block = pl.program_id(1)
         step = pl.program_id(2)
+        token_start = pl.program_id(0) * tile_m
+
+        def hidden_copy(chunk):
+            """Copy one scalar-indexed HBM [vector_m,S,D] chunk into VMEM."""
+            rows = pl.ds(token_start + chunk * vector_m, vector_m)
+            bank = chunk % buffer_count
+            return pltpu.make_async_copy(
+                h_ref.at[rows, :, :], hidden_buffers.at[bank], hidden_sems.at[bank]
+            )
+
+        def output_copy(chunk):
+            """Copy one scalar-indexed VMEM [vector_m,S,D] chunk into HBM."""
+            rows = pl.ds(token_start + chunk * vector_m, vector_m)
+            bank = chunk % buffer_count
+            return pltpu.make_async_copy(
+                output_buffers.at[bank], out_ref.at[rows, :, :], output_sems.at[bank]
+            )
 
         @pl.when((output_block == 0) & (step == 0))
         def prepare():
+            hidden_copy(0).start()
+
             def prepare_rows(index, _):
                 tile = pl.ds(index * vector_m, vector_m)
                 rows = dequantize_rows(raw_ref[:, tile, :], scale_ref[:, tile, :])
@@ -200,82 +227,73 @@ def fused_engram(
                     acc_scratch[tile, :] * xs_scratch[tile, :] * ws_ref[...]
                 ).astype(hidden.dtype)
 
-                @pl.when(output_block == 0)
-                def save_values():
-                    values_scratch[tile, :] = projection
-                    out_ref[tile, :, :] = h_ref[tile, :, :]
+                group = jnp.where(output_block == 0, streams, output_block - 1)
+                projection_scratch[tile, pl.ds(group * dim, dim)] = projection
 
-                @pl.when(output_block != 0)
-                def apply_gate():
-                    kv = jnp.concatenate((projection, values_scratch[tile, :]), axis=-1)
-                    stream = output_block - 1
-                    # VMEM loads/stores cover all sublanes; select in registers.
-                    residuals = out_ref[tile, :, :]
-                    indices = jnp.full((vector_m, 1, dim), stream, jnp.int32)
-                    # TPU dynamic gather requires matching 32-bit data/indices.
-                    selected = jnp.take_along_axis(
-                        residuals.astype(jnp.float32), indices, axis=1
-                    ).astype(hidden.dtype)
-                    updated = gated_residual(
-                        selected,
-                        kv,
+            jax.lax.fori_loop(0, tile_m // vector_m, finish_rows, None)
+
+            @pl.when(output_block == streams)
+            def apply_gates():
+                def gate_rows(chunk, _):
+                    bank = chunk % buffer_count
+                    hidden_copy(chunk).wait()
+
+                    @pl.when(chunk + 1 < chunks)
+                    def prefetch():
+                        hidden_copy(chunk + 1).start()
+
+                    @pl.when(chunk >= buffer_count)
+                    def release_output_bank():
+                        output_copy(chunk - buffer_count).wait()
+
+                    rows = pl.ds(chunk * vector_m, vector_m)
+                    output_buffers[bank] = gated_residual(
+                        hidden_buffers[bank],
+                        projection_scratch[rows, :],
                         q_ref[...],
                         k_ref[...],
-                        mask_ref[tile, 0],
+                        mask_ref[rows, 0],
                         eps,
                         clamp_value,
                     )
-                    selected_stream = jnp.arange(streams)[None, :, None] == stream
-                    out_ref[tile, :, :] = jnp.where(selected_stream, updated, residuals)
+                    output_copy(chunk).start()
 
-            jax.lax.fori_loop(0, tile_m // vector_m, finish_rows, None)
+                jax.lax.fori_loop(0, chunks, gate_rows, None)
+                # Drain outstanding stores before reusing scratch for a new tile.
+                for chunk in range(max(0, chunks - buffer_count), chunks):
+                    output_copy(chunk).wait()
 
     def token_block(i, j, k):
         return 0, i + rank * (tokens // tile_m), 0
 
-    def stream_index(j):
-        return jnp.maximum(j - 1, 0)
-
     def projection_index(j):
-        # Retain the shared value vector, then consume one key stream at a time.
+        # Project the shared value first, followed by each key stream.
         return jnp.where(j == 0, streams, j - 1)
 
-    def local_block(i, j, k):
-        return i, 0, 0
-
-    # Keep all streams in each token tile and select one stream inside VMEM.
-    # TPU BlockSpecs cannot squeeze the sublane dimension at the HBM boundary.
-    # Packed inputs and hidden/output tiles stay resident across projection
-    # groups. Single buffering them keeps the full-stream tiles within VMEM.
-    hidden_spec = pl.BlockSpec(
-        (tile_m, streams, dim), local_block, pipeline_mode=pl.Buffered(1)
-    )
     result = pl.pallas_call(
         kernel,
         grid=(tokens // tile_m, streams + 1, steps),
         in_specs=[
-            pl.BlockSpec(
-                (tp, tile_m, raw_words), token_block, pipeline_mode=pl.Buffered(1)
-            ),
-            pl.BlockSpec(
-                (tp, tile_m, scales.shape[-1]),
-                token_block,
-                pipeline_mode=pl.Buffered(1),
-            ),
-            hidden_spec,
+            pl.BlockSpec((tp, tile_m, raw_words), token_block),
+            pl.BlockSpec((tp, tile_m, scales.shape[-1]), token_block),
+            pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec((tile_k, dim), lambda i, j, k: (k, projection_index(j))),
             pl.BlockSpec((dim,), lambda i, j, k: (projection_index(j),)),
-            pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
-            pl.BlockSpec((None, 1, dim), lambda i, j, k: (stream_index(j), 0, 0)),
+            pl.BlockSpec((streams, dim), lambda i, j, k: (0, 0)),
+            pl.BlockSpec((streams, dim), lambda i, j, k: (0, 0)),
             pl.BlockSpec((tile_m, 1), lambda i, j, k: (i, 0)),
         ],
-        out_specs=hidden_spec,
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
         out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
         scratch_shapes=[
             pltpu.VMEM((tile_m, in_features), weight.dtype),
             pltpu.VMEM((tile_m, 1), jnp.float32),
             pltpu.VMEM((tile_m, dim), jnp.float32),
-            pltpu.VMEM((tile_m, dim), hidden.dtype),
+            pltpu.VMEM((tile_m, out_features), hidden.dtype),
+            pltpu.VMEM((buffer_count, vector_m, streams, dim), hidden.dtype),
+            pltpu.VMEM((buffer_count, vector_m, streams, dim), hidden.dtype),
+            pltpu.SemaphoreType.DMA((buffer_count,)),
+            pltpu.SemaphoreType.DMA((buffer_count,)),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary", "arbitrary"),
@@ -293,8 +311,8 @@ def fused_engram(
         hidden,
         weight,
         weight_scale,
-        query_weight[:, None, :],
-        key_weight[:, None, :],
+        query_weight,
+        key_weight,
         token_mask.reshape(tokens, 1),
     )
     return result
