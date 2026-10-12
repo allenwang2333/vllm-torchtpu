@@ -1660,6 +1660,7 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
 
@@ -7395,6 +7396,7 @@ class TPUModelRunner(GPUModelRunner):
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
         saved_sizes = cc.compile_sizes
         with set_current_vllm_config(self.vllm_config):
+            self._refresh_smem_request_caps()
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
@@ -7450,6 +7452,9 @@ class TPUModelRunner(GPUModelRunner):
         Startup initially has a placeholder table. Refresh after vLLM installs
         the final cache groups so DCP and kernel block splitting are reflected.
         """
+        cache_config = getattr(self, "cache_config", None)
+        if cache_config is not None:
+            self.block_size = cache_config.block_size
         groups = (
             kv_cache_config
             if kv_cache_config is not None
@@ -7469,6 +7474,8 @@ class TPUModelRunner(GPUModelRunner):
             if groups is not None
             else []
         )
+        if not attention_groups and cache_config is not None:
+            self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
 
         def widest_table(model_len: int | None) -> int:
             if attention_groups:

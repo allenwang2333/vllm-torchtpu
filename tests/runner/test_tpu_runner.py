@@ -256,6 +256,35 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.num_reqs_most_model_len is None
 
 
+def test_smem_caps_refresh_after_backend_block_size_update():
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=2048,
+        most_model_len=16384,
+        num_blocks_per_most_len_req=1024,
+        num_reqs_max_model_len=64,
+        num_reqs_most_model_len=128,
+        cache_config=SimpleNamespace(block_size=264),
+        kv_cache_config=None,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.block_size == 264
+    assert runner.max_num_blocks_per_req == 125
+    assert runner.num_reqs_max_model_len == 256
+    assert runner.num_blocks_per_most_len_req == 63
+    assert runner.num_reqs_most_model_len == 256
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
     connector = object()
 
