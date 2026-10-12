@@ -14,7 +14,8 @@
 """Composition of the GLM-5.2 DCP decode flags, all on vs all off.
 
 Flags: TPU_MLA_DECODE_PROLOGUE, TPU_MLA_KV_WRITE_IN_GATHER,
-TPU_DCP_RANK_OPERAND, TPU_IDX_QB_UNDER_TOPK, TPU_DCP_LSE_MERGE_A2A_PACK,
+TPU_DCP_RANK_OPERAND, TPU_INDEXER_QB_OVERLAP, TPU_DCP_LSE_MERGE_A2A_PACK,
+TPU_DCP_LSE_MERGE_A2A_REAL_ROWS,
 TPU_DCP_MLA_MIXED_FUSED_PREP (TPU_MOE_SC_COMBINE_V5 is MoE-only, set for
 completeness).
 
@@ -54,7 +55,8 @@ FLAGS_ON = {
     "TPU_MLA_DECODE_PROLOGUE": "1",
     "TPU_MLA_KV_WRITE_IN_GATHER": "1",
     "TPU_DCP_RANK_OPERAND": "1",
-    "TPU_IDX_QB_UNDER_TOPK": "1",
+    "TPU_INDEXER_QB_OVERLAP": "1",
+    "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": "1",
     "TPU_DCP_LSE_MERGE_A2A_PACK": "1",
     "TPU_DCP_MLA_MIXED_FUSED_PREP": "1",
     # Read at import (fused_moe_gmm._SC_COMBINE_V5) and MoE-only: no effect
@@ -158,11 +160,17 @@ def test_attention_all_flags_on_vs_off():
             np.testing.assert_array_equal(b[k], a[k], err_msg=f"step {i} {k}")
         lse = a["lse"].view(np.float32).reshape(dcp, -1, prologue.HEADS)
         assert np.isfinite(lse).any(axis=0)[: a["real"]].all(), f"step {i}"
-        want = prologue._merge_every_rank(*prologue._rank_partials(a, dcp), pack=False)
-        one = prologue._merge_every_rank(*prologue._rank_partials(b, dcp), pack=True)
-        diff = int((one.view(torch.int16) != want.view(torch.int16)).sum())
-        print(f"step {i} merged (threaded a2a, pack vs two-exchange): {diff} differ")
+        real = a["real"]
+        want = _merge_every_rank(*prologue._rank_partials(a, dcp), on=False)
+        one = _merge_every_rank(*prologue._rank_partials(b, dcp), on=True, real=real)
+        diff = int((one[:real].view(torch.int16) != want[:real].view(torch.int16)).sum())
+        print(
+            f"step {i} merged (threaded a2a, pack + real rows vs two-exchange):"
+            f" {diff} differ on {real} real rows; padding rows zero:"
+            f" {bool((one[real:] == 0).all())}"
+        )
         assert diff == 0, f"step {i}"
+        assert (one[real:] == 0).all(), f"step {i}"
         assert torch.isfinite(one.float()).all(), f"step {i}"
         for tag, r in (("off", a), ("on", b)):
             dump[f"s{i}_{tag}_out"] = r["out"]
@@ -172,6 +180,58 @@ def test_attention_all_flags_on_vs_off():
     if path:
         np.savez(path, dcp=np.int32(dcp), steps=np.int32(len(ref)), **dump)
         print("saved", path)
+
+
+def _merge_every_rank(outputs, lses, on, real=None):
+    """`merge_lse_partials_all_to_all` on every DCP rank (CPU, lockstep threads
+    standing in for the exchanges). `on`: pack + real rows with a step of `real`
+    real tokens; off: the two-exchange all-to-all."""
+    import concurrent.futures
+    import threading
+
+    import torch
+
+    from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+
+    world = outputs.shape[0]
+    slots = [None] * world
+    barrier = threading.Barrier(world)
+
+    class _Group:
+        def __init__(self, rank):
+            self.world_size, self.rank_in_group, self.device_group = world, rank, None
+
+    def exchange(x, group):
+        slots[group.rank_in_group] = x
+        barrier.wait()
+        recv = torch.stack([slots[s][group.rank_in_group] for s in range(world)])
+        barrier.wait()
+        return recv
+
+    def ragged(x, rows, group):
+        recv = exchange(x, group)
+        n = int(rows.reshape(-1)[0])
+        out = torch.zeros_like(recv)
+        out[:, :n] = recv[:, :n]
+        return out
+
+    qsl = None if real is None else torch.tensor([0, real], dtype=torch.int32)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _Group(rank), query_start_loc=qsl
+        )
+
+    with (
+        mock.patch.object(cp_mla, "_all_to_all", exchange),
+        mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", on, create=True),
+        mock.patch.object(
+            cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", on, create=True
+        ),
+    ):
+        with concurrent.futures.ThreadPoolExecutor(world) as pool:
+            return torch.cat(list(pool.map(run, range(world))), dim=1)
 
 
 def test_attention_all_flags_on_rank_control_fails():
@@ -190,13 +250,18 @@ def test_attention_all_flags_on_rank_control_fails():
 
 
 @pytest.mark.multichip
-def test_indexer_rank_operand_and_q_b_side():
+@pytest.mark.parametrize("q_len", [16, 256], ids=["decode16", "mixed256"])
+def test_indexer_rank_operand_and_q_b_overlap(q_len):
+    """streamindex_topk_dcp with the rank operand and the pinned q_b overlap
+    (the served setting: pin decode buckets only) == the plain call, top-k and
+    q bit for bit; rotated rank ids are caught."""
     import importlib.util
 
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
         streamindex_topk_dcp,
     )
-    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import _q_b_side
+    from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+    from vllm_torchtpu.layers.adapter.linear_common import _fp8_linear_pallas_jax
 
     dcp = 8
     if len(jax.devices()) < dcp:
@@ -205,26 +270,20 @@ def test_indexer_rank_operand_and_q_b_side():
     spec = importlib.util.spec_from_file_location("_t4c_sidx", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    _, args, kwargs = mod._dcp_case(dcp, 3, q_len=16)
-    kwargs["num_queries_per_block"] = 16
-    rng = np.random.default_rng(0)
-    side = (
-        jnp.asarray(rng.standard_normal((16, 2048)), jnp.bfloat16),
-        jnp.asarray(rng.standard_normal((2048, 16384)) * 0.05, jnp.float8_e4m3fn),
-        jnp.asarray(rng.uniform(0.5, 1.5, (16384,)), jnp.float32),
-    )
+    _, args, kwargs = mod._dcp_case(dcp, 31, q_len=q_len)
+    x, w, s = mod._qb_overlap_operands(m=q_len)
     base = np.asarray(streamindex_topk_dcp(*args, **kwargs))
-    topk, q = streamindex_topk_dcp(
-        *args, **kwargs, dcp_rank_ids=_rank_ids(dcp), side_fn=_q_b_side, side_args=side
+    want_q = np.asarray(jax.jit(_fp8_linear_pallas_jax)(x, w, s)).view(np.uint16)
+    ov = dict(
+        overlap_fn=_fp8_linear_pallas_jax,
+        overlap_args=(x, w, s),
+        overlap_pin_max_tokens=fp8_skinny.MAX_M,
     )
+    topk, q = streamindex_topk_dcp(*args, **kwargs, **ov, dcp_rank_ids=_rank_ids(dcp))
     np.testing.assert_array_equal(np.asarray(topk), base)
-    np.testing.assert_array_equal(np.asarray(q), np.asarray(jax.jit(_q_b_side)(*side)))
+    np.testing.assert_array_equal(np.asarray(q).view(np.uint16), want_q)
     bad, _ = streamindex_topk_dcp(
-        *args,
-        **kwargs,
-        dcp_rank_ids=_rank_ids(dcp, 1),
-        side_fn=_q_b_side,
-        side_args=side,
+        *args, **kwargs, **ov, dcp_rank_ids=_rank_ids(dcp, 1)
     )
     assert not np.array_equal(np.asarray(bad), base), "rotated rank ids not caught"
 
@@ -264,3 +323,31 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
     assert len(schema.arguments) == 11 + int(q_rope) + int(rank), schema
+
+
+@pytest.mark.parametrize("qb", [False, True])
+@pytest.mark.parametrize("rank", [False, True])
+def test_indexer_dcp_op_schema(qb, rank):
+    """The indexer DCP op for each (q_b overlap, rank operand) variant
+    registers with exactly 8 + 3 * qb + rank operands."""
+    import torch
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mop
+
+    name = f"t4c_idx_{int(qb)}{int(rank)}"
+    stub = mock.Mock(topk_tokens=2048)
+    stub.k_cache.prefix = name
+    env = {"TPU_DCP_RANK_OPERAND": "1"} if rank else {}
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(
+            mop, "dcp_rank_operand", return_value=torch.zeros(1, dtype=torch.int32)
+        ),
+    ):
+        if not rank:
+            os.environ.pop("TPU_DCP_RANK_OPERAND", None)
+        mop.VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 8, 4, qb_overlap=qb)
+    op = f"streamidx_topk_dcp_{name}" + ("_qb" if qb else "")
+    schema = getattr(torch.ops.pallas, op).default._schema
+    print(schema)
+    assert len(schema.arguments) == 8 + 3 * int(qb) + int(rank), schema
