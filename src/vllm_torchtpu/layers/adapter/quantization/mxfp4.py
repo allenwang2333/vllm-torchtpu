@@ -45,11 +45,15 @@ scaling.
    - Returns output tensor
 """
 
-from math import lcm
+import functools
+from collections.abc import Callable
+from math import gcd, lcm
 from typing import TYPE_CHECKING, Any, cast
 
+import jax
 import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -91,6 +95,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedLinearMethod,
 )
+from vllm_torchtpu.layers.core.fused_moe_gmm import quantize_to_native_fp4_kmajor
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
@@ -390,6 +395,53 @@ REQUANTIZED_BLOCK_SIZE = (
 )
 
 
+def _quantize_fp4_kmajor_tied(
+    w: jax.Array, *, block: int, sub: int, pack: bool
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize a K-major weight per `block` rows, scaled per `sub` rows.
+
+    Each `block`-row group gets one absmax scale exactly as if K were
+    zero-padded up to a multiple of `block`: zero rows never raise an absmax,
+    so a short tail group's scale is its own rows' absmax either way. That
+    scale is then repeated over the group's `block // sub` sub-blocks and the
+    padding rows are dropped, so the result dequantizes bit-identically to the
+    padded quantization while K stays unpadded. `sub` must divide `block` and
+    K; the scale tensor is [..., K // sub, 1, N].
+    """
+    size_k = w.shape[-2]
+    pad = -size_k % block
+    if pad:
+        w = jnp.pad(w, [(0, 0)] * (w.ndim - 2) + [(0, pad), (0, 0)])
+    quantized, scale = quantize_to_native_fp4_kmajor(w, block=block, pack=pack)
+    rows = size_k // 2 if pack else size_k
+    quantized = quantized[..., :rows, :]
+    scale = jnp.repeat(scale, block // sub, axis=-3)[..., : size_k // sub, :, :]
+    return quantized, scale
+
+
+_quantize_fp4_kmajor_tied_ops: dict[tuple[int, int, bool], Callable] = {}
+
+
+def _quantize_fp4_kmajor_tied_op(block: int, sub: int, pack: bool) -> Callable:
+    """The torch op running `_quantize_fp4_kmajor_tied` for one closure.
+
+    Keyed on every closed-over value: one qualname serving two closures
+    would silently dispatch to whichever registered first.
+    """
+    key = (block, sub, pack)
+    op = _quantize_fp4_kmajor_tied_ops.get(key)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::mxfp4_quantize_tied_kmajor_b{block}_s{sub}"
+            f"{'' if pack else '_unpacked'}",
+            functools.partial(
+                _quantize_fp4_kmajor_tied, block=block, sub=sub, pack=pack
+            ),
+        )
+        _quantize_fp4_kmajor_tied_ops[key] = op
+    return op
+
+
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
@@ -402,6 +454,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # An armed layer owns its own dispatch and combine, so vLLM must not
         # bracket it with an all-gather/reduce-scatter of its own.
         return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+
+    @staticmethod
+    def _fused_ep_requested(layer: RoutedExperts) -> bool:
+        """Whether this layer will try the fused EP W4A8 kernel at all."""
+        return bool(
+            envs.USE_MOE_FUSED_EP_KERNEL
+            and envs.MOE_FUSED_EP_ENABLE_W4A8
+            and layer.moe_config.moe_parallel_config.use_ep
+        )
 
     def _prebuild_w4a8(
         self,
@@ -420,11 +481,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
-        if not (
-            envs.USE_MOE_FUSED_EP_KERNEL
-            and envs.MOE_FUSED_EP_ENABLE_W4A8
-            and layer.moe_config.moe_parallel_config.use_ep
-        ):
+        if not self._fused_ep_requested(layer):
             return None
         block = REQUANTIZED_BLOCK_SIZE
         if min(block, orig_intermediate_size) != block:
@@ -554,9 +611,17 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w13_block_size = REQUANTIZED_BLOCK_SIZE
 
         # W13's output needs the GMM tile alignment; W2 contracts over the
-        # same dimension and must also contain complete requantization blocks.
-        # V4.1's 2304 channels satisfy the former but not a block of 512.
+        # same dimension and must also contain complete scale blocks. V4.1's
+        # 2304 channels satisfy the former but not a block of 512. For the
+        # GMM path w2's scales therefore sit on the finer gcd(512, 2304) = 256
+        # grid, quantized per full block so the weight dequantizes exactly as
+        # the zero-padded one did while both matmuls skip the 11% of padding.
+        # The fused EP kernel blocks both matmuls at one size, so it keeps the
+        # padded layout.
         w2_block_size = min(w13_block_size, orig_intermediate_size)
+        scale_rows = gcd(w2_block_size, orig_intermediate_size)
+        if scale_rows % 128 == 0 and not self._fused_ep_requested(layer):
+            w2_block_size = scale_rows
         intermediate_alignment = lcm(128, w2_block_size)
         intermediate_padded = (
             -(-orig_intermediate_size // intermediate_alignment)
@@ -620,16 +685,25 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         `pack=False` leaves the fp4 pairs unpacked as `float4_e2m1fn_x2`,
         which is what the fused EP kernel reads; the GMM path wants the uint8
         packing its `should_unpack` step undoes. Same values either way.
+
+        A w2 whose rows `_dequantize_and_pad` left short of a whole block is
+        quantized per block with its scales repeated onto the gcd grid.
         """
         w13_block_size = REQUANTIZED_BLOCK_SIZE
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
+        w2_rows = w2_weight_padded.shape[1]
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
             w13_weight_padded.to(device), block=w13_block_size, pack=pack
         )
-        w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
-            w2_weight_padded.to(device), block=w2_block_size, pack=pack
-        )
+        if w2_rows % w2_block_size:
+            w2_weight_processed, w2_weight_scale = _quantize_fp4_kmajor_tied_op(
+                w2_block_size, gcd(w2_block_size, w2_rows), pack
+            )(w2_weight_padded.to(device))
+        else:
+            w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
+                w2_weight_padded.to(device), block=w2_block_size, pack=pack
+            )
 
         return (
             w13_weight_processed,
