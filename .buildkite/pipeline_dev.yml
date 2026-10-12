@@ -79,9 +79,11 @@ steps:
   # that replays the InferenceX AgentX corpus (kimi-k3-agentx-1p1d.yaml).
   # It joins the same org-wide concurrency group as the nightly Kimi-K3
   # pairs, so it waits for a running pair rather than competing for slices.
+  # Not on a build that sets K3_MK, which runs the megakernel lane below.
   # -----------------------------------------------------------------
   - label: ":kubernetes: :tpu: Perf: Kimi-K3 AgentX 1P1D (dev, TPU v7x 2x2x4 x2)"
     key: k3_agentx_1p1d
+    if: 'build.env("K3_MK") == null'
     depends_on: build_docker
     concurrency_group: "tpu/v7x-2x2x4"
     concurrency: 1
@@ -93,3 +95,41 @@ steps:
           podTemplate: tpu-launcher
     commands:
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
+
+  # -----------------------------------------------------------------
+  # Kimi-K3 AgentX 1P1D on megakernel engines, on demand (K3_MK=1)
+  # The same AgentX client against engines served as the "Kimi-K3 on TPU7x:
+  # 1P1D prefill/decode recipes" doc serves them: TP32 per role, the TP32
+  # pre-shard in the model bucket, DSpark (kimi-k3-mk-agentx-1p1d.yaml).
+  # The engines run an image built from another branch; the client and the
+  # lane's scripts come from this build's commit. Build env:
+  #   K3_MK=1          run this instead of the step above
+  #   K3_MK_POINT      the doc's point, 1-5 (6-7 experimental); default 1
+  #   K3_ENGINE_REF    branch/tag/commit the engine image is built from
+  #                    (default inferact/megakernel-integration), or
+  #   K3_ENGINE_IMAGE  an engine image to use as it is
+  # -----------------------------------------------------------------
+  - label: ":docker: Build Kimi-K3 megakernel engine image"
+    key: k3_engine_image
+    if: 'build.env("K3_MK") != null'
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/build_k3_engine_image.sh
+
+  - label: ":kubernetes: :tpu: Perf: Kimi-K3 megakernel AgentX 1P1D (dev, TPU v7x 2x2x4 x2)"
+    key: k3_mk_agentx_1p1d
+    if: 'build.env("K3_MK") != null'
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    concurrency_group: "tpu/v7x-2x2x4"
+    concurrency: 1
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - .buildkite/kubernetes/k3_mk_submit.sh
