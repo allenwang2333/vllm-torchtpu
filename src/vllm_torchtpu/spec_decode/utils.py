@@ -101,7 +101,7 @@ def gather_sharded_weight(
     sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
     """Gathers a sharded weight tensor across TP into a full replicated tensor."""
-    tp_group = get_tp_group().cpu_group
+    tp = get_tp_group()
     org_vocab = sharded_module.org_vocab_size
     dim = sharded_module.embedding_dim
     weight = cast(torch.Tensor, sharded_module.weight)
@@ -114,19 +114,26 @@ def gather_sharded_weight(
         )
 
     num_org = si.org_vocab_end_index - si.org_vocab_start_index
-    full = torch.zeros(org_vocab, dim, dtype=torch.float32)
-    my_slice = weight.data[:num_org]
-    if my_slice.dtype != torch.float32:
-        my_slice = my_slice.to(torch.float32)
-    my_rows = my_slice if my_slice.device.type == "cpu" else my_slice.cpu()
-    full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
-    dist.all_reduce(full, group=tp_group)
-
     draft_dtype = weight.dtype
     draft_device = weight.device
-    full_dev = full if full.dtype == draft_dtype else full.to(draft_dtype)
-    if full_dev.device != draft_device:
-        full_dev = full_dev.to(draft_device)
+    part_rows = weight.data.shape[0]
+    if (
+        draft_device.type == "tpu"
+        and si.org_vocab_start_index == tp.rank_in_group * part_rows
+        and (num_org == part_rows or si.org_vocab_end_index == org_vocab)
+    ):
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        full_dev = tensor_model_parallel_all_gather(weight.data, dim=0)[:org_vocab]
+        return full_dev, org_vocab, dim, draft_device
+
+    full = torch.zeros(org_vocab, dim, dtype=draft_dtype)
+    my_slice = weight.data[:num_org]
+    my_rows = my_slice if my_slice.device.type == "cpu" else my_slice.cpu()
+    full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
+    dist.all_reduce(full, group=tp.cpu_group)
+
+    full_dev = full if full.device == draft_device else full.to(draft_device)
     return full_dev, org_vocab, dim, draft_device
 
 
@@ -247,10 +254,11 @@ def populate_draft_lm_head_from_target(
     shared_heads = list(iter_mtp_shared_heads(draft_model))
     if shared_heads:
         full_dev, org_vocab, dim, draft_device = gather_sharded_weight(target_lm_head)
+        shared_param = Parameter(full_dev, requires_grad=False)
         for shared_head in shared_heads:
-            shared_head.head.weight = Parameter(full_dev, requires_grad=False)
-            if draft_device.type == "tpu":
-                synchronize_tensors(shared_head.head.weight)
+            shared_head.head.weight = shared_param
+        if draft_device.type == "tpu":
+            synchronize_tensors(shared_param)
         logger.info(
             "Populated %d MTP shared_head.head module(s) with a full "
             "replicated copy of the target lm_head: %d x %d per worker.",
@@ -410,6 +418,16 @@ def normalize_draft_config(hf_config) -> dict:
     _init_parallel_drafting_params only knows pard_token / ptd_token_id /
     dflash_config.mask_token_id — not dspark_noise_token_id.
     """
+    existing = getattr(hf_config, "dflash_config", None)
+    if (
+        isinstance(existing, dict)
+        and existing.get("mask_token_id") is not None
+        and existing.get("target_layer_ids")
+    ):
+        dflash_config = dict(existing)
+        hf_config.dflash_config = dflash_config
+        return dflash_config
+
     hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
     noise_id = hf_dict.get("dflash_config", {}).get("mask_token_id")
