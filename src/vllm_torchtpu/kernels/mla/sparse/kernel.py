@@ -2110,7 +2110,7 @@ def sparse_ragged_paged_attention(
       kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
-        `native_sc_gather.pack_write_rows`' one-operand u32[T, 384] form. The SparseCore gather
+        `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form. The SparseCore gather
         writes them into both caches in place before it gathers (see
         `native_sc_gather.dsa_gather_native_sc`), and the updated caches are
         returned after the other outputs.
