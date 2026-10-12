@@ -361,8 +361,8 @@ def valid_rows(armed, monkeypatch):
     return valid_op
 
 
-@pytest.mark.parametrize("rows", [16, 32])
-def test_valid_rows_op_takes_whole_row_tiles_with_the_mask_count(
+@pytest.mark.parametrize("rows", [16, 24, 32])
+def test_valid_rows_op_takes_blocks_with_a_fold_path_with_the_mask_count(
     armed, valid_rows, rows
 ):
     ar, _ = armed
@@ -386,15 +386,17 @@ def test_valid_rows_count_is_the_whole_block_without_padding(
     assert meta.tolist() == [32, 3]
 
 
-def test_valid_rows_partial_tile_keeps_the_two_shot_and_reads_the_mask(
-    armed, valid_rows, monkeypatch
+@pytest.mark.parametrize("rows", [1, 8])
+def test_valid_rows_below_a_row_tile_keeps_the_two_shot_and_reads_the_mask(
+    armed, valid_rows, monkeypatch, rows
 ):
-    """24 rows are not whole row tiles: the two-shot kernel, its input carrying
-    a live zero read of the mask (a NaN mask entry poisons it)."""
+    """Fewer rows than a row tile have no fold path: the two-shot kernel, its
+    input carrying a live zero read of the mask (a NaN mask entry poisons
+    it)."""
     from vllm_torchtpu.layers.adapter import token_padding
 
     ar, _ = armed
-    x = _block(24)
+    x = _block(rows)
     op.all_reduce_or(x, MESH, _fallback)
     valid_rows.assert_not_called()
     (block, rank), _ = ar.call_args
