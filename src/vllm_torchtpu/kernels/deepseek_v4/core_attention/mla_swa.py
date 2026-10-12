@@ -72,12 +72,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
-    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    bo_ids_ref,
-    # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
-    #     bkv_sem_0_sz, bkv_sem_1_sz)
-    bkv_update_ids_ref,
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
@@ -103,6 +97,13 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     l_ref,  # [bq_sz * num_q_heads],
     m_ref,  # [bq_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
+    sem_ids_ref,  # SMEM [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
+    # SMEM [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx,
+    #           bo_sem_1_bo_idx)
+    bo_ids_ref,
+    # SMEM [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset,
+    #           bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    bkv_update_ids_ref,
     *,
     static_q_len: int,
     sm_scale: float,
@@ -178,10 +179,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
         num_chunks = n // chunk_sz
 
         def load_with_init(ref, init_val):
-            if single_bkv_block:
-                return jnp.full_like(ref, init_val)
-            else:
-                return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
+            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
         # k_span is shared across all chunks (only depends on the bkv column).
         k_span = (
@@ -473,45 +471,26 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
             wait,
         )
 
-    def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
-        sem = sems.at[2, bo_sem_idx]
-        vmem_ref = bo_x2_ref.at[bo_sem_idx]
+    def _transfer_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
 
         _async_copy(
-            vmem_ref.at[pl.ds(0, sz)],
+            bo_x2_ref.at[bo_sem_idx, pl.ds(0, sz)],
             o_hbm_ref.at[pl.ds(q_len_start, sz)],
-            sem,
+            sems.at[2, bo_sem_idx],
             wait,
         )
-
-    def _send_l(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
-        sem = sems.at[4, bo_sem_idx]
-        vmem_ref = bl_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
         _async_copy(
-            vmem_ref.at[pl.ds(0, sz)],
+            bl_x2_ref.at[bo_sem_idx, pl.ds(0, sz)],
             l_hbm_ref.at[pl.ds(q_len_start, sz)],
-            sem,
+            sems.at[4, bo_sem_idx],
             wait,
         )
-
-    def _send_m(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
-        sem = sems.at[5, bo_sem_idx]
-        vmem_ref = bm_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
         _async_copy(
-            vmem_ref.at[pl.ds(0, sz)],
+            bm_x2_ref.at[bo_sem_idx, pl.ds(0, sz)],
             m_hbm_ref.at[pl.ds(q_len_start, sz)],
-            sem,
+            sems.at[5, bo_sem_idx],
             wait,
         )
 
@@ -530,9 +509,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
-        _send_bo(seq_idx, bo_idx, bo_sem_idx)
-        _send_l(seq_idx, bo_idx, bo_sem_idx)
-        _send_m(seq_idx, bo_idx, bo_sem_idx)
+        _transfer_bo(seq_idx, bo_idx, bo_sem_idx)
 
     def wait_send_bo(bo_sem_idx):
         old_seq_idx = bo_ids_ref[bo_sem_idx]
@@ -540,9 +517,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
         @pl.when(jnp.logical_and(old_seq_idx >= 0, old_seq_idx <= seq_idx))
         def _():
-            _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
-            _send_l(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
-            _send_m(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
+            _transfer_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, vmem_start):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
@@ -695,8 +670,6 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
                     cur_start_offset,
                 )
 
-                bq = load_bq(bq_sem_idx)
-
                 flash_attention(
                     bq,
                     bkv,
@@ -707,6 +680,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+            bq = load_bq(bq_sem_idx)
             if single_bkv_block:
                 compute_with_bkv(0, None)
             else:
@@ -763,6 +737,12 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
+        for idx in range(3):
+            sem_ids_ref[idx] = 0
+        for idx in range(4):
+            bo_ids_ref[idx] = -1
+        for idx in range(6):
+            bkv_update_ids_ref[idx] = -1
         start_fetch_bq(start_seq_idx, 0, 0)
 
         # Initialize bkv_x2_ref to avoid NaN issues from accessing uninitialized
@@ -1623,6 +1603,9 @@ def mla_sliding_window_ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
+            pltpu.SMEM((3,), jnp.int32),
+            pltpu.SMEM((4,), jnp.int32),
+            pltpu.SMEM((6,), jnp.int32),
         ]
 
         scalar_prefetches = (
@@ -1630,13 +1613,6 @@ def mla_sliding_window_ragged_paged_attention(
             page_indices,
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
-            # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-            jnp.zeros((3,), jnp.int32),
-            # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-            jnp.full((4,), -1, jnp.int32),
-            # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset,
-            #     bkv_sem_0_sz, bkv_sem_1_sz)
-            jnp.full((6,), -1, jnp.int32),
         )
 
         scope_name = (
@@ -1680,10 +1656,10 @@ def mla_sliding_window_ragged_paged_attention(
                     ),
                 ],
                 input_output_aliases={
-                    11: 0,  # Alias output activation with in_output
-                    10: 1,  # Aliasing cache_kv with updated_cache_kv
-                    12: 2,  # Alias l with in_l
-                    13: 3,  # Alias m with in_m
+                    8: 0,  # Alias output activation with in_output
+                    7: 1,  # Aliasing cache_kv with updated_cache_kv
+                    9: 2,  # Alias l with in_l
+                    10: 3,  # Alias m with in_m
                 },
                 name=scope_name,
             )
@@ -1700,11 +1676,16 @@ def mla_sliding_window_ragged_paged_attention(
         )
 
     num_l_heads = align_to(num_q_heads, 128)
-    l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
-    m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
-    # output of swa attn is consumed by csa, hca attn, padding tokens'
-    # data won't be used downstream at all, so un-initialized buffer is fine.
-    in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
+    # output, l, m of swa attn are consumed by csa, hca attn; padding tokens'
+    # data won't be used downstream at all, so un-initialized buffers are fine.
+    if unnormalized_output:
+        l = jnp.empty((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+        m = jnp.empty((q.shape[0], num_l_heads), dtype=jnp.float32)
+        in_output = jnp.empty_like(q)
+    else:
+        l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+        m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
+        in_output = jnp.zeros_like(q)
 
     bkv_sz = num_kv_pages_per_blocks[0] * logical_page_size
     if sliding_window <= bkv_sz:
