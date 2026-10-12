@@ -24,8 +24,8 @@ proves nothing):
   * trimming below the real slot count (drops a real draft slot);
   * drawing the uniforms at the trimmed shape (a different generator stream).
 
-    pytest tests/runner/test_sampler_verify_trim.py            # CPU, eager
-    pytest tests/runner/test_sampler_verify_trim.py --use-tpu  # TPU, compiled
+Runs compiled on a TPU when one is attached, else eager on CPU (the `dev`
+fixture; conftest's `device` always demands a TPU).
 """
 
 from types import SimpleNamespace
@@ -53,6 +53,18 @@ VARIANTS = [
 ]
 # draft counts per request; every sum <= 8 at padded logits length 16.
 CASES = [[3], [3, 3], [2, 1], [3, 0], [1, 1, 3], [3, 3, 2]]
+
+
+@pytest.fixture
+def dev():
+    try:
+        import torch_tpu  # noqa: F401
+
+        d = torch.device("tpu")
+        torch.zeros(1, device=d)
+        return d
+    except Exception:
+        return torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -153,49 +165,49 @@ def _vocab(device):
 
 @pytest.mark.parametrize("variant", VARIANTS, ids=["stack", "default"])
 @pytest.mark.parametrize("case", CASES, ids=[str(c) for c in CASES])
-def test_trim_is_exact(device, case, variant):
-    vocab, fn = _vocab(device), _fused(device)
+def test_trim_is_exact(dev, case, variant):
+    vocab, fn = _vocab(dev), _fused(dev)
     for seed in range(6):
-        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, device)
+        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, dev)
         draws = _draw(gen, PADDED_NUM_REQS, padded, vocab, logits.dtype)
-        full = _run(fn, device, logits, md, temps, top_k, top_p, draws, 0, **variant)
+        full = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **variant)
         trim = _run(
-            fn, device, logits, md, temps, top_k, top_p, draws, 0,
+            fn, dev, logits, md, temps, top_k, top_p, draws, 0,
             verify_rows=8, **variant,
         )
         assert torch.equal(full, trim), (case, seed, full, trim)
 
 
-def test_positive_control_dropped_real_slot_is_caught(device):
+def test_positive_control_dropped_real_slot_is_caught(dev):
     """verify_rows below the real slot count drops a real draft slot: the
     comparison must see it."""
-    vocab, fn = _vocab(device), _fused(device)
+    vocab, fn = _vocab(dev), _fused(dev)
     case, differs = [3, 3, 2], 0
     for seed in range(6):
-        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, device)
+        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, dev)
         draws = _draw(gen, PADDED_NUM_REQS, padded, vocab, logits.dtype)
-        full = _run(fn, device, logits, md, temps, top_k, top_p, draws, 0, **VARIANTS[0])
+        full = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **VARIANTS[0])
         bad = _run(
-            fn, device, logits, md, temps, top_k, top_p, draws, 0,
+            fn, dev, logits, md, temps, top_k, top_p, draws, 0,
             verify_rows=6, **VARIANTS[0],
         )
         differs += int(not torch.equal(full, bad))
     assert differs > 0
 
 
-def test_positive_control_trimmed_draw_shape_is_caught(device):
+def test_positive_control_trimmed_draw_shape_is_caught(dev):
     """Drawing accept_u / recover_u at the trimmed shape moves the generator
     stream: the comparison must see it (why the trim slices full draws)."""
-    vocab, fn = _vocab(device), _fused(device)
+    vocab, fn = _vocab(dev), _fused(dev)
     case, differs = [3, 3], 0
     for seed in range(6):
-        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, device)
+        gen, logits, md, temps, top_k, top_p, padded = _inputs(case, seed, vocab, dev)
         state = gen.get_state()
         draws = _draw(gen, PADDED_NUM_REQS, padded, vocab, logits.dtype)
-        full = _run(fn, device, logits, md, temps, top_k, top_p, draws, 0, **VARIANTS[0])
+        full = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **VARIANTS[0])
         gen.set_state(state)
         small = _draw(gen, PADDED_NUM_REQS, 8, vocab, logits.dtype)
-        bad = _run(fn, device, logits, md, temps, top_k, top_p, small, 8, **VARIANTS[0])
+        bad = _run(fn, dev, logits, md, temps, top_k, top_p, small, 8, **VARIANTS[0])
         differs += int(not torch.equal(full, bad))
     assert differs > 0
 
