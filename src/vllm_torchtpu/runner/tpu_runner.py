@@ -348,7 +348,21 @@ SAMPLING_EPS = 1e-5
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
-    return runner.sequence_layout_planner
+    planner = runner.sequence_layout_planner
+    eligibility = getattr(planner, "eligibility", None)
+    if eligibility is not None and getattr(eligibility, "is_zigzag", False):
+        from vllm_torchtpu.layers.core.pcp_sequence_layout import (
+            resolve_pcp_zigzag_page_size,
+        )
+
+        eligibility.block_size = resolve_pcp_zigzag_page_size(
+            getattr(runner, "block_size", eligibility.block_size),
+            getattr(runner, "_attention_kernel_block_size", None),
+        )
+        max_num_tokens = getattr(runner, "max_num_tokens", None)
+        if max_num_tokens is not None:
+            eligibility.max_num_tokens = int(max_num_tokens)
+    return planner
 
 
 def _validate_libtpu_version() -> None:
@@ -712,10 +726,12 @@ class TPUModelRunner(GPUModelRunner):
             local_quantum = 2 * page_size
             snapped = []
             for sz in self.num_tokens_paddings:
-                snapped_sz = max(
-                    local_quantum,
-                    ((sz + local_quantum - 1) // local_quantum) * local_quantum,
-                )
+                if sz < local_quantum:
+                    snapped_sz = sz
+                else:
+                    snapped_sz = (
+                        (sz + local_quantum - 1) // local_quantum
+                    ) * local_quantum
                 if not snapped or snapped[-1] != snapped_sz:
                     snapped.append(snapped_sz)
             self.num_tokens_paddings = snapped
@@ -2611,9 +2627,8 @@ class TPUModelRunner(GPUModelRunner):
         # requests have zero length instead of a negative q_len.
         self.query_start_loc_np[num_reqs + 1 :] = self.query_start_loc_np[num_reqs]
 
-        is_zigzag_pcp = self._pcp_enabled and (
-            (getattr(self.vllm_config.model_config, "is_hybrid_mamba_model", False))
-            or (envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag")
+        is_zigzag_pcp = (
+            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
         )
         if is_zigzag_pcp:
             for i in range(num_reqs):

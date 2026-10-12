@@ -733,10 +733,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
-            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
-            > 1
         ):
-            return [128, 256, 512, 1024, 2048, 4096]
+            if (
+                get_current_vllm_config().parallel_config.prefill_context_parallel_size
+                > 1
+                and envs.VLLM_TPU_PCP_LAYOUT.lower() != "zigzag"
+            ):
+                return [128, 256, 512, 1024, 2048, 4096]
+            return [128]
         return [128, 256]
 
 

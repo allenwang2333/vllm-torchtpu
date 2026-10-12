@@ -237,7 +237,8 @@ def test_pcp_zigzag_decode_single_request():
         max_num_tokens=512,
     )
     assert decision.mode is PcpSequenceLayoutMode.ZIGZAG
-    assert decision.local_required_tokens == 32
+    assert decision.local_required_tokens == 1
+    assert decision.local_padded_tokens == 128
 
 
 def test_pcp_zigzag_decode_multi_request():

@@ -797,7 +797,18 @@ def forward_with_pcp(
     k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
     v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
 
-    is_decode = bool(getattr(pcp_meta, "is_decode", False))
+    page_size = (
+        kv_cache.shape[4]
+        if kv_layout == KVLayout.SEQ_ALONG_LANE
+        else kv_cache.shape[1]
+    )
+    if torch.compiler.is_compiling():
+        is_decode = bool(
+            getattr(pcp_meta, "is_decode", False)
+            or (query.shape[0] < (2 * int(page_size)))
+        )
+    else:
+        is_decode = bool(getattr(pcp_meta, "is_decode", False))
 
     cache_kernel, new_kernel = build_pcp_kernels(
         sliding_window=sliding_window,
@@ -864,7 +875,8 @@ def forward_with_pcp(
 
     # ---- 1. CACHE_ONLY pass ----
     cache_pages = pcp_meta.cache_pages
-    if cache_pages == 0:
+    run_cache_pass = torch.compiler.is_compiling() or (cache_pages > 0)
+    if not run_cache_pass:
         ctx_output = ctx_lse = None
     else:
         cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
