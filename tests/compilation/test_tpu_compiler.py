@@ -510,3 +510,27 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
+
+
+def test_copies_of_compiled_artifacts_share_the_program():
+    """copy/deepcopy hand back the artifact instead of reloading it through
+    __reduce__; pickling still serializes."""
+    import copy
+    import pickle
+
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        NoOpCompiledArtifact,
+    )
+
+    from vllm_torchtpu.compilation.tpu_compiler import (
+        _patch_share_executable_copies,
+    )
+
+    _patch_share_executable_copies()
+    _patch_share_executable_copies()  # idempotent
+    artifact = NoOpCompiledArtifact(None)
+    assert copy.copy(artifact) is artifact
+    holder = {"a": artifact, "b": artifact}
+    copied = copy.deepcopy(holder)
+    assert copied["a"] is artifact and copied["b"] is artifact
+    assert pickle.loads(pickle.dumps(artifact)) is not artifact

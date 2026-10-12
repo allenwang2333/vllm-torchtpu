@@ -80,6 +80,37 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     return deserialize_bundled_cache_entry(entry)
 
 
+def _patch_share_executable_copies() -> None:
+    """Make copy/deepcopy of a compiled TPU artifact return the artifact.
+
+    torch copies the OutputCode it stores in a bundled AOTAutograd entry
+    (``BundledOutputCodeLoadable.pre_save`` on a cold compile,
+    ``deserialize_bundled_cache_entry`` on a cache hit) so the stored copy can
+    be prepared for serialization. TorchTPU's artifacts define ``__reduce__``
+    but not ``__copy__``, so that copy serializes the executable and loads a
+    second one; the entry, and with it the second executable, then lives as
+    long as the runnable's ``serialize`` closure -- i.e. for the process. The
+    copy is never mutated (``prepare_for_serialization`` is a no-op for TPU
+    artifacts) and pickling still goes through ``__reduce__``, so sharing is
+    safe and saves one loaded program per compiled graph.
+    """
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        CompiledArtifact,
+    )
+
+    if getattr(CompiledArtifact, "_vllm_tpu_shares_copies", False):
+        return
+
+    def _deepcopy(self: Any, memo: dict[int, Any]) -> Any:
+        memo[id(self)] = self
+        return self
+
+    CompiledArtifact.__copy__ = lambda self: self
+    CompiledArtifact.__deepcopy__ = _deepcopy
+    CompiledArtifact._vllm_tpu_shares_copies = True
+    logger.debug("Applied TPU patch: copies of compiled artifacts share the program.")
+
+
 _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
