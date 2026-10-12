@@ -346,44 +346,50 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         """
         runner = self.runner
         block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
+        max_blocks = block_table_obj.max_num_blocks_per_req
         if ctx.use_max_model_len:
-            target_num_blocks = block_table_obj.max_num_blocks_per_req
-        else:
-            assert runner.most_model_len is not None
-            spec = self.kv_cache_spec
-            first_spec = (
-                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            return block_table_obj, max_blocks
+        most_model_len = runner.most_model_len
+        assert most_model_len is not None
+        geom_key = (most_model_len, max_blocks, ctx.mamba_ckpt_window)
+        if getattr(self, "_cached_geom_key", None) == geom_key:
+            return block_table_obj, self._cached_target_num_blocks
+
+        spec = self.kv_cache_spec
+        first_spec = (
+            spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+        )
+        if isinstance(first_spec, AttentionSpec):
+            target_num_blocks = attention_block_table_width(
+                block_table_obj,
+                self.kv_cache_spec,
+                self.vllm_config,
+                most_model_len,
             )
-            if isinstance(first_spec, AttentionSpec):
-                target_num_blocks = attention_block_table_width(
-                    block_table_obj,
-                    self.kv_cache_spec,
-                    self.vllm_config,
-                    runner.most_model_len,
-                )
-            else:
-                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
-            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
-                # Speculative decoding: the manager appends
-                # `num_speculative_blocks` (= window - 1) checkpoint blocks
-                # after the request's positional state block, so a mamba row
-                # is that much wider than the positional part alone. This
-                # mirrors `MambaSpec.max_num_blocks_per_req`, which the
-                # use_max_model_len branch above already gets for free.
-                # Without it the row stops short of the checkpoint group and
-                # `in_row` below silently redirects checkpoints to the null
-                # block, costing rollback accuracy with no error.
-                target_num_blocks = min(
-                    target_num_blocks + ctx.mamba_ckpt_window - 1,
-                    block_table_obj.max_num_blocks_per_req,
-                )
+        else:
+            target_num_blocks = cdiv(most_model_len, self.target_block_size)
+        if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+            # Speculative decoding: the manager appends
+            # `num_speculative_blocks` (= window - 1) checkpoint blocks
+            # after the request's positional state block, so a mamba row
+            # is that much wider than the positional part alone. This
+            # mirrors `MambaSpec.max_num_blocks_per_req`, which the
+            # use_max_model_len branch above already gets for free.
+            # Without it the row stops short of the checkpoint group and
+            # `in_row` below silently redirects checkpoints to the null
+            # block, costing rollback accuracy with no error.
+            target_num_blocks = min(
+                target_num_blocks + ctx.mamba_ckpt_window - 1,
+                max_blocks,
+            )
+        self._cached_geom_key = geom_key
+        self._cached_target_num_blocks = target_num_blocks
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -393,6 +399,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if ctx.staged_block_tables is not None
             else None
         )
+        block_table_obj = None
+        target_num_blocks = 0
         if staged is not None:
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
@@ -403,11 +411,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
         elif ctx.position_ids_override is not None:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
             source_block_tables = block_table_obj.get_cpu_tensor()
@@ -448,6 +458,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 # program alongside the staged tables.
                 mamba_state_indices, mamba_ckpt_indices = staged_products
             else:
+                if target_num_blocks <= 0:
+                    _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
@@ -666,34 +678,59 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
-        scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        runner._block_table_stage_cpu = scratch
-    flat = scratch[:total]
-    if ctx.position_ids_override is not None:
-        # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
-        flat.zero_()
-    else:
-        offset = 0
-        for _, block_table_obj, target_num_blocks in entries:
-            rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
-                num_reqs_padded, target_num_blocks
+    bt_ver_key = None
+    if ctx.position_ids_override is None:
+        vers = [_get_block_table_version(bt, runner) for _, bt, _ in entries]
+        if all(isinstance(v, int) for v in vers):
+            bt_ver_key = (
+                num_reqs_padded,
+                ctx.start_index,
+                ctx.num_reqs,
+                tuple(
+                    (gid, tnb, v)
+                    for (gid, _, tnb), v in zip(entries, vers)
+                ),
             )
-            source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
-            if ctx.num_reqs < num_reqs_padded:
-                rows[ctx.num_reqs :].zero_()
-            offset += num_reqs_padded * target_num_blocks
+    if (
+        bt_ver_key is not None
+        and getattr(runner, "_staged_bt_ver_key", None) == bt_ver_key
+        and getattr(runner, "_staged_bt_ver_dev", None) is not None
+    ):
+        staged_dev = runner._staged_bt_ver_dev
+    else:
+        scratch = runner._block_table_stage_cpu
+        if scratch is None or scratch.numel() < total:
+            scratch = torch.zeros(
+                (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+            )
+            runner._block_table_stage_cpu = scratch
+        flat = scratch[:total]
+        if ctx.position_ids_override is not None:
+            # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+            flat.zero_()
+            runner._staged_bt_ver_key = None
+        else:
+            offset = 0
+            for _, block_table_obj, target_num_blocks in entries:
+                rows = flat[
+                    offset : offset + num_reqs_padded * target_num_blocks
+                ].view(num_reqs_padded, target_num_blocks)
+                source = block_table_obj.get_cpu_tensor()
+                rows[: ctx.num_reqs] = source[
+                    ctx.start_index : ctx.start_index + ctx.num_reqs,
+                    :target_num_blocks,
+                ]
+                if ctx.num_reqs < num_reqs_padded:
+                    rows[ctx.num_reqs :].zero_()
+                offset += num_reqs_padded * target_num_blocks
 
-    # Re-uploads only when the staged rows change (a page boundary, requests
-    # joining, finishing, being preempted or reordered, spec tokens being
-    # rejected); comparing contents covers every cause.
-    staged_dev = runner._block_table_upload(flat, runner.device)
+        # Re-uploads only when the staged rows change (a page boundary, requests
+        # joining, finishing, being preempted or reordered, spec tokens being
+        # rejected); comparing contents covers every cause.
+        staged_dev = runner._block_table_upload(flat, runner.device)
+        if bt_ver_key is not None:
+            runner._staged_bt_ver_key = bt_ver_key
+            runner._staged_bt_ver_dev = staged_dev
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -762,13 +799,25 @@ def stage_block_table_uploads(
             if np.all(low >= 0):
                 per_group_q: list[bytes] = []
                 in_same_block = True
+                seen_t_bs: dict[tuple[int, int], bytes | None] = {}
                 for _, t, bs in mamba_geom:
+                    t_bs = (t, bs)
+                    if t_bs in seen_t_bs:
+                        cached_q = seen_t_bs[t_bs]
+                        if cached_q is None:
+                            in_same_block = False
+                            break
+                        per_group_q.append(cached_q)
+                        continue
                     q_low = np.minimum(low // bs, t - 1)
                     q_high = np.minimum(high // bs, t - 1)
                     if not np.array_equal(q_low, q_high):
+                        seen_t_bs[t_bs] = None
                         in_same_block = False
                         break
-                    per_group_q.append(q_low.tobytes())
+                    q_bytes = q_low.tobytes()
+                    seen_t_bs[t_bs] = q_bytes
+                    per_group_q.append(q_bytes)
                 if in_same_block:
                     qx_key = (
                         id(staged_dev),
