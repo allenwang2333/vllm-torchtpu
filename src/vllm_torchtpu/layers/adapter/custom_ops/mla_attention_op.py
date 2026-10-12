@@ -69,7 +69,6 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -1785,34 +1784,30 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
 
-    def _q_b_under_topk_args(
-        self, hidden_states: torch.Tensor, q_c: torch.Tensor
-    ) -> tuple[torch.Tensor, ...]:
-        """`TPU_IDX_QB_UNDER_TOPK`: `(q_c, w, scale)` for the DCP indexer op to
-        compute q_b_proj under its cross-rank top-k, or `()` to keep the
-        separate q_b_proj call.
-
-        Only where the result is the same op on the same operands: an indexer
-        layer of a DCP sparse model with the indexer's q_b op built, a decode
-        bucket the fp8_skinny kernel serves (rows <= 16), and a q_b_proj on the
-        fp8 Pallas path with an unpadded weight and no scheduling group.
-        """
+    def _q_b_under_topk_layer(self) -> bool:
+        """`TPU_IDX_QB_UNDER_TOPK` applies to this layer: an indexer layer of a
+        DCP sparse model with the indexer's q_b op built, and a q_b_proj on the
+        fp8 Pallas path with an unpadded weight and no scheduling group -- so
+        the indexer op computes q with the very op q_b_proj would call, on the
+        same operands."""
         if not envs.TPU_IDX_QB_UNDER_TOPK or self.q_b_proj is None:
-            return ()
+            return False
         if not self.is_sparse or self.indexer is None or self.skip_topk:
-            return ()
+            return False
         indexer_op = getattr(self.indexer, "indexer_op", None)
         if getattr(indexer_op, "topk_op_dcp_qb", None) is None:
-            return ()
-        if hidden_states.shape[0] > fp8_skinny.MAX_M:
-            return ()
+            return False
         layer = self.q_b_proj
-        if getattr(layer, FP8_PALLAS_N_ATTR, None) is None:
-            return ()
-        if getattr(layer, FP8_PALLAS_WEIGHT, None) is not None:
-            return ()
-        if getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None) is not None:
-            return ()
+        return (
+            getattr(layer, FP8_PALLAS_N_ATTR, None) is not None
+            and getattr(layer, FP8_PALLAS_WEIGHT, None) is None
+            and getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None) is None
+        )
+
+    def _q_b_under_topk_args(self, q_c: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """`(q_c, w, scale)` as `VllmFp8LinearMethodTPU.apply` hands them to the
+        fp8 Pallas op."""
+        layer = self.q_b_proj
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             weight = weight.transpose(0, 1)
@@ -1881,16 +1876,18 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     )
                 q_c = self.q_a_layernorm(q_c)
                 q = None
-                q_b_args = self._q_b_under_topk_args(hidden_states, q_c)
-                if q_b_args:
+                if self._q_b_under_topk_layer():
                     # TPU_IDX_QB_UNDER_TOPK: the indexer op computes q_b_proj
-                    # inside its cross-rank SparseCore merge window.
+                    # with the op q_b_proj would call (the fp8_skinny kernel on
+                    # decode buckets, XLA above 16 rows), inside the cross-rank
+                    # SparseCore merge window. Every bucket takes this path:
+                    # no token-count branch, one trace for all buckets.
                     pre_topk_index, q = self.indexer(
                         hidden_states,
                         q_c,
                         positions,
                         self.indexer_rope_emb,
-                        q_b_args=q_b_args,
+                        q_b_args=self._q_b_under_topk_args(q_c),
                     )
                 if q is None:
                     q = self.q_b_proj(q_c)[0]
