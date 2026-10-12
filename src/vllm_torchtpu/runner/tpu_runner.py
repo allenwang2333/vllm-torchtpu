@@ -4349,7 +4349,7 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
-        return self.rejection_sampler(
+        sel = self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
             target_logits=target_logits,
@@ -4365,6 +4365,9 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
         )
+        if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+            self._specdbg(md, None, all_greedy, None, out=sel)
+        return sel
 
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -7046,32 +7049,43 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def _specdbg(self, md, target_logits, all_greedy, req_temperatures) -> None:
-        """GLM5_MKD_SPECDBG=1 (debug, host sync): per verify step, the drafts' target probability
-        (temperature-scaled softmax, no top-p) and argmax agreement, accumulated separately for
-        megakernel and stock forwards; rank 0 logs every 50 steps per path."""
+    def _specdbg(self, md, target_logits, all_greedy, req_temperatures, out=None) -> None:
+        """GLM5_MKD_SPECDBG=1 (debug, host sync): per verify step, by the forward path that produced
+        it (megakernel / stock): the drafts' target probability (temperature-scaled softmax, no
+        top-p), argmax agreement, and the rejection sampler's accepted length (valid tokens per
+        request); rank 0 logs every 50 steps per path."""
         try:
+            import torch.distributed as _dist
             path = "mk" if getattr(self, "_fwd_was_mkd", False) else "stock"
-            d = md.draft_token_ids.to(torch.int64)
+            st = self.__dict__.setdefault("_specdbg_st", {})
+            a = st.setdefault(path, [0, 0.0, 0, 0, 0, 0])
+            if out is not None:                  # selected tokens [reqs, 1 + K], invalid < 0
+                v = (out >= 0).sum(-1)
+                a[4] += int(v.sum())
+                a[5] += int(v.numel())
+                return
+            d = md.draft_token_ids.reshape(-1).to(torch.int64)
+            tl = target_logits.reshape(-1, target_logits.shape[-1]).float()
+            n = min(d.shape[0], tl.shape[0])
+            d, tl = d[:n], tl[:n]
             ok = d >= 0
             if not bool(ok.any()):
                 return
-            tl = target_logits.float()
-            t = (req_temperatures[md.segment_ids].float().unsqueeze(-1)
-                 if req_temperatures is not None else torch.ones_like(tl[:, :1]))
+            if req_temperatures is not None:
+                t = req_temperatures[md.segment_ids].reshape(-1)[:n].float().unsqueeze(-1)
+            else:
+                t = torch.ones_like(tl[:, :1])
             p = torch.softmax(tl / (t + 1e-9), -1).gather(-1, d.clamp(min=0).unsqueeze(-1)).squeeze(-1)
             am = tl.argmax(-1) == d
-            st = self.__dict__.setdefault("_specdbg_st", {})
-            a = st.setdefault(path, [0, 0.0, 0, 0])
             a[0] += 1
             a[1] += float(p[ok].mean())
             a[2] += int((am & ok).sum())
             a[3] += int(ok.sum())
-            import torch.distributed as _dist
             r0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
             if a[0] % 50 == 0 and r0:
-                logger.info("SPECDBG %s steps %d mean p(draft) %.3f argmax==draft %.3f (n=%d, greedy=%s)",
-                            path, a[0], a[1] / a[0], a[2] / max(a[3], 1), a[3], all_greedy)
+                logger.info("SPECDBG %s steps %d mean p(draft) %.3f argmax==draft %.3f accepted_len %.3f "
+                            "(n=%d, greedy=%s)", path, a[0], a[1] / a[0], a[2] / max(a[3], 1),
+                            a[4] / max(a[5], 1), a[3], all_greedy)
         except Exception as e:                   # noqa: BLE001
             logger.warning("SPECDBG failed: %r", e)
 
