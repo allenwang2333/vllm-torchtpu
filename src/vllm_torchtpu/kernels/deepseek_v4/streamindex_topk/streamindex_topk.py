@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import logging
 import math
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -1694,6 +1694,7 @@ def streamindex_topk(
         "skip_empty_decode",
         "skip_empty_decode_chunked",
         "global_scheduling_group_id",
+        "side_fn",
     ),
 )
 def streamindex_topk_dcp(
@@ -1723,7 +1724,9 @@ def streamindex_topk_dcp(
     skip_empty_decode_chunked: bool = False,
     global_scheduling_group_id: int | None = None,
     dcp_rank_ids: jax.Array | None = None,
-) -> jax.Array:
+    side_fn: Callable[..., jax.Array] | None = None,
+    side_args: tuple[jax.Array, ...] = (),
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
     Architecture:
@@ -1800,6 +1803,13 @@ def streamindex_topk_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): each shard reads its own rank from its
         one element instead of an `all_to_all` of an iota. Same result.
+      side_fn, side_args: independent TensorCore work, `side_fn(*side_args)`
+        on replicated operands (`TPU_IDX_QB_UNDER_TOPK`: the layer's q_b_proj),
+        run inside the cross-rank SparseCore merge's window: with the
+        all-gather merge, two optimization barriers pin it after the gathered
+        scores (when the merge's SparseCore call is issued) and before the
+        merge's result is read. Returns `(local_topk, side_fn(*side_args))`,
+        the second replicated. Same values; only the schedule moves.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1837,7 +1847,8 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
-        *rank_ids,
+        rank_ids,
+        side,
     ):
         if rank_ids:
             dcp_rank = rank_ids[0][0]
@@ -1892,7 +1903,10 @@ def streamindex_topk_dcp(
             # slots. A slot names its source rank and that rank's own list, so
             # the owner filter resolves it against this rank's `idxs` as is.
             slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
-            return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
+            out = dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
+            if side_fn is not None:
+                return out, side_fn(*side)
+            return out
 
         # Stage 1. All-gather the scores; the indices stay home.
         scores = lax.all_gather(
@@ -1902,9 +1916,16 @@ def streamindex_topk_dcp(
             tiled=True,
         )
 
+        side_out = None
+        if side_fn is not None:
+            # The side work may not start before the gathered scores exist
+            # (the merge's SparseCore call is issued on them) ...
+            side, scores = lax.optimization_barrier((side, scores))
+            side_out = side_fn(*side)
+
         # Stage 2. Fused SparseCore global top-k threshold selection, owner
         # filtering, local index resolution, and prefix compaction.
-        return sparsecore_topk_dcp_merge(
+        out = sparsecore_topk_dcp_merge(
             scores,
             idxs,
             k,
@@ -1912,6 +1933,11 @@ def streamindex_topk_dcp(
             dcp_size=dcp_size,
             scheduling_group_id=global_scheduling_group_id,
         )
+        if side_fn is None:
+            return out
+        # ... and the merge's result is not read before the side work is done,
+        # so the TensorCore runs it while the SparseCore merges.
+        return lax.optimization_barrier((out, side_out))
 
     replicated = P()
     return jax.shard_map(
@@ -1925,9 +1951,12 @@ def streamindex_topk_dcp(
             replicated,  # page_indices
             replicated,  # cu_q_lens
             replicated,  # distribution
-        )
-        + ((P(dcp_axis_name),) if dcp_rank_ids is not None else ()),
-        out_specs=P(dcp_axis_name),
+            (P(dcp_axis_name),) if dcp_rank_ids is not None else (),
+            tuple(replicated for _ in side_args),
+        ),
+        out_specs=(
+            (P(dcp_axis_name), replicated) if side_fn is not None else P(dcp_axis_name)
+        ),
         check_vma=False,
     )(
         q,
@@ -1937,5 +1966,6 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
-        *((dcp_rank_ids,) if dcp_rank_ids is not None else ()),
+        (dcp_rank_ids,) if dcp_rank_ids is not None else (),
+        tuple(side_args),
     )
