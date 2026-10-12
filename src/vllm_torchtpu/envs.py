@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
+    TPU_RUNNER_STAGE_TIMING: bool = False
     HOST_TRACER_LEVEL: int = 2
     DEVICE_TRACER_LEVEL: int = 1
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
@@ -194,6 +195,9 @@ if TYPE_CHECKING:
     TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
     TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
     QX_TTFT_STAGE_LOG_PERIOD_S: float = 0.0
+    VLLM_TPU_LIGHTWEIGHT_STEP_STATS: bool = False
+    VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL: int = 500
+    VLLM_TPU_RAIDEN_LOAD_WAIT_MS: float = 1.5
 
 
 def env_with_choices(
@@ -464,7 +468,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")
     ),
     # Python tracer level for profiling
-    "PYTHON_TRACER_LEVEL": lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
+    "PYTHON_TRACER_LEVEL": lambda: int(
+        os.getenv("PYTHON_TRACER_LEVEL") if os.getenv("PYTHON_TRACER_LEVEL") is not None else "1"
+    ),
+    "TPU_RUNNER_STAGE_TIMING": lambda: os.getenv(
+        "TPU_RUNNER_STAGE_TIMING", "0"
+    ).strip().lower() not in ("0", "false", "off", "no"),
     # Host tracer level for profiling
     "HOST_TRACER_LEVEL": lambda: int(os.getenv("HOST_TRACER_LEVEL") or "2"),
     # Device tracer level for profiling
@@ -1063,7 +1072,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
     # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
     # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
     # execute on p = pad(num_reqs) rows instead of all T verify rows.
@@ -1141,9 +1150,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
     # Cap active running sequences in PrefixAwareScheduler to the megakernel's
-    # verify capacity: 0 = disabled (default); -1 = auto, 64 //
-    # (1 + num_spec_tokens) when VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1
-    # (16 at MTP=3, so requests beyond 16 queue); >0 = explicit cap.
+    # verify capacity: 0 = auto (default), 64 // (1 + num_spec_tokens) when
+    # VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1 (16 at MTP=3, so requests
+    # beyond 16 queue); -1 = disabled; >0 = explicit cap.
     "TPU_SCHED_MK_MAX_RUNNING": env_int(
         "TPU_SCHED_MK_MAX_RUNNING", 0
     ),
@@ -1182,6 +1191,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
         "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2
+    ),
+    "VLLM_TPU_LIGHTWEIGHT_STEP_STATS": env_bool(
+        "VLLM_TPU_LIGHTWEIGHT_STEP_STATS", default=False
+    ),
+    "VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL": env_nonnegative_int(
+        "VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL", 500
+    ),
+    "VLLM_TPU_RAIDEN_LOAD_WAIT_MS": env_float(
+        "VLLM_TPU_RAIDEN_LOAD_WAIT_MS", 1.5
     ),
 }
 

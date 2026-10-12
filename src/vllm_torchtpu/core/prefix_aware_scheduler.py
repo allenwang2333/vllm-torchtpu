@@ -473,6 +473,28 @@ class PrefixAwareScheduler(AsyncScheduler):
         return result
 
     def schedule(self, *args, **kwargs):
+        from vllm_torchtpu.runner import lightweight_step_stats
+
+        _stats_on = lightweight_step_stats.is_enabled()
+        _sched_t0_ns = time.perf_counter_ns() if _stats_on else 0
+        _kv_wait_ns = 0
+        _early_reqs = 0
+        _waited_reqs = 0
+        _waited = False
+
+        connector = getattr(self, "connector", None)
+        if connector is not None:
+            poll_fn = getattr(connector, "poll_and_complete_transfers", None)
+            if callable(poll_fn):
+                try:
+                    _kv_wait_ns, _early_reqs, _waited_reqs, _waited = poll_fn(
+                        self
+                    )
+                except Exception:
+                    logger.exception(
+                        "PrefixAwareScheduler: poll_and_complete_transfers failed."
+                    )
+
         retention = getattr(self, "_retention", None)
         if retention is not None:
             try:
@@ -569,6 +591,15 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
+            if _stats_on:
+                _sched_elapsed_ns = time.perf_counter_ns() - _sched_t0_ns
+                lightweight_step_stats.get_step_stats_recorder().record_scheduler_step(
+                    schedule_ns=_sched_elapsed_ns,
+                    kv_wait_ns=_kv_wait_ns,
+                    early_completed_reqs=_early_reqs,
+                    waited_completed_reqs=_waited_reqs,
+                    waited=_waited,
+                )
             if orig_max_running is not None:
                 self.max_num_running_reqs = orig_max_running
             self._step_running_prefill_ids = set()
