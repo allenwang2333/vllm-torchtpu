@@ -45,7 +45,11 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (
+    dcp_rank_operand,
+    get_dcp_group,
+    get_or_create_dcp_mesh,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -332,6 +336,7 @@ def _cp_scatter_indexer_k(
     axis_name: str = DCP_AXIS_NAME,
     writer: str = "xla",
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    rank_ids: jax.Array | None = None,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -347,6 +352,10 @@ def _cp_scatter_indexer_k(
     come from `cu_q_lens`/`seq_lens`.
 
     `axis_name`/`cp_size` name the axis the cache is split over.
+
+    `rank_ids` (`TPU_DCP_RANK_OPERAND`), when given, is i32[cp_size] sharded
+    over `axis_name` with entry r = r: each shard reads its rank from it
+    instead of from an `all_to_all` of an iota. Same result.
     """
     if writer not in ("xla", "pallas"):
         raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
@@ -355,8 +364,11 @@ def _cp_scatter_indexer_k(
             f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
         )
 
-    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
-        rank = cp_rank_as_data(axis_name, cp_size)
+    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_arg):
+        if rank_arg:
+            rank = rank_arg[0][0]
+        else:
+            rank = cp_rank_as_data(axis_name, cp_size)
         if writer == "pallas":
             return coalesced_kv_append_dcp(
                 cache_kv,
@@ -417,13 +429,15 @@ def _cp_scatter_indexer_k(
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
+    rank_args = () if rank_ids is None else (rank_ids,)
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, replicated, replicated, replicated, replicated),
+        in_specs=(sharded, replicated, replicated, replicated, replicated)
+        + (sharded,) * len(rank_args),
         out_specs=sharded,
         check_vma=False,
-    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_args)
 
 
 @SparseAttnIndexer.register_oot
@@ -600,6 +614,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
+        # TPU_DCP_RANK_OPERAND: this rank's DCP index arrives as a sharded
+        # i32 operand (one element per rank) instead of the iota all_to_all.
+        rank_operand = envs.TPU_DCP_RANK_OPERAND
+        rank_tensor = dcp_rank_operand() if rank_operand else None
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -610,7 +628,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices: jax.Array,  # virtual page ordinals
             cu_q_lens: jax.Array,
             distribution: jax.Array,
+            *rank_ids: jax.Array,  # TPU_DCP_RANK_OPERAND: i32[dcp], sharded
         ) -> tuple[jax.Array, jax.Array]:
+            rank_ids_arg = rank_ids[0] if rank_ids else None
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
@@ -628,6 +648,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 axis_name=DCP_AXIS_NAME,
                 writer=writer,
                 kv_layout=kv_layout,
+                rank_ids=rank_ids_arg,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -657,6 +678,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
                 global_scheduling_group_id=global_group,
+                dcp_rank_ids=rank_ids_arg,
             )
             return cache_kv, local_topk
 
@@ -681,7 +703,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # page_indices
                 replicated,  # cu_q_lens
                 replicated,  # distribution
-            ),
+            )
+            + ((sharded,) if rank_operand else ()),  # rank ids
             output_partition_specs=(
                 sharded,  # new cache_kv
                 sharded,  # local_topk: [num_tokens, topk] per rank
@@ -699,9 +722,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
+            *rank_ids,
             **kwargs,
         ):
             del (
+                rank_ids,
                 weights,
                 k_packed,
                 seq_lens,
@@ -718,6 +743,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         jax_op.register_fake(_fake_streamidx_topk_dcp)
 
         def op(*args):
+            if rank_tensor is not None:
+                args = (*args, rank_tensor)
             new_cache, local_topk = jax_op(*args)
             args[2].copy_(new_cache)
             return local_topk
