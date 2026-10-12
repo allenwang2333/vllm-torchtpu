@@ -39,6 +39,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    bref_override,
     configs,
     kernel,
     schedule,
@@ -506,6 +507,7 @@ def calculate_block_sizes(
         "attention_scope",
         "return_lse",
         "all_decode",
+        "kv_cache_alloc_cls",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -548,6 +550,7 @@ def ragged_paged_attention(
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
     all_decode: bool = False,
+    kv_cache_alloc_cls: type[bref_override.KVBufferedRefHeadAlongSublane] | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
     Args:
@@ -611,6 +614,17 @@ def ragged_paged_attention(
     """
     if not use_causal_mask:
         raise ValueError("Only causal attention is supported.")
+    if kv_cache_alloc_cls is not None and not (
+        all_decode
+        and skip_kv_update
+        and kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+        and cp_group_size is None
+        and not return_lse
+    ):
+        raise ValueError(
+            "KV allocator override requires all_decode, skip_kv_update, "
+            "HEAD_ALONG_SUBLANE, no CP and no LSE."
+        )
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -793,6 +807,7 @@ def ragged_paged_attention(
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            kv_cache_alloc_cls=kv_cache_alloc_cls,
         )
         if return_lse:
             o_out, kv_out, lse_out = result

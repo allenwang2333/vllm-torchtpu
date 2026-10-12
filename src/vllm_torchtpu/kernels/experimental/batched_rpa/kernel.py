@@ -567,6 +567,8 @@ def create_allocs(
     o_hbm_ref: jax.Ref,
     lse_hbm_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
+    *,
+    kv_cache_alloc_cls: type[bref_override.KVBufferedRefHeadAlongSublane] | None = None,
 ) -> tuple[
     bref_override.BatchingQRef,
     bref_override.KVBufferedRefSeqAlongLane
@@ -593,12 +595,28 @@ def create_allocs(
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
     )
 
-    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        kv_cache_alloc_cls = bref_override.KVBufferedRefSeqAlongLane
+    alloc_cls: (
+        type[bref_override.KVBufferedRefHeadAlongSublane]
+        | type[bref_override.KVBufferedRefSeqAlongLane]
+    )
+    if kv_cache_alloc_cls is not None:
+        if not (
+            cfgs.mode == configs.RpaCase.DECODE
+            and cfgs.serve.skip_kv_update
+            and cfgs.serve.kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+            and cfgs.serve.cp_group_size is None
+            and not cfgs.serve.return_lse
+        ):
+            raise ValueError(
+                "KV allocator override requires non-CP decode without KV update/LSE."
+            )
+        alloc_cls = kv_cache_alloc_cls
+    elif cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        alloc_cls = bref_override.KVBufferedRefSeqAlongLane
     else:
-        kv_cache_alloc_cls = bref_override.KVBufferedRefHeadAlongSublane
+        alloc_cls = bref_override.KVBufferedRefHeadAlongSublane
 
-    kv_cache_alloc = kv_cache_alloc_cls.input_output(
+    kv_cache_alloc = alloc_cls.input_output(
         spec=kv_cache_spec,
         dtype_or_type=kv_cache_hbm_ref,
         buffer_count=cfgs.n_buffer,
@@ -673,6 +691,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    kv_cache_alloc_cls: type[bref_override.KVBufferedRefHeadAlongSublane] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
     Args:
@@ -727,7 +746,11 @@ def rpa_kernel(
         if o_lse_hbm_ref is not None:
             del o_lse_hbm_ref
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
+            kv_cache_hbm_ref,
+            q_hbm_ref,
+            lse_hbm_ref,
+            cfgs,
+            kv_cache_alloc_cls=kv_cache_alloc_cls,
         )
         actual_steps = schedule_hbm_ref.actual_steps[0]
         num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)

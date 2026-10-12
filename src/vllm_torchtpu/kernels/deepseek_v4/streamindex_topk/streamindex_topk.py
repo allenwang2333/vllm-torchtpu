@@ -559,7 +559,8 @@ def kernel(
                 # A unified pool's carrier dtype does not describe its keys.
                 # Reinterpret the DMA'd region in VMEM, never the HBM owner.
                 keys = bkv_vmem.at[batch_idx].bitcast(jnp.bfloat16)[...]
-                bkvs.append(keys.reshape(bkv_sz, head_dim))
+                keys = keys.reshape(bkv_sz, cache_kv_hbm_ref.shape[-1])
+                bkvs.append(keys[:, :head_dim])
                 bkv_scales.append(jnp.ones((1, bkv_sz), jnp.float32))
             elif cache_kv_hbm_ref.dtype == jnp.bfloat16:
                 # Unquantized keys use the same paged DMA pipeline. No scale
@@ -698,8 +699,8 @@ def kernel(
                     keys = bkv_vmem.at[
                         0, pl.ds(c * groups_per_chunk, groups_per_chunk)
                     ].bitcast(jnp.bfloat16)[...]
-                    keys = keys.reshape(lane_chunk, head_dim)
-                    return keys, jnp.ones((1, lane_chunk), jnp.float32)
+                    keys = keys.reshape(lane_chunk, cache_kv_hbm_ref.shape[-1])
+                    return keys[:, :head_dim], jnp.ones((1, lane_chunk), jnp.float32)
                 if cache_kv_hbm_ref.dtype == jnp.bfloat16:
                     keys = bkv_vmem[
                         0, pl.ds(c * groups_per_chunk, groups_per_chunk)
@@ -1149,8 +1150,10 @@ def streamindex_topk(
     """StreamIndex Top-K retrieval.
 
     ``cache_view_dtype="bfloat16"`` reads BF16 keys stored as bytes in an
-    8-bit unified pool. Each page has carrier shape ``[page_size // 2, 4, D]``;
-    VMEM ref bitcasts recover ``[page_size // 2, 2, D]`` BF16 values. This is
+    8-bit unified pool. Each page has carrier shape ``[page_size // 2, 4, W]``;
+    VMEM ref bitcasts recover ``[page_size // 2, 2, W]`` BF16 values. The aligned
+    storage width ``W`` may exceed the aligned query width: DMA reads the full
+    row, then scoring uses its first query-width features in VMEM. This is
     storage reinterpretation, not FP8 quantization. The default retains the
     native BF16 and quantized FP8-with-scales formats.
 
@@ -1303,11 +1306,14 @@ def streamindex_topk(
             or kv_layout != KVLayout.HEAD_ALONG_SUBLANE
             or cache_kv.dtype not in (jnp.uint8, jnp.float8_e4m3fn)
             or cache_kv.ndim != 4
-            or cache_kv.shape[2:] != (4, head_dim)
+            or cache_kv.shape[2] != 4
+            or cache_kv.shape[-1] < head_dim
+            or cache_kv.shape[-1] % 128 != 0
         ):
             raise ValueError(
                 "BF16 pool view requires HEAD_ALONG_SUBLANE and an 8-bit "
-                "carrier shaped [pages, page_size // 2, 4, aligned_head_dim]"
+                "carrier shaped [pages, page_size // 2, 4, storage_width], "
+                "with storage_width aligned to 128 and at least the aligned query width"
             )
     elif cache_kv.dtype == jnp.bfloat16:
         if kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
