@@ -169,6 +169,11 @@ def test_gather_write_positive_control_fails(cell, fault):
     if fault in ("no_fence", "late_write"):
         # Caches end right; only the gathered rows can show the ordering.
         print(f"{fault}: gathered rows differ on {gathered_caught}/{owning} ranks")
+        if fault == "no_fence" and cell == "decode_t16" and not gathered_caught:
+            # One owned row per owning rank: the race is hit on 0-12 % of
+            # passes (0/9, 1/9, 9/72, 3/72, 0/72 over five jobs);
+            # straddle_chunk_t32 (2-4 rows per owner) hits it every job.
+            pytest.xfail("no_fence race not hit with one row per owner")
         assert gathered_caught > 0, f"{fault} never read a stale row"
     else:
         assert caught == owning, f"{fault} missed on {owning - caught} ranks"
