@@ -12,6 +12,7 @@ import dataclasses
 import functools
 import inspect
 import math
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -1038,6 +1039,13 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # TPU_KERNEL_PAGE_TOKENS pins the kernel page. vLLM takes the largest
+        # supported size dividing block_size, so block 1280 would get 256-token
+        # pages, while the Qwen3.5 megakernel binds only 128. A disagg pair must
+        # pin both legs: Raiden requires equal page_tokens on the two peers.
+        pinned = os.environ.get("TPU_KERNEL_PAGE_TOKENS", "").strip()
+        if pinned:
+            return [int(pinned)]
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
