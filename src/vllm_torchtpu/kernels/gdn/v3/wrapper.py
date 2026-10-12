@@ -31,6 +31,39 @@ from vllm_torchtpu.kernels.gdn.v3 import (
 )
 
 
+def _compact_qkv_kernel(qkv_ref: jax.Array, out_ref: jax.Array) -> None:
+    out_ref[...] = qkv_ref[...].astype(jnp.float32)[:, None, :]
+
+
+def _compact_qkv_input(qkv: jax.Array) -> jax.Array:
+    """Cast directly into Conv1D's compact layout without an FP32 HBM copy."""
+    tokens, width = qkv.shape
+    tile_tokens = 128
+    # Double-buffered input/output windows use at most 24 MiB, leaving room
+    # within the default 32 MiB scoped budget for compiler temporaries.
+    window_bytes = 2 * tile_tokens * width * (qkv.dtype.itemsize + 4)
+    if (
+        qkv.dtype != jnp.bfloat16
+        or tokens < tile_tokens
+        or tokens % tile_tokens
+        or width % 128
+        or window_bytes > 24 * 1024**2
+    ):
+        return qkv.astype(jnp.float32).reshape(tokens, 1, width)
+
+    # A normal cast followed by reshape materializes a 2D FP32 buffer before
+    # converting T(8,128) to T(1,128). Do that conversion tilewise in VMEM.
+    return pl.pallas_call(
+        _compact_qkv_kernel,
+        grid=(tokens // tile_tokens,),
+        in_specs=(pl.BlockSpec((tile_tokens, width), lambda tile: (tile, 0)),),
+        out_specs=pl.BlockSpec((tile_tokens, 1, width), lambda tile: (tile, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct((tokens, 1, width), jnp.float32),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name="gdn_compact_qkv_input",
+    )(qkv)
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
@@ -458,7 +491,7 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
-    # TODO(kyuyeunk): Support bf16
+    # Conv1D consumes FP32 while outputs retain the projection activation dtype.
     act_out_dtype = qkv.dtype
     pooled = state_plan is not None
     if pooled:
@@ -476,7 +509,6 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -525,8 +557,8 @@ def fused_conv1d_gdn(
             num_spec_tokens,
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+    act_in_dtype = jnp.dtype(jnp.float32)
+    assert a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -586,7 +618,7 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    qkv = _compact_qkv_input(qkv)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
