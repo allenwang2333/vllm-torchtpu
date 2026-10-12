@@ -69,19 +69,14 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
-from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
-from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import (
-    FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
-    FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
-    KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
@@ -328,12 +323,6 @@ def _topk_rows(
     return rows
 
 
-def _q_b_side(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
-    """`TPU_IDX_QB_UNDER_TOPK`: q_b_proj as its own fp8 Pallas op computes it
-    (`_fp8_linear_pallas`, unpadded weight), run inside the DCP indexer op."""
-    return linear_common._fp8_linear_pallas(x, w_q, w_s, None, None)
-
-
 def _cp_scatter_indexer_k(
     cache_kv: jax.Array,
     k_packed: jax.Array,
@@ -467,7 +456,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         dcp_size = dcp_size if isinstance(dcp_size, int) else 1
         self.topk_op_dcp = None
-        self.topk_op_dcp_qb = None
         self.dcp_size = dcp_size
         if dcp_size > 1:
             if pcp_size > 1:
@@ -481,15 +469,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
-            if envs.TPU_IDX_QB_UNDER_TOPK:
-                # Same op plus the layer's q_b_proj, run inside the cross-rank
-                # merge's SparseCore window (see `streamindex_topk_dcp`'s
-                # `side_fn`). Decode buckets only; the attention picks it.
-                self.topk_op_dcp_qb = self._build_streamidx_dcp_op(
-                    dcp_size,
-                    parallel_config.cp_kv_cache_interleave_size,
-                    with_q_b=True,
-                )
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -604,9 +583,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self._streamidx_op = op
         return op
 
-    def _build_streamidx_dcp_op(
-        self, dcp_size: int, interleave_size: int, with_q_b: bool = False
-    ):
+    def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
         """The DCP twin of `_build_streamidx_op`.
 
         DCP shards the KV cache and leaves the *queries*
@@ -652,8 +629,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
             rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
-            q_b_args: tuple[jax.Array, ...] = (),  # TPU_IDX_QB_UNDER_TOPK
-        ) -> tuple[jax.Array, ...]:
+        ) -> tuple[jax.Array, jax.Array]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
@@ -702,74 +678,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 ),
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
-                side_fn=_q_b_side if q_b_args else None,
-                side_args=q_b_args,
             )
-            if q_b_args:
-                local_topk, q_b_out = local_topk
-                return cache_kv, local_topk, q_b_out
             return cache_kv, local_topk
 
         # The op's signature is the schema torch infers: no varargs, and the
         # flag-off op keeps exactly the eight operands it always had.
-        if with_q_b and rank_operand:
-
-            def _streamidx_topk_dcp_jax(
-                q_bytes: jax.Array,
-                weights: jax.Array,
-                cache_kv: jax.Array,
-                k_packed: jax.Array,
-                seq_lens: jax.Array,
-                page_indices: jax.Array,
-                cu_q_lens: jax.Array,
-                distribution: jax.Array,
-                rank_ids: jax.Array,
-                q_c: jax.Array,  # [T, q_lora_rank] bf16, replicated
-                q_b_w: jax.Array,  # fp8 [q_lora_rank, n] (k, n), replicated
-                q_b_s: jax.Array,  # f32 [n], replicated
-            ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                return _streamidx_topk_dcp_impl(
-                    q_bytes,
-                    weights,
-                    cache_kv,
-                    k_packed,
-                    seq_lens,
-                    page_indices,
-                    cu_q_lens,
-                    distribution,
-                    rank_ids,
-                    (q_c, q_b_w, q_b_s),
-                )
-
-        elif with_q_b:
-
-            def _streamidx_topk_dcp_jax(
-                q_bytes: jax.Array,
-                weights: jax.Array,
-                cache_kv: jax.Array,
-                k_packed: jax.Array,
-                seq_lens: jax.Array,
-                page_indices: jax.Array,
-                cu_q_lens: jax.Array,
-                distribution: jax.Array,
-                q_c: jax.Array,
-                q_b_w: jax.Array,
-                q_b_s: jax.Array,
-            ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                return _streamidx_topk_dcp_impl(
-                    q_bytes,
-                    weights,
-                    cache_kv,
-                    k_packed,
-                    seq_lens,
-                    page_indices,
-                    cu_q_lens,
-                    distribution,
-                    None,
-                    (q_c, q_b_w, q_b_s),
-                )
-
-        elif rank_operand:
+        if rank_operand:
 
             def _streamidx_topk_dcp_jax(
                 q_bytes: jax.Array,
@@ -840,13 +754,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # cu_q_lens
                 replicated,  # distribution
             )
-            + ((sharded,) if rank_operand else ())  # rank ids
-            + ((replicated,) * 3 if with_q_b else ()),  # q_c, q_b w, q_b scale
+            + ((sharded,) if rank_operand else ()),  # rank ids
             output_partition_specs=(
                 sharded,  # new cache_kv
                 sharded,  # local_topk: [num_tokens, topk] per rank
-            )
-            + ((replicated,) if with_q_b else ()),  # q = q_b_proj(q_c)
+            ),
         )
 
         # We must overwrite the default fake implementation as vLLM uses
@@ -860,10 +772,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
-            *extra,
+            rank_ids=None,
             **kwargs,
         ):
             del (
+                rank_ids,
                 weights,
                 k_packed,
                 seq_lens,
@@ -872,24 +785,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 kwargs,
             )
-            outs = (
+            return (
                 torch.empty_like(cache_kv),
                 q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
             )
-            if with_q_b:
-                q_c, q_b_w = extra[-3], extra[-2]
-                outs += (q_c.new_empty((q_c.shape[0], q_b_w.shape[1])),)
-            return outs
 
         jax_op.register_fake(_fake_streamidx_topk_dcp)
 
-        def op(*args, q_b_args=()):
+        def op(*args):
             if rank_tensor is not None:
                 args = (*args, rank_tensor)
-            if with_q_b:
-                new_cache, local_topk, q_b_out = jax_op(*args, *q_b_args)
-                args[2].copy_(new_cache)
-                return local_topk, q_b_out
             new_cache, local_topk = jax_op(*args)
             args[2].copy_(new_cache)
             return local_topk
@@ -902,11 +807,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         q_values: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
-        q_b_args: tuple[torch.Tensor, ...] = (),
-    ):
-        """`q_b_args` (`TPU_IDX_QB_UNDER_TOPK`): `(q_c, w, scale)` of the
-        layer's q_b_proj. Then returns `(topk, q)`, `q` None when the DCP op
-        did not run (the caller computes it itself)."""
+    ) -> torch.Tensor:
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
@@ -927,17 +828,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if isinstance(attn_metadata, dict):
             metadata = attn_metadata.get(self.k_cache.prefix)
         if not isinstance(metadata, AttentionMetadata):
-            return (self.topk_indices_buffer, None) if q_b_args else (
-                self.topk_indices_buffer
-            )
+            return self.topk_indices_buffer
 
         # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim],
         # lkv_dim = head_dim + 1 padded to a 128 multiple
         kv_cache = self.k_cache.kv_cache
         if kv_cache.numel() == 0:
-            return (self.topk_indices_buffer, None) if q_b_args else (
-                self.topk_indices_buffer
-            )
+            return self.topk_indices_buffer
 
         seq_lens = metadata.seq_lens
         page_indices = metadata.block_tables
@@ -945,21 +842,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rd = metadata.request_distribution
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
-        q_b_out = None
-        if q_b_args:
-            assert self.topk_op_dcp_qb is not None
-            topk_indices, q_b_out = self.topk_op_dcp_qb(
-                q_values.view(torch.uint8),
-                weights,
-                kv_cache,
-                k_quant_packed,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
-                q_b_args=q_b_args,
-            )
-        elif self.topk_op_dcp is not None:
+        if self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
             # comes back is not global positions but this rank's own local
@@ -991,9 +874,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
             # Read back what the skip_topk layers will read, so the attention
             # index prep is one CSE class across them.
-            rows = self.topk_indices_buffer
-        if q_b_args:
-            return rows, q_b_out
+            return self.topk_indices_buffer
         return rows
 
     def _write_topk_rows(
@@ -1095,15 +976,8 @@ class VllmTPUIndexer(Indexer):
         self._rope_neox_permuted = True
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        qr: torch.Tensor,
-        positions,
-        rotary_emb,
-        q_b_args: tuple[torch.Tensor, ...] = (),
-    ):
-        """`q_b_args` (`TPU_IDX_QB_UNDER_TOPK`): see
-        `VllmTPUSparseAttnIndexer.forward_oot`; returns `(topk, q)` then."""
+        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+    ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
@@ -1159,10 +1033,6 @@ class VllmTPUIndexer(Indexer):
         )
         weights = weights.squeeze(-1).to(weights_dtype)
 
-        if q_b_args:
-            return self.indexer_op.forward_oot(
-                hidden_states, q_fp8, k, weights, q_b_args=q_b_args
-            )
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
@@ -1783,39 +1653,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
 
-    def _q_b_under_topk_args(
-        self, hidden_states: torch.Tensor, q_c: torch.Tensor
-    ) -> tuple[torch.Tensor, ...]:
-        """`TPU_IDX_QB_UNDER_TOPK`: `(q_c, w, scale)` for the DCP indexer op to
-        compute q_b_proj under its cross-rank top-k, or `()` to keep the
-        separate q_b_proj call.
-
-        Only where the result is the same op on the same operands: an indexer
-        layer of a DCP sparse model with the indexer's q_b op built, a decode
-        bucket the fp8_skinny kernel serves (rows <= 16), and a q_b_proj on the
-        fp8 Pallas path with an unpadded weight and no scheduling group.
-        """
-        if not envs.TPU_IDX_QB_UNDER_TOPK or self.q_b_proj is None:
-            return ()
-        if not self.is_sparse or self.indexer is None or self.skip_topk:
-            return ()
-        indexer_op = getattr(self.indexer, "indexer_op", None)
-        if getattr(indexer_op, "topk_op_dcp_qb", None) is None:
-            return ()
-        if hidden_states.shape[0] > fp8_skinny.MAX_M:
-            return ()
-        layer = self.q_b_proj
-        if getattr(layer, FP8_PALLAS_N_ATTR, None) is None:
-            return ()
-        if getattr(layer, FP8_PALLAS_WEIGHT, None) is not None:
-            return ()
-        if getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None) is not None:
-            return ()
-        weight = layer.weight
-        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
-            weight = weight.transpose(0, 1)
-        return (q_c.reshape(-1, q_c.shape[-1]), weight, layer.weight_scale)
-
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
             # torch's stubs resolve this hasattr-guarded method as a Tensor.
@@ -1835,7 +1672,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_c = None
         kv_lora = None
         output_gate = None
-        pre_topk_index = None
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -1878,20 +1714,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                q = None
-                q_b_args = self._q_b_under_topk_args(hidden_states, q_c)
-                if q_b_args:
-                    # TPU_IDX_QB_UNDER_TOPK: the indexer op computes q_b_proj
-                    # inside its cross-rank SparseCore merge window.
-                    pre_topk_index, q = self.indexer(
-                        hidden_states,
-                        q_c,
-                        positions,
-                        self.indexer_rope_emb,
-                        q_b_args=q_b_args,
-                    )
-                if q is None:
-                    q = self.q_b_proj(q_c)[0]
+                q = self.q_b_proj(q_c)[0]
             else:
                 assert self.kv_a_proj_with_mqa is not None, (
                     "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -1944,9 +1767,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         topk_indices = None
         if self.is_sparse:
-            if pre_topk_index is not None:
-                topk_index = pre_topk_index
-            elif self.indexer is not None and not self.skip_topk:
+            if self.indexer is not None and not self.skip_topk:
                 topk_index = self.indexer(
                     hidden_states, q_c, positions, self.indexer_rope_emb
                 )
