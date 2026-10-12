@@ -651,6 +651,11 @@ class _CollectiveGroup:
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width).contiguous()
 
+    def all_to_all_blocks(self, x):
+        """Block `d` of `x`'s leading axis to rank `d` (`cp_mla._all_to_all`)."""
+        terms = self._exchange(x)
+        return torch.stack([t[self.rank_in_group] for t in terms])
+
 
 def _rs_merge_whole(outputs, lses, monkeypatch, **env):
     """Every rank's reduce-scatter merge under `env`, run in lockstep,
@@ -661,6 +666,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
+        "TPU_DCP_MERGE_RS_BF16": 0,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -672,6 +678,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "get_dcp_group",
         lambda: groups[int(threading.current_thread().name.rsplit("_", 1)[-1])],
     )
+    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, g: g.all_to_all_blocks(x))
 
     def run(rank):
         threading.current_thread().name = f"dcp_rank_{rank}"
@@ -819,6 +826,156 @@ def test_merge_chunks_per_bucket(
         outputs[0], lses[0], is_backbone=is_backbone
     )
     assert calls == ([expect] if expect > 1 else [])
+
+
+# ===================================================================== #
+# bf16 wire for the chunked merge (`TPU_DCP_MERGE_RS_BF16`). Not bitwise:
+# bounded in bf16 ulps of the merge's condition scale sum_r w_r |o_r|.
+# ===================================================================== #
+
+# Max error bounds, in bf16 ulps of sum_r w_r |o_r|. f32 today: one final
+# rounding (0.5). Mode 2 (bf16 terms, f32 sum): each term rounds by at most
+# 2^-8 of itself, so all of them by at most one ulp of the scale, plus the
+# final rounding: 1.5, a proof, not a fit. Mode 1 (bf16 accumulation in the
+# collective; the lockstep stand-in sums in rank order, the worst ring
+# order): no tight proof (dcp_size - 1 roundings of a partial sum); the bound
+# is 1.5x the worst seen in a 16-rank CPU emulation (4.6 ulp max).
+_RS_BF16_MAX_ULP = {0: 0.5 + 1e-3, 2: 1.5, 1: 7.0}
+
+
+def _spread_partials(rng, dcp_size, tokens, local_heads, vdim, spread):
+    heads = dcp_size * local_heads
+    outputs = torch.from_numpy(
+        rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
+    ).to(torch.bfloat16)
+    lses = torch.from_numpy(
+        (rng.standard_normal((dcp_size, tokens, heads)) * spread + 3).astype(
+            np.float32
+        )
+    )
+    return outputs, lses
+
+
+def _scale_ulp_errors(got, outputs, lses):
+    """|got - f64 reference| in bf16 ulps of sum_r w_r |o_r| (0 where no rank
+    owns the row, which must then be exactly 0)."""
+    out = outputs.float().numpy().astype(np.float64)
+    lse = lses.numpy().astype(np.float64)
+    fin = np.isfinite(lse)
+    shift = np.where(fin, lse, -np.inf).max(axis=0)
+    shift = np.where(np.isfinite(shift), shift, 0.0)
+    w = np.where(fin, np.exp(lse - shift[None]), 0.0)
+    den = w.sum(axis=0)
+    w = w / np.where(den > 0.0, den, 1.0)
+    ref = (out * w[..., None]).sum(axis=0)
+    scale = (np.abs(out) * w[..., None]).sum(axis=0)
+    g = got.to(torch.float32).numpy().astype(np.float64)
+    err = np.abs(g - ref)
+    ulp = np.exp2(np.floor(np.log2(np.where(scale > 0, scale, 1.0))) - 7)
+    e = np.where(scale > 0, err / ulp, np.where(err == 0, 0.0, np.inf))
+    return {
+        "max": float(e.max()),
+        "mean": float(e.mean()),
+        "frac_over_1ulp": float((e > 1.0).mean()),
+    }
+
+
+# (tokens, chunks, collapsed lse gather): the served c1k / c2k / c8k chunked
+# buckets (the lse gather is collapsed up to 2048 tokens on the stack).
+_MIXED_SHAPES = [(1024, 8, True), (2048, 8, True), (8192, 8, False)]
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("dcp_size", [8, 16])
+@pytest.mark.parametrize("tokens,chunks,lse_ag", _MIXED_SHAPES)
+@pytest.mark.parametrize("spread", [0.5, 4.0])
+def test_bf16_wire_merge_is_within_its_bound(
+    mode, dcp_size, tokens, chunks, lse_ag, spread, monkeypatch
+):
+    """The bf16-wire chunked merge vs the f64 reference and the f32 merge, at
+    the served mixed-bucket shapes."""
+    outputs, lses = _spread_partials(
+        np.random.default_rng(97 + dcp_size + tokens), dcp_size, tokens, 1, 16, spread
+    )
+    env = dict(TPU_DCP_MERGE_CHUNKED=chunks, TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag)
+    f32 = _rs_merge_whole(outputs, lses, monkeypatch, **env)
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_BF16=mode, **env)
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    e_f32 = _scale_ulp_errors(f32, outputs, lses)
+    e_got = _scale_ulp_errors(got, outputs, lses)
+    print(f"RS_BF16 mode={mode} dcp={dcp_size} T={tokens} s={spread}: f32 {e_f32} got {e_got}")
+    assert e_f32["max"] <= _RS_BF16_MAX_ULP[0], e_f32
+    assert e_got["max"] <= _RS_BF16_MAX_ULP[mode], e_got
+    assert not torch.equal(got.view(torch.int16), f32.view(torch.int16))  # really bf16
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("dcp_size", [8, 16])
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_bf16_wire_merge_keeps_the_merge_rules(mode, dcp_size, lse_ag, monkeypatch):
+    """`-inf` rules and exp range under the bf16 wire: a lone owner verbatim,
+    a row nobody owns exactly zero, +-200 lse finite and within the bound."""
+    outputs, lses = _hard_partials(np.random.default_rng(53), dcp_size, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag,
+        TPU_DCP_MERGE_RS_BF16=mode,
+    )
+    assert torch.isfinite(got.float()).all()
+    torch.testing.assert_close(got[2], outputs[0, 2], rtol=0, atol=0)
+    assert (got[3] == 0).all()
+    assert _scale_ulp_errors(got, outputs, lses)["max"] <= _RS_BF16_MAX_ULP[mode]
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_positive_control_wrong_weight_exceeds_the_bf16_bound(
+    mode, lse_ag, monkeypatch
+):
+    """The bound above must fail when one rank weighs its partial 25 % too
+    heavily (its own lse raised by log 1.25, the merged lse left alone)."""
+    real = cp_mla._weighted_reduce_scatter
+
+    def wrong(output, lse_f32, lses, group):
+        if group.rank_in_group == 1:
+            lse_f32 = lse_f32 + math.log(1.25)
+        return real(output, lse_f32, lses, group)
+
+    monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter", wrong)
+    outputs, lses = _spread_partials(np.random.default_rng(59), 16, 1024, 1, 16, 4.0)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=8,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag,
+        TPU_DCP_MERGE_RS_BF16=mode,
+    )
+    assert _scale_ulp_errors(got, outputs, lses)["max"] > _RS_BF16_MAX_ULP[mode]
+
+
+def test_bf16_wire_off_is_bitwise_the_chunked_merge(monkeypatch):
+    """`TPU_DCP_MERGE_RS_BF16=0` leaves the f32 chunked merge as it was."""
+    outputs, lses = _hard_partials(np.random.default_rng(61), 8, tokens=32)
+    for lse_ag in (False, True):
+        env = dict(TPU_DCP_MERGE_CHUNKED=4, TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag)
+        a = _rs_merge_whole(outputs, lses, monkeypatch, **env)
+        b = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_BF16=0, **env)
+        unchunked = _rs_merge_whole(outputs, lses, monkeypatch)
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        torch.testing.assert_close(a, unchunked, rtol=0, atol=0)
+
+
+def test_bf16_wire_leaves_unchunked_buckets_alone(monkeypatch):
+    """Only the chunked merge changes: an unchunked bucket (and the MTP
+    drafter, which never chunks) keeps the f32 reduce-scatter bit for bit."""
+    outputs, lses = _hard_partials(np.random.default_rng(67), 8, tokens=32)
+    a = _rs_merge_whole(outputs, lses, monkeypatch)
+    b = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_BF16=1)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
 # ===================================================================== #

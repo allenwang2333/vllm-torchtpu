@@ -187,6 +187,19 @@ def _merge_chunked(
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
         return _merge_chunked_lse_gathered(output, lse, group, chunks)
+    if envs.TPU_DCP_MERGE_RS_BF16:
+        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype.
+        lse_f32 = lse.to(torch.float32)
+        pieces = [
+            _weighted_reduce_scatter(
+                output[c * step : (c + 1) * step],
+                lse_f32[c * step : (c + 1) * step],
+                _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                group,
+            )
+            for c in range(chunks)
+        ]
+        return torch.cat(pieces, dim=0)
     pieces = [
         cp_lse_ag_out_rs(
             output[c * step : (c + 1) * step], lse[c * step : (c + 1) * step], group
@@ -219,7 +232,31 @@ def _weighted_reduce_scatter(
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-    return group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+    return _scatter_sum(weighted, group).to(output.dtype)
+
+
+def _scatter_sum(weighted: torch.Tensor, group: Any) -> torch.Tensor:
+    """Sum `[T, H, V]` f32 `weighted` over the ranks and keep this rank's
+    head block `[T, H / world, V]`: the merge's reduce-scatter.
+
+    `TPU_DCP_MERGE_RS_BF16` (not bitwise) sends the weighted partial in bf16:
+    1 reduce-scatters it in bf16 (the collective accumulates in bf16); 2
+    exchanges the same bf16 bytes by all-to-all and sums the received ranks
+    locally in f32. Either halves the bytes of the f32 reduce-scatter.
+    """
+    mode = envs.TPU_DCP_MERGE_RS_BF16
+    if mode == 1:
+        return group.reduce_scatter(weighted.to(torch.bfloat16).contiguous(), dim=1)
+    if mode == 2:
+        world = int(group.world_size)
+        tokens, heads, vdim = weighted.shape
+        send = (
+            weighted.to(torch.bfloat16)
+            .reshape(tokens, world, heads // world, vdim)
+            .transpose(0, 1)
+        )
+        return _all_to_all(send, group).to(torch.float32).sum(dim=0)
+    return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
 def _merge_chunked_lse_gathered(

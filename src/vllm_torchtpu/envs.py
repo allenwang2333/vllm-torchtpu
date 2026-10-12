@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
+    TPU_DCP_MERGE_RS_BF16: int = 0
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -485,6 +486,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": env_int(
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS", 0
     ),
+    # NOT bitwise (needs the accuracy gate): the chunked merge
+    # (TPU_DCP_MERGE_CHUNKED) sends its LSE-weighted partial in bf16 instead
+    # of f32, halving the bytes of the SparseCore-bound reduce-scatter chain.
+    # 1 = bf16 reduce-scatter (the collective sums in its operand dtype);
+    # 2 = bf16 all-to-all of the same bytes, then a local f32 sum over the
+    # ranks (bf16 wire, f32 accumulation). 0 = f32 reduce-scatter (today).
+    "TPU_DCP_MERGE_RS_BF16": env_int("TPU_DCP_MERGE_RS_BF16", 0),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
