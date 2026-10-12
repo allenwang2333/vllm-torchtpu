@@ -412,6 +412,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             mk_max_verify_rows = 32
         elif not _env_on("VLLM_TPU_QWEN35_MK_VERIFY_64", "1"):
             mk_max_verify_rows = 48
+        elif _env_on("VLLM_TPU_QWEN35_MK_SPLIT_WIDE", "1"):
+            mk_max_verify_rows = 128
         else:
             mk_max_verify_rows = 64
         num_spec = max(int(getattr(self, "num_spec_tokens", 3) or 0), 0)

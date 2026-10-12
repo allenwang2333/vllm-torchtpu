@@ -6832,7 +6832,7 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35Megakernel
 
             self._qwen35_mk = Qwen35Megakernel.maybe_create(self)
-        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "0") == "1" and hasattr(
+        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "1") == "1" and hasattr(
             self.drafter, "attach_mtp_megakernel"
         ):
             from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35MtpMegakernel

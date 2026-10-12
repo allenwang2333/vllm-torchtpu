@@ -929,7 +929,6 @@ class TpuPlatform(Platform):
             model_config is not None
             and "Qwen3_5MoeForConditionalGeneration"
             in (model_config.architectures or [])
-            and vllm_config.kv_transfer_config is None
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -940,12 +939,17 @@ class TpuPlatform(Platform):
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
-            if hasattr(cache_config, "prefix_cache_retention_interval"):
-                cache_config.prefix_cache_retention_interval = 0
-            if hasattr(cache_config, "prefix_match_unit") and getattr(
-                cache_config, "prefix_match_unit", None
-            ) in (None, 0, 1):
-                cache_config.prefix_match_unit = 128
+            if (
+                vllm_config.kv_transfer_config is None
+                or os.environ.get("TPU_HYBRID_STATE_RETENTION", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+            ):
+                if hasattr(cache_config, "prefix_cache_retention_interval"):
+                    cache_config.prefix_cache_retention_interval = 0
+                if hasattr(cache_config, "prefix_match_unit") and getattr(
+                    cache_config, "prefix_match_unit", None
+                ) in (None, 0, 1):
+                    cache_config.prefix_match_unit = 128
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )
