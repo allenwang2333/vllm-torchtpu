@@ -2248,6 +2248,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # TPU_DCP_RANK_OPERAND: this rank's DCP index as a sharded i32 operand
         # (built here, outside Dynamo) instead of the iota all_to_all.
         rank_tensor = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
+        # TPU_MTP_DCP_MERGE_SIZED: the drafter's merge op, registered here
+        # (model build, outside any trace).
+        _cp_mla_attention.prebuild_sized_merge(dcp_size)
 
         def _sparse_mla_attention_dcp_run(
             kv_cache_nope: jax.Array,

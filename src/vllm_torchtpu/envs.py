@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
+    TPU_MTP_DCP_MERGE_SIZED: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -475,6 +476,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": env_bool(
         "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", default=False
     ),
+    # The MTP drafter's DCP lse merge as one JAX op over the DCP mesh that picks
+    # its exchange per exported bucket: steps of at most
+    # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens take one packed all-to-all (the
+    # partial's bf16 words plus the lse bits) and merge locally, larger ones
+    # the lse all-gather + f32 reduce-scatter. The drafter's FX graph serves
+    # every bucket and cannot branch on the token count in torch; JAX exports
+    # each bucket at its concrete shape, so the choice leaves no guard. Same
+    # per-element weights as the reduce-scatter merge; only the order the
+    # ranks' weighted partials are summed in differs.
+    "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=False),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
