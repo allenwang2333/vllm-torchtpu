@@ -1402,6 +1402,7 @@ def sparse_mla_attention_dcp(
             mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
+            mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
             **chunk_kwargs,
             **split_kwargs,
         )

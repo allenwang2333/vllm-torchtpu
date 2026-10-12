@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -563,6 +564,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Every owning row is bit-identical; the merge result is unchanged.
     "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": env_bool(
         "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL", default=False
+    ),
+    # With TPU_DCP_MLA_MIXED_LIVE, mixed / prefill buckets: build kv_lens, the
+    # live-group table and the window rows in ONE TensorCore Pallas call
+    # (`prepare_capped_window_live_fused`) that reads the top-k as 128-lane
+    # rows (a bitcast of the SparseCore top-k output: no [T, 2048] relayout)
+    # and writes one window array per chunk (no per-chunk slice copy). Same
+    # rows, kv_lens and table; decode buckets unaffected.
+    "TPU_DCP_MLA_MIXED_FUSED_PREP": env_bool(
+        "TPU_DCP_MLA_MIXED_FUSED_PREP", default=False
     ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
