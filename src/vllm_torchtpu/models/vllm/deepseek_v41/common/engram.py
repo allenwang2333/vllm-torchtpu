@@ -290,30 +290,53 @@ class NgramHashState(upstream.NgramHashState):
         for shift in () if all_valid else range(1, ngram):
             blocked[shift] |= blocked[shift - 1]
         _ = None if all_valid else np.copyto(source, pad_id, where=blocked)
-        np.multiply(tables.multipliers[:, :, None], source[None, :, :], out=terms)
-        rolled = terms[:, 1:]
+        heads, has_col_slice = (
+            hashed.shape[2],
+            col_slice is not None
+            and 0 <= col_slice[0] < col_slice[1] <= (ngram - 1) * hashed.shape[2],
+        )
+        max_ngram, rolled = (
+            (
+                m_ng := min(ngram, (col_slice[1] - 1) // heads + 2)
+                if has_col_slice and col_slice is not None
+                else ngram
+            ),
+            terms[:, 1:m_ng],
+        )
+        np.multiply(
+            tables.multipliers[:, :max_ngram, None],
+            source[None, :max_ngram, :],
+            out=terms[:, :max_ngram, :],
+        )
         np.bitwise_xor(terms[:, 0], rolled[:, 0], out=rolled[:, 0])
-        for shift in range(2, ngram):
+        for shift in range(2, max_ngram):
             np.bitwise_xor(
                 rolled[:, shift - 2], rolled[:, shift - 1], out=rolled[:, shift - 1]
             )
+        if has_col_slice and col_slice is not None:
+            # Column c of the output is (shift c // heads, head c % heads).
+            (
+                (shift_idx, primes_tl, offsets_tl, unif_s, rem_buf, out_dst, out_view),
+                rolled_tl,
+            ) = (
+                tables.column_slice(*col_slice, heads, count),
+                torch.from_numpy(rolled),
+            )
+            active_rolled = (
+                rolled_tl[:, unif_s : unif_s + 1, :]
+                if unif_s >= 0
+                else rolled_tl.index_select(1, shift_idx)
+            )
+            out_dst.copy_(
+                torch.remainder(active_rolled, primes_tl, out=rem_buf).add_(offsets_tl)
+            )
+            return out_view
         # Transpose the 8x-smaller rolled [layers, ngram - 1, T] to [T, layers,
         # ngram - 1, 1] first, then compute contiguous PyTorch remainder + add_
         # into the reused hashed scratch buffer before narrowing to int32.
-        heads = hashed.shape[2]
         rolled_t = torch.from_numpy(
             np.ascontiguousarray(rolled.transpose(2, 0, 1))
         ).unsqueeze(-1)
-        if col_slice is not None and 0 <= col_slice[0] < col_slice[1] <= (
-            (ngram - 1) * heads
-        ):
-            # Column c of the output is (shift c // heads, head c % heads).
-            sliced = tables.column_slice(*col_slice, heads)
-            out = torch.zeros(count, layers, (ngram - 1) * heads, dtype=torch.int32)
-            out[:, :, col_slice[0] : col_slice[1]] = torch.remainder(
-                rolled_t.squeeze(-1).index_select(2, sliced[0]), sliced[1]
-            ).add_(sliced[2])
-            return out
         hashed_t = torch.from_numpy(hashed.view().reshape(count, *hashed.shape[:3]))
         torch.remainder(
             rolled_t,
@@ -467,20 +490,35 @@ class _HostHashTables:
         return self._ensure_scratch(count)[0]
 
     def column_slice(
-        self, start: int, end: int, heads: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(shift index, primes, offsets)`` for hash columns ``[start, end)``."""
+        self, start: int, end: int, heads: int, count: int = 0
+    ) -> tuple[Any, ...]:
+        """``(shift index, primes, offsets, ...)`` for hash columns ``[start, end)``."""
         memo = self._memo.get("column_slice")
-        if memo is None or memo[0] != (start, end, heads):
-            layers = self.primes.shape[0]
+        if memo is None or memo[0] != (start, end, heads) or memo[4] != count:
+            layers, out_storage = (
+                self.primes.shape[0],
+                torch.zeros(
+                    (self.primes.shape[0], self.primes.shape[1] * heads, count),
+                    dtype=torch.int32,
+                ),
+            )
             memo = (
                 (start, end, heads),
                 torch.arange(start, end) // heads,
-                torch.from_numpy(self.primes.reshape(layers, -1)[:, start:end].copy()),
-                torch.from_numpy(self.offsets.reshape(layers, -1)[:, start:end].copy()),
+                torch.from_numpy(
+                    self.primes.reshape(layers, -1)[:, start:end, None].copy()
+                ),
+                torch.from_numpy(
+                    self.offsets.reshape(layers, -1)[:, start:end, None].copy()
+                ),
+                count,
+                s_min if (s_min := start // heads) == (end - 1) // heads else -1,
+                torch.empty((layers, end - start, count), dtype=torch.int64),
+                out_storage[:, start:end, :],
+                out_storage.permute(2, 0, 1),
             )
             self._memo["column_slice"] = memo
-        return memo[1], memo[2], memo[3]
+        return memo[1], memo[2], memo[3], memo[5], memo[6], memo[7], memo[8]
 
     def request_rows(
         self,

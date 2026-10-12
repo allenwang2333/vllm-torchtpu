@@ -578,3 +578,34 @@ def test_td8392_hash_on_host_invalid_col_slice_is_full(col_slice):
     assert torch.equal(
         state.hash_on_host(*args, col_slice=col_slice), state.hash_on_host(*args)
     )
+
+
+def test_td8399_hash_on_host_col_slice_max_ngram_pruning_and_permuted_out_view():
+    """TD8.399: Verify max_ngram shift pruning, token-last modulo broadcast across
+    all 8 TP rank slices (both single-shift unif_s >= 0 and cross-shift unif_s == -1),
+    and zero-allocation reuse of the contiguous permuted output buffer."""
+    state = _state(seed=99)
+    args = _inputs(16, 6, seed=99, dead_frac=0.05)
+    full = state.hash_on_host(*args)
+
+    # 1. All 8 TP rank slices: 6 single-shift + 2 cross-shift ((9,12), (18,21))
+    for rank in range(8):
+        s, e = rank * 3, (rank + 1) * 3
+        part = state.hash_on_host(*args, col_slice=(s, e))
+        assert part.shape == full.shape and part.dtype == torch.int32
+        assert torch.equal(part[:, :, s:e], full[:, :, s:e])
+        assert not part[:, :, :s].any() and not part[:, :, e:].any()
+        memo = state._host_tables._memo["column_slice"]
+        expected_unif_s = s // 8 if (s // 8) == ((e - 1) // 8) else -1
+        assert memo[5] == expected_unif_s
+        # Repeated call with same (col_slice, count) reuses the exact same output view
+        part2 = state.hash_on_host(*args, col_slice=(s, e))
+        assert part2 is part and part2.data_ptr() == part.data_ptr()
+        assert torch.equal(part2[:, :, s:e], full[:, :, s:e])
+
+    # 2. Verify max_ngram shift pruning skips higher shifts when col_slice=(0, 3)
+    terms = state._host_tables._scratch[4]
+    terms[:, 2:, :].fill(-777777)
+    part_r0 = state.hash_on_host(*args, col_slice=(0, 3))
+    assert torch.equal(part_r0[:, :, 0:3], full[:, :, 0:3])
+    assert (terms[:, 2:, :] == -777777).all()
