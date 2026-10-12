@@ -341,3 +341,102 @@ def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):
     monkeypatch.setattr(op, "_RANK", torch.tensor([3], dtype=torch.int32))
     monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
     assert op.retain(x) is x
+
+
+# --- TPU_SMALL_ALL_REDUCE_VALID_ROWS -----------------------------------------
+
+
+@pytest.fixture
+def valid_rows(armed, monkeypatch):
+    """The valid-rows op armed beside the two-shot one, with a padding mask
+    marking rows [5, 64) of the step as padding."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    valid_op = Mock(name="all_reduce_valid_rows_op")
+    monkeypatch.setattr(op, "_AR_VALID_OP", valid_op)
+    monkeypatch.setattr(op, "_VALID_TILE_ROWS", 16)
+    state = token_padding.TokenPaddingState.create(64, "cpu")
+    state.update(5, 64)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    return valid_op
+
+
+@pytest.mark.parametrize("rows", [16, 32])
+def test_valid_rows_op_takes_whole_row_tiles_with_the_mask_count(
+    armed, valid_rows, rows
+):
+    ar, _ = armed
+    x = _block(rows)
+    assert op.all_reduce_or(x, MESH, _fallback) is valid_rows.return_value
+    (block, meta), _ = valid_rows.call_args
+    assert block is x
+    assert meta.dtype == torch.int32
+    assert meta.tolist() == [5, 3]  # (valid rows, mesh index)
+    ar.assert_not_called()
+
+
+def test_valid_rows_count_is_the_whole_block_without_padding(
+    armed, valid_rows, monkeypatch
+):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    token_padding._padding_state.update(64, 64)
+    op.all_reduce_or(_block(32), MESH, _fallback)
+    (_, meta), _ = valid_rows.call_args
+    assert meta.tolist() == [32, 3]
+
+
+def test_valid_rows_partial_tile_keeps_the_two_shot_and_reads_the_mask(
+    armed, valid_rows, monkeypatch
+):
+    """24 rows are not whole row tiles: the two-shot kernel, its input carrying
+    a live zero read of the mask (a NaN mask entry poisons it)."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    ar, _ = armed
+    x = _block(24)
+    op.all_reduce_or(x, MESH, _fallback)
+    valid_rows.assert_not_called()
+    (block, rank), _ = ar.call_args
+    torch.testing.assert_close(block, x, rtol=0, atol=0)
+    monkeypatch.setattr(
+        token_padding._padding_state,
+        "local_padding_mask",
+        torch.full((64,), float("nan")),
+    )
+    op.all_reduce_or(x, MESH, _fallback)
+    (block, _), _ = ar.call_args
+    assert torch.isnan(block).all()
+
+
+def test_valid_rows_fallback_reads_the_mask(armed, valid_rows, monkeypatch):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(
+        token_padding._padding_state,
+        "local_padding_mask",
+        torch.full((256,), float("nan")),
+    )
+    out = op.all_reduce_or(_block(op.MAX_ROWS + 1), MESH, _fallback)
+    assert torch.isnan(out).all()
+    valid_rows.assert_not_called()
+
+
+def test_valid_rows_without_a_padding_mask_is_the_two_shot(
+    armed, valid_rows, monkeypatch
+):
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    monkeypatch.setattr(token_padding, "_padding_state", None)
+    ar, _ = armed
+    x = _block(16)
+    assert op.all_reduce_or(x, MESH, _fallback) is ar.return_value
+    valid_rows.assert_not_called()
+
+
+def test_valid_rows_leaves_the_draft_traces_on_the_sized_op(
+    armed, valid_rows, sized, monkeypatch
+):
+    monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: False)
+    assert op.all_reduce_or(_block(16), MESH, _fallback) is sized.return_value
+    valid_rows.assert_not_called()
