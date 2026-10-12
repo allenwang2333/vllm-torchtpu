@@ -11,7 +11,8 @@ Instrumentation:
                                live compiled executables at startup stages,
                                and trim the allocator once startup is done.
   VLLM_TPU_MEMDBG_HEAP_DUMP=1  also write a tcmalloc heap profile per stage
-                               (needs LD_PRELOAD=libtcmalloc_and_profiler).
+                               (needs LD_PRELOAD=libtcmalloc.so.4, the image
+                               default; do not preload a second gperftools lib).
                                Only rank 0 of DP rank 0 of each role dumps;
                                file names carry role and rank, so prefill and
                                decode sharing one output dir no longer clobber
@@ -51,10 +52,20 @@ DROP_SERIALIZE_ENTRY = _flag("VLLM_TPU_MEMDBG_DROP_SERIALIZE_ENTRY")
 CLEAR_COMPILE_CACHE = _flag("VLLM_TPU_MEMDBG_CLEAR_COMPILE_CACHE")
 RELEASE_STAGER_POOL = _flag("VLLM_TPU_MEMDBG_RELEASE_STAGER_POOL")
 
-_TCMALLOC_PATHS = (
-    "/usr/lib/x86_64-linux-gnu/libtcmalloc_and_profiler.so.4",
-    "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4",
-)
+# Resolve tcmalloc symbols from the allocator already in the process
+# (LD_PRELOAD; libtcmalloc.so.4 in our images, which carries the heap
+# profiler). dlopen-ing a second gperftools library -- even
+# libtcmalloc_and_profiler -- runs its heap-checker constructor again and
+# aborts the worker ("Heap-check constructor called twice").
+_process_symbols = ctypes.CDLL(None)
+
+
+def _tcmalloc_fn(name: str) -> Any:
+    fn = getattr(_process_symbols, name, None)
+    if fn is None:
+        logger.warning("[MEMDBG] %s not found; is tcmalloc LD_PRELOADed?", name)
+    return fn
+
 
 _tag = "unknown"
 _dumps_heap = False
@@ -111,17 +122,22 @@ def _live_compiled_executables() -> int:
 def _heap_dump(stage: str) -> None:
     global _heap_profiler
     if _heap_profiler is None:
+        start = _tcmalloc_fn("HeapProfilerStart")
+        dump = _tcmalloc_fn("HeapProfilerDump")
+        if start is None or dump is None:
+            _heap_profiler = False
+            return
         prefix = os.path.join(
             os.environ.get("VLLM_TPU_MEMDBG_HEAP_DIR", "/cdk-outputs"),
             f"heap_{_tag}",
         )
-        lib = ctypes.CDLL(_TCMALLOC_PATHS[0])
-        lib.HeapProfilerStart.argtypes = [ctypes.c_char_p]
-        lib.HeapProfilerDump.argtypes = [ctypes.c_char_p]
-        lib.HeapProfilerStart(prefix.encode())
-        _heap_profiler = lib
+        start.argtypes = [ctypes.c_char_p]
+        dump.argtypes = [ctypes.c_char_p]
+        start(prefix.encode())
+        _heap_profiler = dump
         logger.info("[MEMDBG] heap profiler started, prefix=%s", prefix)
-    _heap_profiler.HeapProfilerDump(stage.encode())
+    if _heap_profiler:
+        _heap_profiler(stage.encode())
 
 
 def stage(name: str) -> None:
@@ -150,14 +166,11 @@ def trim_allocator(name: str) -> None:
         return
     gc.collect()
     before, _ = _proc_mem_mb()
-    for path in _TCMALLOC_PATHS:
-        try:
-            ctypes.CDLL(path).MallocExtension_ReleaseFreeMemory()
-            break
-        except (OSError, AttributeError):
-            continue
+    release = _tcmalloc_fn("MallocExtension_ReleaseFreeMemory")
+    if release is not None:
+        release()
     with contextlib.suppress(AttributeError):  # malloc_trim is glibc-only
-        ctypes.CDLL(None).malloc_trim(0)
+        _process_symbols.malloc_trim(0)
     after, _ = _proc_mem_mb()
     logger.info(
         "[MEMDBG] trim=%s tag=%s VmRSS %.1f -> %.1f MB", name, _tag, before, after
