@@ -391,17 +391,35 @@ def _prepare_routed_gmm_inputs(
     token_indices_sorted = None
     topk_weights_sorted = None
     bucket_counts = None
-    if pairwise_sort:
+    if pairwise_sort and total_routed <= 2304:
         gated_weights = jnp.where(valid_mask, topk_weights_flat, 0)
         (
             argsort_revert_indices,
             token_indices_sorted,
             topk_weights_sorted,
         ) = _pairwise_sort_positions(sort_keys, token_indices_flat, gated_weights)
-    elif ragged_permute:
+    elif pairwise_sort or ragged_permute:
         argsort_revert_indices, bucket_counts = _counting_sort_positions(
             sort_keys, local_num_experts + 1
         )
+        if pairwise_sort:
+            gated_bf16 = jnp.where(valid_mask, topk_weights_flat, 0).astype(
+                jnp.bfloat16
+            )
+            w_u16 = jax.lax.bitcast_convert_type(gated_bf16, jnp.uint16).astype(
+                jnp.int32
+            )
+            payload = jax.lax.shift_left(w_u16, 16) | (
+                token_indices_flat & jnp.int32(0xFFFF)
+            )
+            packed_sorted = (
+                jnp.empty_like(payload).at[argsort_revert_indices].set(payload)
+            )
+            token_indices_sorted = packed_sorted & jnp.int32(0xFFFF)
+            topk_weights_sorted = jax.lax.bitcast_convert_type(
+                jax.lax.shift_right_logical(packed_sorted, 16).astype(jnp.uint16),
+                jnp.bfloat16,
+            )
     else:
         argsort_revert_indices = None
     token_bits = max(1, (num_tokens_local - 1).bit_length())
@@ -607,7 +625,14 @@ def moe_gmm(
                     reduce_group_size=topk,
                 ).astype(x.dtype)
     if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+        valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+        use_owner_unpermute = (
+            envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
+            or argsort_revert_indices.size > 2304
+        )
+        if argsort_revert_indices.size <= onehot_moe_permute_threshold or (
+            use_owner_unpermute and num_tokens <= 1152
+        ):
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
             if topk_weights_sorted is None:
@@ -623,16 +648,12 @@ def moe_gmm(
                 )
             else:
                 topk_weights_sorted = topk_weights_sorted.astype(gmm2_res.dtype)
-            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (
-                envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
-                and can_use_blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                )
+            if use_owner_unpermute and can_use_blockwise_onehot_unpermute(
+                gmm2_res,
+                token_indices_sorted,
+                topk_weights_sorted,
+                valid_count,
+                num_tokens=num_tokens,
             ):
                 logger.info_once(
                     "Selected owner_output blockwise one-hot unpermute: "
@@ -648,19 +669,22 @@ def moe_gmm(
                     valid_count,
                     num_tokens=num_tokens,
                 ).astype(x.dtype)
-            if not zero_init_gmm2:
-                # Rows past the computed prefix (non-local experts under EP,
-                # skipped padded tokens) are never written by the GMM; zero them
-                # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-                computed = (
-                    jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
+            if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+                if not zero_init_gmm2:
+                    # Rows past the computed prefix (non-local experts under EP,
+                    # skipped padded tokens) are never written by the GMM; zero them
+                    # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
+                    computed = (
+                        jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < valid_count[0]
+                    )
+                    gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+                combine = (
+                    jax.nn.one_hot(
+                        token_indices_sorted, num_tokens, dtype=gmm2_res.dtype
+                    ).T
+                    * topk_weights_sorted[None, :]
                 )
-                gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            combine = (
-                jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=gmm2_res.dtype).T
-                * topk_weights_sorted[None, :]
-            )
-            return (combine @ gmm2_res).astype(x.dtype)
+                return (combine @ gmm2_res).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,

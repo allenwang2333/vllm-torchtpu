@@ -351,6 +351,22 @@ def test_prepare_routed_gmm_inputs():
     )
     assert out3[0].shape == (8, 16)
 
+    # 4b. use_ep=True, use_sparse_core=True, 2304 < total_routed <= threshold
+    hidden_hi = jnp.ones((400, 16), dtype=jnp.bfloat16)
+    ids_hi = jnp.zeros((400, 6), dtype=jnp.int32)
+    wts_hi = jnp.ones((400, 6), dtype=jnp.float32) / 6.0
+    out3_hi = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_hi,
+        ids_hi,
+        wts_hi,
+        local_num_experts=4,
+        topk=6,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=4096,
+    )
+    assert out3_hi[0].shape == (2400, 16)
+
     # 5. use_ep=True, use_sparse_core=True, tokens > threshold (ragged permute)
     def dummy_gather(x, indices, starts, ends):
         return x[indices]
@@ -505,6 +521,36 @@ def test_moe_gmm(monkeypatch):
         )
         assert out2b.shape == (n_tok_hi, hidden_size)
 
+        # Branch 2c: EP + SC, size > threshold but num_tokens <= 1152 and
+        # can_use_blockwise_onehot_unpermute is False -> falls through to
+        # ragged_gather_reduce
+        with patch.object(
+            fused_moe_gmm,
+            "ragged_gather_reduce",
+            return_value=jnp.zeros((n_tok_hi, hidden_size), dtype=jnp.bfloat16),
+        ):
+            out2c = fused_moe_gmm.moe_gmm(
+                x_hi,
+                w1,
+                None,
+                None,
+                w2,
+                None,
+                None,
+                group_sizes_hi,
+                revert_hi,
+                weights_hi,
+                valid_hi,
+                tok_sorted_hi,
+                activation="silu",
+                num_tokens=n_tok_hi,
+                topk=6,
+                use_ep=True,
+                use_sparse_core=True,
+                onehot_moe_permute_threshold=128,
+            )
+            assert out2c.shape == (n_tok_hi, hidden_size)
+
         # Branch 3: EP + SC, size <= threshold, owner_output == "on", blockwise
         monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "on")
         with (
@@ -542,6 +588,7 @@ def test_moe_gmm(monkeypatch):
             assert out3.shape == (num_tokens, hidden_size)
 
         # Branch 4: EP + SC, size > threshold -> ragged_gather_reduce
+        monkeypatch.setitem(vars(envs), "TPU_MOE_OWNER_OUTPUT_MODE", "off")
         with patch.object(
             fused_moe_gmm,
             "ragged_gather_reduce",

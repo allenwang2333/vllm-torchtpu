@@ -57,7 +57,10 @@ def can_use_blockwise_onehot_unpermute(
     if valid_count.shape != (1,) or valid_count.dtype != jnp.int32:
         return False
 
-    tpu_info = pltpu.get_tpu_info()
+    try:
+        tpu_info = pltpu.get_tpu_info()
+    except ValueError:
+        return False
     if route_capacity % _ROUTE_BLOCK_SIZE:
         return False
     if hidden_size % tpu_info.mxu_column_size:
