@@ -14,10 +14,13 @@
 """Composition of the GLM-5.2 DCP decode flags, all on vs all off.
 
 Flags: TPU_MLA_DECODE_PROLOGUE, TPU_MLA_KV_WRITE_IN_GATHER,
-TPU_DCP_RANK_OPERAND, TPU_IDX_QB_UNDER_TOPK, TPU_DCP_LSE_MERGE_A2A_PACK.
+TPU_DCP_RANK_OPERAND, TPU_IDX_QB_UNDER_TOPK, TPU_DCP_LSE_MERGE_A2A_PACK,
+TPU_DCP_MLA_MIXED_FUSED_PREP (TPU_MOE_SC_COMBINE_V5 is MoE-only, set for
+completeness).
 
 * Attention (`sparse_mla_attention_dcp`, DCP-8, test_mla_decode_prologue's
-  mixed-256 + decode-16 + decode-32 steps, production env): with prologue +
+  mixed-256 + decode-16 + decode-32 steps plus a 2048-token mixed step,
+  production env): with prologue +
   kv-in-gather + rank operand on, every rank's caches, partial outputs and lse
   equal the all-off run bit for bit; the merged output (all-to-all merge,
   threaded stand-in) with the pack on equals the two-exchange merge of the
@@ -53,6 +56,10 @@ FLAGS_ON = {
     "TPU_DCP_RANK_OPERAND": "1",
     "TPU_IDX_QB_UNDER_TOPK": "1",
     "TPU_DCP_LSE_MERGE_A2A_PACK": "1",
+    "TPU_DCP_MLA_MIXED_FUSED_PREP": "1",
+    # Read at import (fused_moe_gmm._SC_COMBINE_V5) and MoE-only: no effect
+    # here; test_ragged_gather_reduce_v5 holds its own on/off check.
+    "TPU_MOE_SC_COMBINE_V5": "1",
 }
 
 
@@ -71,6 +78,7 @@ def _rank_ids(dcp, shift=0):
 def _attention_run(dcp, on, rank_shift=0):
     from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
     from vllm_torchtpu.kernels.mla import tc_scatter
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
     from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 
     env = dict(prologue.PROD_ENV, **(FLAGS_ON if on else {}))
@@ -90,16 +98,26 @@ def _attention_run(dcp, on, rank_shift=0):
             "cp_rank_as_data",
             wraps=streamindex_topk.cp_rank_as_data,
         ) as iota_spy,
+        mock.patch.object(
+            sparse_kernel,
+            "prepare_capped_window_live_fused",
+            wraps=sparse_kernel.prepare_capped_window_live_fused,
+        ) as prep_spy,
     ):
         if not on:
             for k in FLAGS_ON:
                 os.environ.pop(k, None)
         extra = {"dcp_rank_ids": _rank_ids(dcp, rank_shift)} if on else {}
-        res = prologue._dcp_run(dcp, candidate=on, **extra)
+        res = prologue._dcp_run(dcp, candidate=on, big_mixed=True, **extra)
         kvw = sum(
             c.kwargs.get("kv_write") is not None for c in gather_spy.call_args_list
         )
-    return res, dict(tc=tc_spy.call_count, kvw=kvw, iota=iota_spy.call_count)
+    return res, dict(
+        tc=tc_spy.call_count,
+        kvw=kvw,
+        iota=iota_spy.call_count,
+        prep=prep_spy.call_count,
+    )
 
 
 def _dcp_size():
@@ -127,8 +145,11 @@ def test_attention_all_flags_on_vs_off():
     print("wiring off", ref_w, "on", got_w)
     # Off: tc_scatter writes the two decode steps, the rank comes from the iota
     # all_to_all. On: the gather writes them, the iota is never traced.
+    # Mixed buckets (256, 2048): the fused prep only with the flag.
     assert ref_w["tc"] == 2 and ref_w["kvw"] == 0 and ref_w["iota"] > 0, ref_w
+    assert ref_w["prep"] == 0, ref_w
     assert got_w["tc"] == 0 and got_w["kvw"] == 2 and got_w["iota"] == 0, got_w
+    assert got_w["prep"] > 0, got_w
     dump = {}
     for i, (a, b) in enumerate(zip(ref, got)):
         for k in ("nope", "rope", "out", "lse"):
