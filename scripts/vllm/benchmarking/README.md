@@ -1,6 +1,6 @@
 # Benchmarking vllm-torchtpu
 
-Most configs target TPU v7x-8; some use v7x-2, v7x-16 or v7x-32 (see `.buildkite/pipeline_perf.yml`). KV cache defaults to fp8 in `run_benchmarks.sh`; a config can override it with `KV_CACHE_DTYPE`.
+Most configs target TPU v7x-8; some use v7x-2, v7x-16 or v7x-32 (see `.buildkite/pipeline_perf.yml`, and `.buildkite/pipeline_k3_sweep.yml` for v7x-32). KV cache defaults to fp8 in `run_benchmarks.sh`; a config can override it with `KV_CACHE_DTYPE`.
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ Most configs target TPU v7x-8; some use v7x-2, v7x-16 or v7x-32 (see `.buildkite
 |--------|-------|-----|----|----|----|
 | `qwen3-coder-30b-fp8-tp8-ep` | Qwen3-Coder-30B-A3B-Instruct-FP8 | yes | on | fp8 | guard (scheduled) |
 | `qwen3-coder-30b-tp8-ep` | Qwen3-Coder-30B-A3B-Instruct | yes | on | none | nightly |
-| `qwen3.5-35b-fp8-tp4-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | guard (PR) |
+| `qwen3.5-35b-fp8-tp4-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | guard (scheduled) |
 | `qwen3.5-35b-fp8-dp4-tp2-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | nightly |
 | `qwen3-coder-480b-fp8-tp8-ep` | Qwen3-Coder-480B-A35B-Instruct-FP8 | yes | on | fp8 | nightly short sweep |
 | `qwen3-coder-480b-fp8-tp8-ep-full` | Qwen3-Coder-480B-A35B-Instruct-FP8 | yes | on | fp8 | nightly full sweep |
@@ -123,7 +123,7 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 Results are saved to `benchmark_runs/` (gitignored). Each run creates a directory containing:
 - `config.json` — benchmark parameters
-- `isl<N>_osl<N>_c<N>.json` — per-combo results from `vllm bench serve`
+- `isl<N>_osl<N>_c<N>.json`: per-combo results from `vllm bench serve`
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
 

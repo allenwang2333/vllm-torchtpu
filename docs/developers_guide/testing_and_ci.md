@@ -46,14 +46,14 @@ pytest tests/ -sv --timeout=600 \
 
 ### 4. Speculative Decoding TPU Tests
 
-Speculative decoding e2e tests (`tests/entrypoints/llm/test_speculative_decoding.py`) carry a module-level `pytestmark = pytest.mark.tpu_test` and are split across 2-chip and 8-chip steps:
+Speculative decoding e2e tests (`tests/entrypoints/llm/test_speculative_decoding.py`) carry a module-level `pytestmark = pytest.mark.tpu_test` and are split across v7x-2 and v7x-8 steps:
 
 ```bash
-# 2-chip speculative decoding PR suite
+# v7x-2 speculative decoding PR suite
 pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=1800 \
   -m "not nightly and not multichip"
 
-# 8-chip speculative decoding multichip PR suite (e.g. DP + MTP)
+# v7x-8 speculative decoding multichip PR suite (e.g. DP + MTP)
 pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=3600 \
   -m "not nightly and multichip"
 ```
@@ -108,4 +108,4 @@ Key repository hooks:
 - **`check-b023-baseline`**: Fails when a file under `src/vllm_torchtpu/kernels/` gains a loop-variable closure (ruff B023), ratcheted against `tools/b023_baseline.txt`.
 - **`signoff-commit`** (`commit-msg` stage): Appends a `Signed-off-by:` line to the commit message if it is missing.
 
-The config also runs `check-yaml`, `end-of-file-fixer`, `trailing-whitespace`, `clang-format`, `actionlint`, `pip-compile`, `shellcheck`, `detect-missing-init`, `keep-sorted`, `check-filenames` and `no-internal-refs`.
+The config also runs `check-yaml`, `end-of-file-fixer`, `trailing-whitespace`, `clang-format`, `actionlint`, `pip-compile`, `shellcheck`, `detect-missing-init`, `keep-sorted`, `check-license-header`, `check-filenames`, `no-internal-refs` and `suggestion`.

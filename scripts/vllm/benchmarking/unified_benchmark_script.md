@@ -23,6 +23,7 @@ Run `vllm bench serve` against the running server. The config sets `RANDOM_RANGE
 vllm bench serve \
   --backend vllm \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+  --trust-remote-code \
   --host localhost \
   --port 8000 \
   --dataset-name random \
@@ -32,6 +33,7 @@ vllm bench serve \
   --num-prompts 320 \
   --max-concurrency 64 \
   --request-rate inf \
+  --percentile-metrics ttft,tpot,itl,e2el \
   --ignore-eos \
   --temperature 0 \
   --save-result \
@@ -43,6 +45,7 @@ vllm bench serve \
 vllm bench serve \
   --backend vllm \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+  --trust-remote-code \
   --host localhost \
   --port 8000 \
   --dataset-name random \
@@ -52,6 +55,7 @@ vllm bench serve \
   --num-prompts 320 \
   --max-concurrency 64 \
   --request-rate inf \
+  --percentile-metrics ttft,tpot,itl,e2el \
   --ignore-eos \
   --temperature 0 \
   --save-result \
@@ -63,6 +67,7 @@ vllm bench serve \
 vllm bench serve \
   --backend vllm \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+  --trust-remote-code \
   --host localhost \
   --port 8000 \
   --dataset-name random \
@@ -72,6 +77,7 @@ vllm bench serve \
   --num-prompts 320 \
   --max-concurrency 64 \
   --request-rate inf \
+  --percentile-metrics ttft,tpot,itl,e2el \
   --ignore-eos \
   --temperature 0 \
   --save-result \

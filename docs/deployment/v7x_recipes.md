@@ -2,7 +2,7 @@
 
 **TPU v7x (Ironwood)** is Google Cloud's 7th-generation TPU architecture. Each physical TPU v7x chip exposes **2 logical TensorCore devices** to PyTorch and JAX (`192 GB` HBM per chip / `96 GB` per logical device), so a single 4-chip TPU v7x host (`tpu7x-8`) provides **8 logical TPU devices** and `768 GB` of total HBM.
 
-The recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
+The recipes below are extracted directly from the repository's scheduled and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
 
 ---
 
@@ -78,7 +78,7 @@ vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
 
 ### `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` (`TP=8 + EP`)
 
-Used as the PR-time performance guard gate ([`scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh)):
+Guard config in the scheduled perf lane's general suite; PRs run it only with the `run-perf-eval` label ([`scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh)):
 
 ```bash
 export LIBTPU_INIT_ARGS="--xla_tpu_alternate_memory_benefit_scaling_factor_for_large_buffers=0"
@@ -91,7 +91,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --attention-backend CUSTOM \
   --max-model-len 16384 \
   --max-num-batched-tokens 8192 \
-  --max-num-seqs 512 \
+  --max-num-seqs 128 \
   --gpu-memory-utilization 0.95 \
   --async-scheduling \
   --no-enable-prefix-caching \

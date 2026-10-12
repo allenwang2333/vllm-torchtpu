@@ -46,7 +46,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > [!TIP]
-> **Persisting Compilation Caches Across Restarts**: The first startup compiles XLA/Pallas graphs for the configured token shapes. Set `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT` to a persistent directory to reuse compiled artifacts across runs (vLLM's own cache lives under `VLLM_CACHE_ROOT`, default `~/.cache/vllm`)—see [Compilation Cache](../user_guide/compilation_cache.md).
+> **Persisting Compilation Caches Across Restarts**: The first startup compiles XLA/Pallas graphs for the configured token shapes. Set `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT` to a persistent directory to reuse compiled artifacts across runs (vLLM's own cache lives under `VLLM_CACHE_ROOT`, default `~/.cache/vllm`). See [Compilation Cache](../user_guide/compilation_cache.md).
 
 ---
 

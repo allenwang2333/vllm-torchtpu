@@ -1,6 +1,6 @@
 # Environment Variables Reference
 
-This page lists a curated subset of the variables declared in [`src/vllm_torchtpu/envs.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/envs.py); see that file for the full list. New environment reads must go through `envs.py` (a ratchet enforced by `tools/check_env_reads.py`; some older direct reads remain). Most boolean variables accept `"1"`, `"true"`, `"yes"`, `"on"` or `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive), and invalid values raise a `ValueError`. Exceptions that accept only integers: `VLLM_XLA_CHECK_RECOMPILATION`, `USE_MOE_SPARSE_CORE`, `TPU_KERNEL_ITER_MODE`, and `DP_SCHED_ENABLED`.
+This page lists a curated subset of the variables declared in [`src/vllm_torchtpu/envs.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/src/vllm_torchtpu/envs.py); see that file for the full list. New environment reads must go through `envs.py` (a ratchet enforced by `tools/check_env_reads.py`; some older direct reads remain). Most boolean variables accept `"1"`, `"true"`, `"yes"`, `"on"` or `"0"`, `"false"`, `"no"`, `"off"` (case-insensitive), and invalid values raise a `ValueError`. Exceptions that accept only integers: `VLLM_XLA_CHECK_RECOMPILATION`, `USE_MOE_SPARSE_CORE`, `TPU_KERNEL_ITER_MODE`, and `DP_SCHED_ENABLED`. `TPU_PCP_TOPOLOGY_AWARE_MESH` treats any value other than `0`, `false`, `off`, or `no` as true and never raises.
 
 ---
 
@@ -43,7 +43,7 @@ This page lists a curated subset of the variables declared in [`src/vllm_torchtp
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. Also enabled when `MOE_FUSED_EP_KERNEL_IMPL` is set. |
 | `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v2"` or `"adaptive"`). |
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
-| `TPU_MOE_HIERARCHICAL_EP` | `False` | Hierarchical MoE parallelism: expert-parallel between chips, tensor-parallel between the two cores of a chip. Helps mainly at low concurrency. |
+| `TPU_MOE_HIERARCHICAL_EP` | `False` | Hierarchical MoE parallelism: expert-parallel between chips, tensor-parallel between the two cores of a chip. Helps only at low concurrency. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"`, or `"sort"` for `torch.topk`). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
@@ -78,7 +78,7 @@ This page lists a curated subset of the variables declared in [`src/vllm_torchtp
 | `TPU_RAIDEN_CONTROLLER_ADDRESS` | `""` | Address (`host:port`) of the Raiden P/D coordinator (`run_raiden_controller.py`). |
 | `TPU_RAIDEN_JOB_NAME` | `""` | Role name (`"prefill"` or `"decode"`) registered with the Raiden controller. |
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Engine replica identifier for Raiden KV transfer. |
-| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of parallel DMA transfer streams in `TPURaidenConnector`. |
+| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Source (prefill-side) transfer parallelism that `TPURaidenConnector` records in producer metadata. Must be `1` under DeepSeek-V4 DP-attention admission. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | Where the KV reshard control plane runs: `"controller"` (external sidecar controller) or `"store"` (in-process in each engine's rank-0 worker). |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport for PCP→DP KV pool resharding: `"zmq"` (v1 connector protocol) or `"raiden"` (controller-driven path). |
 | `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |

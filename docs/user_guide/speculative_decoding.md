@@ -9,7 +9,7 @@ Speculative decoding accelerates token generation (reducing median TPOT and end-
 | **EAGLE-3** | `"eagle3"` | Yes (`yuhuili/EAGLE3-*`) | High acceptance rates across general chat, coding, and reasoning tasks. |
 | **Multi-Token Prediction (MTP)** | `"mtp"` (or `"qwen3_next_mtp"`) | Built into checkpoint (`Qwen3.5`, `DeepSeek-V4`, `GLM-5.2`) | Models trained with native MTP heads; zero external draft model management. |
 | **DFlash** | `"dflash"` | Yes (`z-lab/*-DFlash-*`) | Block-diffusion draft heads proposing up to 16 tokens in a single forward pass (`Qwen3`, `Qwen3.5`). |
-| **DSpark** | `"dspark"` | Yes (`deepseek-ai/dspark_*`) | Block draft model proposing a fixed block of tokens per step. |
+| **DSpark** | `"dspark"` | Yes (`deepseek-ai/dspark_*`) | Block draft model proposing a fixed block of tokens per step (`Qwen3`, `DeepSeek-V4`, `Kimi-K3` drafters). |
 | **N-Gram** | `"ngram"` | No | Prompts with repetitive structure, code edits, citations, or RAG extraction. |
 
 ---
@@ -32,7 +32,7 @@ vllm serve NousResearch/Meta-Llama-3.1-8B-Instruct \
 
 ## 2. Multi-Token Prediction (MTP)
 
-Checkpoints with built-in Multi-Token Prediction heads (such as `Qwen/Qwen3.5-4B` and `Qwen/Qwen3.5-35B-A3B-FP8`) require only `"method": "mtp"` and `"num_speculative_tokens"`. Qwen3.5 is a hybrid model, so disable prefix caching when using MTP on it:
+Checkpoints with built-in Multi-Token Prediction heads (such as `Qwen/Qwen3.5-4B` and `Qwen/Qwen3.5-35B-A3B-FP8`) require only `"method": "mtp"` and `"num_speculative_tokens"`. Prefix caching on Qwen3.5, a hybrid model, requires `--mamba-cache-mode align`. The example below disables prefix caching instead:
 
 ```bash
 vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \

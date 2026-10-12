@@ -18,7 +18,7 @@
 | **Tensor Parallelism (TP)** | `--tensor-parallel-size N` | Shard attention heads and dense MLP projections within a high-bandwidth ICI domain. | All-reduce / Reduce-scatter across `TP` ranks per layer. |
 | **Data Parallelism (DP)** | `--data-parallel-size N` | Replicate attention layers across independent engines while sharing a global Expert Parallel MoE mesh (`TP * DP` experts). | Zero attention collective overhead when `TP=1`; All-to-All across `TP * DP` for MoE layers when `--enable-expert-parallel` is enabled. |
 | **Expert Parallelism (EP)** | `--enable-expert-parallel` | Shard Mixture-of-Experts (MoE) routed experts across the `TP * DP` device mesh instead of slicing each expert's weights. | Uses Pallas SparseCore / GMM ragged dispatch and combine collectives across the EP mesh (`src/vllm_torchtpu/distributed/ep_mesh.py`). |
-| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers with dynamic microbatch chunking (`TPU_PP_DYNAMIC_CHUNKS=1`). |
+| **Pipeline Parallelism (PP)** | `--pipeline-parallel-size N` | Partition transformer layers sequentially across stages (`PP` stages). | Point-to-point activation transfers, with prefill chunks sized by a per-step time budget (`TPU_PP_DYNAMIC_CHUNKS=1`). |
 | **Prefill Context Parallelism (PCP)** | `--prefill-context-parallel-size N` | Split long prefill sequences across `PCP` ranks to parallelize prefill compute and reduce time-to-first-token (TTFT). | Topology-aware ring/mesh assignment (`TPU_PCP_TOPOLOGY_AWARE_MESH=1`) minimizing ICI hop count between consecutive PCP ranks. |
 | **Decode Context Parallelism (DCP)** | `--decode-context-parallel-size N` | Shard the KV cache along the sequence dimension across `DCP` ranks for long-context decode. | LSE (log-sum-exp) attention merge across `DCP` ranks (reduce-scatter by default; `TPU_DCP_LSE_MERGE_A2A=1` opts in to an all-to-all merge for small MLA decode steps). |
 
@@ -81,9 +81,9 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | :--- | :--- | :--- |
 | `USE_MOE_SPARSE_CORE` | `1` | Offloads MoE token routing/gather-reduce collectives to TPU SparseCores. |
 | `USE_MOE_FUSED_EP_KERNEL` | `0` | Enables the fused Expert-Parallel Pallas kernel. Setting `MOE_FUSED_EP_KERNEL_IMPL` (`v2` or `adaptive`) also enables it. |
-| `TPU_MOE_HIERARCHICAL_EP` | `0` | Enables two-level (intra-chip / inter-chip) hierarchical EP token dispatch on dual-core TPU v7x topologies. |
-| `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
-| `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |
+| `TPU_MOE_HIERARCHICAL_EP` | `0` | Hierarchical MoE parallelism: expert-parallel across chips, tensor-parallel across the two cores of a TPU v7x chip. Helps only at low concurrency. |
+| `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. Qwen3.5 MoE with EP and `TP > 1` only. |
+| `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards Kimi-K3's unquantized latent-MoE down/up projections across the 2 cores of each TPU v7x chip instead of replicating them. |
 
 ---
 
@@ -102,12 +102,13 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
 When `PP > 1`, the following are not supported yet and are rejected at startup:
 
 - Tensor parallelism inside a stage: use `--tensor-parallel-size 1`.
+- Stages that span several devices (`PCP > 1`, or `DP > 1` with `--enable-expert-parallel`), unless the installed torch_tpu builds Pallas meshes over a stage's process group.
 - Async scheduling: pass `--no-async-scheduling`.
 - Speculative decoding.
-- KV transfer connectors other than `TPURaidenConnector`. With `TPURaidenConnector`, every stage must hold at least one full-attention layer.
+- KV transfer connectors other than `TPURaidenConnector`. With `TPURaidenConnector`, every stage must hold at least one full-attention layer (checked for hybrid models that declare `layer_types`).
 - The legacy Ray executor: set `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1` when using Ray.
 
-By default, `TPU_PP_DYNAMIC_CHUNKS=1` dynamically sizes microbatch chunks to keep pipeline bubbles minimal without recompiling static token buckets.
+By default, `TPU_PP_DYNAMIC_CHUNKS=1` sizes prefill chunks by a per-step time budget instead of a token budget. Set it to `0` to keep token budgets.
 
 ---
 
@@ -118,7 +119,7 @@ For long-context workloads (32K–256K+ tokens) or Prefill/Decode disaggregated 
 - **Prefill Context Parallelism (`--prefill-context-parallel-size`)**: Distributes prefill sequence chunks across `PCP` ranks. `TPU_PCP_TOPOLOGY_AWARE_MESH=1` (enabled by default) binds consecutive PCP ranks to adjacent physical chips on the ICI torus to minimize ring-attention hop latency.
 - **Decode Context Parallelism (`--decode-context-parallel-size`)**: Distributes KV cache pages across `DCP` ranks during decode.
 
-PCP limits: it cannot be combined with DCP or PP, MoE models require `--enable-expert-parallel`, and speculative decoding is limited to `"method": "mtp"` with `num_speculative_tokens=1`.
+PCP limits: it cannot be combined with DCP, with `PP > 1` it is subject to the PP limits above, MoE models require `--enable-expert-parallel`, and speculative decoding is limited to `"method": "mtp"` with `num_speculative_tokens=1`.
 
 ```bash
 vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \

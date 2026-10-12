@@ -13,10 +13,10 @@
 | `mxfp4` | `fp4` (`e2m1`) + `e8m0` block scales (block size 32) | `bf16` / `fp8` | Linear, Fused MoE | Used by `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, and MXFP4 MoE checkpoints. |
 | `modelopt_fp4` | `fp4` (`e2m1`) + `fp8` block scales | `bf16` / `fp8` | Linear, Fused MoE | ModelOpt NVFP4 checkpoints (e.g., `nvidia/Qwen3-30B-A3B-NVFP4`, `nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP4`). |
 | `deepseek_v4_fp8` | `float8_e4m3fn` (with optional `fp4` MoE requantization) | `float8_e4m3fn` | Linear, MLA, Fused MoE | Specialized FP8 + W4A8 MoE path for `DeepSeek-V4`. |
-| `additional_config.tpu_online_fp8` (not a `--quantization` value) | selected `bf16` Linear weights -> `float8_e4m3fn` at load time | — | Selected unquantized Linear layers | Applies on top of an `fp8` or `modelopt_fp4` checkpoint config. |
+| `additional_config.tpu_online_fp8` (not a `--quantization` value) | selected `bf16` Linear weights -> `float8_e4m3fn` at load time | N/A | Selected unquantized Linear layers | Applies on top of an `fp8` or `modelopt_fp4` checkpoint config. |
 
 > [!TIP]
-> **Self-Describing Checkpoints**: When a Hugging Face checkpoint's `config.json` already contains a `quantization_config` section (such as `compressed-tensors`, `fp8`, or `mxfp4`), vLLM detects the format automatically—you do not need to pass `--quantization` unless overriding the detected method.
+> **Self-Describing Checkpoints**: When a Hugging Face checkpoint's `config.json` already contains a `quantization_config` section (such as `compressed-tensors`, `fp8`, or `mxfp4`), vLLM detects the format automatically. You do not need to pass `--quantization` unless overriding the detected method.
 
 ---
 
@@ -47,6 +47,7 @@ For checkpoints whose native block granularity or weight dtype is not optimal fo
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size when requantizing linear weights at load time. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for MoE expert weights (set to `fp4` with `MOE_FUSED_EP_ENABLE_W4A8=1` for W4A8 MoE execution). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size (e.g., `512`) for load-time MoE weight requantization. |
+| `QUANTIZE_ON_LOAD_PREFIXES` | `""` | Comma-separated, dot-bounded module-name prefixes (e.g., `self_attn,shared_experts`). Matching unquantized Linear and embedding weights, including `embed_tokens` and `lm_head`, are quantized to FP8 at load time. `kv_b_proj` is excluded. |
 
 ### Example: Requantizing MoE Experts to W4A8 at Load Time
 
