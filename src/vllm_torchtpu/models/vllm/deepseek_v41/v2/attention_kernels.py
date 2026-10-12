@@ -1715,16 +1715,24 @@ def initialize_paged_attention():
         fused_swa: bool = False,
         owner_perm: jax.Array | None = None,
         owner_inv: jax.Array | None = None,
+        wo_b: jax.Array | None = None,
+        wo_b_scale: jax.Array | None = None,
+        wo_b_full: jax.Array | None = None,
+        wo_b_full_scale: jax.Array | None = None,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
 
-        Returns this rank's ``wo_b`` input ``[T, o_lora_rank]``. With the
+        Returns this rank's ``wo_b`` input ``[T, o_lora_rank]`` (or ``wo_b``
+        output ``[T/tp, hidden_size]`` when ``wo_b_full`` is supplied). With the
         token-parallel shape condition of `fp8_attention`, each rank projects q
         for its own SP token shard ``qr_local`` with the all-gathered
         ``wq_b_full`` (no q ``all_to_all``) and applies ``wo_a`` for every
         ``o_group`` on the shard, so the return ``all_to_all`` carries
         ``[T/tp, groups, o_lora_rank]`` instead of ``[T/tp, heads, head_dim]``.
-        Otherwise it runs the head-sharded path with the
+        When ``wo_b_full`` is supplied on SP-sharded layers, each rank contracts
+        its ``[T/tp, tp * o_lora_rank]`` projection directly with ``wo_b_full``,
+        eliminating both the return ``all_to_all`` and the post-attention
+        ``sp_reduce_scatter``. Otherwise it runs the head-sharded path with the
         local ``wq_b``/``wo_a``. Per token, head and group both paths are the
         same quantized matmul, RoPE, attention and ``wo_a`` math as the unfused
         `_prepare_tpu` + ``_o_proj`` sequence.
@@ -1790,6 +1798,7 @@ def initialize_paged_attention():
                 f"TPU_DEEPSEEK_V41_KV_SHARD requires token-parallel fp8_attention_qo "
                 f"(tokens={tokens}, tp_size={tp_size})"
             )
+        use_local_wob = wo_b_full is not None and wo_b_full_scale is not None
         if use_local:
             pad_rows = -tokens_local % 8
 
@@ -1811,6 +1820,7 @@ def initialize_paged_attention():
                 w,
                 ws,
                 ok,
+                *wob_args,
             ):
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
@@ -1852,19 +1862,15 @@ def initialize_paged_attention():
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
                 )
                 projected = _o_proj_jax(out_tok, pos_tok, cs, w, ws, head_dim=head_dim)
+                if wob_args:
+                    return _quantized_matmul_jax(projected, wob_args[0], wob_args[1])
                 projected = projected.reshape(tokens_local, tp_size, -1)
                 gathered = jax.lax.all_to_all(
                     projected, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
                 )
                 return gathered.reshape(tokens, -1)
 
-            out = jax.shard_map(
-                _local_body,
-                mesh=tp_mesh,
-                in_specs=(P(),) * 17,
-                out_specs=out_spec,
-                check_vma=False,
-            )(
+            local_args = (
                 qr_local,
                 wq_b_full,
                 wq_b_full_scale,
@@ -1882,7 +1888,14 @@ def initialize_paged_attention():
                 wo_a_full,
                 wo_a_full_scale,
                 valid,
-            )
+            ) + ((wo_b_full, wo_b_full_scale) if use_local_wob else ())
+            out = jax.shard_map(
+                _local_body,
+                mesh=tp_mesh,
+                in_specs=(P(),) * len(local_args),
+                out_specs=out_spec,
+                check_vma=False,
+            )(*local_args)
             return (
                 _unpermute_owner_tokens_jax(out, owner_inv)
                 if owner_inv is not None
@@ -1890,7 +1903,23 @@ def initialize_paged_attention():
             )
 
         def _sharded_body(
-            q_in, wq, wqs, pos, cs, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, w, ws, ok
+            q_in,
+            wq,
+            wqs,
+            pos,
+            cs,
+            s_p,
+            m_p,
+            r_p,
+            s_r,
+            m_r,
+            pgs,
+            q_loc,
+            snk,
+            w,
+            ws,
+            ok,
+            *wob_args,
         ):
             if tp_size > 1 and q_in.shape[0] < tokens:
                 q_in = jax.lax.all_gather(q_in, axis_name="tp", axis=0, tiled=True)[
@@ -1902,15 +1931,19 @@ def initialize_paged_attention():
                 q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **attn_kwargs
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
-            return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
+            projected = _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
+            if not wob_args:
+                return projected
+            out_wob = _quantized_matmul_jax(projected, wob_args[0], wob_args[1])
+            pad_tok = tokens_local * tp_size - tokens
+            if pad_tok > 0:
+                out_wob = jnp.pad(out_wob, ((0, pad_tok), (0, 0)))
+            return jax.lax.psum_scatter(
+                out_wob, axis_name="tp", scatter_dimension=0, tiled=True
+            )
 
-        return jax.shard_map(
-            _sharded_body,
-            mesh=tp_mesh,
-            in_specs=(P(),) * 16,
-            out_specs=out_spec,
-            check_vma=False,
-        )(
+        sharded_wob = wo_b is not None and wo_b_scale is not None
+        sharded_args = (
             qr,
             wq_b,
             wq_b_scale,
@@ -1927,17 +1960,29 @@ def initialize_paged_attention():
             wo_a,
             wo_a_scale,
             valid,
-        )
+        ) + ((wo_b, wo_b_scale) if sharded_wob else ())
+        return jax.shard_map(
+            _sharded_body,
+            mesh=tp_mesh,
+            in_specs=(P(),) * len(sharded_args),
+            out_specs=out_spec,
+            check_vma=False,
+        )(*sharded_args)
 
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 23 + (None,) * 7,
+        input_partition_specs=(P(),) * 23 + (None,) * 7 + (P(),) * 6,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
+    # With wo_b_full (args[33]): [T_local, hidden_size], qr_local is args[0].
     _fp8_attention_qo_op.register_fake(
-        lambda qr, *args: qr.new_empty((args[5].shape[0], args[17].shape[-1]))
+        lambda qr, *args: qr.new_empty(
+            (args[0].shape[0], args[33].shape[-1])
+            if len(args) > 33 and args[33] is not None
+            else (args[5].shape[0], args[17].shape[-1])
+        )
     )
 
     def fp8_attention_qo_2bank(
@@ -1976,6 +2021,10 @@ def initialize_paged_attention():
         fused_swa: bool = False,
         owner_perm: jax.Array | None = None,
         owner_inv: jax.Array | None = None,
+        wo_b: jax.Array | None = None,
+        wo_b_scale: jax.Array | None = None,
+        wo_b_full: jax.Array | None = None,
+        wo_b_full_scale: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -2010,17 +2059,26 @@ def initialize_paged_attention():
             fused_swa,
             owner_perm,
             owner_inv,
+            wo_b,
+            wo_b_scale,
+            wo_b_full,
+            wo_b_full_scale,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 26 + (None,) * 7,
+        input_partition_specs=(P(),) * 26 + (None,) * 7 + (P(),) * 6,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
+    # With wo_b_full (args[36]): [T_local, hidden_size], qr_local is args[0].
     _fp8_attention_qo_2bank_op.register_fake(
-        lambda qr, *args: qr.new_empty((args[5].shape[0], args[20].shape[-1]))
+        lambda qr, *args: qr.new_empty(
+            (args[0].shape[0], args[36].shape[-1])
+            if len(args) > 36 and args[36] is not None
+            else (args[5].shape[0], args[20].shape[-1])
+        )
     )
 
 
@@ -2086,8 +2144,12 @@ def sparse_fp8_attention_qo(
     owner_perm=None,
     owner_inv=None,
     main_records_segmented=False,
+    wo_b=None,
+    wo_b_scale=None,
+    wo_b_full=None,
+    wo_b_full_scale=None,
 ):
-    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``.
+    """`fp8_attention_qo` entry: ``qr`` -> ``wo_b`` input ``[T, R]`` or ``[T/tp, H]``.
 
     ``replicated_qr``: ``qr_local`` is the TP-replicated full ``qr`` (decoder
     layers at decode) and the op slices each rank's token shard itself.
@@ -2130,6 +2192,20 @@ def sparse_fp8_attention_qo(
         replicated_qr,
         fused_swa,
     )
+    if (
+        wo_b is not None
+        and wo_b_scale is not None
+        and wo_b_full is not None
+        and wo_b_full_scale is not None
+    ):
+        tail_args = tail_args + (
+            None,
+            None,
+            wo_b,
+            wo_b_scale.reshape(-1),
+            wo_b_full,
+            wo_b_full_scale.reshape(-1),
+        )
     if _has_hi_bank(main):
         assert (
             _fp8_attention_qo_2bank_op is not None
@@ -2900,6 +2976,32 @@ def paged_indexer_jax(
     if not candidate_filter or candidates.shape[1] * block_size >= width:
         return full_context(None)
 
+    blocks = (width + block_size - 1) // block_size
+    tokens = q.shape[0]
+    raw_ids = jnp.where((candidates >= 0) & (candidates < blocks), candidates, blocks)
+    segment = math.gcd(block_size, page_records) if page_records else None
+    dim = q.shape[-1]
+    use_segment_scores = (
+        segment is not None
+        and 512 % segment == 0
+        and (segment * dim // 2) % ROW_WORDS == 0
+        and dim == index_word_scores.DIM
+        and q.dtype == jnp.bfloat16
+    )
+    group_tokens = 6
+    groups = tokens // group_tokens
+    can_group = (
+        jnp.all(
+            requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
+        )
+        & jnp.all(
+            raw_ids.reshape(groups, group_tokens, -1)
+            == raw_ids[::group_tokens, None, :]
+        )
+        if (tokens >= group_tokens and tokens % group_tokens == 0)
+        else None
+    )
+
     def candidate_context(_):
         # Sort before expanding so equal-score ties retain the full-context
         # top_k's logical ordering. Duplicate and invalid blocks cannot select
@@ -2907,21 +3009,7 @@ def paged_indexer_jax(
         # In speculative decode (6 verify tokens per request), all 6 tokens of
         # a request share the same published candidate blocks from L20, so sort
         # and gather key segments once per 6-token group (`group_tokens = 6`).
-        blocks = (width + block_size - 1) // block_size
-        tokens = q.shape[0]
-        raw_ids = jnp.where(
-            (candidates >= 0) & (candidates < blocks), candidates, blocks
-        )
-        can_group = None
-        if tokens >= 6 and tokens % 6 == 0:
-            group_tokens = 6
-            groups = tokens // group_tokens
-            can_group = jnp.all(
-                requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
-            ) & jnp.all(
-                raw_ids.reshape(groups, group_tokens, -1)
-                == raw_ids[::group_tokens, None, :]
-            )
+        if can_group is not None:
             ids = jax.lax.cond(
                 can_group,
                 lambda _: jnp.repeat(
@@ -2949,15 +3037,7 @@ def paged_indexer_jax(
         # zero-length padding rows do not trigger key reads.
         compact_lengths = jnp.where(lengths > 0, logical.shape[1], 0)
         # Candidate blocks are aligned runs of a page's contiguous records.
-        segment = math.gcd(block_size, page_records) if page_records else None
-        dim = q.shape[-1]
-        if (
-            segment is not None
-            and 512 % segment == 0
-            and (segment * dim // 2) % ROW_WORDS == 0
-            and dim == index_word_scores.DIM
-            and q.dtype == jnp.bfloat16
-        ):
+        if use_segment_scores:
             per_block = block_size // segment
 
             def _score_segments(ids_in, unique_valid_in, req_in, len_in):
@@ -3116,9 +3196,8 @@ def paged_indexer_jax(
 
     # Preserve the reference's batch-wide short-context bypass, and use the
     # shared-key-tile full_context path whenever the active requests' total
-    # key reads are at most the per-token candidate key reads in prefill
-    # (q.shape[0] > records.shape[0], where all tokens of a request share one
-    # key tile in full_context).
+    # key reads are at most the candidate key reads (per 6-token group when
+    # grouped segment scoring applies, else per token).
     longest = lengths.max() if batch_max is None else batch_max.max()
     if q.shape[0] > records.shape[0]:
         row_lengths = (
@@ -3126,7 +3205,16 @@ def paged_indexer_jax(
             .at[requests]
             .max(jnp.maximum(lengths, 0))
         )
-        cand_keys = jnp.sum(lengths > 0) * (candidates.shape[1] * block_size)
+        active_units = (
+            jnp.where(
+                can_group,
+                jnp.sum(lengths.reshape(groups, group_tokens).max(-1) > 0),
+                jnp.sum(lengths > 0),
+            )
+            if (can_group is not None and use_segment_scores)
+            else jnp.sum(lengths > 0)
+        )
+        cand_keys = active_units * (candidates.shape[1] * block_size)
         use_full_context = (longest <= topk) | (row_lengths.sum() <= cand_keys)
     else:
         use_full_context = longest <= topk

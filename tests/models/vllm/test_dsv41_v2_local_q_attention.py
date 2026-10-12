@@ -129,6 +129,30 @@ class TestInitLocalQWeights:
         # Non-persistent buffers check
         assert "_wq_b_full" not in attn.state_dict()
         assert "_wo_a_full" not in attn.state_dict()
+        assert attn._local_wo_b is False
+
+    def test_gather_wo_b_full_on_sp_sharded_layer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        attn = _stub_attn(monkeypatch, groups=2)
+        attn._sp_sharded_input = True
+        gen = torch.Generator().manual_seed(99)
+        wob = torch.randn(8, 64, generator=gen).to(torch.float8_e4m3fn)
+        attn.wo_b = SimpleNamespace(
+            weight=wob, weight_scale=torch.rand(64, generator=gen)
+        )
+        attn.gemm_rs = False
+        attn._init_local_q_weights()
+
+        assert attn._local_q_attn is True
+        assert attn._local_wo_b is True
+        assert attn.gemm_rs is True
+        assert hasattr(attn, "_wo_b_full")
+        assert hasattr(attn, "_wo_b_full_scale")
+        assert attn._wo_b_full.dtype == torch.float8_e4m3fn
+        assert attn._wo_b_full.shape == (16, 64)
+        assert attn._wo_b_full_scale.shape == (64,)
+        assert "_wo_b_full" not in attn.state_dict()
 
     @pytest.mark.parametrize(
         "kwargs",
@@ -287,6 +311,13 @@ class TestAttentionForwardLocalQ:
 
         out = attn.forward(torch.zeros(tokens, dtype=torch.long), torch.zeros(2, 8))
         assert torch.equal(out, projected_tensor * 2)
+
+        # When _local_wo_b is True, projected is already wo_b's output [T_local, H]
+        attn._local_wo_b = True
+        out_local = attn.forward(
+            torch.zeros(tokens, dtype=torch.long), torch.zeros(2, 8)
+        )
+        assert out_local is projected_tensor
 
     def test_forward_sp_sharded_with_indexer_and_kv_score(
         self, monkeypatch: pytest.MonkeyPatch
@@ -453,6 +484,7 @@ class TestPrepareTpuLocalQ:
 
         def mock_qo(*args, **kwargs):
             called_qo["args"] = args
+            called_qo["kwargs"] = kwargs
             return torch.full((4, 1024), 9.0)
 
         monkeypatch.setattr(v2_attn, "sparse_fp8_attention_qo", mock_qo)
@@ -482,6 +514,31 @@ class TestPrepareTpuLocalQ:
         # Arg 0 is qr, Arg 1 is qr_local
         assert called_qo["args"][0] is qr
         assert called_qo["args"][1] is qr_local
+        assert "wo_b_full" not in called_qo["kwargs"]
+
+        # With _local_wo_b = True (SP-sharded layer with wo_b), wob_kwargs are forwarded
+        attn._sp_sharded_input = True
+        attn.wo_b = SimpleNamespace(
+            weight=torch.zeros(8, 32, dtype=torch.float8_e4m3fn),
+            weight_scale=torch.ones(32),
+        )
+        attn._init_local_q_weights()
+        assert attn._local_wo_b is True
+        res_wob = v2_attn.DeepseekV41Attention._prepare_tpu(
+            attn,
+            hidden_states=None,
+            qr=qr,
+            kv=kv,
+            qr_scale=None,
+            kv_score=None,
+            index_weights=None,
+            positions=positions,
+            output=output,
+            qr_local=qr_local,
+        )
+        assert res_wob is not None
+        assert called_qo["kwargs"]["wo_b"] is attn.wo_b.weight
+        assert called_qo["kwargs"]["wo_b_full"] is attn._wo_b_full
 
     def test_fused_qo_false_falls_back_to_unfused_attention(
         self, monkeypatch: pytest.MonkeyPatch
@@ -704,9 +761,13 @@ class TestAttentionKernelsLocalQ:
             # page_size passed is main.raw.shape[0] = 8 (index 24)
             assert args1[24] == 8
 
-            # Branch 2: pages is not None
+            # Branch 2: pages is not None + wo_b_full supplied
             pages_tensor = torch.zeros((4, 2), dtype=torch.int32)
             starts_tensor = torch.zeros((4,), dtype=torch.int32)
+            wo_b_t = torch.zeros(512, 2048)
+            wo_b_s = torch.zeros(1, 2048)
+            wo_b_full_t = torch.zeros(1024, 2048)
+            wo_b_full_s = torch.zeros(1, 2048)
             res2 = attention_kernels.sparse_fp8_attention_qo(
                 qr,
                 qr_local,
@@ -734,11 +795,17 @@ class TestAttentionKernelsLocalQ:
                 16,
                 False,
                 128,
+                wo_b=wo_b_t,
+                wo_b_scale=wo_b_s,
+                wo_b_full=wo_b_full_t,
+                wo_b_full_scale=wo_b_full_s,
             )
             assert res2 == "op_result"
             args2 = mock_op.call_args[0]
             # page_size passed is main.shape[1] = 64 (index 24)
             assert args2[24] == 64
+            assert len(args2) == 36
+            assert args2[34] is wo_b_full_t
         finally:
             attention_kernels._fp8_attention_qo_op = saved_op
 
@@ -755,12 +822,15 @@ class TestAttentionKernelsLocalQ:
             attention_kernels._attention_op = None
             attention_kernels._fp8_attention_op = None
             attention_kernels._fp8_attention_qo_op = None
+            attention_kernels._fp8_attention_qo_2bank_op = None
             attention_kernels.initialize_paged_attention()
 
             with FakeTensorMode():
                 qr = torch.empty(256, 1280)
                 qr_local = torch.empty(128, 1280)
                 wo_a = torch.empty(512, 1024)
+                wo_b = torch.empty(512, 5120)
+                wo_b_full = torch.empty(1024, 5120)
                 tensors = [torch.empty(1) for _ in range(21)]
                 tensors[4] = torch.empty(256)  # positions is arg 6 (args[5])
                 tensors[16] = wo_a  # wo_a is arg 18 in full args list
@@ -769,6 +839,54 @@ class TestAttentionKernelsLocalQ:
                     qr, qr_local, *tensors, 0.125, 64, None, True, 128
                 )
                 assert out.shape == (256, 1024)
+
+                out_wob = attention_kernels._fp8_attention_qo_op(
+                    qr,
+                    qr_local,
+                    *tensors,
+                    0.125,
+                    64,
+                    None,
+                    True,
+                    128,
+                    False,
+                    False,
+                    None,
+                    None,
+                    wo_b,
+                    torch.empty(5120),
+                    wo_b_full,
+                    torch.empty(5120),
+                )
+                assert out_wob.shape == (128, 5120)
+
+                tensors_2b = [torch.empty(1) for _ in range(24)]
+                tensors_2b[4] = torch.empty(256)  # positions is args[5]
+                tensors_2b[19] = wo_a  # wo_a is args[20]
+                out_2b = attention_kernels._fp8_attention_qo_2bank_op(
+                    qr, qr_local, *tensors_2b, 0.125, 64, None, True, 128
+                )
+                assert out_2b.shape == (256, 1024)
+
+                out_2b_wob = attention_kernels._fp8_attention_qo_2bank_op(
+                    qr,
+                    qr_local,
+                    *tensors_2b,
+                    0.125,
+                    64,
+                    None,
+                    True,
+                    128,
+                    False,
+                    False,
+                    None,
+                    None,
+                    wo_b,
+                    torch.empty(5120),
+                    wo_b_full,
+                    torch.empty(5120),
+                )
+                assert out_2b_wob.shape == (128, 5120)
 
     def test_fp8_attention_qo_inner_bodies_token_parallel_and_sharded(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
@@ -797,9 +915,13 @@ class TestAttentionKernelsLocalQ:
                     side_effect=lambda x, **kwargs: jnp.concatenate([x, x], axis=0),
                 ),
                 mock.patch(
+                    "jax.lax.psum_scatter",
+                    side_effect=lambda x, **kwargs: x[: x.shape[0] // 2],
+                ),
+                mock.patch(
                     "vllm_torchtpu.layers.adapter.linear_common._quantized_matmul_jax",
                     side_effect=lambda q_in, w, ws: jnp.zeros(
-                        (q_in.shape[0], 512), dtype=jnp.float32
+                        (q_in.shape[0], w.shape[-1]), dtype=jnp.float32
                     ),
                 ),
                 mock.patch(
@@ -855,6 +977,24 @@ class TestAttentionKernelsLocalQ:
                 res_local = fn(*args_28)
                 assert res_local.shape == (256, 512)
 
+                # _local_body with wo_b_full -> [tokens_local, hidden_size]
+                wo_b = jnp.zeros((512, 5120))
+                wo_b_scale = jnp.zeros((5120,))
+                wo_b_full = jnp.zeros((1024, 5120))
+                wo_b_full_scale = jnp.zeros((5120,))
+                res_local_wob = fn(
+                    *args_28,
+                    False,
+                    False,
+                    None,
+                    None,
+                    wo_b,
+                    wo_b_scale,
+                    wo_b_full,
+                    wo_b_full_scale,
+                )
+                assert res_local_wob.shape == (128, 5120)
+
                 # 2. Condition False -> _sharded_body:
                 # E.g. tokens = 128 (< 128 * tp_size=256), tokens_local = 64
                 qr_small = jnp.zeros((128, 1280), dtype=jnp.bfloat16)
@@ -893,3 +1033,37 @@ class TestAttentionKernelsLocalQ:
                 assert res_sharded.shape == (128, 1024)
                 res_sharded_full = fn(qr_small, *args_small[1:])
                 assert res_sharded_full.shape == (128, 1024)
+
+                # _sharded_body with wo_b: pad_tok == 0 (tokens=128, tokens_local=64)
+                res_sharded_wob_nopad = fn(
+                    *args_small,
+                    False,
+                    False,
+                    None,
+                    None,
+                    wo_b,
+                    wo_b_scale,
+                    wo_b_full,
+                    wo_b_full_scale,
+                )
+                assert res_sharded_wob_nopad.shape == (64, 5120)
+
+                # _sharded_body with wo_b: pad_tok > 0 (tokens=120, tokens_local=64)
+                args_small_pad = list(args_small)
+                args_small_pad[6] = jnp.zeros((120,))
+                args_small_pad[7] = jnp.zeros((120, 64))
+                args_small_pad[11] = jnp.zeros((120, 64), dtype=jnp.int32)
+                args_small_pad[12] = jnp.zeros((120, 128), dtype=jnp.int32)
+                args_small_pad[22] = jnp.zeros((120,), dtype=jnp.int32)
+                res_sharded_wob_pad = fn(
+                    *args_small_pad,
+                    False,
+                    False,
+                    None,
+                    None,
+                    wo_b,
+                    wo_b_scale,
+                    wo_b_full,
+                    wo_b_full_scale,
+                )
+                assert res_sharded_wob_pad.shape == (64, 5120)

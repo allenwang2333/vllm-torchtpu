@@ -740,6 +740,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _sp_sharded_input = False
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
+    # True when `_init_local_q_weights` also gathered `wo_b` for SP-sharded layers.
+    _local_wo_b = False
     # True when that path takes the TP-replicated full ``qr`` and slices each
     # rank's token shard itself (`TPU_DEEPSEEK_V41_DECODE_LOCAL_Q`).
     _replicated_local_q = False
@@ -889,6 +891,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if qr_local is not None:
             projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
             if projected is not None:
+                if getattr(self, "_local_wo_b", False):
+                    return projected
                 # The fused q/attention/wo_a op already produced wo_b's input.
                 return _value(self.wo_b(projected))
         else:
@@ -2045,6 +2049,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             )
             if fused_qo:
+                wob_kwargs = (
+                    {
+                        "wo_b": self.wo_b.weight,
+                        "wo_b_scale": self.wo_b.weight_scale,
+                        "wo_b_full": self._wo_b_full,
+                        "wo_b_full_scale": self._wo_b_full_scale,
+                    }
+                    if getattr(self, "_local_wo_b", False)
+                    else {}
+                )
                 return sparse_fp8_attention_qo(
                     qr,
                     qr_local,
@@ -2075,6 +2089,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     replicated_qr=self._replicated_local_q,
                     fused_swa=fused_swa,
                     **owner_kwargs,
+                    **wob_kwargs,
                 )
             assert q is not None
             if self._fp8_kv and self.compress_ratio:
@@ -2144,7 +2159,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         return None
 
     def _init_local_q_weights(self):
-        """All-gather ``wq_b`` and ``wo_a`` for the token-local q path.
+        """All-gather ``wq_b``, ``wo_a`` (and ``wo_b`` on SP layers) for local q.
 
         Column ``r`` blocks of the gathered weights are rank ``r``'s shards, the
         same rank-major head/group order the token-parallel ``all_to_all``
@@ -2195,10 +2210,32 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 wo_scale.reshape(-1).contiguous(), dim=0
             ),
         }
+        wob = (
+            getattr(self, "wo_b", None) if sharded and self._sp_sharded_input else None
+        )
+        wob_weight = getattr(wob, "weight", None)
+        wob_scale = getattr(wob, "weight_scale", None)
+        local_wo_b = False
+        if (
+            wob_weight is not None
+            and wob_scale is not None
+            and wob_scale.ndim == 1
+            and not getattr(wob, KEEP_VLLM_LAYOUT_ATTR, False)
+        ):
+            wob_u8 = wob_weight.contiguous().view(torch.uint8)
+            buffers["_wo_b_full"] = (
+                tensor_model_parallel_all_gather(wob_u8, dim=0)
+                .view(wob_weight.dtype)
+                .contiguous()
+            )
+            buffers["_wo_b_full_scale"] = wob_scale.contiguous()
+            local_wo_b = True
+            self.gemm_rs = True
         for name, value in buffers.items():
             self.register_buffer(name, value, persistent=False)
         self._local_q_attn = True
         self._replicated_local_q = replicated
+        self._local_wo_b = local_wo_b
 
     def _select_paged_indices(
         self,
