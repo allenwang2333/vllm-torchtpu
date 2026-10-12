@@ -26,15 +26,17 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
     def aux_partition_sizes(
         num_blocks: int, max_num_reqs: int | None = None
     ) -> tuple[int, int]:
-        """Tail-block counts reserved for compressor state and SWA caches."""
-        if num_blocks >= 4096:
-            num_state = min(1152, max(16, num_blocks // 4))
-            num_swa = min(2816, max(32, (num_blocks * 7) // 16))
-            return num_state, num_swa
+        """Low-end block counts reserved for compressor state and SWA caches."""
         if num_blocks >= 256:
-            return max(4, min(64, num_blocks // 32)), max(
-                8, min(128, (num_blocks * 3) // 16)
+            num_state = min(
+                1152 if num_blocks >= 16384 else 160, max(16, num_blocks // 32)
             )
+            num_swa = (
+                min(2816 if num_blocks >= 16384 else 1024, max(32, (num_blocks * 2) // 9))
+                if num_blocks >= 4096
+                else min(352, max(32, (num_blocks * 3) // 16))
+            )
+            return num_state, num_swa
         return 0, 0
 
     def _initialize_ds_v4_kv_cache(
@@ -76,18 +78,11 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             dtype: torch.dtype = torch.uint8,
             scale_idx: tuple | None = None,
         ) -> torch.Tensor:
-            if scale_idx is not None and main_end > 1:
-                import gc
-
-                cpu_buf = torch.zeros(shape, dtype=dtype)
-                cpu_buf[(slice(1, main_end), *scale_idx)] = (
+            cache = torch.zeros(shape, dtype=dtype, device=runner.device)
+            if scale_idx is not None and num_blocks > 1 + num_state_aux:
+                cache[(slice(1 + num_state_aux, num_blocks), *scale_idx)] = (
                     (0x7F << 24) if dtype == torch.int32 else 0x7F
-                )  # e8m0 = 1.0
-                cache = cpu_buf.to(runner.device)
-                del cpu_buf
-                gc.collect()
-            else:
-                cache = torch.zeros(shape, dtype=dtype, device=runner.device)
+                )  # e8m0 = 1.0 on swa+main blocks; keep state [1..1+num_state) 0.0
             cache._main_end = main_end
             synchronize_tensors([cache])
             logger.debug(
@@ -130,6 +125,7 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         csa_nope_hosts = [h for h in csa_nope_hosts if h.shape[1] == min_host_page_size]
 
         swa_overflow_shape = tuple(csa_nope_hosts[0].shape)
+        swa_rows = csa_nope_hosts[0].shape[1]
         if swa_layer_groups and swa_layer_groups[0]:
             swa_rows = per_layer_spec(swa_layer_groups[0][0]).block_size * 2
             swa_overflow_shape = (num_blocks, swa_rows, csa_cache_layout.ROW_WORDS)
@@ -145,6 +141,7 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                         alloc_shape,
                         f"deepseek_v41_flash_overflow.{len(hosts)}",
                         csa_nope_hosts[0].dtype,
+                        (slice(None), slice(64, 128)),
                     )
                 )
             return hosts[position]

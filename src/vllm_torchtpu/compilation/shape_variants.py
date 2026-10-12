@@ -180,6 +180,7 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
 
 def _placeholder_keys(graph: fx.GraphModule) -> tuple:
     keys = []
+    sym_idx = 0
     for node in graph.graph.nodes:
         if node.op != "placeholder":
             continue
@@ -187,7 +188,8 @@ def _placeholder_keys(graph: fx.GraphModule) -> tuple:
         if isinstance(value, torch.Tensor):
             keys.append((str(node.target), str(value.dtype), int(value.ndim)))
         else:
-            keys.append((str(node.target), type(value).__name__, -1))
+            keys.append((f"sym_{type(value).__name__}_{sym_idx}", type(value).__name__, -1))
+            sym_idx += 1
     return tuple(keys)
 
 
@@ -235,6 +237,15 @@ class BucketExecutables:
             )
             orig_runnable = runnable
             return lambda *args: orig_runnable(*(args[i] for i in perm))
+        if len(keys) == len(caller_keys) and [(k[1], k[2]) for k in keys] == [
+            (k[1], k[2]) for k in caller_keys
+        ]:
+            logger.info(
+                "[shape-variants] %s handing over matching %d-arg positional signature across traces",
+                key,
+                len(keys),
+            )
+            return runnable
         logger.info(
             "[shape-variants] %s live placeholder set differs across traces (%d vs %d); compiling natively for active trace",
             key,

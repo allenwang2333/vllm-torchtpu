@@ -2839,9 +2839,9 @@ class TPUModelRunner(GPUModelRunner):
                 positions_np >= self.input_batch.num_prompt_tokens[req_indices]
             )
             if (
-                self.speculative_config is not None
+                False
+                and self.speculative_config is not None
                 and dec_mask.any()
-                and os.environ.get("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1") != "1"
             ):
                 known[dec_mask] = False
                 if known.any():
@@ -5178,7 +5178,6 @@ class TPUModelRunner(GPUModelRunner):
                 next_tokens_ready_event = None
                 if (
                     spec_num_rejected is not None
-                    and os.environ.get("VLLM_DSV41_ENGRAM_H2D_PREFIX", "1") == "1"
                     and getattr(getattr(self.model, "model", None), "engram_hash", None)
                     is not None
                 ):

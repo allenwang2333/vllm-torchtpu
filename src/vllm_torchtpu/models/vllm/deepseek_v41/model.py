@@ -1551,7 +1551,41 @@ class DeepseekV41Model(nn.Module):
             if engram_hashes is not None:
                 self._engram_buf_dirty = True
             elif buf_1d is not None:
-                if getattr(self, "_engram_buf_dirty", False):
+                all_attn_metadata = get_forward_context().attn_metadata
+                if (
+                    isinstance(all_attn_metadata, dict)
+                    and self.engram_hash.ensure_cache()
+                    and input_ids is not None
+                ):
+                    swa_meta = all_attn_metadata[
+                        self.engram_hash.swa_cache_module.prefix
+                    ]
+                    hashes_raw = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_meta.query_start_loc,
+                        swa_meta.block_tables,
+                        swa_meta.request_distribution,
+                    )
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_token_shard_ok(num_tokens, tp_size):
+                        stage_ref = self.full_stage or self.encoder_stage
+                        assert stage_ref is not None
+                        hashes_raw = tp_shard_slice(
+                            hashes_raw,
+                            tp_size,
+                            get_tensor_model_parallel_rank(),
+                            stage_ref.tp_rank_idx,
+                        )
+                    flat = torch.ops.tpu.engram_cpu_lookup_all(
+                        hashes_raw,
+                        self._engram_table_ids,
+                        self._engram_packed_dim,
+                    )
+                    n_rows = int(hashes_raw.shape[0])
+                    buf_1d[:n_rows].copy_(flat.view(n_rows, -1))
+                    self._engram_buf_dirty = True
+                elif getattr(self, "_engram_buf_dirty", False):
                     buf_1d.zero_()
                     self._engram_buf_dirty = False
                 engram_hashes = buf_1d

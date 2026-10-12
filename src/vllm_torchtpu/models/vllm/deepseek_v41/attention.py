@@ -163,7 +163,7 @@ def _o_proj_wob_jax(
             wo_b_s,
             head_dim=head_dim,
         )
-    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim in (1, 4) and x.shape[0] <= 384:
+    if int(x.shape[0]) <= 384 and x.shape[1] == 128 and wo_b_s.ndim in (1, 4):
         return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
             x,
             positions,
@@ -2439,22 +2439,22 @@ class VllmDeepseekV41MLAAttention(
             tail_operands += (
                 dummy_main if main_cache_rope is None else main_cache_rope,
             )
+            local_tokens = int(num_tokens)
             if (
                 _CSA_UNION
-                and not isinstance(num_tokens, torch.SymInt)
                 and main_cache_kv.shape[0] > 0
                 and topk_indices is not None
-                and topk_indices.shape[0] == num_tokens
-                and topk_indices.shape[1] % 128 == 0
+                and int(topk_indices.shape[0]) == local_tokens
+                and int(topk_indices.shape[1]) % 128 == 0
             ):
                 max_num_seqs = (
                     int(main_q_loc.shape[0]) - 1
                     if main_q_loc is not None
-                    else num_tokens
+                    else local_tokens
                 )
                 b_q, m_union = (
                     resolve_csa_union_params(
-                        num_tokens,
+                        local_tokens,
                         int(topk_indices.shape[1]),
                         max_num_seqs,
                         ced_decoder=eff_ced_decoder,

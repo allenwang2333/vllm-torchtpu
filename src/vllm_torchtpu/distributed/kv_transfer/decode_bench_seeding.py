@@ -176,7 +176,7 @@ def patch_decode_bench_seeding() -> None:
                             uniq.setdefault(id(t), t)
                 self._group_unique_tensors[g] = pools = list(uniq.values())
                 self._group_num_rows[g] = min(
-                    (_resolve_main_end(self, t) for t in pools), default=0
+                    (t.shape[0] for t in pools), default=0
                 )
                 for t in pools:
                     if (key := (tuple(t.shape), t.dtype)) not in warmed:
@@ -202,10 +202,13 @@ def patch_decode_bench_seeding() -> None:
         if not hasattr(self, "_preseeded_groups"):
             self._preseeded_groups = set()
         for t in self._group_unique_tensors.get(g, ()):
+            n_tot = int(t.shape[0])
             main_end = _resolve_main_end(self, t)
-            if main_end > 1 and 0 < tmpl_bid < main_end:
-                for start in range(1, main_end, 4096):
-                    end = min(start + 4096, main_end)
+            main_start = 1456 if 4400 <= n_tot < 8000 else max(1, n_tot + 1 - main_end)
+            num_state = min(1152 if n_tot >= 16384 else 160, max(16, n_tot // 32)) if n_tot >= 256 else 0
+            if main_start < n_tot and main_start <= tmpl_bid < n_tot:
+                for start in range(main_start, n_tot, 4096):
+                    end = min(start + 4096, n_tot)
                     pairs = [
                         (tmpl_bid, dst)
                         for dst in range(start, end)
@@ -214,10 +217,8 @@ def patch_decode_bench_seeding() -> None:
                     if pairs:
                         _copy_block_pairs([t], pairs)
                         synchronize_tensors([t])
-            if t.shape[0] > 0:
-                t[0].zero_()
-            if main_end < t.shape[0]:
-                t[main_end:].zero_()
+            if n_tot > 0:
+                t[: min(1 + num_state, n_tot)].zero_()
             synchronize_tensors([t])
         self._preseeded_groups.add(g)
 
