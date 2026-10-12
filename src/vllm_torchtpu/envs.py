@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_DCP_MLA_MIXED_LIVE: bool = False
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
+    TPU_MLA_DECODE_ROW_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
@@ -576,6 +577,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MIXED_LIVE_WIDTHS": lambda: os.getenv(
         "TPU_DCP_MLA_MIXED_LIVE_WIDTHS", ""
     ),
+    # DCP sparse MLA, capped path outside the live-group prep (decode): comma
+    # list of ascending row widths (multiples of 128 below TPU_DCP_MLA_TOPK_CAP);
+    # each grid step fetches and attends only the first w rows of its tokens'
+    # tiles, w the smallest width covering the batch's largest per-rank kv_len.
+    # Rows past kv_len are masked either way: same results. "" = off.
+    "TPU_MLA_DECODE_ROW_WIDTHS": lambda: os.getenv("TPU_MLA_DECODE_ROW_WIDTHS", ""),
     # With TPU_DCP_MLA_MIXED_LIVE: attention-body rewrites of the live grid
     # steps -- "1" = the bitwise-identical default set (byte-transpose NOPE
     # unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
