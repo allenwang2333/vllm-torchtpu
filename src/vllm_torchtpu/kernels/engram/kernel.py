@@ -203,20 +203,30 @@ def fused_engram(
                 @pl.when(output_block == 0)
                 def save_values():
                     values_scratch[tile, :] = projection
+                    out_ref[tile, :, :] = h_ref[tile, :, :]
 
                 @pl.when(output_block != 0)
                 def apply_gate():
                     kv = jnp.concatenate((projection, values_scratch[tile, :]), axis=-1)
                     stream = output_block - 1
-                    out_ref[tile, stream, :] = gated_residual(
-                        h_ref[tile, stream, :][:, None, :],
+                    # VMEM loads/stores cover all sublanes; select in registers.
+                    residuals = out_ref[tile, :, :]
+                    indices = jnp.full((vector_m, 1, dim), stream, jnp.int32)
+                    # TPU dynamic gather requires matching 32-bit data/indices.
+                    selected = jnp.take_along_axis(
+                        residuals.astype(jnp.float32), indices, axis=1
+                    ).astype(hidden.dtype)
+                    updated = gated_residual(
+                        selected,
                         kv,
                         q_ref[...],
                         k_ref[...],
                         mask_ref[tile, 0],
                         eps,
                         clamp_value,
-                    )[:, 0, :]
+                    )
+                    selected_stream = jnp.arange(streams)[None, :, None] == stream
+                    out_ref[tile, :, :] = jnp.where(selected_stream, updated, residuals)
 
             jax.lax.fori_loop(0, tile_m // vector_m, finish_rows, None)
 
