@@ -793,9 +793,13 @@ def forward_with_pcp(
     if pcp_meta is None:
         raise ValueError("forward_with_pcp requires attn_metadata.pcp to be set.")
 
-    q_scale = None
-    k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
-    v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
+    q_scale = k_scale = v_scale = None
+    if kv_cache_quantized_dtype:
+        k_scale_value = layer._k_scale_float
+        v_scale_value = layer._v_scale_float
+        if k_scale_value != 0.0 and v_scale_value != 0.0:
+            k_scale = k_scale_value
+            v_scale = v_scale_value
 
     page_size = (
         kv_cache.shape[4]

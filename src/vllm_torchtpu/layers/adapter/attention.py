@@ -1097,6 +1097,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_world_size=pcp_world_size,
             pcp_rank=pcp_rank,
             kv_layout=self.kv_layout,
+            use_causal_mask=self.use_causal_mask,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1274,7 +1275,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         )
         if pcp_configured:
             if (
-                envs.VLLM_TPU_PCP_LAYOUT == "zigzag"
+                envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
                 and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
             ):
                 from vllm_torchtpu.distributed.pcp import (
@@ -1284,18 +1285,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
                 self.decode_query_size = 1
                 self._pcp_streaming = False
-                _build_pcp_kernels(
-                    sliding_window=self.sliding_window,
-                    sm_scale=self.scale,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    cp_group_size=get_pcp_world_size(),
-                    cp_rank=get_pcp_rank(),
-                    use_causal_mask=self.use_causal_mask,
-                    kv_layout=self.kv_layout,
-                )
+                pcp_world_size = get_pcp_world_size()
+                pcp_rank = get_pcp_rank()
+                for is_decode in (False, True):
+                    _build_pcp_kernels(
+                        sliding_window=self.sliding_window,
+                        sm_scale=self.scale,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_scale=q_scale,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        cp_group_size=pcp_world_size,
+                        cp_rank=pcp_rank,
+                        use_causal_mask=self.use_causal_mask,
+                        kv_layout=self.kv_layout,
+                        is_decode=is_decode,
+                    )
                 return
 
             self._validate_pcp_streaming_support(skip_kv_update)
