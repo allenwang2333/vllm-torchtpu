@@ -304,7 +304,7 @@ def _causal_rows(positions, topk, rng):
     return rows
 
 
-def _dcp_run(dcp, *, candidate, fault=None, **dcp_kwargs):
+def _dcp_run(dcp, *, candidate, fault=None, big_mixed=False, **dcp_kwargs):
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
@@ -432,6 +432,22 @@ def _dcp_run(dcp, *, candidate, fault=None, **dcp_kwargs):
             32,
         )
     )
+    if big_mixed:
+        # A 2048-token mixed bucket (MTP decode of seqs 0-1 + 1020-token
+        # prefill chunks of seqs 2 and 3): the >= 2048-token programs.
+        q = [x + 4 for x in q]
+        c = 1020
+        steps.append(
+            (
+                [q[i] + j for i in range(2) for j in range(4)]
+                + list(range(q[2], q[2] + c))
+                + list(range(q[3], q[3] + c)),
+                [q[0] + 4, q[1] + 4, q[2] + c, q[3] + c],
+                [0, 4, 8, 8 + c, 8 + 2 * c],
+                [2, 4, 4],
+                2048,
+            )
+        )
     for i, (positions, seq_lens, qsl, dist, n) in enumerate(steps):
         nope, rope, out, lse = call(
             caches, positions, seq_lens, qsl, dist, n, np.random.default_rng(100 + i)
