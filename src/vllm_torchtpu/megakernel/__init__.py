@@ -14,6 +14,7 @@
 """Config-driven composable TPU Pallas megakernel library."""
 
 from vllm_torchtpu.megakernel import (
+    blocks,
     comm,
     ops,
     planner,
@@ -21,6 +22,12 @@ from vllm_torchtpu.megakernel import (
     spec,
     stream,
     vmem,
+)
+from vllm_torchtpu.megakernel.blocks import (
+    GQABlock,
+    GQAParams,
+    MoEBlock,
+    MoEParams,
 )
 from vllm_torchtpu.megakernel.comm import AllReduceRing
 from vllm_torchtpu.megakernel.spec import (
@@ -45,7 +52,11 @@ __all__ = [
     "Block",
     "DebugOptions",
     "ExecSpec",
+    "GQABlock",
+    "GQAParams",
     "LayerType",
+    "MoEBlock",
+    "MoEParams",
     "ModelSpec",
     "ScratchReq",
     "SmallField",
@@ -55,6 +66,7 @@ __all__ = [
     "Tiles",
     "TwoRing",
     "WeightDecl",
+    "blocks",
     "comm",
     "default_tiles",
     "ops",
