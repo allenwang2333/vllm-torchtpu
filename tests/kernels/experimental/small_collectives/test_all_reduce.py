@@ -107,7 +107,8 @@ def _valid_rows(mesh, per_core, n_valid):
 
     def body(x, m):
         return ar.small_all_reduce_valid_rows(
-            x, m.reshape(2), num_cores=N, axis=AXIS, tile_rows=TILE_ROWS
+            x, m.reshape(2)[:1], m.reshape(2)[1:], num_cores=N, axis=AXIS,
+            tile_rows=TILE_ROWS,
         )
 
     return run_sharded(mesh, body, per_core, meta)
