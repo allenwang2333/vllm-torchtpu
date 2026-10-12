@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
+    TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -467,6 +468,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of two (the f32 lse exchange is a latency-bound collective of a
     # few KB). Bits are moved, not converted: the merge is unchanged.
     "TPU_DCP_LSE_MERGE_A2A_PACK": env_bool("TPU_DCP_LSE_MERGE_A2A_PACK", default=False),
+    # With TPU_DCP_LSE_MERGE_A2A_PACK: send only the real tokens' rows (a
+    # ragged all-to-all sized by the step's token count) instead of every
+    # padded row of the bucket. Real rows unchanged; padding rows merge to 0.
+    "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": env_bool(
+        "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", default=False
+    ),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8

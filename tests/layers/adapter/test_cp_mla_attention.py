@@ -599,6 +599,114 @@ def test_positive_control_packed_lse_rows_from_the_wrong_rank_are_caught(
     assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
+def _ragged_stand_in(hub, calls=None, short_by=0):
+    """`cp_mla._ragged_all_to_all` over the lockstep hub: rank `d` receives
+    the first `rows` rows of every source's block `d`, zeros after."""
+
+    def exchange(x, rows, group):
+        n = int(rows.reshape(-1)[0]) - short_by
+        if calls is not None and group.rank_in_group == 0:
+            calls.append(int(rows.reshape(-1)[0]))
+        recv = group.all_to_all(x)
+        out = torch.zeros_like(recv)
+        out[:, :n] = recv[:, :n]
+        return out
+
+    return exchange
+
+
+def _merge_real_rows(outputs, lses, monkeypatch, real, calls=None, short_by=0):
+    """Every rank's packed a2a merge with TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and a
+    step of `real` real tokens (query_start_loc [0, real])."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", True, raising=False
+    )
+    world = outputs.shape[0]
+    hub = _ExchangeHub(world)
+    monkeypatch.setattr(
+        cp_mla, "_ragged_all_to_all", _ragged_stand_in(hub, calls, short_by)
+    )
+    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+    qsl = torch.tensor([0, real], dtype=torch.int32)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _A2AGroup(hub, rank), query_start_loc=qsl
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        return torch.cat(list(pool.map(run, range(world))), dim=1)
+
+
+def _merge_packed(outputs, lses, monkeypatch):
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", False, raising=False
+    )
+    return _a2a_merge_whole(outputs, lses, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "dcp_size,tokens,local_heads,vdim,real",
+    [
+        (16, 16, 4, 512, 4),  # mirror decode b1: 4 real rows of 16
+        (16, 16, 4, 512, 8),  # b2
+        (16, 16, 4, 512, 16),  # b4: every row real
+        (8, 32, 4, 512, 12),
+        (4, 16, 4, 512, 1),
+        (2, 12, 4, 64, 0),  # a step with no real token
+    ],
+)
+def test_real_rows_merge_is_bitwise_the_packed_merge_on_real_rows(
+    dcp_size, tokens, local_heads, vdim, real, monkeypatch
+):
+    """`TPU_DCP_LSE_MERGE_A2A_REAL_ROWS`: sending only the real tokens' rows
+    returns the packed merge bit for bit on every real row (hard partials:
+    `-inf`/overflowing lse, a rank owning nothing, NaN partials of weight 0),
+    and zero on the padding rows; the exchange is sized `extra + real * local`."""
+    outputs, lses = _hard_partials(
+        np.random.default_rng(37), dcp_size, tokens, local_heads, vdim
+    )
+    outputs = _nan_where_unowned(outputs, lses)
+    want = _merge_packed(outputs, lses, monkeypatch)
+    calls = []
+    got = _merge_real_rows(outputs, lses, monkeypatch, real, calls)
+    extra = -(-2 * tokens * local_heads // vdim)
+    assert calls == [extra + real * local_heads]
+    assert got.shape == want.shape and got.dtype == want.dtype
+    assert torch.equal(got[:real].view(torch.int16), want[:real].view(torch.int16))
+    assert (got[real:] == 0).all() and torch.isfinite(got.float()).all()
+
+
+def test_real_rows_merge_without_query_start_loc_keeps_every_row(monkeypatch):
+    """No query_start_loc (the drafter, eager callers): the full packed exchange."""
+    outputs, lses = _hard_partials(np.random.default_rng(41), 4, 16, 4, 512)
+    want = _merge_packed(outputs, lses, monkeypatch)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", True, raising=False
+    )
+    monkeypatch.setattr(
+        cp_mla,
+        "_ragged_all_to_all",
+        lambda *a: (_ for _ in ()).throw(AssertionError("ragged without qsl")),
+    )
+    got = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
+def test_positive_control_real_rows_short_by_one_is_caught(monkeypatch):
+    """The real-rows check must fail when the exchange drops the last real
+    row (an off-by-one in the row count)."""
+    outputs, lses = _hard_partials(np.random.default_rng(43), 16, 16, 4, 512)
+    real = 5  # the dropped row (token 4's last head) is owned by most ranks
+    want = _merge_packed(outputs, lses, monkeypatch)
+    got = _merge_real_rows(outputs, lses, monkeypatch, real, short_by=1)
+    assert not torch.equal(
+        got[:real].view(torch.int16), want[:real].view(torch.int16)
+    )
+
+
 def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
     """The reference check must fail when the merge skips the max shift."""
 
