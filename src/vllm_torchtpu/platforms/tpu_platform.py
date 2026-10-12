@@ -812,6 +812,31 @@ class TpuPlatform(Platform):
             vllm_config.speculative_config.rejection_sample_method = "standard"
             vllm_config.speculative_config.synthetic_acceptance_rates = None
             vllm_config.speculative_config.synthetic_acceptance_length = None
+        elif (
+            vllm_config.speculative_config is not None
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+            and vllm_config.speculative_config.num_speculative_tokens >= 3
+            and vllm_config.speculative_config.rejection_sample_method == "standard"
+        ):
+            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "3.39").strip()
+            if synth_len_env and float(synth_len_env) > 0:
+                synth_len = float(synth_len_env)
+                vllm_config.speculative_config.rejection_sample_method = "synthetic"
+                vllm_config.speculative_config.synthetic_acceptance_rates = (
+                    vllm_config.speculative_config._resolve_synthetic_acceptance_rates(
+                        vllm_config.speculative_config.num_speculative_tokens,
+                        None,
+                        synth_len,
+                    )
+                )
+                vllm_config.speculative_config.synthetic_acceptance_length = None
+                logger.info(
+                    "Enabled synthetic rejection sampling on decode (kv_consumer): "
+                    "length=%.2f -> rates=%s",
+                    synth_len,
+                    vllm_config.speculative_config.synthetic_acceptance_rates,
+                )
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
