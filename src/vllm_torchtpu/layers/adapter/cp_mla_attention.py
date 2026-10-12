@@ -211,12 +211,69 @@ def _merge_chunked(
     chunk `k + 1`'s gather and multiply instead of after all of them.
     """
     step = output.shape[0] // chunks
+    if _lse_gathered_once(output.shape[0]):
+        return _merge_chunked_lse_gathered(output, lse, group, chunks)
     pieces = [
         cp_lse_ag_out_rs(
             output[c * step : (c + 1) * step],
             lse[c * step : (c + 1) * step],
             group,
             rs_dtype=rs_dtype,
+        )
+        for c in range(chunks)
+    ]
+    return torch.cat(pieces, dim=0)
+
+
+def _lse_gathered_once(num_tokens: int) -> bool:
+    """Whether `TPU_DCP_MERGE_CHUNKED_LSE_AG` applies to this chunked bucket
+    (fixed at trace time; only the backbone chunks)."""
+    cap = envs.TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS
+    return bool(envs.TPU_DCP_MERGE_CHUNKED_LSE_AG) and (cap <= 0 or num_tokens <= cap)
+
+
+def _gather_lse(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
+    """`[T, H]` f32 -> `[world, T, H]`: every rank's lse rows (the gather
+    `cp_lse_ag_out_rs` runs)."""
+    return group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
+
+
+def _weighted_reduce_scatter(
+    output: torch.Tensor, lse_f32: torch.Tensor, lses: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
+    `[world, T, H]` for exactly `output`'s `T` rows."""
+    merged_lse = torch.logsumexp(lses, dim=0)
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+    weighted = output.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    return group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+
+
+def _merge_chunked_lse_gathered(
+    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+) -> torch.Tensor:
+    """`_merge_chunked` with one lse all-gather for every chunk
+    (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
+
+    The per-chunk gathers are synchronous TensorCore collectives with no data
+    edge to the earlier chunks, so the scheduler issues most of them before
+    chunk 0's weight multiply and each one's fixed cost delays the first
+    SparseCore reduce-scatter, the head of the SC-bound chain. One gather pays
+    that cost once. It only moves rows, so each chunk's rows of it are bit for
+    bit what the chunk's own gather returned, and the per-row merge arithmetic
+    is unchanged.
+    """
+    step = output.shape[0] // chunks
+    lse_f32 = lse.to(torch.float32)
+    gathered = _gather_lse(lse_f32, group)
+    pieces = [
+        _weighted_reduce_scatter(
+            output[c * step : (c + 1) * step],
+            lse_f32[c * step : (c + 1) * step],
+            gathered[:, c * step : (c + 1) * step],
+            group,
         )
         for c in range(chunks)
     ]
