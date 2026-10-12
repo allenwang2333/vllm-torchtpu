@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.request_queue import FCFSRequestQueue
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core.srpt_prefill_scheduler import SrptPrefillScheduler
@@ -125,3 +125,48 @@ def test_running_restored_when_upstream_raises():
             s.schedule()
     assert s.running == [chunk]
     assert s.max_num_running_reqs == 8
+
+
+def _with_budget(max_num_batched_tokens=128, max_running=64, draft_slots=5):
+    s = _make_scheduler(max_running=max_running)
+    s.scheduler_config = SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens)
+    s.max_num_scheduled_tokens = max_num_batched_tokens
+    spec = (
+        None
+        if draft_slots is None
+        else SimpleNamespace(max_num_new_slots_for_drafting=draft_slots)
+    )
+    s.vllm_config = SimpleNamespace(speculative_config=spec)
+    return s
+
+
+def test_uncharged_draft_slots_widen_only_the_private_input_budget():
+    s = _with_budget()
+    served = s.scheduler_config
+    s._uncharge_draft_slots()
+    # Every running request's drafting slots fit, so only the scheduled-token
+    # cap can bind: 64 requests x 5 slots + 128 tokens.
+    assert s.scheduler_config.max_num_batched_tokens == 128 + 64 * 5
+    assert s.max_num_scheduled_tokens == 128
+    assert served.max_num_batched_tokens == 128
+
+
+def test_uncharged_draft_slots_noop_without_drafting_slots():
+    for slots in (None, 0):
+        s = _with_budget(draft_slots=slots)
+        served = s.scheduler_config
+        s._uncharge_draft_slots()
+        assert s.scheduler_config is served
+
+
+@pytest.mark.parametrize("value, widened", [("1", True), ("0", False), ("", False)])
+def test_uncharged_draft_slots_follows_env(monkeypatch, value, widened):
+    monkeypatch.setenv("TPU_SCHED_UNCHARGED_DRAFT_SLOTS", value)
+    s = _with_budget()
+
+    def fake_init(self, *args, **kwargs):
+        self.policy = SchedulingPolicy.FCFS
+
+    with patch.object(AsyncScheduler, "__init__", fake_init):
+        SrptPrefillScheduler.__init__(s)
+    assert (s.scheduler_config.max_num_batched_tokens > 128) is widened

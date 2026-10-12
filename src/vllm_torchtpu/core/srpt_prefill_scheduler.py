@@ -37,16 +37,26 @@ left unused: one partial step for the long chunk against the whole long prefill
 for the short request. The running limit is lowered by the number held back so
 the step never admits past ``max_num_seqs``.
 
+With ``TPU_SCHED_UNCHARGED_DRAFT_SLOTS=1`` the step's input budget no longer
+charges each request the drafter's extra slots (K-1 per request for DSpark): the
+TPU drafter runs its own forward sized from the request count, so on TPU the
+charge only takes prefill tokens out of the target forward. The scheduled-token
+cap, and with it the largest token bucket, stays ``max_num_batched_tokens``.
+
 Select with
 ``--scheduler-cls vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler``.
 It extends ``AsyncScheduler``, so it expects ``--async-scheduling``.
 """
+
+import copy
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.request import Request
+
+from vllm_torchtpu import envs
 
 logger = init_logger("vllm." + __name__)
 
@@ -64,7 +74,30 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_steps = 0
         self._srpt_held_steps = 0
         self._srpt_held_chunks = 0
+        if envs.TPU_SCHED_UNCHARGED_DRAFT_SLOTS:
+            self._uncharge_draft_slots()
         logger.info("SrptPrefillScheduler active")
+
+    def _uncharge_draft_slots(self) -> None:
+        """Widen this scheduler's input budget by every running request's
+        drafting slots, so only the scheduled-token cap binds."""
+        spec = self.vllm_config.speculative_config
+        slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        if slots == 0:
+            return
+        config = copy.copy(self.scheduler_config)
+        input_budget = config.max_num_batched_tokens + slots * self.max_num_running_reqs
+        # A private copy: the engine's own config, and every other reader of
+        # max_num_batched_tokens, keep the served value.
+        object.__setattr__(config, "max_num_batched_tokens", input_budget)
+        self.scheduler_config = config
+        logger.info(
+            "SrptPrefillScheduler: %d drafting slots/request uncharged; input "
+            "budget %d, scheduled-token cap %d",
+            slots,
+            input_budget,
+            self.max_num_scheduled_tokens,
+        )
 
     def _waiting_remaining(self, request: Request) -> int:
         """Prompt tokens a waiting request still has to prefill, net of its
