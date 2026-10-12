@@ -253,7 +253,7 @@ def _resolve_async_spec_state(
         (unif_v0, rej_val, int(rejected.ctypes.data)),
     )
     if discard:
-        discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int32)
+        discard_idx = np.fromiter(discard, dtype=np.int32, count=len(discard))
         discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
         if discard_idx.size:
             lengths[discard_idx] = 0
@@ -419,7 +419,11 @@ def _resolve_decode_lookback_cpu(
         )
         return lookback
     np.subtract(starts_1d[:, None], offsets, out=pos)
-    token_ids_cpu = np.asarray(batch.token_ids_cpu)
+    token_ids_cpu = (
+        batch.token_ids_cpu.numpy()
+        if isinstance(batch.token_ids_cpu, torch.Tensor)
+        else np.asarray(batch.token_ids_cpu)
+    )
     max_cols = int(token_ids_cpu.shape[1])
     rows = local + start_index if start_index else local
     if (
@@ -428,13 +432,13 @@ def _resolve_decode_lookback_cpu(
     ):
         out_slice[:] = token_ids_cpu[rows, pos]
     else:
+        out_slice.fill(-1)
         np.greater_equal(pos, 0, out=valid)
         np.less(pos, max_cols, out=tmp_b)
         np.logical_and(valid, tmp_b, out=valid)
-        np.multiply(pos, valid, out=clipped)
-        out_slice[:] = token_ids_cpu[rows, clipped]
-        np.logical_not(valid, out=tmp_b)
-        np.copyto(out_slice, -1, where=tmp_b)
+        if valid.any():
+            np.multiply(pos, valid, out=clipped)
+            np.copyto(out_slice, token_ids_cpu[rows, clipped], where=valid)
     if sampled_overlay is not None:
         np.subtract(delta[:, None], offsets, out=pos)
         np.greater_equal(pos, 0, out=valid)
@@ -849,19 +853,24 @@ def gather_host_engram_hashes(
                 engram_hashes = engram_hashes.to("cpu")
             cpu_group = dp_cpu_group if engram_hashes.device.type == "cpu" else None
             if cpu_group is not None:
-                if engram_hashes.shape[0] > slot:
+                n_tokens = int(engram_hashes.shape[0])
+                if n_tokens > slot:
                     raise ValueError("Engram token count exceeds the DP token slot")
-                if engram_hashes.shape[0] < slot:
-                    pad = engram_hashes.new_full(
-                        (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
-                        DEAD_ID,
+                if n_tokens < slot:
+                    pad_spec = (0, 0) * (engram_hashes.ndim - 1) + (
+                        0,
+                        slot - n_tokens,
                     )
-                    engram_hashes = torch.cat((engram_hashes, pad))
+                    engram_hashes = torch.nn.functional.pad(
+                        engram_hashes, pad_spec, value=DEAD_ID
+                    )
+                else:
+                    engram_hashes = engram_hashes.contiguous()
                 out = engram_hashes.new_empty(
                     (dp_group.world_size * slot, *engram_hashes.shape[1:])
                 )
                 torch.distributed.all_gather_into_tensor(
-                    out, engram_hashes.contiguous(), group=cpu_group
+                    out, engram_hashes, group=cpu_group
                 )
                 return out
             if raw_slot <= 0 and gather_fn is None:
