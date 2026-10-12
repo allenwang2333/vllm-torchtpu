@@ -2220,11 +2220,10 @@ def combine_step_tokens(t_local):
 def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype):
     """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
 
-    `pos` is a scalar-prefetch table of arrival rows, already clamped into the
-    buffer; `coef` is the arrival row's scale folded with the router weight and
-    rides SMEM beside it, so a slot's weight reaches the vector unit as a
-    scalar splat. The result is [t_local, hidden] in the layer's own output
-    layout.
+    `pos` contains clamped arrival rows; `coef` folds each arrival scale with
+    the router weight. Fixed SMEM windows stream both tables alongside the
+    row pipeline, independent of the total token count. The result is
+    [t_local, hidden] in the layer's own output layout.
 
     An arrival row is [lane blocks, 128] -- one register -- while the output
     is [tokens, hidden], which is that layout transposed: a token's hidden
@@ -2238,29 +2237,56 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     gt = COMBINE_GROUP
     groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
+    metadata_rows = host.align_up(tb * topk, host.TOKEN_GATHER_DMA_ALIGNMENT)
 
     def kernel(
-        pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems
+        pos_hbm,
+        coef_hbm,
+        arr_hbm,
+        out_hbm,
+        rows_vm,
+        tile_vm,
+        out_vm,
+        pos_windows,
+        coef_windows,
+        metadata_sems,
+        row_sems,
+        out_sems,
     ):
-        def start_row(base, parity, i, k):
+        def start_metadata(step, parity):
+            for source, destination in (
+                (pos_hbm, pos_windows[parity]),
+                (coef_hbm, coef_windows[parity]),
+            ):
+                pltpu.make_async_copy(
+                    source.at[pl.ds(step * metadata_rows, metadata_rows)],
+                    destination,
+                    metadata_sems.at[parity],
+                ).start()
+
+        def wait_metadata(parity):
+            for window in (pos_windows[parity], coef_windows[parity]):
+                pltpu.make_async_copy(window, window, metadata_sems.at[parity]).wait()
+
+        def start_row(parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
             # arrival row and an in-order queue retires descriptors at a fixed
             # rate, which for a row this small is slower than the row's own
             # bytes. Both queues signal the one semaphore the step waits on,
             # which counts bytes and not descriptors.
             pltpu.make_async_copy(
-                arr_hbm.at[pos_sm[(base + i) * topk + k]],
+                arr_hbm.at[pos_windows[parity][i * topk + k]],
                 rows_vm.at[parity, k * tb + i],
                 row_sems.at[parity],
             ).start(priority=k % 2)
 
-        def reduce_token(base, parity, i):
+        def reduce_token(parity, i):
             """One token's weighted sum, in the arrival rows' own layout."""
             acc = None
             for k in range(topk):
                 term = (
                     rows_vm[parity, k * tb + i].astype(jnp.float32)
-                    * coef_sm[(base + i) * topk + k]
+                    * coef_windows[parity][i * topk + k]
                 )
                 acc = term if acc is None else acc + term
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
@@ -2271,8 +2297,6 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             # rides in slots the vector work leaves empty. The last step
             # re-starts its own rows rather than branching -- the copy is never
             # read and is drained below.
-            nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
-            base = step * tb
             npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
             pltpu.make_async_copy(
                 rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
@@ -2284,12 +2308,14 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                     out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
                 ).wait()
 
+            wait_metadata(npar)
+
             def one_chunk(chunk, carry):
                 for u in range(COMBINE_CHUNK):
                     i = chunk * COMBINE_CHUNK + u
                     for k in range(topk):
-                        start_row(nxt, npar, i, k)
-                    reduce_token(base, parity, i)
+                        start_row(npar, i, k)
+                    reduce_token(parity, i)
                 return carry
 
             lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
@@ -2300,16 +2326,20 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             pltpu.make_async_copy(
                 out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
             ).start()
+            start_metadata(jnp.minimum(step + COMBINE_PARITIES, steps - 1), parity)
 
         def step_pair(pair, carry):
             for parity in range(COMBINE_PARITIES):
                 one_step(pair * COMBINE_PARITIES + parity, parity)
             return carry
 
+        for p in range(COMBINE_PARITIES):
+            start_metadata(p, p)
         for p in range(COMBINE_LEAD):
+            wait_metadata(p)
             for i in range(tb):
                 for k in range(topk):
-                    start_row(p * tb, p, i, k)
+                    start_row(p, i, k)
         lax.fori_loop(0, steps // COMBINE_PARITIES, step_pair, jnp.int32(0))
         # The last COMBINE_LEAD steps re-start the final step's rows into the
         # buffers the loop no longer reads; drain them, and the stores.
@@ -2317,13 +2347,15 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
             pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
         for p in range(COMBINE_PARITIES):
             pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+        for p in range(COMBINE_PARITIES - COMBINE_LEAD, COMBINE_PARITIES):
+            wait_metadata(p)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[hbm],
+            num_scalar_prefetch=0,
+            in_specs=[hbm, hbm, hbm],
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM(
@@ -2331,6 +2363,15 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                 ),
                 pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
                 pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
+                tuple(
+                    pltpu.SMEM((metadata_rows,), jnp.int32)
+                    for _ in range(COMBINE_PARITIES)
+                ),
+                tuple(
+                    pltpu.SMEM((metadata_rows,), jnp.float32)
+                    for _ in range(COMBINE_PARITIES)
+                ),
+                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
                 pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
                 pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
             ),
@@ -2344,17 +2385,26 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     )
 
     def fn(arrivals, coef, pos):
-        # Both tables flatten TOKEN-major, so a token's topk entries are one
-        # contiguous SMEM run and its 2 * topk scalar reads share a single
-        # address computation. That is also the order the plan builds them in,
-        # so neither flatten is a transpose.
+        # DMA windows start on aligned HBM rows even for top-k values that
+        # don't fill a lane block. No padding is needed on aligned shapes.
         if pos.shape != (t_local, topk) or coef.shape != (t_local, topk):
             raise ValueError(
                 f"the combine takes token-major "
                 f"[{t_local}, {topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+
+        def metadata_windows(table):
+            table = table.reshape(steps, tb * topk)
+            if metadata_rows != tb * topk:
+                table = jnp.pad(table, ((0, 0), (0, metadata_rows - tb * topk)))
+            return table.reshape(-1)
+
+        return call(
+            metadata_windows(pos.astype(jnp.int32)),
+            metadata_windows(coef),
+            arrivals,
+        )
 
     return fn
 

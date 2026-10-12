@@ -489,12 +489,25 @@ def fused_ep_moe_v2(
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
+        gather_rows = (
+            U32_SUBLANE_TILE * jnp.dtype(jnp.int32).itemsize // q_l.dtype.itemsize
+        )
+        if form.quantized_activations and t_local % gather_rows == 0:
+            # Group one packed sublane tile without changing token order.
+            wire = q_l.reshape(
+                t_local // gather_rows,
+                gather_rows,
+                hidden // HIDDEN_LANE_BLOCK,
+                HIDDEN_LANE_BLOCK,
+            )
+        else:
+            wire = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
         q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
+            wire,
             ax,
             axis=0,
             tiled=True,
-        )
+        ).reshape(T, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
