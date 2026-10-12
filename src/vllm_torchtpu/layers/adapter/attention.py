@@ -2243,7 +2243,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
 
-        def sparse_mla_attention_core_tpu_dcp(
+        def _sparse_mla_attention_dcp_run(
             kv_cache_nope: jax.Array,
             kv_cache_rope: jax.Array,
             ql_nope: jax.Array,
@@ -2255,7 +2255,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
-            *rope_table: jax.Array,
+            rope_table: jax.Array | None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
@@ -2277,8 +2277,71 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                q_rope_table=rope_table[0] if rope_table else None,
+                q_rope_table=rope_table,
             )
+
+        def sparse_mla_attention_core_tpu_dcp(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                None,
+            )
+
+        core_fn = sparse_mla_attention_core_tpu_dcp
+        if q_rope:
+            # The torch op schema is inferred from the signature: no varargs
+            # or defaults, so the rope variant states its extra input.
+            def sparse_mla_attention_core_tpu_dcp_qrope(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                ql_nope: jax.Array,
+                q_pe: jax.Array,
+                kv_c_normed: jax.Array,
+                k_pe: jax.Array,
+                local_topk_indices: jax.Array,
+                seq_lens: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+                request_distribution: jax.Array,
+                rope_table: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                return _sparse_mla_attention_dcp_run(
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    ql_nope,
+                    q_pe,
+                    kv_c_normed,
+                    k_pe,
+                    local_topk_indices,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    rope_table,
+                )
+
+            core_fn = sparse_mla_attention_core_tpu_dcp_qrope
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
@@ -2290,7 +2353,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             input_specs = input_specs + (P(),)  # rope table, replicated
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
-            sparse_mla_attention_core_tpu_dcp,
+            core_fn,
             donate_argnums=(0, 1),
             mesh=mesh,
             input_partition_specs=input_specs,
