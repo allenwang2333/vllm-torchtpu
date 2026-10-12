@@ -168,17 +168,17 @@ def fold_geometry(rows, hidden, num_cores, tile_rows):
 
 
 def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
-    """Two-shot with the fold path; operands (meta int32 [2] = (n_valid,
-    rank) in SMEM, x). The full path is _twoshot's protocol."""
+    """Two-shot with the fold path; operands (n_valid int32 [1], rank int32
+    [1], both in SMEM, x). Both paths run _twoshot's protocol on per-owner chunks
+    staged by static slices (a column window at a dynamic offset is slow to
+    load), the fold path on [tile_rows, LANES] chunks of the folded tile."""
     rows, hidden = x.shape
     own = hidden // n
     k, fr = fold_geometry(rows, hidden, n, tile_rows)
-    hk = hidden // k  # folded width
-    own_q = hk // n  # = LANES: a core's chunk of the folded tile
+    hk = hidden // k  # folded width; a core's chunk of it is LANES wide
 
-    def exchange(chunk_of, rows_x, width, me, slices, gathered, sems, write_out):
-        """_twoshot's rounds on the [rows_x, width]-per-owner chunks
-        chunk_of(j), into gathered; write_out() then reads gathered."""
+    def exchange(rows_x, width, me, mine, slices, gathered, sems, write_out):
+        """_twoshot's rounds on mine[j] = owner j's [rows_x, width] chunk."""
         send1, recv1, send2, recv2 = sems
 
         def slot(buf, j):
@@ -191,14 +191,18 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                push(chunk_of(j), slot(slices, me), send1, recv1, j, axis, True)
+                push(slot(mine, j), slot(slices, me), send1, recv1, j, axis, True)
 
-        slices[me, pl.ds(0, rows_x), pl.ds(0, width)] = chunk_of(me)[...]
+        slices[pl.ds(me, 1), pl.ds(0, rows_x), pl.ds(0, width)] = mine[
+            pl.ds(me, 1), pl.ds(0, rows_x), pl.ds(0, width)
+        ]
         wait_bytes_of(slots(slices), recv1)
         acc = slices[0, pl.ds(0, rows_x), pl.ds(0, width)].astype(jnp.float32)
         for j in range(1, n):
             acc = acc + slices[j, pl.ds(0, rows_x), pl.ds(0, width)].astype(jnp.float32)
-        gathered[me, pl.ds(0, rows_x), pl.ds(0, width)] = acc.astype(gathered.dtype)
+        gathered[pl.ds(me, 1), pl.ds(0, rows_x), pl.ds(0, width)] = acc.astype(
+            gathered.dtype
+        )[None]
         for j in range(n):
 
             @pl.when(jnp.int32(j) != me)
@@ -210,9 +214,9 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
         wait_bytes_of(slots(slices), send1)
         wait_bytes_of(slots(gathered), send2)
 
-    def kernel(meta_ref, x_ref, o_ref, q, slices, gathered, *sems):
-        n_valid = meta_ref[0]
-        me = meta_ref[1]
+    def kernel(n_valid_ref, rank_ref, x_ref, o_ref, mine, slices, gathered, *sems):
+        n_valid = n_valid_ref[0]
+        me = rank_ref[0]
         barrier(n, axis, True)
 
         @pl.when(n_valid <= fr)
@@ -226,11 +230,15 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
                 if j:
                     blk = pltpu.roll(blk, j * fr, 0)
                 folded = jnp.where((row >= j * fr) & (row < (j + 1) * fr), blk, folded)
-            q[...] = folded.astype(q.dtype)
+            folded = folded.astype(x.dtype)
+            for j in range(n):
+                mine[j, pl.ds(0, tile_rows), pl.ds(0, LANES)] = folded[
+                    :, j * LANES : (j + 1) * LANES
+                ]
 
             def write_out():
                 summed = jnp.concatenate(
-                    [gathered[j, pl.ds(0, tile_rows), pl.ds(0, own_q)] for j in range(n)],
+                    [gathered[j, pl.ds(0, tile_rows), pl.ds(0, LANES)] for j in range(n)],
                     axis=1,
                 ).astype(jnp.float32)
                 for j in range(k):
@@ -243,24 +251,21 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
                         (rows - tile_rows, hidden), o_ref.dtype
                     )
 
-            exchange(
-                lambda j: q.at[:, pl.ds(j * own_q, own_q)],
-                tile_rows, own_q, me, slices, gathered, sems, write_out,
-            )
+            exchange(tile_rows, LANES, me, mine, slices, gathered, sems, write_out)
 
         @pl.when(n_valid > fr)
         def _full():
+            for j in range(n):
+                mine[j] = x_ref[:, pl.ds(j * own, own)]
+
             def write_out():
                 for j in range(n):
                     o_ref[:, pl.ds(j * own, own)] = gathered[j]
 
-            exchange(
-                lambda j: x_ref.at[:, pl.ds(j * own, own)],
-                rows, own, me, slices, gathered, sems, write_out,
-            )
+            exchange(rows, own, me, mine, slices, gathered, sems, write_out)
 
     scratch = [
-        pltpu.VMEM((tile_rows, hk), x.dtype),
+        pltpu.VMEM((n, rows, own), x.dtype),
         pltpu.VMEM((n, rows, own), x.dtype),
         pltpu.VMEM((n, rows, own), x.dtype),
         *[pltpu.SemaphoreType.DMA] * 4,
@@ -269,7 +274,7 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
 
 
 def small_all_reduce_valid_rows(
-    x, meta, *, num_cores, axis, tile_rows, collective_id=COLLECTIVE_ID
+    x, n_valid, rank, *, num_cores, axis, tile_rows, collective_id=COLLECTIVE_ID
 ):
     """The sum of ``x`` over the ``num_cores`` cores of mesh axis ``axis``,
     moving only its first n_valid rows; rows >= n_valid come out +0 when the
@@ -278,8 +283,11 @@ def small_all_reduce_valid_rows(
     Args:
       x: [rows, hidden], this core's block; hidden a multiple of
         num_cores * LANES, rows >= tile_rows, and ``fold_geometry`` not None.
-      meta: int32 [2] = (n_valid, this core's index on the axis), as data;
-        n_valid the same on every core.
+      n_valid: int32 [1], the rows [0, n_valid) that are real, as data; the
+        same on every core.
+      rank: int32 [1], this core's index on the axis, as data. (Two [1]
+        operands rather than one [2]: a 1-element SMEM operand is produced
+        in place, a stacked pair costs a copy per call.)
       tile_rows: the bf16 sublane tiling (16 on TPU v7).
     """
     rows, hidden = x.shape
@@ -289,14 +297,15 @@ def small_all_reduce_valid_rows(
             f"(tile_rows={tile_rows})"
         )
     scratch, kernel, name = _twoshot_valid_rows(x, num_cores, axis, collective_id, tile_rows)
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec()],
+        in_specs=[smem, smem, pl.BlockSpec()],
         scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
         name=name,
-    )(meta.astype(jnp.int32), x)
+    )(n_valid.astype(jnp.int32), rank.astype(jnp.int32), x)
 
 
 def small_all_reduce(
