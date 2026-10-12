@@ -6,11 +6,13 @@ from ..common import engram as common
 from ..common.engram import (
     _INVALID_SCALE,
     _UNIT_SCALE,
+    DPSharedEngramStorage,
     Engram,
     ParallelEngramEmbedding,
     _gather_engram_rows,
     _load_local_rows,
     _unpack_bytes,
+    can_share_engram_tables,
     dequant_fp8_rows,
     register_row_slice,
     upstream,
@@ -18,6 +20,7 @@ from ..common.engram import (
 from .cache import write_cache
 
 __all__ = [
+    "DPSharedEngramStorage",
     "Engram",
     "NgramHashState",
     "ParallelEngramEmbedding",
@@ -26,6 +29,7 @@ __all__ = [
     "_gather_engram_rows",
     "_load_local_rows",
     "_unpack_bytes",
+    "can_share_engram_tables",
     "dequant_fp8_rows",
     "register_row_slice",
     "upstream",

@@ -270,19 +270,51 @@ def test_encoder_stage_returns_encoder_aux_and_dp_shared_memory_guard(monkeypatc
     assert pm_out.shape == (2, 4)
     assert len(enc_aux) == 1
 
-    # 2. DeepseekV41ForCausalLM.__init__ dp_shared_memory guard (line 1131)
-    bad_cfg = SimpleNamespace(
+    # 2. DeepseekV41ForCausalLM.__init__ dp_shared_memory handling
+    monkeypatch.setattr(
+        v2_model.upstream.DeepseekV41LLMForCausalLM,
+        "__init__",
+        lambda self, *, vllm_config, prefix="": setattr(
+            self, "config", SimpleNamespace(expert_dtype="fp4")
+        ),
+    )
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "_make_deepseek_v4_weights_mapper",
+        lambda *a: "mapper",
+    )
+    monkeypatch.setattr(v2_model, "install_host_engram_inputs", lambda: None)
+
+    # Case 2a: CPU_OFFLOAD=0 disables engram_config.dp_shared_memory
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "0")
+    monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", raising=False)
+    cfg_hbm = SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
-            data_parallel_size=1,
-            enable_expert_parallel=False,
+            data_parallel_size=2,
+            enable_expert_parallel=True,
         ),
         engram_config=SimpleNamespace(dp_shared_memory=True),
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
     )
-    with pytest.raises(
-        NotImplementedError, match="engram dp_shared_memory is not supported"
-    ):
-        DeepseekV41ForCausalLM(vllm_config=bad_cfg)
+    DeepseekV41ForCausalLM(vllm_config=cfg_hbm)
+    assert cfg_hbm.engram_config.dp_shared_memory is False
+
+    # Case 2b: CPU_OFFLOAD=1, HOST_DMA=0 preserves engram_config.dp_shared_memory=True
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "1")
+    cfg_shm = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=2,
+            enable_expert_parallel=True,
+        ),
+        engram_config=SimpleNamespace(dp_shared_memory=True),
+        speculative_config=None,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    DeepseekV41ForCausalLM(vllm_config=cfg_shm)
+    assert cfg_shm.engram_config.dp_shared_memory is True
 
 
 def test_td8255_ced_replay_and_window_starts_int32_with_int64_positions(monkeypatch):
@@ -763,3 +795,247 @@ def test_td8392_engram_host_col_slice(monkeypatch, engrams, shared, dp, want):
     # Cached after the first call, including a None result.
     assert DeepseekV41Model._engram_host_col_slice(model) == want
     assert len(calls) == n
+
+
+def test_allocate_shared_host_storage_and_dp_shared_engram_storage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.host_row_table import (
+        allocate_shared_host_storage,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import (
+        DPSharedEngramStorage,
+        Engram,
+        ParallelEngramEmbedding,
+        can_share_engram_tables,
+    )
+
+    shm_dir = str(tmp_path)
+    checked_bytes: list[int] = []
+
+    # 1. Leader rank (rank_in_group=0) creates and maps; peer rank (rank_in_group=1)
+    # attaches to the same POSIX shared-memory file before ExitStack unlinks it.
+    peer_tensors: list[torch.Tensor] = []
+
+    def fake_all_gather_ok(errors: list, error: str | None, group=None):
+        errors[0] = error
+        errors[1] = None
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_ok)
+
+    def bcast_with_peer(obj):
+        path, err = obj
+        if path is not None and err is None:
+            untyped = torch.UntypedStorage.from_file(path, shared=True, nbytes=64)
+            peer_tensors.append(torch.tensor(untyped, dtype=torch.uint8))
+        return obj
+
+    group_r0 = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        cpu_group="cpu_grp",
+        broadcast_object=bcast_with_peer,
+    )
+    t_r0 = allocate_shared_host_storage(
+        64,
+        group_r0,
+        shm_dir=shm_dir,
+        check_free_space=lambda n: checked_bytes.append(n),
+    )
+    assert checked_bytes == [64]
+    assert len(peer_tensors) == 1
+    assert list(tmp_path.iterdir()) == []
+    t_r0.fill_(77)
+    assert torch.all(peer_tensors[0] == 77)
+    peer_tensors[0][0] = 99
+    assert int(t_r0[0].item()) == 99
+
+    # 2. Non-leader rank (rank_in_group=1) with check_free_space=None
+    shared_file = tmp_path / "manual_shm.bin"
+    shared_file.write_bytes(b"\x00" * 32)
+    group_r1 = SimpleNamespace(
+        rank_in_group=1,
+        world_size=2,
+        cpu_group="cpu_grp",
+        broadcast_object=lambda obj: (str(shared_file), None),
+    )
+    t_r1 = allocate_shared_host_storage(32, group_r1, shm_dir=shm_dir)
+    assert t_r1.shape == (32,)
+
+    # 3. Rank 0 creation error -> RuntimeError
+    def fail_check(_n: int):
+        raise OSError("insufficient /dev/shm")
+
+    group_err0 = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        cpu_group="cpu_grp",
+        broadcast_object=lambda obj: obj,
+    )
+    with pytest.raises(
+        RuntimeError, match="Engram shared-memory creation failed on EDP rank 0"
+    ):
+        allocate_shared_host_storage(
+            64, group_err0, shm_dir=shm_dir, check_free_space=fail_check
+        )
+
+    # 4. Peer mapping failure -> RuntimeError
+    def fake_all_gather_fail(errors: list, error: str | None, group=None):
+        errors[0] = None
+        errors[1] = error or "OSError: mmap failed"
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_fail)
+    group_map_err = SimpleNamespace(
+        rank_in_group=1,
+        world_size=2,
+        cpu_group="cpu_grp",
+        broadcast_object=lambda obj: (str(tmp_path / "nonexistent_dir" / "bad"), None),
+    )
+    with pytest.raises(
+        RuntimeError, match="Engram shared-memory initialization failed"
+    ):
+        allocate_shared_host_storage(64, group_map_err, shm_dir=shm_dir)
+
+    # Restore all_gather_object and test DPSharedEngramStorage + ParallelEngramEmbedding
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_ok)
+    barriers: list[object] = []
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda group=None: barriers.append(group)
+    )
+    monkeypatch.setattr(common_engram.upstream, "SHM_PATH", shm_dir, raising=False)
+    monkeypatch.setattr(
+        common_engram.upstream, "check_shm_free_space", None, raising=False
+    )
+
+    group_storage = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        cpu_group="cpu_grp",
+        broadcast_object=lambda obj: obj,
+    )
+    storage = DPSharedEngramStorage(8, 16, 8, group_storage)
+    assert storage.weight.shape == (8, 16)
+    assert storage.weight_scale_inv.shape == (8, 2)
+    w_view, s_view = storage.get_views(storage.weight, storage.weight_scale_inv)
+    assert w_view is storage.weight
+    assert s_view is storage.weight_scale_inv
+    with pytest.raises(
+        RuntimeError, match="Shared Engram parameter storage must not be replaced"
+    ):
+        storage.get_views(torch.empty_like(storage.weight), storage.weight_scale_inv)
+
+    # load_weight on rank 0 vs rank 1
+    param = torch.nn.Parameter(storage.weight_scale_inv, requires_grad=False)
+    loaded = torch.full((8, 2), 127, dtype=torch.uint8)
+    storage.load_weight(param, loaded)
+    assert torch.all(storage.weight_scale_inv == 127)
+    assert barriers == ["cpu_grp"]
+
+    group_storage.rank_in_group = 1
+    storage.load_weight(param, torch.zeros((8, 2), dtype=torch.uint8))
+    # Rank 1 does not overwrite; only hits barrier
+    assert torch.all(storage.weight_scale_inv == 127)
+    assert len(barriers) == 2
+
+    # 5. can_share_engram_tables across modes
+    layout = SimpleNamespace(
+        num_embeddings=[16, 16],
+        head_dim=32,
+        primes=[[(8, 8)], [(8, 8)]],
+        layer_ids=[1, 14],
+    )
+    monkeypatch.setattr(common_engram, "get_engram_dp_size", lambda: 2)
+    monkeypatch.setattr(
+        common_engram.upstream, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        common_engram.upstream, "get_tensor_model_parallel_rank", lambda: 0
+    )
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "0")
+    monkeypatch.delenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", raising=False)
+    assert can_share_engram_tables(layout) is False
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", "1")
+    assert can_share_engram_tables(layout) is False
+
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", "0")
+    monkeypatch.setattr(
+        common_engram.upstream,
+        "can_share_engram_tables",
+        lambda lay, block_size=32: False,
+        raising=False,
+    )
+    assert can_share_engram_tables(layout) is False
+
+    monkeypatch.setattr(
+        common_engram.upstream,
+        "can_share_engram_tables",
+        lambda lay, block_size=32: True,
+        raising=False,
+    )
+    assert can_share_engram_tables(layout) is True
+
+    # 6. ParallelEngramEmbedding & Engram._create_embedding with dp_shared_memory=True
+    group_storage.rank_in_group = 0
+    monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda: group_storage)
+    monkeypatch.setattr(
+        common_engram,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(engram_config=SimpleNamespace(dp_shared_memory=True)),
+    )
+    monkeypatch.setattr(common_engram, "register_row_slice", lambda *a: None)
+    engram_mod = object.__new__(Engram)
+    emb = Engram._create_embedding(engram_mod, layout, 0)
+    assert isinstance(emb, ParallelEngramEmbedding)
+    assert emb.dp_shared_memory is True
+    assert emb.dp_size == 1
+    assert emb._shared_memory is not None
+    st_w, st_s = emb._storage()
+    assert st_w.data_ptr() == emb.weight.data_ptr()
+    assert st_s.data_ptr() == emb.weight_scale_inv.data_ptr()
+
+    # Also test dp_shared_memory=True fallback when get_engram_dp_group() is None
+    monkeypatch.setattr(common_engram, "get_engram_dp_group", lambda: None)
+    emb_fallback = ParallelEngramEmbedding(
+        16, 32, (8, 8), block_size=16, cpu_offload=True, dp_shared_memory=True
+    )
+    assert emb_fallback._shared_memory is None
+    fb_w, fb_s = emb_fallback._storage()
+    assert fb_w.data_ptr() == emb_fallback.weight.data_ptr()
+    assert fb_s.data_ptr() == emb_fallback.weight_scale_inv.data_ptr()
+
+    # 7. HostRowTable.__init__ logger.info diagnostic
+    from vllm_torchtpu.models.vllm.deepseek_v41.common import host_row_table
+
+    monkeypatch.setattr(host_row_table, "_install", lambda: None)
+    monkeypatch.setattr(host_row_table, "_gather_op", lambda c, b: "op")
+    monkeypatch.setattr(
+        torch.ops, "ao", SimpleNamespace(offload=lambda t: t.clone()), raising=False
+    )
+    table = host_row_table.HostRowTable(
+        torch.zeros((16, 256), dtype=torch.uint8),
+        torch.device("cpu"),
+        capacity_rows=32,
+    )
+    assert len(table.chunks) == 1
+
+    # 8. install_host_engram_inputs hook installation and logger.info diagnostic
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
+        install_host_engram_inputs,
+    )
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "_prepare_lookback_token_ids",
+        lambda self, n: torch.zeros(n, dtype=torch.int32),
+    )
+    install_host_engram_inputs()
+    assert getattr(
+        TPUModelRunner._prepare_lookback_token_ids,
+        "_deepseek_v41_host_engram",
+        False,
+    )

@@ -36,6 +36,9 @@ except ImportError:  # vLLM 0.30 keeps it in the nvidia module.
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
@@ -817,7 +820,14 @@ def gather_host_engram_hashes(
     dp_shared_memory: bool = False,
     gather_fn: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Gather Engram hashes across DP, using ``dp_group.cpu_group`` on CPU."""
+    """Gather Engram hashes across DP, or skip when ``dp_shared_memory=True``.
+
+    When ``dp_shared_memory=True`` (POSIX ``/dev/shm`` shared CPU Engram tables
+    under ``TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1``), every co-located DP
+    replica sharing a ``(PP, PCP, TP)`` rank holds the full TP head shard in
+    shared memory (``dp_size = 1``), so each replica looks up only its own
+    tokens without any cross-DP hash collective.
+    """
     if not dp_shared_memory:
         dp_group = get_engram_dp_group()
         if dp_group is not None and getattr(dp_group, "world_size", 1) > 1:
@@ -897,3 +907,6 @@ def install_host_engram_inputs() -> None:
 
     sample_tokens.__wrapped__ = orig_sample  # type: ignore[attr-defined]
     TPUModelRunner.sample_tokens = sample_tokens  # type: ignore[method-assign]
+    logger.info(
+        "Installed DeepSeek V4.1 host Engram input capture hook on TPUModelRunner"
+    )

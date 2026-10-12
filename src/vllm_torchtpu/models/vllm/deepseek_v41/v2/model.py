@@ -42,7 +42,7 @@ from .ced import (
     prefix_replay_enabled,
     sync_decoder_replay_plan,
 )
-from .engram import Engram, NgramHashState
+from .engram import Engram, NgramHashState, can_share_engram_tables
 from .host_engram import (
     HOST_ENGRAM_KEY,
     gather_host_engram_hashes,
@@ -1106,6 +1106,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 DeepseekV4DecoderLayer=DeepseekV41DecoderLayer,
                 DeepseekV4MoE=DeepseekV41MoE,
                 _use_sequence_parallel=_use_sequence_parallel,
+                can_share_engram_tables=can_share_engram_tables,
             ),
             device_hooks(torch.cuda, Stream=lambda: None),
         ):
@@ -1238,15 +1239,28 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             raise NotImplementedError(
                 "V4.1 TPU currently requires PP1 and DP1 (or DP with EP)"
             )
-        engram_config = getattr(vllm_config, "engram_config", None)
+        engram_config = getattr(vllm_config, "engram_config", vllm_config)
         if getattr(engram_config, "dp_shared_memory", False) is True:
-            # TPU shards Engram heads across the node-local DP group and
-            # gathers hash ids for it (common/engram.py); a DP-shared host
-            # table would skip that gather while the heads stay sharded.
-            raise NotImplementedError(
-                "V4.1 TPU Engram shards tables across DP ranks; "
-                "engram dp_shared_memory is not supported"
-            )
+            if (
+                not envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+                or envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
+            ):
+                # On-device HBM and TPU pinned_host DMA tables are sharded
+                # across the global DP x TP (EP=8) world; disable the default
+                # CPU /dev/shm flag that vLLM resolves when DP > 1.
+                engram_config.dp_shared_memory = False
+                logger.info(
+                    "DeepSeek V4.1 TPU disabling engram_config.dp_shared_memory "
+                    "(CPU_OFFLOAD=%s, HOST_DMA=%s): sharding Engram tables across "
+                    "DP x TP ranks.",
+                    bool(envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD),
+                    bool(envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA),
+                )
+            else:
+                logger.info(
+                    "DeepSeek V4.1 TPU enabling POSIX shared-memory Engram table "
+                    "deduplication across co-located DP replicas."
+                )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",

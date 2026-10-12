@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import get_engram_dp_group, get_engram_dp_size
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common import engram as upstream
@@ -44,10 +45,14 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 from vllm_torchtpu.models.vllm.deepseek_v41.common.host_row_table import (
     HostRowTable,
+    allocate_shared_host_storage,
 )
+
+logger = init_logger(__name__)
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -620,11 +625,103 @@ def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     param.data.copy_(loaded_weight)
 
 
+class DPSharedEngramStorage:
+    """POSIX /dev/shm host weights shared by a node-local Engram DP group.
+
+    Under ``DP > 1`` with ``TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`` (and
+    ``TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA=0``), co-located DP replicas that share
+    the same ``(PP, PCP, TP)`` rank hold identical Engram head shards (~26 GiB
+    across the 4 Engram layers at TP=4). Mapping one shared ``UntypedStorage``
+    in ``/dev/shm`` across ``get_engram_dp_group()`` deduplicates host DRAM to
+    a single physical copy per TP shard instead of ``N_DP`` copies, and keeps
+    ``dp_size = 1`` so each replica hashes and gathers only its own tokens
+    without per-step cross-DP hash or row collectives.
+    """
+
+    def __init__(self, num_rows: int, dim: int, block_size: int, group: Any) -> None:
+        self.group = group
+        weight_bytes = num_rows * dim
+        scale_bytes = weight_bytes // block_size
+        self.num_bytes = weight_bytes + scale_bytes
+        storage = self._allocate(self.num_bytes)
+        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
+        self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)
+
+    def _allocate(self, num_bytes: int) -> torch.Tensor:
+        shm_dir = getattr(upstream, "SHM_PATH", "/dev/shm")
+        check_fn = getattr(upstream, "check_shm_free_space", None)
+        return allocate_shared_host_storage(
+            num_bytes,
+            self.group,
+            shm_dir=shm_dir,
+            check_free_space=check_fn if callable(check_fn) else None,
+        )
+
+    def load_weight(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        if self.group.rank_in_group == 0:
+            ParallelEngramEmbedding._weight_loader(param, loaded_weight)
+        # Synchronize across the node-local DP group so all replicas observe
+        # populated shared-memory rows before the first forward step.
+        torch.distributed.barrier(group=self.group.cpu_group)
+
+    def get_views(
+        self, weight: torch.Tensor, scales: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (weight.data_ptr(), scales.data_ptr()) != (
+            self.weight.data_ptr(),
+            self.weight_scale_inv.data_ptr(),
+        ):
+            raise RuntimeError("Shared Engram parameter storage must not be replaced")
+        return self.weight, self.weight_scale_inv
+
+
+def can_share_engram_tables(layout: Any, block_size: int = 32) -> bool:
+    """Whether co-located TPU DP replicas can share CPU-offloaded Engram tables."""
+    dp_size = get_engram_dp_size()
+    if not envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+        logger.info(
+            "Engram DP shared memory disabled (TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=0): "
+            "sharding on-device HBM Engram tables across DP=%d x TP ranks.",
+            dp_size,
+        )
+        return False
+    if envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA:
+        logger.info(
+            "Engram DP shared memory disabled (TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA=1): "
+            "sharding TPU pinned_host DMA Engram tables across DP=%d x TP ranks.",
+            dp_size,
+        )
+        return False
+    if not upstream.can_share_engram_tables(layout, block_size=block_size):
+        return False
+    num_bytes = sum(layout.num_embeddings) * (
+        layout.head_dim + layout.head_dim // block_size
+    )
+    tp_size = max(1, int(upstream.get_tensor_model_parallel_world_size()))
+    shard_gib = (num_bytes / tp_size) / 1024**3
+    total_gib = num_bytes / 1024**3
+    logger.info(
+        "Engram DP shared-memory deduplication enabled across %d co-located DP "
+        "replicas (TP=%d): sharing %.2f GiB per TP shard (%.2f GiB total) in %s, "
+        "saving %.2f GiB of host DRAM.",
+        dp_size,
+        tp_size,
+        shard_gib,
+        total_gib,
+        getattr(upstream, "SHM_PATH", "/dev/shm"),
+        (dp_size - 1) * total_gib,
+    )
+    return True
+
+
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
 
     host_dma: bool = False
     _host_rows: HostRowTable | None = None
+    _shared_memory: DPSharedEngramStorage | None = None
 
     @staticmethod
     def _weight_loader(param, loaded_weight):
@@ -663,22 +760,32 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             else bool(cpu_offload)
         )
         self.cpu_offload = self.host_offload
-        self._dp_shared_memory = bool(kwargs.pop("dp_shared_memory", False))
-        self.dp_shared_memory = self._dp_shared_memory
-        self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
         # Rows load into Host DRAM as with cpu_offload, then
         # `move_rows_to_pinned_host` hands them to the TPU's pinned_host
         # memory, after which `lookup` runs on device like an HBM table.
         self.host_dma = self.host_offload and bool(
             envs.TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA
         )
+        self._dp_shared_memory = (
+            bool(kwargs.pop("dp_shared_memory", False))
+            and self.host_offload
+            and not self.host_dma
+        )
+        self.dp_shared_memory = self._dp_shared_memory
+        self.dp_size = 1 if self.dp_shared_memory else get_engram_dp_size()
+        self._shared_memory = None
         self._host_rows: HostRowTable | None = None
         self._head_sizes = tuple(head_sizes)
         # Upstream asks for the SM count solely to size its Triton lookup grid.
         # The TPU lookup below does not use that launch property.
-        with device_hooks(
-            torch.cuda,
-            get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
+        with (
+            device_hooks(
+                torch.cuda,
+                get_device_properties=lambda _: SimpleNamespace(
+                    multi_processor_count=0
+                ),
+            ),
+            device_hooks(torch.accelerator, current_device_index=lambda: 0),
         ):
             try:
                 super().__init__(
@@ -701,11 +808,34 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._shared_memory is not None:
+            return self._shared_memory.get_views(
+                self.weight.data, self.weight_scale_inv.data
+            )
         return self.weight.data, self.weight_scale_inv.data
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.host_offload:
             return super()._allocate_weights()
+        if self.dp_shared_memory:
+            group = get_engram_dp_group()
+            if group is not None and getattr(group, "world_size", 1) > 1:
+                storage = DPSharedEngramStorage(
+                    self.part_num_embeddings, self.dim, self.block_size, group
+                )
+                self._shared_memory = storage
+                self._weight_loader = storage.load_weight
+                shard_gib = storage.num_bytes / 1024**3
+                logger.info(
+                    "Engram table allocated in POSIX shared memory: %d rows x %d "
+                    "(%.2f GiB shared across %d DP replicas; %.2f GiB deduplicated)",
+                    self.part_num_embeddings,
+                    self.dim,
+                    shard_gib,
+                    group.world_size,
+                    shard_gib * (group.world_size - 1),
+                )
+                return storage.weight, storage.weight_scale_inv
         return (
             torch.empty(
                 self.part_num_embeddings,
@@ -1091,10 +1221,14 @@ class Engram(upstream.Engram):
     )
 
     def _create_embedding(self, layout, layer_hash_index):
+        engram_config = getattr(
+            get_current_vllm_config_or_none(), "engram_config", None
+        )
         embedding = ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+            dp_shared_memory=bool(getattr(engram_config, "dp_shared_memory", False)),
         )
         # Each table is ~98 GB in one tensor, over the Run:AI streamer's
         # per-tensor memory limit, and a rank keeps only its heads' rows.

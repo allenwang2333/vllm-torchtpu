@@ -1064,6 +1064,7 @@ class TestV2Engram:
 
     def test_v2_all_exports(self):
         expected_exports = {
+            "DPSharedEngramStorage",
             "Engram",
             "NgramHashState",
             "ParallelEngramEmbedding",
@@ -1072,6 +1073,7 @@ class TestV2Engram:
             "_gather_engram_rows",
             "_load_local_rows",
             "_unpack_bytes",
+            "can_share_engram_tables",
             "dequant_fp8_rows",
             "register_row_slice",
             "upstream",

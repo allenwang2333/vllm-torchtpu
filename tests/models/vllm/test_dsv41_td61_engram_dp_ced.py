@@ -444,12 +444,18 @@ def test_ready_rows_dp1_keeps_local_path(monkeypatch: pytest.MonkeyPatch):
 # ==============================================================================
 
 
-def test_causal_lm_rejects_engram_dp_shared_memory():
+def test_causal_lm_rejects_engram_dp_shared_memory(monkeypatch: pytest.MonkeyPatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
+
+    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", False)
+    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_HOST_DMA", False)
     cfg = SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1, data_parallel_size=2, enable_expert_parallel=True
         ),
         engram_config=SimpleNamespace(dp_shared_memory=True),
+        speculative_config=SimpleNamespace(method="unsupported"),
     )
-    with pytest.raises(NotImplementedError, match="dp_shared_memory"):
+    with pytest.raises(NotImplementedError, match="speculative method"):
         DeepseekV41ForCausalLM(vllm_config=cfg)
+    assert cfg.engram_config.dp_shared_memory is False

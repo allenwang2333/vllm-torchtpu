@@ -23,17 +23,90 @@ embedded into the compiled graph as constants.
 
 import functools
 import inspect
+import os
+import tempfile
+from collections.abc import Callable
+from contextlib import ExitStack
 from typing import Any
 
 import jax
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41 import host_row_gather as hrg
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 HOST_OP_NAMESPACE = "dsv41_host_rows"
 # Bytes of one pinned_host chunk. Each chunk is staged through HBM once at
 # conversion, so this bounds the transient HBM use.
 CHUNK_BYTES = 2 << 30
+
+
+def allocate_shared_host_storage(
+    num_bytes: int,
+    group: Any,
+    *,
+    shm_dir: str = "/dev/shm",
+    check_free_space: Callable[[int], None] | None = None,
+) -> torch.Tensor:
+    """Allocate a 1-D ``uint8`` CPU tensor in POSIX shared memory across ``group``.
+
+    Under native ``DP + EP`` (``data_parallel_size > 1``), co-located DP
+    replicas sharing the same ``(PP, PCP, TP)`` rank hold identical shards of
+    host-offloaded tables (such as the ~26 GiB per-TP-shard DeepSeek-V4.1
+    Engram table). Leader rank 0 in ``group`` creates and truncates one backing
+    file in ``shm_dir``, broadcasts its path across ``group``, and every rank
+    maps the same physical pages via
+    ``torch.UntypedStorage.from_file(path, shared=True, nbytes=num_bytes)``
+    before rank 0 unlinks the directory entry on context exit.
+    """
+    with ExitStack() as stack:
+        path: str | None = None
+        error: str | None = None
+        if group.rank_in_group == 0:
+            try:
+                if check_free_space is not None:
+                    check_free_space(num_bytes)
+                backing_file = stack.enter_context(
+                    tempfile.NamedTemporaryFile(prefix="vllm_tpu_engram_", dir=shm_dir)
+                )
+                backing_file.truncate(num_bytes)
+                path = backing_file.name
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        path, error = group.broadcast_object((path, error))
+        if error is not None:
+            raise RuntimeError(
+                "Engram shared-memory creation failed on EDP rank 0: " + error
+            )
+
+        tensor: torch.Tensor | None = None
+        try:
+            if not path or not os.path.isfile(path):
+                raise FileNotFoundError(f"Shared Engram backing file not found: {path}")
+            untyped = torch.UntypedStorage.from_file(
+                path, shared=True, nbytes=num_bytes
+            )
+            tensor = torch.tensor(untyped, dtype=torch.uint8)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+
+        # Fence all peer mappings before rank 0 exits ExitStack and unlinks path.
+        errors: list[str | None] = [None] * group.world_size
+        torch.distributed.all_gather_object(errors, error, group=group.cpu_group)
+        failures = "; ".join(
+            f"EDP rank {rank}: {err}"
+            for rank, err in enumerate(errors)
+            if err is not None
+        )
+        if failures:
+            del tensor
+            raise RuntimeError(
+                "Engram shared-memory initialization failed: " + failures
+            )
+        assert tensor is not None
+        return tensor
 
 
 def _pinned_sharding(device: jax.Device) -> jax.sharding.SingleDeviceSharding:
@@ -202,6 +275,14 @@ class HostRowTable:
         # Registered here, outside tracing: Dynamo cannot trace `jax_op`.
         self._op = _gather_op(len(self.chunks), self.row_bytes)
         self._lookup_ops: dict[int, Any] = {}
+        logger.info(
+            "HostRowTable packed %d rows (capacity_rows=%d, row_bytes=%d) "
+            "into %d TPU pinned_host chunks",
+            self.num_rows,
+            max(self.num_rows, capacity_rows),
+            self.row_bytes,
+            len(self.chunks),
+        )
 
     def gather(self, row_ids: torch.Tensor) -> torch.Tensor:
         """``int32[n]`` in-range row ids -> ``uint8[n, row_bytes]`` on device."""
