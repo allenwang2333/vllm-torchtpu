@@ -1345,11 +1345,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the JAX op (XLA's all-reduce above the cap), so no trace forks.
     "TPU_SMALL_ALL_REDUCE_DRAFT": env_bool("TPU_SMALL_ALL_REDUCE_DRAFT", True),
     # With TPU_SMALL_ALL_REDUCE and the token-padding mask (TPU_MOE_SKIP_PADDED_
-    # TOKENS), backbone TP all-reduces of a 16-row-multiple block move only the
-    # step's valid rows (moe_tp_decode's in-kernel all-reduce, standalone:
-    # valid rows <= 5 folded into one row tile); padding rows come out +0.
-    # A batch-1 MTP decode step pads 4 rows to 16. Valid rows are bitwise the
-    # same as TPU_SMALL_ALL_REDUCE's (same f32 sum in rank order).
+    # TOKENS), backbone TP all-reduces hand the two-shot kernel the step's
+    # valid-row count: up to fold_rows valid rows (5 at H=6144 on 16 cores) are
+    # folded into one row tile and only that moves, padding rows coming out +0;
+    # more valid rows run the plain two-shot. A batch-1 MTP decode step pads 4
+    # rows to 16. Valid rows are bitwise TPU_SMALL_ALL_REDUCE's (same f32 sum
+    # in core order).
     "TPU_SMALL_ALL_REDUCE_VALID_ROWS": env_bool("TPU_SMALL_ALL_REDUCE_VALID_ROWS"),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
