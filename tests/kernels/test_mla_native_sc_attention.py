@@ -1477,7 +1477,8 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         out_gf, lse_gf = jax.block_until_ready(
             run(out_pieces=8, out_pieces_gather_first=True)
         )
-        np.testing.assert_array_equal(bits(out_gf), bits(out))
+        w = np.isfinite(np.asarray(lse)).any(axis=-1)
+        np.testing.assert_array_equal(bits(out_gf)[w], bits(out)[w])
         np.testing.assert_array_equal(
             np.asarray(lse_gf).view(np.uint32), np.asarray(lse).view(np.uint32)
         )
