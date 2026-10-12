@@ -1719,3 +1719,130 @@ def test_tp93_token_parallel_segmented_and_prepadded_main_records(monkeypatch):
     with v2_attn.stage_attention_cache_scope():
         source_attn._prepare_tpu(None, qr, kv, None, None, idx_w, positions, out)
         assert captured_main_recs[-1].shape == (count // 2, 128)
+
+
+def test_owner_segmented_swa_records_and_replicated_qr_local(monkeypatch):
+    """Verify stage-segmented SWA records, cached owner-permuted inputs, and
+    replicated qr_local segmentation across layers."""
+    count = 8
+    positions = torch.tensor([10, 11, 20, 21, 30, 31, 40, 41], dtype=torch.int32)
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    owner_perm = torch.tensor([4, 5, 6, -1, 0, 1, 2, 3], dtype=torch.int32)
+    owner_inv = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3], dtype=torch.int32)
+    owner_q_loc = torch.tensor([[0, 3, 3], [0, 2, 4]], dtype=torch.int32)
+    meta = SimpleNamespace(
+        seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        block_tables=table,
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        owner_perm=owner_perm,
+        owner_inv=owner_inv,
+        owner_q_loc=owner_q_loc,
+    )
+    metadata = {"swa_pfx": meta}
+    forward_ctx = SimpleNamespace(attn_metadata=metadata, additional_kwargs={})
+    monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+    monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
+    monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    captured_attn: list[tuple[torch.Tensor, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention",
+        lambda q, swa_c, main_c, recs, *a, **kw: (
+            captured_attn.append((recs.clone(), dict(kw))) or torch.zeros_like(q)
+        ),
+    )
+    captured_qo: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        v2_attn,
+        "sparse_fp8_attention_qo",
+        lambda *a, **kw: (
+            captured_qo.append((a, dict(kw)))
+            or torch.zeros((count, 16), dtype=torch.bfloat16)
+        ),
+    )
+
+    attn = _make_swa_attn(window_size=64, ced_decoder=False, has_fast_swa_offset=True)
+    attn._tp_rank = torch.tensor(0, dtype=torch.int32)
+    attn._tp_rank_1d = torch.tensor([0], dtype=torch.int32)
+    attn._tpu_rope_cache = torch.zeros((64, 8), dtype=torch.bfloat16)
+    attn._full_attn_sink = torch.zeros(4, dtype=torch.float32)
+
+    out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
+    qr = torch.arange(count * 16, dtype=torch.bfloat16).reshape(count, 16)
+    kv = torch.ones((count, 8), dtype=torch.bfloat16)
+
+    with v2_attn.stage_attention_cache_scope():
+        # Call 1: cache miss on swa_owner_seg and swa_records
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert len(captured_attn) == 1
+        recs1, kw1 = captured_attn[-1]
+        assert recs1.shape == (count // 2, 64)
+        assert kw1["swa_records_segmented"] is True
+        assert torch.all(recs1[3] == -1)
+
+        # Call 2: cache hit on swa_owner_seg and swa_records
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert len(captured_attn) == 2
+        assert torch.equal(captured_attn[-1][0], recs1)
+
+        # Call 3: fused_qo=True with _replicated_local_q=True -> seg_qr_local=True
+        attn._local_q_attn = True
+        attn._replicated_local_q = True
+        attn.wq_b = SimpleNamespace(
+            weight=torch.zeros((16, 8)), weight_scale=torch.ones((8,))
+        )
+        attn._wq_b_full = torch.zeros((16, 16))
+        attn._wq_b_full_scale = torch.ones((16,))
+        attn.wo_a = SimpleNamespace(
+            weight=torch.zeros((8, 16)), weight_scale=torch.ones((16,))
+        )
+        attn._wo_a_full = torch.zeros((16, 16))
+        attn._wo_a_full_scale = torch.ones((16,))
+        res_qo_rep = attn._prepare_tpu(
+            None, qr, kv, None, None, None, positions, out, qr_local=qr
+        )
+        assert res_qo_rep is not None
+        qo_args, qo_kw = captured_qo[-1]
+        assert qo_args[1].shape == (count // 2, 16)
+        assert torch.equal(qo_args[1][:3], qr[4:7])
+        assert torch.all(qo_args[1][3] == 0)
+        assert qo_kw["qr_local_segmented"] is True
+        assert qo_kw["owner_inputs_permuted"] is True
+        assert qo_kw["swa_records_segmented"] is True
+
+        # Call 4: fused_qo=True with _replicated_local_q=False -> seg_qr_local=False
+        attn._replicated_local_q = False
+        qr_sp = qr[: count // 2]
+        attn._prepare_tpu(
+            None, qr, kv, None, None, None, positions, out, qr_local=qr_sp
+        )
+        qo_args2, qo_kw2 = captured_qo[-1]
+        assert qo_args2[1] is qr_sp
+        assert qo_kw2["qr_local_segmented"] is False
+        assert qo_kw2["owner_inputs_permuted"] is True
+
+        # Call 5: swa_cache.row_offset == 0 uses active_swa_masked directly
+        attn._local_q_attn = False
+        attn.wq_b = lambda x: x
+        attn.swa_cache_layer.kv_cache.row_offset = 0
+        attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_attn[-1][0].shape == (count // 2, 64)
+        attn.swa_cache_layer.kv_cache.row_offset = 1000
+
+    # 2. Uncached call (stage_cache is None) with owner_perm is not None
+    attn._local_q_attn = False
+    attn.wq_b = lambda x: x
+    attn._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+    assert captured_attn[-1][1]["swa_records_segmented"] is False
+
+    # 3. has_fast_swa_offset=False with owner_perm is not None inside stage_cache:
+    # segmented_swa is False (seg_idx is None), so compressed_inputs computes seg_idx.
+    attn_slow = _make_swa_attn(
+        window_size=64, ced_decoder=False, has_fast_swa_offset=False
+    )
+    attn_slow._tp_rank = torch.tensor(0, dtype=torch.int32)
+    attn_slow._tp_rank_1d = torch.tensor([0], dtype=torch.int32)
+    with v2_attn.stage_attention_cache_scope():
+        attn_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
+        assert captured_attn[-1][1]["swa_records_segmented"] is False

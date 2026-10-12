@@ -986,6 +986,8 @@ def fused_swa_inputs(
     swa_pool: jax.Array | tuple[jax.Array, jax.Array],
     swa_records: jax.Array,
     dim: int,
+    *,
+    group_tokens: int = 6,
 ) -> tuple[jax.Array, jax.Array]:
     """Window rows in natural BF16 order and their additive score bias.
 
@@ -995,7 +997,10 @@ def fused_swa_inputs(
     ``width`` columns in split element order, restores natural order with the
     MXU permutation `merge_halves`, zeroes dead ``< 0`` records to keep
     ``0 * NaN`` out of the PV product, and zero/min-pads the trailing
-    ``padded - width`` columns afterward. ``bias`` is ``finfo.min`` for
+    ``padded - width`` columns afterward. When ``group_tokens == 6`` and
+    ``width == 128`` on ``48 < tokens <= 192`` with ``tokens % 6 == 0``, each
+    6-token group gathers its 133-row window union padded to 136 sublanes and
+    expands to ``[tokens, 128, dim]`` on the MXU. ``bias`` is ``finfo.min`` for
     invalid/padded columns, laid out as one 128-lane row per 128 window
     columns so the kernel's per-batch DMA slices an untiled token axis.
     """
@@ -1014,6 +1019,42 @@ def fused_swa_inputs(
         bias = jnp.pad(
             bias, ((0, 0), (0, pad)), constant_values=jnp.finfo(jnp.float32).min
         )
+    elif group_tokens == 6 and width == 128 and 48 < tokens <= 192 and tokens % 6 == 0:
+        groups = tokens // 6
+        grp = swa_records.reshape(groups, 6, 128)
+        union_rec = jnp.pad(
+            jnp.concatenate((grp[:, 0, :], grp[:, 1:, -1]), axis=1),
+            ((0, 0), (0, 3)),
+            constant_values=-1,
+        )
+        rows = gather_cache_values(
+            cast(Any, swa_pool), union_rec.reshape(-1), dim, split=True
+        )
+        union_kv = merge_halves(rows).reshape(groups, 136, dim)
+        union_kv = jnp.where(
+            (union_rec >= 0)[..., None], union_kv, jnp.zeros((), union_kv.dtype)
+        )
+        basis = (
+            (
+                (jnp.arange(6)[:, None, None] + jnp.arange(128)[None, :, None])
+                == jnp.arange(136)[None, None, :]
+            )
+            .astype(union_kv.dtype)
+            .reshape(6 * 128, 136)
+        )
+        kv = (
+            jnp.einsum(
+                "mk,gkd->gmd",
+                basis,
+                union_kv,
+                preferred_element_type=jnp.float32,
+            )
+            .astype(union_kv.dtype)
+            .reshape(tokens, 128, dim)
+        )
+        live = swa_records >= 0
+        kv = jnp.where(live[..., None], kv, jnp.zeros((), kv.dtype))
+        bias = jnp.where(live, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.float32)
     else:
         swa_records = jnp.pad(swa_records, ((0, 0), (0, pad)), constant_values=-1)
         live = swa_records >= 0
@@ -1762,12 +1803,12 @@ def initialize_paged_attention():
         )
 
         if owner_perm is not None:
+            tokens_local_perm = owner_perm.shape[0] // max(1, tp_size)
             qr = _permute_owner_tokens_jax(qr, owner_perm, 0)
-            if replicated_qr:
+            if replicated_qr and qr_local.shape[0] != tokens_local_perm:
                 qr_local = _permute_owner_tokens_jax(qr_local, owner_perm, 0)
             positions = _permute_owner_tokens_jax(positions, owner_perm, 0)
             valid = _permute_owner_tokens_jax(valid, owner_perm, 0)
-            tokens_local_perm = owner_perm.shape[0] // max(1, tp_size)
             if swa_records.shape[0] != tokens_local_perm:
                 swa_records = _permute_owner_tokens_jax(swa_records, owner_perm, -1)
             if main_records.shape[0] != tokens_local_perm:
@@ -1831,7 +1872,7 @@ def initialize_paged_attention():
                 start = r_id.reshape(()) * tokens_local
                 pos_tok = jax.lax.dynamic_slice_in_dim(pos, start, tokens_local, axis=0)
                 ok_tok = jax.lax.dynamic_slice_in_dim(ok, start, tokens_local, axis=0)
-                if replicated_qr:
+                if replicated_qr and q_in.shape[0] != tokens_local:
                     q_in = jax.lax.dynamic_slice_in_dim(
                         q_in, start, tokens_local, axis=0
                     )
@@ -2147,6 +2188,9 @@ def sparse_fp8_attention_qo(
     owner_perm=None,
     owner_inv=None,
     main_records_segmented=False,
+    swa_records_segmented=False,
+    qr_local_segmented=False,
+    owner_inputs_permuted=False,
     wo_b=None,
     wo_b_scale=None,
     wo_b_full=None,
@@ -2161,12 +2205,20 @@ def sparse_fp8_attention_qo(
     """
     assert _fp8_attention_qo_op is not None and main.rope is not None
     if owner_perm is not None:
-        qr = _permute_owner_tokens_torch(qr, owner_perm, 0)
-        if replicated_qr:
-            qr_local = _permute_owner_tokens_torch(qr_local, owner_perm, 0)
-        positions = _permute_owner_tokens_torch(positions, owner_perm, 0)
-        valid = _permute_owner_tokens_torch(valid, owner_perm, 0)
-        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        qr_matches_local = qr_local is qr
+        if not (qr_local_segmented and envs.TPU_DEEPSEEK_V41_KV_SHARD):
+            qr = _permute_owner_tokens_torch(qr, owner_perm, 0)
+        if replicated_qr and not qr_local_segmented:
+            qr_local = (
+                qr
+                if qr_matches_local
+                else _permute_owner_tokens_torch(qr_local, owner_perm, 0)
+            )
+        if not owner_inputs_permuted:
+            positions = _permute_owner_tokens_torch(positions, owner_perm, 0)
+            valid = _permute_owner_tokens_torch(valid, owner_perm, 0)
+        if not swa_records_segmented:
+            swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
         if not main_records_segmented:
             main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
     page_size = main.shape[1]
@@ -2268,12 +2320,14 @@ def paged_attention(
     owner_perm=None,
     owner_inv=None,
     main_records_segmented=False,
+    swa_records_segmented=False,
 ):
     """``block > 1``: rows ``[r * block, (r + 1) * block)`` are one non-causal
     query block sharing its sliding window (see `_attend_shared_block`)."""
     if owner_perm is not None:
         q = _permute_owner_tokens_torch(q, owner_perm, 0)
-        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        if not swa_records_segmented:
+            swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
         if not main_records_segmented:
             main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
     if full_sink is None:
@@ -2337,6 +2391,7 @@ def sparse_fp8_attention(
     owner_perm=None,
     owner_inv=None,
     main_records_segmented=False,
+    swa_records_segmented=False,
 ):
     """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages).
 
@@ -2346,7 +2401,8 @@ def sparse_fp8_attention(
     assert _fp8_attention_op is not None and main.rope is not None
     if owner_perm is not None:
         q = _permute_owner_tokens_torch(q, owner_perm, 0)
-        swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
+        if not swa_records_segmented:
+            swa_records = _permute_owner_tokens_torch(swa_records, owner_perm, -1)
         if not main_records_segmented:
             main_records = _permute_owner_tokens_torch(main_records, owner_perm, -1)
     page_size = main.shape[1]

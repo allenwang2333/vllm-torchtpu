@@ -541,6 +541,40 @@ class TestFusedSwaHelpers:
         single_kv, _ = attention_kernels.fused_swa_inputs(pool, records, dim)
         assert jnp.array_equal(kv, single_kv)
 
+    @pytest.mark.parametrize("tokens", [54, 96, 144, 192])
+    def test_fused_swa_inputs_group6_union_gather_exactness(self, tokens):
+        rng = np.random.default_rng(7)
+        dim = 256
+        rows = jnp.asarray(rng.standard_normal((512, dim)), jnp.bfloat16)
+        bits = jax.lax.bitcast_convert_type(rows, jnp.uint16).astype(jnp.uint32)
+        pool = (bits[:, 0::2] | (bits[:, 1::2] << 16)).astype(jnp.int32)
+        banks = (pool[:256], pool[256:])
+
+        groups = tokens // 6
+        base = jnp.arange(groups, dtype=jnp.int32)[:, None] * 10 + 100
+        tok_pos = base + jnp.arange(6, dtype=jnp.int32)[None, :]
+        logical = (
+            tok_pos.reshape(tokens, 1) - 127 + jnp.arange(128, dtype=jnp.int32)[None, :]
+        )
+        # Include invalid (< 0) window columns on early positions and padded group
+        records = jnp.where(logical >= 105, logical, -1)
+        records = records.at[-6:].set(-1)
+
+        with mock.patch.object(
+            attention_kernels,
+            "gather_cache_values",
+            wraps=attention_kernels.gather_cache_values,
+        ) as spy_gather:
+            kv_grp, bias_grp = attention_kernels.fused_swa_inputs(banks, records, dim)
+        assert spy_gather.call_args.args[1].shape == (groups * 136,)
+        kv_ref, bias_ref = attention_kernels.fused_swa_inputs(
+            pool, records, dim, group_tokens=0
+        )
+        assert kv_grp.shape == (tokens, 128, dim)
+        assert bias_grp.shape == (tokens, 1, 128)
+        assert jnp.array_equal(kv_grp, kv_ref)
+        assert jnp.array_equal(bias_grp, bias_ref)
+
 
 class TestFusedSwaDriver:
     def _inputs(self, tokens=24, heads=4, topk=16, window=128):

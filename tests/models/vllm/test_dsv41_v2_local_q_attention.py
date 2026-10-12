@@ -1134,3 +1134,349 @@ class TestAttentionKernelsLocalQ:
             )
             assert out_bounded.shape == q.shape
             assert barrier_calls == 0
+
+    def test_owner_segmented_inputs_in_wrappers_and_jax_op(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Verify owner-segmented flags in torch wrappers and fp8_attention_qo."""
+        saved_qo = attention_kernels._fp8_attention_qo_op
+        saved_fp8 = attention_kernels._fp8_attention_op
+        saved_paged = attention_kernels._attention_op
+        mock_qo = mock.MagicMock(return_value=torch.zeros(4, 16))
+        mock_fp8 = mock.MagicMock(return_value=torch.zeros(4, 2, 16))
+        mock_paged = mock.MagicMock(return_value=torch.zeros(4, 2, 16))
+        attention_kernels._fp8_attention_qo_op = mock_qo
+        attention_kernels._fp8_attention_op = mock_fp8
+        attention_kernels._attention_op = mock_paged
+
+        try:
+            perm_calls = []
+            orig_perm = attention_kernels._permute_owner_tokens_torch
+
+            def spy_perm(x, perm, fill):
+                perm_calls.append(x.shape)
+                return orig_perm(x, perm, fill)
+
+            monkeypatch.setattr(
+                attention_kernels, "_permute_owner_tokens_torch", spy_perm
+            )
+            main = SimpleNamespace(
+                rope=torch.zeros(1),
+                raw=torch.zeros(8, 64, 128),
+                shape=(16, 64, 128),
+                total_rows=1024,
+            )
+            swa = SimpleNamespace(raw=torch.zeros(8, 64, 128))
+            owner_perm = torch.tensor([2, 3, 0, 1], dtype=torch.int32)
+            owner_inv = torch.tensor([2, 3, 0, 1], dtype=torch.int32)
+            qr = torch.zeros(4, 16)
+            qr_seg = torch.zeros(2, 16)
+            swa_recs = torch.zeros(4, 8, dtype=torch.int32)
+            swa_recs_seg = torch.zeros(2, 8, dtype=torch.int32)
+            main_recs = torch.zeros(4, 8, dtype=torch.int32)
+            main_recs_seg = torch.zeros(2, 8, dtype=torch.int32)
+
+            # 1. All segmented/permuted with KV_SHARD=True -> 0 torch permutes
+            monkeypatch.setattr(
+                attention_kernels.envs, "TPU_DEEPSEEK_V41_KV_SHARD", True
+            )
+            perm_calls.clear()
+            attention_kernels.sparse_fp8_attention_qo(
+                qr,
+                qr_seg,
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(1),
+                swa,
+                main,
+                swa_recs_seg,
+                main_recs_seg,
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                0.125,
+                None,
+                None,
+                16,
+                False,
+                128,
+                replicated_qr=True,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+                main_records_segmented=True,
+                swa_records_segmented=True,
+                qr_local_segmented=True,
+                owner_inputs_permuted=True,
+            )
+            assert perm_calls == []
+
+            # 2. Unsegmented with replicated_qr=True and qr_local is qr (reuses qr)
+            perm_calls.clear()
+            attention_kernels.sparse_fp8_attention_qo(
+                qr,
+                qr,
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(1),
+                swa,
+                main,
+                swa_recs,
+                main_recs,
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                0.125,
+                None,
+                None,
+                16,
+                False,
+                128,
+                replicated_qr=True,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+            )
+            # Only qr, positions, valid, swa_recs, main_recs permuted (5 calls, not 6)
+            assert len(perm_calls) == 5
+
+            # 3. Unsegmented with replicated_qr=True and qr_local is not qr (6 calls)
+            perm_calls.clear()
+            attention_kernels.sparse_fp8_attention_qo(
+                qr,
+                qr.clone(),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                torch.zeros(1),
+                swa,
+                main,
+                swa_recs,
+                main_recs,
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(1),
+                torch.zeros(4, dtype=torch.int32),
+                0.125,
+                None,
+                None,
+                16,
+                False,
+                128,
+                replicated_qr=True,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+            )
+            assert len(perm_calls) == 6
+
+            # 4. sparse_fp8_attention and paged_attention with swa_records_segmented
+            q = torch.zeros(4, 2, 16)
+            perm_calls.clear()
+            attention_kernels.sparse_fp8_attention(
+                q,
+                swa,
+                main,
+                swa_recs_seg,
+                main_recs_seg,
+                torch.zeros(2),
+                0.125,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+                main_records_segmented=True,
+                swa_records_segmented=True,
+            )
+            assert len(perm_calls) == 1  # only q permuted
+
+            perm_calls.clear()
+            attention_kernels.sparse_fp8_attention(
+                q,
+                swa,
+                main,
+                swa_recs,
+                main_recs,
+                torch.zeros(2),
+                0.125,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+                main_records_segmented=False,
+                swa_records_segmented=False,
+            )
+            assert len(perm_calls) == 3
+
+            perm_calls.clear()
+            attention_kernels.paged_attention(
+                q,
+                swa,
+                main,
+                swa_recs_seg,
+                main_recs_seg,
+                torch.zeros(2),
+                0.125,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+                main_records_segmented=True,
+                swa_records_segmented=True,
+            )
+            assert len(perm_calls) == 1
+
+            perm_calls.clear()
+            attention_kernels.paged_attention(
+                q,
+                swa,
+                main,
+                swa_recs,
+                main_recs,
+                torch.zeros(2),
+                0.125,
+                owner_perm=owner_perm,
+                owner_inv=owner_inv,
+                main_records_segmented=False,
+                swa_records_segmented=False,
+            )
+            assert len(perm_calls) == 3
+
+            perm_calls.clear()
+            attention_kernels.paged_attention(
+                q,
+                swa,
+                main,
+                swa_recs,
+                main_recs,
+                torch.zeros(2),
+                0.125,
+            )
+            assert perm_calls == []
+        finally:
+            attention_kernels._fp8_attention_qo_op = saved_qo
+            attention_kernels._fp8_attention_op = saved_fp8
+            attention_kernels._attention_op = saved_paged
+
+        # 5. Exercise fp8_attention_qo inner JAX body with owner_perm:
+        # both pre-segmented (tokens_local_perm=128) and full (256) shapes
+        mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
+        mock_tp = mock.MagicMock()
+        mock_tp.device_group.size.return_value = 2
+        with (
+            set_vllm_model_wrapper_context(mesh=mesh),
+            mock.patch("vllm.distributed.get_tp_group", return_value=mock_tp),
+            mock.patch("torch_tpu._internal.pallas.get_pallas_mesh", return_value=mesh),
+        ):
+            attention_kernels._attention_op = None
+            attention_kernels._fp8_attention_op = None
+            attention_kernels._fp8_attention_qo_op = None
+            attention_kernels.initialize_paged_attention()
+            fn = inspect.unwrap(attention_kernels._fp8_attention_qo_op._init_fn.jit_fn)
+
+            with (
+                mock.patch(
+                    "jax.shard_map",
+                    side_effect=lambda body, **kwargs: lambda *args: body(*args),
+                ),
+                mock.patch("jax.lax.all_to_all", side_effect=lambda x, **kwargs: x),
+                mock.patch(
+                    "vllm_torchtpu.layers.adapter.linear_common._quantized_matmul_jax",
+                    side_effect=lambda q_in, w, ws: jnp.zeros(
+                        (q_in.shape[0], w.shape[-1]), dtype=jnp.float32
+                    ),
+                ),
+                mock.patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v4.attention._rope_jax",
+                    side_effect=lambda q, pos, cs: q,
+                ),
+                mock.patch.object(
+                    attention_kernels,
+                    "sparse_fp8_attention_jax",
+                    side_effect=lambda q, *args, **kwargs: q,
+                ),
+                mock.patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v4.attention._o_proj_jax",
+                    side_effect=lambda out, pos, cs, w, ws, head_dim: jnp.zeros(
+                        (out.shape[0], 1024), dtype=jnp.float32
+                    ),
+                ),
+            ):
+                owner_perm_j = jnp.arange(256, dtype=jnp.int32)
+                owner_inv_j = jnp.arange(256, dtype=jnp.int32)
+                base_args = [
+                    jnp.zeros((256, 1280), dtype=jnp.bfloat16),
+                    jnp.zeros((128, 1280), dtype=jnp.bfloat16),
+                    jnp.zeros((1280, 256)),
+                    jnp.zeros((256,)),
+                    jnp.zeros((1280, 512)),
+                    jnp.zeros((512,)),
+                    jnp.zeros((256,)),
+                    jnp.zeros((256, 64)),
+                    jnp.zeros((16, 64, 128)),
+                    jnp.zeros((16, 64, 128)),
+                    jnp.zeros((16, 64, 64)),
+                    jnp.zeros((128, 64), dtype=jnp.int32),
+                    jnp.zeros((128, 128), dtype=jnp.int32),
+                    jnp.zeros((1, 1), dtype=jnp.int32),
+                    jnp.zeros((2, 2), dtype=jnp.int32),
+                    jnp.zeros((64,)),
+                    jnp.zeros((64,)),
+                    jnp.zeros((1,), dtype=jnp.int32),
+                    jnp.zeros((512, 1024)),
+                    jnp.zeros((1024,)),
+                    jnp.zeros((512, 1024)),
+                    jnp.zeros((1024,)),
+                    jnp.zeros((256,), dtype=jnp.int32),
+                    0.125,
+                    64,
+                    None,
+                    False,
+                    128,
+                ]
+                # Pre-segmented (128 rows) with replicated_qr=True
+                out_seg = fn(
+                    *base_args,
+                    True,
+                    False,
+                    owner_perm_j,
+                    owner_inv_j,
+                )
+                assert out_seg.shape == (256, 512)
+
+                # Full (256 rows) with replicated_qr=True
+                full_args = list(base_args)
+                full_args[1] = jnp.zeros((256, 1280), dtype=jnp.bfloat16)
+                full_args[11] = jnp.zeros((256, 64), dtype=jnp.int32)
+                full_args[12] = jnp.zeros((256, 128), dtype=jnp.int32)
+                out_full = fn(
+                    *full_args,
+                    True,
+                    False,
+                    owner_perm_j,
+                    owner_inv_j,
+                )
+                assert out_full.shape == (256, 512)
+
+                # replicated_qr=False with owner_perm
+                out_norep = fn(
+                    *base_args,
+                    False,
+                    False,
+                    owner_perm_j,
+                    owner_inv_j,
+                )
+                assert out_norep.shape == (256, 512)
