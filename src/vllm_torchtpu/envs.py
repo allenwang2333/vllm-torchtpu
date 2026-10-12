@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     TPU_IDX_TOPK_SCHED_GROUPS: bool = False
     TPU_DCP_RANK_OPERAND: bool = False
     TPU_SC_TOPK_COST_BYTES: int = 0
+    TPU_IDX_QB_UNDER_TOPK: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -964,6 +965,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bytes_accessed cost hint on decode-sized (b <= 32) SparseCore top-k
     # kernels, for XLA's latency-hiding scheduler; 0 = none. Same values.
     "TPU_SC_TOPK_COST_BYTES": env_nonnegative_int("TPU_SC_TOPK_COST_BYTES", 0),
+    # DCP indexer layers at decode (rows <= 16): the indexer op also computes
+    # the layer's q_b_proj (same fp8 Pallas kernel, same operands), pinned by
+    # optimization barriers inside the cross-rank SparseCore merge's window, so
+    # the TensorCore runs it instead of waiting on the merge. Same values.
+    "TPU_IDX_QB_UNDER_TOPK": env_bool("TPU_IDX_QB_UNDER_TOPK"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
