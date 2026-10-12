@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = True
     TPU_MOE_SC_COMBINE_TILED: bool = False
+    TPU_MOE_SC_COMBINE_V5: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_EP_TP_SIZE: int = 4
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -883,6 +884,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token tiles, accumulates in VMEM and writes bf16 rows. Bit-identical to
     # v2. Falls back to v2 where v4 does not apply.
     "TPU_MOE_SC_COMBINE_TILED": env_bool("TPU_MOE_SC_COMBINE_TILED"),
+    # EP MoE combine on SparseCore: ragged_gather_reduce_v5, v4 with tokens
+    # grouped by route count so each token's rows and its single output write
+    # sit at static positions (no per-row accumulator store, no float32
+    # accumulator). Bit-identical to v4 / v2. Takes precedence over
+    # TPU_MOE_SC_COMBINE_TILED; falls back to it (or v2) where v5 does not apply.
+    "TPU_MOE_SC_COMBINE_V5": env_bool("TPU_MOE_SC_COMBINE_V5"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
