@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     TPU_MOE_ONEHOT_SORTFREE: bool = True
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
+    TPU_MOE_SC_COMBINE_V6: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_EP_TP_SIZE: int = 4
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -931,6 +932,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # accumulator). Bit-identical to v4 / v2. Takes precedence over
     # TPU_MOE_SC_COMBINE_TILED; falls back to it (or v2) where v5 does not apply.
     "TPU_MOE_SC_COMBINE_V5": env_bool("TPU_MOE_SC_COMBINE_V5"),
+    # With TPU_MOE_SC_COMBINE_V5: run v5's combine as ragged_gather_reduce_v6,
+    # the same steps without the emit_pipeline grid (fori_loops over column
+    # chunks and groups, manually double-buffered gather and output DMAs).
+    # Bit-identical to v5. Only where v5 applies.
+    "TPU_MOE_SC_COMBINE_V6": env_bool("TPU_MOE_SC_COMBINE_V6"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
