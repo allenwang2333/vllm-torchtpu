@@ -60,6 +60,8 @@ DROP_SERIALIZE_ENTRY = _flag("VLLM_TPU_MEMDBG_DROP_SERIALIZE_ENTRY")
 CLEAR_COMPILE_CACHE = _flag("VLLM_TPU_MEMDBG_CLEAR_COMPILE_CACHE")
 RELEASE_STAGER_POOL = _flag("VLLM_TPU_MEMDBG_RELEASE_STAGER_POOL")
 CLEAR_PRECOMPILE_CONTEXT = _flag("VLLM_TPU_MEMDBG_CLEAR_PRECOMPILE_CONTEXT")
+RELEASE_ENTRY_COPIES = _flag("VLLM_TPU_MEMDBG_RELEASE_ENTRY_COPIES")
+SHARE_EXECUTABLE_COPIES = _flag("VLLM_TPU_MEMDBG_SHARE_EXECUTABLE_COPIES")
 
 # Resolve tcmalloc symbols from the allocator already in the process
 # (LD_PRELOAD; libtcmalloc.so.4 in our images, which carries the heap
@@ -88,18 +90,50 @@ def configure(role: str, dp_rank: int, rank: int) -> None:
     _tag = f"{role}_dp{dp_rank}_r{rank}"
     _is_rank0 = dp_rank == 0 and rank == 0
     _dumps_heap = HEAP_DUMP and _is_rank0
+    if SHARE_EXECUTABLE_COPIES:
+        _share_executable_copies()
     if TRACE or HEAP_DUMP:
-        logger.info(
-            "[MEMDBG] tag=%s heap_dump=%s drop_serialize_entry=%s "
-            "clear_compile_cache=%s release_stager_pool=%s "
-            "clear_precompile_context=%s",
-            _tag,
-            _dumps_heap,
-            DROP_SERIALIZE_ENTRY,
-            CLEAR_COMPILE_CACHE,
-            RELEASE_STAGER_POOL,
-            CLEAR_PRECOMPILE_CONTEXT,
-        )
+        flags = {
+            "heap_dump": _dumps_heap,
+            "A1": DROP_SERIALIZE_ENTRY,
+            "A1b": CLEAR_PRECOMPILE_CONTEXT,
+            "A1c": RELEASE_ENTRY_COPIES,
+            "A1d": SHARE_EXECUTABLE_COPIES,
+            "A2": CLEAR_COMPILE_CACHE,
+            "C1": RELEASE_STAGER_POOL,
+        }
+        logger.info("[MEMDBG] tag=%s flags=%s", _tag, flags)
+
+
+def _share_executable_copies() -> None:
+    """(A1d) Make copy/deepcopy of a TPU executable share the loaded program.
+
+    torch copies OutputCode objects in BundledOutputCodeLoadable.pre_save (cold
+    start) and deep-copies bundled entries in deserialize_bundled_cache_entry
+    (warm start) so a later serialization starts from a pristine object. For
+    TorchTpuCompiledExecutable the copy goes through __reduce__ -- serialize
+    and load a second program -- although prepare_for_serialization is a no-op
+    and a loaded executable is never mutated. Sharing removes the copy at its
+    source instead of releasing it afterwards.
+    """
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    TorchTpuCompiledExecutable.__copy__ = lambda self: self
+    TorchTpuCompiledExecutable.__deepcopy__ = lambda self, memo: self
+
+
+def _tcmalloc_allocated_mb() -> float:
+    """Bytes the application holds in tcmalloc (excludes allocator caches)."""
+    get = getattr(_process_symbols, "MallocExtension_GetNumericProperty", None)
+    if get is None:
+        return -1.0
+    value = ctypes.c_size_t()
+    get.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]
+    if not get(b"generic.current_allocated_bytes", ctypes.byref(value)):
+        return -1.0
+    return value.value / 2**20
 
 
 def _proc_mem_mb() -> tuple[float, float]:
@@ -149,6 +183,38 @@ def maybe_clear_precompile_context(reason: str) -> None:
     gc.collect()
     logger.info(
         "[MEMDBG] cleared PrecompileContext after %s: %d artifacts", reason, before
+    )
+
+
+def maybe_release_entry_copies(reason: str) -> None:
+    """(A1c) Drop the executable copies that bundled AOTAutograd entries keep.
+
+    AOTAutogradCache.save calls BundledOutputCodeLoadable.pre_save, which
+    replaces the entry's ``result`` with ``copy(result)`` -- for TPU a
+    serialize/load round trip, i.e. a second loaded executable -- so the
+    entry can be pickled. The entry then stays reachable from
+    SerializableCompiledFunction.serialize_fn closures (and TpuBackend's
+    ``serialize`` lambdas) for the life of the process. Runtime wrappers hold
+    the executable they run directly, so dropping ``result`` from every live
+    entry once startup has saved its artifacts releases only the copies.
+    """
+    if not RELEASE_ENTRY_COPIES:
+        return
+    from torch._functorch._aot_autograd.aot_autograd_result import (
+        BundledOutputCodeLoadable,
+    )
+
+    gc.collect()
+    released = 0
+    for obj in gc.get_objects():
+        if isinstance(obj, BundledOutputCodeLoadable) and obj.result is not None:
+            obj.result = None
+            released += 1
+    gc.collect()
+    logger.info(
+        "[MEMDBG] released %d bundled-entry executable copies after %s",
+        released,
+        reason,
     )
 
 
@@ -241,12 +307,13 @@ def stage(name: str) -> None:
     rss, anon = _proc_mem_mb()
     logger.info(
         "[MEMDBG] stage=%s tag=%s VmRSS=%.1f MB RssAnon=%.1f MB "
-        "compile_cache_entries=%d live_compiled_executables=%d "
-        "precompile_artifacts=%d",
+        "tcmalloc_allocated=%.1f MB compile_cache_entries=%d "
+        "live_compiled_executables=%d precompile_artifacts=%d",
         name,
         _tag,
         rss,
         anon,
+        _tcmalloc_allocated_mb(),
         _compile_cache_entries(),
         _live_compiled_executables(),
         _precompile_artifacts(),

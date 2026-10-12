@@ -734,6 +734,7 @@ class TPUWorker(WorkerBase):
         memory_debug.stage("post_capture")
         memory_debug.log_executable_holders("post_capture")
         memory_debug.maybe_clear_precompile_context("capture_model")
+        memory_debug.maybe_release_entry_copies("capture_model")
         memory_debug.maybe_clear_compile_cache("capture_model")
         memory_debug.trim_allocator("post_capture")
         memory_debug.stage("final")
