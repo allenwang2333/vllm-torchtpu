@@ -56,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, memory_debug
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -611,6 +611,16 @@ class ExpertParamStager:
         for param, _ in list(self._staged.values()):
             self.flush(param)
 
+    def release_pool(self) -> int:
+        """Drop the reusable host buffers; returns the bytes released."""
+        released = sum(
+            buffer.numel() * buffer.element_size()
+            for buffers in self._pool.values()
+            for buffer in buffers
+        )
+        self._pool.clear()
+        return released
+
     def __len__(self) -> int:
         return len(self._staged)
 
@@ -699,6 +709,11 @@ def patch_moe_expert_write_staging() -> None:
             during_load,
             stager.flushed - during_load,
         )
+        if memory_debug.RELEASE_STAGER_POOL:
+            logger.info(
+                "[MEMDBG] released %.1f MiB of expert staging buffers",
+                stager.release_pool() / 2**20,
+            )
         return orig_process(model, model_config, target_device)
 
     RoutedExperts.weight_loader = weight_loader
