@@ -5,14 +5,14 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 
 import torch
-
-from vllm_torchtpu import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
@@ -45,7 +45,14 @@ def _apply_compact_swa_block_pool_patch() -> None:
             for b in state_blocks:
                 b.pool_partition = "state"
             self.state_free_block_queue = FreeKVCacheBlockQueue(state_blocks)
-        swa_cap = min(num_swa_blocks, 128)
+        _, target_swa = DeepseekV41FlashKVCacheAllocator.aux_partition_sizes(
+            getattr(self, "num_gpu_blocks", 0)
+        )
+        swa_cap = (
+            max(num_swa_blocks, target_swa)
+            if target_swa > 0
+            else min(num_swa_blocks, 128)
+        )
         swa_blocks = []
         for bid in range(1, swa_cap + 1):
             blk = KVCacheBlock(block_id=bid)
@@ -81,6 +88,8 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             )
             num_swa = max(768, min((11 * reqs) // 2, num_blocks // 11))
             return num_state, num_swa
+        if num_blocks >= 256:
+            return max(16, min(160, num_blocks // 32)), 768
         if num_blocks >= 64:
             return max(4, min(64, num_blocks // 32)), max(
                 8, min(128, (num_blocks * 3) // 16)
@@ -118,7 +127,7 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             max_reqs = None
 
         num_state_aux, num_swa_aux = self.aux_partition_sizes(num_blocks, max_reqs)
-        main_end = max(1, num_blocks - num_state_aux - num_swa_aux)
+        main_end = max(1, num_blocks - num_state_aux)
 
         def _create_cache(
             shape: tuple[int, ...],
@@ -259,7 +268,13 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         min_host_page_size = min(h.shape[1] for h in csa_nope_hosts)
         csa_nope_hosts = [h for h in csa_nope_hosts if h.shape[1] == min_host_page_size]
 
-        compact_swa_blocks = num_swa_aux + 1 if num_swa_aux > 0 else num_blocks
+        coord_swa = (
+            min(2816 if num_blocks >= 16384 else 640, max(32, num_blocks // 11))
+            if num_blocks >= 256
+            else 0
+        )
+        eff_swa_blocks = max(num_swa_aux, coord_swa)
+        compact_swa_blocks = eff_swa_blocks + 1 if eff_swa_blocks > 0 else num_blocks
         swa_overflow_shape = (
             compact_swa_blocks,
             csa_nope_hosts[0].shape[1],
@@ -290,9 +305,9 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
 
         overlay_hosts: list[torch.Tensor] = []
         for group_swa_layers in swa_layer_groups:
-            for position, layer_name in enumerate(group_swa_layers):
+            for layer_name in group_swa_layers:
                 kv_caches[layer_name] = _host_at(
-                    overlay_hosts, position, swa_overflow_shape
+                    overlay_hosts, len(overlay_hosts), swa_overflow_shape
                 )
 
         for position, layer_name in enumerate(state_layer_names):

@@ -605,7 +605,9 @@ def _build_op(
                 hash_topk_ids=ids_s.astype(jnp.int32),
                 topk_weights_override=w_s.astype(jnp.float32),
                 routed_scaling_factor=1.0,
-                token_replica_groups=token_replica_groups,
+                token_replica_groups=(
+                    None if precomputed_routing else token_replica_groups
+                ),
                 subchannel_fp8=subchannel_fp8,
                 requantize_mid=requantize_mid,
                 wire_bf16=(x_s.shape[0] <= wire_bf16_max_tokens),
@@ -670,6 +672,7 @@ def _build_op(
         return torch.empty_like(x)
 
     op.register_fake(_fake)
+    op._jax_fn = fn
     _OPS[key] = op
     return op
 
@@ -944,8 +947,12 @@ def prebuild_fused_moe_ep(
         return None
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
-    token_replica_groups = ep_token_replica_groups(
-        is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+    token_replica_groups = (
+        None
+        if precomputed_routing
+        else ep_token_replica_groups(
+            is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+        )
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
