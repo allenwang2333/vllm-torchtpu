@@ -15,7 +15,7 @@
 and double-buffered pipelined decode on pre-encoded physical cache rows."""
 
 import functools
-import os
+from vllm_torchtpu import envs
 
 import jax
 import jax.numpy as jnp
@@ -62,18 +62,14 @@ def _fused_encode_csa_kernel(
     is_padding = tk < 0
     if page_size & (page_size - 1) == 0:
         ps_shift = page_size.bit_length() - 1
-        logical = jnp.clip(
-            jnp.right_shift(tk, ps_shift), 0, pages_per_seq - 1
-        )
+        logical = jnp.clip(jnp.right_shift(tk, ps_shift), 0, pages_per_seq - 1)
         token_offset = jnp.bitwise_and(tk, page_size - 1)
     else:
         logical = jnp.clip(tk // page_size, 0, pages_per_seq - 1)
         token_offset = tk % page_size
 
     idx0 = jnp.clip(logical, 0, _ENCODE_PAGE_CHUNK - 1)
-    page_ids = jnp.take_along_axis(
-        windows_ref[:, :_ENCODE_PAGE_CHUNK], idx0, axis=1
-    )
+    page_ids = jnp.take_along_axis(windows_ref[:, :_ENCODE_PAGE_CHUNK], idx0, axis=1)
     if use_dynamic_chunks:
         act_chunks = act_chunks_ref[0]
 
@@ -85,9 +81,7 @@ def _fused_encode_csa_kernel(
             gathered = jnp.take_along_axis(
                 window_chunk, jnp.clip(local, 0, _ENCODE_PAGE_CHUNK - 1), axis=1
             )
-            return jnp.where(
-                (local >= 0) & (local < _ENCODE_PAGE_CHUNK), gathered, acc
-            )
+            return jnp.where((local >= 0) & (local < _ENCODE_PAGE_CHUNK), gathered, acc)
 
         page_ids = lax.fori_loop(1, act_chunks, _chunk_body, page_ids)
     else:
@@ -110,22 +104,15 @@ def _fused_encode_csa_kernel(
     flat_idx = rows * topk + cols
 
     if total_num_pages & (total_num_pages - 1) == 0:
-        scattered_page_ids = jnp.bitwise_and(
-            flat_idx * 104729, total_num_pages - 1
-        )
+        scattered_page_ids = jnp.bitwise_and(flat_idx * 104729, total_num_pages - 1)
     else:
         rem_p = lax.rem(flat_idx * 104729, total_num_pages)
-        scattered_page_ids = jnp.where(
-            rem_p < 0, rem_p + total_num_pages, rem_p
-        )
+        scattered_page_ids = jnp.where(rem_p < 0, rem_p + total_num_pages, rem_p)
     if page_size & (page_size - 1) == 0:
-        scattered_token_offset = jnp.bitwise_and(
-            flat_idx * 15485863, page_size - 1
-        )
+        scattered_token_offset = jnp.bitwise_and(flat_idx * 15485863, page_size - 1)
         valid_raw = jnp.left_shift(page_ids, ps_shift) + token_offset
         pad_raw = ~(
-            jnp.left_shift(scattered_page_ids, ps_shift)
-            + scattered_token_offset
+            jnp.left_shift(scattered_page_ids, ps_shift) + scattered_token_offset
         )
     else:
         rem_t = lax.rem(flat_idx * 15485863, page_size)
@@ -170,9 +157,9 @@ def encode_csa_gather_indices(
         )
     else:
         token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-        cmp_bf16 = (
-            token_ids[:, None] >= cu_q_lens[None, 1:max_num_seqs]
-        ).astype(jnp.bfloat16)
+        cmp_bf16 = (token_ids[:, None] >= cu_q_lens[None, 1:max_num_seqs]).astype(
+            jnp.bfloat16
+        )
         ones_bf16 = jnp.ones((max_num_seqs - 1,), dtype=jnp.bfloat16)
         seq_ids_segment = jnp.einsum(
             "ts,s->t",
@@ -186,9 +173,7 @@ def encode_csa_gather_indices(
         padded_pps = num_chunks * _ENCODE_PAGE_CHUNK
         page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
         if padded_pps != pages_per_seq:
-            page_table = jnp.pad(
-                page_table, ((0, 0), (0, padded_pps - pages_per_seq))
-            )
+            page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
         use_dynamic_chunks = num_chunks > 8 and num_tokens >= 128
         if use_dynamic_chunks:
             max_tk = jnp.max(topk_indices)
@@ -210,18 +195,14 @@ def encode_csa_gather_indices(
 
         max_chunk_tokens = max(
             eff_block_tokens,
-            align_to(
-                min(padded_tokens, (512 * 8192) // padded_pps), eff_block_tokens
-            ),
+            align_to(min(padded_tokens, (512 * 8192) // padded_pps), eff_block_tokens),
         )
         out_chunks = []
         for c_start in range(0, padded_tokens, max_chunk_tokens):
             c_end = min(c_start + max_chunk_tokens, padded_tokens)
             c_len = c_end - c_start
             windows_chunk = page_table[seq_seg[c_start:c_end]]
-            tok_start_arr = jnp.asarray(
-                [token_start + c_start], dtype=jnp.int32
-            )
+            tok_start_arr = jnp.asarray([token_start + c_start], dtype=jnp.int32)
             out_c = pl.pallas_call(
                 functools.partial(
                     _fused_encode_csa_kernel,
@@ -237,9 +218,7 @@ def encode_csa_gather_indices(
                         pl.BlockSpec(
                             (eff_block_tokens, padded_pps), lambda t, *_: (t, 0)
                         ),
-                        pl.BlockSpec(
-                            (eff_block_tokens, topk), lambda t, *_: (t, 0)
-                        ),
+                        pl.BlockSpec((eff_block_tokens, topk), lambda t, *_: (t, 0)),
                     ],
                     out_specs=pl.BlockSpec(
                         (eff_block_tokens, topk), lambda t, *_: (t, 0)
@@ -249,9 +228,7 @@ def encode_csa_gather_indices(
                 out_shape=jax.ShapeDtypeStruct((c_len, topk), jnp.int32),
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=(
-                        ("parallel",)
-                        if c_len > eff_block_tokens
-                        else ("arbitrary",)
+                        ("parallel",) if c_len > eff_block_tokens else ("arbitrary",)
                     ),
                     disable_bounds_checks=True,
                 ),
@@ -315,7 +292,12 @@ def _build_candidate_union_and_bitmask(
         and topk % 16 == 0
         and m_union % 16 == 0
         and m_union <= 2048
-        and max(5, (total_cache_rows - 1).bit_length() - 14) <= int(os.environ.get("VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT", os.environ.get("VLLM_DSV41_SC_UNION_MAX_SHIFT", "9")))
+        and max(5, (total_cache_rows - 1).bit_length() - 14)
+        <= int(
+            envs.VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT
+            if envs.VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT is not None
+            else envs.VLLM_DSV41_SC_UNION_MAX_SHIFT
+        )
         and hasattr(pltpu.get_tpu_info(), "sparse_core")
     ):
         from jax.experimental.pallas import tpu_sc as plsc
@@ -329,9 +311,7 @@ def _build_candidate_union_and_bitmask(
 
         grouped = topk_indices.reshape(num_groups, n_cols)
         grouped_pad = (
-            jnp.pad(
-                grouped, ((0, padded_g - num_groups), (0, 0)), constant_values=-1
-            )
+            jnp.pad(grouped, ((0, padded_g - num_groups), (0, 0)), constant_values=-1)
             if padded_g > num_groups
             else grouped
         )
@@ -341,7 +321,19 @@ def _build_candidate_union_and_bitmask(
             if total_cache_rows <= 32768
             else (
                 32768
-                if total_cache_rows <= (1 << (14 + int(os.environ.get("VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT", os.environ.get("VLLM_DSV41_SC_UNION_MAX_SHIFT", "9"))))) and m_union <= 2048
+                if total_cache_rows
+                <= (
+                    1
+                    << (
+                        14
+                        + int(
+                            envs.VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT
+                            if envs.VLLM_DSV41_SC_UNION_MAX_BLK_SHIFT is not None
+                            else envs.VLLM_DSV41_SC_UNION_MAX_SHIFT
+                        )
+                    )
+                )
+                and m_union <= 2048
                 else 16384
             )
         )
@@ -377,18 +369,13 @@ def _build_candidate_union_and_bitmask(
             b_tmp,
             *extra_vmem,
         ):
-            flat = (
-                lax.axis_index("core") * eff_subcores
-                + lax.axis_index("subcore")
-            )
+            flat = lax.axis_index("core") * eff_subcores + lax.axis_index("subcore")
             iota_lanes = jnp.arange(lanes, dtype=jnp.int32)
 
             @pl.when(lax.axis_index("core") >= 0)
             def _init_bm():
                 def zero_bm(i):
-                    bm_vmem[pl.ds(i * lanes, lanes)] = jnp.zeros(
-                        (lanes,), jnp.int32
-                    )
+                    bm_vmem[pl.ds(i * lanes, lanes)] = jnp.zeros((lanes,), jnp.int32)
 
                 plsc.parallel_loop(0, win_size // lanes, unroll=16)(zero_bm)
                 if num_wins > 1:
@@ -410,23 +397,20 @@ def _build_candidate_union_and_bitmask(
                         total_cache_rows,
                     )
                     k_tmp[pl.ds(i * lanes, lanes)] = pad_idx
-                    b_tmp[pl.ds(i * lanes, lanes)] = jnp.zeros(
-                        (lanes,), jnp.int32
-                    )
+                    b_tmp[pl.ds(i * lanes, lanes)] = jnp.zeros((lanes,), jnp.int32)
 
                 plsc.parallel_loop(0, m_union // lanes, unroll=16)(init_tmp)
                 vecs_per_q = topk // lanes
 
                 if num_wins == 1:
+
                     def scatter_step_1w(vec_idx):
                         q_id = vec_idx // vecs_per_q
                         q_bit = jnp.left_shift(jnp.int32(1), q_id)
                         kv = tk_in_vmem[pl.ds(vec_idx * lanes, lanes)]
                         valid = (kv >= 0) & (kv < win_size)
                         rel_idx = jnp.where(valid, kv, 0)
-                        cur_bm_1w = plsc.load_gather(
-                            bm_vmem, [rel_idx], mask=valid
-                        )
+                        cur_bm_1w = plsc.load_gather(bm_vmem, [rel_idx], mask=valid)
                         plsc.store_scatter(
                             bm_vmem,
                             [rel_idx],
@@ -523,8 +507,8 @@ def _build_candidate_union_and_bitmask(
                                     p_ids,
                                     mask=sel,
                                 )
-                                page_slot_vmem[pl.ds(i * lanes, lanes)] = (
-                                    jnp.zeros((lanes,), jnp.int32)
+                                page_slot_vmem[pl.ds(i * lanes, lanes)] = jnp.zeros(
+                                    (lanes,), jnp.int32
                                 )
 
                             return p_cnt + cnt
@@ -544,9 +528,7 @@ def _build_candidate_union_and_bitmask(
                         def scatter_slot_id(j):
                             slot_ids = j * lanes + iota_lanes
                             valid_s = slot_ids < batch_pages
-                            p_ids = act_pages_vmem[
-                                pl.ds(b_start + j * lanes, lanes)
-                            ]
+                            p_ids = act_pages_vmem[pl.ds(b_start + j * lanes, lanes)]
                             plsc.store_scatter(
                                 page_slot_vmem,
                                 [jnp.where(valid_s, p_ids, 0)],
@@ -633,9 +615,7 @@ def _build_candidate_union_and_bitmask(
                         def clear_slot_id(j):
                             slot_ids = j * lanes + iota_lanes
                             valid_s = slot_ids < batch_pages
-                            p_ids = act_pages_vmem[
-                                pl.ds(b_start + j * lanes, lanes)
-                            ]
+                            p_ids = act_pages_vmem[pl.ds(b_start + j * lanes, lanes)]
                             plsc.store_scatter(
                                 page_slot_vmem,
                                 [jnp.where(valid_s, p_ids, 0)],
@@ -643,9 +623,7 @@ def _build_candidate_union_and_bitmask(
                                 mask=valid_s,
                             )
 
-                        plsc.parallel_loop(0, batch_page_vecs, unroll=4)(
-                            clear_slot_id
-                        )
+                        plsc.parallel_loop(0, batch_page_vecs, unroll=4)(clear_slot_id)
                         return woff_out
 
                     if max_total_blks <= max_act_blks:
@@ -681,22 +659,14 @@ def _build_candidate_union_and_bitmask(
                             )
 
                 def copy_out(i):
-                    k_out_vmem[pl.ds(i * lanes, lanes)] = k_tmp[
-                        pl.ds(i * lanes, lanes)
-                    ]
-                    b_out_vmem[pl.ds(i * lanes, lanes)] = b_tmp[
-                        pl.ds(i * lanes, lanes)
-                    ]
+                    k_out_vmem[pl.ds(i * lanes, lanes)] = k_tmp[pl.ds(i * lanes, lanes)]
+                    b_out_vmem[pl.ds(i * lanes, lanes)] = b_tmp[pl.ds(i * lanes, lanes)]
 
                 plsc.parallel_loop(0, m_union // lanes, unroll=16)(copy_out)
-                n_out_vmem[pl.ds(0, lanes)] = jnp.full(
-                    (lanes,), total_u, jnp.int32
-                )
+                n_out_vmem[pl.ds(0, lanes)] = jnp.full((lanes,), total_u, jnp.int32)
 
             in_mode = pl.Buffered(1 if num_waves == 1 else 2)
-            out_mode = pl.Buffered(
-                1 if (num_waves == 1 or m_union > 2048) else 2
-            )
+            out_mode = pl.Buffered(1 if (num_waves == 1 or m_union > 2048) else 2)
 
             def spec(sz, mode=in_mode):
                 return pl.BlockSpec(
@@ -767,9 +737,7 @@ def _build_candidate_union_and_bitmask(
     )
     s_packed = lax.sort(packed_in, dimension=-1, is_stable=False)
     valid_s = s_packed < _INT32_MAX
-    s_keys = jnp.where(
-        valid_s, lax.shift_right_logical(s_packed, 5), _INT32_MAX
-    )
+    s_keys = jnp.where(valid_s, lax.shift_right_logical(s_packed, 5), _INT32_MAX)
     s_bits = jnp.where(
         valid_s,
         jnp.left_shift(jnp.int32(1), jnp.bitwise_and(s_packed, 31)),
@@ -793,9 +761,7 @@ def _build_candidate_union_and_bitmask(
             ],
             axis=-1,
         )
-        s_bits = jnp.where(
-            s_keys == rhs_keys, jnp.bitwise_or(s_bits, rhs_bits), s_bits
-        )
+        s_bits = jnp.where(s_keys == rhs_keys, jnp.bitwise_or(s_bits, rhs_bits), s_bits)
 
     prev_keys = jnp.concatenate(
         [jnp.full((num_groups, 1), -1, dtype=jnp.int32), s_keys[:, :-1]],
@@ -809,17 +775,13 @@ def _build_candidate_union_and_bitmask(
         [u_keys, s_bits_clean], dimension=-1, is_stable=False, num_keys=1
     )
     union_sorted = u_sorted[:, :m_union]
-    cand_bits_tiled = bits_sorted[:, :m_union].reshape(
-        num_groups, m_union // 128, 128
-    )
+    cand_bits_tiled = bits_sorted[:, :m_union].reshape(num_groups, m_union // 128, 128)
 
     flat_grp_idx = jnp.arange(num_groups * m_union, dtype=jnp.int32).reshape(
         num_groups, m_union
     )
     scattered_rows = (flat_grp_idx * 104729) % total_cache_rows
-    valid_or_pad = jnp.where(
-        union_sorted < _INT32_MAX, union_sorted, scattered_rows
-    )
+    valid_or_pad = jnp.where(union_sorted < _INT32_MAX, union_sorted, scattered_rows)
     if u_chunk is not None and m_union % u_chunk == 0:
         col_idx = jnp.arange(m_union, dtype=jnp.int32)[None, :]
         chunk_start = (col_idx // u_chunk) * u_chunk
@@ -882,20 +844,12 @@ def precompute_csa_union_and_gather(
     return u_idx, c_bits, n_uniq, g_nope, g_rope
 
 
-_CSA_UNION_VERIFY_BQ: int = int(
-    os.environ.get("VLLM_DSV41_CSA_UNION_VERIFY_BQ", "0")
-)
-_CSA_UNION_MAX_TOKENS: int = int(
-    os.environ.get("VLLM_DSV41_CSA_UNION_MAX_TOKENS", "16384")
-)
-_FAST_GROUPED_ATTN: bool = (
-    os.environ.get("VLLM_DSV41_FAST_GROUPED_ATTN", "1") == "1"
-)
+_CSA_UNION_VERIFY_BQ: int = int(envs.VLLM_DSV41_CSA_UNION_VERIFY_BQ)
+_CSA_UNION_MAX_TOKENS: int = int(envs.VLLM_DSV41_CSA_UNION_MAX_TOKENS)
+_FAST_GROUPED_ATTN: bool = bool(envs.VLLM_DSV41_FAST_GROUPED_ATTN)
 
 
-def resolve_csa_union_u_chunk(
-    b_q: int, m_union: int, topk: int = 512
-) -> int:
+def resolve_csa_union_u_chunk(b_q: int, m_union: int, topk: int = 512) -> int:
     if (
         topk == 512
         and m_union % 1024 == 0
@@ -1008,9 +962,7 @@ def _grouped_attention_kernel(
     num_q_heads = n_qh // b_q
     q_dtype = q_hbm_ref.dtype
     num_u_chunks = m_union // u_chunk
-    max_exact_chunks = min(
-        num_u_chunks, 2 if (num_q_heads > 64 and n_qh > 768) else 3
-    )
+    max_exact_chunks = min(num_u_chunks, 2 if (num_q_heads > 64 and n_qh > 768) else 3)
     cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
 
@@ -1162,30 +1114,23 @@ def _grouped_attention_kernel(
     q_sub = q_heads_per_tile * num_q_heads
     num_q_tiles = n_qh // q_sub
 
-    bq_tiles = bq_x2_ref.at[bi_sem_idx][...].reshape(
-        num_q_tiles, q_sub, head_dim
-    )
+    bq_tiles = bq_x2_ref.at[bi_sem_idx][...].reshape(num_q_tiles, q_sub, head_dim)
     swa_acc_tiles = swa_acc_x2_ref.at[bi_sem_idx][...].reshape(
         num_q_tiles, q_sub, head_dim
     )
     swa_m_all = (
-        bm_x2_ref.at[bi_sem_idx][...].reshape(-1)[:n_qh].reshape(
-            num_q_tiles, q_sub
-        )
+        bm_x2_ref.at[bi_sem_idx][...].reshape(-1)[:n_qh].reshape(num_q_tiles, q_sub)
     )
     swa_l_all = (
-        bl_x2_ref.at[bi_sem_idx][...].reshape(-1)[:n_qh].reshape(
-            num_q_tiles, q_sub
-        )
+        bl_x2_ref.at[bi_sem_idx][...].reshape(-1)[:n_qh].reshape(num_q_tiles, q_sub)
     )
-    sinks_all = (
-        attention_sinks_ref[...].reshape(-1)[:n_qh].reshape(num_q_tiles, q_sub)
-    )
+    sinks_all = attention_sinks_ref[...].reshape(-1)[:n_qh].reshape(num_q_tiles, q_sub)
 
     kv_sem_0 = sem_ids_ref[2]
     next_kv_sem = lax.select(kv_sem_0 == 0, 1, 0)
 
     if num_u_chunks >= 2:
+
         @pl.when(act_chunks >= 2)
         def _pref_c1():
             sem_ids_ref[2] = next_kv_sem
@@ -1201,9 +1146,7 @@ def _grouped_attention_kernel(
     bits_0 = lax.broadcast_in_dim(
         cand_bits_x2_ref.at[kv_sem_0][...].reshape(-1), (q_sub, u_chunk), (1,)
     )
-    q_iota_base = (
-        lax.broadcasted_iota(jnp.int32, (q_sub, u_chunk), 0) // num_q_heads
-    )
+    q_iota_base = lax.broadcasted_iota(jnp.int32, (q_sub, u_chunk), 0) // num_q_heads
 
     def _masked_qk(qt, bkv_c, bits_c):
         s_c = (
@@ -1234,9 +1177,7 @@ def _grouped_attention_kernel(
                 exp_swa = jnp.exp(swa_m_t - m_new)
                 p = jnp.exp(s_cur - m_new[:, None])
                 s_nxt = (
-                    _masked_qk(qt + 1, bkv_0, bits_0)
-                    if qt + 1 < num_q_tiles
-                    else None
+                    _masked_qk(qt + 1, bkv_0, bits_0) if qt + 1 < num_q_tiles else None
                 )
                 l_new = (exp_swa * swa_l_t + jnp.sum(p, axis=1)) + jnp.exp(
                     sinks_t - m_new
@@ -1253,9 +1194,7 @@ def _grouped_attention_kernel(
                 alpha = jnp.exp(m_init - m_new)
                 p = jnp.exp(s_cur - m_new[:, None])
                 s_nxt = (
-                    _masked_qk(qt + 1, bkv_0, bits_0)
-                    if qt + 1 < num_q_tiles
-                    else None
+                    _masked_qk(qt + 1, bkv_0, bits_0) if qt + 1 < num_q_tiles else None
                 )
                 l_new = alpha * l_init + jnp.sum(p, axis=1)
                 pv = jnp.einsum(
@@ -1267,14 +1206,13 @@ def _grouped_attention_kernel(
             out_t = (
                 lax.div(acc_new, l_new_2d)
                 if q_dtype == jnp.float32
-                else (acc_new * pl.reciprocal(l_new_2d, approx=True)).astype(
-                    q_dtype
-                )
+                else (acc_new * pl.reciprocal(l_new_2d, approx=True)).astype(q_dtype)
             )
             bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
             s_cur = s_nxt
 
     if max_exact_chunks >= 2:
+
         @pl.when(act_chunks == 2)
         def _run_2chunks():
             # Compute all Q @ K_0^T tiles while chunk 1 DMA completes in background!
@@ -1304,9 +1242,7 @@ def _grouped_attention_kernel(
                 sinks_t = sinks_all[qt]
                 swa_acc_t = swa_acc_tiles[qt]
                 s0_t = s0_list[qt]
-                max_s01 = jnp.maximum(
-                    jnp.max(s0_t, axis=1), jnp.max(s1_cur, axis=1)
-                )
+                max_s01 = jnp.maximum(jnp.max(s0_t, axis=1), jnp.max(s1_cur, axis=1))
 
                 if b_q < 8:
                     m_new = jnp.maximum(swa_m_t, max_s01)
@@ -1323,9 +1259,9 @@ def _grouped_attention_kernel(
                         if qt + 1 < num_q_tiles
                         else None
                     )
-                    l_new = (
-                        exp_swa * swa_l_t + jnp.sum(p01, axis=1)
-                    ) + jnp.exp(sinks_t - m_new)
+                    l_new = (exp_swa * swa_l_t + jnp.sum(p01, axis=1)) + jnp.exp(
+                        sinks_t - m_new
+                    )
                     pv = jnp.einsum(
                         "nm,md->nd",
                         p01,
@@ -1364,14 +1300,15 @@ def _grouped_attention_kernel(
                 out_t = (
                     lax.div(acc_new, l_new_2d)
                     if q_dtype == jnp.float32
-                    else (
-                        acc_new * pl.reciprocal(l_new_2d, approx=True)
-                    ).astype(q_dtype)
+                    else (acc_new * pl.reciprocal(l_new_2d, approx=True)).astype(
+                        q_dtype
+                    )
                 )
                 bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
                 s1_cur = s1_nxt
 
     if max_exact_chunks >= 3:
+
         @pl.when(act_chunks == 3)
         def _run_3chunks():
             # Overlap chunk 1 DMA behind Q @ K_0^T!
@@ -1419,9 +1356,7 @@ def _grouped_attention_kernel(
                 s1_t = s1_list[qt]
                 max_s012 = jnp.maximum(
                     jnp.max(s0_t, axis=1),
-                    jnp.maximum(
-                        jnp.max(s1_t, axis=1), jnp.max(s2_cur, axis=1)
-                    ),
+                    jnp.maximum(jnp.max(s1_t, axis=1), jnp.max(s2_cur, axis=1)),
                 )
 
                 if b_q < 8:
@@ -1440,9 +1375,9 @@ def _grouped_attention_kernel(
                         if qt + 1 < num_q_tiles
                         else None
                     )
-                    l_new = (
-                        exp_swa * swa_l_t + jnp.sum(p012, axis=1)
-                    ) + jnp.exp(sinks_t - m_new)
+                    l_new = (exp_swa * swa_l_t + jnp.sum(p012, axis=1)) + jnp.exp(
+                        sinks_t - m_new
+                    )
                     pv = jnp.einsum(
                         "nm,md->nd",
                         p012,
@@ -1482,14 +1417,15 @@ def _grouped_attention_kernel(
                 out_t = (
                     lax.div(acc_new, l_new_2d)
                     if q_dtype == jnp.float32
-                    else (
-                        acc_new * pl.reciprocal(l_new_2d, approx=True)
-                    ).astype(q_dtype)
+                    else (acc_new * pl.reciprocal(l_new_2d, approx=True)).astype(
+                        q_dtype
+                    )
                 )
                 bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
                 s2_cur = s2_nxt
 
     if num_u_chunks > max_exact_chunks:
+
         @pl.when(act_chunks > max_exact_chunks)
         def _run_stream_chunks():
             # Step 0 (chunk 0 is already loaded & dequantized in bkv_0 / bits_0!)
@@ -1501,14 +1437,10 @@ def _grouped_attention_kernel(
                 swa_m_t = swa_m_all[qt]
                 swa_l_t = swa_l_all[qt]
                 sinks_t = sinks_all[qt]
-                m0 = jnp.maximum(
-                    jnp.maximum(swa_m_t, sinks_t), jnp.max(s0, axis=1)
-                )
+                m0 = jnp.maximum(jnp.maximum(swa_m_t, sinks_t), jnp.max(s0, axis=1))
                 exp_swa = jnp.exp(swa_m_t - m0)
                 p0 = jnp.exp(s0 - m0[:, None])
-                l0 = (
-                    exp_swa * swa_l_t + jnp.exp(sinks_t - m0)
-                ) + jnp.sum(p0, axis=1)
+                l0 = (exp_swa * swa_l_t + jnp.exp(sinks_t - m0)) + jnp.sum(p0, axis=1)
                 pv0 = jnp.einsum(
                     "nm,md->nd", p0, bkv_0, preferred_element_type=jnp.float32
                 )
@@ -1580,9 +1512,7 @@ def _grouped_attention_kernel(
                 out_t = (
                     lax.div(acc_fin, l2d)
                     if q_dtype == jnp.float32
-                    else (
-                        acc_fin * pl.reciprocal(l2d, approx=True)
-                    ).astype(q_dtype)
+                    else (acc_fin * pl.reciprocal(l2d, approx=True)).astype(q_dtype)
                 )
                 bo_x2_ref.at[bo_sem_idx, pl.ds(qt * q_sub, q_sub)][...] = out_t
 
@@ -1616,9 +1546,7 @@ def _run_chunked_fallback(
     _, num_q_heads, head_dim = q.shape
     topk = topk_indices.shape[-1]
     kv_lens = jnp.sum(topk_indices >= 0, axis=-1)
-    gather_indices = jnp.where(
-        topk_indices < 0, ~topk_indices, topk_indices
-    ).ravel()
+    gather_indices = jnp.where(topk_indices < 0, ~topk_indices, topk_indices).ravel()
 
     # For decode / verify (<= 384 tokens), process the entire batch in 1 launch
     # while clamping negative padding indices directly on SparseCore in csa_gather
@@ -1831,20 +1759,14 @@ def _batched_grouped_attention_kernel(
     q_heads_per_tile = _largest_divisor(b_q, max(1, 1024 // num_q_heads))
     q_sub = q_heads_per_tile * num_q_heads
     num_q_tiles = n_qh // q_sub
-    q_iota_base = (
-        lax.broadcasted_iota(jnp.int32, (q_sub, u_chunk), 0) // num_q_heads
-    )
+    q_iota_base = lax.broadcasted_iota(jnp.int32, (q_sub, u_chunk), 0) // num_q_heads
     sinks_all = jnp.tile(
         attention_sinks_ref[...].reshape(-1)[:num_q_heads], (b_q,)
     ).reshape(num_q_tiles, q_sub)
 
     nope_all = bkv_nope_x2_ref.at[in_sem][...].reshape(g_batch, u_chunk, -1)
-    rope_all = bkv_rope_x2_ref.at[in_sem][...].reshape(
-        g_batch, u_chunk // 2, -1
-    )
-    q_all = bq_x2_ref.at[in_sem][...].reshape(
-        g_batch, num_q_tiles, q_sub, head_dim
-    )
+    rope_all = bkv_rope_x2_ref.at[in_sem][...].reshape(g_batch, u_chunk // 2, -1)
+    q_all = bq_x2_ref.at[in_sem][...].reshape(g_batch, num_q_tiles, q_sub, head_dim)
     swa_acc_all = swa_acc_x2_ref.at[in_sem][...].reshape(
         g_batch, num_q_tiles, q_sub, head_dim
     )
@@ -1890,9 +1812,7 @@ def _batched_grouped_attention_kernel(
                 )
                 * sm_scale
             )
-            q_bit = jnp.left_shift(
-                jnp.int32(1), qt * q_heads_per_tile + q_iota_base
-            )
+            q_bit = jnp.left_shift(jnp.int32(1), qt * q_heads_per_tile + q_iota_base)
             return jnp.where(
                 jnp.bitwise_and(bits_c, q_bit) != 0,
                 s_c,
@@ -1942,13 +1862,9 @@ def _batched_grouped_attention_kernel(
             out_t = (
                 lax.div(acc_new, l_new_2d)
                 if q_dtype == jnp.float32
-                else (
-                    acc_new * pl.reciprocal(l_new_2d, approx=True)
-                ).astype(q_dtype)
+                else (acc_new * pl.reciprocal(l_new_2d, approx=True)).astype(q_dtype)
             )
-            bo_x2_ref.at[
-                out_sem, pl.ds(k * n_qh + qt * q_sub, q_sub)
-            ][...] = out_t
+            bo_x2_ref.at[out_sem, pl.ds(k * n_qh + qt * q_sub, q_sub)][...] = out_t
             s_cur = s_nxt
         bkv_k = bkv_next
 
@@ -1990,7 +1906,11 @@ def _launch_grouped_or_batched_attention(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
     if _FAST_GROUPED_ATTN:
-        target_gb = 8 if (num_q_heads <= 16 or b_q == 1) else (4 if (num_q_heads <= 64 or b_q <= 2) else 2)
+        target_gb = (
+            8
+            if (num_q_heads <= 16 or b_q == 1)
+            else (4 if (num_q_heads <= 64 or b_q <= 2) else 2)
+        )
         g_batch = (
             _largest_divisor(num_groups, target_gb)
             if (m_union == u_chunk and num_q_heads <= 128)
@@ -2242,12 +2162,11 @@ def sparse_ragged_paged_attention(
 
         grp_iota = jnp.arange(num_groups, dtype=jnp.int32)
         active_grp_mask = (grp_iota >= start_group) & (grp_iota < num_active_groups)
-        all_groups_fit = jnp.all(
-            jnp.where(active_grp_mask, n_unique, 0) <= m_union
-        )
+        all_groups_fit = jnp.all(jnp.where(active_grp_mask, n_unique, 0) <= m_union)
 
         def _run_explicit_grouped(q_orig: jax.Array) -> jax.Array:
             lead_tok_end = start_group * b_q
+
             def _attend_leading_decode_groups(q_in_lead: jax.Array) -> jax.Array:
                 dec_cap = min(num_tokens, align_to(max(8, max_num_seqs), 64))
                 dec_out = _run_chunked_fallback(
@@ -2264,8 +2183,15 @@ def sparse_ragged_paged_attention(
                     gather_and_attention_chunk_size=dec_cap,
                     attention_kernel_batch_size=attention_kernel_batch_size,
                 )
-                return dec_out if dec_cap == num_tokens else q_in_lead.at[:dec_cap].set(dec_out)
-            q_orig = lax.cond(lead_tok_end > 0, _attend_leading_decode_groups, lambda x: x, q_orig)
+                return (
+                    dec_out
+                    if dec_cap == num_tokens
+                    else q_in_lead.at[:dec_cap].set(dec_out)
+                )
+
+            q_orig = lax.cond(
+                lead_tok_end > 0, _attend_leading_decode_groups, lambda x: x, q_orig
+            )
             if pre_gathered_nope is not None and pre_gathered_rope is not None:
                 gathered_nope, gathered_rope = pre_gathered_nope, pre_gathered_rope
             else:
@@ -2319,7 +2245,9 @@ def sparse_ragged_paged_attention(
                     get_vllm_model_wrapper_context,
                 )
 
-                vllm_cfg = getattr(get_vllm_model_wrapper_context(), "vllm_config", None)
+                vllm_cfg = getattr(
+                    get_vllm_model_wrapper_context(), "vllm_config", None
+                )
                 spec_cfg = getattr(vllm_cfg, "speculative_config", None)
                 num_spec = getattr(spec_cfg, "num_speculative_tokens", None)
                 if isinstance(num_spec, int) and num_spec >= 1:
@@ -2373,7 +2301,9 @@ def sparse_ragged_paged_attention(
 
         # Case 2: Spec-Verify slice [decode_1tok_end : verify_tok_end] (q_len == ver_bq, SparseCore sc_union_ztc, m_union = 1024)
         if ver_bq >= 2 and num_tokens >= ver_bq:
-            ver_cap = (min(num_tokens, max(ver_bq, max_num_seqs * ver_bq)) // ver_bq) * ver_bq
+            ver_cap = (
+                min(num_tokens, max(ver_bq, max_num_seqs * ver_bq)) // ver_bq
+            ) * ver_bq
             ver_groups = ver_cap // ver_bq
             ver_m_union = (
                 min(envs.VLLM_DSV41_CSA_UNION_M, ver_bq * topk)
@@ -2394,9 +2324,7 @@ def sparse_ragged_paged_attention(
                 )
                 v_iota = jnp.arange(ver_groups, dtype=jnp.int32)
                 active_v = (v_iota >= ver_start_grp) & (v_iota < ver_act_grps)
-                all_v_fit = jnp.all(
-                    jnp.where(active_v, n_uniq, 0) <= ver_m_union
-                )
+                all_v_fit = jnp.all(jnp.where(active_v, n_uniq, 0) <= ver_m_union)
 
                 def _run_v_grouped(q_sub_in: jax.Array) -> jax.Array:
                     g_nope, g_rope = csa_gather.csa_gather(
@@ -2438,21 +2366,34 @@ def sparse_ragged_paged_attention(
                         swa_l_aligned[:ver_cap],
                         swa_m_aligned[:ver_cap],
                         sm_scale=sm_scale,
-                        gather_and_attention_chunk_size=min(ver_cap, gather_and_attention_chunk_size),
+                        gather_and_attention_chunk_size=min(
+                            ver_cap, gather_and_attention_chunk_size
+                        ),
                         attention_kernel_batch_size=attention_kernel_batch_size,
                     )
 
-                ver_out = lax.cond(all_v_fit, _run_v_grouped, _run_v_fallback, ver_q_slice)
-                return ver_out if ver_cap == num_tokens else q_in.at[:ver_cap].set(ver_out)
+                ver_out = lax.cond(
+                    all_v_fit, _run_v_grouped, _run_v_fallback, ver_q_slice
+                )
+                return (
+                    ver_out if ver_cap == num_tokens else q_in.at[:ver_cap].set(ver_out)
+                )
 
-            q = lax.cond(verify_tok_end > decode_1tok_end, _run_verify_union_stage, lambda x: x, q)
+            q = lax.cond(
+                verify_tok_end > decode_1tok_end,
+                _run_verify_union_stage,
+                lambda x: x,
+                q,
+            )
 
         # Case 3: Prefill / Straddling tail slice [verify_tok_end : num_valid_tokens]
         # Tier 1 fast path: pf_m_union_fast = align_to(2 * topk, 128) = 1024, u_chunk = 1024
         # (SparseCore sc_union_ztc + super-block _batched_grouped_attention_kernel when all
         # active groups satisfy n_uniq <= 1024).
         # Tier 2 zero-overflow fallback: pf_m_union = pf_bq * topk = 4096, u_chunk = 512.
-        _cfg_pf_bq = envs.VLLM_DSV41_CSA_UNION_BQ if envs.VLLM_DSV41_CSA_UNION_BQ > 0 else 8
+        _cfg_pf_bq = (
+            envs.VLLM_DSV41_CSA_UNION_BQ if envs.VLLM_DSV41_CSA_UNION_BQ > 0 else 8
+        )
         if num_tokens >= _cfg_pf_bq and num_tokens % _cfg_pf_bq == 0:
             pf_bq = _cfg_pf_bq
             pf_m_union_fast = (
@@ -2460,9 +2401,7 @@ def sparse_ragged_paged_attention(
                 if envs.VLLM_DSV41_CSA_UNION_M > 0
                 else align_to(2 * topk, 128)
             )
-            pf_u_chunk_fast = resolve_csa_union_u_chunk(
-                pf_bq, pf_m_union_fast, topk
-            )
+            pf_u_chunk_fast = resolve_csa_union_u_chunk(pf_bq, pf_m_union_fast, topk)
             pf_m_union = pf_bq * topk  # 4096: mathematical 0% overflow guarantee
             pf_u_chunk = resolve_csa_union_u_chunk(pf_bq, pf_m_union, topk)  # 512
             pf_groups = num_tokens // pf_bq

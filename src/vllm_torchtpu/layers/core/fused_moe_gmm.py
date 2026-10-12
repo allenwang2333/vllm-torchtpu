@@ -252,10 +252,12 @@ def _moe_gmm_tiling(
                 tile_n=tiles.tile_n,
                 bucket_base=64,
             )
-    _sub_tile = os.environ.get("VLLM_DSV41_MOE_SUBLANE_TILING", "1") == "1"
+    _sub_tile = bool(envs.VLLM_DSV41_MOE_SUBLANE_TILING)
     if (
         dims.size_group > 1
-        and 32 <= dims.size_m <= (max(dims.size_group * 100, 1024) if _sub_tile else dims.size_group * 40)
+        and 32
+        <= dims.size_m
+        <= (max(dims.size_group * 100, 1024) if _sub_tile else dims.size_group * 40)
         and 32 % dims.size_lhs_sublane == 0
     ):
         return TileSizes(
@@ -298,12 +300,9 @@ def gmm_wrapper(
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
     is_fp4_weight = (
-        (
-            jnp.issubdtype(rhs.dtype, jnp.floating)
-            and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-        )
-        or rhs_quant_dtype == jnp.float4_e2m1fn
-    )
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    ) or rhs_quant_dtype == jnp.float4_e2m1fn
     use_fp8_lhs = (not is_fp4_weight) or (lhs_scale is not None)
     return gmm_v2(
         lhs=lhs,
@@ -440,9 +439,7 @@ def prepare_routed_gmm_inputs(
         if return_onehot_combine:
             w_sorted_non_ep = jnp.where(
                 valid_mask[sorted_indices],
-                topk_weights_flat[sorted_indices].astype(
-                    hidden_states_local.dtype
-                ),
+                topk_weights_flat[sorted_indices].astype(hidden_states_local.dtype),
                 0,
             )
             return (
@@ -560,8 +557,8 @@ def prepare_routed_gmm_inputs(
     idx_bits = max(1, (m - 1).bit_length())
     # The second packed sort shifts indices < 2**idx_bits by idx_bits.
     idx_packable = (
-        (local_num_experts + 1).bit_length() + idx_bits < 31 and 2 * idx_bits < 31
-    )
+        local_num_experts + 1
+    ).bit_length() + idx_bits < 31 and 2 * idx_bits < 31
 
     if argsort_revert_indices is not None:
         sorted_indices = jnp.argsort(sort_keys) if not packable else None
@@ -745,17 +742,18 @@ def moe_gmm(
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     inter_dim = w2.shape[1] * packing_factor
     is_w2_fp4 = (
-        (
-            jnp.issubdtype(w2.dtype, jnp.floating)
-            and jax.dtypes.itemsize_bits(w2.dtype) == 4
-        )
-        or rhs_quant_dtype == jnp.float4_e2m1fn
-    )
-    use_w4a8 = os.environ.get("VLLM_DSV41_MOE_FP4_GMM1_FP8", "1") == "1"
-    use_w4a8_gmm2 = os.environ.get("VLLM_DSV41_MOE_FP4_GMM2_FP8", "0") == "1"
+        jnp.issubdtype(w2.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(w2.dtype) == 4
+    ) or rhs_quant_dtype == jnp.float4_e2m1fn
+    use_w4a8 = bool(envs.VLLM_DSV41_MOE_FP4_GMM1_FP8)
+    use_w4a8_gmm2 = bool(envs.VLLM_DSV41_MOE_FP4_GMM2_FP8)
     if (is_w2_fp4 or w1.dtype == jnp.float4_e2m1fn) and lhs_scale is not None:
         n_blocks_k1 = x.shape[1] // 512
-        if use_w4a8 and x.shape[1] % 512 == 0 and lhs_scale.shape[1] in (1, n_blocks_k1):
+        if (
+            use_w4a8
+            and x.shape[1] % 512 == 0
+            and lhs_scale.shape[1] in (1, n_blocks_k1)
+        ):
             lhs_scale = jnp.broadcast_to(
                 lhs_scale.astype(jnp.bfloat16), (x.shape[0], n_blocks_k1)
             )
@@ -765,9 +763,13 @@ def moe_gmm(
             else:
                 nb = lhs_scale.shape[1]
                 x = (
-                    x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
-                    * lhs_scale[:, :, None]
-                ).reshape(x.shape).astype(lhs_scale.dtype)
+                    (
+                        x.reshape(x.shape[0], nb, x.shape[1] // nb).astype(jnp.float32)
+                        * lhs_scale[:, :, None]
+                    )
+                    .reshape(x.shape)
+                    .astype(lhs_scale.dtype)
+                )
             lhs_scale = None
     fuse_gmm1_fp8 = not is_w2_fp4 and inter_dim == 512
     gmm1_res = gmm_wrapper(
@@ -906,15 +908,12 @@ def moe_gmm(
                     .set(valid_mask_flat)
                 )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (
-                _TPU_MOE_OWNER_OUTPUT_ON
-                and can_use_blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                )
+            if _TPU_MOE_OWNER_OUTPUT_ON and can_use_blockwise_onehot_unpermute(
+                gmm2_res,
+                token_indices_sorted,
+                topk_weights_sorted,
+                valid_count,
+                num_tokens=num_tokens,
             ):
                 logger.info_once(
                     "Selected owner_output blockwise one-hot unpermute: "
@@ -944,8 +943,7 @@ def moe_gmm(
             )
             onehot = (
                 onehot_permute
-                if onehot_permute is not None
-                and onehot_permute.dtype == gmm2_res.dtype
+                if onehot_permute is not None and onehot_permute.dtype == gmm2_res.dtype
                 else jax.nn.one_hot(
                     token_indices_sorted, num_tokens, dtype=gmm2_res.dtype
                 )
@@ -1316,19 +1314,15 @@ def fused_moe_func_fp8_dispatch(
         topk_ids = jnp.pad(topk_ids, ((0, pad_t), (0, 0)), constant_values=-1)
     num_tokens = hidden_q.shape[0]
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
-    is_fp4_w4a8 = (
-        rhs_quant_dtype == jnp.float4_e2m1fn
-        and w1.dtype in (jnp.float4_e2m1fn, jnp.uint8)
+    is_fp4_w4a8 = rhs_quant_dtype == jnp.float4_e2m1fn and w1.dtype in (
+        jnp.float4_e2m1fn,
+        jnp.uint8,
     )
     effective_dense_threshold = (
         (
             192
             if packing_factor == 2 and w2.shape[1] * packing_factor <= 512
-            else (
-                160
-                if w2.shape[1] * packing_factor <= 512
-                else 32
-            )
+            else (160 if w2.shape[1] * packing_factor <= 512 else 32)
         )
         if (_DENSE_EXPERT_THRESHOLD == 0 and use_ep)
         else _DENSE_EXPERT_THRESHOLD
@@ -1404,12 +1398,11 @@ def fused_moe_func_fp8_dispatch(
         jnp.issubdtype(w1.dtype, jnp.floating)
         and jax.dtypes.itemsize_bits(w1.dtype) == 4
     )
-    default_bf16_lhs = (
-        "0" if os.environ.get("VLLM_DSV41_MOE_FP4_GMM1_FP8", "1") == "1" else "1"
-    )
-    use_fp4_bf16_lhs = (
-        is_fp4_rhs
-        and os.environ.get("VLLM_DSV41_MOE_FP4_BF16_LHS", default_bf16_lhs) == "1"
+    default_bf16_lhs = not bool(envs.VLLM_DSV41_MOE_FP4_GMM1_FP8)
+    use_fp4_bf16_lhs = is_fp4_rhs and (
+        bool(envs.VLLM_DSV41_MOE_FP4_BF16_LHS)
+        if envs.VLLM_DSV41_MOE_FP4_BF16_LHS is not None
+        else default_bf16_lhs
     )
     if use_fp4_bf16_lhs:
         hidden_in = (

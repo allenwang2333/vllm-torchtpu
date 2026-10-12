@@ -42,7 +42,6 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
-import os
 from typing import Any
 
 import jax
@@ -182,9 +181,19 @@ def _build_op(
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    (ax,) = mesh.axis_names
+    ep = mesh.shape[ax]
     subchannel_fp8 = bool(envs.VLLM_DSV41_MOE_V2_SUBCHANNEL_FP8)
     requantize_mid = bool(envs.VLLM_DSV41_MOE_V2_REQUANTIZE)
     wire_bf16_max_tokens = int(envs.VLLM_DSV41_MOE_V2_WIRE_BF16_MAX_TOKENS)
+    fp4_max_t = int(envs.VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS)
+    fp8_max_t = int(envs.VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS)
+    max_v2_t_local = (
+        int(envs.VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS)
+        if envs.VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS is not None
+        else (32768 if ep <= 2 else 8192)
+    )
+    cap_override = envs.VLLM_DSV41_MOE_V2_CAPACITY
 
     key = (
         topk,
@@ -203,6 +212,10 @@ def _build_op(
         subchannel_fp8,
         requantize_mid,
         wire_bf16_max_tokens,
+        fp4_max_t,
+        fp8_max_t,
+        max_v2_t_local,
+        cap_override,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -231,11 +244,10 @@ def _build_op(
         w1, w2 = _unpack_fp4_u8(w1, w2)
         w1_scale = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
         w2_scale = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
-        _cap = int(
-            os.environ.get(
-                "VLLM_DSV41_MOE_V2_CAPACITY",
-                "32" if x.shape[0] <= 128 else ("64" if x.shape[0] <= 1024 else str(_TILE_M)),
-            )
+        _cap = (
+            int(cap_override)
+            if cap_override is not None
+            else (32 if x.shape[0] <= 128 else (64 if x.shape[0] <= 1024 else _TILE_M))
         )
         return fused_ep_moe_v2(
             x,
@@ -276,9 +288,9 @@ def _build_op(
     ) -> jax.Array:
         w1, w2 = _unpack_fp4_u8(w1, w2)
         from jax import lax
+
         from vllm_torchtpu.kernels.fused_moe.v2.layer import (
             _apply_scoring_fn,
-            _relabel_expert_ids_to_mesh_order,
         )
         from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
         from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -320,9 +332,7 @@ def _build_op(
                     weight_scores=scores,
                 )
             else:
-                w_l, ids_l = pallas_select(
-                    scores, topk=topk, block_rows=sel_rows
-                )
+                w_l, ids_l = pallas_select(scores, topk=topk, block_rows=sel_rows)
             row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
             if renormalize:
                 denom = jnp.maximum(w_l.sum(axis=-1, keepdims=True), 1e-20)
@@ -390,7 +400,11 @@ def _build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
+        if (
+            x.shape[0] <= 384
+            and weight_format == "fp8"
+            and token_replica_groups is None
+        ):
             return _small_t_fp8_gated(x, w1, w2, w1_scale, w2_scale, gating, rank)
         return call(x, w1, w2, w1_scale, w2_scale, gating, rank)
 
@@ -404,7 +418,11 @@ def _build_op(
         rank: jax.Array,
         score_bias: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
+        if (
+            x.shape[0] <= 384
+            and weight_format == "fp8"
+            and token_replica_groups is None
+        ):
             return _small_t_fp8_gated(
                 x, w1, w2, w1_scale, w2_scale, gating, rank, score_bias=score_bias
             )
@@ -429,7 +447,11 @@ def _build_op(
         rank: jax.Array,
         hash_ids: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
+        if (
+            x.shape[0] <= 384
+            and weight_format == "fp8"
+            and token_replica_groups is None
+        ):
             return _small_t_fp8_gated(
                 x, w1, w2, w1_scale, w2_scale, gating, rank, hash_ids=hash_ids
             )
@@ -463,16 +485,13 @@ def _build_op(
         e_total = w1.shape[0]
         g_local = e_total // ep
 
-        fp4_max_t = int(
-            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "16384" if ep <= 2 else "0")
-        )
-        fp8_max_t = int(os.environ.get("VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS", "512"))
-        use_path_c = (
-            T_global <= (fp4_max_t if weight_format == "fp4" else fp8_max_t)
-            and (t_local % 8 == 0)
-        )
+        # fp4_max_t and fp8_max_t closed over from envs and recorded in _OPS key
+        use_path_c = T_global <= (
+            fp4_max_t if weight_format == "fp4" else fp8_max_t
+        ) and (t_local % 8 == 0)
         if use_path_c and weight_format in ("fp8", "fp4"):
             from jax import lax
+
             from vllm_torchtpu.layers.core.fused_moe_gmm import (
                 fused_moe_func_fp8_dispatch,
                 quantize_moe_dispatch_packed_rows,
@@ -491,9 +510,7 @@ def _build_op(
                 else (jnp.float4_e2m1fn if weight_format == "fp4" else None)
             )
 
-            def _local_path_c(
-                x_l, w1_l, w2_l, w1s_l, w2s_l, ids_l, w_l, rank_l
-            ):
+            def _local_path_c(x_l, w1_l, w2_l, w1s_l, w2s_l, ids_l, w_l, rank_l):
                 packed_l = quantize_moe_dispatch_packed_rows(
                     x_l, w_l.astype(x_l.dtype), ids_l.astype(jnp.int32)
                 )
@@ -557,10 +574,13 @@ def _build_op(
             )
 
         def _run_v2(x_s, ids_s, w_s):
-            _cap_s = int(
-                os.environ.get(
-                    "VLLM_DSV41_MOE_V2_CAPACITY",
-                    "32" if x_s.shape[0] <= 128 else ("64" if x_s.shape[0] <= 1024 else str(_TILE_M)),
+            _cap_s = (
+                int(cap_override)
+                if cap_override is not None
+                else (
+                    32
+                    if x_s.shape[0] <= 128
+                    else (64 if x_s.shape[0] <= 1024 else _TILE_M)
                 )
             )
             return fused_ep_moe_v2(
@@ -591,12 +611,7 @@ def _build_op(
                 wire_bf16=(x_s.shape[0] <= wire_bf16_max_tokens),
             )
 
-        _max_v2_t_local = int(
-            os.environ.get(
-                "VLLM_DSV41_MOE_EP_V2_MAX_LOCAL_TOKENS",
-                "32768" if ep <= 2 else "8192",
-            )
-        )
+        _max_v2_t_local = max_v2_t_local
         if t_local <= _max_v2_t_local:
             return _run_v2(x, topk_ids, topk_weights)
 
@@ -1021,7 +1036,9 @@ def fused_moe_ep_unsupported_reason(
             w1.dtype not in (torch.float4_e2m1fn_x2, torch.uint8, torch.int32)
             or w2.dtype != w1.dtype
         ):
-            return "the FP4 form requires native float4_e2m1fn_x2, uint8, or int32 weights"
+            return (
+                "the FP4 form requires native float4_e2m1fn_x2, uint8, or int32 weights"
+            )
         if not isinstance(rhs_qb, int) or rhs_qb <= 0:
             return "NVFP4 fused EP requires a positive integer block size"
         packed_row_tile = U32_SUBLANE_TILE * PACK4

@@ -886,12 +886,7 @@ def _build_fused_ep_moe_kernel(
     else:
         coalesce_peer_push = bool(coalesce_peer_push)
     push_from_vmem = (
-        False
-        if (
-            coalesce_peer_push
-            or host.os.environ.get("VLLM_DSV41_MOE_V2_COALESCED_PUSH", "0") == "1"
-        )
-        else ragged_rows_alloc <= ep * g_local * tile_m
+        False if coalesce_peer_push else ragged_rows_alloc <= ep * g_local * tile_m
     )
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
@@ -2356,7 +2351,8 @@ def build_fused_ep_moe_kernel(**kwargs):
         coalesce = kwargs["ragged_rows_alloc"] <= host.ragged_stride_bound(
             1024, 8, kwargs["ep"] * kwargs["g_local"], cap
         )
-    kwargs = {**kwargs, "coalesce_peer_push": bool(coalesce)}
+    coalesce = bool(coalesce or envs.VLLM_DSV41_MOE_V2_COALESCED_PUSH)
+    kwargs = {**kwargs, "coalesce_peer_push": coalesce}
     key = tuple(sorted(kwargs.items()))
     fn = _BUILD_CACHE.get(key)
     if fn is None:

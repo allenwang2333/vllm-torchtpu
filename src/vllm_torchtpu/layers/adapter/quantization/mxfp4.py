@@ -45,7 +45,6 @@ scaling.
    - Returns output tensor
 """
 
-import os
 from typing import Any
 
 import jax
@@ -68,6 +67,14 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEM
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
+    fused_moe_gmm,
+    fused_moe_gmm_fp8_dispatch,
+    prebuild_fused_moe_kernel,
+    quantize_native_fp4_kmajor,
+)
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     FUSED_MOE_EP_OP_ATTR,
     fused_moe_ep,
@@ -77,14 +84,6 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     prebuild_fused_moe_ep,
     register_score_bias_buffer,
     score_bias_operand,
-)
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
-from vllm_torchtpu.layers.adapter.fused_moe import (
-    TpuMoEActivationMixin,
-    fused_moe_gmm,
-    fused_moe_gmm_fp8_dispatch,
-    prebuild_fused_moe_kernel,
-    quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -312,9 +311,10 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
-        assert not getattr(layer, "_is_k_packed", False) and layer.w13_weight.dtype != torch.int32, (
-            "K-packed int32 MXFP4 weights cannot fall back to unpacked Megablox GMM"
-        )
+        assert (
+            not getattr(layer, "_is_k_packed", False)
+            and layer.w13_weight.dtype != torch.int32
+        ), "K-packed int32 MXFP4 weights cannot fall back to unpacked Megablox GMM"
 
         if x.dtype == torch.int8:
             return fused_moe_gmm_fp8_dispatch(
@@ -330,7 +330,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
                 experts_start=layer._experts_start,
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
-                rhs_quant_dtype=(None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
+                rhs_quant_dtype=(
+                    None
+                    if layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+                    else self.rhs_quant_dtype
+                ),
             )
 
         # Step 1: Routing
@@ -363,7 +367,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "rhs_quant_dtype": (None if layer.w13_weight.dtype == torch.float4_e2m1fn_x2 else self.rhs_quant_dtype),
+            "rhs_quant_dtype": (
+                None
+                if layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+                else self.rhs_quant_dtype
+            ),
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
@@ -387,7 +395,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # An armed layer owns its own dispatch and combine, so vLLM must not
         # bracket it with an all-gather/reduce-scatter of its own.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
         return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
 
@@ -408,7 +415,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
 
         if not (
             envs.USE_MOE_FUSED_EP_KERNEL
@@ -453,9 +459,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
             ),
         )
-        _use_all39_ep_v2 = (
-            os.environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1"
-        )
+        _use_all39_ep_v2 = bool(envs.VLLM_DSV41_MOE_EP_V2_ALL39)
         return prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
@@ -643,7 +647,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         w1_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w1_u8, w1_s)
         w3_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w3_u8, w3_s)
-        w2_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(w2_packed, w2_scale)
+        w2_dq = VllmDeepseekV4Mxfp4MoEMethod._jax_dequant_mxfp4_bf16(
+            w2_packed, w2_scale
+        )
 
         w13_w = jnp.concatenate([w1_dq, w3_dq], axis=1).swapaxes(1, 2)
         w2_w = w2_dq.swapaxes(1, 2)
@@ -659,9 +665,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         q13, s13 = quantize_to_native_fp4_kmajor(
             w13_pad, block=w13_block_size, pack=pack
         )
-        q2, s2 = quantize_to_native_fp4_kmajor(
-            w2_w, block=w2_block_size, pack=pack
-        )
+        q2, s2 = quantize_to_native_fp4_kmajor(w2_w, block=w2_block_size, pack=pack)
         q13_packed = (
             jax.lax.bitcast_convert_type(
                 q13.reshape(
@@ -674,9 +678,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
         q2_packed = (
             jax.lax.bitcast_convert_type(
-                q2.reshape(
-                    *q2.shape[:-2], q2.shape[-2] // 8, 8, q2.shape[-1]
-                ).swapaxes(-1, -2),
+                q2.reshape(*q2.shape[:-2], q2.shape[-2] // 8, 8, q2.shape[-1]).swapaxes(
+                    -1, -2
+                ),
                 jnp.int32,
             )
             if not pack
@@ -690,6 +694,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         op = cls._mxfp4_tpu_chunk_ops.get(key)
         if op is None:
             import functools
+
             from torch_tpu._internal import pallas
 
             fn = functools.partial(
@@ -739,6 +744,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         s2_cat = torch.cat(s2_list, dim=0)
         del q13_list, q2_list, s13_list, s2_list
         import gc
+
         gc.collect()
         synchronize_tensors([q13_cat, q2_cat, s13_cat, s2_cat])
         return q13_cat, q2_cat, s13_cat, s2_cat
@@ -800,12 +806,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         device = layer.w13_weight.device
         activation_str = self._set_tpu_activation(layer)
 
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            FUSED_MOE_EP_OP_ATTR,
-            fused_moe_ep_unsupported_reason,
-            register_score_bias_buffer,
-        )
-
         n_exp = layer.w13_weight.shape[0]
         orig_hidden_size = layer.w2_weight.shape[1]
         orig_intermediate = layer.w2_weight.shape[2] * 2
@@ -861,6 +861,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             )
             self._release_source_weights(layer)
             import gc
+
             gc.collect()
         else:
             (
@@ -939,9 +940,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
-            _use_all39_ep_v2 = (
-                os.environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1"
-            )
+            _use_all39_ep_v2 = bool(envs.VLLM_DSV41_MOE_EP_V2_ALL39)
             reason = fused_moe_ep_unsupported_reason(
                 layer,
                 (
@@ -982,12 +981,18 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             )
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).to("cpu", dtype=torch.float32).contiguous().to(device),
+                layer.w13_weight_scale.squeeze(2)
+                .to("cpu", dtype=torch.float32)
+                .contiguous()
+                .to(device),
                 persistent=False,
             )
             layer.register_buffer(
                 "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).to("cpu", dtype=torch.float32).contiguous().to(device),
+                layer.w2_weight_scale.squeeze(2)
+                .to("cpu", dtype=torch.float32)
+                .contiguous()
+                .to(device),
                 persistent=False,
             )
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -997,6 +1002,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 layer._tpu_fused_w2_scale.unsqueeze(2), requires_grad=False
             )
             import gc
+
             gc.collect()
             synchronize_tensors([layer._tpu_fused_w13_scale, layer._tpu_fused_w2_scale])
             logger.info_once(
@@ -1011,17 +1017,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-            fused_moe_ep,
-            fused_moe_ep_supported,
-            hash_topk_ids_operand,
-            score_bias_operand,
-        )
-
         if fused_moe_ep_supported(self):
             w13_op = getattr(layer, "_tpu_fused_w13_u8", layer.w13_weight)
             w2_op = getattr(layer, "_tpu_fused_w2_u8", layer.w2_weight)
-            if os.environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1":
+            if bool(envs.VLLM_DSV41_MOE_EP_V2_ALL39):
                 topk_weights, topk_ids = moe_routing.route(
                     layer, x, router_logits, input_ids=input_ids
                 )

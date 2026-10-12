@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 from vllm.distributed import (
@@ -43,7 +41,6 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     _get_quantized_matmul_prequant_op,
     _get_quantized_mlp_op,
     _get_quantized_mlp_prequant_op,
-    quantized_matmul,
     quantized_matmul_prequant,
     quantized_mlp,
     quantized_mlp_prequant,
@@ -63,9 +60,7 @@ def mhc_collapse_head(
 ) -> torch.Tensor:
     """Collapse multi-stream residual manifold into a single vector before LM head."""
     residual_flat = hidden_states.flatten(-2).float()
-    rstd = torch.rsqrt(
-        residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps
-    )
+    rstd = torch.rsqrt(residual_flat.square().mean(dim=-1, keepdim=True) + rms_norm_eps)
     pre_mix = torch.nn.functional.linear(residual_flat, hc_fn) * rstd
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
     return torch.sum(pre_mix.unsqueeze(-1) * hidden_states.float(), dim=-2).to(
@@ -133,10 +128,7 @@ class DeepseekV4MLP(nn.Module):
             gu_s is None
             or down_s is None
             or gu_s.ndim not in (1, 4)
-            or (
-                gu_s.ndim == 4
-                and os.environ.get("VLLM_DSV41_REPL_SHARED_EXPERTS", "0") != "1"
-            )
+            or (gu_s.ndim == 4 and not envs.VLLM_DSV41_REPL_SHARED_EXPERTS)
             or down_s.ndim not in (1, 4)
             or getattr(self.gate_up_proj, "bias", None) is not None
             or getattr(self.down_proj, "bias", None) is not None
@@ -146,17 +138,13 @@ class DeepseekV4MLP(nn.Module):
         gu_w = self.gate_up_proj.weight.data
         if getattr(self.gate_up_proj, KEEP_VLLM_LAYOUT_ATTR, False):
             gu_w = gu_w.transpose(0, 1)
-        elif gu_w.shape[0] != getattr(
-            self.gate_up_proj, "input_size", gu_w.shape[0]
-        ):
+        elif gu_w.shape[0] != getattr(self.gate_up_proj, "input_size", gu_w.shape[0]):
             return
 
         down_w = self.down_proj.weight.data
         if getattr(self.down_proj, KEEP_VLLM_LAYOUT_ATTR, False):
             down_w = down_w.transpose(0, 1)
-        elif down_w.shape[1] != getattr(
-            self.down_proj, "output_size", down_w.shape[1]
-        ):
+        elif down_w.shape[1] != getattr(self.down_proj, "output_size", down_w.shape[1]):
             return
 
         def gather(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -197,9 +185,7 @@ class DeepseekV4MLP(nn.Module):
                 tp_down_s_all,
                 tp_down_s.unsqueeze(0).expand_as(tp_down_s_all),
             ):
-                w_3d = tp_down_w_raw.view(
-                    tp_size, -1, tp_down_w_raw.shape[-1]
-                ).float()
+                w_3d = tp_down_w_raw.view(tp_size, -1, tp_down_w_raw.shape[-1]).float()
                 ratio = (
                     tp_down_s_all / tp_down_s.unsqueeze(0).clamp_min(1e-12)
                 ).unsqueeze(1)
@@ -399,9 +385,7 @@ class DeepseekV4MLP(nn.Module):
                     return tp_shard_slice(x, dim=0)
                 return tp_reduce_scatter(x, dim=0)
             return x
-        gate_up = self._apply_gate_up_proj(
-            x, hidden_states_fp8, hidden_states_scale
-        )
+        gate_up = self._apply_gate_up_proj(x, hidden_states_fp8, hidden_states_scale)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         if return_token_sharded:

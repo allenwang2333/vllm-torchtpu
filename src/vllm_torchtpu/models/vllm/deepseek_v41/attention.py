@@ -18,7 +18,6 @@ import os
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
@@ -26,6 +25,8 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+)
+from vllm.distributed import (
     tensor_model_parallel_all_reduce as tp_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -38,18 +39,20 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import (
     tp_all_gather,
-    tp_all_to_all,
     tp_reduce_scatter,
     tp_shard_slice,
 )
 from vllm_torchtpu.kernels.deepseek_v4 import (
     o_projection as o_proj,
+)
+from vllm_torchtpu.kernels.deepseek_v4 import (
     rope as rope_kernel,
 )
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_wq_b_q_rope_prequant_projection,
     fused_wq_b_q_rope_projection,
 )
+
 try:
     from vllm_torchtpu.kernels.deepseek_v41 import tp_attention
 except ImportError:
@@ -96,14 +99,14 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import synchronize_tensors
 
 BATCH_AXIS = _dsv4_attn_op.BATCH_AXIS
-_FLASHMLA_TP8: bool = os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
+_FLASHMLA_TP8: bool = bool(envs.VLLM_DSV41_FLASHMLA_TP8)
 _CSA_UNION: bool = bool(envs.VLLM_DSV41_CSA_UNION)
 _CSA_UNION_M: int = int(envs.VLLM_DSV41_CSA_UNION_M)
 _CSA_UNION_BQ: int = int(envs.VLLM_DSV41_CSA_UNION_BQ)
 _TPU_ROPE_CACHE_TRUNCATE: bool = bool(envs.TPU_ROPE_CACHE_TRUNCATE)
 _FUSED_Q_ROPE: bool = bool(envs.VLLM_DSV41_FUSED_Q_ROPE)
 _FUSED_SEAM_QUANT: bool = bool(envs.VLLM_DSV41_FUSED_SEAM_QUANT)
-_TP_ATTN: bool = os.environ.get("VLLM_DSV41_TP_ATTN_TP8", "0") == "1"
+_TP_ATTN: bool = bool(envs.VLLM_DSV41_TP_ATTN_TP8)
 _TP_ATTN_LOCAL_TOPK: bool = bool(envs.VLLM_DSV41_TP_ATTN_LOCAL_TOPK)
 _TP_ATTN_MIN_TOKENS: int = max(1536, int(envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS))
 
@@ -118,6 +121,8 @@ def _get_tp_attn_min_tokens(tp_size: int) -> int:
     if tp_size <= 2:
         return int(envs.VLLM_DSV41_TP_ATTN_MIN_TOKENS)
     return _TP_ATTN_MIN_TOKENS
+
+
 _TOKEN_SHARD_MIN_TOKENS: int = int(envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS)
 VllmDeepseekV4SWACache = _dsv4_attn_op.VllmDeepseekV4SWACache
 _attention_csa = _deepseek_v41_flash_attn_op._attention_csa
@@ -210,6 +215,7 @@ def _o_proj_wob_jax(
     z = z[:orig_m] if pad_t > 0 else z
     if wo_b_s.ndim == 4:
         from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+
         return gmm_v2(
             lhs=z,
             rhs=wo_b_w[None],
@@ -221,6 +227,7 @@ def _o_proj_wob_jax(
             zero_initialize=True,
         )
     from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+
     return xla_quantized_matmul(z, wo_b_w, wo_b_s)
 
 
@@ -240,7 +247,7 @@ def _fake_o_proj_wob(
 _WQ_B_Q_ROPE_SPECS = (P(), P(), P(), P(), P())
 _WQ_B_Q_ROPE_PREQUANT_SPECS = (P(), P(), P(), P(), P(), P())
 _CSA_UNION_SPECS = (P(BATCH_AXIS, None),)
-_FLASHMLA_TP8: bool = os.environ.get("VLLM_DSV41_FLASHMLA_TP8", "0") == "1"
+_FLASHMLA_TP8: bool = bool(envs.VLLM_DSV41_FLASHMLA_TP8)
 
 
 def _kvnorm_rope_jax(
@@ -358,12 +365,8 @@ def _fake_qkv_norm_rope_and_quant(
     q_dim = q_weight.shape[0]
     return (
         torch.empty_like(qr_kv),
-        torch.empty(
-            (t, q_dim), dtype=torch.float8_e4m3fn, device=qr_kv.device
-        ),
-        torch.empty(
-            (t, rope_kernel.LANE), dtype=torch.float32, device=qr_kv.device
-        ),
+        torch.empty((t, q_dim), dtype=torch.float8_e4m3fn, device=qr_kv.device),
+        torch.empty((t, rope_kernel.LANE), dtype=torch.float32, device=qr_kv.device),
     )
 
 
@@ -657,14 +660,10 @@ class VllmDeepseekV41MLAAttention(
             object.__setattr__(self, cache_attr, res)
         return res
 
-    def _swa_group_bounds(
-        self, ced_decoder: bool | None = None
-    ) -> tuple[Any, int]:
+    def _swa_group_bounds(self, ced_decoder: bool | None = None) -> tuple[Any, int]:
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
         cache_attr = (
-            "_cached_swa_group_bounds_ced"
-            if eff_ced
-            else "_cached_swa_group_bounds"
+            "_cached_swa_group_bounds_ced" if eff_ced else "_cached_swa_group_bounds"
         )
         cached = self.__dict__.get(cache_attr)
         if cached is not None:
@@ -676,8 +675,7 @@ class VllmDeepseekV41MLAAttention(
             mod
             for mod in self._static_forward_context.values()
             if isinstance(mod, VllmDeepseekV41MLAAttention)
-            and mod.non_causal_multi_token_decode
-            == self.non_causal_multi_token_decode
+            and mod.non_causal_multi_token_decode == self.non_causal_multi_token_decode
         ]
         ced_boundary = 20 if len(attn_mods) >= 20 else len(attn_mods)
         min_lid = my_lid
@@ -685,9 +683,8 @@ class VllmDeepseekV41MLAAttention(
         first_leader: Any = self
         for mod in attn_mods:
             if (
-                (mod.compress_ratio > 0) == is_csa
-                and mod.window_size == self.window_size
-            ):
+                mod.compress_ratio > 0
+            ) == is_csa and mod.window_size == self.window_size:
                 lid = extract_layer_index(mod.prefix)
                 if eff_ced and lid < ced_boundary:
                     continue
@@ -735,8 +732,7 @@ class VllmDeepseekV41MLAAttention(
             pages_per_seq = swa_tables.numel() // max_seqs
             win_pages = min(
                 pages_per_seq,
-                ((num_tokens + sliding_window) // logical_page_size + 2 + 15)
-                & ~15,
+                ((num_tokens + sliding_window) // logical_page_size + 2 + 15) & ~15,
             )
             out_pages = (
                 max_seqs * win_pages
@@ -834,9 +830,7 @@ class VllmDeepseekV41MLAAttention(
                 int(swa_tensor.shape[2]),
             )
         else:
-            num_pages, rows, kv_packing, lanes = (
-                int(d) for d in swa_tensor.shape
-            )
+            num_pages, rows, kv_packing, lanes = (int(d) for d in swa_tensor.shape)
         slots_per_token = self.head_dim * 2 // (kv_packing * lanes)
         phys_tokens_per_page = rows // slots_per_token
         logical_page_size = VllmDeepseekV4SWACache._swa_block_size(
@@ -936,9 +930,7 @@ class VllmDeepseekV41MLAAttention(
             first_leader._step_indexer_metadata = None
         return cached_meta
 
-    def _csa_kv_group_bounds(
-        self, ced_decoder: bool | None = None
-    ) -> tuple[Any, int]:
+    def _csa_kv_group_bounds(self, ced_decoder: bool | None = None) -> tuple[Any, int]:
         eff_ced = self._ced_decoder if ced_decoder is None else ced_decoder
         cache_attr = (
             "_cached_csa_kv_group_bounds_ced"
@@ -1010,9 +1002,9 @@ class VllmDeepseekV41MLAAttention(
                     total_cache_rows, m_union, b_q=b_q
                 )(topk_indices, cache_kv_nope, cache_kv_rope)
             else:
-                cached_u = self._get_csa_union_op(
-                    total_cache_rows, m_union, b_q=b_q
-                )(topk_indices)
+                cached_u = self._get_csa_union_op(total_cache_rows, m_union, b_q=b_q)(
+                    topk_indices
+                )
             if last_lid > my_lid:
                 kv_holder._step_csa_union = (b_q, m_union, cached_u)
             else:
@@ -1032,7 +1024,9 @@ class VllmDeepseekV41MLAAttention(
         b_q: int | None = None,
     ):
         b_q = _CSA_UNION_BQ if b_q is None else b_q
-        u_chunk = resolve_csa_union_u_chunk(b_q, m_union, int(getattr(self, "topk", 512)))
+        u_chunk = resolve_csa_union_u_chunk(
+            b_q, m_union, int(getattr(self, "topk", 512))
+        )
         op_name = f"pallas::deepseek_v41_csa_union_gather_r{total_cache_rows}_bq{b_q}_m{m_union}_uc{u_chunk}"
         if (op := self.__dict__.get(op_name)) is not None:
             return op
@@ -1092,7 +1086,9 @@ class VllmDeepseekV41MLAAttention(
         ced_decoder: bool | None = None,
     ):
         b_q = _CSA_UNION_BQ if b_q is None else b_q
-        u_chunk = resolve_csa_union_u_chunk(b_q, m_union, int(getattr(self, "topk", 512)))
+        u_chunk = resolve_csa_union_u_chunk(
+            b_q, m_union, int(getattr(self, "topk", 512))
+        )
         op_name = f"pallas::deepseek_v41_csa_union_r{total_cache_rows}_bq{b_q}_m{m_union}_uc{u_chunk}"
         if (op := self.__dict__.get(op_name)) is not None:
             return op
@@ -1226,23 +1222,28 @@ class VllmDeepseekV41MLAAttention(
                 idx_kv = _live_cache(getattr(self.indexer.k_cache, "kv_cache", None))
                 if idx_kv is not None:
                     _ = self.indexer._get_step_metadata_op(int(idx_kv.shape[3]))
-                if (
-                    getattr(self, "compressor", None) is not None
-                    and getattr(self.indexer, "owns_k", False)
+                if getattr(self, "compressor", None) is not None and getattr(
+                    self.indexer, "owns_k", False
                 ):
                     _idx_eps = float(
                         getattr(self.indexer.k_norm, "variance_epsilon", 1e-6)
                     )
                     for _qwk in (False, True):
                         if self.compressor.has_gate:
-                            _st_e = getattr(self.compressor.state_cache, "kv_cache", None)
+                            _st_e = getattr(
+                                self.compressor.state_cache, "kv_cache", None
+                            )
                             _st_t = _st_e[0] if isinstance(_st_e, tuple) else _st_e
-                            _k_obj = self.compressor._static_forward_context.get(self.compressor.k_cache_prefix)
+                            _k_obj = self.compressor._static_forward_context.get(
+                                self.compressor.k_cache_prefix
+                            )
                             _k_e = getattr(_k_obj, "kv_cache", None)
                             _no_t = _k_e[0] if isinstance(_k_e, tuple) else None
                             if _st_t is not None and _no_t is not None:
                                 _is_al = bool(_st_t.data_ptr() == _no_t.data_ptr())
-                                object.__setattr__(self.compressor, "_aliased_state_to_nope", _is_al)
+                                object.__setattr__(
+                                    self.compressor, "_aliased_state_to_nope", _is_al
+                                )
                             for _al in (True, False):
                                 _ = self.compressor._get_fused_compress_insert_produce_k_op(
                                     _idx_eps, quantized_wk=_qwk, aliased_state=_al
@@ -1251,15 +1252,10 @@ class VllmDeepseekV41MLAAttention(
                             _ = self.compressor._get_fused_insert_produce_k_op(
                                 _idx_eps, quantized_wk=_qwk
                             )
-            if (
-                _CSA_UNION
-                and self.compress_ratio > 0
-            ):
+            if _CSA_UNION and self.compress_ratio > 0:
                 _main_e = getattr(self._kv_source_module(), "kv_cache", None)
                 _main_c = self._as_kernel_cache_view(
-                    _live_cache(
-                        _main_e[0] if isinstance(_main_e, tuple) else _main_e
-                    )
+                    _live_cache(_main_e[0] if isinstance(_main_e, tuple) else _main_e)
                 )
                 if _main_c is not None and _main_c.shape[0] > 0:
                     _tot_rows = int(_main_c.shape[0] * _main_c.shape[1])
@@ -1299,7 +1295,10 @@ class VllmDeepseekV41MLAAttention(
             if (
                 _is_tp_attn_enabled(tp_size)
                 and "_tp_attn_wq_b_w" in self._buffers
-                and self._tp_attn_ready(max(tp_size, ((tp_min_toks + tp_size - 1) // tp_size) * tp_size), tp_size)
+                and self._tp_attn_ready(
+                    max(tp_size, ((tp_min_toks + tp_size - 1) // tp_size) * tp_size),
+                    tp_size,
+                )
             ):
                 self.__dict__.pop("_tp_attn_op", None)
                 self.__dict__.pop("_tp_attn_op_u1", None)
@@ -1475,10 +1474,7 @@ class VllmDeepseekV41MLAAttention(
             # (compilation/shape_variants.py), and this path's extra graph
             # inputs then fail the bucket hand-over's signature check. <= 0
             # skips the comparison so no guard is recorded.
-            and (
-                tp_min_toks <= 0
-                or num_tokens >= tp_min_toks
-            )
+            and (tp_min_toks <= 0 or num_tokens >= tp_min_toks)
             and "_tp_attn_wq_b_w" in self._buffers
             and _live_cache(getattr(self.swa_cache_layer, "kv_cache", None)) is not None
         ):
@@ -1524,7 +1520,13 @@ class VllmDeepseekV41MLAAttention(
         if (
             not members
             or members[0].indexer is None
-            or not all(m._tp_attn_ready(max(tp_size, ((tp_min_toks + tp_size - 1) // tp_size) * tp_size), tp_size) for m in members)
+            or not all(
+                m._tp_attn_ready(
+                    max(tp_size, ((tp_min_toks + tp_size - 1) // tp_size) * tp_size),
+                    tp_size,
+                )
+                for m in members
+            )
         ):
             return None
         indexer = members[0].indexer
@@ -1858,9 +1860,8 @@ class VllmDeepseekV41MLAAttention(
             else ced_global_from_encoder
         )
         compressor = None if eff_ced_global else getattr(self, "compressor", None)
-        use_tp_attn = (
-            _is_tp_attn_enabled(tp_size)
-            and num_tokens >= max(64, _get_tp_attn_min_tokens(tp_size))
+        use_tp_attn = _is_tp_attn_enabled(tp_size) and num_tokens >= max(
+            64, _get_tp_attn_min_tokens(tp_size)
         )
         return (
             num_tokens % tp_size == 0
@@ -1877,9 +1878,7 @@ class VllmDeepseekV41MLAAttention(
         ws_wqa: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = self.fused_wqa_wkv.weight if w_wqa is None else w_wqa
-        weight_scale = (
-            self.fused_wqa_wkv.weight_scale if ws_wqa is None else ws_wqa
-        )
+        weight_scale = self.fused_wqa_wkv.weight_scale if ws_wqa is None else ws_wqa
         if weight.shape[0] != hidden_states.shape[-1]:
             weight = weight.transpose(0, 1)
         if hidden_states_fp8 is not None and hidden_states_scale is not None:
@@ -1951,7 +1950,17 @@ class VllmDeepseekV41MLAAttention(
             if store_op is not None:
                 m_pad = (kv.shape[0] + 7) & ~7
                 kv_store = (
-                    torch.cat((kv, torch.zeros((m_pad - kv.shape[0], *kv.shape[1:]), dtype=kv.dtype, device=kv.device)), dim=0)
+                    torch.cat(
+                        (
+                            kv,
+                            torch.zeros(
+                                (m_pad - kv.shape[0], *kv.shape[1:]),
+                                dtype=kv.dtype,
+                                device=kv.device,
+                            ),
+                        ),
+                        dim=0,
+                    )
                     if m_pad > kv.shape[0]
                     else kv
                 )
@@ -2056,7 +2065,7 @@ class VllmDeepseekV41MLAAttention(
             and tp_size > 1
             and (
                 not getattr(self, "_supports_ced_decoder", False)
-                or os.environ.get("VLLM_DSV41_DECODER_TP_ATTN_VERIFY", "0") == "1"
+                or bool(envs.VLLM_DSV41_DECODER_TP_ATTN_VERIFY)
             )
         ):
             self._build_tp_attn_weights()
@@ -2071,7 +2080,18 @@ class VllmDeepseekV41MLAAttention(
                 self._build_tp_wo_b_weights()
         self._build_fused_csa_input_weights()
         if not torch.compiler.is_compiling():
-            for _op_name in ("q_rope_op", "kvnorm_rope_op", "qkv_norm_rope_quant_op", "qkv_norm_rope_op", "qkv_norm_rope_split_op", "qkv_norm_rope_and_quant_op", "o_proj_op", "o_proj_wob_op", "wq_b_q_rope_op", "wq_b_q_rope_prequant_op"):
+            for _op_name in (
+                "q_rope_op",
+                "kvnorm_rope_op",
+                "qkv_norm_rope_quant_op",
+                "qkv_norm_rope_op",
+                "qkv_norm_rope_split_op",
+                "qkv_norm_rope_and_quant_op",
+                "o_proj_op",
+                "o_proj_wob_op",
+                "wq_b_q_rope_op",
+                "wq_b_q_rope_prequant_op",
+            ):
                 getattr(self, _op_name, None)
 
     def _build_fused_csa_input_weights(self) -> None:
@@ -2094,8 +2114,12 @@ class VllmDeepseekV41MLAAttention(
         if ws_wp is None:
             wp_f32 = w_wp.float()
             amax = wp_f32.abs().amax(dim=0)
-            ws_wp = torch.where(amax == 0, torch.ones_like(amax), amax / 448.0).to(ws_wqa.dtype)
-            w_wp_fp8 = (wp_f32 / ws_wp.unsqueeze(0)).clamp(-448.0, 448.0).to(w_wqa.dtype)
+            ws_wp = torch.where(amax == 0, torch.ones_like(amax), amax / 448.0).to(
+                ws_wqa.dtype
+            )
+            w_wp_fp8 = (
+                (wp_f32 / ws_wp.unsqueeze(0)).clamp(-448.0, 448.0).to(w_wqa.dtype)
+            )
         else:
             w_wp_fp8 = w_wp.to(w_wqa.dtype)
             ws_wp = ws_wp.to(ws_wqa.dtype)
@@ -2107,27 +2131,44 @@ class VllmDeepseekV41MLAAttention(
         s_parts = [ws_wqa, ws_wp]
         if rem > 0:
             parts.append(
-                torch.zeros((w_wqa.shape[0], rem), dtype=w_wqa.dtype, device=w_wqa.device)
+                torch.zeros(
+                    (w_wqa.shape[0], rem), dtype=w_wqa.dtype, device=w_wqa.device
+                )
             )
-            s_parts.append(
-                torch.ones((rem,), dtype=ws_wqa.dtype, device=ws_wqa.device)
-            )
+            s_parts.append(torch.ones((rem,), dtype=ws_wqa.dtype, device=ws_wqa.device))
         w_dec = torch.cat(parts, dim=1).contiguous()
         ws_dec = torch.cat(s_parts, dim=0).contiguous()
         del parts, s_parts, w_wqa, w_wp_fp8
         w_pref = w_dec[:, :pref_cols]
         ws_pref = ws_dec[:pref_cols]
-        qkv_view = (w_dec[:, :qkv_cols].transpose(0, 1) if keep_layout else w_dec[:, :qkv_cols]).contiguous()
+        qkv_view = (
+            w_dec[:, :qkv_cols].transpose(0, 1) if keep_layout else w_dec[:, :qkv_cols]
+        ).contiguous()
         self.fused_wqa_wkv.weight = torch.nn.Parameter(qkv_view, requires_grad=False)
         self.fused_wqa_wkv.weight_scale = torch.nn.Parameter(
             ws_dec[:qkv_cols], requires_grad=False
         )
         object.__setattr__(self, "_csa_idx_dim", idx_dim)
-        object.__setattr__(self, "_fused_csa_w_prefill", torch.nn.Parameter(w_pref, requires_grad=False))
-        object.__setattr__(self, "_fused_csa_ws_prefill", torch.nn.Parameter(ws_pref, requires_grad=False))
-        object.__setattr__(self, "_fused_csa_w_decode", torch.nn.Parameter(w_dec, requires_grad=False))
-        object.__setattr__(self, "_fused_csa_ws_decode", torch.nn.Parameter(ws_dec, requires_grad=False))
+        object.__setattr__(
+            self,
+            "_fused_csa_w_prefill",
+            torch.nn.Parameter(w_pref, requires_grad=False),
+        )
+        object.__setattr__(
+            self,
+            "_fused_csa_ws_prefill",
+            torch.nn.Parameter(ws_pref, requires_grad=False),
+        )
+        object.__setattr__(
+            self, "_fused_csa_w_decode", torch.nn.Parameter(w_dec, requires_grad=False)
+        )
+        object.__setattr__(
+            self,
+            "_fused_csa_ws_decode",
+            torch.nn.Parameter(ws_dec, requires_grad=False),
+        )
         import gc
+
         gc.collect()
         if w_dec.device.type == "tpu":
             synchronize_tensors([w_dec, ws_dec], wait=True)
@@ -2233,10 +2274,7 @@ class VllmDeepseekV41MLAAttention(
                 )
                 if t is not None
             ]
-        elif (
-            _TOKEN_SHARD_MIN_TOKENS > 0
-            and "_tp_attn_wo_b_w" in self._buffers
-        ):
+        elif _TOKEN_SHARD_MIN_TOKENS > 0 and "_tp_attn_wo_b_w" in self._buffers:
             _ = [
                 torch.ops.aten.alias.default(t)
                 for t in (
@@ -2247,8 +2285,8 @@ class VllmDeepseekV41MLAAttention(
                 )
                 if t is not None
             ]
-        use_tp_idx = (
-            self.indexer is not None and self.indexer.use_tp_indexer(num_tokens)
+        use_tp_idx = self.indexer is not None and self.indexer.use_tp_indexer(
+            num_tokens
         )
         qr: torch.Tensor | None = None
         qr_for_indexer: torch.Tensor | None = None
@@ -2318,11 +2356,21 @@ class VllmDeepseekV41MLAAttention(
             if not use_tp_attn:
                 tp_rank = get_tensor_model_parallel_rank()
                 positions_local = tp_shard_slice(positions, tp_size, tp_rank, rank_idx)
-            use_csa_fused = hasattr(self, "_fused_csa_w_decode") and hidden_states.shape[0] <= 384
+            use_csa_fused = (
+                hasattr(self, "_fused_csa_w_decode") and hidden_states.shape[0] <= 384
+            )
             if use_csa_fused:
                 use_dec_align = hidden_states.shape[0] <= 384
-                w_in = self._fused_csa_w_decode if use_dec_align else self._fused_csa_w_prefill
-                ws_in = self._fused_csa_ws_decode if use_dec_align else self._fused_csa_ws_prefill
+                w_in = (
+                    self._fused_csa_w_decode
+                    if use_dec_align
+                    else self._fused_csa_w_prefill
+                )
+                ws_in = (
+                    self._fused_csa_ws_decode
+                    if use_dec_align
+                    else self._fused_csa_ws_prefill
+                )
             else:
                 w_in, ws_in = w_wqa, ws_wqa
             proj_local = self._apply_fused_wqa_wkv(
@@ -2350,7 +2398,11 @@ class VllmDeepseekV41MLAAttention(
                 if use_tp_idx:
                     qr_fp8_for_indexer = qr_q_fp8
                     qr_scale_for_indexer = qr_q_scale
-                kv = self._gather_tp_kv(kv_local) if use_tp_attn else tp_all_gather(kv_local, dim=0)
+                kv = (
+                    self._gather_tp_kv(kv_local)
+                    if use_tp_attn
+                    else tp_all_gather(kv_local, dim=0)
+                )
             elif w_qnorm is not None:
                 if (
                     use_tp_idx
@@ -2401,7 +2453,10 @@ class VllmDeepseekV41MLAAttention(
                             )
                             coal = tp_all_gather(
                                 torch.cat(
-                                    [qr_kv_normed_local, idx_al.to(qr_kv_normed_local.dtype)],
+                                    [
+                                        qr_kv_normed_local,
+                                        idx_al.to(qr_kv_normed_local.dtype),
+                                    ],
                                     dim=-1,
                                 ),
                                 dim=0,
@@ -2451,7 +2506,10 @@ class VllmDeepseekV41MLAAttention(
                         )
                         coal = tp_all_gather(
                             torch.cat(
-                                [qr_kv_normed_local, idx_al.to(qr_kv_normed_local.dtype)],
+                                [
+                                    qr_kv_normed_local,
+                                    idx_al.to(qr_kv_normed_local.dtype),
+                                ],
                                 dim=-1,
                             ),
                             dim=0,
@@ -2512,11 +2570,23 @@ class VllmDeepseekV41MLAAttention(
                 hidden_states = tp_all_gather(hidden_states, dim=0)
                 hidden_states_fp8 = None
                 hidden_states_scale = None
-            use_csa_fused = hasattr(self, "_fused_csa_w_decode") and hidden_states.shape[0] <= 384 and not input_is_token_sharded
+            use_csa_fused = (
+                hasattr(self, "_fused_csa_w_decode")
+                and hidden_states.shape[0] <= 384
+                and not input_is_token_sharded
+            )
             if use_csa_fused:
                 use_dec_align = hidden_states.shape[0] <= 384
-                w_in = self._fused_csa_w_decode if use_dec_align else self._fused_csa_w_prefill
-                ws_in = self._fused_csa_ws_decode if use_dec_align else self._fused_csa_ws_prefill
+                w_in = (
+                    self._fused_csa_w_decode
+                    if use_dec_align
+                    else self._fused_csa_w_prefill
+                )
+                ws_in = (
+                    self._fused_csa_ws_decode
+                    if use_dec_align
+                    else self._fused_csa_ws_prefill
+                )
             else:
                 w_in, ws_in = w_wqa, ws_wqa
             proj_full = self._apply_fused_wqa_wkv(
@@ -2721,7 +2791,9 @@ class VllmDeepseekV41MLAAttention(
         else:
             main_cache_kv = dummy_main
             main_kv_lens, main_tables, main_q_loc, main_dist = _unpack_meta(swa_meta)
-        _shape_kv = orig_main_cache_kv if orig_main_cache_kv is not None else main_cache_kv
+        _shape_kv = (
+            orig_main_cache_kv if orig_main_cache_kv is not None else main_cache_kv
+        )
 
         extra = topk_indices if is_csa else swa_lens
         if use_tp_attn:
@@ -2824,10 +2896,7 @@ class VllmDeepseekV41MLAAttention(
         if (
             orig_sw_cache is not None
             and swa_tables is not None
-            and not (
-                _FLASHMLA_TP8
-                and tp_size == 8
-            )
+            and not (_FLASHMLA_TP8 and tp_size == 8)
         ):
             swa_tables = self._get_or_compute_swa_page_indices(
                 swa_tables,

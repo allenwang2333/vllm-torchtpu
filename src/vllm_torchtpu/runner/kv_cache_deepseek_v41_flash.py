@@ -8,6 +8,8 @@ import math
 from collections.abc import Callable
 
 import torch
+
+from vllm_torchtpu import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
@@ -17,6 +19,7 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
 
 def _apply_compact_swa_block_pool_patch() -> None:
     from vllm.v1.core.block_pool import BlockPool, FreeKVCacheBlockQueue
@@ -58,7 +61,6 @@ try:
     _apply_compact_swa_block_pool_patch()
 except Exception:
     pass
-
 
 
 class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
@@ -124,13 +126,11 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             dtype: torch.dtype = torch.uint8,
             scale_idx: tuple | None = None,
         ) -> torch.Tensor:
-            import os
-
             cache = torch.zeros(shape, dtype=dtype, device=runner.device)
             fill_end = min(main_end, shape[0])
             bench_fill = (
                 fill_end > 1
-                and os.environ.get("ENABLE_DECODE_BENCH_CONNECTOR", "0") == "1"
+                and bool(envs.ENABLE_DECODE_BENCH_CONNECTOR)
                 and not os.path.exists("/tmp/disable_decode_bench_fill")
             )
             if bench_fill:
@@ -316,7 +316,11 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                             swa.kv_cache = kv_caches[swa.prefix]
                         if mod.ensure_cache():
                             init_caches.append(mod._cache)
-                    if hasattr(mod, "state_cache") and getattr(mod, "state_cache", None) is not None and hasattr(mod, "k_cache_prefix"):
+                    if (
+                        hasattr(mod, "state_cache")
+                        and getattr(mod, "state_cache", None) is not None
+                        and hasattr(mod, "k_cache_prefix")
+                    ):
                         _st_e = kv_caches.get(mod.state_cache.prefix)
                         _k_e = kv_caches.get(mod.k_cache_prefix)
                         _st_t = _st_e[0] if isinstance(_st_e, tuple) else _st_e

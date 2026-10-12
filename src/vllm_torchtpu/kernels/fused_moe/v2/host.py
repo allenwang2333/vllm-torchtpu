@@ -58,11 +58,9 @@ WIDEN_KCHUNK = 512
 #
 # Zero is the useful other end: no runway at all, one weight slot, an expert
 # starting its own weights at its head and waiting on them.
-import os
+from vllm_torchtpu import envs
 
-MAX_WEIGHT_PREFETCH_DISTANCE = int(
-    os.environ.get("VLLM_DSV41_MOE_V2_MAX_PREFETCH", "2")
-)
+MAX_WEIGHT_PREFETCH_DISTANCE = int(envs.VLLM_DSV41_MOE_V2_MAX_PREFETCH)
 
 
 def nbuf_for(distance):
@@ -1256,7 +1254,7 @@ def vmem_limit(info=None):
     """VMEM budget for the kernel, read from this generation's capacity."""
     if info is None:
         info = pltpu.get_tpu_info()
-    env_mb = os.environ.get("VLLM_DSV41_MOE_V2_VMEM_MB")
+    env_mb = envs.VLLM_DSV41_MOE_V2_VMEM_MB
     if env_mb is not None:
         return int(float(env_mb) * 1024 * 1024)
     return int(info.vmem_capacity_bytes * VMEM_FRACTION)
@@ -1424,9 +1422,7 @@ def vmem_scratch_arrays(
             HIDDEN_LANE_BLOCK,
         )
     )
-    act_scale = (
-        [("ls_vm", ls_shape, jnp.float32)] if form.quantized_activations else []
-    )
+    act_scale = [("ls_vm", ls_shape, jnp.float32)] if form.quantized_activations else []
     oscl_shape = (
         (OUT_PARITIES, 1, capacity)
         if n_wire_scales == 1

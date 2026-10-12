@@ -68,9 +68,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import align_to
 
 _pallas_op_cache: dict[str, Any] = {}
-_DECODER_TP_ATTN_VERIFY: bool = (
-    os.environ.get("VLLM_DSV41_DECODER_TP_ATTN_VERIFY", "0") == "1"
-)
+_DECODER_TP_ATTN_VERIFY: bool = bool(envs.VLLM_DSV41_DECODER_TP_ATTN_VERIFY)
 _R = P()
 
 
@@ -671,7 +669,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         if (
             cand_buf is None
             and cfg is not None
-            and os.environ.get("VLLM_DSV41_ENCODER_CAND_MODE", "1") == "1"
+            and bool(envs.VLLM_DSV41_ENCODER_CAND_MODE)
         ):
             enc_buf = getattr(cfg, "_tpu_candidate_block_buffer", None)
             enc_boundary = int(getattr(cfg, "num_hidden_layers", 40)) // 2
@@ -691,9 +689,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 cand_blk_sz = int(getattr(cfg, "candidate_block_size", 0) or 8)
         object.__setattr__(self, "_cand_buf", cand_buf)
         self.cand_mode = (
-            None
-            if cand_buf is None
-            else ("write" if cand_write else "read")
+            None if cand_buf is None else ("write" if cand_write else "read")
         )
         self.cand_block_size = cand_blk_sz
         self.cand_blocks = 0 if cand_buf is None else int(cand_buf.shape[1])
@@ -730,9 +726,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 persistent=False,
             )
             if envs.VLLM_DSV41_TP_INDEXER:
-                object.__setattr__(
-                    self, "indexer_op_tp", self._build_tp_indexer_op()
-                )
+                object.__setattr__(self, "indexer_op_tp", self._build_tp_indexer_op())
                 object.__setattr__(
                     self,
                     "indexer_op_tp_pq",
@@ -760,7 +754,9 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         def _fake_fused_wqb_rq(q_fp8, *args, **kwargs):
             t = q_fp8.shape[0]
             return (
-                q_fp8.new_empty((t, self.n_head, self.head_dim), dtype=torch.float8_e4m3fn),
+                q_fp8.new_empty(
+                    (t, self.n_head, self.head_dim), dtype=torch.float8_e4m3fn
+                ),
                 q_fp8.new_empty((t, self.n_head), dtype=torch.float32),
             )
 
@@ -776,9 +772,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             _fake_fused_wqb_rq,
         )
 
-    def _build_indexer_op(
-        self, use_step_meta: bool = False, prequant_q: bool = False
-    ):
+    def _build_indexer_op(self, use_step_meta: bool = False, prequant_q: bool = False):
         op_name = (
             f"pallas::deepseek_v41_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}"
@@ -867,9 +861,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             _fake_tp_indexer,
         )
 
-    def use_tp_indexer(
-        self, num_tokens: int, *, ced_decoder: bool = False
-    ) -> bool:
+    def use_tp_indexer(self, num_tokens: int, *, ced_decoder: bool = False) -> bool:
         """Token-parallel indexer for this batch size (static, per bucket)."""
         if "indexer_op_tp" not in self.__dict__:
             return False
@@ -879,7 +871,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
             _DECODER_TP_ATTN_VERIFY
             and ced_decoder
             and tp_size > 1
-            and num_tokens >= int(os.environ.get("VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS", "1024"))
+            and num_tokens >= int(envs.VLLM_DSV41_DECODER_TP_ATTN_MIN_TOKENS)
             and num_tokens % tp_size == 0
         )
         return (
@@ -1052,9 +1044,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         ):
             tp_rank = get_tensor_model_parallel_rank()
             latent_local = tp_shard_slice(latent, tp_size, tp_rank, rank_idx)
-            k_normed = tp_all_gather(
-                self.k_norm(self.wk(latent_local)[0]), dim=0
-            )
+            k_normed = tp_all_gather(self.k_norm(self.wk(latent_local)[0]), dim=0)
         else:
             k_normed = self.k_norm(self.wk(latent)[0])
         new_kv_cache = self.produce_k_op(
@@ -1140,7 +1130,9 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
         num_tokens = positions.shape[0]
         kv_cache = _as_kernel_cache_view(getattr(self.k_cache, "kv_cache", None))
         if kv_cache is None:
-            return positions.new_zeros((num_tokens, self.topk_tokens), dtype=torch.int32)
+            return positions.new_zeros(
+                (num_tokens, self.topk_tokens), dtype=torch.int32
+            )
 
         attn_ctx = get_forward_context().attn_metadata
         assert isinstance(attn_ctx, dict)
@@ -1228,9 +1220,13 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 step_metadata = step_metadata_fn()
             meta_args: tuple[torch.Tensor, ...] = ()
             if step_metadata is not None:
-                eff_rl_r2, eff_rl_r1, idx_page_indices, pass_num_steps, pass_schedules = (
-                    step_metadata
-                )
+                (
+                    eff_rl_r2,
+                    eff_rl_r1,
+                    idx_page_indices,
+                    pass_num_steps,
+                    pass_schedules,
+                ) = step_metadata
                 eff_rl = eff_rl_r2 if self.compress_ratio == 2 else eff_rl_r1
                 meta_args = (eff_rl, idx_page_indices, pass_num_steps, pass_schedules)
             if use_fused_pq:
@@ -1253,9 +1249,7 @@ class VllmDeepseekV41Indexer(dsv41_attention.DeepseekV4Indexer):
                 )
                 w_arg = indexer_weights
                 idx_op = (
-                    self.indexer_op_hm
-                    if step_metadata is not None
-                    else self.indexer_op
+                    self.indexer_op_hm if step_metadata is not None else self.indexer_op
                 )
 
             op_args = (
