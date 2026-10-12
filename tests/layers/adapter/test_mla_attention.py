@@ -1277,6 +1277,9 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
 
     monkeypatch.setattr(mla_attention_op, "streamindex_topk", _fake_streamindex_topk)
+    # The in-tree op under test; with tokamax importable the indexer would take
+    # tokamax's PyTorch op. Both write the cache through `_append_indexer_k`.
+    monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", "0")
 
     rng = np.random.default_rng(42)
     num_pages, page_size, head_dim, lkv_dim = 4, 128, 128, 256

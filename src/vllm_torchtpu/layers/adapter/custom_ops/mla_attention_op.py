@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import functools
 from typing import Any, cast
 
 import jax
@@ -44,7 +45,6 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.tokamax_ops import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -54,6 +54,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     get_kv_cache_shape,
     indexer_kv_layout,
     kv_cache_append,
+    streamindex_topk,
     streamindex_topk_dcp,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
@@ -73,6 +74,17 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+# tokamax's PyTorch lightning indexer, imported here at module import -- never
+# inside a compiled region, where Dynamo would trace the import -- or None
+# when tokamax is absent or broken, in which case the in-tree op runs.
+try:
+    from tokamax.experimental.torch_tpu.ops.lightning_indexer import (
+        torch_pallas_mosaic_tpu as tokamax_lightning_indexer,
+    )
+except (ImportError, AttributeError) as _e:
+    tokamax_lightning_indexer = None
+    logger.info("tokamax's lightning indexer is unavailable: %s", _e)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -382,6 +394,72 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+def _append_indexer_k(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    *,
+    kv_cache_mode: str | None,
+) -> tuple[jax.Array, KVLayout]:
+    """Inserts this step's indexer K rows into the cache; returns it and its layout.
+
+    The cache write the non-DCP indexer does ahead of its top-k, shared by the
+    in-tree op and the scaffolding around tokamax's indexer.
+    """
+    writer, kv_layout = _resolve_indexer_kv_cache_mode(
+        cache_kv, k_packed, mode=kv_cache_mode
+    )
+    if writer == "xla":
+        _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+        block_size = block_size_per_kv_packing * kv_packing
+        # Cache rows are padded to the 128-lane HBM width; pad the packed
+        # fp8+scale rows to match before scattering.
+        k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+
+        # Insert this step's K rows into the KV cache.
+        tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+        seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+        q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+        pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+        page = jnp.where(
+            tok < cu_q_lens[-1],
+            page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
+            jnp.int32(2**30),
+        )
+        slot = pos % block_size
+        cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+            k_packed
+        )
+    else:
+        cache_kv = coalesced_kv_append(
+            cache_kv,
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            kv_layout=kv_layout,
+        )
+    return cache_kv, kv_layout
+
+
+@torch._dynamo.assume_constant_result
+def _indexer_kv_layout_name(
+    cache_shape: tuple[int, ...], k_width: int, kv_cache_mode: str | None
+) -> str:
+    """The cache layout `_append_indexer_k` resolves, as a name for tokamax.
+
+    Resolved from the shapes alone, eagerly and outside any compiled graph: the
+    resolver logs and checks the device, which Dynamo should not trace.
+    """
+    meta = functools.partial(torch.empty, dtype=torch.uint8, device="meta")
+    _, kv_layout = _resolve_indexer_kv_cache_mode(
+        meta(cache_shape), meta((1, k_width)), mode=kv_cache_mode
+    )
+    return kv_layout.name
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -423,6 +501,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             else None
         )
 
+        reason = self._tokamax_indexer_unsupported_reason()
+        if reason is None:
+            return self._build_tokamax_streamidx_op(chunk_tokens, kv_cache_mode)
+        logger.warning_once(
+            "Sparse attention indexer: keeping the in-tree kernel because of %s.",
+            reason,
+        )
+
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
             weights: jax.Array,  # [num_tokens, H]
@@ -435,45 +521,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                cache_kv, k_packed, mode=kv_cache_mode
+            cache_kv, kv_layout = _append_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                kv_cache_mode=kv_cache_mode,
             )
-            if writer == "xla":
-                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-                block_size = block_size_per_kv_packing * kv_packing
-                # Cache rows are padded to the 128-lane HBM width; pad the packed
-                # fp8+scale rows to match before scattering.
-                k_packed = jnp.pad(
-                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
-                )
-
-                # Insert this step's K rows into the KV cache.
-                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
-                )
-                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-                page = jnp.where(
-                    tok < cu_q_lens[-1],
-                    page_indices.reshape(seq_lens.shape[0], -1)[
-                        seq_id, pos // block_size
-                    ],
-                    jnp.int32(2**30),
-                )
-                slot = pos % block_size
-                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                    k_packed
-                )
-            else:
-                cache_kv = coalesced_kv_append(
-                    cache_kv,
-                    k_packed,
-                    seq_lens,
-                    page_indices,
-                    cu_q_lens,
-                    kv_layout=kv_layout,
-                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -510,6 +565,87 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             new_cache, topk_indices = jax_op(*args)
             args[2].copy_(new_cache)
             return topk_indices
+
+        self._streamidx_op = op
+        return op
+
+    @staticmethod
+    def _tokamax_indexer_unsupported_reason() -> str | None:
+        """Why the non-DCP indexer cannot run tokamax's PyTorch op, or None."""
+        if not envs.VLLM_TPU_USE_TOKAMAX:
+            return "VLLM_TPU_USE_TOKAMAX=0"
+        if tokamax_lightning_indexer is None:
+            return "tokamax is not importable"
+        return None
+
+    def _build_tokamax_streamidx_op(self, chunk_tokens, kv_cache_mode):
+        """The non-DCP indexer on tokamax's `PallasMosaicTpuLightningIndexer`.
+
+        A `jax_op` keeps what the in-tree op does ahead of its kernel -- this
+        step's K rows into the cache, which it donates -- and tokamax's PyTorch
+        op then scores and ranks the cached rows with the in-tree kernel's
+        tuning. Returns a callable with the in-tree op's signature.
+        """
+        topk = self.topk_tokens
+
+        def _append_jax(
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+        ) -> jax.Array:
+            cache_kv, _ = _append_indexer_k(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                kv_cache_mode=kv_cache_mode,
+            )
+            return cache_kv
+
+        op_name = f"pallas::streamidx_k_append_{self.k_cache.prefix.replace('.', '_')}"
+        append_op = pallas.jax_op(op_name, _append_jax, donate_argnums=(0,))
+        append_op.register_fake(lambda cache_kv, *args: torch.empty_like(cache_kv))
+
+        indexer = tokamax_lightning_indexer.PallasMosaicTpuLightningIndexer
+        # Built here, outside any compiled region: it is a pydantic dataclass.
+        config = tokamax_lightning_indexer.Config(
+            # The in-tree kernel's tuning, from microbenchmarks.
+            num_kv_pages_per_block=(2, 2, 2),
+            num_queries_per_block=(1, 128, 128),
+            enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+            chunk_tokens=chunk_tokens,
+        )
+
+        def op(
+            q_bytes,
+            weights,
+            cache_kv,
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+        ):
+            new_cache = append_op(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+            cache_kv.copy_(new_cache)
+            return indexer(
+                q_bytes.view(torch.float8_e4m3fn),
+                weights,
+                new_cache,
+                seq_lens,
+                page_indices.reshape(-1),
+                cu_q_lens,
+                distribution,
+                k=topk,
+                compression_ratio=1,
+                kv_layout=_indexer_kv_layout_name(
+                    tuple(cache_kv.shape), k_packed.shape[-1], kv_cache_mode
+                ),
+                config=config,
+            )
 
         self._streamidx_op = op
         return op

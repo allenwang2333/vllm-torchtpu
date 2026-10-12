@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels import tokamax_ops
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -611,6 +611,258 @@ def prepare_outputs(
     return out[:, :actual_num_q_heads, :actual_head_dim]
 
 
+def run_sparse_mla_chunk(
+    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], prepared
+    cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
+    cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
+    kv_lens: jax.Array,  # i32[max_num_tokens]
+    attention_sinks: jax.Array,  # float32[num_q_heads]
+    swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
+    swa_l: jax.Array,  # float32[max_num_tokens, num_l_heads]
+    swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
+    *,
+    start_seq_idx: int,
+    end_seq_idx: jax.Array,  # i32
+    num_valid_tokens: jax.Array,  # i32
+    kernel_batch_size: int,
+    sm_scale: float,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+) -> jax.Array:
+    """Attention for one chunk of queries over its gathered top-k rows.
+
+    Writes rows `[start_seq_idx, end_seq_idx)` of `q` (aliased to the output)
+    and returns it; the inputs are `prepare_sparse_attention`'s.
+    """
+    _, num_q_heads, head_dim = q.shape
+    batch_size = kernel_batch_size
+    end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
+    grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
+        pl.BlockSpec(memory_space=pltpu.HBM),  # q
+        pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
+        pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
+        pl.BlockSpec(memory_space=pltpu.HBM),  # swa_accumution
+        pl.BlockSpec(memory_space=pltpu.HBM),  # swa_l
+        pl.BlockSpec(memory_space=pltpu.HBM),  # swa_m
+    ]
+
+    out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
+
+    # One batch entry's worth of gathered top-k rows, per cache, in the
+    # uint8 / bf16 views the kernel bitcasts the int32 words to.
+    _, topk_rows, lanes = cache_kv_nope.shape
+    bkv_nope_double_buf = pltpu.VMEM(
+        (2, batch_size, topk_rows * 4, lanes),
+        jnp.uint8,
+    )
+    _, rope_rows, lanes = cache_kv_rope.shape
+    bkv_rope_double_buf = pltpu.VMEM(
+        (2, batch_size, rope_rows * 2, lanes),
+        jnp.bfloat16,
+    )
+
+    bq_double_bufq = pltpu.VMEM(
+        (2, batch_size, num_q_heads, head_dim),
+        q.dtype,
+    )
+
+    bo_double_buf = bq_double_bufq
+
+    num_l_heads = align_to(num_q_heads, 128)
+    bl_double_buf = pltpu.VMEM(
+        (2, batch_size, num_l_heads),
+        jnp.float32,
+    )
+    bm_double_buf = bl_double_buf
+
+    swa_acc_double_buf = pltpu.VMEM(
+        (2, batch_size, num_q_heads, head_dim),
+        q.dtype,
+    )
+
+    scratch_shapes = [
+        bkv_nope_double_buf,
+        bkv_rope_double_buf,
+        bq_double_bufq,
+        bo_double_buf,  # Double buffering for output block.
+        bl_double_buf,  # Double buffering for l output.
+        bm_double_buf,  # Double buffering for m output.
+        swa_acc_double_buf,  # Buffer for swa_accumution.
+        # Semaphores for double buffering of
+        # bkv_nope, bq, bo, swa_acc, swa_l, swa_m, bkv_rope
+        pltpu.SemaphoreType.DMA((7, 2)),
+    ]
+
+    scalar_prefetches = (
+        kv_lens,
+        jnp.array([start_seq_idx, end_seq_idx, num_valid_tokens], jnp.int32),
+        # (bi_sem_idx, bo_sem_idx)
+        jnp.zeros((2,), jnp.int32),
+        # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
+        jnp.full((2,), -1, jnp.int32),
+    )
+
+    gathered_topk = cache_kv_nope.shape[1]
+    scope_name = (
+        f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
+    )
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                _attention_kernel,
+                sm_scale=sm_scale,
+                batch_size=batch_size,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=grid,
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+            input_output_aliases={
+                5: 0,  # Alias output activation with q
+            },
+            name=scope_name,
+        )
+    )
+    return kernel(
+        *scalar_prefetches,
+        attention_sinks,
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        swa_accumution,
+        swa_l,
+        swa_m,
+    )
+
+
+def prepare_sparse_attention(
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+    cache_kv_nope: jax.Array,  # int32[total_num_pages, page_size, 128]
+    cache_kv_rope: jax.Array,  # int32[total_num_pages, page_size // 4, 128]
+    topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    attention_sinks: jax.Array,  # float32[actual_num_q_heads]
+    swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
+    swa_l: jax.Array,  # float32[max_num_tokens, num_q_heads]
+    swa_m: jax.Array,  # float32[max_num_tokens, num_q_heads]
+):
+    """Everything `sparse_ragged_paged_attention` does ahead of its chunk loop.
+
+    Returns `(q, attention_sinks, swa_accumution, swa_l, swa_m, kv_lens,
+    gather_indices, num_valid_tokens)`: the padded queries, sinks and SWA
+    partials, each query's number of valid top-k rows, the flat cache row each
+    top-k entry gathers, and the number of real query tokens.
+    """
+    # The cache is DSV4 FP8 format.
+    # nope_cache contains 448 fp8 + 7 fp8 scales,
+    # rope_cache contains 64 bf16
+    assert cache_kv_nope.dtype == jnp.int32
+    assert cache_kv_rope.dtype == jnp.int32
+
+    _, actual_num_q_heads, actual_head_dim = q.shape
+
+    q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
+    attention_sinks = jnp.pad(
+        attention_sinks,
+        (0, q.shape[1] - actual_num_q_heads),
+        constant_values=jnp.finfo(attention_sinks.dtype).min,
+    )
+    assert swa_accumution.dtype == q.dtype
+    swa_accumution, swa_l, swa_m = prepare_swa_inputs(swa_accumution, swa_l, swa_m)
+
+    _, page_size, _ = cache_kv_nope.shape
+
+    _, num_q_heads, _ = q.shape
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    num_page_indices = page_indices.shape[0]
+    assert num_page_indices % max_num_seqs == 0
+
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
+    )
+    assert topk_indices is not None
+    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+
+    seq_page_ids = topk_indices // page_size
+    token_offset = topk_indices % page_size
+    topk = topk_indices.shape[-1]
+    page_ids = gather_page_ids(
+        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+    )
+
+    # For the "-1" padding elements in topk_indices, we scatter the corresponding
+    # page_ids and token_offset to avoid gather memory access hotspotting.
+    is_padding = topk_indices == -1
+    total_num_pages = cache_kv_nope.shape[0]
+    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
+        q.shape[0], topk
+    )
+    # 104729 and 15485863 are randomly chosen large prime numbers.
+    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
+    scattered_token_offset = (flat_element_index * 15485863) % page_size
+    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+    token_offset = jnp.where(
+        is_padding,
+        scattered_token_offset,
+        token_offset,
+    )
+
+    assert page_ids.shape == (q.shape[0], topk)
+    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
+    return (
+        q,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        kv_lens,
+        gather_indices,
+        cu_q_lens[distribution[2]],
+    )
+
+
+def sparse_attention_chunks(
+    num_tokens: int,
+    gather_and_attention_chunk_size: int = 128,
+    attention_kernel_batch_size: int = 16,
+) -> list[tuple[int, int, int]]:
+    """The query chunks gather and attention run over: `(start, end, batch)`.
+
+    `batch` is the kernel batch size for the chunk, which divides its length.
+    """
+    chunks = []
+    for start in range(0, num_tokens, gather_and_attention_chunk_size):
+        end = min(start + gather_and_attention_chunk_size, num_tokens)
+        batch = _largest_divisor(end - start, attention_kernel_batch_size)
+        assert (end - start) % batch == 0
+        chunks.append((start, end, batch))
+    return chunks
+
+
+def sparse_attention_chunk_end(start, end, batch, num_valid_tokens):
+    """Where a chunk's kernel grid stops, and how many gathered rows it reads.
+
+    The grid walks `[start, batch_end)` in `batch` steps, so `batch_end - start`
+    MUST be a multiple of `batch`.
+    """
+    span = jnp.maximum(0, jnp.minimum(num_valid_tokens, end) - start)
+    batch_end = start + cdiv(span, batch) * batch
+    return batch_end, batch_end - start
+
+
 # Main Attention kernel for DeepSeek V4 CSA (gather and attention)
 # Note that the compressed kv tokens of current batch (current forward pass)
 # have been written to the `cache_kv` by the compressor module before calling
@@ -664,217 +916,38 @@ def sparse_ragged_paged_attention(
     Returns:
       The output of attention.
     """
-    # The cache is DSV4 FP8 format.
-    # nope_cache contains 448 fp8 + 7 fp8 scales,
-    # rope_cache contains 64 bf16
-    assert cache_kv_nope.dtype == jnp.int32
-    assert cache_kv_rope.dtype == jnp.int32
-
     _, actual_num_q_heads, actual_head_dim = q.shape
-
-    q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
-    head_dim = q.shape[-1]
-    attention_sinks = jnp.pad(
+    (
+        q,
         attention_sinks,
-        (0, q.shape[1] - actual_num_q_heads),
-        constant_values=jnp.finfo(attention_sinks.dtype).min,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        kv_lens,
+        gather_indices,
+        num_valid_tokens,
+    ) = prepare_sparse_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
     )
-    assert swa_accumution.dtype == q.dtype
-    swa_accumution, swa_l, swa_m = prepare_swa_inputs(swa_accumution, swa_l, swa_m)
-
-    _, page_size, _ = cache_kv_nope.shape
-
-    _, num_q_heads, _ = q.shape
-    max_num_seqs = cu_q_lens.shape[0] - 1
-    num_page_indices = page_indices.shape[0]
-    assert num_page_indices % max_num_seqs == 0
-
-    def run_mla_kernel(
-        q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
-        cache_kv_nope: jax.Array,  # int32[chunk_size, topk, 128]
-        cache_kv_rope: jax.Array,  # int32[chunk_size, topk // 4, 128]
-        kv_lens: jax.Array,  # i32[max_num_seqs]
-        attention_sinks: jax.Array,  # float32[num_q_heads]
-        swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
-        swa_l: jax.Array,  # float32[max_num_tokens, num_l_heads]
-        swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
-        start_seq_idx: int,
-        end_seq_idx: jax.Array,  # i32
-        num_valid_tokens: jax.Array,  # i32
-        kernel_batch_size: int,
-    ):
-        batch_size = kernel_batch_size
-        end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
-        grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
-            pl.BlockSpec(memory_space=pltpu.HBM),  # q
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
-            pl.BlockSpec(memory_space=pltpu.HBM),  # swa_accumution
-            pl.BlockSpec(memory_space=pltpu.HBM),  # swa_l
-            pl.BlockSpec(memory_space=pltpu.HBM),  # swa_m
-        ]
-
-        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
-
-        # One batch entry's worth of gathered top-k rows, per cache, in the
-        # uint8 / bf16 views the kernel bitcasts the int32 words to.
-        _, topk_rows, lanes = cache_kv_nope.shape
-        bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, topk_rows * 4, lanes),
-            jnp.uint8,
-        )
-        _, rope_rows, lanes = cache_kv_rope.shape
-        bkv_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, rope_rows * 2, lanes),
-            jnp.bfloat16,
-        )
-
-        bq_double_bufq = pltpu.VMEM(
-            (2, batch_size, num_q_heads, head_dim),
-            q.dtype,
-        )
-
-        bo_double_buf = bq_double_bufq
-
-        num_l_heads = align_to(num_q_heads, 128)
-        bl_double_buf = pltpu.VMEM(
-            (2, batch_size, num_l_heads),
-            jnp.float32,
-        )
-        bm_double_buf = bl_double_buf
-
-        swa_acc_double_buf = pltpu.VMEM(
-            (2, batch_size, num_q_heads, head_dim),
-            q.dtype,
-        )
-
-        scratch_shapes = [
-            bkv_nope_double_buf,
-            bkv_rope_double_buf,
-            bq_double_bufq,
-            bo_double_buf,  # Double buffering for output block.
-            bl_double_buf,  # Double buffering for l output.
-            bm_double_buf,  # Double buffering for m output.
-            swa_acc_double_buf,  # Buffer for swa_accumution.
-            # Semaphores for double buffering of
-            # bkv_nope, bq, bo, swa_acc, swa_l, swa_m, bkv_rope
-            pltpu.SemaphoreType.DMA((7, 2)),
-        ]
-
-        scalar_prefetches = (
-            kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx, num_valid_tokens], jnp.int32),
-            # (bi_sem_idx, bo_sem_idx)
-            jnp.zeros((2,), jnp.int32),
-            # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
-            jnp.full((2,), -1, jnp.int32),
-        )
-
-        gathered_topk = cache_kv_nope.shape[1]
-        scope_name = (
-            f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
-        )
-        kernel = jax.named_scope(scope_name)(
-            pl.pallas_call(
-                functools.partial(
-                    _attention_kernel,
-                    sm_scale=sm_scale,
-                    batch_size=batch_size,
-                ),
-                grid_spec=pltpu.PrefetchScalarGridSpec(
-                    num_scalar_prefetch=len(scalar_prefetches),
-                    in_specs=in_specs,
-                    out_specs=out_specs,
-                    grid=grid,
-                    scratch_shapes=scratch_shapes,
-                ),
-                compiler_params=pltpu.CompilerParams(
-                    dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
-                    disable_bounds_checks=True,
-                ),
-                out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                input_output_aliases={
-                    5: 0,  # Alias output activation with q
-                },
-                name=scope_name,
-            )
-        )
-        return kernel(
-            *scalar_prefetches,
-            attention_sinks,
-            q,
-            cache_kv_nope,
-            cache_kv_rope,
-            swa_accumution,
-            swa_l,
-            swa_m,
-        )
-
-    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
-    seq_ids_segment = jnp.repeat(
-        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
-    )
-    assert topk_indices is not None
-    kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-
-    seq_page_ids = topk_indices // page_size
-    token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
-    page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
-    )
-
-    # For the "-1" padding elements in topk_indices, we scatter the corresponding
-    # page_ids and token_offset to avoid gather memory access hotspotting.
-    is_padding = topk_indices == -1
-    total_num_pages = cache_kv_nope.shape[0]
-    flat_element_index = jnp.arange(q.shape[0] * topk, dtype=jnp.int32).reshape(
-        q.shape[0], topk
-    )
-    # 104729 and 15485863 are randomly chosen large prime numbers.
-    scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-    scattered_token_offset = (flat_element_index * 15485863) % page_size
-    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-    token_offset = jnp.where(
-        is_padding,
-        scattered_token_offset,
-        token_offset,
-    )
-
-    assert page_ids.shape == (q.shape[0], topk)
-    gather_indices = (page_ids * page_size + token_offset).reshape(-1)
-    num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
-
-    for i in range(num_chunks):
-        start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+    for start_pos, end_pos, kernel_batch_size in sparse_attention_chunks(
+        q.shape[0], gather_and_attention_chunk_size, attention_kernel_batch_size
+    ):
         chunk_size = end_pos - start_pos
         indices = gather_indices[start_pos * topk : end_pos * topk]
-
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (
-            cdiv(
-                jnp.maximum(
-                    0,
-                    jnp.minimum(
-                        cu_q_lens[distribution[2]],
-                        end_pos,
-                    )
-                    - start_pos,
-                ),
-                kernel_batch_size,
-            )
-            * kernel_batch_size
+        batch_end, valid_rows = sparse_attention_chunk_end(
+            start_pos, end_pos, kernel_batch_size, num_valid_tokens
         )
-        num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
@@ -885,17 +958,17 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = tokamax_ops.csa_gather(
+        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
             indices,
-            num_valid_indices=num_valid_indices,
+            num_valid_indices=valid_rows * topk,
             top_k=topk,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
 
-        q = run_mla_kernel(
+        q = run_sparse_mla_chunk(
             q,
             gathered_nope_buffer,
             gathered_rope_buffer,
@@ -906,8 +979,10 @@ def sparse_ragged_paged_attention(
             swa_m,
             start_seq_idx=start_pos,
             end_seq_idx=batch_end,
-            num_valid_tokens=cu_q_lens[distribution[2]],
+            num_valid_tokens=num_valid_tokens,
             kernel_batch_size=kernel_batch_size,
+            sm_scale=sm_scale,
+            vmem_limit_bytes=vmem_limit_bytes,
         )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim

@@ -47,7 +47,9 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
+    build_tokamax_csa_attention,
     get_packed_mla_head_size,
+    tokamax_csa_unsupported_reason,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
@@ -447,6 +449,27 @@ class VllmDeepseekV4MLAAttention(
 
         attn_jax_op.register_fake(_fake_attn)
         _pallas_op_cache[op_name] = attn_jax_op
+
+        if is_csa and built_from_real_caches:
+            reason = tokamax_csa_unsupported_reason(mesh)
+            if reason is None:
+                # The gather between the SWA pass and the sparse MLA kernel
+                # runs as tokamax's PyTorch op instead.
+                op = build_tokamax_csa_attention(
+                    op_name.replace("pallas::", "pallas::tokamax_", 1),
+                    attn_jax_op,
+                    sm_scale=sm_scale,
+                    sliding_window=self.window_size,
+                    logical_page_size=logical_page_size,
+                    two_caches_same_buffer=two_caches_same_buffer,
+                    non_causal_block=non_causal,
+                )
+                _pallas_op_cache[op_name] = op
+                return op, built_from_real_caches
+            logger.warning_once(
+                "DeepSeek-V4 CSA attention: keeping the in-tree gather because of %s.",
+                reason,
+            )
         return attn_jax_op, built_from_real_caches
 
     def attn_gemm(

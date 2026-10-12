@@ -27,8 +27,9 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.tokamax_ops import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -43,7 +44,26 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# tokamax's PyTorch lightning indexer, imported here at module import -- never
+# inside a compiled region, where Dynamo would trace the import -- or None
+# when tokamax is absent or broken, in which case the in-tree op runs.
+try:
+    from tokamax.experimental.torch_tpu.ops.lightning_indexer import (
+        torch_pallas_mosaic_tpu as tokamax_lightning_indexer,
+    )
+except (ImportError, AttributeError) as _e:
+    tokamax_lightning_indexer = None
+    logger.info("tokamax's lightning indexer is unavailable: %s", _e)
+
 _indexer_op_cache = {}
+
+# The in-tree kernel's tuning, which tokamax's Config takes field for field.
+_STREAMIDX_TUNING = dict(
+    num_kv_pages_per_block=(16, 8, 8),
+    num_queries_per_block=(1, 128, 128),
+    decode_req_batch_size=4,
+    chunk_tokens=128,
+)
 
 BATCH_AXIS = None
 
@@ -102,11 +122,8 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(16, 8, 8),
-            num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=4,
-            chunk_tokens=128,
+            # Tuned based on microbenchmark results.
+            **_STREAMIDX_TUNING,
         )
 
     return _indexer_local(
@@ -120,6 +137,41 @@ def _indexer_jax(
         cu_q_lens,
         distribution,
     )
+
+
+# Module-level so `pallas.jax_op` can trace and register it as a torch op.
+def _indexer_prologue_jax(
+    q: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,
+    *,
+    softmax_scale: float,
+    n_head: int,
+) -> tuple[jax.Array, jax.Array]:
+    """`_indexer_jax` up to the indexer kernel, for tokamax's indexer to finish.
+
+    Returns the rotated fp8 queries and the weights with the query
+    quantization scales folded in, the two inputs the kernel takes besides the
+    cache and the metadata.
+    """
+    q_quant, q_scales = rope_quant(
+        q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+    )
+    return q_quant, indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
+
+
+def _tokamax_indexer_unsupported_reason(mesh) -> str | None:
+    """Why the indexer cannot run tokamax's PyTorch op, or None."""
+    if not envs.VLLM_TPU_USE_TOKAMAX:
+        return "VLLM_TPU_USE_TOKAMAX=0"
+    if tokamax_lightning_indexer is None:
+        return "tokamax is not importable"
+    if mesh is not None:
+        # tokamax's op registers without a mesh, so it cannot take tensors
+        # sharded over a multi-device mesh in this process.
+        return "a multi-device mesh in this process"
+    return None
 
 
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
@@ -155,6 +207,12 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
     def _build_indexer_op(self):
         mesh = get_pallas_op_mesh()
+        reason = _tokamax_indexer_unsupported_reason(mesh)
+        if reason is None:
+            return self._build_tokamax_indexer_op()
+        logger.warning_once(
+            "DeepSeek-V4 indexer: keeping the in-tree kernel because of %s.", reason
+        )
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -206,6 +264,70 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
         _indexer_op_cache[op_name] = indexer_jax_op
         return indexer_jax_op
+
+    def _build_tokamax_indexer_op(self):
+        """The indexer on tokamax's `PallasMosaicTpuLightningIndexer`.
+
+        A `jax_op` keeps what `_indexer_jax` does ahead of the kernel -- RoPE,
+        fp8 quantization and the scale fold -- and tokamax's PyTorch op then
+        scores and ranks the cached rows with the in-tree kernel's tuning.
+        Returns a callable with the in-tree op's signature.
+        """
+        op_name = (
+            f"pallas::deepseek_v4_indexer_prologue_h{self.n_head}"
+            f"_s{self.softmax_scale:.6g}".replace(".", "p").replace("-", "m")
+        )
+        prologue_op = _indexer_op_cache.get(op_name)
+        if prologue_op is None:
+            prologue_op = pallas.jax_op(
+                op_name,
+                functools.partial(
+                    _indexer_prologue_jax,
+                    softmax_scale=self.softmax_scale,
+                    n_head=self.n_head,
+                ),
+            )
+
+            def _fake_prologue(q, positions, cos_sin_cache, indexer_weights):
+                return (
+                    torch.empty_like(q, dtype=torch.float8_e4m3fn),
+                    torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
+                )
+
+            prologue_op.register_fake(_fake_prologue)
+            _indexer_op_cache[op_name] = prologue_op
+
+        indexer = tokamax_lightning_indexer.PallasMosaicTpuLightningIndexer
+        # Built here, outside any compiled region: it is a pydantic dataclass.
+        config = tokamax_lightning_indexer.Config(**_STREAMIDX_TUNING)
+        k, compression_ratio = self.topk_tokens, self.compress_ratio
+
+        def tokamax_indexer_op(
+            q,
+            positions,
+            cos_sin_cache,
+            indexer_weights,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+        ):
+            q_quant, weights = prologue_op(q, positions, cos_sin_cache, indexer_weights)
+            return indexer(
+                q_quant,
+                weights,
+                kv_cache,
+                seq_lens,
+                block_tables.flatten(),
+                query_start_loc,
+                request_distribution,
+                k=k,
+                compression_ratio=compression_ratio,
+                config=config,
+            )
+
+        return tokamax_indexer_op
 
     def forward(
         self,
