@@ -146,12 +146,16 @@ def _resolve_async_spec_state(
         )
         runner._host_engram_spec_ws, runner._host_engram_ref_drafts = ws, {}
     _, lengths, num_draft, rejected = ws
-    valid = sampled != -1
-    if bool(valid.all()):
-        lengths.fill(valid.shape[1])
+    all_valid, unif_v0, rej_val = (
+        sampled.size == 0 or int(sampled.min()) != -1,
+        -1,
+        -1,
+    )
+    if all_valid:
+        lengths.fill(sampled.shape[1])
         tokens = sampled
     else:
-        valid.sum(axis=1, dtype=np.int32, out=lengths)
+        (valid := sampled != -1).sum(axis=1, dtype=np.int32, out=lengths)
         # Compact each row's valid tokens to its front, preserving their order.
         tokens = (
             sampled
@@ -162,7 +166,7 @@ def _resolve_async_spec_state(
         )
     num_draft_per_req = getattr(pre_async, "num_draft_per_req", None) or {}
     if not num_draft_per_req:
-        num_draft.fill(0)
+        num_draft.fill(unif_v0 := 0)
     elif (
         len(num_draft_per_req) == num_rows
         and (v0 := num_draft_per_req.get(0)) is not None
@@ -182,7 +186,7 @@ def _resolve_async_spec_state(
             or num_draft_per_req == ref_draft
         )
     ):
-        num_draft.fill(v0)
+        num_draft.fill(unif_v0 := int(v0))
     else:
         num_draft.fill(0)
         draft_pos = np.fromiter(
@@ -193,14 +197,23 @@ def _resolve_async_spec_state(
         )
         in_range = (draft_pos >= 0) & (draft_pos < num_rows)
         num_draft[draft_pos[in_range]] = draft_cnt[in_range]
-    if spec_num_rejected is not None:
+    if spec_num_rejected is None or (all_valid and unif_v0 >= 0):
+        rejected.fill(
+            rej_val := (
+                max(0, unif_v0 - int(sampled.shape[1]) + 1)
+                if spec_num_rejected is not None and unif_v0 > 0
+                else 0
+            )
+        )
+    else:
         np.subtract(num_draft, lengths, out=rejected)
         rejected += 1
         np.maximum(rejected, 0, out=rejected)
         rejected[num_draft <= 0] = 0
-    else:
-        rejected.fill(0)
-    discard = getattr(pre_async, "discard_sampled_tokens_req_indices", None) or ()
+    discard, runner._host_engram_spec_unif = (
+        getattr(pre_async, "discard_sampled_tokens_req_indices", None) or (),
+        (unif_v0, rej_val, int(rejected.ctypes.data)),
+    )
     if discard:
         discard_idx = np.fromiter((int(i) for i in discard), dtype=np.int32)
         discard_idx = discard_idx[(discard_idx >= 0) & (discard_idx < num_rows)]
@@ -322,6 +335,13 @@ def _resolve_decode_lookback_cpu(
     starts_1d = (
         raw_starts
         if rejected_by_req is None
+        or (
+            spec_unif[1] == 0
+            if (spec_unif := getattr(runner, "_host_engram_spec_unif", (-1, -1, 0)))[1]
+            >= 0
+            and int(rejected_by_req.ctypes.data) == spec_unif[2]
+            else rejected_by_req.size == 0 or not rejected_by_req.any()
+        )
         else raw_starts
         - (
             rejected_by_req
@@ -630,23 +650,37 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
                 )
             if num_tokens_no_spec is not None:
                 write_start = (
-                    (
-                        num_tokens_no_spec[:chunk_num_reqs]
-                        if start_index == 0
-                        and isinstance(num_tokens_no_spec, np.ndarray)
-                        and num_tokens_no_spec.dtype == np.int32
-                        else np.asarray(
-                            num_tokens_no_spec[
-                                start_index : start_index + chunk_num_reqs
-                            ],
-                            dtype=np.int32,
-                        )
+                    num_tokens_no_spec[:chunk_num_reqs]
+                    if start_index == 0
+                    and isinstance(num_tokens_no_spec, np.ndarray)
+                    and num_tokens_no_spec.dtype == np.int32
+                    else np.asarray(
+                        num_tokens_no_spec[start_index : start_index + chunk_num_reqs],
+                        dtype=np.int32,
                     )
-                    - 1
-                    - n_draft
+                ) - (
+                    1 + unif_v0
+                    if is_identity
+                    and (
+                        unif_v0 := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[0]
+                    )
+                    >= 0
+                    else 1 + n_draft
                 )
             else:
-                write_start = raw_starts - n_draft
+                write_start = raw_starts - (
+                    unif_v0
+                    if is_identity
+                    and (
+                        unif_v0 := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[0]
+                    )
+                    >= 0
+                    else n_draft
+                )
             sampled_overlay = _SampledOverlay(
                 tokens=ov_tokens,
                 starts=write_start,
@@ -688,7 +722,16 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             ids.numpy()[dst_idx] = flat_src.numpy()[src_idx]
             if rejected_by_req is not None:
                 m_rej = rejected_by_req if all_matched else rejected_by_req[matched]
-                if m_rej.any():
+                if (
+                    rej_val != 0
+                    if (
+                        rej_val := getattr(
+                            runner, "_host_engram_spec_unif", (-1, -1, 0)
+                        )[1]
+                    )
+                    >= 0
+                    else m_rej.any()
+                ):
                     positions = _acquire_host_scratch(
                         runner,
                         "_host_engram_pos_scratch",

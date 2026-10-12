@@ -843,3 +843,65 @@ def test_td8393_uniform_delta_lookback_slice_and_direct_int32_slices(
     out64 = he.capture_host_engram_inputs(runner, 4)
     assert out64 is not None and out64.host_ready is True
     np.testing.assert_array_equal(out64.lookback_token_ids.numpy(), lb_ref)
+
+
+def test_td8396_all_valid_uniform_spec_state_and_zero_rejection_fast_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TD8.396: Verify _resolve_async_spec_state skips valid bool allocation and
+    np.subtract when all_valid and num_draft is uniform, and capture_host_engram_inputs
+    uses single scalar subtraction and O(1) zero-rejection short-circuit."""
+    runner = _make_runner(8, k=5, depth=4, seed=96)
+    runner._pre_async_results.req_id_to_index_copy = {f"req-{i}": i for i in range(8)}
+    runner._pre_async_results.num_draft_per_req = dict.fromkeys(range(8), 5)
+    # Force 100% accepted tokens (no -1 in sampled_token_ids_cpu)
+    sampled_all_acc = torch.arange(8 * 6, dtype=torch.int32).reshape(8, 6) + 10
+    runner._pre_async_results.wait_for_copy = lambda: sampled_all_acc
+    runner._pre_async_results.discard_sampled_tokens_req_indices = []
+    runner.input_batch.num_computed_tokens_cpu = np.full(8, 64, dtype=np.int32)
+    runner.input_batch.num_tokens_no_spec = np.full(8, 65, dtype=np.int32)
+
+    orig_subtract = he.np.subtract
+    subtract_calls = 0
+
+    def counting_subtract(*args: object, **kwargs: object) -> object:
+        nonlocal subtract_calls
+        subtract_calls += 1
+        return orig_subtract(*args, **kwargs)
+
+    monkeypatch.setattr(he.np, "subtract", counting_subtract)
+
+    # 1. 100% accepted + uniform num_draft=5: zero np.subtract calls across entire step!
+    subtract_calls = 0
+    out_acc = he.capture_host_engram_inputs(runner, 8)
+    assert out_acc is not None and out_acc.host_ready is True
+    assert subtract_calls == 0
+    assert runner._host_engram_spec_unif[:2] == (5, 0)
+    ids_ref, pos_ref, lb_ref = _reference(runner, 8)
+    np.testing.assert_array_equal(out_acc.input_ids.numpy(), ids_ref)
+    np.testing.assert_array_equal(out_acc.positions.numpy(), pos_ref)
+    np.testing.assert_array_equal(out_acc.lookback_token_ids.numpy(), lb_ref)
+
+    # 2. All valid tokens with width (4) < 1 + num_draft (6) -> uniform rej_val = 2
+    sampled_narrow = torch.arange(8 * 4, dtype=torch.int32).reshape(8, 4) + 10
+    runner._pre_async_results.wait_for_copy = lambda: sampled_narrow
+    subtract_calls = 0
+    spec_narrow = he._resolve_async_spec_state(
+        runner, runner._pre_async_results, identity_num_reqs=8
+    )
+    assert spec_narrow is not None
+    assert subtract_calls == 0
+    assert runner._host_engram_spec_unif[:2] == (5, 2)
+    assert spec_narrow.rejected.tolist() == [2] * 8
+
+    # 3. Partial rejections (-1 in sampled) -> falls back to else branch
+    sampled_partial = sampled_all_acc.clone()
+    sampled_partial[0, 5] = -1
+    runner._pre_async_results.wait_for_copy = lambda: sampled_partial
+    out_part = he.capture_host_engram_inputs(runner, 8)
+    assert out_part is not None and out_part.host_ready is True
+    assert runner._host_engram_spec_unif[:2] == (5, -1)
+    ids_ref_p, pos_ref_p, lb_ref_p = _reference(runner, 8)
+    np.testing.assert_array_equal(out_part.input_ids.numpy(), ids_ref_p)
+    np.testing.assert_array_equal(out_part.positions.numpy(), pos_ref_p)
+    np.testing.assert_array_equal(out_part.lookback_token_ids.numpy(), lb_ref_p)
