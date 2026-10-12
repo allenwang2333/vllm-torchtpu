@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -444,6 +445,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # With TPU_DCP_LSE_MERGE_A2A: carry each destination's lse bits as extra
+    # rows of its partial-output send block, so the merge runs ONE all-to-all
+    # instead of two (the f32 lse exchange is a latency-bound collective of a
+    # few KB). Bits are moved, not converted: the merge is unchanged.
+    "TPU_DCP_LSE_MERGE_A2A_PACK": env_bool("TPU_DCP_LSE_MERGE_A2A_PACK", default=False),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
