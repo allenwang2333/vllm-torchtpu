@@ -16,6 +16,8 @@
 from vllm_torchtpu.megakernel import (
     blocks,
     comm,
+    kernel,
+    models,
     ops,
     planner,
     pool_alias,
@@ -30,6 +32,13 @@ from vllm_torchtpu.megakernel.blocks import (
     MoEParams,
 )
 from vllm_torchtpu.megakernel.comm import AllReduceRing
+from vllm_torchtpu.megakernel.kernel import (
+    KernelContext,
+    build,
+    fold,
+    make_step,
+    unfold,
+)
 from vllm_torchtpu.megakernel.spec import (
     Block,
     DebugOptions,
@@ -54,6 +63,7 @@ __all__ = [
     "ExecSpec",
     "GQABlock",
     "GQAParams",
+    "KernelContext",
     "LayerType",
     "MoEBlock",
     "MoEParams",
@@ -67,12 +77,18 @@ __all__ = [
     "TwoRing",
     "WeightDecl",
     "blocks",
+    "build",
     "comm",
     "default_tiles",
+    "fold",
+    "kernel",
+    "make_step",
+    "models",
     "ops",
     "planner",
     "pool_alias",
     "spec",
     "stream",
+    "unfold",
     "vmem",
 ]
