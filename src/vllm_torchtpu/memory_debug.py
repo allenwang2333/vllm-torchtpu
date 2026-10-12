@@ -29,6 +29,14 @@ Experiments:
       KV budget probe and grow the KV cache past what capture_model expects.
   VLLM_TPU_MEMDBG_RELEASE_STAGER_POOL=1   (C1) free the expert staging pool's
       host buffers once weights are on the device.
+  VLLM_TPU_MEMDBG_CLEAR_PRECOMPILE_CONTEXT=1  (A1b) clear torch's
+      PrecompileContext once capture_model is done. AOTAutogradCache.save
+      records a deepcopy of every bundled entry there -- for TPU entries a
+      pickle round trip, i.e. one more loaded executable per graph -- for a
+      mega-AOT serialization we disable (VLLM_USE_MEGA_AOT_ARTIFACT=0).
+
+With VLLM_TPU_MEMDBG_TRACE=1, rank 0 also logs which objects hold the live
+compiled executables after capture_model (``holders`` lines).
 """
 
 import contextlib
@@ -51,6 +59,7 @@ HEAP_DUMP = _flag("VLLM_TPU_MEMDBG_HEAP_DUMP")
 DROP_SERIALIZE_ENTRY = _flag("VLLM_TPU_MEMDBG_DROP_SERIALIZE_ENTRY")
 CLEAR_COMPILE_CACHE = _flag("VLLM_TPU_MEMDBG_CLEAR_COMPILE_CACHE")
 RELEASE_STAGER_POOL = _flag("VLLM_TPU_MEMDBG_RELEASE_STAGER_POOL")
+CLEAR_PRECOMPILE_CONTEXT = _flag("VLLM_TPU_MEMDBG_CLEAR_PRECOMPILE_CONTEXT")
 
 # Resolve tcmalloc symbols from the allocator already in the process
 # (LD_PRELOAD; libtcmalloc.so.4 in our images, which carries the heap
@@ -69,23 +78,27 @@ def _tcmalloc_fn(name: str) -> Any:
 
 _tag = "unknown"
 _dumps_heap = False
+_is_rank0 = False
 _heap_profiler: Any = None
 
 
 def configure(role: str, dp_rank: int, rank: int) -> None:
     """Name this worker's records; called once from TPUWorker.__init__."""
-    global _tag, _dumps_heap
+    global _tag, _dumps_heap, _is_rank0
     _tag = f"{role}_dp{dp_rank}_r{rank}"
-    _dumps_heap = HEAP_DUMP and dp_rank == 0 and rank == 0
+    _is_rank0 = dp_rank == 0 and rank == 0
+    _dumps_heap = HEAP_DUMP and _is_rank0
     if TRACE or HEAP_DUMP:
         logger.info(
             "[MEMDBG] tag=%s heap_dump=%s drop_serialize_entry=%s "
-            "clear_compile_cache=%s release_stager_pool=%s",
+            "clear_compile_cache=%s release_stager_pool=%s "
+            "clear_precompile_context=%s",
             _tag,
             _dumps_heap,
             DROP_SERIALIZE_ENTRY,
             CLEAR_COMPILE_CACHE,
             RELEASE_STAGER_POOL,
+            CLEAR_PRECOMPILE_CONTEXT,
         )
 
 
@@ -119,6 +132,86 @@ def _live_compiled_executables() -> int:
     return sum(isinstance(o, TorchTpuCompiledExecutable) for o in gc.get_objects())
 
 
+def _precompile_artifacts() -> int:
+    from torch._dynamo.precompile_context import PrecompileContext
+
+    return len(PrecompileContext._backend_artifacts_by_key)
+
+
+def maybe_clear_precompile_context(reason: str) -> None:
+    """(A1b) Drop the entry copies AOTAutogradCache.save parked in torch."""
+    if not CLEAR_PRECOMPILE_CONTEXT:
+        return
+    from torch._dynamo.precompile_context import PrecompileContext
+
+    before = _precompile_artifacts()
+    PrecompileContext.clear()
+    gc.collect()
+    logger.info(
+        "[MEMDBG] cleared PrecompileContext after %s: %d artifacts", reason, before
+    )
+
+
+def _label(obj: Any) -> str:
+    if callable(obj) and hasattr(obj, "__qualname__"):
+        return f"{type(obj).__name__}:{obj.__qualname__}"
+    return type(obj).__qualname__
+
+
+def log_executable_holders(stage: str, depth: int = 6, top: int = 15) -> None:
+    """Rank 0 only: histogram of referrer chains above each live executable.
+
+    Answers "who keeps this program alive" for copies a fix was expected to
+    release. Each direct referrer (up to three per executable) is followed
+    ``depth`` levels up, taking the first non-frame referrer per level. One
+    gc pass per level (get_referents over every tracked object) keeps this to
+    a few seconds per level even on a multi-million-object heap.
+    """
+    if not (TRACE and _is_rank0):
+        return
+    import collections
+    import inspect
+
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    gc.collect()
+    objects = [o for o in gc.get_objects() if not inspect.isframe(o)]
+    mine = {id(objects)}
+
+    def parents_of(targets: dict[int, Any]) -> dict[int, list[Any]]:
+        found: dict[int, list[Any]] = collections.defaultdict(list)
+        for o in objects:
+            if id(o) in mine:
+                continue
+            for r in gc.get_referents(o):
+                if id(r) in targets:
+                    found[id(r)].append(o)
+        return found
+
+    exes = [o for o in objects if isinstance(o, TorchTpuCompiledExecutable)]
+    mine.add(id(exes))
+    direct = parents_of({id(e): e for e in exes})
+    chains = [([_label(p)], p) for e in exes for p in direct.get(id(e), [])[:3]]
+    for _ in range(depth - 1):
+        ups = parents_of({id(cur): cur for _, cur in chains})
+        extended = []
+        for labels, cur in chains:
+            above = ups.get(id(cur))
+            if above:
+                labels.append(_label(above[0]))
+                cur = above[0]
+            extended.append((labels, cur))
+        chains = extended
+    counts = collections.Counter(" <- ".join(labels) for labels, _ in chains)
+    logger.info(
+        "[MEMDBG] holders stage=%s tag=%s executables=%d", stage, _tag, len(exes)
+    )
+    for chain, count in counts.most_common(top):
+        logger.info("[MEMDBG] holders %3d x %s", count, chain)
+
+
 def _heap_dump(stage: str) -> None:
     global _heap_profiler
     if _heap_profiler is None:
@@ -148,13 +241,15 @@ def stage(name: str) -> None:
     rss, anon = _proc_mem_mb()
     logger.info(
         "[MEMDBG] stage=%s tag=%s VmRSS=%.1f MB RssAnon=%.1f MB "
-        "compile_cache_entries=%d live_compiled_executables=%d",
+        "compile_cache_entries=%d live_compiled_executables=%d "
+        "precompile_artifacts=%d",
         name,
         _tag,
         rss,
         anon,
         _compile_cache_entries(),
         _live_compiled_executables(),
+        _precompile_artifacts(),
     )
     if _dumps_heap:
         _heap_dump(name)

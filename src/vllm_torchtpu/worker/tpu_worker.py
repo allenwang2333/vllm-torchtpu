@@ -732,9 +732,12 @@ class TPUWorker(WorkerBase):
         with _startup_compilation_artifacts():
             self.model_runner.capture_model()
         memory_debug.stage("post_capture")
+        memory_debug.log_executable_holders("post_capture")
+        memory_debug.maybe_clear_precompile_context("capture_model")
         memory_debug.maybe_clear_compile_cache("capture_model")
         memory_debug.trim_allocator("post_capture")
         memory_debug.stage("final")
+        memory_debug.log_executable_holders("final")
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
