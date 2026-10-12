@@ -1722,6 +1722,7 @@ def streamindex_topk_dcp(
     skip_empty_decode: bool = False,
     skip_empty_decode_chunked: bool = False,
     global_scheduling_group_id: int | None = None,
+    dcp_rank_ids: jax.Array | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1796,6 +1797,9 @@ def streamindex_topk_dcp(
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
         no group. Same result.
+      dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
+        r = r (`TPU_DCP_RANK_OPERAND`): each shard reads its own rank from its
+        one element instead of an `all_to_all` of an iota. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1833,8 +1837,12 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+        *rank_ids,
     ):
-        dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
+        if rank_ids:
+            dcp_rank = rank_ids[0][0]
+        else:
+            dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
         idxs, scores = streamindex_topk(
@@ -1917,7 +1925,8 @@ def streamindex_topk_dcp(
             replicated,  # page_indices
             replicated,  # cu_q_lens
             replicated,  # distribution
-        ),
+        )
+        + ((P(dcp_axis_name),) if dcp_rank_ids is not None else ()),
         out_specs=P(dcp_axis_name),
         check_vma=False,
     )(
@@ -1928,4 +1937,5 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+        *((dcp_rank_ids,) if dcp_rank_ids is not None else ()),
     )

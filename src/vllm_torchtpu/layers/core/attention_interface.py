@@ -1092,6 +1092,7 @@ def sparse_mla_attention_dcp(
     q_rope_table: jax.Array | None = None,
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
+    dcp_rank_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1116,6 +1117,9 @@ def sparse_mla_attention_dcp(
       kv_write_fault: test-only positive controls for
         TPU_MLA_KV_WRITE_IN_GATHER: `"wrong_owner"` (rows addressed as the
         next DCP rank's) or one of `native_sc_gather.WRITE_FAULTS`.
+      dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
+        r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
+        the `all_to_all` of an iota. Same result.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1210,9 +1214,15 @@ def sparse_mla_attention_dcp(
         block_tables_,
         query_start_loc_,
         request_distribution_,
-        rope_table_=None,
+        *extra_,
     ):
-        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
+        # then this shard's DCP rank (TPU_DCP_RANK_OPERAND).
+        rope_table_ = extra_[0] if q_rope else None
+        if dcp_rank_ids is not None:
+            dcp_rank = extra_[-1][0]
+        else:
+            dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         kv_in_gather = (
             envs.TPU_MLA_KV_WRITE_IN_GATHER
@@ -1367,6 +1377,9 @@ def sparse_mla_attention_dcp(
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)
 
+    rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
+    if rank_args:
+        in_specs = in_specs + (P(dcp_axis_name),)
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
@@ -1384,4 +1397,5 @@ def sparse_mla_attention_dcp(
         query_start_loc,
         request_distribution,
         *((q_rope_table,) if q_rope else ()),
+        *rank_args,
     )
