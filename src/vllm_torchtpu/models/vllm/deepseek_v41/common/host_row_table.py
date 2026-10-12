@@ -109,6 +109,7 @@ def allocate_shared_host_storage(
         return tensor
 
 
+@functools.cache
 def _pinned_sharding(device: jax.Device) -> jax.sharding.SingleDeviceSharding:
     return jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
 
@@ -138,18 +139,23 @@ def _install() -> None:
 
     def mark_pinned_host_inputs(graph_module, example_inputs):
         base_mark(graph_module, example_inputs)
-        placeholders = {
-            node: i
-            for i, node in enumerate(
-                n for n in graph_module.graph.nodes if n.op == "placeholder"
-            )
-        }
+        placeholders: dict[Any, int] | None = None
         for node in graph_module.graph.nodes:
-            if node.op != "call_function" or HOST_OP_NAMESPACE not in str(node.target):
+            if node.op != "call_function":
                 continue
+            target_str = str(node.target)
+            if HOST_OP_NAMESPACE not in target_str:
+                continue
+            if placeholders is None:
+                placeholders = {
+                    n: i
+                    for i, n in enumerate(
+                        p for p in graph_module.graph.nodes if p.op == "placeholder"
+                    )
+                }
             # `lookup_and_dequant` takes (rows, valid, weight_scale_inv, *chunks);
             # `gather` takes (row_ids, *chunks).
-            chunk_start = 3 if "lookup_and_dequant" in str(node.target) else 1
+            chunk_start = 3 if "lookup_and_dequant" in target_str else 1
             for arg in node.args[chunk_start:]:
                 index = placeholders.get(arg)
                 if index is not None and isinstance(
@@ -170,8 +176,8 @@ def _gather_op(num_chunks: int, row_bytes: int):
     """
     from torch_tpu._internal.pallas import pallas as tpu_pallas
 
-    def gather(*args):
-        return hrg.gather_rows_jax(args[0], *args[1:], row_bytes=row_bytes)
+    def gather(row_ids, *chunks):
+        return hrg.gather_rows_jax(row_ids, *chunks, row_bytes=row_bytes)
 
     gather.__signature__ = inspect.Signature(  # pyrefly: ignore[missing-attribute]
         [
@@ -199,12 +205,12 @@ def _lookup_and_dequant_op(num_chunks: int, row_bytes: int, block_size: int):
     """``jax_op`` gathering ``row_bytes`` rows and dequantizing to bf16."""
     from torch_tpu._internal.pallas import pallas as tpu_pallas
 
-    def fn(*args):
+    def fn(row_ids, valid, weight_scale_inv, *chunks):
         return hrg.lookup_and_dequant_rows_jax(
-            args[0],
-            args[1],
-            args[2],
-            *args[3:],
+            row_ids,
+            valid,
+            weight_scale_inv,
+            *chunks,
             row_bytes=row_bytes,
             block_size=block_size,
         )
@@ -265,7 +271,7 @@ class HostRowTable:
         num_chunks = -(-total_majors // chunk_majors(self.row_bytes, chunk_bytes))
         majors = -(-total_majors // num_chunks)
         rows_per_chunk = majors * per_major
-        host = rows.view(torch.uint8).numpy()
+        host = rows.contiguous().view(torch.uint8).numpy()
         self.chunks: list[torch.Tensor] = []
         for start in range(0, num_chunks * rows_per_chunk, rows_per_chunk):
             packed = hrg.pack_rows(host[start : start + rows_per_chunk], majors)
