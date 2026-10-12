@@ -29,6 +29,13 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      (`TPU_DCP_MERGE_CHUNKED_LSE_AG`) returns the per-chunk-gather merge bit
      for bit, eager and compiled, and the same check fails when the collapsed
      gather's rows are shifted by one.
+  6. Packing the lse bits into the partial's all-to-all
+     (`TPU_DCP_LSE_MERGE_A2A_PACK`) returns the two-exchange a2a merge bit for
+     bit eager; compiled, where the merge fusion sees the received partial in
+     another layout, it meets the a2a merge's own bar (one bf16 ulp of the f64
+     reference, or no less exact than the a2a merge compiled the same way). The
+     same check fails when the packed lse rows are rotated by one rank while
+     the partial rows are left alone.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -58,6 +65,7 @@ _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A": False,
     "TPU_DCP_MERGE_CHUNKED": 0,
     "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
+    "TPU_DCP_LSE_MERGE_A2A_PACK": False,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
@@ -67,11 +75,14 @@ ARMS = {
     "chunk4": {"TPU_DCP_MERGE_CHUNKED": 4},
     "chunk8": {"TPU_DCP_MERGE_CHUNKED": 8},
     "chunk8_ag1": {"TPU_DCP_MERGE_CHUNKED": 8, "TPU_DCP_MERGE_CHUNKED_LSE_AG": True},
+    "a2a_pack": {"TPU_DCP_LSE_MERGE_A2A": True, "TPU_DCP_LSE_MERGE_A2A_PACK": True},
 }
 # Arms that must return today's merge: same per-row arithmetic, other schedule.
 CHUNK_ARMS = ("chunk2", "chunk4", "chunk8", "chunk8_ag1")
 # Collapsed lse gathers (`TPU_DCP_MERGE_CHUNKED_LSE_AG`): bitwise chunk8.
 LSE_AG_ARMS = ("chunk8_ag1",)
+# lse packed into the partial's exchange (`TPU_DCP_LSE_MERGE_A2A_PACK`): bitwise a2a.
+PACK_ARMS = ("a2a_pack",)
 
 
 def _worker_command(result_dir: Path, extra: list[str]) -> list[str]:
@@ -284,11 +295,19 @@ def _check(rank, world, group, cp_mla):
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
                 }
-                if arm in ("today", "chunk8"):
+                if arm in ("today", "chunk8", "a2a"):
                     got_today[(arm, how)] = got
                 if arm == "today":
                     got_today[how] = got
-                if arm in LSE_AG_ARMS and ("chunk8", how) in got_today:
+                if arm in PACK_ARMS and ("a2a", how) in got_today:
+                    same = got.view(torch.int16) == got_today[("a2a", how)].view(
+                        torch.int16
+                    )
+                    report[f"{arm}/{how}"]["bitwise_vs_a2a"] = bool(same.all())
+                    report[f"{arm}/{how}"]["frac_bitwise_vs_a2a"] = float(
+                        same.float().mean()
+                    )
+                elif arm in LSE_AG_ARMS and ("chunk8", how) in got_today:
                     report[f"{arm}/{how}"]["bitwise_vs_chunk8"] = bool(
                         torch.equal(
                             got.view(torch.int16),
@@ -346,6 +365,40 @@ def _check(rank, world, group, cp_mla):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[f"control_rotated/{arm}/{how}"] = {"error": repr(exc)[:400]}
+    finally:
+        cp_mla._all_to_all = real
+
+    # Positive control for the packed exchange: the received lse rows (every
+    # row after the partial's `T * local`) rotated by one source rank, the
+    # partial rows untouched. The same check must now fail.
+    real = cp_mla._all_to_all
+    pack_rows = CHECK_TOKENS * local
+
+    def _rotated_lse_rows(x, g):
+        r = real(x, g)
+        if r.dim() != 3 or r.shape[-1] != VDIM:  # only the packed exchange
+            return r
+        return torch.cat([r[:, :pack_rows], torch.roll(r[:, pack_rows:], 1, 0)], 1)
+
+    cp_mla._all_to_all = _rotated_lse_rows
+    try:
+        for arm in PACK_ARMS:
+            _set_arm(cp_mla, arm)
+            for how in ("eager", "compiled"):
+                key = f"control_lse_rows_rotated/{arm}/{how}"
+                try:
+                    fn = merge if how == "eager" else _compile(merge)
+                    got = fn(o_dev, l_dev).cpu()
+                    report[key] = _error_stats(got, ref)
+                    report[key]["bitwise_vs_a2a"] = bool(
+                        torch.equal(
+                            got.view(torch.int16),
+                            got_today[("a2a", how)].view(torch.int16),
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    traceback.print_exc()
+                    report[key] = {"error": repr(exc)[:400]}
     finally:
         cp_mla._all_to_all = real
 
@@ -417,7 +470,7 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        arms = ("today", "a2a", *MERGE_VARIANTS)
+        arms = ("today", "a2a", *PACK_ARMS, *MERGE_VARIANTS)
         if tokens > 256:
             arms = ("today", *CHUNK_ARMS)
         for arm in arms:
@@ -609,6 +662,28 @@ def assert_merge_results(results: list[dict]) -> None:
                 how,
                 c,
             )
+        for arm in PACK_ARMS:
+            for how in ("eager", "compiled"):
+                c = check[f"{arm}/{how}"]
+                assert "error" not in c, (r["rank"], arm, how, c)
+                assert c["finite"], (r["rank"], arm, how, c)
+                if how == "eager":
+                    assert c.get("bitwise_vs_a2a") is True, (r["rank"], arm, how, c)
+                a2a = check[f"a2a/{how}"]
+                assert c["within_1ulp"] or (
+                    c["frac_over_1ulp"] <= a2a["frac_over_1ulp"]
+                    and c["max_abs_err"] <= a2a["max_abs_err"]
+                ), (r["rank"], arm, how, a2a, c)
+                ctl = check[f"control_lse_rows_rotated/{arm}/{how}"]
+                assert "error" not in ctl, (r["rank"], arm, how, ctl)
+                assert not ctl["within_1ulp"], (
+                    "positive control: rotated packed lse rows must fail the check",
+                    r["rank"],
+                    arm,
+                    how,
+                    ctl,
+                )
+                assert not ctl["bitwise_vs_a2a"], (r["rank"], arm, how, ctl)
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]

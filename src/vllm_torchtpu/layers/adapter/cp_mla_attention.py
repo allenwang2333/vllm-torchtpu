@@ -264,9 +264,49 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    if envs.TPU_DCP_LSE_MERGE_A2A_PACK and output.element_size() == 2:
+        o_recv, l_recv = _all_to_all_packed(o_send, l_send, group)
+    else:
+        o_recv = _all_to_all(o_send, group)
+        l_recv = _all_to_all(l_send, group)
     return _merge_received(o_recv, l_recv).to(output.dtype)
+
+
+def _all_to_all_packed(
+    o_send: torch.Tensor, l_send: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(_all_to_all(o_send), _all_to_all(l_send))` in ONE all-to-all
+    (`TPU_DCP_LSE_MERGE_A2A_PACK`).
+
+    `o_send` is `[world, T, local, V]` in a 2-byte dtype and `l_send` the f32
+    `[world, T, local]`. Both are reinterpreted as int16 words -- each f32 lse
+    is two words -- and the `T * local * 2` lse words of destination `d` ride
+    as extra rows after its `T * local` partial rows, zero padded to whole
+    `V`-wide rows. The words stay integers until they are unpacked: a float
+    concat may be lowered to a select/max that canonicalizes the NaN bit
+    patterns half an f32 can take. The exchange moves bits, so both halves come
+    back bit for bit what the two separate exchanges return; only the f32
+    lse's own collective (latency-bound at a few KB) is gone, for
+    `ceil(2 * T * local / V)` extra rows on the partial's.
+    """
+    world, tokens, local, vdim = o_send.shape
+    rows = tokens * local
+    words = rows * 2
+    extra = -(-words // vdim)
+    o_words = o_send.reshape(world, rows, vdim).view(torch.int16)
+    l_words = l_send.contiguous().view(torch.int16).reshape(world, words)
+    l_words = torch.nn.functional.pad(l_words, (0, extra * vdim - words))
+    send = torch.cat([o_words, l_words.reshape(world, extra, vdim)], dim=1)
+    recv = _all_to_all(send, group)
+    o_recv = recv[:, :rows].reshape(world, tokens, local, vdim).view(o_send.dtype)
+    l_recv = (
+        recv[:, rows:]
+        .reshape(world, extra * vdim)[:, :words]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(world, tokens, local)
+    )
+    return o_recv, l_recv
 
 
 def _zero_nan(o_f32: torch.Tensor) -> torch.Tensor:

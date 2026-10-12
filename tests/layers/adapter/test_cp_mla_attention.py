@@ -354,6 +354,62 @@ def test_positive_control_wrong_head_slice_is_caught(monkeypatch):
     assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
+@pytest.mark.parametrize(
+    "dcp_size,tokens,local_heads,vdim",
+    [(2, 12, 4, 64), (8, 16, 4, 512), (16, 16, 4, 512), (8, 64, 8, 512), (4, 5, 3, 64)],
+)
+def test_packed_all_to_all_merge_is_bitwise_the_two_exchange_merge(
+    dcp_size, tokens, local_heads, vdim, monkeypatch
+):
+    """`TPU_DCP_LSE_MERGE_A2A_PACK`: one exchange carrying the lse bits after
+    the partial's rows returns the two-exchange merge bit for bit, including
+    the shapes whose lse words do not fill a whole row."""
+    outputs, lses = _hard_partials(
+        np.random.default_rng(29), dcp_size, tokens, local_heads, vdim
+    )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", False, raising=False)
+    two = _a2a_merge_whole(outputs, lses, monkeypatch)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    calls = []
+    real = cp_mla._all_to_all_packed
+    monkeypatch.setattr(
+        cp_mla,
+        "_all_to_all_packed",
+        lambda o, lse, g: calls.append(1) or real(o, lse, g),
+    )
+    one = _a2a_merge_whole(outputs, lses, monkeypatch)
+    assert len(calls) == dcp_size  # every rank took the packed exchange
+    assert torch.equal(one.view(torch.int16), two.view(torch.int16))
+    assert _bf16_close(one, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_packed_lse_rows_from_the_wrong_rank_are_caught(
+    monkeypatch,
+):
+    """The packed merge's check must fail when the lse rows (only) come from
+    the neighbouring source rank."""
+    outputs, lses = _hard_partials(np.random.default_rng(31), 4, 16, 4, 512)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    rows = 16 * 4
+
+    def exchange(x, group):
+        r = group.all_to_all(x)
+        return torch.cat([r[:, :rows], torch.roll(r[:, rows:], 1, 0)], 1)
+
+    world = 4
+    hub = _ExchangeHub(world)
+    monkeypatch.setattr(cp_mla, "_all_to_all", exchange)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        got = torch.cat(list(pool.map(run, range(world))), dim=1)
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
 def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
     """The reference check must fail when the merge skips the max shift."""
 
