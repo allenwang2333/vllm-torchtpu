@@ -668,6 +668,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
         "TPU_DCP_MERGE_RS_BF16": 0,
         "TPU_DCP_MLA_MERGE_PIECES": 0,
+        "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -789,6 +790,27 @@ def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(
     one = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=1, **on)
     assert calls == [32] * dcp_size
     torch.testing.assert_close(one, today, rtol=0, atol=0)
+
+
+def test_head_split_respects_min_tokens(monkeypatch):
+    """Below TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS the merge keeps its one lse
+    gather."""
+    outputs, lses = _hard_partials(np.random.default_rng(59), 4, tokens=32)
+    calls = []
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
+    )
+    on = dict(
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+        TPU_DCP_MLA_MERGE_PIECES=2,
+    )
+    _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS=64, **on)
+    assert calls == [32] * 4
+    calls.clear()
+    _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS=32, **on)
+    assert sorted(calls) == sorted([8, 24] * 4)
 
 
 def test_positive_control_head_split_rest_misaligned_is_caught(monkeypatch):

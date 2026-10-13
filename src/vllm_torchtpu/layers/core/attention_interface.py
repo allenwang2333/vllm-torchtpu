@@ -1367,6 +1367,7 @@ def sparse_mla_attention_dcp(
             and mask_in_kernel
             and split_q_lse
             and topk_cap
+            and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
         ):
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 

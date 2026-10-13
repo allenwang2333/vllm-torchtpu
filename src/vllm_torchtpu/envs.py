@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
     TPU_DCP_MERGE_RS_BF16: int = 0
     TPU_DCP_MLA_MERGE_PIECES: int = 0
+    TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -546,6 +547,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # piece 0's reduce-scatter instead of holding them open under the
     # attention calls. 0 = off.
     "TPU_DCP_MLA_MERGE_PIECES": env_int("TPU_DCP_MLA_MERGE_PIECES", 0),
+    # TPU_DCP_MLA_MERGE_PIECES only for buckets of at least this many tokens
+    # (0 = every chunked bucket); the lse-gather head split (2) follows it.
+    "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
+        "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 0
+    ),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)

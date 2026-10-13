@@ -287,7 +287,10 @@ def _merge_chunked_lse_gathered(
     """
     step = output.shape[0] // chunks
     lse_f32 = lse.to(torch.float32)
-    if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
+    if (
+        envs.TPU_DCP_MLA_MERGE_PIECES >= 2
+        and output.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+    ):
         # Chunk 0's rows alone, then the rest: chunk 0's reduce-scatter need
         # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
         # same rows, so the same gathered values.
