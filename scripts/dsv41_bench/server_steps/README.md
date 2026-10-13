@@ -143,6 +143,32 @@ responses, metrics, raw worker records and startup logs. `run.py` also writes
 `startup-phases.json` automatically. Memory monitoring used during the original
 investigation is not part of this benchmark entry point.
 
+## 96K attempt: 2026-10-13
+
+Branch `develop/dsv41-96k-extend-benchmark`, benchmark commit `5f6f59188`,
+based on epic commit `c4f20a56e`. Falcon experiment `exp-3f5osvzlde` ran on
+`gke-tpu-train-us-central1-1-prod` with the same four-chip topology and pinned
+runtime. Remote benchmark file checksums matched the commit.
+
+The server resolved its default `max_model_len` to 1048576. It failed during
+backbone warmup at the 2048-token bucket, before HTTP readiness or any benchmark
+requests. Elapsed launch-to-failure was 1305.66 seconds; this is not a successful
+cold-start measurement. No valid throughput or profile was produced.
+
+The automatic memory probe reported 31.05–31.06 GiB available per rank before
+KV budget rounding and the RoPE reserve. After KV allocation, XLA reported
+`RuntimeProgramAllocationFailure` while loading
+`tt_jit_layernorm_L21C0_rms_norm_mul`: a 31.40G program-region reservation was
+requested with only 14.29G reservable (1.07G free, 13.22G already reserved).
+The reporting operation alone does not identify the source of the full
+reservation. Investigate runtime memory budgeting and compiled program memory
+at the default context limit before comparing 96K throughput.
+
+Evidence in the experiment artifact: `extend96k/cold/server.log`,
+`extend96k/cold/startup.json`, `extend96k/benchmark-task.log`, and
+`extend96k/source-provenance.txt`. The server context limit was not reduced
+and KV was not replaced by a fixed small budget to bypass the failure.
+
 ## Historical 64K validation: 2026-10-13
 
 The following results used 65536 cached prefix tokens and an explicit
