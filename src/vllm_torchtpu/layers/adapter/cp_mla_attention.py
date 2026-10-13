@@ -475,6 +475,17 @@ def merge_send_layout(
             send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
         )
         return merged.reshape(num_tokens, local, vdim)
+    if envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK:
+        # The exchange and the unpack (row slices and bitcasts only: bits
+        # move, nothing is computed) as one JAX op; the merge below is the
+        # incumbent's, on the same partials and lse.
+        prebuild_send_unpack(world)
+        o_recv, l_recv = _SEND_UNPACK_OPS[world](
+            send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
     recv = _ragged_all_to_all(send, 1 + real * local, group, skip=SEND_PAD_ROWS - 1)
     o_recv = recv[:, SEND_PAD_ROWS:].reshape(world, num_tokens, local, vdim)
     o_recv = o_recv.view(torch.bfloat16)
@@ -706,6 +717,89 @@ def _build_send_merge(world: int):
         input_partition_specs=(rank_spec, P(), rank_spec),
         output_partition_specs=rank_spec,
         fake=_send_merge_fake,
+    )
+
+
+_SEND_UNPACK_OPS: dict = {}
+
+
+def prebuild_send_unpack(world: int) -> None:
+    """Build (register) the send-layout exchange + unpack op
+    (`TPU_DCP_MLA_SEND_LAYOUT_UNPACK`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_UNPACK_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_UNPACK_OPS[world] = _build_send_unpack(world)
+
+
+def _send_unpack_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    world = int(get_dcp_group().world_size)
+    tl = x.shape[0] // world - SEND_PAD_ROWS
+    return (
+        x.new_empty((world, tl, x.shape[1]), dtype=torch.bfloat16),
+        x.new_empty((world, tl), dtype=torch.float32),
+    )
+
+
+def _build_send_unpack(world: int):
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+    skip = SEND_PAD_ROWS - 1
+
+    def body(x, rows, rank):
+        block = x.shape[0] // world
+        vdim = x.shape[1]
+        me = rank[0].astype(jnp.int32)
+        n = jnp.clip(rows[0], 0, block - skip).astype(jnp.int32)
+        sizes = jnp.full((world,), n, jnp.int32)
+        recv = jax.lax.ragged_all_to_all(
+            x,
+            jnp.zeros_like(x),
+            jnp.arange(world, dtype=jnp.int32) * block + skip,
+            sizes,
+            jnp.full((world,), me * block + skip, jnp.int32),
+            sizes,
+            axis_name=DCP_AXIS_NAME,
+        ).reshape(world, block, vdim)
+        tl = block - SEND_PAD_ROWS
+        o = lax.bitcast_convert_type(recv[:, SEND_PAD_ROWS:], jnp.bfloat16)
+        words = recv[:, SEND_PAD_ROWS - 1]
+        hi = words[:, :tl].astype(jnp.int32)
+        lo = words[:, tl : 2 * tl].astype(jnp.int32)
+        l = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+        return o, l
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_unpack_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_unpack_fake,
     )
 
 

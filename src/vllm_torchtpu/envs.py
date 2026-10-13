@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     TPU_MTP_DCP_MERGE_SIZED: bool = False
     TPU_DCP_MLA_SEND_LAYOUT: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
+    TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -489,6 +490,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of torch ops on its views. Same arithmetic, op for op.
     "TPU_DCP_MLA_SEND_LAYOUT_MERGE": env_bool(
         "TPU_DCP_MLA_SEND_LAYOUT_MERGE", default=False
+    ),
+    # With TPU_DCP_MLA_SEND_LAYOUT: the exchange and the unpack of the
+    # received buffer (slices + bitcasts, no arithmetic) as one JAX op, the
+    # merge arithmetic unchanged in torch. Same bits.
+    "TPU_DCP_MLA_SEND_LAYOUT_UNPACK": env_bool(
+        "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", default=False
     ),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token

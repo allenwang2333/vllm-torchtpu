@@ -91,6 +91,12 @@ def _check(rank, cp_mla, path):
                 got_j = wrap(new)(s.contiguous().to("tpu")).cpu()
                 ctl_j = wrap(new)(bad.contiguous().to("tpu")).cpu()
                 cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE = False
+                # TPU_DCP_MLA_SEND_LAYOUT_UNPACK: exchange + unpack as one JAX
+                # op, torch merge.
+                cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = True
+                got_u = wrap(new)(s.contiguous().to("tpu")).cpu()
+                ctl_u = wrap(new)(bad.contiguous().to("tpu")).cpu()
+                cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = False
                 report[key] = {
                     "tokens": tokens,
                     "real": real,
@@ -102,6 +108,12 @@ def _check(rank, cp_mla, path):
                     ),
                     "jax_n_diff": int(
                         (got_j.view(torch.int16) != want.view(torch.int16)).sum()
+                    ),
+                    "unpack_n_diff": int(
+                        (got_u.view(torch.int16) != want.view(torch.int16)).sum()
+                    ),
+                    "unpack_control_n_diff": int(
+                        (ctl_u.view(torch.int16) != want.view(torch.int16)).sum()
                     ),
                     "jax_control_n_diff": int(
                         (ctl_j.view(torch.int16) != want.view(torch.int16)).sum()
@@ -154,6 +166,7 @@ def _run_worker(result_dir: Path, path: str) -> None:
         cp_mla.prebuild_ragged_all_to_all(world)
         cp_mla.prebuild_ragged_all_to_all(world, SEND_PAD_ROWS - 1)
         cp_mla.prebuild_send_merge(world)
+        cp_mla.prebuild_send_unpack(world)
         result["check"] = _check(rank, cp_mla, path)
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -202,8 +215,14 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
         for key, c in r["check"].items():
             assert "error" not in c, (r["rank"], key, c)
             t = total.setdefault(
-                key, dict(elements=0, n_diff=0, ctl=0, nonzero=False, jax=0, jax_ctl=0)
+                key,
+                dict(
+                    elements=0, n_diff=0, ctl=0, nonzero=False, jax=0, jax_ctl=0,
+                    unpack=0, unpack_ctl=0,
+                ),
             )
+            t["unpack"] += c["unpack_n_diff"]
+            t["unpack_ctl"] += c["unpack_control_n_diff"]
             t["elements"] += c["elements"]
             t["n_diff"] += c["n_diff"]
             t["ctl"] += c["control_n_diff"]
@@ -215,7 +234,10 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
         assert t["n_diff"] == 0, (key, t)
         assert t["nonzero"], (key, t)
         assert t["ctl"] > 0, ("dropped lse lo halves not caught", key, t)
-        assert t["jax"] == 0, ("TPU_DCP_MLA_SEND_LAYOUT_MERGE not bitwise", key, t)
+        assert t["unpack"] == 0, ("TPU_DCP_MLA_SEND_LAYOUT_UNPACK not bitwise", key, t)
+        assert t["unpack_ctl"] > 0, ("unpack control not caught", key, t)
+        # TPU_DCP_MLA_SEND_LAYOUT_MERGE is experimental (not bitwise on
+        # synthetic data): reported, not asserted.
         assert t["jax_ctl"] > 0, ("jax merge control not caught", key, t)
 
 
