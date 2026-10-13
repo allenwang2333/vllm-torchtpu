@@ -5869,12 +5869,18 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_shapes = [(n, torch.int64) for n in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            # The stride-(1+K) source takes the drafts' dtype, not the
+            # sampler's: assemble_spec_next_tokens and
+            # _assemble_async_prefill_bootstrap cast the bonus to it, and
+            # _draft_propose_token emits int32. Warmed at int64 only, every
+            # num_tokens bucket compiled in the middle of serving instead.
+            spec_len = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
             )
+            next_shapes += [(spec_len, torch.int32), (spec_len, torch.int64)]
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -5886,8 +5892,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_shapes:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,

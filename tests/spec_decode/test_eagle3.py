@@ -477,7 +477,8 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     assert local_gather_indices.cpu()[:2].tolist() == [-1, 2]
     assert local_gather_indices.cpu()[2:].eq(-1).all()
     if isinstance(rejected, torch.Tensor):
-        assert rejected.cpu().tolist() == [0, 0]
+        # The async count is [p]-padded with zeros.
+        assert rejected.cpu().eq(0).all() and rejected.shape[0] >= 2
     else:
         assert np.array_equal(rejected, np.zeros(2, dtype=np.int32))
 
@@ -658,7 +659,70 @@ def test_prepare_draft_inputs_async_device(device):
     # Gather-index real prefix matches (seed positions [2, 4]); the padded tail
     # repeats the last entry on both paths and is sliced off by propose().
     assert torch.equal(dev_last.cpu(), host_last.cpu())
-    assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
+    # The device count comes back at the loop bucket p with a zero tail (the
+    # pad the draft loop applies); the host count stays [num_reqs].
+    assert dev_rej.shape == (16,)
+    assert dev_rej.cpu()[:2].tolist() == host_rej.tolist() == [1, 3]
+    assert dev_rej.cpu()[2:].eq(0).all()
+
+
+def test_prepare_draft_inputs_async_device_discard_and_padding(device):
+    """Async path at the loop bucket: a partial-prefill (discard) request's
+    seed comes from host request state, and the padded rows repeat the last
+    real request -- including its override -- exactly as the sync path pads."""
+    proposer = _make_proposer(draft_tp=1)
+    req_state = SimpleNamespace(
+        num_computed_tokens=5, get_token_id=lambda pos: 700 + pos
+    )
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2"]),
+        device=device,
+        requests={"r2": req_state},
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    # r0/r1 verify 2 drafts each (spans of 3), r2 is a 4-token partial prefill.
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"r2": 4})
+    chunk = _make_chunk(
+        input_ids=torch.arange(10, dtype=torch.int32, device=device),
+        position_ids=torch.arange(10, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 3, 6, 10], dtype=np.int32),
+        start_index=0,
+        num_reqs=3,
+        device=device,
+        # Padded past num_reqs, like the runner's snapshot.
+        draft_lengths=torch.tensor(
+            [2, 2, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device
+        ),
+        attn_ctx=SimpleNamespace(
+            query_start_loc=torch.tensor(
+                [0, 3, 6, 10, 10, 10, 10, 10, 10], dtype=torch.int32, device=device
+            )
+        ),
+    )
+    # r0 accepts both drafts (bonus 301), r1 rejects one (bonus 302); r2 is a
+    # prefill whose sampled token is discarded. Rows past num_reqs are padding.
+    next_tokens = torch.full((8, 3), -1, dtype=torch.int32, device=device)
+    next_tokens[0] = torch.tensor([11, 12, 301], dtype=torch.int32)
+    next_tokens[1] = torch.tensor([21, 302, -1], dtype=torch.int32)
+    next_tokens[2] = torch.tensor([999, -1, -1], dtype=torch.int32)
+
+    ids, _, last, rej = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[2],
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+
+    # Seed positions: r0 at qsl_end-1 = 2, r1 one rejected -> 4, r2 at 9; the
+    # tail repeats r2's 9.
+    assert last.cpu().tolist() == [2, 4, 9] + [9] * 13
+    assert rej.cpu().tolist() == [0, 1, 0] + [0] * 13
+    # Shift-left then scatter: r2's seed is its host token at seq_len 5 + 4.
+    expected = torch.tensor([1, 2, 301, 4, 302, 6, 7, 8, 9, 709], dtype=torch.int32)
+    assert ids.cpu().tolist() == expected.tolist()
 
 
 @pytest.mark.tpu_test
