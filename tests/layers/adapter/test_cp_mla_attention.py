@@ -1199,6 +1199,35 @@ def test_positive_control_bf16_heads_major_wrong_weight_is_caught(monkeypatch):
     assert _scale_ulp_errors(got, outputs, lses)["max"] > _RS_BF16_MAX_ULP[1]
 
 
+@pytest.mark.parametrize("min_tokens,want", [(0, [4, 8, 16]), (8, [8, 16]), (16, [16])])
+def test_send_layout_min_tokens_gates_small_buckets(min_tokens, want, monkeypatch):
+    """TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: buckets below it keep the packed
+    a2a merge (send_layout_applies is False); larger ones are unchanged."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    group = type("G", (), {"world_size": 16})()
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(sparse_kernel, "send_layout_supported", lambda *a: True)
+    for name, value in dict(
+        TPU_DCP_MLA_SEND_LAYOUT=True,
+        TPU_DCP_LSE_MERGE_A2A=True,
+        TPU_DCP_LSE_MERGE_A2A_PACK=True,
+        TPU_DCP_LSE_MERGE_A2A_REAL_ROWS=True,
+        TPU_DCP_MLA_SPLIT_Q_LSE=True,
+        TPU_DCP_MLA_MASK_IN_KERNEL=True,
+        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=64,
+        TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS=min_tokens,
+    ).items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+    got = [
+        t
+        for t in (4, 8, 16)
+        if cp_mla.send_layout_applies(t, 64, 512, torch.bfloat16, True)
+    ]
+    assert got == want
+    assert not cp_mla.send_layout_applies(16, 64, 512, torch.bfloat16, False)
+
+
 # ===================================================================== #
 # Position ownership tests.
 # ===================================================================== #

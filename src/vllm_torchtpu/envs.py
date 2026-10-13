@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_LAYOUT: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
+    TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -503,6 +504,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # merge arithmetic unchanged in torch. Same bits.
     "TPU_DCP_MLA_SEND_LAYOUT_UNPACK": env_bool(
         "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", default=False
+    ),
+    # TPU_DCP_MLA_SEND_LAYOUT only on decode buckets of at least this many
+    # tokens (0 = every bucket it supports). Below ~8 tokens the send buffer's
+    # SEND_PAD_ROWS lse row block is as large as the partial rows, so the
+    # exchange carries ~2x the packed real-rows bytes (mirror: bucket 4 +1.4 %,
+    # buckets 8 / 16 -1.8 / -2.8 %). Smaller buckets keep the packed a2a merge.
+    "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS": env_int(
+        "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS", 0
     ),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token

@@ -503,6 +503,7 @@ def send_layout_applies(
         and dtype == torch.bfloat16
         and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
         and num_tokens <= sparse_kernel.FUSED_PREP_MAX_TOKENS
+        and num_tokens >= envs.TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS
     ):
         return False
     # The kernel runs one chunk of `num_tokens` (the capped chunk is larger
