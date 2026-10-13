@@ -2238,8 +2238,14 @@ class Qwen35Megakernel:
         bucket_t: int,
         tokens_per_seq: int = 1,
         out_pad_rows: int | None = None,
+        classic_only: bool = False,
     ) -> Any:
-        """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for `(tokens_per_seq, bucket_t)`."""
+        """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for `(tokens_per_seq, bucket_t)`.
+
+        classic_only builds just the classic-signature op (no fused input prep), cached
+        under `(tokens_per_seq, bucket_t, "classic")`, for callers such as the split
+        verify step that do their own prep and call the op with pos/hidden/page_table.
+        """
         bucket_fused = bool(
             self.fused_pool_io and self._bucket_is_fused(bucket_t)
         )
@@ -2266,7 +2272,7 @@ class Qwen35Megakernel:
 
         m_rows = c.M
         target_out_rows = int(out_pad_rows or m_rows)
-        fuse_prep = bool(getattr(self, "fuse_prep", True))
+        fuse_prep = bool(getattr(self, "fuse_prep", True)) and not classic_only
 
         if hasattr(pool_io, "make_flat_pooled_step"):
             mk_kwargs: dict[str, Any] = {"fused_pool_io": bucket_fused}
@@ -2328,6 +2334,10 @@ class Qwen35Megakernel:
             and getattr(step_fn, "_inner_body", None) is not None
             and hasattr(pool_io, "wrap_step_with_fused_prep")
         )
+        if not hasattr(self, "_bucket_prep"):
+            self._bucket_prep = {}
+        if not classic_only:
+            self._bucket_prep[(tokens_per_seq, bucket_t)] = use_fused_prep
         if use_fused_prep:
             step_fn, in_specs, out_specs, donate_argnums = (
                 pool_io.wrap_step_with_fused_prep(
@@ -2344,7 +2354,7 @@ class Qwen35Megakernel:
         ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
         # Distinct op / trace names per pool-I/O mode so the two kernels never
         # share a compilation-cache key.
-        io_tag = "" if bucket_fused else "_3stage"
+        io_tag = ("" if bucket_fused else "_3stage") + ("_classic" if classic_only else "")
         fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
         src = (
             f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
@@ -2478,11 +2488,15 @@ class Qwen35Megakernel:
                     )
                 ] + [torch.empty_like(p) for p in pools]
 
+        if not hasattr(self, "_flat_callables"):
+            self._flat_callables = {}
+        if classic_only:
+            self._bucket_ops[(tokens_per_seq, bucket_t, "classic")] = op
+            self._flat_callables[(tokens_per_seq, bucket_t, "classic")] = flat_callable
+            return op
         self._bucket_ops[(tokens_per_seq, bucket_t)] = op
         if tokens_per_seq == 1:
             self._bucket_ops[bucket_t] = op
-        if not hasattr(self, "_flat_callables"):
-            self._flat_callables = {}
         self._flat_callables[(tokens_per_seq, bucket_t)] = flat_callable
         if tokens_per_seq == 1:
             self._flat_callables[bucket_t] = flat_callable
@@ -2783,10 +2797,20 @@ class Qwen35Megakernel:
             self._build_bucket_op(b0, tokens_per_seq=T)
         if (T, b1) not in self._flat_callables:
             self._build_bucket_op(b1, tokens_per_seq=T)
-        flat_callable_0 = self._flat_callables[(T, b0)]
-        flat_callable_1 = self._flat_callables[(T, b1)]
-        op_0 = self._bucket_ops[(T, b0)]
-        op_1 = self._bucket_ops[(T, b1)]
+
+        # The halves run with this step's own prep, so they need the classic-signature
+        # ops (pos, hidden, page_table, ...). With fused prep on, the per-bucket ops built
+        # above take input_ids/block_tables instead, and calling them here failed with
+        # "Expected a value of type 'Tensor' for argument 's1'" (j-00c6303e-fd97-43a1-94ce).
+        def _classic(b: int) -> tuple[Any, Any]:
+            if (T, b, "classic") not in self._bucket_ops:
+                if not getattr(self, "_bucket_prep", {}).get((T, b), False):
+                    return self._bucket_ops[(T, b)], self._flat_callables[(T, b)]
+                self._build_bucket_op(b, tokens_per_seq=T, classic_only=True)
+            return self._bucket_ops[(T, b, "classic")], self._flat_callables[(T, b, "classic")]
+
+        op_0, flat_callable_0 = _classic(b0)
+        op_1, flat_callable_1 = _classic(b1)
         self._bucket_fused[(T, B)] = bool(
             self._bucket_fused.get((T, b0), False)
             or self._bucket_fused.get((T, b1), False)
