@@ -24,14 +24,19 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_biased
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
+_EMPTY = torch.empty
+_FP32 = torch.float32
+_INT32 = torch.int32
+
 
 def _fake_router_topk(
     scores: torch.Tensor, topk: int, renormalize: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = scores.shape[0]
+    out_shape = (scores.shape[0], topk)
+    dev = scores.device
     return (
-        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
-        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
+        _EMPTY(out_shape, dtype=_FP32, device=dev),
+        _EMPTY(out_shape, dtype=_INT32, device=dev),
     )
 
 
@@ -41,10 +46,11 @@ def _fake_router_topk_biased(
     topk: int,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = scores.shape[0]
+    out_shape = (scores.shape[0], topk)
+    dev = scores.device
     return (
-        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
-        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
+        _EMPTY(out_shape, dtype=_FP32, device=dev),
+        _EMPTY(out_shape, dtype=_INT32, device=dev),
     )
 
 
@@ -67,16 +73,12 @@ def rowmax_select(
     """Sort-free ``topk`` over the expert axis of ``[rows, experts]`` scores."""
     if scores.device.type != "tpu":
         return rowmax_topk(scores, topk, bias=bias, renormalize=renormalize)
-    if scores.dim() != 2:
-        raise ValueError(
-            f"router top-k kernel expects [rows, experts], got {scores.shape}"
-        )
-    scores_f32 = scores if scores.dtype == torch.float32 else scores.float()
+    s_shape = scores.shape
+    if len(s_shape) != 2:
+        raise ValueError(f"router top-k kernel expects [rows, experts], got {s_shape}")
+    scores_f32 = scores if scores.dtype is _FP32 else scores.float()
     if bias is not None:
-        bias_f32 = bias if bias.dtype == torch.float32 else bias.float()
-        target_shape = (1, scores.shape[1])
-        bias_2d = (
-            bias_f32 if bias_f32.shape == target_shape else bias_f32.view(target_shape)
-        )
+        bias_f32 = bias if bias.dtype is _FP32 else bias.float()
+        bias_2d = bias_f32 if len(bias_f32.shape) == 2 else bias_f32.view(1, s_shape[1])
         return _biased_op(scores_f32, bias_2d, topk, renormalize)
     return _op(scores_f32, topk, renormalize)
