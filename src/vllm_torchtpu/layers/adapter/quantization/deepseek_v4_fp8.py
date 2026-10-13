@@ -42,6 +42,9 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+_LinearBase = vllm_linear.LinearBase
+_BASE_IS_SCALE_E8M0 = DeepseekV4FP8Config.is_scale_e8m0.fget
+
 
 @register_quantization_config(DEEPSEEK_V4_FP8)
 @register_quantization_config(get_tpu_quant_method(DEEPSEEK_V4_FP8))
@@ -58,13 +61,14 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
     @property
     def is_scale_e8m0(self) -> bool:
         try:
-            hf_config = get_current_vllm_config().model_config.hf_config
-            quant_cfg = getattr(hf_config, "quantization_config", None) or {}
-            if isinstance(quant_cfg, dict) and quant_cfg.get("scale_fmt") == "ue8m0":
+            quant_cfg = (
+                get_current_vllm_config().model_config.hf_config.quantization_config
+            )
+            if type(quant_cfg) is dict and quant_cfg.get("scale_fmt") == "ue8m0":
                 return True
         except Exception:
             pass
-        return super().is_scale_e8m0
+        return bool(_BASE_IS_SCALE_E8M0(self))  # type: ignore[misc]
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -75,19 +79,22 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> vllm_linear.LinearMethodBase | QuantizeMethodBase | None:
-        if isinstance(layer, vllm_linear.LinearBase):
-            linear_config = self.get_linear_config(layer)
-            if is_layer_skipped(
+        if isinstance(layer, _LinearBase):
+            ignored = self.ignored_layers
+            if ignored and is_layer_skipped(
                 prefix=prefix,
-                ignored_layers=self.ignored_layers,
+                ignored_layers=ignored,
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return VllmUnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, linear_config, prefix=prefix)
-        elif isinstance(layer, RoutedExperts):
-            if is_layer_skipped(
+            return VllmFp8LinearMethodTPU(
+                self, self.get_linear_config(layer), prefix=prefix
+            )
+        if isinstance(layer, RoutedExperts):
+            ignored = self.ignored_layers
+            if ignored and is_layer_skipped(
                 prefix=prefix,
-                ignored_layers=self.ignored_layers,
+                ignored_layers=ignored,
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return VllmUnquantizedFusedMoEMethod(layer.moe_config)
@@ -96,9 +103,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 if self.moe_quant_algo == "NVFP4":
                     raise NotImplementedError("NVFP4 is not supported yet.")
 
-                moe_config = self.get_moe_config(layer)
-                return VllmDeepseekV4Mxfp4MoEMethod(moe_config)
-            else:
-                return VllmFp8MoEMethodTPU(self, self.get_moe_config(layer))
+                return VllmDeepseekV4Mxfp4MoEMethod(self.get_moe_config(layer))
+            return VllmFp8MoEMethodTPU(self, self.get_moe_config(layer))
 
         return None
