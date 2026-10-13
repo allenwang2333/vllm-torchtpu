@@ -64,6 +64,8 @@ class Topology:
     dst_block: int = 256
     head_dim: int = 32
     qk_pair: bool = True
+    ddp: int = 1
+    ddp_rank: int = 0
 
     @property
     def units(self) -> int:
@@ -532,7 +534,11 @@ def _decode_request(monkeypatch, topo: Topology, params: dict, per_layer_tags: b
     _set_env("TPU_RAIDEN_ENGINE_ID", "decode")
     num_tokens = params["num_tokens"]
     scheduler = _make_raiden_scheduler(
-        is_producer=False, tp_size=topo.dtp, block_size=topo.dst_block
+        is_producer=False,
+        tp_size=topo.dtp,
+        block_size=topo.dst_block,
+        dp_size=topo.ddp,
+        dp_rank=topo.ddp_rank,
     )
     scheduler.vllm_config.parallel_config.decode_context_parallel_size = topo.dcp
     scheduler._stage3_mamba_group_indices = [1]
@@ -555,12 +561,19 @@ def _decode_request(monkeypatch, topo: Topology, params: dict, per_layer_tags: b
     assert load.mamba_state_block_ids == [DST_STATE_BLOCK]
 
     worker = _make_raiden_worker(
-        is_producer=False, tp_rank=0, tp_size=topo.dtp, block_size=topo.dst_block
+        is_producer=False,
+        tp_rank=0,
+        tp_size=topo.dtp,
+        block_size=topo.dst_block,
+        dp_size=topo.ddp,
+        dp_rank=topo.ddp_rank,
     )
     worker.vllm_config.parallel_config.decode_context_parallel_size = topo.dcp
     _set_model(worker.vllm_config, topo)
     assert worker._raiden_qwen35_admission_topology() == (
-        f"tp{topo.dtp}dcp{topo.dcp}_decode"
+        f"dp{topo.ddp}tp{topo.dtp}_decode"
+        if topo.ddp > 1
+        else f"tp{topo.dtp}dcp{topo.dcp}_decode"
     )
     geometry = worker._gdn_head_geometry()
     manifest = _manifest(
@@ -1066,3 +1079,20 @@ def test_gdn_fanout_fails_closed(overrides, match):
     args.update(overrides)
     with pytest.raises(sol.SeqOnLaneError, match=match):
         sol.lower_gdn_state_shard_spans_sol(**args)
+
+
+@pytest.mark.parametrize("dp_rank", range(8))
+@pytest.mark.parametrize("num_tokens", [127, 129, 1000, 8191])
+def test_pp4_pcp8_to_dp8_tp4_oracle(monkeypatch, dp_rank, num_tokens):
+    topo = dataclasses.replace(PP4_PCP8, dtp=4, dcp=1, ddp=8, ddp_rank=dp_rank)
+    registrations, transfer = _run_oracle(monkeypatch, topo, num_tokens, True)
+    assert len(transfer["src_units"]) == 32
+    assert len(transfer["dst_units"]) == 4
+    assert all(
+        dict(unit)["data_replica_idx"] == dp_rank for unit in transfer["dst_units"]
+    )
+    for unit, entries in registrations.items():
+        stage = _unit_rank(unit) // topo.pcp
+        assert {split_layer_tag(e.tag)[1] for e in entries} <= set(
+            topo.stage_layers(stage)
+        )
