@@ -21,7 +21,7 @@ from typing import Any
 class Scenario:
     name: str
     concurrency: int
-    prefix_tokens: int = 65536
+    prefix_tokens: int = 98304
     extend_tokens: int = 0
     output_tokens: int = 1
     dp_size: int = 8

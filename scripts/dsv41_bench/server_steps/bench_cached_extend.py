@@ -45,13 +45,14 @@ def prepare_main(argv: list[str]) -> None:
         raise ValueError("Need two distinct single-token prime suffixes")
     documents = sorted(json.loads(args.dataset.read_text()), key=lambda d: d["_id"])
     rows, sources, suffixes, hashes = [], [], [], set()
+    windows_per_document = count if args.scenario == "decode" else 16
     for doc in documents:
         if doc.get("domain") != "Code Repository Understanding":
             continue
         ids = tokenizer.encode(doc["context"][:1000000], add_special_tokens=False)
         # Bounded, deterministic windows retain real code continuation statistics.
         for offset in range(
-            0, min(max(0, len(ids) - row_tokens + 1), count * 256), 256
+            0, min(max(0, len(ids) - row_tokens + 1), windows_per_document * 256), 256
         ):
             row = ids[offset : offset + row_tokens]
             key = hashlib.sha256(json.dumps(row[:prefix]).encode()).hexdigest()
@@ -90,6 +91,7 @@ def prepare_main(argv: list[str]) -> None:
 
 def summarize_extend(ranks: list[dict]) -> dict:
     scenario = SCENARIO
+    prompt_tokens = scenario.prefix_tokens + scenario.extend_tokens
     if sorted(r["rank"] for r in ranks) != list(range(8)):
         raise ValueError("Expected exactly eight distinct DP ranks")
     if len({r["hostname"] for r in ranks}) != 1:
@@ -116,25 +118,25 @@ def summarize_extend(ranks: list[dict]) -> dict:
             row = encoders[0]
             if row["phase"] != "prefill":
                 continue
-            if row["requests"] != 1 or row["prompts"] != [81920]:
-                raise ValueError("Expected local C1 and 81920-token prompt")
+            if row["requests"] != 1 or row["prompts"] != [prompt_tokens]:
+                raise ValueError(f"Expected local C1 and {prompt_tokens}-token prompt")
             start, end = row["starts"][0], row["ends"][0]
             if previous_end is not None and previous_end != start:
                 raise ValueError("Nonconsecutive context: missing or replayed chunk")
-            if not 0 <= start < end <= 81920:
+            if not 0 <= start < end <= prompt_tokens:
                 raise ValueError("Invalid context")
-            counts = token_counts([start], [end], 65536)
+            counts = token_counts([start], [end], scenario.prefix_tokens)
             if any(row[k] != v for k, v in counts.items()):
                 raise ValueError("Token counters disagree with actual context")
             if row["rows"] != end - start or row["padded_rows"] < row["rows"]:
                 raise ValueError("Invalid actual/padded rows")
             if previous_end is None:
                 category = "encoder_first"
-                if start > 65536 or end <= 65536:
+                if start > scenario.prefix_tokens or end <= scenario.prefix_tokens:
                     raise ValueError(
                         "First chunk must cross the cached-prefix boundary"
                     )
-            elif end == 81920:
+            elif end == prompt_tokens:
                 category = "encoder_tail"
             else:
                 category = "encoder_middle"
@@ -152,7 +154,7 @@ def summarize_extend(ranks: list[dict]) -> dict:
             steps.append(
                 {**step, "encoder": row, "category": category, "step_index": step_index}
             )
-        if not steps or previous_end != 81920:
+        if not steps or previous_end != prompt_tokens:
             raise ValueError("Incomplete extend wave")
         if sum(s["encoder"]["new_tokens"] for s in steps) != 16384:
             raise ValueError("Wave must account for exactly 16384 new tokens per rank")
@@ -358,7 +360,7 @@ def client_main(argv: list[str]) -> None:
     args.out.mkdir(parents=True, exist_ok=False)
     scenario = SCENARIO
     input_sha = hashlib.sha256(args.input.read_bytes()).hexdigest()
-    if input_sha != "865b183381ae43367214d9dd0870f94c578b3d581e613ddc7872d1e48f391a11":
+    if input_sha != "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064":
         raise ValueError("Input differs from the frozen DeepSeek natural-code corpus")
     data = json.loads(args.input.read_text())
     rows = data["prompts"][: scenario.concurrency]

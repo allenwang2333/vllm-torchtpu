@@ -21,6 +21,10 @@ kv_args=(--gpu-memory-utilization 0.85)
 if [[ "${KV_BYTES:-auto}" != auto ]]; then
   kv_args+=(--kv-cache-memory-bytes "${KV_BYTES:-auto}")
 fi
+context_args=()
+if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
+  context_args+=(--max-model-len "$MAX_MODEL_LEN")
+fi
 exec vllm serve "$model" \
   --load-format runai_streamer --served-model-name deepseek-v41 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
@@ -29,9 +33,9 @@ exec vllm serve "$model" \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config '{"dp_shared_memory":false}' \
-  --block-size 16 --max-model-len "${MAX_MODEL_LEN:-82944}" \
+  --block-size 16 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
-  "${kv_args[@]}" \
+  "${kv_args[@]}" "${context_args[@]}" \
   --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
   "$@"

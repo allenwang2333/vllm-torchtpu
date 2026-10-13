@@ -4,11 +4,13 @@ This harness qualifies `encoder_extend` on one v7x host: four physical chips,
 eight logical devices, TP1/DP8/EP8/PP1. It observes normal serving completion;
 it adds no device synchronization and never calls `get_output()` early.
 
-The workload uses eight distinct 65536-token cached prefixes, 16384 new input
+The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. Compile buckets are `[128,256,2048]`.
+than capped at 4 GiB. Compile buckets are `[128,256,2048]`. The server uses the model's default
+context limit; it does not cap `max_model_len` to this benchmark's 114688-token
+input. The 96K prefix and 16K extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
 measured budget (1 GiB at 32–64 GiB), before the RoPE companion reserve.
 This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
@@ -34,11 +36,11 @@ LongBench-v2 dataset:
 python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --dataset /path/to/longbench-v2.json \
   --tokenizer /models/DeepSeek-V4.1-Flash \
-  --out /path/to/dsv41-code-c128.json
+  --out /path/to/dsv41-code-96k-c128.json
 ```
 
 The client verifies the frozen input SHA256:
-`865b183381ae43367214d9dd0870f94c578b3d581e613ddc7872d1e48f391a11`.
+`9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064`.
 The first eight deterministic code windows are used for this scenario. They
 have distinct prefixes, but come from adjacent windows of the same document;
 they are not eight unrelated documents. Prime requests branch immediately
@@ -59,7 +61,7 @@ server. Reserve port 8000 and use fresh output directories.
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 export ARTIFACT_LOCAL_DIR=/path/to/artifacts
 python scripts/dsv41_bench/server_steps/run.py \
-  --input /path/to/dsv41-code-c128.json \
+  --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-cold \
   --cache-dir /path/to/persistent-cache/candidate \
   --cache-mode cold --rounds 5 --profile
@@ -79,7 +81,7 @@ buckets and cache directory, with a new result directory:
 
 ```bash
 python scripts/dsv41_bench/server_steps/run.py \
-  --input /path/to/dsv41-code-c128.json \
+  --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-reuse \
   --cache-dir /path/to/persistent-cache/candidate \
   --cache-mode reuse --rounds 5
@@ -116,7 +118,7 @@ The server must use the same DP8 configuration as `run.py`.
 - Also report aggregate encoder throughput including first and tail steps;
   an asynchronous boundary can shift work from middle to tail. Do not label
   middle cadence as client request throughput or isolated decode capacity.
-- Each formal round must complete all eight requests, hit 524288 cached
+- Each formal round must complete all eight requests, hit 786432 cached
   tokens, have zero preemptions, and contain no compilation. Invalid shapes,
   missing ranks, interrupted windows and inconsistent counters fail closed.
 
@@ -141,7 +143,11 @@ responses, metrics, raw worker records and startup logs. `run.py` also writes
 `startup-phases.json` automatically. Memory monitoring used during the original
 investigation is not part of this benchmark entry point.
 
-## Recorded validation: 2026-10-13
+## Historical 64K validation: 2026-10-13
+
+The following results used 65536 cached prefix tokens and an explicit
+82944-token server limit. They are historical references, not a matched
+baseline for the 96K workload with the model-default serving context limit.
 
 Production source `ce69313ec`; all 366 tracked production files on the benchmark
 host matched the submitted source. The four-bucket baseline uses the same
