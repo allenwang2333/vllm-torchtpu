@@ -1368,11 +1368,18 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        is_zigzag_pcp = (
+            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+        )
 
         def segment(req_id: str) -> int:
             # 0: 1-token decode, 1: speculative verify window,
             # 2: prefill/mixed.
             if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                if is_zigzag_pcp:
+                    req_idx = self.input_batch.req_id_to_index[req_id]
+                    if self.input_batch.num_computed_tokens_cpu[req_idx] <= 0:
+                        return 2
                 return 0
             if req_id in spec_decode_tokens:
                 return 1
@@ -2510,13 +2517,25 @@ class TPUModelRunner(GPUModelRunner):
         self._wait_input_staging_fence()
 
         # Get the number of scheduled tokens for each request.
+        is_zigzag_pcp = (
+            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+        )
+        seg_end = (
+            rpa_num_decode_reqs
+            if (
+                is_zigzag_pcp
+                and 0 < rpa_num_decode_reqs < num_reqs
+                and start_index < rpa_num_decode_reqs
+            )
+            else num_reqs
+        )
         use_max_model_len = self.most_model_len is None
         num_scheduled_tokens_per_req = []
         max_num_scheduled_tokens_all_reqs = 0
         end_index = start_index
 
         # Use either most_model_len or max_model_len depending on request size.
-        for i in range(start_index, num_reqs):
+        for i in range(start_index, seg_end):
             req_id = self.input_batch.req_ids[i]
             assert req_id is not None
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -2534,7 +2553,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 end_index = start_index + self.num_reqs_max_model_len
             else:
-                end_index = num_reqs
+                end_index = seg_end
         else:
             assert self.num_reqs_most_model_len is not None
             if len(num_scheduled_tokens_per_req) > self.num_reqs_most_model_len:
@@ -2543,7 +2562,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 end_index = start_index + self.num_reqs_most_model_len
             else:
-                end_index = num_reqs
+                end_index = seg_end
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
         num_scheduled_tokens_per_req = np.array(
             num_scheduled_tokens_per_req, dtype=np.int32
@@ -2555,11 +2574,25 @@ class TPUModelRunner(GPUModelRunner):
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
-            self, int(total_num_scheduled_tokens)
+            self,
+            max(
+                int(total_num_scheduled_tokens),
+                int(scheduler_output.total_num_scheduled_tokens),
+            ),
         )
 
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
+            if start_index > 0:
+                tok_offset = sum(
+                    scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
+                    for i in range(start_index)
+                )
+                self.mrope_positions.cpu[:, :total_num_scheduled_tokens] = (
+                    self.mrope_positions.cpu[
+                        :, tok_offset : tok_offset + total_num_scheduled_tokens
+                    ].clone()
+                )
 
         # Fast path for decode-only: all requests have exactly 1 token.
         if max_num_scheduled_tokens_all_reqs == 1:
@@ -3072,7 +3105,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _count_input_chunks(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: "SchedulerOutput", num_decode_reqs: int = 0
     ) -> tuple[int, int]:
         """Match _prepare_inputs chunking without staging any tensors.
 
@@ -3085,12 +3118,24 @@ class TPUModelRunner(GPUModelRunner):
             return 0, 0
 
         num_reqs = self.input_batch.num_reqs
+        is_zigzag_pcp = (
+            self._pcp_enabled and envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag"
+        )
         start_index = 0
         num_chunks = 0
         max_chunk_reqs = 0
         while start_index < num_reqs:
+            seg_end = (
+                num_decode_reqs
+                if (
+                    is_zigzag_pcp
+                    and 0 < num_decode_reqs < num_reqs
+                    and start_index < num_decode_reqs
+                )
+                else num_reqs
+            )
             use_max_model_len = self.most_model_len is None
-            for i in range(start_index, num_reqs):
+            for i in range(start_index, seg_end):
                 req_id = self.input_batch.req_ids[i]
                 assert req_id is not None
                 num_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -3106,7 +3151,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
+            this_chunk_reqs = min(chunk_reqs, seg_end - start_index)
             max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
             start_index += this_chunk_reqs
             num_chunks += 1
@@ -3282,7 +3327,7 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
+            scheduler_output, num_decode_reqs
         )
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
