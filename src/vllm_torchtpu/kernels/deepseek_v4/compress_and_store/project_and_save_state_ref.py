@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -34,16 +36,8 @@ def ref_wkv_proj_and_save_state(
     state_dim = 2 * state_width
 
     # 1. Project & APE
-    kv_score = jnp.matmul(hidden_states, wkv_wgate)
-    kv = kv_score[:, :state_width]
-    score = kv_score[:, state_width:]
-
-    ape_rows = jnp.mod(positions, compress_ratio)
-    score_state = score + ape[ape_rows]
-    packed = jnp.concatenate([kv, score_state], axis=-1)
-
     # 2. Geometry setup
-    num_pages, page_size, d1, d2 = cache.shape
+    _, page_size, d1, d2 = cache.shape
     slot_bytes = d1 * d2
     slots_per_token = state_dim * 4 // slot_bytes
     f32_per_slot = state_dim // slots_per_token
@@ -54,23 +48,67 @@ def ref_wkv_proj_and_save_state(
         f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
         f"token states a {page_size}-row page holds"
     )
+    return _proj_and_save_state_jit(
+        hidden_states,
+        wkv_wgate,
+        ape,
+        positions,
+        slot_mapping,
+        cache,
+        state_width,
+        state_dim,
+        compress_ratio,
+        slots_per_token,
+        tokens_per_page,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "state_width",
+        "state_dim",
+        "compress_ratio",
+        "slots_per_token",
+        "tokens_per_page",
+    ),
+)
+def _proj_and_save_state_jit(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    positions: jax.Array,
+    slot_mapping: jax.Array,
+    cache: jax.Array,
+    state_width: int,
+    state_dim: int,
+    compress_ratio: int,
+    slots_per_token: int,
+    tokens_per_page: int,
+) -> jax.Array:
+    num_tokens = hidden_states.shape[0]
+    num_pages, page_size, d1, d2 = cache.shape
+
+    kv_score = jnp.matmul(hidden_states, wkv_wgate)
+    kv = kv_score[:, :state_width]
+    score = kv_score[:, state_width:]
+
+    ape_rows = jnp.mod(positions, compress_ratio)
+    score_state = score + ape[ape_rows]
+    packed = jnp.concatenate([kv, score_state], axis=-1).astype(jnp.float32)
 
     # 3. Unpack inline
-    cache_t = cache.reshape(
-        num_pages, tokens_per_page, slots_per_token, d1, d2
-    ).transpose(0, 1, 2, 4, 3)
-    cache_bitcast_shape = cache_t.reshape(num_pages * tokens_per_page, state_dim, 4)
-    flat = jax.lax.bitcast_convert_type(cache_bitcast_shape, jnp.float32)
+    packed_bytes = jax.lax.bitcast_convert_type(packed, jnp.uint8)
+    packed_t = packed_bytes.reshape(num_tokens, slots_per_token, d2, d1).transpose(
+        0, 1, 3, 2
+    )
 
     # 4. Scatter
     num_tokens_flat = num_pages * tokens_per_page
     valid = slot_mapping >= 0
     slots = jnp.where(valid, slot_mapping // slots_per_token, num_tokens_flat)
-    flat = flat.at[slots].set(packed, mode="drop")
+    flat_cache = cache.reshape(num_tokens_flat, slots_per_token, d1, d2)
 
     # 5. Pack inline back
-    chunk_bytes = jax.lax.bitcast_convert_type(flat, jnp.uint8)
-    chunk_bytes_t = chunk_bytes.reshape(
-        num_pages, tokens_per_page, slots_per_token, d2, d1
-    ).transpose(0, 1, 2, 4, 3)
-    return chunk_bytes_t.reshape(num_pages, page_size, d1, d2)
+    updated_cache = flat_cache.at[slots].set(packed_t, mode="drop")
+    return updated_cache.reshape(num_pages, page_size, d1, d2)
