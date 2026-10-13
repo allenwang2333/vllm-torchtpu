@@ -13,10 +13,22 @@
 # limitations under the License.
 """Integer cost model for GLM-5.2 masked-dense MLA dispatch."""
 
-from typing import NamedTuple
+from collections.abc import Iterator
+from dataclasses import dataclass
+
+_COST_MODEL_FIELDS = (
+    "analytic_fixed_ns",
+    "analytic_token_ns",
+    "bitmap_fixed_ns",
+    "bitmap_token_ns",
+    "q_kv_block_ns",
+    "sparse_fixed_ns",
+    "sparse_token_ns",
+)
 
 
-class MaskedDensePrefillCostModel(NamedTuple):
+@dataclass(frozen=True)
+class MaskedDensePrefillCostModel:
     analytic_fixed_ns: int
     analytic_token_ns: int
     bitmap_fixed_ns: int
@@ -24,6 +36,49 @@ class MaskedDensePrefillCostModel(NamedTuple):
     q_kv_block_ns: int
     sparse_fixed_ns: int
     sparse_token_ns: int
+
+    _fields = _COST_MODEL_FIELDS
+
+    def __post_init__(self) -> None:
+        af = self.analytic_fixed_ns
+        at = self.analytic_token_ns
+        bf = self.bitmap_fixed_ns
+        bt = self.bitmap_token_ns
+        qkv = self.q_kv_block_ns
+        sf = self.sparse_fixed_ns
+        st = self.sparse_token_ns
+        object.__setattr__(
+            self,
+            "estimate_analytic_cost_ns",
+            lambda num_tokens, num_kv_blocks, _f=af, _t=at, _b=qkv: (
+                _f + num_tokens * _t + num_kv_blocks * _b
+            ),
+        )
+        object.__setattr__(
+            self,
+            "estimate_bitmap_cost_ns",
+            lambda num_tokens, num_kv_blocks, _f=bf, _t=bt, _b=qkv: (
+                _f + num_tokens * _t + num_kv_blocks * _b
+            ),
+        )
+        object.__setattr__(
+            self,
+            "estimate_sparse_cost_ns",
+            lambda num_tokens, _f=sf, _t=st: _f + num_tokens * _t,
+        )
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(
+            (
+                self.analytic_fixed_ns,
+                self.analytic_token_ns,
+                self.bitmap_fixed_ns,
+                self.bitmap_token_ns,
+                self.q_kv_block_ns,
+                self.sparse_fixed_ns,
+                self.sparse_token_ns,
+            )
+        )
 
     def estimate_analytic_cost_ns(self, num_tokens: int, num_kv_blocks: int) -> int:
         return (
