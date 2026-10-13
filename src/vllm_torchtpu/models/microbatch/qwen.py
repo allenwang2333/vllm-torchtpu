@@ -82,6 +82,8 @@ def parse_schedule_mode(
     if schedule is None or schedule.strip() == "":
         return ScheduleMode.LAYERWISE if layerwise else ScheduleMode.STAGEWISE
     normalized = schedule.strip().lower()
+    if normalized == "substage":
+        return ScheduleMode.STAGEWISE
     try:
         return ScheduleMode(normalized)
     except ValueError as exc:

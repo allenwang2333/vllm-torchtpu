@@ -87,7 +87,7 @@ if TYPE_CHECKING:
     TPU_MICROBATCH_MERGE_MOE: bool = True
     TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS: int = 0
     TPU_MICROBATCH_LAYERWISE: bool = False
-    TPU_MICROBATCH_SCHEDULE: str = "substage"
+    TPU_MICROBATCH_SCHEDULE: str = ""
     TPU_MICROBATCH_FENCE: str = "substage"
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -676,7 +676,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MICROBATCH_MERGE_MOE": env_bool("TPU_MICROBATCH_MERGE_MOE", default=True),
     "TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS": lambda: int(os.getenv("TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS", "0")),
     "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
-    "TPU_MICROBATCH_SCHEDULE": lambda: os.getenv("TPU_MICROBATCH_SCHEDULE", "substage").strip().lower(),
+    "TPU_MICROBATCH_SCHEDULE": lambda: os.getenv("TPU_MICROBATCH_SCHEDULE", "").strip().lower(),
     "TPU_MICROBATCH_FENCE": lambda: os.getenv("TPU_MICROBATCH_FENCE", "substage").strip().lower(),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
