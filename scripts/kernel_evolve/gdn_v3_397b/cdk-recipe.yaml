@@ -1,0 +1,119 @@
+# cdk JobSet for run_job.sh on one tpu7x 2x2x1 node (4 chips, 8 TensorCores).
+# Submit it with submit.sh, which registers it and passes:
+#   IMAGE, WEIGHTS_BUCKET, WEIGHTS_PREFIX, EXPECT_JAX, EXPECT_LIBTPU, ARMS,
+#   SCORER_FLAGS and optionally CANDIDATE.
+# The scorer's JSON is the last line of the container log and score.json in the
+# job's output directory.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "{{ .JOB_NAME | default `gdn-v3-397b-serve-scorer` }}"
+spec:
+  replicatedJobs:
+    - name: tpu-job
+      replicas: 1
+      template:
+        spec:
+          ttlSecondsAfterFinished: 600
+          activeDeadlineSeconds: {{ .DEADLINE | default "21600" }}
+          backoffLimit: 0
+          completions: 1
+          parallelism: 1
+          template:
+            metadata:
+              annotations:
+                gke-gcsfuse/volumes: "true"
+            spec:
+              containers:
+              - name: tpu-job
+                image: "{{ .IMAGE }}"
+                imagePullPolicy: IfNotPresent
+                command: ["/bin/bash", "-c"]
+                args:
+                  - |
+                    eval "${RUN_CMD}"
+                env:
+                - name: RUN_CMD
+                  value: '{{ .RUN_CMD | default "bash /mapped/stage/run_job.sh" }}'
+                - name: ARMS
+                  value: "{{ .ARMS | default `` }}"
+                - name: CANDIDATE
+                  value: "{{ .CANDIDATE | default `` }}"
+                - name: SCORER_FLAGS
+                  value: "{{ .SCORER_FLAGS | default `` }}"
+                - name: EXPECT_JAX
+                  value: "{{ .EXPECT_JAX }}"
+                - name: EXPECT_LIBTPU
+                  value: "{{ .EXPECT_LIBTPU }}"
+                - name: WEIGHTS_DIR
+                  value: /weights
+                # Single host: no multi-slice runtime.
+                - name: MEGASCALE_NUM_SLICES
+                  value: ""
+                - name: MEGASCALE_SLICE_ID
+                  value: ""
+                - name: MEGASCALE_COORDINATOR_ADDRESS
+                  value: ""
+                - name: MEGASCALE_PORT
+                  value: ""
+                - name: CLOUD_TPU_TASK_ID
+                  value: "0"
+                - name: TPU_WORKER_ID
+                  value: "0"
+                - name: TPU_PROCESS_PORT
+                  value: "8471"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                volumeMounts:
+                - name: weights
+                  mountPath: /weights
+                  readOnly: true
+                - name: dshm
+                  mountPath: /dev/shm
+                - name: scratch
+                  mountPath: /scratch
+                resources:
+                  limits:
+                    memory: 900Gi
+                    cpu: "192"
+                    google.com/tpu: 4
+                  requests:
+                    memory: 900Gi
+                    cpu: "192"
+                    google.com/tpu: 4
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: 2x2x1
+              # Non-spot nodes only: a job is hours long, and spot reclaims killed
+              # six of nine such pods mid-job, each re-running the job from the
+              # start. Waiting in the queue for a non-spot node is cheaper.
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      - key: cloud.google.com/gke-spot
+                        operator: NotIn
+                        values: ["true"]
+              restartPolicy: Never
+              terminationGracePeriodSeconds: 180
+              volumes:
+              - name: weights
+                csi:
+                  driver: gcsfuse.csi.storage.gke.io
+                  readOnly: true
+                  volumeAttributes:
+                    bucketName: "{{ .WEIGHTS_BUCKET }}"
+                    mountOptions: "implicit-dirs,only-dir={{ .WEIGHTS_PREFIX }}"
+              - name: dshm
+                emptyDir:
+                  medium: Memory
+              - name: scratch
+                ephemeral:
+                  volumeClaimTemplate:
+                    spec:
+                      storageClassName: premium-rwo
+                      accessModes: ["ReadWriteOnce"]
+                      resources:
+                        requests:
+                          storage: 1Ti
