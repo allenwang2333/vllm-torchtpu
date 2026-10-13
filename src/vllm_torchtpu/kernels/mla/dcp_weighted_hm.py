@@ -31,29 +31,30 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(o_ref, w_ref, out_ref, *, heads: int):
+def _kernel(o_ref, w_ref, out_ref, *, heads: int, order=None):
     # o_ref [bt, heads, D] (tokens-major, as the attention wrote it), w_ref
-    # f32[heads, bt, 1], out_ref f32[heads, bt, D]: head j's rows are a strided
-    # sublane read of the input block, written contiguously.
+    # f32[bt, heads] (the weights as the merge computed them), out_ref
+    # f32[heads, bt, D]: head j's rows are a strided sublane read of the input
+    # block, its weights a lane column, written contiguously.
+    w_all = w_ref[...]
     for j in range(heads):
-        w = w_ref[j]  # f32[bt, 1]
+        w = w_all[:, j : j + 1]  # f32[bt, 1]
         x = o_ref[:, j, :].astype(jnp.float32) * w
         # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-        out_ref[j] = jnp.where(w > 0, x, jnp.zeros_like(x))
+        out_ref[j if order is None else order[j]] = jnp.where(
+            w > 0, x, jnp.zeros_like(x)
+        )
 
 
-def _row_block(tokens: int) -> int:
-    for bt in (128, 64, 32, 16, 8):
-        if tokens % bt == 0:
+# Bytes of one grid step's input (bf16) plus output (f32) block.
+_STEP_BYTES = 6 << 20
+
+
+def _row_block(tokens: int, heads: int, dim: int) -> int:
+    for bt in (256, 128, 64, 32, 16, 8):
+        if tokens % bt == 0 and bt * heads * dim * 6 <= _STEP_BYTES:
             return bt
-    return tokens
-
-
-def _head_block(heads: int) -> int:
-    for hb in (16, 8):
-        if heads % hb == 0:
-            return hb
-    return heads
+    return 8 if tokens % 8 == 0 else tokens
 
 
 @functools.partial(jax.jit, static_argnames=("fault",))
@@ -66,30 +67,25 @@ def weighted_heads_major(
 
     `o` is read in its own [T, H, D] layout (no reshape: a 2-D view of a
     tiled 3-D buffer is a relayout copy). `fault` (test-only): "swap_heads"
-    writes each head block's heads in reverse order.
+    writes the heads in reverse order.
     """
     t, h, d = o.shape
     if w.shape != (t, h):
         raise ValueError(f"w {w.shape} must be [{t}, {h}]")
     if d % 128:
         raise ValueError(f"head dim {d} must be a multiple of 128")
-    bt, hb = _row_block(t), _head_block(h)
-    w3 = jnp.transpose(w.astype(jnp.float32)).reshape(h, t, 1)
-    kernel = functools.partial(_kernel, heads=hb)
-    if fault == "swap_heads":
-
-        def kernel(o_ref, w_ref, out_ref):
-            for j in range(hb):
-                wj = w_ref[j]
-                x = o_ref[:, j, :].astype(jnp.float32) * wj
-                out_ref[hb - 1 - j] = jnp.where(wj > 0, x, jnp.zeros_like(x))
-
+    # Every head per step: the [bt, H] weight block's lane dim must be all
+    # of H (< 128 heads).
+    hb = h
+    bt = _row_block(t, hb, d)
+    order = tuple(range(hb - 1, -1, -1)) if fault == "swap_heads" else None
+    kernel = functools.partial(_kernel, heads=hb, order=order)
     return pl.pallas_call(
         kernel,
-        grid=(h // hb, t // bt),
+        grid=(1, t // bt),
         in_specs=[
             pl.BlockSpec((bt, hb, d), lambda g, i: (i, g, 0)),
-            pl.BlockSpec((hb, bt, 1), lambda g, i: (g, i, 0)),
+            pl.BlockSpec((bt, hb), lambda g, i: (i, g)),
         ],
         out_specs=pl.BlockSpec((hb, bt, d), lambda g, i: (g, i, 0)),
         out_shape=jax.ShapeDtypeStruct((h, t, d), jnp.float32),
@@ -97,4 +93,4 @@ def weighted_heads_major(
             dimension_semantics=("parallel", "parallel")
         ),
         name=f"dcp_weighted_hm_t{t}_h{h}",
-    )(o, w3)
+    )(o, w.astype(jnp.float32))
