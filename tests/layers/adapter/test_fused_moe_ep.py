@@ -1120,3 +1120,80 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+def test_deepseek_v4_mxfp4_prebuilds_before_releasing_source_weights(monkeypatch):
+    from vllm_torchtpu.layers.adapter.quantization import mxfp4
+
+    hidden = inter = mxfp4.REQUANTIZED_BLOCK_SIZE
+    layer = torch.nn.Module()
+    for name, shape in (
+        ("w13_weight", (1, 2 * inter, hidden // 2)),
+        ("w2_weight", (1, hidden, inter // 2)),
+        ("w13_weight_scale", (1, 2 * inter, hidden // 32)),
+        ("w2_weight_scale", (1, hidden, inter // 32)),
+    ):
+        layer.register_parameter(
+            name,
+            torch.nn.Parameter(
+                torch.ones(shape, dtype=torch.uint8), requires_grad=False
+            ),
+        )
+    layer.activation = "silu"
+    layer.renormalize = True
+    layer.custom_routing_function = None
+    layer.scoring_func = "sqrtsoftplus"
+    layer.e_score_correction_bias = None
+    layer.use_grouped_topk = False
+    layer.num_expert_group = None
+    layer.topk_group = None
+    layer.routed_scaling_factor = 1.0
+    layer.global_num_experts = _STUB_EP
+    layer.moe_config = SimpleNamespace(
+        experts_per_token=2,
+        moe_parallel_config=SimpleNamespace(
+            use_ep=True, pcp_size=1, is_sequence_parallel=False
+        ),
+    )
+
+    method = object.__new__(mxfp4.VllmDeepseekV4Mxfp4MoEMethod)
+    method.moe = SimpleNamespace(has_bias=False, is_act_and_mul=True)
+    method.intermediate_size = inter
+    method.hidden_size = hidden
+
+    pack_flags = []
+
+    def quantize(t, block, pack=True):
+        pack_flags.append(pack)
+        e, k, n = t.shape
+        dtype = torch.uint8 if pack else torch.float4_e2m1fn_x2
+        return (
+            torch.empty((e, k, n // 2), dtype=dtype),
+            torch.ones((e, k // block, 1, n), dtype=torch.float32),
+        )
+
+    original_prebuild = bridge.prebuild_fused_moe_ep
+
+    def prebuild(candidate, **kwargs):
+        assert hasattr(candidate, "w13_weight")
+        assert candidate.w13_weight.dtype == torch.uint8
+        with patch.object(bridge, "prebuild_fused_moe_ep", original_prebuild):
+            return _prebuild(candidate, **kwargs)
+
+    monkeypatch.setattr(mxfp4, "RoutedExperts", torch.nn.Module)
+    monkeypatch.setattr(mxfp4, "quantize_native_fp4_kmajor", quantize)
+    monkeypatch.setattr(mxfp4, "synchronize_tensors", lambda *a, **kw: None)
+    monkeypatch.setattr(mxfp4, "prebuild_fused_moe_kernel", lambda **kw: None)
+    monkeypatch.setattr(
+        mxfp4.moe_routing, "register_experts_start_buffer", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        mxfp4.moe_routing, "validate_linear_ep_placement", lambda *a: None
+    )
+    monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
+
+    method.process_weights_after_loading(layer)
+    assert bridge.fused_moe_ep_supported(method)
+    assert pack_flags == [False, False]
+    assert layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+    assert layer.w2_weight.dtype == torch.float4_e2m1fn_x2

@@ -1036,6 +1036,24 @@ def calculate_tiling(
             f" {final_estimate=} (limit: {vmem_limit_bytes})."
         )
 
+    # When average rows per group is small (e.g. decode under EP where
+    # size_m // size_group <= 64), a 128-row bucket pads every active expert by
+    # up to 16x. Use a 32-row bucket base and 2 buckets (tile_m=64) when
+    # sublane alignment permits.
+    if (
+        dims.size_group >= 16
+        and dims.size_m >= 64
+        and dims.size_m // dims.size_group <= 64
+        and dims.size_lhs_sublane <= 32
+    ):
+        bucket_base = max(dims.size_lhs_sublane, 32)
+        tile_m = min(dims.size_m, bucket_base * 2)
+        if _gmm_vmem_estimate(tile_m, tile_n, tile_k) > vmem_limit_bytes:
+            tile_m = min(dims.size_m, bucket_base)
+        return TileSizes(
+            tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base
+        )
+
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
     max_num_buckets = 4
@@ -1047,6 +1065,11 @@ def calculate_tiling(
         if _gmm_vmem_estimate(new_tile_m, tile_n, tile_k) > vmem_limit_bytes:
             break
         tile_m = new_tile_m
+
+    # For large tile_m (>= 384), 2 buckets (bucket_base = tile_m // 2) reduces
+    # dynamic bucket branching and instruction footprint compared to 3-4 buckets.
+    if tile_m >= 384 and (tile_m // 2) % dims.size_lhs_sublane == 0:
+        bucket_base = tile_m // 2
 
     return TileSizes(
         tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, bucket_base=bucket_base

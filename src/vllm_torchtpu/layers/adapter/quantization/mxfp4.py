@@ -602,10 +602,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_bias_padded,
             orig_intermediate,
         ) = self._dequantize_and_pad(layer)
-        self._release_source_weights(layer)
         # Decided before the quantization, not after: the two paths differ
         # only in whether the fp4 pairs cross the bridge packed, and that is
-        # an argument to the quantizer.
+        # an argument to the quantizer. Run before releasing source weights so
+        # `prebuild_fused_moe_ep` can read `layer.w13_weight.device`.
         op = self._prebuild_w4a8(
             layer,
             activation_str,
@@ -613,6 +613,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_weight_padded,
             orig_intermediate,
         )
+        self._release_source_weights(layer)
         (
             w13_weight_processed,
             w2_weight_processed,

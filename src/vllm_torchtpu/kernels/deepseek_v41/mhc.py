@@ -526,7 +526,7 @@ def mhc_fused_post_pre_v41(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
-    if num_tokens <= 16:
+    if num_tokens <= 64:
         new_res2d, post_mix, comb_mix, normed, next_pre_mix = _v41_mhc_pallas_call(
             functools.partial(
                 _v41_fused_post_pre_kernel,
@@ -555,7 +555,7 @@ def mhc_fused_post_pre_v41(
                 (hidden_size, jnp.bfloat16),
                 (hc_mult, jnp.float32),
             ),
-            max_token_block=128,
+            max_token_block=64,
         )
     else:
         mix_hc = hc_mult * (hc_mult + 2)

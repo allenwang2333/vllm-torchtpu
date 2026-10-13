@@ -524,6 +524,34 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        if num_tokens <= 512 and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on":
+            topk_weights_sorted = (
+                jnp.zeros_like(topk_weights_flat)
+                .at[argsort_revert_indices]
+                .set(topk_weights_flat)
+            )
+            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
+            if can_use_blockwise_onehot_unpermute(
+                gmm2_res,
+                token_indices_sorted,
+                topk_weights_sorted,
+                valid_count,
+                num_tokens=num_tokens,
+            ):
+                logger.info_once(
+                    "Selected decode blockwise one-hot unpermute: "
+                    "routes=%d hidden=%d tokens=%d",
+                    gmm2_res.shape[0],
+                    gmm2_res.shape[1],
+                    num_tokens,
+                )
+                return blockwise_onehot_unpermute(
+                    gmm2_res,
+                    token_indices_sorted,
+                    topk_weights_sorted,
+                    valid_count,
+                    num_tokens=num_tokens,
+                ).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,

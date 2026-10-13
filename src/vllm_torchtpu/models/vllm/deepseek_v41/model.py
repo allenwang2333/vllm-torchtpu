@@ -15,6 +15,7 @@
 
 import copy
 import dataclasses
+import os
 import re
 import typing
 from collections.abc import Callable, Iterable
@@ -148,6 +149,15 @@ def _ced_zero_output(hidden_states: torch.Tensor) -> torch.Tensor:
 
 def _moe_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     """Shallow config view for the shared V4 MoE, which reads hf_config."""
+    if getattr(vllm_config.parallel_config, "enable_expert_parallel", False):
+        os.environ.setdefault("USE_MOE_FUSED_EP_KERNEL", "1")
+        os.environ.setdefault("MOE_FUSED_EP_ENABLE_W4A8", "1")
+        os.environ.setdefault("MOE_FUSED_EP_V2_SHARDED_PLAN", "1")
+        os.environ.setdefault("TPU_MOE_OWNER_OUTPUT_MODE", "on")
+        if envs.USE_MOE_FUSED_EP_KERNEL:
+            from vllm_torchtpu import _patch_moe_runner_fused_output_is_reduced
+
+            _patch_moe_runner_fused_output_is_reduced()
     hf_config = copy.copy(vllm_config.model_config.hf_config)
     hf_config.num_hash_layers = 0
     model_config = copy.copy(vllm_config.model_config)
