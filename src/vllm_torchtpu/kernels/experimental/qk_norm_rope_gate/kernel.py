@@ -112,7 +112,7 @@ def qk_norm_rope_gate(
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     tokens = q_gate.shape[0]
-    tile = legal_tile(tokens, tile)
+    tile = legal_tile(tokens, min(tile, max(128, 4096 // max(1, heads))))
     kernel = functools.partial(
         _kernel, heads=heads, kv_heads=kv_heads, dim=dim, rot=rot, eps=eps
     )

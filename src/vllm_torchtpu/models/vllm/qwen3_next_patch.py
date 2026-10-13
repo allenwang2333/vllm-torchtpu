@@ -107,9 +107,9 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
     """
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
+    vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
     if rows <= 256:
-        dma_cap = max(8, (rows // 6 // 8) * 8)
+        dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
     return vreg_cap
 
@@ -843,6 +843,17 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         "Qwen3_5MTP",
         "Qwen3_5MoeMTP",
     )
+    if is_mtp_wrapper:
+        import types
+
+        inner_mtp = getattr(model, "model", None)
+        if inner_mtp is not None:
+            inner_mtp.forward = types.MethodType(patched_mtp_forward, inner_mtp)
+            inner_mtp._supports_step0_post_attn_gather = True
+            for mtp_layer in getattr(inner_mtp, "layers", ()):
+                mtp_layer.forward = types.MethodType(
+                    patched_decoder_layer_forward, mtp_layer
+                )
     quant_shared_lm_head = os.environ.get(
         "TPU_QUANTIZE_SHARED_LM_HEAD", "1"
     ).strip().lower() not in ("0", "false", "no", "off")
@@ -972,7 +983,11 @@ def patched_decoder_layer_forward(
     from vllm_torchtpu.layers.adapter import small_all_reduce_op as _sar
 
     sp = False
-    if self.use_attn_reduce_scatter_for_moe and positions.shape[-1] >= _sp.min_rows():
+    if (
+        self.use_attn_reduce_scatter_for_moe
+        and _sp.enabled()
+        and positions.shape[-1] >= _sp.min_rows()
+    ):
         sp = True
     input_is_sequence_parallel = sp and residual is not None
 
@@ -998,15 +1013,26 @@ def patched_decoder_layer_forward(
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
 
     if self.layer_type == "linear_attention":
-        hidden_states = self.linear_attn(
-            hidden_states=hidden_states,
-            prequant=prequant,
+        hidden_states = (
+            self.linear_attn(hidden_states=hidden_states)
+            if prequant is None
+            else self.linear_attn(
+                hidden_states=hidden_states,
+                prequant=prequant,
+            )
         )
     elif self.layer_type == "full_attention":
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-            prequant=prequant,
+        hidden_states = (
+            self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
+            if prequant is None
+            else self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+                prequant=prequant,
+            )
         )
         gather_idx = _step0_gather_indices
         if gather_idx is not None:
@@ -1096,6 +1122,7 @@ def patched_model_forward(
             layer.use_attn_reduce_scatter_for_moe
             for layer in islice(self.layers, self.start_layer, self.end_layer)
         )
+        and _sp.enabled()
         and positions.shape[-1] >= _sp.min_rows()
     )
     state_is_sp = False
@@ -1178,6 +1205,7 @@ def patched_mtp_forward(
     sp = (
         mtp_layer.use_attn_reduce_scatter_for_moe
         and _step0_gather_indices is None
+        and _sp.enabled()
         and positions.shape[-1] >= _sp.min_rows()
     )
 

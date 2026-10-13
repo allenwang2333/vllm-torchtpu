@@ -855,6 +855,7 @@ class TpuPlatform(Platform):
         if (
             model_config is not None
             and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and int(getattr(parallel_config, "data_parallel_size", 1) or 1) == 1
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -899,6 +900,8 @@ class TpuPlatform(Platform):
                 safe_kv = 33_500_000_000
             credit, slots = _expert_slot_kv_credit(model_config, parallel_config)
             safe_kv += credit
+            if scheduler_config.max_num_batched_tokens > 8192:
+                safe_kv -= 2_500_000_000
             # The recipe always passes its own --kv-cache-memory-bytes (40.4e9),
             # so the measured budget is SET (raised or lowered), not only
             # clamped. TPU_KV_BYTES_EXPLICIT=1 with an explicit value keeps it.

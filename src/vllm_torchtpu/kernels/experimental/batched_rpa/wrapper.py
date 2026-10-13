@@ -348,7 +348,7 @@ def calculate_block_sizes(
         )
 
         # Step 3: Sum up all memory usage.
-        if is_decode:
+        if is_decode and model_cfgs.num_q_heads <= 16:
             # Scratch buffers are allocated per batch item, whereas active
             # compute tiles are live for one batch item at a time.
             return buffer_bytes * batch_size + compute_bytes

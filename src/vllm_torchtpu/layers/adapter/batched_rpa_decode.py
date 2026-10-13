@@ -54,6 +54,12 @@ def decode_tuning(vllm_config: VllmConfig) -> DecodeTuning | None:
     """The decode programs' kernel settings, or None when the flag is off."""
     if not envs.TPU_RPA_DECODE_BATCHED:
         return None
+    if vllm_config.parallel_config.tensor_parallel_size == 1:
+        logger.warning_once(
+            "[Attention] TPU_RPA_DECODE_BATCHED: disabled for TP=1 (32 local q_heads "
+            "require default 64 MiB VMEM limit in RPAm mixed mode)."
+        )
+        return None
     max_model_len = vllm_config.model_config.max_model_len
     # TPU_RPA_DECODE_BATCHED_MAX_MODEL_LEN overrides the bound, for A/B runs
     # at long context.

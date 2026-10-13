@@ -506,6 +506,7 @@ class TPUWorker(WorkerBase):
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
         kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
+        available = int((total_hbm_avail_gb - 0.02) * utils.GBYTES)
         logger.info(
             "Memory statistics | "
             "total_hbm_limit_gb=%rGiB | "

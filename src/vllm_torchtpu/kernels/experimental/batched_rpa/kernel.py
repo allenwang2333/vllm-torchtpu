@@ -666,7 +666,7 @@ def _rpa_step(
     # hybrid pool a recycled page's tail still holds Mamba state bytes, many of
     # which decode to fp8 NaN. SEQ_ALONG_LANE without a `local_k_start` zeroed
     # them in VMEM above (`_zero_unattended_v_lanes`).
-    if not inplace_v_zeroing:
+    if not inplace_v_zeroing and cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         v, v_scale = _mask_unattended_v(v, v_scale, step_meta, cfgs=cfgs)
 
     # Step 3: Perform compute.
@@ -979,7 +979,10 @@ def rpa_kernel(
             # unattended K only reach masked scores, which `jnp.where` replaces.
             # So the KV buffers (~27 MB of VMEM for decode, a fixed few us per
             # call) are no longer zeroed; TPU_RPA_ZERO_KV_VMEM=1 restores it.
-            zero_kv_vmem = os.environ.get("TPU_RPA_ZERO_KV_VMEM", "0") == "1"
+            zero_kv_vmem = (
+                os.environ.get("TPU_RPA_ZERO_KV_VMEM", "0") == "1"
+                or cfgs.serve.kv_layout != configs.KVLayout.SEQ_ALONG_LANE
+            )
 
             @pl.when(actual_steps > 0)
             def _active():

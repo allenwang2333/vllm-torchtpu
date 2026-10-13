@@ -146,6 +146,10 @@ PATCHES = (
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
     ),
+    Patch(
+        "vllm_torchtpu.models.microbatch.qwen:patch_qwen_microbatch",
+        ("platform_activation", "model_load"),
+    ),
 )
 
 _applied: set[str] = set()

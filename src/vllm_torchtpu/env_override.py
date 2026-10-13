@@ -177,14 +177,7 @@ def _set_env(key: str, val: str) -> None:
 # Recipe tokens rewritten in place, so the rest of the string (and with it the
 # native compile key) stays byte-identical. The CDK recipe pairs fused EP with
 # SparseCore all-gather offload at a 256 KiB threshold.
-_LIBTPU_REWRITES = {
-    "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144": (
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=8388608"
-    ),
-    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true": (
-        "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
-    ),
-}
+_LIBTPU_REWRITES: dict[str, str] = {}
 _SC_HAR_FLAG = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
 _SC_AR_MIN_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 # Either flag as a whole token, with its value and the whitespace before it.
@@ -224,7 +217,8 @@ _existing_libtpu_args = _recipe_libtpu_args(os.environ.get("LIBTPU_INIT_ARGS", "
 
 # The CDK recipe (infx-qwen35-agentx) exports stale fused-EP settings in the
 # pod spec: USE_MOE_FUSED_EP_KERNEL=0 and TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=33.
-_set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+    _set_env("USE_MOE_FUSED_EP_KERNEL", "0")
 if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
     _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 
@@ -290,10 +284,17 @@ def _apply_qwen35_serve_cli_defaults() -> None:
     argv = sys.argv
     if "serve" not in argv[:3] or "qwen3.5-397b" not in " ".join(argv).lower():
         return
-    for opt, val in (
-        ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
-        ("--renderer-num-workers", "4"),
-    ):
+    dp = _get_cli_opt(argv, "--data-parallel-size") or "1"
+    allow_auto_mtp = (
+        os.environ.get("VLLM_TPU_DISABLE_AUTO_MTP", "0") != "1"
+        and (not dp.isdigit() or int(dp) <= 1)
+    )
+    cli_defaults = [("--renderer-num-workers", "4")]
+    if allow_auto_mtp:
+        cli_defaults.insert(
+            0, ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}')
+        )
+    for opt, val in cli_defaults:
         if not _has_cli_opt(argv, opt):
             argv.extend([opt, val])
             CHANGES.append(["argv_add", opt, val])

@@ -121,6 +121,10 @@ def test_patched_decoder_layer_forward_mtp_entry_prechunked(monkeypatch):
         lambda: tp_world_size,
     )
     monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.sequence_parallel.min_rows",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
         "vllm_torchtpu.models.vllm.qwen3_next_patch.get_tensor_model_parallel_rank",
         lambda: 0,
     )

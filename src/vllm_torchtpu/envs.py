@@ -165,6 +165,12 @@ if TYPE_CHECKING:
     TPU_SCHED_STEP_TOTAL_CAP: int = 4096
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
+    TPU_MICROBATCH_FACTOR: int = 1
+    TPU_MICROBATCH_MIN_TOKENS: int = 1024
+    TPU_MICROBATCH_MERGE_MOE: bool = True
+    TPU_MICROBATCH_LAYERWISE: bool = False
+    TPU_MICROBATCH_SCHEDULE: str = ""
+    TPU_MICROBATCH_FENCE: str = "substage"
 
 
 def env_with_choices(
@@ -656,7 +662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program, instead of bracketing the per-rank compute with vLLM's
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
-    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=True),
+    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=False),
     # Fused EP kernel implementation. Default "v3"
     # pairs with TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512 so
     # steps <= 256 run moe_lowtok and steps >= 512 run SP=1 + Fused EP v3.
@@ -986,7 +992,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
         "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
     ),
-    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
+    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "0")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
     # Sort prefilling requests in `running` by fewest remaining prompt tokens.
@@ -1020,6 +1026,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
         "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2
+    ),
+    # Number of token-axis micro-batch windows per decoder stage (1 = disabled).
+    "TPU_MICROBATCH_FACTOR": env_nonnegative_int("TPU_MICROBATCH_FACTOR", 1),
+    # Minimum bucket token count for micro-batching; smaller buckets run unsplit.
+    "TPU_MICROBATCH_MIN_TOKENS": env_nonnegative_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
+    # Merge the routed-expert MoE kernel across micro-batch windows into one call.
+    "TPU_MICROBATCH_MERGE_MOE": env_bool("TPU_MICROBATCH_MERGE_MOE", default=True),
+    # Shortcut for TPU_MICROBATCH_SCHEDULE="layerwise" (full-layer windowing).
+    "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
+    # Micro-batch execution schedule:
+    #   "" (default): resolves to "layerwise" if TPU_MICROBATCH_LAYERWISE=1 else "stagewise"
+    #   "stagewise": split each decoder stage across windows (with optional merged MoE)
+    #   "layerwise": run each window through an entire decoder layer before the next window
+    #   "staggered": explicitly interleave compute and collective sub-stages across windows
+    "TPU_MICROBATCH_SCHEDULE": env_with_choices(
+        "TPU_MICROBATCH_SCHEDULE",
+        "",
+        ["", "stagewise", "layerwise", "staggered"],
+        case_sensitive=False,
+    ),
+    # Optimization-barrier fencing policy between micro-batch windows/stages:
+    #   "none": no optimization_barrier fences
+    #   "window": fence each window's output tensor at stage/layer boundaries
+    #   "stage": coupled fence across windows at stage boundaries to block horizontal fusion
+    #   "substage": coupled diamond fence between compute and collective sub-stages
+    "TPU_MICROBATCH_FENCE": env_with_choices(
+        "TPU_MICROBATCH_FENCE",
+        "substage",
+        ["none", "window", "stage", "substage"],
+        case_sensitive=False,
     ),
 }
 

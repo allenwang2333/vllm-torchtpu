@@ -1672,6 +1672,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
+        if cpu_bytes_to_use and int(cpu_bytes_to_use) > 429496729600:
+            cpu_bytes_to_use = 429496729600
         if not cpu_bytes_to_use:
             raise ValueError(
                 "cpu_bytes_to_use must be specified in "
