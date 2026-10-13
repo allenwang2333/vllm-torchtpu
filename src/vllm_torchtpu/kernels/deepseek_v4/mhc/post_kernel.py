@@ -22,21 +22,24 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 
+def _token_index_map(i):
+    return (i, 0)
+
+
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
     """One token block of the unrolled stream recombine."""
     x = x_ref[...].astype(jnp.float32)  # (tb, hidden)
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
-    streams = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
-        for i in range(hc_mult)
+    old_bf = [
+        res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
     ]
     for j in range(hc_mult):
         acc = post[:, j : j + 1] * x
         for i in range(hc_mult):
             k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * streams[i]
+            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
         out_ref[:, j * hidden_size : (j + 1) * hidden_size] = acc.astype(out_ref.dtype)
 
 
@@ -73,10 +76,14 @@ def mhc_post_2d(
     hc_mult = comb_res_mix.shape[-1]
     hidden_size = res2d.shape[-1] // hc_mult
 
-    x2d = x.reshape(-1, hidden_size)
+    x2d = x if x.ndim == 2 else x.reshape(-1, hidden_size)
     if x2d.dtype != jnp.bfloat16:
         x2d = x2d.astype(jnp.bfloat16)
-    post2d = post_layer_mix.reshape(-1, hc_mult)
+    post2d = (
+        post_layer_mix
+        if post_layer_mix.ndim == 2
+        else post_layer_mix.reshape(-1, hc_mult)
+    )
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
     num_tokens = res2d.shape[0]
 
@@ -101,12 +108,12 @@ def mhc_post_2d(
         functools.partial(_post_kernel, hc_mult=hc_mult, hidden_size=hidden_size),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult * hidden_size), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hidden_size), _token_index_map),
+            pl.BlockSpec((tb, hc_mult * hidden_size), _token_index_map),
+            pl.BlockSpec((tb, hc_mult), _token_index_map),
+            pl.BlockSpec((tb, hc_mult * hc_mult), _token_index_map),
         ],
-        out_specs=pl.BlockSpec((tb, hc_mult * hidden_size), lambda i: (i, 0)),
+        out_specs=pl.BlockSpec((tb, hc_mult * hidden_size), _token_index_map),
         out_shape=jax.ShapeDtypeStruct(
             (padded_tokens, hc_mult * hidden_size), res2d.dtype
         ),
@@ -146,10 +153,10 @@ def mhc_post(
     hc_mult, hidden_size = residual.shape[-2:]
 
     out2d = mhc_post_2d(
-        x.reshape(-1, hidden_size),
+        x,
         residual.reshape(-1, hc_mult * hidden_size),
-        post_layer_mix.reshape(-1, hc_mult, 1),
-        comb_res_mix.reshape(-1, hc_mult, hc_mult),
+        post_layer_mix,
+        comb_res_mix,
         token_block_size=token_block_size,
         vmem_limit_bytes=vmem_limit_bytes,
     )
