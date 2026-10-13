@@ -23,17 +23,25 @@ from jax._src import api, lax, tree_util
 from jax._src import core as jax_core
 from jax._src.pallas import core as pl_core
 
+__all__ = ["_deref", "_empty_out_ref", "kernel", "tree_util"]
+
+_DEVICE_MEMORY_SPACE = jax_core.MemorySpace.Device
+_CORE_MEMORY_SPACES = frozenset(jax_core.MemorySpace)
+
 
 def _empty_out_ref(out_type):
     # Mirrors internal `pl.kernel` logic; may need updating on JAX bumps.
     aval = pl_core._convert_out_shape_to_aval(out_type)
-    memory_space = (
-        None
-        if isinstance(aval.memory_space, jax_core.MemorySpace)
-        else aval.memory_space
+    mem_space = aval.memory_space
+    sharding = aval.sharding
+    value = (
+        lax.empty(aval.shape, aval.dtype)
+        if sharding is None
+        else lax.empty(aval.shape, aval.dtype, out_sharding=sharding)
     )
-    value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
-    return jax_core.new_ref(value, memory_space=memory_space)
+    if mem_space is _DEVICE_MEMORY_SPACE or mem_space in _CORE_MEMORY_SPACES:
+        return jax_core.new_ref(value)
+    return jax_core.new_ref(value, memory_space=mem_space)
 
 
 def _deref(ref):
@@ -59,7 +67,6 @@ def kernel(
     ``scratch_shapes`` (list) is renamed to ``scratch_types`` (dict).
     """
     single_output = not isinstance(out_type, (tuple, list))
-    out_types = (out_type,) if single_output else out_type
     core_map_decorator = pl_core.core_map(
         mesh,
         scratch_shapes=scratch_types,
@@ -71,16 +78,35 @@ def kernel(
         metadata=metadata,
     )
 
+    if single_output:
+
+        @api.jit
+        def run(*operands):
+            new_ref_fn = jax_core.new_ref
+            arg_refs = [new_ref_fn(op) for op in operands]
+            out_ref = _empty_out_ref(out_type)
+
+            @core_map_decorator
+            def _(*scratch_refs, **scratch_kwrefs):
+                return body(*arg_refs, out_ref, *scratch_refs, **scratch_kwrefs)
+
+            return out_ref[...]
+
+        return run
+
+    out_cls = type(out_type)
+
     @api.jit
     def run(*operands):
-        arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-        out_refs = tree_util.tree_map(_empty_out_ref, out_types)
+        new_ref_fn = jax_core.new_ref
+        empty_out_fn = _empty_out_ref
+        arg_refs = [new_ref_fn(op) for op in operands]
+        out_refs = [empty_out_fn(t) for t in out_type]
 
         @core_map_decorator
         def _(*scratch_refs, **scratch_kwrefs):
             return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
 
-        outs = tree_util.tree_map(_deref, out_refs)
-        return outs[0] if single_output else outs
+        return out_cls(r[...] for r in out_refs)
 
     return run
