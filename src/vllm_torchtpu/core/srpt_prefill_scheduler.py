@@ -25,7 +25,9 @@ Each step this scheduler
   prefill chunks, in the order vLLM had them;
 * orders RUNNING prefill chunks by remaining prompt tokens, fewest first;
 * orders WAITING requests by remaining prompt tokens net of their local prefix
-  cache hit, fewest first (requests resumed after preemption first);
+  cache hit, fewest first (requests resumed after preemption first); with
+  ``TPU_SRPT_COUNT_EXTERNAL_HIT=1`` also net of the KV connector's (host KV
+  store's) hit, so a prompt whose prefix was offloaded does not sort as cold;
 * holds back, for this step, running prefill chunks that have more remaining
   tokens than an admissible waiting request, so the budget reaches the waiting
   request instead of the long chunk (vLLM admits waiting requests only after the
@@ -74,6 +76,8 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_steps = 0
         self._srpt_held_steps = 0
         self._srpt_held_chunks = 0
+        self._srpt_count_external = envs.TPU_SRPT_COUNT_EXTERNAL_HIT
+        self._srpt_external_end: dict[str, int] = {}
         if envs.TPU_SCHED_UNCHARGED_DRAFT_SLOTS:
             self._uncharge_draft_slots()
         logger.info("SrptPrefillScheduler active")
@@ -101,8 +105,8 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def _waiting_remaining(self, request: Request) -> int:
         """Prompt tokens a waiting request still has to prefill, net of its
-        local prefix-cache hit (an external KV connector hit is not known
-        until admission, so it is not counted)."""
+        local prefix-cache hit and, with TPU_SRPT_COUNT_EXTERNAL_HIT, of its
+        KV connector hit."""
         computed = request.num_computed_tokens
         kvm = self.kv_cache_manager
         if (
@@ -113,7 +117,22 @@ class SrptPrefillScheduler(AsyncScheduler):
             _, computed, _ = kvm.coordinator.find_longest_cache_hit(
                 request.block_hashes, max(request.num_tokens - 1, 0)
             )
+            if self._srpt_count_external:
+                computed = max(computed, self._external_hit_end(request, computed))
         return max(request.num_tokens - computed, 1)
+
+    def _external_hit_end(self, request: Request, local: int) -> int:
+        """Prompt position the connector can load up to, asked once per waiting
+        request with the block-aligned local hit, as admission asks it. An
+        undetermined answer (None) is asked again on a later step."""
+        end = self._srpt_external_end.get(request.request_id)
+        if end is None and self.connector is not None:
+            aligned = local - local % self.block_size
+            matched, _ = self.connector.get_num_new_matched_tokens(request, aligned)
+            if matched is not None:
+                end = aligned + matched
+                self._srpt_external_end[request.request_id] = end
+        return end or 0
 
     @staticmethod
     def _running_remaining(request: Request) -> int:
@@ -130,6 +149,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
         self.running[:] = decoding + prefilling
 
+        if self._srpt_external_end:
+            waiting_ids = {r.request_id for r in self.waiting}
+            for rid in [k for k in self._srpt_external_end if k not in waiting_ids]:
+                del self._srpt_external_end[rid]
         scored = sorted(
             ((self._waiting_remaining(r), r) for r in self.waiting),
             key=lambda t: (t[1].num_preemptions == 0, t[0], t[1].arrival_time),

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     TPU_PREFILL_GATE_MIN_CADENCES: int = 0
     TPU_PREFILL_GATE_LOG_STEPS: int = 1000
     TPU_SCHED_UNCHARGED_DRAFT_SLOTS: bool = False
+    TPU_SRPT_COUNT_EXTERNAL_HIT: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -633,6 +634,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request count, so the charge only shrinks the target forward's prefill
     # budget; the scheduled-token cap (and so the largest bucket) is unchanged.
     "TPU_SCHED_UNCHARGED_DRAFT_SLOTS": env_bool("TPU_SCHED_UNCHARGED_DRAFT_SLOTS"),
+    # SrptPrefillScheduler: rank waiting prompts net of the KV connector's hit
+    # too (asked once per waiting request), not only the local prefix cache's.
+    "TPU_SRPT_COUNT_EXTERNAL_HIT": env_bool("TPU_SRPT_COUNT_EXTERNAL_HIT"),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),

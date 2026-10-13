@@ -21,6 +21,7 @@ def _running(name, num_tokens, computed, prefilling=True):
 def _waiting(name, num_tokens, cached=0, status=RequestStatus.WAITING, preempted=0):
     return SimpleNamespace(
         name=name,
+        request_id=name,
         num_tokens=num_tokens,
         num_computed_tokens=0,
         block_hashes=(name, cached),
@@ -46,6 +47,10 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._srpt_steps = 0
     s._srpt_held_steps = 0
     s._srpt_held_chunks = 0
+    s._srpt_count_external = False
+    s._srpt_external_end = {}
+    s.connector = None
+    s.block_size = 1024
     return s
 
 
@@ -170,3 +175,62 @@ def test_uncharged_draft_slots_follows_env(monkeypatch, value, widened):
     with patch.object(AsyncScheduler, "__init__", fake_init):
         SrptPrefillScheduler.__init__(s)
     assert (s.scheduler_config.max_num_batched_tokens > 128) is widened
+
+
+class _FakeConnector:
+    """Host-store hit lengths by request name; records each lookup."""
+
+    def __init__(self, hits):
+        self.hits = hits
+        self.calls = []
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        self.calls.append((request.name, num_computed_tokens))
+        hit = self.hits[request.name]
+        return (None, False) if hit is None else (hit, hit > 0)
+
+
+def _with_connector(waiting, hits):
+    s = _make_scheduler(waiting=waiting)
+    s._srpt_count_external = True
+    s.connector = _FakeConnector(hits)
+    return s
+
+
+def test_external_hit_counts_as_cached_when_enabled():
+    # "offloaded": 2500 cached locally (block-aligned to 2048), 88000 more in
+    # the host store -> 9500 left; "cold": 5000 left.
+    waiting = [_waiting("cold", 5000), _waiting("offloaded", 100000, cached=2500)]
+    s = _with_connector(waiting, {"cold": 0, "offloaded": 88000})
+    assert _step(s)["waiting"] == ["cold", "offloaded"]
+    s.connector.hits["offloaded"] = 96000  # 100000 - 98048 = 1952 left
+    s._srpt_external_end.clear()
+    assert _step(s)["waiting"] == ["offloaded", "cold"]
+    assert ("offloaded", 2048) in s.connector.calls
+
+
+def test_external_hit_asked_once_and_undetermined_asked_again():
+    waiting = [_waiting("a", 9000), _waiting("b", 9000)]
+    s = _with_connector(waiting, {"a": 4096, "b": None})
+    _step(s)
+    _step(s)
+    names = [n for n, _ in s.connector.calls]
+    assert names.count("a") == 1
+    assert names.count("b") == 2
+
+
+def test_external_hit_cache_dropped_when_request_leaves_waiting():
+    waiting = [_waiting("a", 9000)]
+    s = _with_connector(waiting, {"a": 4096})
+    _step(s)
+    assert "a" in s._srpt_external_end
+    s.waiting.clear()
+    _step(s)
+    assert s._srpt_external_end == {}
+
+
+def test_external_hit_ignored_when_disabled():
+    s = _make_scheduler(waiting=[_waiting("cold", 5000), _waiting("offloaded", 100000)])
+    s.connector = _FakeConnector({"cold": 0, "offloaded": 99000})
+    assert _step(s)["waiting"] == ["cold", "offloaded"]
+    assert s.connector.calls == []
