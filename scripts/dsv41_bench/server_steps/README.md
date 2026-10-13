@@ -160,9 +160,59 @@ KV budget rounding and the RoPE reserve. After KV allocation, XLA reported
 `RuntimeProgramAllocationFailure` while loading
 `tt_jit_layernorm_L21C0_rms_norm_mul`: a 31.40G program-region reservation was
 requested with only 14.29G reservable (1.07G free, 13.22G already reserved).
-The reporting operation alone does not identify the source of the full
-reservation. Investigate runtime memory budgeting and compiled program memory
-at the default context limit before comparing 96K throughput.
+The reporting operation names the compiled decoder graph, not an isolated
+RMSNorm kernel. Inspection of the cached executable and HLO identified full
+`[2048, 1048576]` FP32 indexer score buffers (8 GiB each), including masking
+and top-k copies. Key tiling did not bound the number of query rows kept live.
+The decoder's temporary HBM region was 31.40 GiB; the encoder's was 13.22 GiB.
+
+Fix `c88845921` reuses the native indexer's 32-query score/top-k pipeline,
+finishing selection before reusing each tile's score storage. It retains the
+model-default context limit, automatic KV allocation, and all three buckets.
+The related kernel test module passes all 45 tests, including 12 comparisons
+against full-score selection covering both banks, candidate modes and partial
+query tiles.
+
+Cached rank-0 executable temporary HBM regions, with the same default 1M
+context and bucket shapes:
+
+| Stage / bucket | Before (GiB) | Query tiles (GiB) |
+|---|---:|---:|
+| Encoder / 128 | 1.03 | 0.54 |
+| Encoder / 256 | 1.94 | 0.88 |
+| Encoder / 2048 | 13.22 | 5.33 |
+| Decoder / 128 | 2.03 | 1.61 |
+| Decoder / 256 | 3.99 | 2.06 |
+| Decoder / 2048 | 31.40 | 5.47 |
+
+These are compiled temporary regions, not total process HBM. The fixed run
+passed backbone warmup without reducing the serving context or KV budget.
+Memory evidence: `extend96k/memory-before.json` and
+`extend96k-tiled/memory-after.json` in the same experiment artifact.
+
+With the fix, HTTP readiness took 1253.06 seconds from an empty cache.
+Engine initialization took at most 896.11 seconds across ranks; the logged
+compilation scope took at most 784.22 seconds (64 FX compilations). These
+overlapping scopes must not be added together.
+Five unprofiled rounds produced 35 full-DP middle chunks: 572320 new input
+tokens over 8.90563 seconds of host-observed step intervals, or **64264.96
+tokens/s globally**. The median observed middle interval was 287.81 ms;
+asynchronous observations make this different from a device-kernel duration.
+Including first and tail chunks gives 50320.88 tokens/s over observed steps,
+not client request latency. Every round recorded 786432 prefix-hit tokens,
+zero preemptions, and no compilation during measurement. These results do not
+establish performance recovery relative to the historical 64K configuration.
+Raw records and logs are under `extend96k-tiled/cold/fixed` and
+`extend96k-tiled/cold/server.log`; source checksums are in
+`extend96k-tiled/source-provenance.txt`.
+
+The separate rank-0 profile contains four complete encoder chunks, each with
+20 MoE operations: device median 283.76 ms, equivalent to 57626.02 new input
+tokens/s for 16352 effective tokens per global chunk. A fifth encoder event
+ends at the capture boundary with only nine MoE operations and is excluded.
+Falcon analysis `an-fgel3ii90h` contains the device census. This device timing
+must not be substituted for the host-observed step intervals above.
+[Open the Falcon profile](https://falcon.infiscale-infra.org/v1/experiments/exp-3f5osvzlde/artifacts/art-98194fed5500f43a9cb74c37/view).
 
 Evidence in the experiment artifact: `extend96k/cold/server.log`,
 `extend96k/cold/startup.json`, `extend96k/benchmark-task.log`, and

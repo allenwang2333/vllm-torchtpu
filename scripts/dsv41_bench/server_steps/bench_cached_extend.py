@@ -528,7 +528,7 @@ def client_main(argv: list[str]) -> None:
         hits = delta.get("vllm:prefix_cache_hits_total", -1)
         # Hybrid compressed KV groups align cache hits to 256 logical tokens,
         # despite --block-size 16. An exact-prefix prompt leaves its last hash
-        # unit uncached; an extension can reuse the complete 64k prefix.
+        # unit uncached; an extension can reuse the complete prefix.
         expected_hit = scenario.prefix_tokens - (0 if scenario.extend_tokens else 256)
         if hits != scenario.concurrency * expected_hit:
             raise ValueError(f"Prefix-hit invariant failed: {hits}")
