@@ -156,8 +156,8 @@ class AbstractWeightRef(abc.ABC):
     ...
 
   @abc.abstractmethod
-  def get_scale(self, replicate_size: int | None = None) -> jax.Array | None:
-    """Returns scale array, optionally replicated across sublanes."""
+  def get_scale(self) -> jax.Array | None:
+    """Returns scale array of shape [num_blocks, n]."""
     ...
 
   @abc.abstractmethod
@@ -177,11 +177,8 @@ class SingleWeightRef(AbstractWeightRef):
   def get_weight(self) -> jax.Array:
     return self.weight[...]
 
-  def get_scale(self, replicate_size: int | None = None) -> jax.Array:
+  def get_scale(self) -> jax.Array:
     assert self.scale is not None
-    if replicate_size is not None:
-      # Perform zero-stride load for efficient broadcasting across sublanes.
-      return self.scale[:, pl.ds(0, replicate_size, 0), :]
     return self.scale[...]
 
   def get_bias(self) -> jax.Array:
@@ -202,9 +199,9 @@ class FusedWeightsRef(AbstractWeightRef):
     w_up = self.up.get_weight()
     return layout_util.large_interleave_lane(w_gate, w_up)
 
-  def get_scale(self, replicate_size: int | None = None) -> jax.Array:
-    s_gate = self.gate.get_scale(replicate_size)
-    s_up = self.up.get_scale(replicate_size)
+  def get_scale(self) -> jax.Array:
+    s_gate = self.gate.get_scale()
+    s_up = self.up.get_scale()
 
     return layout_util.large_interleave_lane(s_gate, s_up)
 
@@ -392,7 +389,7 @@ class IndexMapProvider:
 
   def scale_index(self, n_id, gm_id, k_id):
     del n_id, k_id
-    return (self.metadata_ref.get_group_id(gm_id), 0, 0, 0)
+    return (self.metadata_ref.get_group_id(gm_id), 0, 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -442,7 +439,11 @@ class BlockSpecFactory:
     )
 
   def get_scale_spec(self):
-    block_shape = (None, 1, 1, self.cfg.tile.tile_n)
+    # Scales are [groups, num_blocks, n] in HBM (see gmm.kernel); the whole
+    # k extent is resident since k is not tiled.
+    assert self.cfg.w.quant_block_size is not None
+    num_blocks = self.cfg.dim.size_k // self.cfg.w.quant_block_size
+    block_shape = (None, num_blocks, self.cfg.tile.tile_n)
     return pl.BlockSpec(
         block_shape=block_shape,
         index_map=self.index_map_provider.scale_index,

@@ -26,11 +26,11 @@ from vllm_torchtpu.kernels.routing_moe.gmm import memory_ref
 from vllm_torchtpu.kernels.routing_moe.gmm import pipeline
 
 
-@jax.jit(static_argnames=("tile", "fuse_act"))
+@jax.jit(static_argnames=("tile", "fuse_act", "w_quant_dtype"))
 def routing_gmm(
     x: jax.Array,  # [m_in, k // 128 // packing, packing, lane_size]
-    w: jax.Array,  # [local_groups, k, n]
-    w_scale: jax.Array | None,  # [local_groups, num_scales, 1, n]
+    w: jax.Array,  # [local_groups, k // w_packing, n]
+    w_scale: jax.Array | None,  # [local_groups, k // w_block_size, 1, n]
     group_sizes: jax.Array,  # [global_groups]
     *,
     group_offset: jax.Array | None = None,  # [1]
@@ -38,7 +38,16 @@ def routing_gmm(
     scatter_indices: jax.Array | None = None,  # [m_out]
     tile: config.TileConfig | None = None,
     fuse_act: str | None = None,
+    w_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
+  """Grouped matmul with the lhs rows gathered or the output rows scattered.
+
+  w_quant_dtype is the dtype the weights are quantized to, defaulting to
+  w.dtype when w_scale is given. If it is narrower than w.dtype, w holds it
+  packed along k (e.g. two float4_e2m1fn per uint8, even k in the low nibble).
+  w_scale has one row per block of k // num_scales rows of w. Sub-byte weights
+  run with fp8 activations quantized per row and block (A8W4).
+  """
 
   # Step 1: Create config object.
   cfg = config.RoutingGmmConfig.create(
@@ -51,6 +60,7 @@ def routing_gmm(
       scatter_indices=scatter_indices,
       tile=tile,
       fuse_act=fuse_act,
+      w_quant_dtype=w_quant_dtype,
   )
   cfg.validate(x, w, w_scale, group_sizes)
 
@@ -64,7 +74,9 @@ def routing_gmm(
 
   # Step 3: Wrap inputs in parameter object.
   if w_scale is not None:
-    w_scale = w_scale.astype(jnp.float32)
+    # Drop the singleton dim so the scale block is [num_blocks, n] in VMEM
+    # rather than num_blocks tiles each padded from 1 to 8 sublanes.
+    w_scale = w_scale.astype(jnp.float32).squeeze(2)
   wrapped_w = memory_ref.SingleWeightRef(weight=w, scale=w_scale, bias=None)
 
   metadata = memory_ref.MetadataRef.create(

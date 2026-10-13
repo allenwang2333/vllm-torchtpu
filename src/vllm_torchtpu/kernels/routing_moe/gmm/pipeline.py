@@ -15,6 +15,7 @@
 
 """Main kernel module for orchestrating DMA and computation pipeline."""
 
+import dataclasses
 import functools
 
 from jax import lax
@@ -99,6 +100,13 @@ def outer_pipeline(
   """Outer pipeline that handles memory and scheduling for inner pipeline."""
 
   num_gm = metadata_ref.fill_metadata_and_return_num_gm()
+
+  if cfg.w.should_unpack:
+    # View packed sub-byte weights in their quant dtype; the DMAs then carry
+    # the packed bytes and VMEM holds [tile_k, tile_n] of quant dtype values.
+    w_hbm_ref = dataclasses.replace(
+        w_hbm_ref, weight=w_hbm_ref.weight.bitcast(cfg.w.quant_dtype)
+    )
 
   x_buf, w_buf, out_buf = memory_ref.create_allocs(
       x_hbm_ref, w_hbm_ref, out_hbm_ref, metadata_ref, cfg

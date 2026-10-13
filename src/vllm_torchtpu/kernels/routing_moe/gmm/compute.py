@@ -97,9 +97,14 @@ def matmul(
   else:
     # Quantized matmul path.
     x_q_dtype = cfg.x.quant_dtype
-    q_block_size = cfg.x.quant_block_size
-    assert q_block_size is not None
+    x_block_size = cfg.x.quant_block_size
+    assert x_block_size is not None
     assert x_q_dtype is not None
+    # w_scale holds one row per weight block: [k // w_block_size, tile_n].
+    w_block_size = cfg.w.quant_block_size or tile_k
+    # Each k step lies within a single activation block and a single weight
+    # block, so it sees one scale of each.
+    k_step = min(x_block_size, w_block_size)
 
     if jnp.issubdtype(x_q_dtype, jnp.floating):
       dtype_max = float(jnp.finfo(x_q_dtype).max)
@@ -119,16 +124,19 @@ def matmul(
       col_size = end_n - start_n
 
       acc_n = jnp.zeros((tile_m, col_size), dtype=cfg.acc_dtype)
-      for start_k in range(0, tile_k, q_block_size):
-        end_k = min(tile_k, start_k + q_block_size)
+      for start_k in range(0, tile_k, k_step):
+        end_k = min(tile_k, start_k + k_step)
 
-        block_x = x[:, start_k:end_k]
         block_w = w[start_k:end_k, start_n:end_n]
 
-        # Perform lhs quantization. Note that for every block_lhs,
-        # same computation will be performed tiles_n//mxu_size times.
+        # Perform lhs quantization over the whole activation block holding
+        # this k step. Note that for every block_lhs, same computation will be
+        # performed tiles_n//mxu_size times (and once per k step inside it).
         # But we can let compiler perform CSE and avoid recomputation.
-        block_abs_max = jnp.max(jnp.abs(block_x), axis=1, keepdims=True)
+        start_x = start_k // x_block_size * x_block_size
+        block_x_full = x[:, start_x : min(tile_k, start_x + x_block_size)]
+        block_x = x[:, start_k:end_k]
+        block_abs_max = jnp.max(jnp.abs(block_x_full), axis=1, keepdims=True)
         block_scale = block_abs_max / dtype_max
 
         # If block_scale=0, it will cause division by zero and return either
@@ -151,8 +159,10 @@ def matmul(
         ).astype(cfg.acc_dtype)
 
         if w_scale is not None:
-          # TODO(kyuyeunk): Support subchannel quantization.
-          block_acc *= w_scale[0, :, start_n:end_n].astype(cfg.acc_dtype)
+          w_block = start_k // w_block_size
+          block_acc *= w_scale[w_block : w_block + 1, start_n:end_n].astype(
+              cfg.acc_dtype
+          )
 
         block_acc *= block_scale.astype(cfg.acc_dtype)
 

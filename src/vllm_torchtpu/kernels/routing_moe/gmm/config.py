@@ -34,13 +34,46 @@ class RoutingMode(enum.StrEnum):
   REMOTE = enum.auto()  # Remote DMA is performed in per-row basis.
 
 
+def get_packing_factor(
+    storage_dtype: jnp.dtype, quant_dtype: jnp.dtype | None
+) -> int:
+  """Number of quant_dtype values packed in one storage_dtype element."""
+  if quant_dtype is None or quant_dtype == storage_dtype:
+    return 1
+  storage_bits = jax.dtypes.itemsize_bits(storage_dtype)
+  quant_bits = jax.dtypes.itemsize_bits(quant_dtype)
+  packing, remainder = divmod(storage_bits, quant_bits)
+  if packing < 1 or remainder:
+    raise ValueError(
+        f"Storage dtype {storage_dtype} cannot pack quant dtype {quant_dtype}."
+    )
+  return packing
+
+
 @dataclasses.dataclass(frozen=True)
 class WeightConfig:
+  """Contains how weights are stored and dequantized.
+
+  dtype is the storage dtype. Sub-byte weights (e.g. float4_e2m1fn) may be
+  stored packed along k in a wider carrier such as uint8: with b the quant
+  dtype's bit width, the value at row k sits in bits
+  [b * (k % packing), b * (k % packing + 1)) of storage row k // packing, so
+  the lowest bits hold the even row.
+  """
+
   quant_dtype: jnp.dtype | None
   quant_block_size: int | None
   dtype: jnp.dtype
   has_bias: bool = False
   has_scale: bool = False
+
+  @property
+  def packing(self) -> int:
+    return get_packing_factor(self.dtype, self.quant_dtype)
+
+  @property
+  def should_unpack(self) -> bool:
+    return self.packing > 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,6 +155,7 @@ class RoutingGmmConfig:
       scatter_indices: jax.Array | None,
       tile: TileConfig | None,
       fuse_act: str | None,
+      w_quant_dtype: jnp.dtype | None = None,
   ):
     """Create routing gmm config object based on arguments."""
 
@@ -132,6 +166,9 @@ class RoutingGmmConfig:
 
     size_local_groups, size_k, size_n = w.shape
     size_global_groups = group_sizes.size
+    if w_quant_dtype is None and w_scale is not None:
+      w_quant_dtype = w.dtype
+    size_k *= get_packing_factor(w.dtype, w_quant_dtype)
 
     size_m = size_out_m = x.shape[0]
 
@@ -147,18 +184,40 @@ class RoutingGmmConfig:
       size_out_m = scatter_indices.shape[0]
 
     w_quant_block_size = None
-    w_quant_dtype = None
     x_quant_dtype = None
+    # TODO(kyuyeunk): Choose different block size based on HW.
+    x_quant_block_size = 512
     has_scale = False
     if w_scale is not None:
       num_scales = w_scale.shape[1]
-      assert num_scales == 1
-      w_quant_block_size = size_k
-      w_quant_dtype = w.dtype
+      if size_k % num_scales:
+        raise ValueError(
+            f"k={size_k} must be divisible by the {num_scales} scale blocks."
+        )
+      w_quant_block_size = size_k // num_scales
       has_scale = True
+      assert w_quant_dtype is not None
 
-      # TODO(kyuyeunk): Support mixed precision.
-      x_quant_dtype = w.dtype
+      # Activations are quantized to 8 bits whatever the weight width, as in
+      # gmm_v2: e4m3 for floating weights (A8W4 for float4_e2m1fn, which the
+      # MXU only takes widened), int8 for integer ones.
+      if jnp.issubdtype(w_quant_dtype, jnp.floating):
+        x_quant_dtype = jnp.dtype(jnp.float8_e4m3fn)
+      else:
+        x_quant_dtype = jnp.dtype(jnp.int8)
+
+      # The matmul steps over k in min(x, w) block chunks, so each chunk must
+      # see a single activation and a single weight scale. A block spanning
+      # all of k (e.g. per-channel weights) has no inner boundary to respect.
+      k_step = min(x_quant_block_size, w_quant_block_size)
+      for block_size in (x_quant_block_size, w_quant_block_size):
+        if block_size < size_k and block_size % k_step:
+          raise ValueError(
+              f"Weight block size {w_quant_block_size} and activation block"
+              f" size {x_quant_block_size} must divide each other."
+          )
+    elif w_quant_dtype is not None:
+      raise ValueError(f"Weights quantized to {w_quant_dtype} need a w_scale.")
 
     w_cfg = WeightConfig(
         quant_dtype=w_quant_dtype,
@@ -173,8 +232,7 @@ class RoutingGmmConfig:
         mode=x_mode,
         quant_dtype=x_quant_dtype,
         dtype=x.dtype,
-        # TODO(kyuyeunk): Choose different block size based on HW.
-        quant_block_size=512,
+        quant_block_size=x_quant_block_size,
     )
 
     size_out_n = size_n
@@ -241,7 +299,11 @@ class RoutingGmmConfig:
       raise ValueError(
           f"Input x must have shae of {self.x.compact_shape}. Got {x.shape}."
       )
-    w_shape = (self.dim.size_local_groups, self.dim.size_k, self.dim.size_n)
+    w_shape = (
+        self.dim.size_local_groups,
+        self.dim.size_k // self.w.packing,
+        self.dim.size_n,
+    )
     if w.shape != w_shape:
       raise ValueError(f"Weight shape must be {w_shape}. Got {w.shape}.")
 
@@ -250,12 +312,14 @@ class RoutingGmmConfig:
           f"group_sizes must be {self.dim.size_local_groups}. Got"
           f" {group_sizes.shape}."
       )
-    scale_shape = (self.dim.size_local_groups, 1, 1, self.dim.size_n)
-    if w_scale is not None and w_scale.shape != scale_shape:
-      raise ValueError(
-          f"w_scale must be per channel with shape {scale_shape}. Got"
-          f" {w_scale.shape}."
-      )
+    if w_scale is not None:
+      assert self.w.quant_block_size is not None
+      num_blocks = self.dim.size_k // self.w.quant_block_size
+      scale_shape = (self.dim.size_local_groups, num_blocks, 1, self.dim.size_n)
+      if w_scale.shape != scale_shape:
+        raise ValueError(
+            f"w_scale must have shape {scale_shape}. Got {w_scale.shape}."
+        )
     if not 0 < self.dim.size_out_m <= self.max_routed_rows:
       raise ValueError(
           f"Output rows must be less than {self.max_routed_rows} to avoid SMEM "

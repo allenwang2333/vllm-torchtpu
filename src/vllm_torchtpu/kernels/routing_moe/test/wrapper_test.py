@@ -136,6 +136,22 @@ def sub_channel_quantize(x: jax.Array, quant_dtype: jnp.dtype, wsz: int = 256):
   return jnp.concat(w_lst, axis=1), jnp.concat(scale_lst, axis=1)
 
 
+def pack_along_k(w: jax.Array, storage_dtype: jnp.dtype = jnp.uint8):
+  """Packs sub-byte w [..., k, n] along k into storage_dtype.
+
+  Value k lands in bits [b * (k % packing), b * (k % packing + 1)) of storage
+  row k // packing, i.e. the lowest bits hold the even row.
+  """
+  bits = jax.dtypes.itemsize_bits(w.dtype)
+  packing = jax.dtypes.itemsize_bits(storage_dtype) // bits
+  uint = jnp.dtype(f"uint{bits}")
+  w_uint = jax.lax.bitcast_convert_type(w, uint).astype(storage_dtype)
+  *lead, k, n = w.shape
+  w_uint = w_uint.reshape(*lead, k // packing, packing, n)
+  shifts = jnp.arange(packing, dtype=storage_dtype) * bits
+  return jnp.sum(w_uint << shifts[:, None], axis=-2, dtype=storage_dtype)
+
+
 class MoEKernelTest(parameterized.TestCase):
 
   def setUp(self):
@@ -162,6 +178,7 @@ class MoEKernelTest(parameterized.TestCase):
       act_fn: str = "silu",
       w_dtype: jnp.dtype | None = None,
       subc_quant_wsz: int | None = None,
+      pack_weights: bool = False,
       has_bias: bool = False,
       use_ep: bool = False,
       use_sp: bool = False,
@@ -221,6 +238,14 @@ class MoEKernelTest(parameterized.TestCase):
       w1_scale = jnp.expand_dims(w1_scale, axis=2)
       w2_scale = jnp.expand_dims(w2_scale, axis=2)
 
+    # The reference takes the weights unpacked; the kernel may take them packed.
+    w1_ref, w2_ref = w1, w2
+    w_quant_dtype = None
+    if pack_weights:
+      assert w_dtype is not None
+      w1, w2 = pack_along_k(w1), pack_along_k(w2)
+      w_quant_dtype = jnp.dtype(w_dtype)
+
     # Shard weights.
     if use_sp:
       in_sharding = NamedSharding(mesh, P("model", None))
@@ -235,6 +260,8 @@ class MoEKernelTest(parameterized.TestCase):
 
       w1 = jax.device_put(w1, ep_sharding)
       w2 = jax.device_put(w2, ep_sharding)
+      w1_ref = jax.device_put(w1_ref, ep_sharding)
+      w2_ref = jax.device_put(w2_ref, ep_sharding)
       if w_dtype is not None:
         w1_scale = jax.device_put(w1_scale, ep_sharding)
         w2_scale = jax.device_put(w2_scale, ep_sharding)
@@ -244,6 +271,12 @@ class MoEKernelTest(parameterized.TestCase):
     else:
       w1 = jax.device_put(w1, NamedSharding(mesh, P(None, None, "model")))
       w2 = jax.device_put(w2, NamedSharding(mesh, P(None, "model", None)))
+      w1_ref = jax.device_put(
+          w1_ref, NamedSharding(mesh, P(None, None, "model"))
+      )
+      w2_ref = jax.device_put(
+          w2_ref, NamedSharding(mesh, P(None, "model", None))
+      )
       if w_dtype is not None:
         w1_scale = jax.device_put(
             w1_scale, NamedSharding(mesh, P(None, None, None, "model"))
@@ -264,8 +297,8 @@ class MoEKernelTest(parameterized.TestCase):
 
     expected = reference.reference_moe(
         a,
-        w1,
-        w2,
+        w1_ref,
+        w2_ref,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_bias=b1,
@@ -296,6 +329,7 @@ class MoEKernelTest(parameterized.TestCase):
         use_ep=use_ep,
         use_sp=use_sp,
         scoring_fn="softmax",
+        w_quant_dtype=w_quant_dtype,
     )
 
     expected.block_until_ready()
@@ -359,11 +393,9 @@ class MoEKernelTest(parameterized.TestCase):
 
   @parameterized.product(
       w_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
+      subc_quant_wsz=[256, 512],
   )
-  def test_sub_channel_quantization(self, w_dtype):
-    self.skipTest(
-        "TODO(kyuyeunk): Support sub-channel quantization in routing_moe."
-    )
+  def test_sub_channel_quantization(self, w_dtype, subc_quant_wsz):
     if (
         w_dtype in (jnp.float8_e5m2, jnp.float4_e2m1fn)
         and get_tpu_version() < 7
@@ -385,8 +417,62 @@ class MoEKernelTest(parameterized.TestCase):
         seed=1234,
         renormalize_topk_logits=False,
         w_dtype=w_dtype,
-        subc_quant_wsz=256,
+        subc_quant_wsz=subc_quant_wsz,
         use_ep=True,
+    )
+
+  @parameterized.product(
+      subc_quant_wsz=[256, 512, None],
+      use_ep=[True, False],
+  )
+  def test_packed_fp4(self, subc_quant_wsz, use_ep):
+    if get_tpu_version() < 7:
+      self.skipTest("Expect TPUv7+")
+    if not use_ep and subc_quant_wsz == 512:
+      self.skipTest("Each TP shard of w2 has k=256, under one 512 block.")
+    dtype = jnp.bfloat16
+    top_k = 8
+    num_experts = 128
+    hidden_size = 1024
+    intermediate_size = 1024
+    num_tokens = 8 * 32
+    self._test_moe(
+        dtype=dtype,
+        top_k=top_k,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_tokens=num_tokens,
+        seed=1234,
+        renormalize_topk_logits=False,
+        w_dtype=jnp.float4_e2m1fn,
+        subc_quant_wsz=subc_quant_wsz,
+        pack_weights=True,
+        use_ep=use_ep,
+    )
+
+  @parameterized.product(
+      num_tokens=[64, 1024, 8192],
+  )
+  def test_benchmark_dsv4_flash(self, num_tokens):
+    """DeepSeek-V4-Flash routed experts: fp4 packed in uint8, 512 blocks."""
+    if get_tpu_version() < 7:
+      self.skipTest("Expect TPUv7+")
+    self._test_moe(
+        dtype=jnp.bfloat16,
+        top_k=6,
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_tokens=num_tokens,
+        seed=54321,
+        renormalize_topk_logits=True,
+        w_dtype=jnp.float4_e2m1fn,
+        subc_quant_wsz=512,
+        pack_weights=True,
+        use_ep=True,
+        act_fn="silu_and_mul_with_clamp",
+        num_cores=8,
     )
 
   def test_bias(self):

@@ -634,16 +634,38 @@ def moe_intermediate_alignment() -> int:
 
 
 def _routing_gmm_vmem_bytes(
-    size_k: int, size_n: int, size_out_n: int, w_dtype, rows: int
+    size_k: int,
+    size_n: int,
+    size_out_n: int,
+    w_bits: int,
+    num_scale_blocks: int,
+    rows: int,
 ) -> int:
     """Upper bound on one routing_gmm call's VMEM. With no N/K tiling yet the
     whole K x N expert slab stays resident, double-buffered, next to
-    triple-buffered row tiles of x and out (see routing_moe TileConfig)."""
+    triple-buffered row tiles of x and out (see routing_moe TileConfig).
+    Block scales stay resident as f32 [num_blocks, N], double-buffered."""
     tile_m = min(256, rows)
-    w_bytes = 2 * size_k * size_n * jnp.dtype(w_dtype).itemsize
+    w_bytes = 2 * size_k * size_n * w_bits // 8
+    scale_bytes = (
+        2 * (-(num_scale_blocks // -8) * 8) * size_n * 4 if num_scale_blocks else 0
+    )
     xo_bytes = 3 * tile_m * (size_k + size_out_n) * jnp.dtype(jnp.bfloat16).itemsize
     acc_bytes = tile_m * size_n * jnp.dtype(jnp.float32).itemsize
-    return w_bytes + xo_bytes + acc_bytes
+    return w_bytes + scale_bytes + xo_bytes + acc_bytes
+
+
+def _routing_gmm_block_ok(size_k: int, w_scale: jax.Array, mxu_size: int) -> bool:
+    """Whether routing_gmm can step over k for this weight's scale blocks."""
+    num_blocks = w_scale.shape[1]
+    if size_k % num_blocks:
+        return False
+    block = size_k // num_blocks
+    if block == size_k:
+        return True
+    # Each k step must stay inside one weight block and one 512-row activation
+    # block, and a block narrower than the MXU leaves it underfed.
+    return block >= mxu_size and (block % 512 == 0 or 512 % block == 0)
 
 
 def can_use_routing_gmm(
@@ -661,34 +683,42 @@ def can_use_routing_gmm(
 ) -> bool:
     """Whether routing_moe's routing_gmm can serve this layer.
 
-    routing_gmm takes bf16 weights, or fp8 weights with one scale per output
-    channel, and quantizes activations to the weight dtype. It has no bias,
-    no packed or block-scaled weights, and no N/K tiling, so everything else
-    stays on gmm_v2.
+    routing_gmm takes bf16 weights, fp8 weights, or float4_e2m1fn weights
+    (native, or packed two per uint8 along K) with per-channel or block scales
+    along K, and quantizes activations to fp8 (A8W8 / A8W4). It has no bias and
+    no N/K tiling, so everything else stays on gmm_v2.
     """
-    if rhs_quant_dtype is not None or w1_bias is not None or w2_bias is not None:
+    if w1_bias is not None or w2_bias is not None:
         return False
     if activation not in _ROUTING_GMM_ACTIVATIONS:
         return False
     if hidden_states.dtype != jnp.bfloat16 or w1.dtype != w2.dtype:
         return False
     if w1.dtype == jnp.bfloat16:
-        if w1_scale is not None or w2_scale is not None:
+        if rhs_quant_dtype is not None or w1_scale is not None or w2_scale is not None:
             return False
-    elif w1.dtype == jnp.float8_e4m3fn:
-        # Per-channel scales only: [experts, 1, 1, N].
-        if w1_scale is None or w2_scale is None:
-            return False
-        if w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
-            return False
+        w_quant_dtype = None
+    elif w1.dtype == jnp.float8_e4m3fn and rhs_quant_dtype in (None, w1.dtype):
+        w_quant_dtype = w1.dtype
+    elif rhs_quant_dtype == jnp.float4_e2m1fn and w1.dtype in (
+        jnp.float4_e2m1fn,
+        jnp.uint8,
+    ):
+        w_quant_dtype = jnp.dtype(rhs_quant_dtype)
     else:
         return False
+    packing = get_packing_factor(w1.dtype, w_quant_dtype)
 
     _, size_k, size_n = w1.shape
+    size_k *= packing
     size_inter = size_n // 2
     # The compact layout packs two bf16 per 32-bit lane over 128 lanes, and
     # the gate/up output feeds w2 as is: no padded intermediate to trim.
-    if size_k % 256 or size_inter % 256 or w2.shape[1:] != (size_inter, size_k):
+    if (
+        size_k % 256
+        or size_inter % 256
+        or w2.shape[1:] != (size_inter // packing, size_k)
+    ):
         return False
 
     try:
@@ -696,14 +726,28 @@ def can_use_routing_gmm(
     except ValueError:
         # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
         return False
+
+    w1_blocks = w2_blocks = 0
+    if w_quant_dtype is not None:
+        if w1_scale is None or w2_scale is None:
+            return False
+        if not (
+            _routing_gmm_block_ok(size_k, w1_scale, tpu_info.mxu_column_size)
+            and _routing_gmm_block_ok(size_inter, w2_scale, tpu_info.mxu_column_size)
+        ):
+            return False
+        w1_blocks, w2_blocks = w1_scale.shape[1], w2_scale.shape[1]
+
     rows = hidden_states.shape[0] * topk
     # routing_gmm keeps per-row routing metadata in SMEM.
     if not 0 < rows <= int(0.45 * tpu_info.smem_capacity_bytes) // 4:
         return False
+    w_bits = jax.dtypes.itemsize_bits(w_quant_dtype or w1.dtype)
     vmem_budget = _ROUTING_GMM_VMEM_FRACTION * tpu_info.vmem_capacity_bytes
     return (
-        _routing_gmm_vmem_bytes(size_k, size_n, size_inter, w1.dtype, rows) <= vmem_budget
-        and _routing_gmm_vmem_bytes(size_inter, size_k, size_k, w2.dtype, rows)
+        _routing_gmm_vmem_bytes(size_k, size_n, size_inter, w_bits, w1_blocks, rows)
+        <= vmem_budget
+        and _routing_gmm_vmem_bytes(size_inter, size_k, size_k, w_bits, w2_blocks, rows)
         <= vmem_budget
     )
 
@@ -720,6 +764,7 @@ def routing_moe_gmm(
     activation: str,
     topk: int,
     skip_padded_tokens: bool,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
     """MoE through routing_gmm: the token gather is fused into the gate/up GMM
     and the scatter back to (token, k) order into the down GMM, so no separate
@@ -727,10 +772,12 @@ def routing_moe_gmm(
 
     ``topk_ids`` are local expert ids, negative for routes this shard does not
     own. Those rows sort into a sentinel group past the local experts, which
-    routing_gmm never processes.
+    routing_gmm never processes. ``rhs_quant_dtype`` is the logical dtype of
+    weights packed along K (float4_e2m1fn in uint8).
     """
     num_tokens, hidden_size = hidden_states.shape
     local_num_experts, padded_hidden_size, _ = w1.shape
+    padded_hidden_size *= get_packing_factor(w1.dtype, rhs_quant_dtype)
     topk_ids_flat = topk_ids.reshape(-1)
     if skip_padded_tokens:
         # Padded tokens carry zero routing weights; drop them from GMM work.
@@ -750,9 +797,15 @@ def routing_moe_gmm(
         group_sizes,
         gather_indices=sorted_rows // topk,
         fuse_act=activation,
+        w_quant_dtype=rhs_quant_dtype,
     )
     gmm2_res = routing_gmm(
-        gmm1_res, w2, w2_scale, group_sizes, scatter_indices=sorted_rows
+        gmm1_res,
+        w2,
+        w2_scale,
+        group_sizes,
+        scatter_indices=sorted_rows,
+        w_quant_dtype=rhs_quant_dtype,
     )
 
     rows = gmm2_res.reshape(routing_layout.to_large_shape(gmm2_res.shape))
@@ -889,6 +942,7 @@ def fused_moe_func(
             activation=activation,
             topk=topk,
             skip_padded_tokens=skip_padded_tokens,
+            rhs_quant_dtype=rhs_quant_dtype,
         )
 
     (

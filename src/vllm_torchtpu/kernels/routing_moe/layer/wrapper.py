@@ -21,6 +21,7 @@ from typing import Literal
 import jax
 from jax import numpy as jnp
 from jax import sharding
+from vllm_torchtpu.kernels.routing_moe.gmm import config as gmm_config
 from vllm_torchtpu.kernels.routing_moe.gmm import kernel as gmm
 from vllm_torchtpu.kernels.routing_moe.io_relayout import input_pack
 from vllm_torchtpu.kernels.routing_moe.io_relayout import output_reduce
@@ -59,6 +60,7 @@ def routing_moe_local(
     renormalize: bool,
     parallelism: Literal["tp", "ep"],
     use_sp: bool,
+    w_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
   """MPMD MoE function that invokes io kernels and routing gmm."""
 
@@ -119,8 +121,13 @@ def routing_moe_local(
       gather_indices=topk_argsort_indices // topk,
       fuse_act=activation,
       group_offset=group_offset,
+      w_quant_dtype=w_quant_dtype,
   )
-  gmm1_res = gmm1_res[:, : w2.shape[1]]  # trim to hidden size if padded
+  # Trim to w2's (unpacked) contraction size if padded.
+  w2_packing = gmm_config.get_packing_factor(
+      w2.dtype, w_quant_dtype if w2_scale is not None else None
+  )
+  gmm1_res = gmm1_res[:, : w2.shape[1] * w2_packing]
 
   # Step 6: Invoke GMM Down.
   gmm2_res = gmm.routing_gmm(
@@ -130,6 +137,7 @@ def routing_moe_local(
       group_sizes,
       scatter_indices=topk_argsort_indices,
       group_offset=group_offset,
+      w_quant_dtype=w_quant_dtype,
   )
 
   # Step 7: Postprocess outputs from routing gmm.
@@ -159,6 +167,7 @@ def routing_moe_local(
         "use_sp",
         "activation",
         "scoring_fn",
+        "w_quant_dtype",
     )
 )
 def routing_moe(
@@ -177,13 +186,16 @@ def routing_moe(
     activation: str,
     scoring_fn: str,
     use_sp: bool = False,
+    w_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
   """Route tokens in hidden_states into each experts based on routing.
 
   Args:
       hidden_states: [num_tokens, hidden_size]
-      w1: first moe weights [num_experts, hidden_size, intermediate_size * 2]
-      w2: second moe weights [num_experts, intermediate_size, hidden_size]
+      w1: first moe weights [num_experts, hidden_size, intermediate_size * 2],
+        with hidden_size divided by the packing factor when packed.
+      w2: second moe weights [num_experts, intermediate_size, hidden_size],
+        with intermediate_size divided by the packing factor when packed.
       w1_scale: w1 scale [num_experts, num_blocks, 1, intermediate_size * 2]
       w2_scale: w2 scale [num_experts, num_blocks, 1, hidden_size]
       w1_bias: optional bias of w1 [num_experts, 1, intermediate_size * 2]
@@ -196,6 +208,8 @@ def routing_moe(
       activation: activation function to perform on the output of w1.
       scoring_fn: scoring function to apply on gating_output.
       use_sp: use sequence parallelism.
+      w_quant_dtype: dtype the weights are quantized to, if narrower than
+        their storage dtype (e.g. float4_e2m1fn packed in uint8 along k).
 
   Returns:
       Output of moe operation [num_tokens, hidden_size]
@@ -249,6 +263,7 @@ def routing_moe(
           renormalize=renormalize,
           parallelism=parallelism,
           use_sp=use_sp,
+          w_quant_dtype=w_quant_dtype,
       ),
       mesh=mesh,
       in_specs=(

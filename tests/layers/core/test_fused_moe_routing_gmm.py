@@ -31,7 +31,7 @@ INTER = 768
 TOPK = 8
 
 _FAKE_TPU_INFO = types.SimpleNamespace(
-    smem_capacity_bytes=1 << 20, vmem_capacity_bytes=64 << 20
+    smem_capacity_bytes=1 << 20, vmem_capacity_bytes=64 << 20, mxu_column_size=256
 )
 
 
@@ -123,14 +123,57 @@ def test_routing_gmm_rejects_unsupported_layer(fake_tpu, overrides):
     assert not _can_use(*_weights(16), **overrides)
 
 
-def test_routing_gmm_rejects_unsupported_weights(fake_tpu):
+def _packed_fp4(num_experts, hidden, inter, block=512):
+    """DeepSeek-V4 GMM-path weights: e2m1 packed 2/uint8 along K, block scales."""
+    w1 = jax.ShapeDtypeStruct((num_experts, hidden // 2, 2 * inter), jnp.uint8)
+    w2 = jax.ShapeDtypeStruct((num_experts, inter // 2, hidden), jnp.uint8)
+    w1_scale = jax.ShapeDtypeStruct(
+        (num_experts, hidden // block, 1, 2 * inter), jnp.float32
+    )
+    w2_scale = jax.ShapeDtypeStruct(
+        (num_experts, inter // block, 1, hidden), jnp.float32
+    )
+    return w1, w2, w1_scale, w2_scale
+
+
+def test_routing_gmm_admits_block_scales_and_fp4(fake_tpu):
     # Block-scaled fp8: two K blocks per scale row.
     w1, w2 = _weights(16, jnp.float8_e4m3fn)
     w1_scale = jax.ShapeDtypeStruct((16, 2, 1, 2 * INTER), jnp.float32)
     w2_scale = jax.ShapeDtypeStruct((16, 1, 1, HIDDEN), jnp.float32)
+    assert _can_use(w1, w2, w1_scale, w2_scale)
+    # DeepSeek-V4-Flash routed experts (4096 x 2048) at EP8: 32 local experts.
+    hs = jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16)
+    fp4 = dict(hidden_states=hs, rhs_quant_dtype=jnp.float4_e2m1fn)
+    assert _can_use(*_packed_fp4(32, 4096, 2048), **fp4)
+    # The same values as native float4_e2m1fn.
+    w1, w2 = _weights(32, jnp.float4_e2m1fn, hidden=4096, inter=2048)
+    assert _can_use(w1, w2, *_packed_fp4(32, 4096, 2048)[2:], **fp4)
+
+
+def test_routing_gmm_rejects_unsupported_weights(fake_tpu):
+    # 128-row fp8 blocks are narrower than the MXU.
+    w1, w2 = _weights(16, jnp.float8_e4m3fn)
+    w1_scale = jax.ShapeDtypeStruct((16, HIDDEN // 128, 1, 2 * INTER), jnp.float32)
+    w2_scale = jax.ShapeDtypeStruct((16, 1, 1, HIDDEN), jnp.float32)
     assert not _can_use(w1, w2, w1_scale, w2_scale)
-    # fp4 weights would need fp4 activations.
+    # fp4 weights without scales or without their quant dtype.
     assert not _can_use(*_weights(16, jnp.float4_e2m1fn))
+    hs = jax.ShapeDtypeStruct((64, 4096), jnp.bfloat16)
+    assert not _can_use(*_packed_fp4(32, 4096, 2048), hidden_states=hs)
+    # NVFP4's 16-row blocks.
+    assert not _can_use(
+        *_packed_fp4(32, 4096, 2048, block=16),
+        hidden_states=hs,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    # DeepSeek-V4-Pro's 7168 x 2x3072 fp4 slab, double-buffered, overflows VMEM
+    # until routing_gmm tiles N/K.
+    assert not _can_use(
+        *_packed_fp4(24, 7168, 3072),
+        hidden_states=jax.ShapeDtypeStruct((64, 7168), jnp.bfloat16),
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
     # The gate/up output must feed w2 unpadded.
     w1, _ = _weights(16)
     _, w2 = _weights(16, inter=INTER - 256)
@@ -210,7 +253,9 @@ def _run_both_paths(monkeypatch, args, static):
     outputs = {}
     for enabled in (False, True):
         monkeypatch.setattr(fused_moe_gmm, "_ROUTING_GMM", enabled)
-        fn = jax.jit(functools.partial(fused_moe_gmm.fused_moe_func.__wrapped__, **static))
+        fn = jax.jit(
+            functools.partial(fused_moe_gmm.fused_moe_func.__wrapped__, **static)
+        )
         outputs[enabled] = np.asarray(fn(*args).astype(jnp.float32))
         # Traced once per arm: only the enabled arm may reach routing_gmm.
         assert len(routed) == int(enabled)
@@ -302,6 +347,73 @@ def test_routing_gmm_matches_gmm_v2(
         np.testing.assert_array_equal(actual[-8:], 0)
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens", [64, 512])
+@pytest.mark.parametrize("use_ep", [False, True], ids=["local", "ep"])
+def test_routing_gmm_packed_fp4_matches_gmm_v2(monkeypatch, num_tokens, use_ep):
+    """DeepSeek-V4's GMM-path fp4 weights (uint8-packed, 512 blocks): A8W4."""
+    _require_tpu()
+    if not fused_moe_gmm.routing_gmm_runtime_supported():
+        pytest.skip("routing_gmm needs jax >= 0.12.0.dev20261007, libtpu >= 0.0.50")
+    local_experts, hidden, inter, block = 16, 2048, 1024, 512
+    global_experts = 2 * local_experts if use_ep else local_experts
+    k = jax.random.split(jax.random.key(0), 4)
+    hidden_states = (
+        jax.random.normal(k[0], (num_tokens, hidden), jnp.float32) / 10
+    ).astype(jnp.bfloat16)
+    w1, w1_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(k[1], (local_experts, hidden, 2 * inter)) / 10, block
+    )
+    w2, w2_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(k[2], (local_experts, inter, hidden)) / 10, block
+    )
+    assert w1.dtype == jnp.uint8 and w1.shape == (local_experts, hidden // 2, 2 * inter)
+    logits = jax.random.normal(k[3], (num_tokens, global_experts), jnp.float32)
+    topk_weights, topk_ids = jax.lax.top_k(jax.nn.softmax(logits, axis=-1), TOPK)
+    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    experts_start = jnp.array(local_experts if use_ep else 0, jnp.int32)
+
+    args = (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        topk_weights,
+        topk_ids.astype(jnp.int32),
+        experts_start,
+    )
+    static = dict(
+        topk=TOPK,
+        activation="silu_and_mul_with_clamp",
+        use_ep=use_ep,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    assert fused_moe_gmm.can_use_routing_gmm(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        activation="silu_and_mul_with_clamp",
+        topk=TOPK,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+    expected, actual = _run_both_paths(monkeypatch, args, static)
+
+    assert np.abs(expected).max() > 0
+    # Both paths quantize fp8 activations per row and 512 block; accumulation
+    # order and precision differ.
+    rtol = 5e-2
+    np.testing.assert_allclose(
+        actual, expected, rtol=rtol, atol=rtol * float(np.abs(expected).max())
+    )
+
+
 def test_routing_gmm_pad_intermediate_defaults_on(monkeypatch):
     monkeypatch.delenv("TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE", raising=False)
     assert envs.environment_variables["TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE"]() is True
@@ -341,9 +453,13 @@ def _fp8_loader_weights(monkeypatch, pad, num_experts, inter, block_size=None):
 
 
 def test_fp8_loader_pads_tp8_shard_to_256(monkeypatch):
-    w1, s1, w2, s2 = _fp8_loader_weights(monkeypatch, pad=False, num_experts=2, inter=128)
+    w1, s1, w2, s2 = _fp8_loader_weights(
+        monkeypatch, pad=False, num_experts=2, inter=128
+    )
     assert w1.shape == (2, 4096, 256) and w2.shape == (2, 128, 4096)
-    w1, s1, w2, s2 = _fp8_loader_weights(monkeypatch, pad=True, num_experts=2, inter=128)
+    w1, s1, w2, s2 = _fp8_loader_weights(
+        monkeypatch, pad=True, num_experts=2, inter=128
+    )
     assert w1.shape == (2, 4096, 512) and s1.shape == (2, 1, 1, 512)
     assert w2.shape == (2, 256, 4096) and s2.shape == (2, 1, 1, 4096)
     # [gate | 0 | up | 0] and zero rows at the end of w2.
@@ -386,12 +502,28 @@ def test_padded_tp8_shard_routes_and_matches_gmm_v2(monkeypatch, fp8):
         pw1 = jnp.concatenate([w1[..., :inter], zeros, w1[..., inter:], zeros], -1)
         pw2 = jnp.pad(w2, ((0, 0), (0, 256 - inter), (0, 0)))
     assert not fused_moe_gmm.can_use_routing_gmm(
-        jax.ShapeDtypeStruct((num_tokens, 4096), jnp.bfloat16), w1, w2, s1, s2,
-        None, None, activation="silu", topk=topk, rhs_quant_dtype=None,
+        jax.ShapeDtypeStruct((num_tokens, 4096), jnp.bfloat16),
+        w1,
+        w2,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        topk=topk,
+        rhs_quant_dtype=None,
     )
     assert fused_moe_gmm.can_use_routing_gmm(
-        jax.ShapeDtypeStruct((num_tokens, 4096), jnp.bfloat16), pw1, pw2, ps1, ps2,
-        None, None, activation="silu", topk=topk, rhs_quant_dtype=None,
+        jax.ShapeDtypeStruct((num_tokens, 4096), jnp.bfloat16),
+        pw1,
+        pw2,
+        ps1,
+        ps2,
+        None,
+        None,
+        activation="silu",
+        topk=topk,
+        rhs_quant_dtype=None,
     )
 
     k = jax.random.split(jax.random.key(1), 2)
@@ -429,6 +561,8 @@ def test_fp8_loader_leaves_ep8_shard_unpadded(monkeypatch):
     """Qwen3.5-397B at EP=8 keeps whole 1024-wide experts: already a multiple
     of 256, so the pad flag changes nothing."""
     for pad in (False, True):
-        w1, s1, w2, s2 = _fp8_loader_weights(monkeypatch, pad, num_experts=2, inter=1024)
+        w1, s1, w2, s2 = _fp8_loader_weights(
+            monkeypatch, pad, num_experts=2, inter=1024
+        )
         assert w1.shape == (2, 4096, 2048) and s1.shape == (2, 1, 1, 2048)
         assert w2.shape == (2, 1024, 4096) and s2.shape == (2, 1, 1, 4096)
