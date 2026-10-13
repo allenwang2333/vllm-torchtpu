@@ -527,7 +527,10 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     )
     assert positions is chunk.position_ids
     assert gather_indices.cpu()[:2].tolist() == [1, 4]
-    assert gather_indices.cpu()[2:].eq(0).all()
+    # Padded to the loop bucket by repeating the last real index, so the seed
+    # scatter runs at the bucketed shape.
+    assert gather_indices.shape[0] == 16
+    assert gather_indices.cpu()[2:].eq(4).all()
 
 
 def test_propose_delegates_carry_aggregation_after_gather():
@@ -653,9 +656,8 @@ def test_prepare_draft_inputs_async_device(device):
 
     assert torch.equal(dev_ids, host_ids)
     # Gather-index real prefix matches (seed positions [2, 4]); the padded tail
-    # differs by pad convention (async zero-pads, sync repeats the last entry)
-    # and is sliced off by propose(), so compare only [:num_reqs].
-    assert torch.equal(dev_last.cpu()[:2], host_last.cpu()[:2])
+    # repeats the last entry on both paths and is sliced off by propose().
+    assert torch.equal(dev_last.cpu(), host_last.cpu())
     assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
 
 

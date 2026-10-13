@@ -1532,17 +1532,28 @@ class Eagle3Proposer:
             )
             gather_indices = last_token_indices
         else:
-            # Async / bootstrap: the seed scatter stays real [num_reqs] (its
-            # recompile is async-only); pad just the returned gather index.
+            # Async / bootstrap: the seed values live on device, so pad them to
+            # [p] on device by repeating the last real entry (the same
+            # idempotent re-write as the sync path). Left at [num_reqs], the
+            # scatter compiled once per (len(input_ids), num_reqs) pair in the
+            # middle of serving; the pad is keyed on (num_reqs, p) only.
+            if p > num_reqs:
+                fill = p - num_reqs
+                if next_tokens_device is not None:
+                    last_token_indices = torch.cat(
+                        (last_token_indices, last_token_indices[-1:].expand(fill))
+                    )
+                else:
+                    lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
+                    lti_p_np[:num_reqs] = last_token_indices_np
+                    last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
+                next_token_ids = torch.cat(
+                    (next_token_ids, next_token_ids[-1:].expand(fill))
+                )
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
-            if next_tokens_device is not None:
-                gather_indices = _maybe_pad_dim0(last_token_indices, p)
-            else:
-                padded_lti_np = np.zeros(p, dtype=np.int64)
-                padded_lti_np[:num_reqs] = last_token_indices_np
-                gather_indices = torch.from_numpy(padded_lti_np).to(runner.device)
+            gather_indices = last_token_indices
 
         draft_input_ids, gather_indices = (
             chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
