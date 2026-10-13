@@ -59,13 +59,27 @@ def pack_rows(rows: np.ndarray, majors: int | None = None) -> np.ndarray:
     per_major = TILES_PER_MAJOR * rows_per_tile(row_bytes)
     majors = num_majors(num_rows, row_bytes) if majors is None else majors
     assert majors * per_major >= num_rows, (majors, per_major, num_rows)
-    words = np.zeros((majors * per_major, w), dtype=np.int32)
-    words[:num_rows] = np.ascontiguousarray(rows).view(np.int32)
-    return np.ascontiguousarray(
-        words.reshape(majors, TILES_PER_MAJOR, SUBLANES, per_sub, w)
-        .transpose(0, 2, 1, 3, 4)
-        .reshape(majors, SUBLANES, MAJOR_LANES)
-    )
+    src = np.ascontiguousarray(rows).view(np.int32)
+    out = np.empty((majors, SUBLANES, MAJOR_LANES), dtype=np.int32)
+    full_majors = num_rows // per_major
+    if full_majors:
+        out[:full_majors] = (
+            src[: full_majors * per_major]
+            .reshape(full_majors, TILES_PER_MAJOR, SUBLANES, per_sub, w)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(full_majors, SUBLANES, MAJOR_LANES)
+        )
+    if full_majors < majors:
+        rem = num_rows - full_majors * per_major
+        tail = np.zeros(((majors - full_majors) * per_major, w), dtype=np.int32)
+        if rem:
+            tail[:rem] = src[full_majors * per_major : num_rows]
+        out[full_majors:] = (
+            tail.reshape(majors - full_majors, TILES_PER_MAJOR, SUBLANES, per_sub, w)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(majors - full_majors, SUBLANES, MAJOR_LANES)
+        )
+    return out
 
 
 def _gather_kernel(majors_per_chunk, tile_ref, *refs):
@@ -81,8 +95,8 @@ def _gather_kernel(majors_per_chunk, tile_ref, *refs):
 
     def start(i, carry):
         tile = tile_ref[i]
-        major = tile // TILES_PER_MAJOR
-        lanes = pl.multiple_of((tile % TILES_PER_MAJOR) * LANES, LANES)
+        major = tile >> 3
+        lanes = pl.multiple_of((tile & (TILES_PER_MAJOR - 1)) * LANES, LANES)
         if len(chunk_refs) == 1:
             copy(i, 0, major, lanes).start()
         else:
@@ -118,9 +132,11 @@ def select_rows(tiles: jax.Array, slot: jax.Array, row_bytes: int) -> jax.Array:
     w = row_words(row_bytes)
     num_slots = SUBLANES * (LANES // w)
     sub_rows = tiles.reshape(tiles.shape[0], num_slots, w)
+    slot_i32 = slot if slot.dtype == jnp.int32 else slot.astype(jnp.int32)
+    if tiles.shape[0] > 1024:
+        return jnp.take_along_axis(sub_rows, slot_i32[:, None, None], axis=1)[:, 0, :]
     mask = (
-        jnp.arange(num_slots, dtype=jnp.int32)[None, :, None]
-        == slot.astype(jnp.int32)[:, None, None]
+        jnp.arange(num_slots, dtype=jnp.int32)[None, :, None] == slot_i32[:, None, None]
     )
     return jnp.sum(jnp.where(mask, sub_rows, 0), axis=1, dtype=tiles.dtype)
 
@@ -135,11 +151,12 @@ def gather_rows_jax(
     ``interpret`` runs the Pallas interpreter (CPU tests).
     """
     per_tile = rows_per_tile(row_bytes)
+    tile_shift = per_tile.bit_length() - 1
     per_chunk = chunks[0].shape[0]
     assert all(c.shape[0] == per_chunk for c in chunks[:-1]), [c.shape for c in chunks]
     assert chunks[-1].shape[0] <= per_chunk, [c.shape for c in chunks]
     n = rows.shape[0]
-    rows = rows.astype(jnp.int32)
+    rows = rows if rows.dtype == jnp.int32 else rows.astype(jnp.int32)
     gathered = pl.pallas_call(
         functools.partial(_gather_kernel, per_chunk),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -152,8 +169,8 @@ def gather_rows_jax(
         out_shape=pltpu.HBM((n, SUBLANES, LANES), jnp.int32),
         name="host_row_gather",
         interpret=interpret,
-    )(rows // per_tile, *chunks)
-    return select_rows(gathered, rows % per_tile, row_bytes)
+    )(rows >> tile_shift, *chunks)
+    return select_rows(gathered, rows & (per_tile - 1), row_bytes)
 
 
 INVALID_SCALE = 255
@@ -172,18 +189,21 @@ def dequant_fp8_rows_jax(
     (subnormal ``2**-127``) flushes to 0, and ``invalid_scale`` (255) maps the
     entire block to ``+0.0`` even if the raw FP8 byte is NaN.
     """
-    values = (
-        jax.lax.bitcast_convert_type(raw, jnp.float8_e4m3fn)
-        .reshape(raw.shape[0], scale.shape[1], block_size)
-        .astype(jnp.float32)
+    scale_i32 = scale.astype(jnp.int32)
+    valid_block = scale_i32 != invalid_scale
+    raw_blocks = jnp.where(
+        valid_block[..., None],
+        raw.reshape(raw.shape[0], scale.shape[1], block_size // 4),
+        jnp.int32(0),
     )
-    power = jax.lax.bitcast_convert_type(scale.astype(jnp.int32) << 23, jnp.float32)
-    invalid = (scale == invalid_scale)[..., None]
-    return (
-        jnp.where(invalid, 0.0, values * power[..., None])
-        .reshape(raw.shape[0], -1)
+    values = (
+        jax.lax.bitcast_convert_type(raw_blocks, jnp.float8_e4m3fn)
+        .reshape(raw.shape[0], scale.shape[1], block_size)
         .astype(jnp.bfloat16)
     )
+    scale_bits = jnp.where(valid_block, scale_i32 << 23, jnp.int32(0))
+    power = jax.lax.bitcast_convert_type(scale_bits, jnp.float32).astype(jnp.bfloat16)
+    return (values * power[..., None]).reshape(raw.shape[0], -1)
 
 
 def lookup_and_dequant_rows_jax(
@@ -204,6 +224,7 @@ def lookup_and_dequant_rows_jax(
     host DMA on the same ``rows`` operand.
     """
     rows, valid = jax.lax.optimization_barrier((rows, valid))
+    rows = rows if rows.dtype == jnp.int32 else rows.astype(jnp.int32)
     raw = gather_rows_jax(rows, *chunks, row_bytes=row_bytes, interpret=interpret)
     raw, rows, valid = jax.lax.optimization_barrier((raw, rows, valid))
     scale = jnp.take(weight_scale_inv, rows, axis=0)
