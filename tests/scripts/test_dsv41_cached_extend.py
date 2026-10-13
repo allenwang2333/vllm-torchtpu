@@ -64,20 +64,20 @@ def fixture():
     ranks = []
     for rank in range(8):
         steps = []
-        start = 65408
+        start = SCENARIO.prefix_tokens - 128
         for index in range(9):
-            end = min(start + 2044, 81920)
+            end = min(start + 2044, SCENARIO.prefix_tokens + SCENARIO.extend_tokens)
             stage = dict(
                 stage="encoder",
                 phase="prefill",
                 starts=[start],
                 ends=[end],
-                prompts=[81920],
+                prompts=[SCENARIO.prefix_tokens + SCENARIO.extend_tokens],
                 requests=1,
                 rows=end - start,
                 padded_rows=2048,
                 forward_id=index + 1,
-                **token_counts([start], [end], 65536),
+                **token_counts([start], [end], SCENARIO.prefix_tokens),
             )
             steps.append(
                 dict(
@@ -130,8 +130,8 @@ class CaptureTest(unittest.TestCase):
     def test_decoder_uses_encoder_snapshot_and_removes_padding(self):
         metadata = SimpleNamespace(
             query_start_loc_cpu=(0, 384, 384),
-            seq_lens_cpu=(65536, 0),
-            prompt_lens_cpu=(65536, 0),
+            seq_lens_cpu=(SCENARIO.prefix_tokens, 0),
+            prompt_lens_cpu=(SCENARIO.prefix_tokens, 0),
         )
         context = SimpleNamespace(attn_metadata={"attention": metadata})
         recorder = SimpleNamespace(
@@ -174,9 +174,9 @@ class CaptureTest(unittest.TestCase):
             }
             worker._stage_wrapper(original, "decoder")(stage, None, positions)
         encoder, decoder = recorder.stages
-        self.assertEqual(encoder["starts"], [65152])
-        self.assertEqual(decoder["starts"], [65408])
-        self.assertEqual(decoder["ends"], [65536])
+        self.assertEqual(encoder["starts"], [SCENARIO.prefix_tokens - 384])
+        self.assertEqual(decoder["starts"], [SCENARIO.prefix_tokens - 128])
+        self.assertEqual(decoder["ends"], [SCENARIO.prefix_tokens])
         self.assertEqual(decoder["rows"], 128)
         self.assertEqual(decoder["requests"], 1)
         self.assertEqual(decoder["phase"], "prefill")

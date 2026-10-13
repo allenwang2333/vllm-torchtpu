@@ -4,11 +4,13 @@ This harness qualifies `encoder_extend` on one v7x host: four physical chips,
 eight logical devices, TP1/DP8/EP8/PP1. It observes normal serving completion;
 it adds no device synchronization and never calls `get_output()` early.
 
-The workload uses eight distinct 65536-token cached prefixes, 16384 new input
+The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. Compile buckets are `[128,256,2048]`.
+than capped at 4 GiB. Compile buckets are `[128,256,2048]`. The server uses the model's default
+context limit; it does not cap `max_model_len` to this benchmark's 114688-token
+input. The 96K prefix and 16K extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
 measured budget (1 GiB at 32–64 GiB), before the RoPE companion reserve.
 This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
@@ -34,11 +36,11 @@ LongBench-v2 dataset:
 python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --dataset /path/to/longbench-v2.json \
   --tokenizer /models/DeepSeek-V4.1-Flash \
-  --out /path/to/dsv41-code-c128.json
+  --out /path/to/dsv41-code-96k-c128.json
 ```
 
 The client verifies the frozen input SHA256:
-`865b183381ae43367214d9dd0870f94c578b3d581e613ddc7872d1e48f391a11`.
+`9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064`.
 The first eight deterministic code windows are used for this scenario. They
 have distinct prefixes, but come from adjacent windows of the same document;
 they are not eight unrelated documents. Prime requests branch immediately
@@ -59,7 +61,7 @@ server. Reserve port 8000 and use fresh output directories.
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 export ARTIFACT_LOCAL_DIR=/path/to/artifacts
 python scripts/dsv41_bench/server_steps/run.py \
-  --input /path/to/dsv41-code-c128.json \
+  --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-cold \
   --cache-dir /path/to/persistent-cache/candidate \
   --cache-mode cold --rounds 5 --profile
@@ -79,7 +81,7 @@ buckets and cache directory, with a new result directory:
 
 ```bash
 python scripts/dsv41_bench/server_steps/run.py \
-  --input /path/to/dsv41-code-c128.json \
+  --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-reuse \
   --cache-dir /path/to/persistent-cache/candidate \
   --cache-mode reuse --rounds 5
@@ -116,7 +118,7 @@ The server must use the same DP8 configuration as `run.py`.
 - Also report aggregate encoder throughput including first and tail steps;
   an asynchronous boundary can shift work from middle to tail. Do not label
   middle cadence as client request throughput or isolated decode capacity.
-- Each formal round must complete all eight requests, hit 524288 cached
+- Each formal round must complete all eight requests, hit 786432 cached
   tokens, have zero preemptions, and contain no compilation. Invalid shapes,
   missing ranks, interrupted windows and inconsistent counters fail closed.
 
@@ -141,57 +143,85 @@ responses, metrics, raw worker records and startup logs. `run.py` also writes
 `startup-phases.json` automatically. Memory monitoring used during the original
 investigation is not part of this benchmark entry point.
 
-## Recorded validation: 2026-10-13
+## Validated 96K scenario: 2026-10-13
 
-Production source `ce69313ec`; all 366 tracked production files on the benchmark
-host matched the submitted source. The four-bucket baseline uses the same
-rounded-KV source with only the launch buckets restored to `[16,128,256,2048]`. Both cold
-runs use independent empty caches; restart reuses the three-bucket cache.
+The reference workload is 96K cached prefix + 16K new input, with the model's
+1048576-token serving limit, automatic KV allocation, and three compile buckets.
+The historical 64K workload used an 82944-token serving limit and is not a
+matched performance baseline.
 
-| Case | Ready (s) | Engine init (s) | Logged compilation (s) | FX compiles | Artifact loads |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Rounded KV, four buckets, cold | 1683.17 | 1023.10 | 910.47 | 80 | 0 |
-| Rounded KV, three buckets, cold | 1479.24 | 825.46 | 713.98 | 64 | 0 |
-| Same three-bucket cache, restart | 1045.10 | 194.60 | 156.70 | 0 | 64 |
+At the default 1M limit, the original full-query indexer materialized an
+8-GiB FP32 score buffer before masking/top-k copies. Startup failed with a
+31.40-GiB decoder temporary region. The bounded implementation completes
+score/top-k selection in query tiles. The optimized implementation additionally
+uses 65536 compressed key columns and 128 query rows when active lengths fit;
+longer contexts retain the full-width, 32-query fallback. Candidate publication
+and filtering keep their existing contracts. This changes internal working
+shapes, not the serving context limit or KV budget.
 
-Removing the 16-token bucket reduced serving main graphs from 64 to 48
-(80 to 64 FX compiles including initial profiling), logged compilation by 21.6%,
-and launch-to-ready by 12.1%. Restart loaded all 64 artifacts with zero new FX
-compiles; cache inventory stayed at 162 files / 20,687,965,159 bytes. Logged
-compilation includes cache replay/backend warmup and is not pure XLA time.
-Engine initialization fell from 825.46 to 194.60 seconds on restart. Model
-loading varies between runs, so the ready-time gain is smaller.
+### Reproduction
 
-All 24 rank-start observations had the same capacity: 6,575,165 tokens per rank,
-from a 32-GiB budget including RoPE. This retains the two-bank path. Bin crossings
-still change shapes and trigger recompilation; cache-key checks remain intact.
+Use the preparation and cold-run commands above. For separate serving/client
+processes (without the cold-cache startup audit):
 
-| Case | Middle host tokens/s | Whole encoder-window tokens/s |
+```bash
+# Terminal 1: serve with benchmark observations enabled.
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPATH}"
+TP=1 DP=8 CHUNK=2048 MAX_SEQS=1 KV_BYTES=auto \
+  bash scripts/dsv41_bench/serve_cached_prefill.sh \
+  --worker-extension-cls server_step_worker.ServerStepWorker
+
+# Terminal 2: after /health returns success.
+python scripts/dsv41_bench/server_steps/bench_cached_extend.py client \
+  --input /path/to/dsv41-code-96k-c128.json \
+  --out /path/to/results/client --rounds 5
+```
+
+Measured source: bounded baseline `c88845921`, optimized `ebbc20148`, both
+based on `c4f20a56e`. Both use one four-chip v7x host (eight logical devices),
+TP1/DP8/EP8, BF16 execution with FP8 KV, CED, CPU Engram offload and DSpark K5.
+Runtime: torch 2.13.0+cpu, torch-tpu 0.1.1.dev20260924085621,
+JAX/JAXLIB 0.10.2, libtpu 0.0.47, and vLLM revision
+`e37e51dd246cf421c554e7d6f53e178e3fd29085`.
+
+### Results
+
+| Metric | Bounded baseline | Context bucket + query tile 128 |
 | --- | ---: | ---: |
-| Rounded KV, four buckets, cold | 108,588 | 88,346 |
-| Rounded KV, three buckets, cold | 107,272 | 87,447 |
-| Same three-bucket cache, restart | 107,377 | 87,114 |
+| Middle host-observed tokens/s | 64264.96 | 84609.21 (+31.7%) |
+| Middle host interval median (ms) | 287.81 | 218.90 |
+| Complete encoder device median (ms) | 283.76 | 213.74 (-24.7%) |
+| Device-equivalent new-input tokens/s | 57626.02 | 76503.70 |
+| All observed encoder steps, tokens/s | 50320.88 | 64348.47 |
+| Cold HTTP readiness (s) | 1253.06 | 1463.08 |
+| Maximum engine initialization (s) | 896.11 | 905.50 |
+| Maximum logged compilation (s) | 784.22 | 794.28 |
+| Encoder / 2048 temporary HBM (GiB) | 5.33 | 5.34 |
+| Decoder / 2048 temporary HBM (GiB) | 5.47 | 5.47 |
 
-Each case passed five formal rounds / 35 middle samples, with 524288 prefix hits
-per round, zero preemptions and no compiler events after readiness, including
-prime/warmup. All 40 outputs from each three-bucket start matched the four-bucket
-baseline; the baseline also matched the preceding unrounded-KV candidate.
-These are single-token consistency checks, not long-generation accuracy tests.
-Cgroup OOM counters stayed at zero.
+Each run has five unprofiled rounds and 35 middle chunks. Each round completes
+all eight requests, records 786432 prefix hits and zero preemptions, and passes
+the no-compilation audit. Host cadence is not client request throughput.
+The separate rank-0 profiles contain four baseline and five optimized complete
+encoder chunks, with 20 MoE calls each; capture-boundary partial chunks are
+excluded. Each full chunk accounts for 16352 new input tokens across the node.
+Startup and compilation scopes overlap and must not be summed. Startup is one
+observation per version; the larger total startup increase is outside the logged
+compilation scope. Compiled temporary HBM is not total process HBM.
 
-A separate restart profile contains 6 complete rank-0 encoder graphs with
-20 MoE calls each. Median device time is **160.851 ms**, versus the previous
-160.690 ms (about 0.1% difference). At 16352 useful tokens per step, its normalized
-device-equivalent rate is **101,659 tokens/s**. Profiled rounds are
-excluded from host throughput. The roughly 1% lower host cadence does not prove
-a device-speed change; there is only one startup/profile observation per case.
-Neither metric independently qualifies serving capacity or steady decode.
+### Validation limits
 
-Falcon experiment: `exp-hyxe77erhh`, results subtree `pr1848-startup`;
-device analysis: `an-1fughtzu5e` (`topk-census.json`).
-The new budget test and seven consolidated harness tests pass, as do pre-commit
-checks. Full-dependency type checking retains the previous 61 diagnostics,
-with no added or removed diagnostics; this is not a clean full type-check pass.
+The related attention kernel module passes 55 CPU tests, including query-tile,
+bank, bucket-boundary and long-context fallback cases. Full serving completed
+with the production context limit and automatic KV allocation.
+
+Numerical equivalence is not established: a TPU microtest at compressed length
+54269 found 138 differing selected-index positions out of 1048576 (0.0132%).
+This difference was not investigated in this performance-focused run. The
+benchmark's single output token does not establish model accuracy. Long-context
+TPU fallback accuracy, TP>1, steady decode and mixed workloads remain unqualified;
+no performance or accuracy claim is made for those modes.
 
 ## Steady decode (C384)
 
