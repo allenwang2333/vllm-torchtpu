@@ -31,15 +31,18 @@ IDs before the kernel runs, which keeps in-place donation and aliasing.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
+import jax
 import torch
 
 from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+_tpu_block_size_utils: Any = None
 
 
 def unified_block_major_enabled(vllm_config: VllmConfig) -> bool:
@@ -50,11 +53,15 @@ def unified_block_major_enabled(vllm_config: VllmConfig) -> bool:
     for hybrid models on the unified KV layout when `VLLM_TPU_BLOCK_MAJOR_KV`
     is set; dense models retain per-layer caches and the dense block-major bundle.
     """
-    if not envs.VLLM_TPU_BLOCK_MAJOR_KV:
+    if not envs.VLLM_TPU_BLOCK_MAJOR_KV or not vllm_config.model_config.is_hybrid:
         return False
-    from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+    global _tpu_block_size_utils
+    if _tpu_block_size_utils is None:
+        import vllm_torchtpu.platforms.tpu_block_size_utils as _mod
 
-    return unified_kv_layout_enabled(vllm_config) and vllm_config.model_config.is_hybrid
+        _tpu_block_size_utils = _mod
+
+    return _tpu_block_size_utils.unified_kv_layout_enabled(vllm_config)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +79,11 @@ class BlockMajorPoolLayout:
     num_pools: int
     split: int
     pool_index_by_layer: Mapping[str, int]
+    rows_per_block: int = field(init=False, repr=False, compare=False)
 
-    @property
-    def rows_per_block(self) -> int:
+    def __post_init__(self) -> None:
         """Total kernel blocks per scheduler block row (`shape[1]`)."""
-        return self.num_pools * self.split
+        object.__setattr__(self, "rows_per_block", self.num_pools * self.split)
 
 
 def kernel_view(pool):
@@ -87,8 +94,13 @@ def kernel_view(pool):
     blocks along dim 0. Operates on both JAX and PyTorch tensors and compiles
     to a zero-copy bitcast on the donated buffer.
     """
+    if isinstance(pool, torch.Tensor):
+        return pool.flatten(0, 1)
     shape = pool.shape
-    return pool.reshape((shape[0] * shape[1], *shape[2:]))
+    new_shape = (shape[0] * shape[1], *shape[2:])
+    if isinstance(pool, jax.Array):
+        return jax.lax.reshape(pool, new_shape)
+    return pool.reshape(new_shape)
 
 
 def flat_manager_ids(
@@ -97,7 +109,8 @@ def flat_manager_ids(
     """Maps region-local manager block IDs to flat row indices in the merged pool."""
     if num_pools == 1:
         return ids
-    return ids * num_pools + pool_index
+    out = ids * num_pools
+    return out.add_(pool_index) if pool_index else out
 
 
 def flat_kernel_ids(
@@ -113,5 +126,10 @@ def flat_kernel_ids(
     if num_pools == 1:
         return ids
     if split == 1:
-        return ids * num_pools + pool_index
-    return ids + (ids // split) * ((num_pools - 1) * split) + (pool_index * split)
+        out = ids * num_pools
+        return out.add_(pool_index) if pool_index else out
+    if split & (split - 1) == 0:
+        out = torch.add(ids, ids & (-split), alpha=num_pools - 1)
+    else:
+        out = torch.add(ids, ids // split, alpha=(num_pools - 1) * split)
+    return out.add_(pool_index * split) if pool_index else out
