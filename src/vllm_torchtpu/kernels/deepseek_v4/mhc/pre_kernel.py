@@ -21,19 +21,30 @@ from jax.experimental import pallas as pl
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+_DOT_DN = (((1,), (1,)), ((), ()))
+
+
+def _token_index_map(i):
+    return (i, 0)
+
+
+def _zero_index_map(i):
+    return (0, 0)
+
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
     """3-pass exact GEMM: x is bf16 (its low chunks are zero), so three
     bf16 passes against the resident fn chunks reproduce HIGHEST. The
     dimension numbers contract x dim 1 with fn dim 1 (i.e. x @ fn.T) so
     fn needs no transpose on the host side."""
-    dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(x, fn_hi_ref[...], dn, preferred_element_type=jnp.float32)
-    acc = acc + jax.lax.dot_general(
-        x, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+    acc = jax.lax.dot_general(
+        x, fn_hi_ref[...], _DOT_DN, preferred_element_type=jnp.float32
     )
     acc = acc + jax.lax.dot_general(
-        x, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+        x, fn_mid_ref[...], _DOT_DN, preferred_element_type=jnp.float32
+    )
+    acc = acc + jax.lax.dot_general(
+        x, fn_lo_ref[...], _DOT_DN, preferred_element_type=jnp.float32
     )
     return acc
 
@@ -132,19 +143,19 @@ def mhc_pre_mixes(
 
     compiler_params = utils.compiler_params(vmem_limit_bytes)
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    resident = pl.BlockSpec((hc_mult3, hc_hidden), _zero_index_map)
     mixes, sqrsum = pl.pallas_call(
         _mixes_kernel,
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_hidden), _token_index_map),
             resident,
             resident,
             resident,
         ],
         out_specs=[
-            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
-            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult3), _token_index_map),
+            pl.BlockSpec((tb, 1), _token_index_map),
         ],
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, hc_mult3), jnp.float32),
@@ -214,7 +225,7 @@ def mhc_pre_mixes_collapse(
 
     compiler_params = utils.compiler_params(vmem_limit_bytes)
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    resident = pl.BlockSpec((hc_mult3, hc_hidden), _zero_index_map)
     mixes, sqrsum, layer2d = pl.pallas_call(
         functools.partial(
             _mixes_collapse_kernel,
@@ -225,17 +236,17 @@ def mhc_pre_mixes_collapse(
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_hidden), _token_index_map),
             resident,
             resident,
             resident,
-            pl.BlockSpec((1, 3), lambda i: (0, 0)),
-            pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
+            pl.BlockSpec((1, 3), _zero_index_map),
+            pl.BlockSpec((1, hc_mult3), _zero_index_map),
         ],
         out_specs=[
-            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
-            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_mult3), _token_index_map),
+            pl.BlockSpec((tb, 1), _token_index_map),
+            pl.BlockSpec((tb, hidden_size), _token_index_map),
         ],
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, hc_mult3), jnp.float32),
@@ -246,6 +257,53 @@ def mhc_pre_mixes_collapse(
     )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
     return utils.trim_to(num_tokens, mixes, sqrsum, layer2d)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "outer_shape",
+        "hc_mult",
+        "hidden_size",
+        "rms_eps",
+        "hc_pre_eps",
+        "hc_sinkhorn_eps",
+        "hc_post_mult_value",
+        "sinkhorn_repeat",
+    ),
+    inline=True,
+)
+def _pre_gates_epilogue(
+    mixes: jax.Array,
+    sqrsum: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    outer_shape: tuple[int, ...],
+    hc_mult: int,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array]:
+    _, post_mix, comb_mix = utils.mhc_pre_gates(
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return (
+        post_mix.reshape(*outer_shape, hc_mult, 1),
+        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
+    )
 
 
 def mhc_pre(
@@ -277,7 +335,11 @@ def mhc_pre(
 
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
-    x2d = residual.reshape(-1, hc_mult * hidden_size)
+    x2d = (
+        residual.reshape(outer_shape[0], hc_mult * hidden_size)
+        if len(outer_shape) == 1
+        else residual.reshape(-1, hc_mult * hidden_size)
+    )
 
     mixes, sqrsum, layer2d = mhc_pre_mixes_collapse(
         x2d,
@@ -289,22 +351,21 @@ def mhc_pre(
         token_block_size=token_block_size,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    _, post_mix, comb_mix = utils.mhc_pre_gates(
+    post_mix, comb_mix = _pre_gates_epilogue(
         mixes,
         sqrsum,
-        hc_mult,
-        hidden_size,
         hc_scale,
         hc_base,
+        outer_shape,
+        hc_mult,
+        hidden_size,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
     )
-
-    return (
-        post_mix.reshape(*outer_shape, hc_mult, 1),
-        comb_mix.reshape(*outer_shape, hc_mult, hc_mult),
-        layer2d.reshape(*outer_shape, hidden_size),
+    layer_out = (
+        layer2d if len(outer_shape) == 1 else layer2d.reshape(*outer_shape, hidden_size)
     )
+    return post_mix, comb_mix, layer_out
