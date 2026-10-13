@@ -157,6 +157,20 @@ VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH_OVERRIDE:-$VLLM_COMMIT_HASH}"
 buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
 echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
 
+TORCH_TPU_WHEEL_GCS_URI="${TORCH_TPU_WHEEL_GCS_URI:-${WHEEL_GCS_URL:-${WHEEL_GCS_PATH:-}}}"
+if [[ -n "${TORCH_TPU_WHEEL_GCS_URI}" ]]; then
+  export TORCH_TPU_WHEEL_GCS_URI
+  buildkite-agent meta-data set "TORCH_TPU_WHEEL_GCS_URI" "${TORCH_TPU_WHEEL_GCS_URI}"
+  echo "Using torch-tpu wheel override: ${TORCH_TPU_WHEEL_GCS_URI}"
+  buildkite-agent annotate --style info --context torch-tpu-wheel-override \
+    "Overriding \`torch-tpu\` wheel from: \`${TORCH_TPU_WHEEL_GCS_URI}\`"
+fi
+if [[ -n "${TORCH_TPU_OVERRIDE_SOURCE:-}" ]]; then
+  export TORCH_TPU_OVERRIDE_SOURCE
+  buildkite-agent meta-data set "TORCH_TPU_OVERRIDE_SOURCE" "${TORCH_TPU_OVERRIDE_SOURCE}"
+  echo "Using torch-tpu override source: ${TORCH_TPU_OVERRIDE_SOURCE}"
+fi
+
 # Since Buildkite prepends uploaded steps (inserts in reverse order),
 # uploading the test steps first and build steps last ensures they
 # are displayed and queued in correct order: Build -> Tests.

@@ -32,10 +32,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
-#Resolve and publish Version Metadata for developer pipeline
-VLLM_COMMIT_HASH=$(get_vllm_commit_hash)
+# Resolve and publish Version Metadata for developer pipeline
+VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH_OVERRIDE:-$(get_vllm_commit_hash)}"
 buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
 echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
+
+TORCH_TPU_WHEEL_GCS_URI="${TORCH_TPU_WHEEL_GCS_URI:-${WHEEL_GCS_URL:-${WHEEL_GCS_PATH:-}}}"
+if [[ -n "${TORCH_TPU_WHEEL_GCS_URI}" ]]; then
+  export TORCH_TPU_WHEEL_GCS_URI
+  buildkite-agent meta-data set "TORCH_TPU_WHEEL_GCS_URI" "${TORCH_TPU_WHEEL_GCS_URI}"
+  echo "Using torch-tpu wheel override: ${TORCH_TPU_WHEEL_GCS_URI}"
+  buildkite-agent annotate --style info --context torch-tpu-wheel-override \
+    "Overriding \`torch-tpu\` wheel from: \`${TORCH_TPU_WHEEL_GCS_URI}\`"
+fi
+if [[ -n "${TORCH_TPU_OVERRIDE_SOURCE:-}" ]]; then
+  export TORCH_TPU_OVERRIDE_SOURCE
+  buildkite-agent meta-data set "TORCH_TPU_OVERRIDE_SOURCE" "${TORCH_TPU_OVERRIDE_SOURCE}"
+  echo "Using torch-tpu override source: ${TORCH_TPU_OVERRIDE_SOURCE}"
+fi
+
+# Allow running the full CI suite (or selected CI_LANES) from the dev pipeline
+# when RUN_FULL_SUITE=1 or CI_LANES is specified without a custom DEV_PIPELINE_FILE.
+if [[ "${RUN_FULL_SUITE:-0}" == "1" || ( -n "${CI_LANES:-}" && -z "${DEV_PIPELINE_FILE:-}" ) ]]; then
+  echo "--- Delegating to full CI bootstrap (bootstrap.sh)"
+  exec bash "${SCRIPT_DIR}/bootstrap.sh"
+fi
 
 # Dev builds are experiments — they must never outrank real CI on a shared
 # queue. Default to PRIORITY_DEFAULT (1); override per build with
