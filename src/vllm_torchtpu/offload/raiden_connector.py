@@ -66,6 +66,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestOffloadState,
+    SchedulerOffloadConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
@@ -81,6 +83,8 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    ReqContext,
+    get_offload_group_idx,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -189,6 +193,80 @@ class _ParkedStore:
     acks: int = 0
 
 
+class WindowCheckpointPolicy:
+    """Which sliding-window / state chunks are worth a host block.
+
+    A windowed group serves a hit at boundary B through its `window` chunks
+    ending at B, plus, for an EAGLE/MTP group, the chunk starting at B (the
+    lookup peeks one chunk past the boundary and drops it). vLLM offloads
+    such chunks for every full-attention chunk boundary. This admits only
+    the boundaries a later request can plausibly stop at: the request's
+    replay boundary (the last boundary before its final prompt token, where
+    the next turn of a conversation resumes) and, with `interval` > 0, every
+    `interval` tokens. Full-attention chunks are always admitted.
+    """
+
+    def __init__(self, config: SchedulerOffloadConfig, interval: int):
+        full_chunk_tokens = {
+            group.tokens_per_chunk
+            for group in config.kv_group_configs
+            if group.sliding_window_size_in_chunks is None
+        }
+        if len(full_chunk_tokens) != 1:
+            raise ValueError(
+                "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL needs exactly one "
+                "full-attention chunk size to align checkpoints to, got "
+                f"{sorted(full_chunk_tokens)}"
+            )
+        (self.alignment,) = full_chunk_tokens
+        if interval < 0 or interval % self.alignment:
+            raise ValueError(
+                "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL must be 0 or a positive "
+                f"multiple of the full-attention chunk ({self.alignment} "
+                f"tokens), got {interval}"
+            )
+        self.interval = interval
+        self.windowed_groups = tuple(
+            group
+            for group in config.kv_group_configs
+            if group.sliding_window_size_in_chunks is not None
+        )
+        self.windowed_group_ids = frozenset(g.group_idx for g in self.windowed_groups)
+        # Prompt tokens a boundary needs after it: the EAGLE peek chunk.
+        self._replay_lookahead = max(
+            [1] + [g.tokens_per_chunk for g in self.windowed_groups if g.is_eagle_group]
+        )
+
+    def boundaries(self, num_prompt_tokens: int, max_tokens: int) -> set[int]:
+        """Checkpoint boundaries (token counts) in (0, max_tokens]."""
+        replay = (
+            (num_prompt_tokens - self._replay_lookahead)
+            // self.alignment
+            * self.alignment
+        )
+        out = {replay} if 0 < replay <= max_tokens else set()
+        if self.interval:
+            out.update(range(self.interval, max_tokens + 1, self.interval))
+        return out
+
+    def admitted_keys(self, req_status: RequestOffloadState) -> set[OffloadKey]:
+        """The request's windowed-group keys a checkpoint hit would read."""
+        keys: set[OffloadKey] = set()
+        num_prompt_tokens = req_status.req.num_prompt_tokens
+        for group in self.windowed_groups:
+            offload_keys = req_status.group_states[group.group_idx].offload_keys
+            chunk = group.tokens_per_chunk
+            window = group.sliding_window_size_in_chunks
+            assert window is not None
+            peek = int(group.is_eagle_group)
+            for boundary in self.boundaries(
+                num_prompt_tokens, len(offload_keys) * chunk
+            ):
+                end = boundary // chunk
+                keys.update(offload_keys[max(0, end - window) : end + peek])
+        return keys
+
+
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     """Scheduler for the store-backed offload path.
 
@@ -207,9 +285,38 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
 
+        interval = tpu_envs.TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL
+        self._window_checkpoints = (
+            None if interval is None else WindowCheckpointPolicy(self.config, interval)
+        )
+        # Per scheduler step: req_id -> windowed keys `prepare_store` admits.
+        self._admitted_window_keys: dict[str, set[OffloadKey]] = {}
+        if self._window_checkpoints is not None:
+            self._raiden_manager.set_store_key_filter(self._admit_store_key)
+            logger.info(
+                "TPURaidenOffloadingConnector: offloading window/state groups %s "
+                "only at replay boundaries%s",
+                sorted(self._window_checkpoints.windowed_group_ids),
+                f" and every {interval} tokens" if interval else "",
+            )
+
+    def _admit_store_key(self, key: OffloadKey, req_context: ReqContext) -> bool:
+        policy = self._window_checkpoints
+        assert policy is not None
+        if get_offload_group_idx(key) not in policy.windowed_group_ids:
+            return True
+        req_id = req_context.req_id
+        admitted = self._admitted_window_keys.get(req_id)
+        if admitted is None:
+            admitted = policy.admitted_keys(self._req_status[req_id])
+            self._admitted_window_keys[req_id] = admitted
+        return key in admitted
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        # Offload keys grow every step; admitted sets are rebuilt on demand.
+        self._admitted_window_keys.clear()
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
 

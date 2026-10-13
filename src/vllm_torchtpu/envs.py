@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
+    TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL: int | None = None
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -680,6 +681,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # TPURaidenOffloadingConnector: offload a sliding-window / state group's
+    # chunks only where a later hit can end on them -- the request's replay
+    # boundary, plus every N tokens when N > 0 (a multiple of the
+    # full-attention chunk). Unset keeps vLLM's choice, which re-stores a
+    # group's trailing window at nearly every prefill step. Each stored chunk
+    # costs a whole host block whatever its group, so that window state
+    # crowds full-attention chunks out of the host pool.
+    "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL": env_optional_int(
+        "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL"
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
