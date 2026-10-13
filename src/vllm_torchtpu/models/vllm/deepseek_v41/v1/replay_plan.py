@@ -1,5 +1,6 @@
 """Decoder replay planning and its bounded SWA state for shared CSA."""
 
+import bisect
 import functools
 from dataclasses import dataclass
 
@@ -22,6 +23,42 @@ def _sorted_buckets(num_tokens: int, compile_sizes: tuple[int, ...]) -> tuple[in
     return tuple(sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)}))
 
 
+@functools.lru_cache(maxsize=256)
+def _padded_bucket(kept: int, num_tokens: int, compile_sizes: tuple[int, ...]) -> int:
+    if kept <= 0:
+        return 0
+    buckets = _sorted_buckets(num_tokens, compile_sizes)
+    return buckets[bisect.bisect_left(buckets, kept)]
+
+
+@functools.lru_cache(maxsize=64)
+def _static_no_skip_spec(
+    bounds: tuple[int, ...],
+    prompts: tuple[int, ...],
+    window: int,
+    num_tokens: int,
+    compile_sizes: tuple[int, ...],
+):
+    replay_starts = []
+    min_lens = []
+    counts = []
+    for start, end, prompt in zip(bounds, bounds[1:], prompts):
+        count = end - start
+        if count < 0 or prompt < 0:
+            return None
+        replay_start = prompt - window if prompt > window else 0
+        counts.append(count)
+        replay_starts.append(replay_start)
+        min_lens.append(replay_start + count if count > 0 else 0)
+    kept = bounds[-1]
+    padded = _padded_bucket(kept, num_tokens, compile_sizes)
+    plan = DecoderReplayPlan(_range_tuple(kept), bounds, tuple(replay_starts), padded)
+    return tuple(min_lens), plan, max(min_lens, default=0), tuple(counts)
+
+
+_LAST_NO_SKIP_CACHE: list = [None, None, None, None]
+
+
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
     """Keep the same prompt-tail window across every chunk and later decode.
 
@@ -38,30 +75,48 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         raise ValueError("Invalid decoder replay scheduling metadata")
     if bounds[0] != 0 or bounds[-1] > num_tokens:
         raise ValueError("Query boundaries exceed the input token bucket")
-    indices: list[int] | None = None
-    replay_starts, output_bounds = [], [0]
-    kept = 0
-    for start, end, length, prompt in zip(bounds, bounds[1:], lengths, prompts):
-        count = end - start
-        if count < 0 or length < count or prompt < 0:
-            raise ValueError("Invalid scheduled query or prompt length")
-        replay_start = max(0, prompt - window)
-        skip = min(count, max(0, replay_start - (length - count)))
-        if skip > 0 and indices is None:
-            indices = list(range(kept))
-        if indices is not None:
-            indices.extend(range(start + skip, end))
-        kept += count - skip
-        replay_starts.append(replay_start)
-        output_bounds.append(kept)
-    indices_tuple = _range_tuple(kept) if indices is None else tuple(indices)
-    # Each stage dispatches by its own token bucket. Never introduce a second,
-    # independent symbolic token dimension into vLLM's guard-free full graph.
     sizes_key = (
         compile_sizes if isinstance(compile_sizes, tuple) else tuple(compile_sizes)
     )
-    buckets = _sorted_buckets(num_tokens, sizes_key)
-    padded = next(n for n in buckets if n >= kept) if kept else 0
+    if (
+        bounds == (last := _LAST_NO_SKIP_CACHE)[0]
+        and prompts == last[1]
+        and (window, num_tokens, sizes_key) == last[2]
+    ):
+        spec = last[3]
+    else:
+        bounds_t = bounds if isinstance(bounds, tuple) else tuple(bounds)
+        prompts_t = prompts if isinstance(prompts, tuple) else tuple(prompts)
+        spec = _static_no_skip_spec(bounds_t, prompts_t, window, num_tokens, sizes_key)
+        last[:] = [bounds, prompts, (window, num_tokens, sizes_key), spec]
+    if spec is None:
+        raise ValueError("Invalid scheduled query or prompt length")
+    if min(lengths, default=0) >= spec[2]:
+        return spec[1]
+    indices: list[int] | None = None
+    output_bounds = [0]
+    kept = 0
+    for start, count, min_len, length in zip(bounds, spec[3], spec[0], lengths):
+        if length < count:
+            raise ValueError("Invalid scheduled query or prompt length")
+        if length < min_len:
+            skip = min_len - length
+            if skip > count:
+                skip = count
+            if indices is None:
+                indices = list(range(kept))
+            indices.extend(range(start + skip, start + count))
+            kept += count - skip
+        else:
+            if indices is not None:
+                indices.extend(range(start, start + count))
+            kept += count
+        output_bounds.append(kept)
+    if indices is None:
+        return spec[1]
+    # Each stage dispatches by its own token bucket. Never introduce a second,
+    # independent symbolic token dimension into vLLM's guard-free full graph.
+    padded = _padded_bucket(kept, num_tokens, sizes_key)
     return DecoderReplayPlan(
-        indices_tuple, tuple(output_bounds), tuple(replay_starts), padded
+        tuple(indices), tuple(output_bounds), spec[1].replay_starts, padded
     )
