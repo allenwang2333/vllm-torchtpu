@@ -30,7 +30,7 @@ from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
 @pytest.mark.parametrize(
     "prefix,expected",
     [
-        ("model.layers.3.self_attn.fused_qkv_a_proj", True),
+        ("model.layers.3.self_attn.fused_qkv_a_proj", False),
         ("model.layers.3.self_attn.q_b_proj", True),
         ("model.layers.3.self_attn.o_proj", True),
         ("model.layers.0.mlp.gate_up_proj", True),
@@ -47,8 +47,14 @@ def test_site_selection(monkeypatch, prefix, expected):
     assert fp8_mod._fp8_linear_pallas_selected(prefix) is expected
 
 
-def test_site_selection_off_by_default(monkeypatch):
+def test_site_selection_on_by_default(monkeypatch):
     monkeypatch.delenv("TPU_FP8_LINEAR_PALLAS", raising=False)
+    monkeypatch.delenv("TPU_FP8_LINEAR_PALLAS_SITES", raising=False)
+    assert fp8_mod._fp8_linear_pallas_selected("model.layers.3.self_attn.o_proj")
+
+
+def test_site_selection_off_when_disabled(monkeypatch):
+    monkeypatch.setenv("TPU_FP8_LINEAR_PALLAS", "0")
     assert not fp8_mod._fp8_linear_pallas_selected("model.layers.3.self_attn.o_proj")
 
 

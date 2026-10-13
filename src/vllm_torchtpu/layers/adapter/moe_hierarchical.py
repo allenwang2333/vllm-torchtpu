@@ -25,13 +25,58 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+# Architectures the default TPU_MOE_EP_TP_SIZE was measured on (#1510).
+_DEFAULT_EP_TP_ARCHS = ("GlmMoeDsaForCausalLM",)
+_default_ep_tp: int | None = None
+
+
+def ep_tp_size() -> int:
+    """``TPU_MOE_EP_TP_SIZE`` as it applies to this deployment.
+
+    An explicit value is returned as is (and refuses an unsupported deployment
+    downstream). The default applies only where it was measured -- GLM-5.2
+    with flat EP over the whole TP group -- and is 1 (flat) elsewhere. Decided
+    once, from the vLLM config current when the first FusedMoE is built, so
+    the MoE split and the EP weight filter at load time always agree.
+    """
+    if envs.is_set("TPU_MOE_EP_TP_SIZE"):
+        return envs.TPU_MOE_EP_TP_SIZE
+    global _default_ep_tp
+    if _default_ep_tp is None:
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+        if config.model_config is None:
+            return 1  # no model yet; decide when there is one
+        _default_ep_tp = _default_ep_tp_for(config)
+    return _default_ep_tp
+
+
+def _default_ep_tp_for(config) -> int:
+    default = envs.TPU_MOE_EP_TP_SIZE
+    pc = config.parallel_config
+    archs = getattr(config.model_config.hf_config, "architectures", None) or []
+    if (
+        envs.TPU_MOE_HIERARCHICAL_EP
+        or not any(arch in _DEFAULT_EP_TP_ARCHS for arch in archs)
+        or not pc.enable_expert_parallel
+        or pc.data_parallel_size != 1
+        or pc.prefill_context_parallel_size != 1
+        or pc.enable_eplb
+        or pc.use_sequence_parallel_moe
+        or pc.tensor_parallel_size % default != 0
+    ):
+        return 1
+    return default
+
+
 def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     """``(ep_size, ep_rank, tp_size, tp_rank)``, or ``None`` to stay flat.
 
     ``None`` is the safe answer everywhere: the caller keeps vLLM's own
     parallel config and the model runs exactly as it does today.
     """
-    ep_tp = envs.TPU_MOE_EP_TP_SIZE
+    ep_tp = ep_tp_size()
     if ep_tp > 1 and envs.TPU_MOE_HIERARCHICAL_EP:
         raise ValueError(
             "TPU_MOE_EP_TP_SIZE and TPU_MOE_HIERARCHICAL_EP both pick the MoE "

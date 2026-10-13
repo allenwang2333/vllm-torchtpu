@@ -272,9 +272,9 @@ def test_sortfree_inactive_off_the_onehot_path():
 def test_sortfree_env_flag(monkeypatch):
     getter = envs.environment_variables["TPU_MOE_ONEHOT_SORTFREE"]
     monkeypatch.delenv("TPU_MOE_ONEHOT_SORTFREE", raising=False)
-    assert getter() is False
-    monkeypatch.setenv("TPU_MOE_ONEHOT_SORTFREE", "1")
     assert getter() is True
+    monkeypatch.setenv("TPU_MOE_ONEHOT_SORTFREE", "0")
+    assert getter() is False
 
 
 def _require_tpu():

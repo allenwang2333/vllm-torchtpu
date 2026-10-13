@@ -1164,6 +1164,10 @@ def sparse_mla_attention_dcp(
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
         topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        if topk_cap < 0:
+            # Auto: a rank owns ~topk/dcp_size slots, so a cap of 512 rarely
+            # binds at DCP16 and overflows every row at DCP2.
+            topk_cap = 512 if dcp_size >= 16 else 0
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT

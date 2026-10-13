@@ -151,6 +151,10 @@ def prebuild() -> None:
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
+    if mesh is None and not envs.is_set("TPU_SMALL_ALL_REDUCE"):
+        # On by default; without an EP mesh every all-reduce stays on XLA's.
+        logger.info_once("Small collectives off: no expert-parallel mesh.")
+        return
     if mesh is None:
         raise NotImplementedError(
             "TPU_SMALL_ALL_REDUCE=1 builds its kernels over the expert-parallel "

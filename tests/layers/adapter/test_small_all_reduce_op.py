@@ -44,6 +44,8 @@ def armed(monkeypatch):
     monkeypatch.setattr(op, "_DP_COMBINE", True)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(op.shape_variants, "in_warmup", lambda: True)
+    # The kernel's own MAX_ROWS cap; the env default (32) is tested on its own.
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0)
     return ar, rs
 
 
@@ -117,6 +119,12 @@ def test_all_reduce_cap_follows_the_env(armed, monkeypatch, rows, armed_expected
     assert ar.called is armed_expected
     if not armed_expected:
         torch.testing.assert_close(out, _fallback(x), rtol=0, atol=0)
+
+
+def test_all_reduce_cap_env_defaults_to_32_rows(monkeypatch):
+    getter = op.envs.environment_variables["TPU_SMALL_ALL_REDUCE_MAX_ROWS"]
+    monkeypatch.delenv("TPU_SMALL_ALL_REDUCE_MAX_ROWS", raising=False)
+    assert getter() == 32
 
 
 def test_all_reduce_cap_env_zero_keeps_the_default(armed, monkeypatch):
@@ -327,11 +335,21 @@ def test_prebuild_is_a_no_op_with_the_flag_off(monkeypatch):
 
 
 def test_prebuild_refuses_a_deployment_without_an_ep_group(monkeypatch):
+    monkeypatch.setenv("TPU_SMALL_ALL_REDUCE", "1")
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
     monkeypatch.setattr(op, "_AR_OP", None)
     with pytest.raises(NotImplementedError, match="TPU_SMALL_ALL_REDUCE"):
         op.prebuild()
+
+
+def test_prebuild_default_skips_a_deployment_without_an_ep_group(monkeypatch):
+    monkeypatch.delenv("TPU_SMALL_ALL_REDUCE", raising=False)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
+    monkeypatch.setattr(op, "build_ep_mesh", lambda: None)
+    monkeypatch.setattr(op, "_AR_OP", None)
+    op.prebuild()
+    assert op._AR_OP is None
 
 
 def test_retain_is_the_identity_when_unarmed_or_outside_the_warmup(monkeypatch):

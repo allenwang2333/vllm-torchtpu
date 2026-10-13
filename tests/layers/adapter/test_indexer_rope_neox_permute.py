@@ -398,10 +398,19 @@ def test_flag_off_registers_nothing(monkeypatch):
 
 
 def test_flag_rejects_a_neox_indexer_rope(monkeypatch):
+    monkeypatch.setenv("TPU_INDEXER_ROPE_NEOX_PERMUTE", "1")
     monkeypatch.setattr(envs, "TPU_MLA_ROPE_NEOX_PERMUTE", False)
     monkeypatch.setattr(envs, "TPU_INDEXER_ROPE_NEOX_PERMUTE", True)
     with pytest.raises(NotImplementedError):
         _construct(_indexer(), _rope(is_neox_style=True))
+
+
+def test_default_skips_a_neox_indexer_rope(monkeypatch):
+    monkeypatch.delenv("TPU_INDEXER_ROPE_NEOX_PERMUTE", raising=False)
+    monkeypatch.setattr(envs, "TPU_MLA_ROPE_NEOX_PERMUTE", False)
+    monkeypatch.setattr(envs, "TPU_INDEXER_ROPE_NEOX_PERMUTE", True)
+    w = _construct(_indexer(), _rope(is_neox_style=True))
+    assert not getattr(w.mla_attn, "post_load_hooks", [])
 
 
 # --------------------------------------------------------------------------

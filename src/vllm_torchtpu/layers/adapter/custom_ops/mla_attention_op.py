@@ -1430,19 +1430,23 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # are in half-split order, which is what switches `forward` to NeoX
         # rope -- the two can never disagree.
         self._rope_neox_permuted = False
+        # Both permutes are on by default; a rope they cannot reorder keeps
+        # the interleaved layout unless the env was set explicitly.
         if envs.TPU_MLA_ROPE_NEOX_PERMUTE:
-            if not rope_half_split_supported(self.rotary_emb, self.qk_rope_head_dim):
+            if rope_half_split_supported(self.rotary_emb, self.qk_rope_head_dim):
+                hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+                hooks.append(self.permute_rope_to_half_split)
+            elif envs.is_set("TPU_MLA_ROPE_NEOX_PERMUTE"):
                 raise NotImplementedError(
                     "TPU_MLA_ROPE_NEOX_PERMUTE needs a GPT-J-style "
                     f"RotaryEmbedding over the whole {self.qk_rope_head_dim}-dim "
                     f"rope head; got {type(self.rotary_emb).__name__}"
                 )
-            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
-            hooks.append(self.permute_rope_to_half_split)
         if envs.TPU_INDEXER_ROPE_NEOX_PERMUTE and self.indexer is not None:
-            if not rope_half_split_supported(
-                self.indexer_rope_emb, self.indexer.rope_dim
-            ):
+            if rope_half_split_supported(self.indexer_rope_emb, self.indexer.rope_dim):
+                hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+                hooks.append(self.indexer.permute_rope_to_half_split)
+            elif envs.is_set("TPU_INDEXER_ROPE_NEOX_PERMUTE"):
                 neox = getattr(self.indexer_rope_emb, "is_neox_style", None)
                 raise NotImplementedError(
                     "TPU_INDEXER_ROPE_NEOX_PERMUTE needs a GPT-J-style "
@@ -1450,8 +1454,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     "indexer rope head (indexer_rope_interleave); got "
                     f"{type(self.indexer_rope_emb).__name__} is_neox_style={neox}"
                 )
-            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
-            hooks.append(self.indexer.permute_rope_to_half_split)
 
     def permute_rope_to_half_split(self) -> None:
         """Put the q and k_pe rope columns in half-split order (see

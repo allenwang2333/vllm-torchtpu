@@ -17,6 +17,16 @@ import pytest
 from vllm_torchtpu.distributed.chip_topology import ChipTopology
 
 
+@pytest.fixture(autouse=True)
+def _explicit_ep_tp_env(monkeypatch):
+    """Tests here set TPU_MOE_EP_TP_SIZE on the envs module; mark it explicit so
+    the default's GLM-only gating (moe_hierarchical.ep_tp_size) stays out of it."""
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setenv("TPU_MOE_EP_TP_SIZE", "1")
+    monkeypatch.setattr(moe_hierarchical, "_default_ep_tp", None)
+
+
 class _FakeDevice:
     def __init__(
         self, device_id: int, coords: tuple[int, int, int], core_on_chip: int
@@ -478,6 +488,79 @@ def test_ep_tp_patch_leaves_a_flat_world_flat(monkeypatch) -> None:
         tp_size_=16, pcp_size_=1, dp_size_=1, sp_size_=1, vllm_parallel_config=None
     )
     assert dataclasses.asdict(got) == dataclasses.asdict(flat)
+
+
+def _vllm_config(
+    arch="GlmMoeDsaForCausalLM", ep=True, dp=1, pcp=1, eplb=False, sp=False, tp=16
+):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch])),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=ep,
+            data_parallel_size=dp,
+            prefill_context_parallel_size=pcp,
+            enable_eplb=eplb,
+            use_sequence_parallel_moe=sp,
+            tensor_parallel_size=tp,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, 4),
+        ({"arch": "KimiK3ForCausalLM"}, 1),
+        ({"ep": False}, 1),
+        ({"dp": 2}, 1),
+        ({"pcp": 2}, 1),
+        ({"eplb": True}, 1),
+        ({"sp": True}, 1),
+        ({"tp": 6}, 1),
+    ],
+)
+def test_default_ep_tp_applies_only_where_measured(monkeypatch, kwargs, expected):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 4)
+    assert moe_hierarchical._default_ep_tp_for(_vllm_config(**kwargs)) == expected
+
+
+def test_default_ep_tp_yields_to_hierarchical_ep(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", True)
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 4)
+    assert moe_hierarchical._default_ep_tp_for(_vllm_config()) == 1
+
+
+def test_ep_tp_size_explicit_wins_and_default_is_decided_once(monkeypatch):
+    import vllm.config as vllm_config
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    monkeypatch.setenv("TPU_MOE_EP_TP_SIZE", "2")
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 2)
+    assert moe_hierarchical.ep_tp_size() == 2
+
+    monkeypatch.delenv("TPU_MOE_EP_TP_SIZE")
+    monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 4)
+    no_model = _vllm_config()
+    no_model.model_config = None
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: no_model)
+    assert moe_hierarchical.ep_tp_size() == 1  # undecided: no model yet
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config", _vllm_config)
+    assert moe_hierarchical.ep_tp_size() == 4
+    flat = _vllm_config(ep=False)
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: flat)
+    assert moe_hierarchical.ep_tp_size() == 4  # decided at the first FusedMoE
 
 
 def test_experts_start_follows_the_group_block() -> None:
