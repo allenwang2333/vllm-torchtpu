@@ -40,6 +40,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import envs
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -63,6 +65,61 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_scoring_broken = False
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
+        if envs.VLLM_TPU_LOG_PREFIX_HITS:
+            self._install_prefix_hit_log()
+
+    def _install_prefix_hit_log(self) -> None:
+        """Log each request's first prefix-cache lookup.
+
+        One line per request: prompt length, the reconciled hit the scheduler
+        uses, the hash-block-aligned ceiling, and each KV cache group's own
+        hit. A full-attention group hitting further than the reconciled length
+        means another group (mamba state, EAGLE drop) cut the hit short.
+        """
+        kvm = self.kv_cache_manager
+        orig_get_computed_blocks = kvm.get_computed_blocks
+        logged: set[str] = set()
+
+        def get_computed_blocks(request: Request):
+            result = orig_get_computed_blocks(request)
+            if request.request_id in logged:
+                return result
+            if len(logged) > 100_000:
+                logged.clear()
+            logged.add(request.request_id)
+            try:
+                hit = int(result[1])
+                coordinator = kvm.coordinator
+                per_group: tuple[int, ...] = ()
+                if kvm.prefix_cache_lookup_enabled(request) and hasattr(
+                    coordinator, "find_longest_cache_hit_per_group"
+                ):
+                    _, per_group = coordinator.find_longest_cache_hit_per_group(
+                        request.block_hashes, max(request.num_tokens - 1, 0)
+                    )
+                group_types = [
+                    type(g.kv_cache_spec).__name__
+                    for g in kvm.kv_cache_config.kv_cache_groups
+                ]
+                logger.info(
+                    "prefix-hit: req=%s prompt=%d hit=%d cold=%d "
+                    "hash_ceiling=%d shared_boundary=%d per_group=%s",
+                    request.request_id,
+                    request.num_tokens,
+                    hit,
+                    request.num_tokens - hit,
+                    len(request.block_hashes)
+                    * getattr(coordinator, "hash_block_size", 0),
+                    int(result[2]) if len(result) > 2 else 0,
+                    list(zip(group_types, per_group)),
+                )
+            except Exception:
+                logger.exception("prefix-hit log failed; disabling it.")
+                kvm.get_computed_blocks = orig_get_computed_blocks
+            return result
+
+        kvm.get_computed_blocks = get_computed_blocks
+        logger.info("PrefixAwareScheduler: per-request prefix-hit log ON")
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""

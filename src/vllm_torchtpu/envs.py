@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    VLLM_TPU_LOG_PREFIX_HITS: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -959,6 +960,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),
+    # PrefixAwareScheduler: log each request's first prefix-cache lookup (hit
+    # vs prompt length, per KV cache group) to diagnose prefix-hit gaps.
+    "VLLM_TPU_LOG_PREFIX_HITS": env_bool("VLLM_TPU_LOG_PREFIX_HITS", default=False),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),

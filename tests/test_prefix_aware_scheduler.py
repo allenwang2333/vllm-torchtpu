@@ -202,3 +202,33 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def test_prefix_hit_log_logs_once_per_request(caplog):
+    import logging
+
+    req = _make_request("r0", num_tokens=2000)
+    req.block_hashes = [object()] * 7
+    s = _make_scheduler([req], {})
+    kvm = s.kv_cache_manager
+    kvm.get_computed_blocks.return_value = ("blocks", 1024, 0)
+    kvm.prefix_cache_lookup_enabled.return_value = True
+    kvm.coordinator.hash_block_size = 256
+    kvm.coordinator.find_longest_cache_hit_per_group.return_value = (
+        ((), ()),
+        (1536, 1024),
+    )
+    kvm.kv_cache_config.kv_cache_groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace()),
+        SimpleNamespace(kv_cache_spec=SimpleNamespace()),
+    ]
+    s._install_prefix_hit_log()
+
+    with caplog.at_level(logging.INFO):
+        assert s.kv_cache_manager.get_computed_blocks(req) == ("blocks", 1024, 0)
+        assert s.kv_cache_manager.get_computed_blocks(req) == ("blocks", 1024, 0)
+
+    lines = [r.getMessage() for r in caplog.records if "prefix-hit:" in r.getMessage()]
+    assert len(lines) == 1
+    assert "prompt=2000 hit=1024 cold=976 hash_ceiling=1792" in lines[0]
+    assert "1536" in lines[0]
