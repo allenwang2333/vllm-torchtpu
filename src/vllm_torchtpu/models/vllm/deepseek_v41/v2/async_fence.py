@@ -29,8 +29,19 @@ def install_lookback_fence() -> None:
         else:
             fence = torch.tpu.Event()
             self._deepseek_v41_lookback_fence = fence
+        sync = fence.synchronize
+        record = fence.record
+
+        def fast_prepare(n_reqs: int) -> torch.Tensor:
+            sync()
+            out = original(self, n_reqs)
+            record()
+            return out
+
+        fast_prepare._deepseek_v41_fenced = True  # type: ignore[attr-defined]
+        self._prepare_lookback_token_ids = fast_prepare
         ids = original(self, num_reqs)
-        fence.record()
+        record()
         return ids
 
     prepare._deepseek_v41_fenced = True  # type: ignore[attr-defined]
