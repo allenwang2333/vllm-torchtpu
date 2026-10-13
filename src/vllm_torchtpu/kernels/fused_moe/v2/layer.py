@@ -271,6 +271,7 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    scales_expert_second_minor=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -318,6 +319,14 @@ def fused_ep_moe_v2(
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    scales_expert_second_minor says the per-contraction-block scale tables
+    arrive in a device layout whose second-minor dimension is the expert axis
+    (layout {2,0,1} of [E, blocks, N], which torch_tpu picks when `blocks` is
+    not a whole number of sublane tiles). The kernel then reads them as
+    [blocks, E, N], which is that same buffer, so XLA stops relayouting both
+    tables on every call. A table in the default layout would be copied by
+    the transpose instead, so this is the caller's statement of fact.
 
     hash_topk_ids [tokens, topk] i32 replaces the router's selection with
     expert ids the caller already chose -- DeepSeek-V4's bottom layers look
@@ -380,6 +389,11 @@ def fused_ep_moe_v2(
                     f"{form.scale_layout} form {want} the kernel "
                     f"takes"
                 )
+    if scales_expert_second_minor and form.scale_layout != "per_contraction_block":
+        raise ValueError(
+            "scales_expert_second_minor describes [E, blocks, N] scale tables; "
+            f"weight format {weight_format!r} has {form.scale_layout} scales"
+        )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
     if mesh_ep_ranks is not None:
@@ -453,6 +467,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        scales_block_major=scales_expert_second_minor,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -464,6 +479,10 @@ def fused_ep_moe_v2(
         operands = iter(scales_gating_biases)
         w1s_l = next(operands) if form.has_scales else None
         w2s_l = next(operands) if form.has_scales else None
+        if scales_expert_second_minor:
+            # A bitcast for a table already laid out expert-minor; see above.
+            w1s_l = jnp.transpose(w1s_l, (1, 0, 2))
+            w2s_l = jnp.transpose(w2s_l, (1, 0, 2))
         gate_l = next(operands)
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
@@ -782,6 +801,7 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
+        bool(scales_expert_second_minor),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
