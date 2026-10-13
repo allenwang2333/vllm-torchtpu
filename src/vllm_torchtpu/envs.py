@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     TPU_SCHED_UNCHARGED_DRAFT_SLOTS: bool = False
     TPU_SRPT_COUNT_EXTERNAL_HIT: bool = False
     TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL: int | None = None
+    TPU_OFFLOAD_STATS_LOG_S: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -648,6 +649,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL": env_optional_int(
         "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL"
     ),
+    # TPURaidenOffloadingConnector: seconds between per-rank log lines of
+    # store/load job counts, keys and submit-to-completion latency. 0 = off.
+    "TPU_OFFLOAD_STATS_LOG_S": env_nonnegative_int("TPU_OFFLOAD_STATS_LOG_S", 0),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),

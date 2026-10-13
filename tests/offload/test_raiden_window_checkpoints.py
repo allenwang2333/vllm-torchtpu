@@ -234,3 +234,23 @@ class TestWindowCheckpointPolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTransferStatsLog(unittest.TestCase):
+    def test_logs_job_counts_keys_and_latency(self):
+        from vllm.v1.kv_offload.base import ReqContext
+
+        with patch.dict("os.environ", {"TPU_OFFLOAD_STATS_LOG_S": "1"}):
+            store = FakeKVCacheStore()
+            manager = make_manager(store, device_block_size_factor=1, num_blocks=8)
+        keys = [HASHES[0], HASHES[1]]
+        manager.prepare_store(keys, ReqContext(req_id="r"))
+        manager.submit_store_job(3, keys, [5, 6])
+        store.complete_save([h for k in keys for h in sub_hashes(k, 1)])
+        manager._stats_since -= 2
+        with self.assertLogs("vllm.vllm_torchtpu.offload.raiden_store", "INFO") as logs:
+            manager.poll_finished_jobs()
+        (line,) = [r.getMessage() for r in logs.records]
+        self.assertIn("stores=1 keys=2 failed=0", line)
+        self.assertIn("loads=0 keys=0", line)
+        self.assertEqual(manager._stats.jobs, {op: 0 for op in manager._stats.jobs})

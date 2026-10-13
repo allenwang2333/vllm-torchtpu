@@ -225,6 +225,42 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    submitted_at: float = field(default_factory=time.monotonic)
+
+
+class TransferStats:
+    """Per-op count, key volume and submit-to-terminal latency of jobs."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.jobs = {op: 0 for op in AdmissionOp}
+        self.keys = {op: 0 for op in AdmissionOp}
+        self.failed = {op: 0 for op in AdmissionOp}
+        self.latency_sum = {op: 0.0 for op in AdmissionOp}
+        self.latency_max = {op: 0.0 for op in AdmissionOp}
+
+    def record(self, admission: Admission, success: bool, now: float) -> None:
+        op = admission.op
+        latency = now - admission.submitted_at
+        self.jobs[op] += 1
+        self.keys[op] += len(admission.keys)
+        self.failed[op] += not success
+        self.latency_sum[op] += latency
+        self.latency_max[op] = max(self.latency_max[op], latency)
+
+    def summary(self) -> str:
+        parts = []
+        for op in AdmissionOp:
+            n = self.jobs[op]
+            mean_ms = 1e3 * self.latency_sum[op] / n if n else 0.0
+            parts.append(
+                f"{op.name.lower()}s={n} keys={self.keys[op]} "
+                f"failed={self.failed[op]} mean={mean_ms:.0f}ms "
+                f"max={1e3 * self.latency_max[op]:.0f}ms"
+            )
+        return "; ".join(parts)
 
 
 @dataclass
@@ -410,6 +446,10 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+
+        self._stats_interval_s = envs.TPU_OFFLOAD_STATS_LOG_S
+        self._stats = TransferStats()
+        self._stats_since = time.monotonic()
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -1077,6 +1117,8 @@ class RaidenOffloadingManager(OffloadingManager):
         held = self._pins_still_held(admission)
         if held:
             self._store.release(held)
+        if self._stats_interval_s:
+            self._stats.record(admission, success, time.monotonic())
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
             self._finished.append(
@@ -1211,7 +1253,23 @@ class RaidenOffloadingManager(OffloadingManager):
         self._poll_once()
         finished = self._finished
         self._finished = []
+        if self._stats_interval_s:
+            self._maybe_log_stats()
         return finished
+
+    def _maybe_log_stats(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._stats_since
+        if elapsed < self._stats_interval_s:
+            return
+        logger.info(
+            "TPURaidenOffloadingConnector transfers (last %.0fs): %s; in flight %d",
+            elapsed,
+            self._stats.summary(),
+            len(self._admissions),
+        )
+        self._stats.reset()
+        self._stats_since = now
 
     def drain_jobs(self, job_ids: set[int]) -> list[FinishedJob]:
         """Drain in-flight DMA transfers to safely reclaim HBM blocks before reuse.
