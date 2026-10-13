@@ -3490,9 +3490,9 @@ def kda_prefill_tiled_body(
     packed = segments is not None
     if packed:
         segment_ref, count = segments
-        offsets = [segment_ref[s] for s in range(count)]
-        lengths = [segment_ref[count + s] for s in range(count)]
-        positions = [segment_ref[2 * count + s] for s in range(count)]
+
+        def field(index, s):  # descriptor field ``index`` of sequence ``s``
+            return segment_ref[index * count + s]
 
     # ---- load the layer weights (+ the carried state, unpacked) into VMEM once ----
     weight_copies = (
@@ -3545,17 +3545,31 @@ def kda_prefill_tiled_body(
     if checkpoint is not None and not packed:
         write_checkpoint()  # position 0, overwritten when a tile ends there
     if packed:
-        @when(first)
-        def pass_unused_slots():
-            for s in range(count):
-                @pl.when(lengths[s] == 0)
-                def pass_unused(s=s):
-                    # An unused slot: its outputs are its inputs.
-                    copy_now(((rec_state_in_ref.at[s], rec_state_out_ref.at[s]),
-                              (conv_hist_in_ref.at[s], conv_hist_out_ref.at[s])), 9)
-                    if checkpoint is not None:
-                        copy_now(((rec_state_in_ref.at[s], checkpoint[1].at[s]),
-                                  (conv_hist_in_ref.at[s], checkpoint[2].at[s])), 11)
+        # An unused slot: its outputs are its inputs. The copies start with
+        # the first tiles and are waited for after the last: one blocking
+        # round trip per slot would hold up the tiles (~0.15 ms a layer at
+        # 16 slots).
+        def unused_copies(s):
+            pairs = [(rec_state_in_ref.at[s], rec_state_out_ref.at[s]),
+                     (conv_hist_in_ref.at[s], conv_hist_out_ref.at[s])]
+            if checkpoint is not None:
+                pairs += [(rec_state_in_ref.at[s], checkpoint[1].at[s]),
+                          (conv_hist_in_ref.at[s], checkpoint[2].at[s])]
+            return [pltpu.make_async_copy(source, target, weight_sems.at[14 + i % 2])
+                    for i, (source, target) in enumerate(pairs)]
+
+        def each_unused(action):
+            @pl.loop(0, count)
+            def visit(s):
+                @pl.when(field(1, s) == 0)
+                def unused():
+                    for copy in unused_copies(s):
+                        action(copy)
+
+        when(first)(lambda: each_unused(lambda copy: copy.start()))
+        finish_unused = lambda: each_unused(lambda copy: copy.wait())  # noqa: E731
+    else:
+        finish_unused = None
 
     def load_tile(t, buf):
         return pltpu.make_async_copy(
@@ -3585,23 +3599,31 @@ def kda_prefill_tiled_body(
 
         load_tile(t, buf).wait()
         if packed:
-            # The tile's sequence (-1: padding only) and where its rows end.
+            # The tile's sequence (-1: padding only; offsets are page-aligned,
+            # so no tile holds two) and where its rows end. The state copies
+            # index that one sequence: unrolled per slot, they would not fit
+            # the fused layer's instruction memory at 16 slots.
             first_row = t * tile
             segment, segment_end = -1, 0
             for s in range(count):
-                inside = (first_row >= offsets[s]) & (first_row < offsets[s] + lengths[s])
+                start = field(0, s)
+                end = start + field(1, s)
+                inside = (first_row >= start) & (first_row < end)
                 segment = jnp.where(inside, s, segment)
-                segment_end = jnp.where(inside, offsets[s] + lengths[s], segment_end)
+                segment_end = jnp.where(inside, end, segment_end)
+            current = jnp.maximum(segment, 0)
+            offset, position = field(0, current), field(2, current)
 
-                @pl.when((first_row == offsets[s]) & (lengths[s] > 0))
-                def load_segment_state(s=s):
-                    copy_now(((rec_state_in_ref.at[s], rec_state_vmem),
-                              (conv_hist_in_ref.at[s], conv_hist_vmem)), 7)
-                    if checkpoint is not None:
-                        pl.when(positions[s] == 0)(lambda: write_checkpoint(s))
+            @pl.when((segment >= 0) & (first_row == offset))
+            def load_segment_state():
+                copy_now(((rec_state_in_ref.at[current], rec_state_vmem),
+                          (conv_hist_in_ref.at[current], conv_hist_vmem)), 7)
+                if checkpoint is not None:
+                    pl.when(position == 0)(lambda: write_checkpoint(current))
             row_end = segment_end
+            tile_segment = (segment, segment_end, current, offset, position)
         else:
-            row_end = length
+            row_end, tile_segment = length, None
 
         @pl.when(in_block >= 2)
         def wait_previous_store():
@@ -3701,17 +3723,17 @@ def kda_prefill_tiled_body(
                     attended, weight_vmem[:, pl.ds(c * columns, columns)]
                 ).astype(jnp.bfloat16)
 
-        if packed:
-            for s in range(count):
-                if checkpoint is not None:
-                    pl.when((segment == s) & (positions[s] > 0)
-                            & ((t + 1) * tile == offsets[s] + positions[s]))(
-                        lambda s=s: write_checkpoint(s))
+        if tile_segment is not None:
+            segment, segment_end, current, offset, position = tile_segment
+            if checkpoint is not None:
+                pl.when((segment >= 0) & (position > 0)
+                        & ((t + 1) * tile == offset + position))(
+                    lambda: write_checkpoint(current))
 
-                @pl.when((segment == s) & (t == (offsets[s] + lengths[s] - 1) // tile))
-                def store_segment_state(s=s):
-                    copy_now(((rec_state_vmem, rec_state_out_ref.at[s]),
-                              (conv_hist_vmem, conv_hist_out_ref.at[s])), 9)
+            @pl.when((segment >= 0) & (t == (segment_end - 1) // tile))
+            def store_segment_state():
+                copy_now(((rec_state_vmem, rec_state_out_ref.at[current]),
+                          (conv_hist_vmem, conv_hist_out_ref.at[current])), 9)
         elif checkpoint is not None:
             pl.when((t + 1) * tile == checkpoint[0])(write_checkpoint)
 
@@ -3725,7 +3747,8 @@ def kda_prefill_tiled_body(
                 store_tile(t - 1, 1 - buf).wait()
 
     pl.loop(first_tile, end_tile)(tile_body)
-    if packed:
+    if finish_unused is not None:
+        when(last)(finish_unused)
         return  # each sequence's state was stored after its last tile
 
     @when(last)
@@ -3914,7 +3937,9 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         return inside
 
     def window_mask(key_rows, sl):
-        return ((key_rows <= rows[None, sl]) & (key_rows >= row_start[None, sl]) & real(key_rows))
+        # Keys in [row_start, row] of a real row are its own sequence's; a
+        # padding row's range is empty (row_start = row + 1).
+        return (key_rows <= rows[None, sl]) & (key_rows >= row_start[None, sl])
 
     carry = (
         jnp.full((1, q_tile), -jnp.inf, jnp.float32),
@@ -3990,7 +4015,15 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
         own = row_sequence[None] == sequence
         return tuple(_mask_where(own, new, old) for new, old in zip(streamed, carry))
 
-    return jax.lax.fori_loop(0, count, visit, carry)
+    # Visit only the sequences that meet the tile (contiguous: offsets
+    # ascend); any other visit is a no-op, but one per slot and query tile
+    # costs ~0.6 ms a layer at 16 slots.
+    first, end = jnp.int32(count), jnp.int32(0)
+    for s in range(count):
+        meets = live & (offsets[s] < first_row + q_tile) & (ends[s] > first_row)
+        first = jnp.where(meets, jnp.minimum(first, s), first)
+        end = jnp.where(meets, jnp.maximum(end, s + 1), end)
+    return jax.lax.fori_loop(first, jnp.maximum(first, end), visit, carry)
 
 
 # The online softmax runs transposed, keys by queries (S^T = K Q^T,
@@ -4049,7 +4082,8 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
 
         k, v = k_buf[slot], v_buf[slot]
         if value_mask is not None:
-            value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (128, tile), 1)
+            # One row of key indices: the mask varies along the keys only.
+            value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (1, tile), 1)
             v = jnp.where(value_mask(value_keys), v, jnp.zeros((), v.dtype))
         return k, jnp.concatenate((v, jnp.ones((_ONES, tile), v.dtype)), axis=0)
 

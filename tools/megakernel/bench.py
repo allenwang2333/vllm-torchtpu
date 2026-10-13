@@ -257,9 +257,10 @@ def run_prefill(args, records: harness.Records) -> None:
         prompt, _, prefix = part.partition("@")
         length, count = (int(x) for x in prompt.split("x"))
         prefix = int(prefix) if prefix else 0
-        if length * count > k3_program.MAX_STEP_TOKENS or count > 4:
+        if length * count > k3_program.MAX_STEP_TOKENS or count > k3_prefill.SLOTS:
             harness.fail(
-                f"prefill case {part}: N * LEN must fit one 8192-token step, N <= 4"
+                f"prefill case {part}: N * LEN must fit one 8192-token step, "
+                f"N <= {k3_prefill.SLOTS}"
             )
         if prefix % k3.PAGE:
             harness.fail(

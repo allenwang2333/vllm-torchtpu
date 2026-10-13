@@ -157,8 +157,9 @@ conv region extended over the ring rows, `pool_manifest`).
 
 Every live row of a step is computed. A row's tokens are cut into pieces of
 at most the largest window (512, 1024, 2048, 4096, 8192 tokens, up to
-`--max-num-batched-tokens`), and up to four sequences are packed into a
-window at 256-aligned offsets. A window runs the stack's first (embedding +
+`--max-num-batched-tokens`), and up to 16 sequences (`--max-num-seqs`, and
+at most one per page of the window) are packed into a window at page-aligned
+offsets. A window runs the stack's first (embedding +
 layers 0-3), group (8 layers, 11 times) and final (layer 92 + each
 sequence's last-token logits) ops; each rank writes the new pages it owns.
 
