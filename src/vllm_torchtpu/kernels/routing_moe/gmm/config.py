@@ -117,10 +117,7 @@ class TileConfig:
   tile_k: int
   tile_n: int
   bucket_base: int
-  # Two x/out row buffers rather than three: with no N/K tiling the third
-  # one pushes DeepSeek-V4-Pro's resident 7168 x 6144 fp4 gate/up slab past
-  # VMEM at tile_m=256.
-  num_xo_buffers: int = 2
+  num_xo_buffers: int = 3
   num_w_buffers: int = 2
 
   @property
@@ -260,10 +257,12 @@ class RoutingGmmConfig:
         size_global_groups=size_global_groups,
     )
 
-    tile = calculate_tile_size(x_cfg, w_cfg, out_cfg, dim)
+    tpu_info = pltpu.get_tpu_info()
+    vmem_limit_bytes = int(VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+    tile = calculate_tile_size(x_cfg, w_cfg, out_cfg, dim, vmem_limit_bytes)
 
     return cls(
-        tpu_info=pltpu.get_tpu_info(),
+        tpu_info=tpu_info,
         fuse_act=fuse_act,
         dim=dim,
         tile=tile,
@@ -330,12 +329,51 @@ class RoutingGmmConfig:
       )
 
 
+# Share of VMEM the estimate below may fill; the rest covers what it does not
+# count (Mosaic scratch, spills, the widened fp4/fp8 blocks).
+VMEM_FRACTION = 0.95
+# x/out row buffers: three let the gather run two steps ahead of compute, two
+# only one. Three are used unless the resident weights leave no room (e.g.
+# DeepSeek-V4-Pro's 7168 x 6144 fp4 gate/up slab at tile_m=256).
+MAX_NUM_XO_BUFFERS = 3
+MIN_NUM_XO_BUFFERS = 2
+
+
+def estimate_vmem_bytes(
+    *,
+    tile_m: int,
+    size_k: int,
+    size_n: int,
+    size_out_n: int,
+    w_bits: int,
+    num_scale_blocks: int,
+    num_xo_buffers: int,
+    num_w_buffers: int = TileConfig.num_w_buffers,
+) -> int:
+  """Upper bound on one routing gmm call's VMEM.
+
+  With no N/K tiling the whole k x n expert slab stays resident in
+  num_w_buffers, next to num_xo_buffers bf16 row tiles of x and out. Block
+  scales stay resident as f32 [num_blocks, n] (sublane padded), and the matmul
+  intermediates are bounded by an f32 tile_m x n accumulator.
+  """
+  w_bytes = num_w_buffers * size_k * size_n * w_bits // 8
+  scale_bytes = num_w_buffers * pl.cdiv(num_scale_blocks, 8) * 8 * size_n * 4
+  xo_bytes = num_xo_buffers * tile_m * (size_k + size_out_n) * 2
+  acc_bytes = tile_m * size_n * 4
+  return w_bytes + scale_bytes + xo_bytes + acc_bytes
+
+
 def calculate_tile_size(
-    x: ActivationConfig, w: WeightConfig, out: ActivationConfig, dim: Dimension
+    x: ActivationConfig,
+    w: WeightConfig,
+    out: ActivationConfig,
+    dim: Dimension,
+    vmem_limit_bytes: int,
 ) -> TileConfig:
   """Utilize heuristic to calculate tile size for given inputs."""
 
-  del x, w, out
+  del x, out
 
   # TODO(kyuyeunk): Add more sophisticated tile selection logic.
   tile_m = min(256, dim.size_out_m)
@@ -345,9 +383,27 @@ def calculate_tile_size(
   tile_n = dim.size_out_n
   tile_k = dim.size_k
 
+  num_scale_blocks = 0
+  if w.has_scale:
+    assert w.quant_block_size is not None
+    num_scale_blocks = dim.size_k // w.quant_block_size
+  max_xo_bytes = estimate_vmem_bytes(
+      tile_m=tile_m,
+      size_k=dim.size_k,
+      size_n=dim.size_n,
+      size_out_n=dim.size_out_n,
+      w_bits=jax.dtypes.itemsize_bits(w.quant_dtype or w.dtype),
+      num_scale_blocks=num_scale_blocks,
+      num_xo_buffers=MAX_NUM_XO_BUFFERS,
+  )
+  num_xo_buffers = MAX_NUM_XO_BUFFERS
+  if max_xo_bytes > vmem_limit_bytes:
+    num_xo_buffers = MIN_NUM_XO_BUFFERS
+
   return TileConfig(
       tile_m=tile_m,
       tile_k=tile_k,
       tile_n=tile_n,
       bucket_base=bucket_base,
+      num_xo_buffers=num_xo_buffers,
   )

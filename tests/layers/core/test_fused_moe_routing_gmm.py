@@ -186,6 +186,43 @@ def test_routing_gmm_rejects_unsupported_weights(fake_tpu):
     assert not _can_use(*_weights(16, hidden=7168, inter=4096))
 
 
+@pytest.mark.parametrize(
+    ("k", "n", "out_n", "expected"),
+    [
+        # DeepSeek-V4-Pro gate/up: the resident 7168 x 6144 fp4 slab leaves
+        # room for two 256-row x/out buffers only.
+        (7168, 6144, 3072, 2),
+        # DeepSeek-V4-Pro down and DeepSeek-V4-Flash gate/up and down keep
+        # three, so the gather stays two steps ahead.
+        (3072, 7168, 7168, 3),
+        (4096, 4096, 2048, 3),
+        (2048, 4096, 4096, 3),
+    ],
+)
+def test_routing_gmm_drops_to_two_xo_buffers_only_when_needed(k, n, out_n, expected):
+    from vllm_torchtpu.kernels.routing_moe.gmm import config as routing_config
+
+    w_cfg = routing_config.WeightConfig(
+        quant_dtype=jnp.dtype(jnp.float4_e2m1fn),
+        quant_block_size=512,
+        dtype=jnp.dtype(jnp.uint8),
+        has_scale=True,
+    )
+    dim = routing_config.Dimension(
+        size_m=6144,
+        size_k=k,
+        size_n=n,
+        size_out_m=6144,
+        size_out_n=out_n,
+        size_local_groups=24,
+        size_global_groups=384,
+    )
+    vmem_limit = int(routing_config.VMEM_FRACTION * (64 << 20))
+    tile = routing_config.calculate_tile_size(None, w_cfg, None, dim, vmem_limit)
+    assert tile.tile_m == 256
+    assert tile.num_xo_buffers == expected
+
+
 def test_routing_gmm_rejected_off_tpu(monkeypatch):
     def no_tpu():
         raise ValueError("not a TPU")

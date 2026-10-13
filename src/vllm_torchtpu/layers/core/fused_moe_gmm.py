@@ -110,10 +110,9 @@ _ROUTING_GMM = _resolve_routing_gmm()
 _ROUTING_GMM_ACTIVATIONS = frozenset(
     {"silu", "gelu", "gelu_tanh", "swigluoai", "silu_and_mul_with_clamp"}
 )
-# Share of VMEM the untiled routing_gmm buffers may claim; the rest covers what
-# _routing_gmm_vmem_bytes does not count (Mosaic scratch, spills, the widened
-# fp4/fp8 blocks).
-_ROUTING_GMM_VMEM_FRACTION = 0.95
+# Share of VMEM the untiled routing_gmm buffers may claim: the same budget the
+# kernel picks its x/out buffer count against.
+_ROUTING_GMM_VMEM_FRACTION = routing_config.VMEM_FRACTION
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -644,24 +643,17 @@ def _routing_gmm_vmem_bytes(
     num_scale_blocks: int,
     rows: int,
 ) -> int:
-    """Upper bound on one routing_gmm call's VMEM. With no N/K tiling yet the
-    whole K x N expert slab stays resident in num_w_buffers, next to
-    num_xo_buffers row tiles of x and out (see routing_moe TileConfig).
-    Block scales stay resident as f32 [num_blocks, N] in num_w_buffers."""
-    tile_m = min(256, rows)
-    w_buffers = routing_config.TileConfig.num_w_buffers
-    xo_buffers = routing_config.TileConfig.num_xo_buffers
-    w_bytes = w_buffers * size_k * size_n * w_bits // 8
-    scale_bytes = (
-        w_buffers * (-(num_scale_blocks // -8) * 8) * size_n * 4
-        if num_scale_blocks
-        else 0
+    """routing_gmm's VMEM at its fewest x/out buffers; the kernel adds the
+    third buffer itself when it fits (see routing_moe calculate_tile_size)."""
+    return routing_config.estimate_vmem_bytes(
+        tile_m=min(256, rows),
+        size_k=size_k,
+        size_n=size_n,
+        size_out_n=size_out_n,
+        w_bits=w_bits,
+        num_scale_blocks=num_scale_blocks,
+        num_xo_buffers=routing_config.MIN_NUM_XO_BUFFERS,
     )
-    xo_bytes = (
-        xo_buffers * tile_m * (size_k + size_out_n) * jnp.dtype(jnp.bfloat16).itemsize
-    )
-    acc_bytes = tile_m * size_n * jnp.dtype(jnp.float32).itemsize
-    return w_bytes + scale_bytes + xo_bytes + acc_bytes
 
 
 def _routing_gmm_block_ok(size_k: int, w_scale: jax.Array, mxu_size: int) -> bool:
