@@ -327,6 +327,10 @@ class _Split:
                 int(match.group(1)) % _PIECE_STRIDE if match is not None else None
             )
         self.partition_pieces = pieces
+        # torch_tpu prints the split graph, every piece's code included, to
+        # stdout (print_readable's default) on every rank; for GLM that is
+        # megabytes per bucket. Nothing reads it.
+        split_gm.print_readable = _print_nothing
         logger.info(
             "[TpuCompilerAdaptor] Split range %s into %d partitions over %d "
             "pieces; this rank compiles piece %d",
@@ -516,6 +520,12 @@ class _Split:
         self.pending = []
 
 
+def _print_nothing(*args: Any, **kwargs: Any) -> str:
+    """Stands in for a split graph's print_readable; module-level so the
+    graph still pickles."""
+    return ""
+
+
 def _eager_mode() -> Any:
     try:
         from torch_tpu._internal import execution_mode
@@ -559,8 +569,19 @@ def _install() -> None:
                 and isinstance(built, compiler.StaticCompiler)
                 and not isinstance(built, split_compiler.SplitCompiler)
             ):
-                built = split_compiler.SplitCompiler(built)
+                built = _PieceSplitCompiler(built)
             return built
+
+        class _PieceSplitCompiler(split_compiler.SplitCompiler):
+            def __call__(self, *args, **kwargs):
+                executable = super().__call__(*args, **kwargs)
+                # The unsplit graph is kept only to log a failed handshake,
+                # which needs a recompile_fn this split never has. Dropping it
+                # keeps the graph and its device constants out of the cache
+                # entry, which every rank saves for every split bucket.
+                if getattr(executable, "recompile_fn", None) is None:
+                    executable._graph_module = None
+                return executable
 
         def split_module(gm, root, split_callback, *args, **kwargs):
             split = _active()
@@ -585,16 +606,14 @@ def _install() -> None:
         _originals["pickle_entry"] = autograd_cache.AOTAutogradCache._pickle_entry
 
         def pickle_entry(*args, **kwargs):
-            # A split executable keeps the constants SplitCompiler sank into
-            # its pieces as device tensors, and aot_autograd pickles its cache
-            # entry inside torch_tpu's FX trace, where copying a device tensor
-            # to the host fails. Pickle it in the eager mode from outside.
-            original = _originals["pickle_entry"]
-            split = _active()
-            if split is None:
-                return original(*args, **kwargs)
-            with split.outside_trace():
-                return original(*args, **kwargs)
+            # aot_autograd also saves its cache entry to torch's local cache,
+            # pickling it inside torch_tpu's FX trace. For a split bucket that
+            # copy is redundant -- the bucket is saved to vLLM's cache -- and
+            # costly: the entry holds device tensors, which cannot even be
+            # copied to the host inside the trace. None skips the save.
+            if _active() is not None:
+                return None
+            return _originals["pickle_entry"](*args, **kwargs)
 
         autograd_cache.AOTAutogradCache._pickle_entry = staticmethod(pickle_entry)
         _backend.make_backend_compiler = make_backend_compiler

@@ -1027,44 +1027,53 @@ class TestHostSplit:
         assert time.monotonic() - start < 20.0
         assert len(lowered) == 2
 
-    def test_the_cache_entry_is_pickled_outside_the_fx_trace(
-        self, tmp_path, monkeypatch
-    ):
-        """aot_autograd pickles the entry of a split executable, device
-        constants included, in torch_tpu's eager mode from outside the
-        backend: inside the FX trace a device-to-host copy fails."""
-        import contextlib
-
+    def test_a_split_skips_torchs_local_cache_save(self, monkeypatch):
+        """aot_autograd's own copy of a split bucket's entry is skipped: it
+        holds device tensors, which cannot be copied inside the FX trace, and
+        vLLM's cache gets the bucket anyway. Outside a split it is kept."""
         from torch._functorch._aot_autograd import autograd_cache
 
         from vllm_torchtpu.compilation import host_split
 
         host_split._install()
-        pickled_outside = []
-        state = {"outside": False}
-
-        @contextlib.contextmanager
-        def outside_trace(self):
-            state["outside"] = True
-            try:
-                yield
-            finally:
-                state["outside"] = False
-
-        monkeypatch.setattr(host_split._Split, "outside_trace", outside_trace)
-
-        def original(*args, **kwargs):
-            pickled_outside.append(state["outside"])
-            return b""
-
-        monkeypatch.setitem(host_split._originals, "pickle_entry", original)
+        calls = []
+        monkeypatch.setitem(
+            host_split._originals,
+            "pickle_entry",
+            lambda *args, **kwargs: calls.append(args) or b"entry",
+        )
         installed = autograd_cache.AOTAutogradCache._pickle_entry
 
-        installed(None, False)
+        assert installed(None, False) == b"entry"
         split = host_split._Split(host_split.Plan(2, 0, 0.0), "k", None, "r")
         monkeypatch.setattr(host_split._state, "split", split, raising=False)
-        installed(None, False)
-        assert pickled_outside == [False, True]
+        assert installed(None, False) is None
+        assert len(calls) == 1
+
+    def test_a_split_executable_drops_the_unsplit_graph(self, tmp_path, monkeypatch):
+        import torch
+
+        from vllm_torchtpu.compilation import host_split
+
+        self._fake_lowering(monkeypatch)
+        gm, example_inputs, expected = self._model_graph()
+        _, fn, handle = self._compile(tmp_path, 1, gm, example_inputs, 0.0)
+        assert torch.allclose(self._out(fn(*example_inputs)), expected)
+        with open(handle[1], "rb") as f:
+            payload = host_split.pickle.load(f)
+        found = []
+
+        def walk(obj, depth=0):
+            if depth > 6:
+                return
+            if type(obj).__name__ == "_SplitCompiledExecutable":
+                found.append(obj)
+                return
+            for v in getattr(obj, "__dict__", {}).values():
+                walk(v, depth + 1)
+
+        walk(payload.entry)
+        assert found and all(e._graph_module is None for e in found)
 
     def test_outside_a_split_the_backend_is_untouched(self, tmp_path, monkeypatch):
         """Once installed, the hooks do nothing for a bucket built outside
