@@ -37,23 +37,30 @@ class VllmModelWrapperContext:
         self._prev, _vllm_model_wrapper_context = _vllm_model_wrapper_context, self
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def __exit__(
+        self,
+        exc_type: object = None,
+        exc_val: object = None,
+        exc_tb: object = None,
+    ) -> None:
         global _vllm_model_wrapper_context
         _vllm_model_wrapper_context, self._prev = self._prev, None  # type: ignore[assignment]
 
 
-_vllm_model_wrapper_context: VllmModelWrapperContext | None = (
-    None if (_context_cache := {}) is not None else None
-)
+_vllm_model_wrapper_context: VllmModelWrapperContext | None = None
+_last_context: VllmModelWrapperContext | None = None
+_context_cache: dict[tuple[int, int, int, int, int], VllmModelWrapperContext] = {}
+_reentrant_cache: dict[tuple[int, int, int, int, int], VllmModelWrapperContext] = {}
 
 
 def get_vllm_model_wrapper_context() -> VllmModelWrapperContext:
-    assert _vllm_model_wrapper_context is not None, (
+    if (ctx := _vllm_model_wrapper_context) is not None:
+        return ctx
+    raise AssertionError(
         "VllmModelWrapperContext is not set. "
         "Please use `set_vllm_model_wrapper_context` to set the "
         "VllmModelWrapperContext."
     )
-    return _vllm_model_wrapper_context
 
 
 def set_vllm_model_wrapper_context(
@@ -64,51 +71,65 @@ def set_vllm_model_wrapper_context(
     vllm_config: object | None = None,
     kv_cache_bundle: torch.Tensor | None = None,
 ) -> VllmModelWrapperContext:
-    return (
-        cached
-        if (
-            (
-                cached := _context_cache.get(
-                    key := (
-                        id(mesh),
-                        id(kv_caches),
-                        id(layer_name_to_kvcache_index),
-                        id(vllm_config),
-                        id(kv_cache_bundle),
-                    )
-                )
-            )
-            is not None
-            and cached is not _vllm_model_wrapper_context
-            and cached._prev is None
-            and cached.mesh is mesh
-            and cached.kv_caches is kv_caches
-            and cached.layer_name_to_kvcache_index is layer_name_to_kvcache_index
-            and cached.vllm_config is vllm_config
-            and cached.kv_cache_bundle is kv_cache_bundle
-        )
-        else (
-            VllmModelWrapperContext(
-                kv_caches=kv_caches,
-                mesh=mesh,
-                layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                vllm_config=vllm_config,
-                kv_cache_bundle=kv_cache_bundle,
-            )
-            if cached is not None
-            and (cached is _vllm_model_wrapper_context or cached._prev is not None)
-            else _context_cache.setdefault(
-                key,
-                (
-                    _context_cache.pop(key, None),
-                    VllmModelWrapperContext(
-                        kv_caches=kv_caches,
-                        mesh=mesh,
-                        layer_name_to_kvcache_index=layer_name_to_kvcache_index,
-                        vllm_config=vllm_config,
-                        kv_cache_bundle=kv_cache_bundle,
-                    ),
-                )[1],
-            )
-        )
+    global _last_context
+    if (
+        (ctx := _last_context) is not None
+        and ctx.mesh is mesh
+        and ctx.kv_caches is kv_caches
+        and ctx.layer_name_to_kvcache_index is layer_name_to_kvcache_index
+        and ctx.vllm_config is vllm_config
+        and ctx.kv_cache_bundle is kv_cache_bundle
+        and ctx is not _vllm_model_wrapper_context
+        and ctx._prev is None
+    ):
+        return ctx
+    key = (
+        id(mesh),
+        id(kv_caches),
+        id(layer_name_to_kvcache_index),
+        id(vllm_config),
+        id(kv_cache_bundle),
     )
+    cached = _context_cache.get(key)
+    if (
+        cached is not None
+        and cached.mesh is mesh
+        and cached.kv_caches is kv_caches
+        and cached.layer_name_to_kvcache_index is layer_name_to_kvcache_index
+        and cached.vllm_config is vllm_config
+        and cached.kv_cache_bundle is kv_cache_bundle
+    ):
+        if cached is not _vllm_model_wrapper_context and cached._prev is None:
+            _last_context = cached
+            return cached
+        rctx = _reentrant_cache.get(key)
+        if (
+            rctx is not None
+            and rctx is not _vllm_model_wrapper_context
+            and rctx._prev is None
+            and rctx.mesh is mesh
+            and rctx.kv_caches is kv_caches
+            and rctx.layer_name_to_kvcache_index is layer_name_to_kvcache_index
+            and rctx.vllm_config is vllm_config
+            and rctx.kv_cache_bundle is kv_cache_bundle
+        ):
+            return rctx
+        rctx = VllmModelWrapperContext(
+            kv_caches=kv_caches,
+            mesh=mesh,
+            layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+            vllm_config=vllm_config,
+            kv_cache_bundle=kv_cache_bundle,
+        )
+        _reentrant_cache[key] = rctx
+        return rctx
+    ctx = VllmModelWrapperContext(
+        kv_caches=kv_caches,
+        mesh=mesh,
+        layer_name_to_kvcache_index=layer_name_to_kvcache_index,
+        vllm_config=vllm_config,
+        kv_cache_bundle=kv_cache_bundle,
+    )
+    _context_cache[key] = ctx
+    _last_context = ctx
+    return ctx
