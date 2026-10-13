@@ -233,7 +233,7 @@ class DeepseekV4MLP(nn.Module):
 
     def _lift_tp_shape_variant_tensors(self) -> None:
         if (
-            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS >= 0
+            envs.VLLM_DSV41_TOKEN_SHARD_MIN_TOKENS > 0
             and "_tp_gate_up_w" in self._buffers
         ):
             _ = [

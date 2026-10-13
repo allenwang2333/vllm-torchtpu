@@ -163,7 +163,7 @@ def _o_proj_wob_jax(
             wo_b_s,
             head_dim=head_dim,
         )
-    if int(x.shape[0]) <= 384 and x.shape[1] == 128 and wo_b_s.ndim in (1, 4):
+    if not isinstance(x.shape[0], torch.SymInt) and x.shape[1] == 128 and wo_b_s.ndim == 4 and x.shape[0] <= 384:
         return o_proj.fused_reverse_rope_wo_a_wo_b_h128_projection(
             x,
             positions,
@@ -1157,11 +1157,7 @@ class VllmDeepseekV41MLAAttention(
             is_csa
             and main_cache is not None
             and swa_tensor is not None
-            and (
-                main_cache is swa_tensor
-                if torch.compiler.is_compiling()
-                else main_cache.data_ptr() == swa_tensor.data_ptr()
-            )
+            and (main_cache is swa_tensor if torch.compiler.is_compiling() else main_cache.data_ptr() == swa_tensor.data_ptr())
         )
         built_from_real_caches = swa_tensor is not None
 
@@ -1924,7 +1920,7 @@ class VllmDeepseekV41MLAAttention(
             None if eff_ced_global_from_encoder else getattr(self, "compressor", None)
         )
         cos_sin = self.rotary_emb.cos_sin_cache
-        if _TOKEN_SHARD_MIN_TOKENS >= 0 and "_tp_attn_wq_b_w" in self._buffers:
+        if _TOKEN_SHARD_MIN_TOKENS > 0 and "_tp_attn_wq_b_w" in self._buffers:
             _ = self._tp_attn_ready(num_tokens, tp_size)
             _ = [
                 torch.ops.aten.alias.default(t)
@@ -1949,7 +1945,7 @@ class VllmDeepseekV41MLAAttention(
                 if t is not None
             ]
         elif (
-            _TOKEN_SHARD_MIN_TOKENS >= 0
+            _TOKEN_SHARD_MIN_TOKENS > 0
             and "_tp_attn_wo_b_w" in self._buffers
         ):
             _ = [
@@ -2439,42 +2435,6 @@ class VllmDeepseekV41MLAAttention(
             tail_operands += (
                 dummy_main if main_cache_rope is None else main_cache_rope,
             )
-            local_tokens = int(num_tokens)
-            if (
-                _CSA_UNION
-                and main_cache_kv.shape[0] > 0
-                and topk_indices is not None
-                and int(topk_indices.shape[0]) == local_tokens
-                and int(topk_indices.shape[1]) % 128 == 0
-            ):
-                max_num_seqs = (
-                    int(main_q_loc.shape[0]) - 1
-                    if main_q_loc is not None
-                    else local_tokens
-                )
-                b_q, m_union = (
-                    resolve_csa_union_params(
-                        local_tokens,
-                        int(topk_indices.shape[1]),
-                        max_num_seqs,
-                        ced_decoder=eff_ced_decoder,
-                        num_q_heads=int(q.shape[1]),
-                    )
-                    or (0, 0)
-                )
-                if b_q > 0 and m_union > 0:
-                    total_cache_rows = int(
-                        main_cache_kv.shape[0] * main_cache_kv.shape[1]
-                    )
-                    cached_u = self._get_or_compute_csa_union(
-                        topk_indices,
-                        total_cache_rows,
-                        m_union,
-                        b_q,
-                        ced_decoder=eff_ced_decoder,
-                    )
-                    tail_operands += tuple(cached_u)
-                    has_union = True
 
         attn_output, new_sw_cache = self._get_attn_op(
             has_union, ced_decoder=eff_ced_decoder
@@ -2491,7 +2451,7 @@ class VllmDeepseekV41MLAAttention(
             ws_wo_b is not None
             and ws_wo_b.ndim == 1
             and self.wo_b._parameters.get("bias") is None
-            and self.n_local_heads in (16, 128)
+            and self.n_local_heads == 16
         ):
             w_wo_b_in = (
                 w_wo_b.transpose(0, 1)

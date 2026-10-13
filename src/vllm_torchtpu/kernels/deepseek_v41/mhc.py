@@ -1397,7 +1397,7 @@ def mhc_fused_post_pre_quant_v41(
     *outer_shape, hc_mult, hidden_size = residual.shape
     num_tokens = x.size // hidden_size
     normed_w = hidden_size
-    if num_tokens <= 512:
+    if num_tokens <= 256:
         seam_fn = (
             _v41_fused_post_pre_quant_1strip_kernel
             if num_tokens <= 128

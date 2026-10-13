@@ -1010,7 +1010,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             register_score_bias_buffer,
         )
 
-        _use_all39_ep_v2 = False
+        _use_all39_ep_v2 = (
+            __import__("os").environ.get("VLLM_DSV41_MOE_EP_V2_ALL39", "1") == "1"
+        )
         _ep_op = prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,

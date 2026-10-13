@@ -136,14 +136,7 @@ def plan_decoder_replay(
         dec_seq_lens_list.append(length if kept_i > 0 else 0)
         if kept_i > 0:
             active_seq_end = req_idx + 1
-            if (
-                all_decode_so_far
-                and kept_i == count
-                and (
-                    (count == 1 and length > prompt)
-                    or (count > 1 and length - count >= prompt)
-                )
-            ):
+            if all_decode_so_far and count == 1 and kept_i == 1 and length > prompt:
                 decode_end = req_idx + 1
             else:
                 all_decode_so_far = False

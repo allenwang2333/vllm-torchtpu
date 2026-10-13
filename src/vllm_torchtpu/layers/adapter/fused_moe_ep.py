@@ -49,7 +49,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
-from torch_tpu._internal.pallas import jax_op
+from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op as jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -208,8 +208,6 @@ def _build_op(
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
-        w1_scale = w1_scale.squeeze(-2) if w1_scale.ndim == 4 else w1_scale
-        w2_scale = w2_scale.squeeze(-2) if w2_scale.ndim == 4 else w2_scale
         return fused_ep_moe_v2(
             x,
             w1,
@@ -234,124 +232,6 @@ def _build_op(
             **routing_kw,
         )
 
-    def _small_t_fp8_gated(
-        x: jax.Array,
-        w1: jax.Array,
-        w2: jax.Array,
-        w1_scale: jax.Array,
-        w2_scale: jax.Array,
-        gating: jax.Array,
-        rank: jax.Array,
-        *,
-        score_bias: jax.Array | None = None,
-        hash_ids: jax.Array | None = None,
-    ) -> jax.Array:
-        from jax import lax
-        from vllm_torchtpu.kernels.fused_moe.v2.layer import (
-            _apply_scoring_fn,
-            _relabel_expert_ids_to_mesh_order,
-        )
-        from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
-        from vllm_torchtpu.layers.core.fused_moe_gmm import (
-            fused_moe_func_fp8_dispatch,
-            quantize_moe_dispatch_packed_rows,
-            resolve_onehot_permute_threshold,
-        )
-
-        T_global = x.shape[0]
-        (ax,) = mesh.axis_names
-        ep = mesh.shape[ax]
-        t_local = T_global // ep
-        e_total = w1.shape[0]
-        g_local = e_total // ep
-        onehot_thr = resolve_onehot_permute_threshold()
-        _fn_dispatch = getattr(
-            fused_moe_func_fp8_dispatch,
-            "__wrapped__",
-            fused_moe_func_fp8_dispatch,
-        )
-        sel_rows = (
-            t_local
-            if t_local <= 256
-            else next(d for d in range(256, 7, -8) if t_local % d == 0)
-        )
-        skip_pad = T_global > 16
-
-        def _shard_fn(x_l, w1_l, w2_l, w1s_l, w2s_l, gate_l, rank_l, *extra_l):
-            scores = _apply_scoring_fn(gate_l, scoring_fn)
-            if hash_ids is not None:
-                ids_l = extra_l[0].astype(jnp.int32)
-                w_l = jnp.take_along_axis(scores, ids_l, axis=-1)
-            elif score_bias is not None:
-                sb_l = extra_l[0].astype(jnp.float32)
-                w_l, ids_l = pallas_select(
-                    scores + sb_l[None, :],
-                    topk=topk,
-                    block_rows=sel_rows,
-                    weight_scores=scores,
-                )
-            else:
-                w_l, ids_l = pallas_select(
-                    scores, topk=topk, block_rows=sel_rows
-                )
-            row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
-            if renormalize:
-                denom = jnp.maximum(w_l.sum(axis=-1, keepdims=True), 1e-20)
-                w_l = w_l / jnp.where(row_routes, denom, 1.0)
-            if routed_scaling_factor != 1.0:
-                w_l = w_l * jnp.float32(routed_scaling_factor)
-            w_l = jnp.where(row_routes, w_l, 0.0)
-            ids_l = ids_l.astype(jnp.int32)
-            packed_l = quantize_moe_dispatch_packed_rows(
-                x_l, w_l.astype(x_l.dtype), ids_l
-            )
-            packed_g = lax.all_gather(packed_l, ax, axis=0, tiled=True)
-            me = rank_l[0, 0]
-            ep_rank = (
-                jnp.asarray(mesh_expert_order, dtype=jnp.int32)[me]
-                if mesh_expert_order is not None
-                else me
-            )
-            out_g = _fn_dispatch(
-                packed_g,
-                jnp.empty((0,), dtype=x_l.dtype),
-                w1_l,
-                w2_l,
-                w1s_l[:, None, None, :] if w1s_l is not None else None,
-                w2s_l[:, None, None, :] if w2s_l is not None else None,
-                None,
-                None,
-                jnp.empty((0, topk), dtype=x_l.dtype),
-                jnp.empty((0, topk), dtype=jnp.int32),
-                experts_start=ep_rank * g_local,
-                topk=topk,
-                activation=activation,
-                use_ep=True,
-                use_sparse_core=True,
-                onehot_moe_permute_threshold=onehot_thr,
-                skip_padded_tokens=skip_pad,
-            )
-            return lax.psum_scatter(
-                out_g.astype(x_l.dtype), ax, scatter_dimension=0, tiled=True
-            )
-
-        extra_args = ()
-        extra_specs = ()
-        if hash_ids is not None:
-            extra_args = (hash_ids.astype(jnp.int32),)
-            extra_specs = (PartitionSpec(ax),)
-        elif score_bias is not None:
-            extra_args = (score_bias.astype(jnp.float32),)
-            extra_specs = (PartitionSpec(),)
-
-        return jax.shard_map(
-            _shard_fn,
-            mesh=mesh,
-            in_specs=(PartitionSpec(ax),) * 7 + extra_specs,
-            out_specs=PartitionSpec(ax),
-            check_vma=False,
-        )(x, w1, w2, w1_scale, w2_scale, gating, rank, *extra_args)
-
     def moe(
         x: jax.Array,
         w1: jax.Array,
@@ -361,8 +241,6 @@ def _build_op(
         gating: jax.Array,
         rank: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
-            return _small_t_fp8_gated(x, w1, w2, w1_scale, w2_scale, gating, rank)
         return call(x, w1, w2, w1_scale, w2_scale, gating, rank)
 
     def moe_with_score_bias(
@@ -375,10 +253,6 @@ def _build_op(
         rank: jax.Array,
         score_bias: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
-            return _small_t_fp8_gated(
-                x, w1, w2, w1_scale, w2_scale, gating, rank, score_bias=score_bias
-            )
         return call(
             x,
             w1,
@@ -400,10 +274,6 @@ def _build_op(
         rank: jax.Array,
         hash_ids: jax.Array,
     ) -> jax.Array:
-        if x.shape[0] <= 384 and weight_format == "fp8" and token_replica_groups is None:
-            return _small_t_fp8_gated(
-                x, w1, w2, w1_scale, w2_scale, gating, rank, hash_ids=hash_ids
-            )
         return call(
             x,
             w1,
@@ -432,12 +302,7 @@ def _build_op(
         e_total = w1.shape[0]
         g_local = e_total // ep
 
-        fp4_max_t = int(
-            os.environ.get("VLLM_DSV41_MOE_FP4_PATH_C_MAX_TOKENS", "16384" if ep <= 2 else "0")
-        )
-        fp8_max_t = int(os.environ.get("VLLM_DSV41_MOE_FP8_PATH_C_MAX_TOKENS", "512"))
-        use_path_c = T_global <= (fp4_max_t if weight_format == "fp4" else fp8_max_t)
-        if use_path_c and weight_format in ("fp8", "fp4"):
+        if T_global <= 2048 and weight_format == "fp8":
             from jax import lax
             from vllm_torchtpu.layers.core.fused_moe_gmm import (
                 fused_moe_func_fp8_dispatch,
@@ -450,11 +315,6 @@ def _build_op(
                 fused_moe_func_fp8_dispatch,
                 "__wrapped__",
                 fused_moe_func_fp8_dispatch,
-            )
-            rhs_qdtype = (
-                None
-                if w1.dtype == jnp.float4_e2m1fn
-                else (jnp.float4_e2m1fn if weight_format == "fp4" else None)
             )
 
             def _local_path_c(
@@ -471,23 +331,13 @@ def _build_op(
                     else me
                 )
                 exp_start = ep_rank * g_local
-                w1s_4d = (
-                    w1s_l[:, :, None, :]
-                    if (w1s_l is not None and w1s_l.ndim == 3)
-                    else (w1s_l[:, None, None, :] if w1s_l is not None else None)
-                )
-                w2s_4d = (
-                    w2s_l[:, :, None, :]
-                    if (w2s_l is not None and w2s_l.ndim == 3)
-                    else (w2s_l[:, None, None, :] if w2s_l is not None else None)
-                )
                 out_g = _fn_dispatch(
                     packed_g,
                     jnp.empty((0,), dtype=x_l.dtype),
                     w1_l,
                     w2_l,
-                    w1s_4d,
-                    w2s_4d,
+                    w1s_l[:, None, None, :] if w1s_l is not None else None,
+                    w2s_l[:, None, None, :] if w2s_l is not None else None,
                     None,
                     None,
                     jnp.empty((0, topk), dtype=x_l.dtype),
@@ -496,10 +346,9 @@ def _build_op(
                     topk=topk,
                     activation=activation,
                     use_ep=True,
-                    rhs_quant_dtype=rhs_qdtype,
                     use_sparse_core=True,
                     onehot_moe_permute_threshold=onehot_thr,
-                    skip_padded_tokens=(T_global > 16),
+                    skip_padded_tokens=False,
                 )
                 return lax.psum_scatter(
                     out_g.astype(x_l.dtype), ax, scatter_dimension=0, tiled=True
@@ -534,7 +383,7 @@ def _build_op(
                 topk=topk,
                 renormalize=False,
                 mesh=mesh,
-                capacity=int(os.environ.get("VLLM_DSV41_MOE_V2_CAPACITY", "32" if x_s.shape[0] <= 128 else ("64" if x_s.shape[0] <= 1536 else str(_TILE_M)))),
+                capacity=_TILE_M,
                 block=None,
                 ragged_stride=None,
                 weight_format=WeightFormat(weight_format),
@@ -586,24 +435,13 @@ def _build_op(
             fn = moe_with_hash_ids
         else:
             fn = moe
-    try:
-        op = jax_op(
-            name,
-            fn,
-            mesh=mesh,
-            input_partition_specs=input_specs,
-            output_partition_specs=spec,
-        )
-    except TypeError:
-        from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
-
-        op = sharded_jax_op(
-            name,
-            fn,
-            mesh=mesh,
-            input_partition_specs=input_specs,
-            output_partition_specs=spec,
-        )
+    op = jax_op(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=input_specs,
+        output_partition_specs=spec,
+    )
 
     def _fake(x, *_args, **_kwargs):
         return torch.empty_like(x)
@@ -816,7 +654,7 @@ def prebuild_fused_moe_ep(
         return None
     global _RANK_BUFFER
     _RANK_BUFFER = torch.tensor(
-        [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+        [[ep_mesh_index()]], dtype=torch.int32, device=next(layer.parameters()).device
     )
     mesh_expert_order = _mesh_expert_order(ep)
 
@@ -873,14 +711,8 @@ def prebuild_fused_moe_ep(
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
-    sharded_plan = bool(os.environ.get("VLLM_DSV41_MOE_V2_SHARDED_PLAN", "1") == "1")
-    token_replica_groups = (
-        None
-        if precomputed_routing
-        else ep_token_replica_groups(
-            is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
-        )
-    )
+    sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    token_replica_groups = None
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     op = _build_op(

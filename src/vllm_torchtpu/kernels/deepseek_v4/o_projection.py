@@ -1082,40 +1082,6 @@ def fused_reverse_rope_wo_a_wo_b_h128_projection(
     else:
         sb_4d = wo_b_scale
 
-    if t_pad in (192, 384):
-        tile_t = 192
-        out_init = jax.lax.empty((t_pad, hidden_dim), dtype=jnp.bfloat16)
-        out = pl.pallas_call(
-            functools.partial(
-                _wo_a_wo_b_h128_weight_outer_kernel,
-                tile_t=tile_t,
-                num_sub_t=1,
-                lora_rank=lora_rank,
-                head_dim=head_dim,
-                inverse=inverse,
-            ),
-            out_shape=jax.ShapeDtypeStruct((t_pad, hidden_dim), jnp.bfloat16),
-            grid=(8, t_pad // tile_t),
-            in_specs=[
-                pl.BlockSpec((tile_t, 16, head_dim), lambda b, t: (t, b, 0)),
-                pl.BlockSpec((reduction, 2048), lambda b, t: (0, b)),
-                pl.BlockSpec((1, 2048), lambda b, t: (0, b)),
-                pl.BlockSpec((2048, hidden_dim), lambda b, t: (b, 0)),
-                pl.BlockSpec((1, 1, 1, hidden_dim), lambda b, t: (0, b, 0, 0)),
-                pl.BlockSpec((tile_t, 2 * LANE), lambda b, t: (t, 0)),
-                pl.BlockSpec((tile_t, hidden_dim), lambda b, t: (t, 0)),
-            ],
-            out_specs=pl.BlockSpec((tile_t, hidden_dim), lambda b, t: (t, 0)),
-            input_output_aliases={6: 0},
-            compiler_params=pltpu.CompilerParams(
-                vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-                disable_bounds_checks=True,
-                dimension_semantics=("arbitrary", "parallel"),
-            ),
-            name=f"{name}_wouter192",
-        )(x, wo_a, wo_a_scale.reshape(1, out_features), wo_b, sb_4d, cos_sin, out_init)
-        return out[:num_tokens] if pad_t > 0 else out
-
     if t_pad <= 384:
         sub_t = t_pad if t_pad <= 256 else SUBLANE * _largest_divisor(t_pad // SUBLANE, cap=128 // SUBLANE)
         num_sub_t = t_pad // sub_t
@@ -1448,7 +1414,7 @@ def fused_wqa_wkv_norm_rope_quant(
     from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
     num_tokens, in_dim = h.shape
-    if num_tokens not in (8,) and num_tokens < 192:
+    if num_tokens not in (8,) and num_tokens < 384:
         qr_kv = xla_quantized_matmul(h, w_wqa, ws_wqa)
         return rope_mod.qkv_norm_rope_quant(
             qr_kv, q_w, kv_w, positions, cos_sin_cache, q_eps=q_eps, kv_eps=kv_eps
@@ -1531,7 +1497,7 @@ def fused_wqa_wkv_prequant_norm_rope_quant(
     from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_mod
 
     num_tokens, in_dim = h_fp8.shape
-    if num_tokens not in (48,) and num_tokens < 192:
+    if num_tokens not in (48,) and num_tokens < 384:
         qr_kv = (
             jax.lax.dot_general(
                 h_fp8, w_wqa, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32

@@ -26,17 +26,21 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
     def aux_partition_sizes(
         num_blocks: int, max_num_reqs: int | None = None
     ) -> tuple[int, int]:
-        """Low-end block counts reserved for compressor state and SWA caches."""
-        if num_blocks >= 256:
-            num_state = min(
-                1152 if num_blocks >= 16384 else 160, max(16, num_blocks // 32)
+        """Tail-block counts reserved for compressor state and SWA caches."""
+        if num_blocks >= 4096:
+            reqs = (
+                max_num_reqs if max_num_reqs is not None else max(64, num_blocks // 107)
             )
-            num_swa = (
-                min(2816 if num_blocks >= 16384 else 1024, max(32, (num_blocks * 2) // 9))
-                if num_blocks >= 4096
-                else min(352, max(32, (num_blocks * 3) // 16))
+            num_state = max(
+                128,
+                min((9 * reqs) // 4 if reqs > 64 else 2 * reqs, num_blocks // 32),
             )
+            num_swa = max(768, min((11 * reqs) // 2, num_blocks // 11))
             return num_state, num_swa
+        if num_blocks >= 64:
+            return max(4, min(64, num_blocks // 32)), max(
+                8, min(128, (num_blocks * 3) // 16)
+            )
         return 0, 0
 
     def _initialize_ds_v4_kv_cache(
@@ -69,7 +73,51 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         if not isinstance(max_reqs, int):
             max_reqs = None
 
-        num_state_aux, num_swa_aux = self.aux_partition_sizes(num_blocks, max_reqs)
+        mla_bytes_per_block = 0
+        csa_host_page_sizes: list[int] = []
+        for layer_name in mla_layer_names:
+            spec = per_layer_spec(layer_name)
+            page_size = spec.num_states
+            if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
+                mla_bytes_per_block += (
+                    (spec.head_size // packing) * packing * page_size
+                )
+            else:
+                mla_bytes_per_block += (
+                    page_size * csa_cache_layout.ROW_WORDS * 4
+                )
+                mla_bytes_per_block += (
+                    (page_size // csa_cache_layout.ROPE_TOKENS_PER_ROW)
+                    * csa_cache_layout.ROW_WORDS
+                    * 4
+                )
+                csa_host_page_sizes.append(page_size)
+        n_disjoint_swa = max((len(g) for g in swa_layer_groups), default=0)
+        n_extra_swa_hosts = max(0, n_disjoint_swa - len(csa_host_page_sizes))
+        if csa_host_page_sizes and n_extra_swa_hosts > 0:
+            min_csa_page_size = min(csa_host_page_sizes)
+            swa_rows_init = (
+                per_layer_spec(swa_layer_groups[0][0]).block_size * 2
+                if swa_layer_groups and swa_layer_groups[0]
+                else min_csa_page_size
+            )
+            swa_extra_bytes_per_block = (
+                n_extra_swa_hosts
+                * swa_rows_init
+                * csa_cache_layout.ROW_WORDS
+                * 4
+            )
+            total_phys_bytes_per_block = (
+                mla_bytes_per_block + swa_extra_bytes_per_block
+            )
+            pass  # Scaled in tpu_worker.determine_available_memory
+
+        num_state_aux = (
+            1152 if num_blocks >= 16384 else (1056 if num_blocks >= 4096 else max(16, num_blocks // 40))
+        )
+        num_swa_aux = (
+            2816 if num_blocks >= 16384 else (800 if num_blocks >= 4096 else max(32, num_blocks // 11))
+        )
         main_end = max(1, num_blocks - num_state_aux - num_swa_aux)
 
         def _create_cache(
@@ -79,10 +127,10 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             scale_idx: tuple | None = None,
         ) -> torch.Tensor:
             cache = torch.zeros(shape, dtype=dtype, device=runner.device)
-            if scale_idx is not None and num_blocks > 1 + num_state_aux:
-                cache[(slice(1 + num_state_aux, num_blocks), *scale_idx)] = (
+            if scale_idx is not None and main_end > 1:
+                cache[(slice(1, main_end), *scale_idx)] = (
                     (0x7F << 24) if dtype == torch.int32 else 0x7F
-                )  # e8m0 = 1.0 on swa+main blocks; keep state [1..1+num_state) 0.0
+                )  # e8m0 = 1.0
             cache._main_end = main_end
             synchronize_tensors([cache])
             logger.debug(
@@ -125,7 +173,6 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
         csa_nope_hosts = [h for h in csa_nope_hosts if h.shape[1] == min_host_page_size]
 
         swa_overflow_shape = tuple(csa_nope_hosts[0].shape)
-        swa_rows = csa_nope_hosts[0].shape[1]
         if swa_layer_groups and swa_layer_groups[0]:
             swa_rows = per_layer_spec(swa_layer_groups[0][0]).block_size * 2
             swa_overflow_shape = (num_blocks, swa_rows, csa_cache_layout.ROW_WORDS)
@@ -141,7 +188,6 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
                         alloc_shape,
                         f"deepseek_v41_flash_overflow.{len(hosts)}",
                         csa_nope_hosts[0].dtype,
-                        (slice(None), slice(64, 128)),
                     )
                 )
             return hosts[position]
@@ -157,7 +203,12 @@ class DeepseekV41FlashKVCacheAllocator(DsV4KVCacheAllocator):
             kv_layer_name = self._ds_v4_compressed_kv_layer_name(layer_name)
             if kv_layer_name not in kv_caches:
                 raise ValueError(f"State cache {layer_name} missing KV {kv_layer_name}")
-            kv_caches[layer_name] = kv_caches[kv_layer_name]
+            state_rows = max(32, per_layer_spec(layer_name).block_size * 8)
+            kv_caches[layer_name] = _create_cache(
+                (num_blocks, state_rows, csa_cache_layout.ROW_WORDS),
+                layer_name,
+                torch.int32,
+            )
 
         self._validate_ds_v4_overlay(kv_cache_config, kv_caches)
 

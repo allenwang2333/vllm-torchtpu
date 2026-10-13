@@ -500,13 +500,9 @@ def fused_ep_moe_v2(
             topk_weights = jnp.where(valid_route, topk_w_l.astype(jnp.float32), 0.0)
         else:
             scores = _apply_scoring_fn(gate_l, scoring_fn)
-            select_rows = (
-                t_local
-                if t_local <= MAX_ROUTING_BLOCK
-                else next(
-                    d for d in range(MAX_ROUTING_BLOCK, 7, -8) if t_local % d == 0
-                )
-            )
+            select_rows = MAX_ROUTING_BLOCK
+            while t_local % select_rows:
+                select_rows //= 2
             if hash_l is not None:
                 topk_idx = hash_l.astype(jnp.int32)
                 topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
