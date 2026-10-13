@@ -1339,7 +1339,8 @@ def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
     bytes so no fp8-specific pad support is needed on the device. The original
     weight stays for the M > 16 XLA path, which is fast only on its own layout
     (fp8-gemm probe 05: +14% / +78% at M=4096 on the padded N- / K-major forms)."""
-    weight, scale = layer.weight.data, layer.weight_scale.data
+    weight = cast(torch.Tensor, layer.weight).data
+    scale = cast(torch.Tensor, layer.weight_scale).data
     n_in, n_out = weight.shape
     n_pad = padded_n(n_out)
     raw = torch.zeros(n_in, n_pad, dtype=torch.uint8, device=weight.device)

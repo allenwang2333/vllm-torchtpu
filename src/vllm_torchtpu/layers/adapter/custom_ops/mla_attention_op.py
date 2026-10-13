@@ -857,7 +857,7 @@ class VllmTPUIndexer(Indexer):
         )
         kw = self.wk_weights_proj
         flipped = getattr(kw, WEIGHT_FLIPPED_ATTR, False)
-        kw_n_out = kw.weight.shape[1 if flipped else 0]
+        kw_n_out = cast(torch.Tensor, kw.weight).shape[1 if flipped else 0]
         assert kw_n_out == hd + nh, (kw_n_out, hd, nh)
         permute_linear_output_channels(
             kw, mla_rope_output_index(kw_n_out, rope, 0, 0, 1)
@@ -906,6 +906,8 @@ class VllmTPUIndexer(Indexer):
                 )
             else:
                 q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            # A key was passed in, so one comes back.
+            assert k_pe is not None
             # Note: RoPE (NeoX) can introduce extra leading dimensions during
             # compilation so we need to reshape back to token-flattened shapes
             q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
@@ -1482,7 +1484,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
         else:
             kv_layer, kv_offset = self.kv_a_proj_with_mqa, self.kv_lora_rank
-        weight = kv_layer.weight
+        # q_lora_rank picks which projections exist; the chosen ones are set.
+        assert q_layer is not None and kv_layer is not None
+        weight = cast(torch.Tensor, kv_layer.weight)
         kv_n_out = weight.shape[
             1 if getattr(kv_layer, WEIGHT_FLIPPED_ATTR, False) else 0
         ]

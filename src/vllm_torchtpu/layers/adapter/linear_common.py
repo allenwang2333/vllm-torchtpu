@@ -169,7 +169,11 @@ def _fp8_linear_pallas_jax(
     weight whose width is not a lane multiple; the kernel output is cut back to it.
     """
     n_out = w_q.shape[1]
-    kw, ks = (w_q, w_s) if w_k is None else (w_k, s_k)
+    if w_k is None:
+        kw, ks = w_q, w_s
+    else:
+        assert s_k is not None, "the padded weight w_k comes with its scale s_k"
+        kw, ks = w_k, s_k
     if fp8_skinny.supports(x.shape[0], kw, ks):
         return fp8_skinny.fp8_skinny_matmul(x, kw, ks, n_logical=n_out)
     return xla_quantized_matmul(x, w_q, w_s)
