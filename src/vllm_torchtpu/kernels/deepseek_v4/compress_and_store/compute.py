@@ -36,16 +36,15 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     # cos_val_32: (tile_n, 1, 32)
     # sin_val_32: (tile_n, 1, 32)
     tile_n = x.shape[0]
+    x_dtype = x.dtype
 
     # We work with 2D tensors for gather to keep dimensions simple.
-    x_2d = jnp.squeeze(x, axis=1)  # (tile_n, 128)
+    x_2d = jax.lax.squeeze(x, (1,))  # (tile_n, 128)
 
     # swap adjacent pairs: [1, 0, 3, 2, ...]
-    iota = jnp.arange(128)
-    swap_indices = jnp.bitwise_xor(iota, 1)  # (128,)
-    swap_coords = jnp.broadcast_to(swap_indices, (tile_n, 128))[
-        :, :, None
-    ]  # (tile_n, 128, 1)
+    iota = jax.lax.broadcasted_iota(jnp.int32, (tile_n, 128, 1), 1)
+    # (128,)
+    swap_coords = jax.lax.bitwise_xor(iota, 1)  # (tile_n, 128, 1)
 
     x_swapped_2d = jax.lax.gather(
         x_2d,
@@ -57,19 +56,18 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     )
 
     # cos_val_32/sin_val_32 are (tile_n, 1, 32). Squeeze to (tile_n, 32)
-    cos_32 = jnp.squeeze(cos_val_32, axis=1).astype(x.dtype)
-    sin_32 = jnp.squeeze(sin_val_32, axis=1).astype(x.dtype)
+    cos_32 = jax.lax.squeeze(cos_val_32, (1,)).astype(x_dtype)
+    sin_32 = jax.lax.squeeze(sin_val_32, (1,)).astype(x_dtype)
 
-    ones_32 = jnp.ones((tile_n, 32), dtype=x.dtype)
-    zeros_32 = jnp.zeros((tile_n, 32), dtype=x.dtype)
+    ones_32 = jax.lax.full((tile_n, 32), 1, x_dtype)
+    zeros_32 = jax.lax.full((tile_n, 32), 0, x_dtype)
 
     # pad to pairs: (tile_n, 64)
-    cos_pairs = jnp.concatenate([ones_32, cos_32], axis=-1)
-    sin_pairs = jnp.concatenate([zeros_32, sin_32], axis=-1)
+    cos_pairs = jax.lax.concatenate((ones_32, cos_32), 1)
+    sin_pairs = jax.lax.concatenate((zeros_32, sin_32), 1)
 
     # duplicate indices: [0, 0, 1, 1, 2, 2, ..., 63, 63]
-    dup_indices = iota // 2
-    dup_coords = jnp.broadcast_to(dup_indices, (tile_n, 128))[:, :, None]
+    dup_coords = jax.lax.shift_right_arithmetic(iota, 1)
 
     cos_dup_2d = jax.lax.gather(
         cos_pairs,
@@ -90,12 +88,15 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     )
 
     # alternate sin: [-1, 1, -1, 1, ...]
-    alt_mask = ((iota % 2) * 2 - 1).astype(x.dtype)[None, :]  # (1, 128)
+    iota_2d = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+    alt_mask = (jax.lax.shift_left(jax.lax.bitwise_and(iota_2d, 1), 1) - 1).astype(
+        x_dtype
+    )  # (1, 128)
     sin_alt_2d = sin_dup_2d * alt_mask
 
     out_2d = x_2d * cos_dup_2d + x_swapped_2d * sin_alt_2d
 
-    return out_2d[:, None, :]
+    return jax.lax.expand_dims(out_2d, (1,))
 
 
 def quantize_fp8_tiled(x, block_size):
@@ -103,34 +104,42 @@ def quantize_fp8_tiled(x, block_size):
     tile_n, slots, width = x.shape  # (tile_n, S, 128) f32
     num_blocks = width // block_size
 
-    qs = []
-    scales = []
-    for b in range(num_blocks):
-        start = b * block_size
-        end = start + block_size
-        x_block = x[:, :, start:end]  # (tile_n, S, block_size) f32
-
-        amax = jnp.clip(
-            jnp.max(jnp.abs(x_block), axis=-1, keepdims=True), 1e-4, None
+    if num_blocks == 1:
+        amax = jax.lax.max(
+            jnp.max(jax.lax.abs(x), axis=-1, keepdims=True), 1e-4
         )  # (tile_n, S, 1) f32
+        log2_val = jax.lax.log2(amax * _INV_FP8_MAX)  # f32
+        scale = jax.lax.exp2(jax.lax.ceil(log2_val))  # (tile_n, S, 1) f32
+        q = (x * (1.0 / scale)).astype(jnp.float8_e4m3fn)  # (tile_n, S, 128) fp8
+    else:
+        qs = []
+        scales = []
+        for b in range(num_blocks):
+            start = b * block_size
+            end = start + block_size
+            x_block = x[:, :, start:end]  # (tile_n, S, block_size) f32
 
-        log2_val = jnp.log2(amax * _INV_FP8_MAX)  # f32
-        scale = jnp.exp2(jnp.ceil(log2_val))  # (tile_n, S, 1) f32
+            amax = jax.lax.max(
+                jnp.max(jax.lax.abs(x_block), axis=-1, keepdims=True), 1e-4
+            )  # (tile_n, S, 1) f32
 
-        q_block = (x_block * (1.0 / scale)).astype(
-            jnp.float8_e4m3fn
-        )  # (tile_n, S, block_size) fp8
+            log2_val = jax.lax.log2(amax * _INV_FP8_MAX)  # f32
+            scale = jax.lax.exp2(jax.lax.ceil(log2_val))  # (tile_n, S, 1) f32
 
-        qs.append(q_block)
-        scales.append(scale)
+            q_block = (x_block * (1.0 / scale)).astype(
+                jnp.float8_e4m3fn
+            )  # (tile_n, S, block_size) fp8
 
-    q = jnp.concatenate(qs, axis=-1)  # (tile_n, S, 128) fp8
-    scale = jnp.concatenate(scales, axis=-1)  # (tile_n, S, num_blocks) f32
+            qs.append(q_block)
+            scales.append(scale)
+
+        q = jax.lax.concatenate(qs, 2)  # (tile_n, S, 128) fp8
+        scale = jax.lax.concatenate(scales, 2)  # (tile_n, S, num_blocks) f32
 
     # Bitcast workaround directly on f32 to extract exponent
     # f32 exponent is at bits 23-30. Shift right by 23 to align it.
     scale_u32 = pltpu.bitcast(scale, jnp.uint32)
-    scale_exp = scale_u32 >> 23
+    scale_exp = jax.lax.shift_right_logical(scale_u32, jnp.uint32(23))
     scale_u8 = scale_exp.astype(jnp.uint8)
     scale_f8 = pltpu.bitcast(scale_u8, jnp.float8_e8m0fnu)
 
@@ -157,13 +166,19 @@ def quantize_fp8_lane_periodic(x, period, nope_dim):
     ) * width + jax.lax.broadcasted_iota(jnp.int32, x.shape, 2)
     # Dims past the record's end are dropped by the packer; keeping them out
     # of the amax stops them widening a group they are not stored in.
-    a = jnp.where(dim < nope_dim, jnp.abs(x), 0.0)
-    folded = jnp.maximum(a[:, :, :period], a[:, :, period:])
-    amax = jnp.clip(jnp.max(folded, axis=1, keepdims=True), 1e-4, None)
-    scale = jnp.exp2(jnp.ceil(jnp.log2(amax * _INV_FP8_MAX)))  # (tile_n, 1, period)
+    a = jax.lax.select(
+        dim < nope_dim, jax.lax.abs(x), jax.lax.full(x.shape, 0.0, x.dtype)
+    )
+    folded = jax.lax.max(a[:, :, :period], a[:, :, period:])
+    amax = jax.lax.max(jnp.max(folded, axis=1, keepdims=True), 1e-4)
+    scale = jax.lax.exp2(
+        jax.lax.ceil(jax.lax.log2(amax * _INV_FP8_MAX))
+    )  # (tile_n, 1, period)
 
-    q = (x * (1.0 / jnp.concatenate([scale, scale], axis=-1))).astype(jnp.float8_e4m3fn)
-    scale_u8 = (pltpu.bitcast(scale, jnp.uint32) >> 23).astype(jnp.uint8)
+    q = (x * (1.0 / jax.lax.concatenate((scale, scale), 2))).astype(jnp.float8_e4m3fn)
+    scale_u8 = jax.lax.shift_right_logical(
+        pltpu.bitcast(scale, jnp.uint32), jnp.uint32(23)
+    ).astype(jnp.uint8)
     return q, pltpu.bitcast(scale_u8, jnp.float8_e8m0fnu)
 
 
@@ -172,7 +187,7 @@ def pack_nope_lane_periodic(q, scale, nope_dim, nope_width_bytes, last_dim_size)
     tile_n = q.shape[0]
     q_nope = pltpu.bitcast(q, jnp.uint8).reshape(tile_n, -1)[:, :nope_dim]
     scale_bytes = pltpu.bitcast(scale, jnp.uint8).reshape(tile_n, -1)
-    record = jnp.concatenate([q_nope, scale_bytes], axis=1)
+    record = jax.lax.concatenate((q_nope, scale_bytes), 1)
     assert record.shape[1] == nope_width_bytes, record.shape
     return record.reshape(tile_n, -1, last_dim_size)
 
@@ -203,11 +218,13 @@ def pack_nope_tiled(
 
     # Pad with zeros
     pad_size = nope_width_bytes - (nope_dim + nope_blocks)
-    zeros = jnp.zeros((tile_n, pad_size), dtype=jnp.uint8)
-
-    nope_record_padded = jnp.concatenate(
-        [q_nope, scale_nope, zeros], axis=1
-    )  # (tile_n, 512)
+    if pad_size > 0:
+        zeros = jax.lax.full((tile_n, pad_size), 0, jnp.uint8)
+        nope_record_padded = jax.lax.concatenate(
+            (q_nope, scale_nope, zeros), 1
+        )  # (tile_n, 512)
+    else:
+        nope_record_padded = jax.lax.concatenate((q_nope, scale_nope), 1)
     return nope_record_padded.reshape(tile_n, -1, last_dim_size)
 
 
@@ -220,9 +237,11 @@ def rope_words_tiled(rope_slot_ropped, rope_head_dim):
     """
     bits = pltpu.bitcast(rope_slot_ropped.astype(jnp.bfloat16), jnp.uint16)
     bits = bits.astype(jnp.int32)
-    half = rope_head_dim // 2
+    half = rope_head_dim >> 1
     # Lane c picks up channel c + half as its high half.
-    return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
+    return jax.lax.bitwise_or(
+        bits, jax.lax.shift_left(pltpu.roll(bits, bits.shape[-1] - half, 2), 16)
+    )
 
 
 def merge_rope_row(
@@ -240,19 +259,26 @@ def merge_rope_row(
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
     lanes = row.shape[-1]
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
+    window = jax.lax.div(jax.lax.broadcasted_iota(jnp.int32, row.shape, 1), width)
+    window_masks = tuple(window == j for j in range(per_row))
+    shifts = tuple((j * width - rope_lane) % lanes for j in range(per_row))
     curr_slot = kv_slots[n]
     curr_row = curr_slot // per_row
     curr_valid = curr_slot >= 0
+    curr_pos = curr_slot % per_row
 
     for i in range(kv_slots.shape[0]):
-        slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & curr_valid & (slot_i // per_row == curr_row)
-        pos_i = slot_i % per_row
+        if i == n:
+            hit = curr_valid
+            pos_i = curr_pos
+        else:
+            slot_i = kv_slots[i]
+            hit = (slot_i >= 0) & curr_valid & (slot_i // per_row == curr_row)
+            pos_i = slot_i % per_row
         words_i = words[i]
         for j in range(per_row):
-            placed = pltpu.roll(words_i, (j * width - rope_lane) % lanes, 1)
-            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
+            placed = pltpu.roll(words_i, shifts[j], 1)
+            row = jax.lax.select((hit & (pos_i == j)) & window_masks[j], placed, row)
     return row
 
 
@@ -280,16 +306,21 @@ def merge_slot_updates(
 
     curr_row = curr_slot // pack_factor
     curr_valid = curr_slot >= 0
+    curr_sub_idx = curr_slot % pack_factor
 
     slots_list = [slots_val[i] for i in range(pack_factor)]
 
     for i in range(tile_n):
-        slot_i = kv_slots[i]
-        valid_i = slot_i >= 0
-        row_i = slot_i // pack_factor
-        sub_idx = slot_i % pack_factor
+        if i == n:
+            update_cond = curr_valid
+            sub_idx = curr_sub_idx
+        else:
+            slot_i = kv_slots[i]
+            valid_i = slot_i >= 0
+            row_i = slot_i // pack_factor
+            sub_idx = slot_i % pack_factor
 
-        update_cond = valid_i & (row_i == curr_row) & curr_valid
+            update_cond = valid_i & (row_i == curr_row) & curr_valid
 
         val = val_padded[i].reshape(-1)
 
@@ -322,11 +353,13 @@ def gather_from_page_buffer(
     """Extracts kv_window, score_window from page buffer."""
     tile_n = page_buffer.shape[0]
     half_window = window // 2
+    last_token_idx = num_tokens - 1
+    page_offset = pages_to_buffer_per_token - 1
     if is_indexer:
         # CSA_INDEXER (layout 32x4x256)
         # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
         for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
+            safe_idx = jnp.minimum(global_idx + n, last_token_idx)
             pos = positions_ref[safe_idx]
 
             block_idx_curr = pos // block_size
@@ -335,7 +368,7 @@ def gather_from_page_buffer(
             for w in range(window):
                 pos_w = pos_start + w
                 block_idx_w = pos_w // block_size
-                p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
+                p = block_idx_w - block_idx_curr + page_offset
 
                 offset_in_block = pos_w % block_size
                 token_row_start = offset_in_block * 2
@@ -355,17 +388,12 @@ def gather_from_page_buffer(
                     # 256 floats across its LANES. The prev/curr halves of the
                     # overlapping state are therefore lanes 0:128 and 128:256.
                     if overlap:
-                        is_prev = w < half_window
-                        val_kv = jax.lax.select(
-                            is_prev,
-                            row_kv[:, 0:128],
-                            row_kv[:, 128:256],
-                        )
-                        val_score = jax.lax.select(
-                            is_prev,
-                            row_score[:, 0:128],
-                            row_score[:, 128:256],
-                        )
+                        if w < half_window:
+                            val_kv = row_kv[:, 0:128]
+                            val_score = row_score[:, 0:128]
+                        else:
+                            val_kv = row_kv[:, 128:256]
+                            val_score = row_score[:, 128:256]
                     else:
                         val_kv = row_kv[:, 0:128]
                         val_score = row_score[:, 0:128]
@@ -382,7 +410,7 @@ def gather_from_page_buffer(
         score_curr_start = 3 * slots_per_part_row
 
         for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
+            safe_idx = jnp.minimum(global_idx + n, last_token_idx)
             pos = positions_ref[safe_idx]
 
             block_idx_curr = pos // block_size
