@@ -27,7 +27,6 @@
 #   RECIPE_DECODE                 dspark | dspark_mixed | dp2_dcp16
 #   RECIPE_DECODE_MAX_NUM_SEQS    decode's --max-num-seqs
 #   RECIPE_DRAFTS                 dspark: drafts
-#   RECIPE_ACCEPTANCE             dspark: synthetic acceptance length
 #   RECIPE_DRAFTS_PER_BATCH_SIZE  dspark_mixed: drafts by decode batch size
 #   RECIPE_OFFLOAD_BYTES          host KV store size, all ranks; optional
 #
@@ -42,7 +41,12 @@
 #
 # Where this departs from the doc, each needed on GKE: distinct Raiden ids per
 # role, a host KV store a quarter the size, and --headless on hosts 1-3 (which
-# k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
+# k3_1p1d.sh adds). One departure by choice: drafts are verified against the
+# target (vLLM's rejection sampler) instead of accepted at a fixed mean length
+# (rejection_sample_method synthetic). AgentX requires real rejection
+# sampling and does not take synthetic acceptance as evidence, so the decode
+# speed measured here depends on how well DSpark predicts the AgentX corpus.
+# Also not here, since the recipe omits them: --enable-auto-tool-choice,
 # --tool-call-parser and --reasoning-parser, and so not the Kimi tool-call
 # post-eval either.
 
@@ -51,10 +55,11 @@ for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
 done
 case "$RECIPE_DECODE" in
   dspark)
-    if [ -z "${RECIPE_DRAFTS:-}" ] || [ -z "${RECIPE_ACCEPTANCE:-}" ]; then
-      echo "ERROR: kimi-k3-megakernel: dspark needs RECIPE_DRAFTS and RECIPE_ACCEPTANCE" >&2
+    if [ -z "${RECIPE_DRAFTS:-}" ]; then
+      echo "ERROR: kimi-k3-megakernel: dspark needs RECIPE_DRAFTS" >&2
       return 2
-    fi ;;
+    fi
+    ;;
   dspark_mixed)
     if [ -z "${RECIPE_DRAFTS_PER_BATCH_SIZE:-}" ]; then
       echo "ERROR: kimi-k3-megakernel: dspark_mixed needs RECIPE_DRAFTS_PER_BATCH_SIZE" >&2
@@ -84,9 +89,8 @@ AGENTX_PRECISION=fp4
 AGENTX_POST_EVAL_SUITES=""
 # The doc's request path: vllm-router in its prefill/decode mode.
 AGENTX_PROXY=router
-# No GSM8K probe: the DSpark points accept drafts at a synthetic length, so
-# their answers are not the model's, and no point runs the reasoning parser
-# that strips K3's channel markers from the answer.
+# No GSM8K probe: no point runs the reasoning parser that strips K3's channel
+# markers from the answer.
 AGENTX_GSM8K_LIMIT=0
 if [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
   AGENTX_SPEC_METHOD=none
@@ -281,12 +285,13 @@ elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
     --kv-transfer-config "{${_raiden},\"kv_role\":\"kv_consumer\"}"
   )
 else
-  _loader=$(printf '{"presharded":"%s","synthetic_acceptance_lengths":{"3":2.87,"7":3.78}}' "$PRESHARDED_DIR")
+  # Drafts are verified by the target; no synthetic acceptance.
+  _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
   if [ "$RECIPE_DECODE" = dspark ]; then
-    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s}' \
-      "$DSPARK_DIR" "$RECIPE_DRAFTS" "$RECIPE_ACCEPTANCE")
+    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":%s}' \
+      "$DSPARK_DIR" "$RECIPE_DRAFTS")
   else
-    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_length":3.78}' \
+    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":%s}' \
       "$DSPARK_DIR" "$RECIPE_DRAFTS_PER_BATCH_SIZE")
   fi
   ROLE_ARGS=(

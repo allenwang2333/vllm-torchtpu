@@ -14,13 +14,12 @@
 # limitations under the License.
 
 # Kimi-K3 megakernel recipe point 1: concurrency 1; decode admits 1 sequence,
-# DSpark with 7 drafts at synthetic acceptance 3.78, DCP32. See recipe-base.sh.
+# DSpark with 7 drafts, verified by default, DCP32. See recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
 RECIPE_CONCURRENCY=1
 RECIPE_DECODE=dspark
 RECIPE_DECODE_MAX_NUM_SEQS=1
 RECIPE_DRAFTS=7
-RECIPE_ACCEPTANCE=3.78
 # shellcheck source=scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh
 source "$(dirname "${BASH_SOURCE[0]}")/recipe-base.sh"
