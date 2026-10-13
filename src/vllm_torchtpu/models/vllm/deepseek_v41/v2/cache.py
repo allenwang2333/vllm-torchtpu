@@ -952,43 +952,26 @@ def merge_sub_rows(
 ) -> tuple[jax.Array, jax.Array]:
     """Turn unique sub-row records into full word-row writes.
 
-    Sort records so each row's writers are at most ``per_row`` positions
-    apart. Only the first writer emits that row; other destinations are -1.
-    Untouched segments keep their old values. Output shapes remain static.
+    Each valid record yields its row: the current row with every segment
+    written in this batch replaced. Records sharing a row yield identical
+    rows, so writing them in any order is equivalent to the lane scatter.
+    Returns ``(row records, int32 [n, ROW_WORDS])``; invalid records stay -1.
     """
     import jax.numpy as jnp
 
     width = values.shape[1]
     per_row = ROW_WORDS // width
-    count = records.shape[0]
-    if not count:
-        return records, jnp.empty((0, ROW_WORDS), dtype=cache.dtype)
     valid = (records >= 0) & (records < cache.shape[0] * per_row)
-    sorted_records, order = jax.lax.sort_key_val(
-        jnp.where(valid, records, jnp.iinfo(records.dtype).max),
-        jnp.arange(count, dtype=jnp.int32),
-    )
-    valid = valid[order]
-    rows = jnp.where(valid, sorted_records // per_row, -1)
-    first = valid & ((jnp.arange(count) == 0) | (rows != jnp.roll(rows, 1)))
+    rows = jnp.where(valid, records // per_row, -1)
+    segments = records % per_row
     merged = cache[jnp.maximum(rows, 0)]
-    # Valid record ids are unique: a row has at most per_row writers.
-    neighbours = jnp.arange(count)[:, None] + jnp.arange(per_row)[None, :]
-    bounded = jnp.minimum(neighbours, count - 1)
-    candidates = sorted_records[bounded]
-    same_row = (
-        first[:, None]
-        & (neighbours < count)
-        & valid[bounded]
-        & (rows[bounded] == rows[:, None])
-    )
+    # [n, n]: which batch records land in each record's row. Batches are a
+    # step's tokens (<= max_num_batched_tokens), so this stays small.
+    same_row = (rows[:, None] == rows[None, :]) & valid[:, None] & valid[None, :]
     pieces = []
     for segment in range(per_row):
-        writers = same_row & (candidates % per_row == segment)
-        source_index = jnp.take_along_axis(
-            bounded, jnp.argmax(writers, axis=1)[:, None], axis=1
-        )[:, 0]
-        source = values[order[source_index]]
+        writers = same_row & (segments[None, :] == segment)
+        source = jnp.take(values, jnp.argmax(writers, axis=1), axis=0)
         pieces.append(
             jnp.where(
                 writers.any(axis=1)[:, None],
@@ -996,7 +979,7 @@ def merge_sub_rows(
                 merged[:, segment * width : (segment + 1) * width],
             )
         )
-    return jnp.where(first, rows, -1), jnp.concatenate(pieces, axis=1)
+    return rows, jnp.concatenate(pieces, axis=1)
 
 
 def _pack_bf16_words(values: jax.Array) -> jax.Array:

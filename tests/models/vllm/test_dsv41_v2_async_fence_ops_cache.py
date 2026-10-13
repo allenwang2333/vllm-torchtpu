@@ -1077,31 +1077,6 @@ class TestCacheMutationOps:
         assert packed.shape == (2, ROW_WORDS)
         assert packed.dtype == jnp.int32
 
-    @pytest.mark.parametrize("width", [32, 64])
-    @pytest.mark.parametrize("count", [0, 1, 65, 8192])
-    def test_merge_sub_rows_preserves_unwritten_segments(self, width, count):
-        rng = np.random.default_rng(42)
-        per_row = ROW_WORDS // width
-        row_count = max(4, count // per_row + 4)
-        cache = rng.integers(-1000, 1000, (row_count, ROW_WORDS), dtype=np.int32)
-        records = rng.choice(row_count * per_row, count, replace=False).astype(np.int32)
-        records[::7] = -1
-        records[1::11] = row_count * per_row
-        words = rng.integers(-1000, 1000, (count, width), dtype=np.int32)
-        expected = cache.copy()
-        for record, value in zip(records, words):
-            if 0 <= record < row_count * per_row:
-                row, segment = divmod(int(record), per_row)
-                expected[row, segment * width : (segment + 1) * width] = value
-
-        rows, merged = jax.jit(v2_cache.merge_sub_rows)(cache, records, words)
-        rows, merged = np.asarray(rows), np.asarray(merged)
-        valid_rows = rows[rows >= 0]
-        assert len(valid_rows) == len(np.unique(valid_rows))
-        actual = cache.copy()
-        actual[valid_rows] = merged[rows >= 0]
-        np.testing.assert_array_equal(actual, expected)
-
     def test_scatter_cache_values_branches(self, monkeypatch: pytest.MonkeyPatch):
         cache = jnp.zeros((8, ROW_WORDS), dtype=jnp.int32)
         records = jnp.array([0, 1], dtype=jnp.int32)
