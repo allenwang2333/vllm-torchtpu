@@ -28,24 +28,31 @@ cdkj() {
 }
 
 # Prints "<live jobs tagged RUN_TAG> <my Running+Pending jobs> <busy> <ready>",
-# where busy/ready count the Ready single-host tpu7x nodes and those holding a job.
+# where busy/ready count the Ready non-spot single-host tpu7x nodes and those holding a job.
 caps() {
-  local rows nodes
-  rows=$(cdkj job list -a -A -n 300 -o json) || return 1
-  nodes=$(cdkj usage -o json) || return 1
-  ROWS=$rows NODES=$nodes RUN_TAG=$RUN_TAG python3 -c '
-import json, os
-rows, nodes = json.loads(os.environ["ROWS"]), json.loads(os.environ["NODES"])
+  local d rc
+  d=$(mktemp -d)
+  # Files, not environment variables: the job list outgrows one argument's size limit.
+  cdkj job list -a -A -n 300 -o json > "$d/rows" && cdkj usage -o json > "$d/nodes" \
+    && RUN_TAG=$RUN_TAG python3 - "$d/rows" "$d/nodes" <<'PY'
+import json, os, sys
+rows, nodes = (json.load(open(p)) for p in sys.argv[1:3])
 assert isinstance(rows, list) and isinstance(nodes, list), "cdk did not return JSON arrays"
 full = os.environ["USER"]; me = {full, full.split("_")[0], full.split("_")[0] + "_google_com"}
 live = [r for r in rows if r.get("job_status") in ("Running", "Pending", "InQueue")]
 run = [r for r in live if os.environ["RUN_TAG"] in (r.get("tags") or [])]
 mine = [r for r in live if r.get("user") in me and r.get("job_status") in ("Running", "Pending")]
-ready = [n for n in nodes if "singlehost" in n.get("node_pool", "") and n.get("status") == "Ready"]
+# The recipe keeps off spot nodes, so only the other single-host pools are slots.
+pool = lambda n: n.get("node_pool", "")
+ready = [n for n in nodes if "singlehost" in pool(n) and "spot" not in pool(n)
+         and n.get("status") == "Ready"]
 assert ready, "cdk usage lists no Ready single-host node"
 busy = sum(1 for n in ready if any(p.get("job_id") for p in n.get("pods") or []))
 print(len(run), len(mine), busy, len(ready))
-'
+PY
+  rc=$?
+  rm -rf "$d"
+  return $rc
 }
 # Wait for a slot under all three caps (SLOT_WAIT_S, default 6 h), never past one.
 slot_deadline=$(( $(date +%s) + ${SLOT_WAIT_S:-21600} ))
