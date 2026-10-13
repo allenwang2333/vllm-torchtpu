@@ -216,8 +216,8 @@ def run_masked(args, records: harness.Records) -> None:
             decoder.step(
                 mk.StepInput(
                     [
-                        k3.request(tag + n, ids, tables[n], sampling)
-                        for n, ids in zip(names, prompts, strict=True)
+                        k3.request(tag + n, ids, table, sampling)
+                        for n, ids, table in zip(names, prompts, tables, strict=True)
                     ],
                     mask=masks(0),
                 )
@@ -227,7 +227,10 @@ def run_masked(args, records: harness.Records) -> None:
             outs.append(
                 decoder.step(
                     mk.StepInput(
-                        [k3.request(tag + n, [0], tables[n], sampling) for n in names],
+                        [
+                            k3.request(tag + n, [0], table, sampling)
+                            for n, table in zip(names, tables, strict=True)
+                        ],
                         mask=masks(step),
                     )
                 ).tokens[:2, :1]
