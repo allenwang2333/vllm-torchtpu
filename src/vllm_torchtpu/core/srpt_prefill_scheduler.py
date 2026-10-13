@@ -39,6 +39,13 @@ left unused: one partial step for the long chunk against the whole long prefill
 for the short request. The running limit is lowered by the number held back so
 the step never admits past ``max_num_seqs``.
 
+A hold can admit nothing: the waiting request may not fit the KV cache (its
+whole prompt must, and the held chunks keep their blocks), so vLLM stops at it,
+and the next step holds the same chunks again. With no decode on the rank that
+step does no work at all, every step, until the request is gone. With
+``TPU_SRPT_HOLD_PROGRESS_GUARD=1`` a held step that admits no waiting request
+pauses holding until a step admits one.
+
 With ``TPU_SCHED_UNCHARGED_DRAFT_SLOTS=1`` the step's input budget no longer
 charges each request the drafter's extra slots (K-1 per request for DSpark): the
 TPU drafter runs its own forward sized from the request count, so on TPU the
@@ -76,6 +83,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_steps = 0
         self._srpt_held_steps = 0
         self._srpt_held_chunks = 0
+        self._srpt_progress_guard = envs.TPU_SRPT_HOLD_PROGRESS_GUARD
+        self._srpt_hold_paused = False
+        self._srpt_paused_steps = 0
         self._srpt_count_external = envs.TPU_SRPT_COUNT_EXTERNAL_HIT
         self._srpt_external_end: dict[str, int] = {}
         if envs.TPU_SCHED_UNCHARGED_DRAFT_SLOTS:
@@ -182,26 +192,33 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         waiting = self._order_queues()
-        held = self._chunks_to_hold(waiting)
-        self._srpt_steps += 1
-        if not held:
-            output = super().schedule(throttle_prefills)
+        if self._srpt_hold_paused:
+            held = []
+            self._srpt_paused_steps += 1
         else:
+            held = self._chunks_to_hold(waiting)
+        self._srpt_steps += 1
+        held_ids = {id(r) for r in held}
+        self.running[:] = [r for r in self.running if id(r) not in held_ids]
+        before = {id(r) for r in self.running}
+        if held:
             self._srpt_held_steps += 1
             self._srpt_held_chunks += len(held)
-            held_ids = {id(r) for r in held}
-            self.running[:] = [r for r in self.running if id(r) not in held_ids]
-            self.max_num_running_reqs -= len(held)
-            try:
-                output = super().schedule(throttle_prefills)
-            finally:
-                self.max_num_running_reqs += len(held)
-                self.running.extend(held)
+        self.max_num_running_reqs -= len(held)
+        try:
+            output = super().schedule(throttle_prefills)
+        finally:
+            self.max_num_running_reqs += len(held)
+            admitted = any(id(r) not in before for r in self.running)
+            self.running.extend(held)
+        if self._srpt_progress_guard and (held or self._srpt_hold_paused):
+            self._srpt_hold_paused = not admitted
         if self._srpt_steps % _LOG_EVERY_STEPS == 0:
             logger.info(
-                "SRPT prefill: steps=%d held_steps=%d held_chunks=%d",
+                "SRPT prefill: steps=%d held_steps=%d held_chunks=%d paused_steps=%d",
                 self._srpt_steps,
                 self._srpt_held_steps,
                 self._srpt_held_chunks,
+                self._srpt_paused_steps,
             )
         return output

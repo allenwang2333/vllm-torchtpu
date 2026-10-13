@@ -47,6 +47,9 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._srpt_steps = 0
     s._srpt_held_steps = 0
     s._srpt_held_chunks = 0
+    s._srpt_progress_guard = False
+    s._srpt_hold_paused = False
+    s._srpt_paused_steps = 0
     s._srpt_count_external = False
     s._srpt_external_end = {}
     s.connector = None
@@ -234,3 +237,49 @@ def test_external_hit_ignored_when_disabled():
     s.connector = _FakeConnector({"cold": 0, "offloaded": 99000})
     assert _step(s)["waiting"] == ["cold", "offloaded"]
     assert s.connector.calls == []
+
+
+def _step_admitting(s, admit):
+    """schedule() with upstream faked: it admits the head waiting request iff
+    `admit`; returns the names upstream saw running."""
+    seen = {}
+
+    def fake(*args, **kwargs):
+        seen["running"] = [r.name for r in s.running]
+        if admit and len(s.waiting):
+            r = s.waiting.pop_request()
+            r.is_prefill_chunk = True
+            r.num_computed_tokens = r.num_tokens - 1
+            s.running.append(r)
+        return "output"
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=fake):
+        assert s.schedule() == "output"
+    return seen["running"]
+
+
+def _livelock_scheduler(guard):
+    long_chunk = _running("long", 40000, 1000)
+    s = _make_scheduler(
+        running=[long_chunk], waiting=[_waiting("new", 80000, cached=79500)]
+    )
+    s._srpt_progress_guard = guard
+    return s
+
+
+def test_hold_that_admits_nothing_pauses_holding_until_an_admission():
+    s = _livelock_scheduler(guard=True)
+    assert _step_admitting(s, admit=False) == []  # held; "new" did not fit
+    assert _step_admitting(s, admit=False) == ["long"]  # paused: long runs
+    assert s._srpt_paused_steps == 1
+    assert _step_admitting(s, admit=True) == ["long"]  # still paused; "new" admitted
+    s.waiting.extend([_waiting("next", 90000, cached=89900)])
+    assert _step_admitting(s, admit=False) == ["new"]  # holding again
+    assert (s._srpt_held_steps, s._srpt_paused_steps) == (2, 2)
+
+
+def test_hold_repeats_without_progress_guard():
+    s = _livelock_scheduler(guard=False)
+    for _ in range(3):
+        assert _step_admitting(s, admit=False) == []
+    assert (s._srpt_held_steps, s._srpt_paused_steps) == (3, 0)
