@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 
 _NUM_BLOCKS_OVERRIDE_TOL = 4
 _NUM_BLOCKS_OVERRIDE_REL_TOL = 0.005
+_RECONCILE_CACHE: dict[tuple[tuple[int | None, ...], int | None, int, float], int] = {}
 
 
 def reconcile_num_gpu_blocks_override(
@@ -52,16 +53,26 @@ def reconcile_num_gpu_blocks_override(
     is rejected when other stages did: vLLM would apply their value to it
     too, against a capacity it never measured.
     """
-    if workers_per_stage and 0 < workers_per_stage < len(worker_overrides):
+    n_raw = len(worker_overrides)
+    n_none = worker_overrides.count(None)
+    if n_none == n_raw:
+        return None
+    cache_key = (
+        tuple(worker_overrides),
+        workers_per_stage,
+        _NUM_BLOCKS_OVERRIDE_TOL,
+        _NUM_BLOCKS_OVERRIDE_REL_TOL,
+    )
+    if (cached := _RECONCILE_CACHE.get(cache_key)) is not None:
+        return cached
+    if workers_per_stage and 0 < workers_per_stage < n_raw:
         stage_values = [
             reconcile_num_gpu_blocks_override(
                 worker_overrides[start : start + workers_per_stage]
             )
-            for start in range(0, len(worker_overrides), workers_per_stage)
+            for start in range(0, n_raw, workers_per_stage)
         ]
         present = [value for value in stage_values if value is not None]
-        if not present:
-            return None
         if len(present) != len(stage_values):
             missing = [i for i, value in enumerate(stage_values) if value is None]
             raise ValueError(
@@ -73,10 +84,14 @@ def reconcile_num_gpu_blocks_override(
                 "stage holds both attention and mamba layers, or pin "
                 "--num-gpu-blocks-override."
             )
-        return min(present)
-    overrides = [ovr for ovr in worker_overrides if ovr is not None]
-    if not overrides:
-        return None
+        stage_min = min(present)
+        _RECONCILE_CACHE[cache_key] = stage_min
+        return stage_min
+    overrides: list[int] = (
+        worker_overrides  # type: ignore[assignment]
+        if n_none == 0
+        else [ovr for ovr in worker_overrides if ovr is not None]
+    )
 
     lo, hi = min(overrides), max(overrides)
     spread = hi - lo
@@ -105,4 +120,5 @@ def reconcile_num_gpu_blocks_override(
         tol,
         lo,
     )
+    _RECONCILE_CACHE[cache_key] = lo
     return lo
