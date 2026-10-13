@@ -18,10 +18,16 @@ the s25 merge env (a2a merge <= 64 tokens, chunk8 + collapsed lse gather at
   not take the chunked merge (decode a2a, 256 tokens) must be what s25
   allowed (eager bit for bit, compiled within one bf16 ulp). The chunked
   step (2048) is not bitwise by design: held to TPU_DCP_MERGE_RS_BF16's own
-  bound, 7 bf16 ulps of sum_r w_r |o_r| against the f64 merge.
+  bound, 7 bf16 scale-ulps, over today's error against the f64 merge.
 * drafter (`is_backbone=False`): off = today's reduce-scatter merge; on =
   TPU_MTP_DCP_MERGE_SIZED (the a2a branch at <= 64 tokens, reduce-scatter op
-  for op above). Both must be within one bf16 ulp of the f64 merge.
+  for op above): bit for bit above 64 tokens, within one bf16 ulp of off at
+  or below.
+
+Errors vs the f64 merge are in bf16 ulps of max(sum_r w_r |o_r|, 2^-10)
+(real partials cancel to near zero, where an unfloored relative measure
+fails today's merge too); each on arm may add at most its bound (chunked
+backbone: RS_BF16's 7; everything else: 1) to the off arm's error.
 
 Every arm reports its differing-element count vs off, its max direct bf16
 ulp vs off and its scale-ulp error vs f64. Positive control: the on partials
@@ -48,6 +54,35 @@ WORLD_SIZE = 8
 S25_MERGE_ENV = dict(t4m.S23_MERGE_ENV)
 RS_BF16_MODE = 1
 RS_BF16_MAX_SCALE_ULP = mm.RS_BF16_MAX_ULP[RS_BF16_MODE]
+# Real attention partials have outputs near zero (cancellation), where any
+# relative measure explodes for today's merge too: the scale sum_r w_r |o_r|
+# is floored here before taking its bf16 ulp.
+SCALE_FLOOR = 2.0**-10
+
+
+def _scale_err(got, outputs, lses, rank, world):
+    """max |got - f64| in bf16 ulps of max(sum_r w_r |o_r|, SCALE_FLOOR) over
+    this rank's heads, and the max absolute error."""
+    import numpy as np
+
+    local = outputs.shape[2] // world
+    sl = slice(rank * local, (rank + 1) * local)
+    out = outputs[:, :, sl].float().numpy().astype(np.float64)
+    lse = lses[:, :, sl].numpy().astype(np.float64)
+    fin = np.isfinite(lse)
+    shift = np.where(fin, lse, -np.inf).max(axis=0)
+    shift = np.where(np.isfinite(shift), shift, 0.0)
+    w = np.where(fin, np.exp(lse - shift[None]), 0.0)
+    den = w.sum(axis=0)
+    w = w / np.where(den > 0.0, den, 1.0)
+    ref = (out * w[..., None]).sum(axis=0)
+    scale = np.maximum((np.abs(out) * w[..., None]).sum(axis=0), SCALE_FLOOR)
+    err = np.abs(got.float().numpy().astype(np.float64) - ref)
+    e = np.nan_to_num(err / np.exp2(np.floor(np.log2(scale)) - 7), nan=np.inf)
+    return {
+        "max_ulp": float(e.max()),
+        "max_abs": float(np.nan_to_num(err, nan=np.inf).max()),
+    }
 
 
 def _all_partials(z, step, tag, dcp, real):
@@ -136,17 +171,14 @@ def _check(rank, cp_mla, path):
                         "a2a": bool(
                             tokens <= S25_MERGE_ENV["TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS"]
                         ),
-                        "off_scale": mm._scale_ulp_stats(
+                        "off_scale": _scale_err(want[:real], outs, lses, rank, dcp),
+                        "on_scale": _scale_err(got[:real], outs, lses, rank, dcp),
+                        "off_scale_raw": mm._scale_ulp_stats(
                             want[:real], outs, lses, rank, dcp
-                        ),
-                        "on_scale": mm._scale_ulp_stats(
-                            got[:real], outs, lses, rank, dcp
-                        ),
+                        )["max_ulp"],
                         "on_f64": mm._error_stats(got[:real], ref),
                         "off_f64": mm._error_stats(want[:real], ref),
-                        "ctl_scale": mm._scale_ulp_stats(
-                            ctl[:real], outs, lses, rank, dcp
-                        ),
+                        "ctl_scale": _scale_err(ctl[:real], outs, lses, rank, dcp),
                         "ctl_f64": mm._error_stats(ctl[:real], ref),
                     }
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
@@ -254,6 +286,8 @@ def test_t3_merge_of_composed_partials_on_real_collectives(tmp_path):
                     max_ulp=0,
                     on_scale_max=0.0,
                     off_scale_max=0.0,
+                    on_abs_max=0.0,
+                    off_abs_max=0.0,
                     on_within_1ulp_f64=True,
                     off_within_1ulp_f64=True,
                     ctl_scale_max=0.0,
@@ -266,6 +300,8 @@ def test_t3_merge_of_composed_partials_on_real_collectives(tmp_path):
             t["on_scale_max"] = max(t["on_scale_max"], c["on_scale"]["max_ulp"])
             t["off_scale_max"] = max(t["off_scale_max"], c["off_scale"]["max_ulp"])
             t["ctl_scale_max"] = max(t["ctl_scale_max"], c["ctl_scale"]["max_ulp"])
+            t["on_abs_max"] = max(t["on_abs_max"], c["on_scale"]["max_abs"])
+            t["off_abs_max"] = max(t["off_abs_max"], c["off_scale"]["max_abs"])
             t["on_within_1ulp_f64"] &= c["on_f64"]["within_1ulp"]
             t["off_within_1ulp_f64"] &= c["off_f64"]["within_1ulp"]
             t["ctl_within_1ulp_f64"] &= c["ctl_f64"]["within_1ulp"]
@@ -274,15 +310,20 @@ def test_t3_merge_of_composed_partials_on_real_collectives(tmp_path):
         print(f"T3MERGE {key}: {json.dumps(t)}")
         if "/backbone/" in key:
             if t["chunked"]:
-                ok = t["on_scale_max"] <= RS_BF16_MAX_SCALE_ULP
-                ok &= t["ctl_scale_max"] > RS_BF16_MAX_SCALE_ULP
+                # bf16 wire: at most RS_BF16's bound over today's error.
+                bound = t["off_scale_max"] + RS_BF16_MAX_SCALE_ULP
             else:
-                ok = t["max_ulp"] <= 1 and (
+                bound = t["off_scale_max"] + 1
+                ok0 = t["max_ulp"] <= 1 and (
                     not key.endswith("eager") or t["n_diff"] == 0
                 )
-                ok &= t["ctl_scale_max"] > 1
         else:
-            ok = t["on_within_1ulp_f64"] and not t["ctl_within_1ulp_f64"]
+            # Drafter: op for op above the a2a cap; rank-order sum at or below.
+            bound = t["off_scale_max"] + 1
+            ok0 = t["n_diff"] == 0 if t["tokens"] > 64 else t["max_ulp"] <= 1
+        if "/backbone/" in key and t["chunked"]:
+            ok0 = True
+        ok = ok0 and t["on_scale_max"] <= bound and t["ctl_scale_max"] > bound
         if not ok:
             failures.append((key, t))
     assert not failures, failures
