@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -115,13 +117,27 @@ def gather_state_windows(
     block_numbers = block_table[req * block_table_stride + safe_pos // block_size]
     block_offsets = safe_pos % block_size
 
-    head_offset = (w_idx >= compress_ratio).astype(jnp.int32) * head_dim
-    col = head_offset[None, :, None] + jnp.arange(head_dim)[None, None, :]
+    gathered = state_cache[block_numbers, block_offsets]
+    if gathered.dtype == jnp.uint8:
+        gathered = jax.lax.bitcast_convert_type(
+            gathered.transpose(0, 1, 2, 4, 3), jnp.float32
+        ).reshape(gathered.shape[0], window, 2 * state_width)
 
-    bn = block_numbers[:, :, None]
-    bo = block_offsets[:, :, None]
-    kv_window = state_cache[bn, bo, col]
-    score_window = state_cache[bn, bo, state_width + col]
+    if overlap:
+        in_second_half = (w_idx >= compress_ratio)[None, :, None]
+        kv_window = jnp.where(
+            in_second_half,
+            gathered[..., head_dim:state_width],
+            gathered[..., :head_dim],
+        )
+        score_window = jnp.where(
+            in_second_half,
+            gathered[..., state_width + head_dim : 2 * state_width],
+            gathered[..., state_width : state_width + head_dim],
+        )
+    else:
+        kv_window = gathered[..., :head_dim]
+        score_window = gathered[..., head_dim : 2 * state_width]
     return kv_window, score_window, valid_mask
 
 
@@ -176,16 +192,20 @@ def _boundary_dest(
     return jnp.where(store, kv_slot_mapping, num_slots)
 
 
-def ref_compress_norm_rope_store(
-    cache: jax.Array,  # [num_pages, page_size, slots_per_part_hbm, 128] uint8
-    rope_cache: jax.Array,  # [num_pages, page_size // 4, 4, 128] uint8
-    positions: jax.Array,  # [num_tokens] int
-    slot_mapping: jax.Array,  # [num_tokens] int (state-cache slots)
-    block_table: jax.Array,  # [num_reqs * stride] int (state pages)
-    token_to_req_indices: jax.Array,  # [num_tokens] int
-    kv_slot_mapping: jax.Array,  # [num_tokens] int (compressed-KV slots)
-    rms_weight: jax.Array,  # [head_dim] fp32
-    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+@functools.partial(
+    jax.jit,
+    static_argnums=(9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
+)
+def _compress_norm_rope_store_jit(
+    cache: jax.Array,
+    rope_cache: jax.Array,
+    positions: jax.Array,
+    slot_mapping: jax.Array,
+    block_table: jax.Array,
+    token_to_req_indices: jax.Array,
+    kv_slot_mapping: jax.Array,
+    rms_weight: jax.Array,
+    cos_sin_cache: jax.Array,
     block_table_stride: int,
     state_block_size: int,
     head_dim: int,
@@ -194,56 +214,47 @@ def ref_compress_norm_rope_store(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
-    is_quantized: bool = True,
-    has_rope: bool = True,
-    has_rope_cache: bool | None = None,
-    state_cache: jax.Array | None = None,
+    is_quantized: bool,
+    has_rope: bool,
+    has_rope_cache: bool,
+    state_cache: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Golden JAX reference for Kernel 2 (compress + store).
-
-    ``state_cache`` is the array holding the f32 states; ``None`` means it
-    shares ``cache``'s buffer (CSA / indexer). CSA's arrays may also be the
-    int32 ``[num_pages, rows, 128]`` declarations of `csa_cache_layout`; the
-    outputs keep each input's dtype.
-    """
     cache_is_words = csa_cache_layout.is_word_array(cache.dtype)
-    if cache_is_words:
-        cache = csa_cache_layout.words_to_slabs(cache)
-    if state_cache is not None and csa_cache_layout.is_word_array(state_cache.dtype):
-        state_cache = csa_cache_layout.words_to_slabs(state_cache)
+    cache_slab_shape = csa_cache_layout.u8_slab_shape(cache.shape, cache.dtype)
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     state_dim = 2 * state_width
 
-    if has_rope_cache is None:
-        has_rope_cache = is_quantized and has_rope
-
     # Internally reshape packed layouts to unpacked shapes for easy processing
-    is_indexer_mode = (cache.shape[-1] == 256 and cache.shape[-2] == 4) or (
-        cache.shape[-1] == 128 and cache.shape[-2] == 8
+    is_indexer_mode = (cache_slab_shape[-1] == 256 and cache_slab_shape[-2] == 4) or (
+        cache_slab_shape[-1] == 128 and cache_slab_shape[-2] == 8
     )
     if is_indexer_mode:
-        pack_factor = cache.shape[-2]
-        last_dim = cache.shape[-1]
-        unpacked_page_size = cache.shape[1] * pack_factor
-        cache_for_unpack = cache.reshape(
-            cache.shape[0], unpacked_page_size, 1, last_dim
+        pack_factor = cache_slab_shape[-2]
+        last_dim = cache_slab_shape[-1]
+        unpacked_page_size = cache_slab_shape[1] * pack_factor
+        cache_for_unpack_shape = (
+            cache_slab_shape[0],
+            unpacked_page_size,
+            1,
+            last_dim,
         )
     else:
-        cache_for_unpack = cache
+        cache_for_unpack_shape = cache_slab_shape
 
     # 1. Geometry setup
     if is_indexer_mode:
-        num_pages, page_size, dummy, d2 = cache_for_unpack.shape
+        num_pages, page_size, dummy, d2 = cache_for_unpack_shape
         assert dummy == 1
         slots_per_part_hbm = 0
         slot_bytes = d2
     else:
-        num_pages, page_size, slots_per_part_hbm, d2 = cache.shape
+        num_pages, page_size, slots_per_part_hbm, d2 = cache_slab_shape
         assert d2 == 128
         slot_bytes = slots_per_part_hbm * d2
 
     state_source = cache if state_cache is None else state_cache
+    state_is_words = csa_cache_layout.is_word_array(state_source.dtype)
 
     if has_rope_cache:
         assert rope_cache.shape[0] == num_pages
@@ -255,7 +266,10 @@ def ref_compress_norm_rope_store(
     # within a row the ``hbm_pack`` sub-slots hold the four bytes of an f32, so a
     # single byte-transpose inverts the packing for every mode. This is the exact
     # inverse of the pack in ``ref_wkv_proj_and_save_state``.
-    phys_pages, phys_page_size, hbm_pack, last_dim = state_source.shape
+    state_slab_shape = csa_cache_layout.u8_slab_shape(
+        state_source.shape, state_source.dtype
+    )
+    phys_pages, phys_page_size, hbm_pack, last_dim = state_slab_shape
     assert hbm_pack == 4, f"expected 4 bytes per f32 in a slot row, got {hbm_pack}"
     state_row_bytes = hbm_pack * last_dim
     state_rows = state_dim * 4 // state_row_bytes
@@ -267,12 +281,14 @@ def ref_compress_norm_rope_store(
         f"state_block_size {state_block_size} exceeds the {tokens_per_page} "
         f"token states a {phys_page_size}-row page holds"
     )
-    state_bytes_t = state_source.reshape(
-        phys_pages, tokens_per_page, state_rows, hbm_pack, last_dim
-    ).transpose(0, 1, 2, 4, 3)
-    state_view = jax.lax.bitcast_convert_type(state_bytes_t, jnp.float32).reshape(
-        phys_pages, tokens_per_page, state_dim
-    )
+    if state_is_words:
+        state_view = jax.lax.bitcast_convert_type(state_source, jnp.float32).reshape(
+            phys_pages, tokens_per_page, state_dim
+        )
+    else:
+        state_view = state_source.reshape(
+            phys_pages, tokens_per_page, state_rows, hbm_pack, last_dim
+        )
 
     # 3. Gather state windows
     kv_window, score_window, valid_mask = gather_state_windows(
@@ -369,7 +385,7 @@ def ref_compress_norm_rope_store(
     )
 
     # 6. Scatter NOPE into cache
-    page_size_physical = cache_for_unpack.shape[1]
+    page_size_physical = cache_for_unpack_shape[1]
     nope_num_slots_physical = num_pages * page_size_physical
 
     dest_nope_physical = _boundary_dest(
@@ -380,40 +396,59 @@ def ref_compress_norm_rope_store(
         nope_num_slots_physical,
     )
 
-    flat_nope = cache_for_unpack.reshape(
-        nope_num_slots_physical, slot_size_bytes := slot_bytes
-    )
-    flat_nope_padded = jnp.concatenate(
-        [
-            flat_nope,
-            jnp.zeros((slots_per_part_out, slot_size_bytes), dtype=jnp.uint8),
-        ],
-        axis=0,
-    )
-
-    for o in range(slots_per_part_out):
-        dest_o = jnp.where(
-            dest_nope_physical < nope_num_slots_physical,
-            dest_nope_physical + o,
-            nope_num_slots_physical + o,
-        )
-        flat_nope_padded = flat_nope_padded.at[dest_o].set(nope_record_split[:, o])
-
-    new_cache_unpacked = flat_nope_padded[:-slots_per_part_out].reshape(
-        cache_for_unpack.shape
-    )
-    new_cache = new_cache_unpacked.reshape(cache.shape)
     if cache_is_words:
-        new_cache = csa_cache_layout.slabs_to_words(new_cache)
+        nope_words_split = csa_cache_layout.slabs_to_words(
+            nope_record_split.reshape(
+                nope_record.shape[0], slots_per_part_out, csa_cache_layout.SLAB_ROWS, -1
+            )
+        )
+        word_width = nope_words_split.shape[-1]
+        flat_nope = cache.reshape(nope_num_slots_physical, word_width)
+        flat_nope_padded = jnp.concatenate(
+            [
+                flat_nope,
+                jnp.zeros((slots_per_part_out, word_width), dtype=cache.dtype),
+            ],
+            axis=0,
+        )
+        for o in range(slots_per_part_out):
+            dest_o = jnp.where(
+                dest_nope_physical < nope_num_slots_physical,
+                dest_nope_physical + o,
+                nope_num_slots_physical + o,
+            )
+            flat_nope_padded = flat_nope_padded.at[dest_o].set(nope_words_split[:, o])
+        new_cache = flat_nope_padded[:-slots_per_part_out].reshape(cache.shape)
+    else:
+        flat_nope = cache.reshape(
+            nope_num_slots_physical, slot_size_bytes := slot_bytes
+        )
+        flat_nope_padded = jnp.concatenate(
+            [
+                flat_nope,
+                jnp.zeros((slots_per_part_out, slot_size_bytes), dtype=jnp.uint8),
+            ],
+            axis=0,
+        )
+
+        for o in range(slots_per_part_out):
+            dest_o = jnp.where(
+                dest_nope_physical < nope_num_slots_physical,
+                dest_nope_physical + o,
+                nope_num_slots_physical + o,
+            )
+            flat_nope_padded = flat_nope_padded.at[dest_o].set(nope_record_split[:, o])
+
+        new_cache_unpacked = flat_nope_padded[:-slots_per_part_out].reshape(
+            cache_for_unpack_shape
+        )
+        new_cache = new_cache_unpacked.reshape(cache.shape)
 
     # 7. Scatter ROPE into rope_cache (only if has_rope_cache): each token's 32
     # words into its quarter of a 4-token row (see `csa_cache_layout`).
     if not has_rope_cache:
         return new_cache, rope_cache
     rope_is_words = csa_cache_layout.is_word_array(rope_cache.dtype)
-    rope_rows = (
-        rope_cache if rope_is_words else csa_cache_layout.slabs_to_words(rope_cache)
-    )
     rope = compressed[..., nope_dim:].astype(jnp.bfloat16)
     if rope.shape[-1] != csa_cache_layout.ROPE_DIM:
         raise ValueError(
@@ -421,14 +456,93 @@ def ref_compress_norm_rope_store(
             f"{rope.shape[-1]}"
         )
     words = csa_cache_layout.rope_words(rope)
-    flat_rope = rope_rows.reshape(-1, csa_cache_layout.ROPE_WORDS)
-    rope_num_slots = flat_rope.shape[0]
+    if rope_is_words:
+        flat_rope = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
+        rope_num_slots = flat_rope.shape[0]
+        dest_rope = _boundary_dest(
+            positions, slot_mapping, kv_slot_mapping, compress_ratio, rope_num_slots
+        )
+        flat_rope = jnp.concatenate([flat_rope, jnp.zeros_like(flat_rope[:1])], axis=0)
+        flat_rope = flat_rope.at[dest_rope].set(words)
+        new_rope_rows = flat_rope[:-1].reshape(rope_cache.shape)
+        return new_cache, new_rope_rows
+
+    words_slabs = csa_cache_layout.words_to_slabs(words)
+    flat_rope_u8 = rope_cache.reshape(
+        -1,
+        csa_cache_layout.SLAB_ROWS,
+        csa_cache_layout.ROPE_TOKENS_PER_ROW,
+        csa_cache_layout.ROPE_WORDS,
+    )
+    rope_num_slots = flat_rope_u8.shape[0] * csa_cache_layout.ROPE_TOKENS_PER_ROW
     dest_rope = _boundary_dest(
         positions, slot_mapping, kv_slot_mapping, compress_ratio, rope_num_slots
     )
-    flat_rope = jnp.concatenate([flat_rope, jnp.zeros_like(flat_rope[:1])], axis=0)
-    flat_rope = flat_rope.at[dest_rope].set(words)
-    new_rope_rows = flat_rope[:-1].reshape(rope_rows.shape)
-    if rope_is_words:
-        return new_cache, new_rope_rows
-    return new_cache, csa_cache_layout.words_to_slabs(new_rope_rows)
+    flat_rope_u8 = jnp.concatenate(
+        [flat_rope_u8, jnp.zeros_like(flat_rope_u8[:1])], axis=0
+    )
+    flat_rope_u8 = flat_rope_u8.at[
+        dest_rope // csa_cache_layout.ROPE_TOKENS_PER_ROW,
+        :,
+        dest_rope % csa_cache_layout.ROPE_TOKENS_PER_ROW,
+        :,
+    ].set(words_slabs)
+    return new_cache, flat_rope_u8[:-1].reshape(rope_cache.shape)
+
+
+def ref_compress_norm_rope_store(
+    cache: jax.Array,  # [num_pages, page_size, slots_per_part_hbm, 128] uint8
+    rope_cache: jax.Array,  # [num_pages, page_size // 4, 4, 128] uint8
+    positions: jax.Array,  # [num_tokens] int
+    slot_mapping: jax.Array,  # [num_tokens] int (state-cache slots)
+    block_table: jax.Array,  # [num_reqs * stride] int (state pages)
+    token_to_req_indices: jax.Array,  # [num_tokens] int
+    kv_slot_mapping: jax.Array,  # [num_tokens] int (compressed-KV slots)
+    rms_weight: jax.Array,  # [head_dim] fp32
+    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    block_table_stride: int,
+    state_block_size: int,
+    head_dim: int,
+    rope_head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+    is_quantized: bool = True,
+    has_rope: bool = True,
+    has_rope_cache: bool | None = None,
+    state_cache: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Golden JAX reference for Kernel 2 (compress + store).
+
+    ``state_cache`` is the array holding the f32 states; ``None`` means it
+    shares ``cache``'s buffer (CSA / indexer). CSA's arrays may also be the
+    int32 ``[num_pages, rows, 128]`` declarations of `csa_cache_layout`; the
+    outputs keep each input's dtype.
+    """
+    resolved_has_rope_cache = (
+        (is_quantized and has_rope) if has_rope_cache is None else has_rope_cache
+    )
+    return _compress_norm_rope_store_jit(
+        cache,
+        rope_cache,
+        positions,
+        slot_mapping,
+        block_table,
+        token_to_req_indices,
+        kv_slot_mapping,
+        rms_weight,
+        cos_sin_cache,
+        block_table_stride,
+        state_block_size,
+        head_dim,
+        rope_head_dim,
+        compress_ratio,
+        overlap,
+        rms_eps,
+        quant_block,
+        is_quantized,
+        has_rope,
+        resolved_has_rope_cache,
+        state_cache,
+    )
