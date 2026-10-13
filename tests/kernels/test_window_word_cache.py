@@ -28,6 +28,31 @@ def test_scatter_preserves_unwritten_segments(width, count):
     np.testing.assert_array_equal(result, expected.reshape(cache.shape))
 
 
+@pytest.mark.parametrize("width", [128, 256, 1024])
+@pytest.mark.parametrize("count", [7, 65])
+def test_scatter_keeps_old_rows_before_ring_write(width, count):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Cache DMA requires a TPU")
+    cache = jnp.arange(1024 * 128, dtype=jnp.int32).reshape(1024, 128)
+    records = np.random.default_rng(0).permutation(count).astype(np.int32)
+    records[-2:] = [-1, cache.size // width]
+    words = -jnp.arange(count * width, dtype=jnp.int32).reshape(count, width)
+    expected = np.asarray(cache).copy().reshape(-1, width)
+    expected[records[:-2]] = np.asarray(words[:-2])
+
+    @jax.jit
+    def read_and_write(cache, records, words):
+        rows = jnp.arange(count)[:, None] * (width // 128) + jnp.arange(width // 128)
+        old = cache[rows]
+        return scatter_word_records(cache, records, words, after=old), old
+
+    result, old = read_and_write(cache, jnp.asarray(records), words)
+    np.testing.assert_array_equal(result, expected.reshape(cache.shape))
+    np.testing.assert_array_equal(
+        old.reshape(count, width), np.asarray(cache).reshape(-1, width)[:count]
+    )
+
+
 @pytest.mark.parametrize(
     "queries,heads,dim,keys", [(8, 8, 256, 128), (64, 16, 512, 640)]
 )

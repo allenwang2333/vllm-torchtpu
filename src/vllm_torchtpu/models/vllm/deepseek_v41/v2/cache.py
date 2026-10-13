@@ -877,10 +877,16 @@ def initialize_cache_ops():
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
+
+    def write_values(
+        cache: jax.Array, records: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        return scatter_cache_values(cache, records, values)
+
     # Pallas DMA runs independently on each device's replicated cache.
     # Mosaic calls require explicit manual partitioning on a multi-device mesh.
     write_values = jax.shard_map(
-        scatter_cache_values,
+        write_values,
         mesh=mesh,
         in_specs=(P(), P(), P()),
         out_specs=P(),
@@ -900,10 +906,15 @@ def initialize_cache_ops():
     def write_values_after(
         cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
     ) -> jax.Array:
-        # An in-place write that may overlap an async gather of the old pool
-        # makes XLA copy the whole pool first; finish the gather instead.
-        cache, _ = jax.lax.optimization_barrier((cache, after))
-        return write_values(cache, records, values)
+        return scatter_cache_values(cache, records, values, after=after)
+
+    write_values_after = jax.shard_map(
+        write_values_after,
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
 
     _write_values_after_op = pallas.jax_op(
         "pallas::dsv41v2_cache_write_values_after",
@@ -1013,6 +1024,8 @@ def scatter_cache_values(
     cache: jax.Array,
     records: jax.Array,
     values: jax.Array,
+    *,
+    after: jax.Array | None = None,
 ) -> jax.Array:
     """Write unique physical records, preserving the shared owner and padding.
 
@@ -1034,8 +1047,8 @@ def scatter_cache_values(
         return cast(
             Any,
             (
-                scatter_cache_values(cache_lo, records_lo, values),
-                scatter_cache_values(cache_hi, records_hi, values),
+                scatter_cache_values(cache_lo, records_lo, values, after=after),
+                scatter_cache_values(cache_hi, records_hi, values, after=after),
             ),
         )
     assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
@@ -1064,7 +1077,7 @@ def scatter_cache_values(
     if jax.default_backend() == "tpu":
         from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
 
-        return scatter_word_records(cache, records, words)
+        return scatter_word_records(cache, records, words, after=after)
     columns = jnp.arange(width)[None]
     if width < ROW_WORDS:
         per_row = ROW_WORDS // width
