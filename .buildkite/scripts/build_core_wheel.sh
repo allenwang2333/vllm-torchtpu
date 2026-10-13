@@ -90,6 +90,12 @@ VERSION="$("$PY" "$WHEEL_UTILS" validate_version "$VERSION")" \
     || die "version from ${VERSION_SOURCE} is not publishable to PyPI."
 echo "Release version: ${VERSION}"
 
+# Stop before building if this version is already on PyPI (versions can't be
+# reused). PUBLISH_PYPI comes from the step's env in pipeline_release_pypi.yml.
+[[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
+INDEX_BASE="${PYPI_BASE_URL:-https://pypi.org}"
+"$PY" "$WHEEL_UTILS" check_not_published "${INDEX_BASE%/}" "$PUBLISH_PYPI" "$VERSION"
+
 # --- Build -------------------------------------------------------------------
 echo "--- :package: Building wheel"
 cd "${REPO_ROOT}"

@@ -61,6 +61,7 @@ steps:
     depends_on: "approve_release"
     agents:
       queue: cpu_64_core
+    env: *core_env   # PUBLISH_PYPI: fail early if the version is already on PyPI.
     commands:
       - bash .buildkite/scripts/build_core_wheel.sh
 
