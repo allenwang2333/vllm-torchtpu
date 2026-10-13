@@ -12,13 +12,11 @@ class MlaCase(enum.Enum):
     - MIXED: Sequences can be a mix of prefill and decode (q_len > 1, dynamic).
     """
 
+    symbol: str
+
     DECODE = 0
     PREFILL = 1
     MIXED = 2
-
-    @property
-    def symbol(self):
-        return _MLA_CASE_SYMBOLS[self]
 
 
 _MLA_CASE_SYMBOLS: dict[MlaCase, str] = {
@@ -26,6 +24,8 @@ _MLA_CASE_SYMBOLS: dict[MlaCase, str] = {
     MlaCase.PREFILL: "p",
     MlaCase.MIXED: "m",
 }
+for _mla_case, _mla_symbol in _MLA_CASE_SYMBOLS.items():
+    _mla_case.symbol = _mla_symbol
 
 
 class KVLayout(enum.Enum):
@@ -54,13 +54,16 @@ class KVLayout(enum.Enum):
     HEAD_ALONG_SUBLANE = 0
     SEQ_ALONG_LANE = 1
 
-    @classmethod
-    def parse(cls, value: "str | KVLayout | None") -> "KVLayout":
+    @staticmethod
+    def parse(value: "str | KVLayout | None") -> "KVLayout":
         """Parses a `KVLayout` from a case-insensitive string (or passes through)."""
-        if value is None:
-            return cls.HEAD_ALONG_SUBLANE
-        if isinstance(value, cls):
-            return value
+        if value is None or value is _KV_HEAD_ALONG_SUBLANE:
+            return _KV_HEAD_ALONG_SUBLANE
+        if value is _KV_SEQ_ALONG_LANE:
+            return _KV_SEQ_ALONG_LANE
+        layout = _KV_LAYOUT_FAST_MAP.get(value)
+        if layout is not None:
+            return layout
         normalized = str(value).strip().lower()
         layout = _KV_LAYOUT_ALIASES.get(normalized)
         if layout is None:
@@ -71,13 +74,19 @@ class KVLayout(enum.Enum):
         return layout
 
 
+_KV_HEAD_ALONG_SUBLANE: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
+_KV_SEQ_ALONG_LANE: KVLayout = KVLayout.SEQ_ALONG_LANE
 _KV_LAYOUT_ALIASES: dict[str, KVLayout] = {
-    "head_along_sublane": KVLayout.HEAD_ALONG_SUBLANE,
-    "seq_along_lane": KVLayout.SEQ_ALONG_LANE,
+    "head_along_sublane": _KV_HEAD_ALONG_SUBLANE,
+    "seq_along_lane": _KV_SEQ_ALONG_LANE,
     # Tolerate the common typo seen in flags/configs.
-    "seq_alone_lane": KVLayout.SEQ_ALONG_LANE,
+    "seq_alone_lane": _KV_SEQ_ALONG_LANE,
 }
 _KV_LAYOUT_SORTED_ALIASES: list[str] = sorted(_KV_LAYOUT_ALIASES)
+_KV_LAYOUT_FAST_MAP: dict[str | KVLayout | None, KVLayout] = {
+    **_KV_LAYOUT_ALIASES,
+    **{k.upper(): v for k, v in _KV_LAYOUT_ALIASES.items()},
+}
 
 # Default buffer_count for (DECODE, PREFILL, MIXED) cases.
 # Determined from microbenchmarks for 8k/1k and 256k/1k.
@@ -96,6 +105,8 @@ DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 # the same bucket in a different order miss each other's cached executable.
 _next_scheduling_group_id = 1
 _scheduling_group_ids_lock = threading.Lock()
+_lock_acquire = _scheduling_group_ids_lock.acquire
+_lock_release = _scheduling_group_ids_lock.release
 
 
 def reserve_scheduling_group_ids(count: int) -> int:
@@ -112,9 +123,10 @@ def reserve_scheduling_group_ids(count: int) -> int:
     if count < 1:
         raise ValueError(f"count ({count}) must be positive.")
     global _next_scheduling_group_id
-    with _scheduling_group_ids_lock:
-        first = _next_scheduling_group_id
-        _next_scheduling_group_id = first + count
+    _lock_acquire()
+    first = _next_scheduling_group_id
+    _next_scheduling_group_id = first + count
+    _lock_release()
     return first
 
 
@@ -126,5 +138,6 @@ def reset_scheduling_group_ids() -> None:
     whatever this process compiled before.
     """
     global _next_scheduling_group_id
-    with _scheduling_group_ids_lock:
-        _next_scheduling_group_id = 1
+    _lock_acquire()
+    _next_scheduling_group_id = 1
+    _lock_release()
