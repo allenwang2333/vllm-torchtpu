@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
+from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores, indexer
 
 from .cache import (
     ROPE_WORDS,
@@ -2222,21 +2222,73 @@ def paged_indexer_jax(
     """
 
     def full_context(_):
-        scores = paged_index_scores_jax(
-            q, pool, records, weights, lengths, requests, page_records
+        # Finish selection before reusing a query tile's score buffer. Key
+        # tiling alone still materializes [all queries, max context]: at
+        # 2048 x 1M a single FP32 score matrix is 8 GiB, before top-k copies.
+        # Reuse the native indexer's query tile and score/selection pipeline.
+        rows = q.shape[0]
+        tile = min(rows, indexer.QUERY_TILE)
+        padding = -rows % tile
+        longest = lengths.max() if batch_max is None else batch_max
+        inputs = jax.tree.map(
+            lambda x: jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1)),
+            (q, weights, lengths, candidates, requests),
         )
-        scores = jnp.where(jnp.take(records >= 0, requests, axis=0), scores, -jnp.inf)
-        return select_indices_jax(
-            scores,
-            lengths,
-            candidates,
-            topk,
-            block_size,
-            candidate_write,
-            candidate_filter,
-            unordered,
-            batch_max,
+
+        def prepare(i):
+            return jax.tree.map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, i * tile, tile), inputs
+            )
+
+        def score(args):
+            queries, row_weights, row_lengths, _, row_requests = args
+            scores = paged_index_scores_jax(
+                queries,
+                pool,
+                records,
+                row_weights,
+                row_lengths,
+                row_requests,
+                page_records,
+            )
+            return jnp.where(
+                jnp.take(records >= 0, row_requests, axis=0), scores, -jnp.inf
+            )
+
+        def select(i, scores):
+            _, _, row_lengths, row_candidates, _ = prepare(i)
+            return select_indices_jax(
+                scores,
+                row_lengths,
+                row_candidates,
+                topk,
+                block_size,
+                candidate_write,
+                candidate_filter,
+                unordered,
+                longest,
+            )
+
+        if rows <= tile:
+            return select(jnp.int32(0), score(inputs))
+
+        def write(i, selected, output):
+            return jax.tree.map(
+                lambda dst, src: jax.lax.dynamic_update_slice_in_dim(
+                    dst, src, i * tile, axis=0
+                ),
+                output,
+                selected,
+            )
+
+        output = (
+            jnp.full((rows + padding, min(topk, records.shape[1])), -1, jnp.int32),
+            jnp.zeros((rows + padding, candidates.shape[1]), candidates.dtype),
         )
+        selected, published = indexer.pipeline_score_topk(
+            (rows + padding) // tile, prepare, score, select, write, output
+        )
+        return selected[:rows], published[:rows]
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:

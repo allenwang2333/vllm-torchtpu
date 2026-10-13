@@ -1897,3 +1897,66 @@ class TestIndexerKernelsAndSelection:
         )
         assert isinstance(up_2b, tuple) and len(up_2b) == 2
         assert mock_idx_2b_op.call_count == 1
+
+
+@pytest.mark.parametrize("mode", ["plain", "publish", "filter"])
+@pytest.mark.parametrize("banks", [1, 2])
+@pytest.mark.parametrize("unordered", [False, True])
+def test_paged_indexer_query_tiles_preserve_selection(
+    monkeypatch, mode, banks, unordered
+):
+    """Bound score rows, including a partial tile, without changing selection."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+
+    rng = np.random.default_rng(17)
+    rows, width, topk = 65, 128, 16
+    keys = jnp.asarray(rng.standard_normal((2 * width, 128)), jnp.bfloat16)
+    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    if banks == 2:
+        pool = tuple(jnp.split(pool, 2))
+    q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
+    records = jnp.arange(2 * width, dtype=jnp.int32).reshape(2, width)
+    requests = jnp.arange(rows, dtype=jnp.int32) % 2
+    # The first tile is short while another tile is long: candidate filtering
+    # must retain the whole batch's short-context bypass decision.
+    lengths = jnp.asarray([8] * 32 + [0, 64, 127] * 11, jnp.int32)
+    candidates = jnp.tile(jnp.array([[0, 0, 3, -1]], jnp.int32), (rows, 1))
+    scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+    expected = select_indices_jax(
+        scores,
+        lengths,
+        candidates,
+        topk,
+        16,
+        mode == "publish",
+        mode == "filter",
+        unordered,
+    )
+    score_rows = []
+    original = attention_kernels.paged_index_scores_jax
+
+    def record_shape(queries, *args, **kwargs):
+        score_rows.append(queries.shape[0])
+        return original(queries, *args, **kwargs)
+
+    monkeypatch.setattr(attention_kernels, "paged_index_scores_jax", record_shape)
+    actual = jax.jit(
+        lambda: paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            topk,
+            16,
+            mode == "publish",
+            mode == "filter",
+            unordered,
+        )
+    )()
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
+    assert score_rows and max(score_rows) <= attention_kernels.indexer.QUERY_TILE
