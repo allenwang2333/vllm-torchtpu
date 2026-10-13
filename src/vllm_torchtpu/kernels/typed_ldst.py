@@ -26,16 +26,40 @@ The pool gather/scatter kernels and the GDN V3 state seam share these
 helpers so the bytes they exchange are identical.
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 
+_DTYPE_CACHE: dict[Any, Any] = {}
 
-def _typed_view(block_ref, view_dtype, lane_split: int):
+
+def _get_dtype(dt: Any) -> Any:
+    res = jnp.dtype(dt)
+    _DTYPE_CACHE[dt] = res
+    _DTYPE_CACHE[res] = res
+    return res
+
+
+def _typed_view(
+    block_ref,
+    view_dtype,
+    lane_split: int,
+    _cache: dict[Any, Any] = _DTYPE_CACHE,
+):
     """Raw block ref as a ``(rows, lanes // lane_split)`` view_dtype ref."""
-    target_dtype = jnp.dtype(view_dtype)
-    if jnp.dtype(block_ref.dtype) != target_dtype:
-        block_ref = block_ref.bitcast(target_dtype)
-    return block_ref.reshape(-1, block_ref.shape[-1] // lane_split)
+    ref_dt = block_ref.dtype
+    if ref_dt is not view_dtype:
+        target_dtype = _cache.get(view_dtype) or _get_dtype(view_dtype)
+        ref_dtype = _cache.get(ref_dt) or _get_dtype(ref_dt)
+        if ref_dtype != target_dtype:
+            block_ref = block_ref.bitcast(target_dtype)
+    shape = block_ref.shape
+    if len(shape) == 2:
+        if lane_split == 1:
+            return block_ref
+        return block_ref.reshape(shape[0] * lane_split, shape[1] // lane_split)
+    return block_ref.reshape(-1, shape[-1] // lane_split)
 
 
 def load_typed(block_ref, *, view_dtype, lane_split: int = 1) -> jax.Array:
@@ -47,4 +71,5 @@ def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
     """Inverse of ``load_typed``: stores ``values`` through a typed view of
     the raw block ref, which is fully written."""
     ref = _typed_view(block_ref, values.dtype, lane_split)
-    ref[...] = values.reshape(ref.shape)
+    ref_shape = ref.shape
+    ref[...] = values if values.shape == ref_shape else values.reshape(ref_shape)
