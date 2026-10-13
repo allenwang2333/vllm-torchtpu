@@ -6,10 +6,13 @@ from typing import Any
 
 import torch
 
+_AUTOGRAD = torch.autograd
+_PROFILER = torch.profiler
+
 
 def is_trace_annotation_enabled() -> bool:
     """Checks whether PyTorch Kineto profiler session is active."""
-    return torch.autograd._profiler_enabled()
+    return _AUTOGRAD._profiler_enabled()
 
 
 class TraceAnnotation(contextlib.ContextDecorator):
@@ -20,19 +23,17 @@ class TraceAnnotation(contextlib.ContextDecorator):
         self.kwargs = kwargs
         self._rf = None
 
-    @classmethod
-    def is_enabled(cls) -> bool:
-        return is_trace_annotation_enabled()
+    is_enabled = staticmethod(is_trace_annotation_enabled)
 
     def __enter__(self):
-        if self.is_enabled():
-            record_name = (
-                f"{self.name}#{','.join(f'{k}={v}' for k, v in self.kwargs.items())}#"
-                if self.kwargs
+        if _AUTOGRAD._profiler_enabled():
+            kwargs = self.kwargs
+            self._rf = rf = _PROFILER.record_function(
+                f"{self.name}#{','.join([f'{k}={v}' for k, v in kwargs.items()])}#"
+                if kwargs
                 else self.name
             )
-            self._rf = torch.profiler.record_function(record_name)
-            self._rf.__enter__()
+            rf.__enter__()
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
