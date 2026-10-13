@@ -23,9 +23,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import pool_alias
-from vllm_torchtpu.megakernel.ops import F32
-from vllm_torchtpu.megakernel.vmem import StreamParams
+from . import pool_alias
+from .ops import F32
+from .vmem import StreamParams
 
 NN = (((1,), (0,)), ((), ()))
 

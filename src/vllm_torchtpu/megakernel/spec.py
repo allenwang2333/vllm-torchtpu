@@ -21,8 +21,8 @@ from typing import Any, Literal
 
 import jax.numpy as jnp
 
-from vllm_torchtpu.megakernel import pool_alias
-from vllm_torchtpu.megakernel.ops import rup
+from . import pool_alias
+from .ops import rup
 
 
 @dataclass(frozen=True)

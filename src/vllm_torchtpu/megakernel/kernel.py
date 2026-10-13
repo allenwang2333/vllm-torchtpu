@@ -26,16 +26,16 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel.comm import AllReduceRing
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm
-from vllm_torchtpu.megakernel.planner import (
+from .comm import AllReduceRing
+from .ops import BF16, F32, I32, rmsnorm
+from .planner import (
     kernel_out_shapes,
     state_shapes,
     weight_shapes,
 )
-from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec, SwitchSlot
-from vllm_torchtpu.megakernel.stream import TwoRing
-from vllm_torchtpu.megakernel.vmem import CorePlan, build_scratch
+from .spec import ExecSpec, ModelSpec, SwitchSlot
+from .stream import TwoRing
+from .vmem import CorePlan, build_scratch
 
 ABLATIONS = ("dense", "experts", "kv", "gdn_state", "attn", "gdn", "comm")
 COLLECTIVE_ID = 0

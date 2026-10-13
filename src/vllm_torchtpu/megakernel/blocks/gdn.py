@@ -24,7 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel.ops import (
+from ..ops import (
     BF16,
     F32,
     FP8,
@@ -32,7 +32,7 @@ from vllm_torchtpu.megakernel.ops import (
     rnd,
     rup,
 )
-from vllm_torchtpu.megakernel.spec import (
+from ..spec import (
     Block,
     ExecSpec,
     SmallField,

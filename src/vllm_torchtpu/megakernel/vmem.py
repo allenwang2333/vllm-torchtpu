@@ -22,10 +22,10 @@ from typing import Any
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import pool_alias
-from vllm_torchtpu.megakernel.ops import BF16, F32, rup
-from vllm_torchtpu.megakernel.planner import Plan, plan
-from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec, ScratchReq
+from . import pool_alias
+from .ops import BF16, F32, rup
+from .planner import Plan, plan
+from .spec import ExecSpec, ModelSpec, ScratchReq
 
 U8 = jnp.uint8
 

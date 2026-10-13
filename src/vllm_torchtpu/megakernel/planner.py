@@ -18,8 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from vllm_torchtpu.megakernel.ops import BF16, F32, rup
-from vllm_torchtpu.megakernel.spec import (
+from .ops import BF16, F32, rup
+from .spec import (
     Block,
     ExecSpec,
     ModelSpec,

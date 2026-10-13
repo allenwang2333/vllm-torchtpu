@@ -13,7 +13,7 @@
 # limitations under the License.
 """Config-driven composable TPU Pallas megakernel library."""
 
-from vllm_torchtpu.megakernel import (
+from . import (
     blocks,
     comm,
     kernel,
@@ -25,21 +25,24 @@ from vllm_torchtpu.megakernel import (
     stream,
     vmem,
 )
-from vllm_torchtpu.megakernel.blocks import (
+from .blocks import (
+    GDNBlock,
+    GDNLinInLayout,
+    GDNParams,
     GQABlock,
     GQAParams,
     MoEBlock,
     MoEParams,
 )
-from vllm_torchtpu.megakernel.comm import AllReduceRing
-from vllm_torchtpu.megakernel.kernel import (
+from .comm import AllReduceRing
+from .kernel import (
     KernelContext,
     build,
     fold,
     make_step,
     unfold,
 )
-from vllm_torchtpu.megakernel.spec import (
+from .spec import (
     Block,
     DebugOptions,
     ExecSpec,
@@ -54,13 +57,16 @@ from vllm_torchtpu.megakernel.spec import (
     WeightDecl,
     default_tiles,
 )
-from vllm_torchtpu.megakernel.stream import TwoRing
+from .stream import TwoRing
 
 __all__ = [
     "AllReduceRing",
     "Block",
     "DebugOptions",
     "ExecSpec",
+    "GDNBlock",
+    "GDNLinInLayout",
+    "GDNParams",
     "GQABlock",
     "GQAParams",
     "KernelContext",

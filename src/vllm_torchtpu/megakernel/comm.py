@@ -23,8 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel.ops import BF16, F32, rnd
-from vllm_torchtpu.megakernel.vmem import CommParams
+from .ops import BF16, F32, rnd
+from .vmem import CommParams
 
 
 class AllReduceRing:

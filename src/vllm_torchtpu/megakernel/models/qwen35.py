@@ -25,11 +25,11 @@ from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.megakernel import kernel, planner
-from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
-from vllm_torchtpu.megakernel.blocks.gqa import GQABlock
-from vllm_torchtpu.megakernel.blocks.moe import MoEBlock
-from vllm_torchtpu.megakernel.ops import (
+from .. import kernel, planner
+from ..blocks.gdn import GDNBlock
+from ..blocks.gqa import GQABlock
+from ..blocks.moe import MoEBlock
+from ..ops import (
     BF16,
     F32,
     FP8,
@@ -39,7 +39,7 @@ from vllm_torchtpu.megakernel.ops import (
     rope_partial,
     rup,
 )
-from vllm_torchtpu.megakernel.spec import (
+from ..spec import (
     Block,
     ExecSpec,
     LayerType,
