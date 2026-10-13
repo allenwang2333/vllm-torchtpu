@@ -14,6 +14,8 @@ from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
 @pytest.mark.parametrize("width", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("count", [7, 65])
 def test_scatter_preserves_unwritten_segments(width, count):
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore record writes require a TPU")
     cache = jnp.arange(256 * 128, dtype=jnp.int32).reshape(256, 128)
     # Consecutive but permuted records share word rows. Invalid records must
     # neither overwrite row zero nor wrap to the final physical row.
@@ -22,9 +24,7 @@ def test_scatter_preserves_unwritten_segments(width, count):
     words = -jnp.arange(count * width, dtype=jnp.int32).reshape(count, width)
     expected = np.asarray(cache).copy().reshape(-1, width)
     expected[records[:-2]] = np.asarray(words[:-2])
-    result = scatter_word_records(
-        cache, jnp.asarray(records), words, interpret=jax.default_backend() != "tpu"
-    )
+    result = scatter_word_records(cache, jnp.asarray(records), words)
     np.testing.assert_array_equal(result, expected.reshape(cache.shape))
 
 
@@ -88,5 +88,4 @@ def test_scatter_rejects_unaligned_records():
             jnp.zeros((8, 128), jnp.int32),
             jnp.zeros(1, jnp.int32),
             jnp.zeros((1, 2), jnp.int32),
-            interpret=True,
         )
