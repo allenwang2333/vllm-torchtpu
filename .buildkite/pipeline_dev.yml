@@ -126,6 +126,11 @@ steps:
     concurrency_group: "tpu/v7x-2x2x4"
     concurrency: 1
     timeout_in_minutes: 1440
+    env:
+      # bootstrap_dev.sh leaves dev builds unclassed: Kueue priority 0, ahead of
+      # the nightlies and behind every other kind of build. post-merge queues
+      # this one with main. Order only: the TPU ClusterQueues never preempt.
+      WORKLOAD_PRIORITY: "post-merge"
     agents:
       queue: "kube"
     plugins:
