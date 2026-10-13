@@ -24,6 +24,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 # Clamp floor. Below any real routing score (softmax, sigmoid and sqrtsoftplus
 # are all >= 0) and strictly above the dtype minimum used to mask a selected
@@ -32,7 +33,8 @@ NEG = -3.0e38
 
 # Rows per grid step, measured fastest at 512 experts. The grid rounds up, so
 # this does not have to divide the row count.
-MAX_BLOCK_ROWS = 512
+MAX_BLOCK_ROWS = 1024
+_COMPILER_PARAMS = pltpu.CompilerParams(dimension_semantics=("parallel",))
 
 
 def _select_step(
@@ -66,8 +68,10 @@ def _select_step(
     x = jnp.where(choice > NEG, choice, NEG)
     masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    k_iota = jax.lax.broadcasted_iota(jnp.int32, w_ref.shape, 1)
     first_m = None
-    w_list = []
+    w_acc = None
+    denom = None
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)
         if j == 0:
@@ -75,29 +79,33 @@ def _select_step(
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
         idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
-        sel = iota == idx[:, None]
-        w_j = (
-            m
-            if raw is choice
-            else jnp.sum(jnp.where(sel, raw, 0.0), axis=1, keepdims=True)
-        )
-        if renormalize:
-            w_list.append(w_j)
+        if raw is choice:
+            w_j = m
+            if j + 1 < topk:
+                x = jnp.where(iota == idx[:, None], masked, x)
         else:
-            w_ref[:, j] = w_j[:, 0]
-        i_ref[:, j] = idx.astype(jnp.int32)
-        x = jnp.where(sel, masked, x)
-    assert first_m is not None
-    if renormalize:
-        denom = w_list[0]
-        for w_j in w_list[1:]:
-            denom = denom + w_j
-        denom = jnp.maximum(denom, 1e-20)
-        for j, w_j in enumerate(w_list):
-            w_ref[:, j] = (w_j / denom)[:, 0]
+            sel = iota == idx[:, None]
+            w_j = jnp.sum(jnp.where(sel, raw, 0.0), axis=1, keepdims=True)
+            if j + 1 < topk:
+                x = jnp.where(sel, masked, x)
+        if j == 0:
+            w_acc = jnp.broadcast_to(w_j, w_ref.shape)
+            if renormalize:
+                denom = w_j
+        else:
+            w_acc = jnp.where(k_iota == j, w_j, w_acc)
+            if renormalize:
+                denom = denom + w_j
+        i_ref[:, j] = idx
+    assert first_m is not None and w_acc is not None
     # No score above the sentinel means no real maximum: keep the row
     # poisonous rather than letting renormalization make it plausible.
-    w_ref[...] = jnp.where(first_m <= NEG, jnp.nan, w_ref[...])
+    if renormalize:
+        assert denom is not None
+        denom = jnp.where(first_m <= NEG, jnp.nan, jnp.maximum(denom, 1e-20))
+        w_ref[...] = w_acc / denom
+    else:
+        w_ref[...] = jnp.where(first_m <= NEG, jnp.nan, w_acc)
 
 
 def _select_kernel(
@@ -168,6 +176,7 @@ def select(
             in_specs=[scores_spec],
             out_specs=out_specs,
             out_shape=out_shape,
+            compiler_params=_COMPILER_PARAMS,
             interpret=interpret,
         )(scores)
     bias_2d = bias if bias.shape == (1, n) else jnp.reshape(bias, (1, n))
@@ -182,6 +191,7 @@ def select(
         ],
         out_specs=out_specs,
         out_shape=out_shape,
+        compiler_params=_COMPILER_PARAMS,
         interpret=interpret,
     )(scores, bias_2d)
 
