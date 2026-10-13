@@ -26,6 +26,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import kernel, planner
+from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.blocks.gqa import GQABlock
 from vllm_torchtpu.megakernel.blocks.moe import MoEBlock
 from vllm_torchtpu.megakernel.ops import (
@@ -36,6 +37,7 @@ from vllm_torchtpu.megakernel.ops import (
     rmsnorm,
     rnd,
     rope_partial,
+    rup,
 )
 from vllm_torchtpu.megakernel.spec import (
     Block,
@@ -68,6 +70,7 @@ class Qwen35Geometry:
     moe_tp: bool = True
     e_slots: int = 0
     eps: float = 1e-6
+    gdn_l2_eps: float = 1e-6
     theta: float = 10_000_000.0
     zero_centered_norm: bool = True
 
@@ -78,19 +81,22 @@ class Qwen35Geometry:
         return R // self.NKV
 
     def kh(self, R: int) -> int:
-        return self.KH // R
+        return GDNBlock.lin_in_layout(self, R).kh
 
     def vh(self, R: int) -> int:
-        return self.VH // R
+        return GDNBlock.lin_in_layout(self, R).vh
 
     def QKV(self, R: int) -> int:
-        return 2 * self.kh(R) * self.KD + self.vh(R) * self.VD
+        return GDNBlock.lin_in_layout(self, R).QKV
 
     def Z(self, R: int) -> int:
-        return self.vh(R) * self.VD
+        return GDNBlock.lin_in_layout(self, R).Z
+
+    def BA(self, R: int) -> int:
+        return GDNBlock.lin_in_layout(self, R).BA
 
     def NLI(self, R: int) -> int:
-        return self.QKV(R) + self.Z(R) + 128
+        return GDNBlock.lin_in_layout(self, R).NLI
 
     def NAI(self, R: int) -> int:
         return (2 * self.nh(R) + 2) * self.HD
@@ -122,8 +128,7 @@ class Qwen35Geometry:
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
         assert self.L % self.att_every == 0 and self.NH % R == 0 and R % self.NKV == 0
-        assert self.KH % R == 0 and self.VH % R == 0 and self.E % R == 0
-        assert self.vh(R) <= 64 and B * self.TOPK <= 640 and 1 <= B <= M <= 64
+        assert self.E % R == 0 and B * self.TOPK <= 640 and 1 <= B <= M <= 64
         pc = min(1024, self.H)
         assert (
             self.E % 128 == 0
@@ -131,22 +136,24 @@ class Qwen35Geometry:
             and self.H % pc == 0
             and self.nh(R) <= 8
         )
-        assert self.ROT % 2 == 0 and (R & (R - 1) == 0) and self.VH % self.KH == 0
+        assert self.ROT % 2 == 0 and (R & (R - 1) == 0)
         assert T >= 1 and B % T == 0, (B, T)
         assert self.e_slots == 0 or self.e_slots >= (
             self.E if self.moe_tp else self.ER(R)
         )
         for n in (
             self.H,
-            self.QKV(R),
-            self.Z(R),
-            self.KD,
-            self.VD,
             self.HD,
             self.IR(R),
             self.ISR(R),
         ):
             assert n % 128 == 0, n
+        if self.NGDN > 0:
+            assert self.KH % R == 0 and self.VH % R == 0 and self.VH % self.KH == 0
+            lay = GDNBlock.lin_in_layout(self, R)
+            assert lay.vh <= 64, lay.vh
+            for n in (lay.KD, lay.VD, lay.QKV, lay.Z):
+                assert n % 128 == 0, n
 
 
 # Alias for callers using MKConfig name
@@ -162,14 +169,15 @@ def qwen35_spec(g: Qwen35Geometry, gdn_block: Block | None = None) -> ModelSpec:
     """Construct the declarative `ModelSpec` for Qwen3.5."""
     gqa = GQABlock()
     moe = MoEBlock()
-    if g.att_every == 1 or gdn_block is None:
+    if g.att_every == 1:
         mixer: Block | SwitchSlot = SwitchSlot(
             "mixer", branches=(gqa,), branch_counts=(1,)
         )
     else:
+        gdn = GDNBlock() if gdn_block is None else gdn_block
         mixer = SwitchSlot(
             "mixer",
-            branches=(gdn_block, gqa),
+            branches=(gdn, gqa),
             branch_counts=(g.att_every - 1, 1),
         )
     lt = LayerType(name="qwen35_layer", slots=(mixer, moe))
@@ -200,23 +208,33 @@ def make_step(
     return kernel.make_step(mesh, spec, ex, donate_states=donate_states)
 
 
+def accept_states(
+    g: Qwen35Geometry,
+    ex: ExecSpec,
+    st: dict[str, Any],
+    acc: Any,
+) -> dict[str, Any]:
+    """Delegate verify-mode GDN state selection to `GDNBlock.accept`."""
+    return GDNBlock.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
+
+
 def random_logical_inputs(
     key: jax.Array,
     g: Qwen35Geometry,
     ex: ExecSpec,
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Generate small random logical inputs for `reference_step` and `pack_inputs`."""
-    assert g.att_every == 1, (
-        "M1 random_logical_inputs supports att_every=1 (GQA + MoE); M2 adds GDN"
-    )
     g.check(ex)
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
     L, H, E, HD = g.L, g.H, g.E, g.HD
     nh = g.nh(R)
+    lay_gdn = GDNBlock.lin_in_layout(g, ex)
+    vh, KD, VD = lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
+    qkv, z, nli = lay_gdn.QKV, lay_gdn.Z, lay_gdn.NLI
     isr, ir, ew = g.ISR(R), g.IR(R), g.EW(R)
-    natt = g.NATT
+    natt, ngdn = g.NATT, g.NGDN
 
-    keys = jax.random.split(key, 24)
+    keys = jax.random.split(key, 36)
     it = iter(keys)
 
     base_pos = jnp.arange(1, NS + 1, dtype=I32) * min(16, ctx // 4)
@@ -241,27 +259,27 @@ def random_logical_inputs(
     att_kv = jnp.repeat(rfp8((nkv, natt, H, 2 * HD)), G, axis=0)
     att_in = jnp.concatenate([att_q, att_kv], axis=-1)
 
-    att_q_s = rscale((R, L, koff))
-    att_kv_s = jnp.repeat(rscale((nkv, L, 2 * HD)), G, axis=0)
+    att_q_s = rscale((R, natt, koff))
+    att_kv_s = jnp.repeat(rscale((nkv, natt, 2 * HD)), G, axis=0)
     att_in_s = jnp.concatenate([att_q_s, att_kv_s], axis=-1)
 
     kn = jnp.repeat(
-        jax.random.normal(next(it), (nkv, L, HD), dtype=F32) * 0.05, G, axis=0
+        jax.random.normal(next(it), (nkv, natt, HD), dtype=F32) * 0.05, G, axis=0
     )
     sh_gate = jnp.broadcast_to(
         (jax.random.normal(next(it), (L, H), dtype=F32) * 0.1)[None, :, :],
         (R, L, H),
     )
 
-    logical_weights = {
+    logical_weights: dict[str, Any] = {
         "in_norm": jax.random.normal(next(it), (L, H), dtype=F32) * 0.05,
         "post_norm": jax.random.normal(next(it), (L, H), dtype=F32) * 0.05,
         "final_norm": jax.random.normal(next(it), (H,), dtype=F32) * 0.05,
         "att_in": att_in,
         "att_in_s": att_in_s,
         "att_out": rfp8((R, natt, nh * HD, H)),
-        "att_out_s": rscale((R, L, H)),
-        "qn": jax.random.normal(next(it), (R, L, HD), dtype=F32) * 0.05,
+        "att_out_s": rscale((R, natt, H)),
+        "qn": jax.random.normal(next(it), (R, natt, HD), dtype=F32) * 0.05,
         "kn": kn,
         "router": jax.random.normal(next(it), (L, H, E), dtype=BF16) * 0.1,
         "sh_gate": sh_gate,
@@ -274,12 +292,36 @@ def random_logical_inputs(
         "e2": rfp8((R, L, ew, ir, H)),
         "e2_s": rscale((R, L, ew, H)),
     }
+    if ngdn > 0:
+        logical_weights.update(
+            {
+                "lin_in": rfp8((R, ngdn, H, nli)),
+                "lin_in_s": rscale((R, ngdn, nli)),
+                "lin_out": rfp8((R, ngdn, z, H)),
+                "lin_out_s": rscale((R, ngdn, H)),
+                "conv": jax.random.normal(next(it), (R, ngdn, 4 * qkv), dtype=F32)
+                * 0.05,
+                "alog": jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1
+                - 1.0,
+                "dtb": jax.random.normal(next(it), (R, ngdn, vh), dtype=F32) * 0.1,
+                "gnorm": jnp.ones((R, ngdn, VD), dtype=F32)
+                + jax.random.normal(next(it), (R, ngdn, VD), dtype=F32) * 0.05,
+            }
+        )
+
     kc_nkv = jax.random.normal(next(it), (nkv, natt, NS, ctx, HD), dtype=BF16) * 0.1
     vc_nkv = jax.random.normal(next(it), (nkv, natt, NS, ctx, HD), dtype=BF16) * 0.1
-    logical_states = {
+    logical_states: dict[str, Any] = {
         "kc": jnp.repeat(kc_nkv, G, axis=0),
         "vc": jnp.repeat(vc_nkv, G, axis=0),
     }
+    if ngdn > 0:
+        logical_states["conv"] = (
+            jax.random.normal(next(it), (R, ngdn, NS, 3, qkv), dtype=F32) * 0.05
+        )
+        logical_states["rec"] = (
+            jax.random.normal(next(it), (R, ngdn, NS, vh, KD, VD), dtype=BF16) * 0.05
+        )
     return pos, hidden, logical_weights, logical_states
 
 
@@ -296,8 +338,8 @@ def pack_inputs(
     """Pack logical model weights and states into the tiled/folded megakernel layout."""
     ms = qwen35_spec(g)
     p = planner.plan(ms, ex)
-    R, B, M = ex.R, ex.B, ex.M
-    L = g.L
+    R, B, T, NS, M = ex.R, ex.B, ex.T, ex.NS, ex.M
+    L, ngdn = g.L, g.NGDN
 
     hid_pad = jnp.pad(hidden[:B], ((0, M - B), (0, 0)))
     hid_mk = jnp.tile(hid_pad[None, :, :], (R, 1, 1)).reshape(R * M, g.H)
@@ -313,25 +355,59 @@ def pack_inputs(
     S = p.smalls_width
     sm = jnp.zeros((R, L, 1, S), dtype=F32)
 
-    def set_sm(name: str, val: jax.Array):
+    def set_sm_all(name: str, val: jax.Array):
         nonlocal sm
         if name not in lay:
             return
         o, w = lay[name]
-        # val is either [L, w] (replicated) or [R, L, w]
         if val.ndim == 2:
-            val = jnp.broadcast_to(val[None, :, :], (R, L, w))
-        sm = sm.at[:, :, 0, o : o + w].set(val[:, :, :w].astype(F32))
+            val = jnp.broadcast_to(val[None, :, :], (R, L, val.shape[-1]))
+        vw = min(w, val.shape[-1])
+        sm = sm.at[:, :, 0, o : o + vw].set(val[:, :, :vw].astype(F32))
 
-    set_sm("in_norm", logical_weights["in_norm"])
-    set_sm("post_norm", logical_weights["post_norm"])
-    set_sm("in_s", logical_weights["att_in_s"])
-    set_sm("out_s", logical_weights["att_out_s"])
-    set_sm("qn", logical_weights["qn"])
-    set_sm("kn", logical_weights["kn"])
-    set_sm("sh_gate", logical_weights["sh_gate"])
-    set_sm("sh13_s", logical_weights["sh13_s"])
-    set_sm("sh2_s", logical_weights["sh2_s"])
+    def set_sm_layer(lyr: int, name: str, val_l: jax.Array):
+        nonlocal sm
+        if name not in lay:
+            return
+        o, w = lay[name]
+        if val_l.ndim == 1:
+            val_l = jnp.broadcast_to(val_l[None, :], (R, val_l.shape[-1]))
+        vw = min(w, val_l.shape[-1])
+        sm = sm.at[:, lyr, 0, o : o + vw].set(val_l[:, :vw].astype(F32))
+
+    def branch_slice(arr: jax.Array, lyr: int, ord_idx: int) -> jax.Array:
+        return arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
+
+    set_sm_all("in_norm", logical_weights["in_norm"])
+    set_sm_all("post_norm", logical_weights["post_norm"])
+    set_sm_all("sh_gate", logical_weights["sh_gate"])
+    set_sm_all("sh13_s", logical_weights["sh13_s"])
+    set_sm_all("sh2_s", logical_weights["sh2_s"])
+
+    for lyr in range(L):
+        is_att = (lyr + 1) % g.att_every == 0
+        if is_att:
+            a = lyr // g.att_every
+            set_sm_layer(lyr, "in_s", branch_slice(logical_weights["att_in_s"], lyr, a))
+            set_sm_layer(
+                lyr, "out_s", branch_slice(logical_weights["att_out_s"], lyr, a)
+            )
+            set_sm_layer(lyr, "qn", branch_slice(logical_weights["qn"], lyr, a))
+            set_sm_layer(lyr, "kn", branch_slice(logical_weights["kn"], lyr, a))
+        else:
+            o_gdn = lyr - (lyr + 1) // g.att_every
+            set_sm_layer(
+                lyr, "in_s", branch_slice(logical_weights["lin_in_s"], lyr, o_gdn)
+            )
+            set_sm_layer(
+                lyr, "out_s", branch_slice(logical_weights["lin_out_s"], lyr, o_gdn)
+            )
+            set_sm_layer(lyr, "conv", branch_slice(logical_weights["conv"], lyr, o_gdn))
+            set_sm_layer(lyr, "alog", branch_slice(logical_weights["alog"], lyr, o_gdn))
+            set_sm_layer(lyr, "dtb", branch_slice(logical_weights["dtb"], lyr, o_gdn))
+            set_sm_layer(
+                lyr, "gnorm", branch_slice(logical_weights["gnorm"], lyr, o_gdn)
+            )
 
     router_rep = jnp.broadcast_to(
         logical_weights["router"][None, ...], (R, L, g.H, g.E)
@@ -352,22 +428,50 @@ def pack_inputs(
         logical_weights["final_norm"][None, None, :], (R, 1, g.H)
     ).astype(F32)
 
-    weights_mk: dict[str, Any] = {
-        "att_in": tile_w(logical_weights["att_in"], "att_in"),
-        "att_out": tile_w(logical_weights["att_out"], "att_out"),
-        "router": tile_w(router_rep, "router"),
-        "sh13": tile_w(logical_weights["sh13"], "sh13"),
-        "sh2": tile_w(logical_weights["sh2"], "sh2"),
-        "e13": e13_mk,
-        "e2": e2_mk,
-        "es": es_mk,
-        "smalls": sm,
-        "final_norm": fn_mk,
-    }
-    states_mk = {
-        "kc": kernel.fold(logical_states["kc"]),
-        "vc": kernel.fold(logical_states["vc"]),
-    }
+    weights_mk: dict[str, Any] = {}
+    if ngdn > 0:
+        weights_mk["lin_in"] = tile_w(logical_weights["lin_in"], "lin_in")
+        weights_mk["lin_out"] = tile_w(logical_weights["lin_out"], "lin_out")
+    weights_mk.update(
+        {
+            "att_in": tile_w(logical_weights["att_in"], "att_in"),
+            "att_out": tile_w(logical_weights["att_out"], "att_out"),
+            "router": tile_w(router_rep, "router"),
+            "sh13": tile_w(logical_weights["sh13"], "sh13"),
+            "sh2": tile_w(logical_weights["sh2"], "sh2"),
+            "e13": e13_mk,
+            "e2": e2_mk,
+            "es": es_mk,
+            "smalls": sm,
+            "final_norm": fn_mk,
+        }
+    )
+
+    states_mk: dict[str, Any] = {}
+    if ngdn > 0:
+        conv_l = logical_states["conv"]
+        rec_l = logical_states["rec"]
+        qkv = g.QKV(R)
+        vh = g.vh(R)
+        if conv_l.ndim == 5 and conv_l.shape[3] == 3:
+            if T == 1:
+                cr = rup(3 * B, 8)
+                conv_3b = jnp.swapaxes(conv_l, 2, 3).reshape(R, ngdn, 3 * B, qkv)
+                conv_p = jnp.pad(conv_3b, ((0, 0), (0, 0), (0, cr - 3 * B), (0, 0)))
+            else:
+                hr = rup(3 + T, 8)
+                conv_p = jnp.pad(conv_l, ((0, 0), (0, 0), (0, 0), (0, hr - 3), (0, 0)))
+        else:
+            conv_p = conv_l
+        if rec_l.ndim == 6:
+            rec_p = rec_l.reshape(R, ngdn, NS * vh, g.KD, g.VD)
+        else:
+            rec_p = rec_l
+        states_mk["conv"] = kernel.fold(conv_p.astype(F32))
+        states_mk["rec"] = kernel.fold(rec_p.astype(BF16))
+
+    states_mk["kc"] = kernel.fold(logical_states["kc"])
+    states_mk["vc"] = kernel.fold(logical_states["vc"])
 
     if mesh is not None:
         rep = NamedSharding(mesh, P())
@@ -406,22 +510,37 @@ def reference_step(
     logical_states: dict[str, Any],
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank reference oracle consuming logical model weights."""
-    assert g.att_every == 1, (
-        "M1 reference_step supports att_every=1 (GQA + MoE); M2 adds GDN"
-    )
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
-    L = g.L
+    L, ngdn = g.L, g.NGDN
     nh, HD, IR, ISR, ER = g.nh(R), g.HD, g.IR(R), g.ISR(R), g.ER(R)
+    lay_gdn = GDNBlock.lin_in_layout(g, ex)
+    kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
+    QKV, Z, BA, A_OFF = lay_gdn.QKV, lay_gdn.Z, lay_gdn.BA, lay_gdn.A_OFF
+    CR, HR = rup(3 * B, 8), rup(3 + T, 8)
 
     kc_all = logical_states["kc"]  # [R, NATT, NS, ctx, HD]
     vc_all = logical_states["vc"]  # [R, NATT, NS, ctx, HD]
+    conv_in = logical_states.get("conv", jnp.zeros((R, ngdn, NS, 3, QKV), dtype=F32))
+    rec_in = logical_states.get("rec", jnp.zeros((R, ngdn, NS, vh, KD, VD), dtype=BF16))
+    if rec_in.ndim == 5:
+        rec_in = rec_in.reshape(R, ngdn, NS, vh, KD, VD)
+    conv_out = (
+        jnp.zeros((R, ngdn, CR, QKV), dtype=F32)
+        if T == 1
+        else jnp.zeros((R, ngdn, NS, HR, QKV), dtype=F32)
+    )
+    rec_out = jnp.zeros((R, ngdn, B * vh, KD, VD), dtype=BF16)
     res = hidden[:B].astype(F32)
 
     half = g.ROT // 2
     inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / g.ROT))
+    expand = vh // kh
+
+    def branch_slice(arr: jax.Array, lyr: int, ord_idx: int) -> jax.Array:
+        return arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
 
     for l in range(L):  # noqa: E741
-        a = l // g.att_every
+        is_att = (l + 1) % g.att_every == 0
         in_norm = logical_weights["in_norm"][l]
         xb = (
             rmsnorm(res, in_norm, g.eps, zero_centered=g.zero_centered_norm)
@@ -429,92 +548,201 @@ def reference_step(
             .astype(F32)
         )
 
-        att_partials = []
-        knew_ranks = []
-        vnew_ranks = []
-        for r in range(R):
-            w_in = logical_weights["att_in"][r, a].astype(F32)
-            in_s = logical_weights["att_in_s"][r, l]
-            y = rnd((xb @ w_in) * in_s)
+        if is_att:
+            a = l // g.att_every
+            att_partials = []
+            knew_ranks = []
+            vnew_ranks = []
+            att_in_s_l = branch_slice(logical_weights["att_in_s"], l, a)
+            att_out_s_l = branch_slice(logical_weights["att_out_s"], l, a)
+            qn_l = branch_slice(logical_weights["qn"], l, a)
+            kn_l = branch_slice(logical_weights["kn"], l, a)
 
-            qn = logical_weights["qn"][r, l]
-            kn = logical_weights["kn"][r, l]
-            koff = nh * 2 * HD
+            for r in range(R):
+                w_in = logical_weights["att_in"][r, a].astype(F32)
+                in_s = att_in_s_l[r]
+                y = rnd((xb @ w_in) * in_s)
 
-            qg = y[:, :koff].reshape(B, nh, 2 * HD)
-            gate = qg[:, :, HD:].reshape(B, nh * HD)
-            q_all = []
-            k_new_r = []
-            v_new_r = []
-            for b in range(B):
-                ang = pos[b].astype(F32) * inv
-                cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
-                qb = rmsnorm(
-                    qg[b, :, :HD], qn, g.eps, zero_centered=g.zero_centered_norm
-                )
-                kb = rmsnorm(
-                    y[b : b + 1, koff : koff + HD],
-                    kn,
-                    g.eps,
-                    zero_centered=g.zero_centered_norm,
-                )
-                vb = y[b : b + 1, koff + HD : koff + 2 * HD]
-                qb = rnd(rope_partial(qb, cos, sin, g.ROT) * (HD**-0.5))
-                kb = rope_partial(kb, cos, sin, g.ROT)
-                q_all.append(qb)
-                k_new_r.append(kb[0])
-                v_new_r.append(vb[0])
-            q_r = jnp.stack(q_all, axis=0)  # [B, nh, HD]
-            kn_r = jnp.stack(k_new_r, axis=0)  # [B, HD]
-            vn_r = jnp.stack(v_new_r, axis=0)  # [B, HD]
-            knew_ranks.append(kn_r)
-            vnew_ranks.append(vn_r)
+                qn = qn_l[r]
+                kn = kn_l[r]
+                koff = nh * 2 * HD
 
-            mix_r = []
-            for b in range(B):
-                sq, tb = divmod(b, T)
-                plen = pos[sq * T]
-                k_cache = kc_all[r, a, sq].astype(F32)
-                v_cache = vc_all[r, a, sq].astype(F32)
-                idx = jnp.arange(ctx)
-                scores_c = jnp.where(
-                    idx[None, :] < plen,
-                    q_r[b].astype(BF16).astype(F32) @ k_cache.T,
-                    -1e30,
-                )
-                new_k = jnp.stack(
-                    [knew_ranks[r][sq * T + j].astype(F32) for j in range(tb + 1)],
-                    axis=0,
-                )
-                new_v = jnp.stack(
-                    [vnew_ranks[r][sq * T + j].astype(F32) for j in range(tb + 1)],
-                    axis=0,
-                )
-                scores_n = q_r[b] @ new_k.T
-                scores = jnp.concatenate([scores_c, scores_n], axis=-1)
-                vals = jnp.concatenate([v_cache, new_v], axis=0)
-                probs = jax.nn.softmax(scores, axis=-1)
-                out_b = probs @ vals
-                oh = rnd(out_b).reshape(nh * HD)
-                gh = rnd(jax.nn.sigmoid(gate[b]))
-                mix_r.append(rnd(oh * gh))
-            mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
-            w_out = logical_weights["att_out"][r, a].astype(F32)
-            out_s = logical_weights["att_out_s"][r, l]
-            yo = (mix_r_arr @ w_out) * out_s
-            att_partials.append(yo.astype(BF16).astype(F32))
+                qg = y[:, :koff].reshape(B, nh, 2 * HD)
+                gate = qg[:, :, HD:].reshape(B, nh * HD)
+                q_all = []
+                k_new_r = []
+                v_new_r = []
+                for b in range(B):
+                    ang = pos[b].astype(F32) * inv
+                    cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
+                    qb = rmsnorm(
+                        qg[b, :, :HD], qn, g.eps, zero_centered=g.zero_centered_norm
+                    )
+                    kb = rmsnorm(
+                        y[b : b + 1, koff : koff + HD],
+                        kn,
+                        g.eps,
+                        zero_centered=g.zero_centered_norm,
+                    )
+                    vb = y[b : b + 1, koff + HD : koff + 2 * HD]
+                    qb = rnd(rope_partial(qb, cos, sin, g.ROT) * (HD**-0.5))
+                    kb = rope_partial(kb, cos, sin, g.ROT)
+                    q_all.append(qb)
+                    k_new_r.append(kb[0])
+                    v_new_r.append(vb[0])
+                q_r = jnp.stack(q_all, axis=0)  # [B, nh, HD]
+                kn_r = jnp.stack(k_new_r, axis=0)  # [B, HD]
+                vn_r = jnp.stack(v_new_r, axis=0)  # [B, HD]
+                knew_ranks.append(kn_r)
+                vnew_ranks.append(vn_r)
 
-        for r in range(R):
-            for s_idx in range(NS):
-                b0 = s_idx * T
-                kc_all = kc_all.at[r, a, s_idx, pos[b0] : pos[b0] + T].set(
-                    knew_ranks[r][b0 : b0 + T].astype(BF16)
-                )
-                vc_all = vc_all.at[r, a, s_idx, pos[b0] : pos[b0] + T].set(
-                    vnew_ranks[r][b0 : b0 + T].astype(BF16)
-                )
+                mix_r = []
+                for b in range(B):
+                    sq, tb = divmod(b, T)
+                    plen = pos[sq * T]
+                    k_cache = kc_all[r, a, sq].astype(F32)
+                    v_cache = vc_all[r, a, sq].astype(F32)
+                    idx = jnp.arange(ctx)
+                    scores_c = jnp.where(
+                        idx[None, :] < plen,
+                        q_r[b].astype(BF16).astype(F32) @ k_cache.T,
+                        -1e30,
+                    )
+                    new_k = jnp.stack(
+                        [knew_ranks[r][sq * T + j].astype(F32) for j in range(tb + 1)],
+                        axis=0,
+                    )
+                    new_v = jnp.stack(
+                        [vnew_ranks[r][sq * T + j].astype(F32) for j in range(tb + 1)],
+                        axis=0,
+                    )
+                    scores_n = q_r[b] @ new_k.T
+                    scores = jnp.concatenate([scores_c, scores_n], axis=-1)
+                    vals = jnp.concatenate([v_cache, new_v], axis=0)
+                    probs = jax.nn.softmax(scores, axis=-1)
+                    out_b = probs @ vals
+                    oh = rnd(out_b).reshape(nh * HD)
+                    gh = rnd(jax.nn.sigmoid(gate[b]))
+                    mix_r.append(rnd(oh * gh))
+                mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
+                w_out = logical_weights["att_out"][r, a].astype(F32)
+                out_s = att_out_s_l[r]
+                yo = (mix_r_arr @ w_out) * out_s
+                att_partials.append(yo.astype(BF16).astype(F32))
 
-        res = rnd(res + jnp.sum(jnp.stack(att_partials, axis=0), axis=0))
+            for r in range(R):
+                for s_idx in range(NS):
+                    b0 = s_idx * T
+                    kc_all = kc_all.at[r, a, s_idx, pos[b0] : pos[b0] + T].set(
+                        knew_ranks[r][b0 : b0 + T].astype(BF16)
+                    )
+                    vc_all = vc_all.at[r, a, s_idx, pos[b0] : pos[b0] + T].set(
+                        vnew_ranks[r][b0 : b0 + T].astype(BF16)
+                    )
+
+            res = rnd(res + jnp.sum(jnp.stack(att_partials, axis=0), axis=0))
+        else:
+            o_gdn = l - (l + 1) // g.att_every
+            gdn_partials = []
+            lin_in_s_l = branch_slice(logical_weights["lin_in_s"], l, o_gdn)
+            lin_out_s_l = branch_slice(logical_weights["lin_out_s"], l, o_gdn)
+            conv_w_l = branch_slice(logical_weights["conv"], l, o_gdn)
+            alog_l = branch_slice(logical_weights["alog"], l, o_gdn)
+            dtb_l = branch_slice(logical_weights["dtb"], l, o_gdn)
+            gnorm_l = branch_slice(logical_weights["gnorm"], l, o_gdn)
+
+            for r in range(R):
+                w_in = logical_weights["lin_in"][r, o_gdn].astype(F32)
+                in_s = lin_in_s_l[r]
+                ybuf = rnd((xb @ w_in) * in_s)
+
+                cw = conv_w_l[r]
+                taps = [cw[t * QKV : (t + 1) * QKV] for t in range(4)]
+                if T == 1:
+                    s0 = conv_in[r, o_gdn, :, 0, :]
+                    s1 = conv_in[r, o_gdn, :, 1, :]
+                    s2 = conv_in[r, o_gdn, :, 2, :]
+                    x_c = ybuf[:, :QKV]
+                    u = rnd(
+                        jax.nn.silu(
+                            s0 * taps[0] + s1 * taps[1] + s2 * taps[2] + x_c * taps[3]
+                        )
+                    )
+                    conv_next = jnp.concatenate([s1, s2, x_c], axis=0)
+                    conv_out = conv_out.at[r, o_gdn, : 3 * B, :].set(conv_next)
+                else:
+                    us = []
+                    for s_idx in range(NS):
+                        hist = jnp.zeros((HR, QKV), dtype=F32)
+                        hist = hist.at[0:3, :].set(conv_in[r, o_gdn, s_idx, 0:3, :])
+                        hist = hist.at[3 : 3 + T, :].set(
+                            ybuf[s_idx * T : (s_idx + 1) * T, :QKV]
+                        )
+                        conv_out = conv_out.at[r, o_gdn, s_idx].set(hist)
+                        u_s = rnd(
+                            jax.nn.silu(
+                                hist[0:T] * taps[0]
+                                + hist[1 : 1 + T] * taps[1]
+                                + hist[2 : 2 + T] * taps[2]
+                                + hist[3 : 3 + T] * taps[3]
+                            )
+                        )
+                        us.append(u_s)
+                    u = jnp.concatenate(us, axis=0)
+
+                alog = alog_l[r, :vh]
+                dtb = dtb_l[r, :vh]
+                gnw = gnorm_l[r, :VD].astype(BF16)
+                mix_r = []
+                rec_r_list = []
+                rec_prev = rec_in[r, o_gdn, 0]
+                for b in range(B):
+                    s_idx, t_idx = divmod(b, T)
+                    st_cur = (
+                        rec_in[r, o_gdn, s_idx].astype(F32)
+                        if t_idx == 0
+                        else rec_prev.astype(F32)
+                    )
+                    q = u[b, : kh * KD].reshape(kh, KD)
+                    k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
+                    v = u[b, 2 * kh * KD :].reshape(vh, VD)
+                    q = (
+                        q
+                        * lax.rsqrt(
+                            jnp.sum(q * q, axis=-1, keepdims=True) + g.gdn_l2_eps
+                        )
+                        * (KD**-0.5)
+                    )
+                    k = k * lax.rsqrt(
+                        jnp.sum(k * k, axis=-1, keepdims=True) + g.gdn_l2_eps
+                    )
+                    qc = jnp.repeat(q, expand, axis=0)[:, :, None]
+                    kc_ = jnp.repeat(k, expand, axis=0)[:, :, None]
+                    beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+                    a_val = ybuf[b, A_OFF : A_OFF + vh]
+                    decay = -jnp.exp(alog) * jax.nn.softplus(a_val + dtb)
+                    st_cur = st_cur * jnp.exp(decay)[:, None, None]
+                    pred = jnp.sum(st_cur * kc_, axis=1)
+                    delta = (v - pred) * beta[:, None]
+                    st_cur = st_cur + kc_ * delta[:, None, :]
+                    out_b = rnd(jnp.sum(st_cur * qc, axis=1))
+                    rec_prev = st_cur.astype(BF16)
+                    rec_r_list.append(rec_prev)
+                    val = out_b * lax.rsqrt(
+                        jnp.mean(out_b * out_b, axis=-1, keepdims=True) + g.eps
+                    )
+                    val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+                    zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
+                    mix_r.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+
+                rec_out = rec_out.at[r, o_gdn].set(jnp.concatenate(rec_r_list, axis=0))
+                mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
+                w_out = logical_weights["lin_out"][r, o_gdn].astype(F32)
+                out_s = lin_out_s_l[r]
+                yo = (mix_r_arr @ w_out) * out_s
+                gdn_partials.append(yo.astype(BF16).astype(F32))
+
+            res = rnd(res + jnp.sum(jnp.stack(gdn_partials, axis=0), axis=0))
 
         # Post-attention RMSNorm + MoE
         post_norm = logical_weights["post_norm"][l]
@@ -575,4 +803,22 @@ def reference_step(
 
     fn = logical_weights["final_norm"].astype(F32)
     out_b = rmsnorm(res, fn, g.eps, zero_centered=g.zero_centered_norm).astype(BF16)
-    return out_b, {"kc": kc_all, "vc": vc_all}
+    out_states: dict[str, Any] = {"kc": kc_all, "vc": vc_all}
+    if ngdn > 0:
+        if ex.VER:
+            conv_pad = (
+                jnp.pad(
+                    conv_in,
+                    ((0, 0), (0, 0), (0, 0), (0, HR - conv_in.shape[-2]), (0, 0)),
+                )
+                if conv_in.ndim == 5 and conv_in.shape[-2] < HR
+                else conv_in
+            )
+            out_states["conv"] = conv_pad
+            out_states["rec"] = rec_in.reshape(R, ngdn, NS * vh, KD, VD)
+            out_states["conv_ckpt"] = conv_out
+            out_states["rec_ckpt"] = rec_out
+        else:
+            out_states["conv"] = conv_out
+            out_states["rec"] = rec_out
+    return out_b, out_states

@@ -27,7 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import GQABlock, MoEBlock
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm
 from vllm_torchtpu.megakernel.spec import (
     TINY_TILES,
     ExecSpec,
@@ -119,6 +119,7 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
         mr_ref: Any = None
         skip: frozenset[str] = frozenset()
         sc: Any = lambda *_: contextlib.nullcontext()
+        norm_x: Any = None
 
         def block_params(self, name: str) -> Any:
             return self.core_plan.block(name)
@@ -127,6 +128,22 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
             o, w = self.core_plan.stream.lay[name]
             n = w if width is None else width
             return self.scr["sm"][slot, :, o : o + n]
+
+        def apply_input_norm(self, norm_field: str | None, slot: Any) -> None:
+            if norm_field is None:
+                self.norm_x = None
+                return
+            x = rmsnorm(
+                self.scr["res"][...],
+                self.sm(slot, norm_field),
+                g.eps,
+                zero_centered=bool(g.zero_centered_norm),
+            )
+            self.scr["xb"][...] = x.astype(BF16)
+            self.norm_x = x
+
+    assert gqa.input_norm == "in_norm"
+    assert moe.input_norm == "post_norm"
 
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_s, n_o = len(p.w_names), len(p.s_names), len(p.o_names)
@@ -166,8 +183,10 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
             W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
         ).wait()
         ring.begin_layer(jnp.int32(0))
+        ctx.apply_input_norm(gqa.input_norm, jnp.int32(0))
         part_att = gqa.emit(ctx, jnp.int32(0), jnp.int32(0))
         ar.add_residual(ar.allreduce(0, part_att, jnp.bool_(True)))
+        ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
         part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
         ar.add_residual(ar.allreduce(1, part_moe, jnp.bool_(True)))
         O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)

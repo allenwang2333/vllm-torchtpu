@@ -31,7 +31,6 @@ from vllm_torchtpu.megakernel.ops import (
     FP8,
     I32,
     bswitch,
-    rmsnorm,
     rnd,
     rup,
 )
@@ -78,6 +77,7 @@ class MoEBlock(Block):
 
     name: str = "moe"
     reduction = "allreduce"
+    input_norm: str | None = "post_norm"
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         er = g.E // ex.R
@@ -743,13 +743,10 @@ class MoEBlock(Block):
 
         with stream.segment(lazy=LAZY_MOE):
             with sc("moe_router"):
-                x = rmsnorm(
-                    scr["res"][...],
-                    ctx.sm(slot, "post_norm"),
-                    mp.eps,
-                    zero_centered=mp.zero_centered_norm,
+                assert ctx.norm_x is not None, (
+                    "MoEBlock requires input_norm='post_norm' to populate ctx.norm_x"
                 )
-                scr["xb"][...] = x.astype(BF16)
+                x = ctx.norm_x
                 logits = stream.dmatmul("router", scr["xb"], E)[0:MR]
                 glog = jnp.sum(x * ctx.sm(slot, "sh_gate"), axis=-1, keepdims=True)
                 scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))

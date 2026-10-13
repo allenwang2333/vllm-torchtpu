@@ -52,6 +52,12 @@ from vllm_torchtpu.megakernel.spec import (  # noqa: E402
 )
 
 
+def pytest_configure(config: Any) -> None:
+    config.addinivalue_line(
+        "markers", "slow: multi-rank or large-batch CPU interpret tests"
+    )
+
+
 @dataclass(frozen=True)
 class FakeGeometry:
     """Compact model geometry for fast CPU unit tests."""
@@ -74,6 +80,7 @@ class FakeGeometry:
     moe_tp: bool = False
     e_slots: int = 0
     eps: float = 1e-6
+    gdn_l2_eps: float = 1e-6
     theta: float = 10_000_000.0
     zero_centered_norm: bool = True
 
@@ -83,6 +90,7 @@ class FakeMixerBlock(Block):
 
     name = "fake_gqa"
     reduction = "allreduce"
+    input_norm = "in_norm"
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
@@ -145,6 +153,7 @@ class FakeAltMixerBlock(Block):
 
     name = "fake_gdn"
     reduction = "allreduce"
+    input_norm = "in_norm"
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
         kh = g.KH // ex.R
@@ -211,6 +220,7 @@ class FakeFFNBlock(Block):
 
     name = "fake_moe"
     reduction = "allreduce"
+    input_norm = "post_norm"
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
         isr = g.IS // ex.R

@@ -78,7 +78,9 @@ class StreamParams:
             return lyr
         c_b = self.branch_counts[b_idx]
         start_b = sum(self.branch_counts[:b_idx])
-        return (lyr // self.period) * c_b + ((lyr % self.period) - start_b)
+        return (lyr // self.period) * c_b + jnp.clip(
+            (lyr % self.period) - start_b, 0, c_b - 1
+        )
 
 
 @dataclass(frozen=True)

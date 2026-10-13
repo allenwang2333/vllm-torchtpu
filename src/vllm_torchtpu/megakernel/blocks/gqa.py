@@ -83,6 +83,7 @@ class GQABlock(Block):
 
     name: str = "gqa"
     reduction = "allreduce"
+    input_norm: str | None = "in_norm"
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
@@ -259,14 +260,6 @@ class GQABlock(Block):
             ap.LAZY_ATT,
         )
         gi = lax.rem(ctx.me, G) if SPLIT else jnp.int32(0)
-
-        with sc("norm_in"):
-            scr["xb"][...] = rmsnorm(
-                scr["res"][...],
-                ctx.sm(slot, "in_norm"),
-                ap.eps,
-                zero_centered=ap.zero_centered_norm,
-            ).astype(BF16)
 
         a = stream.sp.block_ord(l, self.name)
         ksem = scr["kv_sem"]

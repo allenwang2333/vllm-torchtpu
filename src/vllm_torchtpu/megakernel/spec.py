@@ -137,6 +137,8 @@ TINY_TILES = Tiles(
 
 def default_tiles(B: int) -> Tiles:
     """Tuned default tiles for batch row count `B`."""
+    if B > 48:
+        return dataclasses.replace(WIDE_TILES, nbe=6)
     if B > 32:
         return WIDE_TILES
     if B > 24:
@@ -227,6 +229,7 @@ class Block:
 
     name: str = "block"
     reduction: Literal["allreduce", "none", "custom"] = "allreduce"
+    input_norm: str | None = None
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         return []

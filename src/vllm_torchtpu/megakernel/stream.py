@@ -61,6 +61,8 @@ class TwoRing:
         self.cursor: Any = jnp.int32(0)
         self._lazy: bool = False
         self._seg_tiles: int = 0
+        self._cursor_delta: int = 0
+        self._cond_depth: int = 0
         self._in_segment: bool = False
         self._branch_offsets: list[int] | None = None
         self._active_branches: tuple[int, ...] = tuple(range(len(sp.branch_counts)))
@@ -71,6 +73,7 @@ class TwoRing:
             "begin_layer() cannot be called inside stream.segment()"
         )
         self.cursor = self.sp.layer_start_tile(lyr)
+        self._cursor_delta = 0
         self._branch_offsets = [0 for _ in self.sp.branch_counts]
         self._active_branches = tuple(range(len(self.sp.branch_counts)))
         return self.cursor
@@ -90,26 +93,45 @@ class TwoRing:
         )
         g0 = jnp.asarray(self.cursor, dtype=jnp.int32)
         prev_active = self._active_branches
+        prev_delta = self._cursor_delta
+        dt_box = [0]
+        df_box = [0]
 
         def _t():
             self.cursor = g0
+            self._cursor_delta = 0
             if len(self.sp.branch_counts) >= 2:
                 self._active_branches = (true_branch,)
             out = true_fn()
-            return out, jnp.asarray(self.cursor, dtype=jnp.int32)
+            dt_box[0] = self._cursor_delta
+            return out
 
         def _f():
             self.cursor = g0
+            self._cursor_delta = 0
             if len(self.sp.branch_counts) >= 2:
                 self._active_branches = (false_branch,)
             out = false_fn()
-            return out, jnp.asarray(self.cursor, dtype=jnp.int32)
+            df_box[0] = self._cursor_delta
+            return out
 
+        self._cond_depth += 1
         try:
-            out, next_cursor = lax.cond(pred, _t, _f)
+            out = lax.cond(pred, _t, _f)
         finally:
+            self._cond_depth -= 1
             self._active_branches = prev_active
-        self.cursor = next_cursor
+            self._cursor_delta = prev_delta
+        dt, df = dt_box[0], df_box[0]
+        step = jnp.int32(dt) if dt == df else jnp.where(pred, dt, df)
+        self.cursor = g0 + step
+        if dt == df:
+            self._cursor_delta += dt
+        else:
+            assert self._cond_depth == 0, (
+                f"Nested cond_branches() requires equal tile counts across "
+                f"branches, got {dt} vs {df}"
+            )
         return out
 
     @contextlib.contextmanager
@@ -277,6 +299,7 @@ class TwoRing:
             g0 = self.cursor
             self.cursor = g0 + n_t
             self._seg_tiles += n_t
+            self._cursor_delta += n_t
         use_lazy = self._lazy if lazy is None else lazy
         acc = self.scr["acc"]
         acc[:, :N] = jnp.zeros((sp.MB, N), F32)

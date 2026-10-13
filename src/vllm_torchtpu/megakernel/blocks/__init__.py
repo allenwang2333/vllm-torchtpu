@@ -13,7 +13,20 @@
 # limitations under the License.
 """Composable megakernel building blocks."""
 
+from vllm_torchtpu.megakernel.blocks.gdn import (
+    GDNBlock,
+    GDNLinInLayout,
+    GDNParams,
+)
 from vllm_torchtpu.megakernel.blocks.gqa import GQABlock, GQAParams
 from vllm_torchtpu.megakernel.blocks.moe import MoEBlock, MoEParams
 
-__all__ = ["GQABlock", "GQAParams", "MoEBlock", "MoEParams"]
+__all__ = [
+    "GDNBlock",
+    "GDNLinInLayout",
+    "GDNParams",
+    "GQABlock",
+    "GQAParams",
+    "MoEBlock",
+    "MoEParams",
+]

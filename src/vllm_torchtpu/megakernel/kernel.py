@@ -63,6 +63,7 @@ class KernelContext:
     comm: AllReduceRing
     skip: frozenset[str]
     sc: Any
+    norm_x: Any = None
 
     def block_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Block.plan_params`."""
@@ -73,6 +74,22 @@ class KernelContext:
         o, w = self.core_plan.stream.lay[name]
         n = w if width is None else width
         return self.scr["sm"][slot, :, o : o + n]
+
+    def apply_input_norm(self, norm_field: str | None, slot: Any) -> None:
+        """Normalize `scr['res']` with `sm[slot, norm_field]` into `scr['xb']`."""
+        if norm_field is None:
+            self.norm_x = None
+            return
+        sc_name = "norm_in" if norm_field == "in_norm" else norm_field
+        with self.sc(sc_name):
+            x = rmsnorm(
+                self.scr["res"][...],
+                self.sm(slot, norm_field),
+                self.g.eps,
+                zero_centered=bool(self.g.zero_centered_norm),
+            )
+            self.scr["xb"][...] = x.astype(BF16)
+            self.norm_x = x
 
 
 def build(
@@ -176,18 +193,33 @@ def build(
             ):
                 if isinstance(slot_entry, SwitchSlot):
                     active = slot_entry.active_branches
+                    norm_names = {b.input_norm for b in active}
+                    assert len(norm_names) == 1, norm_names
+                    ctx.apply_input_norm(active[0].input_norm, slot)
                     if len(active) == 1:
                         part = active[0].emit(ctx, l, slot)
+                        if ar_slot is not None:
+                            comm.add_residual(comm.allreduce(ar_slot, part, first))
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
-                        is_b0 = (l % slot_entry.period) < c0
+                        is_b1 = (l % slot_entry.period) >= c0
                         b0, b1 = active[0], active[1]
-                        part = stream.cond_branches(
-                            is_b0,
-                            lambda b0=b0: b0.emit(ctx, l, slot),
-                            lambda b1=b1: b1.emit(ctx, l, slot),
-                            true_branch=0,
-                            false_branch=1,
+
+                        # Emit allreduce + add_residual inside each branch so
+                        # the lowered `scf.if` yields `()` instead of returning
+                        # a `vector<MBxHxf32>` tensor across the branch boundary
+                        # (which would keep 64 VRegs live across `scf.if`).
+                        def _emit_branch(blk, ar_slot=ar_slot):
+                            part = blk.emit(ctx, l, slot)
+                            if ar_slot is not None:
+                                comm.add_residual(comm.allreduce(ar_slot, part, first))
+
+                        stream.cond_branches(
+                            is_b1,
+                            lambda b1=b1: _emit_branch(b1),
+                            lambda b0=b0: _emit_branch(b0),
+                            true_branch=1,
+                            false_branch=0,
                         )
                     else:
                         raise NotImplementedError(
@@ -195,10 +227,10 @@ def build(
                             "not yet supported"
                         )
                 else:
+                    ctx.apply_input_norm(slot_entry.input_norm, slot)
                     part = slot_entry.emit(ctx, l, slot)
-
-                if ar_slot is not None:
-                    comm.add_residual(comm.allreduce(ar_slot, part, first))
+                    if ar_slot is not None:
+                        comm.add_residual(comm.allreduce(ar_slot, part, first))
 
             return carry
 
@@ -408,7 +440,7 @@ def make_step(
             local,
             mesh=mesh,
             in_specs=in_specs,
-            out_specs=(P("tp"), ss),
+            out_specs=(P("tp"), P("tp")),
             check_vma=False,
         )(pos, hidden, weights, states, *extra)
 

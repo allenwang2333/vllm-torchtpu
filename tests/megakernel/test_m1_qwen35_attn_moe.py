@@ -81,7 +81,7 @@ def test_m1_recorded_full_ep_build_invariants():
         (1, 2, 1, 1, False),
         (1, 4, 2, 1, True),
         (2, 2, 1, 1, False),
-        (2, 4, 2, 1, False),
+        pytest.param(2, 4, 2, 1, False, marks=pytest.mark.slow),
     ],
 )
 def test_m1_qwen35_pack_and_step_vs_logical_reference(
@@ -146,6 +146,7 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
     )
 
 
+@pytest.mark.slow
 def test_m1_qwen35_r8_multi_rank_interpret():
     """Verify 2-layer, 8-rank EP + `G=4` split GQA + `HIER=1` AR in `interpret=True`."""
     devs = jax.devices("cpu")

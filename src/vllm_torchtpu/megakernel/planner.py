@@ -125,6 +125,10 @@ def _discover_schedule(
             assert len(reds) == 1, (
                 f"SwitchSlot {s.name} branches must share reduction policy: {reds}"
             )
+            norms = {b.input_norm for b in active}
+            assert len(norms) == 1, (
+                f"SwitchSlot {s.name} branches must share input_norm: {norms}"
+            )
             red = active[0].reduction
             if len(active) == 1:
                 b = active[0]
@@ -218,7 +222,9 @@ def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
                     f"Unsupported stream_ring {w.stream_ring!r} on {w.name}"
                 )
 
+        b_small_names: set[str] = set()
         for sf in b.smalls(g, ex):
+            b_small_names.add(sf.name)
             if sf.name not in small_widths:
                 small_fields_order.append(sf.name)
                 small_widths[sf.name] = sf.width
@@ -230,6 +236,11 @@ def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
                     f"branches of the same SwitchSlot may share a smalls field name."
                 )
                 small_widths[sf.name] = max(small_widths[sf.name], sf.width)
+        if b.input_norm is not None:
+            assert b.input_norm in b_small_names, (
+                f"Block {b.name!r} declares input_norm={b.input_norm!r} "
+                f"which is not in its smalls(): {sorted(b_small_names)}"
+            )
 
         for st in b.states(g, ex):
             assert st.name not in state_decls, f"Duplicate state declaration: {st.name}"
