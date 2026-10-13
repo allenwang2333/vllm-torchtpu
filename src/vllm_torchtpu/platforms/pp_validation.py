@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static checks for pipeline parallelism on TPU."""
 
+import sys
 from typing import Any
+
+_get_pp_indices: Any = None
 
 
 def _legacy_ray_executor() -> bool:
-    import vllm.envs as vllm_envs
-
-    from vllm_torchtpu import envs
-
-    return (
-        envs.TPU_MULTIHOST_BACKEND == "ray"
-        and not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    )
+    envs = sys.modules.get("vllm_torchtpu.envs")
+    if envs is None:
+        from vllm_torchtpu import envs
+    if envs.TPU_MULTIHOST_BACKEND != "ray":
+        return False
+    vllm_envs = sys.modules.get("vllm.envs")
+    if vllm_envs is None:
+        import vllm.envs as vllm_envs
+    return not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
 
 
 _FULL_ATTENTION_LAYER_TYPES = frozenset({"full_attention", "deepseek_sparse_attention"})
@@ -24,18 +28,23 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     Only hybrid models declare ``layer_types``; every layer of the others
     has a KV cache.
     """
-    from vllm.distributed.utils import get_pp_indices
-
+    global _get_pp_indices
     hf_config = vllm_config.model_config.hf_text_config
     layer_types = getattr(hf_config, "layer_types", None)
     if layer_types is None:
         return None
+    get_pp_indices = _get_pp_indices
+    if get_pp_indices is None:
+        from vllm.distributed.utils import get_pp_indices as _gpi
+
+        _get_pp_indices = _gpi
+        get_pp_indices = _gpi
     num_layers = len(layer_types)
     stages = vllm_config.parallel_config.pipeline_parallel_size
     for stage in range(stages):
         start, end = get_pp_indices(num_layers, stage, stages)
         kinds = layer_types[start:end]
-        if _FULL_ATTENTION_LAYER_TYPES.isdisjoint(kinds):
+        if "full_attention" not in kinds and "deepseek_sparse_attention" not in kinds:
             return (
                 f"stage {stage} holds layers {start}-{end - 1}, "
                 f"{'/'.join(sorted(set(kinds)))} only"
@@ -68,13 +77,12 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif vllm_config.speculative_config is not None:
         unsupported = "speculative decoding"
     elif (
-        vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
-    ):
+        kv_transfer_config := vllm_config.kv_transfer_config
+    ) is not None and kv_transfer_config.kv_connector != "TPURaidenConnector":
         # The raiden connector transfers each stage's own layers; the
         # other connectors assume every worker holds every layer.
         unsupported = "KV transfer connectors other than TPURaidenConnector"
-    elif vllm_config.kv_transfer_config is not None and (
+    elif kv_transfer_config is not None and (
         stage := _stage_without_full_attention(vllm_config)
     ):
         # The raiden connector pairs a stage with its peer through the
