@@ -21,6 +21,16 @@ from jax.experimental import pallas as pl
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+_DOT_DN = (((1,), (1,)), ((), ()))
+
+
+def _token_index_map(i):
+    return (i, 0)
+
+
+def _zero_index_map(i):
+    return (0, 0)
+
 
 def _fused_kernel(
     x_ref,
@@ -70,16 +80,15 @@ def _fused_kernel(
         streams_bf.append(new_bf)
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
-    dn = (((1,), (1,)), ((), ()))
     acc = jax.lax.dot_general(
-        g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
+        g_bf, fn_hi_ref[...], _DOT_DN, preferred_element_type=jnp.float32
     )
     if gemm_precision == "highest":
         acc = acc + jax.lax.dot_general(
-            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+            g_bf, fn_mid_ref[...], _DOT_DN, preferred_element_type=jnp.float32
         )
         acc = acc + jax.lax.dot_general(
-            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+            g_bf, fn_lo_ref[...], _DOT_DN, preferred_element_type=jnp.float32
         )
     mixes_ref[...] = acc
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
@@ -150,6 +159,17 @@ def fused_post_pre_mixes(
         sqrsum: (num_tokens, 1), float32.
         layer2d: (num_tokens, hidden_size), bfloat16.
     """
+    if x2d.dtype != jnp.bfloat16:
+        x2d = x2d.astype(jnp.bfloat16)
+    if x2d.ndim != 2:
+        x2d = x2d.reshape(-1, x2d.shape[-1])
+    if res2d.ndim != 2:
+        res2d = res2d.reshape(x2d.shape[0], -1)
+    if post2d.ndim != 2:
+        post2d = post2d.reshape(x2d.shape[0], -1)
+    if comb2d.ndim != 2:
+        comb2d = comb2d.reshape(x2d.shape[0], -1)
+
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
     assert post2d.dtype == jnp.float32, post2d.dtype
@@ -179,7 +199,7 @@ def fused_post_pre_mixes(
 
     compiler_params = utils.compiler_params(vmem_limit_bytes)
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
+    resident = pl.BlockSpec((hc_mult3, hc_hidden), _zero_index_map)
     new_res, mixes, sqrsum, layer2d = pl.pallas_call(
         functools.partial(
             _fused_kernel,
@@ -191,21 +211,21 @@ def fused_post_pre_mixes(
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hidden_size), _token_index_map),
+            pl.BlockSpec((tb, hc_hidden), _token_index_map),
+            pl.BlockSpec((tb, hc_mult), _token_index_map),
+            pl.BlockSpec((tb, hc_mult * hc_mult), _token_index_map),
             resident,
             resident,
             resident,
-            pl.BlockSpec((1, 3), lambda i: (0, 0)),
-            pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
+            pl.BlockSpec((1, 3), _zero_index_map),
+            pl.BlockSpec((1, hc_mult3), _zero_index_map),
         ],
         out_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
-            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
+            pl.BlockSpec((tb, hc_hidden), _token_index_map),
+            pl.BlockSpec((tb, hc_mult3), _token_index_map),
+            pl.BlockSpec((tb, 1), _token_index_map),
+            pl.BlockSpec((tb, hidden_size), _token_index_map),
         ],
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, hc_hidden), jnp.bfloat16),
@@ -217,6 +237,53 @@ def fused_post_pre_mixes(
     )(x2d, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
     return utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "outer_shape",
+        "hc_mult",
+        "hidden_size",
+        "rms_eps",
+        "hc_pre_eps",
+        "hc_sinkhorn_eps",
+        "hc_post_mult_value",
+        "sinkhorn_repeat",
+    ),
+    inline=True,
+)
+def _fused_gates_epilogue(
+    mixes: jax.Array,
+    sqrsum: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    outer_shape: tuple[int, ...],
+    hc_mult: int,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[jax.Array, jax.Array]:
+    _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
+        mixes,
+        sqrsum,
+        hc_mult,
+        hidden_size,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return (
+        post_mix_cur.reshape(*outer_shape, hc_mult, 1),
+        comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
+    )
 
 
 def mhc_fused_post_pre(
@@ -245,18 +312,11 @@ def mhc_fused_post_pre(
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
 
-    x2d = x.reshape(-1, hidden_size)
-    if x2d.dtype != jnp.bfloat16:
-        x2d = x2d.astype(jnp.bfloat16)
-    res2d = residual.reshape(-1, hc_mult * hidden_size)
-    post2d = post_layer_mix.reshape(-1, hc_mult)
-    comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
-
     new_res2d, mixes, sqrsum, layer_input_cur = fused_post_pre_mixes(
-        x2d,
-        res2d,
-        post2d,
-        comb2d,
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
         fn,
         hc_scale,
         hc_base,
@@ -266,23 +326,29 @@ def mhc_fused_post_pre(
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
+    post_mix_cur, comb_mix_cur = _fused_gates_epilogue(
         mixes,
         sqrsum,
-        hc_mult,
-        hidden_size,
         hc_scale,
         hc_base,
+        outer_shape,
+        hc_mult,
+        hidden_size,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
     )
+    layer_out = (
+        layer_input_cur
+        if len(outer_shape) == 1
+        else layer_input_cur.reshape(*outer_shape, hidden_size)
+    )
 
     return (
         new_res2d.reshape(*outer_shape, hc_mult, hidden_size),
-        post_mix_cur.reshape(*outer_shape, hc_mult, 1),
-        comb_mix_cur.reshape(*outer_shape, hc_mult, hc_mult),
-        layer_input_cur.reshape(*outer_shape, hidden_size),
+        post_mix_cur,
+        comb_mix_cur,
+        layer_out,
     )
