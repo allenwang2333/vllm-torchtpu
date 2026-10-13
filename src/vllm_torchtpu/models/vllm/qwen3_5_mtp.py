@@ -83,9 +83,8 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
 
     supports_pp: ClassVar[Literal[True]] = True
 
-    @property
-    def make_empty_intermediate_tensors(self):
-        return self.model.make_empty_intermediate_tensors
+    def make_empty_intermediate_tensors(self, batch_size: int, dtype: torch.dtype, device: torch.device):
+        return self.model.make_empty_intermediate_tensors(batch_size=batch_size, dtype=dtype, device=device)
 
 
 class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
@@ -93,6 +92,5 @@ class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
 
     supports_pp: ClassVar[Literal[True]] = True
 
-    @property
-    def make_empty_intermediate_tensors(self):
-        return self.model.make_empty_intermediate_tensors
+    def make_empty_intermediate_tensors(self, batch_size: int, dtype: torch.dtype, device: torch.device):
+        return self.model.make_empty_intermediate_tensors(batch_size=batch_size, dtype=dtype, device=device)
