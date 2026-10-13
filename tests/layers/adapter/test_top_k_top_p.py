@@ -290,6 +290,7 @@ def test_skip_bits_matches_full_search_when_idle():
     torch.testing.assert_close(fast, full)
 
 
+@pytest.mark.tpu_test
 def test_fast_top_p_matches_bisection(device, monkeypatch):
     """On TPU, compiled like the sampler graphs: f32 rows like the verify
     program and bf16 rows like the bonus program."""

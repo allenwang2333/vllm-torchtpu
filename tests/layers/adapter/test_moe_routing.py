@@ -274,7 +274,9 @@ def _bias_inputs(rows, device):
     return logits.to(device), bias.to(device)
 
 
-@pytest.mark.parametrize("device", ["cpu", "tpu"])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("tpu", marks=pytest.mark.tpu_test)]
+)
 @pytest.mark.parametrize("rows", [16, 4096])
 def test_select_experts_bias_in_kernel_is_bit_identical(monkeypatch, device, rows):
     """TPU_MOE_ROUTER_TOPK_BIAS=1 vs 0 on the GLM-5.2 router shape (256
@@ -310,6 +312,7 @@ def test_select_experts_bias_in_kernel_is_bit_identical(monkeypatch, device, row
         assert torch.equal(got_w.view(torch.int16), ref_w.view(torch.int16))
 
 
+@pytest.mark.tpu_test
 def test_router_topk_bias_kernel_on_device_matches_gather():
     """The Pallas kernel itself (not the bridge), on TPU, f32 weights."""
     torch = pytest.importorskip("torch")

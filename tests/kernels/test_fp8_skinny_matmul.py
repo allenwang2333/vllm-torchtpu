@@ -80,6 +80,7 @@ SITES = [
 ]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("k,n,config", SITES)
 @pytest.mark.parametrize("m,real", [(16, 4), (16, 16), (8, 8)])
 def test_matches_f64_of_quantized_operands(k, n, config, m, real):
@@ -98,6 +99,7 @@ def test_matches_f64_of_quantized_operands(k, n, config, m, real):
     assert _row_err(y, ref) <= _tol(x, wq, ws, ref)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("config", [("n", 512, 2), ("k", 256, 3)])
 @pytest.mark.parametrize("edge", ["none", "zero_row", "outlier", "tiny"])
 def test_quantize_bit_identical_to_quantize_block(config, edge):
@@ -123,6 +125,7 @@ def test_quantize_bit_identical_to_quantize_block(config, edge):
     )
 
 
+@pytest.mark.tpu_test
 def test_padded_copy_and_logical_width():
     """q_a + kv_a: 2624 outputs; the kernel runs on a copy padded to 2688 at load and
     the cut output matches the unpadded math."""
@@ -143,6 +146,7 @@ def test_padded_copy_and_logical_width():
     assert _row_err(y, ref) <= _tol(x, wq, ws, ref)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("config", [("n", 1024, 3), ("k", 256, 3)])
 def test_stacked_weight_index(config):
     """The kernel reads w_stack[idx] itself (the benchmark's cold-weight form): each

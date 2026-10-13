@@ -229,7 +229,10 @@ def _count_sorts(jaxpr):
     return n
 
 
-def test_sortfree_removes_every_sort_at_decode():
+def test_sortfree_removes_every_sort_at_decode(monkeypatch):
+    # TPU_MOE_SINGLE_SORT (on by default) folds the sorted path into one packed
+    # sort; turn it off so the baseline is the three sorts counted below.
+    monkeypatch.setattr("vllm_torchtpu.layers.core.fused_moe_gmm._SINGLE_SORT", False)
     hidden, ids, weights, _ = _route(0, 16, rank=0, skew=0.0)
 
     def sorts(sortfree):
