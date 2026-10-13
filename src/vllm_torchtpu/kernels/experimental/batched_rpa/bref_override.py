@@ -116,8 +116,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
           dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
           src_new_off = dma_entry.fetch_hbm[...]
           dst_vmem_off = dma_entry.fetch_vmem[...]
-          dma_valid = dma_entry.fetch_val
-          sz = dma_valid * self.cfgs.serve.page_size
+          sz = dma_entry.fetch_val
           page = jnp.minimum(
               src_new_off >> self.cfgs.serve.page_size_log2, pages_per_seq - 1
           )

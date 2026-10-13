@@ -873,29 +873,29 @@ def forward_with_pcp(
     value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ---- 1. CACHE_ONLY pass ----
+    cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
+    dist_cache = attn_metadata.request_distribution.clone()
+    if is_decode:
+        dist_cache[0] = torch.maximum(
+            torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
+            attn_metadata.request_distribution[0] // 2,
+        )
+        dist_cache[1] = dist_cache[0]
+        dist_cache[2] = dist_cache[0]
+    else:
+        dist_cache[0] = 0
+        dist_cache[1] = 0
+        dist_cache[2] = attn_metadata.request_distribution[2] // 2
+
+    seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
+    block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
+    kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
+
     cache_pages = pcp_meta.cache_pages
     run_cache_pass = torch.compiler.is_compiling() or (cache_pages > 0)
     if not run_cache_pass:
         ctx_output = ctx_lse = None
     else:
-        cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
-        dist_cache = attn_metadata.request_distribution.clone()
-        if is_decode:
-            dist_cache[0] = torch.maximum(
-                torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
-                attn_metadata.request_distribution[0] // 2,
-            )
-            dist_cache[1] = dist_cache[0]
-            dist_cache[2] = dist_cache[0]
-        else:
-            dist_cache[0] = 0
-            dist_cache[1] = 0
-            dist_cache[2] = attn_metadata.request_distribution[2] // 2
-
-        seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
-        block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
-        kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
-
         pcp_group = get_pcp_group()
         if pcp_group is not None and pcp_world_size > 1:
             if is_decode:
@@ -957,29 +957,42 @@ def forward_with_pcp(
             )
 
     # ---- 2. NEW_TOKENS_ONLY pass ----
+    q_positions = pcp_cache_lens + q_pos_offsets_local
     if is_decode:
         k_curr = key
         v_curr = value
+        new_seq_lens = seq_lens_req
+        new_block_tables = block_tables_req
+        new_cu_q_lens = cu_cache
+        new_dist = dist_cache
+        new_kv_new_lens = kv_new_lens_req
+        new_q_positions = _per_request_1d(q_positions, num_seqs)
+        new_update_kv_cache = _per_request_1d(update_kv_cache_local, num_seqs)
     else:
         k_curr = all_gather_equal_tokens(key, dim=0)
         v_curr = all_gather_equal_tokens(value, dim=0)
         k_curr = torch.nan_to_num(k_curr, nan=0.0, posinf=0.0, neginf=0.0)
         v_curr = torch.nan_to_num(v_curr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    q_positions = pcp_cache_lens + q_pos_offsets_local
+        new_seq_lens = attn_metadata.seq_lens
+        new_block_tables = attn_metadata.block_tables
+        new_cu_q_lens = cu_q_lens_local
+        new_dist = attn_metadata.request_distribution
+        new_kv_new_lens = kv_new_lens
+        new_q_positions = q_positions
+        new_update_kv_cache = update_kv_cache_local
 
     curr_output, curr_lse = new_kernel(
         kv_cache,
         query,
         k_curr,
         v_curr,
-        attn_metadata.seq_lens,
-        attn_metadata.block_tables,
-        cu_q_lens_local,
-        attn_metadata.request_distribution,
-        kv_new_lens,
-        q_positions,
-        update_kv_cache_local,
+        new_seq_lens,
+        new_block_tables,
+        new_cu_q_lens,
+        new_dist,
+        new_kv_new_lens,
+        new_q_positions,
+        new_update_kv_cache,
         pcp_new_pages,
     )
 
