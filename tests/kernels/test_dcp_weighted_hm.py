@@ -58,3 +58,22 @@ def test_weighted_heads_major_bit_identical(t, h):
         dcp_weighted_hm.weighted_heads_major(o, w, fault="swap_heads")
     ).view(np.uint32)
     assert not np.array_equal(bad, want)
+
+
+@pytest.mark.parametrize("t,h", [(512, 64), (256, 64), (128, 64), (512, 32), (16, 64), (8, 64)])
+def test_weighted_heads_major_bf16_out_bit_identical(t, h):
+    """`out_dtype=bf16` (TPU_DCP_MERGE_RS_BF16 with WEIGHTED_HM): the f32 value
+    rounded once to bf16, bit for bit the torch merge's `.to(bfloat16)`."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("Pallas TPU kernel")
+    o, w = _case(t, h, seed=3 * t + h)
+    got = dcp_weighted_hm.weighted_heads_major(o, w, out_dtype=jnp.bfloat16)
+    assert got.dtype == jnp.bfloat16 and got.shape == (h, t, o.shape[-1])
+    want = jax.jit(lambda o, w: _reference(o, w).astype(jnp.bfloat16))(o, w)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
+    bad = dcp_weighted_hm.weighted_heads_major(
+        o, w, fault="swap_heads", out_dtype=jnp.bfloat16
+    )
+    assert not np.array_equal(np.asarray(bad).view(np.uint16), np.asarray(want).view(np.uint16))
