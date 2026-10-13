@@ -14,13 +14,14 @@
 """Torch bridge for the DCP merge's heads-major weighted operand
 (`kernels/mla/dcp_weighted_hm.py`, TPU_DCP_MERGE_WEIGHTED_HM)."""
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.mla import dcp_weighted_hm as _k
 
 
-def _fn(o, w):
+def _fn(o: jax.Array, w: jax.Array) -> jax.Array:
     return _k.weighted_heads_major(o, w)
 
 
