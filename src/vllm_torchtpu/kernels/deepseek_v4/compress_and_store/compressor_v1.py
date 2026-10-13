@@ -13,6 +13,8 @@
 # limitations under the License.
 """DeepSeek V4 Compressor Layer forward pass implementation."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
@@ -20,12 +22,66 @@ import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
 
+_GATHER_1D_DN = jax.lax.GatherDimensionNumbers(
+    offset_dims=(),
+    collapsed_slice_dims=(0,),
+    start_index_map=(0,),
+)
+_SCATTER_1D_DN = jax.lax.ScatterDimensionNumbers(
+    update_window_dims=(),
+    inserted_window_dims=(0,),
+    scatter_dims_to_operand_dims=(0,),
+)
+_PROMISE_IN_BOUNDS = jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS
+_FILL_OR_DROP = jax.lax.GatherScatterMode.FILL_OR_DROP
+
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
     """Per-request row stride of a flattened [num_reqs * max_blocks] table."""
-    assert block_table.ndim == 1
-    assert block_table.shape[0] % num_reqs == 0
-    return block_table.shape[0] // num_reqs
+    shape = block_table.shape
+    assert len(shape) == 1
+    stride, rem = divmod(shape[0], num_reqs)
+    assert rem == 0
+    return stride
+
+
+@functools.lru_cache(maxsize=64)
+def _cached_page_geometry(
+    head_dim: int,
+    overlap: bool,
+    physical_page_size: int,
+    state_physical_page_size: int,
+    state_block_size: int,
+    rope_head_dim: int,
+    compress_ratio: int,
+) -> tuple[int, int, int, int, int]:
+    cfgs = config.Configs.make(
+        config.select_mode(head_dim, overlap),
+        size_n=1,
+        physical_page_size=physical_page_size,
+        state_physical_page_size=state_physical_page_size,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        compress_ratio=compress_ratio,
+    )
+    page_size = cfgs.state_physical_page_size
+    state_rows_per_token = cfgs.state_rows_per_token
+    kv_block_size = cfgs.kv_block_size
+    kv_stride = cfgs.kv_stride
+    kv_page_stride = kv_block_size * kv_stride
+    assert state_block_size <= cfgs.state_page_capacity, (
+        f"state cache block_size {state_block_size} overruns the "
+        f"{cfgs.dims.mode.value} state cache geometry, "
+        f"which holds {cfgs.state_page_capacity} token states per page "
+    )
+    return (
+        page_size,
+        state_rows_per_token,
+        kv_block_size,
+        kv_stride,
+        kv_page_stride,
+    )
 
 
 def derive_metadata(
@@ -80,86 +136,115 @@ def derive_metadata(
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
     state_source = cache if state_cache is None else state_cache
 
-    cfgs = config.Configs.make(
-        config.select_mode(head_dim, overlap),
-        size_n=num_tokens,
-        physical_page_size=cache.shape[1],
-        state_physical_page_size=state_source.shape[1],
-        state_block_size=state_block_size,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        compress_ratio=compress_ratio,
-    )
     # Rows per page, rows per token's state, and the KV sub-slot packing.
-    page_size = cfgs.state_physical_page_size
-    state_rows_per_token = cfgs.state_rows_per_token
-    kv_block_size = cfgs.kv_block_size
-    kv_stride = cfgs.kv_stride
-    kv_page_stride = kv_block_size * kv_stride
-
     # The block tables are paged at vLLM's state-cache block size, and the
     # kernel indexes a page with `position % state_block_size`, so a page must
     # physically hold that many token states. Fewer is a bug; more is the
     # deliberate slack left when a mode is floored to its peer's page size.
-    assert state_block_size <= cfgs.state_page_capacity, (
-        f"state cache block_size {state_block_size} overruns the "
-        f"{cfgs.dims.mode.value} state cache geometry {state_source.shape}, "
-        f"which holds {cfgs.state_page_capacity} token states per page "
+    (
+        page_size,
+        state_rows_per_token,
+        kv_block_size,
+        kv_stride,
+        kv_page_stride,
+    ) = _cached_page_geometry(
+        head_dim,
+        overlap,
+        cache.shape[1],
+        state_source.shape[1],
+        state_block_size,
+        rope_head_dim,
+        compress_ratio,
     )
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
     batch_size = query_start_loc.shape[0] - 1
-    token_to_req_indices = jnp.minimum(
-        jnp.searchsorted(
-            query_start_loc[1:],
-            jnp.arange(num_tokens, dtype=query_start_loc.dtype),
-            side="right",
-        ),
-        batch_size - 1,
-    ).astype(jnp.int32)
+    if batch_size <= 1:
+        token_to_req_indices = jax.lax.full((num_tokens,), 0, jnp.int32)
+    else:
+        q_ends = jax.lax.slice_in_dim(query_start_loc, 1, batch_size)
+        token_indices = jax.lax.broadcasted_iota(
+            query_start_loc.dtype, (1, num_tokens), 1
+        )
+        token_to_req_indices = jnp.sum(
+            jax.lax.le(jax.lax.expand_dims(q_ends, (1,)), token_indices),
+            axis=0,
+            dtype=jnp.int32,
+        )
     req = token_to_req_indices
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
     kv_block_table_stride = block_table_row_stride(kv_block_table, batch_size)
-    req_state_base = req * block_table_stride
+    req_state_base = req * jnp.int32(block_table_stride)
     req_kv_base = (
         req_state_base
         if kv_block_table_stride == block_table_stride
-        else req * kv_block_table_stride
+        else req * jnp.int32(kv_block_table_stride)
     )
 
     # 3. State Cache Slot Mapping (Virtual -> Physical)
-    state_page_idx = positions // state_block_size
-    state_page_offset = positions % state_block_size
-    state_page_numbers = block_table[req_state_base + state_page_idx]
-    slot_mapping_slots = (
-        state_page_numbers * page_size + state_page_offset * state_rows_per_token
+    pos_i32 = positions.astype(jnp.int32)
+    state_bs_i32 = jnp.int32(state_block_size)
+    state_page_idx = jax.lax.div(pos_i32, state_bs_i32)
+    state_page_offset = jax.lax.rem(pos_i32, state_bs_i32)
+    state_page_numbers = jax.lax.gather(
+        block_table,
+        jax.lax.expand_dims(req_state_base + state_page_idx, (1,)),
+        _GATHER_1D_DN,
+        (1,),
+        mode=_PROMISE_IN_BOUNDS,
     )
+    slot_mapping_slots = state_page_numbers * jnp.int32(
+        page_size
+    ) + state_page_offset * jnp.int32(state_rows_per_token)
 
     # 4. Compressed KV Cache Slot Mapping (Virtual -> Physical)
-    kv_idx = positions // compress_ratio
-    kv_page_idx = kv_idx // kv_block_size
-    kv_page_offset = kv_idx % kv_block_size
+    cr_i32 = jnp.int32(compress_ratio)
+    kv_bs_i32 = jnp.int32(kv_block_size)
+    kv_idx = jax.lax.div(pos_i32, cr_i32)
+    kv_page_idx = jax.lax.div(kv_idx, kv_bs_i32)
+    kv_page_offset = jax.lax.rem(kv_idx, kv_bs_i32)
 
-    kv_page_number = kv_block_table[req_kv_base + kv_page_idx]
+    kv_page_number = jax.lax.gather(
+        kv_block_table,
+        jax.lax.expand_dims(req_kv_base + kv_page_idx, (1,)),
+        _GATHER_1D_DN,
+        (1,),
+        mode=_PROMISE_IN_BOUNDS,
+    )
 
-    kv_slot_mapping = kv_page_number * kv_page_stride + kv_page_offset * kv_stride
+    kv_slot_mapping = kv_page_number * jnp.int32(
+        kv_page_stride
+    ) + kv_page_offset * jnp.int32(kv_stride)
 
-    is_boundary = ((positions + 1) % compress_ratio) == 0
-    kv_slot_mapping = jnp.where(is_boundary, kv_slot_mapping, -1)
+    is_boundary = jax.lax.eq(pos_i32 - kv_idx * cr_i32, jnp.int32(compress_ratio - 1))
+    kv_slot_mapping = jax.lax.select(
+        is_boundary,
+        kv_slot_mapping,
+        jax.lax.full(kv_slot_mapping.shape, -1, kv_slot_mapping.dtype),
+    )
 
     return token_to_req_indices, slot_mapping_slots, kv_slot_mapping
 
 
 def _get_packing_indices(keep, size):
     order = jnp.nonzero(keep, size=size, fill_value=-1)[0]
-    valid = order >= 0
-    safe = jnp.where(valid, order, 0)
+    valid = jax.lax.ge(order, 0)
+    safe = jax.lax.select(valid, order, jax.lax.full(order.shape, 0, order.dtype))
     return safe, valid
 
 
 def _pack_array(x, safe, valid, default_value):
-    return jnp.where(valid, x[safe], default_value)
+    gathered = jax.lax.gather(
+        x,
+        jax.lax.expand_dims(safe, (1,)),
+        _GATHER_1D_DN,
+        (1,),
+        mode=_PROMISE_IN_BOUNDS,
+    )
+    return jax.lax.select(
+        valid, gathered, jax.lax.full(gathered.shape, default_value, gathered.dtype)
+    )
 
 
 def prepare_boundary_batch(
@@ -179,50 +264,88 @@ def prepare_boundary_batch(
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
-    packed_size = num_tokens + max_prefill_boundary
 
     # 1. Get packing indices for all boundary tokens
-    safe, valid = _get_packing_indices(is_boundary, packed_size)
+    safe, valid = _get_packing_indices(is_boundary, num_tokens)
+    safe_1d = jax.lax.expand_dims(safe, (1,))
 
     # 2. Pack inputs and the decode mask.
     # Invalid slots map to dest == output_size (dropped by scatter), so pos/req
     # only need gather without a redundant jnp.where(valid, ..., 0).
-    pos = positions[safe]
-    req = token_to_req_indices[safe]
-    kv = _pack_array(kv_slot_mapping, safe, valid, -1)
-    is_decode = valid & is_decode_token[safe]
+    pos = jax.lax.gather(
+        positions, safe_1d, _GATHER_1D_DN, (1,), mode=_PROMISE_IN_BOUNDS
+    )
+    req = jax.lax.gather(
+        token_to_req_indices,
+        safe_1d,
+        _GATHER_1D_DN,
+        (1,),
+        mode=_PROMISE_IN_BOUNDS,
+    )
+    kv_raw = jax.lax.gather(
+        kv_slot_mapping, safe_1d, _GATHER_1D_DN, (1,), mode=_PROMISE_IN_BOUNDS
+    )
+    kv = jax.lax.select(valid, kv_raw, jax.lax.full(kv_raw.shape, -1, kv_raw.dtype))
+    is_decode = jax.lax.bitwise_and(
+        valid,
+        jax.lax.gather(
+            is_decode_token,
+            safe_1d,
+            _GATHER_1D_DN,
+            (1,),
+            mode=_PROMISE_IN_BOUNDS,
+        ),
+    )
 
-    valid_token = kv >= 0
-    is_prefill = valid_token & ~is_decode
+    valid_token = jax.lax.ge(kv, 0)
+    is_prefill = jax.lax.bitwise_and(valid_token, jax.lax.bitwise_not(is_decode))
 
     # 3. Calculate row-tiling ONLY for prefill tokens
-    row = jnp.where(is_prefill, kv // rope_pack, -1)
-    starts_row = is_prefill & jnp.pad(row[1:] != row[:-1], (1, 0), constant_values=True)
+    rope_pack_i32 = jnp.int32(rope_pack)
+    row = jax.lax.select(
+        is_prefill,
+        jax.lax.div(kv.astype(jnp.int32), rope_pack_i32),
+        jax.lax.full(kv.shape, -1, jnp.int32),
+    )
+    row_diff = jax.lax.ne(
+        jax.lax.slice_in_dim(row, 1, num_tokens),
+        jax.lax.slice_in_dim(row, 0, num_tokens - 1),
+    )
+    starts_row = jax.lax.bitwise_and(
+        is_prefill, jax.lax.pad(row_diff, True, ((1, 0, 0),))
+    )
 
-    tile_index = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
+    tile_index = jax.lax.cumsum(starts_row.astype(jnp.int32), 0) - jnp.int32(1)
 
-    index = jnp.arange(packed_size)
-    run_start = jax.lax.cummax(jnp.where(starts_row, index, 0))
+    index = jax.lax.broadcasted_iota(jnp.int32, (num_tokens,), 0)
+    run_start = jax.lax.cummax(
+        jax.lax.select(starts_row, index, jax.lax.full(index.shape, 0, jnp.int32))
+    )
     pos_within_tile = index - run_start
 
     # 4. Calculate alignment offset for prefill block
-    K = jnp.sum(is_decode)
-    K_aligned = ((K + 3) // 4) * 4
+    K = jnp.sum(jax.lax.bitwise_and(is_boundary, is_decode_token), dtype=jnp.int32)
+    K_aligned = jax.lax.bitwise_and(K + jnp.int32(3), jnp.int32(-4))
 
     # 5. Combine destination indices
     prefill_size = rope_pack * max_prefill_boundary
     output_size = num_tokens + prefill_size
 
-    dest_prefill = K_aligned + tile_index * rope_pack + pos_within_tile
-    dest = jnp.where(is_decode, index, dest_prefill)
-    dest = jnp.where(valid_token, dest, output_size)
+    dest_prefill = K_aligned + tile_index * rope_pack_i32 + pos_within_tile
+    dest = jax.lax.select(is_decode, index, dest_prefill)
+    dest = jax.lax.select(
+        valid_token, dest, jax.lax.full(dest.shape, output_size, dest.dtype)
+    )
+    dest_1d = jax.lax.expand_dims(dest, (1,))
 
     # 6. Scatter to output once
     def scatter(default_val, src):
-        return (
-            jnp.full((output_size,), default_val, dtype=src.dtype)
-            .at[dest]
-            .set(src, mode="drop")
+        return jax.lax.scatter(
+            jax.lax.full((output_size,), default_val, src.dtype),
+            dest_1d,
+            src,
+            _SCATTER_1D_DN,
+            mode=_FILL_OR_DROP,
         )
 
     return (
@@ -273,9 +396,24 @@ def compressor_forward(
         state_cache=state_cache,
     )
 
-    token_index = jnp.arange(num_tokens)
-    is_real_token = token_index < query_start_loc[distribution[2]]
-    slot_mapping_slots = jnp.where(is_real_token, slot_mapping_slots, -1)
+    token_index = jax.lax.broadcasted_iota(query_start_loc.dtype, (num_tokens,), 0)
+    dist2_idx = jax.lax.expand_dims(jax.lax.slice_in_dim(distribution, 2, 3), (1,))
+    real_limit = jax.lax.squeeze(
+        jax.lax.gather(
+            query_start_loc,
+            dist2_idx,
+            _GATHER_1D_DN,
+            (1,),
+            mode=_PROMISE_IN_BOUNDS,
+        ),
+        (0,),
+    )
+    is_real_token = jax.lax.lt(token_index, real_limit)
+    slot_mapping_slots = jax.lax.select(
+        is_real_token,
+        slot_mapping_slots,
+        jax.lax.full(slot_mapping_slots.shape, -1, slot_mapping_slots.dtype),
+    )
 
     updated_state = proj_kernel.proj_and_save_state(
         hidden_states=hidden_states,
@@ -291,8 +429,19 @@ def compressor_forward(
     else:
         state_cache = updated_state
 
-    is_decode_token = token_index < query_start_loc[distribution[0]]
-    is_boundary = (kv_slot_mapping >= 0) & is_real_token
+    dist0_idx = jax.lax.expand_dims(jax.lax.slice_in_dim(distribution, 0, 1), (1,))
+    decode_limit = jax.lax.squeeze(
+        jax.lax.gather(
+            query_start_loc,
+            dist0_idx,
+            _GATHER_1D_DN,
+            (1,),
+            mode=_PROMISE_IN_BOUNDS,
+        ),
+        (0,),
+    )
+    is_decode_token = jax.lax.lt(token_index, decode_limit)
+    is_boundary = jax.lax.bitwise_and(jax.lax.ge(kv_slot_mapping, 0), is_real_token)
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
