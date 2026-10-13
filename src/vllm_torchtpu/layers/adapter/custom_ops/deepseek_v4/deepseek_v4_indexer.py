@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     check_seq_along_lane_in_quad_pages,
@@ -124,6 +125,7 @@ def _indexer_jax(
             decode_req_batch_size=1,
             uniform_q_len=uniform_q_len,
             kv_layout=kv_layout,
+            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
         )
 
     return _indexer_local(
