@@ -3,6 +3,7 @@
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import pytest
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
@@ -296,6 +297,15 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
+    # Auto budgets in the same bin must produce identical main/RoPE shapes.
+    auto_budgets = [int(gib * (1 << 30)) for gib in (32.01, 32.42, 32.51, 32.99)]
+    for available in auto_budgets:
+        assert reserve_rope_companion(cfg, available, auto=True) == (32 << 30) * 4 // 5
+        assert reserve_rope_companion(cfg, available) == available * 4 // 5
+    for available in (1, 1000, 1 << 30, (32 << 30) - 1, 32 << 30):
+        rounded = reserve_rope_companion(cfg, available, auto=True)
+        assert 0 <= rounded <= available * 4 // 5
+        assert rounded >= (available * 31 // 32) * 4 // 5
     small_avail = 10 << 30
     assert reserve_rope_companion(cfg, small_avail) == small_avail * 4 // 5
     # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
@@ -537,3 +547,41 @@ def test_chunk_union_gather_overflow_fallback_bitwise_exact():
             # Overflow fallback branch matches direct gather across all entries
             np.testing.assert_array_equal(np.asarray(g_nope), np.asarray(exp_nope))
             np.testing.assert_array_equal(np.asarray(g_rope), np.asarray(exp_rope))
+
+
+@pytest.mark.parametrize("topk", [128, 512, 1024])
+@pytest.mark.parametrize("bank_pattern", ["low", "high", "alternating", "random"])
+@pytest.mark.cpu_test
+def test_two_bank_gather_selects_packed_rope_without_unpack(
+    monkeypatch, topk, bank_pattern
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as kernels
+
+    rng = np.random.default_rng(73)
+    rows, periods = 2048, 3
+    nope = rng.integers(0, 2**32, (rows, 128), dtype=np.uint32).view(np.int32)
+    rope = rng.integers(0, 2**32, (rows, 32), dtype=np.uint32).view(np.int32)
+    indices = rng.integers(0, rows // 2, periods * topk, dtype=np.int32)
+    high = {
+        "low": np.zeros(indices.size, dtype=bool),
+        "high": np.ones(indices.size, dtype=bool),
+        "alternating": np.arange(indices.size) % 2 == 0,
+        "random": rng.integers(0, 2, indices.size).astype(bool),
+    }[bank_pattern]
+    indices += high.astype(np.int32) * (rows // 2)
+    expected_rope = kernels.repack_chunk_rope_words(
+        jnp.asarray(rope[indices].reshape(periods, topk, 32))
+    ).reshape(-1, 128)
+
+    def forbidden_unpack(*args):
+        raise AssertionError("Two-bank selection must preserve the packed payload")
+
+    monkeypatch.setattr(kernels, "unpack_union_rope_words", forbidden_unpack)
+    got_nope, got_rope = kernels._csa_gather_pool(
+        tuple(jnp.asarray(x.reshape(1, -1, 128)) for x in np.split(nope, 2)),
+        tuple(jnp.asarray(x.reshape(1, -1, 128)) for x in np.split(rope, 2)),
+        jnp.asarray(indices),
+        top_k=topk,
+    )
+    np.testing.assert_array_equal(np.asarray(got_nope), nope[indices])
+    np.testing.assert_array_equal(np.asarray(got_rope), np.asarray(expected_rope))
