@@ -36,6 +36,10 @@ _DEFAULT_PCP_STATIC_CONFIG = PcpStaticConfig(
 )
 
 
+_PCP_CONFIG_CACHE: dict[tuple[Any, ...], PcpStaticConfig] = {}
+_VALIDATED_PCP_CACHE: set[tuple[PcpStaticConfig, str]] = set()
+
+
 class PcpStaticSupportValidator:
     @staticmethod
     def from_vllm_config(vllm_config: Any) -> PcpStaticConfig:
@@ -46,24 +50,61 @@ class PcpStaticSupportValidator:
         scheduler_config = vllm_config.scheduler_config
         speculative_config = vllm_config.speculative_config
 
-        speculative_method = None
-        num_speculative_tokens = 0
-        if speculative_config is not None:
+        pcp_size = parallel_config.prefill_context_parallel_size
+        interleave_size = parallel_config.cp_kv_cache_interleave_size
+        dcp_size = parallel_config.decode_context_parallel_size
+        pipeline_parallel_size = parallel_config.pipeline_parallel_size
+        async_scheduling = bool(scheduler_config.async_scheduling)
+        is_moe = parallel_config.is_moe_model is True
+        expert_parallel = bool(parallel_config.enable_expert_parallel)
+
+        if speculative_config is None:
+            if (
+                pcp_size == 1
+                and interleave_size == 1
+                and dcp_size == 1
+                and pipeline_parallel_size == 1
+                and not async_scheduling
+                and not is_moe
+                and not expert_parallel
+            ):
+                return _DEFAULT_PCP_STATIC_CONFIG
+            speculative_enabled = False
+            speculative_method = None
+            num_speculative_tokens = 0
+        else:
+            speculative_enabled = True
             speculative_method = speculative_config.method
             num_speculative_tokens = speculative_config.num_speculative_tokens
 
-        return PcpStaticConfig(
-            pcp_size=parallel_config.prefill_context_parallel_size,
-            interleave_size=parallel_config.cp_kv_cache_interleave_size,
-            dcp_size=parallel_config.decode_context_parallel_size,
-            pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-            async_scheduling=bool(scheduler_config.async_scheduling),
-            speculative_enabled=speculative_config is not None,
+        cache_key = (
+            pcp_size,
+            interleave_size,
+            dcp_size,
+            pipeline_parallel_size,
+            async_scheduling,
+            speculative_enabled,
+            speculative_method,
+            num_speculative_tokens,
+            is_moe,
+            expert_parallel,
+        )
+        if (cached := _PCP_CONFIG_CACHE.get(cache_key)) is not None:
+            return cached
+        cfg = PcpStaticConfig(
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            dcp_size=dcp_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            async_scheduling=async_scheduling,
+            speculative_enabled=speculative_enabled,
             speculative_method=speculative_method,
             num_speculative_tokens=num_speculative_tokens,
-            is_moe=parallel_config.is_moe_model is True,
-            expert_parallel=bool(parallel_config.enable_expert_parallel),
+            is_moe=is_moe,
+            expert_parallel=expert_parallel,
         )
+        _PCP_CONFIG_CACHE[cache_key] = cfg
+        return cfg
 
     @staticmethod
     def validate_platform_config(
@@ -72,7 +113,10 @@ class PcpStaticSupportValidator:
         kv_cache_layout: str,
     ) -> PcpStaticConfig:
         config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
-        if not config.enabled:
+        if config.pcp_size <= 1:
+            return config
+        val_key = (config, kv_cache_layout)
+        if val_key in _VALIDATED_PCP_CACHE:
             return config
         if kv_cache_layout == "HND" and config.interleave_size % 128 != 0:
             raise ValueError(
@@ -108,4 +152,5 @@ class PcpStaticSupportValidator:
             raise ValueError(
                 "PCP runner path requires cp_kv_cache_interleave_size > 0."
             )
+        _VALIDATED_PCP_CACHE.add(val_key)
         return config
