@@ -36,81 +36,93 @@ class DeepseekV4MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = tp_size
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
 
-        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
-        self.hidden_size = config.hidden_size
-        self.n_routed_experts = config.n_routed_experts
-        self.swiglu_limit = config.swiglu_limit
-        self.renormalize = config.norm_topk_prob
-        self.scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
+        routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.routed_scaling_factor = routed_scaling_factor
+        hidden_size = config.hidden_size
+        self.hidden_size = hidden_size
+        n_routed_experts = config.n_routed_experts
+        self.n_routed_experts = n_routed_experts
+        swiglu_limit = config.swiglu_limit
+        self.swiglu_limit = swiglu_limit
+        renormalize = config.norm_topk_prob
+        self.renormalize = renormalize
+        scoring_func = getattr(config, "scoring_func", "sqrtsoftplus")
+        self.scoring_func = scoring_func
 
-        self.gate = GateLinear(
-            input_size=config.hidden_size,
-            output_size=config.n_routed_experts,
+        gate = GateLinear(
+            input_size=hidden_size,
+            output_size=n_routed_experts,
             bias=False,
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
 
-        self.gate.e_score_correction_bias = None
-        self.gate.tid2eid = None
+        correction_bias = None
+        tid2eid = None
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int32
         if is_hash_moe:
-            self.gate.tid2eid = nn.Parameter(
+            tid2eid = nn.Parameter(
                 torch.randint(
                     0,
-                    config.n_routed_experts,
+                    n_routed_experts,
                     (config.vocab_size, config.num_experts_per_tok),
                     dtype=self.hash_indices_dtype,
                 ),
                 requires_grad=False,
             )
         elif getattr(config, "topk_method", None) == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32),
+            correction_bias = nn.Parameter(
+                torch.empty(n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
+        gate.e_score_correction_bias = correction_bias
+        gate.tid2eid = tid2eid
+        self.gate = gate
 
         if config.n_shared_experts is None:
-            self.shared_experts = None
+            shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV4MLP(
-                hidden_size=config.hidden_size,
+            shared_experts = DeepseekV4MLP(
+                hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                swiglu_limit=self.swiglu_limit,
+                swiglu_limit=swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        self.shared_experts = shared_experts
 
         self.tp_rank = get_tensor_model_parallel_rank()
-        assert config.n_routed_experts % self.tp_size == 0
+        assert n_routed_experts % tp_size == 0
 
-        self.experts = FusedMoEFactory(
-            shared_experts=self.shared_experts,
-            gate=self.gate,
-            num_experts=config.n_routed_experts,
+        experts = FusedMoEFactory(
+            shared_experts=shared_experts,
+            gate=gate,
+            num_experts=n_routed_experts,
             top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
+            hidden_size=hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
+            renormalize=renormalize,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self.routed_scaling_factor,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            hash_indices_table=self.gate.tid2eid,
-            swiglu_limit=self.swiglu_limit,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=correction_bias,
+            hash_indices_table=tid2eid,
+            swiglu_limit=swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
         )
+        self.experts = experts
 
         # The monolithic TPU MoE path never consults the router: MoERunner
         # calls `routed_experts.forward_monolithic`, which hands the
@@ -119,11 +131,9 @@ class DeepseekV4MoE(nn.Module):
         # `layer.hash_indices_table`. Passing `hash_indices_table` to
         # `FusedMoEFactory` above only reaches the router object, so mirror it
         # onto the experts layer.
-        self._is_hash_moe = self.gate.tid2eid is not None
+        self._is_hash_moe = tid2eid is not None
         if self._is_hash_moe:
-            object.__setattr__(
-                self.experts.routed_experts, "hash_indices_table", self.gate.tid2eid
-            )
+            object.__setattr__(experts.routed_experts, "hash_indices_table", tid2eid)
 
     @property
     def routes_dp_gathered_tokens(self) -> bool:
@@ -136,7 +146,8 @@ class DeepseekV4MoE(nn.Module):
         and the ids -- stay local. Asked of the layer rather than assumed,
         because arming is decided per layer at weight load.
         """
-        return self.experts.do_naive_dispatch_combine
+        experts = self._modules.get("experts") or self.experts
+        return experts.do_naive_dispatch_combine
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -146,8 +157,9 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
+        experts = self._modules.get("experts") or self.experts
         # FusedMoEFactory gives the runner our gate, so it computes the logits.
-        final_hidden_states = self.experts(
+        final_hidden_states = experts(
             hidden_states=hidden_states,
             router_logits=hidden_states,
             input_ids=input_ids,
@@ -155,6 +167,7 @@ class DeepseekV4MoE(nn.Module):
 
         return (
             final_hidden_states
-            if final_hidden_states.shape == org_shape
+            if final_hidden_states is hidden_states
+            or final_hidden_states.shape == org_shape
             else final_hidden_states.view(org_shape)
         )
