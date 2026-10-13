@@ -34,13 +34,11 @@ def scatter_word_records(
         return cache
     from vllm_torchtpu.kernels.mla.scatter_utils import scatter_rows
 
-    # int32[rows, 128] has the same byte order under TensorCore tiling and
-    # native SparseCore addressing. Reinterpret only the row boundaries;
-    # the shared scatter kernel writes each record without reading old rows.
-    result = scatter_rows(
-        cache.view(jnp.uint32).reshape(-1, width),
-        words.view(jnp.uint32),
+    # Keep the owner's dtype and row boundaries intact so donation can alias
+    # it through the SparseCore write without copying the entire shared pool.
+    return scatter_rows(
+        cache,
+        words,
         records,
         name="scatter_word_records",
     )
-    return result.view(jnp.int32).reshape(cache.shape)
