@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -37,6 +38,10 @@ class Scenario:
 
 
 SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+DECODE_SCENARIO = Scenario(
+    "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
+)
+SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
@@ -152,6 +157,30 @@ class Recorder:
         self.sample = runner.sample_tokens
         runner.execute_model = self.execute_model
         runner.sample_tokens = self.sample_tokens
+        if scenario.name == "decode":
+            drafter = runner.drafter
+            prepare = drafter._prepare_dflash_inputs
+
+            def prepare_draft(chunk: Any, *args: Any, **kwargs: Any) -> Any:
+                started = time.perf_counter_ns()
+                result = prepare(chunk, *args, **kwargs)
+                if self.enabled and self.pending is not None:
+                    row = {
+                        "stage": "draft_inputs",
+                        "forward_id": self.forward_id,
+                        "requests": chunk.num_reqs,
+                        "rows": chunk.num_reqs * drafter.block_size,
+                        "padded_rows": result[0].shape[0],
+                        "input_shape": list(result[0].shape),
+                        "positions_shape": list(result[1].shape),
+                        "dispatch_ns": started,
+                        "host_return_ns": time.perf_counter_ns(),
+                    }
+                    self.pending["stages"].append(row)
+                    self.stages.append(row)
+                return result
+
+            drafter._prepare_dflash_inputs = prepare_draft
 
     def execute_model(self, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
         if not self.enabled:
@@ -159,6 +188,11 @@ class Recorder:
         if self.pending is not None:
             raise RuntimeError("Previous benchmark step did not complete sampling")
         self.pending = {"start_ns": time.perf_counter_ns(), "stages": []}
+        if self.scenario.name == "decode":
+            self.pending["scheduled_draft_lengths"] = {
+                req: len(tokens)
+                for req, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+            }
         result = self.execute(scheduler_output, *args, **kwargs)
         if result is not None:
             self.finish(result)
@@ -244,6 +278,107 @@ def _gather_dp(value: dict) -> list[dict]:
 
 
 class ServerStepWorker:
+    def synchronized_profile_arm(self):
+        import torch.distributed as dist
+        from vllm.distributed import get_dp_group
+
+        from vllm_torchtpu.utils import synchronize_device
+
+        runner = self.model_runner
+        group = get_dp_group()
+        rank = self.vllm_config.parallel_config.data_parallel_rank
+        assert group.world_size == 8
+        assert not hasattr(self, "_sync_capture")
+        scenario = DECODE_SCENARIO
+        original = runner._dp_coordinated_step
+        state = {
+            "rank": rank,
+            "ticks": 0,
+            "captured_steps": 0,
+            "active": False,
+            "completed": False,
+            "rows": [],
+            "profile_rank": rank,
+        }
+        self._sync_capture = state
+        root = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "synchronized-profile"
+        root.mkdir(exist_ok=True)
+
+        def boundary(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if state["completed"]:
+                return result
+            state["ticks"] += 1
+            tokens = int(args[0] if args else kwargs["num_tokens"])
+            n = runner.input_batch.num_reqs
+            contexts = [int(v) for v in runner.input_batch.num_computed_tokens_cpu[:n]]
+            ready = (
+                tokens == scenario.local_concurrency * (scenario.dspark_tokens + 1)
+                and n == scenario.local_concurrency
+                and min(contexts, default=0) >= scenario.prefix_tokens + 44
+            )
+            row = {
+                "tick": state["ticks"],
+                "tokens": tokens,
+                "requests": n,
+                "min_context": min(contexts, default=0),
+                "wall_ns": time.time_ns(),
+            }
+            if state["active"] and state["captured_steps"] == 6:
+                synchronize_device()
+                dist.barrier(group=group.cpu_group)
+                state["stop_boundary_ns"] = time.time_ns()
+                self.profile(is_start=False)
+                # No rank may dispatch subsequent compute during trace export.
+                dist.barrier(group=group.cpu_group)
+                state["export_done_ns"] = time.time_ns()
+                state["active"] = False
+                state["completed"] = True
+                runner._dp_coordinated_step = original
+                (root / f"rank-{rank}-capture.json").write_text(
+                    json.dumps(state, indent=2)
+                )
+                return result
+            if not state["active"]:
+                gathered = [None] * 8
+                dist.all_gather_object(
+                    gathered,
+                    {"rank": rank, "ready": ready, **row},
+                    group=group.cpu_group,
+                )
+                if not all(r["ready"] for r in gathered):
+                    if state["ticks"] > 150:
+                        raise RuntimeError("No common full-DP decode window found")
+                    return result
+                assert len({r["tick"] for r in gathered}) == 1, gathered
+                synchronize_device()
+                dist.barrier(group=group.cpu_group)
+                self.profile(
+                    is_start=True,
+                    profile_prefix="steady-decode",
+                    profiler_kwargs={
+                        "host_tracer_level": 1,
+                        "python_tracer_level": 0,
+                        "device_tracer_level": 1,
+                    },
+                )
+                dist.barrier(group=group.cpu_group)
+                state["start_boundary_ns"] = time.time_ns()
+                state["start_ranks"] = gathered
+                state["active"] = True
+            assert ready, row
+            state["rows"].append(row)
+            state["captured_steps"] += 1
+            return result
+
+        runner._dp_coordinated_step = boundary
+        return {"rank": rank, "armed": True}
+
+    def synchronized_profile_check(self):
+        state = self._sync_capture
+        assert state["completed"] and state["captured_steps"] == 6, state
+        return _gather_dp(state)
+
     def benchmark_begin(self, scenario: str) -> list[dict]:
         global _ACTIVE, _INSTALLED
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
@@ -265,9 +400,9 @@ class ServerStepWorker:
         hf = self.vllm_config.model_config.hf_config
         if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
             raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        if scenario != SCENARIO.name:
+        if scenario not in SCENARIOS:
             raise ValueError(f"Unknown scenario: {scenario}")
-        selected = SCENARIO
+        selected = SCENARIOS[scenario]
         if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
             raise ValueError(
                 "max_num_seqs must equal the scenario's per-DP concurrency"

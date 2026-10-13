@@ -192,3 +192,121 @@ device analysis: `an-1fughtzu5e` (`topk-census.json`).
 The new budget test and seven consolidated harness tests pass, as do pre-commit
 checks. Full-dependency type checking retains the previous 61 diagnostics,
 with no added or removed diagnostics; this is not a clean full type-check pass.
+
+## Steady decode (C384)
+
+`bench_decode.py` measures steady decode on the same single-host TP1/DP8/EP8
+configuration, with DSpark K5, 40 layers and SWA128. Prepare a dedicated input file with
+`bench_cached_extend.py prepare --scenario decode`; its SHA256 is recorded.
+
+The workload uses 384 distinct 98,304-token prompts and 512 output tokens each.
+
+Prepare inputs for this workload, then use the shared launcher:
+
+```bash
+python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
+  --scenario decode --dataset /path/to/longbench-v2.json \
+  --tokenizer /models/DeepSeek-V4.1-Flash --out /data/dsv41-inputs.json
+```
+
+```bash
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+python scripts/dsv41_bench/server_steps/run.py --scenario decode \
+  --input /data/dsv41-inputs.json --out /results/decode \
+  --cache-dir /cache/dsv41-decode --cache-mode cold
+```
+
+This compiles only buckets `[384,2048]`: target verification (288 rows), draft
+inputs (240 rows) and bounded replay fit 384; chunked prefill uses 2048.
+The larger prefill budget admits the 48 requests per rank before early requests
+finish: exact-prefix cache hits leave 256 tokens per request to compute.
+With a 512-token budget, admission overlapped request draining and produced no
+common full-DP steady window in the C384 workload. It keeps
+automatic KV sizing, disables both Tier2 caches and persists the JAX/vLLM/Tier3
+caches. Startup readiness, phase timings, compile/load counts and package/source
+identities are saved. Future runs may use `--cache-mode reuse` with that directory;
+the launcher rejects mismatched source/runtime/model/scenario identities. A
+populated cache is not proof of a hit; inspect `startup-phases.json` and logs.
+Do not reuse earlier cache directories without an identity file.
+
+For manual operation, start a dedicated server (terminal 1):
+
+```bash
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPATH}"
+TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
+  bash scripts/dsv41_bench/serve_cached_prefill.sh \
+  --worker-extension-cls server_step_worker.ServerStepWorker \
+  --compilation-config '{"compile_sizes":[384,2048]}' \
+  2>&1 | tee /results/decode-server.log
+```
+
+After readiness, run the client in terminal 2 with a fresh output directory:
+
+```bash
+python scripts/dsv41_bench/server_steps/bench_decode.py client \
+  --input /data/dsv41-inputs.json --out /results/decode \
+  --server-log /results/decode-server.log
+```
+
+The default is one warmup followed by **one** formal window. `--rounds 0` runs
+warmup only; `--single-window` measures an already warmed server without another
+warmup. `--reuse-prefix` additionally skips priming and requires the same inputs
+to be cached. Formal windows reuse prefixes primed for warmup. The client rejects
+incomplete responses, missing ranks, unexpected prefix hits, preemption and
+logged compilation in formal windows. Compilation
+log checks cannot detect silent runtime compilation; device attribution requires
+a separate profile. Run on an otherwise idle server.
+
+The recorder observes native output consumption without additional device waits.
+The summary retains only consecutive full-C decode observations: 48 requests,
+288 target rows and 240 draft rows per rank, with five scheduled drafts/request.
+Mixed phases, membership changes, gaps and drain observations split/exclude
+windows. At least eight intervals in a segment of ten observations are required.
+Node cadence uses the latest rank observation, never the sum of rank times.
+Throughput counts accepted output events, **including bonus tokens**, within a
+common host-clock window; do not multiply it by K. Host cadence is distinct from
+isolated target/draft device duration. Contexts derived from accepted outputs
+are reported separately from asynchronous scheduler metadata.
+
+Reprocess saved observations without running the model:
+
+```bash
+python scripts/dsv41_bench/server_steps/bench_decode.py summarize \
+  /results/decode/round-1-steps.json --scenario decode \
+  --out /results/decode/reprocessed.json
+```
+
+CPU regression tests cover rank alignment, window boundaries, output accounting
+and native output capture in `tests/scripts/test_dsv41_decode_*.py`.
+
+Use `run.py --scenario decode --profile` to run one warmup and one formal
+benchmark window, then a separate synchronized six-step profile on the same
+server. Profile output is written locally and XPlane files are copied after
+shutdown. Timing summaries exclude profiling. All eight ranks capture at the
+same DP boundaries; validate XPlane coverage instead of the optional Chrome JSON.
+
+### Validated 96k/C384 result
+
+On four physical v7x chips (eight logical devices), TP1/DP8/EP8, DSpark K5,
+40 layers and SWA128, one formal window after warmup produced:
+
+| Metric | Result |
+| --- | ---: |
+| Steady host-observation step median | 210.4713 ms |
+| Steady step P90 (linear interpolation) | 212.2321 ms |
+| Accepted + bonus output throughput | 7,291.18 tok/s |
+| Valid full-DP step intervals | 80 |
+| Common throughput window | 16.86161153 s |
+| Accepted + bonus tokens in that window | 122,941 |
+
+Each rank had 48 requests, 288 target rows and 240 draft rows. The formal
+window had zero preemptions and no logged compilation. Throughput already
+includes accepted drafts and bonus tokens; do not multiply it by K.
+
+A separate synchronized capture recorded six main-model and six draft-module
+executions on each of eight device planes. The maximum device span was
+1.299657 seconds; all ranks captured ticks 32 through 37. Raw XPlane validation
+found no warnings or errors. Chrome conversion's event cap does not establish
+raw XPlane truncation. Full layer-by-layer coverage and model quality remain
+unqualified; the profile lacks embedded HLO protos for static-memory analysis.
