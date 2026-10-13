@@ -90,11 +90,10 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     given serving shape. Each replicated expert slot per rank trades 0.755 GB
     of device HBM (60 layers x one FP8 expert) for lower decode MoE imbalance
     in the few-token kernel: 128 total copies for small batches (max_num_seqs <= 8)
-    when the megakernel is off, 112 co-activation-solved 2-pass Po2C copies for
+    when the megakernel is off, 64 co-activation-solved 2-pass Po2C copies for
     medium batches (max_num_seqs <= 16, or max_num_seqs <= 8 with the megakernel
-    where 112 is the max copy count keeping VEC route_dedup active), and 32
-    co-activation-solved copies for larger batches or DCP > 1 to preserve
-    HBM KV cache headroom."""
+    where VEC route_dedup requires extra_slots <= 14), and 32 co-activation-solved
+    copies for larger batches or DCP > 1 to preserve HBM KV cache headroom."""
     mk_on = os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower() in (
         "1",
         "true",
