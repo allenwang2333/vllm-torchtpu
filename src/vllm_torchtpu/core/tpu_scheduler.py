@@ -18,6 +18,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
 
+_UNPAUSED = PauseState.UNPAUSED
+_PAUSED_NEW = PauseState.PAUSED_NEW
+
 
 class TpuDpScheduler(AsyncScheduler):
     """Scheduler that aligns prefill admission across DP ranks.
@@ -35,9 +38,9 @@ class TpuDpScheduler(AsyncScheduler):
     def _schedule_paused_new(self) -> SchedulerOutput:
         """Run one step while keeping newly prefills buffered."""
         prev_pause_state = self._pause_state
-        if prev_pause_state != PauseState.UNPAUSED:
+        if prev_pause_state is not _UNPAUSED:
             return super().schedule(False)
-        self._pause_state = PauseState.PAUSED_NEW
+        self._pause_state = _PAUSED_NEW
         try:
             return super().schedule(False)
         finally:
@@ -48,14 +51,28 @@ class TpuDpScheduler(AsyncScheduler):
         if not throttle_prefills:
             # Open window for draining accumulated prefills.
             self._drain_prefill = True
-        elif not self._drain_prefill:
-            return self._schedule_paused_new()
-
-        waiting_drain = self.waiting or getattr(
-            self, "kv_holding_waiting", getattr(self, "skipped_waiting", None)
-        )
-        if not waiting_drain:
+            if (
+                self.waiting
+                or getattr(self, "kv_holding_waiting", None)
+                or getattr(self, "skipped_waiting", None)
+            ):
+                return super().schedule(False)
+            self._drain_prefill = False
+        elif self._drain_prefill:
+            if (
+                self.waiting
+                or getattr(self, "kv_holding_waiting", None)
+                or getattr(self, "skipped_waiting", None)
+            ):
+                return super().schedule(False)
             # In drain mode until all accumulated prefills are scheduled.
             self._drain_prefill = False
-            return self._schedule_paused_new()
-        return super().schedule(False)
+
+        prev_pause_state = self._pause_state
+        if prev_pause_state is not _UNPAUSED:
+            return super().schedule(False)
+        self._pause_state = _PAUSED_NEW
+        try:
+            return super().schedule(False)
+        finally:
+            self._pause_state = prev_pause_state
