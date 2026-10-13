@@ -117,7 +117,10 @@ class TileConfig:
   tile_k: int
   tile_n: int
   bucket_base: int
-  num_xo_buffers: int = 3
+  # Two x/out row buffers rather than three: with no N/K tiling the third
+  # one pushes DeepSeek-V4-Pro's resident 7168 x 6144 fp4 gate/up slab past
+  # VMEM at tile_m=256.
+  num_xo_buffers: int = 2
   num_w_buffers: int = 2
 
   @property

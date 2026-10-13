@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     can_use_blockwise_onehot_unpermute,
 )
 from vllm_torchtpu.kernels.routing_moe.common import layout_util as routing_layout
+from vllm_torchtpu.kernels.routing_moe.gmm import config as routing_config
 from vllm_torchtpu.kernels.routing_moe.gmm.kernel import routing_gmm
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
@@ -109,8 +110,10 @@ _ROUTING_GMM = _resolve_routing_gmm()
 _ROUTING_GMM_ACTIVATIONS = frozenset(
     {"silu", "gelu", "gelu_tanh", "swigluoai", "silu_and_mul_with_clamp"}
 )
-# Share of VMEM the untiled routing_gmm buffers may claim.
-_ROUTING_GMM_VMEM_FRACTION = 0.75
+# Share of VMEM the untiled routing_gmm buffers may claim; the rest covers what
+# _routing_gmm_vmem_bytes does not count (Mosaic scratch, spills, the widened
+# fp4/fp8 blocks).
+_ROUTING_GMM_VMEM_FRACTION = 0.95
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -642,15 +645,21 @@ def _routing_gmm_vmem_bytes(
     rows: int,
 ) -> int:
     """Upper bound on one routing_gmm call's VMEM. With no N/K tiling yet the
-    whole K x N expert slab stays resident, double-buffered, next to
-    triple-buffered row tiles of x and out (see routing_moe TileConfig).
-    Block scales stay resident as f32 [num_blocks, N], double-buffered."""
+    whole K x N expert slab stays resident in num_w_buffers, next to
+    num_xo_buffers row tiles of x and out (see routing_moe TileConfig).
+    Block scales stay resident as f32 [num_blocks, N] in num_w_buffers."""
     tile_m = min(256, rows)
-    w_bytes = 2 * size_k * size_n * w_bits // 8
+    w_buffers = routing_config.TileConfig.num_w_buffers
+    xo_buffers = routing_config.TileConfig.num_xo_buffers
+    w_bytes = w_buffers * size_k * size_n * w_bits // 8
     scale_bytes = (
-        2 * (-(num_scale_blocks // -8) * 8) * size_n * 4 if num_scale_blocks else 0
+        w_buffers * (-(num_scale_blocks // -8) * 8) * size_n * 4
+        if num_scale_blocks
+        else 0
     )
-    xo_bytes = 3 * tile_m * (size_k + size_out_n) * jnp.dtype(jnp.bfloat16).itemsize
+    xo_bytes = (
+        xo_buffers * tile_m * (size_k + size_out_n) * jnp.dtype(jnp.bfloat16).itemsize
+    )
     acc_bytes = tile_m * size_n * jnp.dtype(jnp.float32).itemsize
     return w_bytes + scale_bytes + xo_bytes + acc_bytes
 

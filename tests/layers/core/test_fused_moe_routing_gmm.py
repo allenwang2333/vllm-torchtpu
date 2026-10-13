@@ -149,6 +149,17 @@ def test_routing_gmm_admits_block_scales_and_fp4(fake_tpu):
     # The same values as native float4_e2m1fn.
     w1, w2 = _weights(32, jnp.float4_e2m1fn, hidden=4096, inter=2048)
     assert _can_use(w1, w2, *_packed_fp4(32, 4096, 2048)[2:], **fp4)
+    # DeepSeek-V4-Pro (7168 x 2x3072) at EP16, 24 local experts, top-6: the
+    # double-buffered 42 MiB fp4 slab plus two 256-row x/out buffers is
+    # 58.75 MiB of the 60.8 MiB budget, at decode (1024 tokens after the DP
+    # gather) and prefill (16384) alike.
+    for tokens in (1024, 16384):
+        assert _can_use(
+            *_packed_fp4(24, 7168, 3072),
+            hidden_states=jax.ShapeDtypeStruct((tokens, 7168), jnp.bfloat16),
+            rhs_quant_dtype=jnp.float4_e2m1fn,
+            topk=6,
+        )
 
 
 def test_routing_gmm_rejects_unsupported_weights(fake_tpu):
@@ -165,13 +176,6 @@ def test_routing_gmm_rejects_unsupported_weights(fake_tpu):
     assert not _can_use(
         *_packed_fp4(32, 4096, 2048, block=16),
         hidden_states=hs,
-        rhs_quant_dtype=jnp.float4_e2m1fn,
-    )
-    # DeepSeek-V4-Pro's 7168 x 2x3072 fp4 slab, double-buffered, overflows VMEM
-    # until routing_gmm tiles N/K.
-    assert not _can_use(
-        *_packed_fp4(24, 7168, 3072),
-        hidden_states=jax.ShapeDtypeStruct((64, 7168), jnp.bfloat16),
         rhs_quant_dtype=jnp.float4_e2m1fn,
     )
     # The gate/up output must feed w2 unpadded.
