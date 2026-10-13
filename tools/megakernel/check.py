@@ -27,6 +27,11 @@ one-window packing must stay as close as the four-to-a-window reference.
 **greedy** replays the fixed prompt and four short prompts on the decoder, then
 writes each request's greedy tokens and text to ``--output`` (JSON): two kernel
 configs' files compare a layout change (e.g. attention DP) on real text.
+
+**masked** drives the decoder with grammar bitmasks (structured outputs): an
+all-ones mask must reproduce the unmasked tokens exactly, random masks must
+never yield a disallowed token, and a mask allowing a single token must force
+it, greedy or sampled, wherever in the vocabulary the token lives.
 """
 
 from __future__ import annotations
@@ -77,7 +82,12 @@ def add_arguments(parser) -> None:
     greedy.add_argument("--prompt-tokens", type=int, default=5000)
     greedy.add_argument("--generate", type=int, default=128)
     greedy.add_argument("--output", required=True)
-    for check in (spec, handoff, packing, greedy):
+    masked = sub.add_parser(
+        "masked", help="grammar-masked (structured outputs) vs unmasked decode"
+    )
+    masked.add_argument("--prompt-tokens", type=int, default=4000)
+    masked.add_argument("--generate", type=int, default=48)
+    for check in (spec, handoff, packing, greedy, masked):
         check.add_argument(
             "--model",
             required=True,
@@ -91,6 +101,7 @@ def run(args, records: harness.Records) -> None:
         "handoff": run_handoff,
         "packing": run_packing,
         "greedy": run_greedy,
+        "masked": run_masked,
     }[args.check](args, records)
 
 
@@ -164,6 +175,131 @@ def run_greedy(args, records: harness.Records) -> None:
 def _agree(a: list[int], b: list[int]) -> int:
     n = min(len(a), len(b))
     return next((i for i in range(n) if a[i] != b[i]), n)
+
+
+def run_masked(args, records: harness.Records) -> None:
+    import torch
+
+    from vllm_torchtpu.megakernel import program as mk
+    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
+
+    all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
+    prompts = [
+        np.asarray(all_ids, np.int32),
+        np.asarray(
+            tokenizer.encode(
+                "Write a short story about a robot who learns to paint.",
+                disallowed_special=(),
+            ),
+            np.int32,
+        ),
+    ]
+    words = k3_program.VOCAB // 32
+    pages = -(-(args.prompt_tokens + args.generate + 64) // k3.logical()) + 1
+    ops = DecodeOps(args.presharded, num_slots=2 * 4 + 1, batch_sizes=(1, 2, 4))
+    pools = k3.Pools(16 * pages + 1, pages, 1)
+    decoder = k3.decoder(ops, pools, max_num_seqs=4, max_model_len=pages * k3.logical())
+    harness.sync()
+    decoder.warmup()
+    tables = [
+        pools.scheduled(np.arange(1 + n * pages, 1 + (n + 1) * pages), n)
+        for n in range(len(prompts))
+    ]
+    names = tuple(f"m{n}" for n in range(len(prompts)))
+
+    def decode(tag, steps, masks, sampling=(0.0, 1.0, 0, 0)):
+        """``steps`` decode steps of both prompts; ``masks``: step -> the
+        rows' ``[2, words]`` int32 bitmasks (None: unmasked). Returns the
+        steps' first tokens, ``[steps, 2]``."""
+        outs = [
+            decoder.step(
+                mk.StepInput(
+                    [
+                        k3.request(tag + n, ids, tables[n], sampling)
+                        for n, ids in zip(names, prompts, strict=True)
+                    ],
+                    mask=masks(0),
+                )
+            ).tokens[:2, :1]
+        ]
+        for step in range(1, steps):
+            outs.append(
+                decoder.step(
+                    mk.StepInput(
+                        [k3.request(tag + n, [0], tables[n], sampling) for n in names],
+                        mask=masks(step),
+                    )
+                ).tokens[:2, :1]
+            )
+        decoder.forget(tuple(tag + n for n in names))
+        return torch.stack(outs).cpu().numpy().reshape(-1, 2)
+
+    steps = args.generate
+    reference = decode("u", steps, lambda _: None)
+    ones = np.full((2, words), -1, np.int32)
+    unmasked = decode("a", steps, lambda _: ones)
+    same = int((unmasked == reference).sum())
+    harness.log(
+        f"all-ones masks: {same} of {reference.size} tokens identical to unmasked"
+    )
+
+    # Random masks: every token the op chooses must be allowed.
+    rng = np.random.default_rng(0)
+    random_masks = [
+        rng.integers(-(2**31), 2**31, (2, words), np.int32) for _ in range(steps)
+    ]
+    chosen = decode("r", steps, lambda s: random_masks[s])
+    violations = sum(
+        not (random_masks[s][n][token // 32] >> (token % 32)) & 1
+        for s in range(steps)
+        for n, token in enumerate(chosen[s])
+        if token >= 0
+    )
+    harness.log(f"random masks: {violations} disallowed tokens of {chosen.size}")
+
+    # A mask allowing a single token forces it, greedy or sampled, wherever
+    # the token lives in the (vocabulary-sharded) range.
+    forced_ok = True
+    for sampling, label in (
+        ((0.0, 1.0, 0, 0), "greedy"),
+        ((0.7, 0.9, 0, 42), "sampled"),
+    ):
+        for token in (17, 81920, k3_program.VOCAB - 13):
+            mask = np.zeros((2, words), np.int32)
+            mask[:, token // 32] = np.int32(1 << (token % 32))
+            out = decode("f", 1, lambda _, mask=mask: mask, sampling)
+            ok = bool((out[0] == token).all())
+            forced_ok &= ok
+            harness.log(
+                f"forced token {token} ({label}): {out[0].tolist()} "
+                f"({'ok' if ok else 'WRONG'})"
+            )
+
+    # A masked request must not move its unmasked batch-mate (row mapping).
+    blocked = np.full((2, words), -1, np.int32)
+    blocked[0, reference[0, 0] // 32] &= ~np.int32(1 << (reference[0, 0] % 32))
+    mixed = decode("b", 1, lambda _: blocked)
+    row_maps = int(mixed[0, 1]) == int(reference[0, 1])
+    blocks = bool(
+        int(mixed[0, 0]) != int(reference[0, 0])
+        and (blocked[0, mixed[0, 0] // 32] >> (mixed[0, 0] % 32)) & 1
+    )
+    harness.log(
+        f"mixed batch: unmasked row unchanged {row_maps}; masked row blocks "
+        f"{int(reference[0, 0])} -> {int(mixed[0, 0])} ({'ok' if blocks else 'WRONG'})"
+    )
+    records.add(
+        check="masked",
+        generate=steps,
+        all_ones_identical=[same, int(reference.size)],
+        random_violations=int(violations),
+        forced_ok=forced_ok,
+        mixed_rows_ok=bool(row_maps and blocks),
+    )
+    ok = same == reference.size and not violations and forced_ok and row_maps and blocks
+    if not ok:
+        harness.fail("masked check")
 
 
 def run_spec(args, records: harness.Records) -> None:
