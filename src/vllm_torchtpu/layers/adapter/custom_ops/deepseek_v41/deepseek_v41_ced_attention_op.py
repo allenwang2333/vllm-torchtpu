@@ -19,45 +19,73 @@ def swa_attention_state(q, pool, records, scale):
     """Compute the BF16 SWA state consumed by the native CSA merger."""
     tokens, heads, dim = q.shape
     tile = 64
-    state = (
-        jnp.full((tokens, heads), -1e30, jnp.float32),
-        jnp.zeros((tokens, heads), jnp.float32),
-        jnp.zeros(q.shape, jnp.float32),
-    )
     width = records.shape[1]
     if not width:
-        return state
-    records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
+        return (
+            jnp.full((tokens, heads), -1e30, jnp.float32),
+            jnp.zeros((tokens, heads), jnp.float32),
+            jnp.zeros(q.shape, jnp.float32),
+        )
+    pad_width = -width % tile
+    if pad_width:
+        records = jnp.pad(records, ((0, 0), (0, pad_width)), constant_values=-1)
 
     # Gather BF16 rows once outside; keep FP32 scratch tiled.
     gathered = gather_cache_values(
         pool, jnp.maximum(records, 0).reshape(-1), dim
     ).reshape(tokens, records.shape[1], dim)
+    padded_width = records.shape[1]
+    steps = padded_width // tile
     q_f32 = q if q.dtype == jnp.float32 else q.astype(jnp.float32)
+
+    valid_all = records >= 0
+    scores_all = (
+        jnp.einsum(
+            "thd,tkd->thk",
+            q_f32,
+            gathered.astype(jnp.float32),
+            preferred_element_type=jnp.float32,
+        )
+        * scale
+    )
+    scores_all = jnp.where(valid_all[:, None], scores_all, -jnp.inf)
+
+    scores0 = scores_all[:, :, :tile]
+    kv0 = gathered[:, :tile]
+    maximum = jnp.maximum(-1e30, scores0.max(-1))
+    exponentials0 = jnp.exp(scores0 - maximum[..., None])
+    denominator = exponentials0.sum(-1)
+    numerator = jnp.einsum(
+        "thk,tkd->thd",
+        exponentials0.astype(jnp.bfloat16),
+        kv0,
+        preferred_element_type=jnp.float32,
+    )
+
+    if steps <= 12:
+        for start in range(tile, padded_width, tile):
+            scores = scores_all[:, :, start : start + tile]
+            kv = gathered[:, start : start + tile]
+            new_max = jnp.maximum(maximum, scores.max(-1))
+            correction = jnp.exp(maximum - new_max)
+            exponentials = jnp.exp(scores - new_max[..., None])
+            denominator = denominator * correction + exponentials.sum(-1)
+            numerator = numerator * correction[..., None] + jnp.einsum(
+                "thk,tkd->thd",
+                exponentials.astype(jnp.bfloat16),
+                kv,
+                preferred_element_type=jnp.float32,
+            )
+            maximum = new_max
+        return maximum, denominator, numerator
+
+    scores_tiles = scores_all.reshape(tokens, heads, steps, tile)
+    kv_tiles = gathered.reshape(tokens, steps, tile, dim)
 
     def step(index, carry):
         maximum, denominator, numerator = carry
-        if isinstance(index, int):
-            start = index * tile
-            addresses = records[:, start : start + tile]
-            kv = gathered[:, start : start + tile]
-        else:
-            addresses = jax.lax.dynamic_slice_in_dim(
-                records, index * tile, tile, axis=1
-            )
-            kv = jax.lax.dynamic_slice_in_dim(gathered, index * tile, tile, axis=1)
-        valid = addresses >= 0
-        kv = jnp.where(valid[..., None], kv, 0)
-        scores = (
-            jnp.einsum(
-                "thd,tkd->thk",
-                q_f32,
-                kv.astype(jnp.float32),
-                preferred_element_type=jnp.float32,
-            )
-            * scale
-        )
-        scores = jnp.where(valid[:, None], scores, -jnp.inf)
+        scores = scores_tiles[:, :, index, :]
+        kv = kv_tiles[:, index, :, :]
         new_max = jnp.maximum(maximum, scores.max(-1))
         correction = jnp.exp(maximum - new_max)
         exponentials = jnp.exp(scores - new_max[..., None])
@@ -70,12 +98,7 @@ def swa_attention_state(q, pool, records, scale):
         )
         return new_max, denominator, numerator
 
-    steps = records.shape[1] // tile
-    if steps <= 8:
-        for index in range(steps):
-            state = step(index, state)
-        return state
-    return jax.lax.fori_loop(0, steps, step, state)
+    return jax.lax.fori_loop(1, steps, step, (maximum, denominator, numerator))
 
 
 def ced_attention_jax(
@@ -98,8 +121,10 @@ def ced_attention_jax(
 ) -> jax.Array:
     swa_records = masked_row_indices(swa_slots, page_size, page_stride, row_offset)
     maximum, denominator, numerator = swa_attention_state(q, swa, swa_records, scale)
-    if selected.shape[1] == 0:
-        denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
+    sink_f32 = sink if sink.dtype == jnp.float32 else sink.astype(jnp.float32)
+    sel_width = selected.shape[1]
+    if sel_width == 0:
+        denominator += jnp.exp(sink_f32[None] - maximum)
         return (numerator / denominator[..., None]).astype(q.dtype)
     return attention_ops._attention_csa_from_swa(
         q,
@@ -109,13 +134,13 @@ def ced_attention_jax(
         page_indices,
         cu_q_lens,
         distribution,
-        sink.astype(jnp.float32),
+        sink_f32,
         numerator.astype(q.dtype),
         denominator,
         maximum,
         sm_scale=scale,
         logical_main_page_size=logical_main_page_size,
-        attention_kernel_batch_size=min(4, max(1, 4096 // selected.shape[1])),
+        attention_kernel_batch_size=min(4, max(1, 4096 // sel_width)),
     )
 
 
@@ -194,7 +219,8 @@ def ced_attention(
     return _attention_op(
         q,
         swa,
-        *main,
+        main[0],
+        main[1],
         slots_i32,
         selected_i32,
         metadata.block_tables,
@@ -203,5 +229,7 @@ def ced_attention(
         sink,
         scale,
         num_states,
-        *layout.geometry,
+        layout.page_size,
+        layout.page_stride,
+        layout.row_offset,
     )
