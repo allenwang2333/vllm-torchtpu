@@ -36,6 +36,7 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s = SrptPrefillScheduler.__new__(SrptPrefillScheduler)
     s.running = list(running)
     s.waiting = FCFSRequestQueue(waiting)
+    s.skipped_waiting = FCFSRequestQueue()
     s.max_num_running_reqs = max_running
     # Fake prefix cache: block_hashes carries the cached token count.
     s.kv_cache_manager = SimpleNamespace(
@@ -240,17 +241,24 @@ def test_external_hit_ignored_when_disabled():
 
 
 def _step_admitting(s, admit):
-    """schedule() with upstream faked: it admits the head waiting request iff
-    `admit`; returns the names upstream saw running."""
+    """schedule() with upstream faked: with admit="run" it admits the head
+    waiting request to RUNNING, with admit="load" it starts the head's KV load
+    (upstream parks it in skipped_waiting as WAITING_FOR_REMOTE_KVS), with
+    admit=False it admits nothing. Returns the names upstream saw running."""
     seen = {}
 
     def fake(*args, **kwargs):
         seen["running"] = [r.name for r in s.running]
         if admit and len(s.waiting):
             r = s.waiting.pop_request()
-            r.is_prefill_chunk = True
-            r.num_computed_tokens = r.num_tokens - 1
-            s.running.append(r)
+            if admit == "load":
+                r.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                s.skipped_waiting.prepend_request(r)
+            else:
+                r.status = RequestStatus.RUNNING
+                r.is_prefill_chunk = True
+                r.num_computed_tokens = r.num_tokens - 1
+                s.running.append(r)
         return "output"
 
     with patch.object(AsyncScheduler, "schedule", side_effect=fake):
@@ -272,7 +280,7 @@ def test_hold_that_admits_nothing_pauses_holding_until_an_admission():
     assert _step_admitting(s, admit=False) == []  # held; "new" did not fit
     assert _step_admitting(s, admit=False) == ["long"]  # paused: long runs
     assert s._srpt_paused_steps == 1
-    assert _step_admitting(s, admit=True) == ["long"]  # still paused; "new" admitted
+    assert _step_admitting(s, admit="run") == ["long"]  # still paused; "new" admitted
     s.waiting.extend([_waiting("next", 90000, cached=89900)])
     assert _step_admitting(s, admit=False) == ["new"]  # holding again
     assert (s._srpt_held_steps, s._srpt_paused_steps) == (2, 2)
@@ -283,3 +291,12 @@ def test_hold_repeats_without_progress_guard():
     for _ in range(3):
         assert _step_admitting(s, admit=False) == []
     assert (s._srpt_held_steps, s._srpt_paused_steps) == (3, 0)
+
+
+def test_hold_that_starts_a_kv_load_counts_as_progress():
+    s = _livelock_scheduler(guard=True)
+    assert _step_admitting(s, admit="load") == []  # held; "new" starts its host load
+    assert not s._srpt_hold_paused
+    s.waiting.extend([_waiting("next", 80000, cached=79500)])
+    assert _step_admitting(s, admit=False) == []  # still holding for "next"
+    assert s._srpt_paused_steps == 0

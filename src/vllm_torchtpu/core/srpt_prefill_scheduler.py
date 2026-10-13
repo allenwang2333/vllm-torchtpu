@@ -44,7 +44,7 @@ whole prompt must, and the held chunks keep their blocks), so vLLM stops at it,
 and the next step holds the same chunks again. With no decode on the rank that
 step does no work at all, every step, until the request is gone. With
 ``TPU_SRPT_HOLD_PROGRESS_GUARD=1`` a held step that admits no waiting request
-pauses holding until a step admits one.
+(neither runs it nor starts its KV load) pauses holding until a step admits one.
 
 With ``TPU_SCHED_UNCHARGED_DRAFT_SLOTS=1`` the step's input budget no longer
 charges each request the drafter's extra slots (K-1 per request for DSpark): the
@@ -63,13 +63,14 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
 
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY_STEPS = 5000
+_ADMITTABLE = (RequestStatus.WAITING, RequestStatus.PREEMPTED)
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -200,7 +201,13 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_steps += 1
         held_ids = {id(r) for r in held}
         self.running[:] = [r for r in self.running if id(r) not in held_ids]
-        before = {id(r) for r in self.running}
+        # Admission either runs a waiting request or starts its KV load
+        # (WAITING_FOR_REMOTE_KVS); both take it out of these two states.
+        candidates = [
+            r
+            for r in (*(r for _, r in waiting), *self.skipped_waiting)
+            if r.status in _ADMITTABLE
+        ]
         if held:
             self._srpt_held_steps += 1
             self._srpt_held_chunks += len(held)
@@ -209,8 +216,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             output = super().schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs += len(held)
-            admitted = any(id(r) not in before for r in self.running)
             self.running.extend(held)
+        admitted = any(r.status not in _ADMITTABLE for r in candidates)
         if self._srpt_progress_guard and (held or self._srpt_hold_paused):
             self._srpt_hold_paused = not admitted
         if self._srpt_steps % _LOG_EVERY_STEPS == 0:
