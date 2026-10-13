@@ -129,7 +129,10 @@ steps:
     env:
       # bootstrap_dev.sh leaves dev builds unclassed: Kueue priority 0, ahead of
       # the nightlies and behind every other kind of build. post-merge queues
-      # this one with main. Order only: the TPU ClusterQueues never preempt.
+      # this one with main, and it preempts: the 2x2x4 ClusterQueue reclaims
+      # within its cohort from LowerPriority workloads, so the quota it lends
+      # to other tpu7x shapes is taken back by evicting their jobs (Kueue
+      # requeues them). Build 566 evicted five.
       WORKLOAD_PRIORITY: "post-merge"
     agents:
       queue: "kube"
