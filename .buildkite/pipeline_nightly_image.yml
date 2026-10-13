@@ -29,7 +29,7 @@ steps:
             value: "yes"
           - label: "No"
             value: "no"
-      - select: "Overwrite X.Y.Z if it is already on Docker Hub?"
+      - select: "Overwrite vX.Y.Z if it is already on Docker Hub?"
         key: "dockerhub_overwrite"
         hint: "Released tags should not change; choose Yes only to replace a broken image."
         required: true

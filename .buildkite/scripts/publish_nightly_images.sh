@@ -27,9 +27,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 # With PUBLISH_DOCKERHUB=1 (set by pipeline_nightly_image.yml, which logs in to
 # Docker Hub) it also pushes one of the images it built to DOCKERHUB_REPO: main
 # pushes dev as nightly-YYYYMMDD-<commit>-<vllm> and moves nightly;
-# releases/vX.Y.Z pushes prod as X.Y.Z. A release build runs only after the
+# releases/vX.Y.Z pushes prod as vX.Y.Z. A release build runs only after the
 # approval step, where the approver chooses whether to move latest and whether
-# an X.Y.Z already on Docker Hub may be overwritten.
+# a vX.Y.Z already on Docker Hub may be overwritten.
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
@@ -64,7 +64,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   MOVE_LATEST="yes"
   if [[ "${BRANCH}" == releases/* ]]; then
     DOCKERHUB_TARGET="prod"
-    DOCKERHUB_TAG="${VERSION}"
+    DOCKERHUB_TAG="v${VERSION}"
     DOCKERHUB_LATEST_TAG="latest"
     # The approver's choices in the block step of pipeline_nightly_image.yml.
     MOVE_LATEST="$(buildkite-agent meta-data get dockerhub_move_latest --default no)"
