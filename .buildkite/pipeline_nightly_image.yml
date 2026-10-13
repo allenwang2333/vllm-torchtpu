@@ -16,7 +16,8 @@ steps:
   # A release is a build of releases/X.Y.Z started by hand and only work on releases branch. This block holds the step below until someone approves.
   - block: ":rotating_light: Approve vllm-torchtpu release"
     key: "approve_release"
-    if: 'build.branch =~ /^releases\// && build.source != "schedule"'
+    # TODO(test-only): drop the jefft/docker_pipeline_test condition before merge.
+    if: '(build.branch =~ /^releases\// && build.source != "schedule") || (build.branch == "jefft/docker_pipeline_test" && build.env("TEST_BRANCH_AS") =~ /^releases\//)'
     prompt: "Did the vllm-torchtpu-ci build of this commit pass? Build and publish this release?"
     # TODO(release-approvers): limit who can unblock to a Buildkite team.
     fields:
@@ -50,14 +51,14 @@ steps:
         env:
           PUBLISH_DOCKERHUB: "1"
           # TODO(docker-hub): replace this dummy repo with the real Docker Hub repo, e.g. vllm/vllm-torchtpu.
-          DOCKERHUB_REPO: "test/vllm-torchtpu"
+          DOCKERHUB_REPO: "vllm/vllm-torchtpu"
         # TODO(docker-hub): the secret name configured in the Buildkite cluster.
-        # secrets:
-        #   - DOCKERHUB_TOKEN
-        # plugins:
-        #   - docker-login#v3.0.0:
-        #       # TODO(docker-hub): the Docker Hub bot account with push access to DOCKERHUB_REPO. Login fails until this is set.
-        #       username: "REPLACE_WITH_DOCKERHUB_USERNAME"
-        #       password-env: DOCKERHUB_TOKEN
+        secrets:
+           - DOCKERHUB_TOKEN_VLLM_TORCHTPU
+        plugins:
+           - docker-login#v3.0.0:
+        #      TODO(docker-hub): the Docker Hub bot account with push access to DOCKERHUB_REPO. Login fails until this is set.
+               username: vllm
+               password-env: DOCKERHUB_TOKEN_VLLM_TORCHTPU
         commands:
           - bash .buildkite/scripts/publish_nightly_images.sh

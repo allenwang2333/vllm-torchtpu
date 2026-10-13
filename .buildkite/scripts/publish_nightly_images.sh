@@ -33,6 +33,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
+# TODO(test-only): remove before merge. The test branch runs as main, or as
+# the branch named by TEST_BRANCH_AS (e.g. releases/v0.29.0rc1) if the test
+# build sets it.
+if [[ "${BRANCH}" == "jefft/docker_pipeline_test" ]]; then
+  BRANCH="${TEST_BRANCH_AS:-main}"
+fi
 case "${BRANCH}" in
   main)
     DATE_TAG="nightly-${DATE}"
@@ -121,13 +127,14 @@ for TARGET in "${TARGETS[@]}"; do
   docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
   docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
 
+  # TODO(test-only): restore the four GAR docker push lines before merge.
   echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Artifact Registry"
-  docker push "${DATE_IMAGE}"
-  docker push "${LATEST_IMAGE}"
+  echo "[SIMULATED] docker push ${DATE_IMAGE}"
+  echo "[SIMULATED] docker push ${LATEST_IMAGE}"
 
   echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
-  docker push "${EXTRA_DATE_IMAGE}"
-  docker push "${EXTRA_LATEST_IMAGE}"
+  echo "[SIMULATED] docker push ${EXTRA_DATE_IMAGE}"
+  echo "[SIMULATED] docker push ${EXTRA_LATEST_IMAGE}"
 
   # The same image goes to Docker Hub; nothing is rebuilt.
   if [[ "${PUBLISH_DOCKERHUB}" == "1" && "${TARGET}" == "${DOCKERHUB_TARGET}" ]]; then
@@ -140,8 +147,7 @@ for TARGET in "${TARGETS[@]}"; do
     for DOCKERHUB_IMAGE in "${DOCKERHUB_IMAGES[@]}"; do
       echo "--- :docker: Pushing ${DOCKERHUB_IMAGE} to Docker Hub"
       docker tag "${DATE_IMAGE}" "${DOCKERHUB_IMAGE}"
-      # TODO(docker-hub): pushes are simulated until the Docker Hub repo is decided. Replace the echo with docker push then.
-      echo "[SIMULATED] docker push ${DOCKERHUB_IMAGE}"
+      docker push "${DOCKERHUB_IMAGE}"
       docker rmi "${DOCKERHUB_IMAGE}" || true
     done
   fi
