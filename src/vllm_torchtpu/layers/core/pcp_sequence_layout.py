@@ -517,6 +517,7 @@ def _ensure_host_token_buffer_capacity(runner: Any, required_num_tokens: int) ->
         device=old_input_ids_cpu.device,
     )
     runner.input_ids_cpu[:current_num_tokens] = old_input_ids_cpu
+    runner.input_ids_np = runner.input_ids_cpu.numpy()
 
     old_positions_cpu = runner.positions_cpu
     runner.positions_cpu = torch.zeros(

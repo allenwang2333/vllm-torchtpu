@@ -154,15 +154,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        kv_transfer_cfg = getattr(
+            getattr(self, "vllm_config", None), "kv_transfer_config", None
+        )
+        kv_role = getattr(kv_transfer_cfg, "kv_role", None)
         self._is_disagg = (
-            getattr(getattr(self, "vllm_config", None), "kv_transfer_config", None)
-            is not None
+            kv_transfer_cfg is not None
             or getattr(self, "connector", None) is not None
         )
+        self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
+        self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
         self._srpf_running: bool = (
             bool(envs.TPU_SCHED_SRPF_RUNNING)
             if "TPU_SCHED_SRPF_RUNNING" in os.environ
-            else not self._is_disagg
+            else not self._is_kv_consumer
         )
         self._mk_max_running: int = self._resolve_mk_max_running()
         budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
@@ -184,16 +189,28 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._cold_chunk_cap: int = (
             int(envs.TPU_SCHED_COLD_CHUNK_CAP)
             if "TPU_SCHED_COLD_CHUNK_CAP" in os.environ
-            else (0 if self._is_disagg else max(512, self._step_total_cap // 2))
+            else (
+                max(512, budget // 2)
+                if self._is_kv_producer
+                else (0 if self._is_disagg else max(512, self._step_total_cap // 2))
+            )
         )
         self._cold_min_decoders: int = (
             int(envs.TPU_SCHED_COLD_MIN_DECODERS)
             if "TPU_SCHED_COLD_MIN_DECODERS" in os.environ
             else max(1, (3 * eff_seqs) // 4)
         )
-        self._warm_streak: int = int(envs.TPU_SCHED_WARM_STREAK)
+        self._warm_streak: int = (
+            int(envs.TPU_SCHED_WARM_STREAK)
+            if "TPU_SCHED_WARM_STREAK" in os.environ
+            else (0 if self._is_disagg else int(envs.TPU_SCHED_WARM_STREAK))
+        )
         self._warm_min_decoders: int = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
-        self._finish_decode_steps: int = int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+        self._finish_decode_steps: int = (
+            int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+            if "TPU_SCHED_FINISH_DECODE_STEPS" in os.environ
+            else (0 if self._is_disagg else int(envs.TPU_SCHED_FINISH_DECODE_STEPS))
+        )
         self._finish_decode_max_deferral_steps: int = int(
             envs.TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
         )
@@ -814,9 +831,12 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         if cold_chunk_cap > 0 and cold_threshold > 0 and rem > cold_threshold:
             in_running = req_key in getattr(self, "_step_running_prefill_ids", ())
-            has_waiting = bool(getattr(self, "waiting", None)) or bool(
-                getattr(self, "skipped_waiting", None)
-            )
+            if getattr(self, "_is_kv_producer", False):
+                has_waiting = self._has_warm_waiting(cold_threshold)
+            else:
+                has_waiting = bool(getattr(self, "waiting", None)) or bool(
+                    getattr(self, "skipped_waiting", None)
+                )
             if 0 < cold_min_decoders <= num_decoding or (in_running and has_waiting):
                 if has_prior_prefill:
                     rem_cold_cap = cold_chunk_cap - already_scheduled
@@ -1144,6 +1164,16 @@ class PrefixAwareScheduler(AsyncScheduler):
                 num_local = target_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
 
+    def _has_warm_waiting(self, cold_threshold: int) -> bool:
+        waiting = getattr(self, "waiting", None)
+        if not waiting:
+            return False
+        for r in islice(waiting, self.WINDOW):
+            warmth = self._prefix_warmth(r)
+            if max(r.num_tokens - warmth, 0) <= cold_threshold:
+                return True
+        return False
+
     def _rank_and_warmth(
         self,
         request: Request,
@@ -1152,7 +1182,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(max(request.num_tokens - warmth, 0))
-        if getattr(self, "_is_disagg", False):
+        if getattr(self, "_is_kv_consumer", False):
             tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         elif (
             free_blocks_for_fit is not None
@@ -1184,7 +1214,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         head_scored = self._rank_and_warmth(head)
         head_warmth = head_scored[1]
 
-        free_blocks = None if self._is_disagg else self._get_num_free_blocks()
+        free_blocks = (
+            None
+            if getattr(self, "_is_kv_consumer", False)
+            else self._get_num_free_blocks()
+        )
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
             head_cold_tokens = max(head.num_tokens - head_warmth, 0)

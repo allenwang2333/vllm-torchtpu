@@ -3339,8 +3339,19 @@ class Eagle3Proposer:
             )
             else 0
         )
+        seed_t_paddings = sorted(
+            set(runner.num_tokens_paddings)
+            | (
+                {
+                    t * runner.parallel_config.prefill_context_parallel_size
+                    for t in runner.num_tokens_paddings
+                }
+                if getattr(runner, "_pcp_enabled", False)
+                else set()
+            )
+        )
         with runner._precompile_timed("drafter seed_input_ids"):
-            for T in runner.num_tokens_paddings:
+            for T in seed_t_paddings:
                 for p in idx_sizes:
                     if p > T:
                         continue

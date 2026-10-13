@@ -8565,19 +8565,21 @@ class TPUModelRunner(GPUModelRunner):
             return
         if self.enforce_eager or not self._is_async_drafter:
             return
-        P = min(int(self.num_tokens_paddings[0]), self.max_model_len)
+        pcp_size = max(1, int(self.parallel_config.prefill_context_parallel_size))
         n0 = self.num_xla_graphs
         with (
             _suspend_kv_transfer_group(),
             self._precompile_timed("PCP MTP real prefill warmup"),
         ):
-            if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
-                if not self._warmup_one_pcp_mtp_prefill(P):
-                    raise RuntimeError(
-                        "PCP MTP prefill warmup failed after retry; refusing "
-                        "to start a producer whose first live proposal would "
-                        "hit the same failure"
-                    )
+            for local_b in self.num_tokens_paddings:
+                P = min(int(local_b) * pcp_size, self.max_model_len)
+                if not self._warmup_one_pcp_mtp_prefill(P, quiet=True):  # noqa: SIM102 (retry)
+                    if not self._warmup_one_pcp_mtp_prefill(P):
+                        raise RuntimeError(
+                            f"PCP MTP prefill warmup failed after retry for P={P}; refusing "
+                            "to start a producer whose first live proposal would "
+                            "hit the same failure"
+                        )
         logger.info(
             "PCP MTP prefill warmup compiled %d graphs", self.num_xla_graphs - n0
         )
