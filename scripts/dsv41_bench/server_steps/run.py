@@ -133,6 +133,8 @@ def main() -> None:
             DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
         )
         env["USE_PHASED_PROFILER"] = "0"
+    else:
+        env.pop("MAX_MODEL_LEN", None)
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [
         "bash",
