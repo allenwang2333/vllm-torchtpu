@@ -180,11 +180,45 @@ def _input_permutation(
     stored: Sequence[tuple[str, Any]], current: Sequence[tuple[str, Any]]
 ) -> list[int] | None:
     """Where each stored argument sits in ``current``; None unless a reordering."""
+    if len(stored) != len(current):
+        return None
     position = {entry: i for i, entry in enumerate(current)}
     perm = [position.get(entry) for entry in stored]
-    if len(stored) != len(current) or None in perm:
+    if None not in perm and len(set(perm)) == len(stored):
+        return perm
+
+    # Some placeholders may be renamed across traces while others (e.g. layer
+    # weights under sequence-parallel vs non-SP) are reordered. Match shared
+    # (name, meta) pairs first, then pair remaining unmatched entries by meta
+    # in relative order.
+    used_current: set[int] = set()
+    full_perm: list[int | None] = [None] * len(stored)
+    current_by_entry: dict[tuple[str, Any], list[int]] = {}
+    for j, entry in enumerate(current):
+        current_by_entry.setdefault(entry, []).append(j)
+    for i, entry in enumerate(stored):
+        candidates = current_by_entry.get(entry)
+        if candidates:
+            j = candidates.pop(0)
+            full_perm[i] = j
+            used_current.add(j)
+
+    unmatched_current_by_meta: dict[Any, list[int]] = {}
+    for j, (_name, meta) in enumerate(current):
+        if j not in used_current:
+            unmatched_current_by_meta.setdefault(meta, []).append(j)
+
+    for i, (_name, meta) in enumerate(stored):
+        if full_perm[i] is not None:
+            continue
+        candidates = unmatched_current_by_meta.get(meta)
+        if not candidates:
+            return None
+        full_perm[i] = candidates.pop(0)
+
+    if None in full_perm or len(set(full_perm)) != len(stored):
         return None
-    return perm
+    return [int(x) for x in full_perm if x is not None]
 
 
 def _signature_delta(stored: Sequence[Any], current: Sequence[Any]) -> str:
@@ -257,12 +291,17 @@ class BucketExecutables:
         if stored == current:
             return runnable
         if sorted(name for name, _ in stored) != sorted(name for name, _ in current):
-            # Renamed placeholders: match by position, dtype and shape.
+            # Renamed placeholders: match by position, dtype and shape if in same order,
+            # otherwise fall through to _input_permutation which matches shared names
+            # and pairs renamed placeholders by (dtype, shape).
             signature = _signature(graph)
             if signature == stored_signature:
                 return runnable
-            raise _handover_error(key, _signature_delta(stored_signature, signature))
-        perm = _input_permutation(stored, current)
+            perm = _input_permutation(stored, current)
+            if perm is None:
+                raise _handover_error(key, _signature_delta(stored_signature, signature))
+        else:
+            perm = _input_permutation(stored, current)
         if perm is None:
             raise _handover_error(key, _signature_delta(stored, current))
         logger.info(

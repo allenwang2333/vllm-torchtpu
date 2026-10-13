@@ -8611,7 +8611,27 @@ class TPUModelRunner(GPUModelRunner):
 
             chunk = num_tokens_padded // tp_size
             tp_rank = get_tensor_model_parallel_rank()
-            rank_valid = max(0, min(chunk, valid_tokens - tp_rank * chunk))
+            mb_cfg = getattr(self.model, "_microbatch_config", None)
+            if (
+                mb_cfg is not None
+                and mb_cfg.factor > 1
+                and num_tokens_padded >= mb_cfg.min_tokens
+                and num_tokens_padded % (mb_cfg.factor * tp_size) == 0
+            ):
+                win_tokens = num_tokens_padded // mb_cfg.factor
+                win_chunk = win_tokens // tp_size
+                rank_valid = sum(
+                    max(
+                        0,
+                        min(
+                            win_chunk,
+                            (valid_tokens - w * win_tokens) - tp_rank * win_chunk,
+                        ),
+                    )
+                    for w in range(mb_cfg.factor)
+                )
+            else:
+                rank_valid = max(0, min(chunk, valid_tokens - tp_rank * chunk))
             padding_state.update(rank_valid, chunk)
         else:
             padding_state.update(valid_tokens, num_tokens_padded)

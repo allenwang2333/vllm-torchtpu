@@ -177,7 +177,39 @@ def _set_env(key: str, val: str) -> None:
 # Recipe tokens rewritten in place, so the rest of the string (and with it the
 # native compile key) stays byte-identical. The CDK recipe pairs fused EP with
 # SparseCore all-gather offload at a 256 KiB threshold.
-_LIBTPU_REWRITES: dict[str, str] = {}
+def _is_multi_dp_serve() -> bool:
+    if os.environ.get("_VLLM_TORCHTPU_MULTI_DP") == "1":
+        return True
+    import sys
+
+    argv = sys.argv
+    if "serve" not in argv[:3]:
+        return False
+    for i, a in enumerate(argv):
+        if a in ("--data-parallel-size", "-dp") and i + 1 < len(argv):
+            if argv[i + 1].isdigit() and int(argv[i + 1]) > 1:
+                os.environ["_VLLM_TORCHTPU_MULTI_DP"] = "1"
+                return True
+        if a.startswith("--data-parallel-size="):
+            val = a.split("=", 1)[1]
+            if val.isdigit() and int(val) > 1:
+                os.environ["_VLLM_TORCHTPU_MULTI_DP"] = "1"
+                return True
+    return False
+
+
+_LIBTPU_REWRITES = (
+    {}
+    if _is_multi_dp_serve()
+    else {
+        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=262144": (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=8388608"
+        ),
+        "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true": (
+            "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
+        ),
+    }
+)
 _SC_HAR_FLAG = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
 _SC_AR_MIN_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 # Either flag as a whole token, with its value and the whitespace before it.
@@ -217,8 +249,13 @@ _existing_libtpu_args = _recipe_libtpu_args(os.environ.get("LIBTPU_INIT_ARGS", "
 
 # The CDK recipe (infx-qwen35-agentx) exports stale fused-EP settings in the
 # pod spec: USE_MOE_FUSED_EP_KERNEL=0 and TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=33.
-if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
-    _set_env("USE_MOE_FUSED_EP_KERNEL", "0")
+if _is_multi_dp_serve():
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "0")
+    if "TPU_SP_MIN_ROWS" not in os.environ:
+        _set_env("TPU_SP_MIN_ROWS", "0")
+else:
+    _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
 if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
     _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 

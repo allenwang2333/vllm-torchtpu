@@ -48,6 +48,14 @@ def bind_step_inputs_for_trace_alignment(
             positions = positions.view(*positions.shape)
 
     def _bind_md(md: AttentionMetadata) -> None:
+        for field_name in (
+            "mamba_request_distribution",
+            "request_distribution",
+            "mamba_state_indices",
+            "mamba_slot_read_offsets",
+            "block_tables",
+        ):
+            _ = getattr(md, field_name, None)
         for field_name in _SLICED_METADATA_FIELDS:
             tensor = getattr(md, field_name, None)
             if isinstance(tensor, torch.Tensor):
@@ -70,11 +78,12 @@ def bind_step_inputs_for_trace_alignment(
             seen_md_ids.add(md_id)
             _bind_md(layer_md)
 
-    if padding_state is not None and isinstance(
-            padding_state.local_padding_mask, torch.Tensor):
-        orig_mask = padding_state.local_padding_mask
-        restorers.append((padding_state, "local_padding_mask", orig_mask))
-        padding_state.local_padding_mask = orig_mask[:]
+    if padding_state is not None:
+        _ = getattr(padding_state, "local_valid_tokens", None)
+        if isinstance(padding_state.local_padding_mask, torch.Tensor):
+            orig_mask = padding_state.local_padding_mask
+            restorers.append((padding_state, "local_padding_mask", orig_mask))
+            padding_state.local_padding_mask = orig_mask[:]
 
     def _restore() -> None:
         for obj, attr, orig_val in reversed(restorers):

@@ -1673,7 +1673,21 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if cpu_bytes_to_use and int(cpu_bytes_to_use) > 429496729600:
-            cpu_bytes_to_use = 429496729600
+            cgroup_limit = None
+            for cg_path in (
+                "/sys/fs/cgroup/memory.max",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            ):
+                try:
+                    with open(cg_path, encoding="utf-8") as _cg_f:
+                        raw = _cg_f.read().strip()
+                    if raw.isdigit():
+                        cgroup_limit = int(raw)
+                        break
+                except OSError:
+                    pass
+            if cgroup_limit is not None and cgroup_limit < 751619276800:
+                cpu_bytes_to_use = 429496729600
         if not cpu_bytes_to_use:
             raise ValueError(
                 "cpu_bytes_to_use must be specified in "

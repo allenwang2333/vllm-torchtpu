@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    USE_MOE_FUSED_EP_KERNEL: bool = False
+    USE_MOE_FUSED_EP_KERNEL: bool = True
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
@@ -662,7 +662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program, instead of bracketing the per-rank compute with vLLM's
     # all-gather and reduce-scatter. The transport then overlaps the matmuls;
     # the reduce-scatter it replaces is otherwise fully exposed.
-    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=False),
+    "USE_MOE_FUSED_EP_KERNEL": env_bool("USE_MOE_FUSED_EP_KERNEL", default=True),
     # Fused EP kernel implementation. Default "v3"
     # pairs with TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512 so
     # steps <= 256 run moe_lowtok and steps >= 512 run SP=1 + Fused EP v3.
@@ -992,7 +992,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
         "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
     ),
-    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "0")),
+    "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
     # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
     # Sort prefilling requests in `running` by fewest remaining prompt tokens.
@@ -1033,6 +1033,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MICROBATCH_MIN_TOKENS": env_nonnegative_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
     # Merge the routed-expert MoE kernel across micro-batch windows into one call.
     "TPU_MICROBATCH_MERGE_MOE": env_bool("TPU_MICROBATCH_MERGE_MOE", default=True),
+    # Minimum token bucket size at which MoE GMM stays unmerged across windows
+    # when TPU_MICROBATCH_MERGE_MOE=0. Buckets below this threshold merge MoE
+    # into a single GMM call per layer to avoid 2x expert weight HBM reads.
+    "TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS": lambda: int(
+        os.getenv("TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS", "0")
+    ),
     # Shortcut for TPU_MICROBATCH_SCHEDULE="layerwise" (full-layer windowing).
     "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
     # Micro-batch execution schedule:

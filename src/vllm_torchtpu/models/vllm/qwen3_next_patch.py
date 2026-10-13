@@ -107,9 +107,15 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
     """
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
+    if cols > 2048:
+        vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
+        if rows <= 256:
+            dma_cap = max(32, (rows // 6 // 32) * 32)
+            return min(vreg_cap, dma_cap)
+        return vreg_cap
+    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
     if rows <= 256:
-        dma_cap = max(32, (rows // 6 // 32) * 32)
+        dma_cap = max(8, (rows // 6 // 8) * 8)
         return min(vreg_cap, dma_cap)
     return vreg_cap
 
@@ -1267,7 +1273,12 @@ def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> bool | None:
             layer_cls.__init__ = _with_rank_buffer(layer_cls.__init__)
 
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
-    qwen3_next.Qwen3NextModel.forward = patched_model_forward
+    if getattr(qwen3_next.Qwen3NextModel.forward, "__name__", "") == "_microbatch_model_forward":
+        from vllm_torchtpu.models.microbatch import qwen as _mb_qwen
+
+        _mb_qwen._orig_qwen3_next_model_forward = patched_model_forward
+    else:
+        qwen3_next.Qwen3NextModel.forward = patched_model_forward
     qwen3_next_mtp.Qwen3NextMultiTokenPredictor.forward = patched_mtp_forward
     _q35_mtp.Qwen3_5MultiTokenPredictor.forward = patched_mtp_forward
     logger.info(

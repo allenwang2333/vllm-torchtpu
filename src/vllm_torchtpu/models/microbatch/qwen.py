@@ -98,6 +98,7 @@ class MicroBatchConfig:
     factor: int = 1
     min_tokens: int = 1024
     merge_moe: bool = True
+    split_moe_min_tokens: int = 0
     layerwise: bool = False
     schedule: ScheduleMode | str = ""
     fence: FenceMode | str = FenceMode.SUBSTAGE
@@ -128,6 +129,7 @@ class MicroBatchConfig:
             factor=envs.TPU_MICROBATCH_FACTOR,
             min_tokens=envs.TPU_MICROBATCH_MIN_TOKENS,
             merge_moe=envs.TPU_MICROBATCH_MERGE_MOE,
+            split_moe_min_tokens=envs.TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS,
             layerwise=envs.TPU_MICROBATCH_LAYERWISE,
             schedule=envs.TPU_MICROBATCH_SCHEDULE,
             fence=envs.TPU_MICROBATCH_FENCE,
@@ -1216,24 +1218,444 @@ def _active_layers(model: Any) -> list[nn.Module]:
     return list(layers[start_layer:end_layer])
 
 
+def _get_tp_size(layer: Any = None) -> int:
+    if layer is not None:
+        mlp = getattr(layer, "mlp", None)
+        tp = getattr(mlp, "tp_size", None)
+        if isinstance(tp, int) and tp > 1:
+            return tp
+    try:
+        return _ps.get_tensor_model_parallel_world_size()
+    except Exception:
+        return 1
+
+
+def _all_gather_sp_windows(
+    hs_windows: list[torch.Tensor],
+    res_windows: list[torch.Tensor | None],
+    window_tokens: int,
+    hidden_size: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
+    """All-gather sequence-parallel ``hs_windows`` and ``res_windows`` across TP in one collective."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    num_windows = len(hs_windows)
+    has_res = all(r is not None for r in res_windows)
+    if not has_res:
+        combined = torch.cat(hs_windows, dim=-1)
+        gathered = tensor_model_parallel_all_gather(combined, 0).narrow(
+            0, 0, window_tokens
+        )
+        new_hs = list(gathered.split([hidden_size] * num_windows, dim=-1))
+        return new_hs, [None] * num_windows
+
+    res_tensors = [r for r in res_windows if r is not None]
+    combined = torch.cat(hs_windows + res_tensors, dim=-1)
+    gathered = tensor_model_parallel_all_gather(combined, 0).narrow(
+        0, 0, window_tokens
+    )
+    splits = list(gathered.split([hidden_size] * (2 * num_windows), dim=-1))
+    return splits[:num_windows], list(splits[num_windows:])
+
+
+def _sp_attn_pre_gather(
+    layer: Any,
+    hs_w: torch.Tensor,
+    res_w: torch.Tensor | None,
+    pos_w: torch.Tensor,
+    *,
+    input_is_sp: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Substage 1a (SP): input_layernorm + optional FP8 quantize_rows + TP all_gather."""
+    from vllm.distributed import tensor_model_parallel_all_gather
+    from vllm_torchtpu.layers.adapter import linear_common
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op as _sar
+
+    if hasattr(layer, "_tpu_sp_rank"):
+        pos_w = pos_w + (layer._tpu_sp_rank * 0)[0]
+    if _sar._RANK is not None:
+        pos_w = pos_w + (_sar._RANK * 0)[0]
+
+    if res_w is None:
+        res_w = hs_w
+        hs_w = layer.input_layernorm(hs_w)
+    else:
+        hs_w, res_w = layer.input_layernorm(hs_w, res_w)
+
+    prequant: tuple[torch.Tensor, torch.Tensor] | None = None
+    if input_is_sp and _sp.fp8_gather():
+        x_q, x_s = linear_common.quantize_rows(hs_w)
+        x_q = tensor_model_parallel_all_gather(x_q, 0)
+        x_s = tensor_model_parallel_all_gather(x_s, 0)
+        prequant = (x_q, x_s)
+        hs_w = x_q
+    elif input_is_sp:
+        hs_w = tensor_model_parallel_all_gather(hs_w, 0)
+
+    return hs_w, res_w, pos_w, prequant
+
+
+def _sp_attn_compute(
+    layer: Any,
+    hs_w: torch.Tensor,
+    pos_w: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """Substage 1b (SP): linear_attn or self_attn compute + optional attn_layer_scale."""
+    layer_type = getattr(layer, "layer_type", None)
+    if layer_type == "linear_attention" or (
+        layer_type is None and hasattr(layer, "linear_attn")
+    ):
+        attn_out = (
+            layer.linear_attn(hidden_states=hs_w)
+            if prequant is None
+            else layer.linear_attn(hidden_states=hs_w, prequant=prequant)
+        )
+    elif layer_type == "full_attention" or (
+        layer_type is None and hasattr(layer, "self_attn")
+    ):
+        attn_out = (
+            layer.self_attn(hidden_states=hs_w, positions=pos_w)
+            if prequant is None
+            else layer.self_attn(
+                hidden_states=hs_w, positions=pos_w, prequant=prequant
+            )
+        )
+    else:
+        raise ValueError(f"Unsupported layer_type={layer_type!r}")
+
+    if getattr(layer, "layer_scale", False):
+        attn_out = _apply_layer_scale(attn_out, layer.attn_layer_scale)
+    return attn_out
+
+
+def _sp_attn_reduce_scatter(
+    layer: Any,
+    attn_out_w: torch.Tensor,
+    res_w: torch.Tensor,
+    window_tokens: int,
+    *,
+    input_is_sp: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Substage 1c (SP): TP reduce_scatter on attention output + Layer-0 residual slice."""
+    from vllm.distributed import tensor_model_parallel_reduce_scatter
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import _sp_chunk
+
+    hs_sp_w = tensor_model_parallel_reduce_scatter(attn_out_w, 0)
+    if not input_is_sp:
+        tp = _get_tp_size(layer)
+        if hasattr(layer, "_tpu_sp_rank") and tp > 1:
+            res_w = (
+                res_w.reshape(tp, -1, res_w.shape[-1])
+                .index_select(0, layer._tpu_sp_rank)
+                .squeeze(0)
+            )
+        elif tp > 1:
+            res_w = _sp_chunk(res_w, window_tokens)
+    return hs_sp_w, res_w
+
+
+def _sp_moe_pre_compute(
+    layer: Any,
+    hs_sp_w: torch.Tensor,
+    res_w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Substage 2a (SP): post_attention_layernorm + fused gate & shared_expert on SP shard."""
+    hs_sp_w, res_w = layer.post_attention_layernorm(hs_sp_w, res_w)
+    mlp = layer.mlp
+    if (
+        not getattr(mlp, "_fused_gate_se_checked", False)
+        and not torch.compiler.is_compiling()
+    ):
+        from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+            maybe_setup_fused_gate_se,
+        )
+
+        maybe_setup_fused_gate_se(mlp)
+
+    if getattr(mlp, "_fused_gate_se_weight", None) is not None:
+        from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+            compute_fused_gate_and_shared_expert,
+        )
+
+        router_logits_w, shared_out_w = compute_fused_gate_and_shared_expert(
+            mlp, hs_sp_w
+        )
+    else:
+        router_logits_w = mlp.gate(hs_sp_w)
+        shared_out_w = (
+            mlp.shared_expert(hs_sp_w)
+            if getattr(mlp, "shared_expert", None) is not None
+            else None
+        )
+        if (
+            shared_out_w is not None
+            and getattr(mlp, "shared_expert_gate", None) is not None
+        ):
+            shared_out_w = (
+                F.sigmoid(mlp.shared_expert_gate(hs_sp_w)) * shared_out_w
+            )
+    return hs_sp_w, res_w, router_logits_w, shared_out_w
+
+
+def _run_layer_sp_staggered(
+    layer: Any,
+    hs_windows: list[torch.Tensor],
+    res_windows: list[torch.Tensor | None],
+    pos_windows: list[torch.Tensor],
+    md_windows: list[Any],
+    orig_padding: token_padding.TokenPaddingState | None,
+    fc: Any,
+    *,
+    input_is_sp: bool,
+    merge_moe: bool,
+    fence: FenceMode,
+) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
+    """Run one sequence-parallel decoder layer with 3-substage attention overlap + merged Fused EP v3 MoE."""
+    num_windows = len(hs_windows)
+    window_tokens = pos_windows[0].shape[-1]
+
+    hs_prev, res_prev, pos_prev, prequant_prev = _sp_attn_pre_gather(
+        layer,
+        hs_windows[0],
+        res_windows[0],
+        pos_windows[0],
+        input_is_sp=input_is_sp,
+    )
+
+    hs_sp_list: list[torch.Tensor] = []
+    res_sp_list: list[torch.Tensor] = []
+
+    for w in range(1, num_windows):
+        # Fence A: couple w-1's pre-gather output with w's pre-gather input so
+        # w's all_gather runs concurrently with w-1's attention compute.
+        if fence in (FenceMode.STAGE, FenceMode.SUBSTAGE):
+            if prequant_prev is not None:
+                x_q_prev, hs_windows[w] = microbatch_fence_pair(
+                    prequant_prev[0], hs_windows[w]
+                )
+                prequant_prev = (x_q_prev, prequant_prev[1])
+                hs_prev = x_q_prev
+            else:
+                hs_prev, hs_windows[w] = microbatch_fence_pair(
+                    hs_prev, hs_windows[w]
+                )
+
+        hs_curr, res_curr, pos_curr, prequant_curr = _sp_attn_pre_gather(
+            layer,
+            hs_windows[w],
+            res_windows[w],
+            pos_windows[w],
+            input_is_sp=input_is_sp,
+        )
+        with _window_context(fc, md_windows[w - 1], orig_padding):
+            attn_out_prev = _sp_attn_compute(
+                layer, hs_prev, pos_prev, prequant_prev
+            )
+
+        # Fence B: couple w-1's attention output with w's pre-gather output so
+        # w-1's reduce_scatter runs concurrently with w's attention compute.
+        if fence in (FenceMode.STAGE, FenceMode.SUBSTAGE):
+            if prequant_curr is not None:
+                attn_out_prev, x_q_curr = microbatch_fence_pair(
+                    attn_out_prev, prequant_curr[0]
+                )
+                prequant_curr = (x_q_curr, prequant_curr[1])
+                hs_curr = x_q_curr
+            else:
+                attn_out_prev, hs_curr = microbatch_fence_pair(
+                    attn_out_prev, hs_curr
+                )
+
+        hs_sp_prev, res_sp_prev = _sp_attn_reduce_scatter(
+            layer,
+            attn_out_prev,
+            res_prev,
+            window_tokens,
+            input_is_sp=input_is_sp,
+        )
+        hs_sp_list.append(hs_sp_prev)
+        res_sp_list.append(res_sp_prev)
+
+        hs_prev, res_prev, pos_prev, prequant_prev = (
+            hs_curr,
+            res_curr,
+            pos_curr,
+            prequant_curr,
+        )
+
+    with _window_context(fc, md_windows[num_windows - 1], orig_padding):
+        attn_out_last = _sp_attn_compute(
+            layer, hs_prev, pos_prev, prequant_prev
+        )
+
+    # Fence C: couple last window's attention output with window 0's reduce-scattered
+    # shard so last window's reduce_scatter overlaps with window 0's gate+shared_expert.
+    if fence in (FenceMode.STAGE, FenceMode.SUBSTAGE) and hs_sp_list:
+        attn_out_last, hs_sp_list[0] = microbatch_fence_pair(
+            attn_out_last, hs_sp_list[0]
+        )
+
+    hs_sp_last, res_sp_last = _sp_attn_reduce_scatter(
+        layer,
+        attn_out_last,
+        res_prev,
+        window_tokens,
+        input_is_sp=input_is_sp,
+    )
+    hs_sp_list.append(hs_sp_last)
+    res_sp_list.append(res_sp_last)
+
+    router_logits_list: list[torch.Tensor] = []
+    shared_out_list: list[torch.Tensor | None] = []
+
+    for w in range(num_windows - 1):
+        hs_sp_w, res_sp_w, rl_w, se_w = _sp_moe_pre_compute(
+            layer, hs_sp_list[w], res_sp_list[w]
+        )
+        hs_sp_list[w] = hs_sp_w
+        res_sp_list[w] = res_sp_w
+        router_logits_list.append(rl_w)
+        shared_out_list.append(se_w)
+
+    # Fence D: close diamond around (last window reduce_scatter || earlier windows gate+SE).
+    if fence in (FenceMode.STAGE, FenceMode.SUBSTAGE) and router_logits_list:
+        router_logits_list[-1], hs_sp_list[-1] = microbatch_fence_pair(
+            router_logits_list[-1], hs_sp_list[-1]
+        )
+
+    hs_sp_w, res_sp_w, rl_w, se_w = _sp_moe_pre_compute(
+        layer, hs_sp_list[-1], res_sp_list[-1]
+    )
+    hs_sp_list[-1] = hs_sp_w
+    res_sp_list[-1] = res_sp_w
+    router_logits_list.append(rl_w)
+    shared_out_list.append(se_w)
+
+    mlp = layer.mlp
+    if merge_moe:
+        cat_hs_sp = torch.cat(hs_sp_list, dim=0)
+        cat_router_logits = torch.cat(router_logits_list, dim=0)
+        cat_routed_out = mlp.experts(
+            hidden_states=cat_hs_sp,
+            router_logits=cat_router_logits,
+        )
+        routed_outs = list(
+            cat_routed_out.view(
+                num_windows, -1, cat_routed_out.shape[-1]
+            ).unbind(0)
+        )
+    else:
+        routed_outs = [
+            mlp.experts(
+                hidden_states=hs_sp_list[w],
+                router_logits=router_logits_list[w],
+            )
+            for w in range(num_windows)
+        ]
+
+    tp_size = _get_tp_size(layer)
+    se_is_replicated = bool(
+        getattr(mlp, "_fused_se_is_replicated", False)
+        or getattr(mlp, "replicate_shared_expert", False)
+        or getattr(mlp, "is_sequence_parallel", False)
+    )
+    routed_experts = getattr(mlp.experts, "routed_experts", mlp.experts)
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+        fused_moe_ep_supported as fused_moe_ep_v3_supported,
+    )
+
+    v3_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
+        fused_moe_ep_v3_supported(routed_experts)
+        or fused_moe_ep_v3_supported(getattr(routed_experts, "quant_method", None))
+    )
+
+    for w in range(num_windows):
+        final_w = routed_outs[w]
+        shared_w = shared_out_list[w]
+        if shared_w is not None:
+            if se_is_replicated:
+                final_w = final_w + shared_w
+            elif tp_size > 1 and v3_owns_combine:
+                shared_w = tensor_model_parallel_all_reduce(shared_w)
+                final_w = final_w + shared_w
+            else:
+                final_w = final_w + shared_w
+                if tp_size > 1:
+                    final_w = tensor_model_parallel_all_reduce(final_w)
+        elif not se_is_replicated and not v3_owns_combine and tp_size > 1:
+            final_w = tensor_model_parallel_all_reduce(final_w)
+        if getattr(layer, "layer_scale", False):
+            final_w = _apply_layer_scale(final_w, layer.ffn_layer_scale)
+        hs_windows[w] = final_w
+        res_windows[w] = res_sp_list[w]
+
+    return hs_windows, res_windows
+
+
 def _forward_unsplit(
     self: Any,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
 ) -> tuple[torch.Tensor | IntermediateTensors, tuple[torch.Tensor, ...]]:
-    """Standard unsplit forward loop over ``self.layers``."""
+    """Standard unsplit forward loop over ``self.layers`` (including row-gated SP)."""
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        _all_gather_hidden_and_residual,
+    )
+
+    full_num_tokens = positions.shape[-1]
+    active_layers = _active_layers(self)
+    sp = (
+        any(
+            getattr(layer, "use_attn_reduce_scatter_for_moe", False)
+            for layer in active_layers
+        )
+        and _sp.enabled()
+        and full_num_tokens >= _sp.min_rows()
+    )
+    state_is_sp = False
+    hidden_size = (
+        getattr(getattr(self, "config", None), "hidden_size", None)
+        or hidden_states.shape[-1]
+    )
+
     aux_hidden_states = []
     use_aux = getattr(self, "aux_hidden_state_layers", ())
-    for layer_idx, layer in enumerate(_active_layers(self),
-                                      start=getattr(self, "start_layer", 0)):
+    for layer_idx, layer in enumerate(
+        active_layers,
+        start=getattr(self, "start_layer", 0),
+    ):
         if layer_idx in use_aux:
+            if state_is_sp:
+                hidden_states, residual = _all_gather_hidden_and_residual(
+                    hidden_states,
+                    residual,
+                    full_num_tokens,
+                    hidden_size,
+                )
+                state_is_sp = False
             assert residual is not None
             aux_hidden_states.append(hidden_states + residual)
+        if state_is_sp and not getattr(
+            layer, "use_attn_reduce_scatter_for_moe", False
+        ):
+            hidden_states, residual = _all_gather_hidden_and_residual(
+                hidden_states,
+                residual,
+                full_num_tokens,
+                hidden_size,
+            )
+            state_is_sp = False
         hidden_states, residual = layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
+        )
+        state_is_sp = sp and bool(
+            getattr(layer, "use_attn_reduce_scatter_for_moe", False)
         )
 
     pp_group = getattr(_ps, "_PP", None)
@@ -1244,6 +1666,14 @@ def _forward_unsplit(
             "hidden_states": hidden_states,
             "residual": residual,
         }), tuple(aux_hidden_states)
+
+    if state_is_sp:
+        hidden_states, residual = _all_gather_hidden_and_residual(
+            hidden_states,
+            residual,
+            full_num_tokens,
+            hidden_size,
+        )
 
     if getattr(self, "norm", None) is not None:
         if residual is None:
@@ -1342,29 +1772,84 @@ def _microbatch_model_forward(
             slice_forward_metadata(orig_md, w, window_tokens)
             for w in range(factor)
         ]
-        pad_windows = [
-            slice_padding_state(orig_padding, w, window_tokens)
-            for w in range(factor)
-        ]
+
+        from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+        active_layers = _active_layers(self)
+        first_layer = active_layers[0] if active_layers else None
+        tp_size = _get_tp_size(first_layer)
+        sp = (
+            any(
+                getattr(layer, "use_attn_reduce_scatter_for_moe", False)
+                for layer in active_layers
+            )
+            and _sp.enabled()
+            and num_tokens >= _sp.min_rows()
+            and window_tokens % max(1, tp_size) == 0
+        )
+        state_is_sp = False
+        hidden_size = (
+            getattr(getattr(self, "config", None), "hidden_size", None)
+            or hidden_states.shape[-1]
+        )
+
+        pad_windows = (
+            [orig_padding] * factor
+            if sp
+            else [
+                slice_padding_state(orig_padding, w, window_tokens)
+                for w in range(factor)
+            ]
+        )
 
         schedule = config.resolved_schedule
         fence = config.resolved_fence
         merge_moe = config.merge_moe
+        if not merge_moe and config.split_moe_min_tokens > 0:
+            merge_moe = int(hidden_states.size(0)) < config.split_moe_min_tokens
 
         aux_hidden_states: list[torch.Tensor] = []
         use_aux = getattr(self, "aux_hidden_state_layers", ())
         start_layer = getattr(self, "start_layer", 0)
 
-        for layer_idx, layer in enumerate(_active_layers(self),
+        for layer_idx, layer in enumerate(active_layers,
                                           start=start_layer):
             if layer_idx in use_aux:
+                if state_is_sp:
+                    hs_windows, res_windows = _all_gather_sp_windows(
+                        hs_windows, res_windows, window_tokens, hidden_size
+                    )
+                    state_is_sp = False
                 aux_windows = [
                     h + r if r is not None else h
                     for h, r in zip(hs_windows, res_windows)
                 ]
                 aux_hidden_states.append(torch.cat(aux_windows, dim=0))
 
-            if schedule == ScheduleMode.LAYERWISE:
+            layer_uses_sp = sp and bool(
+                getattr(layer, "use_attn_reduce_scatter_for_moe", False)
+            )
+            if state_is_sp and not layer_uses_sp:
+                hs_windows, res_windows = _all_gather_sp_windows(
+                    hs_windows, res_windows, window_tokens, hidden_size
+                )
+                state_is_sp = False
+
+            if layer_uses_sp:
+                hs_windows, res_windows = _run_layer_sp_staggered(
+                    layer,
+                    hs_windows,
+                    res_windows,
+                    pos_windows,
+                    md_windows,
+                    orig_padding,
+                    fc,
+                    input_is_sp=state_is_sp,
+                    merge_moe=merge_moe,
+                    fence=fence,
+                )
+                state_is_sp = True
+            elif schedule == ScheduleMode.LAYERWISE:
                 hs_windows, res_windows = _run_layer_layerwise(
                     layer,
                     hs_windows,
@@ -1400,14 +1885,20 @@ def _microbatch_model_forward(
                     fence=fence,
                 )
 
+        is_last_rank = pp_group.is_last_rank if pp_group is not None else True
+
+        if is_last_rank and state_is_sp:
+            hs_windows, res_windows = _all_gather_sp_windows(
+                hs_windows, res_windows, window_tokens, hidden_size
+            )
+            state_is_sp = False
+
         hidden_states = torch.cat(hs_windows, dim=0)
         if any(r is not None for r in res_windows):
             residual = torch.cat([r for r in res_windows if r is not None],
                                  dim=0)
         else:
             residual = None
-
-        is_last_rank = pp_group.is_last_rank if pp_group is not None else True
 
         if not is_last_rank:
             out: torch.Tensor | IntermediateTensors = IntermediateTensors({
@@ -1535,26 +2026,37 @@ def unsupported_config_reasons(
 
     if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
         reasons.append("TPU_MOE_COLLECTION_CHUNK_SIZE > 0")
-    if envs.USE_MOE_FUSED_EP_KERNEL:
-        reasons.append("USE_MOE_FUSED_EP_KERNEL=1")
 
     inner = _find_inner_model(model)
     if inner is None:
+        if envs.USE_MOE_FUSED_EP_KERNEL:
+            reasons.append("USE_MOE_FUSED_EP_KERNEL=1")
         reasons.append("model has no decoder layers list")
         return reasons
 
+    from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
     from vllm_torchtpu.layers.adapter.fused_moe_ep import \
         fused_moe_ep_supported
 
-    for layer in _active_layers(inner):
+    active_layers = _active_layers(inner)
+    sp_supported = _sp.enabled() and any(
+        getattr(layer, "use_attn_reduce_scatter_for_moe", False)
+        for layer in active_layers
+    )
+    if envs.USE_MOE_FUSED_EP_KERNEL and not sp_supported:
+        reasons.append("USE_MOE_FUSED_EP_KERNEL=1")
+
+    for layer in active_layers:
         mlp = getattr(layer, "mlp", None)
         experts = getattr(mlp, "experts", None)
         if experts is not None:
             runner = _get_moe_runner(experts)
             moe_config = getattr(runner, "moe_config", None)
-            if (getattr(mlp, "is_sequence_parallel", False)
-                    or getattr(experts, "is_sequence_parallel", False)
-                    or getattr(moe_config, "is_sequence_parallel", False)):
+            if not sp_supported and (
+                getattr(mlp, "is_sequence_parallel", False)
+                or getattr(experts, "is_sequence_parallel", False)
+                or getattr(moe_config, "is_sequence_parallel", False)
+            ):
                 reasons.append("FusedMoE.is_sequence_parallel=True")
                 break
             if (getattr(experts, "has_ici_cp_collectives", False)
@@ -1564,8 +2066,10 @@ def unsupported_config_reasons(
             routed = getattr(runner, "routed_experts",
                              getattr(experts, "routed_experts", None))
             qm = getattr(routed, "quant_method", None)
-            if getattr(qm, "_use_fused_ep",
-                       False) or fused_moe_ep_supported(qm):
+            if not sp_supported and (
+                getattr(qm, "_use_fused_ep", False)
+                or fused_moe_ep_supported(qm)
+            ):
                 reasons.append("FusedMoE quant_method._use_fused_ep=True")
                 break
 
@@ -1649,11 +2153,12 @@ def maybe_install_microbatch(
     if installed:
         logger.info(
             "Installed TPU Qwen microbatching: factor=%d, min_tokens=%d, "
-            "schedule=%s, merge_moe=%s, fence=%s",
+            "schedule=%s, merge_moe=%s, split_moe_min_tokens=%d, fence=%s",
             config.factor,
             config.min_tokens,
             config.resolved_schedule.value,
             config.merge_moe,
+            config.split_moe_min_tokens,
             config.resolved_fence.value,
         )
     return installed

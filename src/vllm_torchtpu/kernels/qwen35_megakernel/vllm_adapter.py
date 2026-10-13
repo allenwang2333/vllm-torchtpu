@@ -2101,7 +2101,7 @@ class Qwen35Megakernel:
             attn_md, m0, runner=runner
         )
         if not ok or num_reqs <= 0:
-            return self._note_step(reason, False)
+            return self._note_step(f"{reason}_b{int(input_ids.shape[0])}", False)
 
         active_rows = num_reqs * tokens_per_seq
         if tokens_per_seq == 4:
