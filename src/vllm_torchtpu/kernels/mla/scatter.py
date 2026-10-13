@@ -13,9 +13,113 @@
 # limitations under the License.
 """SparseCore Pallas scatter of MLA latents into the paged KV cache."""
 
+import functools
+from collections.abc import Callable
+
 import jax
+import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.mla import kv_cache_utils, scatter_utils
+
+
+@functools.cache
+def _spec_meta(
+    spec: kv_cache_utils.SparseMLAKVCacheSpec,
+) -> tuple[tuple[int, ...], jnp.dtype, int, int, bool, str]:
+    """Caches static layout metadata derived from an immutable KV cache spec."""
+    return (
+        spec.shape,
+        spec.jax_dtype,
+        spec.token_bytes,
+        spec.page_size,
+        spec.layout is kv_cache_utils.KVCacheLayout.TENSORCORE,
+        f"scatter_{spec.cache_type.value}_{spec.layout.value}_cache",
+    )
+
+
+def _scatter_impl(
+    cache: jax.Array,
+    u8: jax.Array,
+    dst_rows: jax.Array,
+    token_bytes: int,
+    is_tc: bool,
+    kernel_name: str,
+    scatter_rows_fn: Callable[..., jax.Array],
+) -> jax.Array:
+    u8 = jax.lax.optimization_barrier(u8)
+    src = (
+        kv_cache_utils.as_token_bytes(u8, token_bytes)
+        if is_tc
+        else kv_cache_utils.pack_tokens(u8, token_bytes)
+    )
+    return scatter_rows_fn(
+        cache,
+        src,
+        dst_rows,
+        name=kernel_name,
+    )
+
+
+@functools.cache
+def _jit_scatter_dst(
+    token_bytes: int,
+    is_tc: bool,
+    kernel_name: str,
+    scatter_rows_fn: Callable[..., jax.Array],
+) -> Callable[[jax.Array, jax.Array, jax.Array], jax.Array]:
+    @jax.jit
+    def _fn(
+        cache: jax.Array,
+        u8: jax.Array,
+        dst_rows: jax.Array,
+    ) -> jax.Array:
+        return _scatter_impl(
+            cache,
+            u8,
+            dst_rows,
+            token_bytes,
+            is_tc,
+            kernel_name,
+            scatter_rows_fn,
+        )
+
+    return _fn
+
+
+@functools.cache
+def _jit_scatter_addr(
+    page_size: int,
+    token_bytes: int,
+    is_tc: bool,
+    kernel_name: str,
+    scatter_rows_fn: Callable[..., jax.Array],
+) -> Callable[[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]:
+    @jax.jit
+    def _fn(
+        cache: jax.Array,
+        u8: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+    ) -> jax.Array:
+        dst_rows = kv_cache_utils.get_dst_rows(
+            num_tokens=u8.shape[0],
+            seq_lens=seq_lens,
+            block_tables=block_tables,
+            query_start_loc=query_start_loc,
+            page_size=page_size,
+        )
+        return _scatter_impl(
+            cache,
+            u8,
+            dst_rows,
+            token_bytes,
+            is_tc,
+            kernel_name,
+            scatter_rows_fn,
+        )
+
+    return _fn
 
 
 def scatter(
@@ -43,30 +147,40 @@ def scatter(
     Returns:
       The updated cache, same shape and dtype as `cache`.
     """
-    assert cache.shape == spec.shape and cache.dtype == spec.jax_dtype, (
-        f"cache {cache.shape} {cache.dtype} does not match spec"
-        f" {spec.shape} {spec.jax_dtype}"
+    expected_shape, expected_dtype, token_bytes, page_size, is_tc, kernel_name = (
+        _spec_meta(spec)
     )
+    assert cache.shape == expected_shape and cache.dtype == expected_dtype, (
+        f"cache {cache.shape} {cache.dtype} does not match spec"
+        f" {expected_shape} {expected_dtype}"
+    )
+    u8 = (
+        values
+        if values.dtype == jnp.uint8
+        else jax.lax.bitcast_convert_type(values, jnp.uint8)
+    )
+    scatter_rows_fn = scatter_utils.scatter_rows
     if dst_rows is None:
         assert (
             seq_lens is not None
             and block_tables is not None
             and query_start_loc is not None
         ), "pass dst_rows or the addressing arrays"
+        if not isinstance(cache, jax.core.Tracer):
+            return _jit_scatter_addr(
+                page_size, token_bytes, is_tc, kernel_name, scatter_rows_fn
+            )(cache, u8, seq_lens, block_tables, query_start_loc)
         dst_rows = kv_cache_utils.get_dst_rows(
-            num_tokens=values.shape[0],
+            num_tokens=u8.shape[0],
             seq_lens=seq_lens,
             block_tables=block_tables,
             query_start_loc=query_start_loc,
-            page_size=spec.page_size,
+            page_size=page_size,
         )
-    if spec.layout is kv_cache_utils.KVCacheLayout.TENSORCORE:
-        src = kv_cache_utils.as_token_bytes(values, spec.token_bytes)
-    else:
-        src = kv_cache_utils.pack_tokens(values, spec.token_bytes)
-    return scatter_utils.scatter_rows(
-        cache,
-        src,
-        dst_rows,
-        name=f"scatter_{spec.cache_type.value}_{spec.layout.value}_cache",
+    elif not isinstance(cache, jax.core.Tracer):
+        return _jit_scatter_dst(token_bytes, is_tc, kernel_name, scatter_rows_fn)(
+            cache, u8, dst_rows
+        )
+    return _scatter_impl(
+        cache, u8, dst_rows, token_bytes, is_tc, kernel_name, scatter_rows_fn
     )
