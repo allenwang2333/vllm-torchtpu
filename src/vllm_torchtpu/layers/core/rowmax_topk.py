@@ -25,6 +25,9 @@ import torch
 NEG = -3.0e38
 
 
+_MASKED_CACHE: dict[torch.dtype, float] = {}
+
+
 def rowmax_topk(
     scores: torch.Tensor,
     k: int,
@@ -50,7 +53,6 @@ def rowmax_topk(
     n = scores.shape[-1]
     if k > n:
         raise ValueError(f"topk k={k} exceeds the expert count {n}")
-    iota = torch.arange(n, device=scores.device, dtype=torch.int32)
     if bias is None:
         choice = scores
     else:
@@ -60,29 +62,33 @@ def rowmax_topk(
         else:
             bias_view = bias_cast.view([1] * (scores.dim() - 1) + [n])
         choice = scores + bias_view
-    masked = torch.finfo(choice.dtype).min
+    choice_dtype = choice.dtype
+    masked = _MASKED_CACHE.get(choice_dtype)
+    if masked is None:
+        masked = torch.finfo(choice_dtype).min
+        _MASKED_CACHE[choice_dtype] = masked
 
     cur = torch.where(choice > NEG, choice, NEG)
     first_m: torch.Tensor | None = None
-    values, indices = [], []
+    indices: list[torch.Tensor] = []
+    last_j = k - 1
     for j in range(k):
-        m = torch.amax(cur, dim=-1, keepdim=True)
-        if j == 0:
-            first_m = m
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
-        idx = torch.amin(torch.where(cur == m, iota, n - 1), dim=-1, keepdim=True)
-        sel = iota == idx
-        if bias is None:
-            values.append(m)
-        else:
-            values.append(torch.where(sel, scores, 0.0).sum(dim=-1, keepdim=True))
+        idx = torch.argmax(cur, dim=-1, keepdim=True)
+        if j == 0 and bias is not None:
+            first_m = torch.gather(cur, -1, idx)
         indices.append(idx)
-        cur = torch.where(sel, masked, cur)
+        if j < last_j:
+            cur.scatter_(-1, idx, masked)
 
+    ids_i64 = torch.cat(indices, dim=-1)
+    weights = torch.gather(scores, -1, ids_i64)
+    if bias is None:
+        weights = torch.where(weights > NEG, weights, NEG)
+        first_m = weights[..., :1]
     assert first_m is not None
-    weights = torch.cat(values, dim=-1)
-    ids = torch.cat(indices, dim=-1)
+    ids = ids_i64.to(torch.int32)
     if renormalize:
         weights = weights / torch.clamp(weights.sum(dim=-1, keepdim=True), min=1e-20)
     # No score above the sentinel means no real maximum: keep the row
