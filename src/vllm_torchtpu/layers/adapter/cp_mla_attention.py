@@ -199,8 +199,9 @@ def _merge_chunked(
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
         return _merge_chunked_lse_gathered(output, lse, group, chunks)
-    if envs.TPU_DCP_MERGE_RS_BF16:
-        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype.
+    if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM:
+        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
+        # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
         pieces = [
             _weighted_reduce_scatter(
@@ -240,6 +241,10 @@ def _weighted_reduce_scatter(
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
     `[world, T, H]` for exactly `output`'s `T` rows."""
     merged_lse = torch.logsumexp(lses, dim=0)
+    if envs.TPU_DCP_MERGE_WEIGHTED_HM:
+        return _weighted_reduce_scatter_heads_major(
+            output, torch.exp(lse_f32 - merged_lse), group
+        )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -269,6 +274,30 @@ def _scatter_sum(weighted: torch.Tensor, group: Any) -> torch.Tensor:
         )
         return _all_to_all(send, group).to(torch.float32).sum(dim=0)
     return group.reduce_scatter(weighted.contiguous(), dim=1)
+
+
+def _weighted_reduce_scatter_heads_major(
+    output: torch.Tensor, weight: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """`_weighted_reduce_scatter`'s weight multiply and reduce-scatter with the
+    f32 operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`).
+
+    `output` [T, H, D], `weight` f32[T, H]. The reduce-scatter of the head
+    axis runs on a heads-major operand either way (XLA transposes a
+    tokens-major one first); here a TensorCore Pallas kernel writes it
+    heads-major directly, so no relayout copy -- TensorCore or SparseCore
+    data-format -- sits between the weights and the reduce-scatter. Same
+    products, same where, same reduce-scatter: the same bits.
+    """
+    if output.device.type == "tpu":
+        from vllm_torchtpu.layers.adapter.dcp_weighted_hm import weighted_heads_major
+
+        x = weighted_heads_major(output, weight)
+    else:
+        w = weight.transpose(0, 1).unsqueeze(-1)
+        x = output.transpose(0, 1).to(torch.float32) * w
+        x = torch.where(w > 0, x, torch.zeros_like(x))
+    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
 def _merge_chunked_lse_gathered(

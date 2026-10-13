@@ -669,6 +669,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_RS_BF16": 0,
         "TPU_DCP_MLA_MERGE_PIECES": 0,
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
+        "TPU_DCP_MERGE_WEIGHTED_HM": False,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -790,6 +791,54 @@ def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(
     one = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=1, **on)
     assert calls == [32] * dcp_size
     torch.testing.assert_close(one, today, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8, 16])
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_weighted_heads_major_is_bitwise_the_chunked_merge(
+    dcp_size, lse_ag, monkeypatch
+):
+    """`TPU_DCP_MERGE_WEIGHTED_HM` builds the weighted operand heads-major and
+    reduce-scatters dim 0: the chunked merge bit for bit, per-chunk gathers
+    and the collapsed gather alike."""
+    outputs, lses = _hard_partials(np.random.default_rng(61), dcp_size, tokens=32)
+    on = dict(TPU_DCP_MERGE_CHUNKED=4, TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag)
+    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
+    calls = []
+    real = cp_mla._weighted_reduce_scatter_heads_major
+    monkeypatch.setattr(
+        cp_mla,
+        "_weighted_reduce_scatter_heads_major",
+        lambda o, w, g: calls.append(o.shape[0]) or real(o, w, g),
+    )
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on)
+    assert calls == [8] * 4 * dcp_size
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_reshaped_heads_major_operand_is_caught(monkeypatch):
+    """The check above must fail when the heads-major operand is a reshape of
+    the tokens-major one instead of a transpose."""
+
+    def _reshaped(o, w, g):
+        t, h, d = o.shape
+        w_hm = w.reshape(h, t).unsqueeze(-1)
+        x = o.reshape(h, t, d).to(torch.float32) * w_hm
+        x = torch.where(w_hm > 0, x, torch.zeros_like(x))
+        return g.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(o.dtype)
+
+    monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter_heads_major", _reshaped)
+    outputs, lses = _hard_partials(np.random.default_rng(67), 4, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
+    )
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
 def test_head_split_respects_min_tokens(monkeypatch):

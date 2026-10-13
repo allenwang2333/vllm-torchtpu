@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_RS_BF16: int = 0
     TPU_DCP_MLA_MERGE_PIECES: int = 0
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_WEIGHTED_HM: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -552,6 +553,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 0
     ),
+    # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
+    # chunk's weighted f32 operand heads-major in one TensorCore Pallas kernel
+    # (`kernels/mla/dcp_weighted_hm.py`) instead of a tokens-major weight
+    # multiply plus the relayout copy XLA adds for the head-axis
+    # reduce-scatter (which it may offload to the SparseCore and complete
+    # late). Same products, same reduce-scatter: bit-identical.
+    "TPU_DCP_MERGE_WEIGHTED_HM": env_bool("TPU_DCP_MERGE_WEIGHTED_HM", default=False),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
