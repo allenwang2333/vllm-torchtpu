@@ -56,6 +56,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 @dataclass
 class _FakeForwardCtx:
     attn_metadata: Any
+    dp_metadata: Any = None
     is_padding: Any = None
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -1746,12 +1747,12 @@ class TestDeepseekV41ForCausalLM:
     def test_init_capability_guards(self) -> None:
         # PP > 1
         cfg_pp = _mock_vllm_config(pp_size=2)
-        with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
+        with pytest.raises(NotImplementedError, match="requires PP1"):
             DeepseekV41ForCausalLM(vllm_config=cfg_pp)
 
         # DP > 1
         cfg_dp = _mock_vllm_config(dp_size=2)
-        with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
+        with pytest.raises(NotImplementedError, match="DP requires TP1, EP"):
             DeepseekV41ForCausalLM(vllm_config=cfg_dp)
 
         # Speculation not None
@@ -1835,3 +1836,49 @@ class TestDeepseekV41ForCausalLM:
         ):
             res = model_inst.forward("arg2")
             assert res == "fwd_out2"
+
+
+@pytest.mark.parametrize("dp_size,supplied", [(8, False), (8, True), (1, False)])
+def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as module
+
+    ids = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+    positions = torch.arange(2)
+    lookback = torch.tensor([[3, 4]])
+    embeddings = torch.arange(8).reshape(2, 4).bfloat16()
+    events = []
+
+    def lookup(tokens):
+        assert tokens is ids
+        events.append("lookup")
+        return embeddings
+
+    def synchronize(values, *, wait):
+        assert values[0] is embeddings and wait is False
+        events.append("enqueue")
+
+    def stage(tokens, pos, intermediate, inputs_embeds, history):
+        assert tokens is ids and pos is positions and history is lookback
+        assert intermediate is None
+        assert inputs_embeds is (embeddings if supplied or dp_size > 1 else None)
+        events.append("stage")
+        return inputs_embeds
+
+    owner = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+        embed_input_ids=lookup,
+        _has_cpu_offloaded_engram=lambda: False,
+        _ced_enabled=False,
+        full_stage=stage,
+    )
+    monkeypatch.setattr(module, "synchronize_tensors", synchronize)
+    DeepseekV41Model.forward(
+        owner,
+        ids,
+        positions,
+        inputs_embeds=embeddings if supplied else None,
+        lookback_token_ids=lookback,
+    )
+    assert events == (
+        ["lookup", "enqueue", "stage"] if dp_size > 1 and not supplied else ["stage"]
+    )

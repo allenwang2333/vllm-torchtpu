@@ -74,6 +74,8 @@ def _make_runner(
     runner._pp_is_last = True
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        enable_expert_parallel=False,
         prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
@@ -122,6 +124,12 @@ def _make_runner(
         TPUModelRunner._upload_unless_unchanged, runner
     )
     runner._dp_target_bucket = None
+    runner._dp_lockstep_enabled = types.MethodType(
+        TPUModelRunner._dp_lockstep_enabled, runner
+    )
+    runner._dp_num_tokens_across_dp = types.MethodType(
+        TPUModelRunner._dp_num_tokens_across_dp, runner
+    )
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True

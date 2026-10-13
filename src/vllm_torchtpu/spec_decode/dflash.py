@@ -847,7 +847,10 @@ class DFlashProposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            self._draft_has_moe_cache = _draft_has_moe_layers(self.draft_model)
+            self._draft_has_moe_cache = bool(
+                getattr(self.draft_model, "requires_dp_collective_pairing", False)
+                or _draft_has_moe_layers(self.draft_model)
+            )
         return self._draft_has_moe_cache
 
     @torch.no_grad()

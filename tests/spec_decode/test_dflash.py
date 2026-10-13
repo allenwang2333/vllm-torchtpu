@@ -696,3 +696,28 @@ def test_dp_lockstep_sharded_off_without_lockstep():
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
     assert proposer._dp_lockstep_sharded() is False
+
+
+def test_v41_dspark_tp1_pairs_idle_dp_draft_collectives():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.dspark import (
+        DSparkDeepseekV41ForCausalLM,
+    )
+
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.runner._dp_lockstep_enabled.return_value = True
+    # Check the actual draft class contract, without allocating model weights.
+    proposer.draft_model = DSparkDeepseekV41ForCausalLM.__new__(
+        DSparkDeepseekV41ForCausalLM
+    )
+    torch.nn.Module.__init__(proposer.draft_model)
+    proposer._dp_dummy_kv_update = mock.Mock()
+    proposer._dp_dummy_forward = mock.Mock()
+    with mock.patch(
+        "vllm.model_executor.models.interfaces.is_mixture_of_experts",
+        return_value=False,
+    ):
+        proposer.run_dp_dummy_draft(2)
+    assert proposer._dp_dummy_kv_update.call_count == 2
+    assert proposer._dp_dummy_forward.call_count == 2
+    proposer.runner._dp_lockstep_enabled.return_value = False
+    assert not proposer._dp_lockstep_sharded()
