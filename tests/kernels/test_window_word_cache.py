@@ -89,3 +89,21 @@ def test_scatter_rejects_unaligned_records():
             jnp.zeros(1, jnp.int32),
             jnp.zeros((1, 2), jnp.int32),
         )
+
+
+@pytest.mark.parametrize("width", [16, 32, 64, 128, 256])
+def test_scatter_does_not_materialize_a_narrow_cache(width):
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore memory analysis requires a TPU")
+    cache = jax.ShapeDtypeStruct((1 << 20, 128), jnp.int32)
+    records = jax.ShapeDtypeStruct((65,), jnp.int32)
+    words = jax.ShapeDtypeStruct((65, width), jnp.int32)
+    compiled = (
+        jax.jit(scatter_word_records, donate_argnums=(0,))
+        .lower(cache, records, words)
+        .compile()
+    )
+    memory = compiled.memory_analysis()
+    cache_bytes = cache.size * cache.dtype.itemsize
+    assert memory.alias_size_in_bytes == cache_bytes
+    assert memory.temp_size_in_bytes < cache_bytes // 4
