@@ -275,15 +275,21 @@ def _livelock_scheduler(guard):
     return s
 
 
-def test_hold_that_admits_nothing_pauses_holding_until_an_admission():
+def test_hold_that_admits_nothing_skips_holding_for_one_step():
     s = _livelock_scheduler(guard=True)
     assert _step_admitting(s, admit=False) == []  # held; "new" did not fit
-    assert _step_admitting(s, admit=False) == ["long"]  # paused: long runs
-    assert s._srpt_paused_steps == 1
-    assert _step_admitting(s, admit="run") == ["long"]  # still paused; "new" admitted
+    assert _step_admitting(s, admit=False) == ["long"]  # one step without holding
+    assert _step_admitting(s, admit=False) == []  # holding again
+    assert _step_admitting(s, admit=False) == ["long"]
+    assert (s._srpt_held_steps, s._srpt_paused_steps) == (2, 2)
+
+
+def test_hold_that_admits_keeps_holding():
+    s = _livelock_scheduler(guard=True)
+    assert _step_admitting(s, admit="run") == []  # held; "new" admitted
     s.waiting.extend([_waiting("next", 90000, cached=89900)])
     assert _step_admitting(s, admit=False) == ["new"]  # holding again
-    assert (s._srpt_held_steps, s._srpt_paused_steps) == (2, 2)
+    assert s._srpt_paused_steps == 0
 
 
 def test_hold_repeats_without_progress_guard():

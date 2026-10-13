@@ -44,7 +44,10 @@ whole prompt must, and the held chunks keep their blocks), so vLLM stops at it,
 and the next step holds the same chunks again. With no decode on the rank that
 step does no work at all, every step, until the request is gone. With
 ``TPU_SRPT_HOLD_PROGRESS_GUARD=1`` a held step that admits no waiting request
-(neither runs it nor starts its KV load) pauses holding until a step admits one.
+(neither runs it nor starts its KV load) is followed by one step without
+holding, so the held chunks advance at least every other step. (Pausing until
+the next admission was tried and is worse: while paused, the long chunks run
+first and take the whole budget, so nothing is admitted until they finish.)
 
 With ``TPU_SCHED_UNCHARGED_DRAFT_SLOTS=1`` the step's input budget no longer
 charges each request the drafter's extra slots (K-1 per request for DSpark): the
@@ -218,8 +221,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.max_num_running_reqs += len(held)
             self.running.extend(held)
         admitted = any(r.status not in _ADMITTABLE for r in candidates)
-        if self._srpt_progress_guard and (held or self._srpt_hold_paused):
-            self._srpt_hold_paused = not admitted
+        if self._srpt_progress_guard:
+            self._srpt_hold_paused = bool(held) and not admitted
         if self._srpt_steps % _LOG_EVERY_STEPS == 0:
             logger.info(
                 "SRPT prefill: steps=%d held_steps=%d held_chunks=%d paused_steps=%d",
