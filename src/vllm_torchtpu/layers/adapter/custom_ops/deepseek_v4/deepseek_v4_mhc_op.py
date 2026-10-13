@@ -40,7 +40,31 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 # today, so it resolves to None.
 ATTN_DATA_AXIS = None
 
-_mhc_op_cache: dict[str, Any] = {}
+_mhc_op_cache: dict[Any, Any] = {}
+
+_PRE_PARTITION_SPECS = (
+    P(ATTN_DATA_AXIS, None, None),  # residual
+    P(),  # fn
+    P(),  # hc_scale
+    P(),  # hc_base
+)
+
+_POST_PARTITION_SPECS = (
+    P(ATTN_DATA_AXIS, None),  # x
+    P(ATTN_DATA_AXIS, None, None),  # residual
+    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+)
+
+_FUSED_PARTITION_SPECS = (
+    P(ATTN_DATA_AXIS, None),  # x
+    P(ATTN_DATA_AXIS, None, None),  # residual
+    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+    P(),  # fn
+    P(),  # hc_scale
+    P(),  # hc_base
+)
 
 
 def _name_float(value: float) -> str:
@@ -57,9 +81,11 @@ def _gate_suffix(
 ) -> str:
     """The gate constants are baked into the traced op, so they name it."""
     return (
-        f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
-        f"_s{_name_float(hc_sinkhorn_eps)}"
-        f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
+        f"_r{rms_eps:.6g}_p{hc_pre_eps:.6g}"
+        f"_s{hc_sinkhorn_eps:.6g}"
+        f"_a{hc_post_mult_value:.6g}_i{sinkhorn_repeat}".replace(".", "p")
+        .replace("-", "m")
+        .replace("+", "")
     )
 
 
@@ -136,20 +162,25 @@ def _fake_pre_outputs(
     residual: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(post_mix, comb_mix, layer_input) placeholders for Dynamo tracing."""
-    outer_shape = residual.shape[:-2]
-    hc_mult, hidden_size = residual.shape[-2:]
+    dev = residual.device
+    shape = residual.shape
+    if len(shape) == 3:
+        t, hc_mult, hidden_size = shape
+        return (
+            torch.empty((t, hc_mult, 1), dtype=torch.float32, device=dev),
+            torch.empty((t, hc_mult, hc_mult), dtype=torch.float32, device=dev),
+            torch.empty((t, hidden_size), dtype=residual.dtype, device=dev),
+        )
+    outer_shape = shape[:-2]
+    hc_mult, hidden_size = shape[-2:]
     return (
-        torch.empty(
-            (*outer_shape, hc_mult, 1), dtype=torch.float32, device=residual.device
-        ),
+        torch.empty((*outer_shape, hc_mult, 1), dtype=torch.float32, device=dev),
         torch.empty(
             (*outer_shape, hc_mult, hc_mult),
             dtype=torch.float32,
-            device=residual.device,
+            device=dev,
         ),
-        torch.empty(
-            (*outer_shape, hidden_size), dtype=residual.dtype, device=residual.device
-        ),
+        torch.empty((*outer_shape, hidden_size), dtype=residual.dtype, device=dev),
     )
 
 
@@ -196,12 +227,7 @@ def _mhc_pre_op(
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
             mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
-            ),
+            input_partition_specs=_PRE_PARTITION_SPECS,
         )
         op.register_fake(_fake_mhc_pre)
         _mhc_op_cache[op_name] = op
@@ -221,12 +247,7 @@ def get_mhc_post_op():
             op_name,
             _mhc_post_jax,
             mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-            ),
+            input_partition_specs=_POST_PARTITION_SPECS,
         )
         op.register_fake(_fake_mhc_post)
         _mhc_op_cache[op_name] = op
@@ -259,15 +280,7 @@ def _mhc_fused_post_pre_op(
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
             mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
-            ),
+            input_partition_specs=_FUSED_PARTITION_SPECS,
         )
         op.register_fake(_fake_mhc_fused_post_pre)
         _mhc_op_cache[op_name] = op
@@ -314,9 +327,13 @@ def get_mhc_ops(
     """
     gates = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
     # Both gated ops are named by the same constants; format the suffix once.
-    suffix = _gate_suffix(*gates)
-    return MHCOps(
-        pre=_mhc_pre_op(*gates, suffix=suffix),
-        fused=_mhc_fused_post_pre_op(*gates, suffix=suffix),
-        post=get_mhc_post_op(),
-    )
+    ops = _mhc_op_cache.get(gates)
+    if ops is None:
+        suffix = _gate_suffix(*gates)
+        ops = MHCOps(
+            pre=_mhc_pre_op(*gates, suffix=suffix),
+            fused=_mhc_fused_post_pre_op(*gates, suffix=suffix),
+            post=get_mhc_post_op(),
+        )
+        _mhc_op_cache[gates] = ops
+    return ops
