@@ -15,6 +15,9 @@ which ``support_torch_compile`` cannot read. The dims are spelled out below
 anyway, so nothing here depends on annotation style.
 """
 
+import types
+from typing import Any
+
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
@@ -50,6 +53,13 @@ class MtpLoopStepModel(nn.Module):
         self.prefix = prefix
         self.mtp = mtp
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "mtp" and isinstance(value, nn.Module):
+            object.__setattr__(
+                self, "_mtp_forward", types.MethodType(type(value).forward, value)
+            )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -62,8 +72,7 @@ class MtpLoopStepModel(nn.Module):
         # The draft class's forward, called unbound: this program runs exactly
         # what the step-0 program runs, and Dynamo traces it inline instead of
         # going through the draft's own compiled wrapper.
-        return type(self.mtp).forward(
-            self.mtp,
+        return self._mtp_forward(
             input_ids,
             positions,
             hidden_states,
