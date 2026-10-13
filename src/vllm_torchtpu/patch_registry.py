@@ -123,6 +123,8 @@ PATCHES = (
     Patch("vllm_torchtpu.platforms.tpu_platform:_apply_model_specific_patches",
           ("platform_activation", "model_load"),
           model_config=True),
+    Patch("vllm_torchtpu.models.microbatch.qwen:patch_qwen_microbatch",
+          (*_ACTIVE, "model_load")),
 )
 
 _applied: set[str] = set()

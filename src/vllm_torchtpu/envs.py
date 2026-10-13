@@ -82,6 +82,13 @@ if TYPE_CHECKING:
     TPU_SP_FP8_GATHER: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_STEP: int = 0
+    TPU_MICROBATCH_FACTOR: int = 1
+    TPU_MICROBATCH_MIN_TOKENS: int = 1024
+    TPU_MICROBATCH_MERGE_MOE: bool = True
+    TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS: int = 0
+    TPU_MICROBATCH_LAYERWISE: bool = False
+    TPU_MICROBATCH_SCHEDULE: str = "substage"
+    TPU_MICROBATCH_FENCE: str = "substage"
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -664,6 +671,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two wastes up to half of it; 0 keeps the ladder alone.
     "TPU_TOKEN_BUCKET_STEP":
     lambda: int(os.getenv("TPU_TOKEN_BUCKET_STEP", "0")),
+    "TPU_MICROBATCH_FACTOR": lambda: int(os.getenv("TPU_MICROBATCH_FACTOR", "1")),
+    "TPU_MICROBATCH_MIN_TOKENS": lambda: int(os.getenv("TPU_MICROBATCH_MIN_TOKENS", "1024")),
+    "TPU_MICROBATCH_MERGE_MOE": env_bool("TPU_MICROBATCH_MERGE_MOE", default=True),
+    "TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS": lambda: int(os.getenv("TPU_MICROBATCH_SPLIT_MOE_MIN_TOKENS", "0")),
+    "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
+    "TPU_MICROBATCH_SCHEDULE": lambda: os.getenv("TPU_MICROBATCH_SCHEDULE", "substage").strip().lower(),
+    "TPU_MICROBATCH_FENCE": lambda: os.getenv("TPU_MICROBATCH_FENCE", "substage").strip().lower(),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS":

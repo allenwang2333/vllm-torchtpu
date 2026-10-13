@@ -66,6 +66,10 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def get_padding_state() -> "TokenPaddingState | None":
+    return _padding_state
+
+
 def get_local_valid_tokens() -> torch.Tensor | None:
     """Return this rank's persistent valid-prefix length, when configured."""
     if _padding_state is None:

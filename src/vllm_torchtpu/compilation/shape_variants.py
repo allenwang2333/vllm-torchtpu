@@ -173,18 +173,39 @@ def _input_permutation(old: list[tuple[str, Any]],
     """Map reordered trace inputs to stored runnable slots."""
     if len(old) != len(new):
         return None
-    new_index = {name: i for i, (name, _) in enumerate(new)}
-    if len(new_index) != len(new):
-        return None
-    perm = []
-    for name, entry in old:
-        i = new_index.get(name)
-        if i is None or new[i][1] != entry:
+    position = {entry: i for i, entry in enumerate(new)}
+    perm = [position.get(entry) for entry in old]
+    if None not in perm and len(set(perm)) == len(old):
+        return perm
+
+    used_new: set[int] = set()
+    full_perm: list[int | None] = [None] * len(old)
+    new_by_entry: dict[tuple[str, Any], list[int]] = {}
+    for j, entry in enumerate(new):
+        new_by_entry.setdefault(entry, []).append(j)
+    for i, entry in enumerate(old):
+        candidates = new_by_entry.get(entry)
+        if candidates:
+            j = candidates.pop(0)
+            full_perm[i] = j
+            used_new.add(j)
+
+    unmatched_new_by_meta: dict[Any, list[int]] = {}
+    for j, (_name, meta) in enumerate(new):
+        if j not in used_new:
+            unmatched_new_by_meta.setdefault(meta, []).append(j)
+
+    for i, (_name, meta) in enumerate(old):
+        if full_perm[i] is not None:
+            continue
+        candidates = unmatched_new_by_meta.get(meta)
+        if not candidates:
             return None
-        perm.append(i)
-    if len(set(perm)) != len(perm):
+        full_perm[i] = candidates.pop(0)
+
+    if None in full_perm or len(set(full_perm)) != len(old):
         return None
-    return perm
+    return [int(x) for x in full_perm if x is not None]
 
 
 def _signature_delta(cached: Sequence[Any], current: Sequence[Any]) -> str:

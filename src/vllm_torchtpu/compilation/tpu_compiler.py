@@ -171,6 +171,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/vllm/quantization",
     "vllm_torchtpu/layers/vllm/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    "vllm_torchtpu/models/microbatch/fence.py",
 )
 
 
