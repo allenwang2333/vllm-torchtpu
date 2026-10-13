@@ -20,9 +20,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import pool_alias
-from .config import F32, bswitch
-from .context import MKBuildContext
+try:
+    from . import pool_alias
+    from .config import F32, bswitch
+    from .context import MKBuildContext
+except ImportError:
+    import pool_alias
+    from config import F32, bswitch
+    from context import MKBuildContext
 
 
 class DenseWeightRing:

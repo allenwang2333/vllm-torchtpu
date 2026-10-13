@@ -6,20 +6,36 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from .config import (
-    BF16,
-    F32,
-    FP8,
-    I32,
-    NN,
-    NT,
-    U32,
-    bswitch,
-    pool_alias,
-    rnd,
-)
-from .context import MKBuildContext
-from .pool_dma import KVPoolDMA
+try:
+    from .config import (
+        BF16,
+        F32,
+        FP8,
+        I32,
+        NN,
+        NT,
+        U32,
+        bswitch,
+        pool_alias,
+        rnd,
+    )
+    from .context import MKBuildContext
+    from .pool_dma import KVPoolDMA
+except ImportError:
+    from config import (
+        BF16,
+        F32,
+        FP8,
+        I32,
+        NN,
+        NT,
+        U32,
+        bswitch,
+        pool_alias,
+        rnd,
+    )
+    from context import MKBuildContext
+    from pool_dma import KVPoolDMA
 
 
 class PagedAttentionBlock:

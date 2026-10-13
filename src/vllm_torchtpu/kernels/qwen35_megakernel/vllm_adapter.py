@@ -33,6 +33,7 @@ Pallas megakernel (`megakernel.py` + `pool_io.py`):
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import time
@@ -46,8 +47,10 @@ import torch
 import torch.nn.functional as F
 from jax.sharding import PartitionSpec as P
 
+import vllm_torchtpu.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
+
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 
@@ -283,6 +286,15 @@ def parse_mk_zero_copy(env_val: str | None = None) -> bool:
     pool storage under any connector views of the pools (re-synced best effort
     in `_sync_raiden_pool_storages`); kept off until that path is gated."""
     return _env_flag("VLLM_TPU_QWEN35_MK_ZERO_COPY", "0", env_val)
+
+
+def parse_mk_fuse_prep(env_val: str | None = None) -> bool:
+    """`VLLM_TPU_QWEN35_MK_FUSE_PREP` (default on): fuse `prep_only` (`embed_tokens` +
+    metadata slice/pad) and output row slicing directly into the JAX `sharded_jax_callable`."""
+    if env_val is not None:
+        return env_val.strip().lower() not in ("0", "false", "no", "off", "none")
+    return bool(envs.VLLM_TPU_QWEN35_MK_FUSE_PREP)
+
 
 
 # Per-flag kernel switches for bisecting the v16 megakernel defaults without a
@@ -1705,6 +1717,7 @@ class Qwen35Megakernel:
         mesh: jax.sharding.Mesh | None = None,
         fused_pool_io: bool | None = None,
         zero_copy: bool | None = None,
+        fuse_prep: bool | None = None,
     ) -> None:
         _need(mode in ("ep", "tp"), f"unsupported VLLM_TPU_QWEN35_MK_MODE={mode!r}")
         self.mode = mode
@@ -1719,6 +1732,7 @@ class Qwen35Megakernel:
         self.fused_pool_io_min_b_hi = parse_mk_fused_pool_io_min_b_hi()
         self._hlo_checked = False
         self.zero_copy = parse_mk_zero_copy() if zero_copy is None else bool(zero_copy)
+        self.fuse_prep = parse_mk_fuse_prep() if fuse_prep is None else bool(fuse_prep)
         self._runner_ref: Any = runner
         self._raiden_sync_views: list[tuple[int, torch.Tensor, tuple[int, ...]]] = []
         self.backbone = _find_backbone(runner.model)
@@ -1921,6 +1935,22 @@ class Qwen35Megakernel:
         ]
         self.attn_layer_name = self.backbone.layers[3].self_attn.attn.layer_name
 
+        # The stock GDN op and the KV connectors place manager block b's GDN state at kernel page
+        # b * (block_size // page_size), so checkpoint slots sit that many pages apart.
+        block_size = int(
+            getattr(runner, "block_size", 0) or runner.vllm_config.cache_config.block_size
+        )
+        _need(
+            block_size % self.page_size == 0,
+            f"vLLM block_size {block_size} is not a multiple of the kernel page size {self.page_size}",
+        )
+        gdn_stride = block_size // self.page_size
+        _need(
+            gdn_stride >= self.base_cfg.gdn_pages,
+            f"vLLM block_size {block_size} holds {gdn_stride} kernel pages, fewer than the "
+            f"{self.base_cfg.gdn_pages} of one GDN state checkpoint",
+        )
+
         self.base_cfg = dataclasses.replace(
             self.base_cfg,
             ctx=max(self.base_cfg.ctx, self.max_pages_per_seq * self.page_size),
@@ -1928,6 +1958,7 @@ class Qwen35Megakernel:
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
             paged_kv=True,
+            gdn_stride_pages=gdn_stride,
         )
 
         runner_token_paddings = tuple(
@@ -1944,11 +1975,12 @@ class Qwen35Megakernel:
         self._bound = True
         logger.info(
             "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
-            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s, "
-            "fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s)",
+            "page_size=%d, gdn_stride_pages=%d, max_pages_per_seq=%d, decode_buckets=%s, "
+            "verify_buckets=%s, fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s)",
             len(self.raw_pools),
             self.num_pages,
             self.page_size,
+            self.base_cfg.gdn_stride,
             self.max_pages_per_seq,
             self.buckets,
             self.verify_buckets,
@@ -2180,6 +2212,27 @@ class Qwen35Megakernel:
         hi = self.fused_pool_io_min_b_hi
         return bucket_t <= self.fused_pool_io_max_b or (hi > 0 and bucket_t >= hi)
 
+    def _can_fuse_prep(self) -> bool:
+        emb = getattr(self, "embed_tokens", None)
+        w = getattr(emb, "weight", None)
+        return isinstance(w, torch.Tensor) and w.ndim == 2
+
+    def _embed_meta(self) -> dict[str, Any]:
+        emb = getattr(self, "embed_tokens", None)
+        shard_idx = getattr(emb, "shard_indices", None)
+        return {
+            "embed_tp_size": int(getattr(emb, "tp_size", 1)),
+            "embed_vocab_size": getattr(emb, "num_embeddings", None),
+            "embed_org_vocab_size": getattr(emb, "org_vocab_size", None),
+            "embed_org_vocab_size_padded": getattr(
+                shard_idx, "org_vocab_size_padded", None
+            ),
+            "embed_vocab_size_padded": getattr(
+                emb, "num_embeddings_padded", None
+            ),
+            "has_tp_rank_arg": True,
+        }
+
     def _build_bucket_op(
         self,
         bucket_t: int,
@@ -2213,15 +2266,19 @@ class Qwen35Megakernel:
 
         m_rows = c.M
         target_out_rows = int(out_pad_rows or m_rows)
+        fuse_prep = bool(getattr(self, "fuse_prep", True))
 
         if hasattr(pool_io, "make_flat_pooled_step"):
+            mk_kwargs: dict[str, Any] = {"fused_pool_io": bucket_fused}
+            if (
+                fuse_prep
+                and "out_rows"
+                in inspect.signature(pool_io.make_flat_pooled_step).parameters
+            ):
+                mk_kwargs["out_rows"] = target_out_rows
             step_fn, in_specs, out_specs, donate_argnums = (
                 pool_io.make_flat_pooled_step(
-                    self.mesh,
-                    c,
-                    tiles,
-                    fused_pool_io=bucket_fused,
-                    out_rows=target_out_rows,
+                    self.mesh, c, tiles, **mk_kwargs
                 )
             )
             if bucket_fused and not self._hlo_checked:
@@ -2241,13 +2298,10 @@ class Qwen35Megakernel:
                     )
                     bucket_fused = False
                     c = dataclasses.replace(c, fused_pool_io=False)
+                    mk_kwargs["fused_pool_io"] = False
                     step_fn, in_specs, out_specs, donate_argnums = (
                         pool_io.make_flat_pooled_step(
-                            self.mesh,
-                            c,
-                            tiles,
-                            fused_pool_io=False,
-                            out_rows=target_out_rows,
+                            self.mesh, c, tiles, **mk_kwargs
                         )
                     )
                 else:
@@ -2267,6 +2321,22 @@ class Qwen35Megakernel:
                 out_specs = (P("tp"),) * (1 + n_p)
                 donate_argnums = tuple(range(2 + n_w, 2 + n_w + n_p))
         self._bucket_fused[(tokens_per_seq, bucket_t)] = bucket_fused
+
+        use_fused_prep = bool(
+            fuse_prep
+            and self._can_fuse_prep()
+            and getattr(step_fn, "_inner_body", None) is not None
+            and hasattr(pool_io, "wrap_step_with_fused_prep")
+        )
+        if use_fused_prep:
+            step_fn, in_specs, out_specs, donate_argnums = (
+                pool_io.wrap_step_with_fused_prep(
+                    step_fn,
+                    self.mesh,
+                    c,
+                    **self._embed_meta(),
+                )
+            )
 
         n_p = len(self.raw_pools)
         n_in = len(in_specs)
@@ -2295,47 +2365,118 @@ class Qwen35Megakernel:
             donate_argnums=donate_argnums,
         )
 
-        # Wrap in a torch custom_op taking list[Tensor] for weights and pools
-        # to stay well under PyTorch dispatcher's 64-argument schema cap.
-        @torch.library.custom_op(op_name, mutates_args=())
-        def op(
-            pos: torch.Tensor,
-            hidden: torch.Tensor,
-            page_table: torch.Tensor,
-            ckpt_indices: torch.Tensor,
-            read_offsets: torch.Tensor,
-            weights: list[torch.Tensor],
-            pools: list[torch.Tensor],
-        ) -> list[torch.Tensor]:
-            return list(
-                flat_callable(
-                    pos,
-                    hidden,
-                    *weights,
-                    *pools,
-                    page_table,
-                    ckpt_indices,
-                    read_offsets,
+        if use_fused_prep:
+            embed_weight = self.embed_tokens.weight
+            tp_rank_1d = getattr(self, "_tp_rank_1d", None)
+            if (
+                not isinstance(tp_rank_1d, torch.Tensor)
+                or tp_rank_1d.device != embed_weight.device
+            ):
+                tp_rank_1d = torch.tensor(
+                    [int(getattr(self, "tp_rank", 0))],
+                    dtype=torch.int32,
+                    device=embed_weight.device,
                 )
-            )
+                self._tp_rank_1d = tp_rank_1d
 
-        @op.register_fake
-        def _(
-            pos: torch.Tensor,
-            hidden: torch.Tensor,
-            page_table: torch.Tensor,
-            ckpt_indices: torch.Tensor,
-            read_offsets: torch.Tensor,
-            weights: list[torch.Tensor],
-            pools: list[torch.Tensor],
-        ) -> list[torch.Tensor]:
-            return [
-                torch.empty(
-                    (target_out_rows, hidden.shape[1]),
-                    dtype=hidden.dtype,
-                    device=hidden.device,
+            @torch.library.custom_op(op_name, mutates_args=())
+            def op(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                embed_w: torch.Tensor,
+                tp_rank: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> list[torch.Tensor]:
+                return list(
+                    flat_callable(
+                        input_ids,
+                        positions,
+                        block_tables,
+                        s0,
+                        c0,
+                        s1,
+                        c1,
+                        s2,
+                        c2,
+                        roff,
+                        embed_w,
+                        tp_rank,
+                        *weights,
+                        *pools,
+                    )
                 )
-            ] + [torch.empty_like(p) for p in pools]
+
+            @op.register_fake
+            def _(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                embed_w: torch.Tensor,
+                tp_rank: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> list[torch.Tensor]:
+                return [
+                    embed_w.new_empty((target_out_rows, int(c.H)))
+                ] + [torch.empty_like(p) for p in pools]
+        else:
+            # Wrap in a torch custom_op taking list[Tensor] for weights and pools
+            # to stay well under PyTorch dispatcher's 64-argument schema cap.
+            @torch.library.custom_op(op_name, mutates_args=())
+            def op(
+                pos: torch.Tensor,
+                hidden: torch.Tensor,
+                page_table: torch.Tensor,
+                ckpt_indices: torch.Tensor,
+                read_offsets: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> list[torch.Tensor]:
+                return list(
+                    flat_callable(
+                        pos,
+                        hidden,
+                        *weights,
+                        *pools,
+                        page_table,
+                        ckpt_indices,
+                        read_offsets,
+                    )
+                )
+
+            @op.register_fake
+            def _(
+                pos: torch.Tensor,
+                hidden: torch.Tensor,
+                page_table: torch.Tensor,
+                ckpt_indices: torch.Tensor,
+                read_offsets: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> list[torch.Tensor]:
+                return [
+                    torch.empty(
+                        (target_out_rows, hidden.shape[1]),
+                        dtype=hidden.dtype,
+                        device=hidden.device,
+                    )
+                ] + [torch.empty_like(p) for p in pools]
 
         self._bucket_ops[(tokens_per_seq, bucket_t)] = op
         if tokens_per_seq == 1:
@@ -2349,8 +2490,6 @@ class Qwen35Megakernel:
         B = int(bucket_t)
         nseq_bkt = B // T
         max_pages = int(self.max_pages_per_seq)
-        m_rows = c.M
-        target_out_rows = int(out_pad_rows or m_rows)
 
         def prep_only(
             input_ids: torch.Tensor,
@@ -2447,6 +2586,45 @@ class Qwen35Megakernel:
             return h_out
 
         if self.zero_copy:
+            if use_fused_prep:
+                def zero_copy_step(
+                    input_ids: torch.Tensor,
+                    positions: torch.Tensor,
+                    block_tables: torch.Tensor,
+                    s0: torch.Tensor,
+                    c0: torch.Tensor,
+                    s1: torch.Tensor,
+                    c1: torch.Tensor,
+                    s2: torch.Tensor,
+                    c2: torch.Tensor,
+                    roff: torch.Tensor,
+                    weights: list[torch.Tensor],
+                    pools: list[torch.Tensor],
+                ) -> torch.Tensor:
+                    outs = flat_callable(
+                        input_ids,
+                        positions,
+                        block_tables,
+                        s0,
+                        c0,
+                        s1,
+                        c1,
+                        s2,
+                        c2,
+                        roff,
+                        embed_weight,
+                        tp_rank_1d,
+                        *weights,
+                        *pools,
+                    )
+                    for dst, src in zip(pools, outs[1 : 1 + n_p]):
+                        dst.set_(src)
+                    if self._raiden_sync_views:
+                        self._sync_raiden_pool_storages(pools)
+                    return _fit_out_rows(outs[0])
+
+                return zero_copy_step
+
             # `dst.set_(src)` cannot live inside the compiled graph: compile the
             # input preparation alone and rebind the pools eagerly around the
             # sharded callable (the donated pool inputs come back as outputs).
@@ -2496,35 +2674,70 @@ class Qwen35Megakernel:
 
             return zero_copy_step
 
-        def step(
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            block_tables: torch.Tensor,
-            s0: torch.Tensor,
-            c0: torch.Tensor,
-            s1: torch.Tensor,
-            c1: torch.Tensor,
-            s2: torch.Tensor,
-            c2: torch.Tensor,
-            roff: torch.Tensor,
-            weights: list[torch.Tensor],
-            pools: list[torch.Tensor],
-        ) -> torch.Tensor:
-            pos_b, h0, pt_b, ckpt_b, roff_b = prep_only(
-                input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
-            )
-            outs = op(
-                pos_b,
-                h0,
-                pt_b,
-                ckpt_b,
-                roff_b,
-                list(weights),
-                list(pools),
-            )
-            for dst, src in zip(pools, outs[1 : 1 + n_p]):
-                dst.copy_(src)
-            return _fit_out_rows(outs[0])
+        if use_fused_prep:
+            def step(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> torch.Tensor:
+                outs = op(
+                    input_ids,
+                    positions,
+                    block_tables,
+                    s0,
+                    c0,
+                    s1,
+                    c1,
+                    s2,
+                    c2,
+                    roff,
+                    embed_weight,
+                    tp_rank_1d,
+                    list(weights),
+                    list(pools),
+                )
+                for dst, src in zip(pools, outs[1 : 1 + n_p]):
+                    dst.copy_(src)
+                return _fit_out_rows(outs[0])
+        else:
+            def step(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> torch.Tensor:
+                pos_b, h0, pt_b, ckpt_b, roff_b = prep_only(
+                    input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
+                )
+                outs = op(
+                    pos_b,
+                    h0,
+                    pt_b,
+                    ckpt_b,
+                    roff_b,
+                    list(weights),
+                    list(pools),
+                )
+                for dst, src in zip(pools, outs[1 : 1 + n_p]):
+                    dst.copy_(src)
+                return _fit_out_rows(outs[0])
 
         step.__code__ = step.__code__.replace(co_name=f"step_t{tokens_per_seq}_b{bucket_t}")
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
@@ -2849,7 +3062,9 @@ class Qwen35Megakernel:
             return False
         t0 = time.monotonic()
         try:
-            T, B, NP, MPS = 4, 4, 32, 32
+            T, B, MPS = 4, 4, 32
+            # Checkpoint slots 1..T at the bound GDN stride, then 3 KV pages.
+            NP = max(32, (1 + T) * self.base_cfg.gdn_stride + 3)
             bucket_fused = bool(self.fused_pool_io and self._bucket_is_fused(B))
             c = dataclasses.replace(
                 self.base_cfg,
@@ -2883,12 +3098,13 @@ class Qwen35Megakernel:
                 donate_argnums=donate_argnums,
             )
 
-            # One sequence with plen = 10 cached tokens on page 25; pages 26..27
-            # complete its first 2048-token KV block together with the padded
-            # page 0. Checkpoint slots 1..4 (pages 5..24 at R=8) hold zero GDN
-            # states.
-            kv_page, ckpt0 = 25, 1
-            gp = c.gdn_pages
+            # One sequence with plen = 10 cached tokens on page kv_page (25 when
+            # GDN slots are packed); the next 2 pages complete its first 2048-token
+            # KV block together with the padded page 0. Checkpoint slots 1..4
+            # (pages 5..24 at R=8 with packed slots) hold zero GDN states.
+            ckpt0 = 1
+            gp = c.gdn_stride
+            kv_page = max(25, (ckpt0 + T) * gp)
             u8 = np.full((NP, 2, 64, 4, self.page_size), 0xFF, dtype=np.uint8)
             u8[ckpt0 * gp:(ckpt0 + T) * gp] = 0
             u8[kv_page] = 0
@@ -2970,7 +3186,7 @@ class Qwen35Megakernel:
         max_t = max(T for T, _ in all_keys)
         # Fused pool I/O sentinel pages: KV page 0 and the rec pages of GDN
         # checkpoint slot 1 (pages 5..8 at R=8).
-        gp = self.base_cfg.gdn_pages
+        gp = self.base_cfg.gdn_stride
         gdn_sent = slice(gp, gp + self.base_cfg.rec_pages)
         n_save = min(self.num_pages, max(gp, gp * (max_t + 1)))
         # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
@@ -2986,18 +3202,29 @@ class Qwen35Megakernel:
                 runner_tok_pads = tuple(
                     int(x) for x in getattr(runner, "num_tokens_paddings", ())
                 )
-                runner_req_pads = tuple(
-                    sorted(
-                        {
-                            int(x)
-                            for x in (
-                                getattr(runner, "num_reqs_max_model_len", None),
-                                getattr(runner, "num_reqs_most_model_len", None),
-                            )
-                            if x is not None
-                        }
+                most_ml = getattr(runner, "most_model_len", None)
+                most_reqs = getattr(runner, "num_reqs_most_model_len", None)
+                max_b = max((int(b) for _, b in all_keys), default=0)
+                if (
+                    self.fuse_prep
+                    and most_ml is not None
+                    and most_reqs is not None
+                    and int(most_ml) >= max_b
+                ):
+                    runner_req_pads = (int(most_reqs),)
+                else:
+                    runner_req_pads = tuple(
+                        sorted(
+                            {
+                                int(x)
+                                for x in (
+                                    getattr(runner, "num_reqs_max_model_len", None),
+                                    most_reqs,
+                                )
+                                if x is not None
+                            }
+                        )
                     )
-                )
                 roff_buf = getattr(runner, "mamba_slot_read_offsets", None)
                 has_roff = isinstance(roff_buf, torch.Tensor)
                 r_raw = roff_buf if has_roff else self._zero_roff_1d

@@ -558,3 +558,140 @@ def test_mk_max_running_caps_running_seqs_when_megakernel_active(monkeypatch):
     assert s._resolve_mk_max_running() == 0
 
 
+def test_wspt_orders_waiting_queue_by_cold_tokens_times_osl():
+    # r_long_out has fewer cold tokens (512) but huge max_tokens (1024) ->
+    # WSPT score = 512 * 1024 = 524,288.
+    # r_short_out has more cold tokens (1024) but small max_tokens (32) ->
+    # WSPT score = 1024 * 32 = 32,768.
+    r_long_out = _make_request("long_out", num_tokens=2048, arrival_time=1.0)
+    r_long_out.max_tokens = 1024
+    r_short_out = _make_request("short_out", num_tokens=2048, arrival_time=2.0)
+    r_short_out.max_tokens = 32
+
+    warmth = {"long_out": 1536, "short_out": 1024}  # cold: 512 vs 1024
+
+    # Default (WSPT off): pure SRPF keeps long_out (512 cold) ahead of short_out (1024 cold)
+    s_default = _make_scheduler([r_long_out, r_short_out], warmth)
+    s_default._wspt_enable = False
+    q_default = s_default._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q_default] == ["long_out", "short_out"]
+
+    # WSPT enabled: short_out (1024 * 32 = 32,768) is promoted ahead of long_out (512 * 1024 = 524,288)
+    s_wspt = _make_scheduler([r_long_out, r_short_out], warmth)
+    s_wspt._wspt_enable = True
+    q_wspt = s_wspt._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q_wspt] == ["short_out", "long_out"]
+
+
+def test_wspt_orders_running_prefills_by_remaining_times_osl(monkeypatch):
+    seen = {}
+
+    def fake_schedule(self, *args, **kwargs):
+        seen["order"] = [r.request_id for r in self.running]
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+
+    dec = _running_request("dec", prompt=1000, computed=1000)
+    # p_long_out: 1000 remaining prompt tokens, max_tokens=1000 -> WSPT = 1,000,000
+    p_long_out = _running_request("p_long_out", prompt=2000, computed=1000)
+    p_long_out.max_tokens = 1000
+    # p_short_out: 2000 remaining prompt tokens, max_tokens=32 -> WSPT = 64,000
+    p_short_out = _running_request("p_short_out", prompt=4000, computed=2000)
+    p_short_out.max_tokens = 32
+
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = [p_long_out, dec, p_short_out]
+    s._wspt_enable = True
+    assert s.schedule() == "out"
+    assert seen["order"] == ["dec", "p_short_out", "p_long_out"]
+
+
+def test_near_finish_decode_protection_defers_large_prefill_with_starvation_cap():
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.block_size = 640
+    s.num_spec_tokens = 3  # tokens_per_dec = 4
+    s._step_num_decoding = 4
+    s._step_decode_tokens = 16
+    s._finish_decode_steps = 2  # threshold = 2 * 4 = 8 remaining output tokens
+    s._finish_decode_max_deferral_steps = 2
+    s._finish_decode_prefill_min_tokens = 2048
+    s._finish_decode_defer_streak = 0
+    s.waiting = []
+    s.skipped_waiting = []
+
+    near_done = _running_request("d_near", prompt=1000, computed=1094)
+    near_done.max_tokens = 100
+    near_done.num_output_tokens = 94  # remaining = 6 <= 8
+    far_from_done = _running_request("d_far", prompt=1000, computed=1050)
+    far_from_done.max_tokens = 100
+    far_from_done.num_output_tokens = 50  # remaining = 50 > 8
+    s.running = [near_done, far_from_done]
+
+    cold = _running_request("cold", prompt=20_000, computed=0)
+    warm_small = _running_request("warm_small", prompt=2000, computed=1500)
+
+    # Small warm prefill (500 < 2048) is NOT deferred even when near_done is active:
+    assert s._cap_cold_prefill_tokens(warm_small, 1500, 500) == 500
+    assert s._finish_decode_defer_streak == 0
+
+    # Large prefill (4096 >= 2048) is deferred for up to max_deferral_steps (2) steps:
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 0
+    assert s._finish_decode_defer_streak == 1
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 0
+    assert s._finish_decode_defer_streak == 2
+
+    # On the 3rd consecutive attempt (streak == 2 == max_deferral_steps), starvation cap
+    # allows the prefill through and resets the streak to 0:
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 4096
+    assert s._finish_decode_defer_streak == 0
+
+    # When no decoder is within threshold, prefill is not deferred:
+    s.running = [far_from_done]
+    assert s._cap_cold_prefill_tokens(cold, 0, 4096) == 4096
+    assert s._finish_decode_defer_streak == 0
+
+
+def test_near_finish_decode_protection_in_schedule_loop(monkeypatch):
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.block_size = 640
+    s.num_spec_tokens = 3
+    s._finish_decode_steps = 2
+    s._finish_decode_max_deferral_steps = 2
+    s._finish_decode_prefill_min_tokens = 2048
+    s._finish_decode_defer_streak = 0
+    s.waiting = []
+    s.skipped_waiting = []
+
+    near_done = _running_request("d_near", prompt=1000, computed=1095)
+    near_done.max_tokens = 100
+    near_done.num_output_tokens = 95  # remaining = 5 <= 8
+    cold = _running_request("cold", prompt=20_000, computed=0)
+    s.running = [near_done, cold]
+
+    scheduled_chunks = []
+
+    def fake_schedule(self, *args, **kwargs):
+        toks = self._cap_cold_prefill_tokens(cold, 0, 4096)
+        scheduled_chunks.append(toks)
+        return "out"
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+
+    # Step 1: deferred (streak becomes 1)
+    s.schedule()
+    assert scheduled_chunks[-1] == 0
+    assert s._finish_decode_defer_streak == 1
+
+    # Step 2: deferred (streak becomes 2)
+    s.schedule()
+    assert scheduled_chunks[-1] == 0
+    assert s._finish_decode_defer_streak == 2
+
+    # Step 3: starvation cap reached -> allowed through, streak resets to 0
+    s.schedule()
+    assert scheduled_chunks[-1] == 4096
+    assert s._finish_decode_defer_streak == 0
+
+
+

@@ -5,15 +5,26 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from .config import (
-    BF16,
-    F32,
-    FP8,
-    I32,
-    U32,
-    bswitch,
-)
-from .context import MKBuildContext
+try:
+    from .config import (
+        BF16,
+        F32,
+        FP8,
+        I32,
+        U32,
+        bswitch,
+    )
+    from .context import MKBuildContext
+except ImportError:
+    from config import (
+        BF16,
+        F32,
+        FP8,
+        I32,
+        U32,
+        bswitch,
+    )
+    from context import MKBuildContext
 
 
 class GprRecIn:
@@ -98,7 +109,7 @@ class GDNPoolDMA:
         GDN_PAGES, G_PER_ATT = ctx.GDN_PAGES, ctx.G_PER_ATT
         roff = self.gdn_roff(sub, s)
         if ctx.ckpt_is_3d:
-            return ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+            return ST["ckpt_indices"][sub, s, roff] * ctx.GDN_STRIDE
         return ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
     def gdn_pb_out(self, sub, s, t):
@@ -106,7 +117,7 @@ class GDNPoolDMA:
         ST = ctx.ST
         GDN_PAGES, G_PER_ATT, ckpt_t_off = ctx.GDN_PAGES, ctx.G_PER_ATT, ctx.ckpt_t_off
         if ctx.ckpt_is_3d:
-            return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * GDN_PAGES
+            return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * ctx.GDN_STRIDE
         return (
             ST["ckpt_indices"][s, t + ckpt_t_off] * (GDN_PAGES * G_PER_ATT)
             + sub * GDN_PAGES
@@ -118,6 +129,8 @@ class GDNPoolDMA:
         T, ckpt_t_off = ctx.T, ctx.ckpt_t_off
         if not ctx.ckpt_is_3d or T <= 1:
             return jnp.bool_(T == 1)
+        if ctx.GDN_STRIDE != ctx.GDN_PAGES:
+            return jnp.bool_(False)  # consecutive slots are not adjacent pages
         s0 = ST["ckpt_indices"][sub, s, ckpt_t_off]
         ok = jnp.bool_(True)
         for t in range(1, T):

@@ -127,6 +127,7 @@ def gather_gdn_states(
     ssm_u32_rows = (vh * KD) // 2
     REC_PAGES = c.rec_pages
     GDN_PAGES = c.gdn_pages
+    GDN_STRIDE = c.gdn_stride
     SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
@@ -189,7 +190,7 @@ def gather_gdn_states(
             roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, roff]
-                return slot * GDN_PAGES
+                return slot * GDN_STRIDE
             else:
                 slot = ckpt_ref[s, roff]
                 return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
@@ -549,6 +550,7 @@ def scatter_pool_states(
     ssm_u32_rows = (vh * KD) // 2
     REC_PAGES = c.rec_pages
     GDN_PAGES = c.gdn_pages
+    GDN_STRIDE = c.gdn_stride
     SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
@@ -670,7 +672,7 @@ def scatter_pool_states(
         def pb_for(sub, s, t):
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, t + ckpt_t_off]
-                return slot * GDN_PAGES
+                return slot * GDN_STRIDE
             else:
                 slot = ckpt_ref[s, t + ckpt_t_off]
                 return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
@@ -678,6 +680,8 @@ def scatter_pool_states(
         def is_contig_ckpt(sub, s):
             if not ckpt_is_3d or T <= 1:
                 return jnp.bool_(T == 1)
+            if GDN_STRIDE != GDN_PAGES:
+                return jnp.bool_(False)  # consecutive slots are not adjacent pages
             s0 = ckpt_ref[sub, s, ckpt_t_off]
             ok = jnp.bool_(True)
             for t in range(1, T):
@@ -1339,6 +1343,211 @@ def check_fused_pool_hlo(
     return True, "ok"
 
 
+def _jax_slice_or_pad_1d(
+    x: jax.Array, target_len: int, pad_val: int = 0
+) -> jax.Array:
+    """Slice or 1-D pad `x` to `(target_len,)` in JAX."""
+    x1 = x.reshape(-1)
+    n = x1.shape[0]
+    if n == target_len:
+        return x1
+    if n > target_len:
+        return x1[:target_len]
+    return jnp.pad(x1, (0, target_len - n), constant_values=pad_val)
+
+
+def _jax_slice_or_pad_2d(
+    x: jax.Array, target_r: int, target_c: int, pad_val: int = 0
+) -> jax.Array:
+    """Slice or 2-D pad `x` to `(target_r, target_c)` in JAX."""
+    r, c = x.shape[0], x.shape[1]
+    if r > target_r:
+        x = x[:target_r]
+        r = target_r
+    if c > target_c:
+        x = x[:, :target_c]
+        c = target_c
+    if r == target_r and c == target_c:
+        return x
+    return jnp.pad(
+        x, ((0, target_r - r), (0, target_c - c)), constant_values=pad_val
+    )
+
+
+def jax_vocab_parallel_embed(
+    ids_b: jax.Array,
+    embed_w: jax.Array,
+    *,
+    tp_axis: str = "tp",
+    tp_size: int = 1,
+    tp_rank: jax.Array | int | None = None,
+    vocab_size: int | None = None,
+    org_vocab_size: int | None = None,
+    org_vocab_size_padded: int | None = None,
+    vocab_size_padded: int | None = None,
+) -> jax.Array:
+    """Pure-JAX replica of `VocabParallelEmbedding.forward` inside `shard_map`."""
+    n_part = int(embed_w.shape[0])
+    if tp_size <= 1:
+        clipped = jnp.clip(ids_b, 0, n_part - 1)
+        valid = (ids_b >= 0) & (ids_b < (vocab_size or n_part))
+        out = embed_w[clipped]
+        return jnp.where(valid[:, None], out, jnp.zeros_like(out))
+
+    # Under torch_tpu's jax.export bridge, calling `lax.axis_index` outside
+    # `pallas_call` lowers to `stablehlo.partition_id`, which XLA's SPMD
+    # partitioner rejects. Passing `tp_rank` as a sharded int32[1] operand
+    # avoids `partition_id` while keeping the compiled module identical across ranks.
+    if tp_rank is None:
+        rank = lax.axis_index(tp_axis)
+    elif hasattr(tp_rank, "reshape"):
+        rank = tp_rank.reshape(-1)[0].astype(jnp.int32)
+    else:
+        rank = jnp.int32(tp_rank)
+    org_vocab = int(org_vocab_size if org_vocab_size is not None else (vocab_size or (n_part * tp_size)))
+    org_padded = int(org_vocab_size_padded if org_vocab_size_padded is not None else org_vocab)
+    tot_vocab = int(vocab_size if vocab_size is not None else org_vocab)
+    tot_padded = int(vocab_size_padded if vocab_size_padded is not None else (n_part * tp_size))
+    num_added = tot_vocab - org_vocab
+    org_part = org_padded // tp_size
+    added_part = (tot_padded - org_padded) // tp_size
+
+    org_start = rank * org_part
+    org_end = org_start + org_part
+    added_start = rank * added_part
+    added_end = added_start + added_part
+
+    if num_added > 0:
+        valid_org = (ids_b >= org_start) & (ids_b < org_end) & (ids_b < org_vocab)
+        added_off = ids_b - org_vocab
+        valid_added = (
+            (added_off >= added_start)
+            & (added_off < added_end)
+            & (added_off < num_added)
+        )
+        idx_org = ids_b - org_start
+        idx_added = added_off - added_start + org_part
+        masked_idx = jnp.where(
+            valid_org, idx_org, jnp.where(valid_added, idx_added, 0)
+        )
+        valid_mask = valid_org | valid_added
+    else:
+        valid_mask = (ids_b >= org_start) & (ids_b < org_end) & (ids_b < org_vocab)
+        masked_idx = jnp.where(valid_mask, ids_b - org_start, 0)
+
+    masked_idx = jnp.clip(masked_idx, 0, n_part - 1)
+    out_parallel = embed_w[masked_idx]
+    out_parallel = jnp.where(
+        valid_mask[:, None], out_parallel, jnp.zeros_like(out_parallel)
+    )
+    return lax.psum(out_parallel, tp_axis)
+
+
+def jax_prepare_step_inputs(
+    input_ids: jax.Array,
+    positions: jax.Array,
+    block_tables: jax.Array,
+    s0: jax.Array,
+    c0: jax.Array,
+    s1: jax.Array,
+    c1: jax.Array,
+    s2: jax.Array,
+    c2: jax.Array,
+    roff: jax.Array,
+    embed_w: jax.Array,
+    *,
+    T: int,
+    B: int,
+    m_rows: int,
+    max_pages: int,
+    tp_axis: str = "tp",
+    embed_tp_size: int = 1,
+    tp_rank: jax.Array | int | None = None,
+    embed_vocab_size: int | None = None,
+    embed_org_vocab_size: int | None = None,
+    embed_org_vocab_size_padded: int | None = None,
+    embed_vocab_size_padded: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Pure-JAX replica of `Qwen35Megakernel.prep_only` inside `shard_map`."""
+    nseq_bkt = B // T
+    bt = block_tables
+    if bt.ndim == 1:
+        if bt.size % max_pages == 0:
+            bt = bt.reshape(-1, max_pages)
+        else:
+            bt = bt.reshape(int(s0.shape[0]), -1)
+    pt_b = _jax_slice_or_pad_2d(bt, nseq_bkt, max_pages, 0).astype(jnp.int32)
+
+    roff_1d = roff.reshape(-1)
+    has_roff = roff_1d.size > 1
+    ckpt_rows = []
+    roff_rows = []
+    for s_raw, c_raw in ((s0, c0), (s1, c1), (s2, c2)):
+        s_1d = s_raw[:, 0] if s_raw.ndim == 2 else s_raw.reshape(-1)
+        s_b = _jax_slice_or_pad_1d(s_1d, nseq_bkt, 0).astype(jnp.int32)
+        if has_roff:
+            if roff_1d.size > s_1d.shape[0]:
+                s_idx = jnp.clip(s_b, 0, roff_1d.size - 1)
+                roff_g = roff_1d[s_idx].astype(jnp.int32)
+            else:
+                roff_g = _jax_slice_or_pad_1d(roff_1d, nseq_bkt, 0).astype(jnp.int32)
+        else:
+            roff_g = jnp.zeros_like(s_b)
+
+        use_ckpt_2d = c_raw.ndim == 2
+        if T > 1:
+            if use_ckpt_2d and c_raw.shape[1] >= T:
+                ckpt_g = _jax_slice_or_pad_2d(c_raw, nseq_bkt, T, 0).astype(jnp.int32)
+            else:
+                c_1d = c_raw[:, 0] if use_ckpt_2d else c_raw.reshape(-1)
+                ckpt_1d = _jax_slice_or_pad_1d(c_1d, nseq_bkt, 0).astype(jnp.int32)
+                ckpt_g = jnp.broadcast_to(ckpt_1d[:, None], (nseq_bkt, T))
+                roff_g = jnp.zeros_like(roff_g)
+        else:
+            if use_ckpt_2d and has_roff and c_raw.shape[1] > 1:
+                c_b = _jax_slice_or_pad_2d(
+                    c_raw, nseq_bkt, int(c_raw.shape[1]), 0
+                ).astype(jnp.int32)
+                r_idx = jnp.clip(roff_g, 0, c_raw.shape[1] - 1)
+                ckpt_g = jnp.take_along_axis(c_b, r_idx[:, None], axis=1)
+            else:
+                ckpt_g = s_b[:, None]
+            roff_g = jnp.zeros_like(roff_g)
+
+        active_g = ckpt_g[:, 0] > 0
+        roff_g = jnp.where(active_g, roff_g, jnp.zeros_like(roff_g))
+        ckpt_rows.append(ckpt_g)
+        roff_rows.append(roff_g)
+
+    ckpt_b = jnp.stack(ckpt_rows, axis=0)
+    roff_b = jnp.stack(roff_rows, axis=0)
+    active_seq = ckpt_b[0, :, 0] > 0
+    active_tok = jnp.broadcast_to(active_seq[:, None], (nseq_bkt, T)).reshape(B)
+    zero_b = jnp.zeros((B,), dtype=jnp.int32)
+    ids_b = jnp.where(
+        active_tok, _jax_slice_or_pad_1d(input_ids, B, 0).astype(jnp.int32), zero_b
+    )
+    pos_1d = positions[0] if positions.ndim == 2 else positions
+    pos_b = jnp.where(
+        active_tok, _jax_slice_or_pad_1d(pos_1d, B, 0).astype(jnp.int32), zero_b
+    )
+
+    h0 = jax_vocab_parallel_embed(
+        ids_b,
+        embed_w,
+        tp_axis=tp_axis,
+        tp_size=embed_tp_size,
+        tp_rank=tp_rank,
+        vocab_size=embed_vocab_size,
+        org_vocab_size=embed_org_vocab_size,
+        org_vocab_size_padded=embed_org_vocab_size_padded,
+        vocab_size_padded=embed_vocab_size_padded,
+    )
+    if h0.shape[0] < m_rows:
+        h0 = jnp.pad(h0, ((0, m_rows - h0.shape[0]), (0, 0)))
+    return pos_b, h0, pt_b, ckpt_b, roff_b
+
+
 def make_flat_pooled_step(
     mesh,
     c: MKConfig,
@@ -1349,7 +1558,7 @@ def make_flat_pooled_step(
     scopes=False,
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
-    out_rows: int = 0,
+    out_rows: int | None = None,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1409,6 +1618,15 @@ def make_flat_pooled_step(
     out_specs = (A,) * (1 + n_p)
     donate_argnums = tuple(range(2 + n_w_leaves, 2 + n_w_leaves + n_p))
 
+    def _fit_hid(hid: jax.Array) -> jax.Array:
+        # None or 0 (candidate12's default) keeps the kernel's own rows.
+        if not out_rows or int(out_rows) == c_paged.M:
+            return hid
+        target_r = int(out_rows)
+        if target_r < c_paged.M:
+            return hid[:target_r]
+        return jnp.pad(hid, ((0, target_r - c_paged.M), (0, 0)))
+
     def _body(*args):
         pos, hidden = args[0], args[1]
         w_leaves = args[2:2 + n_w_leaves]
@@ -1443,13 +1661,9 @@ def make_flat_pooled_step(
             )
             if bool(interpret):
                 hid, raw_out = out
-                if out_rows > 0 and hid.shape[0] > out_rows:
-                    hid = hid[:out_rows]
-                return (hid, *raw_out)
+                return (_fit_hid(hid), *raw_out)
             hid = out[0] if isinstance(out, (tuple, list)) else out
-            if out_rows > 0 and hid.shape[0] > out_rows:
-                hid = hid[:out_rows]
-            return (hid, *raw_pools)
+            return (_fit_hid(hid), *raw_pools)
 
         if use_gpr:
             hid, conv_out, rec_out, knew, vnew = call(
@@ -1482,14 +1696,107 @@ def make_flat_pooled_step(
             interpret=interpret,
             conv_partial=use_gpr,
         )
-        if out_rows > 0 and hid.shape[0] > out_rows:
-            hid = hid[:out_rows]
-        return (hid, *raw_out)
+        return (_fit_hid(hid), *raw_out)
 
     smap = jax.shard_map(
         _body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
     )
+    smap._inner_body = _body
+    smap._c_paged = c_paged
     return smap, in_specs, out_specs, donate_argnums
+
+
+def wrap_step_with_fused_prep(
+    step_fn: Any,
+    mesh,
+    c: MKConfig,
+    *,
+    embed_tp_size: int = 1,
+    embed_vocab_size: int | None = None,
+    embed_org_vocab_size: int | None = None,
+    embed_org_vocab_size_padded: int | None = None,
+    embed_vocab_size_padded: int | None = None,
+    has_tp_rank_arg: bool = False,
+):
+    """Wrap a `make_flat_pooled_step` `shard_map` so `prep_only` (`embed_tokens` +
+    metadata slice/pad) runs inside the same JAX `shard_map` program.
+
+    Signature of the returned `shard_map`:
+      `(input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff,
+        embed_w, [tp_rank], *w_leaves, *raw_pools) -> (hid, *raw_pools)`
+    """
+    inner_body = getattr(step_fn, "_inner_body", None)
+    if inner_body is None:
+        raise ValueError("step_fn does not expose _inner_body from make_flat_pooled_step")
+    c_paged = getattr(step_fn, "_c_paged", c)
+    n_w_leaves = sum(
+        c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
+    )
+    n_p = c_paged.NATT
+    tp_axis = mesh.axis_names[0]
+    A = P(tp_axis)
+    # 11 prep args (+1 optional tp_rank int32[1] shard operand):
+    # input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff, embed_w, [tp_rank]
+    n_prep = 12 if has_tp_rank_arg else 11
+    in_specs = (A,) * (n_prep + n_w_leaves + n_p)
+    out_specs = (A,) * (1 + n_p)
+    donate_argnums = tuple(range(n_prep + n_w_leaves, n_prep + n_w_leaves + n_p))
+
+    T = int(c_paged.T)
+    B = int(c_paged.B)
+    m_rows = int(c_paged.M)
+    max_pages = int(c_paged.max_pages_per_seq)
+
+    def _fused_body(*args):
+        (
+            input_ids,
+            positions,
+            block_tables,
+            s0,
+            c0,
+            s1,
+            c1,
+            s2,
+            c2,
+            roff,
+            embed_w,
+        ) = args[:11]
+        tp_rank = args[11] if has_tp_rank_arg else None
+        w_leaves = args[n_prep : n_prep + n_w_leaves]
+        raw_pools = args[n_prep + n_w_leaves : n_prep + n_w_leaves + n_p]
+        pos_b, h0, pt_b, ckpt_b, roff_b = jax_prepare_step_inputs(
+            input_ids,
+            positions,
+            block_tables,
+            s0,
+            c0,
+            s1,
+            c1,
+            s2,
+            c2,
+            roff,
+            embed_w,
+            T=T,
+            B=B,
+            m_rows=m_rows,
+            max_pages=max_pages,
+            tp_axis=tp_axis,
+            embed_tp_size=embed_tp_size,
+            tp_rank=tp_rank,
+            embed_vocab_size=embed_vocab_size,
+            embed_org_vocab_size=embed_org_vocab_size,
+            embed_org_vocab_size_padded=embed_org_vocab_size_padded,
+            embed_vocab_size_padded=embed_vocab_size_padded,
+        )
+        return inner_body(
+            pos_b, h0, *w_leaves, *raw_pools, pt_b, ckpt_b, roff_b
+        )
+
+    smap = jax.shard_map(
+        _fused_body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+    )
+    return smap, in_specs, out_specs, donate_argnums
+
 
 
 def make_flat_attn_step(
@@ -1893,12 +2200,12 @@ def default_pool_layout(c: MKConfig):
     `(G_PER_ATT, NS)`).
     """
     G_PER_ATT = max(1, c.att_every - 1)
-    gdn_pages = c.gdn_pages
+    gdn_stride = c.gdn_stride
     pages_per_seq = c.ctx // c.page_size
     kv_pages_total = c.NS * pages_per_seq
     n_ckpt_slots = G_PER_ATT * c.NS * c.T
-    base_slot = (kv_pages_total + gdn_pages - 1) // gdn_pages
-    min_num_pages = (base_slot + n_ckpt_slots) * gdn_pages
+    base_slot = (kv_pages_total + gdn_stride - 1) // gdn_stride
+    min_num_pages = (base_slot + n_ckpt_slots) * gdn_stride
 
     pt = np.zeros((c.NS, max(c.max_pages_per_seq, pages_per_seq)), dtype=np.int32)
     for s in range(c.NS):
@@ -1921,6 +2228,7 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
     G_PER_ATT = AE - 1
     rec_pages = c.rec_pages
     gdn_pages = c.gdn_pages
+    gdn_stride = c.gdn_stride
     pt = np.asarray(page_table)
     ckpt = np.asarray(ckpt_indices)
     ckpt_is_3d = ckpt.ndim == 3
@@ -1954,7 +2262,7 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
                     ro_val = int(roff[sub, s]) if roff_is_2d else int(roff[s])
                     if ckpt_is_3d:
                         slot = int(ckpt[sub, s, ro_val])
-                        page_base = slot * gdn_pages
+                        page_base = slot * gdn_stride
                     else:
                         slot = int(ckpt[s, ro_val])
                         page_base = slot * (gdn_pages * G_PER_ATT) + sub * gdn_pages

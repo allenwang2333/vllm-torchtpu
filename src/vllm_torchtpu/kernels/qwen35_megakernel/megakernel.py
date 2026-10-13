@@ -25,61 +25,118 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .attention_block import PagedAttentionBlock
-from .collectives import PallasAllReduce
-from .config import (
-    ABLATIONS,
-    BF16,
-    COLLECTIVE_ID,
-    CONV_STAGE_MIN_B,
-    DEFAULT_TILES,
-    DENSE,
-    DMM_UNROLL,
-    EXPERT,
-    F32,
-    FP8,
-    FULL,
-    FULL_EP,
-    GQ_PACK,
-    I32,
-    MKConfig,
-    NN,
-    NT,
-    O_NAMES,
-    S_NAMES,
-    Spec,
-    TINY,
-    TINY_EP,
-    TINY_TILES,
-    TOPK_LANES,
-    TOPK_NL,
-    Tiles,
-    U8,
-    U32,
-    VERIFY_TILES,
-    W_NAMES,
-    WIDE_TILES,
-    accept_states,
-    bswitch,
-    default_tiles,
-    encode_ecopy,
-    fold,
-    kernel_out_shapes,
-    plan,
-    pool_alias,
-    rnd,
-    rup,
-    smalls_layout,
-    state_shapes,
-    topk_rows_on_lanes,
-    unfold,
-    weight_shapes,
-)
-from .context import MKBuildContext
-from .gdn_block import GDNBlock
-from .moe_block import MoEBlock
-from .pool_dma import GDNPoolDMA, GprRecIn, KVPoolDMA
-from .rings import DenseWeightRing, ExpertWeightRing, WeightRings
+try:
+    from .attention_block import PagedAttentionBlock
+    from .collectives import PallasAllReduce
+    from .config import (
+        ABLATIONS,
+        BF16,
+        COLLECTIVE_ID,
+        CONV_STAGE_MIN_B,
+        DEFAULT_TILES,
+        DENSE,
+        DMM_UNROLL,
+        EXPERT,
+        F32,
+        FP8,
+        FULL,
+        FULL_EP,
+        GQ_PACK,
+        I32,
+        MKConfig,
+        NN,
+        NT,
+        O_NAMES,
+        S_NAMES,
+        Spec,
+        TINY,
+        TINY_EP,
+        TINY_TILES,
+        TOPK_LANES,
+        TOPK_NL,
+        Tiles,
+        U8,
+        U32,
+        VERIFY_TILES,
+        W_NAMES,
+        WIDE_TILES,
+        accept_states,
+        bswitch,
+        default_tiles,
+        encode_ecopy,
+        fold,
+        kernel_out_shapes,
+        plan,
+        pool_alias,
+        rnd,
+        rup,
+        smalls_layout,
+        state_shapes,
+        topk_rows_on_lanes,
+        unfold,
+        weight_shapes,
+    )
+    from .context import MKBuildContext
+    from .gdn_block import GDNBlock
+    from .moe_block import MoEBlock
+    from .pool_dma import GDNPoolDMA, GprRecIn, KVPoolDMA
+    from .rings import DenseWeightRing, ExpertWeightRing, WeightRings
+except ImportError:
+    from attention_block import PagedAttentionBlock
+    from collectives import PallasAllReduce
+    from config import (
+        ABLATIONS,
+        BF16,
+        COLLECTIVE_ID,
+        CONV_STAGE_MIN_B,
+        DEFAULT_TILES,
+        DENSE,
+        DMM_UNROLL,
+        EXPERT,
+        F32,
+        FP8,
+        FULL,
+        FULL_EP,
+        GQ_PACK,
+        I32,
+        MKConfig,
+        NN,
+        NT,
+        O_NAMES,
+        S_NAMES,
+        Spec,
+        TINY,
+        TINY_EP,
+        TINY_TILES,
+        TOPK_LANES,
+        TOPK_NL,
+        Tiles,
+        U8,
+        U32,
+        VERIFY_TILES,
+        W_NAMES,
+        WIDE_TILES,
+        accept_states,
+        bswitch,
+        default_tiles,
+        encode_ecopy,
+        fold,
+        kernel_out_shapes,
+        plan,
+        pool_alias,
+        rnd,
+        rup,
+        smalls_layout,
+        state_shapes,
+        topk_rows_on_lanes,
+        unfold,
+        weight_shapes,
+    )
+    from context import MKBuildContext
+    from gdn_block import GDNBlock
+    from moe_block import MoEBlock
+    from pool_dma import GDNPoolDMA, GprRecIn, KVPoolDMA
+    from rings import DenseWeightRing, ExpertWeightRing, WeightRings
 
 
 def build(

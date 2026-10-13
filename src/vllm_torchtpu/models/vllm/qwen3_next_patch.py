@@ -188,7 +188,9 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     if rows <= 256:
         dma_cap = max(8, (rows // 6 // 8) * 8)
         return min(vreg_cap, dma_cap)
-    return vreg_cap
+    # `_legal_tile` only takes multiples of 32, so a cap of 16 (TP=2, cols=4096)
+    # finds no tile and falls back to one whole-step block that overflows VMEM.
+    return max(32, vreg_cap)
 
 
 def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref):
@@ -1397,7 +1399,13 @@ def patched_decoder_layer_forward(
         positions = positions + (small_all_reduce_op._RANK * 0)[0]
 
     prequant = None
-    if _fuses_pre_attn_norm_quant(self, hidden_states, input_is_sliced):
+    # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
+    pcp_streaming_gdn = self.layer_type == "linear_attention" and getattr(
+        self.linear_attn, "_pcp_streaming_configured", False
+    )
+    if not pcp_streaming_gdn and _fuses_pre_attn_norm_quant(
+        self, hidden_states, input_is_sliced
+    ):
         x_q, x_s, residual = _norm_quantize_rows(
             self.input_layernorm, hidden_states, residual
         )
@@ -1413,7 +1421,11 @@ def patched_decoder_layer_forward(
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if input_is_sliced and sequence_parallel.fp8_gather():
+        if (
+            input_is_sliced
+            and sequence_parallel.fp8_gather()
+            and not pcp_streaming_gdn
+        ):
             x_q, x_s = linear_common.quantize_rows(hidden_states)
             x_q = tensor_model_parallel_all_gather(x_q, 0)
             x_s = tensor_model_parallel_all_gather(x_s, 0)

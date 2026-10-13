@@ -198,6 +198,12 @@ if TYPE_CHECKING:
     VLLM_TPU_LIGHTWEIGHT_STEP_STATS: bool = False
     VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL: int = 500
     VLLM_TPU_RAIDEN_LOAD_WAIT_MS: float = 1.5
+    TPU_SCHED_WSPT_ENABLE: bool = False
+    TPU_SCHED_FINISH_DECODE_STEPS: int = 0
+    TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS: int = 8
+    TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS: int = 2048
+    QX_TTFT_STAGE_LOG_PERIOD_S: float = 0.0
+    VLLM_TPU_QWEN35_MK_FUSE_PREP: bool = True
 
 
 def env_with_choices(
@@ -1171,6 +1177,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
         "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
     ),
+    # OSL-aware Weighted Shortest Processing Time (WSPT) ordering for waiting
+    # and running prefill requests: weight cold/remaining prefill tokens by
+    # max(max_tokens, 16). Off by default (opt-in).
+    "TPU_SCHED_WSPT_ENABLE": env_bool("TPU_SCHED_WSPT_ENABLE", default=False),
+    # Near-finish decode protection: when >=1 decoding request has remaining
+    # output tokens <= TPU_SCHED_FINISH_DECODE_STEPS * (1 + num_spec_tokens) and
+    # scheduling a prefill would add >= TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS
+    # tokens, defer that prefill for up to TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
+    # consecutive steps. 0 disables (default).
+    "TPU_SCHED_FINISH_DECODE_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_STEPS", 0
+    ),
+    "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS", 8
+    ),
+    "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS", 2048
+    ),
     # Host-side 5-point TTFT stage telemetry periodic summary interval in
     # seconds; 0 disables (default, zero overhead).
     "QX_TTFT_STAGE_LOG_PERIOD_S": env_float("QX_TTFT_STAGE_LOG_PERIOD_S", 0.0),
@@ -1200,6 +1224,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TPU_RAIDEN_LOAD_WAIT_MS": env_float(
         "VLLM_TPU_RAIDEN_LOAD_WAIT_MS", 1.5
+    ),
+    "VLLM_TPU_QWEN35_MK_FUSE_PREP": lambda: (
+        os.environ.get("VLLM_TPU_QWEN35_MK_FUSE_PREP", "1").strip().lower()
+        not in ("0", "false", "no", "off", "none")
     ),
 }
 

@@ -8,16 +8,28 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from .config import (
-    BF16,
-    F32,
-    I32,
-    NT,
-    TOPK_LANES,
-    rnd,
-    topk_rows_on_lanes,
-)
-from .context import MKBuildContext
+try:
+    from .config import (
+        BF16,
+        F32,
+        I32,
+        NT,
+        TOPK_LANES,
+        rnd,
+        topk_rows_on_lanes,
+    )
+    from .context import MKBuildContext
+except ImportError:
+    from config import (
+        BF16,
+        F32,
+        I32,
+        NT,
+        TOPK_LANES,
+        rnd,
+        topk_rows_on_lanes,
+    )
+    from context import MKBuildContext
 
 
 class MoEBlock:

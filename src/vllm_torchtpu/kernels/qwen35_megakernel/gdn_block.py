@@ -6,17 +6,30 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from .config import (
-    BF16,
-    CONV_STAGE_MIN_B,
-    F32,
-    FP8,
-    I32,
-    U32,
-    rnd,
-)
-from .context import MKBuildContext
-from .pool_dma import GDNPoolDMA
+try:
+    from .config import (
+        BF16,
+        CONV_STAGE_MIN_B,
+        F32,
+        FP8,
+        I32,
+        U32,
+        rnd,
+    )
+    from .context import MKBuildContext
+    from .pool_dma import GDNPoolDMA
+except ImportError:
+    from config import (
+        BF16,
+        CONV_STAGE_MIN_B,
+        F32,
+        FP8,
+        I32,
+        U32,
+        rnd,
+    )
+    from context import MKBuildContext
+    from pool_dma import GDNPoolDMA
 
 
 class GDNBlock:

@@ -20,8 +20,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .config import BF16, F32, rnd
-from .context import MKBuildContext
+try:
+    from .config import BF16, F32, rnd
+    from .context import MKBuildContext
+except ImportError:
+    from config import BF16, F32, rnd
+    from context import MKBuildContext
 
 
 class PallasAllReduce:
