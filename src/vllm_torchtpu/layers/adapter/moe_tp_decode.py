@@ -83,6 +83,8 @@ _SUM_FLOOR = 1e-20
 _OPS: dict[tuple, Any] = {}
 _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
+# TPU_MOE_TP_DECODE_SHARED_META: one experts_start buffer per (device, value).
+_E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
 _SELFTEST_DONE = False
 
 
@@ -531,6 +533,20 @@ def _rank_tensor(device: torch.device, mesh_index: int) -> torch.Tensor:
     return _RANK_BUFFER
 
 
+def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
+    """experts_start as int32 [1, 1] data. TPU_MOE_TP_DECODE_SHARED_META: one
+    tensor per value, shared by every layer, so each layer's meta stack is the
+    same HLO value and CSE keeps one; else a fresh tensor per layer."""
+    if not envs.TPU_MOE_TP_DECODE_SHARED_META:
+        return torch.tensor([[experts_start]], dtype=torch.int32, device=device)
+    key = (str(device), int(experts_start))
+    t = _E0_BUFFERS.get(key)
+    if t is None:
+        t = torch.tensor([[experts_start]], dtype=torch.int32, device=device)
+        _E0_BUFFERS[key] = t
+    return t
+
+
 def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
     path through the op's mesh and rank operand; returns this rank's failing
@@ -642,9 +658,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         bias = layer.e_score_correction_bias.detach().to(torch.float32).contiguous()
         rank = _rank_tensor(layer.w13_weight.device, topo.mesh_index)
         # [1, 1] like the rank: per-rank data, one program on every rank.
-        e0 = torch.tensor(
-            [[adm.experts_start]], dtype=torch.int32, device=layer.w13_weight.device
-        )
+        e0 = _e0_tensor(layer.w13_weight.device, adm.experts_start)
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
         setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))

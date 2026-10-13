@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
+    TPU_MOE_TP_DECODE_SHARED_META: bool = False
+    TPU_RMSNORM_DECODE_MATERIALIZE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -886,6 +888,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_TP_DECODE_SPLIT_META": env_bool(
         "TPU_MOE_TP_DECODE_SPLIT_META", default=False
     ),
+    # moe_tp_decode: every armed layer reads ONE experts_start buffer (per
+    # value) instead of its own, so the per-layer scalar meta stack
+    # (n_valid, rank, experts_start) is the same HLO value in every layer and
+    # XLA CSE keeps one per step (was one HBM->HBM op per layer). Exact.
+    "TPU_MOE_TP_DECODE_SHARED_META": env_bool("TPU_MOE_TP_DECODE_SHARED_META"),
+    # Decode-sized residual RMSNorm (rows below the Pallas threshold): pin the
+    # f32 sum x + residual and the bf16 residual it returns behind an
+    # optimization barrier, so XLA materializes each once instead of
+    # re-adding their components (which keeps them live across the MoE
+    # kernel, evicted to HBM, and re-read from HBM by every consumer fusion).
+    # Same ops, same values. Exact.
+    "TPU_RMSNORM_DECODE_MATERIALIZE": env_bool("TPU_RMSNORM_DECODE_MATERIALIZE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
