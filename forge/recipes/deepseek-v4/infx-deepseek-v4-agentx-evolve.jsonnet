@@ -303,6 +303,18 @@ local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
 // DSv4 indexer K-cache layout (vllm-torchtpu VLLM_TPU_DSV4_INDEXER_KV_LAYOUT): sal or has. sal measured slightly
 // ahead of has three times (out tok/s +3.9/+3.6/+1.8% vs the same tree on has, each within noise).
 local indexerKvLayout = cdk.var('VLLM_TPU_DSV4_INDEXER_KV_LAYOUT', 'sal');
+// c=160 serving defaults (forge run 5k2rk0v7; MNBT128 baseline j-c82f8467 250,454 total tok/s, these on
+// j-d555b275 / j-6d392038 309,983 / 309,810). Empty drops the variable (vllm-torchtpu's default, off).
+// The drafter's K-1 per-request slots stop counting against MAX_NUM_BATCHED_TOKENS (SrptPrefillScheduler).
+local schedUnchargedDraftSlots = cdk.var('TPU_SCHED_UNCHARGED_DRAFT_SLOTS', '1');
+// SRPT pauses its hold-back for a step when a held step admitted nothing (livelock guard).
+local srptHoldProgressGuard = cdk.var('TPU_SRPT_HOLD_PROGRESS_GUARD', '1');
+// Raiden stores window/state KV chunks only at replay boundaries and every N tokens, so the host pool holds
+// full-attention prefix instead of per-step window copies.
+local offloadWindowCheckpointInterval = cdk.var('TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL', '32768');
+// The DP routing hook sends a new session that shares >= 12 x 512 prompt tokens with a routed prompt
+// (a subagent and its parent) to that prompt's engine.
+local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFINITY', '1');
 
 // --- Benchmark client --------------------------------------------------------
 local fastMode = cdk.boolVar('FAST', false) || cdk.boolVar('FAST_MODE', false);
@@ -725,6 +737,7 @@ local serverJob = cdk.job(
           'TPU_LOG_HOST_TENSORS_AFTER_LOAD',
           'TPU_STEP_TIMING_LOG_STEPS',
           'VLLM_TPU_DSV4_INDEXER_KV_LAYOUT',
+          'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -754,6 +767,10 @@ local serverJob = cdk.job(
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
         VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: indexerKvLayout,
+        [if schedUnchargedDraftSlots != '' then 'TPU_SCHED_UNCHARGED_DRAFT_SLOTS']: schedUnchargedDraftSlots,
+        [if srptHoldProgressGuard != '' then 'TPU_SRPT_HOLD_PROGRESS_GUARD']: srptHoldProgressGuard,
+        [if offloadWindowCheckpointInterval != '' then 'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL']: offloadWindowCheckpointInterval,
+        [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
         [if prefillGateMinCadences != '' then 'TPU_PREFILL_GATE_MIN_CADENCES']: prefillGateMinCadences,
         [if prefillGateLogSteps != '' then 'TPU_PREFILL_GATE_LOG_STEPS']: prefillGateLogSteps,
