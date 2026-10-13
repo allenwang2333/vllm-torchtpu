@@ -21,7 +21,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
-    _rotate_gptj,
+    _lane_gather,
     gather_cos_sin,
 )
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
@@ -45,14 +45,40 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
+def _partner_gptj(x: jax.Array) -> jax.Array:
+    """Gather the GPT-J rotation partner lane ``i ^ 1`` without sign negation."""
+    lane = jnp.arange(LANE)
+    return _lane_gather(x, lane ^ 1)
+
+
+def _rotate_sign() -> jax.Array:
+    """Alternating ``[-1, 1, -1, 1, ...]`` GPT-J rotation sign across lanes."""
+    lane = jnp.arange(LANE)
+    return jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
+
+
+def _rope_heads_split(
+    x: jax.Array, cos: jax.Array, sin_signed: jax.Array, *, head_dim: int
+) -> jax.Array:
+    """Apply RoPE to the last ``LANE`` channels of ``x`` using pre-signed ``sin``."""
+    lo = head_dim - LANE
+    tail = (x if lo == 0 else x[:, :, lo:]).astype(jnp.float32)
+    roped = (
+        tail * cos[:, None, :] + _partner_gptj(tail) * sin_signed[:, None, :]
+    ).astype(x.dtype)
+    if lo == 0:
+        return roped
+    return jnp.concatenate([x[:, :, :lo], roped], axis=-1)
+
+
 def _rope_heads(x: jax.Array, cos_sin: jax.Array, *, head_dim: int) -> jax.Array:
     """apply RoPE to the last rope dim of head dim of ``x``."""
-    cos = cos_sin[:, :LANE]
-    sin = cos_sin[:, LANE:]
-    lo = head_dim - LANE
-    tail = x[:, :, lo:].astype(jnp.float32)
-    roped = tail * cos[:, None, :] + _rotate_gptj(tail) * sin[:, None, :]
-    return jnp.concatenate([x[:, :, :lo], roped.astype(x.dtype)], axis=-1)
+    return _rope_heads_split(
+        x,
+        cos_sin[:, :LANE],
+        cos_sin[:, LANE:] * _rotate_sign(),
+        head_dim=head_dim,
+    )
 
 
 def _kernel(
@@ -71,15 +97,22 @@ def _kernel(
 ) -> None:
     rhs = w_ref[...]
     scale = scale_ref[...]
-    cos_sin = cos_sin_ref[...]
     sub_t = tile_t // num_sub_t
     out_dtype = x_ref.dtype
+    sign = _rotate_sign()
     for s in range(num_sub_t):
         # Subchunk the tile to allow more Instruction level parallelism
         # opportunities to be exploited by the LLO compiler.
         rows = slice(s * sub_t, (s + 1) * sub_t)
-        x = _rope_heads(x_ref[rows], cos_sin[rows], head_dim=head_dim)
-        x = x.reshape(sub_t, -1)
+        if num_sub_t == 1:
+            cs_s = cos_sin_ref[...]
+            x_s = x_ref[...]
+        else:
+            cs_s = cos_sin_ref[rows]
+            x_s = x_ref[rows]
+        x = _rope_heads_split(
+            x_s, cs_s[:, :LANE], cs_s[:, LANE:] * sign, head_dim=head_dim
+        ).reshape(sub_t, -1)
         inv = None
         if quantize_activations:
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
@@ -99,7 +132,11 @@ def _kernel(
         if quantize_activations:
             assert inv is not None
             partial = partial * (1.0 / inv.astype(jnp.float32))
-        out_ref[rows] = (partial * scale).astype(out_dtype)
+        out = (partial * scale).astype(out_dtype)
+        if num_sub_t == 1:
+            out_ref[...] = out
+        else:
+            out_ref[rows] = out
 
 
 @functools.partial(
