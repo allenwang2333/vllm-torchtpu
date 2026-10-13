@@ -14,7 +14,7 @@ The group is deliberately separate from vLLM's TP group and from
 
 from __future__ import annotations
 
-import collections
+import sys
 
 import torch.distributed as dist
 
@@ -62,16 +62,32 @@ def _chip_rank_groups() -> list[list[int]] | None:
         )
         return None
 
-    by_chip: dict[int, list[int]] = collections.defaultdict(list)
+    by_chip: dict[int, list[int]] = {}
+    by_chip_get = by_chip.get
+    chip_of = topology.chip_of
+    last_chip = -1
+    monotonic = True
     for rank in range(world_size):
-        chip_index, _ = topology.chip_of(rank)
-        by_chip[chip_index].append(rank)
+        chip_index, _ = chip_of(rank)
+        bucket = by_chip_get(chip_index)
+        if bucket is None:
+            if chip_index < last_chip:
+                monotonic = False
+            last_chip = chip_index
+            by_chip[chip_index] = [rank]
+        else:
+            bucket.append(rank)
 
-    groups = [by_chip[chip] for chip in sorted(by_chip)]
-    if any(len(g) != cores_per_chip for g in groups):
-        sizes = sorted({len(g) for g in groups})
-        logger.warning("Chip groups are ragged (%s); not usable.", sizes)
-        return None
+    groups = (
+        list(by_chip.values())
+        if monotonic
+        else [by_chip[chip] for chip in sorted(by_chip)]
+    )
+    for g in groups:
+        if len(g) != cores_per_chip:
+            sizes = sorted({len(grp) for grp in groups})
+            logger.warning("Chip groups are ragged (%s); not usable.", sizes)
+            return None
     return groups
 
 
@@ -91,14 +107,13 @@ def get_intra_chip_group():
     if groups is None:
         return None
 
-    from vllm.distributed.parallel_state import (
-        get_world_group,
-        init_model_parallel_group,
-    )
+    ps_mod = sys.modules.get("vllm.distributed.parallel_state")
+    if ps_mod is None:
+        from vllm.distributed import parallel_state as ps_mod
 
-    world = get_world_group()
+    world = ps_mod.get_world_group()
     backend = dist.get_backend(world.device_group)
-    _group = init_model_parallel_group(
+    _group = ps_mod.init_model_parallel_group(
         groups,
         world.local_rank,
         backend,
