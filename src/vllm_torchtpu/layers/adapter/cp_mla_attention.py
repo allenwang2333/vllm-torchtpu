@@ -203,15 +203,17 @@ def _merge_chunked(
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
-        pieces = [
-            _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
-                lse_f32[c * step : (c + 1) * step],
-                _gather_lse(lse_f32[c * step : (c + 1) * step], group),
-                group,
+        pieces: list[torch.Tensor] = []
+        for c in range(chunks):
+            pieces.append(
+                _weighted_reduce_scatter(
+                    output[c * step : (c + 1) * step],
+                    lse_f32[c * step : (c + 1) * step],
+                    _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                    group,
+                    after=_rs_lag_dep(pieces),
+                )
             )
-            for c in range(chunks)
-        ]
         return torch.cat(pieces, dim=0)
     pieces = [
         cp_lse_ag_out_rs(
@@ -235,16 +237,35 @@ def _gather_lse(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
 
 
+def _rs_lag_dep(done: list[torch.Tensor]) -> torch.Tensor | None:
+    """TPU_DCP_MERGE_RS_LAG=n: the merged result of the chunk n back, which
+    the next chunk's weights are tied to (None below n chunks, or off)."""
+    lag = envs.TPU_DCP_MERGE_RS_LAG
+    return done[-lag] if lag > 0 and len(done) >= lag else None
+
+
 def _weighted_reduce_scatter(
-    output: torch.Tensor, lse_f32: torch.Tensor, lses: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse_f32: torch.Tensor,
+    lses: torch.Tensor,
+    group: Any,
+    after: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows."""
+    `[world, T, H]` for exactly `output`'s `T` rows. `after`
+    (TPU_DCP_MERGE_RS_LAG, heads-major path): an earlier chunk's merged
+    result the weights are tied to by an optimization barrier -- a pure
+    ordering edge, so that chunk's reduce-scatter is completed on the
+    schedule before this one is built instead of every completion waiting
+    until the last chunk."""
     merged_lse = torch.logsumexp(lses, dim=0)
     if envs.TPU_DCP_MERGE_WEIGHTED_HM:
-        return _weighted_reduce_scatter_heads_major(
-            output, torch.exp(lse_f32 - merged_lse), group
-        )
+        weight = torch.exp(lse_f32 - merged_lse)
+        if after is not None and weight.device.type == "tpu":
+            from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
+
+            weight = tie(weight, after)
+        return _weighted_reduce_scatter_heads_major(output, weight, group)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -331,15 +352,17 @@ def _merge_chunked_lse_gathered(
     else:
         gathered = _gather_lse(lse_f32, group)
         rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
-    pieces = [
-        _weighted_reduce_scatter(
-            output[c * step : (c + 1) * step],
-            lse_f32[c * step : (c + 1) * step],
-            rows[c],
-            group,
+    pieces: list[torch.Tensor] = []
+    for c in range(chunks):
+        pieces.append(
+            _weighted_reduce_scatter(
+                output[c * step : (c + 1) * step],
+                lse_f32[c * step : (c + 1) * step],
+                rows[c],
+                group,
+                after=_rs_lag_dep(pieces),
+            )
         )
-        for c in range(chunks)
-    ]
     return torch.cat(pieces, dim=0)
 
 

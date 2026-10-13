@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MERGE_PIECES: int = 0
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = False
+    TPU_DCP_MERGE_RS_LAG: int = 0
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -560,6 +561,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter (which it may offload to the SparseCore and complete
     # late). Same products, same reduce-scatter: bit-identical.
     "TPU_DCP_MERGE_WEIGHTED_HM": env_bool("TPU_DCP_MERGE_WEIGHTED_HM", default=False),
+    # With TPU_DCP_MERGE_WEIGHTED_HM: chunk k's weights wait (optimization
+    # barrier) for chunk k-n's merged result, so the schedule completes the
+    # SparseCore reduce-scatters as the chain runs instead of all after the
+    # last chunk (the offload stalls with three uncompleted in flight).
+    # Ordering only: bit-identical. 0 = off.
+    "TPU_DCP_MERGE_RS_LAG": env_int("TPU_DCP_MERGE_RS_LAG", 0),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
