@@ -13,6 +13,9 @@
 # limitations under the License.
 """Routing helpers for TPU local MoE kernels."""
 
+import types
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 import vllm.distributed.parallel_state as _ps
@@ -30,6 +33,24 @@ logger = init_logger(__name__)
 # Resolved once, at import, so the compiled forward never reads the
 # environment.
 _ROUTER_TOPK = envs.TPU_MOE_ROUTER_TOPK
+_TPU_OP_CACHE: dict[tuple, Callable] = {}
+
+
+def _get_tpu_op(key: tuple, fn: Callable) -> Callable:
+    op = _TPU_OP_CACHE.get(key)
+    if op is not None:
+        return op
+    name = f"moe_route_op_{len(_TPU_OP_CACHE)}"
+    specialized = types.FunctionType(
+        fn.__code__.replace(co_name=name),
+        fn.__globals__,
+        name,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    op = torch.compile(specialized, backend="tpu", dynamic=False)
+    _TPU_OP_CACHE[key] = op
+    return op
 
 
 def _topk(
@@ -195,6 +216,37 @@ def maybe_simulate_routing(
     )
 
 
+def _pack_16bit_topk_impl(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> torch.Tensor:
+    w_contig = (
+        topk_weights if topk_weights.is_contiguous() else topk_weights.contiguous()
+    )
+    i_contig = topk_ids if topk_ids.is_contiguous() else topk_ids.contiguous()
+    w_shifted = w_contig.view(torch.int16).to(torch.int32) << 16
+    return w_shifted | (i_contig & 0xFFFF)
+
+
+def _unpack_16bit_topk_impl(
+    gathered: torch.Tensor, w_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_weights = (gathered >> 16).to(torch.int16).view(w_dtype)
+    out_ids = (gathered << 16) >> 16
+    return out_weights, out_ids
+
+
+def _unpack_gathered_16bit_topk(
+    gathered: torch.Tensor, w_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if gathered.device.type == "tpu" and not torch.compiler.is_compiling():
+        unpack_op = _get_tpu_op(
+            ("unpack_topk", gathered.shape, w_dtype),
+            lambda g: _unpack_16bit_topk_impl(g, w_dtype),
+        )
+        return unpack_op(gathered)
+    return _unpack_16bit_topk_impl(gathered, w_dtype)
+
+
 def _gather_partitioned_topk(
     group,
     topk_weights: torch.Tensor,
@@ -212,20 +264,102 @@ def _gather_partitioned_topk(
     drafter MoE, ``topk=3``, 1 collective instead of 2), and eliminates
     minor-axis ``cat`` and slice copies.
     """
-    if (
-        topk_weights.dtype in (torch.bfloat16, torch.float16)
-        and topk_ids.dtype == torch.int32
-    ):
-        w_shifted = topk_weights.contiguous().view(torch.int16).to(torch.int32) << 16
-        packed = w_shifted | (topk_ids.contiguous() & 0xFFFF)
+    w_dtype = topk_weights.dtype
+    if w_dtype in (torch.bfloat16, torch.float16) and topk_ids.dtype == torch.int32:
+        if topk_weights.device.type == "tpu" and not torch.compiler.is_compiling():
+            pack_op = _get_tpu_op(
+                ("pack_topk", topk_weights.shape, w_dtype),
+                _pack_16bit_topk_impl,
+            )
+            packed = pack_op(topk_weights, topk_ids)
+        else:
+            packed = _pack_16bit_topk_impl(topk_weights, topk_ids)
         gathered = group.all_gather(packed, dim=0)
-        out_weights = (gathered >> 16).to(torch.int16).view(topk_weights.dtype)
-        out_ids = (gathered << 16) >> 16
-        return out_weights, out_ids
+        return _unpack_gathered_16bit_topk(gathered, w_dtype)
     return (
         group.all_gather(topk_weights.contiguous(), dim=0),
         group.all_gather(topk_ids.contiguous(), dim=0),
     )
+
+
+def _resolve_partition_group(moe_config, local_t: int, full_t: int):
+    if getattr(moe_config, "is_sequence_parallel", False):
+        return _ps.get_ep_group()
+    if getattr(getattr(moe_config, "moe_parallel_config", None), "use_ep", False):
+        ep_group = _ps.get_ep_group()
+        if (
+            getattr(moe_config, "dp_size", 1) <= 1
+            or local_t * ep_group.world_size == full_t
+        ):
+            return ep_group
+        return _ps.get_dp_group()
+    return _ps.get_dp_group()
+
+
+def _can_use_fused_classic_select(
+    layer, router_logits: torch.Tensor, input_ids: torch.Tensor | None
+) -> bool:
+    if router_logits.device.type != "tpu" or torch.compiler.is_compiling():
+        return False
+    if (
+        input_ids is not None
+        and layer is not None
+        and getattr(layer, "hash_indices_table", None) is not None
+    ):
+        return False
+    return not (
+        layer is not None
+        and layer.use_grouped_topk
+        and layer.num_expert_group > 1
+        and layer.topk_group < layer.num_expert_group
+    )
+
+
+def _classic_select_impl(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    routed_scaling_factor: float,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = _apply_scoring_fn(scoring_fn, router_logits)
+    topk_weights, topk_ids = _topk(
+        scores,
+        topk,
+        bias=bias,
+        renormalize=renormalize,
+    )
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return (
+        topk_weights if topk_weights.dtype == out_dtype else topk_weights.to(out_dtype),
+        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    )
+
+
+def _classic_select_and_pack_impl(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    topk: int,
+    renormalize: bool,
+    scoring_fn: str,
+    routed_scaling_factor: float,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    topk_weights, topk_ids = _classic_select_impl(
+        router_logits,
+        bias,
+        topk=topk,
+        renormalize=renormalize,
+        scoring_fn=scoring_fn,
+        routed_scaling_factor=routed_scaling_factor,
+        out_dtype=out_dtype,
+    )
+    return _pack_16bit_topk_impl(topk_weights, topk_ids)
 
 
 def route(
@@ -259,19 +393,42 @@ def route(
         )
     if router_logits.shape[0] < hidden_states.shape[0]:
         local_t = router_logits.shape[0]
-        if getattr(moe_config, "is_sequence_parallel", False):
-            group = _ps.get_ep_group()
-        elif getattr(getattr(moe_config, "moe_parallel_config", None), "use_ep", False):
-            ep_group = _ps.get_ep_group()
-            if (
-                getattr(moe_config, "dp_size", 1) <= 1
-                or local_t * ep_group.world_size == hidden_states.shape[0]
-            ):
-                group = ep_group
-            else:
-                group = _ps.get_dp_group()
-        else:
-            group = _ps.get_dp_group()
+        group = _resolve_partition_group(moe_config, local_t, hidden_states.shape[0])
+        w_dtype = hidden_states.dtype
+        if w_dtype in (torch.bfloat16, torch.float16) and _can_use_fused_classic_select(
+            layer, router_logits, input_ids
+        ):
+            bias = layer.e_score_correction_bias
+            renorm = layer.renormalize
+            s_fn = layer.scoring_func
+            scale = layer.routed_scaling_factor
+            bias_key = None if bias is None else (bias.shape, bias.dtype)
+            select_pack_op = _get_tpu_op(
+                (
+                    "select_and_pack",
+                    router_logits.shape,
+                    router_logits.dtype,
+                    bias_key,
+                    _ROUTER_TOPK,
+                    topk,
+                    renorm,
+                    s_fn,
+                    scale,
+                    w_dtype,
+                ),
+                lambda lg, b: _classic_select_and_pack_impl(
+                    lg,
+                    b,
+                    topk=topk,
+                    renormalize=renorm,
+                    scoring_fn=s_fn,
+                    routed_scaling_factor=scale,
+                    out_dtype=w_dtype,
+                ),
+            )
+            packed = select_pack_op(router_logits, bias)
+            gathered = group.all_gather(packed, dim=0)
+            return _unpack_gathered_16bit_topk(gathered, w_dtype)
         local_input_ids = input_ids
         if input_ids is not None:
             n_ids = input_ids.numel()
@@ -424,25 +581,50 @@ def select_experts(
             topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
         )
 
-    scores = _apply_scoring_fn(scoring_fn, router_logits)
     e_score_correction_bias = (
         layer.e_score_correction_bias if layer is not None else None
     )
-    topk_weights, topk_ids = _topk(
-        scores,
-        topk,
-        bias=e_score_correction_bias,
-        renormalize=renormalize,
-    )
     routed_scaling_factor = layer.routed_scaling_factor if layer is not None else 1.0
-    if routed_scaling_factor != 1.0:
-        topk_weights = topk_weights * routed_scaling_factor
+    out_dtype = hidden_states.dtype
+    if router_logits.device.type == "tpu" and not torch.compiler.is_compiling():
+        bias_key = (
+            None
+            if e_score_correction_bias is None
+            else (e_score_correction_bias.shape, e_score_correction_bias.dtype)
+        )
+        select_op = _get_tpu_op(
+            (
+                "classic_select",
+                router_logits.shape,
+                router_logits.dtype,
+                bias_key,
+                _ROUTER_TOPK,
+                topk,
+                renormalize,
+                scoring_fn,
+                routed_scaling_factor,
+                out_dtype,
+            ),
+            lambda lg, b: _classic_select_impl(
+                lg,
+                b,
+                topk=topk,
+                renormalize=renormalize,
+                scoring_fn=scoring_fn,
+                routed_scaling_factor=routed_scaling_factor,
+                out_dtype=out_dtype,
+            ),
+        )
+        return select_op(router_logits, e_score_correction_bias)
 
-    return (
-        topk_weights
-        if topk_weights.dtype == hidden_states.dtype
-        else topk_weights.to(hidden_states.dtype),
-        topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
+    return _classic_select_impl(
+        router_logits,
+        e_score_correction_bias,
+        topk=topk,
+        renormalize=renormalize,
+        scoring_fn=scoring_fn,
+        routed_scaling_factor=routed_scaling_factor,
+        out_dtype=out_dtype,
     )
 
 
