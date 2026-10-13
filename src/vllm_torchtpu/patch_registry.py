@@ -57,6 +57,13 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
+    # Opt-in fp32 activations (VLLM_TPU_ACTIVATION_FP32) for chips that evaluate
+    # bf16 transcendentals natively (v7x); no-op unless set. See
+    # layers/adapter/activation.py.
+    Patch(
+        "vllm_torchtpu.layers.adapter.activation:_register_fp32_activations",
+        _ACTIVE,
+    ),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
