@@ -614,11 +614,11 @@ def _send_merge_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
 
 
 # How `merge_received_jax` forms the two weighted sums over ranks; the first
-# is the one the send-layout merge uses. "dot_default": f32 dots at default
-# precision (bf16 operands, f32 accumulation: the dot torch's
-# multiply-then-sum lowers to); "dot_bf16": the same with bf16 operands
-# spelled out; "reduce_f32": f32 products summed by a reduce.
-MERGE_JAX_VARIANTS = ("dot_default", "dot_bf16", "reduce_f32")
+# is the one the send-layout merge uses. "reduce_f32": f32 products summed by
+# a reduce (the HLO torch's merge compiles to; measured within a few elements
+# per 1e5 of it, not bitwise); "dot_default" / "dot_bf16": bf16-operand dots
+# (far off -- torch's multiply-then-sum is not lowered to a dot here).
+MERGE_JAX_VARIANTS = ("reduce_f32", "dot_default", "dot_bf16")
 
 
 def merge_received_jax(o, l, variant: str = MERGE_JAX_VARIANTS[0]):
