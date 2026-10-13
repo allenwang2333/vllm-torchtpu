@@ -31,18 +31,29 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _kernel(o_ref, w_ref, out_ref):
-    w = w_ref[0]  # f32[bt, 1]
-    x = o_ref[...].astype(jnp.float32) * w
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    out_ref[0] = jnp.where(w > 0, x, jnp.zeros_like(x))
+def _kernel(o_ref, w_ref, out_ref, *, heads: int):
+    # o_ref [bt, heads, D] (tokens-major, as the attention wrote it), w_ref
+    # f32[heads, bt, 1], out_ref f32[heads, bt, D]: head j's rows are a strided
+    # sublane read of the input block, written contiguously.
+    for j in range(heads):
+        w = w_ref[j]  # f32[bt, 1]
+        x = o_ref[:, j, :].astype(jnp.float32) * w
+        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        out_ref[j] = jnp.where(w > 0, x, jnp.zeros_like(x))
 
 
 def _row_block(tokens: int) -> int:
-    for bt in (512, 256, 128, 64, 32, 16, 8):
+    for bt in (128, 64, 32, 16, 8):
         if tokens % bt == 0:
             return bt
     return tokens
+
+
+def _head_block(heads: int) -> int:
+    for hb in (16, 8):
+        if heads % hb == 0:
+            return hb
+    return heads
 
 
 @functools.partial(jax.jit, static_argnames=("fault",))
@@ -53,28 +64,37 @@ def weighted_heads_major(
     `where(w > 0, o * w, 0)` transposed to heads-major, bit for bit the
     torch merge's `output.float() * weight` / `where` per element.
 
-    `fault` (test-only): "swap_heads" writes head h's rows to head h ^ 1.
+    `o` is read in its own [T, H, D] layout (no reshape: a 2-D view of a
+    tiled 3-D buffer is a relayout copy). `fault` (test-only): "swap_heads"
+    writes each head block's heads in reverse order.
     """
     t, h, d = o.shape
     if w.shape != (t, h):
         raise ValueError(f"w {w.shape} must be [{t}, {h}]")
     if d % 128:
         raise ValueError(f"head dim {d} must be a multiple of 128")
-    bt = _row_block(t)
-    o2 = o.reshape(t, h * d)  # head hh is columns [hh * d, (hh + 1) * d)
+    bt, hb = _row_block(t), _head_block(h)
     w3 = jnp.transpose(w.astype(jnp.float32)).reshape(h, t, 1)
-    out_head = (lambda hh: hh ^ 1) if fault == "swap_heads" else (lambda hh: hh)
+    kernel = functools.partial(_kernel, heads=hb)
+    if fault == "swap_heads":
+
+        def kernel(o_ref, w_ref, out_ref):
+            for j in range(hb):
+                wj = w_ref[j]
+                x = o_ref[:, j, :].astype(jnp.float32) * wj
+                out_ref[hb - 1 - j] = jnp.where(wj > 0, x, jnp.zeros_like(x))
+
     return pl.pallas_call(
-        _kernel,
-        grid=(h, t // bt),
+        kernel,
+        grid=(h // hb, t // bt),
         in_specs=[
-            pl.BlockSpec((bt, d), lambda hh, i: (i, hh)),
-            pl.BlockSpec((1, bt, 1), lambda hh, i: (hh, i, 0)),
+            pl.BlockSpec((bt, hb, d), lambda g, i: (i, g, 0)),
+            pl.BlockSpec((hb, bt, 1), lambda g, i: (g, i, 0)),
         ],
-        out_specs=pl.BlockSpec((1, bt, d), lambda hh, i: (out_head(hh), i, 0)),
+        out_specs=pl.BlockSpec((hb, bt, d), lambda g, i: (g, i, 0)),
         out_shape=jax.ShapeDtypeStruct((h, t, d), jnp.float32),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name=f"dcp_weighted_hm_t{t}_h{h}",
-    )(o2, w3)
+    )(o, w3)
