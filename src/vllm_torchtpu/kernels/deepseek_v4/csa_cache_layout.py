@@ -51,15 +51,34 @@ ROPE_DIM = 2 * ROPE_WORDS  # bf16 values per token
 ROPE_TOKENS_PER_ROW = ROW_WORDS // ROPE_WORDS
 
 
+_WORD_DTYPES = frozenset(
+    (
+        jnp.int32,
+        jnp.uint32,
+        jnp.float32,
+        jnp.dtype(jnp.int32),
+        jnp.dtype(jnp.uint32),
+        jnp.dtype(jnp.float32),
+    )
+)
+_BYTE_DTYPES = frozenset(
+    (jnp.uint8, jnp.int8, jnp.dtype(jnp.uint8), jnp.dtype(jnp.int8))
+)
+
+
 def is_word_array(dtype) -> bool:
     """Whether a cache is declared as 32-bit words rather than uint8 slabs."""
+    if dtype in _WORD_DTYPES:
+        return True
+    if dtype in _BYTE_DTYPES:
+        return False
     return jnp.dtype(dtype).itemsize == 4
 
 
 def u8_slab_shape(shape: tuple[int, ...], dtype) -> tuple[int, ...]:
     """The ``(num_pages, rows, 4, lanes)`` uint8 view of a cache array."""
     if not is_word_array(dtype):
-        return tuple(shape)
+        return shape if type(shape) is tuple else tuple(shape)
     num_pages, rows, lanes = shape
     return (num_pages, rows, SLAB_ROWS, lanes)
 
@@ -94,21 +113,43 @@ def slabs_to_words(x: jax.Array) -> jax.Array:
 
 def words_to_slabs(w: jax.Array) -> jax.Array:
     """int32 ``[..., n]`` -> uint8 ``[..., 4, n]``; inverse of the above."""
-    w = lax.bitcast_convert_type(w, jnp.uint32)
+    u = w if w.dtype == jnp.uint32 else lax.bitcast_convert_type(w, jnp.uint32)
     return jnp.stack(
-        [((w >> (8 * b)) & 0xFF).astype(jnp.uint8) for b in range(SLAB_ROWS)],
+        (
+            u.astype(jnp.uint8),
+            (u >> jnp.uint32(8)).astype(jnp.uint8),
+            (u >> jnp.uint32(16)).astype(jnp.uint8),
+            (u >> jnp.uint32(24)).astype(jnp.uint8),
+        ),
         axis=-2,
     )
 
 
 def rope_words(rope: jax.Array) -> jax.Array:
     """bf16 ``[..., 64]`` -> int32 ``[..., 32]``: word k = bf16 k | bf16 k+32."""
-    bits = lax.bitcast_convert_type(rope, jnp.uint16).astype(jnp.uint32)
-    return lax.bitcast_convert_type(
-        bits[..., :ROPE_WORDS] | (bits[..., ROPE_WORDS:] << 16), jnp.int32
+    lo = lax.bitcast_convert_type(
+        rope[..., :ROPE_WORDS].astype(jnp.float32), jnp.uint32
     )
+    hi = lax.bitcast_convert_type(
+        rope[..., ROPE_WORDS:].astype(jnp.float32), jnp.uint32
+    )
+    return lax.bitcast_convert_type((lo >> jnp.uint32(16)) | hi, jnp.int32)
 
 
 def encode_rope(rope: jax.Array) -> jax.Array:
     """bf16 ``[num_tokens, 64]`` -> the int32 ``[num_tokens // 4, 128]`` rows."""
+    if (
+        rope.ndim == 2
+        and rope.shape[1] == ROPE_DIM
+        and rope.shape[0] % ROPE_TOKENS_PER_ROW == 0
+    ):
+        lo = lax.bitcast_convert_type(
+            rope[:, :ROPE_WORDS].reshape(-1, ROW_WORDS).astype(jnp.float32),
+            jnp.uint32,
+        )
+        hi = lax.bitcast_convert_type(
+            rope[:, ROPE_WORDS:].reshape(-1, ROW_WORDS).astype(jnp.float32),
+            jnp.uint32,
+        )
+        return lax.bitcast_convert_type((lo >> jnp.uint32(16)) | hi, jnp.int32)
     return rope_words(rope).reshape(-1, ROW_WORDS)
