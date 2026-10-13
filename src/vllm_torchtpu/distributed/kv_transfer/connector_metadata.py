@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 ReqId = str
 
 
-@dataclass
+@dataclass(slots=True)
 class SendMeta:
     uuid: int
     local_block_ids: list[int]
@@ -32,7 +32,7 @@ class SendMeta:
     group_block_ids: list[list[int]] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class LoadMeta:
     uuid: int
     local_block_ids: list[int] | None
@@ -51,7 +51,15 @@ class LoadMeta:
     fail_only: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        reqs_to_send: dict[ReqId, SendMeta] | None = None,
+        reqs_to_load: dict[ReqId, LoadMeta] | None = None,
+    ) -> None:
+        self.reqs_to_send = {} if reqs_to_send is None else reqs_to_send
+        self.reqs_to_load = {} if reqs_to_load is None else reqs_to_load
