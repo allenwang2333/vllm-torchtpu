@@ -285,6 +285,29 @@ def test_smem_caps_refresh_after_backend_block_size_update():
     assert runner._decode_device_cache_key is None
 
 
+def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
+    """`cache_config.block_size` is unset until the platform picks one (and
+    lightweight harnesses omit it); the runner must keep its own value."""
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=384,
+        max_num_blocks_per_req=86,
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=None),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 384
+    assert runner.max_num_blocks_per_req == 86
+
+
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
     connector = object()
 

@@ -7452,9 +7452,14 @@ class TPUModelRunner(GPUModelRunner):
         Startup initially has a placeholder table. Refresh after vLLM installs
         the final cache groups so DCP and kernel block splitting are reflected.
         """
+        # `TpuPlatform.update_block_size_for_backend` may raise
+        # `cache_config.block_size` after `__init__` captured it (e.g. hybrid
+        # attention+SSM models); re-sync so the caps below use the finalized
+        # value. It is unset until the platform finalizes it.
         cache_config = getattr(self, "cache_config", None)
-        if cache_config is not None:
-            self.block_size = cache_config.block_size
+        block_size = getattr(cache_config, "block_size", None)
+        if block_size is not None:
+            self.block_size = block_size
         groups = (
             kv_cache_config
             if kv_cache_config is not None
@@ -7474,7 +7479,7 @@ class TPUModelRunner(GPUModelRunner):
             if groups is not None
             else []
         )
-        if not attention_groups and cache_config is not None:
+        if not attention_groups and block_size is not None:
             self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
 
         def widest_table(model_len: int | None) -> int:
