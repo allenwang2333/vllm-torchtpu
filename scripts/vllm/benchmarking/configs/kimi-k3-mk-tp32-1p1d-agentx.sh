@@ -119,8 +119,11 @@ export TPU_RAIDEN_POOL_STAGING_LEASES=16
 export TPU_P2P_WAIT_PULL_TIMEOUT=900
 export RAIDEN_EXPECTED_WORKERS_TIMEOUT_S=1800
 export TPU_RAIDEN_ADVERTISE_HOST="$HEAD_IP"
-export TPU_RAIDEN_JOB_NAME=k3-mk-0
-export TPU_RAIDEN_ENGINE_ID=k3-mk-0-engine
+# TPU_RAIDEN_JOB_NAME and TPU_RAIDEN_ENGINE_ID are set per role below. The doc
+# shares k3-mk-0 / k3-mk-0-engine between the roles, which gives prefill rank k
+# and decode rank k the same Raiden work-unit id; the reshard coordinator then
+# makes every decode worker a sender and arms no receiver, and every transfer
+# fails ("No transfer chunks found", vllm-torchtpu-dev build 563).
 export TPU_KV_TRANSFER_NAMESPACE=k3-mk-0
 export TPU_LOG_DIR="$LOG_DIR/tpu"
 export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=0
@@ -133,6 +136,8 @@ export LIBTPU_INIT_ARGS="--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm
 _cache_user="${USER:-k3mk}"
 if [ "$K3_MK_ROLE" = prefill ]; then
   export HF_MODULES_CACHE="$HF_HOME_DIR/modules-prefill"
+  export TPU_RAIDEN_JOB_NAME=k3-mk-0-prefill
+  export TPU_RAIDEN_ENGINE_ID=k3-mk-0-prefill-engine
   export TPU_K3_MOE_REDUCE_DTYPE=bfloat16
   export TPU_RAIDEN_CONTROLLER_ADDRESS="$HEAD_IP:27340"
   export TPU_RAIDEN_RESHARD_PORT_BASE=27340
@@ -147,6 +152,8 @@ if [ "$K3_MK_ROLE" = prefill ]; then
   export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/prefill/torch_tpu_tier3"
 else
   export HF_MODULES_CACHE="$HF_HOME_DIR/modules-decode"
+  export TPU_RAIDEN_JOB_NAME=k3-mk-0-decode
+  export TPU_RAIDEN_ENGINE_ID=k3-mk-0-decode-engine
   export TPU_K3_MOE_REDUCE_DTYPE=float32
   export TPU_RAIDEN_CONTROLLER_ADDRESS="$HEAD_IP:28340"
   export TPU_RAIDEN_RESHARD_PORT_BASE=28340
