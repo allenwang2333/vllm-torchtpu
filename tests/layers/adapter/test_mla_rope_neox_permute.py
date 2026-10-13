@@ -881,7 +881,9 @@ def test_decode_prologue_impl_routes_to_rope_op(monkeypatch):
         "merge_lse_partials_scatter_heads",
         lambda partial, lse, **kw: partial[:t, :h],
     )
-    monkeypatch.setattr(impl, "_get_kv_scales", lambda layer: (None, None, None), raising=False)
+    monkeypatch.setattr(
+        impl, "_get_kv_scales", lambda layer: (None, None, None), raising=False
+    )
     q = torch.randn(t, h * g, QK, generator=gen).bfloat16()
     q_nope, q_pe = q[..., :NOPE], q[..., NOPE:]
     tab = torch.randn(t, 2, 128, generator=gen)
@@ -898,7 +900,9 @@ def test_decode_prologue_impl_routes_to_rope_op(monkeypatch):
         attn_metadata=md,
         topk_indices=topk,
     )
-    impl.forward(q=(q_nope[:, :h], q_pe[:, :h]), q_dcp_replicated=(q_nope, q_pe), **common)
+    impl.forward(
+        q=(q_nope[:, :h], q_pe[:, :h]), q_dcp_replicated=(q_nope, q_pe), **common
+    )
     impl.forward(
         q=(q_nope[:, :h], q_pe[:, :h]), q_dcp_replicated=(q_nope, q, tab), **common
     )

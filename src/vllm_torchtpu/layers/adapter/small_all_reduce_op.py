@@ -42,6 +42,8 @@ the step's tokens). The drafter traces keep the sized op: the mask describes
 the target step's rows.
 """
 
+from typing import Any
+
 import jax
 import torch
 from jax.sharding import PartitionSpec
@@ -78,14 +80,16 @@ def max_rows() -> int:
     return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
 
 
-_AR_OP = None
+# Built ops are torch custom ops; `Any` so the checker does not read the
+# None placeholder as their type.
+_AR_OP: Any = None
 # The all-reduce for traces outside the backbone warmup: the row choice is
 # made per exported bucket inside JAX (TPU_SMALL_ALL_REDUCE_DRAFT).
 _AR_SIZED_OP = None
 _RS_OP = None
 # The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
 # tile its fold path folds into.
-_AR_VALID_OP = None
+_AR_VALID_OP: Any = None
 _VALID_TILE_ROWS = 0
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).

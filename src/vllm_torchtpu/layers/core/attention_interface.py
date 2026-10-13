@@ -29,12 +29,12 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -1282,6 +1282,7 @@ def sparse_mla_attention_dcp(
         mask_in_kernel = mask_in_kernel or (
             envs.TPU_DCP_MLA_MIXED_MASK_IN_KERNEL and not decode_bucket
         )
+        owns = None
         if not mask_in_kernel:
             # A rank owning none of a token's top-k still has to be handed one
             # valid entry: the kernel derives `kv_len` from the `-1` tail and
@@ -1383,6 +1384,7 @@ def sparse_mla_attention_dcp(
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
         if not mask_in_kernel:
+            assert owns is not None
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).
         return (kv_cache_nope, kv_cache_rope, output[..., : ql_nope.shape[-1]], lse)

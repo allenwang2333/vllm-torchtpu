@@ -208,7 +208,9 @@ def test_vocab_parallel_argmax_matches_full_argmax(monkeypatch, tp, width, pad):
         assert torch.equal(out, expected), (r, out, expected)
 
 
-@pytest.mark.parametrize("tp,rows,lead3", [(16, 16, False), (8, 5, False), (4, 6, True)])
+@pytest.mark.parametrize(
+    "tp,rows,lead3", [(16, 16, False), (8, 5, False), (4, 6, True)]
+)
 def test_column_parallel_eh_proj_matches_replicated(monkeypatch, tp, rows, lead3):
     """TPU_MTP_EH_PROJ_TP: every rank's gathered output equals the replicated
     nn.Linear, for 2-D and 3-D inputs. Small-integer f32 values make every dot
@@ -220,7 +222,9 @@ def test_column_parallel_eh_proj_matches_replicated(monkeypatch, tp, rows, lead3
     g = torch.Generator().manual_seed(tp * 7 + rows)
     full = torch.nn.Linear(2 * hidden, hidden, bias=False)
     with torch.no_grad():
-        full.weight.copy_(torch.randint(-4, 5, (hidden, 2 * hidden), generator=g).float())
+        full.weight.copy_(
+            torch.randint(-4, 5, (hidden, 2 * hidden), generator=g).float()
+        )
     shape = (2, rows, 2 * hidden) if lead3 else (rows, 2 * hidden)
     x = torch.randint(-4, 5, shape, generator=g).float()
     expected = full(x).detach()

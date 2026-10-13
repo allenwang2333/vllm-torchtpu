@@ -172,8 +172,17 @@ def test_trim_is_exact(dev, case, variant):
         draws = _draw(gen, PADDED_NUM_REQS, padded, vocab, logits.dtype)
         full = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **variant)
         trim = _run(
-            fn, dev, logits, md, temps, top_k, top_p, draws, 0,
-            verify_rows=8, **variant,
+            fn,
+            dev,
+            logits,
+            md,
+            temps,
+            top_k,
+            top_p,
+            draws,
+            0,
+            verify_rows=8,
+            **variant,
         )
         assert torch.equal(full, trim), (case, seed, full, trim)
 
@@ -188,8 +197,17 @@ def test_positive_control_dropped_real_slot_is_caught(dev):
         draws = _draw(gen, PADDED_NUM_REQS, padded, vocab, logits.dtype)
         full = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **VARIANTS[0])
         bad = _run(
-            fn, dev, logits, md, temps, top_k, top_p, draws, 0,
-            verify_rows=6, **VARIANTS[0],
+            fn,
+            dev,
+            logits,
+            md,
+            temps,
+            top_k,
+            top_p,
+            draws,
+            0,
+            verify_rows=6,
+            **VARIANTS[0],
         )
         differs += int(not torch.equal(full, bad))
     assert differs > 0

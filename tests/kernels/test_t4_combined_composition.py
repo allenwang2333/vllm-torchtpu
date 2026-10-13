@@ -128,6 +128,7 @@ def _dcp_size():
 
 def _ulp_diff(a, b):
     """|a - b| in bf16 ulps (bit patterns as a monotone integer line)."""
+
     def line(x):
         x = x.astype(np.int32)
         return np.where(x < 0, -(x & 0x7FFF), x)
@@ -163,7 +164,9 @@ def test_attention_all_flags_on_vs_off():
         real = a["real"]
         want = _merge_every_rank(*prologue._rank_partials(a, dcp), on=False)
         one = _merge_every_rank(*prologue._rank_partials(b, dcp), on=True, real=real)
-        diff = int((one[:real].view(torch.int16) != want[:real].view(torch.int16)).sum())
+        diff = int(
+            (one[:real].view(torch.int16) != want[:real].view(torch.int16)).sum()
+        )
         print(
             f"step {i} merged (threaded a2a, pack + real rows vs two-exchange):"
             f" {diff} differ on {real} real rows; padding rows zero:"
@@ -229,9 +232,9 @@ def _merge_every_rank(outputs, lses, on, real=None):
         mock.patch.object(
             cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", on, create=True
         ),
+        concurrent.futures.ThreadPoolExecutor(world) as pool,
     ):
-        with concurrent.futures.ThreadPoolExecutor(world) as pool:
-            return torch.cat(list(pool.map(run, range(world))), dim=1)
+        return torch.cat(list(pool.map(run, range(world))), dim=1)
 
 
 def test_attention_all_flags_on_rank_control_fails():
@@ -282,9 +285,7 @@ def test_indexer_rank_operand_and_q_b_overlap(q_len):
     topk, q = streamindex_topk_dcp(*args, **kwargs, **ov, dcp_rank_ids=_rank_ids(dcp))
     np.testing.assert_array_equal(np.asarray(topk), base)
     np.testing.assert_array_equal(np.asarray(q).view(np.uint16), want_q)
-    bad, _ = streamindex_topk_dcp(
-        *args, **kwargs, **ov, dcp_rank_ids=_rank_ids(dcp, 1)
-    )
+    bad, _ = streamindex_topk_dcp(*args, **kwargs, **ov, dcp_rank_ids=_rank_ids(dcp, 1))
     assert not np.array_equal(np.asarray(bad), base), "rotated rank ids not caught"
 
 
@@ -310,7 +311,9 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
     with (
         mock.patch.dict(os.environ, env),
         mock.patch.object(
-            attention, "dcp_rank_operand", return_value=torch.zeros(1, dtype=torch.int32)
+            attention,
+            "dcp_rank_operand",
+            return_value=torch.zeros(1, dtype=torch.int32),
         ),
     ):
         if not rank:

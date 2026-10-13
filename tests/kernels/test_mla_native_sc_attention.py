@@ -1061,11 +1061,16 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     sparse_mla.MIXED_BODY_DEFAULT,
                 )
             ),
-            {"mixed_live_gather": True, "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT},
+            {
+                "mixed_live_gather": True,
+                "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT,
+            },
         ):
             out, lse = jax.block_until_ready(run(topk_glued, **kw))
             np.testing.assert_array_equal(
-                bits(out)[:real_tokens][own], bits(ref)[:real_tokens][own], err_msg=str(kw)
+                bits(out)[:real_tokens][own],
+                bits(ref)[:real_tokens][own],
+                err_msg=str(kw),
             )
             np.testing.assert_array_equal(
                 np.asarray(lse)[:real_tokens][own].view(np.uint32),
@@ -1159,7 +1164,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             ref_lse = jnp.where(owns[:, None], ref_lse, -jnp.inf)
             out, lse = jax.block_until_ready(run(topk_raw, lse_mask_empty=True, **kw))
             np.testing.assert_array_equal(
-                bits(out)[:real_tokens][own], bits(ref)[:real_tokens][own], err_msg=str(kw)
+                bits(out)[:real_tokens][own],
+                bits(ref)[:real_tokens][own],
+                err_msg=str(kw),
             )
             np.testing.assert_array_equal(
                 np.asarray(lse)[:real_tokens][own].view(np.uint32),
@@ -1190,7 +1197,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("Mosaic kernel requires a TPU")
         rng = np.random.default_rng(num_tokens + real)
-        page_size, total_pages, pps, topk, cap, chunk, bz = 256, 2085, 256, 2048, 512, 256, 16
+        page_size, total_pages, pps, topk, cap, chunk, bz = (
+            256,
+            2085,
+            256,
+            2048,
+            512,
+            256,
+            16,
+        )
         page_table = jnp.asarray(rng.integers(0, total_pages, size=8 * pps), jnp.int32)
         cu_q_lens = jnp.asarray([0] + [real] * 8, jnp.int32)
         token_end = jnp.int32(real)
@@ -1201,25 +1216,47 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             counts[real - 1] = max(counts[real - 1], 1)
             logical = rng.integers(0, pps * page_size, size=(num_tokens, topk))
             topk_idx = jnp.asarray(
-                np.where(np.arange(topk)[None] < counts[:, None], logical, -1), jnp.int32
+                np.where(np.arange(topk)[None] < counts[:, None], logical, -1),
+                jnp.int32,
             )
             kv = jnp.sum(topk_idx != -1, axis=-1)
             lw = sparse_mla.capped_live_windows(
-                kv, token_end, chunk_size=chunk, kernel_batch_size=bz,
-                topk_cap=cap, num_windows=topk // cap,
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
             )
             tab, num_live = sparse_mla.live_group_table(
-                kv, token_end, chunk_size=chunk, kernel_batch_size=bz,
-                topk_cap=cap, num_windows=topk // cap,
+                kv,
+                token_end,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                num_windows=topk // cap,
             )
             rows = sparse_mla.prepare_capped_window_live(
-                topk_idx, page_table, cu_q_lens, lw, tab, chunk_size=chunk,
-                kernel_batch_size=bz, topk_cap=cap, page_size=page_size,
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                tab,
+                chunk_size=chunk,
+                kernel_batch_size=bz,
+                topk_cap=cap,
+                page_size=page_size,
                 total_num_pages=total_pages,
             )
             want = sparse_mla.prepare_capped_window_indices(
-                topk_idx, page_table, cu_q_lens, lw, chunk_size=chunk, topk_cap=cap,
-                page_size=page_size, total_num_pages=total_pages,
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                lw,
+                chunk_size=chunk,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total_pages,
             )
             lw, tab, num_live = int(lw), np.asarray(tab), np.asarray(num_live)
             nc, gpc, ng = num_tokens // chunk, chunk // bz, num_tokens // bz
@@ -1287,12 +1324,24 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             kv, token_end, num_windows=topk // cap, **kw
         )
         want = sparse_mla.prepare_capped_window_live(
-            topk_idx, page_table, cu_q_lens, lw, tab, page_size=page_size,
-            total_num_pages=total_pages, **kw,
+            topk_idx,
+            page_table,
+            cu_q_lens,
+            lw,
+            tab,
+            page_size=page_size,
+            total_num_pages=total_pages,
+            **kw,
         )
         rows, got_kv, got_tab, got_live = sparse_mla.prepare_capped_window_live_fused(
-            topk_idx, page_table, cu_q_lens, token_end, page_size=page_size,
-            total_num_pages=total_pages, _fault=fault, **kw,
+            topk_idx,
+            page_table,
+            cu_q_lens,
+            token_end,
+            page_size=page_size,
+            total_num_pages=total_pages,
+            _fault=fault,
+            **kw,
         )
         np.testing.assert_array_equal(np.asarray(got_kv), np.asarray(kv))
         np.testing.assert_array_equal(np.asarray(got_tab), np.asarray(tab))
@@ -1323,8 +1372,15 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         return topk_idx
 
     @parameterized.product(
-        shape=((128, 100), (256, 200), (512, 300), (1024, 1000), (1024, 77),
-               (2048, 2048), (4096, 3000)),
+        shape=(
+            (128, 100),
+            (256, 200),
+            (512, 300),
+            (1024, 1000),
+            (1024, 77),
+            (2048, 2048),
+            (4096, 3000),
+        ),
         overflow=(False, True),
     )
     def test_capped_window_live_fused_matches_live(self, shape, overflow):

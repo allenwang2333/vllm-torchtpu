@@ -25,6 +25,7 @@ Imported only when the flag is set, so the flag-off model builds the stock
 """
 
 from threading import Lock
+from typing import Any
 
 import jax
 import torch
@@ -34,7 +35,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
 
-_ops: dict[tuple[float, bool], object] = {}
+_ops: dict[tuple[float, bool], Any] = {}
 _ops_lock = Lock()
 
 
@@ -93,7 +94,9 @@ class TpuRMSNorm(RMSNorm):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._min_rows = max(envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, kernel.DEFAULT_BLOCK_ROWS)
+        self._min_rows = max(
+            envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, kernel.DEFAULT_BLOCK_ROWS
+        )
         self._pallas_ok = (
             self.has_weight
             and self.variance_size_override is None

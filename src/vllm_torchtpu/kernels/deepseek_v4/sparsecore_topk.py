@@ -606,6 +606,7 @@ def _topk_body(
 
     def hist0_chunks_wait(c):
         del c
+        assert rowdata_vmem is not None and dma_sem is not None
         pltpu.make_async_copy(
             scores_hbm.at[pl.ds(0, dma_chunk)],
             rowdata_vmem.at[pl.ds(0, dma_chunk)],
@@ -630,6 +631,7 @@ def _topk_body(
             @pl.loop(0, num_dmas)
             def _(c):
                 off = pl.multiple_of(c * dma_chunk, dma_chunk)
+                assert rowdata_vmem is not None and dma_sem is not None
                 pltpu.make_async_copy(
                     scores_hbm.at[pl.ds(row_base + off, dma_chunk)],
                     rowdata_vmem.at[pl.ds(off, dma_chunk)],

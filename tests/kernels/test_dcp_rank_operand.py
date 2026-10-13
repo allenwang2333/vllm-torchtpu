@@ -131,7 +131,9 @@ def test_indexer_k_scatter_rank_operand(dcp_size):
     wrong = run(jnp.copy(init), *args, rank_ids=_rank_ids(mesh, dcp_size, 1))
     assert _tree_differs(wrong, base), "rank_ids is ignored"
 
-    lower = lambda **kw: jax.jit(functools.partial(run, **kw)).lower(init, *args)
+    def lower(**kw):
+        return jax.jit(functools.partial(run, **kw)).lower(init, *args)
+
     n0 = _num_a2a(lower().as_text())
     n1 = _num_a2a(lower(rank_ids=_rank_ids(mesh, dcp_size)).as_text())
     assert n1 == n0 - 1, (n0, n1)
@@ -147,9 +149,7 @@ def test_streamindex_topk_dcp_rank_operand(dcp_size):
     _, args, kwargs = _dcp_case(dcp_size, 11)
     mesh = kwargs["mesh"]
     base = streamindex_topk_dcp(*args, **kwargs)
-    got = streamindex_topk_dcp(
-        *args, **kwargs, dcp_rank_ids=_rank_ids(mesh, dcp_size)
-    )
+    got = streamindex_topk_dcp(*args, **kwargs, dcp_rank_ids=_rank_ids(mesh, dcp_size))
     _assert_tree_equal(got, base)
     wrong = streamindex_topk_dcp(
         *args, **kwargs, dcp_rank_ids=_rank_ids(mesh, dcp_size, 1)
@@ -211,9 +211,7 @@ def test_sparse_mla_attention_dcp_rank_operand(dcp_size):
         rng.standard_normal((num_tokens, t.NUM_HEADS, t.ROPE_DIM)), jnp.bfloat16
     )
     kv_c = jnp.asarray(rng.standard_normal((num_tokens, t.LKV_DIM)), jnp.float8_e4m3fn)
-    k_pe = jnp.asarray(
-        rng.standard_normal((num_tokens, t.ROPE_DIM)), jnp.float8_e4m3fn
-    )
+    k_pe = jnp.asarray(rng.standard_normal((num_tokens, t.ROPE_DIM)), jnp.float8_e4m3fn)
     # Every rank attends over its first 40 local positions for every token.
     local_topk = np.full((dcp_size * num_tokens, topk), -1, np.int32)
     local_topk[:, :40] = np.arange(40)

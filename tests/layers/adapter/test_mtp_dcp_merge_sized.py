@@ -55,7 +55,10 @@ def _partials(rng, world, tokens, local=4, vdim=128):
 
 def _run(o, lse, cap, fn=cp_mla.sized_merge_local):
     world = o.shape[0]
-    body = lambda a, b: fn(a, b, world=world, a2a_max_tokens=cap, axis_name=AXIS)
+
+    def body(a, b):
+        return fn(a, b, world=world, a2a_max_tokens=cap, axis_name=AXIS)
+
     out = jax.vmap(body, axis_name=AXIS)(jnp.asarray(o, jnp.bfloat16), jnp.asarray(lse))
     # [world, T, local, V] -> the whole [T, H, V]
     out = np.asarray(out.astype(jnp.float32))
@@ -75,7 +78,10 @@ def _reference(o, lse):
 
 
 def _within_1ulp(got, ref):
-    return bool(np.isfinite(got).all() and (np.abs(got - ref) <= 2.0**-8 * np.abs(ref) + 1e-6).all())
+    return bool(
+        np.isfinite(got).all()
+        and (np.abs(got - ref) <= 2.0**-8 * np.abs(ref) + 1e-6).all()
+    )
 
 
 def _host_rank_order(o, lse):
@@ -161,9 +167,13 @@ def test_routing(flag, is_backbone, built, expect, monkeypatch):
     monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _Group())
     monkeypatch.setattr(
-        cp_mla, "_SIZED_MERGE_OPS", {4: lambda o, l: calls.append(1) or o[:, :1]} if built else {}
+        cp_mla,
+        "_SIZED_MERGE_OPS",
+        {4: lambda o, lse: calls.append(1) or o[:, :1]} if built else {},
     )
-    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", lambda o, l, g: o[:, :1])
+    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", lambda o, lse, g: o[:, :1])
     o = torch.zeros(16, 4, 8, dtype=torch.bfloat16)
-    cp_mla.merge_lse_partials_scatter_heads(o, torch.zeros(16, 4), is_backbone=is_backbone)
+    cp_mla.merge_lse_partials_scatter_heads(
+        o, torch.zeros(16, 4), is_backbone=is_backbone
+    )
     assert bool(calls) == expect

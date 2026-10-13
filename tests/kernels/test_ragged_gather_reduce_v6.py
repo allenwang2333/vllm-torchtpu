@@ -2,14 +2,14 @@
 
 v6 runs v5's steps without the pipeline grid; it must be bit-identical to v5 and
 v4 for every tiling, and within the bf16 rounding bound of a float64 oracle.
-Inputs mirror moe_gmm's EP path: x is the expert-sorted gmm2 output, indices are argsort_revert_indices (token-major),
+Inputs mirror moe_gmm's EP path: x is the expert-sorted gmm2 output, indices are
+argsort_revert_indices (token-major),
 valid = local expert; rows past the valid prefix are NaN.
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
     ragged_gather_reduce_v4,
@@ -27,10 +27,17 @@ pytestmark = pytest.mark.tpu_test
 
 def _inputs(num_tokens, topk, ep, num_experts, hidden, sigma=0.0, seed=0):
     rng = np.random.default_rng(seed)
-    p = np.exp(rng.normal(0.0, sigma, size=num_experts)) if sigma else np.ones(num_experts)
+    p = (
+        np.exp(rng.normal(0.0, sigma, size=num_experts))
+        if sigma
+        else np.ones(num_experts)
+    )
     p /= p.sum()
     ids = np.stack(
-        [rng.choice(num_experts, size=topk, replace=False, p=p) for _ in range(num_tokens)]
+        [
+            rng.choice(num_experts, size=topk, replace=False, p=p)
+            for _ in range(num_tokens)
+        ]
     )
     per_rank = num_experts // ep
     if sigma:
@@ -80,7 +87,9 @@ CASES = [
     [(None, None), (16, 2048), (64, 768), (32, 384)],
     ids=["auto", "t16c2048", "t64c768", "t32c384"],
 )
-def test_v6_matches_v5_and_v4_bitwise(tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk):
+def test_v6_matches_v5_and_v4_bitwise(
+    tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk
+):
     if tile_tokens and tokens % tile_tokens:
         pytest.skip("token count not a multiple of the tile")
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma)
@@ -100,10 +109,14 @@ def test_v6_matches_v5_and_v4_bitwise(tokens, topk, ep, experts, hidden, sigma, 
 
 @pytest.mark.parametrize("tokens,topk,ep,experts,hidden,sigma", CASES[:3] + CASES[5:6])
 @pytest.mark.parametrize("nslots,col_chunk", [(3, None), (4, 768), (6, 512)])
-def test_v6_deeper_rings_match_v5_bitwise(tokens, topk, ep, experts, hidden, sigma, nslots, col_chunk):
+def test_v6_deeper_rings_match_v5_bitwise(
+    tokens, topk, ep, experts, hidden, sigma, nslots, col_chunk
+):
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma)
     kw = dict(reduce_group_size=topk, col_chunk=col_chunk)
-    got = np.asarray(ragged_gather_reduce_v6(x, idx, w, valid, nslots=nslots, **kw)).view(np.uint16)
+    got = np.asarray(
+        ragged_gather_reduce_v6(x, idx, w, valid, nslots=nslots, **kw)
+    ).view(np.uint16)
     v5 = np.asarray(ragged_gather_reduce_v5(x, idx, w, valid, **kw)).view(np.uint16)
     bad = np.argwhere(got != v5)
     assert bad.size == 0, f"{len(bad)} mismatches vs v5, first {bad[:4].tolist()}"
@@ -113,7 +126,9 @@ def test_v6_deeper_rings_match_v5_bitwise(tokens, topk, ep, experts, hidden, sig
 def test_v6_within_bf16_bound_of_f64(tokens, topk, ep, experts, hidden, sigma):
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma, seed=1)
     got = np.asarray(
-        ragged_gather_reduce_v6(x, idx, w, valid, reduce_group_size=topk).astype(jnp.float32),
+        ragged_gather_reduce_v6(x, idx, w, valid, reduce_group_size=topk).astype(
+            jnp.float32
+        ),
         np.float64,
     )
     ref = _oracle_f64(x, idx, w, valid, topk)
@@ -131,7 +146,9 @@ def test_v6_repeated_calls_stable():
     # leak state between calls.
     x, idx, w, valid = _inputs(4096, 8, 4, 256, 6144, 0.8, seed=3)
     outs = [
-        np.asarray(ragged_gather_reduce_v6(x, idx, w, valid, reduce_group_size=8)).view(np.uint16)
+        np.asarray(ragged_gather_reduce_v6(x, idx, w, valid, reduce_group_size=8)).view(
+            np.uint16
+        )
         for _ in range(3)
     ]
     assert all((o == outs[0]).all() for o in outs[1:])

@@ -7,10 +7,9 @@ expert-sorted gmm2 output, indices are argsort_revert_indices (token-major),
 valid = local expert; rows past the valid prefix are NaN.
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
     ragged_gather_reduce_v4,
@@ -25,10 +24,17 @@ pytestmark = pytest.mark.tpu_test
 
 def _inputs(num_tokens, topk, ep, num_experts, hidden, sigma=0.0, seed=0):
     rng = np.random.default_rng(seed)
-    p = np.exp(rng.normal(0.0, sigma, size=num_experts)) if sigma else np.ones(num_experts)
+    p = (
+        np.exp(rng.normal(0.0, sigma, size=num_experts))
+        if sigma
+        else np.ones(num_experts)
+    )
     p /= p.sum()
     ids = np.stack(
-        [rng.choice(num_experts, size=topk, replace=False, p=p) for _ in range(num_tokens)]
+        [
+            rng.choice(num_experts, size=topk, replace=False, p=p)
+            for _ in range(num_tokens)
+        ]
     )
     per_rank = num_experts // ep
     if sigma:
@@ -74,15 +80,25 @@ CASES = [
 
 @pytest.mark.parametrize("tokens,topk,ep,experts,hidden,sigma", CASES)
 @pytest.mark.parametrize(
-    "tile_tokens,col_chunk", [(None, None), (16, 2048), (64, 768)], ids=["auto", "t16c2048", "t64c768"]
+    "tile_tokens,col_chunk",
+    [(None, None), (16, 2048), (64, 768)],
+    ids=["auto", "t16c2048", "t64c768"],
 )
-def test_v5_matches_v4_bitwise(tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk):
+def test_v5_matches_v4_bitwise(
+    tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk
+):
     if tile_tokens and tokens % tile_tokens:
         pytest.skip("token count not a multiple of the tile")
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma)
     assert supported(x, idx, topk, tile_tokens or 16)
     got = ragged_gather_reduce_v5(
-        x, idx, w, valid, reduce_group_size=topk, tile_tokens=tile_tokens, col_chunk=col_chunk
+        x,
+        idx,
+        w,
+        valid,
+        reduce_group_size=topk,
+        tile_tokens=tile_tokens,
+        col_chunk=col_chunk,
     )
     want = ragged_gather_reduce_v4(x, idx, w, valid, reduce_group_size=topk)
     got = np.asarray(got).view(np.uint16)
@@ -96,7 +112,9 @@ def test_v5_matches_v4_bitwise(tokens, topk, ep, experts, hidden, sigma, tile_to
 def test_v5_within_bf16_bound_of_f64(tokens, topk, ep, experts, hidden, sigma):
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma, seed=1)
     got = np.asarray(
-        ragged_gather_reduce_v5(x, idx, w, valid, reduce_group_size=topk).astype(jnp.float32),
+        ragged_gather_reduce_v5(x, idx, w, valid, reduce_group_size=topk).astype(
+            jnp.float32
+        ),
         np.float64,
     )
     ref = _oracle_f64(x, idx, w, valid, topk)
@@ -109,7 +127,9 @@ def test_v5_within_bf16_bound_of_f64(tokens, topk, ep, experts, hidden, sigma):
     assert not np.signbit(got[empty]).any()
 
 
-@pytest.mark.parametrize("tokens,topk,ep", [(4096, 8, 4), (2048, 4, 2)])  # >= 2048: v5 applies
+@pytest.mark.parametrize(
+    "tokens,topk,ep", [(4096, 8, 4), (2048, 4, 2)]
+)  # >= 2048: v5 applies
 def test_moe_gmm_flag_routes_ep_combine_to_v5_bitwise(monkeypatch, tokens, topk, ep):
     from vllm_torchtpu.layers.core import fused_moe_gmm
 
@@ -167,12 +187,18 @@ def test_flag_falls_back_where_v5_does_not_apply(monkeypatch):
     big = jnp.zeros((32768, 6144), jnp.bfloat16)
     assert fused_moe_gmm._use_sc_combine_v5(big, jnp.zeros((32768,), jnp.int32), 8)
     # token count not a multiple of the 16-token tile
-    assert not fused_moe_gmm._use_sc_combine_v5(big, jnp.zeros((8 * 4100,), jnp.int32), 8)
+    assert not fused_moe_gmm._use_sc_combine_v5(
+        big, jnp.zeros((8 * 4100,), jnp.int32), 8
+    )
     # below 2048 tokens (no 64-token tile per subcore): v4 / v2 instead
-    assert not fused_moe_gmm._use_sc_combine_v5(big, jnp.zeros((8 * 1024,), jnp.int32), 8)
+    assert not fused_moe_gmm._use_sc_combine_v5(
+        big, jnp.zeros((8 * 1024,), jnp.int32), 8
+    )
     assert fused_moe_gmm._use_sc_combine_v5(big, jnp.zeros((8 * 2048,), jnp.int32), 8)
     # topk above 16 routes per token
-    assert not fused_moe_gmm._use_sc_combine_v5(big, jnp.zeros((32 * 1024,), jnp.int32), 32)
+    assert not fused_moe_gmm._use_sc_combine_v5(
+        big, jnp.zeros((32 * 1024,), jnp.int32), 32
+    )
     # small source: v2's own cutoff (XLA fallback) applies
     small = jnp.zeros((256, 6144), jnp.bfloat16)
     assert not fused_moe_gmm._use_sc_combine_v5(small, jnp.zeros((256,), jnp.int32), 8)

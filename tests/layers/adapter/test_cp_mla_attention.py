@@ -515,9 +515,7 @@ def test_positive_control_real_rows_short_by_one_is_caught(monkeypatch):
     real = 5  # the dropped row (token 4's last head) is owned by most ranks
     want = _merge_packed(outputs, lses, monkeypatch)
     got = _merge_real_rows(outputs, lses, monkeypatch, real, short_by=1)
-    assert not torch.equal(
-        got[:real].view(torch.int16), want[:real].view(torch.int16)
-    )
+    assert not torch.equal(got[:real].view(torch.int16), want[:real].view(torch.int16))
 
 
 def test_positive_control_dropped_lse_shift_is_caught(monkeypatch):
@@ -851,9 +849,7 @@ def _spread_partials(rng, dcp_size, tokens, local_heads, vdim, spread):
         rng.standard_normal((dcp_size, tokens, heads, vdim)).astype(np.float32)
     ).to(torch.bfloat16)
     lses = torch.from_numpy(
-        (rng.standard_normal((dcp_size, tokens, heads)) * spread + 3).astype(
-            np.float32
-        )
+        (rng.standard_normal((dcp_size, tokens, heads)) * spread + 3).astype(np.float32)
     )
     return outputs, lses
 
@@ -905,7 +901,10 @@ def test_bf16_wire_merge_is_within_its_bound(
     assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
     e_f32 = _scale_ulp_errors(f32, outputs, lses)
     e_got = _scale_ulp_errors(got, outputs, lses)
-    print(f"RS_BF16 mode={mode} dcp={dcp_size} T={tokens} s={spread}: f32 {e_f32} got {e_got}")
+    print(
+        f"RS_BF16 mode={mode} dcp={dcp_size} T={tokens} s={spread}: "
+        f"f32 {e_f32} got {e_got}"
+    )
     assert e_f32["max"] <= _RS_BF16_MAX_ULP[0], e_f32
     assert e_got["max"] <= _RS_BF16_MAX_ULP[mode], e_got
     assert not torch.equal(got.view(torch.int16), f32.view(torch.int16))  # really bf16

@@ -45,7 +45,11 @@ LANE = 128
 TUNED = {  # (k, n) -> (split, tile, nbuf)
     (6144, 2688): ("k", 1024, 3),  # q_a + kv_a (padded copy of 2624)
     (2048, 16384): ("n", 1024, 4),  # q_b
-    (2048, 8192): ("n", 1024, 4),  # q_b at half the heads (scaled microbenchmark twin), not tuned
+    (2048, 8192): (
+        "n",
+        1024,
+        4,
+    ),  # q_b at half the heads (scaled microbenchmark twin), not tuned
     (1024, 6144): ("n", 2048, 3),  # o_proj
     (6144, 1536): ("k", 1536, 3),  # dense gate_up
 }
@@ -95,6 +99,7 @@ def _kernel(
     # Weight slice: 0 in production (a [1, ...] view); a stack index in the benchmark.
     s = idx_ref[0]
 
+    ws_copy = None
     if scale_dma:
         # The per-channel scale arrives as an HBM ref; copy it to VMEM here, issued
         # ahead of the weight ring so its latency hides under the first tile's.
@@ -136,6 +141,7 @@ def _kernel(
                 xq_ref[...], w, dn, preferred_element_type=jnp.float32
             )
             if scale_dma and j == 0:
+                assert ws_copy is not None
                 ws_copy.wait()
             o_ref[:, cols] = (y * xs_ref[...] * ws_ref[:, cols]).astype(o_ref.dtype)
         else:
@@ -153,6 +159,7 @@ def _kernel(
             copy(j + nbuf).start()
     if split == "k":
         if scale_dma:
+            assert ws_copy is not None
             ws_copy.wait()
         o_ref[...] = (acc[0][...] * xs_ref[...] * ws_ref[...]).astype(o_ref.dtype)
 

@@ -53,7 +53,9 @@ def _compile(fn):
     from torch_tpu._internal import compile as tpu_compile
 
     torch._dynamo.reset()
-    return torch.compile(fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend())
+    return torch.compile(
+        fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend()
+    )
 
 
 def _check(rank, world, group, cp_mla):
@@ -61,7 +63,10 @@ def _check(rank, world, group, cp_mla):
 
     report = {}
     local = HEADS // world
-    today = lambda o, l: cp_mla.merge_lse_partials_scatter_heads(o, l, is_backbone=False)
+
+    def today(o, lse):
+        return cp_mla.merge_lse_partials_scatter_heads(o, lse, is_backbone=False)
+
     for tokens in (16, 8, 128):
         outputs, lses = base._global_partials(world, tokens)
         poisoned = outputs.clone()
@@ -81,9 +86,13 @@ def _check(rank, world, group, cp_mla):
                     got[(arm, how)] = y
                     c = {"shape": list(y.shape), **base._error_stats(y, ref)}
                     c["nan_input_finite"] = bool(torch.isfinite(yp.float()).all())
-                    c["nan_input_bitwise"] = bool(torch.equal(yp.view(torch.int16), y.view(torch.int16)))
+                    c["nan_input_bitwise"] = bool(
+                        torch.equal(yp.view(torch.int16), y.view(torch.int16))
+                    )
                     if ("today", "compiled") in got and arm == "sized":
-                        same = y.view(torch.int16) == got[("today", "compiled")].view(torch.int16)
+                        same = y.view(torch.int16) == got[("today", "compiled")].view(
+                            torch.int16
+                        )
                         c["frac_bitwise_vs_today_compiled"] = float(same.float().mean())
                     report[key] = c
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
@@ -146,7 +155,9 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
                     samples.append(time.perf_counter() - t0)
                 samples.sort()
                 times[k] = samples[len(samples) // 2]
-            out[f"{arm}@{tokens}"] = {"per_merge_us": (times[1 + reps] - times[1]) / reps * 1e6}
+            out[f"{arm}@{tokens}"] = {
+                "per_merge_us": (times[1 + reps] - times[1]) / reps * 1e6
+            }
             if rank == 0:
                 print(f"BENCH T={tokens} {arm}: {out[f'{arm}@{tokens}']}", flush=True)
     return out
@@ -181,7 +192,9 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
 
         wg = get_world_group()
         group = init_model_parallel_group(
-            [list(range(world))], wg.local_rank, dist.get_backend(wg.device_group),
+            [list(range(world))],
+            wg.local_rank,
+            dist.get_backend(wg.device_group),
             group_name="mtp_dcp_merge_sized_test",
         )
         cp_mla.get_dcp_group = lambda: group
@@ -211,7 +224,12 @@ def assert_results(results):
         for key, c in r["check"].items():
             assert "error" not in c, (r["rank"], key, c)
             if key.startswith("control"):
-                assert not c["within_1ulp"], ("positive control not caught", r["rank"], key, c)
+                assert not c["within_1ulp"], (
+                    "positive control not caught",
+                    r["rank"],
+                    key,
+                    c,
+                )
                 continue
             assert c["finite"] and c["nan_input_finite"], (r["rank"], key, c)
             if key.startswith("sized"):
@@ -230,8 +248,13 @@ def test_sized_merge_on_real_collectives(tmp_path):
     cmd = base._worker_command(result_dir, extra)
     cmd[cmd.index(str(Path(base.__file__).resolve()))] = str(Path(__file__).resolve())
     completed = subprocess.run(
-        cmd, cwd=Path(__file__).resolve().parents[3], env=base._prepare_worker_env(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+        cmd,
+        cwd=Path(__file__).resolve().parents[3],
+        env=base._prepare_worker_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
         timeout=base.LAUNCH_TIMEOUT_SECONDS,
     )
     results = base._results(result_dir, WORLD_SIZE)

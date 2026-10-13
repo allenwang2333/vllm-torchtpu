@@ -1830,7 +1830,8 @@ def streamindex_topk_dcp(
         all-gather by `optimization_barrier`s -- the only window it can then
         land in is the local SparseCore call's. Only `overlap_args[0]` (the
         activation) goes through the first barrier; the rest (weights) are
-        passed as they are, since a barrier on a parameter makes XLA copy it. `merge_overlap_fn(result)`,
+        passed as they are, since a barrier on a parameter makes XLA copy it.
+        `merge_overlap_fn(result)`,
         if given, is pinned the same way between the all-gather and the
         merge's consumers, i.e. under the merge call. The barriers only add
         ordering edges: the top-k and the work compute the same values as

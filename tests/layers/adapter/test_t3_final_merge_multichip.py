@@ -157,7 +157,9 @@ def _check(rank, cp_mla, path):
                     tokens = int(want.shape[0])
                     outs, lses = _all_partials(z, step, "off", dcp, real)
                     local = outs.shape[2] // dcp
-                    ref = mm._reference(outs, lses)[:, rank * local : (rank + 1) * local]
+                    ref = mm._reference(outs, lses)[
+                        :, rank * local : (rank + 1) * local
+                    ]
                     u = t4m._ulp(got[:real], want[:real])
                     report[key] = {
                         "tokens": tokens,

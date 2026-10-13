@@ -393,8 +393,8 @@ def _all_to_all_packed(
         l_recv_words = recv[:, rows:].reshape(world, extra * vdim)
     hi = l_recv_words[:, :rows].to(torch.int32)
     lo = l_recv_words[:, rows:words].to(torch.int32)
-    l_recv = ((hi << 16) | (lo & 0xFFFF)).view(torch.float32).reshape(
-        world, tokens, local
+    l_recv = (
+        ((hi << 16) | (lo & 0xFFFF)).view(torch.float32).reshape(world, tokens, local)
     )
     return o_recv, l_recv
 
@@ -567,11 +567,17 @@ def _pack_words(o_send: jax.Array, l_send: jax.Array) -> tuple[jax.Array, int]:
     bits = jax.lax.bitcast_convert_type(l_send, jnp.int32).reshape(world, rows)
     hi = (bits >> 16).astype(jnp.int16)
     lo = (((bits & 0xFFFF) ^ 0x8000) - 0x8000).astype(jnp.int16)
-    l_words = jnp.pad(jnp.concatenate([hi, lo], axis=1), ((0, 0), (0, extra * vdim - words)))
-    return jnp.concatenate([o_words, l_words.reshape(world, extra, vdim)], axis=1), extra
+    l_words = jnp.pad(
+        jnp.concatenate([hi, lo], axis=1), ((0, 0), (0, extra * vdim - words))
+    )
+    return jnp.concatenate(
+        [o_words, l_words.reshape(world, extra, vdim)], axis=1
+    ), extra
 
 
-def _unpack_words(recv: jax.Array, tokens: int, local: int, dtype) -> tuple[jax.Array, jax.Array]:
+def _unpack_words(
+    recv: jax.Array, tokens: int, local: int, dtype
+) -> tuple[jax.Array, jax.Array]:
     """Inverse of `_pack_words` on the received blocks: `[world, T, local, V]`
     partials in `dtype` and the f32 `[world, T, local]` lse, bit for bit."""
     world, _, vdim = recv.shape
@@ -611,7 +617,9 @@ def sized_merge_local(
     if tokens > a2a_max_tokens:
         lses = jax.lax.all_gather(lse, axis_name, axis=0)
         weighted = _rs_weighted(o, lse, lses)
-        merged = jax.lax.psum_scatter(weighted, axis_name, scatter_dimension=1, tiled=True)
+        merged = jax.lax.psum_scatter(
+            weighted, axis_name, scatter_dimension=1, tiled=True
+        )
         return merged.astype(o.dtype)
     o_send = o.reshape(tokens, world, local, vdim).transpose(1, 0, 2, 3)
     l_send = lse.reshape(tokens, world, local).transpose(1, 0, 2)

@@ -542,9 +542,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # such a token (finite out = 0) and writes its lse as -inf itself.
     # Same merge result; also removes the NaN a dummy key read from an
     # unwritten slot could put into an empty row's partial output.
-    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool(
-        "TPU_DCP_MLA_MASK_IN_KERNEL", default=False
-    ),
+    "TPU_DCP_MLA_MASK_IN_KERNEL": env_bool("TPU_DCP_MLA_MASK_IN_KERNEL", default=False),
     # With TPU_DCP_MLA_MASK_IN_KERNEL, decode buckets: build the capped
     # window indices, the live-window bound and the SparseCore gather's
     # live-count vector in ONE TensorCore Pallas call
@@ -632,9 +630,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache
     # writer kernel (tc_scatter / scatter_rows). Same bytes, same owner mask.
-    "TPU_MLA_KV_WRITE_IN_GATHER": env_bool(
-        "TPU_MLA_KV_WRITE_IN_GATHER", default=False
-    ),
+    "TPU_MLA_KV_WRITE_IN_GATHER": env_bool("TPU_MLA_KV_WRITE_IN_GATHER", default=False),
     # Run the MLA q_b projection inside the DCP indexer op, in the local
     # SparseCore top-k's XLA scheduling group, so decode issues it while the TC
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
@@ -1463,8 +1459,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output is bit-identical; the normalized output can differ in the last bf16 ulp
     # (f32 summation order of the mean square).
     "TPU_FUSED_ADD_RMSNORM": env_bool("TPU_FUSED_ADD_RMSNORM"),
-    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_int("TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 512),
-    "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int("TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096),
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 512
+    ),
+    "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
+    ),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense

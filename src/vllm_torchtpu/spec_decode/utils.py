@@ -505,7 +505,8 @@ def shard_draft_eh_proj(
     for layer in items:
         eh = getattr(layer, "eh_proj", None)
         if (
-            type(eh) is not torch.nn.Linear
+            eh is None
+            or type(eh) is not torch.nn.Linear
             or eh.bias is not None
             or eh.out_features % tp_size != 0
         ):

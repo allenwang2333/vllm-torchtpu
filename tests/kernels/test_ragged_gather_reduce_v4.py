@@ -1,4 +1,5 @@
-"""ragged_gather_reduce_v4 (SC destination-tiled bf16 combine) vs v2 and a float64 oracle.
+"""ragged_gather_reduce_v4 (SC destination-tiled bf16 combine) vs v2 and a float64
+oracle.
 
 v4 must be bit-identical to v2 (same float32 products, same per-token summation
 order, round-to-nearest-even cast), and within the bf16 rounding bound of a
@@ -6,11 +7,9 @@ float64 oracle. Inputs mirror moe_gmm's EP path: x is the expert-sorted gmm2
 output, indices are argsort_revert_indices (token-major), valid = local expert.
 """
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-
-import jax
-import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
     ragged_gather_reduce_v2,
@@ -25,10 +24,17 @@ pytestmark = pytest.mark.tpu_test
 
 def _inputs(num_tokens, topk, ep, num_experts, hidden, sigma=0.0, seed=0):
     rng = np.random.default_rng(seed)
-    p = np.exp(rng.normal(0.0, sigma, size=num_experts)) if sigma else np.ones(num_experts)
+    p = (
+        np.exp(rng.normal(0.0, sigma, size=num_experts))
+        if sigma
+        else np.ones(num_experts)
+    )
     p /= p.sum()
     ids = np.stack(
-        [rng.choice(num_experts, size=topk, replace=False, p=p) for _ in range(num_tokens)]
+        [
+            rng.choice(num_experts, size=topk, replace=False, p=p)
+            for _ in range(num_tokens)
+        ]
     )
     per_rank = num_experts // ep
     if sigma:
@@ -77,11 +83,19 @@ CASES = [
 @pytest.mark.parametrize(
     "tile_tokens,col_chunk", [(None, 1024), (16, 1536)], ids=["auto-c1024", "t16c1536"]
 )
-def test_v4_matches_v2_bitwise(tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk):
+def test_v4_matches_v2_bitwise(
+    tokens, topk, ep, experts, hidden, sigma, tile_tokens, col_chunk
+):
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma)
     assert supported(x, idx, topk, tile_tokens or 16)
     got = ragged_gather_reduce_v4(
-        x, idx, w, valid, reduce_group_size=topk, tile_tokens=tile_tokens, col_chunk=col_chunk
+        x,
+        idx,
+        w,
+        valid,
+        reduce_group_size=topk,
+        tile_tokens=tile_tokens,
+        col_chunk=col_chunk,
     )
     want = ragged_gather_reduce_v2(x, idx, w, valid, reduce_group_size=topk)
     got = np.asarray(got).view(np.uint16)
@@ -95,7 +109,9 @@ def test_v4_matches_v2_bitwise(tokens, topk, ep, experts, hidden, sigma, tile_to
 def test_v4_within_bf16_bound_of_f64(tokens, topk, ep, experts, hidden, sigma):
     x, idx, w, valid = _inputs(tokens, topk, ep, experts, hidden, sigma, seed=1)
     got = np.asarray(
-        ragged_gather_reduce_v4(x, idx, w, valid, reduce_group_size=topk).astype(jnp.float32),
+        ragged_gather_reduce_v4(x, idx, w, valid, reduce_group_size=topk).astype(
+            jnp.float32
+        ),
         np.float64,
     )
     ref = _oracle_f64(x, idx, w, valid, topk)
@@ -163,11 +179,17 @@ def test_flag_falls_back_where_v4_does_not_apply(monkeypatch):
     big = jnp.zeros((32768, 6144), jnp.bfloat16)
     assert fused_moe_gmm._use_sc_combine_tiled(big, jnp.zeros((32768,), jnp.int32), 8)
     # token count not a multiple of the 16-token tile
-    assert not fused_moe_gmm._use_sc_combine_tiled(big, jnp.zeros((8 * 4100,), jnp.int32), 8)
+    assert not fused_moe_gmm._use_sc_combine_tiled(
+        big, jnp.zeros((8 * 4100,), jnp.int32), 8
+    )
     # 528 tokens: not a multiple of 32 -> 16-token tiles, still v4
     assert fused_moe_gmm._use_sc_combine_tiled(big, jnp.zeros((8 * 528,), jnp.int32), 8)
     # small source: v2's own cutoff (XLA fallback) applies
     small = jnp.zeros((256, 6144), jnp.bfloat16)
-    assert not fused_moe_gmm._use_sc_combine_tiled(small, jnp.zeros((256,), jnp.int32), 8)
+    assert not fused_moe_gmm._use_sc_combine_tiled(
+        small, jnp.zeros((256,), jnp.int32), 8
+    )
     monkeypatch.setattr(fused_moe_gmm, "_SC_COMBINE_TILED", False)
-    assert not fused_moe_gmm._use_sc_combine_tiled(big, jnp.zeros((32768,), jnp.int32), 8)
+    assert not fused_moe_gmm._use_sc_combine_tiled(
+        big, jnp.zeros((32768,), jnp.int32), 8
+    )

@@ -112,7 +112,9 @@ def _prepare(indices, topk_weights, valid_rows_mask, k, tile_tokens, lanes):
     # a repeated constant) and are masked to zero into the spare accumulator row.
     zero = (zero != 0) | ~is_real
     dst = local_slot // k
-    prev_dst = jnp.concatenate([jnp.full((num_tiles, 1), -1, jnp.int32), dst[:, :-1]], 1)
+    prev_dst = jnp.concatenate(
+        [jnp.full((num_tiles, 1), -1, jnp.int32), dst[:, :-1]], 1
+    )
     same = is_real & (dst == prev_dst)
     even = (src & 1) == 0
     dst = jnp.where(is_real, dst, tile_tokens)
@@ -184,10 +186,16 @@ def _kernel(
         @pl.when(tile < num_tiles)
         def _():
             copies = [
-                pltpu.make_async_copy(gidx_hbm.at[pl.ds(tile * e, e)], gidx_vmem, sem.at[0]),
-                pltpu.make_async_copy(aux_hbm.at[pl.ds(tile * e, e)], aux_vmem, sem.at[0]),
+                pltpu.make_async_copy(
+                    gidx_hbm.at[pl.ds(tile * e, e)], gidx_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    aux_hbm.at[pl.ds(tile * e, e)], aux_vmem, sem.at[0]
+                ),
                 pltpu.make_async_copy(w_hbm.at[pl.ds(tile * e, e)], w_vmem, sem.at[0]),
-                pltpu.make_async_copy(cnt_hbm.at[pl.ds(tile * lanes, lanes)], cnt_vmem, sem.at[0]),
+                pltpu.make_async_copy(
+                    cnt_hbm.at[pl.ds(tile * lanes, lanes)], cnt_vmem, sem.at[0]
+                ),
             ]
             for c in copies:
                 c.start()
@@ -208,7 +216,9 @@ def _kernel(
                 for r in range(lanes):
                     aux = aux_vec[r]
                     dsts.append(jnp.bitwise_and(aux, _DST_MASK))
-                    sames.append(jnp.bitwise_and(jnp.right_shift(aux, _SAME_BIT), 1) == 1)
+                    sames.append(
+                        jnp.bitwise_and(jnp.right_shift(aux, _SAME_BIT), 1) == 1
+                    )
                     sh = jnp.bitwise_and(jnp.right_shift(aux, _EVEN_BIT), 1) * 16
                     shifts.append(jnp.broadcast_to(sh.astype(jnp.uint32), (lanes,)))
                     zero = jnp.bitwise_and(jnp.right_shift(aux, _ZERO_BIT), 1) == 1
@@ -246,7 +256,9 @@ def _kernel(
                             a = acc_vmem[pl.ds(2 * p * col_chunk + j, lanes)]
                             b = acc_vmem[pl.ds((2 * p + 1) * col_chunk + j, lanes)]
                             if pack_mode == "pack":
-                                packed = plsc.pack(a, b, format=plsc.PackFormat.INTERLEAVED)
+                                packed = plsc.pack(
+                                    a, b, format=plsc.PackFormat.INTERLEAVED
+                                )
                                 word = plsc.bitcast(packed, jnp.uint32)
                             else:
                                 word = jnp.bitwise_or(

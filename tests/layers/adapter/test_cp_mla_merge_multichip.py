@@ -651,9 +651,7 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
     def chain(k):
         def run(o, lse, qsl):
             for _ in range(k):
-                y = cp_mla.merge_lse_partials_scatter_heads(
-                    o, lse, query_start_loc=qsl
-                )
+                y = cp_mla.merge_lse_partials_scatter_heads(o, lse, query_start_loc=qsl)
                 # A one-element update of both inputs: nothing is loop
                 # invariant, and the update itself costs nothing.
                 s = y.reshape(-1)[:1].float() * 0.0

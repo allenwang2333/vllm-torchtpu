@@ -85,6 +85,7 @@ def _kernel(
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
     if write_refs is not None and write_fault != "late_write":
+        assert write_scratch is not None
         late_drain = _write_phase(
             write_refs,
             write_scratch,
@@ -247,6 +248,7 @@ def _kernel(
         late_drain()
     if write_refs is not None and write_fault == "late_write":
         # Positive control: the write lands after the gather (stale reads).
+        assert write_scratch is not None
         _write_phase(
             write_refs,
             write_scratch,
