@@ -2108,19 +2108,23 @@ def _patch_vllm_dplb_shared_inflight() -> None:
             shm_path = os.path.join(
                 tempfile.gettempdir(), f"vllm_dplb_shared_{os.getppid()}.bin"
             )
+            num_engines = len(self.core_engines)
+            # Slot 0: rotating start index; then client_count x num_engines
+            # inflight counters. Round up to whole pages.
+            nbytes = 8 * (1 + self.client_count * num_engines)
+            nbytes = max(4096, (nbytes + 4095) // 4096 * 4096)
             fd = os.open(shm_path, os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
             try:
                 size = os.fstat(fd).st_size
-                is_new = size < 4096
+                is_new = size < nbytes
                 if is_new:
-                    os.ftruncate(fd, 4096)
+                    os.ftruncate(fd, nbytes)
                 mm = mmap.mmap(
-                    fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
+                    fd, nbytes, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE
                 )
                 if is_new:
                     struct.pack_into("<q", mm, 0, 1)
-                num_engines = len(self.core_engines)
                 base = (1 + self.client_index * num_engines) * 8
                 for idx in range(num_engines):
                     struct.pack_into("<q", mm, base + idx * 8, 0)
@@ -2403,24 +2407,19 @@ def _patch_deepseek_v41_ced_fastpaths() -> None:
     logger.info("Applied TPU patch: DeepSeek-V4.1 CED zero-engram cache fastpath.")
 
 
-_CED_PREFILL_FIRST_MODE: int = 1
-_CED_PREFILL_FIRST_LAST_CHECK: float = 0.0
+_CED_PREFILL_FIRST_MODE: int | None = None
+# How many queued arrivals schedule_with_ced_prefill_first inspects when
+# deciding whether a mixed prefill+decode step would split a prefill chunk.
+_CED_PREFILL_FIRST_LOOKAHEAD = 4
 
 
 def _get_ced_prefill_first_mode() -> int:
-    import time
-
-    global _CED_PREFILL_FIRST_MODE, _CED_PREFILL_FIRST_LAST_CHECK
-    now = time.monotonic()
-    if now - _CED_PREFILL_FIRST_LAST_CHECK > 0.5:
-        _CED_PREFILL_FIRST_LAST_CHECK = now
-        try:
-            with open("/mnt/rish/run/ced_prefill_first") as f:
-                _CED_PREFILL_FIRST_MODE = int(f.read().strip() or "0")
-        except OSError:
-            _CED_PREFILL_FIRST_MODE = (
-                1 if (envs.VLLM_DSV41_CED and envs.VLLM_CED_PREFILL_FIRST) else 0
-            )
+    """1 when CED prefill-first scheduling is active, else 0 (cached)."""
+    global _CED_PREFILL_FIRST_MODE
+    if _CED_PREFILL_FIRST_MODE is None:
+        _CED_PREFILL_FIRST_MODE = (
+            1 if (envs.VLLM_DSV41_CED and envs.VLLM_CED_PREFILL_FIRST) else 0
+        )
     return _CED_PREFILL_FIRST_MODE
 
 
@@ -2462,13 +2461,29 @@ def _patch_vllm_ced_prefill_first_scheduler() -> None:
         if kv_mgr.usage >= 0.85:
             return original_schedule(self, throttle_prefills)
 
-        has_running_prefill = any(r.is_prefill_chunk for r in self.running)
-        has_waiting_prefill = (
-            bool(self.waiting or self.skipped_waiting)
+        # Defer the decodes only while at least one full step of prefill work is
+        # pending (running chunks plus the next few arrivals). A burst of prompts
+        # is then prefilled back-to-back in full-size chunks before the decodes
+        # resume, which is what keeps 8k prompts at 2 x 4096 chunks and gives a
+        # clean decode phase. Sparse short-prompt traffic (e.g. MMLU at moderate
+        # concurrency) never builds such a backlog and keeps vLLM's normal
+        # continuous batching, where separate prefill/decode steps only add steps.
+        full_step = self.max_num_scheduled_tokens
+        pending = sum(
+            r.num_prompt_tokens - r.num_computed_tokens
+            for r in self.running
+            if r.is_prefill_chunk
+        )
+        if (
+            pending < full_step
             and (len(self.running) + self.num_waiting_for_streaming_input)
             < self.max_num_running_reqs
-        )
-        if not (has_running_prefill or has_waiting_prefill):
+        ):
+            for i, r in enumerate(self.waiting):
+                if i >= _CED_PREFILL_FIRST_LOOKAHEAD or pending >= full_step:
+                    break
+                pending += r.num_prompt_tokens - r.num_computed_tokens
+        if pending < full_step:
             return original_schedule(self, throttle_prefills)
 
         saved_steps = [r.next_decode_eligible_step for r in decode_reqs]

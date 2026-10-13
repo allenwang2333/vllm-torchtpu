@@ -319,6 +319,9 @@ _PIN_HOST_BUFS: bool = True
 _ENGRAM_PTRS_CACHE: dict[tuple[int, ...], tuple[Any, ...]] = {}
 _ENGRAM_PREFETCH: dict[str, Any] | None = None
 MADV_HUGEPAGE = 14
+# Scratch sizes baked into engram_hash_and_gather_omp (tok[] / h_arr[]).
+_FUSED_MAX_NGRAM = 16
+_FUSED_MAX_HASH_COLS = 64
 
 # OpenMP row gather from the CPU tables into the packed [value | scale] layout.
 _ENGRAM_GATHER_CPP = r"""
@@ -702,6 +705,14 @@ def engram_prefetch_prefill(
     n_tables = len(table_ids)
     n_hash_cols = int(hash_state.offsets.shape[1])
     row_bytes = n_tables * n_hash_cols * packed_dim
+    # The fused C++ kernel hashes in-register with fixed-size scratch
+    # (tok[16], h_arr[64]); anything wider takes the NumPy cpu_hashes path.
+    fused_ok = (
+        token_ids.dtype == np.int32
+        and token_ids.flags.c_contiguous
+        and int(hash_state.layout.max_ngram_size) <= _FUSED_MAX_NGRAM
+        and n_hash_cols <= _FUSED_MAX_HASH_COLS
+    )
 
     padded_tokens = int(padded_num_tokens)
 
@@ -720,11 +731,7 @@ def engram_prefetch_prefill(
         if n_real_local > 0:
             req_local = req_idx[t_start : t_start + n_real_local]
             pos_local = pos[t_start : t_start + n_real_local]
-            if (
-                all_known_local
-                and token_ids.dtype == np.int32
-                and token_ids.flags.c_contiguous
-            ):
+            if all_known_local and fused_ok:
                 _hash_and_gather_into(
                     lib,
                     hash_state,
@@ -757,11 +764,7 @@ def engram_prefetch_prefill(
 
     alloc_tokens = max(num_tokens, padded_tokens)
     buf = _next_host_buf(alloc_tokens * row_bytes, row_bytes)
-    if (
-        all_known_global
-        and token_ids.dtype == np.int32
-        and token_ids.flags.c_contiguous
-    ):
+    if all_known_global and fused_ok:
         _hash_and_gather_into(
             lib, hash_state, token_ids, req_idx, pos, table_ids, packed_dim, buf
         )

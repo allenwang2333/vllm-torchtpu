@@ -2673,6 +2673,15 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    @staticmethod
+    def _clear_engram_prefetch() -> None:
+        # engram_prefetch_prefill() clears this slot on entry; every path that
+        # skips the call must do the same so a stale host buffer from an
+        # earlier step is never consumed by the next forward.
+        from vllm_torchtpu.models.vllm.deepseek_v41 import engram as _dsv41_engram
+
+        _dsv41_engram._ENGRAM_PREFETCH = None
+
     def _maybe_prefetch_engram(
         self, layout_plan, req_indices: np.ndarray, positions_np: np.ndarray
     ) -> None:
@@ -2685,18 +2694,18 @@ class TPUModelRunner(GPUModelRunner):
         if fn is None:
             return
         if layout_plan.kind is not SequenceLayoutKind.ALL:
+            self._clear_engram_prefetch()
             return
         known = positions_np < self.input_batch.num_prompt_tokens[req_indices]
         inner = getattr(self.model, "model", None)
         if getattr(inner, "_ced_enabled", False):
+            # CED's EncoderStage only consumes an all-known prefetch; a mixed
+            # prefill+decode step falls back to the in-graph lookup instead.
             if not known.all():
-                from vllm_torchtpu.models.vllm.deepseek_v41 import (
-                    engram as _dsv41_engram,
-                )
-
-                _dsv41_engram._ENGRAM_PREFETCH = None
+                self._clear_engram_prefetch()
                 return
         elif not known.any():
+            self._clear_engram_prefetch()
             return
         fn(
             self.input_batch.token_ids_cpu,
