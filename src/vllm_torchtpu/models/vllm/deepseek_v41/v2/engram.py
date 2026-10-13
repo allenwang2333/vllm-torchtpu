@@ -2,6 +2,8 @@
 
 from typing import override
 
+import torch
+
 from ..common import engram as common
 from ..common.engram import (
     _INVALID_SCALE,
@@ -37,6 +39,19 @@ __all__ = [
 
 
 class NgramHashState(common.NgramHashState):
+    write_cache = staticmethod(write_cache)
+
     @override
-    def write_cache(self, cache, slots, values, valid):
-        write_cache(cache, slots, values, valid)
+    def ensure_cache(self) -> bool:
+        if torch.compiler.is_compiling():
+            return super().ensure_cache()
+        kv_cache = self.swa_cache_module.kv_cache
+        ref = self._kv_cache_ref
+        if (
+            ref is not None
+            and ref() is kv_cache
+            and self.block_size == kv_cache.shape[1]
+        ):
+            return True
+        self.write_cache = write_cache
+        return super().ensure_cache()
