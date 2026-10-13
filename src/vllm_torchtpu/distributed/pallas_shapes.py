@@ -7,29 +7,31 @@ one dimension. Install the same conversion for native input and output
 placeholders; keep JaxCallable, packed dtype handling and dispatch upstream.
 """
 
-import math
-
 
 def _convert_partitioned_shape(shape, mesh, partition_spec, *, to_global):
-    if mesh is None or partition_spec is None or len(partition_spec) == 0:
+    if mesh is None or not partition_spec:
         return shape if isinstance(shape, tuple) else tuple(shape)
     mesh_shape = mesh.shape
-    spec_len = len(partition_spec)
-    result = []
-    for index, size in enumerate(shape):
-        axes = partition_spec[index] if index < spec_len else None
-        if axes is None:
-            result.append(size)
+    result = list(shape)
+    shape_len = len(result)
+    for index, axes in enumerate(partition_spec):
+        if axes is None or index >= shape_len:
             continue
         if isinstance(axes, tuple):
-            factor = math.prod(int(mesh_shape[axis]) for axis in axes)
+            factor = 1
+            for axis in axes:
+                factor *= int(mesh_shape[axis])
         else:
             factor = int(mesh_shape[axes])
-        if not to_global and size % factor:
-            raise ValueError(
-                f"Global dimension {size} is not divisible by mesh factor {factor}."
-            )
-        result.append(size * factor if to_global else size // factor)
+        size = result[index]
+        if to_global:
+            result[index] = size * factor
+        else:
+            if size % factor:
+                raise ValueError(
+                    f"Global dimension {size} is not divisible by mesh factor {factor}."
+                )
+            result[index] = size // factor
     return tuple(result)
 
 
