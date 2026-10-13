@@ -51,6 +51,8 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OP_ATTR = "_moe_tp_decode_op"
+_PRE_MB2_OP_ATTR = "_moe_tp_decode_pre_mb2_op"
+_COMB_MB2_OP_ATTR = "_moe_tp_decode_comb_mb2_op"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -68,6 +70,7 @@ SELFTEST_TIMEOUT_S = 300
 _SUM_FLOOR = 1e-20
 
 _OPS: dict[tuple, Any] = {}
+_MB2_OPS: dict[tuple, tuple[Any, Any]] = {}
 _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
 _SELFTEST_DONE = False
@@ -408,6 +411,221 @@ def _get_op(mesh, statics: _OpStatics):
     return op
 
 
+def _route_window(x, scores, bias, is_pad, st: _OpStatics):
+    bias = bias.astype(jnp.float32)
+    if st.router_bias:
+        w, ids = router_select_bias(scores, bias[None, :], st.topk)
+    else:
+        _, ids = router_select(scores + bias[None, :], st.topk)
+        w = jnp.take_along_axis(scores, ids, axis=-1)
+    total = jnp.sum(w, axis=-1, keepdims=True)
+    total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
+    w = (w / total).astype(x.dtype)
+    w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
+    return w, ids
+
+
+def _shared_window(x, sw13, ss13, sw2, ss2):
+    gate_up = xla_quantized_matmul(x, sw13, ss13)
+    fs = sw2.shape[0]
+    act = jax.nn.silu(gate_up[:, :fs].astype(jnp.float32)).astype(x.dtype)
+    return xla_quantized_matmul(act * gate_up[:, fs:], sw2, ss2)
+
+
+def _get_mb2_ops(mesh, statics: _OpStatics):
+    """Two-window micro-batching ops for an armed MoE layer:
+    - `pre_op`: Window 0 routing + shared expert on TensorCore (overlaps with
+      Window 1 attention o_proj All-Reduce).
+    - `comb_op`: Window 1 routing + single full-batch `fused_moe_func` +
+      Window 0 All-Reduce + Window 1 shared expert + Window 1 All-Reduce.
+    """
+    key = (mesh, statics)
+    ops = _MB2_OPS.get(key)
+    if ops is not None:
+        return ops
+    axis = mesh.axis_names[0]
+
+    pre_in_specs = (P(axis), P(axis), P(), P(), P(axis), P(axis), P(axis), P(axis))
+    pre_out_specs = (P(axis), P(axis), P(axis))
+
+    def pre_body(x0, scores0, bias, pad_mask, sw13, ss13, sw2, ss2):
+        m0 = x0.shape[0]
+        is_pad0 = pad_mask[:m0]
+        w0, ids0 = _route_window(x0, scores0, bias, is_pad0, statics)
+        shared0 = _shared_window(x0, sw13, ss13, sw2, ss2)
+        return w0, ids0, shared0
+
+    pre_sharded = jax.shard_map(
+        pre_body,
+        mesh=mesh,
+        in_specs=pre_in_specs,
+        out_specs=pre_out_specs,
+        check_vma=False,
+    )
+
+    def pre_fn(
+        x0: jax.Array,
+        scores0: jax.Array,
+        bias: jax.Array,
+        pad_mask: jax.Array,
+        sw13: jax.Array,
+        ss13: jax.Array,
+        sw2: jax.Array,
+        ss2: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        args = (x0, scores0, bias, pad_mask, sw13, ss13, sw2, ss2)
+        return pre_sharded(
+            *(
+                jax.device_put(a, NamedSharding(mesh, s))
+                for a, s in zip(args, pre_in_specs)
+            )
+        )
+
+    suffix = f"_{len(_MB2_OPS)}" if _MB2_OPS else ""
+    pre_op = pallas.jax_op(
+        "pallas::moe_tp_decode_pre_mb2" + suffix,
+        pre_fn,
+        mesh=mesh,
+        input_partition_specs=pre_in_specs,
+        output_partition_specs=pre_out_specs,
+    )
+    pre_op.register_fake(
+        lambda x0, *args, **kwargs: (
+            x0.new_empty((x0.shape[0], statics.topk)),
+            x0.new_empty((x0.shape[0], statics.topk), dtype=torch.int32),
+            torch.empty_like(x0),
+        )
+    )
+
+    comb_in_specs = (P(axis),) * 6 + (P(), P()) + (P(axis),) * 10
+    comb_out_specs = (P(axis), P(axis))
+
+    def comb_body(
+        x0,
+        x1,
+        w0,
+        ids0,
+        shared0,
+        scores1,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+    ):
+        del rank
+        m0 = x0.shape[0]
+        m1 = x1.shape[0]
+        is_pad1 = pad_mask[m0 : m0 + m1]
+        w1, ids1 = _route_window(x1, scores1, bias, is_pad1, statics)
+        x_full = jnp.concatenate([x0, x1], axis=0)
+        w_full = jnp.concatenate([w0, w1], axis=0)
+        ids_full = jnp.concatenate([ids0, ids1], axis=0)
+        routed_full = fused_moe_func(
+            x_full,
+            w13,
+            w2,
+            s13,
+            s2,
+            None,
+            None,
+            w_full,
+            ids_full,
+            e0.reshape(()) if statics.use_ep else None,
+            topk=statics.topk,
+            activation=statics.activation,
+            use_ep=statics.use_ep,
+            use_sparse_core=statics.use_sparse_core,
+            onehot_moe_permute_threshold=statics.onehot_threshold,
+            rhs_quant_dtype=None,
+            skip_padded_tokens=True,
+        )
+        routed0 = routed_full[:m0]
+        routed1 = routed_full[m0:]
+        h0 = lax.psum(shared0 + routed0 * statics.routed_scale, axis)
+        shared1 = _shared_window(x1, sw13, ss13, sw2, ss2)
+        h1 = lax.psum(shared1 + routed1 * statics.routed_scale, axis)
+        return h0, h1
+
+    comb_sharded = jax.shard_map(
+        comb_body,
+        mesh=mesh,
+        in_specs=comb_in_specs,
+        out_specs=comb_out_specs,
+        check_vma=False,
+    )
+
+    def comb_fn(
+        x0: jax.Array,
+        x1: jax.Array,
+        w0: jax.Array,
+        ids0: jax.Array,
+        shared0: jax.Array,
+        scores1: jax.Array,
+        bias: jax.Array,
+        pad_mask: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        s13: jax.Array,
+        s2: jax.Array,
+        sw13: jax.Array,
+        ss13: jax.Array,
+        sw2: jax.Array,
+        ss2: jax.Array,
+        rank: jax.Array,
+        e0: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        args = (
+            x0,
+            x1,
+            w0,
+            ids0,
+            shared0,
+            scores1,
+            bias,
+            pad_mask,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            rank,
+            e0,
+        )
+        return comb_sharded(
+            *(
+                jax.device_put(a, NamedSharding(mesh, s))
+                for a, s in zip(args, comb_in_specs)
+            )
+        )
+
+    comb_op = pallas.jax_op(
+        "pallas::moe_tp_decode_comb_mb2" + suffix,
+        comb_fn,
+        mesh=mesh,
+        input_partition_specs=comb_in_specs,
+        output_partition_specs=comb_out_specs,
+    )
+    comb_op.register_fake(
+        lambda x0, x1, *args, **kwargs: (
+            torch.empty_like(x0),
+            torch.empty_like(x1),
+        )
+    )
+    _MB2_OPS[key] = (pre_op, comb_op)
+    return pre_op, comb_op
+
+
 def _selftest_op(mesh, spec: all_reduce.AllReduceSpec):
     op = _SELFTEST_OPS.get(spec)
     if op is not None:
@@ -566,6 +784,9 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank)):
             layer.register_buffer(name, tensor, persistent=False)
         setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))
+        pre_mb2_op, comb_mb2_op = _get_mb2_ops(topo.mesh, adm.statics)
+        setattr(layer.quant_method, _PRE_MB2_OP_ATTR, pre_mb2_op)
+        setattr(layer.quant_method, _COMB_MB2_OP_ATTR, comb_mb2_op)
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
@@ -610,4 +831,61 @@ def moe_tp_decode_forward(
         sw2,
         ss2,
         rank,
+    )
+
+
+def moe_tp_decode_pre_mb2(
+    quant_method: Any, layer: Any, x0: torch.Tensor, router_logits0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Window 0 pre-MoE op for an armed layer: returns (w0, ids0, shared0)."""
+    padding = token_padding._padding_state
+    assert padding is not None, "moe_tp_decode needs the token-padding mask"
+    sw13, ss13, sw2, ss2, bias, _, _ = (getattr(layer, n) for n in _BUFFERS)
+    scores0 = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits0)
+    return getattr(quant_method, _PRE_MB2_OP_ATTR)(
+        x0,
+        scores0,
+        bias,
+        padding.local_padding_mask,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+    )
+
+
+def moe_tp_decode_combine_mb2(
+    quant_method: Any,
+    layer: Any,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    w0: torch.Tensor,
+    ids0: torch.Tensor,
+    shared0: torch.Tensor,
+    router_logits1: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Window 1 routing + merged full-batch routed experts + per-window All-Reduces."""
+    padding = token_padding._padding_state
+    assert padding is not None, "moe_tp_decode needs the token-padding mask"
+    sw13, ss13, sw2, ss2, bias, rank, e0 = (getattr(layer, n) for n in _BUFFERS)
+    scores1 = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits1)
+    return getattr(quant_method, _COMB_MB2_OP_ATTR)(
+        x0,
+        x1,
+        w0,
+        ids0,
+        shared0,
+        scores1,
+        bias,
+        padding.local_padding_mask,
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
     )

@@ -180,6 +180,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_TOKEN_MICROBATCHES: int = 1
+    TPU_MICROBATCH_MIN_TOKENS: int = 1024
 
 
 def env_with_choices(
@@ -1115,6 +1117,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    "TPU_TOKEN_MICROBATCHES": env_int("TPU_TOKEN_MICROBATCHES", 1),
+    "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
 }
 
 
