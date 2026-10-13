@@ -1061,75 +1061,17 @@ def scatter_cache_values(
         )
     )
     width = words.shape[1]
-    if width < ROW_WORDS and jax.default_backend() == "tpu":
-        # An elementwise (row, lane) scatter is slow on TPU. Rebuild whole word
-        # rows instead and reuse the full-row DMA below.
-        records, words = merge_sub_rows(cache, records, words)
-        width = ROW_WORDS
-    if width < ROW_WORDS or jax.default_backend() != "tpu":
-        columns = jnp.arange(width)[None]
-        if width < ROW_WORDS:
-            per_row = ROW_WORDS // width
-            rows = records[:, None] // per_row
-            lanes = (records[:, None] % per_row) * width + columns
-        else:
-            rows = records[:, None] * (width // ROW_WORDS) + columns // ROW_WORDS
-            lanes = jnp.broadcast_to(columns % ROW_WORDS, rows.shape)
-        rows = jnp.where(records[:, None] >= 0, rows, cache.shape[0])
-        return cache.at[rows, lanes].set(words, mode="drop")
+    if jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
 
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
-    chunks = width // ROW_WORDS
-    # Records per grid step whose row DMAs are in flight together. A serial
-    # start/wait per 512 B row is DMA-latency bound.
-    block = 64
-    count = records.shape[0]
-    records = jnp.pad(records, (0, -count % block), constant_values=-1)
-
-    def kernel(record_ref, values_ref, _input_ref, output_ref, sem):
-        def copies(index):
-            token = pl.program_id(0) * block + index
-            record = record_ref[token]
-            return (record >= 0) & (record < cache.shape[0] // chunks), [
-                pltpu.make_async_copy(
-                    values_ref.at[
-                        pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
-                    ],
-                    output_ref.at[record * chunks + chunk, :],
-                    sem,
-                )
-                for chunk in range(chunks)
-            ]
-
-        def run(method):
-            def body(index, carry):
-                valid, row_copies = copies(index)
-
-                @pl.when(valid)
-                def _():
-                    for copy in row_copies:
-                        getattr(copy, method)()
-
-                return carry
-
-            jax.lax.fori_loop(0, block, body, 0)
-
-        run("start")
-        run("wait")
-
-    return pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(records.shape[0] // block,),
-            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=[pltpu.SemaphoreType.DMA],
-        ),
-        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        input_output_aliases={2: 0},
-        # Flatten only the small update batch. A partial DMA from a tiled 2D
-        # source can straddle its padded minor dimension; the cache stays 2D.
-    )(records, words.reshape(-1), cache)
+        return scatter_word_records(cache, records, words)
+    columns = jnp.arange(width)[None]
+    if width < ROW_WORDS:
+        per_row = ROW_WORDS // width
+        rows = records[:, None] // per_row
+        lanes = (records[:, None] % per_row) * width + columns
+    else:
+        rows = records[:, None] * (width // ROW_WORDS) + columns // ROW_WORDS
+        lanes = jnp.broadcast_to(columns % ROW_WORDS, rows.shape)
+    rows = jnp.where(records[:, None] >= 0, rows, cache.shape[0])
+    return cache.at[rows, lanes].set(words, mode="drop")

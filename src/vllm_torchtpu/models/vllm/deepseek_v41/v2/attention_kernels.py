@@ -21,6 +21,8 @@ from .cache import (
     ROPE_WORDS,
     ROW_WORDS,
     _cache_num_rows,
+    _gather_raw_rows,
+    _valid_records,
     gather_cache_page_values,
     gather_cache_page_words,
     gather_cache_pieces,
@@ -244,44 +246,74 @@ def _attend_window(
         fallback = min(tokens, -(-(tile - 1) * (max_requests - 1) // 8) * 8)
 
     def fast(_):
-        gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
-        pieces = gathered.shape[0]
-        kv = gathered.reshape(pieces, count, union.shape[1], -1)
-        kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
+        if (
+            jax.default_backend() == "tpu"
+            and q.dtype == jnp.bfloat16
+            and dim % 256 == 0
+            and heads % min(heads, 8) == 0
+        ):
+            from vllm_torchtpu.kernels.mla.window_attention import attend_windows
 
-        def split(x):
-            return split_pieces(x.reshape(count, tile, heads, dim), pieces)
+            pad = -union.shape[1] % 128
+            padded_union = jnp.pad(union, ((0, 0), (0, pad)), constant_values=-1)
+            padded_mask = jnp.pad(mask, ((0, 0), (0, 0), (0, pad)))
+            chunks = dim // (2 * ROW_WORDS)
+            rows = _valid_records(pool, padded_union.reshape(-1), dim // 2) * chunks
+            rows = rows[None] + jnp.arange(chunks, dtype=rows.dtype)[:, None]
+            words = _gather_raw_rows(pool, rows.reshape(-1)).reshape(
+                chunks, count, padded_union.shape[1], ROW_WORDS
+            )
+            maximum, denominator, numerator = attend_windows(
+                q, words, padded_mask, scale=scale
+            )
+            old_max, old_den, old_num = state
+            new_max = jnp.maximum(old_max, maximum)
+            old_correction = jnp.exp(old_max - new_max)
+            correction = jnp.exp(maximum - new_max)
+            result = (
+                new_max,
+                old_den * old_correction + denominator * correction,
+                old_num * old_correction[..., None] + numerator * correction[..., None],
+            )
+        else:
+            gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
+            pieces = gathered.shape[0]
+            kv = gathered.reshape(pieces, count, union.shape[1], -1)
+            kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
 
-        maximum, denominator, numerator = state
-        shape = (count, tile, heads)
-        maximum = maximum.reshape(shape)
-        denominator = denominator.reshape(shape)
-        numerator = split(numerator)
-        scores = (
-            jnp.einsum(
-                "pnthd,pnkd->nthk",
-                split(q).astype(jnp.float32),
-                kv.astype(jnp.float32),
+            def split(x):
+                return split_pieces(x.reshape(count, tile, heads, dim), pieces)
+
+            maximum, denominator, numerator = state
+            shape = (count, tile, heads)
+            maximum = maximum.reshape(shape)
+            denominator = denominator.reshape(shape)
+            numerator = split(numerator)
+            scores = (
+                jnp.einsum(
+                    "pnthd,pnkd->nthk",
+                    split(q).astype(jnp.float32),
+                    kv.astype(jnp.float32),
+                    preferred_element_type=jnp.float32,
+                )
+                * scale
+            )
+            scores = jnp.where(mask[:, :, None], scores, -jnp.inf)
+            new_max = jnp.maximum(maximum, scores.max(-1))
+            correction = jnp.exp(maximum - new_max)
+            exponentials = jnp.exp(scores - new_max[..., None])
+            denominator = denominator * correction + exponentials.sum(-1)
+            numerator = numerator * correction[None, ..., None] + jnp.einsum(
+                "nthk,pnkd->pnthd",
+                exponentials.astype(jnp.bfloat16),
+                kv,
                 preferred_element_type=jnp.float32,
             )
-            * scale
-        )
-        scores = jnp.where(mask[:, :, None], scores, -jnp.inf)
-        new_max = jnp.maximum(maximum, scores.max(-1))
-        correction = jnp.exp(maximum - new_max)
-        exponentials = jnp.exp(scores - new_max[..., None])
-        denominator = denominator * correction + exponentials.sum(-1)
-        numerator = numerator * correction[None, ..., None] + jnp.einsum(
-            "nthk,pnkd->pnthd",
-            exponentials.astype(jnp.bfloat16),
-            kv,
-            preferred_element_type=jnp.float32,
-        )
-        result = (
-            new_max.reshape(tokens, heads),
-            denominator.reshape(tokens, heads),
-            merge_pieces(numerator).reshape(tokens, heads, dim),
-        )
+            result = (
+                new_max.reshape(tokens, heads),
+                denominator.reshape(tokens, heads),
+                merge_pieces(numerator).reshape(tokens, heads, dim),
+            )
 
         # Recompute uncovered tokens from their own records.
         def patch(result):
