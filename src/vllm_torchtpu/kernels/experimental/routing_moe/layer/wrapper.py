@@ -58,8 +58,17 @@ def routing_moe_local(
     ep_axis: str | None,
     tp_axis: str | None,
     use_sp: bool,
+    routing: tuple[jax.Array, jax.Array] | None = None,
+    reduce: bool = True,
 ) -> jax.Array:
-  """MPMD MoE function that invokes io kernels and routing gmm."""
+  """MPMD MoE function that invokes io kernels and routing gmm.
+
+  routing: optional caller-computed (topk_weights, topk_indices) [T, topk],
+    for routers the built-in scoring does not cover (e.g. sigmoid + score
+    correction bias); replaces step 2.
+  reduce: False returns this shard's partial output, for a caller that folds
+    other terms (e.g. a shared expert) into its own reduction.
+  """
 
   local_num_experts = w1.shape[0]
   global_num_experts = gating_output.shape[-1]
@@ -78,10 +87,13 @@ def routing_moe_local(
       w2_bias = jnp.where(shard_idx == 0, w2_bias, 0)
 
   # Step 2: Perform local scoring and topk.
-  topk_weights = apply_scoring_fn(scoring_fn, gating_output)
-  topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
-  if renormalize:
-    topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+  if routing is not None:
+    topk_weights, topk_indices = routing
+  else:
+    topk_weights = apply_scoring_fn(scoring_fn, gating_output)
+    topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
+    if renormalize:
+      topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
 
   if use_sp:
     # Step 3.0: If input is not replicated (SP), perform all-gather.
@@ -139,6 +151,8 @@ def routing_moe_local(
       w1.shape[0],
   )
 
+  if not reduce:
+    return out
   if use_sp:
     out = jax.lax.psum_scatter(
         out, axis_name=reduction_axis, scatter_dimension=0, tiled=True
