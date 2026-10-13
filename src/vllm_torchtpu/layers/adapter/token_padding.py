@@ -31,6 +31,10 @@ class TokenPaddingState:
     _host_cache: tuple[torch.Tensor, tuple[int, int]] | None = field(
         default=None, repr=False, compare=False
     )
+    _size: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._size = self.local_padding_mask.shape[0]
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -50,7 +54,7 @@ class TokenPaddingState:
         # only build the range for negative or out-of-range bounds (CPython:
         # ~100 ns vs ~240 ns for the range slice; pure min/max clamping is
         # slower than the range slice, ~480 ns).
-        n = self.local_padding_mask.shape[0]
+        n = self._size
         if 0 <= local_valid_tokens < local_padded_tokens <= n:
             padding_range = (local_valid_tokens, local_padded_tokens)
         elif 0 <= local_padded_tokens <= local_valid_tokens:
@@ -65,13 +69,17 @@ class TokenPaddingState:
             return
         else:
             host, (start, stop) = cached
-            host[start:stop] = False
-        host[padding_range[0] : padding_range[1]] = True
+            if start < stop:
+                host[start:stop] = False
+        if padding_range[0] < padding_range[1]:
+            host[padding_range[0] : padding_range[1]] = True
         # Synchronous copy: ``host`` is rewritten by the next cache miss.
         self.local_padding_mask.copy_(host)
         self._host_cache = (host, padding_range)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
+        if num_tokens >= self._size:
+            return self.local_padding_mask
         return self.local_padding_mask[:num_tokens]
 
 
@@ -102,9 +110,12 @@ def zero_routing_weights_for_padding(
     # mask. Such a stage supplies a mask in its own routing-row layout; do not
     # reuse the enclosing batch's valid-token prefix for these rows.
     if is_forward_context_available():
-        stage_mask = get_forward_context().additional_kwargs.get("token_padding_mask")
-        if stage_mask is not None:
-            return topk_ids, topk_weights.masked_fill(stage_mask[:, None], 0)
+        additional_kwargs = get_forward_context().additional_kwargs
+        if (
+            additional_kwargs
+            and (stage_mask := additional_kwargs.get("token_padding_mask")) is not None
+        ):
+            return topk_ids, topk_weights.masked_fill(stage_mask.unsqueeze(-1), 0)
     if _padding_state is None:
         return topk_ids, topk_weights
     num_tokens = topk_ids.shape[0]
@@ -120,4 +131,4 @@ def zero_routing_weights_for_padding(
             is_padding = gathered_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
-    return topk_ids, topk_weights.masked_fill(is_padding[:, None], 0)
+    return topk_ids, topk_weights.masked_fill(is_padding.unsqueeze(-1), 0)
