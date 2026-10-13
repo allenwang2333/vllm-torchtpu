@@ -26,36 +26,57 @@ def compact_rope_caches(attentions, max_model_len):
         attention._tpu_rope_cache = compact[key]
 
 
+_rotary_freq_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _get_rotary_frequencies(dim: int, base: float, yarn, device: torch.device):
+    yarn_key = (
+        (
+            yarn["original_max_position_embeddings"],
+            yarn["beta_fast"],
+            yarn["beta_slow"],
+            yarn["factor"],
+        )
+        if yarn and yarn["original_max_position_embeddings"] > 0
+        else None
+    )
+    cache_key = (dim, base, device, yarn_key, torch.arange)
+    cached = _rotary_freq_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    frequencies = 1 / base ** (
+        torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+    )
+    if yarn_key is not None:
+        original, beta_fast, beta_slow, factor = yarn_key
+        inv_two_log_base = dim / (2 * math.log(base))
+        two_pi = 2 * math.pi
+
+        def correction(rotations):
+            return inv_two_log_base * math.log(original / (rotations * two_pi))
+
+        low = max(math.floor(correction(beta_fast)), 0)
+        high = min(math.ceil(correction(beta_slow)), dim - 1)
+        ramp = (
+            (torch.arange(dim // 2, device=device, dtype=torch.float32) - low)
+            / max(high - low, 1e-3)
+        ).clamp(0, 1)
+        frequencies = frequencies * (1 - ramp + ramp / factor)
+    _rotary_freq_cache[cache_key] = frequencies
+    return frequencies
+
+
 def rotary(x, positions, config, *, compressed, inverse=False):
     dim = config["qk_rope_head_dim"]
     if dim < 2 or dim % 2 or dim > x.shape[-1]:
         raise ValueError("invalid rotary dimension")
     base = config["compress_rope_theta"] if compressed else config["rope_theta"]
-    frequencies = 1 / base ** (
-        torch.arange(0, dim, 2, device=x.device, dtype=torch.float32) / dim
-    )
     yarn = (
         (config.get("rope_scaling") or config.get("rope_parameters"))
         if compressed
         else None
     )
-    if yarn and yarn["original_max_position_embeddings"] > 0:
-        original = yarn["original_max_position_embeddings"]
-
-        def correction(rotations):
-            return (
-                dim
-                * math.log(original / (rotations * 2 * math.pi))
-                / (2 * math.log(base))
-            )
-
-        low = max(math.floor(correction(yarn["beta_fast"])), 0)
-        high = min(math.ceil(correction(yarn["beta_slow"])), dim - 1)
-        ramp = (
-            (torch.arange(dim // 2, device=x.device, dtype=torch.float32) - low)
-            / max(high - low, 1e-3)
-        ).clamp(0, 1)
-        frequencies = frequencies * (1 - ramp + ramp / yarn["factor"])
+    frequencies = _get_rotary_frequencies(dim, base, yarn, x.device)
     pos_f32 = (
         positions
         if positions.device == x.device and positions.dtype == torch.float32
@@ -66,11 +87,14 @@ def rotary(x, positions, config, *, compressed, inverse=False):
     cosine, sine = angles.cos().reshape(shape), angles.sin().reshape(shape)
     if inverse:
         sine = -sine
-    x_tail = x[..., -dim:] if x.dtype == torch.float32 else x[..., -dim:].float()
+    x_rope = x if dim == x.shape[-1] else x[..., -dim:]
+    x_tail = x_rope if x.dtype == torch.float32 else x_rope.float()
     pairs = x_tail.unflatten(-1, (-1, 2))
     real, imag = pairs[..., 0], pairs[..., 1]
     rotated = torch.stack(
         (real * cosine - imag * sine, real * sine + imag * cosine), -1
     ).flatten(-2)
     rotated_out = rotated if x.dtype == torch.float32 else rotated.to(x.dtype)
+    if dim == x.shape[-1]:
+        return rotated_out
     return torch.cat((x[..., :-dim], rotated_out), -1)
