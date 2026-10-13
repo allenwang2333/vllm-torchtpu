@@ -7,7 +7,8 @@
 
 This repository contains the integration of **TorchTPU** and **vLLM**. It is a vLLM platform plugin packaged as `vllm_torchtpu`, with TPU kernels and runtime code for TorchTPU.
 
-> For contribution guidelines, developer environment setup, and architecture details, please refer to [CONTRIBUTING.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/CONTRIBUTING.md).
+> [!IMPORTANT] Pre-Public Development Governance
+> During the pre-public phase (July 2026 – Public Launch), we are operating with specialized repository rules due to missing automated GitHub branch protections. Please refer to [PRE_PUBLIC_DEV_GUIDE.md](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/PRE_PUBLIC_DEV_GUIDE.md) for standard submission flows, merge checklists, and mandatory guidelines.
 
 ---
 
@@ -63,25 +64,6 @@ out-of-tree platform of the `vllm` product. We pass this variable during
 the installation of `vllm-torchtpu`, as we are building `vllm` wheel from
 source during this process.
 
-> **Package names:** this repo is distributed as `vllm-torchtpu-core` (the
-> import package is still `vllm_torchtpu`). vLLM is **not** a core
-> dependency; the `vllm` dependency group (`--group vllm`) installs it from
-> source for development. `vllm-torchtpu` is the name of the combined wheel
-> (vLLM + a dependency on `vllm-torchtpu-core`).
->
-> **Migrating an existing environment:** if this repo was installed before the
-> rename (distribution name `vllm_torchtpu`), uninstall it first:
->
-> ```bash
-> pip uninstall -y vllm_torchtpu   # or: uv pip uninstall vllm_torchtpu
-> ```
->
-> pip normalizes `vllm_torchtpu` and `vllm-torchtpu` to the same project, so the
-> old plugin would be "upgraded" by the combined `vllm-torchtpu` wheel. For
-> non-editable installs, that removal can delete `vllm_torchtpu/` files now
-> owned by `vllm-torchtpu-core`. If this already happened, repair it with
-> `pip install --force-reinstall --no-deps vllm-torchtpu-core`.
-
 #### Option A: Using `uv` (Recommended)
 
 ```bash
@@ -97,8 +79,8 @@ uv tool install keyring --with keyrings.google-artifactregistry-auth
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
-# Install vLLM-TorchTPU and dependencies (--group vllm pulls vLLM from source)
-VLLM_TARGET_DEVICE="empty" uv pip install --pre -e . --group vllm
+# Install vLLM-TorchTPU and dependencies
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e .
 ```
 
 #### Option B: Using `pip`
@@ -114,9 +96,8 @@ pip install keyring keyrings.google-artifactregistry-auth
 # Set the PIP_INDEX_URL environment variable (using keyring)
 export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
 
-# Install vLLM-TorchTPU and dependencies (--group vllm pulls vLLM from source;
-# needs pip >= 25.1)
-VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
+# Install vLLM-TorchTPU and dependencies
+VLLM_TARGET_DEVICE="empty" pip install --pre -e .
 ```
 
 ### 3. \[Optional\] Install vLLM

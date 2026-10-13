@@ -2,14 +2,16 @@
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     QWEN_GDN_ARCHITECTURES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
+    pooled_gdn_conv_and_scale_state_bytes,
     pooled_gdn_state_dtypes,
     pooled_gdn_state_itemsize,
     unified_kv_layout_enabled_for_architecture,
@@ -19,20 +21,6 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
-    class _HybridMambaModel(Protocol):
-        """Typing-only view of the mamba state classmethods on a hybrid model."""
-
-        @classmethod
-        def get_mamba_state_shape_from_config(
-            cls, vllm_config: VllmConfig
-        ) -> tuple[tuple[int, ...], ...]: ...
-
-        @classmethod
-        def get_mamba_state_dtype_from_config(
-            cls, vllm_config: VllmConfig
-        ) -> tuple[torch.dtype, ...]: ...
-
 else:
     VllmConfig = None
 
@@ -197,11 +185,10 @@ def _hybrid_mamba_state_layout(
 
     from vllm.model_executor.models import ModelRegistry
 
-    resolved_cls, _ = ModelRegistry.resolve_model_cls(
+    model_cls, _ = ModelRegistry.resolve_model_cls(
         model_config.architecture,
         model_config=model_config,
     )
-    model_cls = cast("type[_HybridMambaModel]", resolved_cls)
     tp_local_shapes = tuple(model_cls.get_mamba_state_shape_from_config(vllm_config))
     parallel_config = vllm_config.parallel_config
     if model_config.architecture in QWEN_GDN_ARCHITECTURES:
@@ -268,25 +255,43 @@ def _hybrid_mamba_state_layout(
             f"(conv, SSM), got dtypes={dtypes}"
         )
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
+    if isinstance(ssm_dtype, str):
+        ssm_dtype = getattr(torch, ssm_dtype.removeprefix("torch."), ssm_dtype)
     conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
-    ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
-    conv_bytes = math.prod(shapes[0]) * conv_itemsize
-    ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
+    raw_conv_bytes = math.prod(shapes[0]) * conv_itemsize
+    if "float4_e2m1fn" in str(ssm_dtype):
+        ssm_bytes = math.prod(shapes[1]) // 2
+    else:
+        ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
+        ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
 
     if pcp_size > 1 and model_config.architecture not in QWEN_GDN_ARCHITECTURES:
         # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
         full_conv_bytes = math.prod(tp_local_shapes[0]) * conv_itemsize
-        full_ssm_bytes = math.prod(tp_local_shapes[1]) * ssm_itemsize
-        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes + full_ssm_bytes):
+        full_ssm_bytes = (
+            math.prod(tp_local_shapes[1]) // 2
+            if "float4_e2m1fn" in str(ssm_dtype)
+            else math.prod(tp_local_shapes[1]) * ssm_itemsize
+        )
+        if (raw_conv_bytes + ssm_bytes) * pcp_size != (
+            full_conv_bytes + full_ssm_bytes
+        ):
             raise ValueError(
                 "PCP-local Mamba state size must be exactly 1/pcp_size of "
                 "the TP-local state: "
                 f"architecture={model_config.architecture!r}, "
                 f"pcp_size={pcp_size}, full_page_size_bytes="
                 f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
-                f"{conv_bytes + ssm_bytes}"
+                f"{raw_conv_bytes + ssm_bytes}"
             )
+
+    conv_bytes = pooled_gdn_conv_and_scale_state_bytes(
+        kernel_size=0,
+        conv_dim=0,
+        ssm_dtype=ssm_dtype,
+        raw_conv_bytes=raw_conv_bytes,
+    )
 
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
@@ -308,39 +313,12 @@ def _tpu_attention_raw_payload_bytes_per_token(vllm_config: VllmConfig) -> int:
     )
 
 
-class _TpuBlockSlotDerivation(TypedDict):
-    """The block-size derivation that the TPU platform logs."""
-
-    backend: str
-    block_size_source: str
-    input_block_size: int
-    backend_supported_kernel_block_sizes: Sequence[object]
-    backend_min_page_size: int
-    user_block_size_floor: int | None
-    mamba_raw_state_bytes: int | None
-    mamba_required_state_bytes: int | None
-    fa_raw_payload_bytes_per_token: int
-    fa_pool_row_tokens: int
-    fa_physical_bytes_per_pool_row: int
-    fa_layout_padding_bytes_per_pool_row: int
-    mamba_fit_block_size: int | None
-    final_block_size: int
-    fa_raw_payload_slot_bytes: int
-    fa_layout_padding_slot_bytes: int
-    fa_physical_slot_bytes: int
-    final_block_slot_bytes: int
-    fa_slot_tail_padding_bytes: int
-    mamba_layout_padding_bytes: int | None
-    mamba_slot_tail_padding_bytes: int | None
-    mamba_slot_padding_bytes: int | None
-
-
 def _derive_tpu_block_slot_config(
     vllm_config: VllmConfig,
     backend_cls,
     *,
     input_block_size: int,
-) -> _TpuBlockSlotDerivation:
+) -> dict[str, int | str | Sequence[object] | None]:
     supported = backend_cls.get_supported_kernel_block_sizes()
     # The pool row (the pool tensor's shape[1] unit) is the quantum the GDN
     # state regions are measured in. GQA/RPA pools hold one token per row;
@@ -433,7 +411,6 @@ def _derive_tpu_block_slot_config(
     mamba_layout_padding_bytes: int | None = None
     mamba_slot_tail_padding_bytes: int | None = None
     if mamba_layout is not None:
-        assert mamba_raw_state_bytes is not None
         mamba_slot_padding_bytes = final_block_slot_bytes - mamba_raw_state_bytes
         mamba_layout_padding_bytes = mamba_layout.required_bytes - mamba_raw_state_bytes
         mamba_slot_tail_padding_bytes = (
@@ -470,7 +447,7 @@ def _optional_log_value(value: int | None) -> int | str:
     return "n/a" if value is None else value
 
 
-def _log_tpu_block_size_derivation(derivation: _TpuBlockSlotDerivation) -> None:
+def _log_tpu_block_size_derivation(derivation: dict[str, object]) -> None:
     logger.info(
         "TPU block_size derivation path: backend=%s -> "
         "backend_supported_kernel_block_sizes=%s -> input_block_size=%s -> "

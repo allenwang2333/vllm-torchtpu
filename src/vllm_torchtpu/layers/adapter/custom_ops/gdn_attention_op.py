@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import itertools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -47,12 +47,14 @@ from vllm_torchtpu.distributed.pcp import (
 )
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter import gated_norm_quant_op
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -75,30 +77,17 @@ _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
 _GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
 
-if TYPE_CHECKING:
-
-    class _GdnAttentionMetadata(Protocol):
-        """The per-layer AttentionMetadata fields that GDN reads.
-
-        The runner fills them with torch tensors, while AttentionMetadata
-        annotates them as jax.Array.
-        """
-
-        block_tables: torch.Tensor
-        seq_lens: torch.Tensor
-        query_start_loc: torch.Tensor
-        request_distribution: torch.Tensor
-        mamba_state_indices: torch.Tensor | None
-
 
 def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
     if dtype == torch.float32:
         return jnp.dtype(jnp.float32)
     if dtype == torch.bfloat16:
         return jnp.dtype(jnp.bfloat16)
+    if dtype == torch.float8_e4m3fn:
+        return jnp.dtype(jnp.float8_e4m3fn)
     raise ValueError(
         f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
-        f"{dtype}; expected float32 or bfloat16"
+        f"{dtype}; expected float32, bfloat16, or float8_e4m3fn"
     )
 
 
@@ -367,10 +356,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
-
-    # Narrowed to the layer that _create_conv1d installs.
-    # pyrefly: ignore[bad-override-mutable-attribute]
-    conv1d: GdnColumnParallelLinear
+    # Set by `gated_norm_quant_op.install` under TPU_GDN_FUSED_NORM_QUANT.
+    fused_norm_quant: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -381,13 +368,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
-        # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
-        # pyrefly: ignore[bad-assignment]
         self.kv_cache = None
-        # The wrapper context types vllm_config as object.
-        vllm_config = cast(
-            VllmConfig | None, get_vllm_model_wrapper_context().vllm_config
-        )
+        vllm_config = get_vllm_model_wrapper_context().vllm_config
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
             vllm_config
         )
@@ -414,7 +396,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _bm_state_ids(self, ids: torch.Tensor) -> torch.Tensor:
         if not self._bm_kernel:
             return ids
-        assert self._bm_region is not None
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
 
@@ -513,6 +494,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             conv_state_dtype = getattr(
                 torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
             )
+            if getattr(
+                self.cache_config, "mamba_ssm_cache_dtype", "auto"
+            ) in ("auto", "float32", "fp8", "float8_e4m3fn"):
+                temporal_state_dtype = getattr(
+                    torch, DEFAULT_POOLED_GDN_SSM_STATE_DTYPE.split(".")[1]
+                )
         else:
             # TODO: Support bf16 conv state.
             # Per-layer cache: unlike the pool, the declared dtype IS the
@@ -557,7 +544,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         if vllm_context.vllm_config is None:
             return False
-        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
+        parallel_config = vllm_context.vllm_config.parallel_config
         return parallel_config.prefill_context_parallel_size > 1
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
@@ -580,7 +567,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
 
         if pcp_streaming:
-            parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
+            parallel_config = vllm_context.vllm_config.parallel_config
             interleave_size = parallel_config.cp_kv_cache_interleave_size
             if not isinstance(interleave_size, int) or interleave_size <= 0:
                 raise ValueError(
@@ -712,7 +699,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
-        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        vllm_config = vllm_context.vllm_config
         mesh = vllm_context.mesh
         n_kq = self.tp_head_geometry.local_num_kq_heads
         d_k = self.head_k_dim
@@ -861,7 +848,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
-        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
+        parallel_config = vllm_context.vllm_config.parallel_config
         interleave_size = parallel_config.cp_kv_cache_interleave_size
         if not isinstance(interleave_size, int) or interleave_size <= 0:
             raise ValueError(
@@ -884,7 +871,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
         derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
 
-        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        vllm_config = vllm_context.vllm_config
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
@@ -1080,6 +1067,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
+        if self.fused_norm_quant:
+            return gated_norm_quant_op.output_projection(self, core_attn_out, z)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
@@ -1100,8 +1089,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         qkvz_weight, qkvz_weight_scale = self._require_pcp_projection_parameters()
         ba, _ = self.in_proj_ba(hidden_states)
         b, a = ba.chunk(2, dim=-1)
-        b = b.contiguous()
-        a = a.contiguous()
 
         state_indices = attn_metadata.mamba_state_indices
         assert state_indices is not None
@@ -1130,34 +1117,49 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
-            assert kv_cache is not None
-            attn_metadata = cast(
-                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
-            )[self.prefix]
+            attn_metadata = get_forward_context().attn_metadata[self.prefix]
             return self._forward_fused_pooled_pcp(
                 hidden_states,
                 kv_cache[0],
                 attn_metadata,
             )
 
+        def _project(layer, x, pq):
+            if pq is None:
+                out, _ = layer(x)
+                return out
+            apply_pq = getattr(layer.quant_method, "apply_prequant", None)
+            bias = (
+                None
+                if getattr(layer, "skip_bias_add", False)
+                else getattr(layer, "bias", None)
+            )
+            if apply_pq is None:
+                if bias is None:
+                    out, _ = layer(pq[0].to(torch.bfloat16))
+                    return (out.to(torch.float32) * pq[1]).to(out.dtype)
+                rows = (pq[0].to(torch.float32) * pq[1]).to(torch.bfloat16)
+                out, _ = layer(rows)
+                return out
+            return apply_pq(layer, pq[0], pq[1], bias)
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            mixed_qkv = _project(self.in_proj_qkv, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
+            z = _project(self.in_proj_z, hidden_states, prequant)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _project(self.in_proj_qkvz, hidden_states, prequant)
+            ba = _project(self.in_proj_ba, hidden_states, prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
@@ -1167,8 +1169,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -1184,9 +1184,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             recurrent_state = None
         else:
-            attn_metadata = cast(
-                "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
-            )[self.prefix]
+            attn_metadata = get_forward_context().attn_metadata[self.prefix]
 
             if len(kv_cache) == 1:
                 # Unified block pool: the attention-shaped pool carries the

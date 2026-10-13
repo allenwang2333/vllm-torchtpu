@@ -13,7 +13,6 @@
 # limitations under the License.
 """Regression tests for zero-valued quantization blocks."""
 
-import pytest
 import torch
 
 from vllm_torchtpu.layers.core.quantization import (
@@ -22,7 +21,6 @@ from vllm_torchtpu.layers.core.quantization import (
 )
 
 
-@pytest.mark.tpu_test
 def test_quantize_tensor_keeps_zero_rows_finite(device):
     tensor = torch.tensor(
         [[0.0, 0.0, 0.0, 0.0], [1.0, -2.0, 3.0, -4.0]],
@@ -54,7 +52,6 @@ def test_quantize_tensor_uses_reciprocal_multiply_scale_rounding():
     torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
 
 
-@pytest.mark.tpu_test
 def test_quantize_tensor_to_fp4_keeps_zero_blocks_finite(device):
     tensor = torch.tensor(
         [[0.0, 0.0, 1.0, -1.0], [2.0, -2.0, 0.0, 0.0]],

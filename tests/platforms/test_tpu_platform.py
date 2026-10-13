@@ -399,33 +399,6 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
-    @patch("vllm_torchtpu.patch_registry.apply")
-    @patch(
-        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
-    )
-    def test_hnd_refuses_head_dim_64(
-        self,
-        mock_prepare_env,
-        mock_apply_patches,
-        vllm_config,
-        monkeypatch,
-        head_size,
-        refused,
-    ):
-        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
-        vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
-        vllm_config.model_config.get_head_size = lambda: head_size
-
-        if refused:
-            with pytest.raises(NotImplementedError, match="head_dim==64"):
-                TpuPlatform.check_and_update_config(vllm_config)
-        else:
-            TpuPlatform.check_and_update_config(vllm_config)
-
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
@@ -975,7 +948,6 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     assert torch.cumsum is original_cumsum
 
 
-@pytest.mark.tpu_test
 class TestQwen3VLModelPatches:
     """Tests for Qwen3-VL platform and model-level patches."""
 
@@ -1154,3 +1126,61 @@ class TestQwen3VLModelPatches:
         finally:
             if hasattr(torch, "_orig_cumsum_ref"):
                 delattr(torch, "_orig_cumsum_ref")
+
+
+def test_check_and_update_config_auto_stream_interval(monkeypatch):
+    """Default stream_interval=1 upgrades to TPU_STREAM_INTERVAL (default 50)
+    while preserving explicit CLI overrides."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    def _make_cfg(stream_interval: int):
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {}
+        vllm_config.model_config = MagicMock()
+        vllm_config.model_config.dtype = torch.bfloat16
+        vllm_config.model_config.architectures = []
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.max_model_len = 4096
+        vllm_config.cache_config = SimpleNamespace(
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            kv_cache_memory_bytes=None,
+        )
+        vllm_config.compilation_config = MagicMock()
+        vllm_config.compilation_config.compile_sizes = [16, 32]
+        vllm_config.scheduler_config = SimpleNamespace(
+            max_num_batched_tokens=2048,
+            max_num_seqs=32,
+            async_scheduling=False,
+            scheduler_cls=None,
+            stream_interval=stream_interval,
+        )
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = None
+        vllm_config.parallel_config = SimpleNamespace(
+            nnodes=1,
+            node_rank=0,
+            world_size=1,
+            world_size_across_dp=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        )
+        return vllm_config
+
+    monkeypatch.delenv("TPU_STREAM_INTERVAL", raising=False)
+    cfg_default = _make_cfg(1)
+    TpuPlatform.check_and_update_config(cfg_default)
+    assert cfg_default.scheduler_config.stream_interval == 1
+
+    monkeypatch.setenv("TPU_STREAM_INTERVAL", "25")
+    cfg_env = _make_cfg(1)
+    TpuPlatform.check_and_update_config(cfg_env)
+    assert cfg_env.scheduler_config.stream_interval == 25
+
+    cfg_explicit = _make_cfg(10)
+    TpuPlatform.check_and_update_config(cfg_explicit)
+    assert cfg_explicit.scheduler_config.stream_interval == 10

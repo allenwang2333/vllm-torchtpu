@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import Any, cast
+from typing import Any
 from urllib.parse import urlparse
 
 import torch
@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -32,10 +33,10 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker.numa_bind import bind_to_chip_numa_node
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -192,6 +193,14 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        # Before the runtime starts, so its threads and buffers follow.
+        if envs.TPU_WORKER_NUMA_BIND:
+            dp_size_local = (
+                (pc.data_parallel_size_local or dp_size) if dp_size > 1 else 1
+            )
+            bind_to_chip_numa_node(
+                binding.native_local_rank, pc.local_world_size * dp_size_local
+            )
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -401,10 +410,7 @@ class TPUWorker(WorkerBase):
 
         from vllm.platforms import current_platform
 
-        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-
-        tpu_platform = cast(TpuPlatform, current_platform)
-        dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
+        dist_backend = current_platform.get_worker_distributed_backend(dist_world_size)
 
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
@@ -425,16 +431,7 @@ class TPUWorker(WorkerBase):
         # the rank -> chip binding is already a Hamiltonian cycle: libtpu opens
         # devices in ascending PCI order, and consecutive ranks land on
         # ICI-adjacent chips.
-        with (
-            set_current_vllm_config(self.vllm_config),
-            pcp_topology_order(
-                None,
-                preserve_dcp_order=(
-                    pcp_size > 1
-                    and self.parallel_config.decode_context_parallel_size > 1
-                ),
-            ),
-        ):
+        with set_current_vllm_config(self.vllm_config):
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=self.parallel_config.tensor_parallel_size,
                 pipeline_model_parallel_size=self.parallel_config.pipeline_parallel_size,
@@ -447,10 +444,7 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        # WorkerBase declares `nn.Module | None`; this worker always holds a
-        # TPUModelRunner from here on.
-        # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner = TPUModelRunner(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
@@ -660,7 +654,6 @@ class TPUWorker(WorkerBase):
             # re-deriving it from the stop call's prefix.
             profile_dir = self.profile_run_dir
             if self.profile_capture_dir and self.profile_canonical_ts:
-                assert profile_dir is not None
                 profiler_trace.merge_rank_capture(
                     self.profile_capture_dir,
                     profile_dir,
@@ -700,6 +693,10 @@ class TPUWorker(WorkerBase):
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
+        # Freeze the heap built by load and compile so per-step GC does not
+        # rescan it, as vLLM's GPU worker does.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 

@@ -74,6 +74,18 @@ class StateRegion:
     # where full-width states interleave Q and K row-pairs per tap so that
     # one whole pool token holds one head-pair's Q and K rows.
     rows_perm: tuple[int, ...] | None = None
+    pack: int = 1
+    block_row0: int = 0
+
+    def __post_init__(self):
+        if self.pack not in (1, 2, 4, 8):
+            raise ValueError(f"unsupported state pack factor: {self.pack}")
+        if self.pack != 1 and self.rows_perm is not None:
+            raise ValueError(
+                "a packed region's rows_perm would permute packed rows, not state rows"
+            )
+        if self.block_row0 and self.nblocks != 1:
+            raise ValueError("a co-located region spans one block")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +103,7 @@ class StateSourcePlan:
     conv: StateRegion
     recurrent: StateRegion
     whole_block_dma: bool = False
+    scale: StateRegion | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -122,11 +135,6 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
-    # Stream states through separate refill and write-back VMEM buffers
-    # (the refill holding only window position 0) instead of one shared
-    # input_output buffer, so a tile's refill never waits for the write-back
-    # of the tile two before it. Costs VMEM; see `split_state_fits`.
-    split_state: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -135,33 +143,6 @@ class GDNConfig:
         # One tile per sequence, holding its whole verify window. BATCHED is
         # the single-token case of that (window_size == 1).
         return self.window_size
-
-    @property
-    def state_in_pos(self) -> int:
-        """VMEM window position the initial (incoming) state is DMA'd into.
-
-        With a speculative window (`window_size > 1`) the state tile is
-        INPUT_OUTPUT and double buffered: the pipeline issues copy_in for tile
-        i+1 into the slot whose checkpoint copy_out for tile i-1 is still in
-        flight (wait_out(i-1) runs only at the end of step i). If the incoming
-        state shared position 0 with checkpoint 0, the copy_in could overwrite
-        it before the copy_out read it, writing another request's state into
-        checkpoint 0 in HBM. Use a dedicated extra position `window_size`
-        instead, which copy_out never reads. Without a window keep position 0
-        (unchanged layout). With `split_state` the refill has its own buffer
-        holding only position 0.
-        """
-        return self.window_size if self._extra_in_pos else 0
-
-    @property
-    def state_window_alloc(self) -> int:
-        """Window positions allocated per sequence in the shared VMEM state
-        tiles."""
-        return self.window_size + (1 if self._extra_in_pos else 0)
-
-    @property
-    def _extra_in_pos(self) -> bool:
-        return self.window_size > 1 and not self.split_state
 
     @property
     def seq_tile_size(self) -> int:

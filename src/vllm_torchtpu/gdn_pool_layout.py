@@ -42,15 +42,30 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
 # imported by the JAX kernel path and by deviceless tests, so it must stay
 # importable without torch.
 DEFAULT_POOLED_GDN_CONV_STATE_DTYPE = "torch.bfloat16"
-DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.float32"
-_ITEMSIZE_BY_DTYPE = {"torch.bfloat16": 2, "torch.float32": 4}
+DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = "torch.bfloat16"
+_ITEMSIZE_BY_DTYPE = {
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+    "torch.float8_e4m3fn": 1,
+}
+
+# When the SSM state is quantized to FP8 (float8_e4m3fn) or FP4 (float4_e2m1fn),
+# a per-(v_head, v_col) FP32 scale sits at the head of the conv region block.
+# Because a bfloat16 VREG on TPU v7 spans 16 rows (8,192 bytes at 256 lanes),
+# the conv region starts at VREG-aligned byte offset 8,192 and its touched rows
+# are also rounded up to whole bfloat16 VREGs (8,192-byte grain).
+POOLED_GDN_SCALE_HEADER_BYTES = 8192
+POOLED_GDN_CONV_VREG_GRAIN_BYTES = 8192
 
 
 def pooled_gdn_state_dtypes(
     dtypes: tuple[object, ...],
 ) -> tuple[object, object]:
     """Resolve declared Conv/SSM dtypes to their pooled physical dtypes."""
-    return DEFAULT_POOLED_GDN_CONV_STATE_DTYPE, dtypes[1]
+    ssm_dtype = dtypes[1]
+    if str(ssm_dtype) in ("torch.float32", "float32", "auto"):
+        ssm_dtype = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE
+    return DEFAULT_POOLED_GDN_CONV_STATE_DTYPE, ssm_dtype
 
 
 def pooled_gdn_state_itemsize(dtype: object) -> int:
@@ -90,6 +105,32 @@ def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
     )
 
 
+def pooled_gdn_conv_and_scale_state_bytes(
+    *,
+    kernel_size: int,
+    conv_dim: int,
+    ssm_dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
+    raw_conv_bytes: int | None = None,
+) -> int:
+    """Bytes required in the conv block, including any co-located FP32 scale."""
+    base_bytes = (
+        raw_conv_bytes
+        if raw_conv_bytes is not None
+        else pooled_gdn_conv_state_bytes(kernel_size=kernel_size, conv_dim=conv_dim)
+    )
+    # vmem_ldst loads and stores conv state at whole bfloat16 VREG granularity
+    # (16 rows = 8,192 bytes at 256 lanes) regardless of ssm_dtype, so always
+    # round conv state bytes up to POOLED_GDN_CONV_VREG_GRAIN_BYTES.
+    aligned_conv = (
+        (base_bytes + POOLED_GDN_CONV_VREG_GRAIN_BYTES - 1)
+        // POOLED_GDN_CONV_VREG_GRAIN_BYTES
+    ) * POOLED_GDN_CONV_VREG_GRAIN_BYTES
+    name = str(ssm_dtype)
+    if "float8_e4m3fn" in name or "float4_e2m1fn" in name:
+        return POOLED_GDN_SCALE_HEADER_BYTES + aligned_conv
+    return aligned_conv
+
+
 def pooled_gdn_ssm_state_bytes(
     *,
     num_v_heads: int,
@@ -98,6 +139,9 @@ def pooled_gdn_ssm_state_bytes(
     dtype: object = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
 ) -> int:
     """Live bytes of one slot's head-major, dense SSM region in ``dtype``."""
+    name = str(dtype)
+    if "float4_e2m1fn" in name:
+        return (num_v_heads * head_k_dim * head_v_dim) // 2
     return num_v_heads * head_k_dim * head_v_dim * pooled_gdn_state_itemsize(dtype)
 
 

@@ -32,9 +32,7 @@ logger = init_logger(__name__)
 
 class DSparkProposer(DFlashProposer):
     def __init__(self, runner, vllm_config: VllmConfig):
-        speculative_config = vllm_config.speculative_config
-        assert speculative_config is not None
-        hf_config = speculative_config.draft_model_config.hf_config
+        hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
         super().__init__(runner, vllm_config)
@@ -118,7 +116,6 @@ class DSparkProposer(DFlashProposer):
         chain seeds from the anchor input id and runs a static K-iteration
         loop: embedding gather + rank-r bias + argmax.
         """
-        assert self.draft_model is not None
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,

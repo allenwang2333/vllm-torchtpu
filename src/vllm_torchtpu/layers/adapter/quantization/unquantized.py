@@ -34,7 +34,7 @@ and uses our native TorchTPU + Pallas kernels.
 4. apply() routes to our TPU Pallas local-topk MoE kernels
 """
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.attention import Attention
@@ -73,12 +73,6 @@ from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_m
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
-if TYPE_CHECKING:
-    from vllm_torchtpu.layers.adapter.quantization.configs import (
-        TpuLinear,
-        TpuRoutedExperts,
-    )
-
 logger = init_logger(__name__)
 
 
@@ -99,7 +93,6 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer = cast("TpuLinear", layer)
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # A consumer reads this weight raw and expects [n_out, n_in];
             # `apply` below falls back to the stock contraction.
@@ -124,7 +117,6 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        layer = cast("TpuLinear", layer)
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Left in vLLM's [n_out, n_in] for a consumer that reads it raw.
             return super().apply(layer, x, bias)
@@ -142,6 +134,28 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply unquantized linear to pre-quantized FP8 rows `(x_q, x_s)` by
+        contracting `x_q.to(weight.dtype) @ weight` first and scaling the
+        `[m, n_out]` result by `x_s`, avoiding materializing a full `[m, k]`
+        float32/bfloat16 dequantized activation buffer."""
+        weight = layer.weight
+        x_cast = x_q.to(weight.dtype)
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            out = torch.nn.functional.linear(x_cast, weight)
+        else:
+            out = torch.matmul(x_cast, weight)
+        out_f32 = out.to(torch.float32) * x_s
+        if bias is not None:
+            out_f32 = out_f32 + bias.to(torch.float32)
+        return out_f32.to(weight.dtype)
+
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
@@ -152,9 +166,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
     TPU-compatible methods for RoutedExperts and Linear layers.
     """
 
-    # "unquantized" is not one of vLLM's QuantizationMethods names.
     @classmethod
-    # pyrefly: ignore[bad-override]
     def get_name(cls) -> str:
         return UNQUANTIZED
 
@@ -171,12 +183,11 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return []  # No extra configs required
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "VllmUnquantizedConfig":
+    def from_config(cls, _: dict[str, Any]) -> "VllmUnquantizedConfig":
         return cls()
 
-    # compressed-tensors also calls this with its own config as `self`.
     def get_quant_method(
-        self: VllmQuantConfig,
+        self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
@@ -252,7 +263,6 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
-        layer = cast("TpuRoutedExperts", layer)
 
         # Pre-compute activation string: layer.activation is a MoEActivation
         # enum in v0.17.1 but the Pallas kernel expects a plain string.
@@ -289,7 +299,6 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
         if self.moe.has_bias:
-            assert layer.w13_bias is not None and layer.w2_bias is not None
             w13_bias = layer.w13_bias.data
             w2_bias = layer.w2_bias.data
 
@@ -316,7 +325,6 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         if layer.w13_weight.device.type == "tpu":
             to_sync = [layer.w13_weight, layer.w2_weight]
             if self.moe.has_bias:
-                assert layer.w13_bias is not None and layer.w2_bias is not None
                 to_sync.append(layer.w13_bias)
                 to_sync.append(layer.w2_bias)
             synchronize_tensors(to_sync)
@@ -343,7 +351,6 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel."""
-        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"

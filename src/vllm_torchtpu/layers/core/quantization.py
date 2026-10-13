@@ -33,8 +33,6 @@ Usage in MXFP4 MoE pipeline:
 5. Use in GMM kernel with rhs_scale
 """
 
-from collections.abc import Sequence
-
 import jax.numpy as jnp
 import torch
 
@@ -61,7 +59,7 @@ def dtype_max(dtype: jnp.dtype) -> float:
 
 
 def is_floating_dtype(dtype: torch.dtype) -> bool:
-    return torch.is_floating_point(torch.empty((), dtype=dtype))
+    return dtype.is_floating_point
 
 
 def _safe_inverse_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -77,12 +75,14 @@ def static_per_tensor_quantize_tensor(
     """Quantize tensor with a fixed scalar scale and clamp to dtype range."""
     if scale == 0.0:
         raise ValueError("Quantization scale must be non-zero.")
-    if is_floating_dtype(quant_dtype):
+    if quant_dtype.is_floating_point:
         dtype_info = torch.finfo(quant_dtype)
+        if scale == 1.0 and tensor.is_floating_point():
+            return torch.clamp(tensor, dtype_info.min, dtype_info.max).to(quant_dtype)
     else:
         dtype_info = torch.iinfo(quant_dtype)
     quantized = torch.clamp(
-        tensor.to(torch.float32) / scale, dtype_info.min, dtype_info.max
+        tensor.to(torch.float32) * (1.0 / scale), dtype_info.min, dtype_info.max
     )
     return quantized.to(quant_dtype)
 
@@ -182,7 +182,7 @@ def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
 def dequantize_tensor(
     tensor_q: torch.Tensor,
     scale: torch.Tensor,
-    axis: int | Sequence[int] = -1,
+    axis: int = -1,
     out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Dequantize a quantized tensor with block scaling.
@@ -347,7 +347,7 @@ def dequantize_mxfp4_packed(
 
 def quantize_tensor_to_fp4(
     tensor: torch.Tensor,
-    axis: int | Sequence[int] = -1,
+    axis: int = -1,
     block_size: int = REQUANTIZED_BLOCK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize float tensor to FP4 with block scaling.

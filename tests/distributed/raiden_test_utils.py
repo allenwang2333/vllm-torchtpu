@@ -56,15 +56,8 @@ class FakeTensor:
         return self._storage_offset
 
 
-KIMI_KV_ITEMSIZE = {"bfloat16": 2, "float8_e4m3fn": 1}
-
-
-def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
-    """The stock full K3 unified pool for a local KDA head count.
-
-    ``kv_dtype`` is the pool's attention KV dtype. The KDA state regions are
-    sized the same for either: conv stays bf16 and SSM stays f32.
-    """
+def kimi_pool_manifest(heads, pool=None):
+    """The stock full K3 unified pool for a local KDA head count."""
     from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
     from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
@@ -76,11 +69,7 @@ def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
     )
     rows = layout.required_tokens
     if pool is None:
-        itemsize = KIMI_KV_ITEMSIZE[kv_dtype]
-        pool = FakeTensor(
-            (4, rows, 4 // itemsize, 640), itemsize, dtype=f"torch.{kv_dtype}"
-        )
-    packing = pool.shape[2]
+        pool = FakeTensor((4, rows, 2, 640), 2, dtype="torch.bfloat16")
     state_layer, fa_layer = "model.layers.1.kda", "model.layers.4.attn"
     groups = [
         types.SimpleNamespace(
@@ -94,7 +83,7 @@ def kimi_pool_manifest(heads, pool=None, kv_dtype="bfloat16"):
         types.SimpleNamespace(
             layer_names=[fa_layer],
             kv_cache_spec=types.SimpleNamespace(
-                block_size=rows * packing, page_size_bytes=rows * 2560
+                block_size=rows * 2, page_size_bytes=rows * 2560
             ),
         ),
     ]

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -39,20 +39,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
-    """Whether a draft carries MoE layers, i.e. emits EP collectives.
-
-    Missing a MoE draft here is a hang, not an error: under EP-DP lockstep
-    the busy rank's draft forward waits on all-to-alls that the idle ranks never issue.
-    """
-    from vllm.model_executor.layers.fused_moe import MoERunner
-    from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
-    if is_mixture_of_experts(draft_model):
-        return True
-    return any(isinstance(m, MoERunner) for m in draft_model.modules())
-
-
 class DFlashProposer:
     """DFlash draft proposer for TPU.
 
@@ -66,9 +52,8 @@ class DFlashProposer:
     ):
         self.runner = runner
         self.vllm_config = vllm_config
-        speculative_config = vllm_config.speculative_config
-        assert speculative_config is not None
-        self.speculative_config = speculative_config
+        self.speculative_config = vllm_config.speculative_config
+        assert self.speculative_config is not None
 
         # Read and normalize draft configurations
         hf_config = self.speculative_config.draft_model_config.hf_config
@@ -188,7 +173,6 @@ class DFlashProposer:
         # Share Embeddings and LM Head. DFlash drafts always predict target
         # vocab, so sharing is forced; DSpark overrides the flag because a
         # reduced-vocab checkpoint carries its own lm_head/embed_tokens.
-        assert self.draft_model is not None
         maybe_share_embeddings(
             self.draft_model,
             target_model,
@@ -435,7 +419,6 @@ class DFlashProposer:
         if hasattr(self.draft_model, "get_draft_kv_cache_layer_names"):
             layer_names = self.draft_model.get_draft_kv_cache_layer_names()
         else:
-            assert self.draft_model is not None
             layer_names = [
                 getattr(layer.self_attn.attn, "layer_name", None)
                 for layer in self.draft_model.model.layers
@@ -487,7 +470,7 @@ class DFlashProposer:
     @torch.no_grad()
     def propose(
         self,
-        sampled_token_ids: list[list[int]] | None,
+        sampled_token_ids: list[list[int]],
         discard_sampled_tokens_req_indices: list[int],
         num_rejected_tokens_np: np.ndarray | None,
         scheduler_output,
@@ -626,8 +609,6 @@ class DFlashProposer:
                     sync=True,
                 )
                 if runner.most_model_len is not None:
-                    assert runner.num_reqs_most_model_len is not None
-                    assert runner.num_blocks_per_most_len_req is not None
                     self._dummy_precompute_and_update_kv_cache(
                         num_tokens=num_tokens,
                         num_reqs=runner.num_reqs_most_model_len,
@@ -666,7 +647,6 @@ class DFlashProposer:
         # One [num_tokens, target_hidden] tensor per tagged target layer,
         # matching what the runner hands the real update.
         target_hidden = self.vllm_config.model_config.get_hidden_size()
-        assert self.draft_model is not None
         dtype = self.draft_model.model.embed_tokens.weight.dtype
         dummy_hidden = [
             torch.zeros((num_tokens, target_hidden), dtype=dtype, device=runner.device)
@@ -715,8 +695,7 @@ class DFlashProposer:
         dummy_hidden, dummy_attn_metadata = self._dummy_kv_update_inputs(
             num_tokens, num_reqs, num_blocks
         )
-        dummy_positions = cast(torch.Tensor, dummy_attn_metadata.input_positions)
-        assert self.draft_model is not None
+        dummy_positions = dummy_attn_metadata.input_positions
 
         with set_vllm_model_wrapper_context(
             mesh=runner.mesh, vllm_config=self.vllm_config
@@ -835,7 +814,9 @@ class DFlashProposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            self._draft_has_moe_cache = _draft_has_moe_layers(self.draft_model)
+            from vllm.model_executor.models.interfaces import is_mixture_of_experts
+
+            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
         return self._draft_has_moe_cache
 
     @torch.no_grad()
@@ -860,7 +841,7 @@ class DFlashProposer:
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
         positions: torch.Tensor,
         draft_md_tuple: tuple[AttentionMetadata, ...],
-    ) -> tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor:
+    ) -> torch.Tensor:
         """
         Projects target model hidden states directly into the draft model's KV space.
 
@@ -869,7 +850,6 @@ class DFlashProposer:
         tensor for all layers at once using `_fused_kv_weight`. We then reshape and
         compute RoPE across all layers simultaneously in a single vectorized operation.
         """
-        assert self.draft_model is not None
         self_model = self.draft_model.model
         if isinstance(hidden_states, (list, tuple)):
             target_hidden = (
@@ -981,7 +961,6 @@ class DFlashProposer:
           3. Computes draft logits and performs greedy argmax sampling in-graph.
         """
         # 1. Forward pass through draft model backbone
-        assert self.draft_model is not None
         hidden = self.draft_model.model(
             input_ids=input_ids,
             positions=positions,

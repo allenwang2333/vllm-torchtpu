@@ -13,7 +13,6 @@
 # limitations under the License.
 import re
 from collections.abc import Iterable
-from typing import cast
 
 import torch
 import torch.nn as nn
@@ -178,7 +177,7 @@ class DSparkDeepseekV4Model(nn.Module):
         # silently lose its earliest in-block keys. K + 1 rows covers the
         # DFlash 1 + K layout as well as the dense DSpark K layout.
         max_block_rows = vllm_config.speculative_config.num_speculative_tokens + 1
-        for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers):
+        for layer in self.layers:
             if max_block_rows > layer.attn.window_size:
                 raise ValueError(
                     f"DSpark draft block of up to {max_block_rows} rows "
@@ -236,10 +235,7 @@ class DSparkDeepseekV4Model(nn.Module):
         return [False] * len(self.layers)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
-        return [
-            layer.attn.swa_cache_layer.prefix
-            for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
-        ]
+        return [layer.attn.swa_cache_layer.prefix for layer in self.layers]
 
     def precompute_and_store_context_kv(
         self,
@@ -253,7 +249,7 @@ class DSparkDeepseekV4Model(nn.Module):
         mirroring upstream; the paged insert goes through the TPU attention op.
         """
         main_x = self.combine_hidden_states(target_hidden_states)
-        for i, layer in enumerate(cast(Iterable[DeepseekV4DecoderLayer], self.layers)):
+        for i, layer in enumerate(self.layers):
             attn = layer.attn
             qr_kv, _ = attn.fused_wqa_wkv(main_x)
             kv = qr_kv[..., attn.mla_attn.q_lora_rank :]

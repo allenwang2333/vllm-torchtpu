@@ -32,12 +32,16 @@ preserved via the HBM alias, with no read-modify-write.
 """
 
 import math
+import os
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from vllm import envs
+try:
+    from vllm import envs
+except ImportError:
+    envs = None
 
 from vllm_torchtpu.kernels import typed_ldst
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
@@ -46,7 +50,9 @@ from vllm_torchtpu.kernels.gdn.v3 import config as gdn_v3_config
 def is_seq_along_lane_pool() -> bool:
     """True if pool uses the SEQ_ON_LANE
     (nb, heads2, packed_d, pack, page_size) layout."""
-    return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+    if envs is not None:
+        return envs.VLLM_KV_CACHE_LAYOUT == "HND"
+    return os.environ.get("VLLM_KV_CACHE_LAYOUT", "") == "HND"
 
 
 def _pool_geometry(pool):
@@ -524,7 +530,11 @@ def v3_state_source(
     # The SSM region may extend past the typed state bytes when the state does
     # not divide the pool token row; the kernel truncates loads to rows_used
     # and zero-fills the padding rows on store.
-    assert ssm_ntok * tok_bytes >= (ssm_elements * recurrent_state_dtype.itemsize), (
+    if recurrent_state_dtype == jnp.float4_e2m1fn:
+        ssm_min_bytes = ssm_elements // 2
+    else:
+        ssm_min_bytes = ssm_elements * recurrent_state_dtype.itemsize
+    assert ssm_ntok * tok_bytes >= ssm_min_bytes, (
         ssm_ntok,
         tok_bytes,
         n_v,
@@ -546,16 +556,24 @@ def v3_state_source(
     assert ssm_elements % ssm_out_lanes == 0, (ssm_elements, ssm_out_lanes)
     ssm_rows_used = ssm_elements // ssm_out_lanes
 
-    # Reading/writing VMEM directly with a bfloat16 view_dtype emits excessive
-    # vrot instructions between VREG and VMEM. View BF16 recurrent state as
-    # uint32 in VMEM (2 bfloat16 elements per uint32) and bitcast in VREG,
-    # which halves the number of view rows used.
+    # Reading/writing VMEM directly with a sub-32-bit view_dtype emits excessive
+    # vrot instructions between VREG and VMEM. View BF16/FP8/FP4 recurrent state
+    # as uint32 in VMEM (2 bf16, 4 fp8_e4m3fn, or 8 fp4_e2m1fn elements per
+    # uint32) and bitcast in VREG.
     if recurrent_state_dtype == jnp.bfloat16:
+        ssm_pack = 2
         ssm_view_dtype = jnp.dtype(jnp.uint32)
-        assert ssm_rows_used % 2 == 0, ssm_rows_used
-        ssm_rows_used //= 2
+    elif recurrent_state_dtype == jnp.float8_e4m3fn:
+        ssm_pack = 4
+        ssm_view_dtype = jnp.dtype(jnp.uint32)
+    elif recurrent_state_dtype == jnp.float4_e2m1fn:
+        ssm_pack = 8
+        ssm_view_dtype = jnp.dtype(jnp.uint32)
     else:
+        ssm_pack = 1
         ssm_view_dtype = recurrent_state_dtype
+    assert ssm_rows_used % ssm_pack == 0, (ssm_rows_used, ssm_pack)
+    ssm_rows_used //= ssm_pack
 
     ssm = gdn_v3_config.StateRegion(
         kb0=0,
@@ -565,6 +583,7 @@ def v3_state_source(
         view_dtype=ssm_view_dtype,
         lane_split=ssm_lane_split,
         rows_used=ssm_rows_used,
+        pack=ssm_pack,
     )
 
     kb0, row0 = divmod(conv_tok0, block_size)
@@ -584,7 +603,28 @@ def v3_state_source(
     # 128-aligned lane concat, which needs whole rows per conv row.
     assert conv_dim % lanes == 0, (conv_dim, lanes)
     conv_rows = (kernel_size - 1) * conv_dim // lanes
-    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
+
+    scale = None
+    conv_block_row0 = 0
+    if recurrent_state_dtype in (jnp.float8_e4m3fn, jnp.float4_e2m1fn):
+        scale_vreg_rows = -(-n_v // 8) * 8
+        scale_bytes = scale_vreg_rows * d_v * jnp.dtype(jnp.float32).itemsize
+        conv_vreg_bytes = 16 * lanes * jnp.dtype(jnp.bfloat16).itemsize
+        conv_block_row0 = -(-scale_bytes // conv_vreg_bytes) * 16
+        scale = gdn_v3_config.StateRegion(
+            kb0=kb0,
+            nblocks=1,
+            row0=row0,
+            nrows=conv_ntok,
+            view_dtype=jnp.dtype(jnp.float32),
+            lane_split=ssm_lane_split,
+            rows_used=scale_vreg_rows,
+            pack=1,
+            block_row0=0,
+        )
+
+    assert (conv_block_row0 + conv_rows) * 2 * lanes <= conv_ntok * tok_bytes, (
+        conv_block_row0,
         conv_rows,
         conv_ntok,
         tok_bytes,
@@ -603,10 +643,13 @@ def v3_state_source(
         lane_split=1,
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,
+        pack=1,
+        block_row0=conv_block_row0,
     )
     return gdn_v3_config.StateSourcePlan(
         stride=split,
         conv=conv,
         recurrent=ssm,
         whole_block_dma=is_seq_along_lane_pool(),
+        scale=scale,
     )

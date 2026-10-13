@@ -25,16 +25,11 @@ def env_float(name: str, default: float) -> float:
         raise SystemExit(f"{name} must be a float: {raw}") from exc
 
 
-# Sent with every request. main() adds vLLM's X-data-parallel-rank from
-# --data-parallel-rank.
-EXTRA_HEADERS: dict = {}
-
-
 def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", **EXTRA_HEADERS},
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
     start = time.time()
@@ -52,12 +47,6 @@ def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
         body = response.read().decode()
         elapsed = time.time() - start
         return response.status, json.loads(body), elapsed
-
-
-# What turns reasoning off differs by chat template: Qwen3.5 reads
-# enable_thinking, Kimi-K3 reads thinking. main() replaces this from
-# --chat-template-kwargs.
-CHAT_TEMPLATE_KWARGS: dict = {"enable_thinking": False}
 
 
 def cached_tokens_from_usage(usage: dict) -> int:
@@ -110,7 +99,9 @@ def chat(
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "return_token_ids": True,
-        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
     }
     if request_logprobs:
         payload.update(
@@ -231,12 +222,6 @@ def parse_args() -> argparse.Namespace:
         "--timeout", type=int, default=env_int("PREFIX_E2E_DIVERGENCE_TIMEOUT", 600)
     )
     parser.add_argument(
-        "--chat-template-kwargs",
-        type=json.loads,
-        help="JSON object sent as chat_template_kwargs with every request, "
-        'in place of {"enable_thinking": false}.',
-    )
-    parser.add_argument(
         "--attempts", type=int, default=env_int("PREFIX_E2E_DIVERGENCE_ATTEMPTS", 8)
     )
     parser.add_argument(
@@ -275,13 +260,6 @@ def parse_args() -> argparse.Namespace:
         "--run-id",
         help="Fixed prompt run ID for fresh-server regression tests; defaults to time.",
     )
-    parser.add_argument(
-        "--data-parallel-rank",
-        type=int,
-        help="Hold every request to this DP rank of the engine, with vLLM's "
-        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
-        "Replicas differ slightly in greedy output, and this compares tokens.",
-    )
     return parser.parse_args()
 
 
@@ -294,11 +272,6 @@ def main() -> int:
     if args.max_tokens < 1:
         raise SystemExit("--max-tokens must be positive")
 
-    if args.chat_template_kwargs is not None:
-        CHAT_TEMPLATE_KWARGS.clear()
-        CHAT_TEMPLATE_KWARGS.update(args.chat_template_kwargs)
-    if args.data_parallel_rank is not None:
-        EXTRA_HEADERS["X-data-parallel-rank"] = str(args.data_parallel_rank)
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
     run_id = args.run_id if args.run_id is not None else str(int(time.time() * 1000))
     hit_attempts = 0

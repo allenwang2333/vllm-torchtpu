@@ -176,7 +176,6 @@ def reference_gmm(
     return jnp.concat(gmm_out, axis=0)
 
 
-@pytest.mark.tpu_test
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("group_offset", [0, 2])
 def test_gmm_matches_reference(has_bias, group_offset):
@@ -217,7 +216,6 @@ def test_gmm_matches_reference(has_bias, group_offset):
     _assert_allclose(actual, expected)
 
 
-@pytest.mark.tpu_test
 @pytest.mark.parametrize("weight_dtype", [jnp.int8, jnp.float8_e4m3fn])
 @pytest.mark.parametrize("block_size", [256, 512])
 def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
@@ -255,7 +253,6 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
 
 
-@pytest.mark.tpu_test
 @pytest.mark.parametrize("fuse_act", ["silu", "swigluoai"])
 def test_gmm_fused_activation_matches_reference(fuse_act):
     _require_tpu()
@@ -315,7 +312,6 @@ def test_gmm_fused_activation_matches_reference(fuse_act):
     _assert_allclose(actual, expected, atol=4.0, rtol=2.0)
 
 
-@pytest.mark.tpu_test
 def test_gmm_weight_quantized_block_larger_than_tile_k():
     _require_tpu()
 
@@ -353,7 +349,6 @@ def test_gmm_weight_quantized_block_larger_than_tile_k():
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
 
 
-@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "group_config",
     [
@@ -396,7 +391,6 @@ def test_gmm_nonlocal_groups_produce_zeros(group_config):
     _assert_allclose(actual, expected)
 
 
-@pytest.mark.tpu_test
 def test_gmm_v2_int4_packed_matches_reference():
     _require_tpu()
 

@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    apply_top_k_top_p,
+    apply_top_k_top_p_candidates,
+    extract_topk_candidates,
+)
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -128,7 +132,7 @@ class RejectionSampler:
           recover_u: Uniform random values used to sample recovered tokens.
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
-          topk_candidates: Candidate vocab blocks for small top-k; 0 searches
+          topk_candidates: Candidate vocab blocks for top-k/top-p; 0 searches
             the full vocab. See `apply_top_k_top_p_candidates`.
           target_argmax: The target's greedy token per row, standing in for
             target_logits on the greedy path (TPU_GREEDY_TOP_TOKENS).
@@ -138,7 +142,7 @@ class RejectionSampler:
           accepted tokens and bonus tokens, padded with PLACEHOLDER_TOKEN_ID.
         """
         if do_sampling:
-            if target_argmax is not None or target_logits is None:
+            if target_argmax is not None:
                 raise ValueError(
                     "Non-greedy rejection sampling needs target_logits, not "
                     "target_argmax."
@@ -186,10 +190,6 @@ class RejectionSampler:
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
             )
-        if target_logits is None:
-            raise ValueError(
-                "Greedy rejection sampling needs target_logits or target_argmax."
-            )
         return _greedy_rejection_sample_with_segment(
             draft_token_ids,
             target_logits,
@@ -201,6 +201,44 @@ class RejectionSampler:
             accept_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
+        )
+
+    def fused_verify_and_sample_candidates(
+        self,
+        logits: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        req_temperatures: torch.Tensor,
+        req_top_k: torch.Tensor,
+        req_top_p: torch.Tensor,
+        accept_u: torch.Tensor | None,
+        u_all: torch.Tensor,
+        topk_candidates: int,
+    ) -> torch.Tensor:
+        """With ``accept_u=None``, ``u_all`` is the [rows, num_cand + 1]
+        uniform buffer whose column 0 holds the draft accept draws."""
+        return _fused_spec_verify_and_sample_candidates(
+            logits,
+            draft_token_ids,
+            num_draft_tokens,
+            bonus_logits_indices,
+            target_logits_indices,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            req_temperatures,
+            req_top_k,
+            req_top_p,
+            accept_u,
+            u_all,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
+            topk_candidates,
         )
 
 
@@ -334,13 +372,13 @@ def _greedy_rejection_sample(
         mismatch_indices = torch.where(
             valid_slot_mask & ~accepted,
             group_indices,
-            torch.tensor(large_value, dtype=torch.int32, device=device),
+            large_value,
         )
 
         masked_mismatch_indices = torch.where(
             match_mask,
             mismatch_indices.unsqueeze(0),
-            torch.tensor(large_value, dtype=torch.int32, device=device),
+            large_value,
         )
         first_mismatch_idx_per_segment = torch.min(
             masked_mismatch_indices, dim=1
@@ -366,7 +404,7 @@ def _greedy_rejection_sample(
             torch.where(
                 at_mismatch,
                 target_logits_argmax,
-                torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+                PLACEHOLDER_TOKEN_ID,
             ),
         )
     else:
@@ -457,7 +495,12 @@ def _random_rejection_sample_with_segment(
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
-    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+    if topk_candidates:
+        masked_logits = apply_top_k_top_p_candidates(
+            scaled_logits, top_k, top_p, topk_candidates
+        )
+    else:
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
     target_probs = torch.softmax(masked_logits, dim=-1)
 
     # Accept test is the Leviathan ratio min(1, p(x) / q(x))
@@ -510,9 +553,34 @@ def _random_rejection_sample_with_segment(
         torch.argmax(target_probs, dim=-1).to(torch.int32),
     )
 
+    return _assemble_output_tokens(
+        draft_token_ids=draft_token_ids,
+        replacement_token_ids=recovered_token_ids,
+        accepted=accepted,
+        num_draft_tokens=num_draft_tokens,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max_draft_tokens,
+    )
+
+
+def _assemble_output_tokens(
+    draft_token_ids: torch.Tensor,
+    replacement_token_ids: torch.Tensor,
+    accepted: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    total_tokens = draft_token_ids.shape[0]
+    batch_size = num_draft_tokens.shape[0]
+    device = draft_token_ids.device
+
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
     match_mask = segment_ids.unsqueeze(0) == batch_indices
-    # Only declared draft slots may participate in rejection sampling.
     draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
     valid_slot_mask = torch.any(
         match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
@@ -523,12 +591,12 @@ def _random_rejection_sample_with_segment(
         rejection_indices = torch.where(
             valid_slot_mask & ~accepted,
             group_indices,
-            torch.tensor(large_value, dtype=torch.int32, device=device),
+            large_value,
         )
         masked_rejection_indices = torch.where(
             match_mask,
             rejection_indices.unsqueeze(0),
-            torch.tensor(large_value, dtype=torch.int32, device=device),
+            large_value,
         )
         first_rejection_idx_per_segment = torch.min(
             masked_rejection_indices, dim=1
@@ -542,7 +610,6 @@ def _random_rejection_sample_with_segment(
         )
 
     if total_tokens > 0:
-        # Clamp padding segment sentinels for a safe gather.
         safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
         first_rejection_idx_broadcast = first_rejection_idx_per_segment[
             safe_segment_ids
@@ -558,8 +625,8 @@ def _random_rejection_sample_with_segment(
             draft_token_ids.to(torch.int32),
             torch.where(
                 at_rejection,
-                recovered_token_ids,
-                torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+                replacement_token_ids.to(torch.int32),
+                PLACEHOLDER_TOKEN_ID,
             ),
         )
     else:
@@ -569,7 +636,6 @@ def _random_rejection_sample_with_segment(
     no_draft_tokens = num_draft_tokens == 0
     should_get_bonus = all_accepted | no_draft_tokens
 
-    # Route padding positions to an extra sink row for a safe scatter.
     selected_tokens = torch.full(
         (batch_size + 1, max_draft_tokens + 1),
         PLACEHOLDER_TOKEN_ID,
@@ -604,3 +670,126 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _fused_spec_verify_and_sample_candidates(
+    logits: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    req_temperatures: torch.Tensor,
+    req_top_k: torch.Tensor,
+    req_top_p: torch.Tensor,
+    accept_u: torch.Tensor | None,
+    u_all: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    topk_candidates: int,
+) -> torch.Tensor:
+    """Fused candidate-space bonus sampling + speculative rejection sampling."""
+    if accept_u is None:
+        accept_u = u_all[: draft_token_ids.shape[0], 0]
+        u_all = u_all[:, 1:]
+    batch_size = num_draft_tokens.shape[0]
+    if topk_candidates > 0:
+        cand_logits, cand_token_ids = extract_topk_candidates(
+            logits, topk_candidates
+        )
+    else:
+        num_cand = logits.shape[-1] // 2
+        cand_logits = logits[:, :num_cand]
+        cand_token_ids = logits[:, num_cand:].to(torch.int32)
+    all_row_indices = torch.cat(
+        [
+            bonus_logits_indices.to(torch.int64),
+            target_logits_indices.to(torch.int64),
+        ],
+        dim=0,
+    )
+    all_cand_logits = torch.index_select(cand_logits, 0, all_row_indices)
+    all_cand_token_ids = torch.index_select(cand_token_ids, 0, all_row_indices)
+
+    safe_seg = segment_ids.clamp(min=0, max=batch_size - 1).to(torch.int64)
+    param_indices = torch.cat(
+        [
+            torch.arange(batch_size, device=logits.device, dtype=torch.int64),
+            safe_seg,
+        ],
+        dim=0,
+    )
+    all_temps = torch.index_select(req_temperatures, 0, param_indices)
+    all_top_k = torch.index_select(req_top_k, 0, param_indices)
+    all_top_p = torch.index_select(req_top_p, 0, param_indices)
+
+    scaled_cand = all_cand_logits.to(torch.float32) / (
+        all_temps.to(torch.float32) + TEMPERATURE_EPS
+    )
+    masked_cand = apply_top_k_top_p(scaled_cand, all_top_k, all_top_p)
+    probs = torch.softmax(masked_cand, dim=-1, dtype=torch.float32)
+
+    tiny = torch.finfo(torch.float32).tiny
+    eps = torch.finfo(torch.float32).eps
+    inv_exp_noise = torch.reciprocal(
+        -torch.log(torch.clamp(u_all, min=tiny, max=1.0 - eps)) + tiny
+    )
+
+    bonus_probs = probs[:batch_size]
+    bonus_inv_exp_noise = inv_exp_noise[:batch_size]
+    bonus_cand_idx = torch.argmax(
+        bonus_probs * bonus_inv_exp_noise, dim=-1, keepdim=True
+    )
+    bonus_token_ids = torch.gather(
+        all_cand_token_ids[:batch_size], 1, bonus_cand_idx
+    ).squeeze(1)
+
+    target_probs = probs[batch_size:]
+    target_cand_logits = all_cand_logits[batch_size:]
+    target_cand_token_ids = all_cand_token_ids[batch_size:]
+    target_inv_exp_noise = inv_exp_noise[batch_size:]
+
+    valid_draft_token_ids = draft_token_ids >= 0
+    draft_token_ids_i32 = draft_token_ids.to(torch.int32)
+    draft_match = (
+        target_cand_token_ids == draft_token_ids_i32.unsqueeze(1)
+    ) & valid_draft_token_ids.unsqueeze(1)
+
+    if synthetic_mode:
+        assert synthetic_conditional_rates is not None
+        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+        accepted = (accept_u < conditional_rates) & valid_draft_token_ids
+    else:
+        target_token_probs = (
+            target_probs * draft_match.to(target_probs.dtype)
+        ).sum(dim=-1)
+        accepted = (target_token_probs >= accept_u) & valid_draft_token_ids
+
+    recovered_probs = torch.where(
+        draft_match, torch.zeros_like(target_probs), target_probs
+    )
+    recovered_scores = recovered_probs * target_inv_exp_noise
+    max_scores, recovered_cand_idx = torch.max(
+        recovered_scores, dim=-1, keepdim=True
+    )
+    fallback_cand_idx = torch.argmax(target_cand_logits, dim=-1, keepdim=True)
+    chosen_cand_idx = torch.where(
+        max_scores > 0, recovered_cand_idx, fallback_cand_idx
+    )
+    recovered_token_ids = torch.gather(
+        target_cand_token_ids, 1, chosen_cand_idx
+    ).squeeze(1)
+
+    return _assemble_output_tokens(
+        draft_token_ids=draft_token_ids,
+        replacement_token_ids=recovered_token_ids,
+        accepted=accepted,
+        num_draft_tokens=num_draft_tokens,
+        bonus_token_ids=bonus_token_ids,
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max_draft_tokens,
+    )

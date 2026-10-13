@@ -58,9 +58,7 @@ Two meta-principles organize this document set:
 - **R-1.5** Use modern typing: PEP 604 unions (`int | None`, not
   `Optional[int]`), builtin generics (`list[int]`), `StrEnum` for string
   enums. Type-annotate public function signatures. The repo runs `pyrefly`
-  at the `default` preset in pre-commit and in CI (see
-  [Type checking](developers_guide/type_checking.md)); code must pass both
-  checks.
+  at the `basic` preset in CI; code must pass it.
 - **R-1.6** Every new file carries the Apache 2.0 license header (copy from a
   sibling file).
 - **R-1.7** No `print` in library code — use `vllm_torchtpu.logger.init_logger`.
@@ -413,10 +411,8 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   helpers out of giant tests; verify parametrization actually flows into the
   code under test (a decorator param that is silently ignored still passes).
 - **R-8.4** **Verify tests are wired into CI.** Green CI ≠ code exercised —
-  check the pipeline yml ignore lists and markers (`tpu_test`, `multichip`,
-  `nightly`). Unmarked tests run on the CPU agent. Mark tests correctly: a
-  test that needs a TPU must carry `tpu_test`, and a mock-only test must not
-  require a TPU or multichip agent.
+  check the pipeline yml ignore lists and markers (`nightly`, `multichip`).
+  Mark tests correctly: a mock-only test must not require a multichip agent.
 - **R-8.5** **Tests must run on the smallest hardware that exercises the
   behavior.** Coverage that only exists on large/pod configurations doesn't
   count as coverage.

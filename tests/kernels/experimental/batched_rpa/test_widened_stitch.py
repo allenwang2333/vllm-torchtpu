@@ -14,8 +14,6 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
-pytestmark = pytest.mark.tpu_test
-
 _LAYOUT = configs.KVLayout.SEQ_ALONG_LANE
 _PAGE_SIZE = 256
 _HEAD_DIM = 128

@@ -37,14 +37,7 @@ def build_prefix(tag: str, lines: int) -> str:
     return f"Inventory ledger {tag}. Read every record before answering.\n{body}\n"
 
 
-def complete(
-    url: str,
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    timeout: int,
-    headers: dict | None = None,
-) -> dict:
+def complete(url: str, model: str, prompt: str, max_tokens: int, timeout: int) -> dict:
     req = urllib.request.Request(
         f"{url}/v1/completions",
         data=json.dumps(
@@ -56,7 +49,7 @@ def complete(
                 "return_token_ids": True,
             }
         ).encode(),
-        headers={"Content-Type": "application/json", **(headers or {})},
+        headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.load(resp)
@@ -80,18 +73,8 @@ def main() -> int:
     p.add_argument("--rounds", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
-    p.add_argument(
-        "--data-parallel-rank",
-        type=int,
-        help="Hold every request to this DP rank of the engine, with vLLM's "
-        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
-        "Replicas differ slightly in greedy output, and this compares tokens.",
-    )
     a = p.parse_args()
     url = f"http://{a.host}:{a.port}"
-    headers = {}
-    if a.data_parallel_rank is not None:
-        headers["X-data-parallel-rank"] = str(a.data_parallel_rank)
 
     tags = ["ALPHA", "BRAVO"]
     prompts = {
@@ -108,9 +91,7 @@ def main() -> int:
     for rnd in range(1, a.rounds + 1):
         for tag in tags:  # interleaved: the slot last held the other prefix
             try:
-                r = complete(
-                    url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
-                )
+                r = complete(url, a.model, prompts[tag], a.max_tokens, a.timeout)
             except (urllib.error.URLError, TimeoutError) as exc:
                 print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
                 return 1

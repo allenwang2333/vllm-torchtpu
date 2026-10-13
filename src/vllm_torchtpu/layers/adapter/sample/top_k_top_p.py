@@ -22,12 +22,6 @@ from collections.abc import Callable, Sequence
 import torch
 
 MASKED_LOGIT_VALUE = -1e12
-# 128 matches the native TPU (8, 128) vector tile / 128-element lane width
-# and evenly divides standard padded vocabs (e.g. 248,320 = 1,940 * 128;
-# 152,064 = 1,188 * 128; 128,256 = 1,002 * 128), ensuring per-block amax
-# and gathers run without tail padding. At 64 blocks, candidate bisection
-# evaluates 8,192 logits instead of 248,320.
-CANDIDATE_BLOCK = 128
 
 
 def _int32_bsearch(
@@ -246,13 +240,8 @@ def topp_mask(
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    topk_candidates: int = 0,
+    logits: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
 ) -> torch.Tensor:
-    if topk_candidates > 0:
-        return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
     topk_masked = topk_mask(logits, top_k, MASKED_LOGIT_VALUE)
     masked_logits = torch.where(should_apply_topk, topk_masked, logits)
@@ -260,6 +249,33 @@ def apply_top_k_top_p(
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(masked_logits, top_p, MASKED_LOGIT_VALUE)
     return torch.where(should_apply_topp, topp_masked, masked_logits)
+
+
+CANDIDATE_BLOCK = 128
+
+
+def extract_topk_candidates(
+    logits: torch.Tensor,
+    num_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract the `num_blocks` blocks of CANDIDATE_BLOCK logits with largest maxima.
+
+    Returns ``(cand_logits, cand_token_ids)`` of shape
+    ``[rows, num_blocks * CANDIDATE_BLOCK]``, where ``cand_token_ids`` holds
+    int32 full-vocab indices in ``[0, vocab_size)``.
+    """
+    rows, vocab_size = logits.shape
+    blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
+    block_max = blocks.amax(dim=-1)
+    block_ids = torch.topk(block_max, num_blocks, dim=-1, sorted=False).indices
+    cand_logits = torch.gather(
+        blocks, 1, block_ids.unsqueeze(-1).expand(-1, -1, CANDIDATE_BLOCK)
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    intra = torch.arange(CANDIDATE_BLOCK, device=logits.device, dtype=torch.int32)
+    cand_token_ids = (
+        block_ids.to(torch.int32).unsqueeze(-1) * CANDIDATE_BLOCK + intra
+    ).reshape(rows, num_blocks * CANDIDATE_BLOCK)
+    return cand_logits, cand_token_ids
 
 
 def apply_top_k_top_p_candidates(
@@ -275,9 +291,8 @@ def apply_top_k_top_p_candidates(
     and masks the full row below the smallest kept logit. Matches
     `apply_top_k_top_p` unless more than `num_blocks - k + 1` logits tie at
     the k-th largest value; float32 sums run in a different order, so a top-p
-    boundary within rounding can flip. Caller must ensure active rows have
-    1 <= top_k <= num_blocks // 2; rows with top_k <= 0 (padded slots) are
-    returned unmasked.
+    boundary within rounding can flip. Rows with top_k <= 0 are returned
+    unmasked, so callers must not pass such rows with top_p < 1.
 
     Args:
       logits: [batch, vocab_size], vocab_size a multiple of CANDIDATE_BLOCK.
@@ -288,15 +303,6 @@ def apply_top_k_top_p_candidates(
     Returns:
       Masked logits. [batch, vocab_size]
     """
-    if (
-        not torch.compiler.is_compiling()
-        and top_p is not None
-        and bool(((top_k <= 0) & (top_p < 1.0)).any())
-    ):
-        raise ValueError(
-            "apply_top_k_top_p_candidates needs top_k >= 1 on every row; "
-            "rows with top_k <= 0 would skip top_p. Use apply_top_k_top_p."
-        )
     rows, vocab_size = logits.shape
     blocks = logits.reshape(rows, vocab_size // CANDIDATE_BLOCK, CANDIDATE_BLOCK)
     block_max = blocks.amax(dim=-1)

@@ -21,9 +21,8 @@ class SpecDecodeMetadata:
     """
 
     # [padded_logits_length] draft token id validated at each
-    # target_logits_indices slot. None only while deferred (see
-    # `deferred_draft_token_ids_cpu`).
-    draft_token_ids: torch.Tensor | None
+    # target_logits_indices slot.
+    draft_token_ids: torch.Tensor
     # [padded_num_reqs] per-request draft-token count (device copy).
     draft_lengths: torch.Tensor
     # [num_reqs] per-request draft-token count (host copy, unpadded).
@@ -42,16 +41,8 @@ class SpecDecodeMetadata:
     segment_ids: torch.Tensor
     # [padded_logits_length] within-request draft-slot index of each position.
     group_indices: torch.Tensor
-    # Host copy of draft_token_ids when its upload was deferred: under async
-    # scheduling execute_model re-sources the drafts from the device and
-    # uploads this only for a chunk with nothing substituted.
-    deferred_draft_token_ids_cpu: np.ndarray | None = None
-
-    def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
-        assert self.deferred_draft_token_ids_cpu is not None
-        return torch.from_numpy(self.deferred_draft_token_ids_cpu).to(
-            device, non_blocking=True
-        )
+    # Max input_ids index read by extract_draft_token_ids (logits_indices[target_logits_indices + 1]).
+    max_draft_input_index: int = 0
 
 
 class SpeculativeDecodingManager:
@@ -79,6 +70,10 @@ class SpeculativeDecodingManager:
         # (logits_indices, target_logits_indices, padded_logits_length) from
         # the cached build — needed to re-extract draft_token_ids on a hit.
         self._meta_cache_np: tuple[np.ndarray, np.ndarray, int] | None = None
+        self._meta_lru_cache: dict[
+            tuple[bytes, bytes, int],
+            tuple[SpecDecodeMetadata, tuple[np.ndarray, np.ndarray, int]],
+        ] = {}
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self._staged_draft_copy is not None:
@@ -179,11 +174,9 @@ class SpeculativeDecodingManager:
             assert self.runner._is_async_drafter, (
                 "device-seeded draft proposing is only supported with an async drafter"
             )
-        assert self.runner.speculative_config is not None
         if self.runner.speculative_config.method == "ngram":
             assert isinstance(self.runner.drafter, NgramProposer)
             assert sampled_token_ids is not None
-            assert scheduler_output is not None
             self._draft_token_ids = self.runner.drafter.propose(
                 scheduler_output.num_spec_tokens_to_schedule,
                 sampled_token_ids[:num_reqs],
@@ -192,7 +185,7 @@ class SpeculativeDecodingManager:
             )
             return None
         elif self.runner._is_async_drafter:
-            result = self.runner._async_drafter.propose(
+            result = self.runner.drafter.propose(
                 sampled_token_ids[:num_reqs]
                 if sampled_token_ids
                 else sampled_token_ids,
@@ -204,9 +197,7 @@ class SpeculativeDecodingManager:
                 device_seed=device_seed,
             )
             if return_device:
-                assert isinstance(result, torch.Tensor)
                 return result
-            assert isinstance(result, list)
             self._draft_token_ids = result
             return None
         else:
@@ -220,7 +211,7 @@ class SpeculativeDecodingManager:
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
         padded_num_reqs: int,
-        defer_draft_token_ids: bool = False,
+        skip_draft_token_ids: bool = False,
     ) -> SpecDecodeMetadata:
         """Calculates indices for speculative decoding forward pass and
         rejection sampling.
@@ -229,49 +220,70 @@ class SpeculativeDecodingManager:
           num_draft_tokens: The number of draft tokens for each request.
           cu_num_scheduled_tokens: The cumulative number of scheduled tokens.
           padded_num_reqs: The padded number of requests.
-          defer_draft_token_ids: Leave `draft_token_ids` None and keep its
-            host copy in `deferred_draft_token_ids_cpu` instead of uploading
-            it; the caller fills it in.
+          skip_draft_token_ids: When True (async scheduling with on-device token
+            substitution), reuse the cached placeholder draft_token_ids tensor
+            on a cache hit without CPU extraction or H2D upload, since
+            execute_model overwrites draft_token_ids on device immediately after
+            token substitution.
 
         Returns:
           A SpecDecodeMetadata object containing the necessary indices for
           speculative decoding.
         """
+        # Function-local (tpu_runner imports this module). Bound before the
+        # cache-hit path below uses it too.
+        from vllm_torchtpu.runner.tpu_runner import _h2d_temp
+
         cache_key = (
             num_draft_tokens.tobytes(),
             cu_num_scheduled_tokens.tobytes(),
             padded_num_reqs,
         )
-        if cache_key == self._meta_cache_key:
-            assert self._meta_cache is not None
-            assert self._meta_cache_np is not None
+        cached_entry = (
+            (self._meta_cache, self._meta_cache_np)
+            if cache_key == self._meta_cache_key and self._meta_cache is not None
+            else self._meta_lru_cache.get(cache_key)
+        )
+        if cached_entry is not None:
+            cached_meta, cached_np = cached_entry
+            assert cached_meta is not None
+            assert cached_np is not None
+            self._meta_cache_key = cache_key
+            self._meta_cache = cached_meta
+            self._meta_cache_np = cached_np
+            if skip_draft_token_ids:
+                return SpecDecodeMetadata(
+                    draft_token_ids=cached_meta.draft_token_ids,
+                    draft_lengths=cached_meta.draft_lengths,
+                    draft_lengths_cpu=cached_meta.draft_lengths_cpu,
+                    target_logits_indices=cached_meta.target_logits_indices,
+                    bonus_logits_indices=cached_meta.bonus_logits_indices,
+                    final_logits_indices=cached_meta.final_logits_indices,
+                    segment_ids=cached_meta.segment_ids,
+                    group_indices=cached_meta.group_indices,
+                    max_draft_input_index=cached_meta.max_draft_input_index,
+                )
             logits_indices, target_logits_indices, padded_logits_length = (
-                self._meta_cache_np
+                cached_np
             )
             # draft_token_ids depends on this step's input_ids_cpu content —
-            # always re-extracted and re-transferred.
+            # re-extracted and re-transferred when not skipped.
             all_token_ids = self.runner.input_ids_cpu.numpy()
             draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
             padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
-                draft_token_ids=(
-                    None
-                    if defer_draft_token_ids
-                    else torch.from_numpy(padded_draft_token_ids).to(
-                        self.runner.device, non_blocking=True
-                    )
+                draft_token_ids=_h2d_temp(
+                    self.runner, torch.from_numpy(padded_draft_token_ids)
                 ),
-                draft_lengths=self._meta_cache.draft_lengths,
-                draft_lengths_cpu=self._meta_cache.draft_lengths_cpu,
-                target_logits_indices=self._meta_cache.target_logits_indices,
-                bonus_logits_indices=self._meta_cache.bonus_logits_indices,
-                final_logits_indices=self._meta_cache.final_logits_indices,
-                segment_ids=self._meta_cache.segment_ids,
-                group_indices=self._meta_cache.group_indices,
-                deferred_draft_token_ids_cpu=(
-                    padded_draft_token_ids if defer_draft_token_ids else None
-                ),
+                draft_lengths=cached_meta.draft_lengths,
+                draft_lengths_cpu=cached_meta.draft_lengths_cpu,
+                target_logits_indices=cached_meta.target_logits_indices,
+                bonus_logits_indices=cached_meta.bonus_logits_indices,
+                final_logits_indices=cached_meta.final_logits_indices,
+                segment_ids=cached_meta.segment_ids,
+                group_indices=cached_meta.group_indices,
+                max_draft_input_index=cached_meta.max_draft_input_index,
             )
 
         # [num_reqs]
@@ -316,7 +328,11 @@ class SpeculativeDecodingManager:
 
         # Compute the draft token ids for validation.
         all_token_ids = self.runner.input_ids_cpu.numpy()
-        draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
+        draft_input_indices = logits_indices[target_logits_indices + 1]
+        draft_token_ids = all_token_ids[draft_input_indices]
+        max_draft_input_index = (
+            int(draft_input_indices.max()) if draft_input_indices.size > 0 else 0
+        )
 
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -361,39 +377,30 @@ class SpeculativeDecodingManager:
         padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
-        # CPU -> TPU copy.
-        device = self.runner.device
-
+        # CPU -> TPU copy. _h2d_temp keeps the temporaries alive until the
+        # runner's input-staging fence (the metadata is cached and reused).
         metadata = SpecDecodeMetadata(
-            draft_token_ids=(
-                None
-                if defer_draft_token_ids
-                else torch.from_numpy(padded_draft_token_ids).to(
-                    device, non_blocking=True
-                )
+            draft_token_ids=_h2d_temp(
+                self.runner, torch.from_numpy(padded_draft_token_ids)
             ),
-            draft_lengths=torch.from_numpy(padded_num_draft_tokens).to(
-                device, non_blocking=True
+            draft_lengths=_h2d_temp(
+                self.runner, torch.from_numpy(padded_num_draft_tokens)
             ),
             draft_lengths_cpu=num_draft_tokens,
-            target_logits_indices=torch.from_numpy(padded_target_logits_indices).to(
-                device, non_blocking=True
+            target_logits_indices=_h2d_temp(
+                self.runner, torch.from_numpy(padded_target_logits_indices)
             ),
-            bonus_logits_indices=torch.from_numpy(padded_bonus_logits_indices).to(
-                device, non_blocking=True
+            bonus_logits_indices=_h2d_temp(
+                self.runner, torch.from_numpy(padded_bonus_logits_indices)
             ),
-            final_logits_indices=torch.from_numpy(padded_logits_indices).to(
-                device, non_blocking=True
+            final_logits_indices=_h2d_temp(
+                self.runner, torch.from_numpy(padded_logits_indices)
             ),
-            segment_ids=torch.from_numpy(padded_segment_ids).to(
-                device, non_blocking=True
+            segment_ids=_h2d_temp(self.runner, torch.from_numpy(padded_segment_ids)),
+            group_indices=_h2d_temp(
+                self.runner, torch.from_numpy(padded_group_indices)
             ),
-            group_indices=torch.from_numpy(padded_group_indices).to(
-                device, non_blocking=True
-            ),
-            deferred_draft_token_ids_cpu=(
-                padded_draft_token_ids if defer_draft_token_ids else None
-            ),
+            max_draft_input_index=max_draft_input_index,
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
@@ -404,5 +411,11 @@ class SpeculativeDecodingManager:
             logits_indices,
             target_logits_indices,
             padded_logits_length,
+        )
+        if len(self._meta_lru_cache) >= 32:
+            self._meta_lru_cache.pop(next(iter(self._meta_lru_cache)))
+        self._meta_lru_cache[cache_key] = (
+            metadata,
+            self._meta_cache_np,
         )
         return metadata

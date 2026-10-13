@@ -18,22 +18,11 @@ This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
 """
 
-from typing import Any, Protocol
-
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
-
-
-class MtpDraftModel(Protocol):
-    """What the loop calls on the MTP draft. The draft is an nn.Module, but
-    nn.Module types its attributes as Tensor | Module, so name the calls."""
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any: ...
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
 
 class _MtpFusedLoop(nn.Module):
@@ -42,27 +31,37 @@ class _MtpFusedLoop(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        mtp: MtpDraftModel,
+        mtp: nn.Module,
         num_steps: int,
+        greedy_head_owner: nn.Module | None = None,
     ) -> None:
         super().__init__()
         # Own compile-cache folder, as in MtpLoopStepModel.
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        self.greedy_head_owner = greedy_head_owner
 
     def forward(
         self,
-        input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         seq_lens: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, ...]:
-        """`positions` and `seq_lens` are step 1's. Returns the K-1 draft
-        tokens, one [p] int32 tensor per step."""
-        tokens = []
+    ) -> torch.Tensor:
+        """`positions` and `seq_lens` are step 1's; `hidden_states` is step 0's
+        gathered carry [p, H]. Proposes step 0's token from `hidden_states` and
+        runs steps 1..K-1, returning the stacked [p, K] int32 draft tokens."""
+        if self.greedy_head_owner is not None:
+            input_ids = self.greedy_head_owner.logits_processor.get_top_tokens(
+                self.greedy_head_owner.lm_head, hidden_states
+            ).to(torch.int32)
+        else:
+            input_ids = (
+                self.mtp.compute_logits(hidden_states).argmax(dim=-1).to(torch.int32)
+            )
+        tokens = [input_ids]
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
@@ -83,25 +82,40 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
-            )
+            if self.greedy_head_owner is not None:
+                input_ids = self.greedy_head_owner.logits_processor.get_top_tokens(
+                    self.greedy_head_owner.lm_head, last_hidden
+                ).to(torch.int32)
+            else:
+                input_ids = (
+                    self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+                )
             tokens.append(input_ids)
-        return tuple(tokens)
+        return torch.stack(tokens, dim=1)
 
 
 def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
     prefix: str,
-    mtp: MtpDraftModel,
+    mtp: nn.Module,
     num_steps: int,
     dynamic_arg_dims: dict,
+    greedy_head_owner: nn.Module | None = None,
 ) -> nn.Module:
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
     token dimension the same way."""
-    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+    loop_dims = {
+        k: v for k, v in dynamic_arg_dims.items() if k != "input_ids"
+    }
+    cls = support_torch_compile(dynamic_arg_dims=loop_dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
-    return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+        num_steps=num_steps,
+        greedy_head_owner=greedy_head_owner,
+    )

@@ -24,7 +24,7 @@ from vllm.sequence import IntermediateTensors
 # What `support_torch_compile` infers for `DeepSeekMTP.forward`: dim 0, the
 # token dimension, of every tensor argument. The proposer checks the draft's
 # own dims against this before building the program.
-MTP_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
+MTP_DYNAMIC_ARG_DIMS = {
     "input_ids": 0,
     "positions": 0,
     "hidden_states": 0,
@@ -71,3 +71,23 @@ class MtpLoopStepModel(nn.Module):
             inputs_embeds,
             spec_step_idx,
         )
+
+
+def build_mtp_loop_step_model(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: nn.Module,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile a separate loop-step program with the draft's own dynamic dims
+    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0)."""
+    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+        type("MtpLoopStepModel", (MtpLoopStepModel,), {})
+    )
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+    )
+

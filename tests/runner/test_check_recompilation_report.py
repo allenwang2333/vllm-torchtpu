@@ -34,6 +34,8 @@ import torch
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+pytestmark = pytest.mark.cpu_test
+
 T0 = dt.datetime(2026, 8, 20, 17, 40, 0)
 
 

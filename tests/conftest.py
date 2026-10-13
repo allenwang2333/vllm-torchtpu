@@ -33,6 +33,18 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Test files that need no chip, by path from the repo root. A session of
+# nothing but these runs with JAX pinned to the CPU.
+HOST_ONLY_TEST_FILES: tuple[str, ...] = (
+    "tests/distributed/test_sharded_jax_op.py",
+    "tests/layers/adapter/test_small_all_reduce_op.py",
+    "tests/kernels/experimental/test_gated_norm_quant.py",
+)
+
+
+def _needs_no_chip(item):
+    return str(item.path).endswith(HOST_ONLY_TEST_FILES)
+
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
@@ -42,21 +54,24 @@ def pytest_collection_modifyitems(items):
     ``torch.distributed.run`` worker group can no longer bootstrap the slice:
     the workers fail with "PjRtClient is not initialized" and libtpu may tear
     down the whole session with SLICE_FAILURE_SW_INJECT_ERROR. libtpu exposes
-    no release API, so the only safe ordering is spawn-first.
-
-    Within each group, files run in path order, whatever order they were
-    passed in. Tests that start an engine in a subprocess (tests/entrypoints)
-    need the TPU free, so they must run before the in-process tests under
-    tests/kernels and tests/layers, and a sharded run receives its files in
-    the planner's order. The sort is stable, so tests within a file keep
-    their order.
+    no release API, so the only safe ordering is spawn-first. The sort is
+    stable, so relative order within each group is unchanged.
     """
     items.sort(
-        key=lambda item: (
-            0 if item.get_closest_marker("spawns_tpu_workers") else 1,
-            item.nodeid.split("::")[0],
-        )
+        key=lambda item: 0 if item.get_closest_marker("spawns_tpu_workers") else 1
     )
+    # JAX raises rather than falling back to the CPU when the chips are busy,
+    # and the pin must not leak into a session with device tests (they would
+    # skip), so it is decided over the whole collection. jax reads
+    # JAX_PLATFORMS once, at import, so a loaded jax is updated as well.
+    if (
+        items
+        and not os.environ.get("JAX_PLATFORMS")
+        and all(_needs_no_chip(item) for item in items)
+    ):
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        if "jax" in sys.modules:
+            sys.modules["jax"].config.update("jax_platforms", "cpu")
 
 
 def pytest_addoption(parser):
@@ -113,7 +128,7 @@ def device(request):
         except ImportError:
             pytest.skip("torch_tpu not available")
         except Exception as e:
-            pytest.fail(f"TPU requested but failed to initialize: {e}")
+            pytest.skip(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
 
 

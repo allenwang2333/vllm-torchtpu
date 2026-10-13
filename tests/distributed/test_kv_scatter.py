@@ -28,8 +28,6 @@ from vllm_torchtpu.distributed.kv_transfer.kv_scatter import (
     smoke_test_multi_layer_scatter,
 )
 
-pytestmark = pytest.mark.tpu_test
-
 
 def _subprocess_worker(target, queue):
     try:

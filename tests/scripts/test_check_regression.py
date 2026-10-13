@@ -19,6 +19,10 @@ import math
 import pathlib
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.cpu_test
+
 _SCRIPT = (
     pathlib.Path(__file__).resolve().parents[2]
     / "scripts"

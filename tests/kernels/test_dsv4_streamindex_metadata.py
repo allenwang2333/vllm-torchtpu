@@ -21,7 +21,6 @@ from absl.testing import absltest, parameterized
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
 
-@pytest.mark.tpu_test
 class MetadataTest(parameterized.TestCase):
     @parameterized.named_parameters(
         (
@@ -313,6 +312,7 @@ class MetadataTest(parameterized.TestCase):
         print("=" * 60 + "\n")
 
 
+@pytest.mark.cpu_test
 class ChunkedMetadataTest(parameterized.TestCase):
     """`chunk_token_start` as a tuple of chunk starts.
 

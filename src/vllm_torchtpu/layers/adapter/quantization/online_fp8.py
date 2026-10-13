@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -31,8 +31,6 @@ from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
-
-    from vllm_torchtpu.layers.adapter.quantization.configs import TpuLinear
 
 
 logger = init_logger(__name__)
@@ -140,7 +138,7 @@ def attach_online_fp8[QuantConfigT: QuantizationConfig | None](
 ) -> QuantConfigT:
     """Keep the checkpoint config intact; attach independent per-model state."""
     policy = OnlineFp8Policy.from_dict(
-        cast("dict[str, Any]", vllm_config.additional_config).get("tpu_online_fp8")
+        vllm_config.additional_config.get("tpu_online_fp8")
     )
     if policy is not None:
         if not isinstance(config, VllmQuantConfig) or config.get_name() not in (
@@ -184,7 +182,6 @@ def validate_online_fp8(
             )
         if not getattr(layer, "_tpu_online_fp8_processed", False):
             raise ValueError(f"Online FP8 target {prefix} was not processed")
-        layer = cast("TpuLinear", layer)
         weight, scale = layer.weight, layer.weight_scale
         keep_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
         n_out = weight.shape[0] if keep_layout else weight.shape[1]
@@ -193,7 +190,6 @@ def validate_online_fp8(
             expected_shape = (1,)
             expected_block = (n_out, k_in)
         elif policy.weight_scheme == "per_block":
-            assert policy.weight_block_size is not None
             block_n, block_k = policy.weight_block_size
             if n_out % block_n or k_in % block_k:
                 raise ValueError(f"Invalid online FP8 block size for {prefix}")
@@ -221,7 +217,7 @@ def validate_online_fp8(
                     "weight_shape": list(weight.shape),
                     "scale_shape": list(scale.shape),
                     "weight_scheme": policy.weight_scheme,
-                    "weight_block_size": list(expected_block),
+                    "weight_block_size": list(layer.weight_block_size),
                     "converted": True,
                 }
             ),
@@ -257,7 +253,6 @@ def quantize_online_fp8(
     if scheme == "per_channel":
         quantized, scale = quantize_tensor(weight, torch.float8_e4m3fn)
         return quantized, scale.reshape(n_out), (1, k_in)
-    assert policy.weight_block_size is not None
     block_n, block_k = policy.weight_block_size
     if n_out % block_n or k_in % block_k:
         raise ValueError(

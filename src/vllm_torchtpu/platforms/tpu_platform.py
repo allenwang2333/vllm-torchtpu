@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Protocol, Union, cast
+from typing import TYPE_CHECKING, Union
 
 import portpicker
 import torch
@@ -29,34 +29,85 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.inputs import EngineInput
+    from vllm.multimodal.processing import ProcessorInputs
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
-
-    class _TpuAttentionBackend(Protocol):
-        """Typing-only view of the TPU classmethods on our attention backends."""
-
-        @staticmethod
-        def get_page_size(vllm_config: VllmConfig) -> int: ...
-
-        @staticmethod
-        def get_min_page_size(vllm_config: VllmConfig) -> int: ...
-
-        @classmethod
-        def get_preferred_block_size(cls, default_block_size: int) -> int: ...
-
 else:
     ModelConfig = None
     VllmConfig = None
-    EngineInput = None
+    ProcessorInputs = None
     PoolingParams = None
     AttentionBackendEnum = None
     SamplingParams = None
     SamplingType = None
 
 logger = init_logger(__name__)
+
+# The Qwen3.5-397B safe_kv clamps were measured with this many expert slots per
+# EP rank (opt_copies128: 64 primaries + 16 copies).
+_QWEN35_SAFE_KV_SLOTS = 80
+
+
+def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
+    """(credit, slots): HBM bytes per device freed (positive) or taken
+    (negative) by the expert placement holding fewer (more) slots per rank
+    than the placement the Qwen3.5 safe_kv budgets were measured with: one FP8
+    expert (gate|up and down, 3 x hidden x moe_intermediate bytes) per slot
+    per placed MoE layer; and the slot count (for logging)."""
+    from vllm_torchtpu import expert_placement
+
+    try:
+        text = model_config.hf_text_config
+        hidden = int(text.hidden_size)
+        inter = int(text.moe_intermediate_size)
+        if expert_placement.enabled():
+            slots = expert_placement.slots()
+            layers = len(expert_placement.data()["layers"])
+        else:
+            ep = int(parallel_config.tensor_parallel_size) * int(
+                parallel_config.data_parallel_size
+            )
+            slots = int(text.num_experts) // max(ep, 1)
+            layers = int(text.num_hidden_layers)
+    except Exception as e:  # noqa: BLE001 - never block startup on the credit
+        logger.warning("expert-slot KV credit unavailable (%s); using 0.", e)
+        return 0, "?"
+    return (_QWEN35_SAFE_KV_SLOTS - slots) * layers * 3 * hidden * inter, slots
+
+
+def _log_effective_config(vllm_config: VllmConfig) -> None:
+    """One grep-able line: every env/LIBTPU_INIT_ARGS/argv rewrite env_override
+    made (in the first process; children inherit it) and the final values the
+    deployment depends on, including what the Qwen3.5 block above set."""
+    import json
+    import sys
+
+    cache = vllm_config.cache_config
+    sched = vllm_config.scheduler_config
+    effective = {
+        "process_changes": json.loads(
+            os.environ.get("VLLM_TORCHTPU_CONFIG_CHANGES", "[]")
+        ),
+        "libtpu_init_args": os.environ.get("LIBTPU_INIT_ARGS", ""),
+        "argv": sys.argv,
+        "dcp": vllm_config.parallel_config.decode_context_parallel_size,
+        "speculative": str(vllm_config.speculative_config),
+        "scheduler_cls": sched.scheduler_cls,
+        "max_num_seqs": sched.max_num_seqs,
+        "max_num_batched_tokens": sched.max_num_batched_tokens,
+        "stream_interval": sched.stream_interval,
+        "kv_cache_memory_bytes": cache.kv_cache_memory_bytes,
+        "prefix_cache_retention_interval": getattr(
+            cache, "prefix_cache_retention_interval", None
+        ),
+        "prefix_match_unit": getattr(cache, "prefix_match_unit", None),
+        "expert_placement": envs.TPU_EXPERT_PLACEMENT,
+        "compile_sizes": vllm_config.compilation_config.compile_sizes,
+    }
+    logger.info("[EFFECTIVE_CONFIG] %s", json.dumps(effective, default=str))
+
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -310,7 +361,7 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     Both mistakes below produce a run that looks healthy and writes no
     traces, which is only discovered once the benchmark has finished.
     """
-    assert "phased_profiling_dir" not in cast(dict, vllm_config.additional_config), (
+    assert "phased_profiling_dir" not in vllm_config.additional_config, (
         "Legacy additional_config['phased_profiling_dir'] is no longer "
         "supported. Set USE_PHASED_PROFILER=true and "
         "--profiler-config.torch_profiler_dir=<dir> instead."
@@ -405,10 +456,6 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
-        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
-        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
-        "TPU_RAIDEN_GLM_ADMISSION",
-        "TPU_KV_RESHARD_TRANSPORT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -520,8 +567,6 @@ class TpuPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
-        # vLLM's selector passes num_heads by keyword; unused here.
-        num_heads: int | None = None,
         **kwargs,
     ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -563,9 +608,7 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_current_memory_usage(
-        cls, device: torch.types.Device | None = None
-    ) -> float:
+    def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         if not torch.tpu.is_initialized():
             return 0.0
         free, total = torch.accelerator.get_memory_info(device)
@@ -620,7 +663,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        assert "sharding" not in cast(dict, vllm_config.additional_config), (
+        assert "sharding" not in vllm_config.additional_config, (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
@@ -652,7 +695,6 @@ class TpuPlatform(Platform):
             get_flashinfer_layout_string,
             resolve_kv_cache_layout,
         )
-        from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
@@ -671,17 +713,6 @@ class TpuPlatform(Platform):
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
-        # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
-        if (
-            layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
-        ):
-            raise NotImplementedError(
-                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
-                "layout, which the head_dim==64 RPA kernel does not "
-                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
-            )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
@@ -748,19 +779,36 @@ class TpuPlatform(Platform):
                     vllm_config.model_config.max_model_len
                     + scheduler_config.max_num_seqs,
                 )
-            compilation_config.compile_sizes = cast(
-                list[int | str],
-                _get_token_paddings(
-                    min_token_size=16,
-                    max_token_size=budget,
-                    extra_bucket_sizes=extra_bucket_sizes,
-                ),
+            compilation_config.compile_sizes = _get_token_paddings(
+                min_token_size=16,
+                max_token_size=budget,
+                extra_bucket_sizes=extra_bucket_sizes,
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
-        if envs.TPU_MOE_SEQUENCE_PARALLEL:
-            _configure_sequence_parallel_moe(vllm_config)
+        # Sequence-parallel MoE splits each bucket over TP. Keep buckets that
+        # split evenly into >= 2 rows per rank: a 1-row shard lets Dynamo
+        # specialize the size and refuse the remaining buckets.
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.use_sequence_parallel_moe:
+            archs = vllm_config.model_config.architectures or []
+            if not any(a.startswith(("Qwen3Next", "Qwen3_5Moe")) for a in archs):
+                raise ValueError(
+                    "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3Next "
+                    f"and Qwen3.5 MoE, got {archs}."
+                )
+            if not envs.USE_MOE_FUSED_EP_KERNEL:
+                logger.warning(
+                    "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
+                    "moves the same collective bytes as the default path."
+                )
+            tp = parallel_config.tensor_parallel_size
+            compilation_config.compile_sizes = [
+                s
+                for s in compilation_config.compile_sizes
+                if s >= 2 * tp and s % tp == 0
+            ]
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
@@ -798,6 +846,79 @@ class TpuPlatform(Platform):
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
+
+        if scheduler_config.stream_interval == 1:
+            scheduler_config.stream_interval = int(
+                os.environ.get("TPU_STREAM_INTERVAL", "1")
+            )
+
+        if (
+            model_config is not None
+            and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            paw_cls = "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+            if scheduler_config.scheduler_cls in (
+                None,
+                "vllm.v1.core.sched.scheduler.Scheduler",
+            ):
+                scheduler_config.scheduler_cls = paw_cls
+                logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
+            if hasattr(cache_config, "prefix_cache_retention_interval"):
+                cache_config.prefix_cache_retention_interval = 0
+            if hasattr(cache_config, "prefix_match_unit") and getattr(
+                cache_config, "prefix_match_unit", None
+            ) in (None, 0, 1):
+                cache_config.prefix_match_unit = 128
+            dcp_size = int(
+                getattr(parallel_config, "decode_context_parallel_size", 1) or 1
+            )
+            if "TPU_EXPERT_PLACEMENT" not in os.environ:
+                from vllm_torchtpu import expert_placement
+
+                table = expert_placement.auto_table(
+                    dcp_size, scheduler_config.max_num_seqs
+                )
+                # Set before the workers spawn so they inherit it.
+                if os.path.isfile(table):
+                    os.environ["TPU_EXPERT_PLACEMENT"] = table
+                logger.info(
+                    "Auto-selected Qwen3.5-397B expert placement %s "
+                    "(max_num_seqs=%d, dcp=%d).",
+                    os.path.basename(table),
+                    scheduler_config.max_num_seqs,
+                    dcp_size,
+                )
+            # Measured with 80 expert slots per rank (opt_copies128), keeping
+            # ~2.5 GiB of HBM headroom. DCP>1 was 36e9: 0.4 GiB headroom and
+            # program-load OOM retries while serving (comp_inspect/hbm).
+            if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+                safe_kv = 32_500_000_000
+            else:
+                safe_kv = 33_500_000_000
+            credit, slots = _expert_slot_kv_credit(model_config, parallel_config)
+            safe_kv += credit
+            # The recipe always passes its own --kv-cache-memory-bytes (40.4e9),
+            # so the measured budget is SET (raised or lowered), not only
+            # clamped. TPU_KV_BYTES_EXPLICIT=1 with an explicit value keeps it.
+            requested = cache_config.kv_cache_memory_bytes
+            keep = requested is not None and os.environ.get(
+                "TPU_KV_BYTES_EXPLICIT", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if keep or requested != safe_kv:
+                logger.warning(
+                    "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
+                    "auto %d (slots=%s, dcp=%d, seqs=%d).",
+                    "kept (TPU_KV_BYTES_EXPLICIT=1)" if keep else "set to auto",
+                    requested,
+                    safe_kv,
+                    slots,
+                    dcp_size,
+                    scheduler_config.max_num_seqs,
+                )
+            if not keep:
+                cache_config.kv_cache_memory_bytes = safe_kv
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
         if (
@@ -1018,12 +1139,15 @@ class TpuPlatform(Platform):
                     "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"
                 )
 
+        try:
+            _log_effective_config(vllm_config)
+        except Exception as e:  # noqa: BLE001 - logging never blocks startup
+            logger.warning("[EFFECTIVE_CONFIG] unavailable: %s", e)
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
-        backend_cls = cast(
-            "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)
-        )
+        backend_cls = cls._find_non_ssm_backend(vllm_config)
 
         if backend_cls is None:
             return
@@ -1102,7 +1226,7 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        processed_inputs: EngineInput,
+        processed_inputs: ProcessorInputs,
         params: Union["SamplingParams", PoolingParams],
     ) -> None:
         """Raises if this request is unsupported on this platform"""
@@ -1253,73 +1377,3 @@ def _get_token_paddings(
         )
     logger.info("Using token paddings: %s", paddings)
     return paddings
-
-
-def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
-    # Each rank receives size // tp rows; require 8-token alignment or
-    # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
-    # to avoid single-token shape specialization in Dynamo.
-    rows, rem = divmod(size, tp)
-    return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
-
-
-def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
-    """Validate architecture and filter compile buckets for sequence-parallel MoE.
-
-    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
-    shard or a validated power-of-two decode shard (2, 4 rows).
-    """
-    parallel_config = vllm_config.parallel_config
-    if not parallel_config.use_sequence_parallel_moe:
-        return
-    # The Qwen3.5 MoE drafter forward (Qwen3_5MultiTokenPredictor) already
-    # chunks to the local token shard and all-gathers after the final norm.
-    if (
-        vllm_config.speculative_config is not None
-        and vllm_config.speculative_config.method != "mtp"
-    ):
-        raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 covers only the MTP drafter; "
-            f"got speculative method {vllm_config.speculative_config.method!r}."
-        )
-    archs = vllm_config.model_config.architectures or []
-    if not any(a.startswith("Qwen3_5Moe") for a in archs):
-        raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3.5 MoE, "
-            f"got {archs}."
-        )
-    if parallel_config.pipeline_parallel_size > 1:
-        raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 does not support pipeline parallelism "
-            f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
-        )
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
-        logger.warning(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
-            "moves the same collective bytes as the default path."
-        )
-    tp = parallel_config.tensor_parallel_size
-    cc = vllm_config.compilation_config
-    if cc.compile_sizes is None:
-        return
-    original = [int(s) for s in cc.compile_sizes]
-    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
-    if not kept:
-        raise ValueError(
-            f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "
-            f"for tp={tp}: {original}"
-        )
-    if max(kept) != max(original):
-        raise ValueError(
-            f"TPU_MOE_SEQUENCE_PARALLEL=1 dropped largest compile size "
-            f"{max(original)} (tp={tp}): {original} -> {kept}. The largest "
-            "compile size must split into 2, 4, or a multiple of 8 rows per "
-            "TP rank."
-        )
-    if dropped := sorted(set(original) - set(kept)):
-        logger.info(
-            "Sequence-parallel MoE dropped compile sizes %s (tp=%d).",
-            dropped,
-            tp,
-        )
-    cc.compile_sizes = cast(list[int | str], kept)

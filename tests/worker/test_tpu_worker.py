@@ -354,16 +354,29 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         torch.set_num_threads(previous_threads)
 
 
+def test_warmup_freezes_gc_heap_after_compile(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    events = []
+    monkeypatch.setattr(tpu_worker, "freeze_gc_heap", lambda: events.append("freeze"))
+    monkeypatch.setattr(
+        tpu_worker, "maybe_attach_gc_debug_callback", lambda: events.append("debug")
+    )
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: events.append("compile")),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    TPUWorker.compile_or_warm_up_model(worker)
+    assert events == ["compile", "freeze", "debug"]
+
+
 def test_real_patch_entrypoints_in_spawned_processes():
     import subprocess
     import sys
 
     probe = Path(__file__).resolve()
     source = probe.parents[2] / "src"
-    pythonpath = os.pathsep.join(
-        filter(None, [str(source), os.environ.get("PYTHONPATH")])
-    )
-    env = dict(os.environ, PYTHONPATH=pythonpath, JAX_PLATFORMS="tpu")
+    env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
     result = subprocess.run(
         [sys.executable, str(probe)],
         env=env,

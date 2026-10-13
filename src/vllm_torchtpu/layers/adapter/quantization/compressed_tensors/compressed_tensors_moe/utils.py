@@ -1,23 +1,14 @@
 import ctypes
 import gc
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch.nn import Parameter
 
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe import RoutedExperts
-
-    class StagedParameter(Parameter):
-        """Typing-only view of a parameter staged by the CPU weight loader."""
-
-        _cpu_scratch: Parameter
-        _orig_shape: tuple[int, ...]
-
 
 def get_cpu_weight_loader_hook(
-    layer: "RoutedExperts",
+    layer: torch.nn.Module,
     orig_loader: Callable | None,
     tp_size: int,
     tp_rank: int,
@@ -32,7 +23,7 @@ def get_cpu_weight_loader_hook(
     """
 
     def _cpu_weight_loader_hook(
-        param: "StagedParameter",
+        param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
         weight_name: str,
         shard_id: str,

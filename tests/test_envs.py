@@ -49,3 +49,30 @@ def test_startup_accepts_the_knob_unset(
     monkeypatch.delenv(REMOVED, raising=False)
 
     TpuPlatform.check_and_update_config(vllm_config)
+
+
+def test_qwen35_dcp_cli_defaults_set_moe_v2_and_disable_reassociate(monkeypatch):
+    import sys
+    from vllm_torchtpu import env_override
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "vllm",
+            "serve",
+            "Qwen/Qwen3.5-397B-A17B-FP8",
+            "--decode-context-parallel-size",
+            "4",
+        ],
+    )
+    monkeypatch.delenv(
+        "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", raising=False
+    )
+    monkeypatch.delenv("MOE_FUSED_EP_KERNEL_IMPL", raising=False)
+    env_override._apply_qwen35_serve_cli_defaults()
+    assert (
+        env_override.os.environ["TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS"]
+        == "0"
+    )
+    assert env_override.os.environ["MOE_FUSED_EP_KERNEL_IMPL"] == "v2"

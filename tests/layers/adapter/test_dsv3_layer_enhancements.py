@@ -4,7 +4,6 @@ Grouped Top-K MoE, Unaligned FP8).
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -16,7 +15,6 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 
 
-@pytest.mark.tpu_test
 def test_pallas_attention_init_kwargs(vllm_config_context):
     """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank
     without raising TypeError.
@@ -37,7 +35,6 @@ def test_pallas_attention_init_kwargs(vllm_config_context):
     assert backend.head_size == 256
 
 
-@pytest.mark.tpu_test
 def test_pallas_attention_forward_2d_reshape(vllm_config_context):
     """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors
     to 3D and restores 2D output.

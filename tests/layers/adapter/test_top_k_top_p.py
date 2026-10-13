@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.sample import top_k_top_p as sampling
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 def test_int32_search_boundaries():
@@ -85,7 +81,7 @@ def test_apply_top_k_top_p_per_request():
     torch.testing.assert_close(logits, original)
 
 
-def test_candidate_blocks_match_full_vocab_for_top_k_sampling():
+def test_candidate_blocks_match_full_vocab_for_agentx_sampling():
     gen = torch.Generator().manual_seed(0)
     logits = (torch.randn(6, 128 * 400, generator=gen) * 3).bfloat16().float() / 0.6
     top_k = torch.full((6, 1), 20, dtype=torch.int32)
@@ -120,51 +116,4 @@ def test_candidate_blocks_leave_rows_without_top_k_unmasked():
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
     result = sampling.apply_top_k_top_p_candidates(logits, top_k, top_p, 16)
     torch.testing.assert_close(result[:2], logits[:2], rtol=0, atol=0)
-    torch.testing.assert_close(result, expected, rtol=0, atol=0)
-
-
-def test_topk_candidate_blocks_gating(monkeypatch):
-    runner = TPUModelRunner.__new__(TPUModelRunner)
-    runner.vocab_size = 248320
-
-    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 0)
-    assert runner._topk_candidate_blocks() == 0
-
-    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 64)
-    runner.vocab_size = 248321
-    assert runner._topk_candidate_blocks() == 0
-    runner.vocab_size = 248320
-    assert runner._topk_candidate_blocks() == 64
-
-
-def test_sampler_topk_candidates_gating(monkeypatch):
-    runner = TPUModelRunner.__new__(TPUModelRunner)
-    runner.vocab_size = 248320
-    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 64)
-
-    input_batch = SimpleNamespace(
-        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64)
-    )
-    runner.input_batch = input_batch
-
-    assert runner._sampler_topk_candidates(0, 4, None) == 64
-    assert runner._sampler_topk_candidates(0, 4, object()) == 0
-
-    input_batch.top_k_cpu_tensor = torch.tensor([40, 20, 20, 20], dtype=torch.int64)
-    assert runner._sampler_topk_candidates(0, 4, None) == 0
-
-    input_batch.top_k_cpu_tensor = torch.tensor([0, 20, 20, 20], dtype=torch.int64)
-    assert runner._sampler_topk_candidates(0, 4, None) == 0
-
-
-def test_rejection_sampler_topk_candidates_cpu_parity():
-    gen = torch.Generator().manual_seed(42)
-    vocab_size = 128 * 400
-    rows = 4
-    logits = (torch.randn(rows, vocab_size, generator=gen) * 3).float() / 0.6
-    top_k = torch.full((rows, 1), 20, dtype=torch.int32)
-    top_p = torch.full((rows, 1), 0.95)
-
-    expected = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=0)
-    result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=64)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)

@@ -30,7 +30,6 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
-from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
 # count against it, because the kernel requires one equal block per shard.
@@ -235,9 +234,12 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
-def test_mesh_expert_order_is_none_when_ranks_follow_device_ids():
-    """The permutation exists only to undo a mesh ordered by device id; where
-    EP rank order already is device order the op must be handed nothing."""
+def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
+    """The permutation exists only to undo a mesh ordered by device id.
+
+    Since google-pytorch/torch_tpu#3522 `build_ep_mesh` orders by rank, so mesh
+    index i holds EP rank i's experts and the op must be handed nothing.
+    """
     seen = []
     assert (
         _prebuild(
@@ -248,6 +250,15 @@ def test_mesh_expert_order_is_none_when_ranks_follow_device_ids():
         == "op"
     )
     assert seen and seen[0][_MESH_ORDER_ARG] is None
+
+
+def test_ep_rank_order_is_the_identity():
+    """It no longer depends on how the group's ranks are arranged."""
+    from vllm_torchtpu.distributed import ep_mesh
+
+    group = SimpleNamespace(ranks=[3, 1, 2, 0])
+    with patch.object(ep_mesh, "get_ep_group", return_value=group):
+        assert ep_mesh.ep_rank_order() == (0, 1, 2, 3)
 
 
 def test_ep_rank_order_is_none_without_a_group():
@@ -458,23 +469,25 @@ def test_mesh_expert_order(order, expected):
         assert bridge._mesh_expert_order(len(order)) == expected
 
 
-def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
-    """The mesh is in ascending device-id order (the rank-ordered one makes the
-    fused MoE's all-gathers slow), so this is what says which rank sits where."""
+def test_ep_rank_order_does_not_depend_on_where_the_devices_sit():
+    """It used to undo a mesh ordered by device id.
+
+    google-pytorch/torch_tpu#3522 binds partition p to rank p and
+    `build_ep_mesh` orders by rank to match, so mesh index i holds EP rank i's
+    experts whatever the chips underneath are doing.
+    """
     from vllm_torchtpu.distributed import ep_mesh
 
-    # EP ranks 0..7 on a tpu7x host's device ids. Sorted ascending, rank r ends
-    # up at the position of its device id.
-    device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
-    with (
-        patch.object(ep_mesh, "get_ep_group", return_value=group),
-        patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
-    ):
-        order = ep_mesh.ep_rank_order()
+    orders = []
+    for device_ids in ((0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 2, 3, 4, 5, 6, 7)):
+        with (
+            patch.object(ep_mesh, "get_ep_group", return_value=group),
+            patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
+        ):
+            orders.append(ep_mesh.ep_rank_order())
 
-    assert order == tuple(rank for _, rank in sorted(zip(device_ids, range(8))))
-    assert order == (0, 1, 6, 7, 2, 3, 4, 5)
+    assert orders[0] == orders[1] == tuple(range(8))
 
 
 def test_supports_internal_mk_tracks_both_owners():
@@ -520,8 +533,8 @@ def test_env_flag_alone_does_not_claim_the_collectives():
         assert prop.fget(SimpleNamespace()) is False
 
 
-class TestFusedOutputIsReduced:
-    """`VllmMoERunner._fused_output_is_reduced` overrides an upstream answer.
+class TestFusedOutputIsReducedPatch:
+    """`_patch_moe_runner_fused_output_is_reduced` rewrites an upstream class.
 
     It is the guard that stops vLLM all-reducing an output the kernel already
     combined, so it has to be right about three things: it stays out of runs
@@ -529,32 +542,77 @@ class TestFusedOutputIsReduced:
     `skip_final_all_reduce`, and it answers per layer.
     """
 
-    def _answer(self, *, armed, skip_final_all_reduce=False):
+    @staticmethod
+    def _fresh_runner_cls():
+        """A MoERunner with the patch un-applied, restored after the test."""
+        from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
+
+        return mr.MoERunner
+
+    @pytest.fixture(autouse=True)
+    def _restore(self):
+        cls = self._fresh_runner_cls()
+        saved = cls.__dict__.get("_fused_output_is_reduced")
+        saved_flag = cls.__dict__.get("_tpu_fused_output_reduced_patch")
+        if hasattr(cls, "_tpu_fused_output_reduced_patch"):
+            del cls._tpu_fused_output_reduced_patch
+        yield cls
+        if saved is not None:
+            cls._fused_output_is_reduced = saved
+        if saved_flag is not None:
+            cls._tpu_fused_output_reduced_patch = saved_flag
+        elif hasattr(cls, "_tpu_fused_output_reduced_patch"):
+            del cls._tpu_fused_output_reduced_patch
+
+    def _apply(self):
+        import vllm_torchtpu
+
+        vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
+
+    def _runner(self, cls, *, armed, skip_final_all_reduce=False):
+        """A stub standing in for a MoERunner, with `original` forced False."""
         # `moe_kernel=None` is what the TPU fp8 method actually has, and it
         # is what makes upstream's own getter return False -- so a True here
-        # can only have come from the override.
+        # can only have come from the patch.
         quant_method = SimpleNamespace(moe_kernel=None)
         if armed:
             setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, "op")
-        runner = VllmMoERunner.__new__(VllmMoERunner)
-        torch.nn.Module.__init__(runner)
-        runner.routed_experts = SimpleNamespace(quant_method=quant_method)
-        runner.moe_config = SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce)
-        return runner._fused_output_is_reduced
+        runner = SimpleNamespace(
+            _quant_method=quant_method,
+            moe_config=SimpleNamespace(skip_final_all_reduce=skip_final_all_reduce),
+        )
+        return cls._fused_output_is_reduced.fget(runner)
 
-    def test_defers_to_upstream_without_the_env_flag(self):
+    def test_not_installed_without_the_env_flag(self, _restore):
+        cls = _restore
+        before = cls.__dict__.get("_fused_output_is_reduced")
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False):
-            assert self._answer(armed=True) is False
+            self._apply()
+        assert cls.__dict__.get("_fused_output_is_reduced") is before
+        assert not getattr(cls, "_tpu_fused_output_reduced_patch", False)
 
-    def test_reports_reduced_only_for_an_armed_layer(self):
+    def test_reports_reduced_only_for_an_armed_layer(self, _restore):
+        cls = _restore
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            assert self._answer(armed=True) is True
-            assert self._answer(armed=False) is False
+            self._apply()
+        assert cls._tpu_fused_output_reduced_patch is True
+        assert self._runner(cls, armed=True) is True
+        assert self._runner(cls, armed=False) is False
 
-    def test_defers_to_upstream_under_skip_final_all_reduce(self):
+    def test_defers_to_upstream_under_skip_final_all_reduce(self, _restore):
         """The upstream assert requires an un-reduced fused output there."""
+        cls = _restore
         with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
-            assert self._answer(armed=True, skip_final_all_reduce=True) is False
+            self._apply()
+        assert self._runner(cls, armed=True, skip_final_all_reduce=True) is False
+
+    def test_is_idempotent(self, _restore):
+        cls = _restore
+        with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True):
+            self._apply()
+            first = cls.__dict__["_fused_output_is_reduced"]
+            self._apply()
+        assert cls.__dict__["_fused_output_is_reduced"] is first
 
 
 def _fp4_layer(block=512, hidden=512, inter=512):
@@ -1062,3 +1120,62 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+
+def test_v3_rejected_contract_does_not_clobber_rank_buffer(monkeypatch):
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_bridge
+
+    mesh = SimpleNamespace(shape={v3_bridge.EP_AXIS_NAME: _STUB_EP})
+    monkeypatch.setattr(v3_bridge, "_OP", None)
+    monkeypatch.setattr(v3_bridge, "_OP_CONTRACT", None)
+    monkeypatch.setattr(v3_bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(v3_bridge, "_EXPERT_ORDER", None)
+    monkeypatch.setattr(v3_bridge, "build_ep_mesh", lambda: mesh)
+    monkeypatch.setattr(v3_bridge, "_max_node_tokens", lambda ep: 4096)
+    monkeypatch.setattr(v3_bridge, "_expert_block_permutation", lambda ep, dev: None)
+    monkeypatch.setattr(
+        v3_bridge,
+        "_build_op",
+        lambda *args, **kwargs: setattr(v3_bridge, "_OP", "v3_op"),
+    )
+
+    layer1 = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=1):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer1, topk=2, renormalize=True, activation="silu"
+        )
+    assert getattr(layer1, "_tpu_fused_ep_eligible", False) is True
+    saved_rank_buf = v3_bridge._RANK_BUFFER
+    assert saved_rank_buf is not None and saved_rank_buf.item() == 1
+
+    # A second layer with a different contract must be rejected before mutating
+    # _RANK_BUFFER or _EXPERT_ORDER.
+    layer2 = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=0):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer2, topk=4, renormalize=True, activation="silu"
+        )
+    assert getattr(layer2, "_tpu_fused_ep_eligible", False) is False
+    assert v3_bridge._RANK_BUFFER is saved_rank_buf
+    assert v3_bridge._RANK_BUFFER.item() == 1
+
+
+def test_v3_rejects_out_of_bounds_ep_mesh_index(monkeypatch):
+    from vllm_torchtpu.layers.adapter import fused_moe_ep_v3 as v3_bridge
+
+    mesh = SimpleNamespace(shape={v3_bridge.EP_AXIS_NAME: _STUB_EP})
+    monkeypatch.setattr(v3_bridge, "_OP", None)
+    monkeypatch.setattr(v3_bridge, "_OP_CONTRACT", None)
+    monkeypatch.setattr(v3_bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(v3_bridge, "build_ep_mesh", lambda: mesh)
+    monkeypatch.setattr(v3_bridge, "_max_node_tokens", lambda ep: 4096)
+
+    layer = _layer(experts=4, hidden=128, inter=256)
+    with patch.object(v3_bridge, "ep_mesh_index", return_value=_STUB_EP):
+        v3_bridge.prebuild_fused_moe_ep(
+            layer, topk=2, renormalize=True, activation="silu"
+        )
+    assert getattr(layer, "_tpu_fused_ep_eligible", False) is False
+    assert v3_bridge._OP is None
+    assert v3_bridge._RANK_BUFFER is None
