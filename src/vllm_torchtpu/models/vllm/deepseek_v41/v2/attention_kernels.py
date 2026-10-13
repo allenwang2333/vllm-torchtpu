@@ -8,7 +8,11 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores, indexer
+from vllm_torchtpu.kernels.deepseek_v41 import (
+    index_word_scores,
+    indexer,
+    tuned_block_sizes,
+)
 
 from .cache import (
     ROPE_WORDS,
@@ -2221,13 +2225,13 @@ def paged_indexer_jax(
     ``gcd(block_size, page_records)`` records (a block lies in one page).
     """
 
-    def full_context(_):
+    def score_context(records, query_tile):
         # Finish selection before reusing a query tile's score buffer. Key
         # tiling alone still materializes [all queries, max context]: at
         # 2048 x 1M a single FP32 score matrix is 8 GiB, before top-k copies.
         # Reuse the native indexer's query tile and score/selection pipeline.
         rows = q.shape[0]
-        tile = min(rows, indexer.QUERY_TILE)
+        tile = min(rows, query_tile)
         padding = -rows % tile
         longest = lengths.max() if batch_max is None else batch_max
         inputs = jax.tree.map(
@@ -2289,6 +2293,25 @@ def paged_indexer_jax(
             (rows + padding) // tile, prepare, score, select, write, output
         )
         return selected[:rows], published[:rows]
+
+    def full_context(_):
+        columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
+        if (
+            not candidate_write
+            and not candidate_filter
+            and topk <= columns
+            and q.shape[0] >= query_tile
+            and records.shape[1] > columns
+        ):
+            # Select a smaller working shape without limiting request length.
+            # Publication/filtering retain their full-width candidate contract.
+            return jax.lax.cond(
+                lengths.max() <= columns,
+                lambda _: score_context(records[:, :columns], query_tile),
+                lambda _: score_context(records, indexer.QUERY_TILE),
+                None,
+            )
+        return score_context(records, indexer.QUERY_TILE)
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:

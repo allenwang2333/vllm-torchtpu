@@ -1960,3 +1960,60 @@ def test_paged_indexer_query_tiles_preserve_selection(
     for result, reference in zip(actual, expected, strict=True):
         np.testing.assert_array_equal(result, reference)
     assert score_rows and max(score_rows) <= attention_kernels.indexer.QUERY_TILE
+
+
+@pytest.mark.parametrize("length", [0, 127, 128, 129, 255])
+@pytest.mark.parametrize("banks", [1, 2])
+def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
+    monkeypatch, length, banks
+):
+    """Bucket edges and the long-context fallback preserve exact selection."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+
+    monkeypatch.setattr(
+        attention_kernels.tuned_block_sizes, "PAGED_INDEXER_PREFILL_BUCKET", (128, 64)
+    )
+    rng = np.random.default_rng(23)
+    rows, width, topk = 129, 256, 16
+    keys = jnp.asarray(rng.standard_normal((width, 128)), jnp.bfloat16)
+    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    if banks == 2:
+        pool = tuple(jnp.split(pool, 2))
+    q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
+    records = jnp.arange(width, dtype=jnp.int32)[None, :]
+    lengths = jnp.full((rows,), length, jnp.int32).at[-1].set(0)
+    requests = jnp.zeros((rows,), jnp.int32)
+    candidates = jnp.zeros((rows, 4), jnp.int32)
+    scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+    expected = select_indices_jax(
+        scores, lengths, candidates, topk, 16, False, False, True
+    )
+    shapes = []
+    original = attention_kernels.paged_index_scores_jax
+
+    def record_shape(queries, pool, records, *args, **kwargs):
+        shapes.append((queries.shape[0], records.shape[1]))
+        return original(queries, pool, records, *args, **kwargs)
+
+    monkeypatch.setattr(attention_kernels, "paged_index_scores_jax", record_shape)
+    actual = jax.jit(
+        lambda: paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            topk,
+            16,
+            False,
+            False,
+            True,
+        )
+    )()
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
+    assert (64, 128) in shapes
+    assert (32, 256) in shapes
