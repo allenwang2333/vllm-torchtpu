@@ -37,12 +37,49 @@ if [ -z "${VLLM_COMMIT_HASH}" ]; then
   exit 1
 fi
 
-# Include vLLM commit SHA in the image tag for registry isolation
-IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
+# Resolve optional torch-tpu wheel override from env or Buildkite metadata
+TORCH_TPU_WHEEL_GCS_URI="${TORCH_TPU_WHEEL_GCS_URI:-${WHEEL_GCS_URL:-${WHEEL_GCS_PATH:-}}}"
+if [ -z "${TORCH_TPU_WHEEL_GCS_URI}" ] && command -v buildkite-agent >/dev/null 2>&1; then
+  TORCH_TPU_WHEEL_GCS_URI="$(buildkite-agent meta-data get "TORCH_TPU_WHEEL_GCS_URI" --default "" 2>/dev/null || true)"
+fi
 
-echo "--- Building Docker Image: ${IMAGE_TAG} (target: ${TARGET})"
-# Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-./docker/build_image.sh --target "${TARGET}" -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+TORCH_TPU_OVERRIDE_SOURCE="${TORCH_TPU_OVERRIDE_SOURCE:-}"
+if [ -z "${TORCH_TPU_OVERRIDE_SOURCE}" ] && command -v buildkite-agent >/dev/null 2>&1; then
+  TORCH_TPU_OVERRIDE_SOURCE="$(buildkite-agent meta-data get "TORCH_TPU_OVERRIDE_SOURCE" --default "" 2>/dev/null || true)"
+fi
+
+OVERRIDE_TAG_SUFFIX=""
+OVERRIDE_KEY="${TORCH_TPU_WHEEL_GCS_URI:-${TORCH_TPU_OVERRIDE_SOURCE:-}}"
+if [ -n "${OVERRIDE_KEY}" ]; then
+  OVERRIDE_HASH="$(printf '%s' "${OVERRIDE_KEY}" | sha256sum | cut -c1-8)"
+  OVERRIDE_TAG_SUFFIX="-whl-${OVERRIDE_HASH}"
+fi
+
+# Include vLLM commit SHA (and optional wheel override hash) in the image tag for registry isolation
+IMAGE_TAG="${IMAGE_REPO}:${COMMIT_HASH}-${VLLM_COMMIT_HASH}${OVERRIDE_TAG_SUFFIX}${IMAGE_SUFFIX}"
+
+BASE_IMAGE_TO_USE="${BASE_IMAGE_OVERRIDE:-}"
+if [ -n "${BASE_IMAGE_TO_USE}" ] && [ -n "${IMAGE_SUFFIX}" ] && [[ "${BASE_IMAGE_TO_USE}" != *"${IMAGE_SUFFIX}" ]]; then
+  BASE_IMAGE_TO_USE="${BASE_IMAGE_TO_USE}${IMAGE_SUFFIX}"
+fi
+
+if [ -n "${OVERRIDE_KEY}" ] && [ -n "${BASE_IMAGE_TO_USE}" ]; then
+  echo "--- Pulling pre-built base image: ${BASE_IMAGE_TO_USE}"
+  docker pull -q "${BASE_IMAGE_TO_USE}"
+else
+  echo "--- Building Docker Image: ${IMAGE_TAG} (target: ${TARGET})"
+  # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
+  ./docker/build_image.sh --target "${TARGET}" -t "${IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+  BASE_IMAGE_TO_USE="${IMAGE_TAG}"
+fi
+
+if [ -n "${TORCH_TPU_WHEEL_GCS_URI}" ]; then
+  echo "--- Overriding torch-tpu wheel in ${IMAGE_TAG} (base: ${BASE_IMAGE_TO_USE}) from ${TORCH_TPU_WHEEL_GCS_URI}"
+  ./docker/build_override_image.sh -b "${BASE_IMAGE_TO_USE}" -t "${IMAGE_TAG}" -w "${TORCH_TPU_WHEEL_GCS_URI}"
+elif [ -n "${TORCH_TPU_OVERRIDE_SOURCE}" ]; then
+  echo "--- Overriding torch-tpu wheel in ${IMAGE_TAG} (base: ${BASE_IMAGE_TO_USE}) from ${TORCH_TPU_OVERRIDE_SOURCE}"
+  ./docker/build_override_image.sh -b "${BASE_IMAGE_TO_USE}" -t "${IMAGE_TAG}" -o "${TORCH_TPU_OVERRIDE_SOURCE}"
+fi
 
 # Publish image tag metadata for downstream test steps
 buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${IMAGE_TAG}"

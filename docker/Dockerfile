@@ -81,8 +81,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     uv pip install --system \
-      --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
-      --extra-index-url https://pypi.org/simple \
+      --index https://pypi.org/simple \
+      --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --index-strategy unsafe-best-match \
       -r pyproject.toml \
       --group vllm
