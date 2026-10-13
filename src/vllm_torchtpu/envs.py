@@ -549,8 +549,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # piece 0's reduce-scatter instead of holding them open under the
     # attention calls. 0 = off.
     "TPU_DCP_MLA_MERGE_PIECES": env_int("TPU_DCP_MLA_MERGE_PIECES", 0),
-    # TPU_DCP_MLA_MERGE_PIECES only for buckets of at least this many tokens
-    # (0 = every chunked bucket); the lse-gather head split (2) follows it.
+    # The kernel pieces of TPU_DCP_MLA_MERGE_PIECES only for buckets of at
+    # least this many tokens (0 = every chunked bucket). The lse-gather head
+    # split (2) is torch-side and does not follow it (a token-count test there
+    # specializes range-compiled graphs).
     "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 0
     ),
