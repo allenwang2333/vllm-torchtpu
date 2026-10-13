@@ -58,7 +58,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        group = self._token_group(is_sequence_parallel)
+        group = get_ep_group() if is_sequence_parallel else get_dp_group()
         if group.world_size == 1:
             return hidden_states, router_logits
         # DeepSeek V4 routes from the hidden states themselves: gather once.
@@ -67,13 +67,12 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             return hidden_states, hidden_states
         # When non-SP router_logits is already TP-sliced to [T_dp // tp_size, E],
         # keep it rank-local so moe_routing.route gathers top-k over ep_group.
-        gather_logits = (
-            is_sequence_parallel or router_logits.shape[0] >= hidden_states.shape[0]
-        )
-        hidden_states = group.all_gather(hidden_states, dim=0)
-        if gather_logits:
-            router_logits = group.all_gather(router_logits, dim=0)
-        return hidden_states, router_logits
+        if is_sequence_parallel or router_logits.shape[0] >= hidden_states.shape[0]:
+            return (
+                group.all_gather(hidden_states, dim=0),
+                group.all_gather(router_logits, dim=0),
+            )
+        return group.all_gather(hidden_states, dim=0), router_logits
 
     def dispatch(
         self,
@@ -87,20 +86,19 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError(
                 "extra_tensors is not supported by TpuDeviceCommunicator"
             )
-        group = self._token_group(is_sequence_parallel)
+        group = get_ep_group() if is_sequence_parallel else get_dp_group()
         if group.world_size == 1:
             return hidden_states, topk_weights, topk_ids
-        all_gather = group.all_gather
         return (
-            all_gather(hidden_states, dim=0),
-            all_gather(topk_weights, dim=0),
-            all_gather(topk_ids, dim=0),
+            group.all_gather(hidden_states, dim=0),
+            group.all_gather(topk_weights, dim=0),
+            group.all_gather(topk_ids, dim=0),
         )
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        group = self._token_group(is_sequence_parallel)
+        group = get_ep_group() if is_sequence_parallel else get_dp_group()
         if group.world_size == 1:
             return hidden_states
         return group.reduce_scatter(hidden_states, dim=0)
