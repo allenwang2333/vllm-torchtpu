@@ -27,6 +27,10 @@ TUNED_BLOCK_SIZES = {
 }
 
 
+_DEFAULT_BLOCK_SIZES = (None, None)
+_TUNED_GET = TUNED_BLOCK_SIZES.get
+
+
 @functools.cache
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU.
@@ -40,8 +44,8 @@ def get_tpu_version() -> int:
     if "TPU" not in kind:
         return -1
     if kind.endswith(" lite"):
-        kind = kind[: -len(" lite")]
-    if kind.endswith("p") or kind.endswith("e"):
+        kind = kind[:-5]
+    if kind.endswith(("p", "e")):
         kind = kind[:-1]
     if kind == "TPU7x":
         return 7
@@ -67,7 +71,17 @@ def get_key(
     )
 
 
-def get_tuned_block_sizes(m, n, k, dtype_name, tp_size):
+def get_tuned_block_sizes(
+    m,
+    n,
+    k,
+    dtype_name,
+    tp_size,
+    _get=_TUNED_GET,
+    _default=_DEFAULT_BLOCK_SIZES,
+):
     """Returns the tuned block sizes for the given parameters."""
-    key = get_key(m, n, k, dtype_name, tp_size)
-    return TUNED_BLOCK_SIZES.get(key, (None, None))
+    return _get(
+        (get_tpu_version(), m, n, k, dtype_name, tp_size),
+        _default,
+    )
