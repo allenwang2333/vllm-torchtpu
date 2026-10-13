@@ -47,6 +47,7 @@ def compiler_params(vmem_limit_bytes: int) -> pltpu.CompilerParams:
     )
 
 
+@functools.cache
 def hc_mult_from_mix_dim(hc_mult3: int) -> int:
     """Invert ``hc_mult3 = hc_mult * (hc_mult + 2)``.
 
@@ -87,7 +88,8 @@ def pad_to(padded_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     pad = padded_tokens - arrays[0].shape[0]
     if pad == 0:
         return arrays
-    return tuple(jnp.pad(a, ((0, pad), (0, 0))) for a in arrays)
+    pad_width = ((0, pad), (0, 0))
+    return tuple(jnp.pad(a, pad_width) for a in arrays)
 
 
 def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
@@ -97,6 +99,7 @@ def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     return tuple(a[:num_tokens] for a in arrays)
 
 
+@functools.partial(jax.jit, inline=True)
 def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
 
@@ -117,6 +120,19 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     )
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "hc_mult",
+        "hidden_size",
+        "rms_eps",
+        "hc_pre_eps",
+        "hc_sinkhorn_eps",
+        "hc_post_mult_value",
+        "sinkhorn_repeat",
+    ),
+    inline=True,
+)
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
@@ -136,20 +152,24 @@ def mhc_pre_gates(
     Returns (pre_mix (T, M), post_mix (T, M), comb_mix (T, M, M)).
     """
     num_tokens = mixes.shape[0]
+    two_m = 2 * hc_mult
 
     mixes = mixes * jax.lax.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
-    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
-    pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
-
-    post_logits = (
-        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    scale_vec = jnp.concatenate(
+        (
+            jnp.broadcast_to(hc_scale[0:1], (hc_mult,)),
+            jnp.broadcast_to(hc_scale[1:2], (hc_mult,)),
+            jnp.broadcast_to(hc_scale[2:3], (hc_mult * hc_mult,)),
+        )
     )
-    post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+    logits = mixes * scale_vec + hc_base
 
-    comb_logits = mixes[:, 2 * hc_mult :].reshape(
-        num_tokens, hc_mult, hc_mult
-    ) * hc_scale[2] + hc_base[2 * hc_mult :].reshape(1, hc_mult, hc_mult)
+    pre_post = jax.nn.sigmoid(logits[:, :two_m])
+    pre_mix = pre_post[:, :hc_mult] + hc_pre_eps
+    post_mix = pre_post[:, hc_mult:two_m] * hc_post_mult_value
+
+    comb_logits = logits[:, two_m:].reshape(num_tokens, hc_mult, hc_mult)
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
     comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_repeat - 1):
