@@ -1,5 +1,8 @@
 """V4.1 C1/C2 compression and compressed KV publication."""
 
+import types
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -22,6 +25,76 @@ from .deepseek_v41_cache import (
 )
 
 _write_op = None
+_TPU_OP_CACHE: dict[tuple, Callable] = {}
+
+
+def _get_tpu_op(key: tuple, fn: Callable) -> Callable:
+    op = _TPU_OP_CACHE.get(key)
+    if op is not None:
+        return op
+    name = f"compressor_op_{len(_TPU_OP_CACHE)}"
+    specialized = types.FunctionType(
+        fn.__code__.replace(co_name=name),
+        fn.__globals__,
+        name,
+        fn.__defaults__,
+        fn.__closure__,
+    )
+    op = torch.compile(specialized, backend="tpu", dynamic=False)
+    _TPU_OP_CACHE[key] = op
+    return op
+
+
+def _compress_ratio1_mask_impl(
+    result: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    slots = slot_mapping[:count]
+    valid = slots >= 0
+    return valid, result.masked_fill(~valid[:, None], 0)
+
+
+def _compress_ratio2_prep_impl(
+    kv_score_f32: torch.Tensor,
+    positions: torch.Tensor,
+    state_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    capacity: int,
+    state_layout=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    count = kv_score_f32.shape[0]
+    slots = slot_mapping[:count]
+    req_idx = token_to_req_indices[:count]
+    valid = slots >= 0
+    # Rows, requests and ring slots are < 2**31: native int32 + 1D gathers.
+    rows = torch.arange(count, dtype=torch.int32, device=kv_score_f32.device)
+    requests = (req_idx if req_idx.dtype == torch.int32 else req_idx.int()).clamp(
+        max=query_start_loc.numel() - 2
+    )
+    qsl_i32 = (
+        query_start_loc
+        if query_start_loc.dtype == torch.int32
+        else query_start_loc.int()
+    )
+    starts = qsl_i32.index_select(0, requests)
+    ends = qsl_i32.index_select(0, requests + 1)
+    previous_slots = (slots if slots.dtype == torch.int32 else slots.int()).clamp(
+        min=0
+    ) // capacity * capacity + (
+        (positions if positions.dtype == torch.int32 else positions.int()) - 1
+    ) % capacity
+    previous = torch.where(
+        (rows > starts)[:, None],
+        kv_score_f32.index_select(0, (rows - 1).clamp(min=0)),
+        read_cache(state_cache, previous_slots, layout=state_layout),
+    )
+    # All reads above refer to the old ring. Keep unique physical writes.
+    publish = valid & (rows >= ends - capacity)
+    valid_out = valid & (positions % 2 == 1)
+    return previous, publish, valid_out
 
 
 def save_compress_norm(
@@ -45,52 +118,97 @@ def save_compress_norm(
     suffix is stored, so writes never race aliases from earlier ring wraps.
     """
     count = kv_score.shape[0]
-    if slot_mapping is not None:
-        slot_mapping = slot_mapping[:count]
-    if token_to_req_indices is not None:
-        token_to_req_indices = token_to_req_indices[:count]
     dim = norm_weight.numel()
     kv_score_f32 = kv_score if kv_score.dtype == torch.float32 else kv_score.float()
     values = kv_score_f32[:, :dim]
-    valid = slot_mapping >= 0
+    use_tpu_op = kv_score.device.type == "tpu" and not torch.compiler.is_compiling()
     if ratio == 2:
         capacity = (
             state_layout.page_size if state_layout is not None else state_cache.shape[1]
         )
         cache = state_cache
         # Rows, requests and ring slots are < 2**31: native int32 + 1D gathers.
-        rows = torch.arange(count, dtype=torch.int32, device=kv_score.device)
-        requests = (
-            token_to_req_indices
-            if token_to_req_indices.dtype == torch.int32
-            else token_to_req_indices.int()
-        ).clamp(max=query_start_loc.numel() - 2)
-        qsl_i32 = (
-            query_start_loc
-            if query_start_loc.dtype == torch.int32
-            else query_start_loc.int()
-        )
-        starts = qsl_i32.index_select(0, requests)
-        ends = qsl_i32.index_select(0, requests + 1)
-        previous_slots = (
-            slot_mapping if slot_mapping.dtype == torch.int32 else slot_mapping.int()
-        ).clamp(min=0) // capacity * capacity + (
-            (positions if positions.dtype == torch.int32 else positions.int()) - 1
-        ) % capacity
-        previous = torch.where(
-            (rows > starts)[:, None],
-            kv_score_f32.index_select(0, (rows - 1).clamp(min=0)),
-            read_cache(cache, previous_slots, layout=state_layout),
-        )
+        if use_tpu_op:
+            prep_op = _get_tpu_op(
+                (
+                    "compress_r2_prep",
+                    kv_score_f32.shape,
+                    positions.shape,
+                    positions.dtype,
+                    cache.shape,
+                    cache.dtype,
+                    slot_mapping.shape,
+                    slot_mapping.dtype,
+                    query_start_loc.shape,
+                    query_start_loc.dtype,
+                    token_to_req_indices.shape,
+                    token_to_req_indices.dtype,
+                    capacity,
+                    state_layout,
+                ),
+                lambda ks, pos, sc, sm, qsl, req: _compress_ratio2_prep_impl(
+                    ks,
+                    pos,
+                    sc,
+                    sm,
+                    qsl,
+                    req,
+                    capacity,
+                    state_layout,
+                ),
+            )
+            previous, publish, valid = prep_op(
+                kv_score_f32,
+                positions,
+                cache,
+                slot_mapping,
+                query_start_loc,
+                token_to_req_indices,
+            )
+        else:
+            previous, publish, valid = _compress_ratio2_prep_impl(
+                kv_score_f32,
+                positions,
+                cache,
+                slot_mapping,
+                query_start_loc,
+                token_to_req_indices,
+                capacity,
+                state_layout,
+            )
         scores = torch.stack((previous[:, dim:], kv_score_f32[:, dim:]), 1)
         pair = torch.stack((previous[:, :dim], values), 1)
         values = (pair * scores.softmax(1)).sum(1)
         # All reads above refer to the old ring. Keep unique physical writes.
-        publish = valid & (rows >= ends - capacity)
-        write_cache(cache, slot_mapping, kv_score_f32, publish, layout=state_layout)
-        valid = valid & (positions % 2 == 1)
+        write_cache(
+            cache,
+            slot_mapping[:count],
+            kv_score_f32,
+            publish,
+            layout=state_layout,
+        )
     elif ratio != 1:
         raise ValueError(f"V4.1 compression ratio must be 1 or 2, got {ratio}")
+    else:
+        result = rms_norm(values, norm_weight, eps)
+        if use_tpu_op:
+            mask_op = _get_tpu_op(
+                (
+                    "compress_r1_mask",
+                    result.shape,
+                    result.dtype,
+                    slot_mapping.shape,
+                    slot_mapping.dtype,
+                    count,
+                ),
+                lambda res, sm: _compress_ratio1_mask_impl(res, sm, count),
+            )
+            _, masked = mask_op(result, slot_mapping)
+            latent.copy_(masked)
+            return
+        _, masked = _compress_ratio1_mask_impl(result, slot_mapping, count)
+        latent.copy_(masked)
+        return
     result = rms_norm(values, norm_weight, eps)
     latent.copy_(result.masked_fill(~valid[:, None], 0))
 
@@ -131,14 +249,38 @@ def write_csa_values(
     )
 
 
-def write_compressed_cache(caches, slots, values, valid, num_states):
-    nope, rope = caches
-    records = row_indices(
+def _compressed_records_impl(
+    slots: torch.Tensor,
+    valid: torch.Tensor,
+    num_states: int,
+    page_stride: int,
+) -> torch.Tensor:
+    return row_indices(
         slots if slots.dtype == torch.int32 else slots.int(),
         num_states,
-        nope.shape[1],
+        page_stride,
         0,
     ).masked_fill(~valid, -1)
+
+
+def write_compressed_cache(caches, slots, values, valid, num_states):
+    nope, rope = caches
+    page_stride = nope.shape[1]
+    if slots.device.type == "tpu" and not torch.compiler.is_compiling():
+        rec_op = _get_tpu_op(
+            (
+                "compressed_records",
+                slots.shape,
+                slots.dtype,
+                valid.shape,
+                num_states,
+                page_stride,
+            ),
+            lambda s, v: _compressed_records_impl(s, v, num_states, page_stride),
+        )
+        records = rec_op(slots, valid)
+    else:
+        records = _compressed_records_impl(slots, valid, num_states, page_stride)
     assert _write_op is not None
     updated_nope, updated_rope = _write_op(nope, rope, records, values)
     nope.copy_(updated_nope)
@@ -198,12 +340,27 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 
         layer = self.fused_wkv_wgate
-        weight = layer.weight.float()
-        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
-            weight = weight.t()
+        raw_weight = layer.weight
+        flipped = bool(getattr(layer, WEIGHT_FLIPPED_ATTR, False))
+        cache_key = (id(raw_weight), raw_weight._version, flipped)
+        cached = getattr(layer, "_project_weight_f32_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            weight = cached[1]
+        else:
+            weight = (
+                raw_weight if raw_weight.dtype == torch.float32 else raw_weight.float()
+            )
+            if not flipped:
+                weight = weight.t()
+            layer._project_weight_f32_cache = (cache_key, weight)
         # Upstream accumulates the unquantized KV/score projection in FP32.
         # Keep that precision through pooling and normalization.
-        return torch.mm(hidden_states.float(), weight)
+        hs_f32 = (
+            hidden_states
+            if hidden_states.dtype == torch.float32
+            else hidden_states.float()
+        )
+        return torch.mm(hs_f32, weight)
 
     def forward(self, kv_score, positions):
         metadata = get_forward_context().attn_metadata
