@@ -1573,8 +1573,8 @@ def streamindex_topk(
                 mixed_only = tuple(p for p in passes if p[0]["case"] == MlaCase.MIXED)
                 scores = jax.lax.cond(
                     distribution[1] > 0,
-                    lambda: scores_for(passes),
-                    lambda: scores_for(mixed_only),
+                    lambda f=scores_for: f(passes),
+                    lambda f=scores_for, p=mixed_only: f(p),
                 )
             else:
                 scores = scores_for(passes)

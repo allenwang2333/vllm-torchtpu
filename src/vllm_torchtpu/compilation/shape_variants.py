@@ -180,10 +180,15 @@ def _input_permutation(
     stored: Sequence[tuple[str, Any]], current: Sequence[tuple[str, Any]]
 ) -> list[int] | None:
     """Where each stored argument sits in ``current``; None unless a reordering."""
-    position = {entry: i for i, entry in enumerate(current)}
-    perm = [position.get(entry) for entry in stored]
-    if len(stored) != len(current) or None in perm:
+    if len(stored) != len(current):
         return None
+    position = {entry: i for i, entry in enumerate(current)}
+    perm: list[int] = []
+    for entry in stored:
+        i = position.get(entry)
+        if i is None:
+            return None
+        perm.append(i)
     return perm
 
 
