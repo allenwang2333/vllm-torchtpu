@@ -619,8 +619,7 @@ class BatchingLSERef(pltpu.BufferedRef):
     wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
     wait_lanes = pl.multiple_of(wait_lanes, 8)
 
-    ref_u32 = lse_hbm.bitcast(jnp.uint32)
-    flat_ref = ref_u32.reshape((-1, 128))
+    flat_ref = lse_hbm.reshape((-1, 128))
     pltpu.make_async_copy(
         flat_ref.at[pl.ds(0, wait_lanes), :],
         flat_ref.at[pl.ds(0, wait_lanes), :],

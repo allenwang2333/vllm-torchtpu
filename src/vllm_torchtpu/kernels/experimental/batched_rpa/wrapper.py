@@ -923,8 +923,8 @@ def ragged_paged_attention(
         num_q_heads_per_kv_head, q_packing
     )
     if serve_cfgs.is_packed_lse:
-      # Even token count: `wait_out` bitcasts the (bf16) LSE to uint32.
-      alloc_tokens = utils.align_to(queries.shape[0], 2)
+      # 8-row alignment: `wait_out` slices 8-sublane tiles of (128,) rows.
+      alloc_tokens = utils.align_to(queries.shape[0], num_sublanes)
       lse_hbm_init = jnp.full(
           [num_kv_heads, alloc_tokens, num_lanes], -jnp.inf, dtype=out_dtype
       )
