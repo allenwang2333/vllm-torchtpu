@@ -13,6 +13,7 @@
 # limitations under the License.
 """Common utilities for GMM kernels."""
 
+import functools
 import re
 
 import jax
@@ -31,13 +32,19 @@ def tpu_kind() -> str:
 # Most TPU devices follow the pattern "TPU v{version}{variant}", e.g. "TPU v5p"
 # TPU v7 has a different pattern (i.e. "TPU7x")
 _TPU_KIND_PATTERN = re.compile(r"TPU( v)?(\d+)")
+_MATCH_TPU_KIND = _TPU_KIND_PATTERN.match
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_tpu_generation(kind: str) -> int:
+    if version := _MATCH_TPU_KIND(kind):
+        return int(version[2])
+    raise NotImplementedError("only TPU devices are supported")
 
 
 def tpu_generation() -> int:
     """Generation number of the currently attached TPU."""
-    if version := _TPU_KIND_PATTERN.match(tpu_kind()):
-        return int(version[2])
-    raise NotImplementedError("only TPU devices are supported")
+    return _parse_tpu_generation(tpu_kind())
 
 
 _GMM_SCALAR_DTYPES = (
@@ -53,8 +60,12 @@ _GMM_SCALAR_DTYPES = (
 _SUPPORTED_GMM_DTYPES = frozenset(
     (*_GMM_SCALAR_DTYPES, *(jnp.dtype(dt) for dt in _GMM_SCALAR_DTYPES))
 )
+_IS_SUPPORTED_DTYPE = _SUPPORTED_GMM_DTYPES.__contains__
 
 
-def assert_is_supported_dtype(dtype: jnp.dtype) -> None:
-    if dtype not in _SUPPORTED_GMM_DTYPES:
+def assert_is_supported_dtype(
+    dtype: jnp.dtype,
+    _is_supported=_IS_SUPPORTED_DTYPE,
+) -> None:
+    if not _is_supported(dtype):
         raise ValueError(f"No support for {dtype=}.")
