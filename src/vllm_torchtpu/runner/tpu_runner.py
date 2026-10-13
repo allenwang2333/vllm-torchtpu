@@ -8551,6 +8551,8 @@ class TPUModelRunner(GPUModelRunner):
                         "Skipping rejection replay and decode/verify warmup "
                         "for prefill-only MTP K1 (TPU_PREFILL_SKIP_VERIFY_WARMUP=1)"
                     )
+                    if self._mtp_enabled:
+                        self._warmup_pcp_mtp_prefill()
                 else:
                     self._precompile_rejection_sampler()
                     self._precompile_spec_logprobs()

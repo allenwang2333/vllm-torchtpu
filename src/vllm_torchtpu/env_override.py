@@ -192,6 +192,15 @@ _LIBTPU_REWRITES = {
         "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
     ),
 }
+if os.environ.get("TPU_SC_REDUCE_SCATTER_OFFLOAD", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    _LIBTPU_REWRITES[
+        "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"
+    ] = "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true"
 _SC_HAR_FLAG = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
 _SC_AR_MIN_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 # Either flag as a whole token, with its value and the whitespace before it.
