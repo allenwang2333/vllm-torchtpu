@@ -29,7 +29,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v41 import attention as deepseek_v41_flash_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.tp_collectives import tp_all_gather, tp_reduce_scatter
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
@@ -179,11 +178,15 @@ class VllmDeepseekV41MLAAttention(
         self._ced_global_from_encoder: bool = False
 
         max_len = vllm_config.model_config.max_model_len
-        cache = self.rotary_emb.cos_sin_cache
-        if envs.TPU_ROPE_CACHE_TRUNCATE and cache.shape[0] > max_len:
-            self.rotary_emb.cos_sin_cache = cache[:max_len].clone(
-                memory_format=torch.contiguous_format
-            )
+        for rope_attr in ("rotary_emb", "indexer_rotary_emb"):
+            rope_mod = getattr(self, rope_attr, None)
+            if rope_mod is None:
+                continue
+            cache: torch.Tensor | None = getattr(rope_mod, "cos_sin_cache", None)
+            if cache is not None and cache.shape[0] > max_len:
+                rope_mod.cos_sin_cache = cache[:max_len].clone(
+                    memory_format=torch.contiguous_format
+                )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

@@ -177,10 +177,11 @@ _libtpu_extra_args: list[str] = []
 if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
     _libtpu_extra_args.append("--xla_tpu_use_dynamic_smem_negotiation=true")
 
-# --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
+# --xla_tpu_sparse_core_{all_reduce,all_gather,reduce_scatter}_offload_min_size_in_bytes:  # noqa: E501
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
-# typical per-layer AR/AG collectives run on TensorCore instead of being
-# offloaded to SparseCore. The chip family is detected from
+# typical per-layer AR/AG/RS collectives run on TensorCore instead of being
+# offloaded to SparseCore, while large prefill collectives (>= VMEM capacity)
+# still overlap on SparseCore. The chip family is detected from
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
@@ -188,6 +189,7 @@ if _sc_offload_bytes is not None:
     for _flag_name in (
         "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+        "--xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes",
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")

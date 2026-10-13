@@ -46,13 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.rotary_embedding import (
-    MRotaryEmbedding,
-    RotaryEmbedding,
-)
-from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
-    MRotaryEmbeddingInterleaved,
-)
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -1174,11 +1168,7 @@ class TPUModelRunner(GPUModelRunner):
         num_eligible = 0
         num_truncated = 0
         for name, module in self.model.named_modules():
-            if type(module) not in (
-                RotaryEmbedding,
-                MRotaryEmbedding,
-                MRotaryEmbeddingInterleaved,
-            ):
+            if not isinstance(module, RotaryEmbeddingBase):
                 continue
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
                 buf = getattr(module, buf_name, None)
@@ -4872,11 +4862,15 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
-        if envs.TPU_ROPE_CACHE_TRUNCATE:
+        is_dsv4 = getattr(self.model_config.hf_config, "model_type", None) in (
+            "deepseek_v4",
+            "deepseek_v41",
+        )
+        if envs.TPU_ROPE_CACHE_TRUNCATE or is_dsv4:
             self._truncate_rope_caches()
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR or is_dsv4:
             runner_utils.relayout_rope_caches(self.model)
-        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR or is_dsv4:
             runner_utils.relayout_hash_tables(self.model)
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and

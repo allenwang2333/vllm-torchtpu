@@ -1140,22 +1140,41 @@ class TpuEngram(nn.Module):
 
         emb = self.embed(hash_ids).flatten(-2)
         key, value = self.wkv(emb).split([self.hc_mult * self.dim, self.dim], dim=-1)
-        key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         weight = (
             self.qk_weight
             if self._qk_weight_ready
             else self.q_weight.float() * self.k_weight.float()
         )
-        h = h_in.float()
-        rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(
-            key.square().mean(-1) + self.eps
-        )
-        dot = (h * weight * key).sum(-1) * rstd * self.inv_sqrt_dim
-        abs_sqrt = dot.abs().clamp_min(self.clamp_value).sqrt()
-        gate = torch.sigmoid(torch.where(dot < 0.0, -abs_sqrt, abs_sqrt))
-        out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
-            hidden_states.dtype
-        )
+        if h_in.shape[0] > 64 and self.dim % 128 == 0:
+            h2d = h_in.reshape(-1, self.hc_mult * self.dim)
+            w2d = weight.reshape(1, self.hc_mult * self.dim)
+            val_f = value.float()
+            outs = []
+            for j in range(self.hc_mult):
+                lo, hi = j * self.dim, (j + 1) * self.dim
+                hj = h2d[:, lo:hi].float()
+                kj = key[:, lo:hi].float()
+                wj = w2d[:, lo:hi]
+                rstd = torch.rsqrt(
+                    hj.square().mean(-1, keepdim=True) + self.eps
+                ) * torch.rsqrt(kj.square().mean(-1, keepdim=True) + self.eps)
+                dot = (hj * wj * kj).sum(-1, keepdim=True) * rstd * self.inv_sqrt_dim
+                abs_sqrt = dot.abs().clamp_min(self.clamp_value).sqrt()
+                gate = torch.sigmoid(torch.where(dot < 0.0, -abs_sqrt, abs_sqrt))
+                outs.append((hj + gate * val_f).to(hidden_states.dtype))
+            out = torch.cat(outs, dim=-1).view(h_in.shape)
+        else:
+            key = key.float().unflatten(-1, (self.hc_mult, self.dim))
+            h = h_in.float()
+            rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(
+                key.square().mean(-1) + self.eps
+            )
+            dot = (h * weight * key).sum(-1) * rstd * self.inv_sqrt_dim
+            abs_sqrt = dot.abs().clamp_min(self.clamp_value).sqrt()
+            gate = torch.sigmoid(torch.where(dot < 0.0, -abs_sqrt, abs_sqrt))
+            out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
+                hidden_states.dtype
+            )
         if sharded:
             out = tp_all_gather(out, dim=0)
         return out

@@ -306,7 +306,7 @@ class TestTpuCompilerCache:
                 else [
                     f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes="
                     f"{expected_threshold}"
-                    for op in ("all_reduce", "all_gather")
+                    for op in ("all_reduce", "all_gather", "reduce_scatter")
                 ]
             )
             assert self._sc_offload_flags() == expected
