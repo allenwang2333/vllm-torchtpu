@@ -43,6 +43,25 @@ DEFAULT_PACKED_CHUNK_TOKENS = 16
 # topk_cap, chosen per grid step by the step's max kv_len (the topk_cap body,
 # fix-up included, is the last one).
 PREFILL_ROW_BUCKETS = (192, 256)
+# Live-prefix gather (`prefill_live_gather`, on top of `prefill_row_bucket`):
+# full prefill chunks gather, per token, only the first rows of window 0 that
+# the chunk's largest row bucket reads; tokens per SparseCore owner batch.
+LIVE_GATHER_TOKENS_PER_BATCH = 8
+
+
+def prefill_row_buckets(topk_cap: int) -> tuple[int, ...]:
+    """The bucketed mode's static row bodies: `PREFILL_ROW_BUCKETS` below
+    `topk_cap`, then `topk_cap` (fix-up included)."""
+    return tuple(b for b in PREFILL_ROW_BUCKETS if b < topk_cap) + (topk_cap,)
+
+
+def live_prefix_atoms(max_kv: jax.Array, topk_cap: int) -> jax.Array:
+    """Atoms (64 rows) of window 0 the row buckets need for a max kv_len."""
+    buckets = prefill_row_buckets(topk_cap)
+    atoms = jnp.int32(buckets[-1] // GATHER_ATOM_ROWS)
+    for b in reversed(buckets[:-1]):
+        atoms = jnp.where(max_kv <= b, jnp.int32(b // GATHER_ATOM_ROWS), atoms)
+    return atoms
 
 
 def cdiv(a, b):
@@ -188,6 +207,7 @@ def _capped_window_indices_kernel(
     page_size: int,
     pages_per_seq: int,
     total_num_pages: int,
+    col_block: int | None = None,
 ):
     """Translates logical top-k slots to physical memory rows for one tile.
 
@@ -199,7 +219,7 @@ def _capped_window_indices_kernel(
     w = pl.program_id(0)
     c = pl.program_id(1)
     tb = pl.program_id(2)
-    idx = topk_ref[...]
+    idx = topk_ref[...]  # [block_tokens, col_block or topk_cap]
     is_padding = idx == -1
 
     # 1. Translate logical index -> (logical sequence page, token offset within page).
@@ -228,6 +248,9 @@ def _capped_window_indices_kernel(
         + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
     )
     col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+    if col_block is not None:
+        # Live-column mode: this tile is columns [cb * col_block, ...) only.
+        col = col + pl.program_id(3) * col_block
     flat_element_index = row * topk + col
 
     _, scattered_page = _floor_divmod_const(
@@ -254,6 +277,8 @@ def prepare_capped_window_indices(
     page_size: int,
     total_num_pages: int,
     block_tokens: int | None = None,
+    live_col_blocks: jax.Array | None = None,
+    col_block: int = 128,
 ) -> jax.Array:
     """Launches the TPU kernel to translate logical slots to physical rows.
 
@@ -273,6 +298,11 @@ def prepare_capped_window_indices(
         page_size: Tokens per physical page (e.g. 256).
         total_num_pages: Total physical cache pages allocated.
         block_tokens: Token sub-tile size inside each chunk (e.g. 16 or 32).
+        live_col_blocks: Optional i32[] in [1, topk_cap // col_block]: translate
+          only the first `live_col_blocks * col_block` columns of every
+          translated window (the live-prefix gather reads no further); later
+          columns are left unwritten. None translates whole windows.
+        col_block: Column tile of the live-column mode (multiple of 128).
 
     Returns:
         Array of shape [num_chunks * num_windows * chunk_size, topk_cap]
@@ -324,6 +354,55 @@ def prepare_capped_window_indices(
         pages_per_seq=pages_per_seq,
         total_num_pages=total_num_pages,
     )
+    if live_col_blocks is not None:
+        if topk_cap % col_block or col_block % 128:
+            raise ValueError(f"col_block {col_block} must tile topk_cap {topk_cap}")
+        num_col_blocks = topk_cap // col_block
+
+        def col_kernel(lw_ref, lc_ref, *refs):
+            del lc_ref
+            return kernel(lw_ref, *refs, col_block=col_block)
+
+        return pl.pallas_call(
+            col_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[
+                    pl.BlockSpec(
+                        (block_tokens, padded_pps),
+                        lambda w, c, tb, cb, lw, lc: (c * blocks_per_chunk + tb, 0),
+                    ),
+                    pl.BlockSpec(
+                        (block_tokens, col_block),
+                        lambda w, c, tb, cb, lw, lc: (
+                            c * blocks_per_chunk + tb,
+                            w * num_col_blocks + cb,
+                        ),
+                    ),
+                ],
+                out_specs=pl.BlockSpec(
+                    (block_tokens, col_block),
+                    lambda w, c, tb, cb, lw, lc: (
+                        (c * num_windows + w) * blocks_per_chunk + tb,
+                        cb,
+                    ),
+                ),
+                grid=(live_windows, num_chunks, blocks_per_chunk, live_col_blocks),
+            ),
+            out_shape=jax.ShapeDtypeStruct(
+                (num_chunks * num_windows * chunk_size, topk_cap), jnp.int32
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",) * 4,
+                disable_bounds_checks=True,
+            ),
+            name="capped_window_indices_live_cols",
+        )(
+            jnp.reshape(live_windows, (1,)).astype(jnp.int32),
+            jnp.reshape(live_col_blocks, (1,)).astype(jnp.int32),
+            windows,
+            topk_indices,
+        )
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -556,7 +635,7 @@ def _attention_kernel(
     row_buckets = (bkv_sz,)
     if step_max_ref is not None:
         assert prefill_row_bucket and capped_windows is not None
-        row_buckets = tuple(b for b in PREFILL_ROW_BUCKETS if b < bkv_sz) + (bkv_sz,)
+        row_buckets = prefill_row_buckets(bkv_sz)
         for b in row_buckets:
             assert b % (8 * native_sc_gather.ROPE_PACKING) == 0, b
 
@@ -1433,6 +1512,7 @@ def prepare_outputs(
         "capped_window_prep",
         "lse_lane_dense",
         "prefill_row_bucket",
+        "prefill_live_gather",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1473,6 +1553,7 @@ def sparse_ragged_paged_attention(
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     prefill_row_bucket: bool = False,
+    prefill_live_gather: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1567,6 +1648,15 @@ def sparse_ragged_paged_attention(
         one `pl.when` body per bucket); the overflow fix-up is checked once
         per step; and the pipelining loop drops its artificial prev_out -> q
         dependency. Same outputs and lse. Decode-sized chunks are untouched.
+      prefill_live_gather: Only where `prefill_row_bucket` takes effect (and
+        `topk_cap` is a multiple of 128): each chunk's SparseCore gather moves
+        only the first 64 * n_c rows of window 0 per live token, n_c = (the
+        row bucket of the chunk's max live kv_len) / 64, in place in the same
+        window-major buffers; the attention kernel reads no row past its
+        step's bucket, which never exceeds the chunk's. A chunk with a token
+        past `topk_cap` gathers as before. The index prep translates only the
+        live 128-column blocks of window 0 (all columns when any token
+        overflows). Same outputs and lse.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1689,6 +1779,13 @@ def sparse_ragged_paged_attention(
         and uniform_chunk == gather_and_attention_chunk_size
         and uniform_chunk > small_chunk_tokens
     )
+    prefill_live_gather = (
+        prefill_live_gather
+        and prefill_row_bucket
+        and topk_cap is not None
+        and topk_cap % 128 == 0
+        and uniform_chunk % LIVE_GATHER_TOKENS_PER_BATCH == 0
+    )
     window_indices_all = None
     step_max_all = None
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
@@ -1711,6 +1808,19 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             num_windows=topk // topk_cap,
         )
+        live_col_blocks = None
+        if prefill_live_gather:
+            # Columns of window 0 any chunk's live-prefix gather can read
+            # (every column of every window once a token overflows).
+            step_max_all = jnp.max(
+                kv_lens.astype(jnp.int32).reshape(-1, prep_batch), axis=1
+            )
+            call_atoms = live_prefix_atoms(jnp.max(step_max_all), topk_cap)
+            live_col_blocks = jnp.where(
+                live_windows > 1,
+                topk_cap // 128,
+                (call_atoms * GATHER_ATOM_ROWS + 127) // 128,
+            )
         window_indices_all = prepare_capped_window_indices(
             topk_indices,
             page_indices,
@@ -1720,8 +1830,9 @@ def sparse_ragged_paged_attention(
             topk_cap=topk_cap,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            live_col_blocks=live_col_blocks,
         )
-        if prefill_row_bucket:
+        if prefill_row_bucket and step_max_all is None:
             # Per-call (hoisted out of the chunk loop): each grid step's max
             # kv_len, the bucket selector of every chunk's kernel.
             step_max_all = jnp.max(
@@ -1823,6 +1934,7 @@ def sparse_ragged_paged_attention(
             lse_lane_dense=lse_lane_dense,
             prefill_row_bucket=prefill_row_bucket,
             step_max=step_max_all,
+            prefill_live_gather=prefill_live_gather,
         )
         if return_lse:
             q, lse = result
@@ -1929,6 +2041,7 @@ def sparse_attention_chunk(
     lse_lane_dense: bool = False,
     prefill_row_bucket: bool = False,
     step_max: jax.Array | None = None,
+    prefill_live_gather: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1955,6 +2068,9 @@ def sparse_attention_chunk(
     (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
     joins them in VMEM and the output (aliasing `q`) is `nope` wide.
     `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
+    `prefill_live_gather` (with `topk_cap` and `step_max`): gather only the
+    live prefix of window 0 the chunk's largest row bucket reads (see
+    `sparse_ragged_paged_attention`).
     """
     return_lse = lse is not None
     if topk_override is not None:
@@ -2257,19 +2373,53 @@ def sparse_attention_chunk(
                 .transpose(1, 0, 2)
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
-        gathered_nope_buffer, gathered_rope_buffer = (
-            native_sc_gather.dsa_gather_native_sc(
-                cache_kv_nope,
-                cache_kv_rope,
-                window_indices,
-                out_size=chunk_size * topk,
-                atoms_per_batch=gather_atoms,
-                wait_mode=sparsecore_gather_wait_mode,
-                serve_pipelined=sparsecore_gather_pipelined,
-                num_live_indices=num_live_capped,
-                live_multiple=kernel_batch_size * topk_cap,
+        if prefill_live_gather:
+            assert step_max is not None and sparsecore_gather_wait_mode == (
+                "overlap_rope"
             )
-        )
+            # Window-0 atoms the chunk's largest row bucket reads (the TC
+            # kernel's per-step bucket is never larger); 0 = a token overflows
+            # `topk_cap`, so every live window is gathered as before.
+            chunk_max = jnp.max(
+                jnp.where(
+                    jnp.arange(chunk_size) < live_tokens,
+                    kv_lens[start_pos:end_pos].astype(jnp.int32),
+                    0,
+                )
+            )
+            n_c = jnp.where(
+                live_windows > 1, 0, live_prefix_atoms(chunk_max, topk_cap)
+            )
+            gathered_nope_buffer, gathered_rope_buffer = (
+                native_sc_gather.dsa_gather_native_sc_live_prefix(
+                    cache_kv_nope,
+                    cache_kv_rope,
+                    window_indices,
+                    n_c,
+                    jnp.maximum(0, live_tokens),
+                    num_live_capped,
+                    chunk_size=chunk_size,
+                    prefix_atoms=tuple(
+                        b // GATHER_ATOM_ROWS for b in prefill_row_buckets(topk_cap)
+                    ),
+                    tokens_per_batch=LIVE_GATHER_TOKENS_PER_BATCH,
+                    full_atoms_per_batch=gather_atoms,
+                )
+            )
+        else:
+            gathered_nope_buffer, gathered_rope_buffer = (
+                native_sc_gather.dsa_gather_native_sc(
+                    cache_kv_nope,
+                    cache_kv_rope,
+                    window_indices,
+                    out_size=chunk_size * topk,
+                    atoms_per_batch=gather_atoms,
+                    wait_mode=sparsecore_gather_wait_mode,
+                    serve_pipelined=sparsecore_gather_pipelined,
+                    num_live_indices=num_live_capped,
+                    live_multiple=kernel_batch_size * topk_cap,
+                )
+            )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             capped_windows * chunk_size, topk_cap, 128
         )

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_PREFILL_ROW_BUCKET: bool = False
+    TPU_DCP_MLA_LIVE_GATHER: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
@@ -457,6 +458,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_PREFILL_ROW_BUCKET": env_bool(
         "TPU_DCP_MLA_PREFILL_ROW_BUCKET", default=False
     ),
+    # With TPU_DCP_MLA_PREFILL_ROW_BUCKET (ignored without it): each full
+    # prefill chunk's SparseCore gather moves only the first rows of window 0
+    # its largest row bucket reads (192/256/topk_cap per token), in place,
+    # and the index prep translates only those columns. Same outputs and lse.
+    # Off by default.
+    "TPU_DCP_MLA_LIVE_GATHER": env_bool("TPU_DCP_MLA_LIVE_GATHER", default=False),
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest backbone step (tokens) that uses it; above this, the

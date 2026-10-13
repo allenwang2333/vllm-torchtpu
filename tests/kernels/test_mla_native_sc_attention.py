@@ -24,6 +24,7 @@ from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 
 pytestmark = pytest.mark.tpu_test
 
@@ -1293,7 +1294,8 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         q_nope = problem["q"][..., :NOPE_DIM]
         q_pe = problem["q"][..., NOPE_DIM:]
 
-        def run(topk_in, flag, fn=None):
+        def run(topk_in, flag, fn=None, live=False):
+            extra = {"prefill_live_gather": True} if live else {}
             out, lse = (fn or sparse_mla.sparse_ragged_paged_attention)(
                 q_nope,
                 problem["sparsecore_nope"],
@@ -1312,6 +1314,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 q_pe=q_pe,
                 small_chunk_batch_size=4,
                 prefill_row_bucket=flag,
+                **extra,
             )
             return out, jnp.where(owns[:, None], lse, -jnp.inf)
 
@@ -1437,6 +1440,140 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             str(jax.make_jaxpr(lambda: run(topk_idx, True))()),
             str(jax.make_jaxpr(lambda: run(topk_idx, False))()),
         )
+
+    @parameterized.parameters(
+        "uniform_128",
+        "uniform_192",
+        "uniform_193",
+        "uniform_256",
+        "uniform_257",
+        "uniform_512",
+        "uniform_513",
+        "mixed",
+        "overflow",
+        "dead_chunk",
+        "mixed_decode",
+        "pool",
+    )
+    def test_prefill_live_gather_bit_identical(self, case):
+        """TPU_DCP_MLA_LIVE_GATHER on == off (row buckets on), bit for bit.
+
+        The SparseCore gathers only the window-0 rows the chunk's largest row
+        bucket reads (all live windows when a row overflows), so every real
+        row's output and lse must equal the row-bucket kernel's.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261013)
+        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
+            self._row_bucket_case(case, rng)
+        )
+        real_tokens = int(cu_q_lens[-1])
+        run = self._row_bucket_run(problem, page_table, cu_q_lens, distribution, owns)
+        self.assertNotEqual(
+            str(jax.make_jaxpr(lambda: run(topk_idx, True, live=True))()),
+            str(jax.make_jaxpr(lambda: run(topk_idx, True))()),
+        )
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx, True), run(topk_idx, True, live=True))
+        )
+        np.testing.assert_array_equal(bits(out)[:real_tokens], bits(ref)[:real_tokens])
+        np.testing.assert_array_equal(
+            np.asarray(lse)[:real_tokens], np.asarray(ref_lse)[:real_tokens]
+        )
+        self.assertTrue(np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all())
+
+    def test_prefill_live_gather_needs_row_bucket_and_spares_decode(self):
+        """Without row buckets, and on decode buckets, the flag traces nothing."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261013)
+        for case in ("prefill", "decode"):
+            if case == "prefill":
+                problem, topk_idx, owns, _, page_table, cu_q_lens, distribution = (
+                    self._row_bucket_case("uniform_193", rng)
+                )
+                flag = False
+            else:
+                problem, topk_idx, owns, _, page_table, cu_q_lens, distribution = (
+                    self._split_q_lse_case(16, (4, 4), rng)
+                )
+                flag = True
+            run = self._row_bucket_run(
+                problem, page_table, cu_q_lens, distribution, owns
+            )
+            self.assertEqual(
+                str(jax.make_jaxpr(lambda: run(topk_idx, flag, live=True))()),
+                str(jax.make_jaxpr(lambda: run(topk_idx, flag))()),
+                case,
+            )
+
+    @parameterized.parameters(
+        (3, 256, 0),
+        (3, 48, 0),
+        (4, 256, 0),
+        (8, 256, 0),
+        (3, 0, 0),
+        (0, 256, 2),
+        (0, 256, 4),
+    )
+    def test_live_prefix_gather_matches_native_gather(
+        self, n_c, live_tokens, live_windows
+    ):
+        """Live-prefix rows == `dsa_gather_native_sc` rows.
+
+        n_c > 0: window 0's first `64 * n_c` rows of the first `live_tokens`
+        tokens; n_c = 0 (overflow fallback): every row of the live windows.
+        (That nothing else is written is checked with poison-seeded outputs in
+        the kernel_work FP-1 probe, which cannot be done through
+        `core_map_helper.kernel` here.)
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore gather requires a TPU")
+        rng = np.random.default_rng(7)
+        chunk, windows, cap = 256, 4, 512
+        problem = _build_problem(rng, k_scale=1.0, query_tokens=chunk, topk=2048)
+        nope = problem["sparsecore_nope"]
+        rope = problem["sparsecore_rope"]
+        rows = nope.shape[0] * nope.shape[1]
+        idx = jnp.asarray(
+            rng.integers(0, rows, (windows * chunk, cap)).astype(np.int32)
+        )
+        num_live_full = (max(live_windows, 1) - 1) * chunk * cap + live_tokens * cap
+        ref_n, ref_r = native_sc_gather.dsa_gather_native_sc(
+            nope,
+            rope,
+            idx,
+            out_size=windows * chunk * cap,
+            atoms_per_batch=16,
+            num_live_indices=jnp.int32(num_live_full),
+            live_multiple=16 * cap,
+        )
+        out_n, out_r = native_sc_gather.dsa_gather_native_sc_live_prefix(
+            nope,
+            rope,
+            idx,
+            jnp.int32(n_c),
+            jnp.int32(live_tokens),
+            jnp.int32(num_live_full),
+            chunk_size=chunk,
+            prefix_atoms=(3, 4, 8),
+        )
+        ref_n = np.asarray(ref_n).reshape(windows * chunk, cap, 128)
+        out_n = np.asarray(out_n).reshape(windows * chunk, cap, 128)
+        ref_r = np.asarray(ref_r).reshape(windows * chunk, cap // 4, 128)
+        out_r = np.asarray(out_r).reshape(windows * chunk, cap // 4, 128)
+        if n_c:
+            sel_n = np.s_[:live_tokens, : 64 * n_c]
+            sel_r = np.s_[:live_tokens, : 16 * n_c]
+        else:
+            sel_n = sel_r = np.s_[: (live_windows - 1) * chunk + live_tokens]
+        np.testing.assert_array_equal(out_n[sel_n], ref_n[sel_n])
+        np.testing.assert_array_equal(out_r[sel_r], ref_r[sel_r])
 
     @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
     def test_split_q_lse_bit_identical_tensorcore(self, query_tokens, seq_q):

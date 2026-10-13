@@ -1223,6 +1223,9 @@ def sparse_mla_attention_dcp(
             # Full prefill chunks of the capped path: per-step live-row
             # buckets (opt-in; the kernel ignores it elsewhere).
             prefill_row_bucket=envs.TPU_DCP_MLA_PREFILL_ROW_BUCKET,
+            # ... and with it, gather only each chunk's live window-0 prefix
+            # (opt-in; needs the row buckets).
+            prefill_live_gather=envs.TPU_DCP_MLA_LIVE_GATHER,
             **chunk_kwargs,
             **split_kwargs,
         )
