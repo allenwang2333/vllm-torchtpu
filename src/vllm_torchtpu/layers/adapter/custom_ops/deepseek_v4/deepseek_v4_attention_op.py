@@ -253,9 +253,10 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        # Measured on tpu7x: smaller gather chunks pay off up to 128
-        # tokens per step and cost beyond that; batches of 8 win throughout.
-        gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 128,
+        # Measured on tpu7x: 32-token gather chunks up to 128 tokens per step,
+        # 64 above (each chunk's SparseCore gather overlaps the previous
+        # chunk's attention); batches of 8 win throughout.
+        gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 64,
         attention_kernel_batch_size=8,
     )
     return output, updated_sw_cache
