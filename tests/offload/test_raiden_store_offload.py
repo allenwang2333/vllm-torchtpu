@@ -995,6 +995,8 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched.config = SimpleNamespace(num_workers=num_workers)
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        sched._window_checkpoints = None
+        sched._admitted_window_keys = {}
         return sched
 
     def _stock_meta(self, store_jobs=None, load_jobs=None, jobs_to_flush=None):

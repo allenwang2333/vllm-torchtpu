@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     TPU_PREFILL_GATE_LOG_STEPS: int = 1000
     TPU_SCHED_UNCHARGED_DRAFT_SLOTS: bool = False
     TPU_SRPT_COUNT_EXTERNAL_HIT: bool = False
+    TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL: int | None = None
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -637,6 +638,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SrptPrefillScheduler: rank waiting prompts net of the KV connector's hit
     # too (asked once per waiting request), not only the local prefix cache's.
     "TPU_SRPT_COUNT_EXTERNAL_HIT": env_bool("TPU_SRPT_COUNT_EXTERNAL_HIT"),
+    # TPURaidenOffloadingConnector: offload a sliding-window / state group's
+    # chunks only where a later hit can end on them -- the request's replay
+    # boundary, plus every N tokens when N > 0 (a multiple of the
+    # full-attention chunk). Unset keeps vLLM's choice, which re-stores a
+    # group's trailing window at nearly every prefill step. Each stored chunk
+    # costs a whole host block whatever its group, so that window state
+    # crowds full-attention chunks out of the host pool.
+    "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL": env_optional_int(
+        "TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL"
+    ),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
