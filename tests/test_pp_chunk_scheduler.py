@@ -58,6 +58,7 @@ def _scheduler(
     scheduler._step_prefill_tokens = 0
     scheduler._step_schedule = 0
     scheduler._seeded = set()
+    scheduler._inflight_ms = []
     scheduler._clips = 0
     scheduler._waits = 0
     return scheduler
@@ -266,6 +267,45 @@ def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
         assert scheduler._step_limit == 8192
 
 
+def test_the_step_limit_costs_the_spreads_against_the_steps_in_flight():
+    model = _model()
+    full = model.step_ms(16384, 0.0, float(16384**2))
+    # A lone 8K prompt on 4 idle stages leaves soonest as two 4K steps.
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+        assert scheduler._step_limit == 4096
+        # Behind a full step the next three steps last a full step
+        # whatever enters, so one 8K step gets the prompt out a step earlier.
+        scheduler._inflight_ms = [full]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # A full step that leaves the pipeline this step no longer counts.
+        scheduler._inflight_ms = [0.0, 0.0, full]
+        scheduler.schedule()
+        assert scheduler._step_limit == 4096
+
+
+def test_schedule_keeps_the_last_stage_count_minus_one_step_estimates():
+    model = _model()
+    scheduler = _scheduler(cost=model)
+    scheduler._pp_size = 4
+    scheduler.requests = {"a": _request(4096, 32768, "a")}
+    step = SimpleNamespace(
+        num_scheduled_tokens={"a": 4096}, total_num_scheduled_tokens=4096
+    )
+    estimate = model.step_ms(4096, 0.0, float(4096**2))
+    with patch.object(Scheduler, "schedule", return_value=step):
+        for _ in range(5):
+            scheduler.schedule()
+    assert scheduler._inflight_ms == [estimate] * 3
+    # An empty step launches nothing and leaves the pipeline as it was.
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._inflight_ms == [estimate] * 3
+
+
 def test_schedule_resets_the_step_accounting():
     scheduler = _scheduler(cost=_model())
     scheduler._step_tokens = 5
@@ -273,8 +313,8 @@ def test_schedule_resets_the_step_accounting():
     scheduler._step_squares = 9.0
     scheduler._step_prefill_tokens = 5
     scheduler._seeded = {"x"}
-    with patch.object(Scheduler, "schedule", return_value="out") as schedule:
-        assert scheduler.schedule(throttle_prefills=True) == "out"
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP) as schedule:
+        assert scheduler.schedule(throttle_prefills=True) is _EMPTY_STEP
     schedule.assert_called_once_with(True)
     assert scheduler._step_tokens == 0 and scheduler._step_pairs == 0.0
     assert scheduler._step_squares == 0.0

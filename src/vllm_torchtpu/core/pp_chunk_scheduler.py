@@ -61,6 +61,9 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_prefill_tokens = 0
         self._step_schedule = 0
         self._seeded: set[str] = set()
+        # Modelled time of the steps still in the pipeline, newest first:
+        # a step launched k steps ago runs for pp_size - k more steps.
+        self._inflight_ms: list[float] = []
         self._clips = 0
         self._waits = 0
         logger.info("Pipeline chunk scheduler: waiting for the step cost model")
@@ -92,7 +95,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
-        return super().schedule(throttle_prefills)
+        output = super().schedule(throttle_prefills)
+        if self._cost is not None and output.total_num_scheduled_tokens > 0:
+            estimate = self.step_estimate_ms(output)
+            assert estimate is not None
+            self._inflight_ms = [estimate, *self._inflight_ms][: self._pp_size - 1]
+        return output
 
     def step_estimate_ms(self, scheduler_output: Any) -> float | None:
         """Modelled time on one stage of the step the last ``schedule``
@@ -116,9 +124,12 @@ class TpuPipelineChunkScheduler(Scheduler):
         spread over up to as many steps as the pipeline has stages, rounded
         up to a granule, at most a full step. Of those spreads the one that
         gets the work through the pipeline soonest is taken: a step of half
-        the tokens that takes as long as the whole one only adds steps.
-        None until the cost model is installed or when no prefill work is
-        pending."""
+        the tokens that takes as long as the whole one only adds steps. The
+        stages advance in lockstep, so while a larger step is still in the
+        pipeline every step lasts at least as long as it does and a smaller
+        one finishes no sooner; the spreads are costed against the steps in
+        flight. None until the cost model is installed or when no prefill
+        work is pending."""
         if self._cost is None:
             return None
         pending = 0
@@ -139,7 +150,11 @@ class TpuPipelineChunkScheduler(Scheduler):
             # The last of the work leaves the pipeline a stage count minus
             # one steps after its step enters.
             steps = -(-pending // share) + self._pp_size - 1
-            done_ms = steps * self._cost.step_ms(bucket, 0.0, float(share) * share)
+            step_ms = self._cost.step_ms(bucket, 0.0, float(share) * share)
+            done_ms = 0.0
+            for step in range(steps):
+                live = self._inflight_ms[: self._pp_size - 1 - step]
+                done_ms += max(step_ms, *live) if live else step_ms
             if done_ms < soonest:
                 limit, soonest = share, done_ms
         return limit
