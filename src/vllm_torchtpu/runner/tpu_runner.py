@@ -564,6 +564,33 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+def _rope_cache_row_major(runner: Any) -> bool:
+    """``TPU_ROPE_CACHE_ROW_MAJOR`` as it applies to ``runner``'s model.
+
+    The default steps aside for a multimodal model, as TPU_ROPE_CACHE_TRUNCATE
+    does: the relayout pins entry layouts by (dtype, shape), and a vision
+    encoder's graphs can take a default-layout activation of the same shape
+    as its rope cache (Qwen2.5-VL's budget-padded rotary rows,
+    bf16[8192, 40]), which then fails with RuntimeProgramInputMismatch. An
+    explicit setting still applies.
+    """
+    if not envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        return False
+    if envs.is_set("TPU_ROPE_CACHE_ROW_MAJOR"):
+        return True
+    model_config = runner.model_config
+    multimodal_config = model_config.multimodal_config
+    if model_config.is_multimodal_model and not (
+        multimodal_config is not None and multimodal_config.language_model_only
+    ):
+        logger.info_once(
+            "TPU_ROPE_CACHE_ROW_MAJOR default skipped for a multimodal model; "
+            "set it explicitly to relayout the rope caches anyway."
+        )
+        return False
+    return True
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -1258,7 +1285,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         if model is None:
             return
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        if _rope_cache_row_major(self):
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
@@ -5037,7 +5064,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_topk_buffer.fill_(-1)
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        if _rope_cache_row_major(self):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)

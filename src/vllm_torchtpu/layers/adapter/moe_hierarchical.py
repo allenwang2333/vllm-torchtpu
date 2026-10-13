@@ -43,10 +43,10 @@ def ep_tp_size() -> int:
         return envs.TPU_MOE_EP_TP_SIZE
     global _default_ep_tp
     if _default_ep_tp is None:
-        from vllm.config import get_current_vllm_config
+        from vllm.config import get_current_vllm_config_or_none
 
-        config = get_current_vllm_config()
-        if config.model_config is None:
+        config = get_current_vllm_config_or_none()
+        if config is None or config.model_config is None:
             return 1  # no model yet; decide when there is one
         _default_ep_tp = _default_ep_tp_for(config)
     return _default_ep_tp

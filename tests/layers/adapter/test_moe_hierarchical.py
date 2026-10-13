@@ -416,6 +416,10 @@ def test_ep_tp_patch_is_inert_when_off(monkeypatch) -> None:
     from vllm_torchtpu.layers.adapter import moe_hierarchical
 
     monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 1)
+    # Start unpatched: an earlier test may have installed the real patch.
+    monkeypatch.setattr(
+        FusedMoEParallelConfig, "_tpu_ep_tp_split_patch", False, raising=False
+    )
     original = FusedMoEParallelConfig.make
     moe_hierarchical.install_ep_tp_split_patch()
     assert FusedMoEParallelConfig.make is original
@@ -554,12 +558,14 @@ def test_ep_tp_size_explicit_wins_and_default_is_decided_once(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_EP_TP_SIZE", 4)
     no_model = _vllm_config()
     no_model.model_config = None
-    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: no_model)
+    monkeypatch.setattr(
+        vllm_config, "get_current_vllm_config_or_none", lambda: no_model
+    )
     assert moe_hierarchical.ep_tp_size() == 1  # undecided: no model yet
-    monkeypatch.setattr(vllm_config, "get_current_vllm_config", _vllm_config)
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config_or_none", _vllm_config)
     assert moe_hierarchical.ep_tp_size() == 4
     flat = _vllm_config(ep=False)
-    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: flat)
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config_or_none", lambda: flat)
     assert moe_hierarchical.ep_tp_size() == 4  # decided at the first FusedMoE
 
 
