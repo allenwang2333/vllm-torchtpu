@@ -7,6 +7,8 @@ gate builds its expected tag list from them. The values are frozen; changing
 one is a coupled two-repo protocol change, not a refactor.
 """
 
+import functools
+
 TAG_FA = "fa"
 TAG_GDN_CONV = "gdn.conv"
 TAG_GDN_SSM = "gdn.ssm"
@@ -30,6 +32,7 @@ TAG_DSV4_STATE_IDX = "dsv4.state.idx"
 TAG_DSV4_STATE_HCA = "dsv4.state.hca"
 
 
+@functools.cache
 def dsv4_group_tag(base_tag: str, group_index: int) -> str:
     """``dsv4.swa`` + group 3 -> ``dsv4.swa.g3``."""
     return f"{base_tag}.g{int(group_index)}"
@@ -42,6 +45,7 @@ def dsv4_group_tag(base_tag: str, group_index: int) -> str:
 _LAYER_SUFFIX = ".l"
 
 
+@functools.cache
 def layer_tag(tag: str, layer_index: int) -> str:
     """Tag of one layer's pool under the per-layer tagging policy."""
     if layer_index < 0:
@@ -49,6 +53,7 @@ def layer_tag(tag: str, layer_index: int) -> str:
     return f"{tag}{_LAYER_SUFFIX}{layer_index}"
 
 
+@functools.cache
 def split_layer_tag(tag: str) -> tuple[str, int | None]:
     """(class tag, layer index) of a tag; the index is None when absent."""
     head, sep, tail = tag.rpartition(_LAYER_SUFFIX)
@@ -57,6 +62,10 @@ def split_layer_tag(tag: str) -> tuple[str, int | None]:
     return tag, None
 
 
+@functools.cache
 def class_tag(tag: str) -> str:
     """The tag with any per-layer suffix removed."""
-    return split_layer_tag(tag)[0]
+    head, sep, tail = tag.rpartition(_LAYER_SUFFIX)
+    if sep and tail.isdigit():
+        return head
+    return tag
