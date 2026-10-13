@@ -6,11 +6,10 @@ k-ascending summation order and the same ``plsc.pack`` rounding), so the output
 is bit-identical to v5 (and to v4 / v2 followed by its cast).
 
 v5 drives each tile through ``pltpu.emit_pipeline`` over a dynamic
-``(col_chunks, groups)`` grid. Every grid step pays the pipeline's scheduling:
-next/previous grid indices over a dynamic grid, the index map evaluated again
-for the prefetch and for the wait (each a group-word vector load and lane
-extract plus the 16-entry gather-index load), and the output block's
-changed/unchanged tests and predicated copies.
+``(col_chunks, groups)`` grid with one gather in flight. Measured on the
+SparseCore (2x2x1, GLM-5.2 shapes), each step costs ~0.30 us beyond its bytes,
+of which the pipeline's scheduling is only ~0.04 us; the rest is the latency of
+the step's 16-row indirect gather, exposed whenever compute does not cover it.
 
 v6 runs the same steps as two plain loops per tile -- ``fori_loop`` over column
 chunks, ``fori_loop`` over the tile's groups -- with a manually multi-buffered
@@ -47,7 +46,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v5 import (
 )
 
 # Gather ring depth: 3 slots (2 gathers in flight while a group computes) beat
-# v5's 2-deep pipeline by ~15 us at c8k; 4 slots no longer fit 1024 columns.
+# 2 slots by ~14 us per c8k call; 4 slots no longer fit 1024 columns.
 _NSLOTS = 3
 # Per-subcore VMEM for the output block (2 slots) and the gather ring, in 32-bit
 # words (the subcore has 128 Ki words; the route lists take ~1 Ki).
@@ -59,6 +58,7 @@ def pick_col_chunk(hidden: int, tile_tokens: int, nslots: int = _NSLOTS) -> int:
     want = _VMEM_WORDS // (tile_tokens + nslots * _LANES)
     want = max(128, min(2048, want // 128 * 128))
     return _col_chunk(hidden, want)
+
 
 __all__ = ["ragged_gather_reduce_v6", "supported", "pick_tile_tokens"]
 
