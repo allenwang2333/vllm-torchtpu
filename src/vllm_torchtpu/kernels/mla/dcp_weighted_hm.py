@@ -41,25 +41,27 @@ def _kernel(o_ref, w_ref, out_ref, *, heads: int, order=None):
         w = w_all[:, j : j + 1]  # f32[bt, 1]
         x = o_ref[:, j, :].astype(jnp.float32) * w
         # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        # A bf16 out_ref (TPU_DCP_MERGE_RS_BF16) rounds the same f32 value
+        # once, as the torch merge's `weighted.to(bfloat16)` does.
         out_ref[j if order is None else order[j]] = jnp.where(
             w > 0, x, jnp.zeros_like(x)
-        )
+        ).astype(out_ref.dtype)
 
 
 # Bytes of one grid step's input (bf16) plus output (f32) block.
 _STEP_BYTES = 6 << 20
 
 
-def _row_block(tokens: int, heads: int, dim: int) -> int:
+def _row_block(tokens: int, heads: int, dim: int, min_rows: int = 8) -> int:
     for bt in (256, 128, 64, 32, 16, 8):
-        if tokens % bt == 0 and bt * heads * dim * 6 <= _STEP_BYTES:
+        if bt >= min_rows and tokens % bt == 0 and bt * heads * dim * 6 <= _STEP_BYTES:
             return bt
-    return 8 if tokens % 8 == 0 else tokens
+    return min_rows if tokens % min_rows == 0 else tokens
 
 
-@functools.partial(jax.jit, static_argnames=("fault",))
+@functools.partial(jax.jit, static_argnames=("fault", "out_dtype"))
 def weighted_heads_major(
-    o: jax.Array, w: jax.Array, fault: str | None = None
+    o: jax.Array, w: jax.Array, fault: str | None = None, out_dtype=jnp.float32
 ) -> jax.Array:
     """`o` [T, H, D] (bf16), `w` f32[T, H] -> f32[H, T, D] =
     `where(w > 0, o * w, 0)` transposed to heads-major, bit for bit the
@@ -67,8 +69,11 @@ def weighted_heads_major(
 
     `o` is read in its own [T, H, D] layout (no reshape: a 2-D view of a
     tiled 3-D buffer is a relayout copy). `fault` (test-only): "swap_heads"
-    writes the heads in reverse order.
+    writes the heads in reverse order. `out_dtype` bf16
+    (TPU_DCP_MERGE_RS_BF16): each f32 value rounded once to bf16, the operand
+    of the bf16 reduce-scatter.
     """
+    out_dtype = jnp.dtype(out_dtype)
     t, h, d = o.shape
     if w.shape != (t, h):
         raise ValueError(f"w {w.shape} must be [{t}, {h}]")
@@ -77,7 +82,8 @@ def weighted_heads_major(
     # Every head per step: the [bt, H] weight block's lane dim must be all
     # of H (< 128 heads).
     hb = h
-    bt = _row_block(t, hb, d)
+    # bf16 output blocks pack 16 rows per sublane tile.
+    bt = _row_block(t, hb, d, min_rows=16 if out_dtype.itemsize == 2 else 8)
     order = tuple(range(hb - 1, -1, -1)) if fault == "swap_heads" else None
     kernel = functools.partial(_kernel, heads=hb, order=order)
     return pl.pallas_call(
@@ -88,9 +94,9 @@ def weighted_heads_major(
             pl.BlockSpec((bt, hb), lambda g, i: (i, g)),
         ],
         out_specs=pl.BlockSpec((hb, bt, d), lambda g, i: (g, i, 0)),
-        out_shape=jax.ShapeDtypeStruct((h, t, d), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((h, t, d), out_dtype),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
-        name=f"dcp_weighted_hm_t{t}_h{h}",
+        name=f"dcp_weighted_hm_t{t}_h{h}" + ("_bf16" if out_dtype.itemsize == 2 else ""),
     )(o, w.astype(jnp.float32))

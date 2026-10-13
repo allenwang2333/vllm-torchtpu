@@ -259,7 +259,9 @@ def _weighted_reduce_scatter(
     schedule before this one is built instead of every completion waiting
     until the last chunk."""
     merged_lse = torch.logsumexp(lses, dim=0)
-    if envs.TPU_DCP_MERGE_WEIGHTED_HM:
+    # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
+    # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
+    if envs.TPU_DCP_MERGE_WEIGHTED_HM and envs.TPU_DCP_MERGE_RS_BF16 != 2:
         weight = torch.exp(lse_f32 - merged_lse)
         if after is not None and weight.device.type == "tpu":
             from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
@@ -309,15 +311,22 @@ def _weighted_reduce_scatter_heads_major(
     heads-major directly, so no relayout copy -- TensorCore or SparseCore
     data-format -- sits between the weights and the reduce-scatter. Same
     products, same where, same reduce-scatter: the same bits.
+
+    With `TPU_DCP_MERGE_RS_BF16=1` the kernel writes the operand in bf16 (each
+    f32 product rounded once, as `_scatter_sum`'s `.to(bfloat16)`) and the
+    reduce-scatter runs in bf16 -- the RS_BF16 merge, heads-major.
     """
+    bf16 = envs.TPU_DCP_MERGE_RS_BF16 == 1
     if output.device.type == "tpu":
         from vllm_torchtpu.layers.adapter.dcp_weighted_hm import weighted_heads_major
 
-        x = weighted_heads_major(output, weight)
+        x = weighted_heads_major(output, weight, bf16=bf16)
     else:
         w = weight.transpose(0, 1).unsqueeze(-1)
         x = output.transpose(0, 1).to(torch.float32) * w
         x = torch.where(w > 0, x, torch.zeros_like(x))
+        if bf16:
+            x = x.to(torch.bfloat16)
     return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
