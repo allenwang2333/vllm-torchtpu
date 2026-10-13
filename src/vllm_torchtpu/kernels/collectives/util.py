@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """utilities for collective kernels."""
 
-import functools
-
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -18,14 +16,23 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
       right_neighbor: Right neighbor device id.
       double_barrier: Whether to perform a second barrier.
     """
+    sem_signal = pltpu.semaphore_signal
+    mesh_id_type = pltpu.DeviceIdType.MESH
+    left_dev = (left_neighbor,)
+    right_dev = (right_neighbor,)
     barrier_sem = pltpu.get_barrier_semaphore()
-    for neighbor in [left_neighbor, right_neighbor]:
-        pltpu.semaphore_signal(
-            barrier_sem,
-            inc=1,
-            device_id=(neighbor,),
-            device_id_type=pltpu.DeviceIdType.MESH,
-        )
+    sem_signal(
+        barrier_sem,
+        inc=1,
+        device_id=left_dev,
+        device_id_type=mesh_id_type,
+    )
+    sem_signal(
+        barrier_sem,
+        inc=1,
+        device_id=right_dev,
+        device_id_type=mesh_id_type,
+    )
     pltpu.semaphore_wait(barrier_sem, 2)
     if double_barrier:
         # The double-barrier prevents a race condition where one neighbor can
@@ -34,13 +41,22 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
         # even if the other neighbor is not ready yet.
         # To implement a double-barrier, we stack-allocate a second REGULAR
         # semaphore using run_scoped.
-        @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
-        def _(second_barrier):
-            for neighbor in [left_neighbor, right_neighbor]:
-                pltpu.semaphore_signal(
-                    second_barrier,
-                    inc=1,
-                    device_id=(neighbor,),
-                    device_id_type=pltpu.DeviceIdType.MESH,
-                )
+        def _second_barrier(second_barrier):
+            sem_signal(
+                second_barrier,
+                inc=1,
+                device_id=left_dev,
+                device_id_type=mesh_id_type,
+            )
+            sem_signal(
+                second_barrier,
+                inc=1,
+                device_id=right_dev,
+                device_id_type=mesh_id_type,
+            )
             pltpu.semaphore_wait(second_barrier, 2)
+
+        pl.run_scoped(
+            _second_barrier,
+            second_barrier=pltpu.SemaphoreType.REGULAR,
+        )
