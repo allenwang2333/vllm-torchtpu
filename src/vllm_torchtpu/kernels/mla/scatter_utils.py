@@ -156,9 +156,10 @@ def scatter_rows(
 ) -> jax.Array:
     """Writes one row of `src` per token into `cache`.
 
-    `cache.dtype` selects the layout: 32-bit words use native SparseCore addressing;
-    uint8 uses TensorCore tiling and folds WORD_BYTES rows into one word row.
-    Native records may divide a physical cache row or span several whole rows.
+    `cache.dtype` selects the layout: uint32 uses native SparseCore tiling;
+    int32 and uint8 retain TensorCore tiling. The uint8 path folds WORD_BYTES
+    rows into one word row. Word records may divide a physical cache row or
+    span several whole rows.
 
     Args:
       cache: KV cache in HBM, any leading dims; its last dimension is preserved.
@@ -233,7 +234,8 @@ def scatter_rows(
         out_type=(),
         scratch_types=(pltpu.SemaphoreType.DMA((plan.lanes_per_block,)),),
         compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=tc_tiled,
+            # Signed word pools retain the TensorCore layout of their owner.
+            use_tc_tiling_on_sc=tc_tiled or cache.dtype == jnp.int32,
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),

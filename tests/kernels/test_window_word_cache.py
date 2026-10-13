@@ -98,8 +98,19 @@ def test_scatter_does_not_materialize_a_narrow_cache(width):
     cache = jax.ShapeDtypeStruct((1 << 20, 128), jnp.int32)
     records = jax.ShapeDtypeStruct((65,), jnp.int32)
     words = jax.ShapeDtypeStruct((65, width), jnp.int32)
+    from jax.experimental.layout import Format, Layout
+
+    owner_layout = Format(
+        Layout(major_to_minor=(0, 1), tiling=((8, 128),)),
+        jax.sharding.SingleDeviceSharding(jax.devices()[0]),
+    )
     compiled = (
-        jax.jit(scatter_word_records, donate_argnums=(0,))
+        jax.jit(
+            scatter_word_records,
+            donate_argnums=(0,),
+            in_shardings=(owner_layout, None, None),
+            out_shardings=owner_layout,
+        )
         .lower(cache, records, words)
         .compile()
     )
