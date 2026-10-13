@@ -826,7 +826,7 @@ class TpuPlatform(Platform):
             and vllm_config.speculative_config.num_speculative_tokens >= 3
             and vllm_config.speculative_config.rejection_sample_method == "standard"
         ):
-            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "3.39").strip()
+            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "").strip()
             if synth_len_env and float(synth_len_env) > 0:
                 synth_len = float(synth_len_env)
                 vllm_config.speculative_config.rejection_sample_method = "synthetic"
