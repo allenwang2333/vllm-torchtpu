@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Single-pass delayed mHC with compact TPU Sinkhorn and upstream residual flow.
 
 Shared by the v1 and v2 DeepSeek V4.1 implementations.

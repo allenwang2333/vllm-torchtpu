@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """V4.1 index selection over compact FP8 keys and companion scale words."""
 
 import jax

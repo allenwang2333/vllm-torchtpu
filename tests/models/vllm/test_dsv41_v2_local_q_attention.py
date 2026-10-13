@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """100% diff line and branch coverage tests for local_q attention op.
 
 Targets:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Host copies of a step's Engram hash inputs, for Host-DRAM Engram tables.
 
 With ``TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`` the Engram rows are gathered on

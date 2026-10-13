@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Shared vLLM backend contract for V4.1 attention and cache adapters."""
 
 from vllm.models.deepseek_v41.compressor import CompressorBackend

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """HBM ledger probe for DSv4.1 serving runs, gated by DSV41_HBM_LEDGER=1.
 
 Put this directory on PYTHONPATH. Every interpreter (incl. spawned vLLM

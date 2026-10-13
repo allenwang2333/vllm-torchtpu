@@ -81,10 +81,8 @@ class MockBuffer:
         if isinstance(idx, tuple) and any(isinstance(x, np.ndarray) for x in idx):
             return jnp.asarray(self.arr[idx])
         if self._jnp is not None:
-            try:
+            with contextlib.suppress(Exception):
                 return self._jnp[idx]
-            except Exception:
-                pass
         res = self.arr[idx]
         return jnp.asarray(res) if isinstance(res, (np.ndarray, np.generic)) else res
 

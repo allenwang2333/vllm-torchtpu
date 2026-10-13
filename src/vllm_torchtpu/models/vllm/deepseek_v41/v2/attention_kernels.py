@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Paged attention, exact index selection and index-cache publication."""
 
 import functools

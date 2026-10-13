@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Torch normalization helpers with FP32 accumulation."""
 
 import torch

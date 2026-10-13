@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Upstream Engram hashing, request history and TPU embedding lookup.
 
 Shared by the v1 and v2 DeepSeek V4.1 implementations. Each implementation

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """token-local q projection (`TPU_DEEPSEEK_V41_LOCAL_Q`) CPU contracts."""
 
 from types import SimpleNamespace

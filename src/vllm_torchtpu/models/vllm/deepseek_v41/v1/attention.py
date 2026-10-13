@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU MLA and compressor adapters with upstream cache ownership."""
 
 from typing import cast

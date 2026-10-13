@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """RoPE cache tables and tensor rotary operations."""
 
 import math

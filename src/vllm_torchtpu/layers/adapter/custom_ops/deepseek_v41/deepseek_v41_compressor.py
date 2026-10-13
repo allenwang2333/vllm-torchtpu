@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """V4.1 C1/C2 compression and compressed KV publication."""
 
 import jax

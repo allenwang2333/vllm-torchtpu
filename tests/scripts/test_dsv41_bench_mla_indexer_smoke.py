@@ -22,6 +22,7 @@ Targets:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -855,7 +856,7 @@ class TestBenchIndexer:
         ]
 
         def dummy_jax_op(name, fn, *args, **kwargs):
-            try:
+            with contextlib.suppress(Exception):
                 if "write_index_keys" in name:
                     fn(
                         jnp.zeros((16, 128), dtype=jnp.bfloat16),
@@ -881,8 +882,6 @@ class TestBenchIndexer:
                         jnp.zeros((16,), dtype=jnp.int32),
                         jnp.array([128], dtype=jnp.int32),
                     )
-            except Exception:
-                pass
 
             if "write_index_keys" in name:
                 return lambda p, r, k: p
@@ -1285,13 +1284,11 @@ class TestBenchSparseMlaSwa:
         ctx = common.WorkerContext(0, 8, 8, None, tmp_path)
 
         def dummy_mla_jax_op(name, fn, *args, **kwargs):
-            try:
+            with contextlib.suppress(Exception):
                 import inspect
 
                 n_params = len(inspect.signature(fn).parameters)
                 fn(*[torch.zeros((16, 16)) for _ in range(n_params)])
-            except Exception:
-                pass
 
             def _len(a):
                 return a[0].shape[0] if a and hasattr(a[0], "shape") else 1024

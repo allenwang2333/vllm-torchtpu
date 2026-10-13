@@ -93,10 +93,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
-    def schedule(self, *args, **kwargs):
-        self._select_waiting_queue_for_scheduling()
-        return super().schedule(*args, **kwargs)
-
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         """Promote the warmest request in the queue upstream admits from next.
 
@@ -109,11 +105,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         return queue
 
     def schedule(self, throttle_prefills: bool = False):
-        queue = getattr(self, "kv_holding_waiting", None) or getattr(
-            self, "waiting", None
-        )
-        if queue is not None:
-            self._promote_warmest(queue)
+        self._select_waiting_queue_for_scheduling()
         return super().schedule(throttle_prefills)
 
     def _promote_warmest(self, queue: RequestQueue) -> None:

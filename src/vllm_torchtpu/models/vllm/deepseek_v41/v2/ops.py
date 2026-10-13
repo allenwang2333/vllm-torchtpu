@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Scoped upstream device bindings and V4.1 tensor helpers."""
 
 import math

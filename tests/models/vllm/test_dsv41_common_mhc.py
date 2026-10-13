@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Checks for the DeepSeek V4.1 delayed mHC shared by the v1 and v2 paths.
 
 The oracle is vLLM's ``mhc_pre_delayed_torch``. ``delayed_pre_flat_jax``

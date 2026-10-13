@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for DeepSeek-V4.1 attention kernels: Indexer & Precompact.
 
 Achieves 100% diff line and branch coverage on:

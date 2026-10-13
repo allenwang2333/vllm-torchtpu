@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Summarize a vLLM TPU .xplane.pb (CPU-only): module/step timing and top ops.
 
 Usage: python xplane_summary.py <rank0.xplane.pb> [plane=/device:TPU:0]

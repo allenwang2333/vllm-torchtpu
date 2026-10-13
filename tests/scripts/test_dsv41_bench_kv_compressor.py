@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for scripts/dsv41_bench/bench_kv_compressor.py."""
 
 from __future__ import annotations

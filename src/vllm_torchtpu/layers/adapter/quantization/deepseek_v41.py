@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """V4.1 model bindings for the shared DeepSeek V4 TPU quantization path."""
 
 from vllm.distributed.parallel_state import get_ep_group

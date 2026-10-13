@@ -126,12 +126,10 @@ class MockRef:
 
     def __getitem__(self, idx):
         if hasattr(self.arr, "__getitem__"):
-            try:
+            with contextlib.suppress(Exception):
                 sub = self.arr[idx]
                 if isinstance(sub, jnp.ndarray):
                     return sub
-            except Exception:
-                pass
         return jnp.zeros((32, 128), dtype=jnp.float32)
 
     def __setitem__(self, idx, val):

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Async-scheduling fence for V4.1's Engram lookback upload.
 
 The runner (``vllm_torchtpu/runner/tpu_runner.py`` ``forward_model``) uploads

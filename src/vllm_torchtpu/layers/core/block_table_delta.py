@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Device-resident staged block tables with delta uploads.
 
 `stage_block_table_uploads` packs every KV cache group's block-table rows into

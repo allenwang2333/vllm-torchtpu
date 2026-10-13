@@ -145,8 +145,8 @@ def _live_cache(entry: Any) -> torch.Tensor | None:
 class DeepseekTPUAttentionMixin:
     """Shared TPU SWA/CSA/HCA dispatch, rotary and output projection ops."""
 
-    backend_cls = DeepseekV4TPUAttentionBackend
-    swa_backend_cls = VllmDeepseekSparseSWABackend
+    backend_cls: type[AttentionBackend] = DeepseekV4TPUAttentionBackend
+    swa_backend_cls: type[AttentionBackend] = VllmDeepseekSparseSWABackend
     # Set with object.__setattr__ in __init__ to avoid registering a submodule.
     mla_attn: VllmDeepseekV4MLAAttention
     # Set to True on DSpark draft layers; read with getattr(..., False).
@@ -241,7 +241,8 @@ class DeepseekTPUAttentionMixin:
 
         built_from_real_caches = swa_tensor is not None
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self, "scale", None)
             or getattr(self, "softmax_scale", None)
@@ -749,8 +750,9 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def swa_page_size(self):
+        vllm_config = cast(VllmConfig, get_vllm_model_wrapper_context().vllm_config)
         return VllmDeepseekV4SWACache._swa_block_size(
-            get_vllm_model_wrapper_context().vllm_config.cache_config.block_size,
+            vllm_config.cache_config.block_size,
             self.window_size,
         )
 

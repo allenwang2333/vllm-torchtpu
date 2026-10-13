@@ -2900,7 +2900,6 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path(
     assert int(runner_fast.seq_lens_np[0]) == int(runner_gen.seq_lens_np[0])
 
 
-
 @pytest.mark.tpu_test
 def test_upload_unless_unchanged_reuses_only_identical_values(device):
     """Spec steps reuse the previous upload of a small tensor while its values

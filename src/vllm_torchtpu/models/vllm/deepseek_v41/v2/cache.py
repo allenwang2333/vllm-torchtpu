@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """V4.1 paged cache allocation, row addressing and mutation."""
 
 import math

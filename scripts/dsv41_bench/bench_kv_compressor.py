@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Standalone micro-benchmark & verifier for DeepSeek-V4.1 KV Compressor & Engram.
 
 Exercises the V4.1 `v2` KV Compressor (`project`, `save_compress_norm`, FP8

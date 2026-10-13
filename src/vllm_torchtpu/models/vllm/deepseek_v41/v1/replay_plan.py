@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Decoder replay planning and its bounded SWA state for shared CSA."""
 
 from dataclasses import dataclass

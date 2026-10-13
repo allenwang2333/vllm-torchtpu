@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
 from dataclasses import dataclass, replace

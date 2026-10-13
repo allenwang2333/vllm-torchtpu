@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Single-launch TPU7x-8 micro-benchmark for Decode mHC & Decode MoE."""
 
 import argparse

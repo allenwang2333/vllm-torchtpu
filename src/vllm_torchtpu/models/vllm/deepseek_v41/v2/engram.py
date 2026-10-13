@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """V2 binding of the shared DeepSeek V4.1 Engram."""
 
 from typing import override

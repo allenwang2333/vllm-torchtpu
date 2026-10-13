@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """CPU checks for the DeepSeek V4.1 FP8 main-KV record and RoPE companion."""
 
 import jax.numpy as jnp

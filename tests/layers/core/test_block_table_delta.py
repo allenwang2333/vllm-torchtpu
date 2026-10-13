@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """incremental (delta) staged block-table uploads.
 
 Every walk staged incrementally must hand each group exactly the table a full

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Tests for decode index scores straight from gathered index-cache word rows."""
 
 from unittest import mock

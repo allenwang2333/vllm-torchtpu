@@ -27,6 +27,7 @@ on CPU under JAX_PLATFORMS=cpu TPU_SKIP_MDS_QUERY=true.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -96,13 +97,11 @@ class MockArrayRef:
 
     def __setitem__(self, idx, val):
         val_arr = getattr(val, "arr", val)
-        try:
+        with contextlib.suppress(Exception):
             if idx is Ellipsis:
                 self.arr[...] = np.asarray(val_arr)
             else:
                 self.arr[_norm_idx(idx)] = np.asarray(val_arr)
-        except Exception:
-            pass
 
     @property
     def at(self):
@@ -120,13 +119,11 @@ class MockArrayRef:
 
             def __setitem__(self, idx, val):
                 val_arr = getattr(val, "arr", val)
-                try:
+                with contextlib.suppress(Exception):
                     if idx is Ellipsis:
                         self.ref.arr[...] = np.asarray(val_arr)
                     else:
                         self.ref.arr[_norm_idx(idx)] = np.asarray(val_arr)
-                except Exception:
-                    pass
 
         return _AtIndexer(self)
 
@@ -185,7 +182,7 @@ def fake_loop(start, stop, step=1, unroll=False):
 def fake_bitcast(x, ty):
     """CPU fallback for pltpu.bitcast."""
     arr = getattr(x, "arr", x)
-    try:
+    with contextlib.suppress(Exception):
         arr = np.asarray(arr)
         ty_str = str(ty)
         if ("int32" in ty_str) and arr.dtype == np.uint8 and arr.shape[-2:] == (4, 128):
@@ -197,8 +194,6 @@ def fake_bitcast(x, ty):
         if "uint16" in ty_str and arr.dtype in (np.float32, np.float16):
             return jnp.asarray(arr.astype(np.float16).view(np.uint16))
         return jnp.asarray(arr.view(ty))
-    except Exception:
-        pass
     try:
         return x.view(ty)
     except Exception:
