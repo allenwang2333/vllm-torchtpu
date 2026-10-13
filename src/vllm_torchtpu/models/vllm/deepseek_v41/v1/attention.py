@@ -204,8 +204,9 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             rows_per_page=self.cache_num_states,
         )
         pos_i32 = positions if positions.dtype == torch.int32 else positions.int()
-        valid = (compressed_slots >= 0) & ((pos_i32 + 1) % self.compress_ratio == 0)
-        group_positions = pos_i32 // self.compress_ratio * self.compress_ratio
+        cr = self.compress_ratio
+        group_positions = pos_i32 & -cr if (cr & (cr - 1)) == 0 else pos_i32 // cr * cr
+        valid = (compressed_slots >= 0) & (pos_i32 - group_positions == cr - 1)
         compressor_ops.write_compressed_cache(
             self.kv_cache,
             compressed_slots,
@@ -224,7 +225,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
             compress_ratio=indexer.k_cache.compress_ratio,
             rows_per_page=index_binding.layout.page_size,
         )
-        index_slots = index_slots.masked_fill(~valid | (index_slots < 0), -1)
+        index_slots = torch.where(valid & (index_slots >= 0), index_slots, -1)
         if defer_index_write and not self._all_indices_fit:
             return index_slots, keys
         indexer_ops.publish_index_keys(
@@ -244,6 +245,15 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         self._write_global_kv(
             self.compressor.project(hidden_states), positions, defer_index_write=False
         )
+
+    def _get_logical_compressed(
+        self, capacity: int, device: torch.device
+    ) -> torch.Tensor:
+        logical = getattr(self, "_logical_compressed", None)
+        if logical is None or logical.device != device or logical.shape[1] != capacity:
+            logical = torch.arange(capacity, device=device, dtype=torch.int32)[None, :]
+            self._logical_compressed = logical
+        return logical
 
     def _prepare_tpu(
         self,
@@ -265,6 +275,7 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         swa_slots = cache_ops.cache_slots(
             swa, positions, rows_per_page=self.swa_cache_layer.block_size
         )
+        invalid_swa_col = (swa_slots < 0)[:, None]
         q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
         # V4.1 normalizes the low-rank qr before wq_b, but does not normalize
         # the projected query heads. Upstream's fused insert passes
@@ -281,10 +292,8 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
                 -1, self.indexer.n_head, self.indexer.head_dim
             )
             index_q = self._rotate(index_q, positions)
-            weights = (
-                index_weights.float()
-                * self.indexer.head_dim**-0.5
-                * self.indexer.n_head**-0.5
+            weights = index_weights.float() * (
+                self.indexer.head_dim**-0.5 * self.indexer.n_head**-0.5
             )
         count = positions.shape[0]
         requests = cache_ops.token_requests(swa, positions).clamp(
@@ -292,19 +301,21 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         )
         selected = None
         if self.compress_ratio:
-            capacity = max(1, self._max_model_len // self.compress_ratio)
+            cr = self.compress_ratio
+            capacity = max(1, self._max_model_len // cr)
+            pos_i32 = positions if positions.dtype == torch.int32 else positions.int()
             lengths = (
-                ((positions if positions.dtype == torch.int32 else positions.int()) + 1)
-                // self.compress_ratio
+                (pos_i32 + 1) >> (cr.bit_length() - 1)
+                if (cr & (cr - 1)) == 0
+                else (pos_i32 + 1) // cr
             )[:, None]
             if self.indexer is not None:
                 if self._all_indices_fit:
-                    logical_compressed = torch.arange(
-                        capacity, device=positions.device, dtype=torch.int32
-                    )
-                    logical_compressed = logical_compressed[None, :].expand(count, -1)
-                    selected = logical_compressed.masked_fill(
-                        logical_compressed >= lengths, -1
+                    logical_compressed = self._get_logical_compressed(
+                        capacity, positions.device
+                    ).expand(count, -1)
+                    selected = torch.where(
+                        logical_compressed < lengths, logical_compressed, -1
                     )
                 else:
                     indexer = self.indexer
@@ -324,26 +335,21 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
                 # Keep the persistent buffer's physical shape across compile
                 # buckets. TorchTPU must not replace it with a shorter donated
                 # slice when prefill switches to decode.
+                pad_r = self.topk_indices_buffer.shape[-1] - selected.shape[-1]
+                pad_b = self.topk_indices_buffer.shape[0] - count
                 self.topk_indices_buffer.copy_(
-                    torch.nn.functional.pad(
-                        selected,
-                        (
-                            0,
-                            self.topk_indices_buffer.shape[-1] - selected.shape[-1],
-                            0,
-                            self.topk_indices_buffer.shape[0] - count,
-                        ),
-                        value=-1,
-                    )
+                    torch.nn.functional.pad(selected, (0, pad_r, 0, pad_b), value=-1)
+                    if (pad_r or pad_b)
+                    else selected
                 )
             selected = self.topk_indices_buffer[
                 :count, : min(capacity, self.topk_indices_buffer.shape[-1])
             ]
             selected = selected.masked_fill(
-                (selected < 0) | (selected >= lengths) | (swa_slots[:, None] < 0), -1
+                (selected < 0) | (selected >= lengths) | invalid_swa_col, -1
             )
         self.forward_mqa(q, kv, positions, output, topk_indices=selected)
-        output.masked_fill_((swa_slots < 0)[:, None, None], 0)
+        output.masked_fill_(invalid_swa_col[:, :, None], 0)
 
     def _select_paged_indices(
         self,
@@ -402,12 +408,11 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         index_cache.copy_(updated_cache)
         scale_cache.copy_(updated_scales)
         if candidate_write:
+            pad_b = self.candidate_block_buffer.shape[0] - count
             self.candidate_block_buffer.copy_(
-                torch.nn.functional.pad(
-                    published,
-                    (0, 0, 0, self.candidate_block_buffer.shape[0] - count),
-                    value=-1,
-                )
+                torch.nn.functional.pad(published, (0, 0, 0, pad_b), value=-1)
+                if pad_b
+                else published
             )
         return selected
 
@@ -439,7 +444,8 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         slots = cache_ops.cache_slots(
             swa, positions, rows_per_page=self.swa_cache_layer.block_size
         )
-        cache_ops.write_cache(cache, slots, kv, slots >= 0, layout=layout)
+        valid_slots = slots >= 0
+        cache_ops.write_cache(cache, slots, kv, valid_slots, layout=layout)
         table = cache_ops.block_table(swa)
         requests = cache_ops.token_requests(swa, positions).clamp(
             max=table.shape[0] - 1
@@ -450,11 +456,8 @@ class DeepseekV41Attention(DeepseekTPUAttentionMixin, upstream.DeepseekV4Attenti
         replay_starts = get_forward_context().additional_kwargs[
             "deepseek_v41_replay_starts"
         ]
-        valid = (
-            (logical >= 0)
-            & (slots[:, None] >= 0)
-            & (logical >= replay_starts.index_select(0, requests)[:, None])
-        )
+        min_logical = replay_starts.index_select(0, requests).clamp_min(0)[:, None]
+        valid = valid_slots[:, None] & (logical >= min_logical)
         window_slots = cache_ops.row_slots(
             table,
             requests,
