@@ -27,6 +27,8 @@ import copy
 
 from vllm.tokenizers.protocol import TokenizerLike
 
+_SUBCLASS_CACHE: dict[type, type] = {}
+
 
 def _tpu_deepseek_v4_tokenizer(tokenizer):
     """Return a copy of ``tokenizer`` that honors ``continue_final_message``.
@@ -35,12 +37,23 @@ def _tpu_deepseek_v4_tokenizer(tokenizer):
     DeepSeek-V4 tokenizer class dynamically from the checkpoint's HF backend.
     """
     base_cls = tokenizer.__class__
+    tpu_cls = _SUBCLASS_CACHE.get(base_cls)
+    if tpu_cls is not None:
+        tpu_tokenizer = copy.copy(tokenizer)
+        tpu_tokenizer._tpu_orig_tokenizer = tokenizer
+        tpu_tokenizer.__class__ = tpu_cls
+        return tpu_tokenizer
+    base_apply = base_cls.apply_chat_template
 
     class _TpuDeepseekV4Tokenizer(base_cls):
-        def apply_chat_template(self, messages, tools=None, **kwargs):
+        def apply_chat_template(
+            self, messages, tools=None, _apply=base_apply, **kwargs
+        ):
             """Set ``wo_eos`` on a trailing assistant turn when
             ``continue_final_message`` is set, so the encoder omits
             ``eos_token`` and the model continues that turn."""
+            if not kwargs:
+                return _apply(self, messages, tools)
             if kwargs.pop("continue_final_message", False):
                 # The parent renders the conversation from kwargs when it is
                 # there, so the marked copy goes back the same way.
@@ -51,12 +64,16 @@ def _tpu_deepseek_v4_tokenizer(tokenizer):
                 ):
                     conversation[-1] = {**last_msg, "wo_eos": True}
                 kwargs["conversation"] = conversation
-            return super().apply_chat_template(messages, tools, **kwargs)
+            if not kwargs:
+                return _apply(self, messages, tools)
+            return _apply(self, messages, tools, **kwargs)
 
         def __reduce__(self):
-            return _tpu_deepseek_v4_tokenizer, (tokenizer,)
+            return _tpu_deepseek_v4_tokenizer, (self._tpu_orig_tokenizer,)
 
+    _SUBCLASS_CACHE[base_cls] = _TpuDeepseekV4Tokenizer
     tpu_tokenizer = copy.copy(tokenizer)
+    tpu_tokenizer._tpu_orig_tokenizer = tokenizer
     tpu_tokenizer.__class__ = _TpuDeepseekV4Tokenizer
     return tpu_tokenizer
 
