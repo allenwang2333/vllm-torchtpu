@@ -16,9 +16,7 @@ __all__ = ["Engram", "NgramHashState"]
 
 
 class NgramHashState(common.NgramHashState):
-    @override
-    def write_cache(self, cache, slots, values, valid):
-        write_cache(cache, slots, values, valid)
+    write_cache = staticmethod(write_cache)
 
     @override
     def ensure_cache(self) -> bool:
@@ -28,6 +26,10 @@ class NgramHashState(common.NgramHashState):
         # tracking must use the stable allocator object, not that temporary view.
         swa_mod = self.swa_cache_module
         kv_cache = swa_mod.bound_cache
+        ref = self._kv_cache_ref
+        block_size = swa_mod.block_size
+        if ref is not None and ref() is kv_cache and self.block_size == block_size:
+            return True
         if not kv_cache.numel():
             self._cache = None
             self._kv_cache_ref = None
@@ -38,14 +40,11 @@ class NgramHashState(common.NgramHashState):
         # block size copied at model construction. Match the bound view
         # used by slot_mapping and block_table before upstream sizes its
         # generated-token history cache.
-        block_size = swa_mod.block_size
         if self.block_size != block_size:
             self.block_size = block_size
-            self._kv_cache_ref = None
-        if self._kv_cache_ref is not None and self._kv_cache_ref() is kv_cache:
-            return True
+        self.write_cache = write_cache
         self._cache = torch.zeros(
-            kv_cache.shape[0] * self.block_size,
+            kv_cache.shape[0] * block_size,
             dtype=torch.int32,
             device=kv_cache.device,
         )
