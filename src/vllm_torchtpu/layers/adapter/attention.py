@@ -2461,8 +2461,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # rank ids, sharded
         output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
         if send_layout:
-            # Caches, then this rank's [dcp, rows, V] send blocks.
+            # Caches, then this rank's [dcp, rows, V] send blocks. The torch
+            # op's schema is inferred from the return annotation too: three
+            # outputs, not the partial + lse pair's four.
             output_specs = output_specs[:2] + (P(DCP_AXIS_NAME),)
+            core_fn.__annotations__ = {
+                **core_fn.__annotations__,
+                "return": tuple[jax.Array, jax.Array, jax.Array],
+            }
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
             core_fn,

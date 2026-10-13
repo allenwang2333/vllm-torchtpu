@@ -368,6 +368,9 @@ def test_sparse_mla_dcp_send_op_schema(rank):
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
     assert len(schema.arguments) == 12 + int(rank), schema
+    # Caches + the send buffer: a schema with the partial + lse pair's four
+    # returns segfaults torch's functionalization on the three real outputs.
+    assert len(schema.returns) == 3, schema
 
 
 @pytest.mark.parametrize("world,tokens,per", [(16, 16, 4), (16, 32, 4), (8, 16, 8), (8, 32, 8)])
@@ -392,11 +395,6 @@ def test_jax_merge_matches_torch_merge(world, tokens, per):
     o[1, :, :7] = np.nan  # a rank's NaN partial (weight 0 where lse is -inf)
     lse[1, :] = -np.inf
     o_bf = jnp.asarray(o, jnp.bfloat16)
-    want_j = np.asarray(
-        jax.jit(lambda a, b: cp_mla.merge_received_jax(a, b).astype(jnp.bfloat16))(
-            o_bf, jnp.asarray(lse)
-        )
-    ).view(np.int16)
     ot = torch.from_numpy(np.asarray(o_bf).view(np.int16).copy()).view(torch.bfloat16)
     lt = torch.from_numpy(lse.copy())
     fn = torch.compile(
@@ -408,7 +406,14 @@ def test_jax_merge_matches_torch_merge(world, tokens, per):
         backend=tpu_compile.TpuBackend(),
     )
     got_t = fn(ot.to("tpu"), lt.to("tpu")).cpu().view(torch.int16).numpy()
-    nd = int((got_t != want_j).sum())
-    print(f"W={world} T={tokens} L={per}: jax vs torch merge diffs {nd} / {want_j.size}")
-    assert nd == 0
-    assert np.isfinite(np.asarray(want_j.view(jnp.bfloat16), np.float32)).all()
+    diffs = {}
+    for name in cp_mla.MERGE_JAX_VARIANTS:
+        f = jax.jit(
+            lambda a, b, name=name: cp_mla.merge_received_jax(a, b, name).astype(
+                jnp.bfloat16
+            )
+        )
+        want_j = np.asarray(f(o_bf, jnp.asarray(lse))).view(np.int16)
+        diffs[name] = int((got_t != want_j).sum())
+    print(f"W={world} T={tokens} L={per}: jax vs torch merge diffs {diffs} / {got_t.size}")
+    assert diffs[cp_mla.MERGE_JAX_VARIANTS[0]] == 0, diffs

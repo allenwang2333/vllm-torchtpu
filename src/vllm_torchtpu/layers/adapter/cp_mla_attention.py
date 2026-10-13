@@ -613,10 +613,19 @@ def _send_merge_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
     return x.new_empty((tl, x.shape[1]), dtype=torch.bfloat16)
 
 
-def merge_received_jax(o, l):
-    """`_merge_received` in jnp, op for op, on `[R, n, V]` bf16 partials and
-    `[R, n]` f32 lse (rows flattened): the f32 `[n, V]` merge."""
+# How `merge_received_jax` forms the two weighted sums over ranks; the first
+# is the one the send-layout merge uses. "dot_default": f32 dots at default
+# precision (bf16 operands, f32 accumulation: the dot torch's
+# multiply-then-sum lowers to); "dot_bf16": the same with bf16 operands
+# spelled out; "reduce_f32": f32 products summed by a reduce.
+MERGE_JAX_VARIANTS = ("dot_default", "dot_bf16", "reduce_f32")
+
+
+def merge_received_jax(o, l, variant: str = MERGE_JAX_VARIANTS[0]):
+    """`_merge_received` in jnp on `[R, n, V]` bf16 partials and `[R, n]` f32
+    lse (rows flattened): the f32 `[n, V]` merge."""
     import jax.numpy as jnp
+    from jax import lax
 
     finite = jnp.isfinite(l)
     shift = jnp.where(finite, l, -jnp.inf).max(axis=0)
@@ -628,7 +637,20 @@ def merge_received_jax(o, l):
     of = jnp.where(jnp.isnan(of), 0.0, of)
     w_hi = weights.astype(jnp.bfloat16).astype(jnp.float32)
     w_lo = weights - w_hi
-    return (of * w_hi[..., None]).sum(axis=0) + (of * w_lo[..., None]).sum(axis=0)
+    if variant == "reduce_f32":
+        return (of * w_hi[..., None]).sum(axis=0) + (of * w_lo[..., None]).sum(axis=0)
+    if variant == "dot_bf16":
+        of, w_hi, w_lo = (x.astype(jnp.bfloat16) for x in (of, w_hi, w_lo))
+    # Contract ranks, batch rows: [R, n, V] x [R, n] -> [n, V].
+    dims = (((0,), (0,)), ((1,), (1,)))
+
+    def dot(a, w):
+        return lax.dot_general(
+            a, w, dims, precision=lax.Precision.DEFAULT,
+            preferred_element_type=jnp.float32,
+        )
+
+    return dot(of, w_hi) + dot(of, w_lo)
 
 
 def _build_send_merge(world: int):
