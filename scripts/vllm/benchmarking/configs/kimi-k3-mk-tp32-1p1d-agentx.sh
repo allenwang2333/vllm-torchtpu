@@ -176,9 +176,15 @@ COMMON_ARGS=(
 )
 
 # ---- per role and point ---------------------------------------------------------
-# The host-memory KV store the DSpark points' roles add beside Raiden.
+# The host-memory KV store the DSpark points' roles add beside Raiden. Its size
+# is split across the 32 ranks, so a quarter of it lands on each host. The doc's
+# 1.5 TiB (1649267441664) put ~384 GiB on each GKE tpu7x host, and the prefill
+# head - which also stages 67 GiB of weights per rank and shares its memory with
+# the gcsfuse sidecar's cache - was evicted at ~829 GiB (vllm-torchtpu-dev build
+# 562). 384 GiB in all is ~96 GiB per host.
+K3_MK_OFFLOAD_BYTES="${K3_MK_OFFLOAD_BYTES:-412316860416}"
 _offload_connector() {  # _offload_connector <raiden_controller_port>
-  printf '{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":1649267441664,"raiden_controller_port":%s,"raiden_job_name":"k3-mk-offload-0","store_server_ip":"%s"}}' "$1" "$HEAD_IP"
+  printf '{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":%s,"raiden_controller_port":%s,"raiden_job_name":"k3-mk-offload-0","store_server_ip":"%s"}}' "$K3_MK_OFFLOAD_BYTES" "$1" "$HEAD_IP"
 }
 _multi_connector() {  # _multi_connector <kv_role> <raiden connector json> <offload connector json>
   printf '{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"%s","kv_connector_extra_config":{"connectors":[%s,%s]}}' "$1" "$2" "$3"
