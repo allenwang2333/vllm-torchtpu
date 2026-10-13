@@ -200,7 +200,18 @@ def row_indices(slots, page_size, page_stride, row_offset):
     """Map slots using prevalidated record geometry, never pool byte offsets."""
     if page_size == page_stride:
         return slots if row_offset == 0 else row_offset + slots
-    return row_offset + slots // page_size * page_stride + slots % page_size
+    if page_size > 0 and (page_size & (page_size - 1)) == 0:
+        page_shift = page_size.bit_length() - 1
+        pages = slots >> page_shift
+        base = (
+            pages << (page_stride.bit_length() - 1)
+            if page_stride > 0 and (page_stride & (page_stride - 1)) == 0
+            else pages * page_stride
+        )
+        records = base + (slots & (page_size - 1))
+    else:
+        records = slots // page_size * page_stride + slots % page_size
+    return records if row_offset == 0 else row_offset + records
 
 
 def masked_row_indices(slots, page_size, page_stride, row_offset):
@@ -225,18 +236,11 @@ def read_cache(cache, slots, *, layout=None):
     elements, dtype = layout.elements, layout.dtype
     if cache.device.type == "cpu":
         records = row_indices(slots, page_size, page_stride, row_offset)
-        pool = cache.view(torch.int8).reshape(-1, elements * dtype.itemsize)
-        return (
-            pool.index_select(
-                0,
-                (records if records.dtype == torch.int32 else records.int()).reshape(
-                    -1
-                ),
-            )
-            .contiguous()
-            .view(dtype)
-            .reshape(*slots.shape, elements)
-        )
+        pool = cache.view(dtype).reshape(-1, elements)
+        return pool.index_select(
+            0,
+            (records if records.dtype == torch.int32 else records.int()).reshape(-1),
+        ).reshape(*slots.shape, elements)
     assert _read_values_op is not None
     gathered = _read_values_op(
         cache,
@@ -278,16 +282,20 @@ def _gather_words(cache, records, record_words):
     assert cache.dtype == jnp.int32 and cache.shape[1] == ROW_WORDS
     if record_words >= ROW_WORDS:
         chunks = record_words // ROW_WORDS
+        if chunks == 1:
+            return cache[records.reshape(-1)]
         indices = (records[:, None] * chunks + jnp.arange(chunks)[None]).reshape(-1)
         return cache[indices].reshape(records.size, record_words)
     # Like DSV4's packed RoPE records, several records can share a word row.
     # Select contiguous segments; a per-element dynamic gather is costly on TPU.
     per_row = ROW_WORDS // record_words
-    words = cache[records // per_row]
+    shift = per_row.bit_length() - 1
+    words = cache[records >> shift]
+    rem = (records & (per_row - 1))[:, None]
     selected = words[:, :record_words]
     for segment in range(1, per_row):
         selected = jnp.where(
-            (records % per_row == segment)[:, None],
+            rem == segment,
             words[:, segment * record_words : (segment + 1) * record_words],
             selected,
         )
@@ -304,10 +312,11 @@ def gather_cache_values(
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
-    columns = jnp.arange(elements)[None]
-    selected = jnp.take_along_axis(words, columns // 2, axis=1)
-    bits = (selected >> ((columns % 2) * 16)) << 16
-    return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
+    lo = jax.lax.bitcast_convert_type(words << 16, jnp.float32).astype(jnp.bfloat16)
+    hi = jax.lax.bitcast_convert_type((words >> 16) << 16, jnp.float32).astype(
+        jnp.bfloat16
+    )
+    return jnp.stack((lo, hi), axis=-1).reshape(words.shape[0], elements)
 
 
 def initialize_cache_ops():
@@ -388,11 +397,9 @@ def write_cache(cache, slots, values, valid, *, layout=None):
             records = row_indices(
                 slots.clamp(min=0), page_size, page_stride, row_offset
             )
-            pool = cache.view(torch.int8).reshape(-1, elements * dtype.itemsize)
+            pool = cache.view(dtype).reshape(-1, elements)
             valid = slots >= 0
-            pool.index_copy_(
-                0, records[valid].long(), values[valid].contiguous().view(torch.int8)
-            )
+            pool.index_copy_(0, records[valid].long(), values[valid])
         else:
             assert _write_values_op is not None
             slots_i32 = slots if slots.dtype == torch.int32 else slots.int()
@@ -541,22 +548,32 @@ def cache_slots(
     requests = (requests if requests.dtype == torch.int32 else requests.int()).clamp(
         max=table.shape[0] - 1
     )
-    logical = (
-        (positions if positions.dtype == torch.int32 else positions.int())
-        if compress_ratio == 1
-        else (positions if positions.dtype == torch.int32 else positions.int())
-        // compress_ratio
-    )
-    columns = torch.zeros_like(logical) if ring else logical // rows_per_page
+    pos_i32 = positions if positions.dtype == torch.int32 else positions.int()
+    if compress_ratio == 1:
+        logical = pos_i32
+    elif compress_ratio > 0 and (compress_ratio & (compress_ratio - 1)) == 0:
+        logical = pos_i32 >> (compress_ratio.bit_length() - 1)
+    else:
+        logical = pos_i32 // compress_ratio
+    is_pow2_page = rows_per_page > 0 and (rows_per_page & (rows_per_page - 1)) == 0
+    page_shift = rows_per_page.bit_length() - 1 if is_pow2_page else 0
     # Requests, pages and slots are < 2**31: gather the flattened table with
     # a native int32 1D index_select instead of 2D int64 advanced indexing.
-    block_idx = requests * table.shape[1] + columns.clamp(max=table.shape[1] - 1)
+    if ring:
+        block_idx = requests * table.shape[1]
+    else:
+        columns = logical >> page_shift if is_pow2_page else logical // rows_per_page
+        block_idx = requests * table.shape[1] + columns.clamp(max=table.shape[1] - 1)
     blocks = (
         (table if table.dtype == torch.int32 else table.int())
         .reshape(-1)
         .index_select(0, block_idx)
     )
-    slots = blocks * rows_per_page + logical % rows_per_page
+    slots = (
+        (blocks << page_shift) + (logical & (rows_per_page - 1))
+        if is_pow2_page
+        else blocks * rows_per_page + logical % rows_per_page
+    )
     # Padded request boundaries repeat the last real token offset. Keep the
     # mask on device, including dummy runs and batches with no active tokens.
     return slots.masked_fill(rows >= metadata.query_start_loc[-1], -1)
@@ -567,13 +584,22 @@ def row_slots(block_table, requests, logical, *, rows_per_page):
     safe = (logical if logical.dtype == torch.int32 else logical.int()).clamp(
         min=0, max=block_table.shape[1] * rows_per_page - 1
     )
-    flat_idx = (requests if requests.dtype == torch.int32 else requests.int())[
+    req_base = (requests if requests.dtype == torch.int32 else requests.int())[
         :, None
-    ] * block_table.shape[1] + safe // rows_per_page
+    ] * block_table.shape[1]
+    is_pow2_page = rows_per_page > 0 and (rows_per_page & (rows_per_page - 1)) == 0
+    page_shift = rows_per_page.bit_length() - 1 if is_pow2_page else 0
+    flat_idx = req_base + (
+        safe >> page_shift if is_pow2_page else safe // rows_per_page
+    )
     blocks = (
         (block_table if block_table.dtype == torch.int32 else block_table.int())
         .reshape(-1)
         .index_select(0, flat_idx.reshape(-1))
         .view_as(safe)
     )
-    return blocks * rows_per_page + safe % rows_per_page
+    return (
+        (blocks << page_shift) + (safe & (rows_per_page - 1))
+        if is_pow2_page
+        else blocks * rows_per_page + safe % rows_per_page
+    )
