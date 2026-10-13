@@ -3,6 +3,10 @@
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
 
+def _return_none() -> None:
+    return None
+
+
 class TPUMultiConnector(MultiConnector):
     """MultiConnector combining TPURaidenConnector (disaggregation) with
     TPURaidenOffloadingConnector (offloading).
@@ -19,8 +23,6 @@ class TPUMultiConnector(MultiConnector):
         # torchtpu extension unknown to upstream MultiConnector: forward it to
         # the children, or the Raiden child never gets a runner and fails with
         # "register_runner must be called before transfer" on the first load.
-        if not self._connectors:
-            return
         for c in self._connectors:
             fn = getattr(c, "register_runner", None)
             if fn is not None:
@@ -35,21 +37,37 @@ class TPUMultiConnector(MultiConnector):
         One scalar cannot scope two groups, so conflicting child indices
         raise instead of mis-scoping.
         """
-        if not self._connectors:
+        fns = tuple(
+            fn
+            for c in self._connectors
+            if (fn := getattr(c, "get_block_ids_with_load_errors_group_index", None))
+            is not None
+        )
+        if not fns:
+            object.__setattr__(
+                self, "get_block_ids_with_load_errors_group_index", _return_none
+            )
             return None
-        index: int | None = None
-        for c in self._connectors:
-            fn = getattr(c, "get_block_ids_with_load_errors_group_index", None)
-            if fn is None:
-                continue
-            child_index = fn()
-            if child_index is None:
-                continue
-            if index is not None and child_index != index:
-                raise RuntimeError(
-                    "Conflicting KV-load-error group indices across child "
-                    f"connectors: {index} vs {child_index}; cannot scope "
-                    "invalid blocks to a single cache group"
-                )
-            index = child_index
-        return index
+        if len(fns) == 1:
+            fn0 = fns[0]
+            object.__setattr__(self, "get_block_ids_with_load_errors_group_index", fn0)
+            return fn0()
+
+        def _multi_group_index() -> int | None:
+            index: int | None = None
+            for fn in fns:
+                child_index = fn()
+                if child_index is not None:
+                    if index is not None and child_index != index:
+                        raise RuntimeError(
+                            "Conflicting KV-load-error group indices across child "
+                            f"connectors: {index} vs {child_index}; cannot scope "
+                            "invalid blocks to a single cache group"
+                        )
+                    index = child_index
+            return index
+
+        object.__setattr__(
+            self, "get_block_ids_with_load_errors_group_index", _multi_group_index
+        )
+        return _multi_group_index()
