@@ -1103,6 +1103,15 @@ def _run_routed_expert_stream(
 
     def stage_planned_rows(row_plan, destination):
         indices, valid = row_plan
+        if batch_size in (64, 96, 128):
+            # A one-hot product selects the planned rows (exact: one BF16
+            # term per entry, zero rows past the plan) without a scalar
+            # read and a gather per row.
+            one_hot = (
+                (indices[:, None] == jnp.arange(batch_size)[None, :]) & valid[:, None]
+            ).astype(jnp.bfloat16)
+            destination[...] = _dot(one_hot, source[:, :expert_input_size])
+            return
         destination[...] = jnp.zeros(destination.shape, destination.dtype)
 
         if batch_size == 32:
