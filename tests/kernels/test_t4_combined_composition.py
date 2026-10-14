@@ -107,8 +107,9 @@ def _attention_run(dcp, on, rank_shift=0):
         ) as prep_spy,
     ):
         if not on:
+            # The flags are on by default: the off arm turns each one off.
             for k in FLAGS_ON:
-                os.environ.pop(k, None)
+                os.environ[k] = "" if k.endswith("_WIDTHS") else "0"
         extra = {"dcp_rank_ids": _rank_ids(dcp, rank_shift)} if on else {}
         res = prologue._dcp_run(dcp, candidate=on, big_mixed=True, **extra)
         kvw = sum(
@@ -317,7 +318,7 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
         ),
     ):
         if not rank:
-            os.environ.pop("TPU_DCP_RANK_OPERAND", None)
+            os.environ["TPU_DCP_RANK_OPERAND"] = "0"  # on by default
         attention.PallasMLAttentionBackendImpl._build_sparse_mla_dcp_op(
             impl, layer, 8, 4, q_rope=q_rope
         )
@@ -348,7 +349,7 @@ def test_indexer_dcp_op_schema(qb, rank):
         ),
     ):
         if not rank:
-            os.environ.pop("TPU_DCP_RANK_OPERAND", None)
+            os.environ["TPU_DCP_RANK_OPERAND"] = "0"  # on by default
         mop.VllmTPUSparseAttnIndexer._build_streamidx_dcp_op(stub, 8, 4, qb_overlap=qb)
     op = f"streamidx_topk_dcp_{name}" + ("_qb" if qb else "")
     schema = getattr(torch.ops.pallas, op).default._schema

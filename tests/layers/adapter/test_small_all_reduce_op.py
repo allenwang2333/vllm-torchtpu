@@ -277,6 +277,8 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
+    # On by default; its op needs a TPU (get_tpu_info) and is covered below.
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_VALID_ROWS", False)
     for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK"):
         monkeypatch.setattr(op, name, None)
     monkeypatch.setattr(

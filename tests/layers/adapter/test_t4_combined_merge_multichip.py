@@ -44,6 +44,8 @@ S23_MERGE_ENV = {
     "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024,
     "TPU_DCP_MERGE_CHUNKED_LSE_AG": True,
     "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 2048,
+    # Not part of the S23 stack (on by default since trial 3; not bitwise).
+    "TPU_DCP_MERGE_RS_BF16": 0,
 }
 
 

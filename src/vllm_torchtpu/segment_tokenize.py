@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact segment-cached prompt tokenization for long multi-turn chat prompts.
 
-Opt-in with ``VLLM_TPU_SEGMENT_TOKENIZE=1``.
+On by default; ``VLLM_TPU_SEGMENT_TOKENIZE=0`` turns it off.
 
 Why: the API server tokenizes the whole chat-templated prompt on every turn.
 HF fast tokenizers run ~1.5-2.5 us/token on one core, so a 500k-token agent
@@ -83,9 +83,31 @@ class SegmentTokenizer:
         """Return why ``backend`` cannot use the piecewise path, or None."""
         if getattr(backend, "encode_special_tokens", False):
             return "encode_special_tokens is set"
-        for tok in backend.get_added_tokens_decoder().values():
+        added = backend.get_added_tokens_decoder().values()
+        if not added:
+            # Nothing to split on (and an empty alternation would match the
+            # empty string everywhere).
+            return "no added tokens"
+        for tok in added:
             if tok.normalized or tok.lstrip or tok.rstrip or tok.single_word:
                 return f"added token {tok.content!r} is not a hard split point"
+        return None
+
+    def probe_mismatch(self) -> str | None:
+        """Why piecewise encoding is not the full encoding here, or None.
+
+        The split rule above is necessary, not sufficient: a pre-tokenizer
+        that reads a piece's offset in the whole string (e.g. Metaspace with
+        ``prepend_scheme="first"``) encodes a later piece differently once it
+        is cut out. One short probe around an added token catches that.
+        """
+        tok = min(self._added_id, key=len)
+        text = f"Hello world{tok}Hello  world {tok} hello\n world"
+        want = self._backend.encode(text, add_special_tokens=False).ids
+        got = self.encode(text)
+        self.hits = self.misses = 0  # the probe is not traffic
+        if got != list(want):
+            return "piecewise encoding differs from the full encoding"
         return None
 
     def encode(self, text: str) -> list[int]:
@@ -171,6 +193,10 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int):
             reason = SegmentTokenizer.eligible(backend)
         if reason is None:
             seg = SegmentTokenizer(backend, max_cached_tokens)
+            reason = seg.probe_mismatch()
+            if reason is not None:
+                seg = None
+        if seg is not None:
             logger.info(
                 "VLLM_TPU_SEGMENT_TOKENIZE: piecewise prompt tokenization on "
                 "(%d added tokens, cache %d tokens, ~12 B/token).",
@@ -178,7 +204,15 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int):
                 max_cached_tokens,
             )
         else:
-            logger.warning(
+            from vllm_torchtpu import envs
+
+            # On by default: an ineligible tokenizer is routine unless asked for.
+            log = (
+                logger.warning
+                if envs.is_set("VLLM_TPU_SEGMENT_TOKENIZE")
+                else logger.info
+            )
+            log(
                 "VLLM_TPU_SEGMENT_TOKENIZE: falling back to full tokenization: %s",
                 reason,
             )

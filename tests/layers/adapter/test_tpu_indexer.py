@@ -582,11 +582,16 @@ def test_streamidx_block_sizes_mixed_kv_pages():
     )
 
 
-def test_streamidx_small_bucket_tokens_default_is_16(monkeypatch):
-    """The cap defaults to 16 (off for 32/64 buckets) and reads the env."""
+def test_streamidx_small_bucket_tokens_default_is_64(monkeypatch):
+    """The cap defaults to 64 (#1796; 32/64 buckets take bq 4), reads the env,
+    and the mixed-pass kv block defaults to 4 pages."""
     from vllm_torchtpu import envs
 
     monkeypatch.delenv("TPU_STREAMIDX_SMALL_BUCKET_TOKENS", raising=False)
-    assert envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS == 16
-    monkeypatch.setenv("TPU_STREAMIDX_SMALL_BUCKET_TOKENS", "64")
     assert envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS == 64
+    monkeypatch.setenv("TPU_STREAMIDX_SMALL_BUCKET_TOKENS", "16")
+    assert envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS == 16
+    monkeypatch.delenv("TPU_STREAMIDX_MIXED_KV_PAGES", raising=False)
+    assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 4
+    monkeypatch.setenv("TPU_STREAMIDX_MIXED_KV_PAGES", "2")
+    assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 2

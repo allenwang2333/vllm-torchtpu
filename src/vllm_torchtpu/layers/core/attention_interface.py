@@ -1041,20 +1041,48 @@ def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
     return words
 
 
+def dcp_mla_topk_cap(dcp_size: int) -> int:
+    """TPU_DCP_MLA_TOPK_CAP as it applies at this DCP size (0 = off).
+
+    Auto (-1, the default): a rank owns ~topk/dcp_size slots, so a cap of 512
+    rarely binds at DCP16 and overflows every row at DCP2.
+    """
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    if topk_cap < 0:
+        return 512 if dcp_size >= 16 else 0
+    return topk_cap
+
+
+def _row_widths(env_name: str, value: str, topk_cap: int) -> tuple[int, ...]:
+    """A comma list of capped-path row widths (TPU_DCP_MLA_MIXED_LIVE_WIDTHS,
+    TPU_MLA_DECODE_ROW_WIDTHS) for this cap (0 = none).
+
+    The defaults were set for the auto cap of 512 at DCP >= 16: without a cap
+    they step aside, and under a smaller explicit cap the widths it cannot take
+    are dropped. Widths set explicitly reach the kernel as given, which refuses
+    any that is not below the cap.
+    """
+    widths = tuple(int(w) for w in value.split(",") if w)
+    if envs.is_set(env_name):
+        return widths
+    return tuple(w for w in widths if w < topk_cap)
+
+
 def kv_write_in_gather_supported(
     nope_spec: SparseMLAKVCacheSpec,
     rope_spec: SparseMLAKVCacheSpec,
     num_tokens: int,
     topk: int,
+    dcp_size: int,
 ) -> bool:
     """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this decode step.
 
     The fused-prep capped gather must run (SparseCore caches, a top-k wider
-    than TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a
-    rope token one 32-word SparseCore row, and the step at most 32 tokens
-    (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
+    than the cap `dcp_mla_topk_cap` resolves at this DCP size), a nope token
+    must be one 128-word row and a rope token one 32-word SparseCore row, and
+    the step at most 32 tokens (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
     """
-    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    topk_cap = dcp_mla_topk_cap(dcp_size)
     return (
         0 < num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         and bool(topk_cap)
@@ -1230,7 +1258,7 @@ def sparse_mla_attention_dcp(
             and envs.TPU_DCP_MLA_FUSED_PREP
             and decode_bucket
             and kv_write_in_gather_supported(
-                nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
+                nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1], dcp_size
             )
         )
         kv_write = None
@@ -1311,11 +1339,7 @@ def sparse_mla_attention_dcp(
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
-        if topk_cap < 0:
-            # Auto: a rank owns ~topk/dcp_size slots, so a cap of 512 rarely
-            # binds at DCP16 and overflows every row at DCP2.
-            topk_cap = 512 if dcp_size >= 16 else 0
+        topk_cap = dcp_mla_topk_cap(dcp_size)
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
@@ -1365,15 +1389,21 @@ def sparse_mla_attention_dcp(
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,
-            mixed_live_widths=tuple(
-                int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
+            mixed_live_widths=_row_widths(
+                "TPU_DCP_MLA_MIXED_LIVE_WIDTHS",
+                envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS,
+                topk_cap or 0,
             ),
             mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
             decode_row_widths=(
-                tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
+                _row_widths(
+                    "TPU_MLA_DECODE_ROW_WIDTHS",
+                    envs.TPU_MLA_DECODE_ROW_WIDTHS,
+                    topk_cap,
+                )
                 if topk_cap
                 else ()
             ),

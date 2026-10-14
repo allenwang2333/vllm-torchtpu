@@ -583,6 +583,19 @@ def _check_ranks_agree(entry: dict) -> None:
         )
 
 
+def should_arm() -> bool:
+    """Whether load_model should call `arm` at all.
+
+    USE_MOE_TP_DECODE_KERNEL is on by default, and without
+    TPU_MOE_SKIP_PADDED_TOKENS every layer refuses (the op reads n_valid from
+    the padding mask), so the default skips arming and its collectives there.
+    An explicit setting still arms and logs why each layer was refused.
+    """
+    if not envs.USE_MOE_TP_DECODE_KERNEL:
+        return False
+    return envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.is_set("USE_MOE_TP_DECODE_KERNEL")
+
+
 def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> int:
     """Arm every admitted MoE layer of `model` and of `draft_model` (the MTP
     drafter); returns how many were armed. Collective over the TP group."""
@@ -652,7 +665,12 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
     armed_drafter = sum(1 for r, _ in plan if id(r) not in known)
-    log = logger.info if plan else logger.warning
+    # On by default, so a model it does not serve is the common case there.
+    log = (
+        logger.info
+        if plan or not envs.is_set("USE_MOE_TP_DECODE_KERNEL")
+        else logger.warning
+    )
     log(
         "moe_tp_decode: armed %d/%d target and %d/%d drafter MoE layers (mesh "
         "index %d, kernel token counts %s, sig %s); refused: %s",

@@ -59,7 +59,7 @@ def test_t3_attention_all_flags_on_vs_off():
         mock.patch.object(sparse_kernel, "sparse_ragged_paged_attention", spy),
         mock.patch.dict(os.environ, env),
     ):
-        os.environ.pop("TPU_MLA_DECODE_ROW_WIDTHS", None)
+        os.environ["TPU_MLA_DECODE_ROW_WIDTHS"] = ""  # on by default
         t4.test_attention_all_flags_on_vs_off()
     want = tuple(int(w) for w in ROW_WIDTHS.split(","))
     print("decode_row_widths per kernel call:", seen)

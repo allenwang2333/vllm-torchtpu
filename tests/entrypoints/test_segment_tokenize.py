@@ -164,6 +164,44 @@ def test_encode_special_tokens_ineligible():
     assert SegmentTokenizer.eligible(tok) is not None
 
 
+def test_no_added_tokens_ineligible():
+    # On by default, so it meets tokenizers with nothing to split on: an empty
+    # alternation would match "" everywhere (KeyError on the added-id lookup).
+    tok = Tokenizer(models.BPE())
+    assert SegmentTokenizer.eligible(tok) == "no added tokens"
+
+
+def _metaspace_tokenizer(prepend_scheme):
+    vocab = {"[UNK]": 0, "▁": 1}
+    for ch in "abcdefghijklmnopqrstuvwxyzHW \n":
+        vocab.setdefault(ch, len(vocab))
+    tok = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Metaspace(prepend_scheme=prepend_scheme)
+    tok.add_special_tokens([AddedToken("<x>", normalized=False)])
+    return tok
+
+
+def test_offset_dependent_pre_tokenizer_falls_back(monkeypatch):
+    # Metaspace prepend_scheme="first" prepends only at offset 0 of the whole
+    # string, so a piece cut out after an added token gains a spurious prefix.
+    from vllm_torchtpu import segment_tokenize as st
+
+    first = _metaspace_tokenizer("first")
+    assert SegmentTokenizer.eligible(first) is None  # the split rule holds
+    assert SegmentTokenizer(first, 1000).probe_mismatch() is not None
+
+    class Hf:  # what get_segment_tokenizer reads off a vLLM tokenizer
+        def __init__(self, backend):
+            self.backend_tokenizer = backend
+
+    monkeypatch.setattr(st, "_INSTANCES", {})
+    # Both alive at once: instances are keyed by id().
+    hf_first, hf_always = Hf(first), Hf(_metaspace_tokenizer("always"))
+    assert st.get_segment_tokenizer(hf_first, 1000) is None
+    seg = st.get_segment_tokenizer(hf_always, 1000)
+    assert seg is not None and seg.hits == seg.misses == 0
+
+
 GLM = os.environ.get("SEGMENT_TOKENIZE_TEST_MODEL", "zai-org/GLM-5.2-FP8")
 
 
