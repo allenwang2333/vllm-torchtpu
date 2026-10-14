@@ -468,6 +468,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+@dataclass
+class _StageBuffer:
+    """One host scratch of the TPU_BLOCK_TABLE_STAGE_RING rotation."""
+
+    scratch: torch.Tensor | None = None
+    # Spans holding real rows from this buffer's last staging.
+    dirty: list[tuple[int, int]] = field(default_factory=list)
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -506,13 +515,28 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
+    ring = envs.TPU_BLOCK_TABLE_STAGE_RING
+    if ring > 1:
+        # Rotate host scratches so a staging never rewrites the buffer the
+        # previous upload was issued from.
+        slots = runner._block_table_stage_ring
+        if not slots:
+            slots.extend(_StageBuffer() for _ in range(ring))
+        buf = slots[runner._block_table_stage_next % ring]
+        runner._block_table_stage_next += 1
+    else:
+        buf = None
+    scratch = runner._block_table_stage_cpu if buf is None else buf.scratch
     if scratch is None or scratch.numel() < total:
         scratch = torch.zeros(
             (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
-        runner._block_table_stage_cpu = scratch
-        runner._block_table_stage_dirty = []
+        if buf is None:
+            runner._block_table_stage_cpu = scratch
+            runner._block_table_stage_dirty = []
+        else:
+            buf.scratch = scratch
+            buf.dirty = []
     flat = scratch[:total]
     real_rows = ctx.position_ids_override is None
     sparse_zero = envs.TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO
@@ -527,8 +551,12 @@ def stage_block_table_uploads(
     if sparse_zero:
         # The scratch is zero outside the real rows the last staging wrote, so
         # only those need clearing, minus the rows this staging overwrites.
-        zero_stale_spans(scratch, runner._block_table_stage_dirty, fresh)
-        runner._block_table_stage_dirty = fresh
+        if buf is None:
+            zero_stale_spans(scratch, runner._block_table_stage_dirty, fresh)
+            runner._block_table_stage_dirty = fresh
+        else:
+            zero_stale_spans(scratch, buf.dirty, fresh)
+            buf.dirty = fresh
     else:
         flat.zero_()
 

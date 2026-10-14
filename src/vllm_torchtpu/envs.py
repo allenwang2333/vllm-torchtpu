@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
     TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD: bool = False
+    TPU_BLOCK_TABLE_STAGE_RING: int = 1
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -679,6 +680,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD": env_bool(
         "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD"
     ),
+    # Block-table staging: number of host scratch buffers used in rotation, so
+    # a staging does not rewrite the buffer the previous upload read from.
+    "TPU_BLOCK_TABLE_STAGE_RING": env_int("TPU_BLOCK_TABLE_STAGE_RING", 1),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

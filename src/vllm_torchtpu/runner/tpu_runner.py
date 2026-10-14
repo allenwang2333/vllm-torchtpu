@@ -876,6 +876,9 @@ class TPUModelRunner(GPUModelRunner):
         # Last block-table upload per staged group set, keyed by its layout
         # and real-row contents (TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD).
         self._block_table_stage_uploads: dict[Any, tuple[Any, list, Any]] = {}
+        # TPU_BLOCK_TABLE_STAGE_RING > 1: rotating scratch buffers.
+        self._block_table_stage_ring: list[Any] = []
+        self._block_table_stage_next = 0
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,
