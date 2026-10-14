@@ -1186,6 +1186,23 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     except Exception:
         vocab_size = 151936
 
+    # weight.json `index` is the global HBM weight slot. `lm_head.weight` is arg 1
+    # of the sampling subgraphs, which is also the slot of forward's
+    # `model.embed_tokens.weight`, so give it the first slot no forward weight uses.
+    used_weight_indices: set[int] = set()
+    for wj_path in (
+        export_dir / "serving_checkpoint" / "weight.json",
+        export_dir / "weight.json",
+    ):
+        if wj_path.is_file():
+            with contextlib.suppress(Exception):
+                raw_wj = json.loads(wj_path.read_text())
+                for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
+                    if w_name != "lm_head.weight" and isinstance(w_spec, dict):
+                        used_weight_indices.add(int(w_spec["index"]))
+            break
+    lm_head_index = max(used_weight_indices, default=0) + 1
+
     def _export_bucket(
         fn_key: str,
         num_reqs: int,
@@ -1234,7 +1251,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     "weight_name": "",
                 },
                 {
-                    "index": 1,
+                    "index": lm_head_index,
                     "name": "lm_head.weight",
                     "shape": lm_shape,
                     "dtype": _dtype_name(lm_head_weight),
