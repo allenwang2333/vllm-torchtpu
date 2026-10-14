@@ -14,7 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -1413,7 +1413,16 @@ def _attention_kernel(
     lse_fill: bool = False,
     fault: str | None = None,
     row_widths: tuple[int, ...] = (),
+    out_row_offset: int = 0,
+    o_in_aliased: bool = False,
+    grouped_out: bool = False,
 ):
+    # Group-local output (`grouped_out`; `merge_group_rows` of the caller): the
+    # output and lse refs are one token group's `[rows, ...]` buffers instead of
+    # q-sized ones, and query row r is stored at row r - `out_row_offset`. The
+    # output does not alias q; with `o_in_aliased` its in-place input (the
+    # group's earlier chunks) follows the lse input and is never read.
+    #
     # Row widths (`row_widths`, TPU_MLA_DECODE_ROW_WIDTHS; not live-group):
     # ascending static row counts (multiples of 128 below bkv_sz). A grid step
     # whose tokens all have kv_len <= w fetches only the first w rows of each
@@ -1522,11 +1531,14 @@ def _attention_kernel(
     if lse_fill:
         # No aliased lse input: the kernel defines every row itself.
         refs = (None, *refs)
+    if o_in_aliased:
+        assert grouped_out and return_lse and not lse_fill
+        refs = (refs[0], *refs[2:])  # drop the group output's aliased input
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
-            o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-            lse_hbm_ref,  # f32[max_num_tokens, num_q_heads, 1]
+            o_hbm_ref,  # [tokens or group rows, num_q_heads, head_dim]
+            lse_hbm_ref,  # f32[tokens or group rows, num_q_heads, 1]
             bkv_nope_x2_ref,  # [2, bsz, topk * WORD_BYTES, TILE_LANE_BYTES]
             bkv_rope_x2_ref,  # [2, bsz, topk, rope_dim]
             bq_x2_ref,  # [2, bsz, num_q_heads, head_dim]
@@ -1547,7 +1559,11 @@ def _attention_kernel(
         blse_x2_ref = None
 
     assert o_hbm_ref is not None
-    assert q_hbm_ref.shape == o_hbm_ref.shape
+    if grouped_out:
+        assert return_lse and not preserve_suffix
+        assert o_hbm_ref.shape[1:] == q_hbm_ref.shape[1:]
+    else:
+        assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
@@ -1795,6 +1811,12 @@ def _attention_kernel(
                     src=bq_tab_vmem_ref, dst=bq_tab_vmem_ref, sem=sem, wait=True
                 )
 
+    def _out_row(seq_idx_start):
+        # Where query row `seq_idx_start` lands in the output and lse refs.
+        if out_row_offset:
+            return seq_idx_start - out_row_offset
+        return seq_idx_start
+
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
         vmem_ref = bo_x2_ref.at[bo_sem_idx, :]
@@ -1814,7 +1836,7 @@ def _attention_kernel(
         if not wait:
             _async_copy(
                 vmem_ref,
-                o_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                o_hbm_ref.at[pl.ds(_out_row(seq_idx_start), batch_size)],
                 sem,
                 wait,
             )
@@ -1828,7 +1850,7 @@ def _attention_kernel(
         if not wait:
             _async_copy(
                 vmem_ref,
-                lse_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                lse_hbm_ref.at[pl.ds(_out_row(seq_idx_start), batch_size)],
                 sem,
                 wait,
             )
@@ -2395,6 +2417,7 @@ def prepare_outputs(
         "kv_write_fault",
         "mixed_fused_prep",
         "decode_row_widths",
+        "merge_group_rows",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -2441,6 +2464,7 @@ def sparse_ragged_paged_attention(
     kv_write_fault: str | None = None,
     mixed_fused_prep: bool = False,
     decode_row_widths: tuple[int, ...] = (),
+    merge_group_rows: int = 0,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -2557,11 +2581,24 @@ def sparse_ragged_paged_attention(
         live-group window rows in one call that reads the top-k as 128-lane
         rows and writes one window array per chunk
         (`prepare_capped_window_live_fused`). Same rows, kv_lens and table.
+      merge_group_rows: With `return_lse` and `lse_mask_empty`: attend each
+        group of this many tokens (a multiple of
+        `gather_and_attention_chunk_size` dividing the token count) into an
+        output and an lse of its own, instead of the one output that aliases
+        `q` and the one lse every chunk threads through. Each group's buffers
+        then depend on that group's chunks alone, so a consumer of group k
+        (the DCP merge, TPU_DCP_MERGE_PIPELINED) can run while later groups
+        are attended. Rows the grid reaches are bit for bit the ungrouped
+        result (the same kernel body on the same operands, stored at the row
+        offset); rows it never reaches keep lse -inf and an unwritten output.
+        0 (default) = one output.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
       `lse` is f32[max_num_tokens, actual_num_q_heads]. With `kv_write`, the
-      updated `(cache_kv_nope, cache_kv_rope)` follow.
+      updated `(cache_kv_nope, cache_kv_rope)` follow. With
+      `merge_group_rows`, `(outputs, lses)`: tuples with one
+      `[merge_group_rows, ...]` output and lse per token group, in order.
     """
     if cache_layout not in (TENSORCORE_CACHE_LAYOUT, SPARSECORE_CACHE_LAYOUT):
         raise ValueError(
@@ -2694,6 +2731,19 @@ def sparse_ragged_paged_attention(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
+    if merge_group_rows and not (
+        return_lse
+        and lse_mask_empty
+        and kv_write is None
+        and merge_group_rows % gather_and_attention_chunk_size == 0
+        and q.shape[0] % merge_group_rows == 0
+    ):
+        raise ValueError(
+            f"merge_group_rows ({merge_group_rows}) needs return_lse, "
+            "lse_mask_empty and no kv_write, and must be a multiple of "
+            f"gather_and_attention_chunk_size ({gather_and_attention_chunk_size}) "
+            f"dividing the token count ({q.shape[0]})"
+        )
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
     # whenever every chunk has one static size; otherwise the full-width
@@ -2859,7 +2909,13 @@ def sparse_ragged_paged_attention(
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
-    lse_fill = bool(lse_in_kernel and return_lse and lse_lane_dense and num_chunks == 1)
+    lse_fill = bool(
+        lse_in_kernel
+        and return_lse
+        and lse_lane_dense
+        and num_chunks == 1
+        and not merge_group_rows
+    )
     lse = (
         jnp.full(
             (q.shape[0], num_q_heads)
@@ -2868,20 +2924,46 @@ def sparse_ragged_paged_attention(
             -jnp.inf if lse_mask_empty else jnp.finfo(jnp.float32).min,
             dtype=jnp.float32,
         )
-        if return_lse and not lse_fill
+        if return_lse and not lse_fill and not merge_group_rows
         else None
     )
 
+    # merge_group_rows: each group's output (None until its first chunk makes
+    # one) and lse (the -inf sentinel lse_mask_empty uses), one per group.
+    group_outs: list[jax.Array | None] = []
+    group_lses: list[jax.Array] = []
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
+        chunk_lse = lse
+        group_kwargs: dict[str, Any] = {}
+        group = 0
+        if merge_group_rows:
+            group, group_row = divmod(start_pos, merge_group_rows)
+            if group_row == 0:
+                group_outs.append(None)
+                group_lses.append(
+                    jnp.full(
+                        (merge_group_rows, num_q_heads)
+                        if lse_lane_dense
+                        else (merge_group_rows, num_q_heads, 1),
+                        -jnp.inf,
+                        dtype=jnp.float32,
+                    )
+                )
+            chunk_lse = group_lses[group]
+            group_kwargs = dict(
+                out_rows=merge_group_rows,
+                out_row_offset=group * merge_group_rows,
+                o_in=group_outs[group],
+            )
         result = sparse_attention_chunk(
             q,
             cache_kv_nope,
             cache_kv_rope,
             kv_lens,
             physical_indices,
-            lse,
+            chunk_lse,
             start_pos=start_pos,
             end_pos=end_pos,
             token_end=cu_q_lens[distribution[2]],
@@ -2927,13 +3009,29 @@ def sparse_ragged_paged_attention(
             prologue_fault=prologue_fault,
             kv_write=kv_write,
             kv_write_fault=kv_write_fault,
+            **group_kwargs,
         )
         if kv_write is not None:
             result, (cache_kv_nope, cache_kv_rope) = result
-        if return_lse:
+        if merge_group_rows:
+            group_outs[group], group_lses[group] = result
+        elif return_lse:
             q, lse = result
         else:
             q = result
+
+    if merge_group_rows:
+        outs = tuple(
+            prepare_outputs(cast(jax.Array, o), actual_num_q_heads, actual_head_dim)
+            for o in group_outs
+        )
+        lses = tuple(
+            group_lse[:, :actual_num_q_heads]
+            if lse_lane_dense
+            else group_lse[:, :actual_num_q_heads, 0]
+            for group_lse in group_lses
+        )
+        return outs, lses
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
@@ -3046,6 +3144,9 @@ def sparse_attention_chunk(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     kv_write_fault: str | None = None,
     row_widths: tuple[int, ...] = (),
+    out_rows: int = 0,
+    out_row_offset: int = 0,
+    o_in: jax.Array | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -3078,9 +3179,30 @@ def sparse_attention_chunk(
     kernel specializes its body to per grid step (see `_attention_kernel`).
     `kv_write` (with `gather_live_in_indices`): the gather first writes this
     step's packed tokens into both caches; returns `(result, (nope, rope))`.
+    `out_rows` (with `lse`; `merge_group_rows` of the caller): the output does
+    not alias `q`; it and the lse are `[out_rows, ...]` buffers of one token
+    group, row `r` stored at `r - out_row_offset`, and `lse` is that group's
+    lse. `o_in` is the group's output from an earlier chunk, updated in place;
+    without it the output is a new buffer whose rows the grid does not reach
+    stay unwritten. Returns `(output, lse)` of the group.
     """
     if kv_write is not None and not gather_live_in_indices:
         raise ValueError("kv_write rides the fused-prep capped gather only")
+    if out_rows and (lse is None or lse_fill or preserve_suffix):
+        raise ValueError(
+            "out_rows needs an lse buffer, and neither lse_fill nor preserve_suffix"
+        )
+    # The kernel runs without bounds checks: a store outside the group's
+    # buffer would land silently.
+    if o_in is not None and not out_rows:
+        raise ValueError("o_in (an earlier chunk's group output) needs out_rows")
+    if out_rows and not (
+        out_row_offset <= start_pos and end_pos <= out_row_offset + out_rows
+    ):
+        raise ValueError(
+            f"rows [{start_pos}, {end_pos}) fall outside the group buffer "
+            f"[{out_row_offset}, {out_row_offset + out_rows})"
+        )
     return_lse = lse is not None or lse_fill
     assert not (lse_fill and lse is not None), "lse_fill owns the lse buffer"
     q_rope = q_rope_table is not None
@@ -3152,6 +3274,10 @@ def sparse_attention_chunk(
             if not lse_fill:
                 in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # lse (in)
             out_specs = [out_specs, pl.BlockSpec(memory_space=pltpu.HBM)]
+        if o_in is not None:
+            # out_rows: the group's output from its earlier chunks, in place.
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # o (in)
+        o_shape = (out_rows, *q.shape[1:]) if out_rows else q.shape
 
         # One batch entry's worth of gathered top-k rows, per cache.
         nope_tile = cache_kv_nope.shape[1:]
@@ -3246,6 +3372,15 @@ def sparse_attention_chunk(
             lse_fill=lse_fill,
             fault=prologue_fault,
             row_widths=tuple(row_widths) if capped_windows is not None else (),
+            **(
+                dict(
+                    out_row_offset=out_row_offset,
+                    o_in_aliased=o_in is not None,
+                    grouped_out=True,
+                )
+                if out_rows
+                else {}
+            ),
         )
         if live_views is not None:
             group_body = functools.partial(
@@ -3266,6 +3401,27 @@ def sparse_attention_chunk(
         if capped_windows is not None:
             scope_name += f"-capw_{capped_windows}"
         num_prefetch = len(scalar_prefetches)
+        lse_operand = (
+            num_prefetch
+            + 3
+            + int(split_q)
+            + int(q_rope)
+            + 2 * int(live_views is not None)
+        )
+        if out_rows:
+            # The group's own buffers: lse in place, and the output in place
+            # over the group's earlier chunks (a new buffer for its first).
+            aliases = {lse_operand: 1}
+            if o_in is not None:
+                aliases[lse_operand + 1] = 0
+        elif lse_fill:
+            aliases = {num_prefetch: 0}
+        elif return_lse:
+            aliases = {num_prefetch: 0, lse_operand: 1}
+        else:
+            # 3 = q; operand indices count the scalar prefetches
+            # (DSV4's "4" also counted attention_sinks).
+            aliases = {num_prefetch: 0}  # Alias output activation with q
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 kernel_body,
@@ -3283,30 +3439,13 @@ def sparse_attention_chunk(
                 ),
                 out_shape=(
                     [
-                        jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                        jax.ShapeDtypeStruct(shape=o_shape, dtype=q.dtype),
                         jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
                     ]
                     if return_lse
-                    else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
+                    else jax.ShapeDtypeStruct(shape=o_shape, dtype=q.dtype)
                 ),
-                input_output_aliases=(
-                    {num_prefetch: 0}
-                    if lse_fill
-                    else {
-                        num_prefetch: 0,
-                        num_prefetch
-                        + 3
-                        + int(split_q)
-                        + int(q_rope)
-                        + 2 * int(live_views is not None): 1,
-                    }
-                    if return_lse
-                    else {
-                        # 3 = q; operand indices count the scalar prefetches
-                        # (DSV4's "4" also counted attention_sinks).
-                        num_prefetch: 0,  # Alias output activation with q
-                    }
-                ),
+                input_output_aliases=aliases,
                 name=scope_name,
             )
         )
@@ -3319,6 +3458,8 @@ def sparse_attention_chunk(
             operands += list(live_views)
         if return_lse and not lse_fill:
             operands.append(lse)
+        if o_in is not None:
+            operands.append(o_in)
         return kernel(*scalar_prefetches, *operands)
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]

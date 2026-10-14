@@ -1121,7 +1121,8 @@ def sparse_mla_attention_dcp(
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    merge_group_rows: int = 0,
+) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
@@ -1148,6 +1149,11 @@ def sparse_mla_attention_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
         the `all_to_all` of an iota. Same result.
+      merge_group_rows: TPU_DCP_MERGE_PIPELINED, mixed / prefill buckets with
+        the kernel's empty-row lse (TPU_DCP_MLA_MIXED_MASK_IN_KERNEL): attend
+        each group of this many tokens into a partial output and lse of its
+        own (`sparse_ragged_paged_attention(merge_group_rows=...)`), so the
+        merge of group k waits for group k's attention only. 0 = one output.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1161,7 +1167,10 @@ def sparse_mla_attention_dcp(
       and both *partial*: they must go through the log-sum-exp merge above
       before `W_UV`. `lse` is `-inf` wherever a rank owns none of a token's
       top-k, which is what makes that merge a plain softmax with no separate
-      count channel.
+      count channel. With `merge_group_rows`, `(kv_cache_nope, kv_cache_rope,
+      *outputs, *lses)`: one output `[dcp_size * merge_group_rows, num_heads,
+      lkv_dim]` per token group, then the matching lses, groups in token
+      order; rows past the real token count hold lse -inf.
     """
     if dcp_size <= 1:
         raise ValueError(
@@ -1221,6 +1230,18 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None, None),  # partial output
         P(dcp_axis_name, None),  # partial lse
     )
+    if merge_group_rows:
+        if num_tokens % merge_group_rows:
+            raise ValueError(
+                f"merge_group_rows ({merge_group_rows}) must divide the token "
+                f"count ({num_tokens})"
+            )
+        groups = num_tokens // merge_group_rows
+        out_specs = (
+            out_specs[:2]
+            + (P(dcp_axis_name, None, None),) * groups  # partial outputs
+            + (P(dcp_axis_name, None),) * groups  # partial lses
+        )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1310,6 +1331,17 @@ def sparse_mla_attention_dcp(
         mask_in_kernel = mask_in_kernel or (
             envs.TPU_DCP_MLA_MIXED_MASK_IN_KERNEL and not decode_bucket
         )
+        group_kwargs = {}
+        if merge_group_rows:
+            # Unreached group rows rely on the kernel's -inf lse, which the
+            # merge weights to zero whatever the unwritten output holds.
+            if not mask_in_kernel or kv_in_gather:
+                raise ValueError(
+                    "merge_group_rows needs the kernel's empty-row lse "
+                    "(TPU_DCP_MLA_MIXED_MASK_IN_KERNEL) and no KV write in "
+                    "the gather"
+                )
+            group_kwargs = {"merge_group_rows": merge_group_rows}
         owns = None
         if not mask_in_kernel:
             # A rank owning none of a token's top-k still has to be handed one
@@ -1409,7 +1441,16 @@ def sparse_mla_attention_dcp(
             ),
             **chunk_kwargs,
             **split_kwargs,
+            **group_kwargs,
         )
+        if merge_group_rows:
+            outputs, lses = attn
+            return (
+                kv_cache_nope,
+                kv_cache_rope,
+                *(o[..., : ql_nope.shape[-1]] for o in outputs),
+                *lses,
+            )
         output, lse = attn[:2]
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = True
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 2048
     TPU_DCP_MERGE_RS_BF16: int = 1
+    TPU_DCP_MERGE_PIPELINED: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 32
@@ -515,6 +516,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # accuracy-gated on GLM-5.2 DCP16 (mmlu_pro); only backbone buckets of at
     # least TPU_DCP_MERGE_CHUNKED_MIN_TOKENS take the chunked merge.
     "TPU_DCP_MERGE_RS_BF16": env_int("TPU_DCP_MERGE_RS_BF16", 1),
+    # The chunked merge (TPU_DCP_MERGE_CHUNKED) pipelined under the DCP sparse
+    # MLA attention of the same layer: the attention writes each merge chunk's
+    # tokens to buffers of their own, so chunk k's lse gather, weight multiply
+    # and reduce-scatter depend on chunk k's attention alone and can run while
+    # chunk k+1 is attended. Bitwise the same merge: the same per-chunk ops,
+    # with one lse gather per chunk in place of TPU_DCP_MERGE_CHUNKED_LSE_AG's
+    # single gather (a gather only moves rows). Only backbone buckets whose
+    # chunk length is a multiple of TPU_DCP_MLA_TOPK_CAP_CHUNK, with
+    # TPU_DCP_MLA_SPLIT_Q_LSE and TPU_DCP_MLA_MIXED_MASK_IN_KERNEL on; every
+    # other bucket, and the MTP drafter, keeps the unpipelined merge.
+    "TPU_DCP_MERGE_PIPELINED": env_bool("TPU_DCP_MERGE_PIPELINED", default=False),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)

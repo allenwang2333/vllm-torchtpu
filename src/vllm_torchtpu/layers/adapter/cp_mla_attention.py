@@ -33,6 +33,7 @@ Each DCP rank stores a shard of the KV cache, so it can only produce a
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import jax
@@ -298,6 +299,113 @@ def _merge_chunked_lse_gathered(
         for c in range(chunks)
     ]
     return torch.cat(pieces, dim=0)
+
+
+def pipelined_merge_enabled() -> bool:
+    """Whether the chunked merge may be pipelined under the DCP sparse MLA
+    attention (`TPU_DCP_MERGE_PIPELINED`). The attention must run split q with
+    the kernel's empty-row lse (`TPU_DCP_MLA_SPLIT_Q_LSE`,
+    `TPU_DCP_MLA_MIXED_MASK_IN_KERNEL`): the other modes finish with
+    whole-output ops that would re-join the groups."""
+    return bool(
+        envs.TPU_DCP_MERGE_PIPELINED
+        and envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        and envs.TPU_DCP_MLA_MIXED_MASK_IN_KERNEL
+        and envs.TPU_DCP_MERGE_CHUNKED > 1
+    )
+
+
+def pipelined_merge_groups(num_tokens: int, is_backbone: bool) -> int:
+    """How many token groups the DCP sparse MLA attention of a `num_tokens`
+    bucket writes to buffers of their own, so the chunked merge can run under
+    the attention (`pipelined_merge_enabled`); 0 = one output and the
+    unpipelined merge.
+
+    The groups are the chunked merge's chunks, so a bucket qualifies when
+    `merge_lse_partials_scatter_heads` would take the chunked merge and each
+    chunk is a whole number of attention chunks (`TPU_DCP_MLA_TOPK_CAP_CHUNK`
+    tokens, the chunk of the capped SparseCore path; without the cap the
+    kernel's default chunk applies, and a chunk length it does not divide
+    fails at trace time). Fixed at trace time like that merge's own choice,
+    so only the backbone qualifies, and the flags and `is_backbone` are
+    checked before the token count: the drafter never compares it.
+    """
+    if not (is_backbone and pipelined_merge_enabled()):
+        return 0
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return 0
+    chunks = _merge_chunks(num_tokens)
+    if chunks <= 1 or (num_tokens // chunks) % envs.TPU_DCP_MLA_TOPK_CAP_CHUNK:
+        return 0
+    return chunks
+
+
+def merge_lse_partials_scatter_heads_grouped(
+    outputs: Sequence[torch.Tensor],
+    lses: Sequence[torch.Tensor],
+    is_backbone: bool = True,
+    query_start_loc: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """`merge_lse_partials_scatter_heads` of the token-order concatenation of
+    `outputs` and `lses`, for an attention that wrote each token group to
+    buffers of its own (`TPU_DCP_MERGE_PIPELINED`).
+
+    When the groups are the chunked merge's chunks (`pipelined_merge_groups`),
+    each chunk is merged from its own group's tensors by exactly the ops
+    `_merge_chunked` runs on that chunk's rows, so every row is bit for bit
+    the same, and no op reads two groups: chunk k's lse gather, weight and
+    reduce-scatter depend on group k's attention alone, and the scheduler may
+    run them while later groups are attended. One lse gather for every chunk
+    (`TPU_DCP_MERGE_CHUNKED_LSE_AG`) would read every group, so this path
+    gathers per chunk; the rows are the same bits, since a gather only moves
+    them. Any other grouping merges the concatenation.
+
+    Args:
+      outputs: per group `[tokens_g, tp_local_num_heads * dcp_size,
+        kv_lora_rank]`, in token order.
+      lses: the matching `[tokens_g, tp_local_num_heads * dcp_size]`.
+      is_backbone, query_start_loc: as for `merge_lse_partials_scatter_heads`.
+
+    Returns:
+      `[sum(tokens_g), tp_local_num_heads, kv_lora_rank]` in the outputs'
+      dtype, as `merge_lse_partials_scatter_heads` returns it.
+    """
+    group = get_dcp_group()
+    num_tokens = sum(o.shape[0] for o in outputs)
+    pipelined = (
+        group is not None
+        and int(group.world_size) > 1
+        and len(outputs) == len(lses)
+        and len(outputs) == pipelined_merge_groups(num_tokens, is_backbone)
+        and all(o.shape[0] * len(outputs) == num_tokens for o in outputs)
+        and all(o.shape[0] == lse.shape[0] for o, lse in zip(outputs, lses))
+    )
+    if not pipelined:
+        return merge_lse_partials_scatter_heads(
+            torch.cat(list(outputs), dim=0),
+            torch.cat(list(lses), dim=0),
+            is_backbone=is_backbone,
+            query_start_loc=query_start_loc,
+        )
+    pieces = [_merge_one_chunk(o, lse, group) for o, lse in zip(outputs, lses)]
+    return _retain_rank(torch.cat(pieces, dim=0))
+
+
+def _merge_one_chunk(
+    output: torch.Tensor, lse: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """One chunk of `_merge_chunked` with its own lse gather: the
+    reduce-scatter merge of `output`'s rows, op for op as `_merge_chunked`
+    runs it on a chunk (bf16 wire with `TPU_DCP_MERGE_RS_BF16`)."""
+    if envs.TPU_DCP_MERGE_RS_BF16:
+        lse_f32 = lse.to(torch.float32)
+        return _weighted_reduce_scatter(
+            output, lse_f32, _gather_lse(lse_f32, group), group
+        )
+    return cp_lse_ag_out_rs(output, lse, group)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

@@ -75,6 +75,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
+from vllm_torchtpu.layers.adapter.cp_mla_attention import pipelined_merge_enabled
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
@@ -1594,6 +1595,8 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         self.sparse_mla_dcp_rope_op = None
+        self.sparse_mla_dcp_grouped_op = None
+        self.sparse_mla_dcp_grouped_rope_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1604,6 +1607,23 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.sparse_mla_dcp_rope_op = impl._build_sparse_mla_dcp_op(
                     self, dcp_size, impl.dcp_interleave_size, q_rope=True
                 )
+            # TPU_DCP_MERGE_PIPELINED: the variants that attend each merge
+            # chunk into buffers of its own.
+            if pipelined_merge_enabled():
+                self.sparse_mla_dcp_grouped_op = impl._build_sparse_mla_dcp_op(
+                    self,
+                    dcp_size,
+                    impl.dcp_interleave_size,
+                    merge_groups=envs.TPU_DCP_MERGE_CHUNKED,
+                )
+                if self.sparse_mla_dcp_rope_op is not None:
+                    self.sparse_mla_dcp_grouped_rope_op = impl._build_sparse_mla_dcp_op(
+                        self,
+                        dcp_size,
+                        impl.dcp_interleave_size,
+                        q_rope=True,
+                        merge_groups=envs.TPU_DCP_MERGE_CHUNKED,
+                    )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention
