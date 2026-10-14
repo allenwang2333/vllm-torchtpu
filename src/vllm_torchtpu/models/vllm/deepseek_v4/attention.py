@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
@@ -65,7 +66,45 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 
 logger = init_logger(__name__)
 
+# tokamax's PyTorch DeepSeek-V4 RoPE, imported here at module import -- never
+# inside a compiled region, where Dynamo would trace the import -- or None when
+# tokamax is absent or broken, in which case the in-tree RoPE ops run.
+try:
+    from tokamax.experimental.torch_tpu.ops.deepseek_rope import (
+        torch_pallas_mosaic_tpu as tokamax_rope,
+    )
+except (ImportError, AttributeError) as _e:
+    tokamax_rope = None
+    logger.info("tokamax's DeepSeek RoPE is unavailable: %s", _e)
+
 _pallas_op_cache: dict[str, Any] = {}
+
+
+def _tokamax_rope_unsupported_reason(mesh, head_dim: int) -> str | None:
+    """Why the q/kv RoPE cannot run tokamax's PyTorch op, or None."""
+    if not envs.VLLM_TPU_USE_TOKAMAX:
+        return "VLLM_TPU_USE_TOKAMAX=0"
+    if tokamax_rope is None:
+        return "tokamax is not importable"
+    if mesh is not None:
+        # tokamax's op registers without a mesh, so it cannot take query heads
+        # sharded over a multi-device mesh in this process.
+        return "a multi-device mesh in this process"
+    if head_dim == 128:
+        return "head_dim 128 (tokamax's qnorm_rope needs more than one lane block)"
+    return None
+
+
+def _tokamax_rope_op(mode: str, **kwargs):
+    """tokamax's `PallasMosaicTpuDeepseekRope` in `mode`, with the in-tree op's
+    `(x, positions, cos_sin_cache)` signature. Its kernel config is resolved
+    inside the op, so nothing here is traced but the call."""
+    rope = tokamax_rope.PallasMosaicTpuDeepseekRope
+
+    def op(x, positions, cos_sin_cache):
+        return rope(x, positions, cos_sin_cache, mode=mode, **kwargs)
+
+    return op
 
 
 class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
@@ -453,8 +492,8 @@ class VllmDeepseekV4MLAAttention(
         if is_csa and built_from_real_caches:
             reason = tokamax_csa_unsupported_reason(mesh)
             if reason is None:
-                # The gather between the SWA pass and the sparse MLA kernel
-                # runs as tokamax's PyTorch op instead.
+                # The sparse pass after the SWA pass runs as tokamax's
+                # PyTorch sparse MLA op instead.
                 op = build_tokamax_csa_attention(
                     op_name.replace("pallas::", "pallas::tokamax_", 1),
                     attn_jax_op,
@@ -467,7 +506,8 @@ class VllmDeepseekV4MLAAttention(
                 _pallas_op_cache[op_name] = op
                 return op, built_from_real_caches
             logger.warning_once(
-                "DeepSeek-V4 CSA attention: keeping the in-tree gather because of %s.",
+                "DeepSeek-V4 CSA attention: keeping the in-tree sparse pass "
+                "because of %s.",
                 reason,
             )
         return attn_jax_op, built_from_real_caches
@@ -492,13 +532,23 @@ class VllmDeepseekV4MLAAttention(
             return op
 
         eps = float(self.mla_attn.eps)
+        mesh = get_pallas_op_mesh()
+        reason = _tokamax_rope_unsupported_reason(mesh, self.mla_attn.head_dim)
+        if reason is None:
+            op = _tokamax_rope_op("qnorm_rope", eps=eps)
+            object.__setattr__(self, "_qnorm_rope_op_instance", op)
+            return op
+        logger.warning_once(
+            "DeepSeek-V4 q RMSNorm+RoPE: keeping the in-tree kernel because of %s.",
+            reason,
+        )
         op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_pallas_op_mesh(),
+                mesh=mesh,
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions
@@ -517,13 +567,22 @@ class VllmDeepseekV4MLAAttention(
         if op is not None:
             return op
 
+        mesh = get_pallas_op_mesh()
+        reason = _tokamax_rope_unsupported_reason(mesh, self.mla_attn.head_dim)
+        if reason is None:
+            op = _tokamax_rope_op("rope")
+            object.__setattr__(self, "_kv_rope_op_instance", op)
+            return op
+        logger.warning_once(
+            "DeepSeek-V4 kv RoPE: keeping the in-tree kernel because of %s.", reason
+        )
         op_name = "pallas::deepseek_v4_kv_rope"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_pallas_op_mesh(),
+                mesh=mesh,
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions

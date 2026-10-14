@@ -44,16 +44,19 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# tokamax's PyTorch lightning indexer, imported here at module import -- never
+# tokamax's PyTorch lightning indexer and RoPE, imported here at module import -- never
 # inside a compiled region, where Dynamo would trace the import -- or None
 # when tokamax is absent or broken, in which case the in-tree op runs.
 try:
+    from tokamax.experimental.torch_tpu.ops.deepseek_rope import (
+        torch_pallas_mosaic_tpu as tokamax_rope,
+    )
     from tokamax.experimental.torch_tpu.ops.lightning_indexer import (
         torch_pallas_mosaic_tpu as tokamax_lightning_indexer,
     )
 except (ImportError, AttributeError) as _e:
-    tokamax_lightning_indexer = None
-    logger.info("tokamax's lightning indexer is unavailable: %s", _e)
+    tokamax_rope = tokamax_lightning_indexer = None
+    logger.info("tokamax's lightning indexer or RoPE is unavailable: %s", _e)
 
 _indexer_op_cache = {}
 
@@ -137,28 +140,6 @@ def _indexer_jax(
         cu_q_lens,
         distribution,
     )
-
-
-# Module-level so `pallas.jax_op` can trace and register it as a torch op.
-def _indexer_prologue_jax(
-    q: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
-    indexer_weights: jax.Array,
-    *,
-    softmax_scale: float,
-    n_head: int,
-) -> tuple[jax.Array, jax.Array]:
-    """`_indexer_jax` up to the indexer kernel, for tokamax's indexer to finish.
-
-    Returns the rotated fp8 queries and the weights with the query
-    quantization scales folded in, the two inputs the kernel takes besides the
-    cache and the metadata.
-    """
-    q_quant, q_scales = rope_quant(
-        q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
-    )
-    return q_quant, indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
 
 
 def _tokamax_indexer_unsupported_reason(mesh) -> str | None:
@@ -266,41 +247,22 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         return indexer_jax_op
 
     def _build_tokamax_indexer_op(self):
-        """The indexer on tokamax's `PallasMosaicTpuLightningIndexer`.
+        """The indexer on tokamax's PyTorch ops, with no `jax_op` of its own.
 
-        A `jax_op` keeps what `_indexer_jax` does ahead of the kernel -- RoPE,
-        fp8 quantization and the scale fold -- and tokamax's PyTorch op then
-        scores and ranks the cached rows with the in-tree kernel's tuning.
-        Returns a callable with the in-tree op's signature.
+        What `_indexer_jax` does ahead of its kernel is RoPE with fp8
+        quantization, which tokamax's `PallasMosaicTpuDeepseekRope` does in
+        `rope_quant` mode, and folding the scales into the weights, a product
+        done here in torch, in `_indexer_jax`'s order. tokamax's
+        `PallasMosaicTpuLightningIndexer` then scores and ranks the cached rows
+        with the in-tree kernel's tuning. Returns a callable with the in-tree
+        op's signature.
         """
-        op_name = (
-            f"pallas::deepseek_v4_indexer_prologue_h{self.n_head}"
-            f"_s{self.softmax_scale:.6g}".replace(".", "p").replace("-", "m")
-        )
-        prologue_op = _indexer_op_cache.get(op_name)
-        if prologue_op is None:
-            prologue_op = pallas.jax_op(
-                op_name,
-                functools.partial(
-                    _indexer_prologue_jax,
-                    softmax_scale=self.softmax_scale,
-                    n_head=self.n_head,
-                ),
-            )
-
-            def _fake_prologue(q, positions, cos_sin_cache, indexer_weights):
-                return (
-                    torch.empty_like(q, dtype=torch.float8_e4m3fn),
-                    torch.empty(q.shape[:2], dtype=torch.float32, device=q.device),
-                )
-
-            prologue_op.register_fake(_fake_prologue)
-            _indexer_op_cache[op_name] = prologue_op
-
+        rope = tokamax_rope.PallasMosaicTpuDeepseekRope
         indexer = tokamax_lightning_indexer.PallasMosaicTpuLightningIndexer
         # Built here, outside any compiled region: it is a pydantic dataclass.
         config = tokamax_lightning_indexer.Config(**_STREAMIDX_TUNING)
         k, compression_ratio = self.topk_tokens, self.compress_ratio
+        softmax_scale, head_scale = self.softmax_scale, self.n_head**-0.5
 
         def tokamax_indexer_op(
             q,
@@ -313,7 +275,14 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             query_start_loc,
             request_distribution,
         ):
-            q_quant, weights = prologue_op(q, positions, cos_sin_cache, indexer_weights)
+            q_quant, q_scales = rope(
+                q,
+                positions,
+                cos_sin_cache,
+                mode="rope_quant",
+                quant_dtype=torch.float8_e4m3fn,
+            )
+            weights = indexer_weights * softmax_scale * head_scale * q_scales
             return indexer(
                 q_quant,
                 weights,

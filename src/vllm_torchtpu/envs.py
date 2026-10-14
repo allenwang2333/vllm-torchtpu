@@ -616,10 +616,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # without restarting it. Development aid; off by default.
     "TPU_KERNEL_ITER_MODE": lambda: bool(int(os.getenv("TPU_KERNEL_ITER_MODE") or "0")),
     # Call tokamax's PyTorch ops (tokamax.experimental.torch_tpu.ops) for
-    # batched RPA, the DeepSeek-V4 CSA gather and the DeepSeek-V3.2/V4 lightning
-    # indexer in place of the in-tree kernels, where each call site supports it
-    # (see the `_tokamax_*_unsupported_reason` helpers). 0 keeps every in-tree
-    # kernel, e.g. for an A/B against tokamax.
+    # batched RPA, DeepSeek-V4 RoPE and CSA sparse MLA, and the DeepSeek-V3.2/V4
+    # lightning indexer in place of the in-tree kernels, where each call site
+    # supports it (see the `*tokamax_*_unsupported_reason` helpers). 0 keeps
+    # every in-tree kernel, e.g. for an A/B against tokamax.
     "VLLM_TPU_USE_TOKAMAX": lambda: bool(int(os.getenv("VLLM_TPU_USE_TOKAMAX") or "1")),
     # Comma-separated module names re-imported by /reload_kernel (and, in
     # kernel-iteration mode, excluded from the compile-cache key). Defaults

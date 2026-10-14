@@ -17,7 +17,9 @@ import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs as batched_rpa_configs
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    configs as batched_rpa_configs,
+)
 from vllm_torchtpu.layers.adapter import attention
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackendImpl,
@@ -61,8 +63,9 @@ def _mesh(model=1):
 def fake_tokamax(monkeypatch):
     """Installs a fake tokamax batched RPA module, parents included.
 
-    Its op class stands in for tokamax's `_PallasMosaicTpuBatchedRpa`: vLLM
-    subclasses it to register a donating copy, and calls go through its
+    Its op class stands in for tokamax's `_PallasMosaicTpuBatchedRpa`, which
+    donates the pool and has its own fake: vLLM subclasses it to register a
+    non-donating copy for kernel-iteration mode, and calls go through its
     `__call__`, which records the call and bumps the pool. Returns a namespace
     with every call (`calls`, each tagged with the op that took it) and the
     module singleton (`singleton`).
@@ -72,8 +75,8 @@ def fake_tokamax(monkeypatch):
     class FakeBatchedRpa:
         def __init__(self):
             self.jax_op_name = "torch_tpu_pallas_mosaic_tpu_batched_rpa"
-            self.donate_argnums = None
-            self.fake_impl = None
+            self.donate_argnums = (3,)
+            self.fake_impl = object()
             self._torch_tokamax_op = mock.Mock()
 
         def __call__(self, queries, keys, values, kv_cache, *args, **kwargs):
@@ -89,8 +92,8 @@ def fake_tokamax(monkeypatch):
         setattr(sys.modules[parent], child, sys.modules[f"{parent}.{child}"])
     singleton = FakeBatchedRpa()
     sys.modules[_TOKAMAX_RPA].PallasMosaicTpuBatchedRpa = singleton
-    # vLLM builds its donating subclass once per process.
-    monkeypatch.setattr(attention, "_donating_tokamax_rpa_op", None)
+    # vLLM builds its non-donating subclass once per process.
+    monkeypatch.setattr(attention, "_non_donating_tokamax_rpa_op", None)
     return SimpleNamespace(calls=calls, singleton=singleton)
 
 
@@ -198,19 +201,12 @@ def test_batched_layer_runs_tokamax_and_writes_the_pool_back(
     assert torch.all(out == 7.0)
     # The new pool's contents land in the runner's tensor.
     assert torch.all(kv_cache == 1.0)
-    # The call took tokamax's `__call__` on vLLM's subclass, which donates the
-    # pool (argument 3) and carries vLLM's fake in place of jax_op's default,
-    # which refuses a symbolic token count. The singleton is left as it was.
-    assert op is not fake_tokamax.singleton
-    assert isinstance(op, type(fake_tokamax.singleton))
-    assert "__call__" not in type(op).__dict__
-    assert op.donate_argnums == (3,)
-    assert op.fake_impl is attention._fake_tokamax_rpa
-    assert op.jax_op_name != fake_tokamax.singleton.jax_op_name
-    assert fake_tokamax.singleton.donate_argnums is None
+    # Compiled serving takes tokamax's singleton as is: it donates the pool
+    # (argument 3) and brings its own fake.
+    assert op is fake_tokamax.singleton
 
 
-def test_kernel_iteration_mode_takes_the_non_donating_singleton(
+def test_kernel_iteration_mode_takes_a_non_donating_subclass(
     vllm_config_context, fake_tokamax, in_tree, monkeypatch
 ):
     """As for the in-tree op: kernel-iteration mode runs the op eagerly, where
@@ -218,35 +214,25 @@ def test_kernel_iteration_mode_takes_the_non_donating_singleton(
     monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
     _call(_build(_impl()), torch.zeros(8, 16, 2, 1, 128))
     assert not in_tree
-    assert fake_tokamax.calls[0][0] is fake_tokamax.singleton
-    fake_tokamax.singleton._torch_tokamax_op.register_fake.assert_called_with(
-        attention._fake_tokamax_rpa
-    )
+    op = fake_tokamax.calls[0][0]
+    # tokamax's `__call__` and fake, on a registration of its own that does
+    # not donate. The singleton is left as it was.
+    assert op is not fake_tokamax.singleton
+    assert isinstance(op, type(fake_tokamax.singleton))
+    assert "__call__" not in type(op).__dict__
+    assert op.donate_argnums is None
+    assert op.fake_impl is not None
+    assert op.jax_op_name != fake_tokamax.singleton.jax_op_name
+    assert fake_tokamax.singleton.donate_argnums == (3,)
 
 
-def test_the_donating_subclass_is_built_once(vllm_config_context, fake_tokamax, in_tree):
+def test_the_non_donating_subclass_is_built_once(
+    vllm_config_context, fake_tokamax, in_tree, monkeypatch
+):
+    monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
     _call(_build(_impl(sliding_window=64)), torch.zeros(8, 16, 2, 1, 128))
     _call(_build(_impl()), torch.zeros(8, 16, 2, 1, 128))
     assert fake_tokamax.calls[0][0] is fake_tokamax.calls[1][0]
-
-
-def test_fake_takes_a_symbolic_token_count():
-    from torch._subclasses import fake_tensor
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
-    mode = fake_tensor.FakeTensorMode(shape_env=ShapeEnv())
-    with mode:
-        tokens = mode.shape_env.create_unbacked_symint()
-        torch._check_is_size(tokens)
-        queries = torch.empty((tokens, 2, 128), dtype=torch.bfloat16)
-        pool = torch.empty((8, 16, 2, 1, 128), dtype=torch.bfloat16)
-        out, kv = attention._fake_tokamax_rpa(queries, queries, queries, pool)
-        out32, _ = attention._fake_tokamax_rpa(
-            queries, queries, queries, pool, out_dtype="float32"
-        )
-    assert out.shape == queries.shape and out.dtype == torch.bfloat16
-    assert kv.shape == pool.shape
-    assert out32.dtype == torch.float32
 
 
 def test_layers_with_one_config_share_one_closure(

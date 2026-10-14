@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DeepSeek kernels that call tokamax's PyTorch ops, and their fallbacks.
 
-Three call sites hand part of their work to an op from
-`tokamax.experimental.torch_tpu.ops`, with `jax_op` scaffolding around it for
-what tokamax does not do:
+These call sites call ops from `tokamax.experimental.torch_tpu.ops` in place of
+in-tree kernels, with `jax_op` scaffolding only for what tokamax does not do:
 
-* DeepSeek-V4 CSA attention gathers its top-k cache rows with
-  `PallasMosaicTpuCsaGather`, between a prologue `jax_op` (SWA pass, sparse
-  prep) and a per-chunk sparse MLA `jax_op`.
-* The DeepSeek-V4 indexer ranks with `PallasMosaicTpuLightningIndexer` after a
-  RoPE/quantize prologue `jax_op`.
-* The DeepSeek-V3.2 indexer ranks with `PallasMosaicTpuLightningIndexer` after
-  a K-append `jax_op`.
+* DeepSeek-V4 q RMSNorm+RoPE and kv RoPE run `PallasMosaicTpuDeepseekRope`.
+* DeepSeek-V4 CSA attention runs its SWA pass in a `jax_op`, then
+  `PallasMosaicTpuSparseMla` for the sparse gather-and-attention pass.
+* The DeepSeek-V4 indexer runs `PallasMosaicTpuDeepseekRope` (`rope_quant`),
+  folds the scales into the weights in torch, then
+  `PallasMosaicTpuLightningIndexer`.
+* The DeepSeek-V3.2 indexer appends K rows in a `jax_op`, then
+  `PallasMosaicTpuLightningIndexer`.
 
 The routing tests fake tokamax and `jax_op` and run anywhere. The parity tests
 hold each tokamax path against the in-tree op it replaces, on TPU.
@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
     deepseek_v4_attention_op as csa_op,
@@ -35,6 +35,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
     deepseek_v4_indexer as v4_indexer,
 )
+from vllm_torchtpu.models.vllm.deepseek_v4 import attention as v4_attention
 
 
 @pytest.fixture
@@ -70,170 +71,176 @@ def _recording_jax_op(registered):
 
 def test_csa_unsupported_reasons(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", "1")
-    monkeypatch.setattr(csa_op, "tokamax_csa_gather", object())
+    monkeypatch.setattr(csa_op, "tokamax_sparse_mla", object())
     assert csa_op.tokamax_csa_unsupported_reason(None) is None
     assert "mesh" in csa_op.tokamax_csa_unsupported_reason(object())
-    monkeypatch.setattr(csa_op, "tokamax_csa_gather", None)
+    monkeypatch.setattr(csa_op, "tokamax_sparse_mla", None)
     assert csa_op.tokamax_csa_unsupported_reason(None) == "tokamax is not importable"
-    monkeypatch.setattr(csa_op, "tokamax_csa_gather", object())
+    monkeypatch.setattr(csa_op, "tokamax_sparse_mla", object())
     monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", "0")
     assert csa_op.tokamax_csa_unsupported_reason(None) == "VLLM_TPU_USE_TOKAMAX=0"
 
 
-@pytest.mark.parametrize("two_caches_same_buffer", [False, True])
-def test_csa_gathers_each_chunk_with_tokamax(monkeypatch, two_caches_same_buffer):
-    """The torch-level pipeline: what each op gets, chunk by chunk."""
-    tokens, heads, dim, topk = 300, 3, 448, 128
-    padded_heads, padded_dim = 4, 512
-    updated_sw_cache = torch.full((2, 16, 128), 7, dtype=torch.int32)
-    gather_indices = torch.arange(tokens * topk, dtype=torch.int32)
-    calls = {"gather": [], "chunk": []}
-
-    def prologue(*args):
-        return (
-            updated_sw_cache,
-            torch.zeros(tokens, padded_heads, padded_dim, dtype=torch.bfloat16),
-            torch.zeros(padded_heads),
-            torch.zeros(tokens, padded_heads, padded_dim, dtype=torch.bfloat16),
-            torch.zeros(tokens, 128),
-            torch.zeros(tokens, 128),
-            torch.zeros(tokens, dtype=torch.int32),
-            gather_indices,
-            torch.tensor([290], dtype=torch.int32),
-            # Per chunk: where the kernel grid ends, how many indices to gather.
-            torch.tensor([128, 256, 300], dtype=torch.int32),
-            torch.tensor([128, 128, 44], dtype=torch.int32) * topk,
-        )
-
-    def chunk(out, nope, rope, *args, start_seq_idx, kernel_batch_size):
-        end_seq_idx = args[5]
-        calls["chunk"].append(
-            (start_seq_idx, kernel_batch_size, int(end_seq_idx), nope.shape, rope.shape)
-        )
-        return out + 1
-
-    def gather(nope_cache, rope_cache, indices, num_valid_indices, *, top_k, configs):
-        calls["gather"].append(
-            (nope_cache, indices, int(num_valid_indices), top_k, configs)
-        )
-        n = indices.shape[0]
-        return torch.zeros(n, 128, dtype=torch.int32), torch.zeros(
-            n // 4, 128, dtype=torch.int32
-        )
-
-    monkeypatch.setattr(
-        csa_op.pallas,
-        "jax_op",
-        _recording_jax_op({"prologue": prologue, "chunk": chunk}),
-    )
+def _build_csa(monkeypatch, swa, sparse_mla, in_tree, **kwargs):
+    monkeypatch.setattr(csa_op.pallas, "jax_op", _recording_jax_op({"_swa": swa}))
     monkeypatch.setattr(
         csa_op,
-        "tokamax_csa_gather",
-        SimpleNamespace(PallasMosaicTpuCsaGather=gather, Config=lambda: "config"),
+        "tokamax_sparse_mla",
+        SimpleNamespace(PallasMosaicTpuSparseMla=sparse_mla, Config=lambda: "config"),
     )
     monkeypatch.setattr(csa_op, "_tokamax_csa_op_cache", {})
-    op = csa_op.build_tokamax_csa_attention(
-        f"pallas::test_csa_{two_caches_same_buffer}",
-        lambda *args: pytest.fail("the in-tree op ran with live caches"),
+    return csa_op.build_tokamax_csa_attention(
+        f"pallas::test_csa_{kwargs}",
+        in_tree,
         sm_scale=0.1,
         sliding_window=128,
         logical_page_size=16,
-        two_caches_same_buffer=two_caches_same_buffer,
+        **kwargs,
     )
 
+
+@pytest.mark.parametrize("two_caches_same_buffer", [False, True])
+def test_csa_runs_tokamax_sparse_mla_after_the_swa_pass(
+    monkeypatch, two_caches_same_buffer
+):
+    tokens, heads, dim, topk = 300, 3, 448, 128
+    updated_sw_cache = torch.full((2, 16, 128), 7, dtype=torch.int32)
+    swa_out = torch.ones(tokens, heads, dim, dtype=torch.bfloat16)
+    swa_l, swa_m = torch.ones(tokens, heads), torch.zeros(tokens, heads)
+    swa_calls, sparse_calls = [], []
+
+    def swa(*args):
+        swa_calls.append(args)
+        return updated_sw_cache, swa_out, swa_l, swa_m
+
+    def sparse_mla(*args, **kwargs):
+        sparse_calls.append((args, kwargs))
+        return torch.full_like(args[0], 3.0)
+
+    op = _build_csa(
+        monkeypatch,
+        swa,
+        sparse_mla,
+        lambda *args: pytest.fail("the in-tree op ran with live caches"),
+        two_caches_same_buffer=two_caches_same_buffer,
+    )
     q = torch.zeros(tokens, heads, dim, dtype=torch.bfloat16)
+    sw_cache = torch.zeros(2, 16, 128, dtype=torch.int32)
     main_cache_kv = torch.zeros(2, 16, 128, dtype=torch.int32)
     main_cache_rope = torch.zeros(2, 4, 128, dtype=torch.int32)
     topk_indices = torch.zeros(tokens, topk, dtype=torch.int32)
+    page_indices = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+    sinks = torch.zeros(heads)
     output, new_sw_cache = op(
         q,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        "new_kv",
+        sw_cache,
+        "swa_kv_lens",
+        "swa_page_indices",
+        "swa_cu_q_lens",
+        "swa_distribution",
         main_cache_kv,
-        None,
+        "main_kv_lens",
         topk_indices,
-        None,
-        None,
-        None,
-        None,
+        page_indices,
+        "main_cu_q_lens",
+        "main_distribution",
+        sinks,
         main_cache_rope,
     )
 
-    # Chunks of 128 queries; the last 44 run in batches of 11.
-    assert [c[:3] for c in calls["chunk"]] == [
-        (0, 16, 128),
-        (128, 16, 256),
-        (256, 11, 300),
-    ]
-    assert [c[3] for c in calls["chunk"]] == [
-        (128, topk, 128),
-        (128, topk, 128),
-        (44, topk, 128),
-    ]
-    assert [c[4] for c in calls["chunk"]] == [
-        (128, topk // 4, 128),
-        (128, topk // 4, 128),
-        (44, topk // 4, 128),
-    ]
+    # The SWA pass takes the SWA operands and the sinks; nothing of the main
+    # caches.
+    ((swa_args,),) = [swa_calls]
+    assert swa_args[0] is q and swa_args[2] is sw_cache and swa_args[7] is sinks
+    assert swa_args[1:7:5] == ("new_kv", "swa_distribution")
+    # tokamax's sparse MLA gets the in-tree kernel's operands, with the SWA
+    # partials, and reads the SWA kernel's write when both caches are one.
+    ((args, kwargs),) = sparse_calls
     want_nope = updated_sw_cache if two_caches_same_buffer else main_cache_kv
-    for (nope_cache, indices, num_valid, top_k, configs), start, rows in zip(
-        calls["gather"], (0, 128, 256), (128, 128, 44)
-    ):
-        assert nope_cache is want_nope
-        assert torch.equal(
-            indices, gather_indices[start * topk : (start + rows) * topk]
-        )
-        assert num_valid == rows * topk
-        assert top_k == topk
-        assert configs == ("config", None)
-    # Every chunk wrote into the output; the padding is sliced off again.
-    assert output.shape == q.shape
-    assert torch.all(output == 3)
-    assert new_sw_cache is updated_sw_cache
-
-
-def test_csa_chunk_bounds():
-    """Chunks of 128 queries, kernel batches that divide each, and a grid that
-    stops at the first whole batch past the last real query (290 here)."""
-    chunks = sparse_mla.sparse_attention_chunks(300)
-    assert chunks == [(0, 128, 16), (128, 256, 16), (256, 300, 11)]
-    num_valid_tokens = jnp.int32(290)
-    bounds = [
-        tuple(
-            int(x) for x in sparse_mla.sparse_attention_chunk_end(*c, num_valid_tokens)
-        )
-        for c in chunks
-    ]
-    assert bounds == [(128, 128), (256, 128), (300, 44)]
-    # A chunk wholly past the real queries gathers nothing.
-    assert int(sparse_mla.sparse_attention_chunk_end(256, 300, 11, 100)[1]) == 0
+    assert args[0] is q and args[1] is want_nope and args[2] is main_cache_rope
+    assert args[3] is topk_indices
+    assert torch.equal(args[4], page_indices.flatten())
+    assert args[5:7] == ("main_cu_q_lens", "main_distribution")
+    assert args[7] is sinks
+    assert args[8] is swa_out and args[9] is swa_l and args[10] is swa_m
+    assert kwargs == dict(sm_scale=0.1, configs=("config", None))
+    assert torch.all(output == 3) and new_sw_cache is updated_sw_cache
 
 
 def test_csa_profiling_pass_takes_the_in_tree_op(monkeypatch):
-    monkeypatch.setattr(csa_op.pallas, "jax_op", _recording_jax_op({}))
-    monkeypatch.setattr(
-        csa_op,
-        "tokamax_csa_gather",
-        SimpleNamespace(PallasMosaicTpuCsaGather=None, Config=lambda: None),
-    )
-    monkeypatch.setattr(csa_op, "_tokamax_csa_op_cache", {})
     sentinel = object()
-    op = csa_op.build_tokamax_csa_attention(
-        "pallas::test_csa_prof",
-        lambda *args: sentinel,
-        sm_scale=0.1,
-        sliding_window=128,
-        logical_page_size=16,
-        two_caches_same_buffer=False,
+    op = _build_csa(
+        monkeypatch, None, None, lambda *args: sentinel, two_caches_same_buffer=False
     )
     empty = torch.zeros(0, 1, 1)
     args = [None] * 15
     args[7] = args[14] = empty
     assert op(*args) is sentinel
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 q and kv RoPE
+# ---------------------------------------------------------------------------
+
+
+def _v4_attention(head_dim=512):
+    layer = v4_attention.VllmDeepseekV4MLAAttention.__new__(
+        v4_attention.VllmDeepseekV4MLAAttention
+    )
+    object.__setattr__(layer, "mla_attn", SimpleNamespace(eps=1e-6, head_dim=head_dim))
+    return layer
+
+
+def test_v4_rope_runs_tokamax(monkeypatch):
+    calls = []
+
+    def rope(x, positions, cos_sin_cache, **kwargs):
+        calls.append((x, positions, cos_sin_cache, kwargs))
+        return "rotated"
+
+    monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", "1")
+    monkeypatch.setattr(v4_attention, "get_pallas_op_mesh", lambda: None)
+    monkeypatch.setattr(
+        v4_attention, "tokamax_rope", SimpleNamespace(PallasMosaicTpuDeepseekRope=rope)
+    )
+    layer = _v4_attention()
+    assert layer.qnorm_rope_op("q", "pos", "cs") == "rotated"
+    assert layer.kv_rope_op("kv", "pos", "cs") == "rotated"
+    assert calls == [
+        ("q", "pos", "cs", dict(mode="qnorm_rope", eps=1e-6)),
+        ("kv", "pos", "cs", dict(mode="rope")),
+    ]
+
+
+@pytest.mark.parametrize(
+    "env, mesh, tokamax, head_dim",
+    [
+        ("0", None, True, 512),
+        ("1", object(), True, 512),
+        ("1", None, False, 512),
+        ("1", None, True, 128),
+    ],
+    ids=["disabled", "mesh", "missing", "hd128"],
+)
+def test_v4_rope_keeps_the_in_tree_ops(monkeypatch, env, mesh, tokamax, head_dim):
+    monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", env)
+    monkeypatch.setattr(v4_attention, "get_pallas_op_mesh", lambda: mesh)
+    monkeypatch.setattr(v4_attention, "_pallas_op_cache", {})
+    monkeypatch.setattr(v4_attention, "tokamax_rope", object() if tokamax else None)
+    built = []
+    monkeypatch.setattr(
+        v4_attention.pallas,
+        "jax_op",
+        lambda name, fn, **kwargs: built.append(name)
+        or SimpleNamespace(register_fake=lambda f: None),
+    )
+    layer = _v4_attention(head_dim)
+    layer.qnorm_rope_op  # noqa: B018 -- building the op is what is under test
+    layer.kv_rope_op  # noqa: B018
+    assert len(built) == 2
+    assert built[0].startswith("pallas::deepseek_v4_qnorm_rope_e")
+    assert built[1] == "pallas::deepseek_v4_kv_rope"
 
 
 # ---------------------------------------------------------------------------
@@ -250,9 +257,14 @@ def _v4_indexer(topk=512):
     return indexer
 
 
-def test_v4_indexer_runs_tokamax_after_the_prologue(monkeypatch):
-    q_quant, weights = torch.zeros(5, 64, 128), torch.ones(5, 64)
-    calls = []
+def test_v4_indexer_runs_tokamax_rope_then_the_indexer(monkeypatch):
+    q_quant = torch.zeros(5, 64, 128)
+    q_scales = torch.full((5, 64), 2.0)
+    rope_calls, calls = [], []
+
+    def rope(*args, **kwargs):
+        rope_calls.append((args, kwargs))
+        return q_quant, q_scales
 
     def lightning_indexer(*args, **kwargs):
         calls.append((args, kwargs))
@@ -260,11 +272,8 @@ def test_v4_indexer_runs_tokamax_after_the_prologue(monkeypatch):
 
     monkeypatch.setenv("VLLM_TPU_USE_TOKAMAX", "1")
     monkeypatch.setattr(v4_indexer, "get_pallas_op_mesh", lambda: None)
-    monkeypatch.setattr(v4_indexer, "_indexer_op_cache", {})
     monkeypatch.setattr(
-        v4_indexer.pallas,
-        "jax_op",
-        _recording_jax_op({"prologue": lambda *args: (q_quant, weights)}),
+        v4_indexer, "tokamax_rope", SimpleNamespace(PallasMosaicTpuDeepseekRope=rope)
     )
     monkeypatch.setattr(
         v4_indexer,
@@ -274,14 +283,28 @@ def test_v4_indexer_runs_tokamax_after_the_prologue(monkeypatch):
             Config=lambda **kwargs: kwargs,
         ),
     )
-    op = _v4_indexer()._build_indexer_op()
+    monkeypatch.setattr(
+        v4_indexer.pallas,
+        "jax_op",
+        lambda *args, **kwargs: pytest.fail("no jax_op on the tokamax path"),
+    )
+    indexer = _v4_indexer()
+    op = indexer._build_indexer_op()
+    weights = torch.full((5, 64), 3.0)
     block_tables = torch.arange(6, dtype=torch.int32).reshape(2, 3)
     assert (
-        op("q", "pos", "cos_sin", "w", "cache", "lens", block_tables, "loc", "dist")
+        op("q", "pos", "cos_sin", weights, "cache", "lens", block_tables, "loc", "dist")
         == "topk"
     )
+    ((rope_args, rope_kwargs),) = rope_calls
+    assert rope_args == ("q", "pos", "cos_sin")
+    assert rope_kwargs == dict(mode="rope_quant", quant_dtype=torch.float8_e4m3fn)
     ((args, kwargs),) = calls
-    assert args[0] is q_quant and args[1] is weights
+    assert args[0] is q_quant
+    # The weights with the softmax scale, head count and query scales folded
+    # in, as `_indexer_jax` does.
+    want = weights * indexer.softmax_scale * indexer.n_head**-0.5 * q_scales
+    assert torch.equal(args[1], want)
     assert args[2:4] == ("cache", "lens")
     assert torch.equal(args[4], block_tables.flatten())
     assert args[5:] == ("loc", "dist")
@@ -440,10 +463,10 @@ def _fake_swa(q, new_kv, sw_cache, *args, swa_only, **kwargs):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("two_caches_same_buffer", [False, True])
 def test_csa_tokamax_matches_in_tree(tpu, monkeypatch, two_caches_same_buffer):
-    pytest.importorskip("tokamax.experimental.torch_tpu.ops.csa_gather")
-    assert csa_op.tokamax_csa_gather is not None
+    pytest.importorskip("tokamax.experimental.torch_tpu.ops.sparse_mla")
+    assert csa_op.tokamax_sparse_mla is not None
     # Both paths call `_run_swa` identically; stubbing it isolates the sparse
-    # half, which is what the tokamax path restructures.
+    # half, which is what tokamax's op replaces.
     monkeypatch.setattr(csa_op, "_run_swa", _fake_swa)
     monkeypatch.setattr(csa_op, "_tokamax_csa_op_cache", {})
     device = tpu
@@ -474,8 +497,8 @@ def test_csa_tokamax_matches_in_tree(tpu, monkeypatch, two_caches_same_buffer):
         if two_caches_same_buffer
         else rng.integers(0, 200, (8, 16, 4, 128), dtype=np.uint8)
     )
-    # With one buffer, the gather must read the SWA kernel's output; a zero
-    # main cache would show it reading the other.
+    # With one buffer, the sparse pass must read the SWA kernel's output; a
+    # zero main cache would show it reading the other.
     main_nope = np.zeros_like(cache_nope) if two_caches_same_buffer else cache_nope
 
     def operands():
@@ -594,7 +617,8 @@ def _same_selection(got, want, scores, k):
 @pytest.mark.tpu_test
 def test_v4_indexer_tokamax_matches_in_tree(tpu, monkeypatch):
     pytest.importorskip("tokamax.experimental.torch_tpu.ops.lightning_indexer")
-    assert v4_indexer.tokamax_lightning_indexer is not None
+    pytest.importorskip("tokamax.experimental.torch_tpu.ops.deepseek_rope")
+    assert v4_indexer.tokamax_rope is not None
     monkeypatch.setattr(v4_indexer, "get_pallas_op_mesh", lambda: None)
     device = tpu
     rng = np.random.default_rng(1)
@@ -637,15 +661,11 @@ def test_v4_indexer_tokamax_matches_in_tree(tpu, monkeypatch):
         v4_indexer, "_tokamax_indexer_unsupported_reason", lambda m: "test"
     )
     want = indexer._build_indexer_op()(*operands)
-    # What the kernel scores: the prologue's fp8 queries and folded weights.
-    q_quant, folded = v4_indexer._indexer_prologue_jax(
-        q,
-        jnp.asarray(positions),
-        jnp.asarray(cos_sin_cache),
-        jnp.asarray(weights),
-        softmax_scale=indexer.softmax_scale,
-        n_head=n_head,
+    # What the in-tree kernel scores: its fp8 queries and folded weights.
+    q_quant, q_scales = rope_quant(
+        q, jnp.asarray(positions), jnp.asarray(cos_sin_cache)
     )
+    folded = weights * indexer.softmax_scale * n_head**-0.5 * q_scales
     scores = _reference_scores(
         q_quant.astype(jnp.float32), folded, cache, seq_lens, block_table, q_lens, 4
     )
@@ -718,3 +738,34 @@ def test_v32_indexer_tokamax_matches_in_tree(tpu, monkeypatch):
         1,
     )
     _same_selection(got, want, scores, k=256)
+
+
+@pytest.mark.tpu_test
+def test_v4_rope_tokamax_matches_in_tree(tpu, monkeypatch):
+    pytest.importorskip("tokamax.experimental.torch_tpu.ops.deepseek_rope")
+    assert v4_attention.tokamax_rope is not None
+    monkeypatch.setattr(v4_attention, "get_pallas_op_mesh", lambda: None)
+    device = tpu
+    rng = np.random.default_rng(3)
+    tokens, heads, head_dim = 96, 16, 512
+    q = _to_torch(rng.standard_normal((tokens, heads, head_dim), np.float32), device)
+    kv = _to_torch(rng.standard_normal((tokens, head_dim), np.float32), device)
+    q, kv = q.to(torch.bfloat16), kv.to(torch.bfloat16)
+    positions = _to_torch(rng.integers(0, 4096, tokens).astype(np.int32), device)
+    cos_sin_cache = _to_torch(rng.uniform(-1, 1, (4096, 64)).astype(np.float32), device)
+
+    def run(layer):
+        return (
+            layer.qnorm_rope_op(q, positions, cos_sin_cache).float().cpu(),
+            layer.kv_rope_op(kv, positions, cos_sin_cache).float().cpu(),
+        )
+
+    got = run(_v4_attention())
+    monkeypatch.setattr(
+        v4_attention, "_tokamax_rope_unsupported_reason", lambda *args: "test"
+    )
+    want = run(_v4_attention())
+    for name, g, w in zip(("qnorm_rope", "rope"), got, want):
+        torch.testing.assert_close(
+            g, w, atol=2e-2, rtol=2e-2, msg=lambda m, name=name: f"{name}: {m}"
+        )

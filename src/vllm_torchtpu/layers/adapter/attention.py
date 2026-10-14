@@ -542,48 +542,32 @@ def _pallas_rpa_kernel_batched(
     )
 
 
-def _fake_tokamax_rpa(queries, keys, values, kv_cache, *args, out_dtype=None, **kwargs):
-    """Meta shapes for tokamax's batched RPA operator under vLLM's compile.
+_non_donating_tokamax_rpa_op = None
 
-    jax_op's default fake re-exports the JAX function and refuses a
-    `torch.SymInt` dimension, and vLLM compiles with a symbolic token count,
-    so -- as for the in-tree RPA op -- vLLM supplies its own. The output is
-    query-shaped and the cache keeps its shape.
+
+def _non_donating_tokamax_rpa(tokamax_rpa: Any) -> Any:
+    """tokamax's batched RPA torch operator, registered without donation.
+
+    tokamax's `PallasMosaicTpuBatchedRpa` donates the KV pool, which compiled
+    serving needs: without it the `copy_` writeback lands at the end of vLLM's
+    graph and the whole pool exists twice. Kernel-iteration mode runs the op
+    eagerly, where donating would kill the buffer `copy_` writes into. `TorchOp`
+    takes `donate_argnums` from the constructor, so a subclass that clears it --
+    under its own op name -- gets a second registration through tokamax's own
+    `TorchOp` machinery, with tokamax's fake, `__call__` and `op_impl_call`.
     """
-    del keys, values, args, kwargs
-    dtype = queries.dtype if out_dtype is None else getattr(torch, out_dtype)
-    return torch.empty_like(queries, dtype=dtype), torch.empty_like(kv_cache)
-
-
-_donating_tokamax_rpa_op = None
-
-
-def _donating_tokamax_rpa(tokamax_rpa: Any) -> Any:
-    """tokamax's batched RPA torch operator, registered to donate the KV pool.
-
-    tokamax's `PallasMosaicTpuBatchedRpa` registers itself without donation,
-    so each call returns a new pool and the `copy_` writeback lands at the end
-    of vLLM's compiled graph: the whole pool exists twice, and Qwen3-0.6B at
-    gpu_memory_utilization=0.6 needs 112 GiB of HLO temporaries on a 95 GiB
-    v7x chip. `TorchOp` takes `donate_argnums` and `fake_impl` from the
-    constructor, so a subclass that sets only those -- plus its own op name --
-    gets a second registration with donation and vLLM's fake, through
-    tokamax's own `TorchOp` machinery. `__call__` and `op_impl_call` are
-    tokamax's, inherited unchanged.
-    """
-    global _donating_tokamax_rpa_op
-    if _donating_tokamax_rpa_op is None:
+    global _non_donating_tokamax_rpa_op
+    if _non_donating_tokamax_rpa_op is None:
         base = type(tokamax_rpa.PallasMosaicTpuBatchedRpa)
 
-        class _DonatingBatchedRpa(base):
+        class _NonDonatingBatchedRpa(base):
             def __init__(self):
                 super().__init__()
-                self.jax_op_name = "vllm_tpu_donating_batched_rpa"
-                self.donate_argnums = (3,)  # kv_cache
-                self.fake_impl = _fake_tokamax_rpa
+                self.jax_op_name = "vllm_tpu_non_donating_batched_rpa"
+                self.donate_argnums = None
 
-        _donating_tokamax_rpa_op = _DonatingBatchedRpa()
-    return _donating_tokamax_rpa_op
+        _non_donating_tokamax_rpa_op = _NonDonatingBatchedRpa()
+    return _non_donating_tokamax_rpa_op
 
 
 def _tokamax_rpa_unsupported_reason(
@@ -1059,10 +1043,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         """Closes over tokamax's batched RPA torch operator for this layer.
 
         Calls go through `PallasMosaicTpuBatchedRpa.__call__`, which resolves
-        the kernel config inside the op, on the donating registration from
-        `_donating_tokamax_rpa`; what is left here is the writeback. The pool
-        crosses in the packed 5-D shape the runner allocated, which tokamax's
-        wrapper takes natively, so donation targets the runner's own buffer.
+        the kernel config inside the op and donates the pool; what is left here
+        is the writeback. The pool crosses in the packed 5-D shape the runner
+        allocated, which tokamax's wrapper takes natively, so donation targets
+        the runner's own buffer.
         """
         # Imported lazily so a missing or moved tokamax surfaces against a
         # concrete layer rather than at module import.
@@ -1091,12 +1075,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if envs.TPU_KERNEL_ITER_MODE:
             # As for the in-tree op, kernel-iteration mode runs the op eagerly,
             # where donating the pool would kill the buffer `copy_` writes
-            # into, so it takes tokamax's own, non-donating registration --
-            # with vLLM's fake, as Dynamo still traces through it.
-            tokamax_batched_rpa = tokamax_rpa.PallasMosaicTpuBatchedRpa
-            tokamax_batched_rpa._torch_tokamax_op.register_fake(_fake_tokamax_rpa)
+            # into.
+            tokamax_batched_rpa = _non_donating_tokamax_rpa(tokamax_rpa)
         else:
-            tokamax_batched_rpa = _donating_tokamax_rpa(tokamax_rpa)
+            tokamax_batched_rpa = tokamax_rpa.PallasMosaicTpuBatchedRpa
 
         def tokamax_rpa_kernel_impl(
             kv_cache,
