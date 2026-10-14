@@ -44,6 +44,9 @@ export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 # projection under it (#1673). SP needs every compile size >= 2 * TP.
 export TPU_DEEPSEEK_V41_SP="${TPU_DEEPSEEK_V41_SP:-1}"
 export TPU_DEEPSEEK_V41_LOCAL_Q="${TPU_DEEPSEEK_V41_LOCAL_Q:-1}"
+export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
+export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
+export MOE_FUSED_EP_V2_SHARDED_PLAN="${MOE_FUSED_EP_V2_SHARDED_PLAN:-1}"
 # The 1280 MiB single-request budget of deepseek-v41-flash-tp8-ep-100k; the
 # suite's 14 GiB with 16 seqs was slower at C1. The 128 size fits CED's
 # 128-token decoder replay of the last chunk, which 2048 would pad.
@@ -52,4 +55,7 @@ EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filt
 # Keep the v7x Engram gather on the runtime default path.
 if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then
   export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+fi
+if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes"* ]]; then
+  export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} --xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes=16777216"
 fi

@@ -261,7 +261,7 @@ class DSparkDeepseekV41Model(nn.Module):
         for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
             attn = layer.attn
             qr_kv = attn._fused_wqa_wkv_gemm(main_x)
-            _, _, kv = attn._split_qkv_and_norm(qr_kv)
+            kv = attn.kv_norm(qr_kv[:, attn.q_lora_rank :])
             layer_md = None if metadata is None else metadata[i]
             _insert_context_kv(attn, kv, positions, layer_md)
         return main_x
