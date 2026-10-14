@@ -1550,10 +1550,14 @@ def get_default_block_sizes(
     pages_per_seq,
     *,
     case: RpaCase = RpaCase.MIXED,
+    vmem_limit_bytes: int | None = None,
 ):
     """Get (bq, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas.
 
-    Note the default block sizes are not necessarily optimal.
+    Note the default block sizes are not necessarily optimal. The heuristic
+    sizes are shrunk until the kernel's scratch footprint (per
+    `get_vmem_estimate_bytes`) fits in `vmem_limit_bytes` (default: the chip's
+    VMEM capacity) minus a small reserve for compiler-internal scratch.
     """
     tpu_version = get_tpu_version()
 
@@ -1598,12 +1602,107 @@ def get_default_block_sizes(
     # The query compute block should never exceed the query fetch block.
     bq_csz = min(bq_csz, bq_sz)
 
+    bq_sz = max(1, bq_sz)
+    bkv_sz = align_to(bkv_sz, page_size)
+    bq_csz = max(1, bq_csz)
+    bkv_csz = align_to(bkv_csz, page_size)
+
+    bq_sz, bkv_sz, bq_csz, bkv_csz = fit_block_sizes_to_vmem(
+        bq_sz,
+        bkv_sz,
+        bq_csz,
+        bkv_csz,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        actual_num_q_heads=actual_num_q_heads,
+        actual_num_kv_heads=actual_num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+
     return {
-        "bq_sz": max(1, bq_sz),
-        "bkv_sz": align_to(bkv_sz, page_size),
-        "bq_csz": max(1, bq_csz),
-        "bkv_csz": align_to(bkv_csz, page_size),
+        "bq_sz": bq_sz,
+        "bkv_sz": bkv_sz,
+        "bq_csz": bq_csz,
+        "bkv_csz": bkv_csz,
     }
+
+
+# VMEM the Mosaic compiler keeps for itself on top of the kernel's explicitly
+# allocated scratch (internal scratch, spills). On v7x the compiler reports
+# ~61 MiB usable out of the 64 MiB `vmem_capacity_bytes`, so reserve 4 MiB.
+_VMEM_RESERVE_BYTES = 4 * 1024 * 1024
+
+# Below this KV-fetch block the kernel loops over too many small KV chunks;
+# prefer shrinking the query block first once bkv reaches it.
+_MIN_PREFERRED_BKV_SZ = 512
+
+
+def fit_block_sizes_to_vmem(
+    bq_sz,
+    bkv_sz,
+    bq_csz,
+    bkv_csz,
+    *,
+    q_dtype,
+    kv_dtype,
+    actual_num_q_heads,
+    actual_num_kv_heads,
+    head_dim,
+    page_size,
+    vmem_limit_bytes: int | None = None,
+):
+    """Shrink (bq_sz, bkv_sz, bq_csz, bkv_csz) until the scratch fits in VMEM.
+
+    The default heuristics in `get_default_block_sizes` only look at the
+    query/KV lengths, not at the per-token footprint (`num_kv_heads *
+    head_dim`). Models with large head_dim and many KV heads per shard
+    (e.g. Gemma-4-31B's sliding-window layers at TP=2: 8 KV heads, head_dim
+    256) exceed v7x's 64 MiB VMEM as soon as `max_num_batched_tokens >= 1024`
+    (bq=512, bkv=2048 -> 68 MiB) and fail at compile time with a Pallas VMEM
+    OOM. Halving the KV-fetch block, then the query block, brings the footprint
+    back under budget; the kernel simply iterates over more blocks.
+
+    Shrinking order: bkv_sz down to `_MIN_PREFERRED_BKV_SZ`, then bq_sz down to
+    1, then bkv_sz down to `page_size`. Each step keeps bkv a multiple of
+    page_size and the compute blocks <= the fetch blocks. Block sizes that
+    already fit are returned unchanged, so configurations that compile today
+    are not affected.
+    """
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    budget = vmem_limit_bytes - _VMEM_RESERVE_BYTES
+    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+
+    def estimate(bq, bkv):
+        return get_vmem_estimate_bytes(
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            head_dim,
+            bq,
+            bkv,
+            q_dtype,
+            kv_dtype,
+        )
+
+    def halve_bkv(bkv):
+        return max(page_size, align_to(bkv // 2, page_size))
+
+    while estimate(bq_sz, bkv_sz) > budget:
+        if bkv_sz > max(page_size, _MIN_PREFERRED_BKV_SZ):
+            bkv_sz = halve_bkv(bkv_sz)
+        elif bq_sz > 1:
+            bq_sz = max(1, bq_sz // 2)
+        elif bkv_sz > page_size:
+            bkv_sz = halve_bkv(bkv_sz)
+        else:
+            # Nothing left to shrink; let the compiler report the OOM.
+            break
+
+    bq_csz = min(bq_csz, bq_sz)
+    bkv_csz = min(bkv_csz, bkv_sz)
+    return bq_sz, bkv_sz, bq_csz, bkv_csz
 
 
 @jax.jit(
@@ -1939,6 +2038,7 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
+                vmem_limit_bytes=vmem_limit_bytes,
             )
         return {
             "bq_sz": block_sizes[0],
