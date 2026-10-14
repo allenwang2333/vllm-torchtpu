@@ -60,6 +60,23 @@ def get_dp_size(parallel_config) -> int:
     )
 
 
+def min_across_ep_dp(parallel_config, value: int) -> int:
+    """Return the minimum of `value` across the DP engines coupled by EP.
+
+    EP-coupled engines must compile identical programs, so a value baked into
+    them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
+    """
+    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+        return value
+    from vllm.distributed.parallel_state import get_dp_group
+
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+    )
+    return int(t.item())
+
+
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
     usage = []
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
@@ -331,3 +348,24 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a copy of `t` backed by a fresh device buffer of its own shape.
+
+    torch_tpu hands a compiled executable the buffer behind each argument. If a
+    persistent tensor's storage is a buffer of a different shape (e.g. it is a
+    view, or was filled by `copy_` from a view), torch_tpu re-materializes it as
+    a standalone `tt_jit_as_strided` program before every forward. Calling this
+    once at load time removes that per-step program.
+
+    `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
+    same-shape, same-dtype `copy_` by aliasing the destination's storage to
+    `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
+    a real op whose output buffer has `t`'s logical shape. Other devices get a
+    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    """
+    out = torch.clone(t, memory_format=torch.contiguous_format)
+    if out.device.type == "tpu":
+        out = out + 0
+    return out
