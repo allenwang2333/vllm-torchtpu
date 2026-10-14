@@ -69,7 +69,7 @@ def test_paired_matches_unpaired(vllm_config_context, rows, compiled):
     torch._dynamo.reset()
     fn = torch.compile(_layer, fullgraph=True, dynamic=False) if compiled else _layer
     got_out, got_res = fn(n, lin, x.clone(), r.clone())
-    assert getattr(lin, PREQUANT_ATTR) is None, "the linear must consume the stash"
+    assert getattr(lin, PREQUANT_ATTR).value is None, "the linear must consume the stash"
     assert torch.equal(got_res.cpu(), ref_res.cpu())
     d = (got_out.cpu().view(torch.int16) != ref_out.cpu().view(torch.int16)).sum()
     print(f"PAIRED rows={rows} compiled={compiled} out_mismatch={int(d)}")
@@ -98,7 +98,7 @@ def test_decode_rows_keep_old_path(vllm_config_context):
     assert tpu_rmsnorm._pair(n, lin, True)
     x = torch.randn(16, H).to(torch.bfloat16).to("tpu")
     n(x, x.clone())
-    assert getattr(lin, PREQUANT_ATTR) is None
+    assert getattr(lin, PREQUANT_ATTR).value is None
 
 
 def test_compiled_first_uses_op_built_at_arming(vllm_config_context):
@@ -121,3 +121,48 @@ def test_compiled_first_uses_op_built_at_arming(vllm_config_context):
     got_out, got_res = fn(n, lin, x.clone(), r.clone())
     assert torch.equal(got_res.cpu(), ref_res.cpu())
     assert torch.equal(got_out.cpu(), ref_out.cpu())
+
+
+class _Layer(torch.nn.Module):
+    """The decoder-layer shape: a norm, then an MLP whose gate_up reads it."""
+
+    def __init__(self):
+        super().__init__()
+        self.post_attention_layernorm = _norm()
+        self.mlp = torch.nn.Module()
+        self.mlp.gate_up_proj = _Linear()
+
+    def forward(self, x, r):
+        y, res = self.post_attention_layernorm(x, r)
+        return self.mlp.gate_up_proj(y), res
+
+
+def test_both_rows_branches_lift_the_same_named_inputs(vllm_config_context):
+    """Regression (twin j-31afc1f2, ShapeSpecializationError): the paired
+    (>= 512 rows) and unpaired (decode) traces must lift the same inputs under
+    the same names, or a bucket cannot be handed between the traces. A norm
+    holding the linear module made Dynamo name the linear's weights through
+    the norm on the paired side only."""
+    layer = _Layer()
+    assert tpu_rmsnorm._pair(layer.post_attention_layernorm, layer.mlp.gate_up_proj, False)
+    names = {}
+
+    def capture(rows):
+        def backend(gm, example_inputs):
+            names[rows] = sorted(
+                n.name for n in gm.graph.nodes if n.op == "placeholder"
+            )
+            return gm.forward
+
+        return backend
+
+    for rows in (16, 1024):
+        torch._dynamo.reset()
+        x = torch.randn(rows, H).to(torch.bfloat16).to("tpu")
+        fn = torch.compile(layer, backend=capture(rows), fullgraph=True, dynamic=False)
+        fn(x, x.clone())
+    strip = lambda ns: [n for n in ns if not n.startswith(("l_x_", "l_r_"))]  # noqa: E731
+    print("PLACEHOLDERS 16:", names[16])
+    print("PLACEHOLDERS 1024:", names[1024])
+    assert strip(names[16]) == strip(names[1024])
+    assert not any("prequant" in n for n in names[1024])

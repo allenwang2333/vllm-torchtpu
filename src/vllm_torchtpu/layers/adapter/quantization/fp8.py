@@ -1752,11 +1752,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        prequant = getattr(layer, _PREQUANT_ATTR, None)
+        slot = getattr(layer, _PREQUANT_ATTR, None)
+        prequant = None if slot is None else slot.value
         if prequant is not None:
             # TPU_FUSED_ADD_RMSNORM_QUANT: the norm that produced `x` also
             # emitted its per-row fp8 quant (bit-identical to the one below).
-            setattr(layer, _PREQUANT_ATTR, None)
+            slot.value = None
             x_q, x_scale = prequant
             out = prequantized_matmul(x_q, x_scale, weight, layer.weight_scale)
             out = out.reshape(*x.shape[:-1], out.shape[-1])

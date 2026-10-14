@@ -33,7 +33,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
-from vllm_torchtpu.layers.adapter.linear_common import PREQUANT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_WEIGHT,
+    PREQUANT_ATTR,
+    PrequantSlot,
+)
 
 _ops: dict[tuple[float, bool], object] = {}
 _ops_lock = Lock()
@@ -137,13 +141,18 @@ def _pair(norm, linear, emit_y: bool) -> bool:
         return False
     if not _per_channel_fp8_linear(linear):
         return False
+    if getattr(linear, FP8_PALLAS_WEIGHT, None) is not None:
+        # Its unpaired path lifts the padded kernel copy, the paired one would
+        # not: the two sides of the rows branch must lift the same buffers.
+        return False
     # Both ops are built here, at load, outside Dynamo: the forward only calls them.
     from vllm_torchtpu.layers.adapter.linear_common import get_prequantized_matmul_op
 
     get_prequantized_matmul_op()
-    norm._prequant_target = linear
+    slot = PrequantSlot()
+    norm._prequant_slot = slot
     norm._op_quant = _get_quant_op(norm.variance_epsilon, emit_y)
-    setattr(linear, PREQUANT_ATTR, None)
+    setattr(linear, PREQUANT_ATTR, slot)
     return True
 
 
@@ -250,7 +259,7 @@ class TpuRMSNorm(RMSNorm):
             and self.hidden_size >= envs.TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN
         )
         # TPU_FUSED_ADD_RMSNORM_QUANT: set by arm_prequant.
-        self._prequant_target = None
+        self._prequant_slot = None
         self._op_quant = None
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
@@ -307,14 +316,14 @@ class TpuRMSNorm(RMSNorm):
                 return self._materialized_add_norm(x, residual)
             return super().forward(x, residual)
         if (
-            self._prequant_target is not None
+            self._prequant_slot is not None
             and residual is not None
             and x.dim() == 2
         ):
             # The same rows predicate as the plain Pallas path above: no new
             # token-count branch. The paired linear takes (y_q, scale).
             y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
-            setattr(self._prequant_target, PREQUANT_ATTR, (y_q, scale))
+            self._prequant_slot.value = (y_q, scale)
             return y, new_res
         if x.dim() == 2:
             # No view ops on the 2-D residual stream: a view the backend

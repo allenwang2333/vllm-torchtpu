@@ -54,9 +54,22 @@ FP8_PALLAS_SCALE = "weight_scale_pallas"
 # layer's q_b_proj (G2: it runs under the cross-rank SparseCore top-k).
 FP8_PALLAS_SCHED_GROUP_ATTR = "_tpu_fp8_pallas_sched_group"
 # TPU_FUSED_ADD_RMSNORM_QUANT: a per-channel FP8 linear paired with the
-# residual-stream norm in front of it reads `(x_q [m, k], x_scale f32 [m, 1])`
-# from this attribute; the norm's forward sets it and `apply` takes and clears it.
-PREQUANT_ATTR = "_tpu_prequant_input"
+# residual-stream norm in front of it holds a PrequantSlot under this attribute;
+# the norm holds the same slot. The norm's forward puts
+# `(x_q [m, k], x_scale f32 [m, 1])` in it and `apply` takes and clears it.
+PREQUANT_ATTR = "_tpu_prequant_slot"
+
+
+class PrequantSlot:
+    """A plain object shared by a norm and its linear, so the norm never holds
+    the linear module: Dynamo would otherwise reach the linear's weights
+    through the norm on one side of the token-count branch, and the two traces
+    would lift the same buffers under different names (no bucket handover)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = None
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
