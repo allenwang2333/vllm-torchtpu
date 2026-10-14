@@ -19,6 +19,9 @@ import jax.numpy as jnp
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.tuned_block_sizes import (
+    COMPACT_BOUNDARY_BATCHES,
+)
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
@@ -40,6 +43,7 @@ def derive_metadata(
     overlap: bool,
     cos_sin_cache: jax.Array | None,
     state_cache: jax.Array | None = None,
+    token_to_req_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Derives token_to_req_indices, slot_mapping_slots, and kv_slot_mapping.
 
@@ -70,6 +74,8 @@ def derive_metadata(
       cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
       state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
         state shares ``cache``'s buffer. Only its shape is read here.
+      token_to_req_indices: Optional exact request mapping supplied by a
+        specialized caller; other paths retain the ragged repeat mapping.
     Returns:
       token_to_req_indices: [num_tokens]. Request index for each token.
       slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
@@ -108,11 +114,23 @@ def derive_metadata(
     )
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
-    query_lens = jnp.diff(query_start_loc)
     batch_size = query_start_loc.shape[0] - 1
-    token_to_req_indices = jnp.repeat(
-        jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
-    )
+    if token_to_req_indices is None:
+        if (num_tokens, batch_size, compress_ratio) in COMPACT_BOUNDARY_BATCHES:
+            # Match repeat's first nonempty request and final-request fill.
+            token_to_req_indices = (
+                jnp.minimum(jnp.sum(query_start_loc[1:] <= 0), batch_size - 1)
+                .astype(jnp.int32)
+                .reshape(1)
+            )
+        else:
+            query_lens = jnp.diff(query_start_loc)
+            token_to_req_indices = jnp.repeat(
+                jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
+            )
+    else:
+        assert token_to_req_indices.shape == positions.shape
+        assert token_to_req_indices.dtype == jnp.int32
     req = token_to_req_indices
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
@@ -166,10 +184,22 @@ def prepare_boundary_batch(
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+    A single token only needs one padded row.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
     packed_size = num_tokens + max_prefill_boundary
+
+    if (num_tokens, num_reqs, compress_ratio) in COMPACT_BOUNDARY_BATCHES:
+        # A single boundary always occupies slot zero for decode and prefill.
+        output_size = rope_pack
+        keep = (jnp.arange(output_size) == 0) & is_boundary[0]
+        keep &= kv_slot_mapping[0] >= 0
+        return (
+            jnp.where(keep, positions[0], 0),
+            jnp.where(keep, token_to_req_indices[0], 0),
+            jnp.where(keep, kv_slot_mapping[0], -1),
+        )
 
     # 1. Get packing indices for all boundary tokens
     safe, valid = _get_packing_indices(is_boundary, packed_size)
@@ -222,7 +252,7 @@ def prepare_boundary_batch(
     )
 
 
-def compressor_forward(
+def compressor_forward_generic(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
     ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
@@ -325,3 +355,148 @@ def compressor_forward(
     # the read supplies the missing ordering edge.
     state_cache, cache = jax.lax.optimization_barrier((state_cache, cache))
     return cache, rope_cache, state_cache
+
+
+def compressor_forward(
+    hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
+    wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
+    ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
+    norm_weight: jax.Array,  # [head_dim] fp32
+    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    positions: jax.Array,  # [num_tokens] int
+    block_table: jax.Array,  # [num_reqs * max_blocks] int
+    query_start_loc: jax.Array,  # [num_reqs + 1] int
+    kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
+    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
+    distribution: jax.Array,  # i32[3]
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+    state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Select launch fusion for a supported, device-validated decode batch."""
+    from . import decode_compressor
+
+    args = dict(locals())
+    args.pop("decode_compressor")
+    if head_dim == 128 and state_cache is not None and cache.shape[1] == 33:
+        from . import indexer_sal
+
+        return indexer_sal.compressor_forward(**args)
+    from . import hca_decode_compressor
+
+    if rope_cache is None and hca_decode_compressor.is_supported(
+        hidden_states,
+        wkv_wgate,
+        cache,
+        state_cache,
+        query_start_loc,
+        block_table,
+        kv_block_table,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        state_block_size=state_block_size,
+    ):
+        dense = (
+            jnp.all(distribution == 1)
+            & jnp.all(
+                query_start_loc == jnp.minimum(jnp.arange(query_start_loc.size), 1)
+            )
+            & (positions[0] >= 0)
+            & (
+                positions[0] // state_block_size
+                < block_table.size // (query_start_loc.size - 1)
+            )
+            & (
+                positions[0] // (compress_ratio * (cache.shape[1] // 2))
+                < kv_block_table.size // (query_start_loc.size - 1)
+            )
+        )
+        return jax.lax.cond(
+            dense,
+            lambda _: hca_decode_compressor.compressor_forward(**args),
+            lambda _: compressor_forward_generic(**args),
+            None,
+        )
+    n = hidden_states.shape[0]
+    reqs = query_start_loc.size - 1
+    eligible = (
+        head_dim == 512
+        and compress_ratio == 4
+        and overlap
+        and quant_block == 64
+        and state_cache is None
+        and rope_cache is not None
+        and cache.dtype == jnp.int32
+        and cache.shape[1:] == (128, 128)
+        and state_block_size == 8
+        and n in (4, 16, 64, 128)
+        and n <= reqs
+        and hidden_states.shape[1] == 4096
+        and wkv_wgate.shape == (4096, 2048)
+    )
+    if not eligible:
+        return compressor_forward_generic(**args)
+    active = distribution[0]
+    req = jnp.arange(n)
+    real = req < active
+    pos = positions
+    st = block_table.reshape(reqs, -1)
+    kt = kv_block_table.reshape(reqs, -1)
+    previous = jnp.maximum(pos - 7, 0) // 8
+    current = pos // 8
+    output = pos // 512
+    a = st[req, previous]
+    b = st[req, current]
+    c = kt[req, output]
+    pair = real[:, None] & real[None, :]
+    distinct = req[:, None] != req[None, :]
+    exclusive = ~jnp.any(
+        pair
+        & distinct
+        & (
+            (a[:, None] == a[None, :])
+            | (a[:, None] == b[None, :])
+            | (b[:, None] == a[None, :])
+            | (b[:, None] == b[None, :])
+            | (c[:, None] == c[None, :])
+        )
+    )
+    disjoint = ~jnp.any(
+        pair & ((c[:, None] == a[None, :]) | (c[:, None] == b[None, :]))
+    )
+    valid = (
+        jnp.all(distribution == active)
+        & (active >= 0)
+        & (active <= n)
+        & jnp.all(
+            query_start_loc == jnp.minimum(jnp.arange(query_start_loc.size), active)
+        )
+        & jnp.all(
+            ~real
+            | (
+                (pos >= 0)
+                & (current < st.shape[1])
+                & (output < kt.shape[1])
+                & (a >= 0)
+                & (a < cache.shape[0])
+                & (b >= 0)
+                & (b < cache.shape[0])
+                & (c >= 0)
+                & (c < min(cache.shape[0], rope_cache.shape[0]))
+            )
+        )
+        & exclusive
+        & disjoint
+    )
+    return jax.lax.cond(
+        valid,
+        lambda _: decode_compressor.compressor_forward(**args),
+        lambda _: compressor_forward_generic(**args),
+        None,
+    )

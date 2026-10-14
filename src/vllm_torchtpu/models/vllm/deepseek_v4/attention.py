@@ -34,14 +34,26 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.hca_compress_attention import (
+    attention_compressor,
+    attention_compressor_shared,
+)
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    get_prequantized_bf16_matmul_op,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
-from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
-    fused_reverse_rope_wo_a_projection,
+from vllm_torchtpu.kernels.deepseek_v4.o_projection_fused import output_projection
+from vllm_torchtpu.kernels.deepseek_v4.o_projection_gather import (
+    fused as fused_o_projection,
 )
+from vllm_torchtpu.kernels.deepseek_v4.qkv_preprocess import qkv_preprocess
+from vllm_torchtpu.kernels.deepseek_v4.qkv_rms_norm import qkv_rms_norm
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
     VllmDeepseekSparseSWABackend,
@@ -57,11 +69,14 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
     VllmDeepseekV4Indexer,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v4.stable_graph_inputs import (
+    stable_weight_inputs,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import fresh_buffer
+from vllm_torchtpu.utils import fresh_buffer, get_device_name
 
 logger = init_logger(__name__)
 
@@ -75,6 +90,24 @@ class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
+def _qkv_rms_norm_jax(
+    x: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    *,
+    q_eps: float,
+    kv_eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    return qkv_rms_norm(x, q_weight, kv_weight, q_eps=q_eps, kv_eps=kv_eps)
+
+
+def _fake_qkv_rms_norm(x, q_weight, kv_weight, *args, **kwargs):
+    return (
+        x.new_empty((x.shape[0], q_weight.numel())),
+        x.new_empty((x.shape[0], kv_weight.numel())),
+    )
+
+
 def _qnorm_rope_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -105,16 +138,44 @@ def _o_proj_jax(
     head_dim: int,
 ) -> jax.Array:
     """Inverse RoPE fused into the per-group `wo_a` projection."""
-    return fused_reverse_rope_wo_a_projection(
+    return fused_o_projection(
         x,
         positions,
         cos_sin_cache,
         wo_a,
-        wo_a_scale.reshape(-1),
+        wo_a_scale,
         head_dim=head_dim,
-        inverse=True,
-        quantize_activations=True,
     )
+
+
+def _o_proj_decode_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    wo_b: jax.Array,
+    wo_b_scale: jax.Array,
+) -> jax.Array:
+    logger.info(
+        "[output_projection] compiling resident B1 kernel x=%s wa=%s wb=%s",
+        x.shape,
+        wo_a.shape,
+        wo_b.shape,
+    )
+    return output_projection(
+        x, positions, cos_sin_cache, wo_a, wo_a_scale, wo_b, wo_b_scale
+    )
+
+
+def _fake_o_proj_decode(
+    x, positions, cos_sin_cache, wo_a, wo_a_scale, wo_b, wo_b_scale
+):
+    return torch.empty((x.shape[0], wo_b.shape[-1]), dtype=x.dtype, device=x.device)
+
+
+def _fake_qkv_preprocess(q, kv, *args, **kwargs):
+    return torch.empty_like(q), torch.empty_like(kv)
 
 
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
@@ -242,6 +303,9 @@ class VllmDeepseekV4MLAAttention(
                     self.mla_attn.compressor.state_cache.prefix
                 ] = self.mla_attn.compressor.state_cache
 
+        # Build the JAX op before torch.compile traces the forward method.
+        _ = self.qkv_norm_op
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
@@ -298,9 +362,67 @@ class VllmDeepseekV4MLAAttention(
             "_attn_op_instance" if built_from_real_caches else "_attn_op_prof_instance",
             op,
         )
+        if self.compress_ratio == 128:
+            # The runner prebuilds attn_op before Dynamo tracing. Build the
+            # paired decode entry here too, including after cache rebinding.
+            preprocess_op, real = self._build_attn_op(preprocess=True)
+            object.__setattr__(
+                self,
+                "_hca_preprocess_attn_op_instance"
+                if real
+                else "_hca_preprocess_attn_op_prof_instance",
+                preprocess_op,
+            )
+        if self.compress_ratio == 128:
+            comp_op, real = self._build_attn_op(preprocess=True, compress=True)
+            object.__setattr__(
+                self,
+                "_hca_compressor_attn_op_instance"
+                if real
+                else "_hca_compressor_attn_op_prof_instance",
+                comp_op,
+            )
         return op
 
-    def _build_attn_op(self):
+    @property
+    def hca_compressor_attn_op(self):
+        op = self.__dict__.get("_hca_compressor_attn_op_instance")
+        if op is not None:
+            return op
+        if _live_cache(self.mla_attn.swa_cache_layer.kv_cache) is None:
+            prof = self.__dict__.get("_hca_compressor_attn_op_prof_instance")
+            if prof is not None:
+                return prof
+        op, real = self._build_attn_op(preprocess=True, compress=True)
+        object.__setattr__(
+            self,
+            "_hca_compressor_attn_op_instance"
+            if real
+            else "_hca_compressor_attn_op_prof_instance",
+            op,
+        )
+        return op
+
+    @property
+    def hca_preprocess_attn_op(self):
+        op = self.__dict__.get("_hca_preprocess_attn_op_instance")
+        if op is not None:
+            return op
+        if _live_cache(self.mla_attn.swa_cache_layer.kv_cache) is None:
+            prof = self.__dict__.get("_hca_preprocess_attn_op_prof_instance")
+            if prof is not None:
+                return prof
+        op, real = self._build_attn_op(preprocess=True)
+        object.__setattr__(
+            self,
+            "_hca_preprocess_attn_op_instance"
+            if real
+            else "_hca_preprocess_attn_op_prof_instance",
+            op,
+        )
+        return op
+
+    def _build_attn_op(self, *, preprocess=False, compress=False):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = get_pallas_op_mesh()
 
@@ -370,8 +492,34 @@ class VllmDeepseekV4MLAAttention(
         # attribute a layer stays causal, so target layers are unaffected.
         non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
 
+        fp8_compute = cast(dict[str, Any], vllm_config.additional_config).get(
+            "tpu_csa_fp8_compute", False
+        )
+        if not isinstance(fp8_compute, bool):
+            raise ValueError("tpu_csa_fp8_compute must be a boolean")
+        csa_fp8_compute = is_csa and fp8_compute
+        shared_state = False
+        if compress:
+            state_tensor = _live_cache(self.mla_attn.compressor.state_cache.kv_cache)
+            shared_state = bool(
+                state_tensor is not None
+                and swa_tensor is not None
+                and state_tensor.data_ptr() == swa_tensor.data_ptr()
+                and state_tensor.shape == swa_tensor.shape
+                and state_tensor.dtype == swa_tensor.dtype
+            )
+            object.__setattr__(self, "_hca_state_swa_shared", shared_state)
+        attention_fn = (
+            functools.partial(_attention_csa, use_fp8_compute=csa_fp8_compute)
+            if is_csa
+            else attention_compressor_shared
+            if compress and shared_state
+            else attention_compressor
+            if compress
+            else _attention_hca
+        )
         wrapped_fn = functools.partial(
-            _attention_csa if is_csa else _attention_hca,
+            attention_fn,
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -380,17 +528,40 @@ class VllmDeepseekV4MLAAttention(
             non_causal_block=non_causal,
         )
 
+        if preprocess:
+            assert self.compress_ratio == 128 and not is_csa and not swa_only
+            wrapped_fn = functools.partial(wrapped_fn, eps=float(self.mla_attn.eps))
+
+        if compress:
+            assert preprocess
+            c = self.mla_attn.compressor
+            wrapped_fn = functools.partial(
+                wrapped_fn,
+                state_block_size=c.state_cache.block_size,
+                compress_eps=float(c.rms_norm_eps),
+                quant_block=c._quant_block,
+            )
+
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, block
         # causality, and profiling stage.
         op_name = (
             f"pallas::deepseek_v4_attention_{op_type}"
             f"_p{logical_page_size}"
+            f"{'_fp8_qk_pv' if csa_fp8_compute else ''}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
+        if preprocess:
+            op_name += f"_qkv_e{_name_float(float(self.mla_attn.eps))}"
+        if compress:
+            op_name += (
+                f"_compress_s{c.state_cache.block_size}"
+                f"_e{_name_float(float(c.rms_norm_eps))}_q{c._quant_block}"
+                f"_shared{int(shared_state)}"
+            )
         if op_name in _pallas_op_cache:
             return _pallas_op_cache[op_name], built_from_real_caches
 
@@ -429,13 +600,35 @@ class VllmDeepseekV4MLAAttention(
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
 
+        if preprocess:
+            input_partition_specs += (P(), P())  # positions, cos_sin_cache
+
+        if compress:
+            input_partition_specs += (
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(batch_axis),
+                P(),
+                P(batch_axis),
+                P(),
+            )
+        if compress and shared_state:
+            input_partition_specs = (
+                input_partition_specs[:20] + input_partition_specs[21:]
+            )
+
         # Donate sw_cache to permit in-place updates by the Pallas
         # sliding-window kernel.
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
-            donate_argnums=(2,),
+            donate_argnums=((2, 7) if shared_state else (2, 7, 20))
+            if compress
+            else (2,),
             input_partition_specs=input_partition_specs,
         )
 
@@ -447,16 +640,48 @@ class VllmDeepseekV4MLAAttention(
                 dtype=q.dtype,
                 device=q.device,
             )
+            if compress and shared_state:
+                return out_tensor, torch.empty_like(args[4]), torch.empty_like(sw_cache)
+            if compress:
+                # *args starts at operand3; main7 and state20 are cache outputs.
+                return (
+                    out_tensor,
+                    torch.empty_like(args[17]),
+                    torch.empty_like(args[4]),
+                    torch.empty_like(sw_cache),
+                )
             return out_tensor, torch.empty_like(sw_cache)
 
         attn_jax_op.register_fake(_fake_attn)
         _pallas_op_cache[op_name] = attn_jax_op
         return attn_jax_op, built_from_real_caches
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        linear = self.fused_wqa_wkv
+        return (
+            isinstance(linear.quant_method, VllmFp8LinearMethodTPU)
+            and linear.tp_size == 1
+            and linear.weight.dtype == torch.float8_e4m3fn
+            and linear.weight_scale.ndim == 1
+            and linear.bias is None
+            and not getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
+        )
+
     def attn_gemm(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        if quantized_input is None:
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        else:
+            assert self.supports_prequantized_input
+            qr_kv = get_prequantized_bf16_matmul_op()(
+                *quantized_input,
+                self.fused_wqa_wkv.weight,
+                self.fused_wqa_wkv.weight_scale,
+            )
 
         if self.indexer is not None:
             indexer_weights, _ = self.indexer.weights_proj(hidden_states)
@@ -464,6 +689,52 @@ class VllmDeepseekV4MLAAttention(
             indexer_weights = None
 
         return qr_kv, indexer_weights
+
+    @property
+    def qkv_norm_op(self):
+        """One launch for the independent low-rank Q and KV norms."""
+        op = self.__dict__.get("_qkv_norm_op_instance")
+        if op is not None:
+            return op
+        q_eps = float(self.q_norm.variance_epsilon)
+        kv_eps = float(self.kv_norm.variance_epsilon)
+        op_name = (
+            f"pallas::deepseek_v4_qkv_norm_q{_name_float(q_eps)}"
+            f"_kv{_name_float(kv_eps)}"
+        )
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            mesh = get_pallas_op_mesh()
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qkv_rms_norm_jax, q_eps=q_eps, kv_eps=kv_eps),
+                mesh=mesh,
+                input_partition_specs=(P(), P(), P()),
+            )
+            op.register_fake(_fake_qkv_rms_norm)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qkv_norm_op_instance", op)
+        return op
+
+    def normalize_qkv(self, qr_kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize packed projection outputs, preserving both RMS statistics."""
+        q_width = self.q_norm.weight.numel()
+        kv_width = self.kv_norm.weight.numel()
+        if (
+            qr_kv.shape == (1, q_width + kv_width)
+            and q_width % 128 == 0
+            and kv_width % 128 == 0
+            and qr_kv.dtype in (torch.bfloat16, torch.float32)
+            and self.q_norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.kv_norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.q_norm.variance_size_override is None
+            and self.kv_norm.variance_size_override is None
+            and self.q_norm.pass_weight
+            and self.kv_norm.pass_weight
+        ):
+            return self.qkv_norm_op(qr_kv, self.q_norm.weight, self.kv_norm.weight)
+        qr, kv = qr_kv.split([q_width, kv_width], dim=-1)
+        return self.q_norm(qr), self.kv_norm(kv)
 
     @property
     def qnorm_rope_op(self):
@@ -532,6 +803,27 @@ class VllmDeepseekV4MLAAttention(
         """Apply scaling RoPE to decoupled key states."""
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
+    @property
+    def qkv_preprocess_op(self) -> Any:
+        """Joint query normalization/rotation and key rotation."""
+        op = self.__dict__.get("_qkv_preprocess_op_instance")
+        if op is not None:
+            return op
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qkv_preprocess_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(qkv_preprocess, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(P(None, "model", None), P(), P(), P()),
+            )
+            op.register_fake(_fake_qkv_preprocess)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qkv_preprocess_op_instance", op)
+        return op
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -545,11 +837,31 @@ class VllmDeepseekV4MLAAttention(
         q = self.wq_b(qr).view(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
+        preprocess_hca = self.compress_ratio == 128
+        if not preprocess_hca:
+            q, kv = self.qkv_preprocess_op(
+                q,
+                kv,
+                positions,
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
+        # Keep operand discovery stable across prefill/decode FX traces.
+        # The JAX adapter selects the dense single-token fast path.
+        compress_hca = (
+            preprocess_hca
+            and compressor is not None
+            and hidden_states.shape[-1:] == (4096,)
+            and q.shape[1:] == (64, 512)
+            and hidden_states.dtype == torch.bfloat16
+            and compressor.head_dim == 512
+            and compressor.state_cache.block_size == 32
+            and not compressor.overlap
+            and compressor.fused_wkv_wgate.weight.shape == (4096, 1024)
+            and compressor.fused_wkv_wgate.weight.dtype == torch.bfloat16
+        )
         if self.indexer is not None:
             indexer_emb = getattr(
                 self.mla_attn,
@@ -559,7 +871,7 @@ class VllmDeepseekV4MLAAttention(
             topk_indices = self.indexer(
                 hidden_states, qr, indexer_weights, positions, indexer_emb
             )
-        if compressor is not None:
+        if compressor is not None and not compress_hca:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 
         res = self.forward_mqa(
@@ -568,6 +880,8 @@ class VllmDeepseekV4MLAAttention(
             positions,
             None,
             topk_indices=topk_indices,
+            preprocess_hca=preprocess_hca,
+            composite_hidden=hidden_states if compress_hca else None,
         )
         return res
 
@@ -597,6 +911,8 @@ class VllmDeepseekV4MLAAttention(
         output: torch.Tensor | None,
         *,
         topk_indices: torch.Tensor | None,
+        preprocess_hca: bool = False,
+        composite_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
@@ -726,7 +1042,53 @@ class VllmDeepseekV4MLAAttention(
                 main_cache_rope = main_cache_kv.clone()
             operands += (main_cache_rope,)
 
-        output, new_sw_cache = self.attn_op(*operands)
+        if preprocess_hca:
+            operands += (positions, self.mla_attn.rotary_emb.cos_sin_cache)
+            c = self.mla_attn.compressor
+            sm = (
+                attn_ctx.get(c.state_cache.prefix)
+                if isinstance(attn_ctx, dict)
+                else None
+            )
+            kp = getattr(
+                c.k_cache, "prefix", getattr(c.k_cache, "custom_prefix", None)
+            ) or getattr(c, "k_cache_prefix", None)
+            km = attn_ctx.get(kp) if isinstance(attn_ctx, dict) else None
+            history = c._as_kernel_cache_view(c.state_cache.kv_cache)
+            if (
+                sm is not None
+                and km is not None
+                and history is not None
+                and composite_hidden is not None
+            ):
+                extra_operands = (
+                    composite_hidden,
+                    c.fused_wkv_wgate.weight,
+                    c.ape.clone(),
+                    c.norm.weight.clone(),
+                    history,
+                    sm.block_tables,
+                    sm.query_start_loc,
+                    km.block_tables,
+                    sm.request_distribution,
+                )
+                if self.__dict__.get("_hca_state_swa_shared", False):
+                    output, new_main, new_sw_cache = self.hca_compressor_attn_op(
+                        *operands, *extra_operands[:4], *extra_operands[5:]
+                    )
+                else:
+                    output, new_history, new_main, new_sw_cache = (
+                        self.hca_compressor_attn_op(*operands, *extra_operands)
+                    )
+                    history.copy_(new_history)
+                main_cache_kv.copy_(new_main)
+            else:
+                # Profiling and incomplete metadata retain the original guarded calls.
+                if composite_hidden is not None:
+                    c(composite_hidden, positions, self.mla_attn.rotary_emb)
+                output, new_sw_cache = self.hca_preprocess_attn_op(*operands)
+        else:
+            output, new_sw_cache = self.attn_op(*operands)
 
         if (
             orig_sw_cache is not None
@@ -766,27 +1128,71 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_o_proj_op_instance", op)
         return op
 
+    @property
+    def o_proj_decode_op(self):
+        op = self.__dict__.get("_o_proj_decode_op_instance")
+        if op is not None:
+            return op
+        op_name = "pallas::deepseek_v4_output_projection_resident"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                _o_proj_decode_jax,
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(None, "model", None),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                    P(),
+                ),
+            )
+            op.register_fake(_fake_o_proj_decode)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_o_proj_decode_op_instance", op)
+        return op
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """Store `wo_a` in the layout the fused o-projection kernel wants,
-        which is (self.n_local_heads * self.head_dim // self.n_local_groups,
-                  self.n_local_groups * self.o_lora_rank).
-        """
+        """Retain prefill weights and prepare a byte-preserving decode layout."""
         del act_dtype
         weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
             self.n_local_groups * self.o_lora_rank,
         )
-        if tuple(weight.shape) == transposed:
-            # Already done -- a reload path can run this hook twice.
-            return
-        assert tuple(weight.shape) == transposed[::-1], (
-            f"{self.prefix}.wo_a: expected the linear to hold "
-            f"{list(transposed[::-1])}, got {list(weight.shape)}."
+        if tuple(weight.shape) != transposed:
+            assert tuple(weight.shape) == transposed[::-1]
+            out = fresh_buffer(weight.data.t())
+            self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+        enabled = (
+            get_device_name() == "TPU v7"
+            and get_tensor_model_parallel_world_size() == 1
+            and transposed == (4096, 8192)
+            and tuple(self.wo_b.weight.shape) == (8192, 4096)
+            and self.wo_a.weight.dtype == torch.float8_e4m3fn
+            and self.wo_b.weight.dtype == torch.float8_e4m3fn
+            and tuple(self.wo_a.weight_scale.shape) == (8192,)
+            and tuple(self.wo_b.weight_scale.shape) == (4096,)
+            and self.rotary_emb.cos_sin_cache.shape[-1] == 64
         )
-
-        out = fresh_buffer(weight.data.t())
-        self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
+        self._resident_output_enabled = enabled
+        if enabled:
+            packed = (
+                self.wo_a.weight.detach()
+                .reshape(4096, 8, 1024)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            self.register_buffer("wo_a_decode_packed", packed, persistent=False)
+            logger.info(
+                "[output_projection] prepared %s packed=%s extra_bytes=%d",
+                self.prefix,
+                tuple(packed.shape),
+                packed.numel() * packed.element_size(),
+            )
 
     def _assert_o_proj_supported(self) -> None:
         """Check what the fused `wo_a` kernel requires.
@@ -852,6 +1258,18 @@ class VllmDeepseekV4MLAAttention(
             f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
             f"got {list(o.shape)}."
         )
+        if self._resident_output_enabled:
+            o = stable_weight_inputs(o, self.wo_a.weight, self.wo_a_decode_packed)
+        if self._resident_output_enabled and o.shape[0] == 1:
+            return self.o_proj_decode_op(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a_decode_packed,
+                self.wo_a.weight_scale,
+                self.wo_b.weight,
+                self.wo_b.weight_scale,
+            )
         z = self.o_proj_op(
             o,
             positions,
@@ -869,18 +1287,15 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass for DeepSeek-V4 attention layer."""
         if positions.ndim > 1:
             positions = positions.flatten()
 
-        qr_kv, indexer_weights = self.attn_gemm(hidden_states)
+        qr_kv, indexer_weights = self.attn_gemm(hidden_states, quantized_input)
 
-        qr, kv = qr_kv.split(
-            [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
-        )
-        qr = self.q_norm(qr)
-        kv = self.kv_norm(kv)
+        qr, kv = self.normalize_qkv(qr_kv)
 
         attn_output = self.attention_impl(
             hidden_states,

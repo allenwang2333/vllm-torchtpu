@@ -104,6 +104,24 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    # Isolated integration of csa-wqb-opt-20261012's retained candidate.
+    # Keep the existing torch op signature and all other shape/dtype paths.
+    if (
+        x.shape == (1, 1024)
+        and w_q.shape == (1024, 32768)
+        and w_s.shape == (32768,)
+        and x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.float8_e4m3fn
+        and w_s.dtype == jnp.float32
+    ):
+        from jax.experimental.pallas import tpu as pltpu
+
+        if pltpu.get_tpu_info().generation == 7:
+            from vllm_torchtpu.kernels.quantized_matmul.single_token import (
+                single_token_mxu,
+            )
+
+            return single_token_mxu(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
 
 
@@ -376,3 +394,43 @@ def get_model_matmul_fusion_assignment(
 ):
     key = (model_name, batch_size, tp_size, layer_name)
     return MODEL_MATMUL_FUSION_TRUTH_TABLE.get(key, True)
+
+
+def _prequantized_bf16_matmul_jax(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_scale: jax.Array
+) -> jax.Array:
+    """Per-channel FP8 contraction with prepared activations, returning BF16."""
+    assert x_q.dtype == w_q.dtype == jnp.float8_e4m3fn
+    assert x_q.ndim == w_q.ndim == 2 and x_q.shape[1] == w_q.shape[0]
+    assert x_scale.shape == (x_q.shape[0], 1)
+    assert w_scale.shape == (w_q.shape[1],)
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    return ((out * x_scale) * w_scale[None]).astype(jnp.bfloat16)
+
+
+_prequantized_bf16_matmul_op: Callable | None = None
+
+
+def get_prequantized_bf16_matmul_op() -> Callable:
+    """Materialize outside a compiled forward, like the mHC bridge ops."""
+    global _prequantized_bf16_matmul_op
+    if _prequantized_bf16_matmul_op is None:
+        op = pallas.jax_op(
+            "pallas::prequantized_bf16_matmul", _prequantized_bf16_matmul_jax
+        )
+
+        def fake(x_q, x_scale, w_q, w_scale):
+            return torch.empty(
+                (x_q.shape[0], w_q.shape[1]),
+                dtype=torch.bfloat16,
+                device=x_q.device,
+            )
+
+        op.register_fake(fake)
+        _prequantized_bf16_matmul_op = op
+    return _prequantized_bf16_matmul_op

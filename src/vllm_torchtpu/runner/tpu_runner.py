@@ -5214,9 +5214,11 @@ class TPUModelRunner(GPUModelRunner):
                     for op_name in (
                         "mhc_ops",
                         "mhc_post_op",
+                        "qkv_preprocess_op",
                         "qnorm_rope_op",
                         "kv_rope_op",
                         "o_proj_op",
+                        "o_proj_decode_op",
                     ):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)
