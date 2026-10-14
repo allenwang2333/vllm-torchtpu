@@ -531,8 +531,22 @@ def upstream_moe(monkeypatch):
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
     from vllm_torchtpu.models.vllm.qwen4_exp.moe import Qwen4ExpSparseMoeBlock
 
-    def build(tp, enable_ep, rank, renormalize=True, shared_fp8=False, world_size=8):
+    def build(
+        tp,
+        enable_ep,
+        rank,
+        renormalize=True,
+        shared_fp8=False,
+        world_size=8,
+        transfer=False,
+    ):
         cfg = VllmConfig()
+        if transfer:
+            from vllm.config import KVTransferConfig
+
+            cfg.kv_transfer_config = KVTransferConfig(
+                kv_connector="Qwen4ExpRaidenConnector", kv_role="kv_producer"
+            )
         text = q4exp_text_config(
             hidden_size=256,
             num_experts=8,
@@ -764,6 +778,7 @@ def test_tpu_upstream_moe_block128_checkpoint_accuracy(upstream_moe, monkeypatch
         assert cosine > 0.999, cosine.item()
 
 
+@pytest.mark.parametrize("pd_identity", [False, True])
 @pytest.mark.parametrize("prefix", ["model.language_model.", "model."])
 @pytest.mark.parametrize(
     "enable_ep,shared_fp8,missing_projection",
@@ -776,7 +791,7 @@ def test_tpu_upstream_moe_block128_checkpoint_accuracy(upstream_moe, monkeypatch
     ],
 )
 def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
-    upstream_moe, prefix, enable_ep, shared_fp8, missing_projection
+    upstream_moe, prefix, enable_ep, shared_fp8, missing_projection, pd_identity
 ):
     """Checkpoint name mapping must preserve expert IDs and shared gate/up halves."""
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
@@ -785,6 +800,7 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
     block = upstream_moe(tp, enable_ep, 7, shared_fp8=shared_fp8)
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     nn.Module.__init__(model)
+    model._pd_weight_identity_enabled = pd_identity
     model.model = nn.Module()
     layer = nn.Module()
     layer.mlp = block
@@ -843,6 +859,7 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
             if ".experts." not in name or ".experts.7." in name
         ]
     model.load_weights(iter(source))
+    assert (model.pd_loaded_weight_identity is not None) == pd_identity
     experts = block.experts.routed_experts
     expert_ids = [7] if enable_ep else list(range(8))
     logical_width = 640 if enable_ep else 320
@@ -939,3 +956,13 @@ def test_request_capacity_is_not_limited_to_bringup_slots(slots):
     cfg = config()
     cfg.scheduler_config.max_num_seqs = slots
     validate_config(cfg)
+
+
+@pytest.mark.parametrize("transfer", [False, True])
+def test_pd_configures_fp32_outer_combine_only_when_enabled(upstream_moe, transfer):
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+
+    block = upstream_moe(1, True, 0, transfer=transfer)
+    assert isinstance(block.experts, VllmMoERunner)
+    assert block.experts.combine_dtype == (torch.float32 if transfer else None)
+    assert block.experts.do_naive_dispatch_combine

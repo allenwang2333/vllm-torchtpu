@@ -29,6 +29,7 @@ from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
@@ -37,6 +38,7 @@ from .config import gdn_cache_spec, use_unified_pool
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .moe import Qwen4ExpSparseMoeBlock
 from .parallel import PLEParallel
+from .pd_identity import LoadedWeightIdentity
 from .ple import Qwen4ExpPLE, ple_state_shape
 from .ple_host import shared_ple_options
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
@@ -298,6 +300,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
+        self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
+        self.pd_loaded_weight_identity: str | None = None
+        self.pd_loaded_ple_identity: str | None = None
+        self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.lm_head = ParallelLMHead(
@@ -370,6 +376,11 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return {kind: functions[kind] for kind in mamba_types}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.pd_loaded_weight_identity = None
+        self.pd_loaded_ple_identity = None
+        identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
+        if identity is not None:
+            weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
         moe_mapper = WeightsMapper(
@@ -494,4 +505,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp checkpoint: {sorted(missing)}")
+        if identity is not None:
+            self.pd_loaded_weight_identity = identity.finish()
+            self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
         return set(dict(self.named_parameters()))
