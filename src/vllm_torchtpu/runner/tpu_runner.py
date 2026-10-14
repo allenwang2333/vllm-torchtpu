@@ -3210,6 +3210,8 @@ class TPUModelRunner(GPUModelRunner):
             sequence_layout_descriptor=layout_plan.descriptor,
         )
         slot_mappings = self.empty_slot_mappings
+        if self._hlt is not None:
+            self._hlt.mark("meta_s")
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
             self._build_attention_metadata(
                 num_tokens=local_total_num_scheduled_tokens,
@@ -3220,6 +3222,8 @@ class TPUModelRunner(GPUModelRunner):
                 slot_mappings=slot_mappings,
             )
         )
+        if self._hlt is not None:
+            self._hlt.mark("meta_e")
 
         if self.lora_config is not None:
             # We need to respect padding when activating LoRA adapters
