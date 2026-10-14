@@ -1629,13 +1629,37 @@ def get_default_block_sizes(
     }
 
 
-# VMEM the Mosaic compiler keeps for itself on top of the kernel's explicitly
-# allocated scratch (internal scratch, spills). On v7x the compiler reports
-# ~61 MiB usable out of the 64 MiB `vmem_capacity_bytes`, so reserve 4 MiB.
-_VMEM_RESERVE_BYTES = 4 * 1024 * 1024
+def _largest_divisor_at_most(n, upper, multiple_of=1):
+    """Largest d <= `upper` with d | n and (multiple_of | d); falls back to
+    `multiple_of` (callers guarantee `multiple_of | n`)."""
+    d = min(n, max(multiple_of, upper))
+    d -= d % multiple_of
+    while d > multiple_of and n % d:
+        d -= multiple_of
+    return max(d, multiple_of)
 
-# Below this KV-fetch block the kernel loops over too many small KV chunks;
-# prefer shrinking the query block first once bkv reaches it.
+
+# Headroom kept below `vmem_limit_bytes` when fitting block sizes to the scratch
+# footprint from `get_vmem_estimate_bytes`.
+#
+# The Mosaic compiler needs VMEM on top of the explicitly allocated scratch
+# (internal scratch, vreg spills). Bisecting the smallest compiling
+# `vmem_limit_bytes` for the MIXED kernel over head counts, head dims, KV
+# dtypes, page sizes and block sizes on v5e/v5p/v6e/v7x measured that extra
+# between ~0.6 MiB and ~11.5 MiB. It grows with the query block and the number
+# of query heads, differs per generation, and is not a constant: on a 64 MiB
+# VMEM part a 32q/8kv/hd128 shard at bq=512/bkv=2048 (estimate 58 MiB) compiles
+# with 0.24 MiB to spare while an 8q/8kv/hd128 shard at bq=1024 (also 58 MiB)
+# does not. Any positive reserve that caught the latter would shrink the former,
+# which compiles and serves today. Hence the reserve is zero: the fit only
+# rejects block sizes whose explicit scratch alone cannot fit, which (since the
+# real footprint is always >= the estimate) never alters a configuration that
+# compiles today. Configurations that overflow only through compiler overhead
+# still need the compiler itself as the oracle.
+_VMEM_COMPILER_RESERVE_BYTES = 0
+
+# Shrinking the KV-fetch block below this many tokens makes the kernel loop over
+# many small DMAs; once bkv reaches it, the query block is shrunk first.
 _MIN_PREFERRED_BKV_SZ = 512
 
 
@@ -1655,24 +1679,24 @@ def fit_block_sizes_to_vmem(
 ):
     """Shrink (bq_sz, bkv_sz, bq_csz, bkv_csz) until the scratch fits in VMEM.
 
-    The default heuristics in `get_default_block_sizes` only look at the
-    query/KV lengths, not at the per-token footprint (`num_kv_heads *
-    head_dim`). Models with large head_dim and many KV heads per shard
-    (e.g. Gemma-4-31B's sliding-window layers at TP=2: 8 KV heads, head_dim
-    256) exceed v7x's 64 MiB VMEM as soon as `max_num_batched_tokens >= 1024`
-    (bq=512, bkv=2048 -> 68 MiB) and fail at compile time with a Pallas VMEM
-    OOM. Halving the KV-fetch block, then the query block, brings the footprint
-    back under budget; the kernel simply iterates over more blocks.
+    The heuristics in `get_default_block_sizes` derive the block sizes from the
+    query/KV lengths only. The scratch footprint, however, scales with the
+    per-token width of the shard (`num_kv_heads * head_dim` for the KV buffers,
+    `num_q_heads * head_dim` for the query/output/accumulator buffers), so wide
+    shards overflow VMEM once the query block grows with
+    `max_num_batched_tokens` and the kernel fails to compile with a Pallas VMEM
+    OOM. Shrinking the blocks keeps the kernel compilable; it then iterates over
+    more (smaller) blocks.
 
     Shrinking order: bkv_sz down to `_MIN_PREFERRED_BKV_SZ`, then bq_sz down to
-    1, then bkv_sz down to `page_size`. Each step keeps bkv a multiple of
-    page_size and the compute blocks <= the fetch blocks. Block sizes that
-    already fit are returned unchanged, so configurations that compile today
-    are not affected.
+    1, then bkv_sz down to `page_size`. bkv_sz stays a multiple of page_size
+    and the compute blocks stay divisors of the fetch blocks. Block sizes whose
+    footprint already fits are returned unchanged, so configurations that
+    compile today produce the identical kernel.
     """
     if vmem_limit_bytes is None:
         vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-    budget = vmem_limit_bytes - _VMEM_RESERVE_BYTES
+    budget = vmem_limit_bytes - _VMEM_COMPILER_RESERVE_BYTES
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
     def estimate(bq, bkv):
@@ -1700,8 +1724,8 @@ def fit_block_sizes_to_vmem(
             # Nothing left to shrink; let the compiler report the OOM.
             break
 
-    bq_csz = min(bq_csz, bq_sz)
-    bkv_csz = min(bkv_csz, bkv_sz)
+    bq_csz = _largest_divisor_at_most(bq_sz, bq_csz)
+    bkv_csz = _largest_divisor_at_most(bkv_sz, bkv_csz, multiple_of=page_size)
     return bq_sz, bkv_sz, bq_csz, bkv_csz
 
 
