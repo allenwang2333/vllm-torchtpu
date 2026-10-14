@@ -418,11 +418,39 @@ async def lifespan(app: FastAPI):
         )
     else:
         app.state.prefill_router = None
+    decode_routing = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    if len(app.state.decode_clients) > 1 and decode_routing == "prefix_hash":
+        app.state.decode_router = _PrefixAffinityRouter(
+            n=len(app.state.decode_clients),
+            chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
+            min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
+            slack=_env_int("PROXY_DECODE_HASH_SLACK", 8),
+        )
+    else:
+        app.state.decode_router = None
+    # Admission cap per decode leg: a request takes a slot on its decode leg
+    # before it is sent to prefill and frees it when its stream ends, so the
+    # contexts a decode leg holds (running plus arriving KV) stay within its
+    # KV cache. Above the cap, requests wait here holding no KV anywhere;
+    # without it a burst fills the decode KV, vLLM preempts and recomputes
+    # whole ~90k-token contexts on the decode leg, and E2E explodes.
+    decode_cap = _env_int("PROXY_DECODE_MAX_INFLIGHT", 0)
+    app.state.decode_slots = (
+        [asyncio.Semaphore(decode_cap) for _ in app.state.decode_clients]
+        if decode_cap > 0
+        else None
+    )
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
         f"(routing={'prefix_hash' if app.state.prefill_router else 'round_robin'}) "
         f"and {len(app.state.decode_clients)} decode clients.",
+        flush=True,
+    )
+    print(
+        "Decode routing="
+        f"{'prefix_hash' if app.state.decode_router else 'round_robin'} "
+        f"max_inflight_per_decode={decode_cap or 'unlimited'}",
         flush=True,
     )
 
@@ -639,111 +667,157 @@ async def _handle_completions(api: str, request: Request):
         router: _PrefixAffinityRouter | None = getattr(
             request.app.state, "prefill_router", None
         )
+        decode_router: _PrefixAffinityRouter | None = getattr(
+            request.app.state, "decode_router", None
+        )
         prefill_idx: int | None = None
-        if router is not None:
-            hs = router.hashes(router.extract_text(req_data))
-            prefill_idx, _ = router.route(hs)
-            prefill_client_info = request.app.state.prefill_clients[prefill_idx]
+        decode_idx: int | None = None
+        hs: list[bytes] | None = None
+        if router is not None or decode_router is not None:
+            hasher = router if router is not None else decode_router
+            hs = hasher.hashes(hasher.extract_text(req_data))
+        # The decode leg is chosen before the prefill hop so that the
+        # admission slot is taken while the request holds no KV. A
+        # conversation keeps its decode leg, so a later turn hits that leg's
+        # own prefix cache and pulls only the new tokens' KV from the prefill.
+        if decode_router is not None:
+            decode_idx, _ = decode_router.route(hs)
         else:
-            prefill_client_info = get_next_client(request.app, "prefill")
+            decode_idx = next(request.app.state.decode_iterator)
+        decode_client_info = request.app.state.decode_clients[decode_idx]
+        decode_slots = getattr(request.app.state, "decode_slots", None)
+        slot = decode_slots[decode_idx] if decode_slots is not None else None
+        released = False
+
+        def release_decode() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            if slot is not None:
+                slot.release()
+            if decode_router is not None:
+                decode_router.done(decode_idx)
+
+        if slot is not None:
+            t_admit_perf = time.perf_counter()
+            await slot.acquire()
+            admit_wait_ms = (time.perf_counter() - t_admit_perf) * 1000.0
+            _PROXY_LATENCY.record("decode_admit", admit_wait_ms)
+            print(
+                f"PERF PROXY decode_admit req_id={request_id} "
+                f"decode_id={decode_client_info.get('id', decode_idx)} "
+                f"wait_ms={admit_wait_ms:.2f} ts={time.time():.6f}",
+                flush=True,
+            )
 
         try:
-            render_endpoint = _render_endpoint_for_api(api)
-            if render_endpoint is not None:
-                render_response = await render_completion_prompt(
-                    prefill_client_info,
-                    render_endpoint,
-                    req_data,
-                    request_id,
-                    forwarded,
-                )
-                req_data = _replace_prompt_with_rendered_token_ids(
-                    req_data, render_response.json()
-                )
+            if router is not None:
+                prefill_idx, _ = router.route(hs)
+                prefill_client_info = request.app.state.prefill_clients[prefill_idx]
+            else:
+                prefill_client_info = get_next_client(request.app, "prefill")
 
-            # Send request to prefill service
-            t_prefill_send = time.time()
-            t_prefill_send_perf = time.perf_counter()
+            try:
+                render_endpoint = _render_endpoint_for_api(api)
+                if render_endpoint is not None:
+                    render_response = await render_completion_prompt(
+                        prefill_client_info,
+                        render_endpoint,
+                        req_data,
+                        request_id,
+                        forwarded,
+                    )
+                    req_data = _replace_prompt_with_rendered_token_ids(
+                        req_data, render_response.json()
+                    )
+
+                # Send request to prefill service
+                t_prefill_send = time.time()
+                t_prefill_send_perf = time.perf_counter()
+                print(
+                    f"PERF PROXY prefill_send req_id={request_id} "
+                    f"prefill_id={prefill_client_info.get('id', 0)} "
+                    f"ts={t_prefill_send:.6f}",
+                    flush=True,
+                )
+                response = await send_request_to_prefill(
+                    prefill_client_info, api, req_data, request_id, forwarded
+                )
+            finally:
+                if router is not None and prefill_idx is not None:
+                    router.done(prefill_idx)
+
+            t_prefill_recv = time.time()
+            t_prefill_recv_perf = time.perf_counter()
+            prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
+            _PROXY_LATENCY.record("prefill", prefill_ms)
+            _PROXY_LATENCY.record(
+                "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
+            )
+
+            # Extract the needed fields
+            response_json = response.json()
+            kv_transfer_params = response_json.get("kv_transfer_params", {})
+            kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
+            kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
             print(
-                f"PERF PROXY prefill_send req_id={request_id} "
-                f"prefill_id={prefill_client_info.get('id', 0)} "
-                f"ts={t_prefill_send:.6f}",
+                f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
+                f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
                 flush=True,
             )
-            response = await send_request_to_prefill(
-                prefill_client_info, api, req_data, request_id, forwarded
-            )
-        finally:
-            if router is not None and prefill_idx is not None:
-                router.done(prefill_idx)
 
-        t_prefill_recv = time.time()
-        t_prefill_recv_perf = time.perf_counter()
-        prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
-        _PROXY_LATENCY.record("prefill", prefill_ms)
-        _PROXY_LATENCY.record(
-            "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
-        )
+            if kv_transfer_params:
+                req_data["kv_transfer_params"] = kv_transfer_params
 
-        # Extract the needed fields
-        response_json = response.json()
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
-        kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
-        kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
-        print(
-            f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
-            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
-            flush=True,
-        )
+            logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
-        if kv_transfer_params:
-            req_data["kv_transfer_params"] = kv_transfer_params
-
-        # Get the next decode client in round-robin fashion
-        decode_client_info = get_next_client(request.app, "decode")
-
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
-
-        # Stream response from decode service
-        async def generate_stream():
-            t_decode_send = time.time()
-            t_decode_send_perf = time.perf_counter()
-            print(
-                f"PERF PROXY decode_send req_id={request_id} "
-                f"ts={t_decode_send:.6f}{kv_uuid_log}",
-                flush=True,
-            )
-            first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
+            # Stream response from decode service
+            async def generate_stream():
+                try:
+                    t_decode_send = time.time()
+                    t_decode_send_perf = time.perf_counter()
                     print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                        f"PERF PROXY decode_send req_id={request_id} "
+                        f"ts={t_decode_send:.6f}{kv_uuid_log}",
                         flush=True,
                     )
-                    first = False
-                yield chunk
+                    first = True
+                    async for chunk in stream_from_decode(
+                        decode_client_info, api, req_data, request_id, forwarded
+                    ):
+                        if first:
+                            t_first = time.time()
+                            t_first_perf = time.perf_counter()
+                            decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                            ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                            _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                            _PROXY_LATENCY.record("ttft", ttft_ms)
+                            print(
+                                f"PERF PROXY first_chunk req_id={request_id} "
+                                f"ts={t_first:.6f} "
+                                f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                                f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                                flush=True,
+                            )
+                            first = False
+                        yield chunk
+                finally:
+                    release_decode()
 
-        # text/event-stream when the caller asked for a stream, which is what
-        # the decode instance is actually sending back. Declared as
-        # application/json, a client parses each SSE frame - "data: {...}" prefix
-        # and all - as one JSON document, and every request fails; aiperf's
-        # agentic replay does exactly that, while the non-streaming callers this
-        # proxy had until now (check_completions.py, lm_eval) never noticed.
-        media_type = (
-            "text/event-stream" if req_data.get("stream") else "application/json"
-        )
-        return StreamingResponse(generate_stream(), media_type=media_type)
+            # text/event-stream when the caller asked for a stream, which is what
+            # the decode instance is actually sending back. Declared as
+            # application/json, a client parses each SSE frame - "data: {...}" prefix
+            # and all - as one JSON document, and every request fails; aiperf's
+            # agentic replay does exactly that, while the non-streaming callers this
+            # proxy had until now (check_completions.py, lm_eval) never noticed.
+            media_type = (
+                "text/event-stream" if req_data.get("stream") else "application/json"
+            )
+            return StreamingResponse(generate_stream(), media_type=media_type)
+        except BaseException:
+            release_decode()
+            raise
 
     except Exception as e:
         import sys
@@ -791,6 +865,11 @@ async def healthcheck():
     }
     if router is not None:
         res["prefill_router"] = router.stats()
+    decode_router: _PrefixAffinityRouter | None = getattr(
+        app.state, "decode_router", None
+    )
+    if decode_router is not None:
+        res["decode_router"] = decode_router.stats()
     return res
 
 

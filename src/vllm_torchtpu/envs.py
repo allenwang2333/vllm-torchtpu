@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
+    TPU_RAIDEN_STORE_DISPATCH_WAIT_S: float = 600.0
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
@@ -153,6 +154,7 @@ if TYPE_CHECKING:
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
+    TPU_DRAFT_LOAD_BARRIER: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     RAIDEN_STORAGE_PATH: str = ""
@@ -591,6 +593,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE": lambda: int(
         os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"
     ),
+    # How long a worker waits for rank 0's reshard store dispatch endpoint
+    # at register_runner. The ranks of one engine reach that step up to a
+    # minute apart on a loaded host, and only rank 0 hosts the store.
+    "TPU_RAIDEN_STORE_DISPATCH_WAIT_S": lambda: float(
+        os.getenv("TPU_RAIDEN_STORE_DISPATCH_WAIT_S") or "600"
+    ),
     # Decode-side prefix-cache-aware reshard loads: when true, the consumer
     # subtracts the local prefix-cache hit and transfers only the missing
     # FA suffix (page-aligned dst_skip_bytes clip planned by the source
@@ -987,6 +995,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the real spec-decode dispatch once at startup so the first request
     # does not pay for those compiles. Off skips that warmup.
     "SPEC_WARMUP": env_bool("SPEC_WARMUP", default=True),
+    # Barrier on the world CPU group right before the draft model load, so the
+    # ranks enter the load's process-group creation together. torch_tpu's
+    # new_group waits a fixed 300 s for every rank's store key, and the ranks
+    # can finish streaming the target weights further apart than that.
+    "TPU_DRAFT_LOAD_BARRIER": env_bool("TPU_DRAFT_LOAD_BARRIER", default=True),
     # Raiden library switch, on by default. The TPU offloading connector
     # cannot run next to the raiden singleton worker, so it rejects an
     # explicit off and exports the variable as on for the raiden library.
