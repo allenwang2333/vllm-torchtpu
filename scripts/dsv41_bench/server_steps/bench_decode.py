@@ -19,6 +19,23 @@ from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIOS
 
 
+def prefix_cache_alignment(server_log: str, dp_size: int) -> int:
+    """Read the scheduler's effective hybrid-cache alignment on every rank."""
+    matches = re.findall(
+        r"EngineCore_DP(\d+)[^\n]*kv lcm block sizes (\d+)", server_log
+    )
+    ranks = {int(rank) for rank, _ in matches}
+    alignments = {int(alignment) for _, alignment in matches}
+    if ranks != set(range(dp_size)) or len(alignments) != 1:
+        raise ValueError(
+            "Missing or inconsistent prefix-cache alignment across DP ranks"
+        )
+    alignment = alignments.pop()
+    if alignment <= 0:
+        raise ValueError("Prefix-cache alignment must be positive")
+    return alignment
+
+
 def client_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=["decode"], default="decode")
@@ -47,6 +64,9 @@ def client_main(argv: list[str]) -> None:
         parser.error("rounds must be nonnegative; zero runs warmup only")
     args.out.mkdir(parents=True, exist_ok=False)
     scenario = SCENARIOS[args.scenario]
+    alignment = prefix_cache_alignment(args.server_log.read_text(), scenario.dp_size)
+    if scenario.prefix_tokens % alignment:
+        raise ValueError("Benchmark prefix must align with the hybrid cache")
     data = json.loads(args.input.read_text())
     rows = data["prompts"][: scenario.concurrency]
     suffixes = data["prime_suffix"][: scenario.concurrency]
@@ -74,6 +94,7 @@ def client_main(argv: list[str]) -> None:
         "corpus": data["manifest"],
         "rounds": args.rounds,
         "admission_settle_seconds": args.admission_settle_seconds,
+        "prefix_cache_alignment": alignment,
         "rank_affinity": [i % scenario.dp_size for i in range(len(rows))],
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -206,10 +227,11 @@ def client_main(argv: list[str]) -> None:
         ):
             raise ValueError("Missing preemption metric or nonzero preemptions")
         hits = delta.get("vllm:prefix_cache_hits_total", -1)
-        # Hybrid compressed KV groups align cache hits to 256 logical tokens,
-        # despite --block-size 16. An exact-prefix prompt leaves its last hash
-        # unit uncached; an extension can reuse the complete 64k prefix.
-        expected_hit = scenario.prefix_tokens - (0 if scenario.extend_tokens else 256)
+        # An exact-prefix prompt leaves its final hybrid-cache unit uncached.
+        # The effective alignment depends on the physical cache page layout.
+        expected_hit = scenario.prefix_tokens - (
+            0 if scenario.extend_tokens else alignment
+        )
         if hits != scenario.concurrency * expected_hit:
             raise ValueError(f"Prefix-hit invariant failed: {hits}")
         with args.server_log.open() as stream:

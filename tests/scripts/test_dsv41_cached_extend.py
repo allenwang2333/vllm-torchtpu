@@ -21,9 +21,29 @@ from bench_cached_extend import (  # noqa: E402
     summarize_extend,
     summarize_startup,
 )
+from bench_decode import prefix_cache_alignment  # noqa: E402
 from server_step_worker import SCENARIO, token_counts  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("alignment", [128, 256])
+def test_decode_reads_effective_cache_alignment(alignment):
+    log = "\n".join(
+        f"(EngineCore_DP{rank} pid=1) INFO kv lcm block sizes {alignment}"
+        for rank in range(8)
+    )
+    assert prefix_cache_alignment(log, 8) == alignment
+
+
+@pytest.mark.parametrize("alignments", [[128] * 7, [128] * 7 + [256], [0] * 8])
+def test_decode_rejects_invalid_cache_alignment(alignments):
+    log = "\n".join(
+        f"(EngineCore_DP{rank} pid=1) INFO kv lcm block sizes {alignment}"
+        for rank, alignment in enumerate(alignments)
+    )
+    with pytest.raises(ValueError, match="[Aa]lignment"):
+        prefix_cache_alignment(log, 8)
 
 
 def test_compilation_audit_excludes_startup_and_handles_new_year():
