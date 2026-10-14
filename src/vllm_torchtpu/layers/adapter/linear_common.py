@@ -202,8 +202,18 @@ def prequantized_matmul(
 ) -> torch.Tensor:
     """Per-channel FP8 linear on an activation quantized upstream:
     bit for bit ``quantized_matmul(x, w_q, w_s)`` when ``(x_q, x_scale)`` is
-    ``quantize_tensor(x)`` (bf16 out). ``w_q`` is (k, n), ``w_s`` [n]."""
-    return get_prequantized_matmul_op()(x_q, x_scale, w_q, w_s)
+    ``quantize_tensor(x)`` (bf16 out). ``w_q`` is (k, n), ``w_s`` [n].
+
+    Runs inside the compiled forward, so it only reads the op that
+    ``get_prequantized_matmul_op`` built at arming (rmsnorm.arm_prequant):
+    Dynamo cannot trace the lock or the lazy construction."""
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "prequantized_matmul op not built: call get_prequantized_matmul_op() "
+            "at load (rmsnorm.arm_prequant does)"
+        )
+    return op(x_q, x_scale, w_q, w_s)
 
 
 def _fp8_linear_pallas_jax(

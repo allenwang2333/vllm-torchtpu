@@ -137,6 +137,10 @@ def _pair(norm, linear, emit_y: bool) -> bool:
         return False
     if not _per_channel_fp8_linear(linear):
         return False
+    # Both ops are built here, at load, outside Dynamo: the forward only calls them.
+    from vllm_torchtpu.layers.adapter.linear_common import get_prequantized_matmul_op
+
+    get_prequantized_matmul_op()
     norm._prequant_target = linear
     norm._op_quant = _get_quant_op(norm.variance_epsilon, emit_y)
     setattr(linear, PREQUANT_ATTR, None)

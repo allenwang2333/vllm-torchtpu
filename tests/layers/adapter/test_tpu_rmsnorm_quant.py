@@ -99,3 +99,25 @@ def test_decode_rows_keep_old_path(vllm_config_context):
     x = torch.randn(16, H).to(torch.bfloat16).to("tpu")
     n(x, x.clone())
     assert getattr(lin, PREQUANT_ATTR) is None
+
+
+def test_compiled_first_uses_op_built_at_arming(vllm_config_context):
+    """Regression (twin j-367e571f): the consumer op must be built by arming,
+    not lazily under Dynamo (a Lock in the compiled region fails the capture).
+    Start with no op built and run the compiled forward first."""
+    from vllm_torchtpu.layers.adapter import linear_common
+
+    torch.manual_seed(9)
+    torch._dynamo.reset()
+    linear_common._prequantized_matmul_op = None
+    n, lin = _norm(), _Linear()
+    x = (0.7 * torch.randn(1024, H)).to(torch.bfloat16).to("tpu")
+    r = (4 * torch.randn(1024, H)).to(torch.bfloat16).to("tpu")
+    ref_out, ref_res = _layer(n, lin, x.clone(), r.clone())  # unpaired, eager
+    linear_common._prequantized_matmul_op = None
+    assert tpu_rmsnorm._pair(n, lin, False)
+    assert linear_common._prequantized_matmul_op is not None
+    fn = torch.compile(_layer, fullgraph=True, dynamic=False)
+    got_out, got_res = fn(n, lin, x.clone(), r.clone())
+    assert torch.equal(got_res.cpu(), ref_res.cpu())
+    assert torch.equal(got_out.cpu(), ref_out.cpu())
