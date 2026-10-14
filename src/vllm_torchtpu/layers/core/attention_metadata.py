@@ -19,12 +19,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.runner.staging_spans import zero_stale_spans
 
 
 def attention_block_table_width(
@@ -510,10 +512,27 @@ def stage_block_table_uploads(
             (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         runner._block_table_stage_cpu = scratch
+        runner._block_table_stage_dirty = []
     flat = scratch[:total]
-    flat.zero_()
+    real_rows = ctx.position_ids_override is None
+    sparse_zero = envs.TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO
+    reuse_upload = envs.TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD
+    # The [start, stop) spans of `flat` this staging fills with real rows.
+    fresh: list[tuple[int, int]] = []
+    if real_rows:
+        offset = 0
+        for _, _, target_num_blocks in entries:
+            fresh.append((offset, offset + ctx.num_reqs * target_num_blocks))
+            offset += num_reqs_padded * target_num_blocks
+    if sparse_zero:
+        # The scratch is zero outside the real rows the last staging wrote, so
+        # only those need clearing, minus the rows this staging overwrites.
+        zero_stale_spans(scratch, runner._block_table_stage_dirty, fresh)
+        runner._block_table_stage_dirty = fresh
+    else:
+        flat.zero_()
 
-    if ctx.position_ids_override is None:
+    if real_rows:
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
@@ -526,7 +545,28 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    if reuse_upload:
+        # `flat` is zero outside `fresh`, so (total, fresh, fresh contents)
+        # determine every byte; an identical staging reuses its upload.
+        key = (total, tuple(fresh))
+        filled = [flat[a:b] for a, b in fresh]
+        slot = None if gids is None else frozenset(gids)
+        prev = runner._block_table_stage_uploads.get(slot)
+        if (
+            prev is not None
+            and prev[0] == key
+            and all(torch.equal(x, y) for x, y in zip(filled, prev[1]))
+        ):
+            staged_dev = prev[2]
+        else:
+            staged_dev = flat.to(runner.device, non_blocking=True)
+            runner._block_table_stage_uploads[slot] = (
+                key,
+                [x.clone() for x in filled],
+                staged_dev,
+            )
+    else:
+        staged_dev = flat.to(runner.device, non_blocking=True)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

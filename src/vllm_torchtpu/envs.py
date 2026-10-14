@@ -73,6 +73,8 @@ if TYPE_CHECKING:
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
+    TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
+    TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -668,6 +670,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Directory for per-step host timestamps of the EngineCore, the runner and
     # the worker output thread (runner/host_loop_trace.py). Empty disables it.
     "TPU_HOST_LOOP_TRACE_DIR": env_str("TPU_HOST_LOOP_TRACE_DIR", ""),
+    # Block-table staging: clear only the scratch rows the previous staging
+    # wrote instead of the whole (max_num_reqs x every group) scratch each step.
+    # Uploads the same bytes.
+    "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO": env_bool("TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO"),
+    # Block-table staging: reuse the previous upload when the staged bytes are
+    # identical (steady decode rarely crosses a block boundary).
+    "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD": env_bool(
+        "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD"
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
