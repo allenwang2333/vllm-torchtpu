@@ -52,13 +52,9 @@ steps:
           PUBLISH_DOCKERHUB: "1"
           # TODO(docker-hub): replace this dummy repo with the real Docker Hub repo, e.g. vllm/vllm-torchtpu.
           DOCKERHUB_REPO: "vllm/vllm-torchtpu"
+          DOCKERHUB_USERNAME: "vllm"
         # TODO(docker-hub): the secret name configured in the Buildkite cluster.
         secrets:
            - DOCKERHUB_TOKEN_VLLM_TORCHTPU
-        plugins:
-           - docker-login#v3.0.0:
-        #      TODO(docker-hub): the Docker Hub bot account with push access to DOCKERHUB_REPO. Login fails until this is set.
-               username: vllm
-               password-env: DOCKERHUB_TOKEN_VLLM_TORCHTPU
         commands:
           - bash .buildkite/scripts/publish_nightly_images.sh

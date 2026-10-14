@@ -67,6 +67,24 @@ if [[ "${BRANCH}" == releases/* ]] && ! buildkite-agent meta-data exists dockerh
 fi
 if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   DOCKERHUB_REPO="${DOCKERHUB_REPO:?DOCKERHUB_REPO must be set when PUBLISH_DOCKERHUB=1}"
+  DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?DOCKERHUB_USERNAME must be set when PUBLISH_DOCKERHUB=1}"
+  # Never trace from here on, so the token can't reach the build log.
+  { set +x; } 2>/dev/null
+  : "${DOCKERHUB_TOKEN_VLLM_TORCHTPU:?DOCKERHUB_TOKEN_VLLM_TORCHTPU must be set when PUBLISH_DOCKERHUB=1}"
+  # Log in to a private, temporary Docker config: the token never reaches the
+  # agent's shared config, and the trap logs out and deletes it however the
+  # script ends. Image builds keep pulling the base image anonymously.
+  DOCKERHUB_CONFIG="$(mktemp -d)"
+  cleanup_dockerhub() {
+    DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker logout >/dev/null 2>&1 || true
+    rm -rf "${DOCKERHUB_CONFIG}"
+  }
+  trap cleanup_dockerhub EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  printf '%s' "${DOCKERHUB_TOKEN_VLLM_TORCHTPU}" \
+    | DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker login -u "${DOCKERHUB_USERNAME}" --password-stdin >/dev/null 2>&1 \
+    || { echo "ERROR: Docker Hub login failed; check DOCKERHUB_TOKEN_VLLM_TORCHTPU and DOCKERHUB_USERNAME." >&2; exit 1; }
   MOVE_LATEST="yes"
   if [[ "${BRANCH}" == releases/* ]]; then
     DOCKERHUB_TARGET="prod"
@@ -77,7 +95,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
     OVERWRITE="$(buildkite-agent meta-data get dockerhub_overwrite --default no)"
     # Released tags are immutable unless the approver chose to overwrite.
     # Checked here so a refused release builds nothing.
-    if [[ "${OVERWRITE}" != "yes" ]] && docker manifest inspect "${DOCKERHUB_REPO}:${DOCKERHUB_TAG}" >/dev/null 2>&1; then
+    if [[ "${OVERWRITE}" != "yes" ]] && DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker manifest inspect "${DOCKERHUB_REPO}:${DOCKERHUB_TAG}" >/dev/null 2>&1; then
       echo "ERROR: ${DOCKERHUB_REPO}:${DOCKERHUB_TAG} already exists; choose Overwrite in the approval step to replace it." >&2
       exit 1
     fi
@@ -147,7 +165,7 @@ for TARGET in "${TARGETS[@]}"; do
     for DOCKERHUB_IMAGE in "${DOCKERHUB_IMAGES[@]}"; do
       echo "--- :docker: Pushing ${DOCKERHUB_IMAGE} to Docker Hub"
       docker tag "${DATE_IMAGE}" "${DOCKERHUB_IMAGE}"
-      docker push "${DOCKERHUB_IMAGE}"
+      DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker push "${DOCKERHUB_IMAGE}"
       docker rmi "${DOCKERHUB_IMAGE}" || true
     done
   fi
