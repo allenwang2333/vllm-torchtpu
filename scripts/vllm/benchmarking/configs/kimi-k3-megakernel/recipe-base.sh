@@ -57,10 +57,11 @@
 # the decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h)
 # adds the global registry on the prefill head and a host-store server on each
 # decode host, which k3_1p1d.sh starts; the prefill's host store joins their
-# pool and the decode drops its own. Departures for GKE: the DP2 points' prefill
-# keeps the 1.5 TiB host store (the doc: 2 TiB, 512 GiB per host, which does not
-# fit beside the engine), and has no --numa-bind, which runs the ranks under
-# numactl and the engine image has none.
+# pool and the decode drops its own. Departures for GKE: each store server lends
+# 384 GiB (the doc: 512 GiB, which evicted the decode hosts), the DP2 points'
+# prefill keeps the 1.5 TiB host store (the doc: 2 TiB, 512 GiB per host, which
+# does not fit beside the engine), and has no --numa-bind, which runs the ranks
+# under numactl and the engine image has none.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -408,18 +409,20 @@ SERVE_ARGS=("$MODEL_DIR" "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}")
 # The Oct 13 store servers, which k3_1p1d.sh starts: the global registry on the
 # prefill head before its serve, and a host-store server on each decode host
 # once the decode head serves, as the doc starts them after the engines are up.
-# Each server lends the doc's 512 GiB (549755813888): without its own host
-# store a decode host holds ~410-440 GiB, and without the fleet's gcsfuse file
-# cache (#1950) the server brings it to roughly 860-880 GiB of the 917.9
-# allocatable, about where the prefill hosts sit under their 1.5 TiB store. A
-# point may set RECIPE_STORE_NODE_BYTES.
+# Each server lends 384 GiB (412316860416), not the doc's 512 GiB: a decode
+# host without its own host store holds ~400-450 GiB, and with 512 GiB servers
+# the hosts reached 868-917 GiB of the 917.9 allocatable and the kubelet
+# evicted two of them as the servers finished allocating (vllm-torchtpu-dev
+# build 598, without the fleet's caches). 384 GiB puts them at roughly
+# 790-830 GiB, where the prefill hosts sit under their 1.5 TiB store. A point
+# may set RECIPE_STORE_NODE_BYTES.
 if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
   K3_1P1D_REGISTRY_ADDRESS="$PREFILL_HEAD_IP:$_registry_port"
   if [ "$_role" = prefill ]; then
     K3_1P1D_REGISTRY_ARGS=(--port="$_registry_port")
   else
     K3_1P1D_STORE_NODE_ARGS=(
-      --dram_budget_bytes="${RECIPE_STORE_NODE_BYTES:-549755813888}"
+      --dram_budget_bytes="${RECIPE_STORE_NODE_BYTES:-412316860416}"
       --global_registry_address="$K3_1P1D_REGISTRY_ADDRESS"
       --kv_pool_group="$_pool_group"
       --store_server_ip="$NODE_IP"
