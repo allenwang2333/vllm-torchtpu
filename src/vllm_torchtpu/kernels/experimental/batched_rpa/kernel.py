@@ -31,6 +31,13 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     utils,
 )
 
+# Test-only hook, see tests/kernels/experimental/batched_rpa/test_poisoned_vmem.py.
+# When True, `_run` first fills every Q/KV pipeline slot with `VMEM_POISON_U32`, so
+# a slot the gated zero-fill skips but a step still reads surfaces as NaN in the
+# outputs. Must stay False outside tests; when False nothing extra is traced.
+POISON_UNUSED_VMEM_FOR_TESTS = False
+VMEM_POISON_U32 = 0x7FFF7FFF  # NaN as f32, as bf16 halves and as fp8 bytes.
+
 
 def strided_load_bkv(
     kv_in_vref: jax.Ref,
@@ -894,19 +901,43 @@ def rpa_kernel(
             # memory is storing kv cache from previous step, as long as the data is
             # not NaNs, there will be no numeric concerns.
 
-            scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
-
             q_alloc, kv_cache_alloc, o_alloc, lse_alloc = final_allocs
 
             num_lanes = pltpu.get_tpu_info().num_lanes
-            q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
-            kv_ref_flat = kv_cache_alloc.window_ref.bitcast(jnp.uint32).reshape(
-                -1, num_lanes
-            )
+            if POISON_UNUSED_VMEM_FOR_TESTS:
+                # Test-only: poison every slot first; the gated fill below has to
+                # zero exactly the slots the steps read, or NaN reaches the outputs.
+                for window_ref in (q_alloc.window_ref, kv_cache_alloc.window_ref):
+                    window_u32 = window_ref.bitcast(jnp.uint32).reshape(-1, num_lanes)
+                    window_u32[...] = jnp.full_like(window_u32, VMEM_POISON_U32)
 
-            # Explicitly zero out scratches and Q/KV buffers.
-            for ref in (scratches[1], scratches[2], q_ref_flat, kv_ref_flat):
-                ref[...] = jnp.zeros_like(ref)
+            # Only initialize what this launch can read: the fill is the dominant
+            # fixed cost of a short launch. A launch with no steps reads nothing.
+            # Input slot `s` is first read at step `s` (`comp_slot = step %
+            # NUM_INPUT_SLOTS` in `pipeline.run_manual_triple_buffer`, and later
+            # schedule chunks restart from slot 0), so a launch of `actual_steps`
+            # steps only ever reads slots `s < actual_steps`; every later visit to a
+            # slot finds data an earlier step already fetched or stitched. Slots that
+            # are zeroed are zeroed exactly as before.
+            @pl.when(actual_steps > 0)
+            def _init_vmem():
+                scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
+
+                # Explicitly zero out scratches.
+                for ref in (scratches[1], scratches[2]):
+                    ref[...] = jnp.zeros_like(ref)
+
+                for slot in range(configs.NUM_INPUT_SLOTS):
+                    # Explicitly zero out the Q/KV buffers of every slot that is read.
+                    @pl.when(actual_steps > slot)
+                    def _zero_input_slot(slot=slot):
+                        for window_ref in (
+                            q_alloc.window_ref,
+                            kv_cache_alloc.window_ref,
+                        ):
+                            slot_ref = window_ref.at[slot].bitcast(jnp.uint32)
+                            slot_ref_flat = slot_ref.reshape(-1, num_lanes)
+                            slot_ref_flat[...] = jnp.zeros_like(slot_ref_flat)
 
             def execute_schedule_chunk(start_step, num_steps):
                 # All reads are aligned to 128 and some extra steps are copied in the
