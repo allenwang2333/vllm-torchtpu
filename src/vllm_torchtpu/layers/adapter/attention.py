@@ -62,7 +62,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb import pick_blocks as pick_absorb_blocks
+from vllm_torchtpu.kernels.mla.absorb import HEADS_PER_BLOCK as ABSORB_HEADS_PER_BLOCK
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -593,11 +593,21 @@ def get_mla_absorb_op(scaled: bool) -> Any:
         return op
 
 
-def mla_absorb_mode(num_tokens: int) -> str | None:
+def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
     """"pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
-    of `num_tokens` tokens, else None (the head-major bmm)."""
+    of `num_tokens` tokens, else None (the head-major bmm).
+
+    Only the backbone may branch on the token count: it is traced once per
+    bucket group (`_precompile_backbone` retraces where a branch needs it).
+    The MTP drafter (model_tag "eagle_head") is traced once for every bucket,
+    so the comparison below would pin its graph to the first size and the
+    other buckets fail with ShapeSpecializationError. The drafter keeps the
+    bmm, so the flag never touches its graph (checked before the comparison:
+    no guard is recorded)."""
     mode = envs.TPU_MLA_ABSORB_TOKEN_MAJOR
-    if mode in (None, "0") or num_tokens < envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS:
+    if mode in (None, "0") or not is_backbone:
+        return None
+    if num_tokens < envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS:
         return None
     return "pallas" if mode == "1" else mode
 
@@ -621,7 +631,7 @@ def mla_absorb_w_uk(
         if (
             q_src.dtype != torch.bfloat16
             or w_uk_t.shape[-1] % 128
-            or pick_absorb_blocks(q_src.shape[0], q_src.shape[1]) is None
+            or q_src.shape[1] % ABSORB_HEADS_PER_BLOCK
         ):
             mode = "einsum"
         else:
@@ -2655,7 +2665,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # TPU_MLA_ABSORB_TOKEN_MAJOR (mixed buckets): absorb token-major, from
         # the whole raw q head when the decode prologue hands it over (q_pe
         # is then q_b's [T, H, nope + rope] view), so nothing is relayouted.
-        absorb_mode = mla_absorb_mode(q_nope.shape[0])
+        absorb_mode = mla_absorb_mode(
+            q_nope.shape[0],
+            is_backbone=vllm_compilation_backends.model_tag == "backbone",
+        )
         q_src = q_nope
         if (
             absorb_mode == "pallas"

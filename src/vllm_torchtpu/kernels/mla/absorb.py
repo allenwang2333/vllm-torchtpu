@@ -41,6 +41,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+HEADS_PER_BLOCK = 16
+
+
 def pick_blocks(num_tokens: int, num_heads: int) -> tuple[int, int] | None:
     """(token block, heads per block) for the grid, or None if unsupported.
 
@@ -51,9 +54,6 @@ def pick_blocks(num_tokens: int, num_heads: int) -> tuple[int, int] | None:
     if tb is None or hb is None:
         return None
     return tb, hb
-
-
-HEADS_PER_BLOCK = 16
 
 
 def _absorb_kernel(q_ref, w_ref, *rest, hb, nope, qk, lora, has_scale):
@@ -111,7 +111,15 @@ def mla_absorb_token_major(
     assert wh == num_heads and wn == nope_dim <= qk, (q.shape, w_uk_t.shape)
     assert q.dtype == jnp.bfloat16 and lora % 128 == 0, (q.dtype, lora)
     blocks = pick_blocks(num_tokens, num_heads)
-    assert blocks is not None, (num_tokens, num_heads)
+    if blocks is None:
+        # Untileable token count (never a served mixed bucket): the reference
+        # head-major product, same rounding as the torch bmm path.
+        out = jnp.matmul(
+            jnp.transpose(q[..., :nope_dim], (1, 0, 2)), w_uk_t.astype(q.dtype)
+        )
+        if w_scale is not None:
+            out = out * w_scale.reshape(num_heads, 1, lora)
+        return jnp.transpose(out, (1, 0, 2)).astype(q.dtype)
     tb, hb = blocks
     # q_b's output is [T, H * qk] row-major: read it as such (the 3D view is
     # a different tiled layout, and would cost XLA a relayout).

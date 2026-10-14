@@ -133,6 +133,8 @@ def test_mode_gate(monkeypatch):
     monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", "2048")
     assert attention.mla_absorb_mode(1024) is None
     assert attention.mla_absorb_mode(2048) == "einsum"
+    # The MTP drafter is traced once for all buckets: never on the new path.
+    assert attention.mla_absorb_mode(4096, is_backbone=False) is None
 
 
 @pytest.mark.tpu_test
