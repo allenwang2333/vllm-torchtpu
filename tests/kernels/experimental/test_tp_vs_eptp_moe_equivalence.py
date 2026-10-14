@@ -26,7 +26,9 @@ f32; #1763: relative L2 0.045). Two fault controls run the TP arm broken (routed
 scale 1.0; one rank holding the wrong TP slice) and must fail the same gate.
 
 Run on TPU: pytest -s tests/kernels/experimental/test_tp_vs_eptp_moe_equivalence.py
-A RESULT json line carries every number, and per-layer timings of both arms.
+A RESULT json line carries every number. (No timings: a host-timed loop of an
+8-device program is dominated by dispatch jitter; the mirror microbenchmark
+measures the layers.)
 """
 
 import json
@@ -59,8 +61,6 @@ DECODE = [(4, 4), (8, 7), (16, 13), (32, 27), (64, 57)]
 PREFILL = [(4096, 4000)]
 REF_ROWS = 256
 TOL = {"rel_l2": 0.06, "worst_row": 0.08, "tp_vs_ep": 0.06}
-TIME_ITERS = (1, 6)
-TIME_REPEATS = 5
 
 
 def _on_tpu():
@@ -257,22 +257,12 @@ def _run_all():
         )
         return stacked, rank, e0
 
-    def program(statics, iters=None):
+    def program(statics):
         body = adapter._op_body(statics, N, "d")
-        if iters is None:
-            fn = body
-        else:
-
-            def fn(x, *rest):
-                def step(_, xx):
-                    out = body(xx, *rest)
-                    # A data dependency the compiler cannot drop; never taken.
-                    return jnp.where(jnp.isinf(out[:1, :1]), out, xx)
-
-                return lax.fori_loop(0, iters, step, x)
-
         return jax.jit(
-            jax.shard_map(fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False)
+            jax.shard_map(
+                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
         )
 
     def operands(rows, n_valid, w):
@@ -305,21 +295,6 @@ def _run_all():
             "fused_moe_prefill": txt.count("fused_moe_prefill-t_"),
             "ragged_or_gmm": txt.count("gmm") + txt.count("ragged"),
         }
-
-    def timing(statics, ops):
-        progs = {k: program(statics, k) for k in TIME_ITERS}
-        for p in progs.values():
-            jax.block_until_ready(p(*ops))
-        per_iter = []
-        for _ in range(TIME_REPEATS):
-            t = {}
-            for k, p in progs.items():
-                t0 = time.perf_counter()
-                jax.block_until_ready(p(*ops))
-                t[k] = time.perf_counter() - t0
-            k0, k1 = TIME_ITERS
-            per_iter.append((t[k1] - t[k0]) / (k1 - k0) * 1e6)
-        return float(np.median(per_iter))
 
     w_tp, w_ep, w_bad = weights("tp"), weights("ep"), weights("tp_bad_slice")
     res = {"tol": TOL, "cases": {}, "controls": {}}
@@ -355,8 +330,6 @@ def _run_all():
             "nan": int(np.isnan(out_tp).sum() + np.isnan(out_ep).sum()),
             "kernels_tp": kernels_in(prog_tp, ops_tp),
             "kernels_ep": kernels_in(prog_ep, ops_ep),
-            "us_per_layer_tp": timing(st_tp, ops_tp),
-            "us_per_layer_ep": timing(st_ep, ops_ep),
             "seconds": round(time.monotonic() - t0, 1),
         }
         res["cases"][str(rows)] = case
