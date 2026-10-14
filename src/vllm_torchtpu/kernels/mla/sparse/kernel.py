@@ -1384,7 +1384,9 @@ MIXED_BODY_LEVERS = (
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
-MIXED_KERNEL_V2_LEVERS = ("fxskip", "q128", "pair")
+# "q128" is not among them: at 32 q heads it slowed the capped-overflow
+# fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
+MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
 # Buckets up to this many tokens keep the plain live body: at 64 tokens the
 # levers measured within noise to +2.5 % (partly filled bucket).
 MIXED_BODY_MAX_SKIP_TOKENS = 64

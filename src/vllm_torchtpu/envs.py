@@ -682,9 +682,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
     # With TPU_DCP_MLA_MIXED_BODY set: add the stage-A body levers
     # (kernels/mla/sparse/kernel.py MIXED_KERNEL_V2_LEVERS) -- the capped
-    # fix-up only on steps that overflow, a q DMA of only the read lanes, and
-    # two-token stacked softmax with the unpacked KV staged in VMEM. Bitwise
-    # identical to the body levers alone.
+    # fix-up only on steps that overflow, and a two-token stacked softmax with
+    # the unpacked KV staged in VMEM. Bitwise identical to the body levers
+    # alone.
     "TPU_DCP_MLA_MIXED_KERNEL_V2": env_bool(
         "TPU_DCP_MLA_MIXED_KERNEL_V2", default=False
     ),
