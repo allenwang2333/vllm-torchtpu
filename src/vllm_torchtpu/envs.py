@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    FUSED_MOE_DECODE_KERNEL: bool = False
+    FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -92,6 +96,11 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_DCP_INDEXER_A2A_MERGE: bool = False
+    TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -113,6 +122,7 @@ if TYPE_CHECKING:
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
@@ -389,6 +399,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
+    # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
+    "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
+    # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
+    # q_nope and q_pe to the kernel as separate operands. The kernel joins
+    # them in VMEM and its output aliases q_nope (512 wide), instead of the
+    # caller materialising a concat the wrapper pads to [T, H, 640]. Where the
+    # caller also needs the log-sum-exp (DCP), it is exported lane-dense as
+    # f32[T, H] (`lse_lane_dense=True`) instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -584,6 +606,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
+    # fused MoE decode kernel: routed experts, shared expert and all-reduce in
+    # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
+    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
+    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
+    "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
@@ -733,6 +764,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Merge the DCP indexer candidates with an all-to-all over the token axis
+    # instead of an all-gather over the candidate axis. Same result.
+    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
+    # Smallest padded token bucket that takes the all-to-all merge when
+    # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
+    # variant picks one merge with no runtime cost.
+    "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
+    ),
+    # MIXED-pass query block for StreamIndex top-k token buckets of at most
+    # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
+    # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
+    # scores ~124 padding rows per request. 4 is the recommended value. Unset
+    # keeps 128 everywhere.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    ),
+    # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
+    # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Largest padded token bucket that takes the small-bucket block sizes. A
+    # small query block re-reads a sequence's keys once per block, so one long
+    # q_len row in the bucket erodes the win: at 64 a lone 60-token tail is at
+    # parity with the 128-row block.
+    "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
+    ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
@@ -818,6 +878,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # On by default; inline-load mode overrides it back to off.
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
+    ),
+    # On by default: a PCP, TP or DP Stage-3 producer registers a request's
+    # KV blocks in the step that completes its prompt rather than in the step
+    # after its finish response (pipeline producers always do).
+    "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": env_bool(
+        "TPU_RAIDEN_STAGE3_REGISTER_AHEAD", default=True
     ),
     # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(
