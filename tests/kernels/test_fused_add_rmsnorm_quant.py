@@ -157,6 +157,8 @@ def _fault_body(*refs, eps, emit_y, q_max, fault):
         y_ref[...] = y
     yf = y.astype(jnp.float32)
     src = yf32 if fault == "amax_unrounded" else yf
+    if fault == "amax_half_row":  # a dropped tail: amax over the first half only
+        src = src[:, : src.shape[-1] // 2]
     amax = jnp.max(jnp.abs(src), axis=-1, keepdims=True)
     scale = amax / jnp.float32(q_max)
     if fault != "no_zero_guard":
@@ -175,9 +177,12 @@ FAULTS = {
     # fault -> the cell classes that must catch it
     "residual_dropped": ("T512", "T4096"),
     "amax_unrounded": ("T512", "T4096"),
-    "recip_multiply": ("T512", "T4096"),
+    "amax_half_row": ("T512", "T4096"),
     "scale_bf16": ("T512", "T4096"),
     "no_zero_guard": ("zero_rows",),
+    # Not a fault on v7x: y * (1 / scale) gave the same fp8 bytes and scales as
+    # y / scale on every cell (j-b8a093f5). Kept, printed, never asserted.
+    "recip_multiply": (),
 }
 
 
