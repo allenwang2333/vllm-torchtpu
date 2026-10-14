@@ -26,24 +26,52 @@ from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
         (jnp.float32, 1024),
     ],
 )
-def test_native_record_preserves_bits_and_feature_order(dtype, dim):
+@pytest.mark.parametrize("rows", [19, 256])
+def test_native_record_preserves_bits_and_feature_order(dtype, dim, rows):
     size = jnp.dtype(dtype).itemsize
     unsigned = {1: np.uint8, 2: np.uint16, 4: np.uint32}[size]
     rng = np.random.default_rng(dim)
-    bits = rng.integers(0, 2 ** (size * 8), (19, dim), dtype=unsigned)
+    bits = rng.integers(0, 2 ** (size * 8), (rows, dim), dtype=unsigned)
     # Include zero, signed zero, subnormals, infinity and NaN payloads.
     if size == 2:
         bits[0, :8] = [0, 0x8000, 1, 0x8001, 0x7F80, 0xFF80, 0x7FC1, 0xFFFF]
     values = jax.device_put(bits.view(jnp.dtype(dtype)))
-    words = jax.jit(pack_cache_values)(values)
+    if jax.default_backend() == "tpu" and dtype == jnp.bfloat16 and dim == 64:
+        from jax.experimental import pallas as pl
+        from jax.experimental.layout import Format, Layout
+
+        # device_put chooses a transposed layout for [256, 64]. Relayouting
+        # BF16 canonicalizes NaNs/subnormals even before the tested kernel.
+        # Transfer integer payloads, then change only the native ref dtype.
+        fmt = Format(
+            Layout((0, 1), tiling=((8, 128), (2, 1))),
+            jax.sharding.SingleDeviceSharding(jax.devices()[0]),
+        )
+        raw = jax.device_put(bits, fmt)
+
+        def view_bits(x_ref, y_ref):
+            y_ref.bitcast(jnp.uint16)[...] = x_ref[...]
+
+        view = pl.pallas_call(
+            view_bits,
+            out_shape=jax.ShapeDtypeStruct(bits.shape, dtype),
+            grid=(pl.cdiv(rows, 16),),
+            in_specs=[pl.BlockSpec((16, dim), lambda i: (i, 0))],
+            out_specs=pl.BlockSpec((16, dim), lambda i: (i, 0)),
+        )
+        values = jax.jit(view, in_shardings=fmt, out_shardings=fmt)(raw)
+        np.testing.assert_array_equal(np.asarray(values).view(np.uint16), bits)
+    words = jax.jit(pack_cache_values, in_shardings=values.format)(values)
     packing, width = packed_record_shape(dim, size)
     padded = np.pad(bits, ((0, 0), (0, packing * width - dim)))
-    parts = padded.reshape(19, packing, width).astype(np.uint32)
-    expected = np.zeros((19, width), np.uint32)
+    parts = padded.reshape(rows, packing, width).astype(np.uint32)
+    expected = np.zeros((rows, width), np.uint32)
     for part in range(packing):
         expected |= parts[:, part] << (8 * size * part)
     np.testing.assert_array_equal(np.asarray(words).view(np.uint32), expected)
-    restored = jax.jit(lambda w: unpack_cache_values(w, dim, dtype))(words)
+    restored = jax.jit(
+        lambda w: unpack_cache_values(w, dim, dtype), out_shardings=values.format
+    )(words)
     np.testing.assert_array_equal(np.asarray(restored).view(unsigned), bits)
 
 

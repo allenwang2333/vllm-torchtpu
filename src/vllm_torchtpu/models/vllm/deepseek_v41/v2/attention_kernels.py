@@ -970,6 +970,7 @@ def sparse_ragged_paged_attention_union_gather(
                     sparse_mla._attention_kernel,
                     sm_scale=sm_scale,
                     batch_size=kbs,
+                    nope_row_scale=True,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),

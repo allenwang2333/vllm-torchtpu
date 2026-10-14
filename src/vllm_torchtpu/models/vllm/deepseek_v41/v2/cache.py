@@ -10,6 +10,7 @@ from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
+from vllm_torchtpu.kernels.deepseek_v41.fp8_cache import encode_fp8_kv
 from vllm_torchtpu.kernels.mla.cache_layout import (
     pack_cache_values,
     packed_record_shape,
@@ -17,10 +18,6 @@ from vllm_torchtpu.kernels.mla.cache_layout import (
 )
 
 ROW_BYTES = ROW_WORDS * 4
-# DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
-# 64-lane period (groups {j, j + 64, ...}); 448 + 64 = 512 bytes = one pool row.
-NOPE_DIM = 448
-NOPE_SCALE_PERIOD = 64
 # SparseMLA's gathered RoPE ABI still uses 32 compact words per token.
 ROPE_WORDS = 32
 FP8_RECORD_WORDS = 2 * ROW_WORDS
@@ -709,39 +706,6 @@ def gather_cache_page_values(
     _, width = packed_record_shape(elements, 2)
     words = words.reshape(first_records.size * page_records, width)
     return unpack_cache_values(words, elements, jnp.bfloat16)
-
-
-def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """BF16 ``[n, 512]`` latents -> DSV4 FP8 NoPE rows and RoPE words.
-
-    Returns int32 ``[n, 128]`` rows (the ``(4, 128)`` uint8 slab of
-    `csa_cache_layout`: 448 e4m3 values, then 64 lane-periodic e8m0 scales)
-    and int32 ``[n, 128]`` tail-padded RoPE words. Matches the V4
-    compressor's quantizer, so `sparse_ragged_paged_attention` reads it.
-    """
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-
-    nope = latent[:, :NOPE_DIM].astype(jnp.float32)
-    groups = NOPE_DIM // NOPE_SCALE_PERIOD
-    amax = jnp.abs(nope).reshape(-1, groups, NOPE_SCALE_PERIOD).max(axis=1)
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    exponent = jnp.ceil(jnp.log2(jnp.maximum(amax, 1e-4) / fp8_max)).astype(jnp.int32)
-    # Build the power of two from its bits: exp2 is approximate on some
-    # backends, and a scale off by one ulp flips e4m3 rounding at ties.
-    biased = exponent + 127
-    scales = jax.lax.bitcast_convert_type(biased << 23, jnp.float32)
-    values = (nope / jnp.tile(scales, groups)).astype(jnp.float8_e4m3fn)
-    record = jnp.concatenate(
-        (jax.lax.bitcast_convert_type(values, jnp.uint8), biased.astype(jnp.uint8)),
-        axis=-1,
-    )
-    words = csa_cache_layout.slabs_to_words(
-        record.reshape(-1, csa_cache_layout.SLAB_ROWS, ROW_WORDS)
-    )
-    rope = pack_cache_values(latent[:, NOPE_DIM:].astype(jnp.bfloat16))
-    return words, rope
 
 
 def initialize_cache_ops():

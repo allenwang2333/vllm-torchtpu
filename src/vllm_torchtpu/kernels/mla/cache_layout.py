@@ -72,26 +72,28 @@ def _native_bitcast(values, output_dim, dtype, *, packing):
     rows = math.prod(values.shape[:-1])
     unpack = values.dtype == jnp.int32
     width = input_dim if unpack else output_dim
+    # Byte/BF16 batches need complete native sublane tiles, including when
+    # a batch spans multiple tiles. The shared word owner is never relaid out.
+    block_rows = 8 * packing
+    unsigned = jnp.uint16 if packing == 2 else jnp.uint8
 
     def kernel(x_ref, y_ref):
-        x = x_ref[...]
         if unpack:
-            y = pltpu.bitcast(x.reshape(8, 1, width), dtype)
-            y = y.reshape(8, packing * width)[:, :output_dim]
+            x = x_ref[...]
+            y = pltpu.bitcast(x.reshape(block_rows, 1, width), unsigned)
+            y = y.reshape(block_rows, packing * width)[:, :output_dim]
+            y_ref.bitcast(unsigned)[...] = y
         else:
-            # Operate on unsigned bits: floating-point conversion on TPU
-            # canonicalizes NaNs and flushes BF16 subnormals.
-            bits = pltpu.bitcast(x, jnp.uint16 if packing == 2 else jnp.uint8)
+            bits = x_ref.bitcast(unsigned)[...]
             bits = jnp.pad(bits, ((0, 0), (0, packing * width - input_dim)))
-            y = pltpu.bitcast(bits.reshape(8, packing, width), dtype)
-            y = y.reshape(8, width)
-        y_ref[...] = y
+            y = pltpu.bitcast(bits.reshape(block_rows, packing, width), dtype)
+            y_ref[...] = y.reshape(block_rows, width)
 
     result = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((rows, output_dim), dtype),
-        grid=(pl.cdiv(rows, 8),),
-        in_specs=[pl.BlockSpec((8, input_dim), lambda i: (i, 0))],
-        out_specs=pl.BlockSpec((8, output_dim), lambda i: (i, 0)),
+        grid=(pl.cdiv(rows, block_rows),),
+        in_specs=[pl.BlockSpec((block_rows, input_dim), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((block_rows, output_dim), lambda i: (i, 0)),
     )(values.reshape(rows, input_dim))
     return result.reshape(*values.shape[:-1], output_dim)

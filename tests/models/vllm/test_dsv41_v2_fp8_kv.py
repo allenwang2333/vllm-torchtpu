@@ -1,15 +1,12 @@
 """CPU checks for the DeepSeek V4.1 FP8 combined main-KV record."""
 
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import compact_records
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    NOPE_DIM,
     PagedCacheRows,
     encode_fp8_kv,
     scatter_cache_values,
@@ -20,57 +17,6 @@ def _latent(n, seed=0):
     rng = np.random.default_rng(seed)
     values = rng.standard_normal((n, 512)) * rng.uniform(0.01, 30, (n, 1))
     return jnp.asarray(values, jnp.bfloat16)
-
-
-def _decode(words, rope):
-    """Dequantize records back to float32 ``[n, 512]``."""
-    record = np.asarray(csa_cache_layout.words_to_slabs(words)).reshape(-1, 512)
-    values = record[:, :NOPE_DIM].view(jnp.float8_e4m3fn).astype(np.float32)
-    scales = record[:, NOPE_DIM:].view(jnp.float8_e8m0fnu).astype(np.float32)
-    nope = values * np.tile(scales, NOPE_DIM // 64)
-    bits = np.asarray(rope).view(np.uint32)
-    halves = np.concatenate((bits & 0xFFFF, bits >> 16), axis=-1).astype(np.uint16)
-    return np.concatenate(
-        (nope, halves[:, :64].view(jnp.bfloat16).astype(np.float32)), -1
-    )
-
-
-def test_encode_matches_exact_lane_periodic_quantizer():
-    """V4's lane-periodic UE8M0 quantizer, with exact power-of-two scales."""
-    latent = _latent(37)
-    # Exact e4m3 ties (bf16 inputs make them common) and zero lanes.
-    latent = latent.at[0, :NOPE_DIM].set(0).at[1, :NOPE_DIM].set(76 * 2.0**-19)
-    words, rope = encode_fp8_kv(latent)
-    assert words.shape == (37, 128) and words.dtype == jnp.int32
-    assert rope.shape == (37, 128) and rope.dtype == jnp.int32
-    nope = np.asarray(latent, np.float64)[:, :NOPE_DIM]
-    amax = np.maximum(np.abs(nope).reshape(37, -1, 64).max(axis=1), 1e-4)
-    exponent = np.ceil(np.log2(amax / 448)).astype(np.int64)
-    q = (nope / np.tile(2.0**exponent, NOPE_DIM // 64)).astype(np.float32)
-    expected = np.concatenate(
-        (
-            q.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),
-            (exponent + 127).astype(np.uint8),
-        ),
-        axis=-1,
-    )
-    got = np.asarray(csa_cache_layout.words_to_slabs(words)).reshape(37, 512)
-    np.testing.assert_array_equal(got, expected)
-    np.testing.assert_array_equal(
-        np.asarray(rope[:, :64]),
-        np.asarray(latent[:, NOPE_DIM:]).view(np.uint16).astype(np.int32),
-    )
-
-
-def test_encode_round_trip_error():
-    latent = _latent(64, seed=1)
-    decoded = _decode(*encode_fp8_kv(latent))
-    reference = np.asarray(latent, np.float32)
-    np.testing.assert_array_equal(decoded[:, NOPE_DIM:], reference[:, NOPE_DIM:])
-    # e4m3 keeps 3 mantissa bits; power-of-two scales add at most one more.
-    nope = reference[:, :NOPE_DIM]
-    lane_max = np.tile(np.abs(nope).reshape(64, -1, 64).max(axis=1), NOPE_DIM // 64)
-    assert np.all(np.abs(decoded[:, :NOPE_DIM] - nope) <= lane_max / 8 + 1e-6)
 
 
 def test_companion_scatter_places_slot_by_row():
