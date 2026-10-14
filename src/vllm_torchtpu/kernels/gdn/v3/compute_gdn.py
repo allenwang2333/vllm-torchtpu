@@ -12,11 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config
+
+# Value heads the chunked (PER_SEQ) step computes per slab of the carried state.
+CHUNK_HEAD_GROUP = 64
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -192,45 +198,51 @@ def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.A
     return jnp.where(mask, x, 0).sum(axis=src_dim, keepdims=True, dtype=dtype)
 
 
-def chunked_gdn_per_seq(
-    q_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
-    k_large: jax.Array,  # [num_kq_heads, chunk, kq_head_dim]
-    v_large: jax.Array,  # [num_v_heads, chunk, v_head_dim]
-    gating_log: jax.Array,  # [1, 1, num_v_heads]
-    beta: jax.Array,  # [1, 1, num_v_heads]
-    state_prev: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
+def heads_to_columns(x: jax.Array, h0: int, num_heads: int) -> jax.Array:
+    """`fused_transpose_broadcast(x, 2, 0)[h0:h0 + num_heads]`, computing only
+    those rows: [1, rows, lanes] -> [num_heads, rows, 1]."""
+    mask_dtype = get_mask_dtype(x.dtype)
+    mask_shape = (num_heads, x.shape[1], x.shape[2])
+    src_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, 2)
+    dst_mask = jax.lax.broadcasted_iota(mask_dtype, mask_shape, 0) + h0
+    mask = src_mask == dst_mask
+    return jnp.where(mask, x, 0).sum(axis=2, keepdims=True, dtype=x.dtype)
+
+
+def chunked_gdn_heads(
+    q_kq: jax.Array,  # [kq heads covering the slab, chunk, kq_head_dim]
+    k_kq: jax.Array,  # [kq heads covering the slab, chunk, kq_head_dim]
+    v_large: jax.Array,  # [heads, chunk, v_head_dim]
+    g_cum_sum_log: jax.Array,  # [heads, chunk, 1]
+    beta_large: jax.Array,  # [heads, chunk, 1]
+    state_prev: jax.Array,  # [heads, kq_head_dim, v_head_dim]
+    head_slice: slice,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
+    """Chunked GDN over one slab of value heads.
 
-    # NOTE: Repeat along non lane/sublane dim is free.
-    q_repeat = jnp.repeat(q_large, cfg.v_per_kq_head, axis=0)
-    k_repeat = jnp.repeat(k_large, cfg.v_per_kq_head, axis=0)
+    `head_slice` picks the slab's value heads out of `q_kq`/`k_kq` repeated
+    `v_per_kq_head` times. Heads are independent, so every head goes through
+    the same operations as in a whole-tile step.
+    """
 
-    # Compute cumulative sum of decay.
-    # [1, 1, num_v_heads]
-    g_cum_sum_list = [gating_log[:, :1]]
-    for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
-    # [1, chunk, num_v_heads]
-    g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+    def repeat(x: jax.Array) -> jax.Array:
+        # NOTE: Repeat along non lane/sublane dim is free.
+        return jnp.repeat(x, cfg.v_per_kq_head, axis=0)[head_slice]
 
-    # [num_v_heads, chunk, 1]
-    g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log, src_dim=2, dst_dim=0)
-    g_cum_sum_log = g_cum_sum_log[: cfg.num_v_heads]
-    beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta_large = beta[: cfg.num_v_heads]
+    q_repeat = repeat(q_kq)
+    k_repeat = repeat(k_kq)
 
-    # [num_v_heads, 1, chunk]
+    # [heads, 1, chunk]
     g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
-    # [num_v_heads, chunk, chunk]
+    # [heads, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
     gating_map = jnp.exp(g_cum_sum_diff_log)
-    # [num_v_heads, chunk, 1]
+    # [heads, chunk, 1]
     gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
-    # [num_v_heads, chunk, 1]
+    # [heads, chunk, 1]
     gating_forward = jnp.exp(g_cum_sum_log)
-    # [num_v_heads, 1, 1]
+    # [heads, 1, 1]
     gating_last = gating_forward[:, -1:]
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
@@ -239,13 +251,13 @@ def chunked_gdn_per_seq(
     identity_mask = iota_r == iota_c
     strictly_lower_mask = iota_r > iota_c
     lower_mask = iota_r >= iota_c
-    # [num_v_heads, chunk, chunk]
+    # [heads, chunk, chunk]
     gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
 
-    # [num_v_heads, chunk, kq_head_dim]
+    # [heads, chunk, kq_head_dim]
     k_beta_repeat = k_repeat * beta_large
 
-    # [num_v_heads, chunk, chunk]
+    # [heads, chunk, chunk]
     beta_k_k_t = jax.lax.dot(
         k_beta_repeat,
         k_repeat,
@@ -255,17 +267,17 @@ def chunked_gdn_per_seq(
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
     t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
-    # [num_v_heads, chunk, chunk]
+    # [heads, chunk, chunk]
     t_inv = invert_triangular_matrix(t)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads, chunk, v_head_dim]
     v_beta_large = v_large * beta_large
-    # [num_v_heads, chunk, kv_head_dim]
+    # [heads, chunk, kv_head_dim]
     k_beta_gating = k_beta_repeat * gating_forward
     # NOTE: If v_head_dim < mxu size, concatenating them will help increase mxu
     # utilization. Also, if v_head_dim is multiple of lane size, concat / split
     # along lane dim is free - making this optimization strictly beneficial.
-    # [num_v_heads, chunk, v_head_dim + kq_head_dim]
+    # [heads, chunk, v_head_dim + kq_head_dim]
     merged_v_k = jnp.concat([v_beta_large, k_beta_gating], axis=-1)
     merged_uw = jax.lax.dot(
         t_inv,
@@ -274,16 +286,16 @@ def chunked_gdn_per_seq(
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads, chunk, v_head_dim]
     u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
 
-    # [num_v_heads, chunk, kq_head_dim]
+    # [heads, chunk, kq_head_dim]
     q_large_gating = q_repeat * gating_forward
     # NOTE: Concatenate lhs with same rhs to leverage weight
     # stationary architecture.
-    # [num_v_heads, 2 * chunk, kq_head_dim]
+    # [heads, 2 * chunk, kq_head_dim]
     merged_w_q = jnp.concat([w, q_large_gating], axis=1)
-    # [num_v_heads, 2 * chunk, v_head_dim]
+    # [heads, 2 * chunk, v_head_dim]
     merged_ws_out_updated = jax.lax.dot(
         merged_w_q,
         state_prev,
@@ -295,13 +307,13 @@ def chunked_gdn_per_seq(
     ws, out_updated = jnp.split(merged_ws_out_updated, 2, axis=1)
     ws = ws.astype(cfg.dtypes.compute)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads, chunk, v_head_dim]
     u_ws = u - ws
 
-    # [num_v_heads, chunk, kq_head_dim]
+    # [heads, chunk, kq_head_dim]
     k_repeat_gating = k_repeat * gating_backward
 
-    # [num_v_heads, kq_head_dim, v_head_dim]
+    # [heads, kq_head_dim, v_head_dim]
     state_new = jax.lax.dot(
         k_repeat_gating,
         u_ws,
@@ -309,24 +321,24 @@ def chunked_gdn_per_seq(
         preferred_element_type=jnp.float32,
     )
 
-    # [num_v_heads, kq_head_dim, v_head_dim]
+    # [heads, kq_head_dim, v_head_dim]
     state_updated = state_prev * gating_last
     state = state_updated + state_new
 
-    # [num_kq_heads, chunk, chunk]
+    # [kq heads, chunk, chunk]
     out_qk = jax.lax.dot(
-        q_large,
-        k_large,
+        q_kq,
+        k_kq,
         dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
     # NOTE: must perform repeat after matmul to reduce required compute.
-    # [num_v_heads, chunk, chunk]
-    out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head, axis=0)
+    # [heads, chunk, chunk]
+    out_qk = repeat(out_qk)
     out_qk *= gating_map
     out_qk = jnp.where(lower_mask, out_qk, 0)
 
-    # [num_v_heads, chunk, v_head_dim]
+    # [heads, chunk, v_head_dim]
     out_new = jax.lax.dot(
         out_qk,
         u_ws,
@@ -345,19 +357,29 @@ def chunked_gdn(
     v_large: jax.Array,
     b_large: jax.Array,
     a_large: jax.Array,
-    state_prev: jax.Array,
+    load_state: Callable[[int, int, int], jax.Array],
+    store_state: Callable[[int, int, jax.Array], None],
+    store_out: Callable[[int, int, jax.Array], None],
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
+) -> None:
     """Perform chunked GDN over input [seq, num_heads, chunk, head_dim].
 
-    The returned state is [seq, 1, num_v_heads, kq_head_dim, v_head_dim]: the
-    chunked path only produces the final state, so it is never taken when
-    more than one checkpoint per sequence is required.
+    Walks the value heads in slabs of `CHUNK_HEAD_GROUP`, so no intermediate
+    spans every head. `load_state(idx, h0, n)` returns heads [h0, h0 + n) of
+    sequence `idx`'s carried state as [n, kq_head_dim, v_head_dim] fp32,
+    `store_state(idx, h0, values)` writes their updated state back where it
+    lives and `store_out(idx, h0, out)` writes their [n, chunk, v_head_dim]
+    output. The chunked path only produces the final state, so it is never
+    taken when more than one checkpoint per sequence is required.
     """
 
     assert not cfg.use_recurrent
+    group = min(CHUNK_HEAD_GROUP, cfg.num_v_heads)
+    vpk = cfg.v_per_kq_head
+    assert cfg.num_v_heads % group == 0
+    assert group % vpk == 0 or vpk % group == 0
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     iota = jax.lax.broadcasted_iota(
@@ -393,24 +415,33 @@ def chunked_gdn(
     # will be 1 (i.e., no decay) if current row is invalid.
     gating_log = jnp.where(mask, gating_log, 0)
 
-    out_list = []
-    state_list = []
     for idx in range(cfg.seq_tile_size):
-        out, state = chunked_gdn_per_seq(
-            q_large[idx],
-            k_large[idx],
-            v_large[idx],
-            gating_log[idx],
-            beta[idx],
-            state_prev[idx],
-            cfg,
-        )
-        out_list.append(out.swapaxes(0, 1))
-        state_list.append(state)
-    out = jnp.stack(out_list, axis=0)
-    # Single checkpoint per sequence, laid out like the recurrent path.
-    state = jnp.stack(state_list, axis=0)[:, jnp.newaxis]
-    return out, state
+        # Compute cumulative sum of decay.
+        # [1, 1, num_v_heads]
+        g_cum_sum_list = [gating_log[idx, :, :1]]
+        for row in range(1, cfg.chunk_size):
+            g_cum_sum_list.append(
+                g_cum_sum_list[-1] + gating_log[idx, :, row : row + 1]
+            )
+        # [1, chunk, num_v_heads]
+        g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
+
+        for h0 in range(0, cfg.num_v_heads, group):
+            kq0 = h0 // vpk
+            kq1 = pl.cdiv(h0 + group, vpk)
+            out, state = chunked_gdn_heads(
+                q_large[idx, kq0:kq1],
+                k_large[idx, kq0:kq1],
+                v_large[idx, h0 : h0 + group],
+                # [heads, chunk, 1]
+                heads_to_columns(g_cum_sum_log, h0, group),
+                heads_to_columns(beta[idx], h0, group),
+                load_state(idx, h0, group),
+                slice(h0 - kq0 * vpk, h0 - kq0 * vpk + group),
+                cfg,
+            )
+            store_state(idx, h0, state)
+            store_out(idx, h0, out)
 
 
 def recurrent_gdn_per_seq(

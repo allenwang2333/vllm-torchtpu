@@ -206,7 +206,8 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    load_recurrent: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Load correct states from HBM or prior tile, and masks invalid states.
 
     Reference metadata to select the appropriate prior states. If `is_first_tile`
@@ -230,6 +231,9 @@ def load_and_select_states(
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
             shape [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
         cfg: GDN configuration object.
+        load_recurrent: Whether to return the recurrent state. When False the
+            carry scratch is left holding it, for the caller to update in
+            place, and None is returned in its place.
 
     Returns:
         real_sizes: Valid token count per sequence tile of shape [seq_tile_size].
@@ -254,7 +258,25 @@ def load_and_select_states(
         # Both scratches are allocated together (see GDNConfig.scratch_shapes).
         # Only the pool decode is worth guarding; a dense slot read is cheap
         # enough that the guard costs more than it saves.
-        if carry_conv_scratch_ref is None or cfg.state_plan is None:
+        if not load_recurrent and cfg.state_plan is None:
+            assert carry_recurrent_scratch_ref is not None
+            prev_conv_state = jnp.where(
+                has_initial_state, _load_conv_state(conv_state_slot_ref, cfg, idx), 0
+            )
+            prev_conv_state = jnp.where(
+                is_first_tile, prev_conv_state, carry_conv_scratch_ref[idx]
+            )
+
+            @pl.when(is_first_tile)
+            def _():
+                carry_recurrent_scratch_ref[idx] = jnp.where(
+                    has_initial_state,
+                    _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                    0,
+                )
+
+            prev_recurrent_state = None
+        elif carry_conv_scratch_ref is None or cfg.state_plan is None:
             prev_conv_state = jnp.where(
                 has_initial_state, _load_conv_state(conv_state_slot_ref, cfg, idx), 0
             )
@@ -290,7 +312,9 @@ def load_and_select_states(
                 )
 
             prev_conv_state = carry_conv_scratch_ref[idx]
-            prev_recurrent_state = carry_recurrent_scratch_ref[idx]
+            prev_recurrent_state = None
+            if load_recurrent:
+                prev_recurrent_state = carry_recurrent_scratch_ref[idx]
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
@@ -298,7 +322,9 @@ def load_and_select_states(
 
     real_sizes = jnp.stack(real_sizes_list, axis=0)
     prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
-    prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
+    prev_recurrent_state = None
+    if load_recurrent:
+        prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
 
     return real_sizes, prev_conv_state, prev_recurrent_state
 

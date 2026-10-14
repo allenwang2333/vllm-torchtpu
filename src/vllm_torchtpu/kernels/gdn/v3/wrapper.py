@@ -30,6 +30,77 @@ from vllm_torchtpu.kernels.gdn.v3 import (
 )
 
 
+def _chunked_gdn_in_place(
+    qkv_out_compact: jax.Array,
+    qkv_slot_ref: jax.Array,
+    b_slot_ref: jax.Array,
+    a_slot_ref: jax.Array,
+    recurrent_slot_ref: jax.Array,
+    out_slot_ref: jax.Array,
+    metadata_ref: memory_ref.MetadataRef,
+    carry_recurrent_scratch_ref: jax.Array,
+    real_sizes: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+    p_id: jax.Array,
+) -> None:
+    """Chunked GDN that updates the carried recurrent state where it lives
+    and writes the output and the sequence's final state itself."""
+    q_large, k_large, v_large, b_large, a_large = (
+        vmem_ldst.load_activation_as_large(
+            qkv_vreg=qkv_out_compact,
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
+            cfgs=cfg,
+        )
+    )
+
+    def load_state(idx: int, h0: int, n: int) -> jax.Array:
+        return carry_recurrent_scratch_ref[idx, pl.ds(h0, n)]
+
+    def store_state(idx: int, h0: int, values: jax.Array) -> None:
+        heads = pl.ds(h0, values.shape[0])
+        carry_recurrent_scratch_ref[idx, heads] = values
+        if cfg.state_plan is None:
+            recurrent_slot_ref[idx, 0, heads] = values.astype(
+                recurrent_slot_ref.dtype
+            )
+
+    def store_out(idx: int, h0: int, values: jax.Array) -> None:
+        # [heads, chunk, v_head_dim] -> [chunk, heads, v_head_dim]
+        out_slot_ref[idx, :, pl.ds(h0, values.shape[0])] = values.swapaxes(
+            0, 1
+        ).astype(out_slot_ref.dtype)
+
+    compute_gdn.chunked_gdn(
+        real_sizes=real_sizes,
+        q_large=q_large,
+        k_large=k_large,
+        v_large=v_large,
+        b_large=b_large,
+        a_large=a_large,
+        load_state=load_state,
+        store_state=store_state,
+        store_out=store_out,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
+    )
+
+    if cfg.state_plan is not None:
+        for idx in range(cfg.seq_tile_size):
+            # pl.when traces the body here, so `idx` is this iteration's.
+            @pl.when(metadata_ref.p_id_is_last_tile[p_id, idx])
+            def _():
+                vmem_ldst.store_state_region(
+                    recurrent_slot_ref.at[idx, 0],
+                    cfg.state_plan.recurrent,
+                    carry_recurrent_scratch_ref[idx],
+                )
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
@@ -79,6 +150,13 @@ def inner_kernel(
     if p_id is None:
         p_id = pl.program_id(0)
 
+    # The chunked GDN step updates the carried recurrent state in place.
+    chunked_in_place = (
+        not cfg.is_kda
+        and not cfg.use_recurrent
+        and carry_recurrent_scratch_ref is not None
+    )
+
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
         metadata_ref=metadata_ref,
@@ -88,6 +166,7 @@ def inner_kernel(
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
+        load_recurrent=not chunked_in_place,
     )
 
     # Step 1: Conv1D.
@@ -161,6 +240,24 @@ def inner_kernel(
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
         dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
 
+    if chunked_in_place:
+        _chunked_gdn_in_place(
+            qkv_out_compact=qkv_out_compact,
+            qkv_slot_ref=qkv_slot_ref,
+            b_slot_ref=b_slot_ref,
+            a_slot_ref=a_slot_ref,
+            recurrent_slot_ref=recurrent_slot_ref,
+            out_slot_ref=out_slot_ref,
+            metadata_ref=metadata_ref,
+            carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+            real_sizes=real_sizes,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            cfg=cfg,
+            p_id=p_id,
+        )
+        return
+
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
@@ -192,7 +289,8 @@ def inner_kernel(
         )
 
     else:
-        chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
+        assert cfg.is_kda
+        chunked_fn = compute_kda.chunked_kda
         q_large, k_large, v_large, b_large, a_large = (
             vmem_ldst.load_activation_as_large(
                 qkv_vreg=qkv_out_compact,
