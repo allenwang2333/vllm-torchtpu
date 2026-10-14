@@ -1246,7 +1246,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SparseCore top-k over 32+ rows of a 32K..64K-word bucket: one row per
     # subcore (P=1, all 32 busy) instead of P=2, reading each row only up to
-    # its length. Bitwise identical output.
+    # its length. Past 64K words (DCP <= 8 per-rank rows): P = n / 64K
+    # subcores per row, the row split between them by its length, again
+    # reading only up to it. Bitwise identical output.
     "TPU_SC_TOPK_ROW_CAP": env_bool("TPU_SC_TOPK_ROW_CAP", default=False),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
