@@ -89,3 +89,72 @@ _tie_op.register_fake(_tie_fake)
 def tie(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """`a`, unchanged, available only once `b` is: an optimization barrier."""
     return _tie_op(a.contiguous(), b.contiguous())
+
+
+# ---- V-space merge operand (TPU_DCP_MERGE_VSPACE) --------------------------
+# (out bf16, scaled W_UV, test fault) -> torch op; all registered at import,
+# never inside a trace.
+_VSPACE_OPS: dict = {}
+# Test-only: the fault `vspace_weighted_heads_major` injects (None in serving).
+VSPACE_FAULT: str | None = None
+
+
+def _register_vspace(bf16: bool, scaled: bool, fault: str | None) -> None:
+    out_dtype = jnp.bfloat16 if bf16 else jnp.float32
+    t_dtype = torch.bfloat16 if bf16 else torch.float32
+
+    if scaled:
+
+        def fn(
+            o: jax.Array, w: jax.Array, w_uv: jax.Array, scale: jax.Array
+        ) -> jax.Array:
+            return _k.vspace_weighted_heads_major(
+                o, w, w_uv, scale, out_dtype=out_dtype, fault=fault
+            )
+
+        def fake(o, w, w_uv, scale):
+            t, h, _ = o.shape
+            return torch.empty((h, t, w_uv.shape[-1]), dtype=t_dtype, device=o.device)
+
+    else:
+
+        def fn(o: jax.Array, w: jax.Array, w_uv: jax.Array) -> jax.Array:
+            return _k.vspace_weighted_heads_major(
+                o, w, w_uv, None, out_dtype=out_dtype, fault=fault
+            )
+
+        def fake(o, w, w_uv):
+            t, h, _ = o.shape
+            return torch.empty((h, t, w_uv.shape[-1]), dtype=t_dtype, device=o.device)
+
+    name = "pallas::dcp_vspace_weighted_hm" + ("_bf16" if bf16 else "_f32")
+    name += "_scaled" if scaled else ""
+    name += f"_fault_{fault}" if fault else ""
+    op = pallas.jax_op(name, fn)
+    op.register_fake(fake)
+    _VSPACE_OPS[(bf16, scaled, fault)] = op
+
+
+for _bf16 in (True, False):
+    for _scaled in (False, True):
+        _register_vspace(_bf16, _scaled, None)
+for _fault in ("swap_heads", "unweighted"):
+    _register_vspace(True, False, _fault)
+
+
+def vspace_weighted_heads_major(
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None = None,
+    bf16: bool = True,
+) -> torch.Tensor:
+    """[T, H, C], f32[T, H], W_UV [H, C, V] (+ scale) -> [H, T, V] =
+    where(w > 0, (o_h @ W_UV_h) * w, 0), heads-major, in bf16 (`bf16`,
+    TPU_DCP_MERGE_RS_BF16=1) or f32."""
+    scaled = w_uv_scale is not None
+    op = _VSPACE_OPS[(bf16, scaled, VSPACE_FAULT if not scaled else None)]
+    args = [output.contiguous(), weight.to(torch.float32).contiguous(), w_uv.contiguous()]
+    if scaled:
+        args.append(w_uv_scale.contiguous())
+    return op(*args)

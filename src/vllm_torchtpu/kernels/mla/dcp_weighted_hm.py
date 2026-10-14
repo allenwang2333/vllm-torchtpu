@@ -117,3 +117,53 @@ def weighted_heads_major_xla(
     x = o.astype(jnp.float32) * w
     x = jnp.where(w > 0, x, jnp.zeros_like(x)).astype(out_dtype)
     return jnp.transpose(x, (1, 0, 2))
+
+
+@functools.partial(jax.jit, static_argnames=("out_dtype", "fault"))
+def vspace_weighted_heads_major(
+    o: jax.Array,
+    w: jax.Array,
+    w_uv: jax.Array,
+    w_uv_scale: jax.Array | None = None,
+    out_dtype=jnp.bfloat16,
+    fault: str | None = None,
+) -> jax.Array:
+    """The V-space merge's reduce-scatter operand (TPU_DCP_MERGE_VSPACE).
+
+    `o` [T, H, C] bf16 (this rank's latent partial over every head of the DCP
+    group), `w` f32[T, H] (its merge weights), `w_uv` [H, C, V] (W_UV gathered
+    for the same H heads, in the same order), `w_uv_scale` optional
+    [H, 1, V] (per-channel scale of a quantized W_UV) -> `[H, T, V]` =
+    `where(w > 0, (o_h @ W_UV_h) * w, 0)`, heads-major, rounded once to
+    `out_dtype`.
+
+    The projection runs on the MXU with bf16 operands and f32 accumulation
+    (the torch path's `bmm` operands); the weight multiplies the f32 product,
+    so the only rounding before the collective is the final cast. A NaN
+    partial (zero weight) only reaches its own (token, head) row of the
+    product, which the where zeroes.
+
+    `fault` (test-only): "swap_heads" applies head h's W_UV to head H-1-h;
+    "unweighted" skips the weight multiply (keeps the where).
+    """
+    out_dtype = jnp.dtype(out_dtype)
+    t, h, c = o.shape
+    if w.shape != (t, h):
+        raise ValueError(f"w {w.shape} must be [{t}, {h}]")
+    if w_uv.shape[:2] != (h, c):
+        raise ValueError(f"w_uv {w_uv.shape} must be [{h}, {c}, V]")
+    wuv = w_uv.astype(o.dtype)
+    if fault == "swap_heads":
+        wuv = wuv[::-1]
+    v = jax.lax.dot_general(
+        o,
+        wuv,
+        (((2,), (1,)), ((1,), (0,))),
+        preferred_element_type=jnp.float32,
+    )  # [H, T, V]
+    if w_uv_scale is not None:
+        v = v * w_uv_scale.astype(jnp.float32).reshape(h, 1, -1)
+    wt = jnp.transpose(w.astype(jnp.float32), (1, 0))[:, :, None]  # [H, T, 1]
+    x = v if fault == "unweighted" else v * wt
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    return jnp.where(wt > 0, x, jnp.zeros_like(x)).astype(out_dtype)

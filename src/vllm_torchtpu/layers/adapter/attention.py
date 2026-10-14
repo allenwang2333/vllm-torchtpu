@@ -2691,6 +2691,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # TPU_DCP_MERGE_VSPACE: the DCP merge already applied W_UV.
+        projected = False
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2853,12 +2855,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # comparison would pin its graph to the first size, and the
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
-                    outputs = merge_lse_partials_scatter_heads(
-                        partial,
-                        lse,
-                        is_backbone=vllm_compilation_backends.model_tag == "backbone",
-                        query_start_loc=attn_metadata.query_start_loc,
-                    )
+                    w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
+                    if w_uv_vspace is not None and use_qrep:
+                        # TPU_DCP_MERGE_VSPACE: chunked buckets merge in V
+                        # space and come back through W_UV already.
+                        outputs, projected = (
+                            _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
+                                partial,
+                                lse,
+                                w_uv_vspace,
+                                getattr(layer, "W_UV_dcp_vspace_scale", None),
+                                is_backbone=is_backbone,
+                                query_start_loc=attn_metadata.query_start_loc,
+                            )
+                        )
+                    else:
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=vllm_compilation_backends.model_tag
+                            == "backbone",
+                            query_start_loc=attn_metadata.query_start_loc,
+                        )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2894,6 +2912,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.query_start_loc,
                 attn_metadata.request_distribution,
             )
+
+        if projected:
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
+            if output is not None and outputs is not output:
+                output.copy_(outputs)
+            return outputs
 
         outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
             0, 1

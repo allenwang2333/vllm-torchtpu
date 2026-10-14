@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_WEIGHTED_HM: bool = False
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_RS_LAG: int = 0
+    TPU_DCP_MERGE_VSPACE: bool = False
+    TPU_DCP_MERGE_VSPACE_MIN_TOKENS: int = 1024
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
@@ -597,6 +599,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last chunk (the offload stalls with three uncompleted in flight).
     # Ordering only: bit-identical. 0 = off.
     "TPU_DCP_MERGE_RS_LAG": env_int("TPU_DCP_MERGE_RS_LAG", 0),
+    # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) merges in V
+    # space: every rank applies W_UV for all of the DCP group's heads to its
+    # own partial before the weighted reduce-scatter, so the collective moves
+    # v_head_dim (256) instead of kv_lora_rank (512) columns per head, and the
+    # local W_UV after the merge is skipped. The lse weight is a per-(token,
+    # head) scalar, so it commutes with W_UV; not bitwise (the bf16 rounding
+    # moves from the latent to V). Needs W_UV gathered for the whole DCP
+    # group at load (+heads*kv_lora*v_head_dim weights per layer). Backbone
+    # chunked buckets only; with TPU_DCP_MERGE_RS_BF16=2 it stays off.
+    "TPU_DCP_MERGE_VSPACE": env_bool("TPU_DCP_MERGE_VSPACE", default=False),
+    # TPU_DCP_MERGE_VSPACE only for buckets of at least this many tokens. At or
+    # below TPU_DCP_MERGE_CHUNKED_MIN_TOKENS it is implied by the chunk gate
+    # and adds no token-count test; above it, the comparison is a new
+    # trace-time shape guard on the backbone.
+    "TPU_DCP_MERGE_VSPACE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_VSPACE_MIN_TOKENS", 1024
+    ),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
