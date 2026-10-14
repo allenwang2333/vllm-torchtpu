@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -653,8 +666,8 @@ def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
 
     It used to be a local subclass so it could size shard_map outputs from
     ``lowered._out_named_shardings``; stock derived them from
-    ``lowered.out_avals``, which jax.export records as replicated. Since
-    cl/975923205 stock takes ``output_partition_specs`` directly, so the
+    ``lowered.out_avals``, which jax.export records as replicated. Now
+    stock takes ``output_partition_specs`` directly, so the
     subclass is unnecessary -- and while it existed it silently dropped every
     argument stock's __call__ gained, ``mesh_device_ids`` included. Asserting
     the exact type is what keeps a subclass from creeping back in.

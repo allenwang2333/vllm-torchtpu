@@ -124,6 +124,91 @@ def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
+    """TPU_DCP_RS_OUT_PRECISION rounds the terms to the output dtype before the
+    reduce-scatter; off, they cross in f32. The result keeps the output dtype."""
+    monkeypatch.setattr(
+        cp_mla.envs,
+        "TPU_DCP_RS_OUT_PRECISION",
+        enabled,
+        raising=False,
+    )
+    outputs, lses = _partials(np.random.default_rng(5), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0])
+    assert seen == [torch.bfloat16 if enabled else torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
+    """The MTP drafter (is_backbone=False) keeps the f32 reduce-scatter even
+    with TPU_DCP_RS_OUT_PRECISION on."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", True, raising=False)
+    outputs, lses = _partials(np.random.default_rng(6), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=False
+    )
+    assert seen == [torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
+def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
+    """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
+    with the flag at its default, the merge passes rs_dtype=bf16."""
+    monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
+    dcp, heads, kv_lora_rank = 16, 64, 512
+    outputs, lses = _partials(
+        np.random.default_rng(52),
+        dcp,
+        tokens=4,
+        local_heads=heads // dcp,
+        vdim=kv_lora_rank,
+    )
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 3)
+    seen = []
+    real = cp_mla.cp_lse_ag_out_rs
+
+    def spy(output, lse, grp, **kwargs):
+        seen.append(kwargs.get("rs_dtype"))
+        return real(output, lse, grp, **kwargs)
+
+    monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", spy)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(outputs[3], lses[3])
+    assert seen == [torch.bfloat16]
+    assert got.dtype == torch.bfloat16
+    assert tuple(got.shape) == (4, heads // dcp, kv_lora_rank)
+    np.testing.assert_allclose(
+        got.float().numpy(),
+        _reference_merge(outputs.float(), lses)[:, 12:16],
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_each_rank_gets_its_own_block_of_one_answer(rank, monkeypatch):
     """The rank index must only select which head block comes back -- never
@@ -193,11 +278,21 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
         got[:, rank * 3 : (rank + 1) * 3].numpy(), per_rank[rank].numpy()
     )
 
+    nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+        per_rank[rank][..., :5], per_rank[rank][..., 5:], 5
+    )
+    np.testing.assert_array_equal(nope_dcp.numpy(), got[..., :5].numpy())
+    np.testing.assert_array_equal(pe_dcp.numpy(), got[..., 5:].numpy())
+
 
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)
     assert cp_mla.all_gather_heads(q) is q
+    q_pe = torch.ones(2, 3, 2)
+    nope_out, pe_out = cp_mla.all_gather_q_nope_pe_heads(q, q_pe, 4)
+    assert nope_out is q
+    assert pe_out is q_pe
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):

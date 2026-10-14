@@ -62,6 +62,22 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+def all_gather_q_nope_pe_heads(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call."""
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return ql_nope, q_pe
+    q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
+    return (
+        q_dcp[..., :kv_lora_rank].contiguous(),
+        q_dcp[..., kv_lora_rank:].contiguous(),
+    )
+
+
 def merge_lse_partials_scatter_heads(
     output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
 ) -> torch.Tensor:
@@ -117,7 +133,8 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    return cp_lse_ag_out_rs(output, lse, group)
+    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

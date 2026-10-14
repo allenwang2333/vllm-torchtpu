@@ -132,7 +132,7 @@ fi
 
 echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   -v "${HOST_CACHE_ROOT}/models:/local_hf_cache" \
   -v "${HOST_CACHE_ROOT}/perf_eval_results:/perf_eval_results" \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
@@ -200,6 +200,11 @@ if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
   fi
   echo "Last 40 lines of container output:"
   tail -n 40 "${RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${RUN_LOG}" \
+    --exit-code "${DOCKER_EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 
 exit "$DOCKER_EXIT_CODE"
