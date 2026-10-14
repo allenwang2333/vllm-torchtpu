@@ -1009,13 +1009,20 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
-def _mixed_body_levers(value: str) -> tuple[str, ...]:
-    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set)."""
+def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
+    plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
     if not value or value == "0":
         return ()
     if value == "1":
-        return sparse_mla_kernel.MIXED_BODY_DEFAULT
-    return tuple(v.strip() for v in value.split(",") if v.strip())
+        levers = sparse_mla_kernel.MIXED_BODY_DEFAULT
+    else:
+        levers = tuple(v.strip() for v in value.split(",") if v.strip())
+    if kernel_v2:
+        levers += tuple(
+            v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
+        )
+    return levers
 
 
 def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
@@ -1399,7 +1406,9 @@ def sparse_mla_attention_dcp(
             mixed_live_widths=tuple(
                 int(w) for w in envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS.split(",") if w
             ),
-            mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
+            mixed_body_levers=_mixed_body_levers(
+                envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+            ),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,

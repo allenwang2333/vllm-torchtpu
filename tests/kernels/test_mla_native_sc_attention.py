@@ -1060,6 +1060,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     ("noinf",),
                     ("pbf16",),
                     sparse_mla.MIXED_BODY_DEFAULT,
+                    # TPU_DCP_MLA_MIXED_KERNEL_V2 stage-A levers (exact).
+                    ("fxskip",),
+                    ("pair",),
+                    sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS,
                 )
             ),
             {"mixed_live_gather": True, "mixed_body_levers": sparse_mla.MIXED_BODY_DEFAULT},

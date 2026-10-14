@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     TPU_MLA_DECODE_ROW_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
+    TPU_DCP_MLA_MIXED_KERNEL_V2: bool = False
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
@@ -679,6 +680,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MXU/VPU dependency), or a comma list of lever names
     # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty = off.
     "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
+    # With TPU_DCP_MLA_MIXED_BODY set: add the stage-A body levers
+    # (kernels/mla/sparse/kernel.py MIXED_KERNEL_V2_LEVERS) -- the capped
+    # fix-up only on steps that overflow, a q DMA of only the read lanes, and
+    # two-token stacked softmax with the unpacked KV staged in VMEM. Bitwise
+    # identical to the body levers alone.
+    "TPU_DCP_MLA_MIXED_KERNEL_V2": env_bool(
+        "TPU_DCP_MLA_MIXED_KERNEL_V2", default=False
+    ),
     # DCP sparse MLA, mixed / prefill buckets (> 32 tokens): the mixed-step
     # counterpart of TPU_DCP_MLA_MASK_IN_KERNEL. Drop the per-layer owns mask,
     # dummy-key update of the top-k (and the copy of the top-k it forces when

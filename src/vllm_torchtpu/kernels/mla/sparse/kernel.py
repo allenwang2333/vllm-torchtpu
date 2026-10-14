@@ -3117,6 +3117,12 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
+    if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
+        raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
+    if q_rope_table is None:
+        # "q128" narrows the in-kernel q rope's raw-head DMA; without it
+        # there is nothing to narrow.
+        mixed_body_levers = tuple(v for v in mixed_body_levers if v != "q128")
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
