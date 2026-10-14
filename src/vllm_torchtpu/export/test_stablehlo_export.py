@@ -1555,9 +1555,10 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
 @pytest.mark.parametrize(
     ("tp", "expected"),
     [
-        (1, {"num_replicas": 1, "num_partitions": 1, "use_spmd_partitioning": False}),
         # torch_tpu compiles each TP rank's module with num_partitions=TP,
-        # replica_count=1 and use_spmd_partitioning=true (XLA dump of a TP=4 run).
+        # replica_count=1 and use_spmd_partitioning=true (XLA dumps of TP=1 and
+        # TP=4 runs).
+        (1, {"num_replicas": 1, "num_partitions": 1, "use_spmd_partitioning": True}),
         (4, {"num_replicas": 1, "num_partitions": 4, "use_spmd_partitioning": True}),
     ],
 )
