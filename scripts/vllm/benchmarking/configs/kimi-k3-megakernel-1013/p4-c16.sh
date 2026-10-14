@@ -15,7 +15,7 @@
 
 # Kimi-K3 megakernel recipe point 4 of the Oct 13 set: concurrency 16; decode
 # admits 8 sequences, DSpark with 7 drafts at synthetic acceptance 3.78, DCP32.
-# See recipe-1013.sh.
+# See ../kimi-k3-megakernel/recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
 RECIPE_CONCURRENCY=16
@@ -23,5 +23,5 @@ RECIPE_DECODE=dspark
 RECIPE_DECODE_MAX_NUM_SEQS=8
 RECIPE_DRAFTS=7
 RECIPE_ACCEPTANCE=3.78
-# shellcheck source=scripts/vllm/benchmarking/configs/kimi-k3-megakernel-1013/recipe-1013.sh
-source "$(dirname "${BASH_SOURCE[0]}")/recipe-1013.sh"
+# shellcheck source=scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../kimi-k3-megakernel/recipe-base.sh"

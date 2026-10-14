@@ -19,9 +19,9 @@
 # TP32 on its own 2x2x4 slice, the megakernel backend on the TP32 pre-shard,
 # FP8 KV in 512-token blocks, Raiden prefill-to-decode transfer and a host
 # memory KV store, behind vLLM's Rust frontend - on the AgentX 1P1D pair
-# (kimi-k3-agentx-1p1d.yaml). A point is one file beside this one that sets
-# the RECIPE_* values below and sources it, and
-# K3_PD_CONFIG=kimi-k3-megakernel/<point> serves it.
+# (kimi-k3-agentx-1p1d.yaml). A point is one file beside this one, or in
+# kimi-k3-megakernel-1013/ for the doc's Oct 13 set, that sets the RECIPE_*
+# values below and sources it, and K3_PD_CONFIG=<directory>/<point> serves it.
 #
 #   RECIPE_CONCURRENCY            the AgentX concurrency
 #   RECIPE_DECODE                 dspark | dspark_mixed | dp2_dcp16
@@ -45,6 +45,15 @@
 # k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
 # --tool-call-parser and --reasoning-parser, and so not the Kimi tool-call
 # post-eval either.
+#
+# The Oct 13 points carry the doc's concurrency, decode --max-num-seqs, and
+# drafts or DP2 decode. Not carried, as each needs more than a config: TPU
+# P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles; the prefill without
+# --prefix-cache-retention-interval; the global registry and decode-host store
+# servers of points 3-9, and the decode without a host offload connector that
+# goes with them; the --long-prefill-token-threshold, --numa-bind and 2 TiB host
+# store of the points 7-9 prefill; and the one-hour benchmark with the doc's
+# aiperf options (the client takes AGENTX_DURATION from its environment).
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
