@@ -102,6 +102,25 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
+
+def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tensor:
+    """`out`, bit for bit, plus a read of each buffer, inside the backbone
+    warmup only. The warmup hands a token bucket between two traces of a
+    token-count branch only if both lift the same buffers
+    (`shape_variants`); TPU_DCP_MERGE_VSPACE's chunked side reads the
+    DCP-gathered W_UV and the other side the local one, so each side reads
+    the other's too. `out - (v - v)` subtracts +0.0: every value, -0.0
+    included, is unchanged (a dead read would be eliminated)."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    if not shape_variants.in_warmup():
+        return out
+    for buf in bufs:
+        if buf is not None:
+            v = buf.reshape(-1)[:1].to(out.dtype)
+            out = out - (v - v)
+    return out
+
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
@@ -2913,7 +2932,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
+        vspace_w = getattr(layer, "W_UV_dcp_vspace", None)
         if projected:
+            # The decode buckets' trace lifts the local W_UV; lift it here too
+            # so buckets can be handed between the two traces.
+            outputs = _retain_buffers(
+                outputs, layer.W_UV, getattr(layer, "W_UV_scale", None)
+            )
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
@@ -2932,6 +2957,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         out_proj = torch.bmm(outputs_t, w_uv)
         if hasattr(layer, "W_UV_scale"):
             out_proj = out_proj * layer.W_UV_scale
+        if vspace_w is not None:
+            # TPU_DCP_MERGE_VSPACE: the chunked buckets' trace lifts the
+            # gathered W_UV instead; read it here too (see above).
+            out_proj = _retain_buffers(
+                out_proj, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+            )
         outputs = (
             out_proj.transpose(0, 1)
             .to(input_dtype)
