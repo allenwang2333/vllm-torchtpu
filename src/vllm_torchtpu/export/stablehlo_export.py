@@ -1358,69 +1358,68 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     # Finalize metadata.json global config
     meta_path = export_dir / "metadata.json"
     if meta_path.is_file():
-        with contextlib.suppress(Exception):
-            meta_dict = json.loads(meta_path.read_text())
-            model_cfg = getattr(runner, "model_config", None)
-            parallel_cfg = getattr(runner, "parallel_config", None)
-            cache_cfg = getattr(runner, "cache_config", None)
+        meta_dict = json.loads(meta_path.read_text())
+        model_cfg = getattr(runner, "model_config", None)
+        parallel_cfg = getattr(runner, "parallel_config", None)
+        cache_cfg = getattr(runner, "cache_config", None)
 
-            meta_dict["format_version"] = 2
-            meta_dict["model_name"] = str(getattr(model_cfg, "model", "serving_model"))
-            meta_dict["target_tpu"] = _get_target_hardware_fingerprint().get(
-                "chip_type", "v5p"
-            )
+        meta_dict["format_version"] = 2
+        meta_dict["model_name"] = str(getattr(model_cfg, "model", "serving_model"))
+        meta_dict["target_tpu"] = _get_target_hardware_fingerprint().get(
+            "chip_type", "v5p"
+        )
 
-            block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
-            num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)
-            for fn_key, entry in meta_dict.items():
-                if fn_key.startswith("forward_bucket") and isinstance(entry, dict):
-                    for inp in entry.get("inputs", []):
-                        if inp.get("buffer_donor") is True:
-                            shape = inp.get("shape", [])
-                            if shape and isinstance(shape[0], int) and shape[0] > 0:
-                                num_blocks = int(shape[0])
-                                break
-                    if num_blocks != 512:
-                        break
+        block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
+        num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)
+        for fn_key, entry in meta_dict.items():
+            if fn_key.startswith("forward_bucket") and isinstance(entry, dict):
+                for inp in entry.get("inputs", []):
+                    if inp.get("buffer_donor") is True:
+                        shape = inp.get("shape", [])
+                        if shape and isinstance(shape[0], int) and shape[0] > 0:
+                            num_blocks = int(shape[0])
+                            break
+                if num_blocks != 512:
+                    break
 
-            cfg_vocab = int(
-                getattr(model_cfg, "vocab_size", 0)
-                or (
-                    model_cfg.get_vocab_size()
-                    if hasattr(model_cfg, "get_vocab_size")
-                    else 0
-                )
-                or getattr(getattr(model_cfg, "hf_config", None), "vocab_size", 0)
-                or 0
+        cfg_vocab = int(
+            getattr(model_cfg, "vocab_size", 0)
+            or (
+                model_cfg.get_vocab_size()
+                if hasattr(model_cfg, "get_vocab_size")
+                else 0
             )
-            eos_token_id = int(
-                getattr(model_cfg, "eos_token_id", 0)
-                or getattr(getattr(model_cfg, "hf_config", None), "eos_token_id", 0)
-                or 0
-            )
-            meta_dict["config"] = {
-                "vocab_size": cfg_vocab,
-                "eos_token_id": eos_token_id,
-                "max_num_seqs": 64,
-                "max_num_pages": num_blocks,
-                "max_cu_seqs": 65,
-                "block_size": block_size,
-                "num_blocks": num_blocks,
-                "max_model_len": int(getattr(model_cfg, "max_model_len", 2048) or 2048),
-                "tensor_parallel_size": int(
-                    getattr(parallel_cfg, "tensor_parallel_size", 1) or 1
-                ),
-                "pipeline_parallel_size": int(
-                    getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1
-                ),
-                "data_parallel_size": 1,
-            }
-            meta_dict["compile_options"] = _compile_options_for(
-                meta_dict["config"]["tensor_parallel_size"]
-            )
-            tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
-            tmp_path.write_text(json.dumps(meta_dict, indent=2))
-            os.replace(tmp_path, meta_path)
+            or getattr(getattr(model_cfg, "hf_config", None), "vocab_size", 0)
+            or 0
+        )
+        eos_token_id = int(
+            getattr(model_cfg, "eos_token_id", 0)
+            or getattr(getattr(model_cfg, "hf_config", None), "eos_token_id", 0)
+            or 0
+        )
+        meta_dict["config"] = {
+            "vocab_size": cfg_vocab,
+            "eos_token_id": eos_token_id,
+            "max_num_seqs": 64,
+            "max_num_pages": num_blocks,
+            "max_cu_seqs": 65,
+            "block_size": block_size,
+            "num_blocks": num_blocks,
+            "max_model_len": int(getattr(model_cfg, "max_model_len", 2048) or 2048),
+            "tensor_parallel_size": int(
+                getattr(parallel_cfg, "tensor_parallel_size", 1) or 1
+            ),
+            "pipeline_parallel_size": int(
+                getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1
+            ),
+            "data_parallel_size": 1,
+        }
+        meta_dict["compile_options"] = _compile_options_for(
+            meta_dict["config"]["tensor_parallel_size"]
+        )
+        tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
+        tmp_path.write_text(json.dumps(meta_dict, indent=2))
+        os.replace(tmp_path, meta_path)
 
     # Bundle checkpoint assets, constants.safetensors, and per-source paths
     model_id = getattr(getattr(runner, "model_config", None), "model", None)
