@@ -12,6 +12,9 @@ TPU compile-cache key.
   VLLM_TPU_MEMDBG_SMAPS=1       also break anonymous RSS down by mapping kind
                                 (heap, thread stacks, file-backed, large anon
                                 regions) from /proc/self/smaps at each stage.
+  VLLM_TPU_MEMDBG_PYCENSUS=1    at post_capture (before the GC heap is frozen)
+                                log the Python object types holding the most
+                                memory and the CPU tensors by size.
   VLLM_TPU_MEMDBG_HEAP_DUMP=1   rank 0 of each role writes a tcmalloc heap
                                 profile at each stage (gperftools tcmalloc is
                                 LD_PRELOADed) to VLLM_TPU_MEMDBG_HEAP_DIR.
@@ -38,6 +41,7 @@ def _flag(name: str) -> bool:
 TRACE = _flag("VLLM_TPU_MEMDBG_TRACE")
 SMAPS = _flag("VLLM_TPU_MEMDBG_SMAPS")
 HEAP_DUMP = _flag("VLLM_TPU_MEMDBG_HEAP_DUMP")
+PYCENSUS = _flag("VLLM_TPU_MEMDBG_PYCENSUS")
 NO_A1D = _flag("VLLM_TPU_MEMDBG_NO_A1D")
 NO_C1 = _flag("VLLM_TPU_MEMDBG_NO_C1")
 NO_G1 = _flag("VLLM_TPU_MEMDBG_NO_G1")
@@ -164,6 +168,61 @@ def _heap_dump(name: str) -> None:
         _heap_profiler(name.encode())  # type: ignore[operator]
 
 
+def _py_census(name: str, top: int = 20) -> None:
+    """Python objects by type (shallow sizeof) and CPU tensors by storage."""
+    import collections
+    import sys
+
+    import torch
+
+    sizes: collections.Counter = collections.Counter()
+    counts: collections.Counter = collections.Counter()
+    storages: dict[int, tuple[int, str]] = {}
+    for obj in gc.get_objects():
+        t = type(obj)
+        try:
+            sizes[t.__qualname__] += sys.getsizeof(obj)
+        except TypeError:
+            continue
+        counts[t.__qualname__] += 1
+        if t is torch.Tensor or isinstance(obj, torch.Tensor):
+            try:
+                if obj.device.type != "cpu":
+                    continue
+                st = obj.untyped_storage()
+                storages[st.data_ptr()] = (
+                    st.nbytes(),
+                    f"{tuple(obj.shape)}:{obj.dtype}",
+                )
+            except Exception:  # noqa: BLE001 - fake/meta tensors etc.
+                continue
+    for qual, size in sizes.most_common(top):
+        logger.info(
+            "[MEMDBG] pycensus stage=%s tag=%s %s n=%d shallow=%.1f MB",
+            name,
+            _tag,
+            qual,
+            counts[qual],
+            size / 2**20,
+        )
+    total = sum(n for n, _ in storages.values())
+    logger.info(
+        "[MEMDBG] pycensus stage=%s tag=%s cpu_tensor_storages=%d total=%.1f MB",
+        name,
+        _tag,
+        len(storages),
+        total / 2**20,
+    )
+    for nbytes, desc in sorted(storages.values(), reverse=True)[:top]:
+        logger.info(
+            "[MEMDBG] pycensus stage=%s tag=%s cpu_tensor %s %.1f MB",
+            name,
+            _tag,
+            desc,
+            nbytes / 2**20,
+        )
+
+
 def stage(name: str, count_executables: bool = True) -> None:
     """Record one stage: RssAnon, tcmalloc in-use and free, executables."""
     if not TRACE:
@@ -184,6 +243,8 @@ def stage(name: str, count_executables: bool = True) -> None:
     )
     if SMAPS:
         logger.info("[MEMDBG] smaps stage=%s tag=%s %s", name, _tag, _smaps_breakdown())
+    if PYCENSUS and _is_rank0 and name == "post_capture":
+        _py_census(name)
     if HEAP_DUMP and _is_rank0 and name != "periodic":
         _heap_dump(name)
 
