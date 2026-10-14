@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_CHECK_NAN: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -348,6 +349,7 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "TPU_CHECK_NAN": env_bool("TPU_CHECK_NAN", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave

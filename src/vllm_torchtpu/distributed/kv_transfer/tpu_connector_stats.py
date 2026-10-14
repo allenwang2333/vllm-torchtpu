@@ -95,6 +95,10 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record a failed KV transfer operation."""
         self.data["num_failed_transfers"].append(1)
 
+    def record_model_nan(self, has_nan: bool) -> None:
+        """Record one checked round, including a clean round's zero sample."""
+        self.data.setdefault("model_nan_detected", []).append(int(has_nan))
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -305,7 +309,17 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.counter_tpu_num_failed_transfers = create_metric_per_engine(
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues
         )
-
+        counter_model_nan_rounds = self._counter_cls(
+            name="vllm:tpu_model_nan_rounds",
+            documentation=(
+                "Checked model execution rounds with NaN in final hidden or logits; "
+                "worker results are ORed once per engine round."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_model_nan_rounds = create_metric_per_engine(
+            counter_model_nan_rounds, self.per_engine_labelvalues
+        )
         gauge_tpu_prefill_queue_length = self._gauge_cls(
             name="vllm:tpu_prefill_kv_queue_length",
             documentation="Current length of the TPU KV transfer prefill queue.",
@@ -393,6 +407,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         return metric_defs
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        nan_flags = transfer_stats_data.get("model_nan_detected", [])
+        if nan_flags:
+            self.counter_model_nan_rounds[engine_idx].inc(max(nan_flags))
         engine_labels = self.per_engine_labelvalues[engine_idx]
         for rank, stage, seconds in transfer_stats_data.get(
             "runner_cpu_issue_seconds", []

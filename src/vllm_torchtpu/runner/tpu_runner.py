@@ -132,6 +132,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.model_nan_check import ModelNaNChecker
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -958,6 +959,11 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._nan_checker = (
+            ModelNaNChecker.from_vllm_config(profiler_rank, self.vllm_config)
+            if envs.TPU_CHECK_NAN
+            else None
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -1082,6 +1088,8 @@ class TPUModelRunner(GPUModelRunner):
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
+            if self._nan_checker is not None:
+                self._nan_checker.take_result()
             return None, None, None, set(), None, None
         kv_connector = get_kv_transfer_group()
         finished_sending, finished_recving = kv_connector.get_finished(
@@ -1102,6 +1110,8 @@ class TPUModelRunner(GPUModelRunner):
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
+        if self._nan_checker is not None:
+            kv_connector_stats = self._nan_checker.attach_stats(kv_connector_stats)
         cpu_samples, device_samples = self._stage_timing.take_samples()
         if cpu_samples or device_samples:
             # Preserve connector-owned stats; discard timings without a TPU sink.
@@ -3764,6 +3774,13 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
             layout_plan = self._last_sequence_layout_plan
+            if self._nan_checker is not None:
+                assert layout_plan is not None, (
+                    "Final hidden NaN checking requires the real chunk's layout plan"
+                )
+                self._nan_checker.check_hidden(
+                    cast(torch.Tensor, hidden_states), layout_plan
+                )
             if self.is_pooling_model:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
@@ -3822,6 +3839,13 @@ class TPUModelRunner(GPUModelRunner):
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
                     )
+                if self._nan_checker is not None:
+                    num_valid_rows = (
+                        int((spec_decode_metadata.draft_lengths_cpu + 1).sum())
+                        if spec_decode_metadata is not None
+                        else num_reqs
+                    )
+                    self._nan_checker.check_logits(logits, num_valid_rows)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -5856,7 +5880,16 @@ class TPUModelRunner(GPUModelRunner):
             if self._hidden_nan_detector is not None:
                 self._hidden_nan_detector.arm()
             return
-        with self.maybe_setup_dummy_loras(self.lora_config):
+        with (
+            self.maybe_setup_dummy_loras(self.lora_config),
+            contextlib.ExitStack() as nan_check_context,
+        ):
+            # Spec warmup calls execute_model with synthetic requests.
+            if self._nan_checker is not None:
+                nan_check_context.callback(
+                    setattr, self, "_nan_checker", self._nan_checker
+                )
+                self._nan_checker = None
             with self._precompile_timed("model backbone"):
                 self._precompile_backbone()
 
