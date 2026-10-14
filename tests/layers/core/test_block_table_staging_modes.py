@@ -60,7 +60,7 @@ def _staged(runner, ctx, padded, gids):
 
 
 @pytest.mark.parametrize("reuse", [False, True])
-@pytest.mark.parametrize("ring", [1, 3])
+@pytest.mark.parametrize("ring", [2, 3])
 def test_sparse_zero_and_reuse_stage_identical_tables(monkeypatch, reuse, ring):
     # A device upload is a copy; on CPU `.to()` would alias the host scratch.
     original_to = torch.Tensor.to
@@ -103,3 +103,13 @@ def test_sparse_zero_and_reuse_stage_identical_tables(monkeypatch, reuse, ring):
         assert ref.keys() == new.keys()
         for g in ref:
             assert torch.equal(ref[g], new[g]), (step, g)
+
+
+def test_sparse_zero_requires_a_ring(monkeypatch):
+    tables = [torch.ones((MAX_REQS, w), dtype=torch.int32) for w in WIDTHS]
+    monkeypatch.setattr(
+        attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO", True
+    )
+    monkeypatch.setattr(attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_RING", 1)
+    with pytest.raises(ValueError, match="RING"):
+        stage_block_table_uploads(_runner(tables), _ctx(2, 0, False), 4)

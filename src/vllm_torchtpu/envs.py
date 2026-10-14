@@ -673,7 +673,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_HOST_LOOP_TRACE_DIR": env_str("TPU_HOST_LOOP_TRACE_DIR", ""),
     # Block-table staging: clear only the scratch rows the previous staging
     # wrote instead of the whole (max_num_reqs x every group) scratch each step.
-    # Uploads the same bytes.
+    # Uploads the same bytes. Requires TPU_BLOCK_TABLE_STAGE_RING >= 2.
     "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO": env_bool("TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO"),
     # Block-table staging: reuse the previous upload when the staged bytes are
     # identical (steady decode rarely crosses a block boundary).

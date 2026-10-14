@@ -516,6 +516,13 @@ def stage_block_table_uploads(
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     ring = envs.TPU_BLOCK_TABLE_STAGE_RING
+    if envs.TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO and ring < 2:
+        # Measured on the 4-chip DSv4 rig: with one scratch, sparse clearing
+        # produced NaN logprobs, so an upload can still be reading its scratch
+        # when the next staging rewrites it.
+        raise ValueError(
+            "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO=1 needs TPU_BLOCK_TABLE_STAGE_RING>=2"
+        )
     if ring > 1:
         # Rotate host scratches so a staging never rewrites the buffer the
         # previous upload was issued from.
