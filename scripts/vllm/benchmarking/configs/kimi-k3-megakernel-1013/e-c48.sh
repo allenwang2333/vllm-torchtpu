@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kimi-K3 megakernel recipe point 7 of the Oct 13 set: concurrency 64; decode
-# admits 128 sequences, no speculation, attention DP2 x DCP16; decode-host store
-# servers. See ../kimi-k3-megakernel/recipe-base.sh.
+# Kimi-K3 megakernel recipe pruned point e of the Oct 13 set: concurrency 48;
+# decode admits 128 sequences, no speculation, attention DP2 x DCP16; decode-
+# host store servers. See ../kimi-k3-megakernel/recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
 RECIPE_SET=oct13
-RECIPE_CONCURRENCY=64
+RECIPE_CONCURRENCY=48
 RECIPE_DECODE=dp2_dcp16
 RECIPE_DECODE_MAX_NUM_SEQS=128
 RECIPE_STORE_SERVERS=1

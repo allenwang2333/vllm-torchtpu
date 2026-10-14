@@ -20,8 +20,9 @@
 # FP8 KV in 512-token blocks, Raiden prefill-to-decode transfer and a host
 # memory KV store, behind vLLM's Rust frontend - on the AgentX 1P1D pair
 # (kimi-k3-agentx-1p1d.yaml). A point is one file beside this one, or in
-# kimi-k3-megakernel-1013/ for the doc's Oct 13 set, that sets the RECIPE_*
-# values below and sources it, and K3_PD_CONFIG=<directory>/<point> serves it.
+# kimi-k3-megakernel-1013/ for the doc's Oct 13 set (its pruned points a-g),
+# that sets the RECIPE_* values below and sources it, and
+# K3_PD_CONFIG=<directory>/<point> serves it.
 #
 #   RECIPE_CONCURRENCY            the AgentX concurrency
 #   RECIPE_DECODE                 dspark | dspark_mixed | dp2_dcp16
@@ -53,13 +54,13 @@
 # RECIPE_SET=oct13 serves the doc's Oct 13 set as its "Changes from" list reads:
 # TPU P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles, the prefill without
 # --prefix-cache-retention-interval, the one-hour benchmark, and for the DP2
-# points the prefill's --long-prefill-token-threshold 4096 and the decode's
-# default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 adds the global
-# registry on the prefill head and a host-store server on each decode host,
-# which k3_1p1d.sh starts; the prefill's host store joins their pool and the
-# decode drops its own. Departures for GKE: the prefill's host store stays at
-# this file's 768 GiB (the doc: 1.5 TiB, 2 TiB for the DP2 points), each store
-# server lends 256 GiB (the doc: 512 GiB), and the DP2 prefill has no
+# points (e-g) the prefill's --long-prefill-token-threshold 4096 and the
+# decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-g) adds
+# the global registry on the prefill head and a host-store server on each decode
+# host, which k3_1p1d.sh starts; the prefill's host store joins their pool and
+# the decode drops its own. Departures for GKE: the prefill's host store stays
+# at this file's 768 GiB (the doc: 1.5 TiB, 2 TiB for the DP2 points), each
+# store server lends 256 GiB (the doc: 512 GiB), and the DP2 prefill has no
 # --numa-bind, which runs the ranks under numactl and the engine image has none.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do

@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kimi-K3 megakernel recipe point 2 of the Oct 13 set: concurrency 8; decode
-# admits 4 sequences, DSpark with 7 drafts at synthetic acceptance 3.78, DCP32.
-# See ../kimi-k3-megakernel/recipe-base.sh.
+# Kimi-K3 megakernel recipe pruned point g of the Oct 13 set: concurrency 72;
+# decode admits 128 sequences, no speculation, attention DP2 x DCP16; decode-
+# host store servers. See ../kimi-k3-megakernel/recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
 RECIPE_SET=oct13
-RECIPE_CONCURRENCY=8
-RECIPE_DECODE=dspark
-RECIPE_DECODE_MAX_NUM_SEQS=4
-RECIPE_DRAFTS=7
-RECIPE_ACCEPTANCE=3.78
+RECIPE_CONCURRENCY=72
+RECIPE_DECODE=dp2_dcp16
+RECIPE_DECODE_MAX_NUM_SEQS=128
+RECIPE_STORE_SERVERS=1
 # shellcheck source=scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../kimi-k3-megakernel/recipe-base.sh"
