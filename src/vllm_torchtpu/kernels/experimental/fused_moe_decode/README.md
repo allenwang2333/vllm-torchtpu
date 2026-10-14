@@ -61,8 +61,11 @@ Use it when all of these hold:
 - The MoE is TP-sharded, or EP with `ep_size == mesh size`.
 - Weights are FP8 with per-channel scales, the activation is SiLU, and there
   are no expert biases.
-- The shared expert has a sigmoid gate, `routed_scaling_factor` is 1, and there
-  are no routed input/output transforms.
+- The shared expert has a sigmoid gate, or none (then it must be a SiLU MLP
+  without biases); `routed_scaling_factor` is 1 or another value exact in BF16
+  (applied by the op to the routed output; not under FP16); and there are no
+  routed input/output transforms. Layers without a gate or with a scale other
+  than 1 (GLM-5.2 has both, scale 2.5) are served with TP experts only.
 - `i`, `i_s` and `H / n_ranks` are multiples of 128, and `i_s <= i`.
 - At least 3 slots of one expert's `w1 + w2` fit in half of VMEM. This holds
   for Qwen3.5-397B TP8 and EP8.

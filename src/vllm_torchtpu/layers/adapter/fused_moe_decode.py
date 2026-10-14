@@ -23,14 +23,15 @@ nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``).
 
+Layers whose shared expert has no gate or whose runner scales the routed
+output (``routed_scaling_factor``; GLM-5.2 has both) are served too, with TP
+experts only: the scale moves from the runner into the program.
+
 ``FUSED_MOE_PREFILL_KERNEL=1`` arms the same layers, with or without this
 kernel, and the same program serves steps of at least
 ``FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS`` tokens with the fused MoE prefill
-kernel (``layers/adapter/fused_moe_prefill.py``). It also arms TP-expert
-layers whose shared expert has no gate, with or without a runner that scales
-the routed output (``routed_scaling_factor``; GLM-5.2 has both), which this
-kernel does not support: the scale moves from the runner into the program,
-and their smaller steps run GMM MoE.
+kernel (``layers/adapter/fused_moe_prefill.py``); smaller steps run this
+kernel when ``FUSED_MOE_DECODE_KERNEL=1`` and its cap allows, else GMM MoE.
 """
 
 import functools
@@ -179,9 +180,8 @@ def _layer(
 ):
     """Per-rank body of the op: the prefill kernel from `prefill_min_tokens`
     tokens when it is on, else the decode kernel up to `max_tokens` and GMM MoE
-    above. A layer without a shared-expert gate (`gated` False; the gate
-    operand is then a placeholder) or with a `routed_scale` other than 1 is
-    armed with `max_tokens` 0: the decode kernel supports neither."""
+    above. Without a shared-expert gate (`gated` False) the gate operand is a
+    placeholder; `routed_scale` multiplies the routed output alone."""
     start = rank[0, 1] if expert_parallel else None
     gate = shared_gate_weight if gated else None
     if prefill_min_tokens is not None and x.shape[0] >= prefill_min_tokens:
@@ -233,11 +233,12 @@ def _layer(
         shared_w1_scale.reshape(1, -1),
         shared_w2,
         shared_w2_scale.reshape(1, -1),
-        shared_gate_weight.reshape(-1, 1),
+        None if gate is None else gate.reshape(-1, 1),
         tw,
         ti,
         n_ranks=n_ranks,
         expert_start=start,
+        routed_scale=routed_scale,
     )
 
 
@@ -251,8 +252,6 @@ def _build_op(
     gated: bool = True,
     routed_scale: float = 1.0,
 ):
-    # The decode kernel has no ungated shared expert and no routed scale.
-    assert not max_tokens or (gated and routed_scale == 1.0)
     key = (
         id(mesh),
         n_ranks,
@@ -319,8 +318,8 @@ def _build_op(
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
-    # torch_tpu annotates the specs as tuples of axis names but passes each
-    # one to NamedSharding, which takes these PartitionSpecs.
+    # torch_tpu annotates the specs as tuples of axis names but takes the
+    # PartitionSpecs every other jax_op caller passes.
     # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
@@ -526,18 +525,15 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
             continue
         shared, expert_parallel = admitted
         layer = runner.routed_experts
-        # The decode kernel has no ungated shared expert and no routed scale:
-        # such a layer (GLM-5.2) gets a decode cap of 0, so GMM MoE serves
-        # what the prefill kernel does not, and is not armed without it. Nor
-        # with EP experts: the prefill kernel's weight ring holds three whole
-        # experts, more than VMEM for GLM-5.2's, and only TP is tested.
+        # A layer without a shared-expert gate or with a routed scale (GLM-5.2)
+        # is armed with TP experts only: with EP experts the decode and prefill
+        # kernels' weight rings hold three whole experts, more than VMEM for
+        # GLM-5.2's, and only TP is tested.
         gated = shared[4] is not None
         routed_scale = float(runner.routed_scaling_factor)
+        if (not gated or routed_scale != 1.0) and expert_parallel:
+            continue
         layer_max_tokens = max_tokens
-        if not gated or routed_scale != 1.0:
-            layer_max_tokens = 0
-            if min_tokens is None or expert_parallel:
-                continue
         if layer_max_tokens:
             _check_vmem(layer_max_tokens, layer, shared[2].shape[0], n_ranks)
         start = get_experts_start(layer) or 0
@@ -571,7 +567,10 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         if not gated:
             # The op's operands are all tensors: a stand-in the program ignores.
             placeholder = torch.zeros(
-                1, 1, dtype=torch.bfloat16, device=shared[0].device
+                1,
+                1,
+                dtype=torch.bfloat16,
+                device=cast(torch.Tensor, layer.w13_weight).device,
             )
             shared = (*shared[:4], placeholder)
         for name, tensor in zip(_SHARED_BUFFERS, shared):

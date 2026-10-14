@@ -118,8 +118,9 @@ def _kernel(
     Inputs in VMEM:
       x_ref [m, h] bf16: hidden states.
       coeff_ref [m, E padded to 128] f32: route weight of token t for local
-        expert e, 0 where t does not route to e.
-      shared_gate_ref [m, 128] f32: sigmoid(x . w_g) per token, repeated over lanes.
+        expert e (times routed_scale), 0 where t does not route to e.
+      shared_gate_ref [m, 128] f32: sigmoid(x . w_g) per token (1 without a
+        gate), repeated over lanes.
     Inputs in HBM (weights in `weight_dtype`, scales f32 per output channel):
       w1_hbm [E, h, 2 i] and w1_scale_hbm [E, 1, 1, 2 i]: gate and up projections.
       w2_hbm [E, i, h] and w2_scale_hbm [E, 1, 1, h]: down projection.
@@ -409,6 +410,7 @@ def fused_moe_decode(
     n_ranks,
     expert_start=None,
     scatter_rows=False,
+    routed_scale=1.0,
 ):
     """Per-rank body; call inside shard_map over the TP mesh.
 
@@ -431,6 +433,8 @@ def fused_moe_decode(
       shared_w2_scale: [1, H] FP32 scales of shared_w2.
       shared_gate_weight: [H, 1] the replicated shared_expert_gate; the shared
         expert's output is scaled by sigmoid(hidden @ shared_gate_weight).
+        None for a shared expert without a gate (GLM-5.2): its output is
+        added with coefficient 1.
       topk_weights: [tokens, k] route weights from the caller's router.
       topk_ids: [tokens, k] int32 expert ids of those routes.
       n_ranks: ranks in the mesh, the all-reduce width.
@@ -445,6 +449,8 @@ def fused_moe_decode(
         n_ranks), [tokens / n_ranks, H], and no all-gather runs. Needs tokens
         % n_ranks == 0. The wire is BF16 when tokens / n_ranks is a multiple
         of 16, else FP32.
+      routed_scale: multiplies the route weights (in f32) and not the shared
+        expert: GLM-5.2's routed_scaling_factor.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
     quantizes the hidden states and the activated intermediate to, so both
@@ -465,19 +471,25 @@ def fused_moe_decode(
         topk_ids = topk_ids - expert_start
     expert_ids = jnp.arange(experts, dtype=jnp.int32)[None, :]
     weights = topk_weights.astype(hidden.dtype).astype(jnp.float32)
+    # A Python-level branch: at 1.0 the traced program is the unscaled one.
+    if routed_scale != 1.0:
+        weights = weights * routed_scale
     coeff = jnp.zeros((m, experts), jnp.float32)
     for route in range(topk_ids.shape[1]):
         selected = topk_ids[:, route : route + 1] == expert_ids
         coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
-    shared_gate = jax.nn.sigmoid(
-        jnp.dot(
-            hidden,
-            shared_gate_weight.astype(hidden.dtype),
-            preferred_element_type=jnp.float32,
+    if shared_gate_weight is None:  # no gate: the shared expert is added as is
+        shared_gate = jnp.ones((m, 1), jnp.float32)
+    else:
+        shared_gate = jax.nn.sigmoid(
+            jnp.dot(
+                hidden,
+                shared_gate_weight.astype(hidden.dtype),
+                preferred_element_type=jnp.float32,
+            )
         )
-    )
     shared_gate = jnp.broadcast_to(shared_gate, (m, 128))
     i_s = shared_w2.shape[0]
     weight_dtype = w1.dtype
