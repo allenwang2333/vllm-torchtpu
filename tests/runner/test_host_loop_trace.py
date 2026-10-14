@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 
+import pytest
+
 from vllm_torchtpu.runner import host_loop_trace
 from vllm_torchtpu.runner.host_loop_trace import HostLoopTrace, _timed
 
@@ -32,10 +34,8 @@ def test_timed_marks_start_and_end_even_on_error(tmp_path):
         raise ValueError
 
     wrapped = _timed(trace, "sched", boom)
-    try:
+    with pytest.raises(ValueError):
         wrapped()
-    except ValueError:
-        pass
     assert trace._rec["sched_s"] <= trace._rec["sched_e"]
 
 

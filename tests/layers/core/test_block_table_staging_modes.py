@@ -20,8 +20,6 @@ def _runner(tables):
     runner = MagicMock()
     runner.device = torch.device("cpu")
     runner._block_table_stage_cpu = None
-    runner._block_table_stage_dirty = []
-    runner._block_table_stage_uploads = {}
     runner._block_table_stage_ring = []
     runner._block_table_stage_next = 0
     runner._unified_kv_layout = False
@@ -59,9 +57,8 @@ def _staged(runner, ctx, padded, gids):
     return {g: t.clone() for g, t in ctx.staged_block_tables.items()}
 
 
-@pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("ring", [2, 3])
-def test_sparse_zero_and_reuse_stage_identical_tables(monkeypatch, reuse, ring):
+def test_sparse_zero_stages_identical_tables(monkeypatch, ring):
     # A device upload is a copy; on CPU `.to()` would alias the host scratch.
     original_to = torch.Tensor.to
 
@@ -87,16 +84,10 @@ def test_sparse_zero_and_reuse_stage_identical_tables(monkeypatch, reuse, ring):
         monkeypatch.setattr(
             attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO", False
         )
-        monkeypatch.setattr(
-            attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD", False
-        )
         monkeypatch.setattr(attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_RING", 1)
         ref = _staged(ref_runner, _ctx(num_reqs, start, dummy), padded, gids)
         monkeypatch.setattr(
             attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO", True
-        )
-        monkeypatch.setattr(
-            attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD", reuse
         )
         monkeypatch.setattr(attention_metadata.envs, "TPU_BLOCK_TABLE_STAGE_RING", ring)
         new = _staged(new_runner, _ctx(num_reqs, start, dummy), padded, gids)

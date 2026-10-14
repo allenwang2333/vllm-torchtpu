@@ -74,7 +74,6 @@ if TYPE_CHECKING:
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
-    TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD: bool = False
     TPU_BLOCK_TABLE_STAGE_RING: int = 1
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -675,11 +674,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # wrote instead of the whole (max_num_reqs x every group) scratch each step.
     # Uploads the same bytes. Requires TPU_BLOCK_TABLE_STAGE_RING >= 2.
     "TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO": env_bool("TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO"),
-    # Block-table staging: reuse the previous upload when the staged bytes are
-    # identical (steady decode rarely crosses a block boundary).
-    "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD": env_bool(
-        "TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD"
-    ),
     # Block-table staging: number of host scratch buffers used in rotation, so
     # a staging does not rewrite the buffer the previous upload read from.
     "TPU_BLOCK_TABLE_STAGE_RING": env_int("TPU_BLOCK_TABLE_STAGE_RING", 1),

@@ -870,12 +870,6 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
-        # Spans of `_block_table_stage_cpu` holding real rows from the last
-        # staging (TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO); zero everywhere else.
-        self._block_table_stage_dirty: list[tuple[int, int]] = []
-        # Last block-table upload per staged group set, keyed by its layout
-        # and real-row contents (TPU_BLOCK_TABLE_STAGE_REUSE_UPLOAD).
-        self._block_table_stage_uploads: dict[Any, tuple[Any, list, Any]] = {}
         # TPU_BLOCK_TABLE_STAGE_RING > 1: rotating scratch buffers.
         self._block_table_stage_ring: list[Any] = []
         self._block_table_stage_next = 0
