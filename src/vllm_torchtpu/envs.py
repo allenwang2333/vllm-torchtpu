@@ -83,6 +83,10 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    FUSED_MOE_DECODE_KERNEL: bool = False
+    FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL: bool = False
+    FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
@@ -877,6 +881,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the original GMM path. This counts tokens, not tokens * topk.
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
+    ),
+    # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
+    # fused MoE decode kernel: routed experts, shared expert and all-reduce in
+    # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
+    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
+    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
+    "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
+    # Serve steps of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS tokens of the
+    # same layers, and of TP-expert layers whose shared expert has no gate
+    # (GLM-5.2), with the fused MoE prefill kernel: routed and shared experts,
+    # combine and all-reduce (layers/adapter/fused_moe_prefill.py). It takes
+    # precedence over the decode kernel; smaller steps run the decode kernel
+    # when that is on and its cap allows, else the GMM MoE path.
+    "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL"),
+    "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
+        "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
