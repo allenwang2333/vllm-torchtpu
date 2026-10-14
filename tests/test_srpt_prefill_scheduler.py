@@ -49,6 +49,8 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._srpt_held_steps = 0
     s._srpt_held_chunks = 0
     s._srpt_progress_guard = False
+    s._srpt_strict_cadence = False
+    s.prefill_capacity_bound = False
     s._srpt_hold_paused = False
     s._srpt_paused_steps = 0
     s._srpt_count_external = False
@@ -306,3 +308,34 @@ def test_hold_that_starts_a_kv_load_counts_as_progress():
     s.waiting.extend([_waiting("next", 80000, cached=79500)])
     assert _step_admitting(s, admit=False) == []  # still holding for "next"
     assert s._srpt_paused_steps == 0
+
+
+def _step_throttled(s, throttle):
+    seen = {}
+
+    def fake(throttle_prefills):
+        seen["running"] = [r.name for r in s.running]
+        seen["bound"] = s.prefill_capacity_bound
+        seen["throttle"] = throttle_prefills
+        # upstream: the release step left requests waiting
+        s.prefill_capacity_bound = True
+        return "output"
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=fake):
+        assert s.schedule(throttle) == "output"
+    return seen
+
+
+def test_strict_cadence_clears_capacity_bound_and_skips_holds_off_cadence():
+    s = _livelock_scheduler(guard=False)
+    s._srpt_strict_cadence = True
+    seen = _step_throttled(s, throttle=False)  # cadence step: SRPT holds as usual
+    assert (seen["running"], seen["bound"], seen["throttle"]) == ([], False, False)
+    seen = _step_throttled(s, throttle=True)  # off-cadence: upstream defers prefill
+    assert (seen["running"], seen["bound"], seen["throttle"]) == (["long"], False, True)
+
+
+def test_capacity_bound_kept_without_strict_cadence():
+    s = _livelock_scheduler(guard=False)
+    _step_throttled(s, throttle=False)
+    assert _step_throttled(s, throttle=True)["bound"] is True

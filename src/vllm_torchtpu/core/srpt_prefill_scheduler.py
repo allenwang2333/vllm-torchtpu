@@ -55,6 +55,13 @@ TPU drafter runs its own forward sized from the request count, so on TPU the
 charge only takes prefill tokens out of the target forward. The scheduled-token
 cap, and with it the largest token bucket, stays ``max_num_batched_tokens``.
 
+With ``--prefill-schedule-interval N`` vLLM defers prefill to every N-th step,
+except on a rank whose last prefill step left requests waiting
+(``prefill_capacity_bound``); under sustained load that is nearly every rank,
+so the deferral rarely holds. ``TPU_SRPT_STRICT_PREFILL_CADENCE=1`` clears that
+flag every step, so a rank with a decoding request prefills only on cadence
+steps.
+
 Select with
 ``--scheduler-cls vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler``.
 It extends ``AsyncScheduler``, so it expects ``--async-scheduling``.
@@ -88,6 +95,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_held_steps = 0
         self._srpt_held_chunks = 0
         self._srpt_progress_guard = envs.TPU_SRPT_HOLD_PROGRESS_GUARD
+        self._srpt_strict_cadence = envs.TPU_SRPT_STRICT_PREFILL_CADENCE
         self._srpt_hold_paused = False
         self._srpt_paused_steps = 0
         self._srpt_count_external = envs.TPU_SRPT_COUNT_EXTERNAL_HIT
@@ -196,7 +204,11 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         waiting = self._order_queues()
-        if self._srpt_hold_paused:
+        if self._srpt_strict_cadence:
+            self.prefill_capacity_bound = False
+        if self._srpt_strict_cadence and throttle_prefills:
+            held = []  # upstream defers every prefill this step anyway
+        elif self._srpt_hold_paused:
             held = []
             self._srpt_paused_steps += 1
         else:
