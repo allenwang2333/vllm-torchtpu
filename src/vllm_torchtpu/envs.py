@@ -162,6 +162,8 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
+    TPU_MLA_ABSORB_TOKEN_MAJOR: str = "0"
+    TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS: int = 64
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -710,6 +712,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # XLA-initialised aliased lse). Needs TPU_DCP_MLA_SPLIT_Q_LSE and
     # TPU_MLA_ROPE_NEOX_PERMUTE.
     "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
+    # MLA W_UK absorb computed token-major on buckets of at least
+    # TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS tokens (mixed / prefill), instead
+    # of `transpose -> bmm -> transpose`, whose transposes XLA lowers to
+    # full-size q / ql_nope relayouts. "pallas" (= "1"): a Pallas kernel that
+    # reads q_b's [T, H*qk] and writes the [T, H, lora] the attention kernel
+    # reads; "einsum": torch.einsum("thd,hdc->thc"), layout left to XLA.
+    # Decode buckets keep the bmm.
+    "TPU_MLA_ABSORB_TOKEN_MAJOR": env_with_choices(
+        "TPU_MLA_ABSORB_TOKEN_MAJOR", "0", ["0", "1", "pallas", "einsum"]
+    ),
+    "TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS": env_int(
+        "TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", 64
+    ),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache

@@ -1557,6 +1557,14 @@ class VllmTPUMLAAttention(MLAAttention):
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
 
+        # TPU_MLA_ABSORB_TOKEN_MAJOR: register the absorb ops here, outside
+        # Dynamo (building one takes a lock).
+        if envs.TPU_MLA_ABSORB_TOKEN_MAJOR in ("1", "pallas"):
+            from vllm_torchtpu.layers.adapter.attention import get_mla_absorb_op
+
+            get_mla_absorb_op(False)
+            get_mla_absorb_op(True)
+
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
