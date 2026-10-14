@@ -688,30 +688,32 @@ async def _handle_completions(api: str, request: Request):
         decode_slots = getattr(request.app.state, "decode_slots", None)
         slot = decode_slots[decode_idx] if decode_slots is not None else None
         released = False
+        slot_acquired = False
 
         def release_decode() -> None:
-            nonlocal released
+            nonlocal released, slot_acquired
             if released:
                 return
             released = True
-            if slot is not None:
+            if slot is not None and slot_acquired:
                 slot.release()
+                slot_acquired = False
             if decode_router is not None:
                 decode_router.done(decode_idx)
 
-        if slot is not None:
-            t_admit_perf = time.perf_counter()
-            await slot.acquire()
-            admit_wait_ms = (time.perf_counter() - t_admit_perf) * 1000.0
-            _PROXY_LATENCY.record("decode_admit", admit_wait_ms)
-            print(
-                f"PERF PROXY decode_admit req_id={request_id} "
-                f"decode_id={decode_client_info.get('id', decode_idx)} "
-                f"wait_ms={admit_wait_ms:.2f} ts={time.time():.6f}",
-                flush=True,
-            )
-
         try:
+            if slot is not None:
+                t_admit_perf = time.perf_counter()
+                await slot.acquire()
+                slot_acquired = True
+                admit_wait_ms = (time.perf_counter() - t_admit_perf) * 1000.0
+                _PROXY_LATENCY.record("decode_admit", admit_wait_ms)
+                print(
+                    f"PERF PROXY decode_admit req_id={request_id} "
+                    f"decode_id={decode_client_info.get('id', decode_idx)} "
+                    f"wait_ms={admit_wait_ms:.2f} ts={time.time():.6f}",
+                    flush=True,
+                )
             if router is not None:
                 prefill_idx, _ = router.route(hs)
                 prefill_client_info = request.app.state.prefill_clients[prefill_idx]
