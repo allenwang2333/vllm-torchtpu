@@ -44,7 +44,6 @@ BF16 = 2
 # segment-major ([Q heads | K heads | V heads] per tap); the SSM state here
 # stays BF16.
 CONV_BYTES = 4
-LANE_BYTES = KERNEL_PAGE * CONV_BYTES  # one fp32 conv row of carrier lanes
 GRANULE = PACKING * KERNEL_PAGE
 SRC_STATE_BLOCK = 11
 DST_STATE_BLOCK = 77
@@ -972,7 +971,6 @@ def test_gdn_fanout_reassembles_destination_states(src, dst, keys, values, kind)
             physical_granule_bytes=GRANULE,
             num_key_heads=keys,
             num_value_heads=values,
-            conv_lane_bytes=LANE_BYTES,
         )
         fan_out = dst // src
         assert reg.block_ids == (9,)
@@ -1016,7 +1014,6 @@ def test_gdn_fanout_fails_closed(overrides, match):
         physical_granule_bytes=GRANULE,
         num_key_heads=16,
         num_value_heads=128,
-        conv_lane_bytes=LANE_BYTES,
     )
     args.update(overrides)
     with pytest.raises(sol.SeqOnLaneError, match=match):

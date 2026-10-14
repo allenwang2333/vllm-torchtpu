@@ -152,7 +152,6 @@ def _run_fanout_state_seam():
     tiles = ((4, 128), (4, 1))
     d = 128
     taps = 3
-    lane_bytes = sol.sol_gdn_conv_lane_bytes(sol.SolFaGeometry(2, 64, 128))
     idx = jnp.array([0])
 
     def side(keys, values, degree, fa_heads):
@@ -224,7 +223,6 @@ def _run_fanout_state_seam():
                 physical_granule_bytes=512,
                 num_key_heads=keys,
                 num_value_heads=values,
-                conv_lane_bytes=lane_bytes,
             )
             for span in reg.spans:
                 local = span.dst_unit_ordinal - rank * fan_out
