@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     TPU_SRPT_HOLD_PROGRESS_GUARD: bool = False
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
+    TPU_HOST_LOOP_TRACE_DIR: str = ""
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -664,6 +665,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
+    # Directory for per-step host timestamps of the EngineCore, the runner and
+    # the worker output thread (runner/host_loop_trace.py). Empty disables it.
+    "TPU_HOST_LOOP_TRACE_DIR": env_str("TPU_HOST_LOOP_TRACE_DIR", ""),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

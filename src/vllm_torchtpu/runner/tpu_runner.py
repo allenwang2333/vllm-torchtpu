@@ -125,6 +125,8 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.host_loop_trace import HostLoopTrace
+from vllm_torchtpu.runner.host_loop_trace import make_trace as make_host_loop_trace
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -539,6 +541,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # Class default so runners built without __init__ (tests) skip tracing.
+    _hlt: HostLoopTrace | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -987,6 +991,7 @@ class TPUModelRunner(GPUModelRunner):
             if envs.TPU_STEP_TIMING_LOG_STEPS
             else None
         )
+        self._hlt = make_host_loop_trace("worker")
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -2504,7 +2509,11 @@ class TPUModelRunner(GPUModelRunner):
         if not pre_request_seq_lens:
             return
         wait_start = time.perf_counter()
+        if self._hlt is not None:
+            self._hlt.mark("rw_s")
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+        if self._hlt is not None:
+            self._hlt.mark("rw_e")
         if self._step_timing_log is not None:
             self._step_timing_log.result_wait(time.perf_counter() - wait_start)
         assert pre_next_tokens_cpu is not None
@@ -3259,7 +3268,11 @@ class TPUModelRunner(GPUModelRunner):
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
         if fence is not None:
+            if self._hlt is not None:
+                self._hlt.mark("fence_s")
             fence.synchronize()
+            if self._hlt is not None:
+                self._hlt.mark_last("fence_e")
             self._input_staging_fence = None
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
@@ -3423,9 +3436,13 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
         sync_start = time.perf_counter()
+        if self._hlt is not None:
+            self._hlt.mark("sync_s")
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
+        if self._hlt is not None:
+            self._hlt.mark("sync_e")
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         if self._step_timing_log is not None:
             self._step_timing_log.dp_sync(bucket, time.perf_counter() - sync_start)
@@ -3531,12 +3548,19 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._hlt is not None:
+            self._hlt.end_step()
+            self._hlt.mark("x_s")
+            self._hlt.note("tok", scheduler_output.total_num_scheduled_tokens)
+            self._hlt.note("nreq", len(scheduler_output.num_scheduled_tokens))
         if self._step_timing_log is not None:
             self._step_timing_log.step_start()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
+        if self._hlt is not None:
+            self._hlt.mark("upd_e")
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -3667,6 +3691,8 @@ class TPUModelRunner(GPUModelRunner):
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+        if self._hlt is not None:
+            self._hlt.mark("kv_e")
 
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
@@ -3689,6 +3715,8 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
+            if self._hlt is not None:
+                self._hlt.mark("prep_e")
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -3830,12 +3858,16 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
+                if self._hlt is not None:
+                    self._hlt.mark("fwd_s")
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
                 )
+                if self._hlt is not None:
+                    self._hlt.mark_last("fwd_e")
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -3947,6 +3979,9 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
             return None
+        if self._hlt is not None:
+            self._hlt.mark("x_e")
+            self._hlt.note("bucket", self._dp_target_bucket)
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
@@ -4394,6 +4429,8 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+        if self._hlt is not None:
+            self._hlt.mark("s_s")
 
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
@@ -4739,6 +4776,8 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        if self._hlt is not None:
+            self._hlt.mark("draft_e")
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
         # just filled; a save taken before it, or the save fence
@@ -4938,6 +4977,8 @@ class TPUModelRunner(GPUModelRunner):
 
             return final_output
 
+        if self._hlt is not None:
+            self._hlt.mark("s_e")
         return async_output
 
     def load_model(self) -> None:
@@ -6578,7 +6619,7 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
-        if R * (1 + K) > self.max_num_tokens:
+        if self.max_num_tokens < R * (1 + K):
             # No serving step can carry R verify windows: the token budget caps it.
             logger.info(
                 "skip spec-decode warmup R=%d: %d verify tokens exceed the "

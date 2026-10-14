@@ -91,6 +91,15 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
+    # Host-loop timing (TPU_HOST_LOOP_TRACE_DIR); no-ops when unset.
+    Patch(
+        "vllm_torchtpu.runner.host_loop_trace:install_engine_core_trace",
+        ("engine_core",),
+    ),
+    Patch(
+        "vllm_torchtpu.runner.host_loop_trace:install_worker_output_trace",
+        ("worker_init",),
+    ),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
