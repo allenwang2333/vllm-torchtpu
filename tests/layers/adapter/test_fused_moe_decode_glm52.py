@@ -101,8 +101,9 @@ def test_admits_glm52_layer():
         (H,),
         None,
     ]
-    # The same layer with a Qwen-style gate: admitted with its gate weight.
-    shared, _ = bridge._admit(_Runner(gate=_gate()), N_RANKS)
+    # The same layer with a Qwen-style gate: admitted with its gate weight
+    # (at scale 1.0: #1823 refuses a gated shared expert with a routed scale).
+    shared, _ = bridge._admit(_Runner(gate=_gate(), routed_scaling_factor=1.0), N_RANKS)
     assert tuple(shared[4].shape) == (1, H)
 
 
@@ -198,10 +199,10 @@ def test_arms_glm52_layer(arming):
     glm = _Runner()
     qwen = _Runner(gate=_gate(), routed_scaling_factor=1.0)
     assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 2
-    # (n_ranks, topk, expert_parallel, decode cap, gated, scale).
+    # (n_ranks, topk, expert_parallel, decode cap, prefill from, gated, scale).
     assert built == [
-        (N_RANKS, TOPK, False, 256, False, ROUTED_SCALE),
-        (N_RANKS, TOPK, False, 256, True, 1.0),
+        (N_RANKS, TOPK, False, 256, None, False, ROUTED_SCALE),
+        (N_RANKS, TOPK, False, 256, None, True, 1.0),
     ]
     assert [v[0] for v in vmem] == [256, 256]
     for runner in (glm, qwen):
@@ -237,7 +238,7 @@ def test_glm52_layer_not_armed_with_ep_experts(arming):
     # Only TP experts are tested for GLM-5.2 layers: under EP the gated layer
     # is still armed, the GLM-5.2 layer keeps the runner's path.
     assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 1
-    assert built == [(N_RANKS, TOPK, True, 256, True, 1.0)]
+    assert built == [(N_RANKS, TOPK, True, 256, None, True, 1.0)]
     assert not _armed(glm) and _armed(qwen)
     assert glm._shared_experts is not None
     assert glm.routed_scaling_factor == ROUTED_SCALE
@@ -262,10 +263,13 @@ def test_build_op_binds_statics(monkeypatch):
     monkeypatch.setattr(bridge, "jax_op", jax_op)
     monkeypatch.setattr(jax, "shard_map", lambda f, **kwargs: f)
     mesh = object()
-    glm = bridge._build_op(mesh, N_RANKS, TOPK, False, 256, False, ROUTED_SCALE)
-    qwen = bridge._build_op(mesh, N_RANKS, TOPK, False, 256, True, 1.0)
+    glm = bridge._build_op(mesh, N_RANKS, TOPK, False, 256, None, False, ROUTED_SCALE)
+    qwen = bridge._build_op(mesh, N_RANKS, TOPK, False, 256, None, True, 1.0)
     assert qwen is not glm
-    assert bridge._build_op(mesh, N_RANKS, TOPK, False, 256, False, ROUTED_SCALE) is glm
+    assert (
+        bridge._build_op(mesh, N_RANKS, TOPK, False, 256, None, False, ROUTED_SCALE)
+        is glm
+    )
     for op in (glm, qwen):
         op.fn(*[np.zeros((1, 1), np.float32)] * 13)
     assert seen == [(False, ROUTED_SCALE), (True, 1.0)]

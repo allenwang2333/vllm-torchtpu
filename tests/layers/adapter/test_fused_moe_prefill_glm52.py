@@ -195,7 +195,7 @@ def _armed(runner):
 
 
 @pytest.mark.parametrize("decode", [False, True])
-def test_arms_glm52_layer_with_decode_cap_0(monkeypatch, arming, decode):
+def test_arms_glm52_layer_with_the_decode_cap(monkeypatch, arming, decode):
     built, vmem = arming
     monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1" if decode else "0")
@@ -204,12 +204,13 @@ def test_arms_glm52_layer_with_decode_cap_0(monkeypatch, arming, decode):
     assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 2
     cap = 256 if decode else 0
     # (n_ranks, topk, expert_parallel, decode cap, prefill from, gated, scale):
-    # the GLM-5.2 layer gets cap 0 whatever FUSED_MOE_DECODE_KERNEL says.
+    # with #1822 merged the decode kernel serves the GLM-5.2 layer too, so its
+    # cap follows FUSED_MOE_DECODE_KERNEL like the gated layer's.
     assert built == [
-        (N_RANKS, TOPK, False, 0, 256, False, ROUTED_SCALE),
+        (N_RANKS, TOPK, False, cap, 256, False, ROUTED_SCALE),
         (N_RANKS, TOPK, False, cap, 256, True, 1.0),
     ]
-    assert [v[0] for v in vmem] == ([256] if decode else [])  # the gated layer's
+    assert [v[0] for v in vmem] == ([256, 256] if decode else [])
     for runner in (glm, qwen):
         assert _armed(runner)
         assert runner._shared_experts is None
@@ -221,18 +222,21 @@ def test_arms_glm52_layer_with_decode_cap_0(monkeypatch, arming, decode):
     assert tuple(qwen.routed_experts._fmd_wg.shape) == (1, H)
 
 
-def test_glm52_layer_not_armed_by_decode_kernel_alone(monkeypatch, arming):
+def test_glm52_layer_armed_by_decode_kernel_alone(monkeypatch, arming):
+    # #1822: the decode kernel serves the GLM-5.2 layer without the prefill
+    # kernel.
     built, vmem = arming
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1")
     monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
     glm = _Runner()
     qwen = _Runner(gate=_gate(), routed_scaling_factor=1.0)
-    assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 1
-    assert built == [(N_RANKS, TOPK, False, 256, None, True, 1.0)]
-    assert not _armed(glm) and _armed(qwen)
-    # Untouched: the runner keeps its shared expert and its scale.
-    assert glm._shared_experts is not None
-    assert glm.routed_scaling_factor == ROUTED_SCALE
+    assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 2
+    assert built == [
+        (N_RANKS, TOPK, False, 256, None, False, ROUTED_SCALE),
+        (N_RANKS, TOPK, False, 256, None, True, 1.0),
+    ]
+    assert _armed(glm) and _armed(qwen)
+    assert glm.routed_scaling_factor == 1.0
 
 
 def test_glm52_layer_not_armed_with_ep_experts(monkeypatch, arming):
@@ -275,10 +279,17 @@ def test_prefill_layer_passes_gate_and_scale_to_kernel(monkeypatch):
     assert seen == dict(gate=None, expert_start=None, routed_scale=ROUTED_SCALE)
 
 
-def test_build_op_refuses_decode_cap_for_glm52_layer():
-    for gated, scale in ((False, 1.0), (True, ROUTED_SCALE), (False, ROUTED_SCALE)):
-        with pytest.raises(AssertionError):
-            bridge._build_op(None, N_RANKS, TOPK, False, 256, 256, gated, scale)
+def test_build_op_admits_decode_cap_for_glm52_layer(monkeypatch):
+    # #1822 gives the decode kernel the ungated shared expert and the scale,
+    # so _build_op no longer asserts a cap of 0 for such layers.
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(
+        bridge,
+        "jax_op",
+        lambda name, fn, **kw: types.SimpleNamespace(register_fake=lambda f: None),
+    )
+    for gated, scale in ((False, 1.0), (False, ROUTED_SCALE)):
+        bridge._build_op(object(), N_RANKS, TOPK, False, 256, 256, gated, scale)
 
 
 def test_build_op_binds_statics(monkeypatch):
@@ -369,7 +380,7 @@ def test_dispatch_with_scale(monkeypatch, tokens, path, gated, expert_parallel):
     assert gate is (w if gated else None)
 
 
-def test_decode_kernel_never_serves_armed_glm52_layer(monkeypatch, arming):
+def test_decode_kernel_serves_armed_glm52_layer_below_prefill(monkeypatch, arming):
     built, _ = arming
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1")
     monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
@@ -385,7 +396,7 @@ def test_decode_kernel_never_serves_armed_glm52_layer(monkeypatch, arming):
             gated=gated,
             routed_scale=scale,
         )
-        assert [c[0] for c in calls] == ["prefill" if tokens >= 256 else "gmm"]
+        assert [c[0] for c in calls] == ["prefill" if tokens >= 256 else "decode"]
 
 
 def _gmm_fallback(monkeypatch, gate, scale):
