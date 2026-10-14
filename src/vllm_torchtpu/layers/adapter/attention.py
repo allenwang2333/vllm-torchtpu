@@ -102,6 +102,33 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
 
+
+def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tensor:
+    """`out` unchanged, with each buffer lifted into the trace, inside the
+    backbone warmup only. The warmup hands a token bucket between two traces
+    of a token-count branch only if both lift the same buffers
+    (`shape_variants`); TPU_DCP_MERGE_VSPACE's chunked side reads the
+    DCP-gathered W_UV and the other side the local one, so each side lifts
+    the other's too. The buffer goes through an op that ignores it
+    (`keep_input`): no data is read, so the program computes exactly what
+    it did (an unused parameter). Reading a reshaped element instead made
+    XLA relayout the whole 64-head buffer every decode step."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    if not shape_variants.in_warmup() or out.device.type != "tpu":
+        return out
+    from vllm_torchtpu.layers.adapter.dcp_weighted_hm import keep_input
+
+    for buf in bufs:
+        if buf is not None:
+            out = keep_input(out, buf)
+    return out
+    for buf in bufs:
+        if buf is not None:
+            v = buf.reshape(-1)[:1].to(out.dtype)
+            out = out - (v - v)
+    return out
+
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
@@ -2691,6 +2718,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # TPU_DCP_MERGE_VSPACE: the DCP merge already applied W_UV.
+        projected = False
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2853,12 +2882,35 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # comparison would pin its graph to the first size, and the
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
-                    outputs = merge_lse_partials_scatter_heads(
-                        partial,
-                        lse,
-                        is_backbone=vllm_compilation_backends.model_tag == "backbone",
-                        query_start_loc=attn_metadata.query_start_loc,
-                    )
+                    w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
+                    if w_uv_vspace is not None and use_qrep:
+                        # The decode buckets' trace lifts the local W_UV;
+                        # lift it here too, unread (`_retain_buffers`).
+                        w_uv_vspace = _retain_buffers(
+                            w_uv_vspace,
+                            layer.W_UV,
+                            getattr(layer, "W_UV_scale", None),
+                        )
+                        # TPU_DCP_MERGE_VSPACE: chunked buckets merge in V
+                        # space and come back through W_UV already.
+                        outputs, projected = (
+                            _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
+                                partial,
+                                lse,
+                                w_uv_vspace,
+                                getattr(layer, "W_UV_dcp_vspace_scale", None),
+                                is_backbone=is_backbone,
+                                query_start_loc=attn_metadata.query_start_loc,
+                            )
+                        )
+                    else:
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=vllm_compilation_backends.model_tag
+                            == "backbone",
+                            query_start_loc=attn_metadata.query_start_loc,
+                        )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2895,13 +2947,29 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
+        vspace_w = getattr(layer, "W_UV_dcp_vspace", None)
+        if projected:
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
+            if output is not None and outputs is not output:
+                output.copy_(outputs)
+            return outputs
+
         outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
             0, 1
         )
+        w_uv_src = layer.W_UV
+        if vspace_w is not None:
+            # TPU_DCP_MERGE_VSPACE: the chunked buckets' trace lifts the
+            # gathered W_UV; lift it here too, unread (`_retain_buffers`).
+            w_uv_src = _retain_buffers(
+                w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+            )
         w_uv = (
-            layer.W_UV.to(outputs_t.dtype)
-            if layer.W_UV.dtype != outputs_t.dtype
-            else layer.W_UV
+            w_uv_src.to(outputs_t.dtype)
+            if w_uv_src.dtype != outputs_t.dtype
+            else w_uv_src
         )
         out_proj = torch.bmm(outputs_t, w_uv)
         if hasattr(layer, "W_UV_scale"):

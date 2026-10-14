@@ -1565,6 +1565,22 @@ class VllmTPUMLAAttention(MLAAttention):
             get_mla_absorb_op(False)
             get_mla_absorb_op(True)
 
+        # TPU_DCP_MERGE_VSPACE: the chunked DCP merge applies W_UV before its
+        # reduce-scatter, to the partials of every head in the DCP group, so
+        # W_UV has to span them too (the same gather, the same head order as
+        # W_UK_T_dcp_qrep). Sparse DCP layers only -- the merge's only user.
+        self.W_UV_dcp_vspace = None
+        self.W_UV_dcp_vspace_scale = None
+        if envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
+            dcp_group = get_dcp_group()
+            self.W_UV_dcp_vspace = _fresh(
+                dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+            )
+            if hasattr(self, "W_UV_scale"):
+                self.W_UV_dcp_vspace_scale = _fresh(
+                    dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                )
+
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
         kv_b_proj_params = dict(self.kv_b_proj.named_parameters())
@@ -1580,7 +1596,12 @@ class VllmTPUMLAAttention(MLAAttention):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
                 t
-                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                for t in (
+                    self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_scale,
+                    self.W_UV_dcp_vspace,
+                    self.W_UV_dcp_vspace_scale,
+                )
                 if t is not None
             )
             synchronize_tensors(tensors)
