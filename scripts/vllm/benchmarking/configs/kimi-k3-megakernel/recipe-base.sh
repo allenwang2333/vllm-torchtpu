@@ -187,6 +187,12 @@ DSPARK_DIR="$HF_HUB_CACHE_DIR/models--RedHatAI--Kimi-K3-speculator.dspark/snapsh
 export PYTHONPATH="$PLUGIN_SRC"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
+# Experiment: the engine image preloads gperftools tcmalloc, which keeps freed
+# pages in its heap rather than returning them to the OS. After load each
+# worker holds ~52-54 GiB of private memory beside weights that live in HBM
+# (build 599); this has tcmalloc return pages as they are freed, to measure how
+# much of that is freed load buffers.
+export TCMALLOC_AGGRESSIVE_DECOMMIT=true
 # vLLM's Rust frontend, which the engine image carries from #1884 on.
 export VLLM_USE_RUST_FRONTEND=1
 export VLLM_RUST_FRONTEND_PATH=/usr/local/bin/vllm-rs
