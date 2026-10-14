@@ -5075,8 +5075,13 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
-        # After the drafter, so its MTP layer is armed too.
-        if envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL:
+        # After the drafter, so its MTP layer is armed too. With
+        # USE_MOE_TP_DECODE_KERNEL it runs after that arming instead (below):
+        # moe_tp_decode's op carries the prefill kernel for the layers it arms.
+        fused_moe_arming = (
+            envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL
+        )
+        if fused_moe_arming and not envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
@@ -5112,6 +5117,14 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+            if fused_moe_arming:
+                # Layers moe_tp_decode armed have no shared expert left, so
+                # fused_moe_decode admits only the ones it refused.
+                from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+                    arm_runner_models,
+                )
+
+                arm_runner_models(self)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
