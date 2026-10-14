@@ -644,3 +644,14 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
     monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: process)
     tpu_worker._release_free_host_heap()
     assert calls == [0]
+
+
+def test_clear_jax_tracing_caches(monkeypatch):
+    import jax
+
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+    monkeypatch.setattr(jax, "clear_caches", lambda: calls.append(True))
+    tpu_worker._clear_jax_tracing_caches()
+    assert calls == [True]

@@ -124,6 +124,20 @@ def _release_free_host_heap() -> None:
     )
 
 
+def _clear_jax_tracing_caches() -> None:
+    """Drop jax's tracing caches once every program is compiled.
+
+    torch.compile exports each Pallas kernel through jax, which caches the
+    traced jaxprs (and their pytrees and source info) per shape. The compiled
+    TPU programs no longer need them, but the caches keep them for the life of
+    the process: 0.1-0.2 GB per worker on Qwen3.5-397B. A kernel traced again
+    later is simply re-traced.
+    """
+    import jax
+
+    jax.clear_caches()
+
+
 class TPUWorker(WorkerBase):
     def __init__(
         self,
@@ -816,7 +830,9 @@ class TPUWorker(WorkerBase):
         set_torch_threads_for_runtime()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
-        # from scanning those objects mid-step.
+        # from scanning those objects mid-step. Drop jax's tracing caches first
+        # so what they held is collected rather than frozen.
+        _clear_jax_tracing_caches()
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
