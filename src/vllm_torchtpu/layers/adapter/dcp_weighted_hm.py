@@ -158,3 +158,23 @@ def vspace_weighted_heads_major(
     if scaled:
         args.append(w_uv_scale.contiguous())
     return op(*args)
+
+
+def _keep_fn(a: jax.Array, b: jax.Array) -> jax.Array:
+    del b
+    return a
+
+
+def _keep_fake(a: torch.Tensor, b: torch.Tensor):
+    return torch.empty_like(a)
+
+
+_keep_op = pallas.jax_op("pallas::dcp_keep_input", _keep_fn)
+_keep_op.register_fake(_keep_fake)
+
+
+def keep_input(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a` unchanged; `b` becomes an input of the traced graph without any
+    computation on it (the exported function ignores it, so XLA drops the
+    use: no copy, no op). For graphs that must lift the same buffers."""
+    return _keep_op(a.contiguous(), b)

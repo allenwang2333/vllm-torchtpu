@@ -104,17 +104,25 @@ logger = init_logger(__name__)
 
 
 def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tensor:
-    """`out`, bit for bit, plus a read of each buffer, inside the backbone
-    warmup only. The warmup hands a token bucket between two traces of a
-    token-count branch only if both lift the same buffers
+    """`out` unchanged, with each buffer lifted into the trace, inside the
+    backbone warmup only. The warmup hands a token bucket between two traces
+    of a token-count branch only if both lift the same buffers
     (`shape_variants`); TPU_DCP_MERGE_VSPACE's chunked side reads the
-    DCP-gathered W_UV and the other side the local one, so each side reads
-    the other's too. `out - (v - v)` subtracts +0.0: every value, -0.0
-    included, is unchanged (a dead read would be eliminated)."""
+    DCP-gathered W_UV and the other side the local one, so each side lifts
+    the other's too. The buffer goes through an op that ignores it
+    (`keep_input`): no data is read, so the program computes exactly what
+    it did (an unused parameter). Reading a reshaped element instead made
+    XLA relayout the whole 64-head buffer every decode step."""
     from vllm_torchtpu.compilation import shape_variants
 
-    if not shape_variants.in_warmup():
+    if not shape_variants.in_warmup() or out.device.type != "tpu":
         return out
+    from vllm_torchtpu.layers.adapter.dcp_weighted_hm import keep_input
+
+    for buf in bufs:
+        if buf is not None:
+            out = keep_input(out, buf)
+    return out
     for buf in bufs:
         if buf is not None:
             v = buf.reshape(-1)[:1].to(out.dtype)
@@ -2876,6 +2884,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # drafter keeps the reduce-scatter, as with the flag off.
                     w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
                     if w_uv_vspace is not None and use_qrep:
+                        # The decode buckets' trace lifts the local W_UV;
+                        # lift it here too, unread (`_retain_buffers`).
+                        w_uv_vspace = _retain_buffers(
+                            w_uv_vspace,
+                            layer.W_UV,
+                            getattr(layer, "W_UV_scale", None),
+                        )
                         # TPU_DCP_MERGE_VSPACE: chunked buckets merge in V
                         # space and come back through W_UV already.
                         outputs, projected = (
@@ -2934,11 +2949,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         vspace_w = getattr(layer, "W_UV_dcp_vspace", None)
         if projected:
-            # The decode buckets' trace lifts the local W_UV; lift it here too
-            # so buckets can be handed between the two traces.
-            outputs = _retain_buffers(
-                outputs, layer.W_UV, getattr(layer, "W_UV_scale", None)
-            )
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
@@ -2949,20 +2959,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
             0, 1
         )
+        w_uv_src = layer.W_UV
+        if vspace_w is not None:
+            # TPU_DCP_MERGE_VSPACE: the chunked buckets' trace lifts the
+            # gathered W_UV; lift it here too, unread (`_retain_buffers`).
+            w_uv_src = _retain_buffers(
+                w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+            )
         w_uv = (
-            layer.W_UV.to(outputs_t.dtype)
-            if layer.W_UV.dtype != outputs_t.dtype
-            else layer.W_UV
+            w_uv_src.to(outputs_t.dtype)
+            if w_uv_src.dtype != outputs_t.dtype
+            else w_uv_src
         )
         out_proj = torch.bmm(outputs_t, w_uv)
         if hasattr(layer, "W_UV_scale"):
             out_proj = out_proj * layer.W_UV_scale
-        if vspace_w is not None:
-            # TPU_DCP_MERGE_VSPACE: the chunked buckets' trace lifts the
-            # gathered W_UV instead; read it here too (see above).
-            out_proj = _retain_buffers(
-                out_proj, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
-            )
         outputs = (
             out_proj.transpose(0, 1)
             .to(input_dtype)
