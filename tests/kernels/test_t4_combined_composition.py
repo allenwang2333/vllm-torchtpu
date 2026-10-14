@@ -290,11 +290,13 @@ def test_indexer_rank_operand_and_q_b_overlap(q_len):
     assert not np.array_equal(np.asarray(bad), base), "rotated rank ids not caught"
 
 
+@pytest.mark.parametrize("merge_groups", [0, 4, 8])
 @pytest.mark.parametrize("q_rope", [False, True])
 @pytest.mark.parametrize("rank", [False, True])
-def test_sparse_mla_dcp_op_schema(q_rope, rank):
-    """The torch op for each (q_rope, rank operand) variant registers (no
-    varargs in the inferred schema) with exactly its operands."""
+def test_sparse_mla_dcp_op_schema(merge_groups, q_rope, rank):
+    """The torch op for each (q_rope, rank operand, merge_groups) variant
+    registers (no varargs in the inferred schema) with 11 + q_rope + rank
+    operands and 2 + 2G returns (4 when G == 0)."""
     import torch
 
     from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk
@@ -303,11 +305,14 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
     mesh = jax.sharding.Mesh(
         np.array(jax.devices("cpu")[:1]), (streamindex_topk.DCP_AXIS_NAME,)
     )
-    name = f"t4c_schema_{int(q_rope)}{int(rank)}"
+    name = f"t4c_schema_{merge_groups}_{int(q_rope)}{int(rank)}"
     layer = mock.Mock(
         kv_cache_quantized_dtype=None, layer_name=name, scale=0.1, mla_kv_spec=(1, 2)
     )
     impl = mock.Mock(_dcp_mesh=mesh)
+    # TPU_MTP_DCP_MERGE_SIZED defaults to True, causing _build_sparse_mla_dcp_op
+    # to call prebuild_sized_merge(8), which requires an 8-device DCP mesh; mock
+    # it out here since this schema check runs single-process on a 1-CPU mesh.
     env = {"TPU_DCP_RANK_OPERAND": "1"} if rank else {}
     with (
         mock.patch.dict(os.environ, env),
@@ -316,17 +321,20 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
             "dcp_rank_operand",
             return_value=torch.zeros(1, dtype=torch.int32),
         ),
+        mock.patch.object(attention._cp_mla_attention, "prebuild_sized_merge"),
     ):
         if not rank:
             os.environ["TPU_DCP_RANK_OPERAND"] = "0"  # on by default
         attention.PallasMLAttentionBackendImpl._build_sparse_mla_dcp_op(
-            impl, layer, 8, 4, q_rope=q_rope
+            impl, layer, 8, 4, q_rope=q_rope, merge_groups=merge_groups
         )
     op = f"sparse_mla_attention_dcp_{name}" + ("_qrope" if q_rope else "")
     op += "_rank" if rank else ""
+    op += f"_g{merge_groups}" if merge_groups else ""
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
     assert len(schema.arguments) == 11 + int(q_rope) + int(rank), schema
+    assert len(schema.returns) == (2 + 2 * merge_groups if merge_groups else 4), schema
 
 
 @pytest.mark.parametrize("qb", [False, True])

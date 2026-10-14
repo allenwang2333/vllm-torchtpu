@@ -1566,3 +1566,157 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+@pytest.mark.parametrize(
+    "num_tokens,model_tag,pipelined,chunks,with_rope_table,expected_groups",
+    [
+        (16, "backbone", True, 8, False, 0),  # decode a2a bucket -> ungrouped
+        (2048, "eagle_head", True, 8, False, 0),  # drafter -> ungrouped
+        (2048, "backbone", False, 8, False, 0),  # flag off -> ungrouped
+        (1024, "backbone", True, 8, False, 0),  # 1024 // 8 < 256 cap -> ungrouped
+        (1024, "backbone", True, 4, False, 4),  # 1024 // 4 == 256 -> 4 groups
+        (2048, "backbone", True, 8, False, 8),  # 2048 at 8 chunks -> 8 groups
+        (4096, "backbone", True, 8, False, 8),  # 4096 at 8 chunks -> 8 groups
+        (2048, "backbone", True, 8, True, 8),  # decode prologue rope op -> 8 groups
+    ],
+)
+def test_mla_forward_pipelined_dcp_routing(
+    num_tokens,
+    model_tag,
+    pipelined,
+    chunks,
+    with_rope_table,
+    expected_groups,
+    monkeypatch,
+):
+    """`PallasMLAttentionBackendImpl.forward` dispatches to `sparse_mla_dcp_grouped_op`
+    and `merge_lse_partials_scatter_heads_grouped` with `G = chunks` only on
+    chunked backbone buckets when `TPU_DCP_MERGE_PIPELINED` is enabled; drafter,
+    decode a2a, flag-off, and `T=1024` at 8 chunks call `sparse_mla_dcp_op`."""
+    dcp_size, local_heads = 2, 16
+    group_heads = local_heads * dcp_size
+    impl, layer, inputs, _ = _make_impl_and_layer(num_tokens=num_tokens)
+    impl.dcp_size = dcp_size
+
+    for name, val in {
+        "TPU_DCP_MERGE_PIPELINED": pipelined,
+        "TPU_DCP_MERGE_CHUNKED": chunks,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024,
+        "TPU_DCP_MLA_TOPK_CAP_CHUNK": 256,
+        "TPU_DCP_MLA_SPLIT_Q_LSE": True,
+        "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": True,
+        "TPU_DCP_LSE_MERGE_A2A": True,
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": 64,
+    }.items():
+        monkeypatch.setattr(envs, name, val, raising=False)
+        monkeypatch.setattr(cp_mla.envs, name, val, raising=False)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+
+    single_partial = torch.randn(num_tokens, group_heads, 512)
+    single_lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(single_partial, single_lse))
+    layer.sparse_mla_dcp_rope_op = MagicMock(return_value=(single_partial, single_lse))
+
+    group_rows = num_tokens // max(expected_groups, 1)
+    grouped_outs = tuple(
+        torch.randn(group_rows, group_heads, 512)
+        for _ in range(max(expected_groups, 1))
+    )
+    grouped_lses = tuple(
+        torch.zeros(group_rows, group_heads) for _ in range(max(expected_groups, 1))
+    )
+    layer.sparse_mla_dcp_grouped_op = MagicMock(
+        return_value=(*grouped_outs, *grouped_lses)
+    )
+    layer.sparse_mla_dcp_grouped_rope_op = MagicMock(
+        return_value=(*grouped_outs, *grouped_lses)
+    )
+
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    qsl = torch.tensor([0, num_tokens], dtype=torch.int32)
+    inputs["attn_metadata"] = SimpleNamespace(
+        seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        block_tables=torch.zeros((1, 2), dtype=torch.int32),
+        query_start_loc=qsl,
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+    )
+
+    unsplit_calls = []
+    grouped_calls = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, lse, **kw: (
+            unsplit_calls.append((out, lse, kw)),
+            out[:, :local_heads, :],
+        )[1],
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads_grouped",
+        lambda outs, lses, **kw: (
+            grouped_calls.append((tuple(outs), tuple(lses), kw)),
+            torch.cat(list(outs), dim=0)[:, :local_heads, :],
+        )[1],
+    )
+
+    q_rep = [
+        torch.randn(num_tokens, group_heads, 128),
+        torch.randn(num_tokens, group_heads, 64),
+    ]
+    if with_rope_table:
+        q_rep.append(torch.zeros(num_tokens, 64))
+
+    out = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=tuple(q_rep),
+    )
+    assert out.shape == (num_tokens, local_heads * layer.v_head_dim)
+
+    if expected_groups > 0:
+        target_grouped_op = (
+            layer.sparse_mla_dcp_grouped_rope_op
+            if with_rope_table
+            else layer.sparse_mla_dcp_grouped_op
+        )
+        target_grouped_op.assert_called_once()
+        layer.sparse_mla_dcp_op.assert_not_called()
+        layer.sparse_mla_dcp_rope_op.assert_not_called()
+        assert len(unsplit_calls) == 0
+        assert len(grouped_calls) == 1
+        got_outs, got_lses, got_kw = grouped_calls[0]
+        assert len(got_outs) == expected_groups
+        assert len(got_lses) == expected_groups
+        assert all(a is b for a, b in zip(got_outs, grouped_outs, strict=True))
+        assert all(a is b for a, b in zip(got_lses, grouped_lses, strict=True))
+        assert set(got_kw) == {"is_backbone", "query_start_loc"}
+        assert got_kw["is_backbone"] is True
+        assert got_kw["query_start_loc"] is qsl
+    else:
+        target_unsplit_op = (
+            layer.sparse_mla_dcp_rope_op if with_rope_table else layer.sparse_mla_dcp_op
+        )
+        target_unsplit_op.assert_called_once()
+        layer.sparse_mla_dcp_grouped_op.assert_not_called()
+        layer.sparse_mla_dcp_grouped_rope_op.assert_not_called()
+        assert len(grouped_calls) == 0
+        assert len(unsplit_calls) == 1
+        got_out, got_lse, got_kw = unsplit_calls[0]
+        assert got_out is single_partial
+        assert got_lse is single_lse
+        assert set(got_kw) == {"is_backbone", "query_start_loc"}
+        assert got_kw["is_backbone"] is (model_tag == "backbone")
+        assert got_kw["query_start_loc"] is qsl

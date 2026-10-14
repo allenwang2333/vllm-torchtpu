@@ -630,7 +630,9 @@ class _CollectiveGroup:
     def __init__(self, hub, rank):
         self.world_size = hub.world
         self.rank_in_group = rank
+        self.device_group = None
         self._hub = hub
+        self.calls = []
 
     def _exchange(self, x):
         hub = self._hub
@@ -641,9 +643,11 @@ class _CollectiveGroup:
         return got
 
     def all_gather(self, tensor, dim=0):
+        self.calls.append(("all_gather", tuple(tensor.shape)))
         return torch.cat(self._exchange(tensor), dim=dim)
 
     def reduce_scatter(self, tensor, dim=-1):
+        self.calls.append(("reduce_scatter", tuple(tensor.shape)))
         terms = self._exchange(tensor)
         total = terms[0]
         for term in terms[1:]:
@@ -651,10 +655,13 @@ class _CollectiveGroup:
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width).contiguous()
 
-    def all_to_all_blocks(self, x):
+    def all_to_all(self, x):
         """Block `d` of `x`'s leading axis to rank `d` (`cp_mla._all_to_all`)."""
+        self.calls.append(("all_to_all", tuple(x.shape)))
         terms = self._exchange(x)
         return torch.stack([t[self.rank_in_group] for t in terms])
+
+    all_to_all_blocks = all_to_all
 
 
 def _rs_merge_whole(outputs, lses, monkeypatch, **env):
@@ -977,6 +984,360 @@ def test_bf16_wire_leaves_unchunked_buckets_alone(monkeypatch):
     a = _rs_merge_whole(outputs, lses, monkeypatch)
     b = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_BF16=1)
     torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+# ===================================================================== #
+# The pipelined grouped merge (`TPU_DCP_MERGE_PIPELINED`).
+# ===================================================================== #
+
+_GROUPED_FAULT_EXPECTED_CHECK = {
+    "boundary_off_by_one": "check_pipelined_bitwise",
+    "neighbour_lse": "check_pipelined_bitwise",
+    "swapped_groups": "check_pipelined_bitwise",
+    "collapsed_cross_group_gather": "check_pipelined_gather_shapes",
+    "pipelined_on_a2a": "check_pipelined_collectives_match",
+    "pipelined_on_drafter": "check_pipelined_collectives_match",
+    "nan_padding_leak": "check_pipelined_finite",
+    "nonzero_padding_row": "check_pipelined_padding_zero",
+}
+
+
+def _slice_token_groups(tensor, group_rows, *, boundary_off_by_one=False):
+    num_groups = tensor.shape[1] // group_rows
+    groups = [
+        tensor[:, g * group_rows : (g + 1) * group_rows].contiguous()
+        for g in range(num_groups)
+    ]
+    if boundary_off_by_one and num_groups >= 2:
+        groups[1] = torch.cat(
+            [groups[0][:, -1:], groups[1][:, :-1]], dim=1
+        ).contiguous()
+    return tuple(groups)
+
+
+def _run_grouped_vs_reference(
+    outputs,
+    lses,
+    group_rows,
+    monkeypatch,
+    *,
+    real_tokens=None,
+    is_backbone=True,
+    fault=None,
+    **env,
+):
+    """Run ungrouped and grouped merges over `_CollectiveGroup` and assert contracts."""
+    defaults = {
+        "TPU_DCP_MERGE_PIPELINED": True,
+        "TPU_DCP_MERGE_CHUNKED": 4,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024,
+        "TPU_DCP_MERGE_RS_BF16": 1,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG": True,
+        "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 2048,
+        "TPU_DCP_MLA_TOPK_CAP_CHUNK": 256,
+        "TPU_DCP_MLA_SPLIT_Q_LSE": True,
+        "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": True,
+        "TPU_DCP_LSE_MERGE_A2A": True,
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": 64,
+        "TPU_DCP_LSE_MERGE_A2A_PACK": True,
+        "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
+        "TPU_MTP_DCP_MERGE_SIZED": False,
+    }
+    for name, value in {**defaults, **env}.items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+
+    world, num_tokens, heads, _ = outputs.shape
+    if real_tokens is None:
+        real_tokens = num_tokens
+    qsl = torch.tensor([0, real_tokens], dtype=torch.int32)
+
+    outs_g = _slice_token_groups(
+        outputs, group_rows, boundary_off_by_one=(fault == "boundary_off_by_one")
+    )
+    lses_g = _slice_token_groups(
+        lses, group_rows, boundary_off_by_one=(fault == "boundary_off_by_one")
+    )
+    if fault == "neighbour_lse" and len(lses_g) >= 2:
+        lses_g = (lses_g[0], torch.roll(lses_g[1], 1, dims=1), *lses_g[2:])
+    elif fault == "swapped_groups" and len(outs_g) >= 3:
+        outs_g = (outs_g[0], outs_g[2], outs_g[1], *outs_g[3:])
+        lses_g = (lses_g[0], lses_g[2], lses_g[1], *lses_g[3:])
+
+    expected_groups = cp_mla.pipelined_merge_groups(num_tokens, is_backbone)
+
+    def _run_world(fn_per_rank):
+        hub = _ExchangeHub(world)
+        groups = [_CollectiveGroup(hub, rank) for rank in range(world)]
+        monkeypatch.setattr(
+            cp_mla,
+            "get_dcp_group",
+            lambda: groups[int(threading.current_thread().name.rsplit("_", 1)[-1])],
+        )
+        monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, g: g.all_to_all(x))
+        monkeypatch.setattr(cp_mla, "_ragged_all_to_all", _ragged_stand_in(hub))
+        monkeypatch.setitem(
+            cp_mla._SIZED_MERGE_OPS,
+            world,
+            lambda o, lse: cp_mla._retain_rank(
+                cp_mla.cp_lse_ag_out_rs(o, lse, cp_mla.get_dcp_group())
+            ),
+        )
+
+        def worker(rank):
+            threading.current_thread().name = f"dcp_rank_{rank}"
+            return fn_per_rank(rank, groups[rank])
+
+        with concurrent.futures.ThreadPoolExecutor(world) as pool:
+            merged = torch.cat(list(pool.map(worker, range(world))), dim=1)
+        return merged, list(groups[0].calls)
+
+    want, ref_calls = _run_world(
+        lambda r, _g: cp_mla.merge_lse_partials_scatter_heads(
+            outputs[r], lses[r], is_backbone=is_backbone, query_start_loc=qsl
+        )
+    )
+
+    if fault in ("pipelined_on_a2a", "pipelined_on_drafter"):
+        monkeypatch.setattr(
+            cp_mla, "pipelined_merge_groups", lambda _n, _b: len(outs_g)
+        )
+    elif fault == "collapsed_cross_group_gather":
+        monkeypatch.setattr(
+            cp_mla,
+            "merge_lse_partials_scatter_heads_grouped",
+            lambda os_seq, ls_seq, **_kw: cp_mla._retain_rank(
+                cp_mla._merge_chunked_lse_gathered(
+                    torch.cat(list(os_seq), dim=0),
+                    torch.cat(list(ls_seq), dim=0),
+                    cp_mla.get_dcp_group(),
+                    len(os_seq),
+                )
+            ),
+        )
+    elif fault == "nan_padding_leak":
+        # In-op fault: omit the `torch.where(finite, ...)` zeroing on output
+        # rows so NaN partials on -inf rows multiply by 0.0 -> NaN.
+        def _unguarded_weighted_rs(output, lse_f32, lses_all, group):
+            shift = torch.where(
+                torch.isfinite(lses_all),
+                lses_all,
+                torch.full_like(lses_all, float("-inf")),
+            ).amax(dim=0)
+            shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
+            w = torch.exp(lses_all - shift)
+            den = w.sum(dim=0)
+            w_r = torch.exp(lse_f32 - shift) / torch.where(
+                den > 0, den, torch.ones_like(den)
+            )
+            return cp_mla._scatter_sum(output.float() * w_r.unsqueeze(-1), group)
+
+        monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter", _unguarded_weighted_rs)
+    elif fault == "nonzero_padding_row":
+        # In-op fault: on rows where no rank owns any KV (`merged_lse == -inf`),
+        # emit finite non-zero instead of 0.0 so `check_pipelined_finite` passes
+        # and `check_pipelined_padding_zero` fires.
+        def _nonzero_padding_wrs(output, lse_f32, lses_all, group):
+            merged_lse = torch.logsumexp(lses_all, dim=0)
+            weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+            weighted = output.to(torch.float32) * weight
+            zeroed = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+            weighted = torch.where(
+                torch.isfinite(merged_lse).unsqueeze(-1),
+                zeroed,
+                torch.ones_like(zeroed),
+            )
+            return cp_mla._scatter_sum(weighted, group).to(output.dtype)
+
+        monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter", _nonzero_padding_wrs)
+
+    got, grp_calls = _run_world(
+        lambda r, _g: cp_mla.merge_lse_partials_scatter_heads_grouped(
+            [g[r] for g in outs_g],
+            [g[r] for g in lses_g],
+            is_backbone=is_backbone,
+            query_start_loc=qsl,
+        )
+    )
+
+    if not torch.isfinite(want.float()).all() or not torch.isfinite(got.float()).all():
+        raise AssertionError(
+            "check_pipelined_finite: non-finite values in merged output"
+        )
+    if (num_tokens > 3 and not (got[3] == 0).all()) or (
+        real_tokens < num_tokens and not (got[real_tokens:] == 0).all()
+    ):
+        raise AssertionError(
+            "check_pipelined_padding_zero: all-(-inf) or padding rows are not zero"
+        )
+
+    if expected_groups > 1 and len(outs_g) == expected_groups:
+        ag_shapes = [shape for op, shape in grp_calls if op == "all_gather"]
+        want_ag = [(1, group_rows, heads)] * expected_groups
+        if ag_shapes != want_ag:
+            raise AssertionError(
+                f"check_pipelined_gather_shapes: expected {want_ag}, got {ag_shapes}"
+            )
+    else:
+        if grp_calls != ref_calls:
+            raise AssertionError(
+                f"check_pipelined_collectives_match: {grp_calls} != {ref_calls}"
+            )
+
+    if not torch.equal(got.view(torch.int16), want.view(torch.int16)):
+        raise AssertionError(
+            f"check_pipelined_bitwise: grouped output differs from reference "
+            f"(T={num_tokens}, R={group_rows})"
+        )
+    return got, ref_calls, grp_calls
+
+
+@pytest.mark.parametrize(
+    "tokens,is_backbone,overrides,expected",
+    [
+        (2048, True, {"TPU_DCP_MERGE_PIPELINED": False}, 0),
+        (2048, True, {"TPU_DCP_MLA_SPLIT_Q_LSE": False}, 0),
+        (2048, True, {"TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": False}, 0),
+        (2048, True, {"TPU_DCP_MERGE_CHUNKED": 0}, 0),
+        (2048, True, {"TPU_DCP_MERGE_CHUNKED": 1}, 0),
+        (2048, False, {}, 0),  # MTP drafter
+        (32, True, {"TPU_DCP_LSE_MERGE_A2A": True}, 0),  # decode a2a bucket
+        (512, True, {"TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024}, 0),  # below floor
+        (1024, True, {"TPU_DCP_MERGE_CHUNKED": 8}, 0),  # 1024 // 8 = 128 < 256 cap
+        (1024, True, {"TPU_DCP_MERGE_CHUNKED": 4}, 4),
+        (2048, True, {"TPU_DCP_MERGE_CHUNKED": 4}, 4),
+        (2048, True, {"TPU_DCP_MERGE_CHUNKED": 8}, 8),
+        (4096, True, {"TPU_DCP_MERGE_CHUNKED": 4}, 4),
+        (4096, True, {"TPU_DCP_MERGE_CHUNKED": 8}, 8),
+    ],
+)
+def test_pipelined_merge_groups_gate(
+    tokens, is_backbone, overrides, expected, monkeypatch
+):
+    defaults = {
+        "TPU_DCP_MERGE_PIPELINED": True,
+        "TPU_DCP_MLA_SPLIT_Q_LSE": True,
+        "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL": True,
+        "TPU_DCP_MERGE_CHUNKED": 8,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024,
+        "TPU_DCP_MLA_TOPK_CAP_CHUNK": 256,
+        "TPU_DCP_LSE_MERGE_A2A": True,
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": 64,
+    }
+    for name, value in {**defaults, **overrides}.items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+    assert cp_mla.pipelined_merge_groups(tokens, is_backbone) == expected
+
+
+@pytest.mark.parametrize("tokens", [1024, 2048, 4096])
+@pytest.mark.parametrize("chunks", [4, 8])
+@pytest.mark.parametrize("rs_bf16", [0, 1, 2])
+@pytest.mark.parametrize(
+    "lse_ag,lse_ag_cap", [(False, 2048), (True, 2048), (True, 1024)]
+)
+def test_grouped_merge_is_bitwise_the_unsplit_merge(
+    tokens, chunks, rs_bf16, lse_ag, lse_ag_cap, monkeypatch
+):
+    """54-case matrix: grouped merge returns the unsplit merge bit for bit,
+    zeros all-`-inf` / padding rows on zero-weight NaN partials, and replaces
+    the collapsed cross-group LSE gather with per-group gathers."""
+    real_tokens = tokens - 64
+    outputs, lses = _hard_partials(
+        np.random.default_rng(101 + tokens + chunks * 7 + rs_bf16),
+        8,
+        tokens=tokens,
+        local_heads=1,
+        vdim=16,
+    )
+    lses[:, real_tokens:] = float("-inf")
+    outputs = _nan_where_unowned(outputs, lses)
+    group_rows = max(tokens // chunks, 256)
+    _, ref_calls, grp_calls = _run_grouped_vs_reference(
+        outputs,
+        lses,
+        group_rows,
+        monkeypatch,
+        real_tokens=real_tokens,
+        is_backbone=True,
+        TPU_DCP_MERGE_CHUNKED=chunks,
+        TPU_DCP_MERGE_RS_BF16=rs_bf16,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS=lse_ag_cap,
+    )
+    if tokens // chunks >= 256 and lse_ag and tokens <= lse_ag_cap:
+        ref_ag = [s for op, s in ref_calls if op == "all_gather"]
+        grp_ag = [s for op, s in grp_calls if op == "all_gather"]
+        assert ref_ag == [(1, tokens, 8)]
+        assert grp_ag == [(1, group_rows, 8)] * chunks
+
+
+@pytest.mark.parametrize(
+    "tokens,group_rows,is_backbone,overrides",
+    [
+        (16, 8, True, {"TPU_DCP_LSE_MERGE_A2A_PACK": False}),
+        (32, 16, True, {"TPU_DCP_LSE_MERGE_A2A_PACK": True}),
+        (
+            32,
+            16,
+            True,
+            {
+                "TPU_DCP_LSE_MERGE_A2A_PACK": True,
+                "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": True,
+            },
+        ),
+        (512, 256, True, {}),  # unchunked backbone bucket
+        (1024, 256, True, {"TPU_DCP_MERGE_CHUNKED": 8}),  # 1024 // 8 < 256 fallback
+        (16, 8, False, {"TPU_MTP_DCP_MERGE_SIZED": True}),  # sized drafter
+        (1024, 256, False, {"TPU_MTP_DCP_MERGE_SIZED": False}),  # unsized drafter
+        (2048, 256, True, {"TPU_DCP_MERGE_PIPELINED": False}),  # flag off
+    ],
+)
+def test_grouped_merge_non_pipelined_routes_unchanged(
+    tokens, group_rows, is_backbone, overrides, monkeypatch
+):
+    outputs, lses = _hard_partials(
+        np.random.default_rng(303 + tokens),
+        8,
+        tokens=tokens,
+        local_heads=1,
+        vdim=64,
+    )
+    real_tokens = max(tokens - 4, 1)
+    lses[:, real_tokens:] = float("-inf")
+    outputs = _nan_where_unowned(outputs, lses)
+    _run_grouped_vs_reference(
+        outputs,
+        lses,
+        group_rows,
+        monkeypatch,
+        real_tokens=real_tokens,
+        is_backbone=is_backbone,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    "fault,expected_check", list(_GROUPED_FAULT_EXPECTED_CHECK.items())
+)
+def test_grouped_merge_fault_controls_fail(fault, expected_check, monkeypatch):
+    tokens = 32 if fault == "pipelined_on_a2a" else 1024
+    group_rows = 8 if fault == "pipelined_on_a2a" else 256
+    is_backbone = fault != "pipelined_on_drafter"
+    outputs, lses = _hard_partials(
+        np.random.default_rng(505), 8, tokens=tokens, local_heads=1, vdim=64
+    )
+    real_tokens = tokens - 4
+    lses[:, real_tokens:] = float("-inf")
+    outputs = _nan_where_unowned(outputs, lses)
+    with pytest.raises(AssertionError, match=rf"^{expected_check}:"):
+        _run_grouped_vs_reference(
+            outputs,
+            lses,
+            group_rows,
+            monkeypatch,
+            real_tokens=real_tokens,
+            is_backbone=is_backbone,
+            fault=fault,
+        )
 
 
 # ===================================================================== #
