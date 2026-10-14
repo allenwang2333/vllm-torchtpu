@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     HOST_TRACER_LEVEL: int = 2
     DEVICE_TRACER_LEVEL: int = 1
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
+    TPU_HIDDEN_NAN_LOG: bool = False
     TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
     TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
@@ -399,6 +400,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "DEVICE_TRACER_LEVEL": lambda: int(os.getenv("DEVICE_TRACER_LEVEL") or "1"),
     # TPU trace mode (e.g. TRACE_COMPUTE, TRACE_COMPUTE_AND_SYNC)
     "TPU_TRACE_MODE": lambda: os.getenv("TPU_TRACE_MODE", "TRACE_COMPUTE"),
+    "TPU_HIDDEN_NAN_LOG": env_bool("TPU_HIDDEN_NAN_LOG"),
     # Number of sparse cores to trace
     "TPU_NUM_SPARSE_CORES_TO_TRACE": lambda: int(
         os.getenv("TPU_NUM_SPARSE_CORES_TO_TRACE") or "1"
