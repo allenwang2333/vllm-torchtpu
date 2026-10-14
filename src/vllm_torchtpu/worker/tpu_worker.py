@@ -828,6 +828,7 @@ class TPUWorker(WorkerBase):
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
+        memory_debug.maybe_clear_jax_caches()
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         memory_debug.stage("pre_g1", count_executables=False)

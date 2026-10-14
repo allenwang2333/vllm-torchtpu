@@ -23,6 +23,10 @@ Ablations (turn one fix off to measure it against a run with all fixes):
   VLLM_TPU_MEMDBG_NO_A1D=1  copies of compiled artifacts reload the program.
   VLLM_TPU_MEMDBG_NO_C1=1   keep the expert staging pool after loading.
   VLLM_TPU_MEMDBG_NO_G1=1   do not return freed startup heap after warmup.
+
+Experiments:
+  VLLM_TPU_MEMDBG_JAX_CLEAR=1  after warmup, drop jax's tracing caches (jaxprs
+      of the Pallas kernels traced while torch.compile exported them).
 """
 
 import ctypes
@@ -45,6 +49,7 @@ PYCENSUS = _flag("VLLM_TPU_MEMDBG_PYCENSUS")
 NO_A1D = _flag("VLLM_TPU_MEMDBG_NO_A1D")
 NO_C1 = _flag("VLLM_TPU_MEMDBG_NO_C1")
 NO_G1 = _flag("VLLM_TPU_MEMDBG_NO_G1")
+JAX_CLEAR = _flag("VLLM_TPU_MEMDBG_JAX_CLEAR")
 
 # tcmalloc is LD_PRELOADed in our images; resolve from the process.
 _process_symbols = ctypes.CDLL(None)
@@ -270,3 +275,15 @@ def start_periodic_sampler() -> None:
 
     threading.Thread(target=_loop, name="memdbg-sampler", daemon=True).start()
 
+
+
+def maybe_clear_jax_caches() -> None:
+    """(experiment) Drop jax tracing caches once every program is compiled."""
+    if not JAX_CLEAR:
+        return
+    import jax
+
+    stage("pre_jax_clear", count_executables=False)
+    jax.clear_caches()
+    gc.collect()
+    stage("post_jax_clear", count_executables=False)
