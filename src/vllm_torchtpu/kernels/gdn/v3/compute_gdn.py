@@ -14,6 +14,7 @@
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config
 
@@ -33,6 +34,94 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+def _lane_gather(x: jax.Array, idx: jax.Array) -> jax.Array:
+    """`jnp.take_along_axis(x, idx, axis=-1)` for 2D x: a lane permute."""
+    dnums = jax.lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(1,),
+        start_index_map=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(0,),
+    )
+    return jax.lax.gather(
+        x,
+        idx[..., None],
+        dnums,
+        slice_sizes=(1, 1),
+        mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
+
+
+def _can_pair_heads(t_mat: jax.Array, b_mat: jax.Array) -> bool:
+    """Whether `_forward_sub_paired` applies: two heads' columns fill the
+    lanes, and a pair's rows fit one vreg."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    heads, rows, cols = b_mat.shape
+    return (
+        2 * cols == num_lanes
+        and 2 * rows <= num_lanes
+        and heads % 2 == 0
+        and t_mat.dtype == b_mat.dtype == jnp.float32
+    )
+
+
+def _forward_sub_paired(t_mat: jax.Array, b_mat: jax.Array) -> jax.Array:
+    """Unit lower-triangular forward substitution with two heads per vreg.
+
+    Heads 2p and 2p + 1 sit side by side along lanes, so each multiply,
+    sublane sum and subtract covers both. Row i's coefficients t[h, i, j]
+    reach sublane j by a sublane broadcast of the pair's row i and one
+    lane gather whose pattern is the same for every pair and row. Every
+    element goes through the same operations on the same values as the
+    one-head-per-vreg loop in `invert_triangular_matrix`: lanes are
+    independent in the sublane sums.
+    """
+    heads, rows, cols = b_mat.shape
+    lanes = 2 * cols
+    pairs = b_mat.reshape(heads // 2, 2, rows, cols)
+    b_pair = jnp.concatenate([pairs[:, 0], pairs[:, 1]], axis=-1)
+
+    # [heads // 2, rows, lanes]: head 2p's row on lanes [0, rows), head
+    # 2p + 1's on [rows, 2 * rows).
+    t_pairs = t_mat.reshape(heads // 2, 2, rows, rows)
+    pad = jnp.zeros((heads // 2, rows, lanes - 2 * rows), t_mat.dtype)
+    t_rows = jnp.concatenate([t_pairs[:, 0], t_pairs[:, 1], pad], axis=-1)
+    # Sublane s of the gather picks column j0 + s of its half's head.
+    sublanes = pltpu.get_tpu_info().num_sublanes
+    sub = jax.lax.broadcasted_iota(jnp.int32, (sublanes, lanes), 0)
+    lane = jax.lax.broadcasted_iota(jnp.int32, (sublanes, lanes), 1)
+    col = jnp.where(lane < cols, sub, rows + sub)
+
+    x_list = []
+    for i in range(rows):
+        b_i = b_pair[:, i, :]
+        if i == 0:
+            x_i = b_i
+        else:
+            stacked_x = jnp.stack(x_list, axis=1)
+            # [heads // 2, i, lanes]: t[h, i, j] down sublane j.
+            prev_t = []
+            for j0 in range(0, i, sublanes):
+                prev_t.append(
+                    jnp.stack(
+                        [
+                            _lane_gather(
+                                jnp.broadcast_to(row[i : i + 1], (sublanes, lanes)),
+                                col + j0,
+                            )
+                            for row in t_rows
+                        ]
+                    )
+                )
+            prev_t = jnp.concatenate(prev_t, axis=1)[:, :i]
+            prev_sum = jnp.sum(prev_t * stacked_x, axis=1)
+            x_i = b_i - prev_sum
+        x_list.append(x_i)
+    x_pair = jnp.stack(x_list, axis=1)
+    x = jnp.stack([x_pair[..., :cols], x_pair[..., cols:]], axis=1)
+    return x.reshape(heads, rows, cols)
+
+
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     """Compute invert matrix of a given triauglar matrix."""
@@ -44,6 +133,8 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     num_blocks = chunk // block_size
 
     def local_forward_sub(t_mat, b_mat):
+        if _can_pair_heads(t_mat, b_mat):
+            return _forward_sub_paired(t_mat, b_mat)
         x_list = []
         for i in range(block_size):
             b_i = b_mat[:, i, :]
