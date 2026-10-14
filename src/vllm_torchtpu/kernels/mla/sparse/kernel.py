@@ -294,11 +294,9 @@ def _window_physical_rows(
 
     # 3. Handle empty padding slots (-1) with pseudo-random scattering.
     # If all -1s read row 0, SparseCore would bottleneck on memory bank 0.
-    # Multiplying unique slot coordinates by large primes hashes -1s uniformly.
-    _, scattered_page = _floor_divmod_const(
-        flat_element_index * 104729, total_num_pages
+    scattered_page, scattered_offset = scatter_padding_slots(
+        flat_element_index, total_num_pages, page_size
     )
-    _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
 
     # Use the real page/offset for valid slots; use scattered values for -1 padding.
     page = jnp.where(is_padding, scattered_page, page)
