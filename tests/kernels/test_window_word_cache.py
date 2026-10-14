@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.mla.cache_layout import pack_cache_values
 from vllm_torchtpu.kernels.mla.window_attention import attend_windows
 from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
 
@@ -63,9 +64,7 @@ def test_window_attention_matches_dense_masked_attention(queries, heads, dim, ke
     )
     kv = jax.random.normal(jax.random.key(1), (groups, keys, dim)).astype(jnp.bfloat16)
     kv = kv.at[:, queries + 64 :].set(jnp.nan)
-    words = jax.lax.bitcast_convert_type(
-        kv.reshape(groups, keys, dim // 2, 2), jnp.int32
-    )
+    words = pack_cache_values(kv)
     words = words.reshape(groups, keys, dim // 256, 128).transpose(2, 0, 1, 3)
     column = jnp.arange(keys)[None, None]
     row = jnp.arange(queries)[None, :, None]

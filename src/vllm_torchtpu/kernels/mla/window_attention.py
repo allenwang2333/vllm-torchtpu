@@ -26,7 +26,7 @@ def _kernel(q_ref, words_ref, mask_ref, max_ref, den_ref, num_ref, *, scale):
             [words_ref[c, 0, key_slice] for c in range(chunks)], axis=1
         ).reshape(key_block, 1, dim // 2)
         packed = pltpu.bitcast(words, q_ref.dtype)
-        kv = packed.transpose(0, 2, 1).reshape(key_block, dim)
+        kv = packed.reshape(key_block, dim)
         valid = mask_ref[0, :, key_slice]
         used = valid.astype(jnp.int32).sum(axis=0, keepdims=True).T > 0
         kv = jnp.where(used, kv, 0)
@@ -76,8 +76,8 @@ def attend_windows(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return FP32 max, denominator and numerator for independent windows.
 
-    ``words[dim // 256, groups, keys, 128]`` contains consecutive BF16 element
-    pairs in each int32 word. Each group owns consecutive queries from
+    ``words[dim // 256, groups, keys, 128]`` pairs corresponding elements
+    of the two contiguous feature halves. Each group owns queries from
     ``q[tokens, heads, dim]``; ``mask[groups, queries, keys]`` defines their
     exact windows, including request boundaries and padded tokens.
     """
