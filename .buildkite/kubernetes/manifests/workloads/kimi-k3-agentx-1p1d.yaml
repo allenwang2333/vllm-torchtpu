@@ -139,6 +139,11 @@ spec:
                     - name: k3-checkpoint
                       mountPath: /ckpt/k3
                       readOnly: true
+                    # Inside the fleet's /cache/hf/hub, which the launcher
+                    # mounts ahead of this.
+                    - name: k3-presharded
+                      mountPath: /cache/hf/hub/presharded/kimi-k3-tp32
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
@@ -155,6 +160,25 @@ spec:
                     volumeAttributes:
                       bucketName: tpu-commons-ci
                       mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+                # The TP32 pre-shard the megakernel configs load, from the model
+                # bucket the fleet mounts at /cache/hf/hub (us-central1's, the
+                # only cluster with 2x2x4 pools), mounted again without a file
+                # cache. Through the fleet's mount the shards fill its 65Gi
+                # gcsfuse file cache, which is host memory: 61-67 GiB on every
+                # engine host in vllm-torchtpu-dev builds 562, 588 and 589,
+                # enough to get build 562's prefill head evicted under a 1.5 TiB
+                # host KV store. A boot reads each shard once and the cache goes
+                # with the pod, so nothing hits it. With no fileCacheCapacity
+                # the mount has no file cache; read_ahead_kb is the fleet
+                # mount's, for the loader's large sequential reads.
+                - name: k3-presharded
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=presharded/kimi-k3-tp32,read_ahead_kb=131072"
                       skipCSIBucketAccessCheck: "true"
 
     - name: decode
@@ -233,6 +257,9 @@ spec:
                     - name: k3-checkpoint
                       mountPath: /ckpt/k3
                       readOnly: true
+                    - name: k3-presharded
+                      mountPath: /cache/hf/hub/presharded/kimi-k3-tp32
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
@@ -249,6 +276,15 @@ spec:
                     volumeAttributes:
                       bucketName: tpu-commons-ci
                       mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+                # The pre-shard without a file cache, as prefill's.
+                - name: k3-presharded
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=presharded/kimi-k3-tp32,read_ahead_kb=131072"
                       skipCSIBucketAccessCheck: "true"
 
     # Chipless, so it is scheduled by its requests onto a worker-cpu node rather
