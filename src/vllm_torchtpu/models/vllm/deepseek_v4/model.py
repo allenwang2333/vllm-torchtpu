@@ -87,7 +87,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.layer_idx = int(_m.group(1)) if _m else -1
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = VllmDeepseekV4MLAAttention(
+        attn_cls = VllmDeepseekV4MLAAttention
+        if envs.TPU_DSV4_ATTN_INTRA_CHIP_TP:
+            from vllm_torchtpu.models.vllm.deepseek_v4.attn_intra_chip import (
+                VllmDeepseekV4MLAAttentionIntraChip as attn_cls,
+            )
+        self.attn = attn_cls(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,

@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_LOG_HOST_TENSORS_AFTER_LOAD: bool = False
+    TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -715,6 +716,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reachable and what holds the largest of it. A one-off diagnostic for host
     # memory that does not come back after loading; costs one GC walk.
     "TPU_LOG_HOST_TENSORS_AFTER_LOAD": env_bool("TPU_LOG_HOST_TENSORS_AFTER_LOAD"),
+    # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
+    # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
+    "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
