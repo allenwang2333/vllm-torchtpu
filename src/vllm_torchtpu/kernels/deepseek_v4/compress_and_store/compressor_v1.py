@@ -172,6 +172,12 @@ def prepare_boundary_batch(
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+
+    The store kernel read-modify-writes each HBM row (``rope_pack`` records)
+    within one tile of 4 slots, so a row's prefill records never straddle
+    tiles. Rows do share tiles where they fit: whole rows of 4, a row of 3
+    with one of 1, rows of 2 in pairs, rows of 1 in fours. The kernel walks
+    one grid step per tile, and one row per tile left most slots empty.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
@@ -189,27 +195,70 @@ def prepare_boundary_batch(
     valid_token = kv >= 0
     is_prefill = valid_token & ~is_decode
 
-    # 3. Calculate row-tiling ONLY for prefill tokens
+    # 3. Prefill rows: a row id per record, its rank within the row, and the
+    # number of records each row has.
     row = jnp.where(is_prefill, kv // rope_pack, -1)
     row_shifted = jnp.roll(row, 1)
     starts_row = (row != row_shifted) & is_prefill
     starts_row = starts_row.at[0].set(is_prefill[0])
 
-    tile_index = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
-
+    row_id = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
     index = jnp.arange(packed_size)
     run_start = jax.lax.cummax(jnp.where(starts_row, index, 0))
-    pos_within_tile = index - run_start
+    pos_within_row = index - run_start
+    row_size = (
+        jnp.zeros((packed_size,), jnp.int32)
+        .at[jnp.where(is_prefill, row_id, packed_size)]
+        .add(1, mode="drop")
+    )
 
-    # 4. Calculate alignment offset for prefill block
+    # 4. Tile and slot offset of every row, by size class (all counts and
+    # ranks are over rows, in row order).
+    def rank_and_count(size):
+        is_size = row_size == size
+        return jnp.cumsum(is_size.astype(jnp.int32)) - 1, jnp.sum(is_size)
+
+    r1, n1 = rank_and_count(1)
+    r2, n2 = rank_and_count(2)
+    r3, n3 = rank_and_count(3)
+    r4, n4 = rank_and_count(4)
+    ones_with_threes = jnp.minimum(n3, n1)
+    tiles_of_twos = n2 // 2 + n2 % 2
+    # An odd row of 2 leaves two slots, which take the next two rows of 1.
+    ones_with_odd_two = jnp.where(n2 % 2 == 1, jnp.minimum(2, n1 - ones_with_threes), 0)
+    first_tile_3 = n4
+    first_tile_2 = n4 + n3
+    first_tile_1 = first_tile_2 + tiles_of_twos
+    k = r1 - ones_with_threes
+    rest = k - ones_with_odd_two
+    tile_1 = jnp.where(
+        r1 < ones_with_threes,
+        first_tile_3 + r1,
+        jnp.where(k < ones_with_odd_two, first_tile_2 + n2 // 2, first_tile_1 + rest // 4),
+    )
+    offset_1 = jnp.where(
+        r1 < ones_with_threes, 3, jnp.where(k < ones_with_odd_two, 2 + k, rest % 4)
+    )
+    row_tile = jnp.select(
+        [row_size == 4, row_size == 3, row_size == 2],
+        [r4, first_tile_3 + r3, first_tile_2 + r2 // 2],
+        tile_1,
+    )
+    row_offset = jnp.select(
+        [row_size == 4, row_size == 3, row_size == 2], [0, 0, 2 * (r2 % 2)], offset_1
+    )
+
+    # 5. Combine destination indices
     K = jnp.sum(is_decode)
     K_aligned = ((K + 3) // 4) * 4
 
-    # 5. Combine destination indices
     prefill_size = rope_pack * max_prefill_boundary
     output_size = num_tokens + prefill_size
 
-    dest_prefill = K_aligned + tile_index * rope_pack + pos_within_tile
+    safe_row = jnp.maximum(row_id, 0)
+    dest_prefill = (
+        K_aligned + row_tile[safe_row] * rope_pack + row_offset[safe_row] + pos_within_row
+    )
     dest = jnp.where(is_decode, index, dest_prefill)
     dest = jnp.where(valid_token, dest, output_size)
 
