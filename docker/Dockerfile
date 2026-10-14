@@ -187,6 +187,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --group vllm \
       --extra omni
 
+# `vllm serve --omni` imports torchaudio (vllm_omni.entrypoints.openai.
+# audio_utils_mixin) even for image models, and vllm-omni does not declare it.
+# The PyPI torchaudio wheel links CUDA (libcudart) and fails to import here, so
+# install the CPU build from the PyTorch CPU index. torchaudio releases no
+# longer track torch minor versions (2.11.0 is the newest CPU wheel; it imports
+# against torch 2.13.0+cpu). --no-deps leaves the installed torch untouched.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-deps \
+      --index-url https://download.pytorch.org/whl/cpu \
+      "torchaudio==2.11.0" && \
+    python -c "import torchaudio, torchaudio.functional as F; F.melscale_fbanks"
 
 # Variant 5: Production/Full Image (Production/Minimal Variant)
 # This variant copies all source code and installs the package regularly
