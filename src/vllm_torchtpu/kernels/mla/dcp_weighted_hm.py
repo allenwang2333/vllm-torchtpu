@@ -100,3 +100,20 @@ def weighted_heads_major(
         ),
         name=f"dcp_weighted_hm_t{t}_h{h}" + ("_bf16" if out_dtype.itemsize == 2 else ""),
     )(o, w.astype(jnp.float32))
+
+
+@functools.partial(jax.jit, static_argnames=("out_dtype",))
+def weighted_heads_major_xla(
+    o: jax.Array, w: jax.Array, out_dtype=jnp.float32
+) -> jax.Array:
+    """`weighted_heads_major` in XLA ops: the same f32 product, the same
+    `where`, the same single rounding to `out_dtype`, then heads-major. For
+    the buckets below TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS, where the
+    kernel's per-chunk launch costs more than the fusion XLA emits."""
+    t, h, _ = o.shape
+    if w.shape != (t, h):
+        raise ValueError(f"w {w.shape} must be [{t}, {h}]")
+    w = w.astype(jnp.float32)[:, :, None]
+    x = o.astype(jnp.float32) * w
+    x = jnp.where(w > 0, x, jnp.zeros_like(x)).astype(out_dtype)
+    return jnp.transpose(x, (1, 0, 2))

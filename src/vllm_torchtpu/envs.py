@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MERGE_PIECES: int = 0
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = False
+    TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_RS_LAG: int = 0
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 1
@@ -579,6 +580,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter (which it may offload to the SparseCore and complete
     # late). Same products, same reduce-scatter: bit-identical.
     "TPU_DCP_MERGE_WEIGHTED_HM": env_bool("TPU_DCP_MERGE_WEIGHTED_HM", default=False),
+    # With TPU_DCP_MERGE_WEIGHTED_HM: the Pallas kernel only for buckets of at
+    # least this many tokens (0 = every chunked bucket). Smaller buckets build
+    # the same heads-major operand with XLA ops inside the same op (multiply,
+    # where, transpose, cast: the same bits). Tested in JAX on the chunk's
+    # static row count times TPU_DCP_MERGE_CHUNKED, not in torch, where a
+    # token-count test specializes range-compiled graphs.
+    "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", 0
+    ),
     # With TPU_DCP_MERGE_WEIGHTED_HM: chunk k's weights wait (optimization
     # barrier) for chunk k-n's merged result, so the schedule completes the
     # SparseCore reduce-scatters as the chain runs instead of all after the

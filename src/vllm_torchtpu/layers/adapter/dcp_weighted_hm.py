@@ -20,11 +20,26 @@ import torch
 from jax import lax
 from torch_tpu._internal import pallas
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.mla import dcp_weighted_hm as _k
 
 
+def use_kernel(chunk_rows: int) -> bool:
+    """TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS on the bucket: the op sees one
+    merge chunk (static rows); the chunked merge splits every bucket it takes
+    into TPU_DCP_MERGE_CHUNKED equal chunks."""
+    bucket = chunk_rows * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+    return bucket >= envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS
+
+
+def _build(o: jax.Array, w: jax.Array, out_dtype) -> jax.Array:
+    if use_kernel(o.shape[0]):
+        return _k.weighted_heads_major(o, w, out_dtype=out_dtype)
+    return _k.weighted_heads_major_xla(o, w, out_dtype=out_dtype)
+
+
 def _fn(o: jax.Array, w: jax.Array) -> jax.Array:
-    return _k.weighted_heads_major(o, w)
+    return _build(o, w, jnp.float32)
 
 
 def _fake(o: torch.Tensor, w: torch.Tensor):
@@ -37,7 +52,7 @@ _op.register_fake(_fake)
 
 
 def _fn_bf16(o: jax.Array, w: jax.Array) -> jax.Array:
-    return _k.weighted_heads_major(o, w, out_dtype=jnp.bfloat16)
+    return _build(o, w, jnp.bfloat16)
 
 
 def _fake_bf16(o: torch.Tensor, w: torch.Tensor):

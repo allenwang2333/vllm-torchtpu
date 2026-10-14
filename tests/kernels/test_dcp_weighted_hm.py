@@ -77,3 +77,47 @@ def test_weighted_heads_major_bf16_out_bit_identical(t, h):
         o, w, fault="swap_heads", out_dtype=jnp.bfloat16
     )
     assert not np.array_equal(np.asarray(bad).view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+@pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("t,h", [(128, 64), (256, 64), (16, 64)])
+def test_weighted_heads_major_xla_matches_kernel(t, h, out_dtype):
+    """TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS' small-bucket path (XLA ops) writes
+    the kernel's bits, so the gate changes no merged row."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("Pallas TPU kernel")
+    o, w = _case(t, h, seed=5 * t + h)
+    view = np.uint16 if jnp.dtype(out_dtype).itemsize == 2 else np.uint32
+    got = dcp_weighted_hm.weighted_heads_major_xla(o, w, out_dtype=out_dtype)
+    want = dcp_weighted_hm.weighted_heads_major(o, w, out_dtype=out_dtype)
+    assert got.dtype == want.dtype and got.shape == want.shape == (h, t, o.shape[-1])
+    np.testing.assert_array_equal(np.asarray(got).view(view), np.asarray(want).view(view))
+    bad = dcp_weighted_hm.weighted_heads_major(o, w, fault="swap_heads", out_dtype=out_dtype)
+    assert not np.array_equal(np.asarray(bad).view(view), np.asarray(got).view(view))
+
+
+@pytest.mark.parametrize(
+    "min_tokens,chunks,rows,kernel",
+    [
+        (0, 8, 128, True),  # default: every bucket
+        (2048, 8, 128, False),  # c1k bucket (1024 = 8 x 128): XLA
+        (2048, 8, 256, True),  # c2k bucket (2048): kernel
+        (2048, 8, 512, True),  # c8k step's 4096 bucket: kernel
+        (2048, 4, 256, False),  # 4 chunks of 256 = 1024
+    ],
+)
+def test_weighted_hm_min_tokens_dispatch(monkeypatch, min_tokens, chunks, rows, kernel):
+    adapter = pytest.importorskip("vllm_torchtpu.layers.adapter.dcp_weighted_hm")
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", min_tokens, raising=False)
+    monkeypatch.setattr(envs, "TPU_DCP_MERGE_CHUNKED", chunks, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        adapter._k, "weighted_heads_major", lambda o, w, out_dtype: calls.append("kernel")
+    )
+    monkeypatch.setattr(
+        adapter._k, "weighted_heads_major_xla", lambda o, w, out_dtype: calls.append("xla")
+    )
+    adapter._build(jnp.zeros((rows, 64, 512), jnp.bfloat16), jnp.zeros((rows, 64)), jnp.bfloat16)
+    assert calls == ["kernel" if kernel else "xla"]
