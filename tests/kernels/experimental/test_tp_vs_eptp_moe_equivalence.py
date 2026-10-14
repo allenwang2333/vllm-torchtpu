@@ -70,7 +70,6 @@ def _on_tpu():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _on_tpu(), reason=f"needs {N} TPU devices")
 
 
 def _q(key, shape):
@@ -378,6 +377,9 @@ def _run_all():
 
 @pytest.fixture(scope="module")
 def result():
+    # Not at import: a JAX backend initialized during collection claims the TPU.
+    if not _on_tpu():
+        pytest.skip(f"needs {N} TPU devices")
     return _run_all()
 
 
