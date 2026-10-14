@@ -215,14 +215,17 @@ def test_dcp_merge_chunked_small_on_real_collectives(tmp_path):
     for key, t in sorted(total.items()):
         print(f"CHUNKSMALL {key}: {json.dumps(t)}")
         if "/vspace/" in key and "off_scale_ulp" in t:
-            # Larger chunks may move the bf16 reduce-scatter to another
-            # algorithm (another summation order): held to RS_BF16's own bound
-            # against f64 and to no worse mean error than off.
+            # Larger chunks may move the bf16 reduce-scatter from the
+            # TensorCore to the SparseCore offload (output >= the offload
+            # minimum, 1 MiB): another summation order. Held to RS_BF16's own
+            # bound against f64 and within 5 % of off's mean error
+            # (j-7cd02c33: +3.2 % at T=1024; with the offload minimum at
+            # 256 KiB, where off is offloaded too, the arms are bitwise).
             ok = all(
                 t[f"{a}_ndiff"] == 0
                 or (
                     t[f"{a}_scale_ulp"] <= vm.RS_BF16_MAX_SCALE_ULP
-                    and t[f"{a}_mean_abs"] <= 1.01 * t["off_mean_abs"]
+                    and t[f"{a}_mean_abs"] <= 1.05 * t["off_mean_abs"]
                 )
                 for a in ARMS
             )
