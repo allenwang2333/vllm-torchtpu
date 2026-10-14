@@ -1479,6 +1479,79 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
     )
 
 
+def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `lm_head.weight` is arg 1 of compute_logits and `model.embed_tokens.weight`
+    # is arg 1 of forward_bucket. weight.json `index` is the global HBM weight
+    # slot, so the two tensors must not share it.
+    export_dir = tmp_path / "export_lm_head_index"
+    monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
+    monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
+    (export_dir / "serving_checkpoint").mkdir(parents=True, exist_ok=True)
+    seed_weights = {
+        name: {
+            "index": idx,
+            "shape": [32, 16],
+            "dtype": "bfloat16",
+            "sharding": None,
+            "sources": [{"path": "", "source_tensor": name, "source_shape": [32, 16]}],
+        }
+        for name, idx in (("model.embed_tokens.weight", 1), ("model.norm.weight", 9))
+    }
+    for wj_path in (
+        export_dir / "weight.json",
+        export_dir / "serving_checkpoint" / "weight.json",
+    ):
+        wj_path.write_text(json.dumps(seed_weights))
+
+    class MockModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lm_head = torch.nn.Linear(16, 32, bias=False, dtype=torch.bfloat16)
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return self.lm_head(hidden_states)
+
+    class MockRunner:
+        def __init__(self) -> None:
+            self.model = MockModel()
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [1]
+            self.model_config = MagicMock()
+            self.model_config.model = str(tmp_path / "no_such_ckpt")
+            self.model_config.get_hidden_size.return_value = 16
+            self.model_config.vocab_size = 32
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    mock_mlir_res = MagicMock()
+    mock_mlir_res.serialize_text.return_value = (
+        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>, "
+        "%arg1: tensor<32x16xbf16>) -> tensor<1x32xbf16> "
+        "{ return %arg0 : tensor<1x32xbf16> } }"
+    )
+    mock_mlir_res.is_noop = False
+    mock_mlir_res.module = MagicMock()
+
+    with (
+        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
+        patch(
+            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
+            return_value=torch.zeros((1, 1), dtype=torch.int64),
+        ),
+        pytest.raises(SystemExit),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+
+    wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
+    lm_head_index = wj["lm_head.weight"]["index"]
+    assert lm_head_index not in {1, 9}
+    metadata = json.loads((export_dir / "metadata.json").read_text())
+    for fn_key in ("compute_logits_req1", "sample_top_tokens_req1"):
+        assert metadata[fn_key]["inputs"][1]["index"] == lm_head_index
+
+
 def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
