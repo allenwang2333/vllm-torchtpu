@@ -1610,6 +1610,53 @@ def test_export_sampling_subgraphs_writes_compile_options(
     assert metadata["config"]["tensor_parallel_size"] == tp
 
 
+def test_export_sampling_subgraphs_fails_when_metadata_cannot_be_finalized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An invalid tensor_parallel_size must fail the export instead of leaving a
+    # metadata.json without config/compile_options behind.
+    export_dir = tmp_path / "export_bad_parallel_config"
+    monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
+    monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
+
+    class MockModel(torch.nn.Module):
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    class MockRunner:
+        def __init__(self) -> None:
+            self.model = MockModel()
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [1]
+            self.model_config = MagicMock()
+            self.model_config.model = str(tmp_path / "no_such_ckpt")
+            self.model_config.get_hidden_size.return_value = 16
+            self.model_config.vocab_size = 32
+            self.parallel_config = MagicMock()
+            self.parallel_config.tensor_parallel_size = "four"
+            self.parallel_config.pipeline_parallel_size = 1
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    mock_mlir_res = MagicMock()
+    mock_mlir_res.serialize_text.return_value = (
+        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>) "
+        "-> tensor<1x16xbf16> { return %arg0 : tensor<1x16xbf16> } }"
+    )
+    mock_mlir_res.is_noop = False
+    mock_mlir_res.module = MagicMock()
+
+    with (
+        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
+        patch(
+            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
+            return_value=torch.zeros((1, 1), dtype=torch.int64),
+        ),
+        pytest.raises(ValueError),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+
+
 def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
