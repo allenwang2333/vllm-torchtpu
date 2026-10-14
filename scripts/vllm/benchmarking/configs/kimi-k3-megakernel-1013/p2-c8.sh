@@ -18,6 +18,7 @@
 # See ../kimi-k3-megakernel/recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
+RECIPE_SET=oct13
 RECIPE_CONCURRENCY=8
 RECIPE_DECODE=dspark
 RECIPE_DECODE_MAX_NUM_SEQS=4
