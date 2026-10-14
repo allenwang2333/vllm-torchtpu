@@ -7,7 +7,8 @@ every scheduled prompt chunk into vLLM's unified pools for the KV connector:
 
 * **Windows.** A step's rows are cut into pieces of at most the largest window
   (:func:`plan_pieces`); the i-th pieces of all rows are packed, up to
-  :data:`SLOTS` sequences at page-aligned offsets, into windows run in order
+  :data:`SLOTS` sequences (at most one per page of the window) at
+  page-aligned offsets, into windows run in order
   (:func:`pack_windows`) through the ``first`` (embedding + layers 0-3),
   ``group`` (eight layers per call) and ``final`` (layer 92 + logits) ops.
 * **Context parallel over the pool** (DCP 32): rank ``r`` holds a sequence's
@@ -73,9 +74,21 @@ AXIS = "k3_sp"
 WINDOWS = (512, 1024, 2048, 4096, 8192)
 PAGE_TOKENS = 256
 VOCAB = 163840
-SLOTS = 4  # sequences per window, at most
+SLOTS = 16  # sequences per window, at most (and at most one per page)
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call
+
+
+def live_slots(used: int, slots: int) -> int:
+    """The sequence slots a window's pool writes cover: ``used`` rounded up
+    to a power of two, at most the window's ``slots`` (one compiled write
+    per size; slots past it are unused and their states are not written)."""
+    return min(slots, 1 << max(used - 1, 0).bit_length())
+
+
+def write_sizes(slots: int) -> tuple[int, ...]:
+    """Every :func:`live_slots` size of a window with ``slots`` slots."""
+    return tuple(sorted({live_slots(n, slots) for n in range(1, slots + 1)}))
 
 
 def _device_i32(values) -> torch.Tensor:
@@ -201,18 +214,68 @@ def pack_windows(
     return packed
 
 
+# Expert families follow the first (layers 1..3), eleven regular groups, and
+# final layer. Keeping those resident banks separate avoids addressing a 92-layer
+# expert operand in every fused MoE call. No padding or device-side copies.
+_EXPERT_FAMILIES = ("expert_gu", "expert_gus", "expert_down", "expert_ds")
+_EXPERT_BANK_SIZES = (3,) + (8,) * 11 + (1,)
+
+
+def _bank_expert_weights(iterator):
+    """Stream checkpoint parts into exactly one resident copy of each expert."""
+    state: dict[str, list[Any]] = {}
+    for group, name, value in iterator:
+        family, marker, suffix = name.partition("@")
+        if group != "moe" or family not in _EXPERT_FAMILIES:
+            yield group, name, value
+            continue
+        part, parts = map(int, suffix.split("/")) if marker else (0, 1)
+        entry = state.setdefault(family, [0, 0, 0, None])
+        expected_part, bank, used, buffer = entry
+        if part != expected_part:
+            raise ValueError(f"Out-of-order expert checkpoint part: {name}")
+        offset = 0
+        while offset < value.shape[0]:
+            if bank == len(_EXPERT_BANK_SIZES):
+                raise ValueError(f"Too many expert layers for {family}")
+            capacity = _EXPERT_BANK_SIZES[bank]
+            if buffer is None:
+                buffer = np.empty((capacity, *value.shape[1:]), dtype=value.dtype)
+            count = min(capacity - used, value.shape[0] - offset)
+            buffer[used : used + count] = value[offset : offset + count]
+            used += count
+            offset += count
+            if used == capacity:
+                yield group, f"{family}#bank{bank}", buffer
+                bank, used, buffer = bank + 1, 0, None
+        state[family] = [part + 1, bank, used, buffer]
+        if part + 1 == parts and (bank != len(_EXPERT_BANK_SIZES) or used):
+            raise ValueError(f"Incomplete expert checkpoint: {family}")
+    if set(state) != set(_EXPERT_FAMILIES) or any(
+        bank != len(_EXPERT_BANK_SIZES) or used for _, bank, used, _ in state.values()
+    ):
+        raise ValueError("Missing expert checkpoint parts")
+
+
 class PrefillProgram:
     """The prefill stack's device weights and packed-window ops.
 
-    :meth:`run_packed` prefills a window of up to ``slots`` sequences, each
-    continuing a prefix whose pages are spread over the ranks' pools
-    (context parallel attention); ``capacity`` is the most tokens a window's
-    prefixes may hold in all.
+    :meth:`run_packed` prefills a window of up to :meth:`window_slots`
+    sequences, each continuing a prefix whose pages are spread over the
+    ranks' pools (context parallel attention); ``capacity`` is the most
+    tokens a window's prefixes may hold in all.
     """
 
-    def __init__(self, windows: tuple[int, ...], capacity: int, slots: int) -> None:
+    def __init__(
+        self,
+        windows: tuple[int, ...],
+        capacity: int,
+        slots: int,
+        page_tokens: int = PAGE_TOKENS,
+    ) -> None:
         self.windows = tuple(sorted(int(w) for w in windows))
         self.capacity, self.slots = int(capacity), int(slots)
+        self.page_tokens = int(page_tokens)
         self._kernels, self._rank_loader = kernel_modules(
             "prefill_megakernel", "rank_loader"
         )
@@ -226,6 +289,7 @@ class PrefillProgram:
             "moe": tuple(self._kernels.MOE_FAMILIES),
         }
         self.weights: dict[str, dict[str, torch.Tensor]] = {}
+        self._expert_banks: list[dict[str, torch.Tensor]] = []
         self._ops: dict[Any, dict[str, Any]] = {}
         self._pairs: list[torch.Tensor] = []
         self._state_ops: dict[tuple[str, int], Any] = {}
@@ -233,19 +297,42 @@ class PrefillProgram:
     # ------------------------------------------------------------ weights
     def load_weights(self, presharded) -> None:
         cache = presharded / "prefill-sp-cache"
-        stats = stream_to_device(
-            self._rank_loader.iter_prefill_rank(
-                presharded, cache, self.rank, split_experts=True
-            ),
-            lambda group, name, tensor: self.weights.setdefault(group, {}).__setitem__(
-                name, tensor
-            ),
+        from .config import active
+
+        iterator = self._rank_loader.iter_prefill_rank(
+            presharded, cache, self.rank, split_experts=True
         )
+        self._expert_banks = []
+        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
+            self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
+            iterator = _bank_expert_weights(iterator)
+
+        def store(group, name, tensor):
+            family, marker, index = name.partition("#bank")
+            if marker:
+                bank = int(index)
+                self._expert_banks[bank][family] = tensor
+                # The default dictionary retains handles to bank zero so common
+                # shape/introspection code still sees every named family.
+                if bank != 0:
+                    return
+                name = family
+            self.weights.setdefault(group, {})[name] = tensor
+
+        stats = stream_to_device(iterator, store)
+        if self._expert_banks and any(
+            set(bank) != set(_EXPERT_FAMILIES) for bank in self._expert_banks
+        ):
+            raise RuntimeError("K3 prefill: incomplete resident expert banks")
         for group, names in self.names.items():
             missing = [n for n in names if n not in self.weights.get(group, {})]
             if missing:
                 raise RuntimeError(f"K3 prefill: missing {group} weights {missing}")
-        materialize(self.weights["moe"]["expert_ds"])
+        materialize(
+            self._expert_banks[-1]["expert_ds"]
+            if self._expert_banks
+            else self.weights["moe"]["expert_ds"]
+        )
         if self.rank == 0:
             logger.info(
                 "K3 prefill: rank 0 weights resident (%.1f GiB) in %.1f s "
@@ -257,8 +344,13 @@ class PrefillProgram:
             )
         report_load_stats("prefill", self.rank, stats)
 
-    def _flat(self, *groups: str) -> list[torch.Tensor]:
-        return [self.weights[g][n] for g in groups for n in self.names[g]]
+    def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
+        experts = self._expert_banks[expert_bank] if self._expert_banks else {}
+        return [
+            experts[n] if g == "moe" and n in experts else self.weights[g][n]
+            for g in groups
+            for n in self.names[g]
+        ]
 
     def _unflat(self, args, *groups: str) -> tuple[dict, list]:
         out, index = {}, 0
@@ -269,6 +361,12 @@ class PrefillProgram:
 
     def _count(self, *groups: str) -> int:
         return sum(len(self.names[g]) for g in groups)
+
+    def window_slots(self, window: int) -> int:
+        """The sequence slots a window's ops are compiled for: ``slots``, or
+        fewer when the window holds fewer pages (each sequence starts a
+        page), so a small window carries no state for slots it never fills."""
+        return max(1, min(self.slots, window // self.page_tokens))
 
     # ------------------------------------------------------------ ops
     #
@@ -285,7 +383,8 @@ class PrefillProgram:
             return self._ops[window]
         if window not in self.windows:
             raise ValueError(f"K3 prefill: window {window} is not among {self.windows}")
-        mesh, ops, count, kernels = self.mesh, {}, self.slots, self._kernels
+        mesh, ops, kernels = self.mesh, {}, self._kernels
+        count = self.window_slots(window)
         sharded, replicated = P(AXIS), P()
         embedding = self._kernels.make_embedding_sp(mesh, seq_len=window)
         first = self._kernels.make_prefill_stack_sp_indexed(
@@ -476,6 +575,7 @@ class PrefillProgram:
         return repr(
             (
                 "prefill",
+                "moe-bank8" if self._expert_banks else "moe-global",
                 op,
                 window,
                 self.capacity,
@@ -499,12 +599,13 @@ class PrefillProgram:
         ids (its SP stripes, :meth:`sp_order`), ``extent`` [1] the end of
         the last sequence, ``segments`` the descriptor,
         ``recurrent``/``conv`` [1, 69, slots, ...] the incoming KDA states
-        (donated), ``pools`` the 24 MLA layers' unified pools (MLA
-        layer m's at m), ``ids`` [1, 1 + ...] this rank's prefix page count
-        then its prefix pages end to end and ``local`` [1, 2 * slots] each
-        sequence's base and token count in them. Returns ``(logits [slots,
-        VOCAB], latents [1, 24, W, 576], recurrent, conv, recurrent_at,
-        conv_at)`` (the states after each sequence and at its checkpoint).
+        (donated; ``slots`` the window's :meth:`window_slots`), ``pools`` the
+        24 MLA layers' unified pools (MLA layer m's at m), ``ids`` [1, 1 +
+        ...] this rank's prefix page count then its prefix pages end to end
+        and ``local`` [1, 2 * slots] each sequence's base and token count in
+        them. Returns ``(logits [slots, VOCAB], latents [1, 24, W, 576],
+        recurrent, conv, recurrent_at, conv_at)`` (the states after each
+        sequence and at its checkpoint).
         ``ring(blocks, prefix, middle)`` (the DSpark ring's update, if any)
         runs on the residual streams before the final op consumes them."""
         ops = self._build(int(shard.shape[-1]) * 32)
@@ -519,7 +620,6 @@ class PrefillProgram:
             *tail,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
-        weights = self._flat("common", "kda", "mla", "moe")
         middle = None
         for p, pair in enumerate(self._pairs):
             *state, middle = ops["group"](
@@ -530,7 +630,7 @@ class PrefillProgram:
                 pools[2 * p + 1],
                 pools[2 * p + 2],
                 *tail,
-                *weights,
+                *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
         prefix, blocks, rec, hist, rec_at, hist_at, latents = state
         if ring is not None:
@@ -543,7 +643,7 @@ class PrefillProgram:
             segments,
             pools[MLA_LAYERS - 1],
             *tail,
-            *self._flat("io", "common", "mla", "moe"),
+            *self._flat("io", "common", "mla", "moe", expert_bank=12),
         )
         return logits, latents, rec, hist, rec_at, hist_at
 
@@ -754,11 +854,15 @@ class PoolWriter:
         (``[1, W / page]``, this rank's own table: the null block for pages it
         does not own or not to write), then sequence ``s``'s KDA states at its
         checkpoint into ``blocks_at[s * 69:(s + 1) * 69]`` and its final ones
-        into ``kda_blocks[s * 69:...]``. ``rings``: each sequence's DSpark
-        ring ``(cache, meta)`` after the window and at its checkpoint
-        (:meth:`PrefillRing.update`), written with the states."""
-        window, count = int(latents.shape[2]), int(recurrent.shape[2])
-        key = ("write", window, count, rings is not None)
+        into ``kda_blocks[s * 69:...]``. Only the first ``len(kda_blocks) //
+        69`` slots' states are written (:func:`live_slots`: the window's used
+        ones, rounded up); the rest of the window's slots are unused. ``rings``:
+        each of those sequences' DSpark ring ``(cache, meta)`` after the
+        window and at its checkpoint (:meth:`PrefillRing.update`), written
+        with the states."""
+        window, slots = int(latents.shape[2]), int(recurrent.shape[2])
+        count = int(kda_blocks.shape[0]) // KDA_LAYERS
+        key = ("write", window, slots, count)
         if key not in self._ops:
             num_raw, mla_raw, perm, pages = (
                 len(self.raw_pools),
@@ -767,25 +871,15 @@ class PoolWriter:
                 window // self.layout.tokens_per_block,
             )
 
-            with_rings = rings is not None
-            (dspark,) = kernel_modules("dspark")
-
-            def write_rings(raws, caches, metas, blocks):
-                caches = jnp.stack([cache[0] for cache in caches])
-                if perm is not None:
-                    caches = jax.lax.ppermute(caches, AXIS, perm)
-                packed = dspark.pack_ring(caches, jnp.stack(metas), KDA_LAYERS)
-                return write_draft_rings(
-                    raws, self._kda_raw, packed, blocks.reshape(count, KDA_LAYERS)
-                )
-
             def body(latents, recurrent, conv, recurrent_at, conv_at, *rest):
                 raws = list(rest[:num_raw])
-                table, kda_blocks, blocks_at = rest[num_raw : num_raw + 3]
-                ring_args = rest[num_raw + 3 :]
+                table, kda_blocks, blocks_at = rest[num_raw:]
                 table = table[0]
-                latents, recurrent, conv = latents[0], recurrent[0], conv[0]
-                recurrent_at, conv_at = recurrent_at[0], conv_at[0]
+                latents = latents[0]
+                # The live slots only: unused ones would go to the null block.
+                recurrent, conv, recurrent_at, conv_at = (
+                    x[0, :, :count] for x in (recurrent, conv, recurrent_at, conv_at)
+                )
                 if perm is not None:
                     recurrent, conv, recurrent_at, conv_at = (
                         jax.lax.ppermute(x, AXIS, perm)
@@ -811,25 +905,13 @@ class PoolWriter:
                 # Checkpoints first (a sequence without one aims it at the null block).
                 raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
-                if with_rings:
-                    caches_after, caches_at, metas_after, metas_at = (
-                        ring_args[i * count : (i + 1) * count] for i in range(4)
-                    )
-                    raws = write_rings(raws, caches_at, metas_at, blocks_at)
-                    raws = write_rings(raws, caches_after, metas_after, kda_blocks)
                 return tuple(raws)
 
             self._ops[key] = register_op(
-                f"pallas::k3_prefill_write_pool_packed{count}_r{num_raw}_w{window}_ranked",
+                f"pallas::k3_prefill_write_pool_packed{slots}_{count}_r{num_raw}_w{window}_ranked",
                 self.mesh,
                 body,
-                (P(AXIS),) * (6 + num_raw)
-                + (P(),) * 2
-                + (
-                    (P(AXIS),) * (2 * count) + (P(),) * (2 * count)
-                    if with_rings
-                    else ()
-                ),
+                (P(AXIS),) * (6 + num_raw) + (P(),) * 2,
                 (P(AXIS),) * num_raw,
                 donate_argnums=tuple(range(5, 5 + num_raw)),
                 export_key=repr(
@@ -837,24 +919,15 @@ class PoolWriter:
                         "write_pool_packed",
                         self.layout,
                         window,
+                        slots,
                         count,
                         self.mla_raw,
                         self._kda_raw,
                         self._perm,
-                        with_rings,
                     )
                 ),
             )
-        ring_operands = ()
-        if rings is not None:
-            after, at = rings
-            ring_operands = (
-                *(cache for cache, _ in after),
-                *(cache for cache, _ in at),
-                *(meta for _, meta in after),
-                *(meta for _, meta in at),
-            )
-        return self._adopt(
+        self._adopt(
             self._ops[key](
                 latents,
                 recurrent,
@@ -865,7 +938,57 @@ class PoolWriter:
                 table,
                 kda_blocks,
                 blocks_at,
-                *ring_operands,
+            )
+        )
+        if rings is not None:
+            after, at = rings
+            self._write_rings(at[:count], blocks_at)
+            self._write_rings(after[:count], kda_blocks)
+        return self.raw_pools
+
+    def _write_rings(self, rings: list, blocks: torch.Tensor) -> list[torch.Tensor]:
+        """Each sequence's DSpark ring ``(cache, meta)`` into the draft rows of
+        its 69 state blocks (``blocks`` ``[n * 69]``). Its own op: with the
+        window's other writes, 16 sequences' rings would exceed the 64
+        arguments a torch op takes."""
+        count = len(rings)
+        key = ("write_rings", count)
+        if key not in self._ops:
+            num_raw, perm = len(self.raw_pools), self._perm
+            (dspark,) = kernel_modules("dspark")
+
+            def body(*args):
+                raws = list(args[:num_raw])
+                blocks = args[num_raw]
+                caches = args[num_raw + 1 : num_raw + 1 + count]
+                metas = args[num_raw + 1 + count :]
+                caches = jnp.stack([cache[0] for cache in caches])
+                if perm is not None:
+                    caches = jax.lax.ppermute(caches, AXIS, perm)
+                packed = dspark.pack_ring(caches, jnp.stack(metas), KDA_LAYERS)
+                return tuple(
+                    write_draft_rings(
+                        raws, self._kda_raw, packed, blocks.reshape(count, KDA_LAYERS)
+                    )
+                )
+
+            self._ops[key] = register_op(
+                f"pallas::k3_prefill_write_rings{count}_r{num_raw}_ranked",
+                self.mesh,
+                body,
+                (P(AXIS),) * num_raw + (P(),) + (P(AXIS),) * count + (P(),) * count,
+                (P(AXIS),) * num_raw,
+                donate_argnums=tuple(range(num_raw)),
+                export_key=repr(
+                    ("write_rings", self.layout, count, self._kda_raw, self._perm)
+                ),
+            )
+        return self._adopt(
+            self._ops[key](
+                *self.raw_pools,
+                blocks,
+                *(cache for cache, _ in rings),
+                *(meta for _, meta in rings),
             )
         )
 
@@ -1024,14 +1147,14 @@ class KimiPrefiller:
         budget = config.max_num_batched_tokens
         windows = prefill_windows(budget, config.max_model_len)
         # The most prefix tokens a window's sequences may hold in all (a
-        # multiple of 4096), and a rank's share of them: 1/32 plus 16 pages
-        # of rounding slack, in multiples of 1024.
+        # multiple of 4096), and a rank's share of them: 1/32 plus a page of
+        # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
         self.cp_capacity = (
-            -(-(capacity // DCP_SIZE + 16 * self.page_tokens) // 1024) * 1024
+            -(-(capacity // DCP_SIZE + SLOTS * self.page_tokens) // 1024) * 1024
         )
         self.slots = min(config.max_num_seqs, SLOTS)
-        self.program = PrefillProgram(windows, capacity, self.slots)
+        self.program = PrefillProgram(windows, capacity, self.slots, self.page_tokens)
         self.rank = self.program.rank
         self._requests: dict[str, _Request] = {}
         self._zero_pair: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -1319,8 +1442,8 @@ class KimiPrefiller:
         """One packed window: run it on the members' prefixes, write each
         member's pages (from its first uncached one) and KDA states (final,
         and at its checkpoint), keep its state. Returns the ``[slots,
-        VOCAB]`` logits."""
-        count, local = self.slots, window // 32
+        VOCAB]`` logits (the window's slots)."""
+        count, local = self.program.window_slots(window), window // 32
         tokens = np.full(window, -1, np.int32)
         offsets, lengths, checkpoints, bases, cached = [], [], [], [], []
         states, finals, ats = [], [], []
@@ -1360,8 +1483,10 @@ class KimiPrefiller:
         bases += [base] * unused
         cached += [0] * unused
         states += [self._zero_state()] * unused
-        finals += [self._zero_blocks()] * unused
-        ats += [self._zero_blocks()] * unused
+        # The pool writes cover the live slots only (live_slots).
+        live = live_slots(len(members), count)
+        finals += [self._zero_blocks()] * (live - len(members))
+        ats += [self._zero_blocks()] * (live - len(members))
         ids, local_bases, write_table = self._cp_operands(rows, by_row, window, members)
         order = self.program.sp_order(window)  # the ranks' rows, rank-major
         ring_hook, ring_out = None, {}
@@ -1448,8 +1573,9 @@ class KimiPrefiller:
         prefix pages end to end (``[1, 1 + cp_capacity / page]``: count, then
         the block ids of global pages k with ``k % 32 == cp_rank``, at logical
         block ``k // 32``), each sequence's base and token count in that list
-        (``[1, 2 * slots]``), and its page table for the window's writes
-        (``[1, W / page]``: the pages it owns, the null block elsewhere)."""
+        (``[1, 2 * slots]``, the window's slots), and its page table for the
+        window's writes (``[1, W / page]``: the pages it owns, the null block
+        elsewhere)."""
         cp, rank = DCP_SIZE, self.cp_rank
         own, bases, counts, cursor = [], [], [], 0
         table = [0] * (window // self.page_tokens)
@@ -1468,7 +1594,7 @@ class KimiPrefiller:
             for p in range(skip, piece.rows // self.page_tokens):
                 if (first + p) % cp == rank:
                     table[offset // self.page_tokens + p] = int(row[(first + p) // cp])
-        unused = self.slots - len(members)
+        unused = self.program.window_slots(window) - len(members)
         if cursor > self.cp_capacity:
             raise RuntimeError(
                 f"K3 prefill: this rank's prefix share {cursor} "
@@ -1489,8 +1615,9 @@ class KimiPrefiller:
         if writer is None:
             raise RuntimeError("K3 prefill: bind the KV caches before warming up")
         started = time.perf_counter()
-        count, outputs = self.slots, []
+        outputs = []
         for window in self.program.windows:
+            count = self.program.window_slots(window)
             desc = (
                 [0] + [window] * (count - 1) + [1] + [0] * (count - 1) + [0] * 3 * count
             )
@@ -1501,7 +1628,9 @@ class KimiPrefiller:
             if self.ring is not None:
                 none = np.full(window, -1, np.int32)
 
-                def ring_hook(blocks, prefix, middle, none=none, ring_out=ring_out):
+                def ring_hook(
+                    blocks, prefix, middle, none=none, ring_out=ring_out, count=count
+                ):
                     ring_out["after"], ring_out["at"] = self.ring.update(
                         blocks,
                         prefix,
@@ -1527,17 +1656,19 @@ class KimiPrefiller:
                 )
             )
             outputs += [logits, self.program.split_states(recurrent, conv)[0][0]]
-            writer.write_packed(
-                latents,
-                recurrent,
-                conv,
-                recurrent_at,
-                conv_at,
-                _rank_zeros_i32(window // self.page_tokens),
-                _zeros_i32(count * KDA_LAYERS),
-                _zeros_i32(count * KDA_LAYERS),
-                (ring_out["after"], ring_out["at"]) if ring_out else None,
-            )
+            for live in write_sizes(count):
+                writer.write_packed(
+                    latents,
+                    recurrent,
+                    conv,
+                    recurrent_at,
+                    conv_at,
+                    _rank_zeros_i32(window // self.page_tokens),
+                    _zeros_i32(live * KDA_LAYERS),
+                    _zeros_i32(live * KDA_LAYERS),
+                    (ring_out["after"], ring_out["at"]) if ring_out else None,
+                )
+        count = self.slots  # a hit-state read's sequences (_read_hit_states)
         outputs.append(writer.read_states(_zeros_i32(count * KDA_LAYERS))[0])
         if self.ring is not None:
             outputs.append(

@@ -26,6 +26,7 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.forward_context import set_forward_context
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -147,7 +148,9 @@ class MegakernelModelRunner(TPUModelRunner):
         # The weightless model (its layers declare the KV cache spec), through
         # the megakernel load format.
         super().load_model()
-        self.program = build_program(self.vllm_config, get_tensor_model_parallel_rank())
+        tp_rank = get_tensor_model_parallel_rank()
+        self._is_output_rank = tp_rank == 0
+        self.program = build_program(self.vllm_config, tp_rank)
         self.program.load_weights()
 
     def profile_run(self, num_tokens: int) -> None:
@@ -158,6 +161,17 @@ class MegakernelModelRunner(TPUModelRunner):
                 "the megakernel runner needs an explicit KV budget "
                 "(--kv-cache-memory-bytes)"
             )
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        """The layers' spec without the state blocks ``MambaSpec`` reserves
+        per draft token: the program verifies drafts in its own ops, so no
+        request's recurrent state is ever held in them."""
+        return {
+            name: dataclasses.replace(spec, num_speculative_blocks=0)
+            if isinstance(spec, MambaSpec)
+            else spec
+            for name, spec in super().get_kv_cache_spec().items()
+        }
 
     def initialize_kv_cache(self, kv_cache_config: Any) -> None:
         super().initialize_kv_cache(kv_cache_config)
@@ -328,19 +342,32 @@ class MegakernelModelRunner(TPUModelRunner):
         self._modify_prev_results()
         self.maybe_wait_for_kv_save()
         kv_connector_output = self._build_kv_connector_output(scheduler_output)
-        model_runner_output = ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index=dict(self.input_batch.req_id_to_index),
-            sampled_token_ids=[],
-            logprobs=[],
-            prompt_logprobs_dict={req_id: None for req_id in req_ids},
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
+        materialize_token_ids = (
+            not self.scheduler_config.async_scheduling
+            or self._is_output_rank
+            or not has_kv_transfer_group()
         )
+        if materialize_token_ids:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=dict(self.input_batch.req_id_to_index),
+                sampled_token_ids=[],
+                logprobs=[],
+                prompt_logprobs_dict={req_id: None for req_id in req_ids},
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+        else:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                kv_connector_output=kv_connector_output,
+            )
         async_output = AsyncTPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             copy_state=copy_state,
             discard_sampled_tokens_req_indices=discard,
+            materialize_token_ids=materialize_token_ids,
         )
         if self.scheduler_config.async_scheduling:
             req_id_to_index_copy = self._update_placeholder(

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerics checks of the K3 programs (``check spec`` / ``check handoff`` /
-``check greedy``).
+``check packing`` / ``check greedy``).
 
 **spec** drives the decoder (``KimiDecoder``) as the runner does, over stand-in
 unified pools, and checks greedy DSpark against plain greedy decode (the streams
@@ -15,6 +15,14 @@ each request from the prefill's first token, against a decode-only replay: the
 first tokens must match (later ones may part at a near-tie). With ``--dspark``
 each imported draft ring must hold the prompt's last positions, and decoding
 from it is compared with a cold ring in tokens per step.
+
+**packing** prefills sixteen prompts of mixed lengths, four continuing cached
+prefixes, into separate pool blocks three times: each alone, packed at most
+four to a window, and all in one window. Each packing's first tokens, latent
+pages and final KDA states (with ``--dspark``, draft rings) are compared with
+the prompts alone (relative L2). A packing places rows on other ranks, so the
+reductions run in another order and the deep stack amplifies that: the
+one-window packing must stay as close as the four-to-a-window reference.
 
 **greedy** replays the fixed prompt and four short prompts on the decoder, then
 writes each request's greedy tokens and text to ``--output`` (JSON): two kernel
@@ -55,13 +63,21 @@ def add_arguments(parser) -> None:
         help="the DSpark speculator checkpoint: hand the draft ring over too",
     )
     handoff.add_argument("--speculate-steps", type=int, default=64)
+    packing = sub.add_parser(
+        "packing", help="prompts packed into one prefill window against each alone"
+    )
+    packing.add_argument(
+        "--dspark",
+        default=None,
+        help="the DSpark speculator checkpoint: compare the prefill's rings too",
+    )
     greedy = sub.add_parser(
         "greedy", help="real prompts replayed on the decoder, then greedy tokens"
     )
     greedy.add_argument("--prompt-tokens", type=int, default=5000)
     greedy.add_argument("--generate", type=int, default=128)
     greedy.add_argument("--output", required=True)
-    for check in (spec, handoff, greedy):
+    for check in (spec, handoff, packing, greedy):
         check.add_argument(
             "--model",
             required=True,
@@ -70,9 +86,12 @@ def add_arguments(parser) -> None:
 
 
 def run(args, records: harness.Records) -> None:
-    {"spec": run_spec, "handoff": run_handoff, "greedy": run_greedy}[args.check](
-        args, records
-    )
+    {
+        "spec": run_spec,
+        "handoff": run_handoff,
+        "packing": run_packing,
+        "greedy": run_greedy,
+    }[args.check](args, records)
 
 
 def run_greedy(args, records: harness.Records) -> None:
@@ -671,6 +690,7 @@ def run_handoff(args, records: harness.Records) -> None:
     harness.log(f"prefill done; first tokens {first_token}")
     # The registered ops keep the prefill program alive: drop its weights by hand.
     prefiller.program.weights.clear()
+    prefiller.program._expert_banks.clear()  # the fused MoE's resident experts
     if prefiller.ring is not None:
         prefiller.ring.weights = ()
     del prefiller
@@ -844,3 +864,258 @@ def _handoff_rings(
             tokens_per_step_cold=rates["cold"],
         )
     return ok
+
+
+# Pages per ``check packing`` prompt when the window has two pages a sequence
+# (BF16 pools); FP8's 512-token pages leave one page each.
+_PACKING_PAGES = (1, 2, 1, 4, 1, 3, 1, 2, 1, 1, 5, 2, 1, 3, 2, 2)
+_PACKING_PREFIX_PAGES = (2, 4, 8, 3)
+
+
+def _packing_cases(page: int, window: int, slots: int) -> list[tuple[int, int]]:
+    """``check packing``'s prompts, ``(new tokens, cached prefix tokens)``:
+    ``slots`` prompts whose page-padded rows fill one ``window`` exactly, the
+    last four on cached prefixes; they end mid-page, on a page or (one) after
+    a single token."""
+    pages = list(_PACKING_PAGES)
+    if len(pages) != slots or sum(pages) != window // page:
+        pages = [window // page // slots] * slots
+    cases = []
+    for i, n in enumerate(pages):
+        trim = 0 if i % 4 == 1 else (37 * i + 11) % page
+        length = 1 if i == 4 else n * page - trim
+        hit = i - (slots - len(_PACKING_PREFIX_PAGES))
+        cases.append((length, _PACKING_PREFIX_PAGES[hit] * page if hit >= 0 else 0))
+    return cases
+
+
+def run_packing(args, records: harness.Records) -> None:
+    import math
+    from pathlib import Path
+
+    import torch
+
+    from vllm_torchtpu.megakernel import bridge
+    from vllm_torchtpu.megakernel import program as mk
+    from vllm_torchtpu.megakernel.kimi_k3 import prefill as k3_prefill
+    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from vllm_torchtpu.megakernel.kimi_k3.pools import kda_blocks_at_length
+
+    window, slots = k3_program.MAX_STEP_TOKENS, k3_prefill.SLOTS
+    max_model_len = 2 * window
+    cases = _packing_cases(k3.PAGE, window, slots)
+    hits = [i for i, (_, prefix) in enumerate(cases) if prefix]
+    ids, tokenizer = k3.fixed_prompt(sum(n + p for n, p in cases), args.model)
+    prompts, at = [], 0
+    for length, prefix in cases:
+        prompts.append(ids[at : at + prefix + length])
+        at += prefix + length
+    mla_width, state_width = max_model_len // k3.LOGICAL, max_model_len // k3.PAGE
+    # Per request: its MLA blocks and a state block per KDA group at the one
+    # column a step writes (the last); the rest of its rows is the null block.
+    per_request = -(-max_model_len // k3.LOGICAL) + 3
+    pools = k3.Pools(
+        1 + (len(hits) + 3 * len(cases)) * per_request, mla_width, state_width
+    )
+    # The kernel rank stands in for the TP / DCP rank (see run_handoff).
+    rank = bridge.kernel_mesh("tp", k3_program.TP_SIZE)[1]
+    draft = Path(args.dspark) if args.dspark else None
+    prefiller = k3_program.build(
+        k3.engine_config(
+            "prefill",
+            max_num_seqs=slots,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=window,
+        ),
+        args.presharded,
+        draft,
+        tp_rank=rank,
+    )
+    prefiller.load_weights()
+    prefiller.bind_kv_caches(pools.caches, pools.groups)
+    prefiller.warmup()
+    harness.sync()
+
+    def tables(end, donor=None, cached=0):
+        """Fresh blocks for a request ``end`` tokens long: ``(mla, kda)``; a
+        hit's state block at its last cached column is the donor's."""
+        mla = pools.fresh(-(-end // k3.LOGICAL))
+        kda = [[0] * state_width for _ in range(3)]
+        for g in range(3):
+            kda[g][(end - 1) // k3.PAGE] = pools.fresh(1)[0]
+            if donor is not None:
+                column = cached // k3.PAGE - 1
+                kda[g][column] = donor[1][g][column]
+        return mla, kda
+
+    def row(req_id, tokens, computed, table):
+        tokens = np.asarray(tokens, np.int32)
+        return mk.RequestInput(
+            req_id=req_id,
+            computed=computed,
+            scheduled=len(tokens) - computed,
+            token_ids=tokens,
+            num_tokens=len(tokens),
+            num_prompt_tokens=len(tokens),
+            block_tables=pools.tables(*table),
+        )
+
+    def step(rows, copies=()):
+        return prefiller.step(mk.StepInput(rows, copies=tuple(copies))).tokens
+
+    # The cached prefixes, prefilled once. A hit gets a private copy of the
+    # donor's MLA block (vLLM's copy-on-write of the block the hit ends in)
+    # and shares the donor's state block.
+    donors = {i: tables(cases[i][1]) for i in hits}
+    step([row(f"donor-{i}", prompts[i][: cases[i][1]], 0, donors[i]) for i in hits])
+
+    # Three arms over fresh blocks each: every prompt alone, the step packed at
+    # most four to a window (the reference: how far another packing moves the
+    # results) and all of them packed into one window.
+    runs = {}
+    for arm, limit in (("alone", 1), ("packed4", 4), ("packed", slots)):
+        blocks = [
+            tables(prefix + length, donors.get(i), prefix)
+            for i, (length, prefix) in enumerate(cases)
+        ]
+        rows = [
+            row(f"{arm}-{i}", prompts[i], prefix, blocks[i])
+            for i, (_, prefix) in enumerate(cases)
+        ]
+        copies = {i: (donors[i][0][0], blocks[i][0][0]) for i in hits}
+        if arm == "alone":
+            first = []
+            for i, one in enumerate(rows):
+                tokens = step([one], [copies[i]] if i in copies else ())
+                first.append(int(tokens[0, 0].cpu()))
+        else:
+            pieces = [
+                k3_prefill.plan_pieces(i, prefix, prefix + n, [], window, k3.PAGE)[0]
+                for i, (n, prefix) in enumerate(cases)
+            ]
+            plan = k3_prefill.pack_windows(
+                pieces,
+                prefiller.program.windows,
+                limit,
+                prefiller.program.capacity,
+            )
+            shapes = [f"{len(m)} sequences in a {w}-token window" for w, m in plan]
+            harness.log(f"{arm}: " + "; ".join(shapes))
+            if arm == "packed" and (len(plan) != 1 or len(plan[0][1]) != len(cases)):
+                harness.fail(f"the {len(cases)} prompts did not pack into one window")
+            prefiller.slots = limit  # the step packs at most this many a window
+            tokens = step(rows, list(copies.values()))
+            prefiller.slots = slots
+            first = [int(t) for t in tokens[: len(rows), 0].cpu().tolist()]
+        finals = [
+            kda_blocks_at_length(r.block_tables, prefiller._kda_groups, r.end)
+            for r in rows
+        ]
+        runs[arm] = (first, blocks, finals)
+    bridge.materialize(pools.tensors[0])
+
+    # Each rank compares what it holds: the new whole pages it owns (page k on
+    # rank k % 32; no padding rows) and its heads of the KDA states and rings.
+    # Squared sums per (request, quantity), added over the ranks.
+    def device(values, dtype=torch.int32):
+        return torch.from_numpy(np.asarray(values)).to(dtype).to("tpu")
+
+    def squares(a, b):
+        a, b = a.to(torch.float32), b.to(torch.float32)
+        return [float(((a - b) ** 2).sum().cpu()), float((a**2).sum().cpu())]
+
+    def owned_pages(table, prefix, length):
+        cp = k3.LOGICAL // k3.PAGE
+        pages = range(prefix // k3.PAGE, (prefix + length) // k3.PAGE)
+        return [table[0][k // cp] for k in pages if k % cp == prefiller.cp_rank]
+
+    states = {
+        arm: prefiller._writer.read_states(device(np.concatenate(runs[arm][2])))
+        for arm in runs
+    }
+    rings = {}
+    if prefiller.ring is not None:
+        for arm in runs:
+            rings[arm] = [
+                prefiller._writer.read_rings(
+                    prefiller.ring.config, device(runs[arm][2][i]), [prefix + length]
+                )[0][0]
+                for i, (length, prefix) in enumerate(cases)
+            ]
+
+    def compare(arm, i, length, prefix):
+        """This rank's squared sums of ``arm`` against the prompt alone:
+        latents (all MLA layers, and the first alone), states and ring."""
+        entry = {}
+        pages = [owned_pages(runs[a][1][i], prefix, length) for a in ("alone", arm)]
+        if pages[0]:
+            index = [device(p, torch.int64) for p in pages]
+            per_layer = [
+                squares(pool[index[0]], pool[index[1]]) for pool in pools.tensors
+            ]
+            entry["latents"] = np.sum(per_layer, axis=0).tolist()
+            entry["latents0"] = per_layer[0]
+        for name, part in (("recurrent", 0), ("conv", 1)):
+            entry[name] = squares(
+                states["alone"][part][0, :, i], states[arm][part][0, :, i]
+            )
+        if rings:
+            entry["ring"] = squares(rings["alone"][i], rings[arm][i])
+        return entry
+
+    arms = ("packed4", "packed")
+    sums = {
+        arm: [compare(arm, i, n, prefix) for i, (n, prefix) in enumerate(cases)]
+        for arm in arms
+    }
+    gathered = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(gathered, sums)
+    names = ("latents0", "latents", "recurrent", "conv", "ring")
+
+    def relative(arm, i, name):
+        num = sum(g[arm][i].get(name, (0.0, 0.0))[0] for g in gathered)
+        den = sum(g[arm][i].get(name, (0.0, 0.0))[1] for g in gathered)
+        return math.sqrt(num / den) if den else None
+
+    alone = runs["alone"][0]
+    worst = {arm: dict.fromkeys(names, 0.0) for arm in arms}
+    matches = {arm: sum(a == b for a, b in zip(alone, runs[arm][0])) for arm in arms}
+    for i, (length, prefix) in enumerate(cases):
+        line = []
+        for arm in arms:
+            errors = {n: relative(arm, i, n) for n in names}
+            errors = {n: v for n, v in errors.items() if v is not None}
+            for name, value in errors.items():
+                worst[arm][name] = max(worst[arm][name], value)
+            token = runs[arm][0][i]
+            line.append(
+                f"{arm} {'same' if token == alone[i] else 'DIFFERS'} "
+                f"{tokenizer.decode([token])!r} "
+                + " ".join(f"{k} {v:.1e}" for k, v in errors.items())
+            )
+            records.add(
+                case=f"packing-{arm}-{i}",
+                length=length,
+                prefix=prefix,
+                first_token_matches=token == alone[i],
+                **{f"rel_l2_{k}": round(v, 6) for k, v in errors.items()},
+            )
+        harness.log(
+            f"{i:2d}: {length} tokens"
+            + (f" on a {prefix}-token prefix" if prefix else "")
+            + f", alone {tokenizer.decode([alone[i]])!r}: "
+            + "; ".join(line)
+        )
+    for arm in arms:
+        harness.log(
+            f"{arm}: {matches[arm]} of {len(cases)} first tokens match alone; "
+            "worst relative L2 "
+            + ", ".join(f"{k} {v:.1e}" for k, v in worst[arm].items() if v)
+        )
+    # Another packing reorders the reductions, and 93 layers (top-k routing
+    # among them) amplify that; a sequence reading another's rows or state
+    # would be far worse than the four-to-a-window reference.
+    if matches["packed"] < matches["packed4"] - 1 or any(
+        worst["packed"][n] > 2 * worst["packed4"][n] + 0.02 for n in names
+    ):
+        harness.fail("one-window packing departs further than the reference packing")

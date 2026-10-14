@@ -13,8 +13,11 @@ scheduler's id space is larger than the pools (``N`` physical blocks):
 * ids ``g N + [S, N)``: MLA pages of DP group ``g`` at physical row
   ``id % N`` on group ``g``'s ranks only.
 
-A request joins the group with the fewest requests at its first lookup;
-prefix hits reuse only its group's pages. The KV transfer writes every
+New requests choose the group with the fewest assigned requests. A pending
+request can leave a full group after 16 scheduling steps with capacity in
+another group, before a prefix lookup. This lets short admission stalls drain
+without changing the placement. Requests holding blocks keep their group.
+Prefix hits only reuse pages of the chosen group. The KV transfer writes every
 destination block on every rank, so while a request's pages load the
 scheduler also holds the other groups' ids of the same rows ("twins").
 """
@@ -36,6 +39,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 SHARED = 0
+_REASSIGN_AFTER_STEPS = 16
 
 # The region pool's settings while a decode scheduler builds its KV cache
 # manager (see ``_scheduler_init``).
@@ -94,6 +98,7 @@ class RegionBlockPool(BlockPool):
         self.req_group: dict[str, int] = {}
         self.active: dict[str, int] = {}
         self.twins: dict[str, list[KVCacheBlock]] = {}
+        self.blocked_since: dict[str, int] = {}
         # The group of the request being looked up or allocated, and the KV
         # cache groups holding MLA pages.
         self.group = 0
@@ -232,9 +237,8 @@ class RegionBlockPool(BlockPool):
         return 1.0 - self.get_num_free_blocks() / usable if usable else 0.0
 
     # ------------------------------------------------------------ requests
-    def place(self, request_id: str) -> int:
-        """``request_id``'s DP group: kept once placed, else the group with
-        the fewest requests."""
+    def place(self, request_id: str, *, step: int | None = None) -> int:
+        """Balance new placements; reconsider stalled ones before prefix lookup."""
         group = self.req_group.get(request_id)
         if group is None:
             counts = [0] * self.groups
@@ -242,6 +246,19 @@ class RegionBlockPool(BlockPool):
                 counts[g] += 1
             group = min(range(self.groups), key=counts.__getitem__)
             self.req_group[request_id] = group
+        if step is not None and request_id not in self.active:
+            counts = [0] * self.groups
+            for g in self.active.values():
+                counts[g] += 1
+            best = min(range(self.groups), key=counts.__getitem__)
+            if counts[group] >= self.cap and counts[best] < self.cap:
+                since = self.blocked_since.setdefault(request_id, step)
+                if step - since >= _REASSIGN_AFTER_STEPS:
+                    group = best
+                    self.req_group[request_id] = group
+                    self.blocked_since.pop(request_id)
+            else:
+                self.blocked_since.pop(request_id, None)
         self.group = group
         return group
 
@@ -249,6 +266,7 @@ class RegionBlockPool(BlockPool):
         """Forget ``request_id``'s group; returns its twins (not yet freed)."""
         self.req_group.pop(request_id, None)
         self.active.pop(request_id, None)
+        self.blocked_since.pop(request_id, None)
         return self.twins.pop(request_id, [])
 
 
@@ -268,6 +286,24 @@ class _GroupView:
 
 def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
+
+
+def _state_blocks_per_request(kv_cache_config: Any) -> int:
+    """The most shared blocks a request holds at once: vLLM's ``align`` mode
+    keeps at most ``2 + num_speculative_blocks + num_prefill_checkpoint_blocks``
+    per KDA (Mamba) group (``MambaSpec.max_memory_usage_bytes``)."""
+    from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+
+    total = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            spec = next(iter(spec.kv_cache_specs.values()))
+        if isinstance(spec, MambaSpec):
+            total += (
+                2 + spec.num_speculative_blocks + spec.num_prefill_checkpoint_blocks
+            )
+    return total
 
 
 def _install(scheduler: Any) -> None:
@@ -384,9 +420,12 @@ def install() -> None:
         if dp > 1:
             max_seqs = int(vllm_config.scheduler_config.max_num_seqs)
             shared = backend.shared_blocks(vllm_config)
+            if shared is None:
+                kv_cache_config = kwargs.get("kv_cache_config") or args[0]
+                shared = _state_blocks_per_request(kv_cache_config) * max_seqs + 1
             _PENDING = {
                 "groups": dp,
-                "shared": 12 * max_seqs + 1 if shared is None else shared,
+                "shared": shared,
                 "cap": max_seqs // dp,
             }
         try:
@@ -404,7 +443,7 @@ def install() -> None:
     def _get_local_prefix_cache_hit(self, request):
         pool = self.kv_cache_manager.block_pool
         if isinstance(pool, RegionBlockPool):
-            pool.place(request.request_id)
+            pool.place(request.request_id, step=self.current_step)
         return original_lookup(self, request)
 
     Scheduler._get_local_prefix_cache_hit = _get_local_prefix_cache_hit

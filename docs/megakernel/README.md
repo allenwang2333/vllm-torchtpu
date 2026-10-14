@@ -157,8 +157,9 @@ conv region extended over the ring rows, `pool_manifest`).
 
 Every live row of a step is computed. A row's tokens are cut into pieces of
 at most the largest window (512, 1024, 2048, 4096, 8192 tokens, up to
-`--max-num-batched-tokens`), and up to four sequences are packed into a
-window at 256-aligned offsets. A window runs the stack's first (embedding +
+`--max-num-batched-tokens`), and up to 16 sequences (`--max-num-seqs`, and
+at most one per page of the window) are packed into a window at page-aligned
+offsets. A window runs the stack's first (embedding +
 layers 0-3), group (8 layers, 11 times) and final (layer 92 + each
 sequence's last-token logits) ops; each rank writes the new pages it owns.
 
@@ -321,9 +322,9 @@ words, min_tokens; `platforms/tpu_platform.py`).
   batches 1–8, and 3 at batches 9–16 (compiled request buckets 1, 2, 4, 8
   and 16, up to `--max-num-seqs`), and 0 anywhere; the per-batch-size
   schedule chooses among them and the decoder rejects any other at startup.
-- Each decode request holds ~190 MB of the decode KV budget however short
-  (its KDA state), so the budget bounds decode concurrency (6 GiB: ~30
-  requests). Under KV pressure a request can hang: its Stage-3 transfer
+- Besides its pages, each decode request holds one KDA state block per KDA
+  group of the decode KV budget (two while it crosses a page), 7.5 MiB a
+  rank each. Under KV pressure a request can hang: its Stage-3 transfer
   completes but the completion is dropped as unmapped.
 
 ## Tools

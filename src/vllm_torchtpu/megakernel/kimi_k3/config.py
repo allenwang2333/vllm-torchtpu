@@ -35,19 +35,19 @@ class KernelConfig:
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0
-    # None: 1024 at B96, 512 at power-of-two B1-B64, else unsplit (0).
+    # None: 1024 at B96, 512 at power-of-two B1-B128, else unsplit (0).
     mxfp4_dot_tile: int | None = None
     pooled_weights: bool = True
-    shared_shards: bool = False
+    shared_shards: bool | None = None  # None: at B128
     compact_only: bool = False
-    singleton_block: bool | None = None  # None: at B16/B32/B64/B96
-    stage_blocks: bool | None = None  # None: at B16/B32/B64/B96
+    singleton_block: bool | None = None  # None: at B16-B128
+    stage_blocks: bool | None = None  # None: at B16-B128
     b16_compact_experts: bool = True
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
-    decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B96, DP B2/B4
+    decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
     shard_routing: bool = False
     kda_staged: bool = False
     weight_streams: tuple[tuple[str, tuple], ...] = ()  # (weight, (axis, streams))
@@ -65,7 +65,8 @@ class KernelConfig:
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
-    # EP16 4K/8K windows only; False: the unfused SparseCore gather/combine.
+    # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
+    # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
     moe_reduce_dtype: str = "float32"
