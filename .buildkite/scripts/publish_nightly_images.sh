@@ -33,11 +33,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
-# TODO(test-only): remove before merge. The test branch runs as main, or as
-# the branch named by TEST_BRANCH_AS (e.g. releases/v0.29.0rc1) if the test
-# build sets it.
+# TODO(test-only): remove before merge. The test branch runs as a placeholder
+# release branch when RELEASE_VERSION is set (Docker Hub takes the version
+# from it), else as main.
 if [[ "${BRANCH}" == "jefft/docker_pipeline_test" ]]; then
-  BRANCH="${TEST_BRANCH_AS:-main}"
+  if [[ -n "${RELEASE_VERSION:-}" ]]; then BRANCH="releases/v0.0.0"; else BRANCH="main"; fi
 fi
 case "${BRANCH}" in
   main)
@@ -88,11 +88,24 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   MOVE_LATEST="yes"
   if [[ "${BRANCH}" == releases/* ]]; then
     DOCKERHUB_TARGET="prod"
-    DOCKERHUB_TAG="v${VERSION}"
+    # As in the PyPI release pipeline, RELEASE_VERSION (e.g. v0.29.0rc1, set
+    # on New Build) overrides the branch version for a pre-release. Docker Hub
+    # only; GAR keeps the branch version.
+    DOCKERHUB_VERSION="${RELEASE_VERSION:-${VERSION}}"
+    DOCKERHUB_VERSION="${DOCKERHUB_VERSION#v}"
+    if [[ ! "${DOCKERHUB_VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
+      echo "ERROR: RELEASE_VERSION '${RELEASE_VERSION}' is not usable as an image tag; expected e.g. v0.29.0rc1." >&2
+      exit 1
+    fi
+    DOCKERHUB_TAG="v${DOCKERHUB_VERSION}"
     DOCKERHUB_LATEST_TAG="latest"
     # The approver's choices in the block step of pipeline_nightly_image.yml.
     MOVE_LATEST="$(buildkite-agent meta-data get dockerhub_move_latest --default no)"
     OVERWRITE="$(buildkite-agent meta-data get dockerhub_overwrite --default no)"
+    # A pre-release never becomes latest, whatever the approver chose.
+    if [[ -n "${RELEASE_VERSION:-}" ]]; then
+      MOVE_LATEST="no"
+    fi
     # Released tags are immutable unless the approver chose to overwrite.
     # Checked here so a refused release builds nothing.
     if [[ "${OVERWRITE}" != "yes" ]] && DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker manifest inspect "${DOCKERHUB_REPO}:${DOCKERHUB_TAG}" >/dev/null 2>&1; then
@@ -160,7 +173,7 @@ for TARGET in "${TARGETS[@]}"; do
     if [[ "${MOVE_LATEST}" == "yes" ]]; then
       DOCKERHUB_IMAGES+=("${DOCKERHUB_REPO}:${DOCKERHUB_LATEST_TAG}")
     else
-      echo "--- Not moving ${DOCKERHUB_LATEST_TAG}: the approver chose not to."
+      echo "--- Not moving ${DOCKERHUB_LATEST_TAG}: the approver chose not to, or RELEASE_VERSION marks a pre-release."
     fi
     for DOCKERHUB_IMAGE in "${DOCKERHUB_IMAGES[@]}"; do
       echo "--- :docker: Pushing ${DOCKERHUB_IMAGE} to Docker Hub"

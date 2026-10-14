@@ -17,7 +17,7 @@ steps:
   - block: ":rotating_light: Approve vllm-torchtpu release"
     key: "approve_release"
     # TODO(test-only): drop the jefft/docker_pipeline_test condition before merge.
-    if: '(build.branch =~ /^releases\// && build.source != "schedule") || (build.branch == "jefft/docker_pipeline_test" && build.env("TEST_BRANCH_AS") =~ /^releases\//)'
+    if: '(build.branch =~ /^releases\/v[0-9]+\.[0-9]+\.[0-9]+$/ && build.source != "schedule") || (build.branch == "jefft/docker_pipeline_test" && build.env("RELEASE_VERSION") =~ /^v[0-9]/)'
     prompt: "Did the vllm-torchtpu-ci build of this commit pass? Build and publish this release?"
     # TODO(release-approvers): limit who can unblock to a Buildkite team.
     fields:
