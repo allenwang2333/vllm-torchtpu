@@ -173,6 +173,8 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    VLLM_TORCHTPU_EXPORT_HLO_DIR: bool | str = False
+    VLLM_TORCHTPU_LOAD_HLO_DIR: str = ""
 
 
 def env_with_choices(
@@ -381,6 +383,8 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_TORCHTPU_EXPORT_HLO_DIR": env_str("VLLM_TORCHTPU_EXPORT_HLO_DIR", default=""),
+    "VLLM_TORCHTPU_LOAD_HLO_DIR": env_str("VLLM_TORCHTPU_LOAD_HLO_DIR", default=""),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
