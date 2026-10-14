@@ -23,7 +23,7 @@ Per prompt length L:
 
   turn1  a fresh ledger prompt. Gate: nothing cached.
   reset  POST /reset_prefix_cache empties HBM; the Raiden store keeps its
-         entries.
+         entries. --no-reset skips this, so turn 2 recalls from HBM.
   turn2  turn 1's prompt + its answer + a follow-up question. Gate: no local
          hits, an external hit reaching at least the last whole block before
          turn 1's final prompt token, less one block of slack for a
@@ -89,7 +89,7 @@ def ask_messages(client, messages, cache_salt=None):
     }
 
 
-def run_length(client, salt, aim, hit_block, settle_s):
+def run_length(client, salt, aim, hit_block, settle_s, reset=True):
     namespace = f"{salt}-L{aim}"
     code = manifest_code(namespace)
     prompt, sized = size_prompt(client, namespace, code, aim, hit_block)
@@ -99,7 +99,7 @@ def run_length(client, salt, aim, hit_block, settle_s):
     if turn1["cached_tokens"]:
         failures.append(f"L={sized}: turn 1 already hit ({turn1['cached_tokens']})")
     time.sleep(settle_s)
-    if not client.reset_prefix_cache():
+    if reset and not client.reset_prefix_cache():
         return failures + [f"L={sized}: /reset_prefix_cache never succeeded"], {}
     turn2_msgs = turn1_msgs + [
         {"role": "assistant", "content": turn1["text"]},
@@ -124,12 +124,13 @@ def run_length(client, salt, aim, hit_block, settle_s):
         ),
         flush=True,
     )
-    if turn2["local_hits"]:
+    recalled = turn2["ext_hits"] if reset else turn2["local_hits"]
+    if reset and turn2["local_hits"]:
         failures.append(f"L={p1}: turn 2 hit HBM after the reset")
-    if turn2["ext_hits"] < max(floor, hit_block):
+    if recalled < max(floor, hit_block):
         failures.append(
-            f"L={p1}: turn 2 recalled {turn2['ext_hits']} tokens from the store, "
-            f"want >= {max(floor, hit_block)}"
+            f"L={p1}: turn 2 recalled {recalled} tokens from "
+            f"{'the store' if reset else 'HBM'}, want >= {max(floor, hit_block)}"
         )
     if ref["cached_tokens"]:
         failures.append(f"L={p1}: the salted reference hit ({ref['cached_tokens']})")
@@ -156,6 +157,11 @@ def main() -> int:
         default="2200,9300,34000",
         help="comma-separated turn-1 prompt lengths to aim for",
     )
+    ap.add_argument(
+        "--no-reset",
+        action="store_true",
+        help="keep the HBM prefix cache between turns, so turn 2 recalls from HBM",
+    )
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     client = Client(
@@ -167,7 +173,14 @@ def main() -> int:
     )
     failures, records = [], []
     for aim in (int(x) for x in args.lengths.split(",")):
-        f, rec = run_length(client, args.salt, aim, args.hit_block_size, args.settle_s)
+        f, rec = run_length(
+            client,
+            args.salt,
+            aim,
+            args.hit_block_size,
+            args.settle_s,
+            reset=not args.no_reset,
+        )
         failures += f
         records.append(rec)
     if args.out:

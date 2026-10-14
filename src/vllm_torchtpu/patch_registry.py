@@ -90,6 +90,10 @@ PATCHES = (
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
     ),
+    Patch(
+        "vllm_torchtpu.core.checkpoint_free_order:patch_hold_replay_checkpoint",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Host-loop timing (TPU_HOST_LOOP_TRACE_DIR); no-ops when unset.
     Patch(
