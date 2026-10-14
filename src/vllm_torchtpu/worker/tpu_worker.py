@@ -38,7 +38,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu import envs, memory_debug, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -167,6 +167,13 @@ class TPUWorker(WorkerBase):
         # TPU compilation requires static shapes, so clear dynamic compile
         # ranges vLLM might have added.
         self.compilation_config.compile_ranges_endpoints = []
+
+        transfer_config = vllm_config.kv_transfer_config
+        memory_debug.configure(
+            role=transfer_config.kv_role if transfer_config is not None else "none",
+            dp_rank=self.parallel_config.data_parallel_rank,
+            rank=self.rank,
+        )
 
         # TPU-specific extras not in WorkerBase.
         self.devices = devices if devices is not None else []
@@ -553,6 +560,7 @@ class TPUWorker(WorkerBase):
         # VLLM directive of the percentage of HBM memory the model executor can use
         with _startup_compilation_artifacts():
             self.model_runner.profile_run(self.model_runner.max_num_tokens)
+        memory_debug.stage("post_profile_run")
 
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
@@ -805,12 +813,15 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu import patch_registry
 
         patch_registry.apply("model_load", model_config=self.model_config)
+        memory_debug.stage("pre_weights")
         self.model_runner.load_model()
+        memory_debug.stage("post_weights")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
         with _startup_compilation_artifacts():
             self.model_runner.capture_model()
+        memory_debug.stage("post_capture")
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
@@ -819,7 +830,11 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
-        _release_free_host_heap()
+        memory_debug.stage("pre_g1", count_executables=False)
+        if not memory_debug.NO_G1:
+            _release_free_host_heap()
+        memory_debug.stage("post_g1", count_executables=False)
+        memory_debug.start_periodic_sampler()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

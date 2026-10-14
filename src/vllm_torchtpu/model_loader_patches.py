@@ -60,7 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, memory_debug
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -925,7 +925,9 @@ def patch_moe_expert_write_staging() -> None:
     def process_weights_after_loading(model, model_config, target_device):
         during_load = stager.flushed
         stager.flush_all()
-        released = stager.release_pool()
+        memory_debug.stage("pre_c1", count_executables=False)
+        released = 0 if memory_debug.NO_C1 else stager.release_pool()
+        memory_debug.stage("post_c1", count_executables=False)
         logger.info(
             "Expert parameters written to the device: %d as their last "
             "expert landed, %d at the end of loading; released %.1f MiB of "

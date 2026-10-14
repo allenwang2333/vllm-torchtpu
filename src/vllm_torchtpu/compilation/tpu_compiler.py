@@ -27,7 +27,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, memory_debug, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
@@ -98,7 +98,9 @@ def _patch_share_executable_copies() -> None:
         CompiledArtifact,
     )
 
-    if getattr(CompiledArtifact, "_vllm_tpu_shares_copies", False):
+    if memory_debug.NO_A1D or getattr(
+        CompiledArtifact, "_vllm_tpu_shares_copies", False
+    ):
         return
 
     def _deepcopy(self: Any, memo: dict[int, Any]) -> Any:
