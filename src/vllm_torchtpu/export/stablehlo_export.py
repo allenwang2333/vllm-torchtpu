@@ -1138,8 +1138,8 @@ def _compile_options_for(tensor_parallel_size: int) -> dict[str, Any]:
     """Returns the `compile_options` object of metadata.json (rvllm RFC 0001 §3.2.1).
 
     torch_tpu compiles each TP rank's module with `num_partitions` = TP,
-    `replica_count` = 1 and `use_spmd_partitioning` = true (from the XLA dump of a
-    TP=4 Qwen3-0.6B run). A TP=1 module is compiled for a single device.
+    `replica_count` = 1 and `use_spmd_partitioning` = true (from XLA dumps of TP=1
+    and TP=4 Qwen3-0.6B runs).
     """
     if tensor_parallel_size < 1:
         raise ValueError(
@@ -1148,7 +1148,7 @@ def _compile_options_for(tensor_parallel_size: int) -> dict[str, Any]:
     return {
         "num_replicas": 1,
         "num_partitions": tensor_parallel_size,
-        "use_spmd_partitioning": tensor_parallel_size > 1,
+        "use_spmd_partitioning": True,
     }
 
 
