@@ -9,6 +9,12 @@ TPU compile-cache key.
                                 bytes and live compiled executables at startup
                                 stages, and around the C1 and G1 releases.
   VLLM_TPU_MEMDBG_PERIODIC_S=N  also log RssAnon/tcmalloc every N s at serving.
+  VLLM_TPU_MEMDBG_SMAPS=1       also break anonymous RSS down by mapping kind
+                                (heap, thread stacks, file-backed, large anon
+                                regions) from /proc/self/smaps at each stage.
+  VLLM_TPU_MEMDBG_HEAP_DUMP=1   rank 0 of each role writes a tcmalloc heap
+                                profile at each stage (gperftools tcmalloc is
+                                LD_PRELOADed) to VLLM_TPU_MEMDBG_HEAP_DIR.
 
 Ablations (turn one fix off to measure it against a run with all fixes):
   VLLM_TPU_MEMDBG_NO_A1D=1  copies of compiled artifacts reload the program.
@@ -30,6 +36,8 @@ def _flag(name: str) -> bool:
 
 
 TRACE = _flag("VLLM_TPU_MEMDBG_TRACE")
+SMAPS = _flag("VLLM_TPU_MEMDBG_SMAPS")
+HEAP_DUMP = _flag("VLLM_TPU_MEMDBG_HEAP_DUMP")
 NO_A1D = _flag("VLLM_TPU_MEMDBG_NO_A1D")
 NO_C1 = _flag("VLLM_TPU_MEMDBG_NO_C1")
 NO_G1 = _flag("VLLM_TPU_MEMDBG_NO_G1")
@@ -37,12 +45,15 @@ NO_G1 = _flag("VLLM_TPU_MEMDBG_NO_G1")
 # tcmalloc is LD_PRELOADed in our images; resolve from the process.
 _process_symbols = ctypes.CDLL(None)
 _tag = "unknown"
+_is_rank0 = False
+_heap_profiler: object = None
 
 
 def configure(role: str, dp_rank: int, rank: int) -> None:
     """Name this worker's records; called once from TPUWorker.__init__."""
-    global _tag
+    global _tag, _is_rank0
     _tag = f"{role}_dp{dp_rank}_r{rank}"
+    _is_rank0 = dp_rank == 0 and rank == 0
     if TRACE:
         logger.info(
             "[MEMDBG] tag=%s ablations={A1d off: %s, C1 off: %s, G1 off: %s}",
@@ -81,6 +92,78 @@ def _live_compiled_executables() -> int:
     return sum(isinstance(o, TorchTpuCompiledExecutable) for o in gc.get_objects())
 
 
+def _smaps_breakdown() -> str:
+    """Anonymous RSS by mapping kind, plus the largest anonymous regions."""
+    kinds: dict[str, float] = {}
+    big: list[tuple[float, float, str]] = []
+    header = ""
+    size_kb = 0
+    with open("/proc/self/smaps") as f:
+        for line in f:
+            first = line.split(None, 1)[0]
+            if "-" in first and not first.endswith(":"):
+                header = line
+                continue
+            if first == "Size:":
+                size_kb = int(line.split()[1])
+            elif first == "Anonymous:":
+                anon_kb = int(line.split()[1])
+                if not anon_kb:
+                    continue
+                parts = header.split()
+                path = parts[5] if len(parts) > 5 else ""
+                if path == "[heap]":
+                    kind = "brk_heap"
+                elif path.startswith("[stack"):
+                    kind = "main_stack"
+                elif path.startswith("/dev/shm") or "memfd" in path:
+                    kind = "shm"
+                elif path:
+                    kind = "file_private"
+                elif size_kb in (8192, 8196, 10240, 16384):
+                    kind = "thread_stack"
+                elif size_kb >= 65536:
+                    kind = "anon_ge64M"
+                elif size_kb >= 1024:
+                    kind = "anon_1M_64M"
+                else:
+                    kind = "anon_lt1M"
+                kinds[kind] = kinds.get(kind, 0.0) + anon_kb / 1024
+                if not path and size_kb >= 262144:
+                    big.append((anon_kb / 1024, size_kb / 1024, parts[0]))
+    threads = 0
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("Threads:"):
+                threads = int(line.split()[1])
+    big.sort(reverse=True)
+    parts_out = " ".join(f"{k}={v:.0f}" for k, v in sorted(kinds.items()))
+    top = ",".join(f"{rss:.0f}/{size:.0f}" for rss, size, _ in big[:6])
+    return f"threads={threads} {parts_out} big_anon_rss/size_MB=[{top}]"
+
+
+def _heap_dump(name: str) -> None:
+    global _heap_profiler
+    if _heap_profiler is None:
+        start = getattr(_process_symbols, "HeapProfilerStart", None)
+        dump = getattr(_process_symbols, "HeapProfilerDump", None)
+        if start is None or dump is None:
+            logger.warning("[MEMDBG] gperftools heap profiler not available")
+            _heap_profiler = False
+            return
+        prefix = os.path.join(
+            os.environ.get("VLLM_TPU_MEMDBG_HEAP_DIR", "/cdk-outputs"),
+            f"heap_{_tag}",
+        )
+        start.argtypes = [ctypes.c_char_p]
+        dump.argtypes = [ctypes.c_char_p]
+        start(prefix.encode())
+        _heap_profiler = dump
+        logger.info("[MEMDBG] heap profiler started, prefix=%s", prefix)
+    if _heap_profiler:
+        _heap_profiler(name.encode())  # type: ignore[operator]
+
+
 def stage(name: str, count_executables: bool = True) -> None:
     """Record one stage: RssAnon, tcmalloc in-use and free, executables."""
     if not TRACE:
@@ -99,6 +182,10 @@ def stage(name: str, count_executables: bool = True) -> None:
         _tcmalloc_property_mb("tcmalloc.pageheap_free_bytes"),
         executables,
     )
+    if SMAPS:
+        logger.info("[MEMDBG] smaps stage=%s tag=%s %s", name, _tag, _smaps_breakdown())
+    if HEAP_DUMP and _is_rank0 and name != "periodic":
+        _heap_dump(name)
 
 
 def start_periodic_sampler() -> None:
@@ -109,10 +196,16 @@ def start_periodic_sampler() -> None:
     import threading
     import time
 
+    # One labelled stage (smaps + heap dump) after N periods of serving.
+    serving_at = int(os.environ.get("VLLM_TPU_MEMDBG_SERVING_STAGE_TICKS", "0"))
+
     def _loop() -> None:
+        tick = 0
         while True:
             time.sleep(period)
-            stage("periodic", count_executables=False)
+            tick += 1
+            name = "serving" if tick == serving_at else "periodic"
+            stage(name, count_executables=False)
 
     threading.Thread(target=_loop, name="memdbg-sampler", daemon=True).start()
 
