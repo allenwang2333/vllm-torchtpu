@@ -991,7 +991,9 @@ class TPUModelRunner(GPUModelRunner):
             if envs.TPU_STEP_TIMING_LOG_STEPS
             else None
         )
-        self._hlt = make_host_loop_trace("worker")
+        self._hlt = make_host_loop_trace(
+            f"worker_dp{self.parallel_config.data_parallel_rank}"
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.

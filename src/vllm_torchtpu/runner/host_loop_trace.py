@@ -47,6 +47,7 @@ class HostLoopTrace:
         if not self._rec:
             return
         rec, self._rec = self._rec, {}
+        rec["wall"] = time.time()  # aligns records with wall-clock stage logs
         with self._lock:
             self._lines.append(json.dumps(rec, separators=(",", ":")))
             if len(self._lines) >= _FLUSH_EVERY:
@@ -86,7 +87,8 @@ def install_engine_core_trace() -> None:
 
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        trace = make_trace("engine")
+        rank = self.vllm_config.parallel_config.data_parallel_rank
+        trace = make_trace(f"engine_dp{rank}")
         assert trace is not None
         sched = self.scheduler
         sched.schedule = _timed(trace, "sched", sched.schedule)
