@@ -41,7 +41,7 @@
 #                            environment, and launches with --nnodes
 #
 # Where this departs from the doc, each needed on GKE: distinct Raiden ids per
-# role, a host KV store a quarter the size, and --headless on hosts 1-3 (which
+# role, a host KV store half the size, and --headless on hosts 1-3 (which
 # k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
 # --tool-call-parser and --reasoning-parser, and so not the Kimi tool-call
 # post-eval either.
@@ -237,9 +237,11 @@ COMMON_ARGS=(
 # ~384 GiB on each GKE tpu7x host; on top of the weight loads' page cache and
 # the gcsfuse sidecar's ~63 GiB, every host's working set reached 790-850 GiB of
 # 960 and the kubelet evicted the prefill head (vllm-torchtpu-dev build 562).
-# 384 GiB in all is ~96 GiB per host, which peaked at 500-590 GiB (builds 566,
-# 573). A point may set RECIPE_OFFLOAD_BYTES.
-_offload_bytes="${RECIPE_OFFLOAD_BYTES:-412316860416}"
+# 768 GiB in all is ~192 GiB per host, which peaked at 604-677 GiB (build 589).
+# Half that left point 4's prefill recomputing 3.2x the trace's minimum prompt
+# tokens against 2.6x, with P90 TTFT 19.2 s against 7.5 s and 13% less
+# throughput (build 588). A point may set RECIPE_OFFLOAD_BYTES.
+_offload_bytes="${RECIPE_OFFLOAD_BYTES:-824633720832}"
 _offload_connector() {  # _offload_connector <raiden_controller_port>
   printf '{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":%s,"raiden_controller_port":%s,"raiden_job_name":"k3-mk-offload-0","store_server_ip":"%s"}}' "$_offload_bytes" "$1" "$HEAD_IP"
 }
