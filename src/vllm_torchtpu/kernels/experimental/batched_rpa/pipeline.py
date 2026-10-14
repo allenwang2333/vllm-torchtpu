@@ -61,8 +61,14 @@ def run_manual_triple_buffer(
     with jax.named_scope("ep_initialize"):
         q_bref.copy_in(0, 0, total_steps)
         kv_bref.copy_in(0, 0, total_steps)
-        q_bref.copy_in(1, 1, total_steps)
-        kv_bref.copy_in(1, 1, total_steps)
+
+        # Step 1 only exists when there are at least two steps. Issuing its fetch
+        # anyway would walk every descriptor of a full `copy_in` pass at size 0,
+        # which is pure scalar overhead on single-step launches.
+        @pl.when(total_steps > 1)
+        def _prefetch_step_one():
+            q_bref.copy_in(1, 1, total_steps)
+            kv_bref.copy_in(1, 1, total_steps)
 
     @pl.loop(0, total_steps)
     def steady_state(step):
