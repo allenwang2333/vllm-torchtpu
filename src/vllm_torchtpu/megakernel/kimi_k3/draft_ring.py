@@ -149,6 +149,28 @@ class PrefillRing:
         per sequence (``-1``: no checkpoint). Returns the ``(cache, meta)``
         rings after the window and at the checkpoints."""
         slots, window = len(rings), int(positions.shape[0])
+
+        def device(values) -> torch.Tensor:
+            return torch.from_numpy(np.ascontiguousarray(values, np.int32)).to("tpu")
+
+        out = self._update_op(window, slots)(
+            blocks,
+            prefix,
+            middle,
+            device(positions),
+            device(sequences),
+            device(ends),
+            device(stops),
+            *self.weights,
+            *(cache for cache, _ in rings),
+            *(meta for _, meta in rings),
+        )
+        after = list(zip(out[:slots], out[2 * slots : 3 * slots], strict=True))
+        at = list(zip(out[slots : 2 * slots], out[3 * slots :], strict=True))
+        return after, at
+
+    def _update_op(self, window: int, slots: int) -> Any:
+        """:meth:`update`'s op for a ``window`` of ``slots`` sequences."""
         key = ("update", window, slots)
         if key not in self._ops:
             c, axis, dspark = self.config, self.axis, self.dspark
@@ -194,22 +216,4 @@ class PrefillRing:
                     ("prefill_draft_ring", window, slots, dataclasses.astuple(c))
                 ),
             )
-
-        def device(values) -> torch.Tensor:
-            return torch.from_numpy(np.ascontiguousarray(values, np.int32)).to("tpu")
-
-        out = self._ops[key](
-            blocks,
-            prefix,
-            middle,
-            device(positions),
-            device(sequences),
-            device(ends),
-            device(stops),
-            *self.weights,
-            *(cache for cache, _ in rings),
-            *(meta for _, meta in rings),
-        )
-        after = list(zip(out[:slots], out[2 * slots : 3 * slots], strict=True))
-        at = list(zip(out[slots : 2 * slots], out[3 * slots :], strict=True))
-        return after, at
+        return self._ops[key]
