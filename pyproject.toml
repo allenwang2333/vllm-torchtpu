@@ -107,6 +107,7 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
+torchtpu_runai_pull = "vllm_torchtpu.runai_pull_patches:patch_runai_pull_once"
 
 # Dev / CI / Docker only. These are PEP 735 dependency groups, not extras:
 # groups are never written into the built wheel's metadata, so their git URLs
