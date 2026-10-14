@@ -102,9 +102,20 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         )
         else 0
     )
-    return (
+    credit = (
         (_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots
-    ) * 3 * hidden * inter, slots
+    ) * 3 * hidden * inter
+    mk_tp = (
+        os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        and os.environ.get("VLLM_TPU_QWEN35_MK_MODE", "ep").strip().lower() == "tp"
+    )
+    if mk_tp:
+        # In TP MoE mode, each rank holds per-expert FP32 scale tensors
+        # (s13_tp, s2_tp, es_mk) for all 512 experts instead of 64 experts
+        # (~0.94 GB across 60 layers); reserve 1.07 GB of the freed slot credit.
+        credit -= 1_070_230_528
+    return credit, slots
 
 
 def _log_effective_config(vllm_config: VllmConfig) -> None:
@@ -998,7 +1009,15 @@ class TpuPlatform(Platform):
             ep_size = int(parallel_config.tensor_parallel_size) * int(
                 parallel_config.data_parallel_size
             )
-            if "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
+            mk_tp = (
+                os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+                and os.environ.get("VLLM_TPU_QWEN35_MK_MODE", "ep").strip().lower()
+                == "tp"
+            )
+            if mk_tp:
+                os.environ["TPU_EXPERT_PLACEMENT"] = ""
+            elif "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
                 from vllm_torchtpu import expert_placement
 
                 table = expert_placement.auto_table(

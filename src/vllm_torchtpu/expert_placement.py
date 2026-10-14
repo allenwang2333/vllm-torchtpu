@@ -72,7 +72,16 @@ _ROUTER_RE = re.compile(r"\.mlp\.gate\.(weight|bias)$|e_score_correction_bias$")
 
 
 def _path() -> str:
-    return _envs.TPU_EXPERT_PLACEMENT
+    if (
+        os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        and os.environ.get("VLLM_TPU_QWEN35_MK_MODE", "ep").strip().lower() == "tp"
+    ):
+        return ""
+    p = _envs.TPU_EXPERT_PLACEMENT.strip()
+    if p.lower() in ("", "0", "false", "no", "off", "none"):
+        return ""
+    return p
 
 
 def enabled() -> bool:
