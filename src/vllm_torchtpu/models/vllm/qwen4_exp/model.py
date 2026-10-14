@@ -31,6 +31,7 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
 )
+from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -42,7 +43,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
 
 from .config import gdn_cache_spec, use_unified_pool
 from .hyperconnection import GatedResidual, HyperConnectionConfig
-from .moe import Qwen4ExpSparseMoeBlock
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
 from .ple import Qwen4ExpPLE, ple_state_shape
@@ -125,7 +125,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn
             )
-        self.mlp = Qwen4ExpSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
+        self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         hc_up_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
         )

@@ -15,7 +15,6 @@
 
 from collections.abc import Callable
 
-import torch
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -43,8 +42,6 @@ class VllmMoERunner(MoERunner):
     name) and gets none of the behavior below. No model this plugin serves
     passes one.
     """
-
-    combine_dtype: torch.dtype | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -143,26 +140,6 @@ class VllmMoERunner(MoERunner):
         return super()._maybe_dispatch(hidden_states, router_logits)
 
     def _maybe_combine(self, shared_output, hidden_states):
-        if self.combine_dtype is not None:
-            if (
-                not self.do_naive_dispatch_combine
-                or self.moe_config.pcp_size != 1
-                or not isinstance(hidden_states, torch.Tensor)
-            ):
-                raise NotImplementedError(
-                    "Explicit MoE combine dtype requires the outer EP combine, "
-                    "PCP1 and materialized routed output"
-                )
-            output_dtype = hidden_states.dtype
-            result = super()._maybe_combine(
-                shared_output, hidden_states.to(self.combine_dtype)
-            )
-            if isinstance(result, tuple):
-                shared, routed = result
-                assert isinstance(routed, torch.Tensor)
-                return shared, routed.to(output_dtype)
-            assert isinstance(result, torch.Tensor)
-            return result.to(output_dtype)
         if self._fused_ep_owns_pcp_collectives():
             # The fused program has already pushed and summed routed rows
             # back onto their token-owning PCP rank. Preserve upstream's

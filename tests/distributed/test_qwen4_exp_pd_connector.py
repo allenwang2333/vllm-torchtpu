@@ -460,7 +460,7 @@ def test_qwen_loaded_requires_controller_and_native_completion(
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "checkpoint", "scale", "layout_flag", "binding", "precision"]
+    "fault", [None, "checkpoint", "scale", "layout_flag", "binding"]
 )
 def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fault):
     import torch
@@ -486,17 +486,6 @@ def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fau
         _k_scale_cpu=torch.tensor(0.5),
         _v_scale_cpu=torch.tensor(0.25),
     )
-    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
-
-    experts = object.__new__(VllmMoERunner)
-    torch.nn.Module.__init__(experts)
-    experts.combine_dtype = None if fault == "precision" else torch.float32
-    experts.moe_config = SimpleNamespace(
-        dp_size=8, is_sequence_parallel=False, pcp_size=1
-    )
-    experts.routed_experts = SimpleNamespace(
-        quant_method=SimpleNamespace(supports_internal_mk=False)
-    )
     cache.model = SimpleNamespace(
         pd_loaded_weight_identity=None if fault == "checkpoint" else "a" * 64,
         pd_loaded_ple_identity="b" * 64,
@@ -507,7 +496,6 @@ def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fau
                 SimpleNamespace(
                     layer_type="full_attention",
                     self_attn=attention,
-                    mlp=SimpleNamespace(experts=experts),
                 )
             ]
         ),
@@ -582,6 +570,5 @@ def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fau
         assert payload["semantics"]["ranks"][0]["checkpoint"] == "a" * 64
         assert payload["semantics"]["ranks"][0]["kv_scales"] == [(0, 0.5, 0.25)]
         assert (
-            payload["semantics"]["ranks"][0]["state_flags"]["moe_combine_dtype"]
-            == "torch.float32"
+            "moe_combine_dtype" not in payload["semantics"]["ranks"][0]["state_flags"]
         )

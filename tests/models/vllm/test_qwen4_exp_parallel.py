@@ -308,7 +308,7 @@ def test_model_uses_true_tp_ep_and_embedding_geometry(
     )
     monkeypatch.setattr(model, "Qwen4ExpQSA", qsa)
     monkeypatch.setattr(model, "Qwen4ExpPLE", ple)
-    monkeypatch.setattr(model, "Qwen4ExpSparseMoeBlock", moe)
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", moe)
     gdn = Mock(side_effect=lambda *a, **kw: nn.Identity())
     monkeypatch.setattr(model, "VllmGatedDeltaNetAttention", gdn)
     monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: nn.Identity())
@@ -525,10 +525,10 @@ def upstream_moe(monkeypatch):
     from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
     from vllm.model_executor.model_loader.utils import configure_quant_config
     from vllm.model_executor.models import qwen3_next
+    from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
-    from vllm_torchtpu.models.vllm.qwen4_exp.moe import Qwen4ExpSparseMoeBlock
 
     def build(
         tp,
@@ -605,7 +605,7 @@ def upstream_moe(monkeypatch):
         try:
             torch.set_default_dtype(torch.bfloat16)
             with set_current_vllm_config(cfg), torch.device("cpu"):
-                return Qwen4ExpSparseMoeBlock(cfg, "model.layers.0.mlp")
+                return Qwen3NextSparseMoeBlock(cfg, "model.layers.0.mlp")
         finally:
             torch.set_default_dtype(previous_dtype)
 
@@ -652,7 +652,6 @@ def test_moe_uses_upstream_quantization_and_checkpoint_exclusions(
     )
     assert block.gate.weight.dtype == torch.bfloat16
     assert block.shared_expert.gate_up_proj.weight.dtype == torch.bfloat16
-    assert block.n_shared_experts == 1
     assert experts.renormalize == renormalize
     assert experts.moe_config.experts_per_token == 2
     width = 640 if enable_ep else 640 // tp
@@ -955,10 +954,13 @@ def test_request_capacity_is_not_limited_to_bringup_slots(slots):
 
 
 @pytest.mark.parametrize("transfer", [False, True])
-def test_pd_configures_fp32_outer_combine_only_when_enabled(upstream_moe, transfer):
+def test_pd_reuses_upstream_moe_without_precision_override(upstream_moe, transfer):
     from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 
     block = upstream_moe(1, True, 0, transfer=transfer)
     assert isinstance(block.experts, VllmMoERunner)
-    assert block.experts.combine_dtype == (torch.float32 if transfer else None)
+    from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+    assert type(block) is Qwen3NextSparseMoeBlock
+    assert "combine_dtype" not in vars(block.experts)
     assert block.experts.do_naive_dispatch_combine

@@ -171,22 +171,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         return self._raiden_transfer_engine
 
     def _collect_pd_semantics(self, runner) -> dict[str, Any]:
-        from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
-
         model = runner.model_adapter.cache.model
         if model.pd_gdn_qk_pair_layout != envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
             raise ValueError("Qwen PD GDN layout changed since model construction")
-        for layer in model.model.layers:
-            experts = layer.mlp.experts
-            if (
-                not isinstance(experts, VllmMoERunner)
-                or experts.combine_dtype != torch.float32
-                or not experts.do_naive_dispatch_combine
-                or experts.moe_config.pcp_size != 1
-            ):
-                raise ValueError(
-                    "Qwen PD requires FP32 outer MoE combine on every layer"
-                )
         scales = []
         for index, layer in enumerate(model.model.layers):
             if layer.layer_type == "full_attention":
@@ -219,7 +206,6 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             state_flags=dict(
                 gdn_qk_pair=model.pd_gdn_qk_pair_layout,
                 expert_parallel=parallel.enable_expert_parallel,
-                moe_combine_dtype=str(torch.float32),
                 ssm_dtype=str(self.vllm_config.cache_config.mamba_ssm_cache_dtype),
                 cp=1,
                 pp=1,
