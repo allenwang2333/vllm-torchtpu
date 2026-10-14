@@ -313,7 +313,10 @@ def _launcher_command(exchange: Path) -> list[str]:
 def _run_runtime_worker(rank: int, exchange: Path) -> None:
     import torch
     from torch import distributed as dist
+    from vllm.plugins import load_general_plugins
 
+    # Runtime participants need the same plugin bootstrap as the P/D workers.
+    load_general_plugins()
     dist.init_process_group(backend="tpu_dist", timeout=datetime.timedelta(seconds=120))
     try:
         torch.empty(1, device="tpu").cpu()
