@@ -2,7 +2,6 @@
 """Two logical KV pages may have unrelated physical addresses."""
 
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -54,9 +53,7 @@ def test_paired_tile_selection_for_shared_pool(monkeypatch, page_size):
     assert get_sparse_prefill_tiles(query, cache, kv_heads=2, ratio=4) == (256, 256)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires the exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("starts", [(0, 256), (0, 129, 129, 255)])
 @pytest.mark.parametrize("page_size", [128, 1664])
 def test_permuted_odd_pages_and_partial_groups(starts, page_size):
@@ -143,9 +140,7 @@ def test_permuted_odd_pages_and_partial_groups(starts, page_size):
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires the exclusive TPU window"
-)
+@pytest.mark.tpu_test
 def test_production_shape_torch_bridge():
     import torch
     from torch_tpu._internal import compile as tpu_compile

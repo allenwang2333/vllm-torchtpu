@@ -20,6 +20,7 @@ from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
     VerifyAndUpdateConfig,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
@@ -66,7 +67,7 @@ def gdn_cache_spec(cfg):
     )
 
 
-def native_cache_specs(cfg):
+def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     """Describe model-owned caches before allocating any model weights."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import MambaSpec
@@ -78,7 +79,7 @@ def native_cache_specs(cfg):
     main, auxiliary = get_qsa_cache_specs(
         t, cfg.parallel_config.tensor_parallel_size, cfg.cache_config.cache_dtype
     )
-    specs = {}
+    specs: dict[str, KVCacheSpec] = {}
     for index, layer_type in enumerate(t.layer_types):
         prefix = f"model.layers.{index}"
         if layer_type == "linear_attention":

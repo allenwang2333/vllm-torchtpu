@@ -22,6 +22,7 @@ def bare_config(config_type):
 def launch_config(monkeypatch, instance, *, offload=True):
     from transformers import PretrainedConfig
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config.aux_output import AuxOutputConfig
 
     from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
     from vllm_torchtpu.models.vllm.qwen4_exp import config
@@ -57,6 +58,7 @@ def launch_config(monkeypatch, instance, *, offload=True):
     )
     config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     hashed = bare_config(VllmConfig)
+    hashed.aux_output_config = AuxOutputConfig()
     hashed.model_config = model
     hashed.additional_config = cfg.additional_config
     hashed.observability_config = NS(compute_hash=lambda: "observability")
@@ -105,7 +107,7 @@ def test_launch_identity_survives_config_transport_and_dp_collapse(
 
 @pytest.mark.parametrize("dp", [1, 2, 8])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_host_boundary_preserves_bits_dp_axis_and_current_ids(dp, fp8):
+def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, fp8):
     from functools import partial
 
     from vllm.compilation.backends import split_graph
@@ -114,6 +116,8 @@ def test_host_boundary_preserves_bits_dp_axis_and_current_ids(dp, fp8):
     from vllm_torchtpu.models.vllm.qwen4_exp.ple import HostPLEEmbedding
     from vllm_torchtpu.models.vllm.qwen4_exp.ple_offload import host_lookup
 
+    # This test compiles a CPU FX graph; Dynamo must not acquire a TPU stream.
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     width, heads, start, rows = 24, 3, 17, 11
     bits = (torch.arange(rows * width, device="cpu") * 73 + 159).reshape(rows, width)
     bits = bits.to(torch.int8 if fp8 else torch.int16)

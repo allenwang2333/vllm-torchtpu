@@ -5,6 +5,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import cast
 
 import torch
 from torch import nn
@@ -15,17 +16,20 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheSpec,
     MLAAttentionSpec,
     get_kv_quant_mode,
 )
 
 from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_qsa_op
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -122,7 +126,7 @@ class Qwen4ExpQSABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        return Qwen4ExpQSA
+        raise NotImplementedError("QSA is constructed by its model-owned layer")
 
     @staticmethod
     def get_builder_cls():
@@ -135,7 +139,9 @@ class Qwen4ExpQSABackend(AttentionBackend):
         return AttentionMetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[MultipleOf | int]:
         return [QSA_BLOCK_SIZE]
 
     @staticmethod
@@ -161,9 +167,9 @@ class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
         return "QWEN4_EXP_TPU_POOLED_QSA"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import MultipleOf
-
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[MultipleOf | int]:
         return [MultipleOf(QSA_BLOCK_SIZE)]
 
     @staticmethod
@@ -227,6 +233,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """
 
     supports_dcp = False
+    # This model owns a tuple of separate state buffers, or one pooled carrier.
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    kv_cache: tuple[torch.Tensor, ...]
+    k_proj: ColumnParallelLinear
+    v_proj: ColumnParallelLinear
 
     def __init__(
         self,
@@ -450,7 +461,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             parameter = parameters[name]
             with torch.no_grad():
                 if name in ("q_proj.weight", "k_proj.weight", "v_proj.weight"):
-                    parameter.weight_loader(parameter, weight)
+                    cast(BasevLLMParameter, parameter).weight_loader(parameter, weight)
                 elif name == "o_proj.weight":
                     width = self.num_heads * self.head_dim
                     self.o_proj.weight_loader(
@@ -473,14 +484,20 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             "Task4 must bind real or profiling scratch QSA owners"
         )
         if self.pooled:
-            per_layer = get_forward_context().attn_metadata
+            per_layer = cast(
+                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+            )
             metadata = replace(
                 metadata,
-                state_slots=per_layer[self.prefix + ".raw_ring"].block_tables,
-                main_block_table=per_layer[self.prefix].block_tables,
-                compressed_block_table=per_layer[
-                    self.prefix + ".compressed_k"
-                ].block_tables,
+                state_slots=cast(
+                    torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+                ),
+                main_block_table=cast(
+                    torch.Tensor, per_layer[self.prefix].block_tables
+                ),
+                compressed_block_table=cast(
+                    torch.Tensor, per_layer[self.prefix + ".compressed_k"].block_tables
+                ),
             )
         output, selected = self._op(
             self.q_proj(hidden),

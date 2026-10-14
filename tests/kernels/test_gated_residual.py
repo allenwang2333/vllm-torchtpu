@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP32 scalar gates must retain their precision between BF16 boundaries."""
 
-import os
-
 import pytest
 import torch
 
@@ -17,9 +15,7 @@ def test_invalid_geometry(branches, hidden, tile):
         build_gated_residual_op(branches, hidden, tile)
 
 
-TPU = pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires the exclusive TPU window"
-)
+TPU = pytest.mark.tpu_test
 
 
 @TPU

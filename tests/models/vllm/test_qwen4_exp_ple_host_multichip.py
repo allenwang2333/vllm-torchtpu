@@ -20,10 +20,6 @@ import pytest
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1",
-    reason="Requires an exclusive eight-TPU window",
-)
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_host_ple_compiled_transport_preserves_checkpoint_bits(tp, tmp_path):
     command = [

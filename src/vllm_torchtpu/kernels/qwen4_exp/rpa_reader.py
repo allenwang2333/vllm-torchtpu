@@ -2,6 +2,7 @@
 """Qwen decode reader deriving regular DMA fields from the schedule base."""
 
 import dataclasses
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -38,10 +39,14 @@ class QwenDecodeKVRef(bref_override.KVBufferedRefHeadAlongSublane):
                 "Qwen reader requires page4 FP8 skip-update HEAD decode, K256/batch8."
             )
         cache, new_kv, metadata, pages = src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         block = jnp.maximum(grid_indices[0], 0)
-        dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        dst = cast(jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride])
+        # Pallas refs support reshape; jax.Ref omits that method from its type.
+        # pyrefly: ignore[missing-attribute]
         flat = cache.reshape(-1, *cache.shape[2:])
         cache_copies, new_copies = [], []
         for batch in range(self.cfgs.batch_size):

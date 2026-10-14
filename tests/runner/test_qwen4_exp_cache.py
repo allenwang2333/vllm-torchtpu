@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
@@ -38,6 +39,7 @@ def test_native_groups_last_blocks_and_real_capacity(
     cc.kv_cache_layout = "BLHNC"
     cfg = NS(
         additional_config={},
+        attention_config=AttentionConfig(),
         cache_config=cc,
         scheduler_config=NS(disable_hybrid_kv_cache_manager=False, max_num_seqs=seqs),
         speculative_config=None,

@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Production Qwen state precision across a full prefill and subsequent decode."""
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [4096, 8192])
 def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monkeypatch):
     from vllm_torchtpu import envs

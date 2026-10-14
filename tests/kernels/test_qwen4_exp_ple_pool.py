@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pooled state contracts: exact continuation and preservation of other owners."""
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,9 +18,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
 )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("batch", [7, 8, 128])
 def test_qsa_ring_tag_dma_preserves_exact_bytes_and_inactive_owners(fp8, batch):
@@ -76,9 +72,7 @@ def test_qsa_ring_tag_dma_preserves_exact_bytes_and_inactive_owners(fp8, batch):
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn"])
 @pytest.mark.parametrize("channels", [128, 10240])
 def test_pooled_ple_matches_private_state_and_preserves_other_pages(dtype, channels):
@@ -122,9 +116,7 @@ def test_pooled_ple_matches_private_state_and_preserves_other_pages(dtype, chann
     np.testing.assert_array_equal(after[[0, 1, 2, 4, 6]], before[[0, 1, 2, 4, 6]])
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
@@ -262,9 +254,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         context = context + jnp.array([3, 4, 0], jnp.int32)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("starts", [[0, 128, 256], [0, 96, 256]])
 def test_qsa_main_cache_universal_tiled_writer_matches_scatter(fp8, starts):
@@ -294,9 +284,7 @@ def test_qsa_main_cache_universal_tiled_writer_matches_scatter(fp8, starts):
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("query_block", [32, 64, 128, 256])
 def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(

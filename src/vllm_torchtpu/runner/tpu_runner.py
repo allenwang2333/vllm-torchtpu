@@ -3844,6 +3844,8 @@ class TPUModelRunner(GPUModelRunner):
             if self.model_adapter is not None:
                 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
 
+                assert step_token_store is not None
+                assert input_ids is not None
                 model_kwargs = self.model_adapter.prepare_inputs(
                     ModelInputSnapshot(
                         step_token_store,

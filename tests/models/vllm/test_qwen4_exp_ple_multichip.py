@@ -2,8 +2,8 @@
 """PLE bytes must survive compiled TP-by-DP transport, including odd buckets.
 
 CPU group mocks cannot catch the narrow-view/packed-reduction corruption this
-test reproduces. Run with Q4EXP_TEST_TPU=1 on an idle eight-device host. Workers
-borrow TP and DP groups without creating an EP group or loading the full model.
+test reproduces. Use the multichip test selection on an idle eight-device host.
+Workers borrow TP and DP groups without creating an EP group or loading the full model.
 """
 
 import argparse
@@ -20,10 +20,6 @@ import pytest
 pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1",
-    reason="Requires an exclusive eight-TPU window",
-)
 @pytest.mark.parametrize("tp", [2, 4])
 def test_compiled_ple_transport_preserves_raw_bits(tp, tmp_path):
     command = [

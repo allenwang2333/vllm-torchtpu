@@ -227,7 +227,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 apc=False,
             ),
         )
-        records = [None] * group.world_size
+        records: list[Any] = [None] * group.world_size
         torch.distributed.all_gather_object(records, record, group=group.cpu_group)
         return canonical_rank_identity(records, world_size=group.world_size)
 

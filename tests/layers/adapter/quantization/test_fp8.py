@@ -809,6 +809,10 @@ def _make_fp8_experts(
         "get_tensor_model_parallel_world_size",
         lambda: tp_size,
     )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
     quant_cls = VllmFp8Config
     if deepseek_v4:
         from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (

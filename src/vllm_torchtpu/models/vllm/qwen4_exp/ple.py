@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from typing import cast
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 
 from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as ple_kernels
 from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import compute_ngram_ids
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .parallel import PLEParallel
 from .ple_host import SharedPLETable
@@ -370,6 +372,10 @@ class HostPLEEmbedding(ResidentPLEEmbedding):
 
 
 class _HashEmbedding(nn.Module):
+    layer_multipliers: torch.Tensor
+    ngram_heads_offsets: torch.Tensor
+    ngram_heads_vocab_sizes: torch.Tensor
+
     def __init__(
         self,
         config,
@@ -506,6 +512,10 @@ class Qwen4ExpPLE(nn.Module):
     def get_state_dtype(self):
         return (torch.bfloat16,)
 
+    norm_key: _NormWeight
+    norm_query: _NormWeight
+    norm_conv: _NormWeight
+
     def bind_pool(self, pool):
         from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
             build_pooled_short_conv_op,
@@ -530,7 +540,7 @@ class Qwen4ExpPLE(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if self._finalized:
             raise ValueError("PLE weights are already finalized")
-        tensors = dict(self.named_parameters())
+        tensors: dict[str, torch.Tensor] = dict(self.named_parameters())
         tensors.update(self.named_buffers())
         loaded = set()
         embedding_prefix = "ple_embedding.ngram_embedding."
@@ -618,7 +628,10 @@ class Qwen4ExpPLE(nn.Module):
         if self.pooled:
             from vllm.forward_context import get_forward_context
 
-            metadata = get_forward_context().attn_metadata[self.prefix]
+            per_layer = cast(
+                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+            )
+            metadata = per_layer[self.prefix]
             state_indices = metadata.mamba_state_indices
         embedding = self.ple_embedding.ngram_embedding
         if self.cpu_offload:

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Admitted topology, physical DP slots and checkpoint ownership contracts."""
 
-import os
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -663,10 +662,7 @@ def test_moe_uses_upstream_quantization_and_checkpoint_exclusions(
     assert block.shared_expert.gate_up_proj.weight.shape == (2 * 640 // tp, 256)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1",
-    reason="Set Q4EXP_TEST_TPU=1 in the serialized TPU window",
-)
+@pytest.mark.tpu_test
 def test_tpu_upstream_moe_block128_checkpoint_accuracy(upstream_moe, monkeypatch):
     """Existing block-128 FP8 mode retains BF16 activations on this TPU."""
     import torch.nn.functional as F

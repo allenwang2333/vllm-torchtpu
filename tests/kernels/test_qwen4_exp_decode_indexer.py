@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 decode selection: page ownership, completed groups and exact ties."""
 
-import os
-
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -31,9 +29,7 @@ def _reference(query, cache, lengths, table):
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("ties", [False, True])
 @pytest.mark.parametrize("heads", [1, 2, 4, 8])
 def test_decode_blocks_match_exact_topk_set(ties, heads):
@@ -64,9 +60,7 @@ def test_decode_indexer_rejects_quantized_index_cache():
         )
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("batch", [7, 8, 9])
 @pytest.mark.parametrize("ties", [False, True])
 def test_decode_batch_boundary_preserves_idle_tail_and_page_ownership(batch, ties):
@@ -88,9 +82,7 @@ def test_decode_batch_boundary_preserves_idle_tail_and_page_ownership(batch, tie
         np.testing.assert_array_equal(actual[row, count:], -1)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 def test_streamindex_bf16_cache_preserves_scores_and_selection():
     """Reusing FP8 unpacking on BF16 bytes corrupts QSA retrieval scores."""
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
@@ -125,9 +117,7 @@ def test_streamindex_bf16_cache_preserves_scores_and_selection():
         np.testing.assert_array_equal(np.asarray(ids[row, count:]), -1)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("carrier", ["uint8", "float8_e4m3fn"])
 @pytest.mark.parametrize("ties", [False, True])
 def test_streamindex_bf16_pool_view_matches_native_cache(carrier, ties):
@@ -185,9 +175,7 @@ def test_streamindex_bf16_pool_view_matches_native_cache(carrier, ties):
     np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("batch", [8, 9, 128])
 @pytest.mark.parametrize("ties", [False, True])
 def test_pooled_decode_uses_logical_width_without_changing_selection(batch, ties):

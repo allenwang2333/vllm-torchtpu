@@ -20,9 +20,7 @@ from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import compute_ngram_ids
 from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import ResidentPLEEmbedding
 
-TPU = pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires serialized TPU window"
-)
+TPU = pytest.mark.tpu_test
 EOS = 248044
 MULTIPLIERS = [23703573157769, 20109073645365, 8052911324071]
 SIZES = [

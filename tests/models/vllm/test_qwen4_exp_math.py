@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Checkpoint geometry/math contracts; TPU bridge checks are explicitly opt-in."""
-
-import os
+"""Checkpoint math contracts and TPU bridge checks with hardware markers."""
 
 import numpy as np
 import pytest
@@ -14,10 +12,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     HyperConnectionConfig,
 )
 
-TPU = pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1",
-    reason="Set Q4EXP_TEST_TPU=1 in the serialized TPU window",
-)
+TPU = pytest.mark.tpu_test
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +27,8 @@ def cpu_default(request):
 
 
 def hc_fixture(per_branch):
-    torch.manual_seed(383)
+    # Seed only CPU: torch.manual_seed also initializes registered accelerators.
+    torch.random.default_generator.manual_seed(383)
     config = HyperConnectionConfig(
         hidden_size=2560, hc_count=4, hc_lowrank=320, hc_per_branch_norm=per_branch
     )

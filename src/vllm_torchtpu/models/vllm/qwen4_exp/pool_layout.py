@@ -10,7 +10,12 @@ import math
 from dataclasses import dataclass, replace
 
 import torch
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
@@ -57,6 +62,7 @@ def pooled_cache_specs(cfg):
     gdn = specs[
         f"model.layers.{text.layer_types.index('linear_attention')}.linear_attn"
     ]
+    assert isinstance(gdn, MambaSpec)
     state = derive_pooled_gdn_state_layout(
         ssm_bytes=math.prod(gdn.shapes[1]) * gdn.dtypes[1].itemsize,
         conv_bytes=math.prod(gdn.shapes[0]) * POOLED_GDN_CONV_STATE_DTYPE.itemsize,
@@ -92,7 +98,7 @@ def pooled_cache_specs(cfg):
         compressed_kernel_bytes=compressed_bytes,
         compressed_width=compressed_width,
     )
-    pooled = {}
+    pooled: dict[str, KVCacheSpec] = {}
     # Upstream uses one persistent Mamba state block per request without APC.
     # Its logical span is max_model_len, while the physical state still fits
     # in a single uniform pool page. APC uses position-indexed align blocks.
@@ -115,7 +121,9 @@ def pooled_cache_specs(cfg):
                 mamba_cache_mode=mamba_mode,
             )
         else:
+            assert isinstance(spec, AttentionSpec)
             if name.endswith(".compressed_k"):
+                assert isinstance(spec, MLAAttentionSpec)
                 spec = replace(spec, state_content_bytes=compressed_width * 2)
             pooled[name] = replace(
                 spec,

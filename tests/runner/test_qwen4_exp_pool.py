@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
@@ -30,6 +31,7 @@ def pool_config(tp=1, kv="fp8_e4m3", ssm="bfloat16"):
     cache.kv_cache_layout = "BLHNC"
     return NS(
         additional_config={},
+        attention_config=AttentionConfig(),
         cache_config=cache,
         model_config=NS(
             hf_text_config=q4exp_text_config(), max_model_len=9216, dtype=torch.bfloat16

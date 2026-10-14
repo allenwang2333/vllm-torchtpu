@@ -1788,7 +1788,7 @@ class KVCacheManager:
                 continue
                 # xs.mark_sharding(cache, self.mesh, (None, "x", None, None))
 
-        self._register_kv_connector(kv_caches)
+        self._register_kv_connector(cast(dict[str, LayerKVCache], kv_caches))
 
         # Initialize the compact-mamba slot allocator now that the true mamba
         # block count is known. When compact sizing was skipped, mamba shares

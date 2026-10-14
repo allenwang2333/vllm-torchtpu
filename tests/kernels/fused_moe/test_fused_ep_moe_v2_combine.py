@@ -20,6 +20,8 @@ import pytest
 
 from vllm_torchtpu.kernels.fused_moe.v2 import kernel
 
+pytestmark = pytest.mark.tpu_test
+
 FP8 = jnp.float8_e4m3fn
 
 

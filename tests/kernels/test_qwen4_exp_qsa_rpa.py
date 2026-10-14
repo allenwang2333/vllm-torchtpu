@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native-layout QSA must preserve request state across prefill and decode."""
 
-import os
 from functools import partial
 
 import jax
@@ -90,9 +89,7 @@ def test_head_packing_preserves_values(fp8, heads):
         np.testing.assert_array_equal(np.asarray(decoded[:, 2:], np.float32), 0)
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Exclusive TPU required"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "context_base,prefill_count",
@@ -268,9 +265,7 @@ def _check_lifecycle(
         state, reference_state = actual[:-2], expected[:-2]
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Exclusive TPU required"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_one_kv_head_rpa_lifecycle(fp8):
     _check_lifecycle(fp8, 126, 8, heads=1, hq=3)
@@ -285,9 +280,7 @@ def test_query_batch_bounds_scalar_page_metadata(budget):
         assert batch == 64
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Exclusive TPU required"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_alternative_geometry_with_padded_head_dimensions(fp8):
     _check_lifecycle(

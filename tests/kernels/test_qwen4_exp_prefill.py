@@ -3,7 +3,6 @@
 
 import functools
 import importlib
-import os
 
 import jax
 import jax.numpy as jnp
@@ -220,9 +219,7 @@ def test_single_prefill_supports_tp_head_counts_and_padded_dimensions(
     assert cache.shape[0] == 3
 
 
-@pytest.mark.skipif(
-    os.environ.get("Q4EXP_TEST_TPU") != "1", reason="Requires exclusive TPU window"
-)
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [512, 8192])
 @pytest.mark.parametrize("carrier", ["uint8", "float8_e4m3fn"])
 def test_blocked_prefill_bf16_pool_view_matches_native_cache(tokens, carrier):

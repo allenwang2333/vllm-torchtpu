@@ -14,6 +14,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
 from .config import native_cache_capacity, native_cache_specs
+from .qsa import Qwen4ExpQSABackend
 
 logger = init_logger(__name__)
 TEMP_HEADROOM = 8 * 1024**3
@@ -258,7 +259,7 @@ class Qwen4ExpCache:
             runner.attn_groups.append(
                 [
                     AttentionGroup(
-                        backend=None,
+                        backend=Qwen4ExpQSABackend,
                         layer_names=list(group.layer_names),
                         kv_cache_spec=metadata_spec,
                         kv_cache_group_id=gid,

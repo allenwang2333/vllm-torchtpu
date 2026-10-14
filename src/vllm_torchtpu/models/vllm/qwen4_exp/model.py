@@ -13,20 +13,26 @@
 # limitations under the License.
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.distributed import get_dp_group, get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsHybrid,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
@@ -213,7 +219,9 @@ class Qwen4ExpBackbone(nn.Module):
         self.host_ple_index = next(
             (
                 i
-                for i, layer in enumerate(self.layers)
+                for i, layer in enumerate(
+                    cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
+                )
                 if layer.ple is not None and layer.ple.cpu_offload
             ),
             None,
@@ -263,7 +271,9 @@ class Qwen4ExpBackbone(nn.Module):
         # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
         if self.host_ple_index is not None:
-            ple_raw_embeddings = self.layers[self.host_ple_index].ple.lookup_for_model(
+            ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
+            assert ple is not None
+            ple_raw_embeddings = ple.lookup_for_model(
                 input_ids, query_start_loc, ngram_context, valid_tokens
             )
         hidden = (
@@ -325,8 +335,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return gdn_cache_spec(cfg).dtypes
 
     @classmethod
-    def get_mamba_state_shape_from_config(cls, cfg):
-        return gdn_cache_spec(cfg).shapes
+    # TPU convolution state has an extra singleton axis absent from IsHybrid.
+    # pyrefly: ignore[bad-override]
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config
+    ) -> tuple[tuple[int, ...], ...]:
+        return gdn_cache_spec(vllm_config).shapes
 
     @classmethod
     def get_ple_mamba_state_dtype_from_config(cls, cfg):
@@ -361,13 +375,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
     @classmethod
-    def get_mamba_state_copy_funcs(cls, mamba_types):
+    def get_mamba_state_copy_funcs(cls, mamba_types) -> MambaStateCopyFuncsByType:
         from vllm.model_executor.layers.mamba.mamba_utils import (
             MambaStateCopyFuncCalculator,
         )
         from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-        functions = {
+        functions: MambaStateCopyFuncsByType = {
             MambaAttentionBackendEnum.GDN_ATTN: cls.get_mamba_state_copy_func(),
             MambaAttentionBackendEnum.SHORT_CONV: (
                 MambaStateCopyFuncCalculator.short_conv_state_copy_func()
@@ -389,7 +403,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 "shared_expert.up_proj": ("shared_expert.gate_up_proj", 1),
             }
         )
-        moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in self.model.layers]
+        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
+        moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
         # separate checkpoint-native parameters (no NVIDIA packed-HC mapper).
         gdn_map = {
@@ -401,13 +416,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         for original, weight in weights:
             if original.startswith(("model.visual.", "mtp.")):
                 continue
-            name = next(self.hf_to_vllm_mapper.apply([(original, weight)]))[0]
+            name = next(iter(self.hf_to_vllm_mapper.apply([(original, weight)])))[0]
             if name in source:
                 raise ValueError(f"Duplicate checkpoint tensor {original}")
             source.add(name)
             if name.startswith("model.layers."):
                 _, _, idx, family, relative = name.split(".", 4)
-                layer = self.model.layers[int(idx)]
+                layer = layers[int(idx)]
                 if family == "mlp":
                     targets = moe_loaders[int(idx)].load_weights(
                         iter([(relative, weight)]), mapper=moe_mapper
@@ -424,7 +439,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     mapped, shard = gdn_map[relative]
                     target = f"model.layers.{idx}.linear_attn.{mapped}"
                     param = parameters[target]
-                    param.weight_loader(param, weight, shard)
+                    cast(BasevLLMParameter, param).weight_loader(param, weight, shard)
                     loaded.add(target)
                     continue
             if name not in parameters:
@@ -433,7 +448,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, weight)
             loaded.add(name)
-        for i, layer in enumerate(self.model.layers):
+        for i, layer in enumerate(layers):
             prefix = f"model.layers.{i}.mlp."
             experts = layer.mlp.experts.routed_experts
             required = {
