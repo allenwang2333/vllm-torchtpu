@@ -19,7 +19,6 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     produce,
     quantize_kv,
 )
-from vllm_torchtpu.kernels.qwen4_exp.rpa_reader import QwenDecodeKVRef
 
 
 def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
@@ -114,21 +113,9 @@ def _rpa_attention_batch(
         v_scale=v_scale,
         out_dtype=jnp.dtype(jnp.float32),
         skip_kv_update=True,
-        all_decode=True,
         kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
         decode_block_sizes=decode,
         prefill_block_sizes=prefill,
-        kv_cache_alloc_cls=(
-            QwenDecodeKVRef
-            if ratio == 4
-            and cache.dtype == jnp.float8_e4m3fn
-            and cache.shape[2:] == (1, 4, 256)
-            and q.shape[1:] == (24, 256)
-            and kv_heads == 2
-            and blocks.shape[1] == 512
-            and bkv_size == 256
-            else None
-        ),
     )
     out = out[jnp.minimum(cu_q_lens[:-1], len(q) - 1), :, : q.shape[-1]]
     out = bf16(
