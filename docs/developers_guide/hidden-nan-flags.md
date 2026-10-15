@@ -1,112 +1,106 @@
-# 逐层 hidden NaN 日志
+# 逐层 hidden NaN 现场快照
 
 ## TL;DR
 
-设置 `TPU_HIDDEN_NAN_LOG=1` 后，每个 decoder layer 结束时检查 rank-local
-hidden 输出，每个模型只保存长度等于层数的布尔数组。某一调度轮存在 NaN 时，
-在 `AsyncTPUModelRunnerOutput.get_output()` 消费采样结果后记录完整数组；正常轮次不打印。
-不保存 hidden，不生成 pickle，不读取 KV，不改变模型输出。
-
-当前仍为实验实现：R38 两机性能验收尚未通过。XProf 已完成 Prefill / Decode 各三次
-采集，但设备事件耗时不能直接作为稳态 TPOT 增量。
+设置 `TPU_HIDDEN_NAN_LOG=1` 后，每个 worker 对 Target / Draft 分别检查 decoder
+layer 的 rank-local hidden 输出。一轮首次发现 NaN 时保留该层的完整 hidden 和该次
+forward 的实际输入 token；每 100 次异常轮只保存前 3 次，即第 1–3、101–103 次，
+正常轮不推进异常计数。日志提示快照文件位置，不再输出逐层 true/false 数组。
 
 ```bash
 export TPU_HIDDEN_NAN_LOG=1
 ```
 
-当前入口支持 PP=1 的 causal LM，以及异步 MTP Draft，不限制 decoder layer 类名。
-按语言模型最外层 `ModuleList` / 整数索引 `ModuleDict` 的直接成员安装 hook；每个完整
-block 一个 flag，block 内部的 Attention、Linear、Norm 和嵌套容器不单独安装 hook。
-多模态包装通过 vLLM 的 `get_language_model()` 取得语言模型，视觉层不计入数组。
-block 输出可以是 Tensor 或首项为 hidden 的 tuple；当前 kernel 仍要求 hidden 为非空
-二维 Tensor。本次仅扩展 hook 接入，kernel、Torch bridge 和异步回读路径保持原样。
-异步 TP/PCP 多 rank 必须配置 KV connector，确保每个 rank 的 AsyncOutput 被消费。
-关闭配置时不安装 hook、不分配诊断数组、不提交诊断回读。旧 A/B hidden 快照实现在
-`codex/async-decode-nan` 的 `af5843bef8600b9b2f56e9c853a8fa080bb52f9c` 保留。
+当前支持 PP=1 的 causal LM 和异步 MTP / hidden-state Draft。异步 TP/PCP 多 rank
+需要 KV connector，以保证每个 rank 的 AsyncOutput 被消费。关闭开关时不安装诊断
+hook、不分配诊断 buffer、不提交诊断回读。
 
-## 数组与轮次
+## 文件与内容
 
-Target 和 Draft 各自拥有一个 `torch.bool` 数组。按层在容器中的注册索引排序，使用连续
-slot；不能把 MTP 层号当作数组下标。Q397 的 Target 为 60 层，R38 Draft 为 1 层，
-实际 Draft 层号为 0。数组按模型分别输出，`layer_ids[i]` 对应 `isnan[i]`。
+文件默认位于 Python 临时目录下的 `vllm-hidden-nan/`，通常是
+`/tmp/vllm-hidden-nan/hidden-nan-<host>-<pid>-<role>-round<N>-layer<L>.pt`。
+临时目录遵循进程启动时的标准 `TMPDIR` 设置。
 
-一次 `execute_model` / `sample_tokens` 调度步是一轮。进入该轮 chunk 循环前清零，
-同一轮分块、重复 MTP forward 使用 OR 累积，因此一个异常 chunk 不会被后续正常
-chunk 覆盖。零 token 的 KV 协调步没有模型 forward，不递增编号。检测包含 padding 和
-有输出的调度轮中的 collective dummy forward；独立 idle dummy 没有 AsyncOutput，
-不产生诊断日志。检测只反映本 rank
-的 decoder hidden；不包含 residual、最终 norm、logits 或 KV。
-
-以下为三层示例日志，真实日志打印完整数组：
-
-```text
-Hidden NaN detected: role=target round=1 layer_ids=[7, 11, 19] isnan=[false, true, true]
+```python
+snapshot = torch.load(path, weights_only=True)
+hidden = snapshot["hidden_states"]
+tokens = snapshot["input_ids"]
 ```
 
-每个异常轮都会记录，没有首次命中后冻结或停检的行为。`round` 是 worker 内部递增
-编号，不是 request ID，也不是跨 rank 的全局轮号。
+文件包含 `role`、`round`、`layer_id`、`nan_event_in_window`、`req_ids`、
+`hidden_states` 和 `input_ids`。hidden 保留原 dtype；token 为 int32。
+只保存首次异常 forward 的实际长度，包括其 padding，不把缓冲区剩余容量写入文件。
+不保存逐层计数、residual、最终 norm、logits 或 KV。
 
-## 执行边界
+`req_ids` 是该调度轮的请求集合；`input_ids` 是首次异常 forward 的 rank-local
+输入，可能仅覆盖其中一个 chunk，两者不是逐项对应的数组。PCP 下保存的是该 rank
+本地输入；需要联合各 rank 的快照分析全局 batch。Target 的 token 在异步占位符替换后
+绑定；MTP 每个实际 embedding 调用重新绑定，因此后续 draft step 不沿用 step 0 的 token。
+多模态包装只检查语言模型的 decoder block，保存送入词嵌入的 token。
 
-诊断独立拥有 JAX kernel、私有 Torch bridge、hook/controller。kernel 对 hidden
-执行 `isnan().any()`，仅 donate 布尔数组；不 donate、复制或保留 live hidden。
-入口统一校验支持范围，原模型、公共 backend 和 KV allocator 不承载诊断状态。
+## 首次命中与限频
 
-warmup 的 device arm flag 为 false，结束后启用；host arm flag 阻止 warmup 提交
-无人消费的诊断 D2H。正式输出组装时异步回读 Target/Draft 的小数组，在最后一份
-回读后记录一个 event；CPU 在 AsyncOutput 原 sampled-token wait 后消费此 event。
-下一轮清零依赖设备队列顺序，CPU 目的数组由各轮 readback 持有；没有 forward 前
-新增 CPU fence。这个较晚 event 的耗时仍必须通过真实模型性能对照验证。
+一次有模型输出的 `execute_model` / `sample_tokens` 调度步为一轮。进入该轮后清除
+首次命中位置；每个模型沿实际执行顺序检查 block 输出。首次发现 NaN 后，该模型本轮
+后续层、chunk 和重复 draft forward 不再扫描，也不覆盖快照。“首次”指执行顺序，
+不是全局最小层号。Target 与 Draft、不同 worker 的计数相互独立。
 
-Q397 的每 worker 逻辑持久数据为 60 + 1 个 bool 和一个共享 arm bool；不把逻辑字节数
-等同于后端实际分配粒度、编译临时空间或性能无损的证明。
+检测范围沿用原功能：包含真实调度轮内的 padding 和用于 collective 配对的 dummy
+forward；独立 idle dummy 和启动 warmup 不计数、不保存。零 token 的 KV 协调步不推进
+轮次。首次 NaN 之后没有本轮传播统计；这项功能用于保留现场，不能单凭一份快照自动
+判定 NaN 的完整传播路径。
 
-## 复现与验证
+限频选择在设备端执行。事件 phase 仅在 0–99 内循环，不依赖可能延迟的 CPU 消费进度，
+也不会因后续正常轮或本轮更多异常层而占用新名额。没有进程级“首次异常后永久冻结”。
 
-保持 R38 全部依赖；测试版本和两机验收证据记录在父仓实验文档中。
-先验证 FP32/BF16、后续异常层、同轮 OR、轮次清零、dense layer slot、warmup 无回读
-和异步消费顺序。hook 契约测试另覆盖非 Qwen block、Tensor / tuple 输出、稀疏
-`ModuleDict` 索引、内部容器不重复检测，以及多模态包装只检测语言模型：
+## 数据与执行边界
+
+诊断拥有独立 JAX kernel、Torch bridge、hook/controller 和快照 buffer。
+使用语言模型最外层 `ModuleList` / 整数索引 `ModuleDict` 的完整 block 输出；
+Tensor 和首项为 hidden 的 tuple 均支持，hidden 需要是非空二维 Tensor。
+
+每个模型保存 4 个 int32 状态值及一份最大容量 hidden 快照。Target 容量来自 runner
+的最大 token bucket；Draft 同时覆盖最多请求数乘以每请求 draft query 长度。
+共享词嵌入会触发多个角色的 hook，因此 token staging/snapshot 采用各角色容量的最大值。
+固定容量设备 staging 加实际行数，避免无 guards 的已编译模型绑定到旧 Tensor 或旧长度。
+
+存在词嵌入时只在词嵌入入口绑定 token，不再同时安装模型根 hook；普通输入路径的绑定
+进入编译图，避免 runner 和根 hook 重复提交 eager copy/fill。不同 TP 的 Draft 使用
+`nn.Embedding` 时沿用 vLLM 的 `embed_tokens` 替换约定；位置嵌入、LM head 和视觉分支
+不作为 token 输入。`inputs_embeds` 路径由 runner 绑定替换后的实际 token；没有词嵌入的
+模型保留根 hook。此调整不改变逐层 kernel、采样限频或快照 ownership。
+
+**只 donate 检测状态，hidden/token 快照不可 donate。** 当前 TorchTPU 的 `clone()`
+可以与源共享 PJRT buffer，不能当作物理深复制；让快照以非 donation 的函数输出保留
+版本，readback 再持有本轮的逻辑版本，才能跨越后续更新安全地延迟消费。
+
+正式输出组装时异步回读小状态并记录 event，随后关闭本轮设备检测。在原 sampled-token
+等待之后消费事件，仅命中采样窗口时才回传大快照并调用 `torch.save()`。这避免正常轮
+的大 D2H/文件写入；设备端分支、buffer 更新和版本保留仍有成本，需以真实模型测量。
+
+命中保存时，当前先按缓冲区容量回传，再以实际行数裁剪落盘。故障轮的 D2H 与 CPU
+临时内存成本因此取决于最大容量，不能仅用当前 batch 的落盘大小估算。
+
+## 验证
+
+长期测试覆盖首次命中不被后续层覆盖、正常轮不计数、205 次异常的窗口边界、
+FP32/BF16、稀疏真实层号、warmup、idle、共享 embedding、大 Draft、unbound MTP 输入绑定
+以及异步消费的轮次归属。原生回归必须使用真实 TorchTPU donation 与 D2H；CPU 替身
+不能复现 PJRT buffer 失效。
+
+准备好项目依赖、TPU 拓扑及设备权限后，先运行实际 Torch bridge 的 ownership 回归，
+再运行 kernel case：
 
 ```bash
-JAX_PLATFORMS=cpu pytest tests/kernels/test_hidden_nan_flags_kernel.py \
-  tests/runner/test_hidden_nan_flags.py tests/runner/test_tpu_runner_async_output.py \
-  tests/runner/test_tpu_runner_kv_connector_lifecycle.py
+JAX_PLATFORMS=tpu,cpu pytest -q --use-tpu \
+  tests/runner/test_hidden_nan_flags.py::test_native_readback_retains_snapshot_after_later_donated_updates \
+  tests/kernels/test_hidden_nan_flags_kernel.py
 ```
 
-R38 CPU-only 测试使用隔离容器及测试用 TPU event mock；它不能代替 native TPU 验证。
-实机需验证两份未消费 readback 在下一轮清零后仍各自保留原值，并完成异常/正常轮
-日志检查。性能比较必须使用同 wheel 的 env-off 与 env-on，健康轮持续检测、无异常
-日志；固定输入、cache salt、输出 token 数，重复运行并记录 avg/min/max/count/stddev/
-p90/p99。不能用已 frozen 的旧 A/B feature 或保留 kernel 的 unarmed 模式代替 env-off。
-
-## R38 XProf 与编译 shape
-
-2026-10-14 在 PCP8 Prefill（34.37.32.206）和 TP2/DP4 Decode（34.37.69.96）
-各采集三次，保持 R38 全部依赖。以下是 rank0 的实际 NaN 检查 hidden shape；
-不是对所有已配置 bucket 的耗时覆盖。
-
-| 阶段 | 模型 / 步骤 | hidden shape（BF16） | token compile size |
-| --- | --- | --- | ---: |
-| PCP8 Prefill | Target、MTP Draft | `[1024,4096]` | 1024 |
-| TP2/DP4 Decode | Target、首次 MTP Draft | `[16,4096]` | 16 |
-| TP2/DP4 Decode | 后两次 MTP Draft | `[192,4096]` | 192 |
-
-rank0/core0 的 Target 单层完整 NaN 条件分支平均为 Prefill 11.741 µs、Decode 7.237 µs；
-60 层 duration 相加平均为 0.704 / 0.434 ms。纯扫描子事件平均为 7.661 / 3.370 µs。
-父条件分支包含子事件，不能重复相加；这些是在 profiler 下的设备 duration，
-不代表未开启 profiler 时的关键路径延迟或功能性能验收。
-
-当前 Prefill 的本地 token buckets 为 `[512,1024,2048,4096]`，Decode 配置为
-`[16,32,64,80,96,128,192,256,512,1024]`。hook 在 `capture_model()` 预编译前安装；
-hidden 特征宽度固定4096，token 维度补齐到 bucket。`layer_slot` 和 arm flag 是数据参数，
-不按层编号或 NaN 布尔值做静态特化。
-
-当前未开启 `VLLM_XLA_CHECK_RECOMPILATION`，因此不能由日志中的
-`warmup compiled 0 graphs` 宣称没有编译。严格验证需要开启现有监控，重复覆盖所有
-bucket、greedy/non-greedy 及 Draft/verify 路径，检查预热后新 cache entry 的实际
-compile duration。已有短 trace 未识别到实际 XLA 编译事件，不证明全链路无热编译。
-
-详细版本、采集命令、全部统计与浏览器故障排查位于父仓
-`pd_disagg/docs/hidden-nan-xprof-r38-20261014.md`；原始 profile 保留在两机
-`/experiment/perf/traces`，归档及 SHA256 清单见父仓证据目录。
+CPU 验证需要使用 CPU transport/event 测试环境，原生 case 会明确跳过；同时验证
+`tests/runner/test_hidden_nan_flags.py`、`test_tpu_runner_async_output.py` 和
+`test_tpu_runner_kv_connector_lifecycle.py`。性能验证使用同一 wheel、模型、拓扑与输入，
+分别测关闭检测、正常检测、异常但限频跳过、异常并保存；重复采样并记录
+avg/min/max/count/stddev/p90/p99，区分客户端延迟、模型 forward、设备 trace 和文件写入。
+与旧 bool 实现比较时，需要在相同部署重新运行该实现；关闭检测的结果只用于衡量
+绝对诊断成本，不能替代旧版本基线。真实 PD/MTP 与不执行 Draft 的 Target-only 探针应分开记录。

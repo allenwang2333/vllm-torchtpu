@@ -3581,7 +3581,7 @@ class TPUModelRunner(GPUModelRunner):
             else None
         )
         if self._hidden_nan_detector is not None:
-            self._hidden_nan_detector.begin_round()
+            self._hidden_nan_detector.begin_round(self.input_batch.req_ids)
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -3665,6 +3665,8 @@ class TPUModelRunner(GPUModelRunner):
                 # Later stages start from the previous stage's hidden
                 # states; the token ids only size the forward.
                 inputs_embeds = None
+            if self._hidden_nan_detector is not None and input_ids is None:
+                self._hidden_nan_detector.record_input_ids(draft_input_ids_src)
             # Run the decoder
             # set_forward_context: vLLM's native context for attention metadata
             # set_vllm_model_wrapper_context: TPU-specific context for mesh info
@@ -5854,11 +5856,25 @@ class TPUModelRunner(GPUModelRunner):
                     "Async multi-rank hidden NaN detection requires all-rank output "
                     "consumption through a KV connector"
                 )
-            models = [("target", self.model)]
+            models = [("target", self.model, self.model_config, self.max_num_tokens)]
             if self._is_async_drafter:
                 draft_model = self._async_drafter.draft_model
                 assert draft_model is not None, "Draft is loaded before capture_model"
-                models.append(("draft", draft_model))
+                assert self.speculative_config is not None, (
+                    "Loaded async draft model must have a speculative configuration"
+                )
+                models.append(
+                    (
+                        "draft",
+                        draft_model,
+                        self.speculative_config.draft_model_config,
+                        max(
+                            self.max_num_tokens,
+                            self.max_num_reqs
+                            * (self.speculative_config.num_speculative_tokens + 1),
+                        ),
+                    )
+                )
             self._hidden_nan_detector = install_hidden_nan_detector(models, self.device)
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
