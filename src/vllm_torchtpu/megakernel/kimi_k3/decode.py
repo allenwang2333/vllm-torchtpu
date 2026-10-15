@@ -16,7 +16,9 @@ host's tokens lag (async scheduling). A step is one of:
   :meth:`DsparkDraft.step_single`;
 * three drafts alone, or several requests: :meth:`DecodeOps.verify_batched`,
   then :meth:`DsparkDraft.step_batched` (each request keeps its own ring);
-* otherwise a plain step (:meth:`DecodeOps.plain_step`).
+* otherwise a plain step (:meth:`DecodeOps.plain_step`), also whenever a
+  structured-output request decodes (grammar masks: the verify ops do not
+  mask, so the whole batch steps plain, without drafts).
 
 The verify ops decide acceptance and commit only the selected KDA post-state.
 Under attention DP a request's pages and KDA state live on the DP group its MLA
@@ -232,18 +234,12 @@ class KimiDecoder:
                 "K3 decode: copy-on-write block copies (prefix hits inside a block)"
             )
         mask = step_input.mask
-        if mask is not None:
-            if self.draft is not None:
-                raise NotImplementedError(
-                    "K3 decode: structured outputs with DSpark (the verify ops "
-                    "do not mask)"
-                )
-            if mask.shape != (len(step_input.requests), VOCAB // 32):
-                raise ValueError(
-                    f"K3 decode: grammar masks {mask.shape} do not cover "
-                    f"{len(step_input.requests)} requests of the {VOCAB}-token "
-                    "vocabulary"
-                )
+        if mask is not None and mask.shape != (len(step_input.requests), VOCAB // 32):
+            raise ValueError(
+                f"K3 decode: grammar masks {mask.shape} do not cover "
+                f"{len(step_input.requests)} requests of the {VOCAB}-token "
+                "vocabulary"
+            )
         self.forget(step_input.finished)
         return StepOutput(self._decode(step_input.requests, mask))
 
@@ -670,6 +666,10 @@ class KimiDecoder:
             if len(decoding) < len(self.spec_tokens)
             else 0
         )
+        if mask is not None:
+            # A structured request decodes: the whole batch steps plain and
+            # masked (the verify ops do not mask), its drafts unused.
+            k = 0
         if len(decoding) == 1 and k == self.WIDTH - 1:
             emitted = self._speculate(decoding[0][1], entries, tables, sampled)
         elif k > 0 and (
@@ -880,7 +880,7 @@ class KimiDecoder:
                 self.spec_alone,
                 self.spec_shapes,
                 self.draft._synthetic_rates if self.draft is not None else None,
-                masked_ops=self.draft is None,
+                masked_ops=True,
             )
             if self.draft is not None:
                 calls.extend(
@@ -1040,10 +1040,19 @@ class KimiDecoder:
                         )
                         speculate_batched(sampled, 1, 4, states=states[:1])
                 plain(sampled)
-            if self.draft is None:
-                # Structured outputs: the grammar-masked variants (all-ones
-                # masks here) run the same op history serving does.
-                plain(sampled, masked=True)
+            # Structured outputs: the grammar-masked variants (all-ones masks
+            # here) run the same op history serving does; with DSpark a masked
+            # step also follows and precedes speculative ones.
+            plain(sampled, masked=True)
+            if speculating:
+                if self.spec_alone:
+                    speculate(sampled)
+                    plain(sampled, masked=True)
+                    speculate(sampled)
+                for requests, rows_per in self.spec_shapes:
+                    speculate_batched(sampled, requests, rows_per)
+                    plain(sampled, masked=True)
+                    speculate_batched(sampled, requests, rows_per)
         self.spec_req, self.draft_state, self.next_ids, self.device_plan = (
             None,
             None,

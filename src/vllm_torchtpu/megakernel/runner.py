@@ -17,6 +17,9 @@ Structured outputs: the grammar bitmask only reaches ``sample_tokens``, so a
 decode step with a structured request is deferred -- ``execute_model`` holds
 its :class:`StepInput` and ``sample_tokens`` runs the program with the masks
 (``StepInput.mask``); the plain ops then choose among the allowed tokens.
+With DSpark such a step runs plain too: its drafts stay on the device, so
+vLLM's per-draft rows are unconstrained and only each request's first row
+is used.
 """
 
 from __future__ import annotations
@@ -75,20 +78,29 @@ class MegakernelStepState:
 
 
 def grammar_bitmask_rows(
-    grammar_output: Any, req_id_to_index: dict[str, int], num_reqs: int, words: int
+    grammar_output: Any,
+    req_id_to_index: dict[str, int],
+    num_reqs: int,
+    words: int,
+    spec_tokens: dict[str, list[int]] | None = None,
 ) -> np.ndarray | None:
     """The batch's per-request grammar bitmasks ``[num_reqs, words]`` int32
     (all-ones rows unconstrained), from ``grammar_output``'s compact rows
-    (ordered by ``structured_output_request_ids``, one per structured
-    request). None: no structured request of this batch has a row."""
+    (ordered by ``structured_output_request_ids``). A structured request
+    has one row, or with speculative decoding one per scheduled draft
+    (``spec_tokens``, vLLM's ``scheduled_spec_decode_tokens``) and then the
+    bonus row; its first row, the next token's given the tokens it has
+    committed, is the one a step that does not verify drafts uses. None: no
+    structured request of this batch has a row."""
     mask = np.full((num_reqs, words), -1, np.int32)
     mapped = False
-    for row, req_id in enumerate(grammar_output.structured_output_request_ids):
+    row = 0
+    for req_id in grammar_output.structured_output_request_ids:
         index = req_id_to_index.get(req_id)
-        if index is None or index >= num_reqs:
-            continue
-        mask[index] = grammar_output.grammar_bitmask[row]
-        mapped = True
+        if index is not None and index < num_reqs:
+            mask[index] = grammar_output.grammar_bitmask[row]
+            mapped = True
+        row += 1 + len((spec_tokens or {}).get(req_id, ()))
     return mask if mapped else None
 
 
@@ -378,6 +390,7 @@ class MegakernelModelRunner(TPUModelRunner):
                     self.input_batch.req_id_to_index,
                     self.input_batch.num_reqs,
                     -(-self.vocab_size // 32),
+                    state.scheduler_output.scheduled_spec_decode_tokens,
                 )
             state.tokens = self.program.step(state.step_input).tokens
         assert state.tokens is not None

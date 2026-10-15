@@ -377,8 +377,8 @@ class DecodeOps:
         """The configured primary decoder graphs, using shape-only operands.
         ``synthetic_rates``: the rates, or ``drafts -> rates`` (per draft
         width), the verify ops are built with. ``masked_ops``: also compile
-        the grammar-masked plain steps (structured outputs; a decoder that
-        speculates never runs them)."""
+        the grammar-masked plain steps (structured outputs; with DSpark, the
+        steps where a structured request decodes)."""
         from vllm_torchtpu.megakernel.compilation import CompileCall
 
         operands = self._operands()

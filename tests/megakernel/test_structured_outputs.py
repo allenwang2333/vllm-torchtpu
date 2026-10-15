@@ -50,6 +50,32 @@ def test_grammar_bitmask_rows_skips_requests_outside_the_batch():
     assert grammar_bitmask_rows(grammar, {"a": 0}, 1, VOCAB_WORDS) is None
 
 
+def test_grammar_bitmask_rows_take_each_requests_first_row_with_drafts():
+    """With speculative decoding vLLM sends one row per scheduled draft and
+    then the bonus row; the plain step uses each request's first row."""
+    from vllm_torchtpu.megakernel.runner import grammar_bitmask_rows
+
+    def row(value):
+        return np.full(VOCAB_WORDS, value, np.int32)
+
+    pairs = (
+        [("a", row(1)), ("a", row(2)), ("a", row(3))]  # two drafts + bonus
+        + [("gone", row(4)), ("gone", row(5))]  # one draft, not in the batch
+        + [("b", row(6))]  # no drafts
+        + [("c", row(7))]
+        + [("c", row(-1))] * 3  # three -1 drafts + bonus
+    )
+    grammar = SimpleNamespace(
+        structured_output_request_ids=["a", "gone", "b", "c"],
+        grammar_bitmask=np.asarray([r for _, r in pairs], np.int32),
+    )
+    spec = {"a": [11, 12], "gone": [13], "c": [-1, -1, -1]}
+    mask = grammar_bitmask_rows(grammar, {"a": 0, "b": 1, "c": 2}, 3, VOCAB_WORDS, spec)
+    assert mask is not None
+    for index, first in enumerate((1, 6, 7)):
+        assert (mask[index] == first).all()
+
+
 def test_mask_logits_unpacking_and_sharding():
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")
@@ -122,7 +148,9 @@ def test_deferred_structured_step_runs_in_sample_tokens():
 
     program = Program()
     step_input = SimpleNamespace(mask=None)
-    scheduled = SimpleNamespace(num_scheduled_tokens={"a": 1, "b": 1})
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"a": 1, "b": 1}, scheduled_spec_decode_tokens={}
+    )
     row = np.full(vocab_words, 0x55555555, np.int32)
     grammar = _grammar_output([("b", row)])
     instance = SimpleNamespace(

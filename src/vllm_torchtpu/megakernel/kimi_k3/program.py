@@ -216,10 +216,10 @@ def capabilities(config: MegakernelEngineConfig) -> Capabilities:
         else config.max_num_batched_tokens,
         page_aligned_chunks=config.role == "prefill",
         block_copies=config.role == "prefill",
-        # The plain decoder masks its logits in the op (the prefill discards
-        # its first tokens, so it only accepts the requests); DSpark's verify
-        # ops do not mask.
-        structured_outputs=config.role == "prefill" or not speculating,
+        # The decoder's plain op masks its logits (the prefill discards its
+        # first tokens, so it only accepts the requests). DSpark's verify ops
+        # do not mask: a step with a structured request runs plain instead.
+        structured_outputs=True,
     )
 
 

@@ -315,7 +315,9 @@ plain decoder applies in its step op: a step with a structured request is
 deferred to `sample_tokens` (the engine computes the bitmask from the
 previous step's tokens), which runs the program with the requests' masks
 (`StepInput.mask`) and loses that step's async overlap. With DSpark the
-verify ops do not mask, so structured requests are still rejected.
+verify ops do not mask: while a structured request decodes, the whole batch
+steps plain and masked (no drafts), and speculation resumes once no
+structured request is left in the batch.
 
 ## Limits and known issues
 
