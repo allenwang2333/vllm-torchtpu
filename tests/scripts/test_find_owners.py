@@ -202,3 +202,25 @@ def test_self_owned_area_does_not_suppress_the_rest_of_the_cover():
 def test_no_groups_means_no_reviewers():
     assert find_owners.minimal_cover({}) == []
     assert find_owners.self_owned_areas({}, author="alice") == []
+
+
+# --------------------------------------------------------------------------
+# reading a PR
+# --------------------------------------------------------------------------
+def test_pr_over_300_files_falls_back_to_the_files_api(monkeypatch):
+    """GitHub refuses `gh pr diff` past 300 files; the files API still lists
+    them, so a large PR (e.g. a branch sync) is gated instead of crashing."""
+    calls = []
+
+    def fake_run(cmd, cwd=None):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return None  # HTTP 406: the diff exceeded 300 files
+        return "b.py\na.py\nb.py"
+
+    monkeypatch.setattr(find_owners, "run", fake_run)
+    files, label = find_owners.pr_files("2031", "org/repo")
+    assert files == ["a.py", "b.py"]
+    assert label == "PR #2031"
+    assert calls[1][:3] == ["gh", "api", "--paginate"]
+    assert "repos/org/repo/pulls/2031/files" in calls[1]

@@ -222,6 +222,20 @@ def pr_files(pr: str, repo: str | None) -> tuple[list[str], str]:
         cmd += ["--repo", repo]
     out = run(cmd)
     if out is None:
+        # GitHub refuses the diff of a PR touching more than 300 files (HTTP
+        # 406, e.g. a branch sync); the paginated files API lists up to 3000.
+        # `{owner}/{repo}` is gh's placeholder for the current repository.
+        out = run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{repo or '{owner}/{repo}'}/pulls/{pr}/files",
+                "--jq",
+                ".[].filename",
+            ]
+        )
+    if out is None:
         die(f"could not read PR #{pr}; is `gh` installed and authenticated?")
     return sorted(set(out.splitlines())), f"PR #{pr}"
 
