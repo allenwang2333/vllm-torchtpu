@@ -150,3 +150,48 @@ def test_prefill_layer_on_norm_rows(setup, monkeypatch, v2_flag):
         np.asarray(_run(mesh, fed, y, x_q, x_scale, tw, ti, *weights)),
         np.asarray(_run(mesh, own, y, tw, ti, *weights)),
     )
+
+
+@pytest.fixture(scope="module")
+def setup_tp8():
+    """The 2x2x1 twin's TP8 slice: per-rank intermediate 256 (gate|up 512 columns), shared 256."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires a TPU")
+    inter = inter_s = 256
+    ks = jax.random.split(jax.random.key(8), 4)
+
+    def q(w, axis):
+        s = jnp.max(jnp.abs(w), axis=axis, keepdims=True) / 448.0
+        return (w / s).astype(F8), s
+
+    w1, w1s = q(jax.random.normal(ks[0], (E, H, 2 * inter)) * 0.02, 1)
+    w2, w2s = q(jax.random.normal(ks[1], (E, inter, H)) * 0.02, 1)
+    sw1, sw1s = q(jax.random.normal(ks[2], (H, 2 * inter_s)) * 0.02, 0)
+    sw2, sw2s = q(jax.random.normal(ks[3], (inter_s, H)) * 0.02, 0)
+    weights = (w1, w2, w1s[:, :, None, :], w2s[:, :, None, :], sw1, sw1s.reshape(-1), sw2, sw2s.reshape(-1))
+    return weights, Mesh(np.asarray(jax.devices()[:1]), ("d",))
+
+
+@pytest.mark.parametrize("m", [256, 4096])
+def test_v2_unsupported_shape_falls_back_bit_exact(setup_tp8, m):
+    """FUSED_MOE_PREFILL_KERNEL_V2 on a shape the explicit-MXU body does not handle (TP8: i = 256) runs v1's
+    build instead of asserting, bit for bit v1; the norm-fed path too."""
+    weights, mesh = setup_tp8
+    assert not v2.xmxu_supported(H, 256, 256)
+    x = jax.random.normal(jax.random.key(m + 1), (m, H)).astype(jnp.bfloat16)
+    tw, ti = _routing(m, m + 1, True)
+
+    def body(op, **kw):
+        def f(x, tw, ti, *w):
+            w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+            return op(x, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, None, tw, ti, axis_name="d",
+                      routed_scale=ROUTED_SCALE, **kw)
+
+        return f
+
+    ref = _run(mesh, body(fused_moe_prefill), x, tw, ti, *weights)
+    got = _run(mesh, body(v2.fused_moe_prefill, **v2.STAGE_A), x, tw, ti, *weights)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    x_q, x_scale = jax.jit(lambda y: v1._quantize_rows(y, F8))(x)
+    fed = _run(mesh, body(v2.fused_moe_prefill, x_q=x_q, x_scale=x_scale, **v2.STAGE_A), x, tw, ti, *weights)
+    np.testing.assert_array_equal(np.asarray(fed), np.asarray(ref))

@@ -45,6 +45,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     _routing_plan,
 )
 from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     COMBINE_CHUNK,
     COMBINE_GROUP,
@@ -57,6 +58,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_combine_kernel,
     combine_step_tokens,
 )
+
+logger = init_logger(__name__)
 
 _COMBINE_CHUNK_TOKENS = 2048
 # What FUSED_MOE_PREFILL_KERNEL_V2 serves (t4-moe-prefill probe 03, v7x, GLM-5.2 TP16 per-rank shapes; device
@@ -668,6 +671,16 @@ def combine(slab, slab_row, coeff, axis_name, flat=False):
 # The op: fused_moe_prefill's body with the levers as arguments. x_q / x_scale (A6) replace the
 # in-op quantization when the caller's RMSNorm already emitted them.
 # --------------------------------------------------------------------------------------------- #
+_FALLBACK_LOGGED = set()
+
+
+def xmxu_supported(h, i, i_s):
+    """Shapes the explicit-MXU body is written for: gate|up of the routed and the shared expert each one
+    256-column N-tile (2 i = 2 i_s = 256: GLM-5.2's TP16 slice), the down contraction padded up to one
+    256-deep K-tile, and h whole 256-column N-tiles."""
+    return 2 * i == _NT and 2 * i_s == _NT and h % _NT == 0 and (h // _LANES) % 2 == 0
+
+
 def fused_moe_prefill(x, w1, w2, w1_scale, w2_scale, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
                       shared_gate_weight, topk_weights, topk_ids, *, axis_name, expert_start=None,
                       routed_scale=1.0, nb=3, down="dot", issue="loop", tile_min=8192, flat=False,
@@ -683,6 +696,16 @@ def fused_moe_prefill(x, w1, w2, w1_scale, w2_scale, shared_w1, shared_w1_scale,
     i_s = shared_w2.shape[0]
     routes = tokens * topk_ids.shape[1]
     weight_dtype = w1.dtype
+    if down == "xmxu" and not xmxu_supported(h, two_i // 2, i_s):
+        # Static shapes only: another TP degree (e.g. TP8, i = 256) gets v1's levers -- the incumbent's
+        # body, which takes x_q / x_scale like the rest of this function.
+        key = (h, two_i // 2, i_s)
+        if key not in _FALLBACK_LOGGED:
+            _FALLBACK_LOGGED.add(key)
+            logger.warning(
+                "FUSED_MOE_PREFILL_KERNEL_V2: h=%d i=%d i_s=%d is not a shape the stage-A body handles "
+                "(gate|up must be one 256-column tile); running v1's build", h, two_i // 2, i_s)
+        nb, down, issue, tile_min, flat, tall_rung_rows = 3, "dot", "loop", 8192, False, None
     tile_rows = tile_rows_for(tokens, tile_min)
     call, scale_rows, token_rows = build_expert_kernel(
         experts=experts, h=h, i=two_i // 2, i_s=i_s, tokens=tokens, routes=routes, tile_rows=tile_rows,
