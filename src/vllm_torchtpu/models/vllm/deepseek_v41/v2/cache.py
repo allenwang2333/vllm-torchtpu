@@ -1,5 +1,6 @@
 """V4.1 paged cache allocation, row addressing and mutation."""
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
@@ -10,6 +11,7 @@ from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 
 ROW_BYTES = ROW_WORDS * 4
 # DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
@@ -263,6 +265,8 @@ _write_op = None
 _write_values_op = None
 _write_values_after_op = None
 _encode_fp8_op = None
+# Native index-key layout (`index_key_layout`): read/read_2bank/write/write_after.
+_native_key_ops: dict[str, Any] = {}
 
 
 class _CacheBinding(Protocol):
@@ -277,7 +281,9 @@ class PagedCacheRows:
     record units, before any device arithmetic or int32 index conversion.
     """
 
-    def __init__(self, raw, layout, rope=None, scale=None, swa_words=False):
+    def __init__(
+        self, raw, layout, rope=None, scale=None, swa_words=False, native_keys=False
+    ):
         self.scale, self.scale_hi = scale if isinstance(scale, tuple) else (scale, None)
         self.swa_words = swa_words
         if isinstance(raw, tuple):
@@ -363,6 +369,20 @@ class PagedCacheRows:
             or any(bank.shape[0] % (2 * self.shape[1]) for bank in banks)
         ):
             raise ValueError("CSA2 SWA owners must preserve whole plane-major pages")
+        # Index keys in the native layout: both records of a word row must
+        # belong to this cache (even page size, stride and offset).
+        self.native_keys = bool(native_keys)
+        if self.native_keys and (
+            self.dtype != torch.bfloat16
+            or self.row_bytes != ROW_BYTES // 2
+            or self.shape[1] % 2
+            or self.page_stride % 2
+            or self.row_offset % 2
+        ):
+            raise ValueError(
+                "Native index keys need BF16 [128] records in even, "
+                "row-aligned pages (TPU_DSV41_INDEX_NATIVE_KEYS)"
+            )
 
     def numel(self):
         return math.prod(self.shape)
@@ -402,6 +422,8 @@ class PagedCacheRows:
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)
+        if self.native_keys:
+            return self._read_native_keys(records)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             if self.raw_hi is None:
@@ -441,6 +463,71 @@ class PagedCacheRows:
             )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
+    def _read_native_keys(self, records):
+        """Natural-order BF16 keys of native-layout index records."""
+        if self.raw.device.type == "cpu":
+            import numpy as np
+
+            rec = records.long().flatten()
+            banks = [self.raw] if self.raw_hi is None else [self.raw, self.raw_hi]
+            rows = torch.cat(banks).numpy()[(rec // 2).numpy()]
+            legacy = np.asarray(
+                index_key_layout.native_to_legacy_rows(jax.numpy.asarray(rows))
+            )
+            even = (rec % 2 == 0).numpy()[:, None]
+            words = np.where(even, legacy[:, :64], legacy[:, 64:])
+            return (
+                torch.from_numpy(np.ascontiguousarray(words))
+                .view(torch.bfloat16)
+                .reshape(*records.shape, *self.shape[2:])
+            )
+        elem_count = self.row_bytes // self.dtype.itemsize
+        flat = records.flatten().int()
+        gathered = (
+            _native_key_ops["read"](self.raw, flat, elem_count)
+            if self.raw_hi is None
+            else _native_key_ops["read_2bank"](self.raw, self.raw_hi, flat, elem_count)
+        )
+        return gathered.reshape(*records.shape, *self.shape[2:])
+
+    def _write_native_keys(self, records, values, after):
+        if self.raw.device.type == "cpu":
+            import numpy as np
+
+            keys = jax.numpy.asarray(values.float().numpy()).astype(jax.numpy.bfloat16)
+            rec = jax.numpy.asarray(records.int().numpy())
+            pool = (
+                jax.numpy.asarray(self.raw.numpy())
+                if self.raw_hi is None
+                else (
+                    jax.numpy.asarray(self.raw.numpy()),
+                    jax.numpy.asarray(self.raw_hi.numpy()),
+                )
+            )
+            updated = scatter_index_keys(pool, rec, keys, native=True)
+            if self.raw_hi is None:
+                self.raw.copy_(torch.from_numpy(np.array(updated)))
+            else:
+                self.raw.copy_(torch.from_numpy(np.array(updated[0])))
+                self.raw_hi.copy_(torch.from_numpy(np.array(updated[1])))
+            return
+        rec_lo = records.int()
+        banks = [(self.raw, rec_lo)]
+        if self.raw_hi is not None:
+            banks.append(
+                (
+                    self.raw_hi,
+                    torch.where(
+                        rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
+                    ),
+                )
+            )
+        for bank, rec in banks:
+            if after is not None:
+                bank.copy_(_native_key_ops["write_after"](bank, rec, values, after))
+            else:
+                bank.copy_(_native_key_ops["write"](bank, rec, values))
+
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
@@ -452,6 +539,10 @@ class PagedCacheRows:
             from .csa2_adapter import publish_swa
 
             publish_swa(self, records, values.to(torch.bfloat16).reshape(-1, 512))
+            return
+        if self.native_keys:
+            values = values.to(torch.bfloat16).reshape(slots.shape[0], -1)
+            self._write_native_keys(records, values, after)
             return
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
@@ -556,6 +647,7 @@ class NativeCacheView:
                 getattr(self, "_tpu_rope_pool", None),
                 getattr(self, "_tpu_scale_pool", None),
                 getattr(self, "_tpu_swa_words", False),
+                native_keys=getattr(self, "tpu_native_index_keys", False),
             )
         return self._bound_cache
 
@@ -623,10 +715,12 @@ def _gather_raw_rows(
     return jnp.where(in_hi[..., None], cache_hi[idx_hi], cache_lo[idx_lo])
 
 
-def _gather_words(cache, records, record_words):
+def _gather_words(cache, records, record_words, native=False):
     import jax.numpy as jnp
 
     _cache_num_rows(cache)
+    if native and record_words != index_key_layout.DIM // 2:
+        raise ValueError("The native layout only holds BF16 [128] index keys")
     if record_words >= ROW_WORDS:
         chunks = record_words // ROW_WORDS
         indices = (records[:, None] * chunks + jnp.arange(chunks)[None]).reshape(-1)
@@ -635,6 +729,8 @@ def _gather_words(cache, records, record_words):
     # Select contiguous segments; a per-element dynamic gather is costly on TPU.
     per_row = ROW_WORDS // record_words
     words = _gather_raw_rows(cache, records // per_row)
+    if native:
+        words = index_key_layout.native_to_legacy_rows(words)
     selected = words[:, :record_words]
     for segment in range(1, per_row):
         selected = jnp.where(
@@ -736,9 +832,9 @@ def _valid_records(cache, records, record_words):
     return jnp.where(records >= 0, records, spread)
 
 
-def _gather_records(cache, records, record_words):
+def _gather_records(cache, records, record_words, native=False):
     return _gather_words(
-        cache, _valid_records(cache, records, record_words), record_words
+        cache, _valid_records(cache, records, record_words), record_words, native
     )
 
 
@@ -784,6 +880,7 @@ def gather_cache_values(
     elements: int,
     fp32: bool = False,
     split: bool = False,
+    native: bool = False,
 ) -> jax.Array:
     """Read physical records without flattening or converting the whole pool.
 
@@ -791,19 +888,20 @@ def gather_cache_values(
     They read distinct rows: clamping them all to row 0 serializes the
     SparseCore gather on the repeated index (padded decode, short top-k).
     ``split`` returns BF16 elements reordered as `piece_order` (see
-    `split_halves`), which needs no lane gather.
+    `split_halves`), which needs no lane gather. ``native``: the pool holds
+    BF16 [128] index keys in the `index_key_layout` native layout.
     """
     import jax.numpy as jnp
 
     if split:
         if elements // 2 <= ROW_WORDS:
-            words = _gather_records(cache, records, elements // 2)
+            words = _gather_records(cache, records, elements // 2, native)
             return jnp.concatenate(_split_words(words), axis=1)
         return jnp.concatenate(
             list(gather_cache_pieces(cache, records, elements)), axis=1
         )
     record_words = elements if fp32 else elements // 2
-    words = _gather_records(cache, records, record_words)
+    words = _gather_records(cache, records, record_words, native)
     if fp32:
         return jax.lax.bitcast_convert_type(words, jnp.float32)
     # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
@@ -823,6 +921,8 @@ def gather_cache_page_words(
 
     Each row holds ``ROW_WORDS // (elements // 2)`` consecutive records of
     its page, in the split element order; see `gather_cache_page_values`.
+    Rows are returned in the pool's layout (legacy or `index_key_layout`
+    native); the consumer must match it.
     """
     import jax.numpy as jnp
 
@@ -850,6 +950,7 @@ def gather_cache_page_values(
     first_records: jax.Array,
     page_records: int,
     elements: int,
+    native: bool = False,
 ) -> jax.Array:
     """`gather_cache_values` (``split=True``) of whole pages.
 
@@ -863,6 +964,8 @@ def gather_cache_page_values(
     import jax.numpy as jnp
 
     words = gather_cache_page_words(cache, first_records, page_records, elements)
+    if native:
+        words = index_key_layout.native_to_legacy_rows(words)
     words = words.reshape(first_records.size * page_records, elements // 2)
     return jnp.concatenate(_split_words(words), axis=1)
 
@@ -997,6 +1100,66 @@ def initialize_cache_ops():
     _write_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
     )
+
+    def read_native_keys(cache, records, elements):
+        return gather_cache_values(cache, records, elements, native=True)
+
+    def read_native_keys_2bank(cache_lo, cache_hi, records, elements):
+        return gather_cache_values(
+            cast(Any, (cache_lo, cache_hi)), records, elements, native=True
+        )
+
+    write_native_keys = jax.shard_map(
+        functools.partial(scatter_index_keys, native=True),
+        mesh=mesh,
+        in_specs=(P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+
+    def write_native_keys_after(cache, records, values, after):
+        cache, _ = jax.lax.optimization_barrier((cache, after))
+        return write_native_keys(cache, records, values)
+
+    for name, fn, specs, fake in (
+        (
+            "read",
+            read_native_keys,
+            (P(), P(), None),
+            lambda cache, records, elements: cache.new_empty(
+                (records.numel(), elements), dtype=torch.bfloat16
+            ),
+        ),
+        (
+            "read_2bank",
+            read_native_keys_2bank,
+            (P(), P(), P(), None),
+            lambda cache_lo, cache_hi, records, elements: cache_lo.new_empty(
+                (records.numel(), elements), dtype=torch.bfloat16
+            ),
+        ),
+        (
+            "write",
+            write_native_keys,
+            (P(), P(), P()),
+            lambda cache, records, values: torch.empty_like(cache),
+        ),
+        (
+            "write_after",
+            write_native_keys_after,
+            (P(), P(), P(), P()),
+            lambda cache, records, values, after: torch.empty_like(cache),
+        ),
+    ):
+        op = pallas.jax_op(
+            f"pallas::dsv41v2_native_index_keys_{name}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=specs,
+            **({"donate_argnums": (0,)} if name.startswith("write") else {}),
+        )
+        op.register_fake(fake)
+        _native_key_ops[name] = op
     _encode_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_encode_fp8_kv",
         encode_fp8_kv,
@@ -1033,6 +1196,48 @@ def write_cache(cache, slots, values, valid, after=None):
     else:
         assert _write_op is not None
         cache.copy_(_write_op(cache, slots.int(), values))
+
+
+def scatter_index_keys(
+    cache: jax.Array | tuple[jax.Array, jax.Array],
+    records: jax.Array,
+    keys: jax.Array,
+    native: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Write unique BF16 [128] index-key records in the pool's layout.
+
+    The legacy layout uses `scatter_cache_values`. The native layout
+    (`index_key_layout`) rebuilds each touched word row (both 16-bit halves)
+    and publishes whole rows through the same full-row writer.
+    """
+    import jax.numpy as jnp
+
+    if not native:
+        return scatter_cache_values(cast(Any, cache), records, keys)
+    if isinstance(cache, tuple):
+        cache_lo, cache_hi = cache
+        bank_records = cache_lo.shape[0] * 2
+        return cast(
+            Any,
+            (
+                scatter_index_keys(
+                    cache_lo,
+                    jnp.where(records < bank_records, records, -1),
+                    keys,
+                    native,
+                ),
+                scatter_index_keys(
+                    cache_hi,
+                    jnp.where(records >= bank_records, records - bank_records, -1),
+                    keys,
+                    native,
+                ),
+            ),
+        )
+    assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
+    return index_key_layout.scatter_native_keys(
+        cache, records, keys, write_rows=scatter_cache_values
+    )
 
 
 def merge_sub_rows(

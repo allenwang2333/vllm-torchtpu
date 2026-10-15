@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41 import indexer
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import scores, streaming_topk
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
@@ -79,6 +79,7 @@ def _request_kernel(
     profile_stages,
     fuse_mask,
     depth,
+    native,
 ):
     request = pl.program_id(0)
     # Keep the scalar-prefetch address space flat: a 2D SMEM row subview
@@ -102,6 +103,7 @@ def _request_kernel(
         row_lengths=query_limits if fuse_mask else None,
         row_offset=request * q.shape[0],
         depth=depth,
+        native=native,
     )
 
 
@@ -116,6 +118,7 @@ def _request_kernel(
         "score_window",
         "fuse_mask",
         "depth",
+        "native_keys",
     ),
 )
 def grouped_decode_scores(
@@ -133,6 +136,7 @@ def grouped_decode_scores(
     score_window: int = 32768,
     fuse_mask: bool = False,
     depth: int = DECODE_KEY_DEPTH,
+    native_keys: bool = index_key_layout.NATIVE_KEYS,
 ) -> jax.Array:
     """Score split-order Q [requests, queries, heads, 128] against paged keys.
 
@@ -176,6 +180,7 @@ def grouped_decode_scores(
             profile_stages=profile_stages,
             fuse_mask=fuse_mask,
             depth=depth,
+            native=native_keys,
         ),
         out_shape=jax.ShapeDtypeStruct((requests * queries, 1, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -189,7 +194,7 @@ def grouped_decode_scores(
             out_specs=pl.BlockSpec((queries, 1, window), lambda i, j, *_: (i, 0, j)),
             scratch_shapes=(
                 pltpu.VMEM((depth, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),
+                pltpu.VMEM((8 if native_keys else key_tile, ROW_WORDS), jnp.int32),
                 (
                     pltpu.SemaphoreType.DMA((depth,))
                     if depth > 2

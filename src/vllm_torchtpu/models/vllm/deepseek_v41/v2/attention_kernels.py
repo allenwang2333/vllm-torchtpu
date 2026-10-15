@@ -13,6 +13,7 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
+    index_key_layout,
     index_word_scores,
     indexer,
     tuned_block_sizes,
@@ -39,7 +40,7 @@ from .cache import (
     gather_cache_pieces,
     gather_cache_values,
     merge_pieces,
-    scatter_cache_values,
+    scatter_index_keys,
     split_halves,
     split_pieces,
 )
@@ -2208,6 +2209,8 @@ def paged_index_scores_jax(
     """
     tokens, dim = q.shape[0], q.shape[-1]
     width = records.shape[1]
+    # The pool layout is process-wide; Pallas word scorers default to it too.
+    native = index_key_layout.NATIVE_KEYS
     # Keep about `_INDEX_KEYS_PER_ITER` keys per iteration: small (decode)
     # batches otherwise run many latency-bound tiny gathers. Prefill batches use
     # 512: with 128 the loop is iteration-latency bound (2.3x slower at T=512
@@ -2285,10 +2288,12 @@ def paged_index_scores_jax(
                 ).reshape(-1)
                 if pages:
                     keys = gather_cache_page_values(
-                        pool, addresses[::page_records], page_records, dim
+                        pool, addresses[::page_records], page_records, dim, native
                     )
                 else:
-                    keys = gather_cache_values(pool, addresses, dim, split=True)
+                    keys = gather_cache_values(
+                        pool, addresses, dim, split=True, native=native
+                    )
                 values = head_sum(
                     jnp.einsum(
                         "thd,cd->thc",
@@ -2430,10 +2435,12 @@ def paged_index_scores_jax(
             assert page_records is not None
             # Tiles start on page boundaries: one gather per page.
             keys = gather_cache_page_values(
-                pool, addresses[:, ::page_records], page_records, dim
+                pool, addresses[:, ::page_records], page_records, dim, native
             )
         else:
-            keys = gather_cache_values(pool, addresses.reshape(-1), dim, split=True)
+            keys = gather_cache_values(
+                pool, addresses.reshape(-1), dim, split=True, native=native
+            )
         keys = keys.reshape(records.shape[0], tile, dim)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         return jax.lax.dynamic_update_slice_in_dim(
@@ -3224,7 +3231,9 @@ def write_index_keys(
         raise ValueError("Index keys must be BF16")
     if keys.ndim != 2 or write_records.shape != (keys.shape[0],):
         raise ValueError("One physical record index per key is required")
-    return scatter_cache_values(cast(Any, pool), write_records, keys)
+    return scatter_index_keys(
+        cast(Any, pool), write_records, keys, index_key_layout.NATIVE_KEYS
+    )
 
 
 def update_and_select_jax(

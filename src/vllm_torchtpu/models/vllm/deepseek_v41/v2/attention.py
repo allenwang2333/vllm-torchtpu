@@ -21,6 +21,7 @@ from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
@@ -361,6 +362,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
+    # TPU_DSV41_INDEX_NATIVE_KEYS: keys stored bitcast-ready for the scorers.
+    tpu_native_index_keys = index_key_layout.NATIVE_KEYS
+
     def __init__(self, *args, **kwargs):
         # The first TPU path stores rounded values in BF16; ownership and
         # compression ratio still come from upstream. Packed storage follows

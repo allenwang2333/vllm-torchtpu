@@ -21,6 +21,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from . import index_key_layout
+
 ROW_WORDS = 128
 DIM = 128  # BF16 elements per key: two keys per word row
 SLOTS = ROW_WORDS // (DIM // 2)
@@ -47,8 +49,8 @@ def unpack_word_rows(words, keys_ref):
     return jnp.where(first, lo, pltpu.roll(hi, half, 1))
 
 
-def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
-    key = unpack_word_rows(words_ref[0], keys_ref)
+def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref, *, native):
+    key = index_key_layout.rows_to_keys(words_ref[0], keys_ref, native)
     for t in range(q_ref.shape[0]):
         logits = jax.lax.dot_general(
             q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
@@ -57,9 +59,14 @@ def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
 
 
 # Jitted: the memory-space constraint below cannot run eagerly.
-@functools.partial(jax.jit, static_argnames=("interpret",))
+@functools.partial(jax.jit, static_argnames=("interpret", "native_keys"))
 def score_word_rows(
-    q: jax.Array, weights: jax.Array, words: jax.Array, *, interpret: bool = False
+    q: jax.Array,
+    weights: jax.Array,
+    words: jax.Array,
+    *,
+    interpret: bool = False,
+    native_keys: bool = index_key_layout.NATIVE_KEYS,
 ) -> jax.Array:
     """Scores ``[tokens, SLOTS * rows]`` of the keys in ``words``.
 
@@ -67,7 +74,8 @@ def score_word_rows(
     ``weights``: FP32 ``[tokens, heads, 1]``. ``words``: int32
     ``[groups, rows, ROW_WORDS]`` where ``tokens % groups == 0``; each group of
     ``tokens // groups`` consecutive queries shares one ``[rows, ROW_WORDS]``
-    word tile. ``rows`` must be a power of two >= 8.
+    word tile. ``rows`` must be a power of two >= 8. ``native_keys`` selects
+    the pool layout (`index_key_layout`).
     """
     groups, rows, row_words = words.shape
     tokens, heads = q.shape[:2]
@@ -91,7 +99,7 @@ def score_word_rows(
     words = pltpu.with_memory_space_constraint(words, pltpu.MemorySpace.HBM)
     keys = SLOTS * block
     return pl.pallas_call(
-        _kernel,
+        functools.partial(_kernel, native=native_keys),
         grid=(groups, rows // block),
         in_specs=[
             pl.BlockSpec((group_tokens, heads, DIM), lambda i, j: (i, 0, 0)),
@@ -101,7 +109,7 @@ def score_word_rows(
         # A unit middle axis keeps the block's last two dims TPU-legal.
         out_specs=pl.BlockSpec((group_tokens, 1, keys), lambda i, j: (i, 0, j)),
         out_shape=jax.ShapeDtypeStruct((tokens, 1, SLOTS * rows), jnp.float32),
-        scratch_shapes=[pltpu.VMEM((keys, ROW_WORDS), jnp.int32)],
+        scratch_shapes=[pltpu.VMEM((8 if native_keys else keys, ROW_WORDS), jnp.int32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),

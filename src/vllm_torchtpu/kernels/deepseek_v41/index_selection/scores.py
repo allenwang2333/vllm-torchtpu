@@ -14,7 +14,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..index_word_scores import DIM, ROW_WORDS, SLOTS, unpack_word_rows
+from .. import index_key_layout
+from ..index_word_scores import DIM, ROW_WORDS, SLOTS
 from . import tuned_block_sizes
 
 
@@ -73,11 +74,14 @@ def _kernel(
     row_lengths=None,
     row_offset=0,
     depth=2,
+    native=False,
 ):
     """``depth`` key tiles are buffered: ``depth - 1`` fetches stay in flight.
 
     Depth 2 shares one DMA semaphore (one fetch in flight at every wait).
     Deeper pipelines need ``words`` [depth, ...] and ``sem`` DMA[depth].
+    ``native`` pools (`index_key_layout`) bitcast each tile straight to BF16
+    keys; ``unpacked`` is then unused.
     """
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
@@ -186,7 +190,7 @@ def _kernel(
             # Keep the fused vector/MXU region in one scope: splitting dot and
             # reduction introduces materialization/spills in the Mosaic compiler.
             with scope("prefill_unpack_dot_reduce_store"):
-                keys = unpack_word_rows(words[bank], unpacked)
+                keys = index_key_layout.rows_to_keys(words[bank], unpacked, native)
                 logits = jax.lax.dot_general(
                     query,
                     keys,
@@ -234,6 +238,7 @@ def _kernel(
         "interpret",
         "prefetch",
         "profile_stages",
+        "native_keys",
     ),
 )
 def prefill_index_scores(
@@ -250,6 +255,7 @@ def prefill_index_scores(
     interpret: bool = False,
     prefetch: bool = True,
     profile_stages: bool = False,
+    native_keys: bool = index_key_layout.NATIVE_KEYS,
 ) -> jax.Array:
     """Score one shared request; caller applies per-query causal/record masks.
 
@@ -303,6 +309,7 @@ def prefill_index_scores(
             coalesce=coalesce,
             prefetch=prefetch,
             profile_stages=profile_stages,
+            native=native_keys,
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -316,7 +323,7 @@ def prefill_index_scores(
             out_specs=pl.BlockSpec((query_tile, window), lambda i, j, *_: (i, j)),
             scratch_shapes=(
                 pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),
+                pltpu.VMEM((8 if native_keys else key_tile, ROW_WORDS), jnp.int32),
                 pltpu.SemaphoreType.DMA,
             ),
         ),

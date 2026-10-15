@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41 import indexer
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode, tuned_block_sizes
 
 # Experimental knobs. SKIP: score only key tiles that hold union blocks (exact).
@@ -112,7 +112,9 @@ def union_record_starts(
     return jnp.where(valid, starts, -1), jnp.where(valid, metadata.membership, 0)
 
 
-def _unpack_words(words, scratch):
+def _unpack_words(words, scratch, native=False):
+    if native:
+        return pltpu.bitcast(words, jnp.bfloat16)
     rows = words.shape[0]
     scratch[pl.ds(0, rows, stride=2), :] = words
     scratch[pl.ds(1, rows, stride=2), :] = pltpu.roll(words, 64, 1)
@@ -128,51 +130,82 @@ def _unpack_words(words, scratch):
     )
 
 
-def _unpack_kernel(words_ref, out_ref, scratch):
-    out_ref[0] = _unpack_words(words_ref[0], scratch)
+def _unpack_kernel(words_ref, out_ref, scratch, *, native):
+    out_ref[0] = _unpack_words(words_ref[0], scratch, native)
 
 
-@functools.partial(jax.jit, static_argnames=("interpret",))
-def unpack_candidate_words(words: jax.Array, *, interpret: bool = False) -> jax.Array:
-    """Unpack native word pairs once into split-order BF16 [request, key, 128]."""
+@functools.partial(jax.jit, static_argnames=("interpret", "native_keys"))
+def unpack_candidate_words(
+    words: jax.Array,
+    *,
+    interpret: bool = False,
+    native_keys: bool = index_key_layout.NATIVE_KEYS,
+) -> jax.Array:
+    """Unpack pool word pairs once into split-order BF16 [request, key, 128]."""
     groups, rows, dim = words.shape
     if dim != 128 or words.dtype != jnp.int32 or rows < 1:
         raise ValueError("Expected nonempty int32 [requests, word rows, 128]")
     tile = math.gcd(rows, 1024)
     return pl.pallas_call(
-        _unpack_kernel,
+        functools.partial(_unpack_kernel, native=native_keys),
         out_shape=jax.ShapeDtypeStruct((groups, rows * 2, dim), jnp.bfloat16),
         grid=(groups, rows // tile),
         in_specs=[pl.BlockSpec((1, tile, dim), lambda g, t: (g, t, 0))],
         out_specs=pl.BlockSpec((1, tile * 2, dim), lambda g, t: (g, t, 0)),
-        scratch_shapes=[pltpu.VMEM((tile * 2, dim), jnp.int32)],
+        scratch_shapes=[pltpu.VMEM((8 if native_keys else tile * 2, dim), jnp.int32)],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
         interpret=interpret,
         name="candidate_unpack_cache",
     )(words)
 
 
-def _score_kernel(q, weights, keys, ids, membership, lengths, out, *scratch):
-    _score_body(q, weights, keys, ids, membership, lengths, out, *scratch)
+def _score_kernel(
+    q, weights, keys, ids, membership, lengths, out, *scratch, packed, native
+):
+    _score_body(
+        q,
+        weights,
+        keys,
+        ids,
+        membership,
+        lengths,
+        out,
+        *scratch,
+        packed=packed,
+        native=native,
+    )
 
 
 def _skip_score_kernel(
-    tiles, q, weights, keys, ids, membership, lengths, out, *scratch
+    tiles, q, weights, keys, ids, membership, lengths, out, *scratch, packed, native
 ):
     """`_score_kernel` for tiles holding union blocks; -inf for the empty tail."""
 
     @pl.when(pl.program_id(1) < tiles[pl.program_id(0)])
     def _():
-        _score_body(q, weights, keys, ids, membership, lengths, out, *scratch)
+        _score_body(
+            q,
+            weights,
+            keys,
+            ids,
+            membership,
+            lengths,
+            out,
+            *scratch,
+            packed=packed,
+            native=native,
+        )
 
     @pl.when(pl.program_id(1) >= tiles[pl.program_id(0)])
     def _():
         out[...] = jnp.full(out.shape, -jnp.inf, out.dtype)
 
 
-def _score_body(q, weights, keys, ids, membership, lengths, out, *scratch):
+def _score_body(
+    q, weights, keys, ids, membership, lengths, out, *scratch, packed, native
+):
     queries, heads, dim = q.shape[1:]
-    kk = _unpack_words(keys[0], scratch[0]) if scratch else keys[0]
+    kk = _unpack_words(keys[0], scratch[0], native) if packed else keys[0]
     logits = jax.lax.dot_general(
         q[0].reshape(queries * heads, dim),
         kk,
@@ -189,7 +222,9 @@ def _score_body(q, weights, keys, ids, membership, lengths, out, *scratch):
     out[0] = jnp.where(allow, values, -jnp.inf)
 
 
-@functools.partial(jax.jit, static_argnames=("block_size", "key_tile", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("block_size", "key_tile", "interpret", "native_keys")
+)
 def candidate_scores(
     q: jax.Array,
     weights: jax.Array,
@@ -201,8 +236,12 @@ def candidate_scores(
     block_size: int,
     key_tile: int = 4096,
     interpret: bool = False,
+    native_keys: bool = index_key_layout.NATIVE_KEYS,
 ) -> jax.Array:
-    """Per-head dot/ReLU/weight/sum with per-query membership and causal masks."""
+    """Per-head dot/ReLU/weight/sum with per-query membership and causal masks.
+
+    Packed int32 ``keys`` are pool word rows in the ``native_keys`` layout.
+    """
     groups, queries, heads, dim = q.shape
     width = ids.shape[1] * block_size
     packed = keys.dtype == jnp.int32
@@ -236,7 +275,7 @@ def candidate_scores(
             return jnp.minimum(t, tl[g] - 1)
 
         return pl.pallas_call(
-            _skip_score_kernel,
+            functools.partial(_skip_score_kernel, packed=packed, native=native_keys),
             out_shape=jax.ShapeDtypeStruct((groups, queries, width), jnp.float32),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
@@ -260,7 +299,9 @@ def candidate_scores(
                 out_specs=pl.BlockSpec(
                     (1, queries, key_tile), lambda g, t, tl: (g, 0, t)
                 ),
-                scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)]
+                scratch_shapes=[
+                    pltpu.VMEM((8 if native_keys else key_tile, dim), jnp.int32)
+                ]
                 if packed
                 else [],
             ),
@@ -271,7 +312,7 @@ def candidate_scores(
             else "candidate_union_scores",
         )(tiles, q, weights, keys, logical[:, None], members[:, None], lengths[:, None])
     return pl.pallas_call(
-        _score_kernel,
+        functools.partial(_score_kernel, packed=packed, native=native_keys),
         out_shape=jax.ShapeDtypeStruct((groups, queries, width), jnp.float32),
         grid=(groups, width // key_tile),
         in_specs=[
@@ -286,7 +327,11 @@ def candidate_scores(
             pl.BlockSpec((1, 1, queries), lambda g, t: (g, 0, 0)),
         ],
         out_specs=pl.BlockSpec((1, queries, key_tile), lambda g, t: (g, 0, t)),
-        scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)] if packed else [],
+        scratch_shapes=(
+            [pltpu.VMEM((8 if native_keys else key_tile, dim), jnp.int32)]
+            if packed
+            else []
+        ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
         interpret=interpret,
         name="candidate_union_packed_scores" if packed else "candidate_union_scores",
