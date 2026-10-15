@@ -436,9 +436,7 @@ def _topk_body(
                 sel = sel & (col_offset >= 0)
             else:
                 col_offset = (
-                    i * LANES + lane_iota
-                    if p == 1
-                    else cb + i * LANES + lane_iota
+                    i * LANES + lane_iota if p == 1 else cb + i * LANES + lane_iota
                 )
             plsc.store_compressed(
                 rowbuf_vmem.at[pl.ds(woff, LANES)],
@@ -657,6 +655,7 @@ def _topk_body(
 
             @pl.loop(0, num_dmas)
             def _(c):
+                assert rowdata_vmem is not None and dma_sem is not None
                 off = pl.multiple_of(c * dma_chunk, dma_chunk)
                 pltpu.make_async_copy(
                     scores_hbm.at[pl.ds(row_base + off, dma_chunk)],

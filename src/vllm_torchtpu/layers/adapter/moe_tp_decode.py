@@ -540,7 +540,9 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
         rank: jax.Array,
         e0: jax.Array,
     ) -> jax.Array:
-        return run(x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0)
+        return run(
+            x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+        )
 
     def fn_prequant(
         x: jax.Array,
@@ -561,7 +563,22 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
         x_scale: jax.Array,
     ) -> jax.Array:
         return run(
-            x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0, x_q, x_scale
+            x,
+            scores,
+            bias,
+            pad_mask,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            rank,
+            e0,
+            x_q,
+            x_scale,
         )
 
     name = "pallas::moe_tp_decode" + ("_prequant" if prequant else "")
@@ -812,6 +829,7 @@ def moe_tp_decode_forward(
     op = getattr(quant_method, _OP_ATTR)
     extra = ()
     if prequant is not None:
+        assert slot is not None
         slot.value = None
         op = getattr(quant_method, _OP_PREQUANT_ATTR)
         extra = prequant

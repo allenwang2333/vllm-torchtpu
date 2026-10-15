@@ -30,17 +30,25 @@ ENV = {
 def env(monkeypatch):
     for k, v in ENV.items():
         monkeypatch.setattr(cp_mla.envs, k, v, raising=False)
-    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: types.SimpleNamespace(world_size=8))
+    monkeypatch.setattr(
+        cp_mla, "get_dcp_group", lambda: types.SimpleNamespace(world_size=8)
+    )
     return monkeypatch
 
 
 @pytest.mark.parametrize(
     "tokens,backbone,want",
     [
-        (4, True, False), (16, True, False), (64, True, False), (512, True, False),
-        (1024, True, True), (2048, True, True), (4096, True, True),
+        (4, True, False),
+        (16, True, False),
+        (64, True, False),
+        (512, True, False),
+        (1024, True, True),
+        (2048, True, True),
+        (4096, True, True),
         (1032, True, False),  # not a multiple of 8 * chunks: unchunked
-        (2048, False, False), (4096, False, False),  # the drafter
+        (2048, False, False),
+        (4096, False, False),  # the drafter
     ],
 )
 def test_buckets(env, tokens, backbone, want):

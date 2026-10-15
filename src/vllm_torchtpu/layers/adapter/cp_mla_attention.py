@@ -221,14 +221,17 @@ def vspace_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
         return False
-    if envs.TPU_DCP_LSE_MERGE_A2A and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS:
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
         return False
     if _merge_chunks(num_tokens) <= 1:
         return False
     min_tokens = envs.TPU_DCP_MERGE_VSPACE_MIN_TOKENS
-    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and num_tokens < min_tokens:
-        return False
-    return True
+    return not (
+        min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and num_tokens < min_tokens
+    )
 
 
 def _merge_chunks(num_tokens: int) -> int:
@@ -501,9 +504,7 @@ def _merge_chunked_lse_gathered(
         # same rows, so the same gathered values.
         head = _gather_lse(lse_f32[:step], group)
         rest = _gather_lse(lse_f32[step:], group)
-        rows = [head] + [
-            rest[:, (c - 1) * step : c * step] for c in range(1, chunks)
-        ]
+        rows = [head] + [rest[:, (c - 1) * step : c * step] for c in range(1, chunks)]
     else:
         gathered = _gather_lse(lse_f32, group)
         rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
@@ -715,8 +716,10 @@ def merge_send_layout(
     l_recv_words = recv[:, SEND_PAD_ROWS - 1]
     hi = l_recv_words[:, :rows].to(torch.int32)
     lo = l_recv_words[:, rows : 2 * rows].to(torch.int32)
-    l_recv = ((hi << 16) | (lo & 0xFFFF)).view(torch.float32).reshape(
-        world, num_tokens, local
+    l_recv = (
+        ((hi << 16) | (lo & 0xFFFF))
+        .view(torch.float32)
+        .reshape(world, num_tokens, local)
     )
     return _merge_received(o_recv, l_recv).to(torch.bfloat16)
 
@@ -842,7 +845,9 @@ def prebuild_send_merge(world: int) -> None:
 def _send_merge_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
-    world = int(get_dcp_group().world_size)
+    group = get_dcp_group()
+    assert group is not None
+    world = int(group.world_size)
     tl = x.shape[0] // world - SEND_PAD_ROWS
     return x.new_empty((tl, x.shape[1]), dtype=torch.bfloat16)
 
@@ -855,16 +860,16 @@ def _send_merge_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
 MERGE_JAX_VARIANTS = ("reduce_f32", "dot_default", "dot_bf16")
 
 
-def merge_received_jax(o, l, variant: str = MERGE_JAX_VARIANTS[0]):
+def merge_received_jax(o, lse, variant: str = MERGE_JAX_VARIANTS[0]):
     """`_merge_received` in jnp on `[R, n, V]` bf16 partials and `[R, n]` f32
     lse (rows flattened): the f32 `[n, V]` merge."""
     import jax.numpy as jnp
     from jax import lax
 
-    finite = jnp.isfinite(l)
-    shift = jnp.where(finite, l, -jnp.inf).max(axis=0)
+    finite = jnp.isfinite(lse)
+    shift = jnp.where(finite, lse, -jnp.inf).max(axis=0)
     shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
-    weights = jnp.where(finite, jnp.exp(l - shift[None]), 0.0)
+    weights = jnp.where(finite, jnp.exp(lse - shift[None]), 0.0)
     denom = weights.sum(axis=0)
     weights = weights / jnp.where(denom > 0, denom, 1.0)
     of = o.astype(jnp.float32)
@@ -880,7 +885,10 @@ def merge_received_jax(o, l, variant: str = MERGE_JAX_VARIANTS[0]):
 
     def dot(a, w):
         return lax.dot_general(
-            a, w, dims, precision=lax.Precision.DEFAULT,
+            a,
+            w,
+            dims,
+            precision=lax.Precision.DEFAULT,
             preferred_element_type=jnp.float32,
         )
 
@@ -921,8 +929,8 @@ def _build_send_merge(world: int):
         words = recv[:, SEND_PAD_ROWS - 1]
         hi = words[:, :tl].astype(jnp.int32)
         lo = words[:, tl : 2 * tl].astype(jnp.int32)
-        l = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
-        return merge_received_jax(o, l).astype(jnp.bfloat16)
+        lse = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+        return merge_received_jax(o, lse).astype(jnp.bfloat16)
 
     def fn(x: jax.Array, rows: jax.Array, rank: jax.Array) -> jax.Array:
         return jax.shard_map(
@@ -960,7 +968,9 @@ def prebuild_send_unpack(world: int) -> None:
 def _send_unpack_fake(x: torch.Tensor, rows: torch.Tensor, rank: torch.Tensor):
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
-    world = int(get_dcp_group().world_size)
+    group = get_dcp_group()
+    assert group is not None
+    world = int(group.world_size)
     tl = x.shape[0] // world - SEND_PAD_ROWS
     return (
         x.new_empty((world, tl, x.shape[1]), dtype=torch.bfloat16),
@@ -1002,8 +1012,8 @@ def _build_send_unpack(world: int):
         words = recv[:, SEND_PAD_ROWS - 1]
         hi = words[:, :tl].astype(jnp.int32)
         lo = words[:, tl : 2 * tl].astype(jnp.int32)
-        l = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
-        return o, l
+        lse = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+        return o, lse
 
     def fn(
         x: jax.Array, rows: jax.Array, rank: jax.Array

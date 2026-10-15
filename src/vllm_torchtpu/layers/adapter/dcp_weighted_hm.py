@@ -154,7 +154,11 @@ def vspace_weighted_heads_major(
     TPU_DCP_MERGE_RS_BF16=1) or f32."""
     scaled = w_uv_scale is not None
     op = _VSPACE_OPS[(bf16, scaled, VSPACE_FAULT if not scaled else None)]
-    args = [output.contiguous(), weight.to(torch.float32).contiguous(), w_uv.contiguous()]
+    args = [
+        output.contiguous(),
+        weight.to(torch.float32).contiguous(),
+        w_uv.contiguous(),
+    ]
     if scaled:
         args.append(w_uv_scale.contiguous())
     return op(*args)

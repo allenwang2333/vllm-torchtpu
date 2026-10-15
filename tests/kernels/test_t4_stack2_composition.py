@@ -27,8 +27,8 @@ the on partials equals the two-exchange merge of the off partials. Decode
 steps: every rank's sent rows equal the packed real rows of the off partials,
 and the send-layout merge (threaded ragged exchange) equals the two-exchange
 merge of the off partials, bit for bit. Wiring: row widths on every capped
-on-call, send_world on exactly the two decode calls, out_pieces (= the 8 merge chunks) on
-exactly the 2048 call.
+on-call, send_world on exactly the two decode calls, out_pieces (= the 8 merge
+chunks) on exactly the 2048 call.
 
 `T4S2_DUMP=<prefix>` writes `<prefix>.mixed.npz` (the mixed steps' off / on
 partials, test_t4_stack2_merge_multichip) and `<prefix>.send.npz` (decode
@@ -40,7 +40,6 @@ import os
 import sys
 from unittest import mock
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest

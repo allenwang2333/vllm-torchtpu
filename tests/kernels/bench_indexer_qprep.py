@@ -80,7 +80,11 @@ def bench():
     arms = {"inc": inc, "fused": fused}
     for t in TOKENS:
         args = inputs(t)
-        fns = {(a, m): chained(f, m).lower(*args).compile() for a, f in arms.items() for m in M_LIST}
+        fns = {
+            (a, m): chained(f, m).lower(*args).compile()
+            for a, f in arms.items()
+            for m in M_LIST
+        }
         times = {k: [] for k in fns}
         for _ in range(REPS):
             for k, c in fns.items():
@@ -96,21 +100,31 @@ def bench():
                 (m - mbar) ** 2 for m in M_LIST
             )
             res[a] = slope
-            print(f"BENCH T={t} arm={a} per_call_us={slope:.2f} T(M)={[round(x, 1) for x in meds]}", flush=True)
-        print(f"BENCH-SUMMARY T={t} inc={res['inc']:.2f} fused={res['fused']:.2f} "
-              f"delta={res['fused'] - res['inc']:+.2f}us", flush=True)
+            print(
+                f"BENCH T={t} arm={a} per_call_us={slope:.2f} "
+                f"T(M)={[round(x, 1) for x in meds]}",
+                flush=True,
+            )
+        print(
+            f"BENCH-SUMMARY T={t} inc={res['inc']:.2f} fused={res['fused']:.2f} "
+            f"delta={res['fused'] - res['inc']:+.2f}us",
+            flush=True,
+        )
 
 
-BIG = re.compile(r"(bf16\[4096,4096\]|bf16\[4096,32,128\]|bf16\[131072,1?,?128\]|bf16\[131072,128\]|"
-                 r"bf16\[4096,32,64\]|bf16\[4096,32,32\]|f8e4m3fn\[4096,32,128\]|bf16\[131072\]|"
-                 r"bf16\[131072,1,128\])")
+BIG = re.compile(
+    r"(bf16\[4096,4096\]|bf16\[4096,32,128\]|bf16\[131072,1?,?128\]|bf16\[131072,128\]|"
+    r"bf16\[4096,32,64\]|bf16\[4096,32,32\]|f8e4m3fn\[4096,32,128\]|bf16\[131072\]|"
+    r"bf16\[131072,1,128\])"
+)
 
 
 def hlo(dump_dir):
     import torch
 
     sys.path.insert(0, os.path.dirname(__file__))
-    from test_indexer_qprep import _compiled, _inputs, _Rope, fused as tfused, unfused  # noqa: PLC0415
+    from test_indexer_qprep import _compiled, _inputs, _Rope, unfused  # noqa: PLC0415
+    from test_indexer_qprep import fused as tfused
     from vllm.config import VllmConfig, set_current_vllm_config  # noqa: PLC0415
 
     with set_current_vllm_config(VllmConfig()):
@@ -121,13 +135,17 @@ def hlo(dump_dir):
             out = _compiled(fn)(q, pos, w, rope)
             [o.cpu() for o in out]
             torch.tpu.synchronize() if hasattr(torch, "tpu") else None
-            new = sorted(set(glob.glob(os.path.join(dump_dir, "*after_optimizations.txt"))) - before)
+            new = sorted(
+                set(glob.glob(os.path.join(dump_dir, "*after_optimizations.txt")))
+                - before
+            )
             print(f"HLO arm={name} new_modules={len(new)}")
             for path in new:
-                text = open(path).read()
+                with open(path) as fh:
+                    text = fh.read()
                 if "f8e4m3fn[4096,32,128]" not in text:
                     continue
-                entry = text[text.index("\nENTRY"):]
+                entry = text[text.index("\nENTRY") :]
                 entry = entry[: entry.index("\n}") + 2]
                 n_big = 0
                 kinds = {}
@@ -136,7 +154,13 @@ def hlo(dump_dir):
                     if not m:
                         continue
                     nm, shape, op = m.group(2), m.group(3), m.group(4)
-                    if op in ("parameter", "constant", "get-tuple-element", "tuple", "bitcast"):
+                    if op in (
+                        "parameter",
+                        "constant",
+                        "get-tuple-element",
+                        "tuple",
+                        "bitcast",
+                    ):
                         continue
                     big = bool(BIG.search(line))
                     n_big += big
@@ -146,9 +170,14 @@ def hlo(dump_dir):
                     extra = (calls.group(1) if calls else "") + (
                         f" kernel={kn.group(1) or kn.group(2)}" if kn else ""
                     )
-                    print(f"HLO {name} {'BIG ' if big else '    '}{op:14s} {nm:44s} {shape[:70]:70s} {extra}")
-                print(f"HLO-SUMMARY arm={name} module={os.path.basename(path)} "
-                      f"ops_touching_q={n_big} kinds={kinds}")
+                    print(
+                        f"HLO {name} {'BIG ' if big else '    '}{op:14s} {nm:44s} "
+                        f"{shape[:70]:70s} {extra}"
+                    )
+                print(
+                    f"HLO-SUMMARY arm={name} module={os.path.basename(path)} "
+                    f"ops_touching_q={n_big} kinds={kinds}"
+                )
 
 
 def variants():
@@ -165,11 +194,20 @@ def variants():
                 )
                 try:
                     a8, asc = jax.jit(fn)(*args)
-                    mm = (int((a8.view(jnp.uint8) != r8.view(jnp.uint8)).sum()), int((asc != rsc).sum()))
-                    fns[(v, bt)] = {m: chained(fn, m).lower(*args).compile() for m in M_LIST}
+                    mm = (
+                        int((a8.view(jnp.uint8) != r8.view(jnp.uint8)).sum()),
+                        int((asc != rsc).sum()),
+                    )
+                    fns[(v, bt)] = {
+                        m: chained(fn, m).lower(*args).compile() for m in M_LIST
+                    }
                     ok[(v, bt)] = mm
                 except Exception as e:  # noqa: BLE001
-                    print(f"VAR T={t} variant={v} block={bt} FAILED {type(e).__name__}: {str(e)[:300]}", flush=True)
+                    print(
+                        f"VAR T={t} variant={v} block={bt} FAILED "
+                        f"{type(e).__name__}: {str(e)[:300]}",
+                        flush=True,
+                    )
         times = {(k, m): [] for k in fns for m in M_LIST}
         for _ in range(REPS):
             for k, d in fns.items():
@@ -184,8 +222,11 @@ def variants():
             slope = sum((m - mbar) * (x - tbar) for m, x in zip(M_LIST, meds)) / sum(
                 (m - mbar) ** 2 for m in M_LIST
             )
-            print(f"VAR T={t} variant={k[0]} block={k[1]} per_call_us={slope:.2f} "
-                  f"mismatch_q8/scale={ok[k]}", flush=True)
+            print(
+                f"VAR T={t} variant={k[0]} block={k[1]} per_call_us={slope:.2f} "
+                f"mismatch_q8/scale={ok[k]}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

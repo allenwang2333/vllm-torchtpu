@@ -88,9 +88,7 @@ def test_chain_bitwise(vllm_config_context, rows):
     torch._dynamo.reset()
     norms = [_norm(seed=100 + i) for i in range(4)]
     torch.manual_seed(rows)
-    ws = [
-        (torch.randn(6144, 6144) / 80).to(torch.bfloat16).to("tpu") for _ in range(4)
-    ]
+    ws = [(torch.randn(6144, 6144) / 80).to(torch.bfloat16).to("tpu") for _ in range(4)]
     h0 = (2 * torch.randn(rows, 6144)).to(torch.bfloat16).to("tpu")
 
     def chain(h):

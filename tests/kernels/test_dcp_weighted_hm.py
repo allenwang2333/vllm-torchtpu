@@ -60,7 +60,9 @@ def test_weighted_heads_major_bit_identical(t, h):
     assert not np.array_equal(bad, want)
 
 
-@pytest.mark.parametrize("t,h", [(512, 64), (256, 64), (128, 64), (512, 32), (16, 64), (8, 64)])
+@pytest.mark.parametrize(
+    "t,h", [(512, 64), (256, 64), (128, 64), (512, 32), (16, 64), (8, 64)]
+)
 def test_weighted_heads_major_bf16_out_bit_identical(t, h):
     """`out_dtype=bf16` (TPU_DCP_MERGE_RS_BF16 with WEIGHTED_HM): the f32 value
     rounded once to bf16, bit for bit the torch merge's `.to(bfloat16)`."""
@@ -76,7 +78,9 @@ def test_weighted_heads_major_bf16_out_bit_identical(t, h):
     bad = dcp_weighted_hm.weighted_heads_major(
         o, w, fault="swap_heads", out_dtype=jnp.bfloat16
     )
-    assert not np.array_equal(np.asarray(bad).view(np.uint16), np.asarray(want).view(np.uint16))
+    assert not np.array_equal(
+        np.asarray(bad).view(np.uint16), np.asarray(want).view(np.uint16)
+    )
 
 
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16])
@@ -91,8 +95,12 @@ def test_weighted_heads_major_xla_matches_kernel(t, h, out_dtype):
     got = dcp_weighted_hm.weighted_heads_major_xla(o, w, out_dtype=out_dtype)
     want = dcp_weighted_hm.weighted_heads_major(o, w, out_dtype=out_dtype)
     assert got.dtype == want.dtype and got.shape == want.shape == (h, t, o.shape[-1])
-    np.testing.assert_array_equal(np.asarray(got).view(view), np.asarray(want).view(view))
-    bad = dcp_weighted_hm.weighted_heads_major(o, w, fault="swap_heads", out_dtype=out_dtype)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(view), np.asarray(want).view(view)
+    )
+    bad = dcp_weighted_hm.weighted_heads_major(
+        o, w, fault="swap_heads", out_dtype=out_dtype
+    )
     assert not np.array_equal(np.asarray(bad).view(view), np.asarray(got).view(view))
 
 
@@ -110,14 +118,22 @@ def test_weighted_hm_min_tokens_dispatch(monkeypatch, min_tokens, chunks, rows, 
     adapter = pytest.importorskip("vllm_torchtpu.layers.adapter.dcp_weighted_hm")
     import vllm_torchtpu.envs as envs
 
-    monkeypatch.setattr(envs, "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", min_tokens, raising=False)
+    monkeypatch.setattr(
+        envs, "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", min_tokens, raising=False
+    )
     monkeypatch.setattr(envs, "TPU_DCP_MERGE_CHUNKED", chunks, raising=False)
     calls = []
     monkeypatch.setattr(
-        adapter._k, "weighted_heads_major", lambda o, w, out_dtype: calls.append("kernel")
+        adapter._k,
+        "weighted_heads_major",
+        lambda o, w, out_dtype: calls.append("kernel"),
     )
     monkeypatch.setattr(
-        adapter._k, "weighted_heads_major_xla", lambda o, w, out_dtype: calls.append("xla")
+        adapter._k,
+        "weighted_heads_major_xla",
+        lambda o, w, out_dtype: calls.append("xla"),
     )
-    adapter._build(jnp.zeros((rows, 64, 512), jnp.bfloat16), jnp.zeros((rows, 64)), jnp.bfloat16)
+    adapter._build(
+        jnp.zeros((rows, 64, 512), jnp.bfloat16), jnp.zeros((rows, 64)), jnp.bfloat16
+    )
     assert calls == ["kernel" if kernel else "xla"]

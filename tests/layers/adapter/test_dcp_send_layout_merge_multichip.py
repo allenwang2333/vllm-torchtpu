@@ -83,7 +83,9 @@ def _check(rank, cp_mla, path):
 
                 wrap = mm._compile if how == "compiled" else (lambda f: f)
                 cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE = False
-                want = wrap(inc)(o.contiguous().to("tpu"), lr.contiguous().to("tpu")).cpu()
+                want = wrap(inc)(
+                    o.contiguous().to("tpu"), lr.contiguous().to("tpu")
+                ).cpu()
                 got = wrap(new)(s.contiguous().to("tpu")).cpu()
                 ctl = wrap(new)(bad.contiguous().to("tpu")).cpu()
                 # TPU_DCP_MLA_SEND_LAYOUT_MERGE: exchange + merge as one JAX op.
@@ -101,7 +103,9 @@ def _check(rank, cp_mla, path):
                     "tokens": tokens,
                     "real": real,
                     "elements": int(want.numel()),
-                    "n_diff": int((got.view(torch.int16) != want.view(torch.int16)).sum()),
+                    "n_diff": int(
+                        (got.view(torch.int16) != want.view(torch.int16)).sum()
+                    ),
                     "nonzero_real": bool((want[:real] != 0).any()),
                     "control_n_diff": int(
                         (ctl.view(torch.int16) != want.view(torch.int16)).sum()
@@ -217,8 +221,14 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
             t = total.setdefault(
                 key,
                 dict(
-                    elements=0, n_diff=0, ctl=0, nonzero=False, jax=0, jax_ctl=0,
-                    unpack=0, unpack_ctl=0,
+                    elements=0,
+                    n_diff=0,
+                    ctl=0,
+                    nonzero=False,
+                    jax=0,
+                    jax_ctl=0,
+                    unpack=0,
+                    unpack_ctl=0,
                 ),
             )
             t["unpack"] += c["unpack_n_diff"]

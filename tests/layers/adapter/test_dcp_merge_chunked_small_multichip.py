@@ -79,15 +79,19 @@ def _check(rank, world, cp_mla, hw):
                 try:
                     comp = how == "compiled"
 
-                    def run(f):
+                    def run(f, comp=comp):
                         return vm._compile(f) if comp else f
 
                     _set(cp_mla, hw, vspace)
                     off = run(fn)(o, lse).cpu()
                     c = {"tokens": tokens, "elements": int(off.numel())}
                     if vspace and tokens > 16:
-                        ref, scale = vm._reference(rank, tokens, lses, vm._w_uv(), world)
-                        c["off_scale_ulp"], c["off_mean_abs"] = vm._scale_ulp(off, ref, scale)
+                        ref, scale = vm._reference(
+                            rank, tokens, lses, vm._w_uv(), world
+                        )
+                        c["off_scale_ulp"], c["off_mean_abs"] = vm._scale_ulp(
+                            off, ref, scale
+                        )
                     for arm, small in ARMS.items():
                         _set(cp_mla, hw, vspace, small)
                         c[f"{arm}_chunks"] = cp_mla._merge_chunks(tokens)
@@ -96,7 +100,9 @@ def _check(rank, world, cp_mla, hw):
                         c[f"{arm}_ndiff"] = int((u > 0).sum())
                         c[f"{arm}_maxulp"] = int(u.max())
                         if vspace and tokens > 16:
-                            c[f"{arm}_scale_ulp"], c[f"{arm}_mean_abs"] = vm._scale_ulp(got, ref, scale)
+                            c[f"{arm}_scale_ulp"], c[f"{arm}_mean_abs"] = vm._scale_ulp(
+                                got, ref, scale
+                            )
                     if 16 < tokens <= 2048:
                         _set(cp_mla, hw, vspace, 4)
                         cp_mla._gather_lse = rolled
@@ -107,9 +113,13 @@ def _check(rank, world, cp_mla, hw):
                         c["ctl_ndiff"] = int((vm._ulp(bad, off) > 0).sum())
                     if tokens == 2048 and comp:
                         _set(cp_mla, hw, vspace)
-                        d_off = vm._compile(lambda o, l: fn(o, l, backbone=False))(o, lse).cpu()
+                        d_off = vm._compile(lambda a, b: fn(a, b, backbone=False))(
+                            o, lse
+                        ).cpu()
                         _set(cp_mla, hw, vspace, 4)
-                        d_on = vm._compile(lambda o, l: fn(o, l, backbone=False))(o, lse).cpu()
+                        d_on = vm._compile(lambda a, b: fn(a, b, backbone=False))(
+                            o, lse
+                        ).cpu()
                         c["drafter_ndiff"] = int((vm._ulp(d_on, d_off) > 0).sum())
                     report[key] = c
                 except Exception as exc:  # noqa: BLE001 - reported to the parent

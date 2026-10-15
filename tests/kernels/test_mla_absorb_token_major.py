@@ -91,9 +91,9 @@ def _max_ulp(a, b):
 def test_kernel_matches_head_major_bmm(num_tokens, scaled):
     _require_tpu()
     q, w, s = _inputs(num_tokens, scaled=scaled)
-    got = jax.jit(
-        lambda q, w, s: mla_absorb_token_major(q, w, s, nope_dim=NOPE)
-    )(q, w, s)
+    got = jax.jit(lambda q, w, s: mla_absorb_token_major(q, w, s, nope_dim=NOPE))(
+        q, w, s
+    )
     want = _reference_scaled(q, w, s) if scaled else _reference(q, w)
     assert got.shape == (num_tokens, HEADS, LORA) and got.dtype == jnp.bfloat16
     assert _max_ulp(got, want) == 0

@@ -54,14 +54,23 @@ def _batch(rng, t, kind):
     cu = np.concatenate([[0], np.cumsum(q)]).astype(np.int32)
     # Distinct local pages (virtual % num_pages), random virtual rank offset.
     local = rng.permutation(SEQS * PPS)
-    pages = (local + SEQS * PPS * rng.integers(0, DCP, size=local.shape)).astype(np.int32)
+    pages = (local + SEQS * PPS * rng.integers(0, DCP, size=local.shape)).astype(
+        np.int32
+    )
     return jnp.asarray(seq_lens), jnp.asarray(cu), jnp.asarray(pages.reshape(SEQS, PPS))
 
 
 def _dst(t, seq_lens, cu, pages, rank, num_pages):
     page, slot = kv_cache_utils.get_dcp_page_and_slot(
-        t, seq_lens, pages, cu, rank, page_size=PAGE, num_pages=num_pages,
-        dcp_size=DCP, interleave_size=IL,
+        t,
+        seq_lens,
+        pages,
+        cu,
+        rank,
+        page_size=PAGE,
+        num_pages=num_pages,
+        dcp_size=DCP,
+        interleave_size=IL,
     )
     return kv_cache_utils.get_dst_rows(page, slot, PAGE)
 
@@ -72,7 +81,9 @@ def test_bound_never_exceeded():
     for trial in range(100):
         t = int(rng.choice([16, 64, 1024, 2048, 4096]))
         sl, cu, pg = _batch(rng, t, "decode" if t <= 64 else "mixed")
-        cap = kv_cache_append.owned_rows_bound(t, num_seqs=SEQS, dcp_size=DCP, interleave_size=IL)
+        cap = kv_cache_append.owned_rows_bound(
+            t, num_seqs=SEQS, dcp_size=DCP, interleave_size=IL
+        )
         for r in range(DCP):
             n = int((np.asarray(_dst(t, sl, cu, pg, r, SEQS * PPS)) >= 0).sum())
             worst = max(worst, n - min(cap, t) + 1_000_000)
@@ -83,13 +94,23 @@ def test_bound_never_exceeded():
 @functools.partial(jax.jit, static_argnames=("layout", "compact"), donate_argnums=0)
 def _append(cache, k, seq_lens, cu, pages, rank, *, layout, compact):
     return kv_cache_append.coalesced_kv_append_dcp(
-        cache, k, seq_lens, pages, cu, rank, dcp_size=DCP, interleave_size=IL,
-        kv_layout=layout, compact=compact,
+        cache,
+        k,
+        seq_lens,
+        pages,
+        cu,
+        rank,
+        dcp_size=DCP,
+        interleave_size=IL,
+        kv_layout=layout,
+        compact=compact,
     )
 
 
 def _cache(rng, layout):
-    c = jnp.asarray(rng.integers(0, 256, size=(SEQS * PPS, PAGE // 4, 4, 256), dtype=np.uint8))
+    c = jnp.asarray(
+        rng.integers(0, 256, size=(SEQS * PPS, PAGE // 4, 4, 256), dtype=np.uint8)
+    )
     if layout == _SAL:
         c = st_lib.convert_cache_to_seq_along_lane(c, actual_head_dim=128)
     return c
@@ -105,8 +126,26 @@ def test_compact_bit_exact(layout, t):
         cache = _cache(rng, layout)
         bad = 0
         for r in range(DCP):
-            a = _append(jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=False)
-            b = _append(jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=True)
+            a = _append(
+                jnp.copy(cache),
+                k,
+                sl,
+                cu,
+                pg,
+                jnp.int32(r),
+                layout=layout,
+                compact=False,
+            )
+            b = _append(
+                jnp.copy(cache),
+                k,
+                sl,
+                cu,
+                pg,
+                jnp.int32(r),
+                layout=layout,
+                compact=True,
+            )
             bad += int((np.asarray(a) != np.asarray(b)).sum())
         print(f"COMPACT layout={layout} T={t} trial={trial} mismatching_bytes={bad}")
         assert bad == 0
@@ -119,20 +158,32 @@ def test_fault_control(monkeypatch, fault):
     sl, cu, pg = _batch(rng, t, "mixed")
     k = jnp.asarray(rng.integers(0, 256, size=(t, 129), dtype=np.uint8))
     cache = _cache(rng, layout)
-    ref = [_append(jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=False) for r in range(DCP)]
+    ref = [
+        _append(
+            jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=False
+        )
+        for r in range(DCP)
+    ]
     if fault == "bound_cut":
-        monkeypatch.setattr(kv_cache_append, "owned_rows_bound", lambda n, **kw: n // DCP - 64)
+        monkeypatch.setattr(
+            kv_cache_append, "owned_rows_bound", lambda n, **kw: n // DCP - 64
+        )
     else:
         orig_take = jnp.take
         monkeypatch.setattr(
-            kv_cache_append.jnp, "take",
-            lambda a, i, axis=None, **kw: orig_take(a, jnp.minimum(i + 1, a.shape[0] - 1), axis=axis, **kw),
+            kv_cache_append.jnp,
+            "take",
+            lambda a, i, axis=None, **kw: orig_take(
+                a, jnp.minimum(i + 1, a.shape[0] - 1), axis=axis, **kw
+            ),
         )
     _append.clear_cache() if hasattr(_append, "clear_cache") else None
     jax.clear_caches()
     bad = 0
     for r in range(DCP):
-        b = _append(jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=True)
+        b = _append(
+            jnp.copy(cache), k, sl, cu, pg, jnp.int32(r), layout=layout, compact=True
+        )
         bad += int((np.asarray(ref[r]) != np.asarray(b)).sum())
     print(f"FAULT {fault} mismatching_bytes={bad} caught={bad > 0}")
     assert bad > 0
@@ -149,17 +200,38 @@ def bench():
             res = {}
             for compact in (False, True):
 
-                def chained(m, compact=compact):
-                    def f(c, k, sl, cu, pg):
-                        def body(i, c):
+                def chained(
+                    m,
+                    compact=compact,
+                    layout=layout,
+                    cache=cache,
+                    k=k,
+                    sl=sl,
+                    cu=cu,
+                    pg=pg,
+                ):
+                    def f(c0, k, sl, cu, pg):
+                        def body(i, acc):
                             return kv_cache_append.coalesced_kv_append_dcp(
-                                c, k, sl, pg, cu, jnp.int32(i % DCP), dcp_size=DCP,
-                                interleave_size=IL, kv_layout=layout, compact=compact,
+                                acc,
+                                k,
+                                sl,
+                                pg,
+                                cu,
+                                jnp.int32(i % DCP),
+                                dcp_size=DCP,
+                                interleave_size=IL,
+                                kv_layout=layout,
+                                compact=compact,
                             )
 
-                        return jax.lax.fori_loop(0, m, body, c)
+                        return jax.lax.fori_loop(0, m, body, c0)
 
-                    return jax.jit(f, donate_argnums=0).lower(cache, k, sl, cu, pg).compile()
+                    return (
+                        jax.jit(f, donate_argnums=0)
+                        .lower(cache, k, sl, cu, pg)
+                        .compile()
+                    )
 
                 fns = {m: chained(m) for m in M_LIST}
                 times = {m: [] for m in M_LIST}
@@ -172,12 +244,16 @@ def bench():
                         times[m].append(time.perf_counter() - t0)
                 meds = [statistics.median(times[m][1:]) * 1e6 for m in M_LIST]
                 mbar, tbar = statistics.mean(M_LIST), statistics.mean(meds)
-                slope = sum((m - mbar) * (x - tbar) for m, x in zip(M_LIST, meds)) / sum(
-                    (m - mbar) ** 2 for m in M_LIST
-                )
+                slope = sum(
+                    (m - mbar) * (x - tbar) for m, x in zip(M_LIST, meds)
+                ) / sum((m - mbar) ** 2 for m in M_LIST)
                 res[compact] = slope
-            print(f"KWBENCH layout={layout} T={t} full={res[False]:.1f}us compact={res[True]:.1f}us "
-                  f"delta={res[True] - res[False]:+.1f}us", flush=True)
+            print(
+                f"KWBENCH layout={layout} T={t} full={res[False]:.1f}us "
+                f"compact={res[True]:.1f}us "
+                f"delta={res[True] - res[False]:+.1f}us",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

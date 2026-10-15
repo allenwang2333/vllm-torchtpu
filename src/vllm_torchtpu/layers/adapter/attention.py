@@ -129,6 +129,7 @@ def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tens
             out = out - (v - v)
     return out
 
+
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
@@ -608,7 +609,9 @@ def get_mla_absorb_op(scaled: bool) -> Any:
         if op is not None:
             return op
         if scaled:
-            op = pallas.jax_op("pallas::mla_absorb_token_major_s", _mla_absorb_scaled_jax)
+            op = pallas.jax_op(
+                "pallas::mla_absorb_token_major_s", _mla_absorb_scaled_jax
+            )
         else:
             op = pallas.jax_op("pallas::mla_absorb_token_major", _mla_absorb_jax)
 
@@ -621,7 +624,7 @@ def get_mla_absorb_op(scaled: bool) -> Any:
 
 
 def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
-    """"pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
+    """ "pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
     of `num_tokens` tokens, else None (the head-major bmm).
 
     Only the backbone may branch on the token count: it is traced once per

@@ -79,7 +79,6 @@ def _get_op(eps: float, has_residual: bool):
         return op
 
 
-
 _quant_ops: dict[tuple[float, bool], object] = {}
 
 
@@ -140,14 +139,18 @@ def _get_quant_moe_op(eps: float):
         def fn(
             x: jax.Array, residual: jax.Array, weight: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-            return kernel.fused_add_rms_norm_quant_moe(x, residual, weight, eps=float(eps))
+            return kernel.fused_add_rms_norm_quant_moe(
+                x, residual, weight, eps=float(eps)
+            )
 
         def fake(x, residual, weight):
             rows, hidden = x.shape
             return (
                 torch.empty_like(x),
                 torch.empty(
-                    (rows, hidden // 128, 128), dtype=torch.float8_e4m3fn, device=x.device
+                    (rows, hidden // 128, 128),
+                    dtype=torch.float8_e4m3fn,
+                    device=x.device,
                 ),
                 torch.empty((rows,), dtype=torch.float32, device=x.device),
                 torch.empty_like(residual),
@@ -259,8 +262,10 @@ def arm_prequant(model: torch.nn.Module) -> int:
         ln_post = getattr(layer, "post_attention_layernorm", None)
         attn = getattr(layer, "self_attn", None)
         mlp = getattr(layer, "mlp", None)
-        if ln_in is None or attn is None or getattr(
-            layer, "use_sequence_parallel_moe", False
+        if (
+            ln_in is None
+            or attn is None
+            or getattr(layer, "use_sequence_parallel_moe", False)
         ):
             continue
         wrappers = [
@@ -400,13 +405,10 @@ class TpuRMSNorm(RMSNorm):
             ):
                 return self._materialized_add_norm(x, residual)
             return super().forward(x, residual)
-        if (
-            self._prequant_slot is not None
-            and residual is not None
-            and x.dim() == 2
-        ):
+        if self._prequant_slot is not None and residual is not None and x.dim() == 2:
             # The same rows predicate as the plain Pallas path above: no new
             # token-count branch. The paired linear takes (y_q, scale).
+            assert self._op_quant is not None
             y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
             self._prequant_slot.value = (y_q, scale)
             return y, new_res
@@ -417,6 +419,7 @@ class TpuRMSNorm(RMSNorm):
         ):
             # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
             # on its prefill kernel; y still feeds the router.
+            assert self._op_quant_moe is not None
             y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight.data)
             self._prequant_moe_slot.value = (x_q, x_scale)
             return y, new_res

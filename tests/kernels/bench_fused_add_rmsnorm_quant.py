@@ -96,7 +96,8 @@ def bench():
                 cc = count_custom_calls(c)
                 fns[(arm, m)] = c
                 print(
-                    f"COMPILE rows={rows} arm={arm} M={m} {time.perf_counter() - t0:.1f}s"
+                    f"COMPILE rows={rows} arm={arm} M={m} "
+                    f"{time.perf_counter() - t0:.1f}s"
                     f" custom_calls={cc}",
                     flush=True,
                 )
@@ -128,8 +129,13 @@ def bench():
             )
     print("SUMMARY rows | inc_nq fused_nq (d%) fused_nqy (d%) | inc_mm fused_mm (d%)")
     for rows in ROWS:
-        g = lambda a: results[(rows, a)]  # noqa: E731
-        d = lambda a, b: (g(b) - g(a)) / g(a) * 100  # noqa: E731
+
+        def g(a, rows=rows):
+            return results[(rows, a)]
+
+        def d(a, b, g=g):
+            return (g(b) - g(a)) / g(a) * 100
+
         print(
             f"SUMMARY {rows} | {g('inc_nq'):.1f} {g('fused_nq'):.1f} "
             f"({d('inc_nq', 'fused_nq'):+.1f}%) {g('fused_nqy'):.1f} "
@@ -154,16 +160,22 @@ def hlo():
             if not line or line == "}":
                 continue
             m = re.match(r"(ROOT )?(\S+) = (\S+) (\w[\w-]*)\(", line)
-            name, shape, op = (m.group(2), m.group(3), m.group(4)) if m else ("?", "?", "?")
+            name, shape, op = (
+                (m.group(2), m.group(3), m.group(4)) if m else ("?", "?", "?")
+            )
             big = bool(pat_big.search(line)) and op not in ("parameter",)
             n_big += big
             flag = "BIG " if big else "    "
             calls = re.search(r"calls=(\S+?)[,\s]", line)
             cn = re.search(r'custom_call_target="([^"]+)"', line)
-            kn = re.search(r'"name":"([^"]+)"', line) or re.search(r"kernel_name=(\S+)", line)
-            extra = (calls.group(1) if calls else "") + (
-                f" target={cn.group(1)}" if cn else ""
-            ) + (f" kernel={kn.group(1)}" if kn else "")
+            kn = re.search(r'"name":"([^"]+)"', line) or re.search(
+                r"kernel_name=(\S+)", line
+            )
+            extra = (
+                (calls.group(1) if calls else "")
+                + (f" target={cn.group(1)}" if cn else "")
+                + (f" kernel={kn.group(1)}" if kn else "")
+            )
             print(f"HLO {arm} {flag}{op:14s} {name:40s} {shape[:60]:60s} {extra}")
         print(f"HLO-SUMMARY arm={arm} ops_touching_[{rows},{H}]={n_big}")
         # Fused computations that reduce or convert over [rows, H]
@@ -171,7 +183,10 @@ def hlo():
             re.findall(rf"bf16\[{rows},{H}\][^\n]*abs\(", text)
         )
         f8_conv = len(re.findall(rf"f8e4m3fn\[{rows},{H}\][^\n]* convert\(", text))
-        print(f"HLO-COUNTS arm={arm} abs_on_bf16[{rows},{H}]={abs_red} convert_to_f8[{rows},{H}]={f8_conv}")
+        print(
+            f"HLO-COUNTS arm={arm} abs_on_bf16[{rows},{H}]={abs_red} "
+            f"convert_to_f8[{rows},{H}]={f8_conv}"
+        )
 
 
 if __name__ == "__main__":

@@ -133,6 +133,7 @@ def _quant_kernel(*refs, eps: float, emit_y: bool, q_max: float):
         x_ref.dtype
     )
     if emit_y:
+        assert y_ref is not None
         y_ref[...] = y
     yf = y.astype(jnp.float32)
     amax = jnp.max(jnp.abs(yf), axis=-1, keepdims=True)
@@ -177,7 +178,9 @@ def fused_add_rms_norm_quant(
     )
 
 
-def _quant_call(x, residual, weight, *, eps, quant_dtype, emit_y, block_rows, interpret, body):
+def _quant_call(
+    x, residual, weight, *, eps, quant_dtype, emit_y, block_rows, interpret, body
+):
     """The wrapper; ``body`` is a kernel with ``_quant_kernel``'s signature
     (tests pass fault-injected bodies through the same grid and specs)."""
     rows, hidden = x.shape
@@ -232,7 +235,9 @@ def reference(x, residual, weight, eps):
     return (y, new_res) if residual is not None else y
 
 
-def _moe_quant_kernel(x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, *, eps: float, q_max: float):
+def _moe_quant_kernel(
+    x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, *, eps: float, q_max: float
+):
     """``_kernel`` plus the fused MoE prefill kernel's own activation quant
     (``fused_moe_prefill_kernel._quantize_rows``) on the bf16 ``y``, op for op:
 
@@ -246,7 +251,7 @@ def _moe_quant_kernel(x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, *, eps: 
     rows per word) is byte-transposed four lane blocks at a time and stored
     with sublane-strided u32 stores (the inverse of the expert kernel's LHS
     build)."""
-    from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (  # noqa: E501
         _byte_transpose4,
     )
 
@@ -255,21 +260,26 @@ def _moe_quant_kernel(x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, *, eps: 
     ro_ref[...] = s.astype(ro_ref.dtype)
     var = jnp.mean(s * s, axis=-1, keepdims=True)
     normed = (s * jax.lax.rsqrt(var + eps)).astype(x_ref.dtype)
-    y = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(x_ref.dtype)
+    y = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(
+        x_ref.dtype
+    )
     y_ref[...] = y
     amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
     scale = amax.astype(jnp.float32) / q_max
     usable = jnp.isfinite(scale) & (scale > 0)
     scale = jnp.where(usable, scale, 0.0)
     inv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
-    q = jnp.where(usable, y * inv.astype(y.dtype), jnp.zeros_like(y)).astype(q_ref.dtype)
+    q = jnp.where(usable, y * inv.astype(y.dtype), jnp.zeros_like(y)).astype(
+        q_ref.dtype
+    )
     s_ref[...] = scale
     rows, hidden = y.shape
     lane_blocks = hidden // lanes
     wpr = lane_blocks // 4
     # byte t of word (s, c) of qn is row 4s + t, column c
     qn = pltpu.bitcast(q, jnp.uint32)
-    # word-row r * wpr + k of q32 holds lane blocks 4k..4k+3 of row r (block 4k + j in byte j)
+    # word-row r * wpr + k of q32 holds lane blocks 4k..4k+3 of row r
+    # (block 4k + j in byte j)
     q32 = q_ref.bitcast(jnp.uint32).reshape(rows * wpr, lanes)
     for k in range(wpr):
         a = [qn[:, (4 * k + j) * lanes : (4 * k + j + 1) * lanes] for j in range(4)]

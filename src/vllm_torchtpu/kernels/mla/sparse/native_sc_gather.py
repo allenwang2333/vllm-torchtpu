@@ -797,7 +797,8 @@ def dsa_gather_native_sc(
 # nope + rope (160 words; `rope_union`).
 UNION_CAP_ROWS = 736
 UNION_CAP_ROWS_ROPE = 576
-# TPU_DCP_MLA_MIXED_UNION_GATHER=1: the measured default mode (t4-mla-mixed probes 12-14).
+# TPU_DCP_MLA_MIXED_UNION_GATHER=1: the measured default mode
+# (t4-mla-mixed probes 12-14).
 UNION_GATHER_DEFAULT = ("pair", "rope")
 # `pair_union`: a pair's two regions hold one union (2 x these rows), less the
 # table + list hand-off area in Spmem.
@@ -850,11 +851,24 @@ def _rope_group(rope_inputs, rope_output):
             data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
             data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
             for band in range(ROPE_PACKING):
-                rope_output[row, pl.ds(band * 32 + half * NUM_LANES, NUM_LANES)] = data[band]
+                rope_output[row, pl.ds(band * 32 + half * NUM_LANES, NUM_LANES)] = data[
+                    band
+                ]
 
 
-def _expand_units(src_nope, src_rope, nidx_ref, nidx_off, ridx_ref, ridx_off, pos_of,
-                  nope_out_ref, rope_out_ref, sem_ref, num_units):
+def _expand_units(
+    src_nope,
+    src_rope,
+    nidx_ref,
+    nidx_off,
+    ridx_ref,
+    ridx_off,
+    pos_of,
+    nope_out_ref,
+    rope_out_ref,
+    sem_ref,
+    num_units,
+):
     """Gather `num_units` 64-row units and write each at its own output rows.
 
     Unit k reads nope rows `nidx_ref[nidx_off(k) + [0, 64)]` of `src_nope`
@@ -978,7 +992,9 @@ def _union_kernel(
     nl_size = min(NUM_LANES, num_chunks - nl_base)
     meta = [
         pltpu.make_async_copy(
-            tab_hbm_ref.at[pl.ds(chunk_index * gpc, gpc)], vec_ref.at[pl.ds(0, gpc)], sem_ref.at[0]
+            tab_hbm_ref.at[pl.ds(chunk_index * gpc, gpc)],
+            vec_ref.at[pl.ds(0, gpc)],
+            sem_ref.at[0],
         ),
         pltpu.make_async_copy(
             tab_hbm_ref.at[pl.ds(num_groups + chunk_index * gpc, gpc)],
@@ -986,7 +1002,9 @@ def _union_kernel(
             sem_ref.at[1],
         ),
         pltpu.make_async_copy(
-            live_hbm_ref.at[pl.ds(nl_base, nl_size)], vec_ref.at[pl.ds(2 * gpc, nl_size)], sem_ref.at[2]
+            live_hbm_ref.at[pl.ds(nl_base, nl_size)],
+            vec_ref.at[pl.ds(2 * gpc, nl_size)],
+            sem_ref.at[2],
         ),
     ]
     for cp in meta:
@@ -1029,7 +1047,9 @@ def _union_kernel(
     def prep_slots():
         tok0 = chunk_index * chunk_size + g * bz
         kv_cp = pltpu.make_async_copy(
-            kv_hbm_ref.at[pl.ds(pl.multiple_of(tok0, bz), bz)], vec_ref.at[pl.ds(0, bz)], load_sem_ref.at[1, 1]
+            kv_hbm_ref.at[pl.ds(pl.multiple_of(tok0, bz), bz)],
+            vec_ref.at[pl.ds(0, bz)],
+            load_sem_ref.at[1, 1],
         )
         kv_cp.start()
 
@@ -1040,7 +1060,10 @@ def _union_kernel(
         def blk(a):
             return pltpu.make_async_copy(
                 indices_hbm_ref.at[
-                    pl.ds(pl.multiple_of((goff + a) * block + h * half * atom, atom), half * atom)
+                    pl.ds(
+                        pl.multiple_of((goff + a) * block + h * half * atom, atom),
+                        half * atom,
+                    )
                 ],
                 ibuf.at[pl.ds(pl.multiple_of(a * half * atom, atom), half * atom)],
                 load_sem_ref.at[0, 0],
@@ -1048,7 +1071,9 @@ def _union_kernel(
 
         span = half * atoms_w * atom
         whole_cp = pltpu.make_async_copy(
-            indices_hbm_ref.at[pl.ds(pl.multiple_of(goff * block + h * span, atom), span)],
+            indices_hbm_ref.at[
+                pl.ds(pl.multiple_of(goff * block + h * span, atom), span)
+            ],
             ibuf.at[pl.ds(0, span)],
             load_sem_ref.at[0, 0],
         )
@@ -1078,10 +1103,14 @@ def _union_kernel(
 
     def clear_table():
         def clear(i):
-            htab[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full((NUM_LANES,), -1, jnp.int32)
+            htab[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full(
+                (NUM_LANES,), -1, jnp.int32
+            )
 
         def clear_list(i):
-            ulist[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full((NUM_LANES,), -1, jnp.int32)
+            ulist[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full(
+                (NUM_LANES,), -1, jnp.int32
+            )
 
         plsc.parallel_loop(0, htab.shape[0] // NUM_LANES, unroll=8)(clear)
         plsc.parallel_loop(0, ulist.shape[0] // NUM_LANES, unroll=8)(clear_list)
@@ -1118,7 +1147,9 @@ def _union_kernel(
             a = jnp.right_shift(jv, 2)
             v16 = jnp.bitwise_and(jv, 3) * NUM_LANES
             live = v16 + iota < kv_t - a * atom
-            rows = ibuf[pl.ds(pl.multiple_of(unit_of(a) * atom + v16, NUM_LANES), NUM_LANES)]
+            rows = ibuf[
+                pl.ds(pl.multiple_of(unit_of(a) * atom + v16, NUM_LANES), NUM_LANES)
+            ]
             return rows, live
 
         def look(jv):
@@ -1129,8 +1160,8 @@ def _union_kernel(
             hit = known if fault == "noverify" else known & (r == rows)
             miss = live & jnp.logical_not(hit)
             # hit: its id; miss: -1; padding: -2
-            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = jnp.where(
-                hit, uo, jnp.where(live, -1, -2)
+            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = (
+                jnp.where(hit, uo, jnp.where(live, -1, -2))
             )
             ovf_smem[jv] = plsc.all_reduce_population_count(miss)[0]
 
@@ -1154,10 +1185,12 @@ def _union_kernel(
             m_hit = m0
             if fault == "map_off":
                 m_hit = jnp.minimum(jnp.bitwise_xor(m0, 1), jnp.maximum(base - 1, 0))
-            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = jnp.where(
-                m0 >= 0, m_hit, jnp.where(ok, newu, 0)
+            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = (
+                jnp.where(m0 >= 0, m_hit, jnp.where(ok, newu, 0))
             )
-            ovf_smem[jv] = plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
+            ovf_smem[jv] = plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[
+                0
+            ]
 
         plsc.parallel_loop(0, nvec)(insert)
         base = jnp.minimum(base + total, cap_u)
@@ -1185,11 +1218,19 @@ def _union_kernel(
                     # Pad lanes read a distinct already-loaded row (the attention
                     # masks them); a repeated index is the degenerate bank conflict.
                     fill = jnp.where(lane < base, lane, 0)
-                    m = mtok[pl.ds(pl.multiple_of((4 * a + v) * NUM_LANES, NUM_LANES), NUM_LANES)]
+                    m = mtok[
+                        pl.ds(
+                            pl.multiple_of((4 * a + v) * NUM_LANES, NUM_LANES),
+                            NUM_LANES,
+                        )
+                    ]
                     m = jnp.where(lane < nlive, m, fill)
-                    cbuf[pl.ds(pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)] = (
-                        m + region
-                    )
+                    cbuf[
+                        pl.ds(
+                            pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES),
+                            NUM_LANES,
+                        )
+                    ] = m + region
                 pos_smem[nlu] = pos
                 uid_smem[nlu] = u
 
@@ -1226,15 +1267,24 @@ def _union_kernel(
         @pl.when((hi > lo) & (fault != "rm_load"))
         def _load():
             first = ulist[pl.ds(0, NUM_LANES)]
-            filler = jnp.where(iota < hi, first, jnp.broadcast_to(first[0], (NUM_LANES,)))
+            filler = jnp.where(
+                iota < hi, first, jnp.broadcast_to(first[0], (NUM_LANES,))
+            )
             for q in range(streams):
-                p = pl.multiple_of(lo + (nld - 1) * UNION_LOAD_ROWS + q * NUM_LANES, NUM_LANES)
+                p = pl.multiple_of(
+                    lo + (nld - 1) * UNION_LOAD_ROWS + q * NUM_LANES, NUM_LANES
+                )
                 cur = ulist[pl.ds(p, NUM_LANES)]
                 ulist[pl.ds(p, NUM_LANES)] = jnp.where(p + iota >= hi, filler, cur)
 
             def lvalues(p, stream):
                 return ulist[
-                    pl.ds(pl.multiple_of(lo + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES), NUM_LANES)
+                    pl.ds(
+                        pl.multiple_of(
+                            lo + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES
+                        ),
+                        NUM_LANES,
+                    )
                 ]
 
             def lbody(*refs):
@@ -1242,15 +1292,23 @@ def _union_kernel(
                 cps = []
                 for stream in range(streams):
                     dst = pl.ds(
-                        pl.multiple_of(region + lo + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES),
+                        pl.multiple_of(
+                            region + lo + p * UNION_LOAD_ROWS + stream * NUM_LANES,
+                            NUM_LANES,
+                        ),
                         NUM_LANES,
                     )
-                    c1 = pltpu.make_async_copy(refs[stream], nope_sh.at[dst], load_sem_ref.at[0, stream])
+                    c1 = pltpu.make_async_copy(
+                        refs[stream], nope_sh.at[dst], load_sem_ref.at[0, stream]
+                    )
                     c1.start()
                     cps.append(c1)
                     if rope_union:
+                        assert rope_sh is not None
                         c2 = pltpu.make_async_copy(
-                            refs[streams + stream], rope_sh.at[dst], load_sem_ref.at[1, stream]
+                            refs[streams + stream],
+                            rope_sh.at[dst],
+                            load_sem_ref.at[1, stream],
                         )
                         c2.start()
                         cps.append(c2)
@@ -1258,16 +1316,25 @@ def _union_kernel(
                     c.wait()
 
             nspecs = tuple(
-                pl.BlockSpec((pl.Indirect(NUM_LANES), 128), lambda p, st=st: (lvalues(p, st), 0))
+                pl.BlockSpec(
+                    (pl.Indirect(NUM_LANES), 128), lambda p, st=st: (lvalues(p, st), 0)
+                )
                 for st in range(streams)
             )
-            rspecs = tuple(
-                pl.BlockSpec((pl.Indirect(NUM_LANES), 32), lambda p, st=st: (lvalues(p, st), 0))
-                for st in range(streams)
-            ) if rope_union else ()
-            pltpu.emit_pipeline(lbody, grid=(nld,), in_specs=nspecs + rspecs, out_specs=())(
-                *([nope_hbm_ref] * streams), *([rope_hbm_ref] * len(rspecs))
+            rspecs = (
+                tuple(
+                    pl.BlockSpec(
+                        (pl.Indirect(NUM_LANES), 32),
+                        lambda p, st=st: (lvalues(p, st), 0),
+                    )
+                    for st in range(streams)
+                )
+                if rope_union
+                else ()
             )
+            pltpu.emit_pipeline(
+                lbody, grid=(nld,), in_specs=nspecs + rspecs, out_specs=()
+            )(*([nope_hbm_ref] * streams), *([rope_hbm_ref] * len(rspecs)))
 
     if not pair:
 
@@ -1285,6 +1352,7 @@ def _union_kernel(
         # the rows it added; a barrier then makes every row visible to both.
         pair_idx = jnp.right_shift(sub, 1)
         ht = htab.shape[0]
+        assert hand_sh is not None
 
         @pl.when(work & (h == 0))
         def _first():
@@ -1295,15 +1363,24 @@ def _union_kernel(
             u0r = round_up(u0)
             # pad [u0, u0r) with distinct loaded rows (2i's load fills it too)
             first = ulist[pl.ds(0, NUM_LANES)]
-            filler = jnp.where(iota < u0, first, jnp.broadcast_to(first[0], (NUM_LANES,)))
+            filler = jnp.where(
+                iota < u0, first, jnp.broadcast_to(first[0], (NUM_LANES,))
+            )
             for q in range(streams):
-                p = pl.multiple_of(jnp.maximum(u0r - UNION_LOAD_ROWS, 0) + q * NUM_LANES, NUM_LANES)
+                p = pl.multiple_of(
+                    jnp.maximum(u0r - UNION_LOAD_ROWS, 0) + q * NUM_LANES, NUM_LANES
+                )
                 cur = ulist[pl.ds(p, NUM_LANES)]
                 ulist[pl.ds(p, NUM_LANES)] = jnp.where(p + iota >= u0, filler, cur)
             vec_ref[pl.ds(0, NUM_LANES)] = jnp.broadcast_to(u0r, (NUM_LANES,))
             pltpu.sync_copy(htab, hand_sh.at[pair_idx, pl.ds(0, ht)])
-            pltpu.sync_copy(ulist.at[pl.ds(0, cap_u)], hand_sh.at[pair_idx, pl.ds(ht, cap_u)])
-            pltpu.sync_copy(vec_ref.at[pl.ds(0, NUM_LANES)], hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)])
+            pltpu.sync_copy(
+                ulist.at[pl.ds(0, cap_u)], hand_sh.at[pair_idx, pl.ds(ht, cap_u)]
+            )
+            pltpu.sync_copy(
+                vec_ref.at[pl.ds(0, NUM_LANES)],
+                hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)],
+            )
 
         plsc.subcore_barrier()
 
@@ -1311,8 +1388,13 @@ def _union_kernel(
         def _second():
             prep_slots()
             pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(0, ht)], htab)
-            pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(ht, cap_u)], ulist.at[pl.ds(0, cap_u)])
-            pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)], vec_ref.at[pl.ds(0, NUM_LANES)])
+            pltpu.sync_copy(
+                hand_sh.at[pair_idx, pl.ds(ht, cap_u)], ulist.at[pl.ds(0, cap_u)]
+            )
+            pltpu.sync_copy(
+                hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)],
+                vec_ref.at[pl.ds(0, NUM_LANES)],
+            )
             u0r = vec_ref[pl.ds(0, NUM_LANES)][0]
             dedup(u0r)
             load_rows(u0r, misc_smem[1])
@@ -1361,7 +1443,9 @@ def _union_kernel(
         @pl.when(fb)
         def _fetch():
             start = pl.multiple_of(batch * occ, occ)
-            pltpu.sync_copy(indices_hbm_ref.at[pl.ds(start, occ)], ibuf.at[pl.ds(0, occ)])
+            pltpu.sync_copy(
+                indices_hbm_ref.at[pl.ds(start, occ)], ibuf.at[pl.ds(0, occ)]
+            )
             for j in range(atoms_per_batch):
                 pos_smem[max_units + j] = start + j * atom
                 uid_smem[max_units + j] = jnp.int32(j)
@@ -1390,7 +1474,9 @@ def _union_kernel(
     lax.fori_loop(0, n_rounds, hbm_round, 0)
 
 
-def union_gather_supported(chunk_size: int, kernel_batch_size: int, topk_cap: int) -> bool:
+def union_gather_supported(
+    chunk_size: int, kernel_batch_size: int, topk_cap: int
+) -> bool:
     """Whether `dsa_gather_native_sc_union` serves a live-group chunk: one
     subcore pair per grid step (chunk / bz == cores * subcores / 2), whole
     64-slot units per subcore, power-of-two atoms per window."""
@@ -1478,7 +1564,9 @@ def dsa_gather_native_sc_union(
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
     bz = kernel_batch_size
     if not union_gather_supported(chunk_size, bz, topk_cap):
-        raise ValueError(f"union gather unsupported: chunk {chunk_size}, bz {bz}, cap {topk_cap}")
+        raise ValueError(
+            f"union gather unsupported: chunk {chunk_size}, bz {bz}, cap {topk_cap}"
+        )
     if cap_rows is None:
         cap_rows = (
             (UNION_CAP_ROWS_ROPE_PAIR if rope_union else UNION_CAP_ROWS_PAIR)
@@ -1491,7 +1579,9 @@ def dsa_gather_native_sc_union(
         live_vec_geometry(out_size, atoms_per_batch)
     )
     if occurrences_per_batch & (occurrences_per_batch - 1):
-        raise ValueError(f"occurrences per batch {occurrences_per_batch} not a power of two")
+        raise ValueError(
+            f"occurrences per batch {occurrences_per_batch} not a power of two"
+        )
     num_owners = num_cores * num_subcores
     num_groups = group_tab.shape[0] // 2
     num_chunks = group_num_live.shape[0]
@@ -1515,9 +1605,13 @@ def dsa_gather_native_sc_union(
         "misc_smem": pltpu.SMEM((8,), jnp.int32),
         "ovf_smem": pltpu.SMEM((atoms_w * UNION_UNIT_ROWS // NUM_LANES,), jnp.int32),
         "mtok": pltpu.VMEM((atoms_w * UNION_UNIT_ROWS,), jnp.int32),
-        "ibuf": pltpu.VMEM((max(max_units * UNION_UNIT_ROWS, occurrences_per_batch),), jnp.int32),
+        "ibuf": pltpu.VMEM(
+            (max(max_units * UNION_UNIT_ROWS, occurrences_per_batch),), jnp.int32
+        ),
         "cbuf": pltpu.VMEM((max_units * UNION_UNIT_ROWS,), jnp.int32),
-        "ulist": pltpu.VMEM(((2 if pair_union else 1) * cap_rows + UNION_LOAD_ROWS,), jnp.int32),
+        "ulist": pltpu.VMEM(
+            ((2 if pair_union else 1) * cap_rows + UNION_LOAD_ROWS,), jnp.int32
+        ),
         "htab": pltpu.VMEM((UNION_HASH_SIZE,), jnp.int32),
         "nope_sh": pltpu.VMEM_SHARED((num_subcores * cap_rows, 128), jnp.uint32),
     }

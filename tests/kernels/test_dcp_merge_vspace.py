@@ -71,7 +71,8 @@ def test_bf16_is_f32_rounded_once(t):
     b16 = k.vspace_weighted_heads_major(o, w, wuv, out_dtype=jnp.bfloat16)
     assert b16.dtype == jnp.bfloat16
     np.testing.assert_array_equal(
-        np.asarray(b16.view(jnp.int16)), np.asarray(f32.astype(jnp.bfloat16).view(jnp.int16))
+        np.asarray(b16.view(jnp.int16)),
+        np.asarray(f32.astype(jnp.bfloat16).view(jnp.int16)),
     )
 
 
@@ -100,7 +101,9 @@ def test_torch_bridge(compiled):
 
     def to_t(x):
         a = np.asarray(x.astype(jnp.float32))
-        return torch.from_numpy(a).to(torch.bfloat16 if x.dtype == jnp.bfloat16 else torch.float32)
+        return torch.from_numpy(a).to(
+            torch.bfloat16 if x.dtype == jnp.bfloat16 else torch.float32
+        )
 
     ot, wt, wuvt = (to_t(x).to("tpu") for x in (o, w, wuv))
     fn = hw.vspace_weighted_heads_major
@@ -108,7 +111,9 @@ def test_torch_bridge(compiled):
         from torch_tpu._internal import compile as tpu_compile
 
         torch._dynamo.reset()
-        fn = torch.compile(fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend())
+        fn = torch.compile(
+            fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend()
+        )
     got = fn(ot, wt, wuvt).cpu()
     assert tuple(got.shape) == (H, 256, V) and got.dtype == torch.bfloat16
     np.testing.assert_array_equal(

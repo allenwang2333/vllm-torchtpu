@@ -40,7 +40,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-
 HEADS_PER_BLOCK = 16
 
 

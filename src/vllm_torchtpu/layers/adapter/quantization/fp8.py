@@ -92,11 +92,13 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
-    PREQUANT_ATTR as _PREQUANT_ATTR,
     get_fp8_linear_pallas_op,
     prequantized_matmul,
     quantized_matmul,
     quantized_matmul_pallas,
+)
+from vllm_torchtpu.layers.adapter.linear_common import (
+    PREQUANT_ATTR as _PREQUANT_ATTR,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1758,6 +1760,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if prequant is not None:
             # TPU_FUSED_ADD_RMSNORM_QUANT: the norm that produced `x` also
             # emitted its per-row fp8 quant (bit-identical to the one below).
+            assert slot is not None
             slot.value = None
             x_q, x_scale = prequant
             out = prequantized_matmul(x_q, x_scale, weight, layer.weight_scale)

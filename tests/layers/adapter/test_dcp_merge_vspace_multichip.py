@@ -242,12 +242,20 @@ def _check(rank, world, cp_mla, hw):
                 _set(cp_mla, hw, TPU_DCP_MERGE_VSPACE=True)
                 res["on"] = run_arm("on", f_on, o, lse, comp, f"T{tokens}_on")
                 applies = cp_mla.vspace_merge_applies(tokens, True)
-                c = {"tokens": tokens, "vspace": bool(applies),
-                     "elements": int(res["on"].numel())}
+                c = {
+                    "tokens": tokens,
+                    "vspace": bool(applies),
+                    "elements": int(res["on"].numel()),
+                }
                 if comp and tokens in CHUNKED_TOKENS:
                     _set(cp_mla, hw, TPU_DCP_MERGE_VSPACE=True, TPU_DCP_MERGE_RS_BF16=0)
-                    res["on_rs32"] = run_arm("on_rs32", f_on, o, lse, comp, f"T{tokens}_on_rs32")
-                    for fault, nm in (("swap_heads", "ctl_swap"), ("unweighted", "ctl_unw")):
+                    res["on_rs32"] = run_arm(
+                        "on_rs32", f_on, o, lse, comp, f"T{tokens}_on_rs32"
+                    )
+                    for fault, nm in (
+                        ("swap_heads", "ctl_swap"),
+                        ("unweighted", "ctl_unw"),
+                    ):
                         _set(cp_mla, hw, TPU_DCP_MERGE_VSPACE=True)
                         hw.VSPACE_FAULT = fault
                         res[nm] = run_arm(nm, f_on, o, lse, comp, f"T{tokens}_{nm}")
@@ -255,17 +263,25 @@ def _check(rank, world, cp_mla, hw):
                 if tokens == 2048 and comp:
                     # The drafter never compares the token count: latent merge.
                     _set(cp_mla, hw)
-                    d_off = _compile(lambda o, l: f_off(o, l, backbone=False))(o, lse).cpu()
+                    d_off = _compile(lambda a, b: f_off(a, b, backbone=False))(
+                        o, lse
+                    ).cpu()
                     _set(cp_mla, hw, TPU_DCP_MERGE_VSPACE=True)
-                    d_on = _compile(lambda o, l: f_on(o, l, backbone=False))(o, lse).cpu()
+                    d_on = _compile(lambda a, b: f_on(a, b, backbone=False))(
+                        o, lse
+                    ).cpu()
                     c["drafter_on_vs_off_ndiff"] = int((_ulp(d_on, d_off) > 0).sum())
                 for nm, r_ in res.items():
-                    c[f"{nm}_scale_ulp"], c[f"{nm}_mean_abs"] = _scale_ulp(r_, ref, scale)
+                    c[f"{nm}_scale_ulp"], c[f"{nm}_mean_abs"] = _scale_ulp(
+                        r_, ref, scale
+                    )
                 u = _ulp(res["on"], res["off"])
                 c["on_vs_off_ndiff"] = int((u > 0).sum())
                 c["on_vs_off_maxulp"] = int(u.max())
                 if "on_rs32" in res:
-                    c["on_vs_rs32_ndiff"] = int((_ulp(res["on"], res["on_rs32"]) > 0).sum())
+                    c["on_vs_rs32_ndiff"] = int(
+                        (_ulp(res["on"], res["on_rs32"]) > 0).sum()
+                    )
                 c["on_finite"] = bool(torch.isfinite(res["on"].float()).all())
                 report[key] = c
             except Exception as exc:  # noqa: BLE001 - reported to the parent

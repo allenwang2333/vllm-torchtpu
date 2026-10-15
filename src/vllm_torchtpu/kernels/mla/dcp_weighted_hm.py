@@ -98,7 +98,8 @@ def weighted_heads_major(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
-        name=f"dcp_weighted_hm_t{t}_h{h}" + ("_bf16" if out_dtype.itemsize == 2 else ""),
+        name=f"dcp_weighted_hm_t{t}_h{h}"
+        + ("_bf16" if out_dtype.itemsize == 2 else ""),
     )(o, w.astype(jnp.float32))
 
 

@@ -1603,7 +1603,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         overlap=(True, False),
         overflow=(False, True),
     )
-    def test_mixed_union_gather_bit_identical(self, query_tokens, seq_q, overlap, overflow):
+    def test_mixed_union_gather_bit_identical(
+        self, query_tokens, seq_q, overlap, overflow
+    ):
         """TPU_DCP_MLA_MIXED_UNION_GATHER on the served mixed config (raw top-k,
         fused prep, live gather, widths, V2 levers): every real row's output
         and lse bit for bit, with heavy cross-token overlap (union hits) and
@@ -1611,7 +1613,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         row past the cap window (that chunk takes the incumbent work)."""
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
-        rng = np.random.default_rng(20261015 + query_tokens + 2 * overlap + int(overflow))
+        rng = np.random.default_rng(
+            20261015 + query_tokens + 2 * overlap + int(overflow)
+        )
         problem, _, _, _, page_table, cu_q_lens, distribution = self._split_q_lse_case(
             query_tokens, seq_q, rng
         )
@@ -1685,7 +1689,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 np.asarray(ref_lse)[:real_tokens].view(np.uint32),
                 err_msg=str(kw),
             )
-            self.assertTrue(np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all())
+            self.assertTrue(
+                np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all()
+            )
         # Positive controls: a wrong union row on hits, a dropped last slot.
         # ("no_fallback" leaves rows unwritten, which in-process buffer reuse
         # can refill with the previous run's correct rows; its control runs
@@ -1942,7 +1948,6 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         """
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
-        import re
 
         T = 512
         rng = np.random.default_rng(20261007)

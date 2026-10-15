@@ -69,7 +69,9 @@ def test_paired_matches_unpaired(vllm_config_context, rows, compiled):
     torch._dynamo.reset()
     fn = torch.compile(_layer, fullgraph=True, dynamic=False) if compiled else _layer
     got_out, got_res = fn(n, lin, x.clone(), r.clone())
-    assert getattr(lin, PREQUANT_ATTR).value is None, "the linear must consume the stash"
+    assert getattr(lin, PREQUANT_ATTR).value is None, (
+        "the linear must consume the stash"
+    )
     assert torch.equal(got_res.cpu(), ref_res.cpu())
     d = (got_out.cpu().view(torch.int16) != ref_out.cpu().view(torch.int16)).sum()
     print(f"PAIRED rows={rows} compiled={compiled} out_mismatch={int(d)}")
@@ -144,7 +146,9 @@ def test_both_rows_branches_lift_the_same_named_inputs(vllm_config_context):
     holding the linear module made Dynamo name the linear's weights through
     the norm on the paired side only."""
     layer = _Layer()
-    assert tpu_rmsnorm._pair(layer.post_attention_layernorm, layer.mlp.gate_up_proj, False)
+    assert tpu_rmsnorm._pair(
+        layer.post_attention_layernorm, layer.mlp.gate_up_proj, False
+    )
     names = {}
 
     def capture(rows):

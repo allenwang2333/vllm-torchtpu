@@ -778,9 +778,7 @@ def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(
     monkeypatch.setattr(
         cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
     )
-    got = _rs_merge_whole(
-        outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=2, **on
-    )
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=2, **on)
     step = 32 // chunks
     assert calls == [step, 32 - step] * dcp_size or sorted(calls) == sorted(
         [step, 32 - step] * dcp_size
@@ -812,7 +810,9 @@ def test_weighted_heads_major_is_bitwise_the_chunked_merge(
         "_weighted_reduce_scatter_heads_major",
         lambda o, w, g: calls.append(o.shape[0]) or real(o, w, g),
     )
-    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on)
+    got = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on
+    )
     assert calls == [8] * 4 * dcp_size
     assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
     torch.testing.assert_close(got, today, rtol=0, atol=0)
@@ -1130,7 +1130,10 @@ def test_weighted_heads_major_bf16_wire_is_bitwise_the_bf16_wire_merge(
     )
     want = _rs_merge_whole(outputs, lses, monkeypatch, **env)
     f32_hm = _rs_merge_whole(
-        outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True,
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
         **dict(env, TPU_DCP_MERGE_RS_BF16=0),
     )
     calls = []
