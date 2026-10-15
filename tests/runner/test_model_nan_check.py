@@ -128,6 +128,7 @@ def test_capture_suspends_checks_and_restores_them_after_warmup(
     runner = SimpleNamespace(
         _nan_checker=check,
         _hidden_nan_detector=None,
+        _kv_cache_nan_detector=None,
         _add_pipeline_chunk_buckets=lambda: None,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
         enforce_eager=False,

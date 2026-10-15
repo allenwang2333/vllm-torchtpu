@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
     from vllm_torchtpu.runner.hidden_nan_flags import HiddenNaNDetector
+    from vllm_torchtpu.runner.kv_cache_nan_flags import KVCacheNaNDetector
 
 
 @dataclass
@@ -956,6 +957,7 @@ class TPUModelRunner(GPUModelRunner):
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         self._hidden_nan_detector: HiddenNaNDetector | None = None
+        self._kv_cache_nan_detector: KVCacheNaNDetector | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -3582,6 +3584,8 @@ class TPUModelRunner(GPUModelRunner):
         )
         if self._hidden_nan_detector is not None:
             self._hidden_nan_detector.begin_round(self.input_batch.req_ids)
+        if self._kv_cache_nan_detector is not None:
+            self._kv_cache_nan_detector.begin_round(self.input_batch.req_ids)
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -3611,6 +3615,9 @@ class TPUModelRunner(GPUModelRunner):
             # A recycled slot/block still carries the previous request's read
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+
+            if self._kv_cache_nan_detector is not None:
+                self._kv_cache_nan_detector.record_chunk(attn_metadata)
 
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
@@ -4724,12 +4731,16 @@ class TPUModelRunner(GPUModelRunner):
             hidden_nan_readback = None
             if self._hidden_nan_detector is not None and copy_state is not None:
                 hidden_nan_readback = self._hidden_nan_detector.readback()
+            kv_cache_nan_readback = None
+            if self._kv_cache_nan_detector is not None and copy_state is not None:
+                kv_cache_nan_readback = self._kv_cache_nan_detector.readback()
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                 kv_ready_event=kv_ready_event,
                 hidden_nan_readback=hidden_nan_readback,
+                kv_cache_nan_readback=kv_cache_nan_readback,
             )
 
         if not self.scheduler_config.async_scheduling:
@@ -5151,6 +5162,9 @@ class TPUModelRunner(GPUModelRunner):
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self._attn_layer_names
             }
+
+        if self._kv_cache_nan_detector is not None:
+            self._kv_cache_nan_detector.record_chunk(per_layer_attn_metadata)
 
         padding_state = getattr(self, "_token_padding_state", None)
         if padding_state is not None:
@@ -5835,6 +5849,12 @@ class TPUModelRunner(GPUModelRunner):
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
+        if envs.TPU_KV_CACHE_NAN_LOG:
+            from vllm_torchtpu.runner.kv_cache_nan_flags import (
+                install_kv_cache_nan_detector,
+            )
+
+            self._kv_cache_nan_detector = install_kv_cache_nan_detector(self)
         if envs.TPU_HIDDEN_NAN_LOG:
             from vllm_torchtpu.runner.hidden_nan_flags import (
                 install_hidden_nan_detector,
@@ -5895,6 +5915,8 @@ class TPUModelRunner(GPUModelRunner):
         if self.enforce_eager:
             if self._hidden_nan_detector is not None:
                 self._hidden_nan_detector.arm()
+            if self._kv_cache_nan_detector is not None:
+                self._kv_cache_nan_detector.arm()
             return
         with (
             self.maybe_setup_dummy_loras(self.lora_config),
@@ -5942,6 +5964,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if self._hidden_nan_detector is not None:
             self._hidden_nan_detector.arm()
+        if self._kv_cache_nan_detector is not None:
+            self._kv_cache_nan_detector.arm()
 
     def _warmup_pcp_mtp_prefill(self) -> None:
         """Warm the real PCP MTP K1 prefill proposal and nothing else.
