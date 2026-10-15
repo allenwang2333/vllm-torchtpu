@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused BF16 SWA + FP8 CSA + inverse RoPE in request-local BQ groups.
+"""Fused BF16 SWA + FP8 CSA in request-local BQ groups.
 
 SWA keeps two fixed 128-token blocks and prefetches the following block into
 separate staging memory. Causal/window masks advance without shifting KV lanes.
@@ -34,7 +34,9 @@ asynchronous MXU protocol.
 
 The initial grouped DMA/RoPE organization was adapted from
 pallas-samples/kernels/deepseek-v4.1/csa2/csa2.py. Gather/cache publication,
-non-causal windows, TP collectives and output projection remain caller-owned.
+TP collectives and output projection remain caller-owned. The standalone API
+fuses inverse RoPE. The native cache API keeps BF16 RoPE precision and supports
+shared noncausal windows; serving retains its existing inverse RoPE projection.
 """
 
 import functools
@@ -52,7 +54,7 @@ def main_kernel(
     positions_ref: Any,
     q_hbm_ref: Any,
     main_kv_hbm_ref: Any,
-    main_scale_hbm_ref: Any,
+    main_aux_hbm_ref: Any,
     swa_kv_hbm_ref: Any,
     sink_hbm_ref: Any,
     rope_hbm_ref: Any,
@@ -60,7 +62,7 @@ def main_kernel(
     sink_ref: Any,
     q_buffer_ref: Any,
     main_fp8_buffer_ref: Any,
-    main_scale_buffer_ref: Any,
+    main_aux_buffer_ref: Any,
     main_bf16_ref: Any,
     swa_first_ref: Any,
     swa_shared_ref: Any,
@@ -79,12 +81,21 @@ def main_kernel(
     bq: int,
     interpret: bool,
 ) -> None:
+    native = main_kv_hbm_ref.dtype == jnp.int32
+    fixed_window = native and swa_kv_hbm_ref.shape[1] == 256
+    if native:
+        (
+            positions_ref,
+            main_lengths_ref,
+            swa_lower_ref,
+            swa_upper_ref,
+            swa_lookup_ref,
+        ) = positions_ref
     request_index = pl.program_id(0)
     start, end = starts_ref[request_index], starts_ref[request_index + 1]
     num_heads = q_hbm_ref.shape[1]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
-    window_size = swa_kv_hbm_ref.shape[1]
     sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
     sink_dma.start()
     # Incomplete groups still participate in the grouped SWA QK.
@@ -104,11 +115,14 @@ def main_kernel(
             end - 1,
             start + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
         )
+        source = swa_lookup_ref[source_q] if native else source_q
         return pltpu.make_async_copy(
-            swa_kv_hbm_ref.at[source_q], swa_first_ref, dma_sem.at[1]
+            swa_kv_hbm_ref.at[source], swa_first_ref, dma_sem.at[1]
         )
 
     def group_count(t0):
+        if fixed_window:
+            return jnp.minimum(bq, end - t0)
         # Split before a group would need a third SWA block.
         p0 = positions_ref[jnp.minimum(t0, q_hbm_ref.shape[0] - 1)]
         block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
@@ -117,16 +131,16 @@ def main_kernel(
         )
 
     def query_dmas(t0, i, bank):
+        inputs = (
+            (q_hbm_ref.at[t0 + i], q_buffer_ref.at[bank, i]),
+            (main_kv_hbm_ref.at[t0 + i], main_fp8_buffer_ref.at[bank, i]),
+            (main_aux_hbm_ref.at[t0 + i], main_aux_buffer_ref.at[bank, i]),
+        )
+        if not native:
+            inputs += ((rope_hbm_ref.at[t0 + i], rope_buffer_ref.at[bank, i]),)
         return tuple(
             pltpu.make_async_copy(src, dst, dma_sem.at[2 + 4 * (bank * bq + i) + k])
-            for k, (src, dst) in enumerate(
-                (
-                    (q_hbm_ref.at[t0 + i], q_buffer_ref.at[bank, i]),
-                    (main_kv_hbm_ref.at[t0 + i], main_fp8_buffer_ref.at[bank, i]),
-                    (main_scale_hbm_ref.at[t0 + i], main_scale_buffer_ref.at[bank, i]),
-                    (rope_hbm_ref.at[t0 + i], rope_buffer_ref.at[bank, i]),
-                )
-            )
+            for k, (src, dst) in enumerate(inputs)
         )
 
     def start_group(t0, bank):
@@ -138,13 +152,19 @@ def main_kernel(
     @pl.when(start < end)
     def prime_group():
         start_group(start, 0)
+        if fixed_window:
+            dma = pltpu.make_async_copy(
+                swa_kv_hbm_ref.at[swa_lookup_ref[start]], swa_shared_ref, dma_sem.at[1]
+            )
+            dma.start()
+            dma.wait()
 
     def process_group(state):
         t0, bank = state
         q_ref = q_buffer_ref.at[bank]
         main_fp8_ref = main_fp8_buffer_ref.at[bank]
-        main_scale_ref = main_scale_buffer_ref.at[bank]
-        rope_ref = rope_buffer_ref.at[bank]
+        main_aux_ref = main_aux_buffer_ref.at[bank]
+        rope_ref = None if native else rope_buffer_ref.at[bank]
         p0 = positions_ref[t0]
         block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
         count = group_count(t0)
@@ -154,68 +174,90 @@ def main_kernel(
         def prefetch_group():
             start_group(next_t0, 1 - bank)
 
-        for offset in range(2):
-            wanted = block_id + offset
-            slot = wanted % 2
+        if not fixed_window:
+            for offset in range(2):
+                wanted = block_id + offset
+                slot = wanted % 2
 
-            @pl.when(swa_cache_ids[slot] != wanted)
-            def fill_block(*, wanted=wanted, slot=slot):
-                # Gathered windows expose a complete block at its last Q.
-                # At request end the available window overlaps the previous
-                # block; the score mask removes that overlap, including +5 MTP.
-                source_q = jnp.minimum(
-                    end - 1,
-                    start
-                    + jnp.maximum(
-                        0, anchor + wanted * 128 + 127 - first_query_position
-                    ),
-                )
-                dma = block_dma(wanted)
+                @pl.when(swa_cache_ids[slot] != wanted)
+                def fill_block(*, wanted=wanted, slot=slot):
+                    # Gathered windows expose a complete block at its last Q.
+                    # At request end the available window overlaps the previous
+                    # block; the score mask removes that overlap, including +5 MTP.
+                    source_q = jnp.minimum(
+                        end - 1,
+                        start
+                        + jnp.maximum(
+                            0, anchor + wanted * 128 + 127 - first_query_position
+                        ),
+                    )
+                    dma = block_dma(wanted)
 
-                @pl.when(swa_prefetched_id[0] != wanted)
-                def start_block():
-                    dma.start()
+                    @pl.when(swa_prefetched_id[0] != wanted)
+                    def start_block():
+                        dma.start()
 
-                dma.wait()
-                swa_prefetched_id[0] = -1
-                rows = pl.ds(slot * 128, 128)
-                swa_shared_ref[rows, :] = swa_first_ref[...]
-                swa_cache_ids[slot] = wanted
-                swa_cache_bases[slot] = jnp.maximum(0, positions_ref[source_q] - 127)
+                    dma.wait()
+                    swa_prefetched_id[0] = -1
+                    rows = pl.ds(slot * 128, 128)
+                    swa_shared_ref[rows, :] = swa_first_ref[...]
+                    swa_cache_ids[slot] = wanted
+                    swa_cache_bases[slot] = jnp.maximum(
+                        0, positions_ref[source_q] - 127
+                    )
 
-                @pl.when(
-                    (wanted >= 1)
-                    & (anchor + (wanted + 1) * 128 - 1 <= positions_ref[end - 1])
-                )
-                def prefetch_block():
-                    # Stage the following block without overwriting either live K.
-                    block_dma(wanted + 1).start()
-                    swa_prefetched_id[0] = wanted + 1
+                    @pl.when(
+                        (wanted >= 1)
+                        & (anchor + (wanted + 1) * 128 - 1 <= positions_ref[end - 1])
+                    )
+                    def prefetch_block():
+                        # Stage the following block without overwriting either live K.
+                        block_dma(wanted + 1).start()
+                        swa_prefetched_id[0] = wanted + 1
+
+        def unpack(words, group):
+            if interpret:
+                return ((words >> (8 * group)) & 0xFF).astype(jnp.uint8)
+            return pltpu.unpack_elementwise(
+                words,
+                index=group,
+                packed_dtype=jnp.uint8,
+                unpacked_dtype=jnp.uint32,
+            ).astype(jnp.uint8)
 
         def dequant(i):
+            if native:
+                packed = main_fp8_ref.at[i].bitcast(jnp.uint8)[...].reshape(512, 512)
+                nope = lax.bitcast_convert_type(
+                    packed[:, :448], jnp.float8_e4m3fn
+                ).astype(jnp.bfloat16)
+                tail = lax.bitcast_convert_type(
+                    packed[:, -128:], jnp.float8_e8m0fnu
+                ).astype(jnp.bfloat16)
+                lanes = jnp.arange(128)[None, :]
+                scale_tile = jnp.where(lanes < 64, pltpu.roll(tail, 64, axis=1), tail)
+                scales = jnp.concatenate((scale_tile,) * 4, axis=1)[:, :448]
+                nope = (nope * scales).astype(jnp.bfloat16)
+                rope = main_aux_ref.at[i].bitcast(jnp.bfloat16)[...]
+                rope = jnp.concatenate((rope[:, :64], rope[:, 64:]), axis=0)
+                values = jnp.concatenate((nope, rope), axis=1)
+                # Overlay cache storage may contain NaNs in unused rows.
+                main_bf16_ref[i] = jnp.where(
+                    jnp.arange(512)[:, None] < main_lengths_ref[t0 + i], values, 0
+                )
+                return
             # Byte g of each word holds feature g * 128 + lane.
             words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
             for row in range(0, 512, 128):
                 rows = pl.ds(row, 128)
                 words = words_ref[rows, :]
-                scales = main_scale_ref[i, 0, rows][:, None]
+                scales = main_aux_ref[i, 0, rows][:, None]
                 for group in range(4):
-                    if interpret:
-                        # unpack_elementwise has no CPU lowering.
-                        bits = (words >> (8 * group)) & 0xFF
-                    else:
-                        bits = pltpu.unpack_elementwise(
-                            words,
-                            index=group,
-                            packed_dtype=jnp.uint8,
-                            unpacked_dtype=jnp.uint32,
-                        )
                     values = lax.bitcast_convert_type(
-                        bits.astype(jnp.uint8), main_fp8_ref.dtype
+                        unpack(words, group), jnp.float8_e4m3fn
                     ).astype(jnp.float32)
-                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
-                        values * scales
-                    ).astype(jnp.bfloat16)
+                    values = (values * scales).astype(jnp.bfloat16)
+                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = values
 
         @pl.loop(0, count)
         def finish_query(i):
@@ -298,24 +340,32 @@ def main_kernel(
             if not interpret and has_next:
                 csa_launch(i + 1, mrb_stride - addr, pv=False)
             main_logits = csa_pop(i, addr, pv=False) * scale
-            main_count = jnp.minimum((p0 + i + 1) // compress_ratio, 512)
+            main_count = (
+                main_lengths_ref[t0 + i]
+                if native
+                else jnp.minimum((p0 + i + 1) // compress_ratio, 512)
+            )
             main_logits = jnp.where(
                 jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
             )
-            lanes = jnp.arange(128)
-            key_positions = jnp.concatenate(
-                (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
-            )
-            # Concatenate integer boundaries before constructing the boolean mask.
-            unique = key_positions >= jnp.concatenate(
-                tuple(
-                    jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
-                    for slot in range(2)
+            if fixed_window:
+                key_positions = jnp.arange(256)
+                unique = jnp.ones((256,), dtype=jnp.bool_)
+            else:
+                lanes = jnp.arange(128)
+                key_positions = jnp.concatenate(
+                    (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
                 )
-            )
-            swa_valid = (key_positions >= jnp.maximum(0, p0 + i - window_size + 1)) & (
-                key_positions <= p0 + i
-            )
+                # Request-tail blocks overlap; count each key exactly once.
+                unique = key_positions >= jnp.concatenate(
+                    tuple(
+                        jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
+                        for slot in range(2)
+                    )
+                )
+            lower = swa_lower_ref[t0 + i] if native else jnp.maximum(0, p0 + i - 127)
+            upper = swa_upper_ref[t0 + i] if native else p0 + i + 1
+            swa_valid = (key_positions >= lower) & (key_positions < upper)
             swa_logits = jnp.where(
                 (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
             )
@@ -329,6 +379,30 @@ def main_kernel(
             probabilities = (exponentials / denominator).astype(jnp.bfloat16)
             main_p_ref[i] = probabilities[:, :512]
             swa_p_ref[i] = probabilities[:, 512:]
+
+        def store_output(i, output):
+            if native:
+                # Serving's fused wo_a projection owns inverse RoPE. Preserve
+                # its BF16 input boundary and the cache's BF16 RoPE precision.
+                output_ref[i] = output.astype(jnp.bfloat16)
+            else:
+                assert rope_ref is not None
+                tail = output[:, 384:]
+                partner = jnp.where(
+                    (jnp.arange(128) % 2 == 0)[None, :],
+                    pltpu.roll(tail, 127, axis=1),
+                    pltpu.roll(tail, 1, axis=1),
+                )
+                rotated = (
+                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
+                )
+                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+            pltpu.make_async_copy(
+                output_ref.at[i],
+                output_hbm_ref.at[t0 + i],
+                dma_sem.at[2 + 8 * bq + i],
+            ).start()
 
         # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
         if 10 * mrb_stride <= 256:
@@ -385,22 +459,7 @@ def main_kernel(
                         axis=1,
                     )
                 output = main_output + swa_output
-                tail = output[:, 384:]
-                partner = jnp.where(
-                    (jnp.arange(128) % 2 == 0)[None, :],
-                    pltpu.roll(tail, 127, axis=1),
-                    pltpu.roll(tail, 1, axis=1),
-                )
-                rotated = (
-                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-                )
-                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
+                store_output(i, output)
 
             def finish_tile(first, slot, *, size=2):
                 for row in range(size):
@@ -491,22 +550,7 @@ def main_kernel(
                         axis=1,
                     )
                 output = main_output + swa_output
-                tail = output[:, 384:]
-                partner = jnp.where(
-                    (jnp.arange(128) % 2 == 0)[None, :],
-                    pltpu.roll(tail, 127, axis=1),
-                    pltpu.roll(tail, 1, axis=1),
-                )
-                rotated = (
-                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-                )
-                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
+                store_output(i, output)
 
             def advance(i, slot, *, has_next=True):
                 softmax(i, slot * mrb_stride, has_next=has_next)
@@ -552,10 +596,12 @@ def main_kernel(
 
     lax.while_loop(lambda state: state[0] < end, process_group, (start, jnp.int32(0)))
 
-    @pl.when(swa_prefetched_id[0] >= 0)
-    def drain_block_prefetch():
-        # A final partial BQ can finish before the prefetched block is needed.
-        block_dma(swa_prefetched_id[0]).wait()
+    if not fixed_window:
+
+        @pl.when(swa_prefetched_id[0] >= 0)
+        def drain_block_prefetch():
+            # A final partial BQ can finish before the prefetched block is needed.
+            block_dma(swa_prefetched_id[0]).wait()
 
     @pl.when(request_index == starts_ref.shape[0] - 2)
     def clear_padding():
@@ -658,6 +704,39 @@ def csa2(
             raise ValueError(f"CSA2 {name} must have shape {shape} and dtype {dtype}")
     if num_tokens == 0:
         return jnp.zeros(q.shape, q.dtype)
+    return _call(
+        q,
+        main_kv,
+        main_kv_scale[:, None, :],
+        swa_kv,
+        starts,
+        positions,
+        sink,
+        rope_cache,
+        scale=scale,
+        compress_ratio=compress_ratio,
+        bq=bq,
+        interpret=interpret,
+    )
+
+
+def _call(
+    q: jax.Array,
+    main_kv: jax.Array,
+    main_aux: jax.Array,
+    swa_kv: jax.Array,
+    starts: jax.Array,
+    metadata: jax.Array | tuple[jax.Array, ...],
+    sink: jax.Array,
+    rope_cache: jax.Array | None,
+    *,
+    scale: float,
+    compress_ratio: int,
+    bq: int,
+    interpret: bool,
+) -> jax.Array:
+    native = main_kv.dtype == jnp.int32
+    num_heads = q.shape[1]
     shared_window_size = 256
     return pl.pallas_call(
         functools.partial(
@@ -671,20 +750,23 @@ def csa2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(starts.shape[0] - 1,),
-            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 6,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 5
+            + [None if native else pl.BlockSpec(memory_space=pltpu.HBM)],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
                 pltpu.VMEM((num_heads,), jnp.float32),
                 pltpu.VMEM((2, bq, num_heads, 512), jnp.bfloat16),
-                pltpu.VMEM((2, bq, 512, 4, 128), jnp.float8_e4m3fn),
-                pltpu.VMEM((2, bq, 1, 512), jnp.float32),
+                pltpu.VMEM((2, bq, *main_kv.shape[1:]), main_kv.dtype),
+                pltpu.VMEM((2, bq, *main_aux.shape[1:]), main_aux.dtype),
                 pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
-                pltpu.VMEM((128, 512), jnp.bfloat16),
+                None
+                if native and swa_kv.shape[1] == 256
+                else pltpu.VMEM((128, 512), jnp.bfloat16),
                 pltpu.VMEM((shared_window_size, 512), jnp.bfloat16),
                 pltpu.SMEM((2,), jnp.int32),
                 pltpu.SMEM((2,), jnp.int32),
                 pltpu.SMEM((1,), jnp.int32),
-                pltpu.VMEM((2, bq, 2, 128), jnp.float32),
+                None if native else pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.float32),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.bfloat16),
@@ -694,14 +776,100 @@ def csa2(
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
-        name="csa2_swa_csa_inverse_rope",
+        name="csa2_native_packed" if native else "csa2_swa_csa_inverse_rope",
     )(
         starts,
-        positions,
+        metadata,
         q,
         main_kv,
-        main_kv_scale[:, None, :],
+        main_aux,
         swa_kv,
         sink,
         rope_cache,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("scale", "bq", "interpret"))
+def csa2_packed(
+    q: jax.Array,
+    main_kv: jax.Array,
+    main_rope: jax.Array,
+    swa_kv: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    main_lengths: jax.Array,
+    swa_lower: jax.Array,
+    swa_upper: jax.Array,
+    sink: jax.Array,
+    swa_lookup: jax.Array | None = None,
+    *,
+    scale: float = 512**-0.5,
+    bq: int = 6,
+    interpret: bool = False,
+) -> jax.Array:
+    """Attend to native DSv4 packed KV without requantization or inverse RoPE.
+
+    ``main_kv[T,512,128]`` and ``main_rope[T,128,128]`` are the int32
+    outputs of csa_gather: 448 E4M3 NoPE lanes, 64 periodic E8M0 scales,
+    and 64 BF16 RoPE lanes. Valid main rows occupy ``[:main_lengths[t]]``.
+
+    BF16 ``swa_kv`` has either 128 causal or 256 noncausal rows per window.
+    Optional ``swa_lookup[T]`` maps a query to its window; callers can gather
+    only the block representatives loaded by the kernel instead of every Q.
+    Causal rows start at max(0, positions[t]-127); noncausal rows are identical
+    within each request (pad a 192-row DSpark window to 256). ``swa_lower``
+    and ``swa_upper`` are inclusive lower / exclusive upper bounds in absolute
+    positions for causal
+    windows and in row indices for noncausal windows. Masked rows must be zero.
+    Bounds may tighten the window for CED replay. Valid positions must be
+    consecutive within a request; starts and padding follow ``csa2``.
+
+    Returns BF16 attention output before serving's inverse RoPE + wo_a.
+    """
+    if q.ndim != 3 or q.shape[2] != 512:
+        raise ValueError("CSA2 q must have shape [T,H,512]")
+    tokens, heads, _ = q.shape
+    if heads < 8 or heads > 128 or heads % 8:
+        raise NotImplementedError("CSA2 requires H divisible by 8, with 8 <= H <= 128")
+    if type(bq) is not int or not 1 <= bq <= 16:
+        raise ValueError("CSA2 bq must be a static Python int in [1,16]")
+    if starts.ndim != 1 or starts.shape[0] < 2:
+        raise ValueError("CSA2 starts must have shape [B_max+1], B_max >= 1")
+    if swa_kv.ndim != 3 or swa_kv.shape[1] not in (128, 256):
+        raise ValueError("CSA2 packed SWA must have 128 or 256 rows per Q")
+    if swa_lookup is None:
+        if swa_kv.shape[0] != tokens:
+            raise ValueError("CSA2 requires a window for each query without swa_lookup")
+        swa_lookup = jnp.arange(tokens, dtype=jnp.int32)
+    specs = (
+        ("swa_lookup", swa_lookup, (tokens,), jnp.int32),
+        ("q", q, (tokens, heads, 512), jnp.bfloat16),
+        ("main_kv", main_kv, (tokens, 512, 128), jnp.int32),
+        ("main_rope", main_rope, (tokens, 128, 128), jnp.int32),
+        ("swa_kv", swa_kv, (swa_kv.shape[0], swa_kv.shape[1], 512), jnp.bfloat16),
+        ("starts", starts, starts.shape, jnp.int32),
+        ("positions", positions, (tokens,), jnp.int32),
+        ("main_lengths", main_lengths, (tokens,), jnp.int32),
+        ("swa_lower", swa_lower, (tokens,), jnp.int32),
+        ("swa_upper", swa_upper, (tokens,), jnp.int32),
+        ("sink", sink, (heads,), jnp.float32),
+    )
+    for name, value, shape, dtype in specs:
+        if value.shape != shape or value.dtype != jnp.dtype(dtype):
+            raise ValueError(f"CSA2 {name} must have shape {shape} and dtype {dtype}")
+    if tokens == 0:
+        return jnp.zeros(q.shape, q.dtype)
+    return _call(
+        q,
+        main_kv,
+        main_rope,
+        swa_kv,
+        starts,
+        (positions, main_lengths, swa_lower, swa_upper, swa_lookup),
+        sink,
+        None,
+        scale=scale,
+        compress_ratio=1,
+        bq=bq,
+        interpret=interpret,
     )

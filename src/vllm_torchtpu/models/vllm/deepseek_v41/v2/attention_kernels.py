@@ -1027,6 +1027,7 @@ def sparse_fp8_attention_jax(
     union_cap: int = 4096,
     gathered_nope: jax.Array | None = None,
     gathered_rope: jax.Array | None = None,
+    positions: jax.Array | None = None,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -1044,6 +1045,38 @@ def sparse_fp8_attention_jax(
         sparse_ragged_paged_attention,
     )
     from vllm_torchtpu.kernels.mla import tuned_window_attention, window_attention
+
+    # CSA2 wins for request-local K=5 decode groups. Contiguous prefill
+    # (128..2048 Qs on TPU7x) is faster with window reuse + SparseMLA, even
+    # after tuning CSA2 BQ and request splits. Keep that measured route.
+    if (
+        positions is not None
+        and max_requests != 1
+        and q.shape[0] % 6 == 0
+        and q.shape[-1] == 512
+        and 8 <= q.shape[1] <= 128
+        and q.shape[1] % 8 == 0
+        and main_records.shape[1] == 512
+        and swa_records.shape[1] in (128, 192)
+    ):
+        return _csa2_attention_jax(
+            q,
+            swa_pool,
+            main_pool,
+            rope_pool,
+            swa_records,
+            main_records,
+            pages,
+            query_start_loc,
+            positions,
+            sink,
+            scale,
+            page_size,
+            precompacted,
+            max_requests,
+            gathered_nope,
+            gathered_rope,
+        )
 
     if (
         max_requests == 1
@@ -1125,6 +1158,116 @@ def sparse_fp8_attention_jax(
         denominator,
         maximum,
         sm_scale=scale,
+    )
+
+
+def _csa2_attention_jax(
+    q: jax.Array,
+    swa_pool: jax.Array | tuple[jax.Array, jax.Array],
+    main_pool: jax.Array | tuple[jax.Array, jax.Array],
+    rope_pool: jax.Array | tuple[jax.Array, jax.Array],
+    swa_records: jax.Array,
+    main_records: jax.Array,
+    pages: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    scale: float,
+    page_size: int,
+    precompacted: bool,
+    max_requests: int | None,
+    gathered_nope: jax.Array | None,
+    gathered_rope: jax.Array | None,
+) -> jax.Array:
+    """Bridge native cache records to CSA2; retain staged compressed gathers."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2_packed
+
+    compacted = (
+        _pad_compacted_records(main_records)
+        if precompacted
+        else compact_records(main_records)
+    )
+    if gathered_nope is None:
+        main_lo, main_hi = (
+            main_pool if isinstance(main_pool, tuple) else (main_pool, None)
+        )
+        rope_lo, rope_hi = (
+            rope_pool if isinstance(rope_pool, tuple) else (rope_pool, None)
+        )
+        gathered_nope, gathered_rope = gather_fp8_kv_jax(
+            main_lo,
+            main_hi,
+            rope_lo,
+            rope_hi,
+            compacted,
+            pages,
+            starts,
+            jnp.zeros((1,), jnp.int32),
+            page_size,
+            1,
+            True,
+        )
+    assert gathered_rope is not None
+    positions = positions.astype(jnp.int32)
+    width = swa_records.shape[1]
+    columns = jnp.arange(width, dtype=jnp.int32)[None, :]
+    valid = swa_records >= 0
+    logical = positions[:, None] - 127 + columns if width == 128 else columns
+    lower = jnp.min(jnp.where(valid, logical, jnp.iinfo(jnp.int32).max), axis=1)
+    upper = jnp.max(jnp.where(valid, logical + 1, 0), axis=1)
+    if width == 128:
+        # Serving left-pads positions <127; CSA2's reusable blocks start at 0.
+        indices = columns + jnp.maximum(0, 127 - positions[:, None])
+        swa_records = jnp.where(
+            indices < width,
+            jnp.take_along_axis(swa_records, jnp.minimum(indices, width - 1), axis=1),
+            -1,
+        )
+    # CSA2 reads only one representative per 128-token block (plus a tail),
+    # or one shared DSpark window per request. Gather those windows once.
+    tokens = q.shape[0]
+    row = jnp.arange(tokens, dtype=jnp.int32)
+    request = jnp.repeat(
+        jnp.arange(starts.shape[0] - 1, dtype=jnp.int32),
+        starts[1:] - starts[:-1],
+        total_repeat_length=tokens,
+    )
+    first = starts[request]
+    if width == 128:
+        anchor = jnp.maximum(0, positions[first] - 127)
+        offset = positions - anchor - 127
+        selected = ((offset >= 0) & (offset % 128 == 0)) | (
+            row == starts[request + 1] - 1
+        )
+    else:
+        selected = row == first
+    selected &= row < starts[-1]
+    requests = starts.shape[0] - 1 if max_requests is None else max_requests
+    capacity = min(tokens, tokens // 128 + 2 * requests if width == 128 else requests)
+    representatives = jnp.nonzero(selected, size=capacity, fill_value=0)[0]
+    lookup = jnp.cumsum(selected, dtype=jnp.int32) - 1
+    swa_records = swa_records[representatives]
+    pieces = gather_cache_pieces(swa_pool, swa_records.reshape(-1), 512)
+    # Mask before merge_pieces: multiplying a NaN by a zero permutation entry
+    # would otherwise contaminate valid lanes too.
+    pieces = jnp.where((swa_records.reshape(-1) >= 0)[None, :, None], pieces, 0)
+    swa_kv = merge_pieces(pieces).reshape(capacity, width, 512)
+    if width == 192:
+        swa_kv = jnp.pad(swa_kv, ((0, 0), (0, 64), (0, 0)))
+    return csa2_packed(
+        q,
+        gathered_nope[: q.shape[0]],
+        gathered_rope[: q.shape[0]],
+        swa_kv,
+        starts.astype(jnp.int32),
+        positions,
+        jnp.sum(compacted >= 0, axis=1, dtype=jnp.int32),
+        lower,
+        upper,
+        sink.astype(jnp.float32),
+        swa_lookup=lookup,
+        scale=scale,
+        interpret=jax.default_backend() != "tpu",
     )
 
 
@@ -1689,6 +1832,7 @@ def initialize_paged_attention():
                     **attn_kwargs,
                     gathered_nope=g_n,
                     gathered_rope=g_r,
+                    positions=pos_tok,
                 )
                 out_tok = jnp.where(
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
@@ -1767,6 +1911,7 @@ def initialize_paged_attention():
                 **attn_kwargs,
                 gathered_nope=g_n,
                 gathered_rope=g_r,
+                positions=pos,
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
             return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)

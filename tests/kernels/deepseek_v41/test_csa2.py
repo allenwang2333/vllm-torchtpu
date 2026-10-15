@@ -342,5 +342,127 @@ class Csa2Test(unittest.TestCase):
             np.testing.assert_array_equal(self.run_kernel(inputs), 0)
 
 
+def _packed_inputs(
+    *, noncausal=False, lengths=(0, 7, 3), first=(0, 124, 0), heads=8, padding=2
+):
+    inputs = _inputs(lengths=lengths, starts=first, heads=heads, padding=padding)
+    tokens = inputs["q"].shape[0]
+    rng = np.random.default_rng(91)
+    raw = np.asarray(
+        jnp.asarray(rng.normal(size=(tokens, 512, 448)), jnp.float8_e4m3fn)
+    )
+    # Vary all 64 scale lanes, including zero/subnormal exponent encoding.
+    exponents = rng.integers(120, 128, (tokens, 512, 64), dtype=np.uint8)
+    exponents[0, 0, 0] = 0
+    scales = np.asarray(
+        jax.lax.bitcast_convert_type(jnp.asarray(exponents), jnp.float8_e8m0fnu)
+    ).astype(np.float32)
+    nope = (raw.astype(np.float32) * np.tile(scales, (1, 1, 7))).astype(jnp.bfloat16)
+    rope = np.asarray(jnp.asarray(rng.normal(size=(tokens, 512, 64)), jnp.bfloat16))
+    dense = np.concatenate((nope, rope), axis=-1).astype(np.float32)
+    bytes_ = np.concatenate((raw.view(np.uint8), exponents), axis=-1)
+    bytes_ = bytes_.reshape(tokens, 512, 4, 128).astype(np.uint32)
+    words = sum(bytes_[:, :, g] << (8 * g) for g in range(4)).view(np.int32)
+    rope_slab = np.concatenate((rope[:, :256], rope[:, 256:]), axis=-1).view(np.uint16)
+    rope_words = (
+        rope_slab[:, ::2].astype(np.uint32)
+        | (rope_slab[:, 1::2].astype(np.uint32) << 16)
+    ).view(np.int32)
+    counts = rng.integers(0, 513, tokens, dtype=np.int32)
+    counts[0] = 0
+    if tokens > 1:
+        counts[1] = 512
+    for t in range(tokens):
+        # Unused cache overlays can encode NaN; zero probabilities alone do
+        # not protect PV, so the kernel must zero invalid KV before the dots.
+        words[t, counts[t] :] = -1
+    positions = np.asarray(inputs["positions"])
+    lower = np.maximum(0, positions - 127)
+    upper = positions + 1
+    swa = np.array(inputs["swa_kv"])
+    if noncausal:
+        swa = np.zeros((tokens, 256, 512), dtype=jnp.bfloat16)
+    boundaries = np.asarray(inputs["starts"])
+    for r, length in enumerate(lengths):
+        begin, end = boundaries[r : r + 2]
+        if not length:
+            continue
+        if noncausal:
+            # A padded 192-row DSpark window shared across the request,
+            # including future keys and a masked replay prefix.
+            values = rng.normal(size=(192, 512)).astype(jnp.bfloat16)
+            lo, hi = 3, min(192, 128 + length)
+            swa[begin:end, lo:hi] = values[lo:hi]
+            lower[begin:end], upper[begin:end] = lo, hi
+        else:
+            replay_start = max(0, first[r] - 90)
+            for t in range(begin, end):
+                base = max(0, positions[t] - 127)
+                lower[t] = max(base, replay_start)
+                swa[t, : lower[t] - base] = 0
+    return dict(
+        q=inputs["q"],
+        main_kv=jnp.asarray(words),
+        main_rope=jnp.asarray(rope_words),
+        swa_kv=jnp.asarray(swa),
+        starts=inputs["starts"],
+        positions=inputs["positions"],
+        main_lengths=jnp.asarray(counts),
+        swa_lower=jnp.asarray(lower),
+        swa_upper=jnp.asarray(upper),
+        sink=inputs["sink"],
+    ), dense
+
+
+def _packed_reference(inputs, dense):
+    data = {k: np.asarray(v) for k, v in inputs.items()}
+    result = np.zeros(data["q"].shape, np.float32)
+    for t in range(int(data["starts"][-1])):
+        base = (
+            max(0, int(data["positions"][t]) - 127)
+            if data["swa_kv"].shape[1] == 128
+            else 0
+        )
+        lo, hi = int(data["swa_lower"][t]) - base, int(data["swa_upper"][t]) - base
+        kv = np.concatenate(
+            (
+                dense[t, : data["main_lengths"][t]],
+                data["swa_kv"][t, lo:hi].astype(np.float32),
+            )
+        )
+        logits = data["q"][t].astype(np.float32) @ kv.T * np.float32(512**-0.5)
+        logits = np.concatenate((logits, data["sink"][:, None]), axis=1)
+        probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probs /= probs.sum(axis=1, keepdims=True)
+        result[t] = (probs[:, :-1].astype(jnp.bfloat16).astype(np.float32) @ kv).astype(
+            jnp.bfloat16
+        )
+    return result
+
+
+class Csa2PackedTest(unittest.TestCase):
+    def check_case(self, **kwargs):
+        inputs, dense = _packed_inputs(**kwargs)
+        actual = np.asarray(
+            csa2.csa2_packed(**inputs, interpret=jax.default_backend() != "tpu")
+        ).astype(np.float32)
+        expected = _packed_reference(inputs, dense)
+        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=2e-2)
+        self.assertLess(
+            np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12),
+            0.006,
+        )
+        np.testing.assert_array_equal(actual[int(inputs["starts"][-1]) :], 0)
+
+    def test_causal_native_layout_replay_and_nan_padding(self):
+        self.check_case()
+
+    def test_noncausal_native_layout_replay_and_future_keys(self):
+        self.check_case(noncausal=True, heads=64)
+
+    def test_native_window_block_rotation(self):
+        self.check_case(lengths=(136,), first=(2048,), padding=1)
+
+
 if __name__ == "__main__":
     unittest.main()
