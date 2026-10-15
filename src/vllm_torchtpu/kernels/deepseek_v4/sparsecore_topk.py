@@ -1052,6 +1052,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "scheduling_group_id",
         "return_scores",
         "row_cap",
+        "valid_reads",
     ),
 )
 def sparsecore_topk(
@@ -1063,6 +1064,7 @@ def sparsecore_topk(
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
     row_cap: bool | None = None,
+    valid_reads: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -1079,7 +1081,24 @@ def sparsecore_topk(
     rows, ``p = n / 64K`` with a length-balanced split past that). The output is
     bitwise identical to the default path: same indices in the same order,
     same keys.
+
+    ``valid_reads`` (None reads ``TPU_SC_TOPK_VALID_READS``) runs every shape
+    on `sparsecore_topk_valid` instead (#1905: valid-prefix reads at every P);
+    it takes precedence over ``row_cap``. Same index sets.
     """
+    if valid_reads is None:
+        valid_reads = envs.TPU_SC_TOPK_VALID_READS
+    if valid_reads:
+        from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk_valid
+
+        return sparsecore_topk_valid.sparsecore_topk.__wrapped__(
+            scores,
+            k,
+            row_lengths,
+            write_empty_rows=write_empty_rows,
+            scheduling_group_id=scheduling_group_id,
+            return_scores=return_scores,
+        )
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_SPARSE_MLA_LIVE_GATHER: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
@@ -158,6 +159,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
     TPU_STREAMIDX_MIXED_KV_PAGES: int | None = None
     TPU_SC_TOPK_ROW_CAP: bool = False
+    TPU_SC_TOPK_VALID_READS: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -477,6 +479,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # Capped path: the native gather skips each window row's atoms past its live
+    # top-k count (outputs unchanged). Opt-in.
+    "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=False),
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is
@@ -1316,6 +1321,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # subcores per row, the row split between them by its length, again
     # reading only up to it. Bitwise identical output.
     "TPU_SC_TOPK_ROW_CAP": env_bool("TPU_SC_TOPK_ROW_CAP", default=False),
+    # #1905: route every `sparsecore_topk` call to `sparsecore_topk_valid`,
+    # whose subcores fetch only each row's valid prefix (manual wave loop at
+    # every P, per-wave double buffer, min P = cdiv(n, 64K), row lengths read
+    # in-kernel). Takes precedence over TPU_SC_TOPK_ROW_CAP. Same index sets.
+    "TPU_SC_TOPK_VALID_READS": env_bool("TPU_SC_TOPK_VALID_READS", default=False),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA

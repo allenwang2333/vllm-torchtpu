@@ -2805,6 +2805,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "capped_live_rows",
         "lse_lane_dense",
         "lse_mask_empty",
         "fused_window_prep",
@@ -2852,6 +2853,7 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    capped_live_rows: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
@@ -2930,6 +2932,12 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      capped_live_rows: With `topk_cap`, the native gather also skips each
+        (window, token) row's 64-slot atoms past its live count; the kernel
+        never reads those slots (`kv_len` masks), so outputs are unchanged.
+        Plain capped window-prep path only: `fused_window_prep` (decode) and
+        `mixed_live_gather` (live-group) calls already bound their gathers and
+        ignore it.
       q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
         num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
         multiple of the dtype packing, and `q_pe` `[max_num_tokens,
@@ -3393,6 +3401,7 @@ def sparse_ragged_paged_attention(
             small_chunk_gather_atoms=small_chunk_gather_atoms,
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
+            capped_live_rows=capped_live_rows,
             topk_override=topk,
             window_indices=(
                 window_indices_all
@@ -3582,6 +3591,7 @@ def sparse_attention_chunk(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
+    capped_live_rows: bool = False,
     topk_override: int | None = None,
     window_indices: jax.Array | None = None,
     gather_live_in_indices: bool = False,
@@ -4030,6 +4040,22 @@ def sparse_attention_chunk(
                     0, live_tokens
                 ) * topk_cap
                 live_kwargs = dict(num_live_indices=num_live_capped)
+                if capped_live_rows:
+                    # TPU_SPARSE_MLA_LIVE_GATHER (#1948): window w of a gridded
+                    # token holds prefix-packed slots [w*cap, (w+1)*cap); gather
+                    # only each (window, token) row's live 64-slot atoms.
+                    window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
+                    live_slots = jnp.clip(
+                        kv_lens[start_pos:end_pos][None, :] - window_start[:, None],
+                        0,
+                        topk_cap,
+                    )
+                    live_slots = jnp.where(
+                        jnp.arange(chunk_size) < live_tokens, live_slots, 0
+                    )
+                    live_kwargs["row_live_atoms"] = (
+                        (live_slots + GATHER_ATOM_ROWS - 1) // GATHER_ATOM_ROWS
+                    ).reshape(-1)
             if window_indices is None:
                 assert indices is not None
                 window_indices = (
