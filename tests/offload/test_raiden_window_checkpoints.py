@@ -227,6 +227,20 @@ class TestWindowCheckpointPolicy(unittest.TestCase):
             with self.subTest(interval=interval):
                 self.assertEqual(self._hit(sched, hashes, 8000), hit)
 
+    def test_fine_local_hit_inside_a_chunk_skips_the_host(self):
+        # TPU_FINE_PREFIX_HIT_TOKENS: an HBM hit at 9216 + 384 ends inside a
+        # full-attention chunk that the request copies on write.
+        sched, _, _ = self._prefill(32768)
+        longer = self.PROMPT + 3000
+        with patch.dict("os.environ", {"TPU_FINE_PREFIX_HIT_TOKENS": "128"}):
+            self.assertEqual(self._hit(sched, HASHES, longer, local=9216 + 384), 0)
+            self.assertEqual(
+                sched._req_status["b"].num_locally_computed_tokens, 9216 + 384
+            )
+            self.assertEqual(
+                self._hit(sched, HASHES, longer, local=4096, req_id="c"), 9216 - 4096
+            )
+
     def test_rejects_unaligned_interval(self):
         with self.assertRaisesRegex(ValueError, "multiple of the full-attention chunk"):
             make_scheduler(1000)

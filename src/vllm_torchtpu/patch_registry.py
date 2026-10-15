@@ -94,6 +94,7 @@ PATCHES = (
         "vllm_torchtpu.core.checkpoint_free_order:patch_hold_replay_checkpoint",
         _ENGINE,
     ),
+    Patch("vllm_torchtpu.core.fine_prefix_hits:patch_fine_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Host-loop timing (TPU_HOST_LOOP_TRACE_DIR); no-ops when unset.
     Patch(

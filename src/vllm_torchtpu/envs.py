@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL: int | None = None
     TPU_OFFLOAD_STATS_LOG_S: int = 0
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
+    TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     TPU_SRPT_HOLD_PROGRESS_GUARD: bool = False
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
@@ -663,6 +664,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix-cache checkpoint until the request is freed, and the freed request
     # queues it with the prefix it serves (core/checkpoint_free_order.py).
     "TPU_KV_HOLD_REPLAY_CHECKPOINT": env_bool("TPU_KV_HOLD_REPLAY_CHECKPOINT"),
+    # Engine core: prefix-cache hits on full-attention + sliding-window hybrids
+    # land on multiples of this many tokens instead of the scheduler block; the
+    # full-attention block holding the hit point is copied on write
+    # (core/fine_prefix_hits.py). 0 = off.
+    "TPU_FINE_PREFIX_HIT_TOKENS": env_nonnegative_int("TPU_FINE_PREFIX_HIT_TOKENS", 0),
     # SrptPrefillScheduler: after a held step that admits no waiting request,
     # stop holding prefill chunks until a step admits one (breaks the livelock
     # where the held chunks' own KV blocks keep the waiting request out).

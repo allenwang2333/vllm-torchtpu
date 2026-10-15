@@ -99,6 +99,7 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -299,6 +300,32 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 sorted(self._window_checkpoints.windowed_group_ids),
                 f" and every {interval} tokens" if interval else "",
             )
+
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        if not tpu_envs.TPU_FINE_PREFIX_HIT_TOKENS:
+            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        (full_chunk,) = {
+            group.tokens_per_chunk
+            for group in self.config.kv_group_configs
+            if group.sliding_window_size_in_chunks is None
+        }
+        if num_computed_tokens % full_chunk == 0:
+            return super().get_num_new_matched_tokens(request, num_computed_tokens)
+        # A fine local hit ends inside a full-attention chunk, which the local
+        # copy-on-write block now owns; the host pool holds whole chunks and
+        # cannot extend it. Keep the base bookkeeping, skip the lookup.
+        req_status = self._req_status[request.request_id]
+        for group_state in req_status.group_states:
+            group_state.block_ids.clear()
+        if req_status.transfer_jobs:
+            return None, False
+        req_status.update_offload_keys()
+        req_status.num_locally_computed_tokens = num_computed_tokens
+        req_status.update_num_hit_chunks(num_computed_tokens)
+        self._touch(req_status)
+        return 0, False
 
     def _admit_store_key(self, key: OffloadKey, req_context: ReqContext) -> bool:
         policy = self._window_checkpoints

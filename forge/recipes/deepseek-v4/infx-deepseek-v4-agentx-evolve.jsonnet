@@ -324,6 +324,10 @@ local attnIntraChipTp = cdk.var('TPU_DSV4_ATTN_INTRA_CHIP_TP', '1');
 // Sliding-window groups keep each request's replay-boundary checkpoint until the request is freed, so the next
 // turn can hit there after a long decode (j-0cda3671: uncached/request 5926 -> 5771).
 local kvHoldReplayCheckpoint = cdk.var('TPU_KV_HOLD_REPLAY_CHECKPOINT', '1');
+// Prefix-cache hits land on multiples of this many tokens instead of the 1024-token block: the
+// full-attention block holding the hit point is copied on write (vllm_torchtpu core/fine_prefix_hits.py).
+// Needs VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=1. Empty = off (hits stay block-aligned).
+local finePrefixHitTokens = cdk.var('TPU_FINE_PREFIX_HIT_TOKENS', '');
 // Block-table staging: rotate 3 host scratch buffers (H2D uploads are not fenced against the next step's
 // staging) and zero only the rows written last time.
 local blockTableStageRing = cdk.var('TPU_BLOCK_TABLE_STAGE_RING', '3');
@@ -789,6 +793,7 @@ local serverJob = cdk.job(
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
+        [if finePrefixHitTokens != '' then 'TPU_FINE_PREFIX_HIT_TOKENS']: finePrefixHitTokens,
         [if blockTableStageRing != '' then 'TPU_BLOCK_TABLE_STAGE_RING']: blockTableStageRing,
         [if blockTableStageSparseZero != '' then 'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO']: blockTableStageSparseZero,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
