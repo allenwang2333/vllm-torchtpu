@@ -83,7 +83,7 @@ def _lag_for(rows, nt):
 @functools.cache
 def build_expert_kernel(
     *, experts, h, i, i_s, tokens, routes, tile_rows, weight_dtype,
-    nb=3, down="dot", issue="loop", lag=None,
+    nb=3, down="dot", issue="loop", lag=None, rung_rows=None,
 ):
     assert down in ("dot", "xmxu") and issue in ("loop", "inline")
     assert not (issue == "inline" and down != "xmxu"), "inline issue lives in the xmxu N-tile sequence"
@@ -91,15 +91,19 @@ def build_expert_kernel(
     n_act = _LOOKAHEAD + 1
     window = tile_rows + _LANES
     scale_window = tile_rows // _LANES + 1
-    rungs = [tile_rows * (r + 1) // _TILE_RUNGS for r in range(_TILE_RUNGS)]
+    # rung_rows: the height step of the rungs a tile computes on (None: tile_rows / _TILE_RUNGS, v1). A
+    # 256-row tile on 32-row rungs pads a visit's tail exactly as a 128-row tile on 32-row rungs does, so a
+    # taller tile only ever saves tiles.
+    n_rungs = _TILE_RUNGS if rung_rows is None else tile_rows // rung_rows
+    rungs = [tile_rows * (r + 1) // n_rungs for r in range(n_rungs)]
     lane_blocks = h // _LANES
     lhs_from_words = (
         jnp.dtype(weight_dtype).itemsize == 1
         and lane_blocks % 4 == 0
-        and tile_rows % (4 * _TILE_RUNGS * 8) == 0
+        and tile_rows % (4 * n_rungs * 8) == 0
         and math.gcd(lane_blocks, 32) <= 16
     )
-    out_by_pairs = lane_blocks % 2 == 0 and tile_rows % (8 * _TILE_RUNGS) == 0
+    out_by_pairs = lane_blocks % 2 == 0 and tile_rows % (8 * n_rungs) == 0
     xmxu = down == "xmxu"
     if xmxu:
         assert out_by_pairs and h % _NT == 0 and _NT == 2 * _LANES
@@ -531,7 +535,7 @@ def build_expert_kernel(
         pltpu.VMEM((1, h), jnp.float32),
         pltpu.SemaphoreType.DMA(()),
     ]
-    tag = f"nb{nb}-{down}-{issue}"
+    tag = f"nb{nb}-{down}-{issue}" + ("" if rung_rows is None else f"-r{rung_rows}")
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -667,7 +671,7 @@ def combine(slab, slab_row, coeff, axis_name, flat=False):
 def fused_moe_prefill(x, w1, w2, w1_scale, w2_scale, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
                       shared_gate_weight, topk_weights, topk_ids, *, axis_name, expert_start=None,
                       routed_scale=1.0, nb=3, down="dot", issue="loop", tile_min=8192, flat=False,
-                      lag=None, x_q=None, x_scale=None):
+                      lag=None, x_q=None, x_scale=None, tall_rung_rows=None):
     """fused_moe_prefill_kernel.fused_moe_prefill with the stage-A levers as arguments. x_q [T, h/128, 128]
     fp8 and x_scale [T] f32 (fused_add_rmsnorm.fused_add_rms_norm_quant_moe) replace the op's own
     quantization when given; they must be _quantize_rows of the op's input, bit for bit."""
@@ -682,7 +686,8 @@ def fused_moe_prefill(x, w1, w2, w1_scale, w2_scale, shared_w1, shared_w1_scale,
     tile_rows = tile_rows_for(tokens, tile_min)
     call, scale_rows, token_rows = build_expert_kernel(
         experts=experts, h=h, i=two_i // 2, i_s=i_s, tokens=tokens, routes=routes, tile_rows=tile_rows,
-        weight_dtype=weight_dtype, nb=nb, down=down, issue=issue, lag=lag)
+        weight_dtype=weight_dtype, nb=nb, down=down, issue=issue, lag=lag,
+        rung_rows=tall_rung_rows if tile_rows > 128 else None)
     if x_q is None:
         x_q, x_scale = _quantize_rows(x, weight_dtype)
     route_valid = topk_weights != 0
