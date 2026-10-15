@@ -992,16 +992,25 @@ class TpuPlatform(Platform):
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
+            kv_tc = vllm_config.kv_transfer_config
+            is_kv_consumer = bool(
+                kv_tc is not None and not getattr(kv_tc, "is_kv_producer", False)
+            )
+            default_retention = "0" if is_kv_consumer else "1"
             if (
-                vllm_config.kv_transfer_config is None
-                or os.environ.get("TPU_HYBRID_STATE_RETENTION", "0").strip().lower()
+                os.environ.get("TPU_HYBRID_STATE_RETENTION", default_retention)
+                .strip()
+                .lower()
                 in ("1", "true", "yes", "on")
             ):
                 if hasattr(cache_config, "prefix_cache_retention_interval"):
                     cache_config.prefix_cache_retention_interval = 0
-                if hasattr(cache_config, "prefix_match_unit") and getattr(
-                    cache_config, "prefix_match_unit", None
-                ) in (None, 0, 1):
+                if (
+                    not is_kv_consumer
+                    and hasattr(cache_config, "prefix_match_unit")
+                    and getattr(cache_config, "prefix_match_unit", None)
+                    in (None, 0, 1)
+                ):
                     cache_config.prefix_match_unit = 128
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1

@@ -770,6 +770,28 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             and _prefix_aware_load_enabled()
         )
 
+    def resolve_divergent_local_hit_tokens(
+        self,
+        request: "Request",
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
+        """Align divergent local FA hits on Decode to full destination pages."""
+        if not self.supports_divergent_local_hybrid_hits:
+            return None
+        vllm_cfg = getattr(self, "_vllm_config", getattr(self, "vllm_config", None))
+        dcp_size = int(
+            getattr(
+                getattr(vllm_cfg, "parallel_config", None),
+                "decode_context_parallel_size",
+                1,
+            )
+            or 1
+        )
+        page_tokens = max(int(block_size) * dcp_size, 1)
+        return (int(num_local) // page_tokens) * page_tokens
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1108,9 +1130,27 @@ class TPUConnectorScheduler:
             return
         if request.prompt_token_ids is None:
             return
+        old_num_prompt_tokens = request.num_prompt_tokens
         request.prompt_token_ids.pop()
         request._all_token_ids.pop()
         request.num_prompt_tokens -= 1
+        block_hashes = getattr(request, "block_hashes", None)
+        if block_hashes:
+            hash_unit = (
+                getattr(
+                    getattr(self.vllm_config, "cache_config", None),
+                    "prefix_match_unit",
+                    None,
+                )
+                or self.block_size
+            )
+            if (
+                isinstance(hash_unit, int)
+                and hash_unit > 0
+                and old_num_prompt_tokens % hash_unit == 0
+                and len(block_hashes) > request.num_prompt_tokens // hash_unit
+            ):
+                block_hashes.pop()
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True

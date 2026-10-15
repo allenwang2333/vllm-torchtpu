@@ -244,7 +244,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     "then run without it too.",
                     why,
                 )
-        default_retention = "0" if self._is_disagg else "1"
+        default_retention = "0" if self._is_kv_consumer else "1"
         if os.environ.get("TPU_HYBRID_STATE_RETENTION", default_retention) != "0":
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
@@ -549,10 +549,33 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
         return cached
 
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ):
+        retention = getattr(self, "_retention", None)
+        if retention is not None:
+            drain_fn = getattr(self, "_drain_deferred_frees", None)
+            if callable(drain_fn):
+                try:
+                    drain_fn()
+                except Exception:
+                    pass
+            try:
+                retention.pin_running([request])
+            except Exception:
+                self._retention_failed()
+        return super()._free_request(request, delay_free_blocks=delay_free_blocks)
+
     def _free_request_blocks(self, request: Request):
         retention = getattr(self, "_retention", None)
         if retention is None:
             return super()._free_request_blocks(request)
+        drain_fn = getattr(self, "_drain_deferred_frees", None)
+        if callable(drain_fn):
+            try:
+                drain_fn()
+            except Exception:
+                pass
         try:
             attn_blocks = retention.snapshot_attention_blocks(request)
         except Exception:
