@@ -41,10 +41,12 @@ def inner_kernel(
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
+    conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
+    recurrent_in_slot_ref: jax.Ref,  # [seq, 1, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Ref,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head]
+    conv_state_out_slot_ref: jax.Ref,  # [seq, window, prev_kernel_size, 1, dim]
+    recurrent_out_slot_ref: jax.Ref,  # [seq, window, num_v_heads, kq, v]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
@@ -65,11 +67,11 @@ def inner_kernel(
         qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
         b_slot_ref: b VMEM ref that stores data loaded from HBM.
         a_slot_ref: a VMEM ref that stores data loaded from HBM.
-        conv_state_slot_ref: Convolution state VMEM ref that stores data loaded from
-            HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
-        recurrent_slot_ref: Recurrent state VMEM ref that stores data loaded from
-            HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
+        conv_state_in_slot_ref: Convolution state VMEM ref loaded from HBM.
+        recurrent_in_slot_ref: Recurrent state VMEM ref loaded from HBM.
         out_slot_ref: Output VMEM ref that will be used for VMEM to HBM write.
+        conv_state_out_slot_ref: Convolution state VMEM ref written to HBM.
+        recurrent_out_slot_ref: Recurrent state VMEM ref written to HBM.
         metadata_ref: Metadata reference containing grid and sequence mappings.
         weights_ref: Weight references for Conv1D and GDN in VMEM.
         carry_conv_scratch_ref: Optional VMEM scratch reference for inter-tile
@@ -89,8 +91,8 @@ def inner_kernel(
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
         metadata_ref=metadata_ref,
         p_id=p_id,
-        conv_state_slot_ref=conv_state_slot_ref,
-        recurrent_slot_ref=recurrent_slot_ref,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
@@ -120,11 +122,11 @@ def inner_kernel(
     )
 
     if cfg.state_plan is None:
-        conv_state_slot_ref[...] = new_conv_state
+        conv_state_out_slot_ref[...] = new_conv_state
     else:
         # TODO: Delete this after completing unified pool redesign.
         legacy_unified.store_external_state(
-            conv_state_slot_ref, cfg.state_plan.conv, new_conv_state, cfg
+            conv_state_out_slot_ref, cfg.state_plan.conv, new_conv_state, cfg
         )
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
@@ -206,13 +208,13 @@ def inner_kernel(
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     if cfg.state_plan is None:
         # Round to the state dtype, then pack into the uint32 window.
-        recurrent_slot_ref[...] = pltpu.bitcast(
+        recurrent_out_slot_ref[...] = pltpu.bitcast(
             new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
         )
     else:
         # TODO: Delete this after unified pool migration completes.
         legacy_unified.store_external_state(
-            recurrent_slot_ref, cfg.state_plan.recurrent, new_recurrent_state, cfg
+            recurrent_out_slot_ref, cfg.state_plan.recurrent, new_recurrent_state, cfg
         )
 
     if carry_recurrent_scratch_ref is not None:
@@ -238,45 +240,71 @@ def outer_kernel(
     cfg: config.GDNConfig,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
-    del states_out_ref
-
     if cfg.is_shared:
         # One pool row holds both regions; they are told apart by their
         # granule offset, which `create_allocs` derives from this ref.
         assert not isinstance(states_ref, tuple)
+        assert not isinstance(states_out_ref, tuple)
         conv_state_ref = recurrent_state_ref = states_ref
+        conv_state_out_ref = recurrent_state_out_ref = states_out_ref
     else:
         assert len(states_ref) == 2
+        assert len(states_out_ref) == 2
         conv_state_ref, recurrent_state_ref = states_ref
-    qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
-        memory_ref.create_allocs(
-            metadata_ref=metadata_ref,
-            qkv_ref=qkv_ref,
-            b_ref=b_ref,
-            a_ref=a_ref,
-            out_ref=out_ref,
-            conv_state_ref=conv_state_ref,
-            recurrent_state_ref=recurrent_state_ref,
-            cfg=cfg,
-        )
-    )
+        conv_state_out_ref, recurrent_state_out_ref = states_out_ref
 
+    (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = memory_ref.create_allocs(
+        metadata_ref=metadata_ref,
+        qkv_ref=qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=out_ref,
+        conv_state_ref=conv_state_ref,
+        recurrent_state_ref=recurrent_state_ref,
+        cfg=cfg,
+    )
     num_tiles = metadata_ref.num_tiles[...]
+    body = functools.partial(inner_kernel, cfg=cfg)
+
+    if conv_out_alloc is None:
+        # TODO: Delete this after unified pool migration completes. The
+        # legacy external-state path keeps one input/output window per state,
+        # so the kernel stores into the tiles it loaded.
+        assert recurrent_out_alloc is None
+        state_allocs = (conv_in_alloc, recurrent_in_alloc)
+        out_allocs = (out_alloc,)
+        state_out_args = ()
+
+        def body(qkv, b, a, conv, recurrent, out, *scratches):
+            inner_kernel(
+                qkv, b, a, conv, recurrent, out, conv, recurrent, *scratches, cfg=cfg
+            )
+
+    else:
+        assert recurrent_out_alloc is not None
+        state_allocs = (conv_in_alloc, recurrent_in_alloc)
+        out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
+        state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
 
     pipeline_func = pltpu.emit_pipeline(
-        body=functools.partial(
-            inner_kernel,
-            cfg=cfg,
-        ),
+        body=body,
         grid=(num_tiles,),
         in_specs=(
             qkv_alloc.spec,
             b_alloc.spec,
             a_alloc.spec,
-            conv_alloc.spec,
-            recurrent_alloc.spec,
+            *(alloc.spec for alloc in state_allocs),
         ),
-        out_specs=(out_alloc.spec,),
+        out_specs=tuple(alloc.spec for alloc in out_allocs),
     )
 
     @pl.with_scoped(
@@ -284,9 +312,8 @@ def outer_kernel(
             qkv_alloc,
             b_alloc,
             a_alloc,
-            conv_alloc,
-            recurrent_alloc,
-            out_alloc,
+            *state_allocs,
+            *out_allocs,
         ),
     )
     def _run(allocations):
@@ -297,6 +324,7 @@ def outer_kernel(
             conv_state_ref,
             recurrent_state_ref,
             out_ref,
+            *state_out_args,
             scratches=(
                 metadata_ref,
                 weights_ref,
@@ -519,6 +547,7 @@ def fused_conv1d_gdn(
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
+    # KDA stays on static tiles until the VMEM estimate models its gate.
     if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
@@ -545,45 +574,34 @@ def fused_conv1d_gdn(
             decode_tile_size,
             mixed_tile_size,
         )
+    else:
+        # Each sequence holds 1 input state slot plus `window` output
+        # checkpoint slots per buffer in VMEM, at every window size. Shrink
+        # the tile so the double-buffered windows fit in roughly half the
+        # scoped-VMEM budget.
+        window = num_spec_tokens + 1
+        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+        state_positions = 1 + window
+        recurrent_bytes_per_seq = (
+            state_positions * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
+        )
+        bytes_per_seq = (
+            # Recurrent checkpoints — the dominant term.
+            recurrent_bytes_per_seq
+            # Conv checkpoints (fp32).
+            + state_positions * (kernel_size - 1) * dim * 4
+            # qkv (fp32), b/a (fp32), out (act_out).
+            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+        )
+        spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
+        decode_tile_size = max(
+            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+        )
 
-    if num_spec_tokens > 0:
-        if not envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
-            # A verify window holds one state checkpoint per window position
-            # per sequence in VMEM, which multiplies the per-sequence
-            # footprint by the window size. Shrink the tile so the
-            # double-buffered windows fit in roughly half the scoped-VMEM
-            # budget (the rest goes to weights, activations scratch and
-            # compiler temporaries). Dynamic tiling counts the windows in
-            # tiling.get_tile_sizes instead.
-            window = num_spec_tokens + 1
-            num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-            recurrent_bytes_per_seq = (
-                window * n_v * d_k * d_v * jnp.dtype(recurrent_dtype).itemsize
-            )
-            bytes_per_seq = (
-                # Recurrent checkpoints — the dominant term.
-                recurrent_bytes_per_seq
-                # Conv checkpoints (fp32).
-                + window * (kernel_size - 1) * dim * 4
-                # qkv (fp32), b/a (fp32), out (act_out).
-                + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-            )
-            spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
-            decode_tile_size = max(
-                1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
-            )
-
-        if is_kda:
-            # Keep exactly one KDA sequence in each window tile.  The state
-            # pipeline issues one async recurrent-state DMA per sequence but
-            # shares a semaphore and drains the tile with one aggregate wait.
-            # Bounding only the total bytes is insufficient: TP32's four
-            # 3-head sequences have the same 6 MiB footprint as one TP8
-            # 12-head sequence, but the former still has four independent DMA
-            # starts and corrupts recurrent checkpoints in long-running
-            # serving.  A one-sequence tile is the only schedule validated for
-            # repeated rollback and slot reuse on v7, independent of TP size.
-            decode_tile_size = 1
+    if num_spec_tokens > 0 and is_kda:
+        # KDA verify keeps one sequence per tile until multi-sequence KDA
+        # verify tiles are sized by a KDA-aware VMEM estimate.
+        decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v

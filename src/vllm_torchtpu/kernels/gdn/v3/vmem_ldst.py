@@ -94,8 +94,8 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
@@ -114,10 +114,11 @@ def load_and_select_states(
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
-        conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
-        recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
+        conv_state_in_slot_ref: Convolution state read from HBM of shape
+            [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
+        recurrent_in_slot_ref: Recurrent state read from HBM as uint32 words,
+            of shape [seq_tile_size, 1, num_v_heads, kq_head_dim // packing,
+            v_head_dim].
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -145,8 +146,8 @@ def load_and_select_states(
         if cfg.state_plan is not None:
             # TODO: Delete this after unified pool migration completes.
             prev_conv_state, prev_recurrent_state = legacy_unified.select_states(
-                conv_state_slot_ref,
-                recurrent_slot_ref,
+                conv_state_in_slot_ref,
+                recurrent_in_slot_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
                 cfg,
@@ -156,7 +157,7 @@ def load_and_select_states(
             )
         else:
             # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
-            hbm_conv_state = conv_state_slot_ref[idx, 0].astype(jnp.float32)
+            hbm_conv_state = conv_state_in_slot_ref[idx, 0].astype(jnp.float32)
             prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
 
             if carry_conv_scratch_ref is not None:
@@ -168,7 +169,7 @@ def load_and_select_states(
             # Unpack the uint32 words to the state dtype, then upcast because
             # compute runs in fp32.
             hbm_recurrent_state = pltpu.bitcast(
-                recurrent_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+                recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
             ).astype(jnp.float32)
             prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 

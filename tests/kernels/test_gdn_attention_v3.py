@@ -409,7 +409,7 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         init_conv = jax.random.normal(
-            next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+            next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.float32
         )
         init_rec = jax.random.normal(
             next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
@@ -454,8 +454,7 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
                     qkv=qkv,
                     b=b,
                     a=a,
-                    conv_state=init_conv,
-                    recurrent_state=init_rec,
+                    states=(init_conv, init_rec),
                     conv_weight=conv_w,
                     conv_bias=conv_b,
                     a_log=a_log,
@@ -1104,8 +1103,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 qkv=qkv,
                 b=b,
                 a=a,
-                conv_state=conv_state,
-                recurrent_state=recurrent_state,
+                states=(conv_state, recurrent_state),
                 conv_weight=conv_weight,
                 conv_bias=conv_bias,
                 a_log=a_log,
@@ -1176,8 +1174,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv,
             b=b,
             a=a,
-            conv_state=conv_state,
-            recurrent_state=recurrent_state,
+            states=(conv_state, recurrent_state),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=a_log,
@@ -1278,8 +1275,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=init_conv,
-            recurrent_state=init_rec,
+            states=(init_conv, init_rec),
             conv_weight=conv_weight,
             conv_bias=conv_bias,
             a_log=a_log,
@@ -1300,8 +1296,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 qkv=qkv,
                 b=b,
                 a=a,
-                conv_state=init_conv.copy(),
-                recurrent_state=init_rec.copy(),
+                states=(init_conv.copy(), init_rec.copy()),
                 conv_weight=conv_weight,
                 conv_bias=conv_bias,
                 a_log=a_log,
@@ -1396,7 +1391,7 @@ class GDNAttentionTest(parameterized.TestCase):
         a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         init_conv = jax.random.normal(
-            next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+            next(rngs), (num_blocks, kernel_size - 1, dim), dtype=jnp.float32
         )
         init_rec = jax.random.normal(
             next(rngs), (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
@@ -1412,8 +1407,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=init_conv,
-            recurrent_state=init_rec,
+            states=(init_conv, init_rec),
             conv_weight=conv_w,
             conv_bias=conv_b,
             a_log=a_log,
@@ -1435,8 +1429,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 qkv=qkv,
                 b=b,
                 a=a,
-                conv_state=init_conv.copy(),
-                recurrent_state=init_rec.copy(),
+                states=(init_conv.copy(), init_rec.copy()),
                 conv_weight=conv_w,
                 conv_bias=conv_b,
                 a_log=a_log,
@@ -1490,7 +1483,7 @@ class GDNAttentionTest(parameterized.TestCase):
         a_log = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         dt_bias = jax.random.normal(next(rngs), (n_v,), dtype=jnp.float32)
         init_conv = jax.random.normal(
-            next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.bfloat16
+            next(rngs), (num_seqs, kernel_size - 1, dim), dtype=jnp.float32
         )
         init_rec = jax.random.normal(
             next(rngs), (num_seqs, n_v, d_k, d_v), dtype=jnp.float32
@@ -1505,8 +1498,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=qkv,
             b=b,
             a=a,
-            conv_state=init_conv,
-            recurrent_state=init_rec,
+            states=(init_conv, init_rec),
             conv_weight=conv_w,
             conv_bias=conv_b,
             a_log=a_log,
@@ -1527,8 +1519,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 qkv=qkv,
                 b=b,
                 a=a,
-                conv_state=init_conv.copy(),
-                recurrent_state=init_rec.copy(),
+                states=(init_conv.copy(), init_rec.copy()),
                 conv_weight=conv_w,
                 conv_bias=conv_b,
                 a_log=a_log,
@@ -1565,7 +1556,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 num_blocks = num_seqs * window + 4
                 k1, k2, k3, k4, k5, k6, k7, k8, k9, rng = jax.random.split(rng, 10)
                 init_conv = jax.random.normal(
-                    k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16
+                    k8, (num_blocks, kernel_size - 1, dim), dtype=jnp.float32
                 )
                 init_rec = jax.random.normal(
                     k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
@@ -1604,8 +1595,7 @@ class GDNAttentionTest(parameterized.TestCase):
                     kernel_size=kernel_size,
                 )
                 (conv_ref, rec_ref), out_ref = gdn_attention_ref(
-                    conv_state=init_conv,
-                    recurrent_state=init_rec,
+                    states=(init_conv, init_rec),
                     **common_kwargs,
                 )
                 with mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", True):
@@ -1623,8 +1613,7 @@ class GDNAttentionTest(parameterized.TestCase):
                         ],
                     )
                     (conv_out, rec_out), out = fn_dyn(
-                        conv_state=init_conv.copy(),
-                        recurrent_state=init_rec.copy(),
+                        states=(init_conv.copy(), init_rec.copy()),
                         read_offsets=(
                             jnp.zeros((num_seqs,), dtype=jnp.int32)
                             if num_spec_tokens > 0

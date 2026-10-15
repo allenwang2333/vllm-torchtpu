@@ -249,19 +249,12 @@ class OutBufferedRef(BaseBufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class StateBufferedRef(BaseBufferedRef):
-    """Input/output buffered ref for per-sequence state (conv / recurrent).
+class _GranuleStateRef(BaseBufferedRef):
+    """Shared addressing of the per-sequence state refs below.
 
-    The VMEM window holds one state per window position,
-    [seq_tile_size, window_size, *state_shape]. The initial state is read
-    from `state_indices[s] + read_offset[s]` into position 0 of the
-    sequence's window row, and after compute the first
-    `min(r_size, window_size)` checkpoints are written back to
-    `state_indices[s] .. + that many slots`.
-
-    Without speculative decoding `window_size` is 1 and `read_offset` is 0,
-    so this reduces to reading and writing the single state at
-    `state_indices[s]`.
+    A state block is addressed in 512-byte granules (`granule_view`): one
+    unified-pool row holds both state regions, told apart by `offset`, and a
+    dense state tensor is the same view with `offset` 0.
     """
 
     # HBM address offset.
@@ -279,6 +272,21 @@ class StateBufferedRef(BaseBufferedRef):
         if ckpt_indices is None:
             return self.metadata_ref.s_idx_to_state_indices[s_idx]
         return ckpt_indices[s_idx, ckpt]
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class StateInBufferedRef(_GranuleStateRef):
+    """Input buffered ref for the per-sequence initial state (conv / recurrent).
+
+    The VMEM window holds one initial state per sequence in the tile,
+    [seq_tile_size, 1, *state_shape], read from the checkpoint of the last
+    accepted token (`read_offset`) into position 0 of row `idx`.
+
+    Loads have their own double-buffered window, separate from the stores'
+    (`StateOutBufferedRef`), so the load for tile p + 2, issued during step
+    p + 1, cannot overwrite the slot that tile p's store is still reading.
+    """
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -333,6 +341,19 @@ class StateBufferedRef(BaseBufferedRef):
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class StateOutBufferedRef(_GranuleStateRef):
+    """Output buffered ref for the per-sequence state checkpoints.
+
+    The VMEM window holds one state per window position,
+    [seq_tile_size, window_size, *state_shape]. After compute the first
+    `min(r_size, window_size)` checkpoints are written back, checkpoint `t`
+    to its own source block. Without speculative decoding `window_size` is
+    1 and this writes the single state back to `state_indices[s]`.
+    """
+
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -382,8 +403,8 @@ class StateBufferedRef(BaseBufferedRef):
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-        # Each checkpoint moved one window row's worth of bytes; see wait_in
-        # for why this counts them on the typed tile.
+        # Each checkpoint moved one window row's worth of bytes; see
+        # StateInBufferedRef.wait_in for why this counts them on the typed tile.
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
@@ -401,10 +422,20 @@ def create_allocs(
     InBufferedRef,
     InBufferedRef,
     InBufferedRef,
-    StateBufferedRef,
-    StateBufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
     OutBufferedRef,
+    StateOutBufferedRef | None,
+    StateOutBufferedRef | None,
 ]:
+    """Allocate the pipeline's buffered refs.
+
+    Returns `(qkv, b, a, conv_in, recurrent_in, out, conv_out, recurrent_out)`.
+    Each state has separate input and output windows (one initial state per
+    sequence in, one checkpoint per window position out). The legacy
+    external-state path keeps one input/output window per state and returns
+    None for the two output refs.
+    """
     del recurrent_state_ref
 
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
@@ -453,50 +484,75 @@ def create_allocs(
     )
 
     if cfg.state_plan is None:
-        # One state checkpoint per window position per sequence (a single one
-        # without speculative decoding, where window_size is 1).
-        conv_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
-            cfg.prev_kernel_size,
-            1,
-            cfg.dim_size,
-        )
-        # The window stores the state as uint32 words; `packing` state
-        # values share one word, so it has kq_head_dim // packing rows.
+        # Initial state needs only 1 slot per sequence; output holds one
+        # checkpoint per window position (1 without speculative decoding).
+        conv_shape = (cfg.prev_kernel_size, 1, cfg.dim_size)
+        # The window stores the recurrent state as uint32 words; `packing`
+        # state values share one word, so it has kq_head_dim // packing rows.
         packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
         recurrent_shape = (
-            cfg.seq_tile_size,
-            cfg.window_size,
             cfg.num_v_heads,
             cfg.kq_head_dim // packing,
             cfg.v_head_dim,
         )
-        state_buffered_partial = functools.partial(
-            StateBufferedRef.input_output,
+        state_in_partial = functools.partial(
+            StateInBufferedRef.input,
             buffer_count=pipeline_mode.buffer_count,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
         )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
+        state_out_partial = functools.partial(
+            StateOutBufferedRef.output,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+        )
+        conv_in_alloc = state_in_partial(
+            spec=block_spec_partial(block_shape=(cfg.seq_tile_size, 1, *conv_shape)),
             dtype_or_type=cfg.dtypes.conv_state,
             offset=cfg.conv_hbm_offset,
         )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
+        recurrent_in_alloc = state_in_partial(
+            spec=block_spec_partial(
+                block_shape=(cfg.seq_tile_size, 1, *recurrent_shape)
+            ),
+            dtype_or_type=jnp.uint32,
+            offset=cfg.recurrent_hbm_offset,
+        )
+        conv_out_alloc = state_out_partial(
+            spec=block_spec_partial(
+                block_shape=(cfg.seq_tile_size, cfg.window_size, *conv_shape)
+            ),
+            dtype_or_type=cfg.dtypes.conv_state,
+            offset=cfg.conv_hbm_offset,
+        )
+        recurrent_out_alloc = state_out_partial(
+            spec=block_spec_partial(
+                block_shape=(cfg.seq_tile_size, cfg.window_size, *recurrent_shape)
+            ),
             dtype_or_type=jnp.uint32,
             offset=cfg.recurrent_hbm_offset,
         )
     else:
         # TODO: Delete this after unified pool migration completes.
-        conv_alloc, recurrent_alloc = legacy_unified.external_state_allocs(
+        conv_in_alloc, recurrent_in_alloc = legacy_unified.external_state_allocs(
             cfg=cfg,
             metadata_ref=metadata_ref,
             state_source_ref=conv_state_ref,
             block_spec_partial=block_spec_partial,
             pipeline_mode=pipeline_mode,
         )
+        conv_out_alloc = recurrent_out_alloc = None
 
-    return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
+    return (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    )
