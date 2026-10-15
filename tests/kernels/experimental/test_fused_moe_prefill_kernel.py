@@ -1,10 +1,9 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 """8-device parity for the fused MoE prefill kernel (routed + shared expert,
-combine and all-reduce) against the decode kernel tests' decomposed layer, with
-the experts TP-sliced or EP-sharded, whole or streamed in intermediate blocks,
-and the shared expert gated (Qwen3.5) or ungated with a routed scale
-(GLM-5.2)."""
+combine and all-reduce), with the experts TP-sliced (every rank holds all E)
+or EP-sharded (rank r holds global experts [r*E, (r+1)*E)); the shared expert
+is always a TP slice."""
 
 import functools
 
@@ -12,93 +11,153 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-from tests.kernels.experimental.test_fused_moe_decode_kernel import (
-    GLM_SCALE,
-    E,
-    _inputs,
-    _max_rel,
-    _reference,
-    setup,  # noqa: F401  (the module fixture)
-)
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
-    fused_moe_prefill,
-    plan_blocks,
-)
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import fused_moe_prefill
 
-pytestmark = pytest.mark.multichip
-
+N, H, INTER, INTER_S, E, TOPK = 8, 1024, 256, 128, 64, 10
 F8 = jnp.float8_e4m3fn
 
 
-def _prefill(rank, x, *rest, ep=False, glm=False, i_block=None):
-    *weights, shared_gate_weight, tw, ti = rest
-    return fused_moe_prefill(
-        x,
-        *weights,
-        None if glm else shared_gate_weight,
-        tw,
-        ti,
-        axis_name="d",
-        expert_start=rank.reshape(()) * E if ep else None,
-        routed_scale=GLM_SCALE if glm else 1.0,
-        i_block=i_block,
+@pytest.fixture(scope="module")
+def setup():
+    if jax.default_backend() != "tpu" or jax.device_count() < N:
+        pytest.skip("requires 8 TPU devices")
+    mesh = Mesh(np.asarray(jax.devices()[:N]), ("d",))
+    sh = NamedSharding(mesh, P("d"))
+    rank = jax.device_put(np.arange(N, dtype=np.int32).reshape(N, 1), sh)
+
+    def gen(r):
+        ks = jax.random.split(jax.random.fold_in(jax.random.key(3), r[0, 0]), 4)
+
+        def q(w, axis):
+            s = jnp.max(jnp.abs(w), axis=axis, keepdims=True) / 448.0
+            return (w / s).astype(F8), s
+
+        w1, w1_scale = q(jax.random.normal(ks[0], (E, H, 2 * INTER)) * 0.02, 1)
+        w2, w2_scale = q(jax.random.normal(ks[1], (E, INTER, H)) * 0.02, 1)
+        shared_w1, shared_w1_scale = q(
+            jax.random.normal(ks[2], (H, 2 * INTER_S)) * 0.02, 0
+        )
+        shared_w2, shared_w2_scale = q(jax.random.normal(ks[3], (INTER_S, H)) * 0.02, 0)
+        return (
+            w1,
+            w2,
+            w1_scale[:, :, None, :],
+            w2_scale[:, :, None, :],
+            shared_w1,
+            shared_w1_scale.reshape(-1),
+            shared_w2,
+            shared_w2_scale.reshape(-1),
+        )
+
+    weights = jax.jit(
+        jax.shard_map(
+            gen, mesh=mesh, in_specs=P("d"), out_specs=P("d"), check_vma=False
+        )
+    )(rank)
+    shared_gate_weight = jax.device_put(
+        jnp.asarray(np.random.default_rng(1).normal(size=(1, H)) * 0.02, jnp.bfloat16),
+        NamedSharding(mesh, P()),
+    )
+    return mesh, sh, rank, weights, shared_gate_weight
+
+
+def _ffn(x, w1, w1_scale, w2, w2_scale):
+    i = w2.shape[0]
+    gu = jnp.dot(x, w1.astype(jnp.float32) * w1_scale.reshape(1, -1))
+    return jnp.dot(
+        jax.nn.silu(gu[:, :i]) * gu[:, i:],
+        w2.astype(jnp.float32) * w2_scale.reshape(1, -1),
     )
 
 
-# "blocked" forces blocked mode (the one GLM-5.2's EP experts take) with ib
-# 128: two blocks per expert, and the sparse combine.
-_PATHS = {"kernel": _prefill, "blocked": functools.partial(_prefill, i_block=128)}
+def _reference(
+    rank,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    shared_w1,
+    shared_w1_scale,
+    shared_w2,
+    shared_w2_scale,
+    shared_gate_weight,
+    tw,
+    ti,
+    skip_expert=None,
+    ep=False,
+):
+    """The decomposed layer in f32: routed experts + gated shared expert + psum."""
+    if ep:
+        ti = ti - rank.reshape(()) * E
+    xf = x.astype(jnp.float32)
+    out = jax.nn.sigmoid(
+        jnp.dot(x, shared_gate_weight.T, preferred_element_type=jnp.float32)
+    ) * _ffn(xf, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale)
+    for e in range(E):
+        if e != skip_expert:
+            coeff = jnp.sum(
+                jnp.where(ti == e, tw.astype(jnp.float32), 0.0), 1, keepdims=True
+            )
+            out = out + coeff * _ffn(xf, w1[e], w1_scale[e], w2[e], w2_scale[e])
+    return jax.lax.psum(out, "d").astype(x.dtype)
+
+
+def _fused(rank, x, *rest, ep=False):
+    return fused_moe_prefill(
+        x, *rest, axis_name="d", expert_start=rank.reshape(()) * E if ep else None
+    )
 
 
 # 256: one combine chunk on the Pallas combine. 1000: a chunk the Pallas
-# combines do not tile (their XLA form). 4096: two chunks, two all-reduces.
+# combine does not tile (XLA combine). 4096: two chunks, two all-reduces.
 @pytest.mark.parametrize("m", [256, 1000, 4096])
 @pytest.mark.parametrize("ep", [False, True])
-@pytest.mark.parametrize("path", ["kernel", "blocked"])
-def test_matches_decomposed_layer(setup, m, ep, path):  # noqa: F811
-    if path == "blocked" and m == 4096:
-        pytest.skip("two-chunk case on the whole-expert path only")
-    run, ids = _inputs(setup, m, ep, padded=True, seed=m)
-    got = run(functools.partial(_PATHS[path], ep=ep))
-    ref = run(functools.partial(_reference, ep=ep))
-    assert all(np.array_equal(got[0], got[r]) for r in range(len(got))), (
-        "ranks disagree"
+def test_matches_decomposed_layer(setup, m, ep):
+    mesh, sh, rank, weights, shared_gate_weight = setup
+    rng = np.random.default_rng(m)
+    x = rng.normal(size=(m, H)).astype(np.float32)
+    n_global = N * E if ep else E
+    ids = np.stack(
+        [rng.choice(n_global, TOPK, replace=False) for _ in range(m)]
+    ).astype(np.int32)
+    tw = rng.dirichlet(np.ones(TOPK), size=m).astype(np.float32)
+    tw[m - 3 :] = 0  # padded rows: zero routing weight, shared expert only
+    args = (
+        rank,
+        jax.device_put(jnp.tile(jnp.asarray(x, jnp.bfloat16), (N, 1)), sh),
+        *weights,
+        shared_gate_weight,
+        jax.device_put(jnp.tile(jnp.asarray(tw, jnp.bfloat16), (N, 1)), sh),
+        jax.device_put(jnp.tile(jnp.asarray(ids), (N, 1)), sh),
     )
+    specs = (P("d"),) * 10 + (P(), P("d"), P("d"))
+
+    def run(fn):
+        out = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )(*args)
+        return np.asarray(out.astype(jnp.float32)).reshape(N, m, H)
+
+    def max_rel(a, ref):
+        return (
+            np.linalg.norm(a - ref, axis=1)
+            / np.maximum(np.linalg.norm(ref, axis=1), 1e-30)
+        ).max()
+
+    got = run(functools.partial(_fused, ep=ep))
+    ref = run(functools.partial(_reference, ep=ep))
+    assert all(np.array_equal(got[0], got[r]) for r in range(N)), "ranks disagree"
     assert np.isfinite(got).all()
     # FP8 activations, BF16 slab rows and a BF16 all-reduce against f32 math:
     # a few percent per row.
-    assert _max_rel(got[0], ref[0]) < 0.08
+    assert max_rel(got[0], ref[0]) < 0.08
     # Positive control: a reference missing one routed expert must fail the bound.
     # In EP mode the local id of expert ids[0, 0] is only that on its owner rank.
     broken = run(functools.partial(_reference, skip_expert=int(ids[0, 0]) % E, ep=ep))
-    assert _max_rel(got[0], broken[0]) > 0.08
-
-
-@pytest.mark.parametrize("path", ["kernel", "blocked"])
-def test_glm_ungated_shared_expert_routed_scale(setup, path):  # noqa: F811
-    """GLM-5.2 under EP: no shared-expert gate and routed_scaling_factor 2.5 on
-    the routed experts only, against the kernel-off composition. Must-fail
-    control: the scale applied to the shared expert too."""
-    run, _ = _inputs(setup, 256, ep=True, padded=True, seed=200)
-    got = run(functools.partial(_PATHS[path], ep=True, glm=True))
-    ref = run(functools.partial(_reference, ep=True, glm=True))
-    assert np.isfinite(got).all()
-    assert _max_rel(got[0], ref[0]) < 0.08
-    wrong = run(functools.partial(_reference, ep=True, glm=True, scale_shared=True))
-    assert _max_rel(got[0], wrong[0]) > 0.08
-
-
-def test_plan_blocks_only_oversized_experts():
-    """Whole experts for Qwen3.5-397B (TP8 i 128, EP8 i 1024) and GLM-5.2 at
-    TP16 (i 128) at any token count; GLM-5.2's EP16 experts (i 2048) stream
-    512-wide blocks through 3 slots below 8192 tokens, 1024-wide through 2
-    from 8192 (taller tiles)."""
-    if jax.default_backend() != "tpu":
-        pytest.skip("requires a TPU")
-    for tokens in (512, 16384):
-        assert plan_blocks(tokens, 4096, 128, 128, F8) is None
-        assert plan_blocks(tokens, 4096, 1024, 128, F8) is None
-        assert plan_blocks(tokens, 6144, 128, 128, F8) is None
-    assert plan_blocks(1024, 6144, 2048, 128, F8) == (512, 3, 512)
-    assert plan_blocks(8192, 6144, 2048, 128, F8) == (1024, 2, 256)
+    assert max_rel(got[0], broken[0]) > 0.08

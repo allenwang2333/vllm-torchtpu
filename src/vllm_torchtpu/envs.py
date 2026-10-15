@@ -11,30 +11,42 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = -1
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
-    TPU_SPARSE_MLA_LIVE_GATHER: bool = True
+    TPU_SPARSE_MLA_LIVE_GATHER: bool = False
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
-    TPU_DCP_RS_OUT_PRECISION: bool = True
-    TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
-    TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
-    TPU_MLA_SPARSE_SPLIT_Q: bool = True
-    TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
-    TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
-    TPU_MTP_DCP_MERGE_SIZED: bool = False
-    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
+    TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = True
+    TPU_MTP_DCP_MERGE_SIZED: bool = True
+    TPU_DCP_MLA_SEND_LAYOUT: bool = False
+    TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
+    TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
+    TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_CHUNKED: int = 8
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
-    TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
-    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
-    TPU_DCP_MERGE_RS_BF16: int = 0
-    TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
-    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
-    TPU_DCP_MLA_FUSED_PREP: bool = False
-    TPU_DCP_MLA_MIXED_LIVE: bool = False
-    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
-    TPU_MLA_DECODE_ROW_WIDTHS: str = ""
-    TPU_DCP_MLA_MIXED_BODY: str = ""
-    TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
-    TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
+    TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = True
+    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 2048
+    TPU_DCP_MERGE_CHUNKED_SMALL: int = 0
+    TPU_DCP_MERGE_RS_BF16: int = 1
+    TPU_DCP_MLA_MERGE_PIECES: int = 0
+    TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_WEIGHTED_HM: bool = False
+    TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_RS_LAG: int = 0
+    TPU_DCP_MERGE_VSPACE: bool = False
+    TPU_DCP_MERGE_VSPACE_MIN_TOKENS: int = 1024
+    TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
+    TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
+    TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 32
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = True
+    TPU_DCP_MLA_FUSED_PREP: bool = True
+    TPU_DCP_MLA_MIXED_LIVE: bool = True
+    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = "256,384"
+    TPU_MLA_DECODE_ROW_WIDTHS: str = "128,256,384"
+    TPU_DCP_MLA_MIXED_BODY: str = "1"
+    TPU_DCP_MLA_MIXED_KERNEL_V2: bool = False
+    TPU_DCP_MLA_MIXED_UNION_GATHER: str = ""
+    TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = True
+    TPU_DCP_MLA_MIXED_FUSED_PREP: bool = True
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -81,8 +93,13 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = False
+    FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
-    USE_MOE_TP_DECODE_KERNEL: bool = False
+    USE_MOE_TP_DECODE_KERNEL: bool = True
+    TPU_MOE_TP_DECODE_SPLIT_META: bool = False
+    TPU_MOE_TP_DECODE_SHARED_META: bool = False
+    TPU_RMSNORM_DECODE_MATERIALIZE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -123,6 +140,9 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = True
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = True
     TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = True
+    TPU_INDEXER_QPREP_FUSED: bool = False
+    TPU_INDEXER_QPREP_FUSED_MIN_TOKENS: int = 128
+    TPU_INDEXER_K_WRITE_COMPACT: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -139,6 +159,10 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
+    TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = True
+    TPU_STREAMIDX_MIXED_KV_PAGES: int | None = 4
+    TPU_SC_TOPK_ROW_CAP: bool = True
+    TPU_SC_TOPK_VALID_READS: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
@@ -152,10 +176,12 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
-    TPU_MLA_TC_KV_WRITER: bool = False
-    TPU_MLA_DECODE_PROLOGUE: bool = False
-    TPU_MLA_KV_WRITE_IN_GATHER: bool = False
-    TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_MLA_TC_KV_WRITER: bool = True
+    TPU_MLA_DECODE_PROLOGUE: bool = True
+    TPU_MLA_ABSORB_TOKEN_MAJOR: str = "0"
+    TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS: int = 64
+    TPU_MLA_KV_WRITE_IN_GATHER: bool = True
+    TPU_INDEXER_QB_OVERLAP: bool = True
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -214,6 +240,8 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    TPU_SCHED_PREFILL_SRPT: bool = False
+    TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -229,7 +257,10 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
-    TPU_MTP_EH_PROJ_TP: bool = False
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
+    TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
+    TPU_SAMPLER_VOCAB_PARALLEL: bool = True
+    TPU_MTP_EH_PROJ_TP: bool = True
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
@@ -462,9 +493,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
     # Capped path: the native gather skips each window row's atoms past its live
-    # top-k count (outputs unchanged). On by default.
-    "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=True),
-    # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
+    # top-k count (outputs unchanged). Opt-in.
+    "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=False),
+    # All-to-all DCP MLA lse merge for decode-sized steps (default on).
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=True),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
@@ -493,7 +524,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each bucket at its concrete shape, so the choice leaves no guard. Same
     # per-element weights as the reduce-scatter merge; only the order the
     # ranks' weighted partials are summed in differs.
-    "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=False),
+    "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=True),
+    # With TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and TPU_MLA_DECODE_PROLOGUE: on
+    # decode buckets the DCP MLA kernel writes the packed real-rows exchange's
+    # send buffer itself (partials destination-major, lse words in place), so
+    # no XLA retile / concat runs between the kernel and the all-to-all. Same
+    # bits sent, same merge.
+    "TPU_DCP_MLA_SEND_LAYOUT": env_bool("TPU_DCP_MLA_SEND_LAYOUT", default=False),
+    # With TPU_DCP_MLA_SEND_LAYOUT: run the receive side (ragged exchange,
+    # lse word unpack and the merge) as one JAX op over the received buffer
+    # instead of torch ops on its views. Same arithmetic, op for op.
+    "TPU_DCP_MLA_SEND_LAYOUT_MERGE": env_bool(
+        "TPU_DCP_MLA_SEND_LAYOUT_MERGE", default=False
+    ),
+    # With TPU_DCP_MLA_SEND_LAYOUT: the exchange and the unpack of the
+    # received buffer (slices + bitcasts, no arithmetic) as one JAX op, the
+    # merge arithmetic unchanged in torch. Same bits.
+    "TPU_DCP_MLA_SEND_LAYOUT_UNPACK": env_bool(
+        "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", default=False
+    ),
+    # TPU_DCP_MLA_SEND_LAYOUT only on decode buckets of at least this many
+    # tokens (0 = every bucket it supports). Below ~8 tokens the send buffer's
+    # SEND_PAD_ROWS lse row block is as large as the partial rows, so the
+    # exchange carries ~2x the packed real-rows bytes (mirror: bucket 4 +1.4 %,
+    # buckets 8 / 16 -1.8 / -2.8 %). Smaller buckets keep the packed a2a merge.
+    "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS": env_int(
+        "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS", 0
+    ),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
@@ -520,13 +577,92 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": env_int(
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS", 0
     ),
+    # The chunked merge's chunk count for the buckets that gather their lse
+    # once (TPU_DCP_MERGE_CHUNKED_LSE_AG, <= ..._LSE_AG_MAX_TOKENS: c1k, c2k)
+    # instead of TPU_DCP_MERGE_CHUNKED (kept for the larger buckets). Their
+    # V-space reduce-scatters compile synchronous, so each chunk pays the
+    # collective's fixed cost on the critical path; fewer, larger chunks pay it
+    # fewer times. Per-row arithmetic is unchanged (bit-identical). 0 = off;
+    # values below 2 are ignored (an unsplit bucket lifts another input set).
+    "TPU_DCP_MERGE_CHUNKED_SMALL": env_int("TPU_DCP_MERGE_CHUNKED_SMALL", 0),
     # NOT bitwise (needs the accuracy gate): the chunked merge
     # (TPU_DCP_MERGE_CHUNKED) sends its LSE-weighted partial in bf16 instead
     # of f32, halving the bytes of the SparseCore-bound reduce-scatter chain.
     # 1 = bf16 reduce-scatter (the collective sums in its operand dtype);
     # 2 = bf16 all-to-all of the same bytes, then a local f32 sum over the
-    # ranks (bf16 wire, f32 accumulation). 0 = f32 reduce-scatter (today).
-    "TPU_DCP_MERGE_RS_BF16": env_int("TPU_DCP_MERGE_RS_BF16", 0),
+    # ranks (bf16 wire, f32 accumulation). 0 = f32 reduce-scatter. Default 1,
+    # accuracy-gated on GLM-5.2 DCP16 (mmlu_pro); only backbone buckets of at
+    # least TPU_DCP_MERGE_CHUNKED_MIN_TOKENS take the chunked merge.
+    "TPU_DCP_MERGE_RS_BF16": env_int("TPU_DCP_MERGE_RS_BF16", 1),
+    # With TPU_DCP_MERGE_CHUNKED, mixed / prefill buckets the merge chunks: the
+    # DCP sparse MLA kernel writes each merge chunk's rows (output and lse)
+    # into that chunk's own buffer instead of one q-aliased buffer threaded
+    # through all its attention chunks (`out_pieces`), so merge chunk k's lse
+    # gather, weights and SparseCore reduce-scatter depend only on the
+    # attention chunks that produce its rows and can run under the later
+    # ones. Every merged row is bit-identical. 2 also splits the one lse
+    # gather of TPU_DCP_MERGE_CHUNKED_LSE_AG into chunk 0's rows and the rest,
+    # so chunk 0's reduce-scatter need not wait for the last attention chunk
+    # (same gathered rows). 3 also issues every attention chunk's SparseCore
+    # gather first and ties the later chunks' gathers to piece 0's buffers
+    # (`out_pieces_gather_first`), so the schedule closes the gathers before
+    # piece 0's reduce-scatter instead of holding them open under the
+    # attention calls. 0 = off.
+    "TPU_DCP_MLA_MERGE_PIECES": env_int("TPU_DCP_MLA_MERGE_PIECES", 0),
+    # The kernel pieces of TPU_DCP_MLA_MERGE_PIECES only for buckets of at
+    # least this many tokens (0 = every chunked bucket). The lse-gather head
+    # split (2) is torch-side and does not follow it (a token-count test there
+    # specializes range-compiled graphs).
+    "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": env_int(
+        "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS", 0
+    ),
+    # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) builds each
+    # chunk's weighted f32 operand heads-major in one TensorCore Pallas kernel
+    # (`kernels/mla/dcp_weighted_hm.py`) instead of a tokens-major weight
+    # multiply plus the relayout copy XLA adds for the head-axis
+    # reduce-scatter (which it may offload to the SparseCore and complete
+    # late). Same products, same reduce-scatter: bit-identical.
+    "TPU_DCP_MERGE_WEIGHTED_HM": env_bool("TPU_DCP_MERGE_WEIGHTED_HM", default=False),
+    # With TPU_DCP_MERGE_WEIGHTED_HM: the Pallas kernel only for buckets of at
+    # least this many tokens (0 = every chunked bucket). Smaller buckets build
+    # the same heads-major operand with XLA ops inside the same op (multiply,
+    # where, transpose, cast: the same bits). Tested in JAX on the chunk's
+    # static row count times TPU_DCP_MERGE_CHUNKED, not in torch, where a
+    # token-count test specializes range-compiled graphs.
+    "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", 0
+    ),
+    # With TPU_DCP_MERGE_WEIGHTED_HM: chunk k's weights wait (optimization
+    # barrier) for chunk k-n's merged result, so the schedule completes the
+    # SparseCore reduce-scatters as the chain runs instead of all after the
+    # last chunk (the offload stalls with three uncompleted in flight).
+    # Ordering only: bit-identical. 0 = off.
+    "TPU_DCP_MERGE_RS_LAG": env_int("TPU_DCP_MERGE_RS_LAG", 0),
+    # The chunked reduce-scatter merge (TPU_DCP_MERGE_CHUNKED) merges in V
+    # space: every rank applies W_UV for all of the DCP group's heads to its
+    # own partial before the weighted reduce-scatter, so the collective moves
+    # v_head_dim (256) instead of kv_lora_rank (512) columns per head, and the
+    # local W_UV after the merge is skipped. The lse weight is a per-(token,
+    # head) scalar, so it commutes with W_UV; not bitwise (the bf16 rounding
+    # moves from the latent to V). Needs W_UV gathered for the whole DCP
+    # group at load (+heads*kv_lora*v_head_dim weights per layer). Backbone
+    # chunked buckets only; with TPU_DCP_MERGE_RS_BF16=2 it stays off.
+    "TPU_DCP_MERGE_VSPACE": env_bool("TPU_DCP_MERGE_VSPACE", default=False),
+    # TPU_DCP_MERGE_VSPACE only for buckets of at least this many tokens. At or
+    # below TPU_DCP_MERGE_CHUNKED_MIN_TOKENS it is implied by the chunk gate
+    # and adds no token-count test; above it, the comparison is a new
+    # trace-time shape guard on the backbone.
+    "TPU_DCP_MERGE_VSPACE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_VSPACE_MIN_TOKENS", 1024
+    ),
+    # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
+    # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
+    # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
+    # instead of materialising a padded [T, H, 640] concat, and export the
+    # log-sum-exp as a lane-dense f32[T, H] instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=True),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
     # this many query tokens per kernel grid step instead of one, so the
@@ -592,8 +728,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # steps -- "1" = the bitwise-identical default set (byte-transpose NOPE
     # unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
     # MXU/VPU dependency), or a comma list of lever names
-    # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty = off.
-    "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
+    # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty or "0" = off.
+    "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", "1"),
+    # With TPU_DCP_MLA_MIXED_BODY set: add the stage-A body levers
+    # (kernels/mla/sparse/kernel.py MIXED_KERNEL_V2_LEVERS) -- the capped
+    # fix-up only on steps that overflow, and a two-token stacked softmax with
+    # the unpacked KV staged in VMEM. Bitwise identical to the body levers
+    # alone.
+    "TPU_DCP_MLA_MIXED_KERNEL_V2": env_bool(
+        "TPU_DCP_MLA_MIXED_KERNEL_V2", default=False
+    ),
+    # DCP sparse MLA, mixed buckets on the live-group path
+    # (TPU_DCP_MLA_MIXED_LIVE): the SparseCore gather reads each half grid
+    # step's distinct cache rows from HBM once into SparseCore shared memory
+    # and writes every live slot from there (kernels/mla/sparse/
+    # native_sc_gather.py dsa_gather_native_sc_union). The rows on every live
+    # slot are the same; chunks with a token past the cap window gather as
+    # before.
+    # "1" = the measured default (native_sc_gather.UNION_GATHER_DEFAULT), or a
+    # comma list of "solo" | "pair" (one union per subcore / per grid step)
+    # and "rope" (rope rows from the union too). Empty / "0" = off.
+    "TPU_DCP_MLA_MIXED_UNION_GATHER": lambda: os.getenv(
+        "TPU_DCP_MLA_MIXED_UNION_GATHER", ""
+    ),
     # DCP sparse MLA, mixed / prefill buckets (> 32 tokens): the mixed-step
     # counterpart of TPU_DCP_MLA_MASK_IN_KERNEL. Drop the per-layer owns mask,
     # dummy-key update of the top-k (and the copy of the top-k it forces when
@@ -644,9 +801,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA with query replication: rope q_pe inside the attention
     # kernel from the raw q head (no torch-side q rope / q_pe concat), and on
     # decode buckets let the kernel lay down the lse sentinel itself (no
-    # XLA-initialised aliased lse). Needs TPU_MLA_SPARSE_SPLIT_Q and
-    # TPU_MLA_ROPE_NEOX_PERMUTE.
-    "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
+    # XLA-initialised aliased lse). Needs TPU_DCP_MLA_SPLIT_Q_LSE and
+    # TPU_MLA_ROPE_NEOX_PERMUTE. On by default; the default steps aside without
+    # split q/lse or for a q head other than 192 + 64, which an explicit
+    # setting refuses.
+    "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=True),
+    # MLA W_UK absorb computed token-major on buckets of at least
+    # TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS tokens (mixed / prefill), instead
+    # of `transpose -> bmm -> transpose`, whose transposes XLA lowers to
+    # full-size q / ql_nope relayouts. "pallas" (= "1"): a Pallas kernel that
+    # reads q_b's [T, H*qk] and writes the [T, H, lora] the attention kernel
+    # reads; "einsum": torch.einsum("thd,hdc->thc"), layout left to XLA.
+    # Decode buckets keep the bmm.
+    "TPU_MLA_ABSORB_TOKEN_MAJOR": env_with_choices(
+        "TPU_MLA_ABSORB_TOKEN_MAJOR", "0", ["0", "1", "pallas", "einsum"]
+    ),
+    "TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS": env_int(
+        "TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", 64
+    ),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache
@@ -836,12 +1008,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
-    # With FUSED_MOE_DECODE_KERNEL=1, serve the armed TP-expert layers' steps
-    # above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens with the fused MoE prefill
-    # kernel (routed and shared experts, combine and all-reduce) instead of
-    # the GMM MoE path, in the same exported program. EP layers keep the GMM
-    # path for now.
+    # Serve steps of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS tokens of the
+    # same layers, and of TP-expert layers whose shared expert has no gate
+    # (GLM-5.2), with the fused MoE prefill kernel: routed and shared experts,
+    # combine and all-reduce (layers/adapter/fused_moe_prefill.py). It takes
+    # precedence over the decode kernel; smaller steps run the decode kernel
+    # when that is on and its cap allows, else the GMM MoE path.
     "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL"),
+    "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
+        "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
+    ),
+    # With FUSED_MOE_PREFILL_KERNEL: run the stage-A build of the prefill kernel
+    # (kernels/experimental/fused_moe_prefill/fused_moe_prefill_kernel_v2.py,
+    # STAGE_A): both matmuls on the explicit MXU with the down epilogue per
+    # 256-column N-tile (no spilled f32 accumulator), 256-row tiles on 32-row
+    # rungs from 4096 tokens, combine descriptors from a carried flat pointer.
+    # Same numerics as the default build, bit for bit. Per-rank shapes the
+    # stage-A body does not handle (gate|up wider than 256 columns, e.g. TP8)
+    # run the default build.
+    "FUSED_MOE_PREFILL_KERNEL_V2": env_bool("FUSED_MOE_PREFILL_KERNEL_V2"),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
@@ -852,10 +1037,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
     # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
     # the real token count from its padding mask), otherwise every layer keeps
-    # the usual path. Arms nothing while FUSED_MOE_DECODE_KERNEL is set. Remove
-    # once the path is the default for these layers or is replaced by another
-    # fused TP MoE path.
-    "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # the usual path. On by default; without TPU_MOE_SKIP_PADDED_TOKENS the
+    # default does not try to arm at all (an explicit 1 still arms and logs why
+    # each layer was refused). Remove once the path is the default for these layers or
+    # is replaced by another fused TP MoE path.
+    "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL", True),
+    # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
+    # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
+    # layer, ~0.6 us in situ). Exact; default off.
+    "TPU_MOE_TP_DECODE_SPLIT_META": env_bool(
+        "TPU_MOE_TP_DECODE_SPLIT_META", default=False
+    ),
+    # moe_tp_decode: every armed layer reads ONE experts_start buffer (per
+    # value) instead of its own, so the per-layer scalar meta stack
+    # (n_valid, rank, experts_start) is the same HLO value in every layer and
+    # XLA CSE keeps one per step (was one HBM->HBM op per layer). Exact.
+    "TPU_MOE_TP_DECODE_SHARED_META": env_bool("TPU_MOE_TP_DECODE_SHARED_META"),
+    # Decode-sized residual RMSNorm (rows below the Pallas threshold): pin the
+    # f32 sum x + residual and the bf16 residual it returns behind an
+    # optimization barrier, so XLA materializes each once instead of
+    # re-adding their components (which keeps them live across the MoE
+    # kernel, evicted to HBM, and re-read from HBM by every consumer fusion).
+    # Same ops, same values. Exact.
+    "TPU_RMSNORM_DECODE_MATERIALIZE": env_bool("TPU_RMSNORM_DECODE_MATERIALIZE"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -1025,6 +1229,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INDEXER_ROPE_NEOX_PERMUTE": env_bool(
         "TPU_INDEXER_ROPE_NEOX_PERMUTE", default=True
     ),
+    # Indexer q prep (rope + per-(token, head) amax + fp8 cast) as one Pallas
+    # pass over the wq_b output, written in the top-k op's [T, H, D] layout
+    # (kernels/indexer_qprep.py). Needs TPU_INDEXER_ROPE_NEOX_PERMUTE.
+    # Bit-identical to the unfused path.
+    "TPU_INDEXER_QPREP_FUSED": env_bool("TPU_INDEXER_QPREP_FUSED"),
+    # Token counts below this keep the same expression in plain XLA (decided on
+    # the static JAX shape inside the op): at decode buckets the kernel's fixed
+    # cost exceeds the whole XLA chain (twin j-58e2f29b: +0.2 ms per decode step).
+    "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS": env_int(
+        "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS", 128
+    ),
+    # DCP indexer K write: compact this rank's owned rows (about T / dcp) to the
+    # front before the Pallas writer, so its scalar walk skips the other
+    # ranks' rows. Same rows written, same order.
+    "TPU_INDEXER_K_WRITE_COMPACT": env_bool("TPU_INDEXER_K_WRITE_COMPACT"),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -1150,6 +1369,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_MIXED_KV_PAGES": env_positive_int_or_none(
         "TPU_STREAMIDX_MIXED_KV_PAGES"
     ),
+    # SparseCore top-k over 32+ rows of a 32K..64K-word bucket: one row per
+    # subcore (P=1, all 32 busy) instead of P=2, reading each row only up to
+    # its length. Past 64K words (DCP <= 8 per-rank rows): P = n / 64K
+    # subcores per row, the row split between them by its length, again
+    # reading only up to it. Bitwise identical output.
+    "TPU_SC_TOPK_ROW_CAP": env_bool("TPU_SC_TOPK_ROW_CAP", default=True),
+    # #1905: route every `sparsecore_topk` call to `sparsecore_topk_valid`,
+    # whose subcores fetch only each row's valid prefix (manual wave loop at
+    # every P, per-wave double buffer, min P = cdiv(n, 64K), row lengths read
+    # in-kernel). Takes precedence over TPU_SC_TOPK_ROW_CAP. Same index sets.
+    "TPU_SC_TOPK_VALID_READS": env_bool("TPU_SC_TOPK_VALID_READS", default=False),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA
@@ -1395,6 +1625,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
     ),
+    # Scheduler (core/prefill_srpt.py): shortest-remaining-prefill-first across
+    # in-progress prefills and waiting requests; a long running prefill is held
+    # back for a step while a shorter one goes in. Off by default.
+    "TPU_SCHED_PREFILL_SRPT": env_bool("TPU_SCHED_PREFILL_SRPT", False),
+    # ... stop holding one prefill after this many consecutive held steps
+    # (0 = no limit).
+    "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS": env_int(
+        "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS", 0
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1513,6 +1752,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
         "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
     ),
+    # With TPU_FUSED_ADD_RMSNORM: a residual-stream norm whose output feeds a
+    # per-channel FP8 linear (the MLA fused_qkv_a_proj; a dense layer's
+    # gate_up_proj) also emits that linear's per-row fp8 activation + scale from
+    # the same Pallas pass, and the linear skips its amax + convert passes over
+    # the bf16 output. Bit-identical. Only where the Pallas norm already runs
+    # (the same rows predicate); decode buckets are untouched.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
+    # With TPU_FUSED_ADD_RMSNORM, USE_MOE_TP_DECODE_KERNEL and
+    # FUSED_MOE_PREFILL_KERNEL: each MoE layer's post-attention norm also emits
+    # the fused MoE prefill kernel's own fp8 rows and scales (bit for bit its
+    # _quantize_rows) on the norm's Pallas branch, and the MoE op's prefill
+    # kernel takes them instead of quantizing again. The router still reads
+    # the bf16 output. Steps below the norm's Pallas rows threshold unchanged.
+    "TPU_FUSED_ADD_RMSNORM_QUANT_MOE": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT_MOE"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense

@@ -14,6 +14,7 @@
 """Standalone sparse-attention tests for both physical cache layouts."""
 
 import functools
+import re
 from unittest import mock
 
 import jax
@@ -543,24 +544,19 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             2e-2,
         )
 
-    def _capped_live_problem(self, query_tokens, real_tokens, seed, counts=None):
+    def _capped_live_problem(self, query_tokens, real_tokens, seed):
         topk = 2048
         rng = np.random.default_rng(seed)
         problem = _build_problem(
             rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
         )
-        if counts is None:
-            # 0 / 1 live, atom boundaries (64, 128), the cap and one past it
-            # (window 2), every window (2048).
-            counts = np.resize(
-                np.array(
-                    [0, 1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1025, 2048]
-                ),
-                query_tokens,
-            )
-            rng.shuffle(counts)
-        counts = np.asarray(counts)
-        assert counts.shape == (query_tokens,)
+        # 0 / 1 live, atom boundaries (64, 128), the cap and one past it
+        # (window 2), every window (2048).
+        counts = np.resize(
+            np.array([0, 1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1025, 2048]),
+            query_tokens,
+        )
+        rng.shuffle(counts)
         live = np.arange(topk)[None, :] < counts[:, None]
         topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
 
@@ -670,72 +666,6 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.asarray(lse), np.asarray(ref_lse))
         self.assertTrue(np.isnan(np.asarray(ctl, np.float32)[token]).any())
         self.assertFalse(np.isnan(np.asarray(out, np.float32)).any())
-
-    def test_capped_live_rows_with_dcp_mode_slice_rungs(self):
-        """`capped_live_rows` under `is_dcp_mode`: the slice rungs read rows the
-        live gather left unwritten (rung >= the batch max, > shorter rows' live
-        atoms). Those rows NaN-poisoned must not reach the output; one batch per
-        rung, an all-empty batch and two overflow batches. Positive control as above.
-        """
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("SparseCore cache-layout attention requires a TPU")
-        query_tokens = real_tokens = 128
-        cap, atom, bsz = 512, sparse_mla.GATHER_ATOM_ROWS, 16
-        batches = [
-            [1, 5, 17, 33, 40, 50, 63, 64, 2, 9, 30, 44, 60, 61, 62, 0],  # rung 64
-            [65, 70, 1, 0, 100, 127, 128, 3, 90, 66, 64, 2, 110, 120, 80, 5],  # 128
-            [129, 1, 200, 30, 150, 64, 65, 0, 199, 2, 170, 128, 7, 140, 9, 180],  # 256
-            [256, 0, 1, 255, 63, 64, 65, 127, 128, 129, 191, 192, 193, 2, 3, 4],  # 256
-            [0] * bsz,  # all-empty batch: zero-batch bypass
-            [513, 1, 64, 100, 0, 130, 257, 300, 2, 65, 400, 511, 512, 10, 20, 30],
-            [2048, 1025, 0, 1, 64, 600, 700, 129, 2, 3, 511, 512, 513, 256, 5, 6],
-            [65, 66, 127, 128, 129, 64, 63, 65, 66, 67, 70, 80, 90, 100, 110, 129],
-        ]
-        counts = np.concatenate([np.asarray(b) for b in batches])
-        run, base, _ = self._capped_live_problem(
-            query_tokens, real_tokens, 11, counts=counts
-        )
-        kw = dict(
-            base,
-            gather_and_attention_chunk_size=64,
-            topk_cap=cap,
-            is_dcp_mode=True,
-            attention_kernel_batch_size=bsz,
-        )
-        gather = sparse_mla.native_sc_gather.dsa_gather_native_sc
-        poison_live_row = []
-
-        def poisoned(nope_c, rope_c, idx, *, row_live_atoms=None, **k):
-            nope, rope = gather(nope_c, rope_c, idx, row_live_atoms=row_live_atoms, **k)
-            assert row_live_atoms is not None
-            slot = jnp.arange(idx.shape[1])[None, :]
-            dead = (slot >= row_live_atoms[:, None] * atom).reshape(-1)
-            if poison_live_row:
-                dead = dead.at[poison_live_row[0]].set(True)
-            nan = jnp.uint32(0xFFFFFFFF)
-            nope = jnp.where(dead[:, None], nan, nope)
-            rope = jnp.where(dead[::4, None], nan, rope)
-            return nope, rope
-
-        ref, ref_lse = jax.block_until_ready(run(**kw))
-        with mock.patch.object(
-            sparse_mla.native_sc_gather, "dsa_gather_native_sc", poisoned
-        ):
-            out, lse = jax.block_until_ready(
-                run(jit=False, capped_live_rows=True, **kw)
-            )
-            # Control: slot 0 of token 1 (batch 0, rung 64, 5 live rows).
-            token = 1
-            poison_live_row.append(token * cap)
-            ctl, _ = jax.block_until_ready(run(jit=False, capped_live_rows=True, **kw))
-        np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
-        np.testing.assert_array_equal(np.asarray(lse), np.asarray(ref_lse))
-        self.assertFalse(np.isnan(np.asarray(out, np.float32)).any())
-        self.assertTrue(np.isnan(np.asarray(ctl, np.float32)[token]).any())
-        # The all-empty batch is the bypass: zeros and a -inf lse.
-        empty = slice(4 * bsz, 5 * bsz)
-        np.testing.assert_array_equal(np.asarray(out, np.float32)[empty], 0)
-        self.assertTrue(np.all(np.isneginf(np.asarray(lse)[empty])))
 
     @parameterized.product(
         (
@@ -1187,6 +1117,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     ("noinf",),
                     ("pbf16",),
                     sparse_mla.MIXED_BODY_DEFAULT,
+                    # TPU_DCP_MLA_MIXED_KERNEL_V2 stage-A levers (exact).
+                    ("fxskip",),
+                    ("pair",),
+                    sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS,
                 )
             ),
             {
@@ -1593,6 +1527,242 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
         bad, _ = jax.block_until_ready(run(moved, mixed_fused_prep=True))
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    @parameterized.product(
+        (
+            {"query_tokens": 512, "seq_q": (4, 4, 504)},
+            {"query_tokens": 1024, "seq_q": (4, 4, 1016)},
+        ),
+        overlap=(True, False),
+        overflow=(False, True),
+    )
+    def test_mixed_union_gather_bit_identical(self, query_tokens, seq_q, overlap, overflow):
+        """TPU_DCP_MLA_MIXED_UNION_GATHER on the served mixed config (raw top-k,
+        fused prep, live gather, widths, V2 levers): every real row's output
+        and lse bit for bit, with heavy cross-token overlap (union hits) and
+        without (union rows past the cap -> units read from HBM), and with a
+        row past the cap window (that chunk takes the incumbent work)."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261015 + query_tokens + 2 * overlap + int(overflow))
+        problem, _, _, _, page_table, cu_q_lens, distribution = self._split_q_lse_case(
+            query_tokens, seq_q, rng
+        )
+        counts = np.clip(rng.normal(256, 40, size=query_tokens), 0, 448).astype(int)
+        counts[16:20] = 0
+        if overflow:
+            counts[300] = 700  # chunk 1 reaches past window 0
+        topk = np.asarray(problem["topk"]).copy()
+        if overlap:
+            # each token picks from a 600-entry pool of its sequence (served-like
+            # reuse across neighbouring tokens)
+            pool = topk[0, :600]
+            for t in range(query_tokens):
+                topk[t, :600] = rng.permutation(pool)
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), jnp.asarray(topk), -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+        levers = sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                attention_kernel_batch_size=16,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=levers,
+                mixed_fused_prep=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run(topk_raw))
+        for kw in (
+            {"mixed_union_gather": True},
+            {"mixed_union_gather": True, "mixed_union_gather_rope": True},
+            {"mixed_union_gather": True, "mixed_union_gather_pair": True},
+            {
+                "mixed_union_gather": True,
+                "mixed_union_gather_rope": True,
+                "mixed_union_gather_pair": True,
+            },
+        ):
+            out, lse = jax.block_until_ready(run(topk_raw, **kw))
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens], bits(ref)[:real_tokens], err_msg=str(kw)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens].view(np.uint32),
+                err_msg=str(kw),
+            )
+            self.assertTrue(np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all())
+        # Positive controls: a wrong union row on hits, a dropped last slot.
+        # ("no_fallback" leaves rows unwritten, which in-process buffer reuse
+        # can refill with the previous run's correct rows; its control runs
+        # first on fresh buffers in the kernel_work gather check instead.)
+        faults = ["kv_lo"] + (["map_off"] if overlap else [])
+        for fault in faults:
+            for pair in (False, True):
+                bad, _ = jax.block_until_ready(
+                    run(
+                        topk_raw,
+                        mixed_union_gather=True,
+                        mixed_union_gather_pair=pair,
+                        mixed_union_gather_fault=fault,
+                    )
+                )
+                self.assertFalse(
+                    np.array_equal(bits(bad)[:real_tokens], bits(ref)[:real_tokens]),
+                    (fault, pair),
+                )
+
+    def _merge_pieces_run(self, query_tokens, seq_q):
+        """The served mixed config (fused prep, live gather, widths, levers,
+        in-kernel mask) at `query_tokens`; returns (run, counts, real)."""
+        rng = np.random.default_rng(20261012 + query_tokens)
+        problem, _, _, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        counts[16:32] = 0
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+
+        def run(**kw):
+            return sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_raw,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=sparse_mla.MIXED_BODY_DEFAULT,
+                mixed_fused_prep=True,
+                **kw,
+            )
+
+        return run, counts, int(sum(seq_q))
+
+    @parameterized.parameters(
+        # The served mixed buckets: c1k (merge chunk 128 < attention chunk
+        # 256), c2k (one chunk per piece), c8k (two chunks per piece).
+        {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        {"query_tokens": 2048, "seq_q": (4, 4, 2040)},
+        {"query_tokens": 4096, "seq_q": (4, 4, 3500)},
+    )
+    def test_merge_pieces_bit_identical(self, query_tokens, seq_q):
+        """TPU_DCP_MLA_MERGE_PIECES (`out_pieces=8`): every real row's output
+        and every row's lse bit for bit, and the rows past the real tokens
+        weighted 0 by any merge (lse -inf) on both paths."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, real = self._merge_pieces_run(query_tokens, seq_q)
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run())
+        out, lse = jax.block_until_ready(run(out_pieces=8))
+        # Gathers first (TPU_DCP_MLA_MERGE_PIECES=3): the same buffers.
+        out_gf, lse_gf = jax.block_until_ready(
+            run(out_pieces=8, out_pieces_gather_first=True)
+        )
+        w = np.isfinite(np.asarray(lse)).any(axis=-1)
+        np.testing.assert_array_equal(bits(out_gf)[w], bits(out)[w])
+        np.testing.assert_array_equal(
+            np.asarray(lse_gf).view(np.uint32), np.asarray(lse).view(np.uint32)
+        )
+        self.assertEqual(out.shape, ref.shape)
+        self.assertEqual(lse.shape, ref_lse.shape)
+        np.testing.assert_array_equal(bits(out)[:real], bits(ref)[:real])
+        np.testing.assert_array_equal(
+            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
+        # Every row a merge can weight above 0 (any finite lse) matches bit for
+        # bit, padding rows the grid wrote included; the rest have lse -inf on
+        # both paths, weight 0 in the merge's `where` whatever they hold.
+        weighted = np.isfinite(np.asarray(lse)).any(axis=-1)
+        np.testing.assert_array_equal(bits(out)[weighted], bits(ref)[weighted])
+        self.assertTrue(np.all(np.asarray(lse)[~weighted] == -np.inf))
+        self.assertGreater(int((~weighted).sum()), 0)
+        # Positive control: swapping two pieces is caught.
+        bad, _ = jax.block_until_ready(run(out_pieces=8, out_pieces_fault="swap"))
+        self.assertFalse(np.array_equal(bits(bad)[:real], bits(ref)[:real]))
+
+    @parameterized.parameters((2048, 1), (4096, 2))
+    def test_merge_pieces_cut_the_dependency(self, query_tokens, calls):
+        """Piece 0 alone needs only its own attention chunks: with
+        `out_pieces=8`, a program reading rows [0, T/8) keeps `calls` MLA
+        kernel calls; the threaded incumbent keeps all T/256 of them."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, _ = self._merge_pieces_run(query_tokens, (4, 4, query_tokens - 8))
+        rows = query_tokens // 8
+
+        # Named `layers` for `_optimized_hlo`'s XLA-dump fallback glob.
+        def layers(dummy, *, pieces):
+            out, lse = run(out_pieces=pieces)
+            return out[:rows].astype(jnp.float32).sum() + lse[:rows].sum() + dummy
+
+        counts = {}
+        for pieces in (0, 8):
+            fn = jax.jit(functools.partial(layers, pieces=pieces))
+            hlo = _optimized_hlo(fn, jnp.float32(0))
+            counts[pieces] = sum(
+                "custom-call(" in line and "MLA-sparsecore" in line
+                for line in hlo.splitlines()
+            )
+        # Positive control: the threaded buffer keeps every chunk.
+        self.assertEqual(counts[0], query_tokens // 256, counts)
+        self.assertEqual(counts[8], calls, counts)
+
+    def test_merge_pieces_supported(self):
+        ok = sparse_mla.merge_pieces_supported
+        self.assertTrue(ok(4096, 256, 8))
+        self.assertTrue(ok(2048, 256, 8))
+        self.assertTrue(ok(1024, 256, 8))
+        self.assertFalse(ok(256, 256, 8))  # one chunk: nothing to split
+        self.assertFalse(ok(1024, 256, 1))
+        self.assertFalse(ok(3072, 256, 8))  # 384-row pieces straddle chunks
+        self.assertFalse(ok(1000, 256, 8))
 
     @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
     def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):

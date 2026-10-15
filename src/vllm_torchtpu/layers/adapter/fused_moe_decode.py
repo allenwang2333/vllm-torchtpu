@@ -21,25 +21,21 @@ computes what the runner would have with the kernel off: the regular GMM MoE
 all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
-refuses (``compilation.shape_variants``). With ``FUSED_MOE_PREFILL_KERNEL=1``
-the steps above the cap of a TP-expert layer run ``fused_moe_prefill`` instead
-of the GMM path, in the same program and with the same conventions; EP layers
-keep the GMM path for now.
+refuses (``compilation.shape_variants``).
 
-Two shared-expert conventions are served, each as vLLM's MoERunner computes it
-with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
-``expert_gate``) or an ungated ``DeepseekV2MLP`` (GLM-5.2). A
-``runner.routed_scaling_factor`` (GLM-5.2: 2.5) scales the ROUTED output only,
-before the shared output is added (``_maybe_apply_routed_scale_to_output``);
-the op applies it the same way, and arming sets the runner's factor to 1.0,
-since the runner would otherwise scale the op's shared + routed sum.
+Layers whose shared expert has no gate or whose runner scales the routed
+output (``routed_scaling_factor``; GLM-5.2 has both) are served too, with TP
+experts only: the scale moves from the runner into the program.
 
-Every rank must arm the same layers: the kernel's collectives start at entry,
-and a rank serving a layer with the GMM path leaves its peers waiting. Arming
-compares a signature across the EP group and raises on any mismatch.
+``FUSED_MOE_PREFILL_KERNEL=1`` arms the same layers, with or without this
+kernel, and the same program serves steps of at least
+``FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS`` tokens with the fused MoE prefill
+kernel (``layers/adapter/fused_moe_prefill.py``); smaller steps run this
+kernel when ``FUSED_MOE_DECODE_KERNEL=1`` and its cap allows, else GMM MoE.
 """
 
 import functools
+import math
 from typing import Any, cast
 
 import jax
@@ -48,19 +44,17 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm.model_executor.layers.activation import SiluAndMul
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME, build_ep_mesh, ep_mesh_index
 from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     fused_moe_decode as _kernel_body,
 )
-from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
-    plan_weight_ring,
-    vmem_bytes,
-)
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
-    fused_moe_prefill,
-    plan_blocks,
+from vllm_torchtpu.kernels.experimental.fused_moe_decode import vmem_bytes
+from vllm_torchtpu.layers.adapter.fused_moe_prefill import (
+    prefill_layer,
+    prefill_min_tokens,
 )
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -91,7 +85,6 @@ _OPS: dict[tuple, Any] = {}
 # tied to mesh order.
 _RANK_BUFFER: Any = None
 _RANK_BUFFER_START = 0
-_RANK_BUFFER_INDEX: int | None = None
 
 
 def fused_moe_decode_supported(quant_method: Any) -> bool:
@@ -112,14 +105,14 @@ def _gmm_layer(
     tw,
     ti,
     start,
+    routed_scale=1.0,
     *,
     topk,
-    shared_gated,
-    routed_scale,
 ):
     """Above the cap: the layer as the runner computes it with the kernel off,
-    shared expert + routed GMM MoE (scaled by routed_scale), all-reduced. Per
-    rank, inside shard_map."""
+    shared expert + routed GMM MoE, all-reduced. Per rank, inside shard_map.
+    `shared_gate_weight` is None for a shared expert without a gate;
+    `routed_scale` is the runner's routed_scaling_factor."""
     routed = fused_moe_func(
         x,
         w1,
@@ -139,8 +132,6 @@ def _gmm_layer(
         rhs_quant_dtype=None,
         skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
     )
-    if routed_scale != 1.0:
-        routed = routed * routed_scale
     # Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
     # sigmoid of the replicated expert_gate linear (DeepseekV2MLP: no gate).
     i_s = shared_w2.shape[0]
@@ -150,68 +141,18 @@ def _gmm_layer(
         shared_w2,
         shared_w2_scale.reshape(-1),
     )
-    if shared_gated:
+    if shared_gate_weight is not None:
         shared = (
             jax.nn.sigmoid(
                 jnp.dot(x, shared_gate_weight.reshape(-1, 1).astype(x.dtype))
             )
             * shared
         )
+    if routed_scale != 1.0:
+        # MoERunner._maybe_apply_routed_scale_to_output: fused_output *=
+        # routed_scaling_factor, in the routed output's dtype.
+        routed = routed * jnp.asarray(routed_scale, routed.dtype)
     return jax.lax.psum(shared + routed, EP_AXIS_NAME)
-
-
-def _prefill_layer(
-    x,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    shared_w1,
-    shared_w1_scale,
-    shared_w2,
-    shared_w2_scale,
-    shared_gate_weight,
-    tw,
-    ti,
-    start,
-    *,
-    shared_gated,
-    routed_scale,
-):
-    """Above the cap of a layer armed with the prefill kernel (TP experts with
-    FUSED_MOE_PREFILL_KERNEL=1): the fused MoE prefill kernel, all-reduced.
-    Per rank, inside shard_map."""
-    # Trace-time, once per token bucket: the evidence that the prefill kernel
-    # serves this shape, and in which mode (the kernel's name carries it too).
-    blocks = plan_blocks(
-        x.shape[0], x.shape[1], w2.shape[1], shared_w2.shape[0], w1.dtype
-    )
-    logger.info(
-        "Fused MoE prefill kernel traced for %d tokens (%s)",
-        x.shape[0],
-        "whole experts"
-        if blocks is None
-        else "blocked ib={} ring={} chunk_rows={}".format(*blocks),
-    )
-    return fused_moe_prefill(
-        x,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        shared_w1,
-        shared_w1_scale,
-        shared_w2,
-        shared_w2_scale,
-        shared_gate_weight if shared_gated else None,
-        # Route weights rounded to the activation dtype, as the decode kernel
-        # and the GMM path round them.
-        tw.astype(x.dtype),
-        ti,
-        axis_name=EP_AXIS_NAME,
-        expert_start=start,
-        routed_scale=routed_scale,
-    )
 
 
 def _layer(
@@ -233,22 +174,18 @@ def _layer(
     topk,
     expert_parallel,
     max_tokens,
-    shared_gated=True,
+    prefill_min_tokens=None,
+    gated=True,
     routed_scale=1.0,
-    prefill_kernel=False,
 ):
-    """Per-rank body of the op: the kernel up to `max_tokens`; above, the
-    prefill kernel when `prefill_kernel`, else GMM MoE. An ungated layer still
-    passes its placeholder shared_gate_weight operand (fixed op arity);
-    shared_gated=False ignores it."""
+    """Per-rank body of the op: the prefill kernel from `prefill_min_tokens`
+    tokens when it is on, else the decode kernel up to `max_tokens` and GMM MoE
+    above. Without a shared-expert gate (`gated` False) the gate operand is a
+    placeholder; `routed_scale` multiplies the routed output alone."""
     start = rank[0, 1] if expert_parallel else None
-    if x.shape[0] > max_tokens:
-        above = (
-            _prefill_layer
-            if prefill_kernel
-            else functools.partial(_gmm_layer, topk=topk)
-        )
-        return above(
+    gate = shared_gate_weight if gated else None
+    if prefill_min_tokens is not None and x.shape[0] >= prefill_min_tokens:
+        return prefill_layer(
             x,
             w1,
             w2,
@@ -258,30 +195,33 @@ def _layer(
             shared_w1_scale,
             shared_w2,
             shared_w2_scale,
-            shared_gate_weight,
+            gate,
             tw,
             ti,
             start,
-            shared_gated=shared_gated,
-            routed_scale=routed_scale,
+            routed_scale,
+        )
+    if x.shape[0] > max_tokens:
+        return _gmm_layer(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            gate,
+            tw,
+            ti,
+            start,
+            routed_scale,
+            topk=topk,
         )
     # Trace-time, once per token bucket: the evidence that the kernel serves
-    # this shape, and in which mode (the kernel's name carries it too).
-    ib, nb = plan_weight_ring(
-        x.shape[0] + (-x.shape[0]) % 16,
-        x.shape[1],
-        w2.shape[1],
-        shared_w2.shape[0],
-        w2.shape[0],
-        n_ranks,
-        w1.dtype,
-    )
-    logger.info(
-        "Fused MoE decode kernel traced for %d tokens (%s, ring %d)",
-        x.shape[0],
-        "whole experts" if ib is None else f"blocked ib={ib}",
-        nb,
-    )
+    # this shape.
+    logger.info("Fused MoE decode kernel traced for %d tokens", x.shape[0])
     return _kernel_body(
         rank[0, :1],
         x,
@@ -293,7 +233,7 @@ def _layer(
         shared_w1_scale.reshape(1, -1),
         shared_w2,
         shared_w2_scale.reshape(1, -1),
-        shared_gate_weight.reshape(-1, 1) if shared_gated else None,
+        None if gate is None else gate.reshape(-1, 1),
         tw,
         ti,
         n_ranks=n_ranks,
@@ -308,9 +248,9 @@ def _build_op(
     topk: int,
     expert_parallel: bool,
     max_tokens: int,
-    shared_gated: bool = True,
+    prefill_min_tokens: int | None,
+    gated: bool = True,
     routed_scale: float = 1.0,
-    prefill_kernel: bool = False,
 ):
     key = (
         id(mesh),
@@ -318,9 +258,9 @@ def _build_op(
         topk,
         expert_parallel,
         max_tokens,
-        shared_gated,
+        prefill_min_tokens,
+        gated,
         routed_scale,
-        prefill_kernel,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -332,9 +272,9 @@ def _build_op(
         topk=topk,
         expert_parallel=expert_parallel,
         max_tokens=max_tokens,
-        shared_gated=shared_gated,
+        prefill_min_tokens=prefill_min_tokens,
+        gated=gated,
         routed_scale=routed_scale,
-        prefill_kernel=prefill_kernel,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
@@ -378,8 +318,8 @@ def _build_op(
         )
 
     name = "pallas::fused_moe_decode" + (f"_{len(_OPS)}" if _OPS else "")
-    # torch_tpu types the partition specs as tuples of axis names, but takes
-    # (and fused_moe_ep passes) jax PartitionSpecs.
+    # torch_tpu annotates the specs as tuples of axis names but takes the
+    # PartitionSpecs every other jax_op caller passes.
     # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
@@ -397,21 +337,8 @@ def _build_op(
     return op
 
 
-def _shared_mlp_is_ungated_silu(mlp) -> bool:
-    """A shared expert with no gate of its own: gate_up -> SiluAndMul -> down
-    (vLLM's DeepseekV2MLP, GLM-5.2's shared expert), nothing else in forward."""
-    from vllm.model_executor.layers.activation import SiluAndMul
-
-    return (
-        type(mlp).__name__ == "DeepseekV2MLP"
-        and isinstance(getattr(mlp, "act_fn", None), SiluAndMul)
-        and getattr(mlp, "expert_gate", None) is None
-    )
-
-
 def _shared_slice(runner) -> tuple | None:
-    """This rank's shared-expert tensors in the kernel's layout, or None. The
-    last entry, the gate weight, is None for an ungated shared expert."""
+    """This rank's shared-expert tensors in the kernel's layout, or None."""
     shared = getattr(runner, "_shared_experts", None)
     mlp = getattr(shared, "_layer", None)
     if mlp is None:
@@ -421,7 +348,13 @@ def _shared_slice(runner) -> tuple | None:
     gate = getattr(mlp, "expert_gate", None)
     if gate_up is None or down is None:
         return None
-    if gate is None and not _shared_mlp_is_ungated_silu(mlp):
+    # Without a gate, admit only what the kernel and _gmm_layer compute:
+    # down(silu(gate) * up) with no biases (DeepseekV2MLP).
+    if gate is None and (
+        not isinstance(getattr(mlp, "act_fn", None), SiluAndMul)
+        or getattr(gate_up, "bias", None) is not None
+        or getattr(down, "bias", None) is not None
+    ):
         return None
     shared_w1, shared_w1_scale = (
         getattr(gate_up, "weight", None),
@@ -431,11 +364,15 @@ def _shared_slice(runner) -> tuple | None:
         getattr(down, "weight", None),
         getattr(down, "weight_scale", None),
     )
+    # No expert_gate (GLM-5.2's DeepseekV2MLP): the shared output is not
+    # gated, and None stands in for the gate weight.
+    shared_gate_weight = getattr(gate, "weight", None)
     if (
         shared_w1 is None
         or shared_w1_scale is None
         or shared_w2 is None
         or shared_w2_scale is None
+        or (gate is not None and shared_gate_weight is None)
     ):
         return None
     # Per-channel FP8 linears are stored K-major ([in, out]) with a 1-D scale.
@@ -445,10 +382,8 @@ def _shared_slice(runner) -> tuple | None:
         or shared_w1.dtype != torch.float8_e4m3fn
     ):
         return None
-    shared_gate_weight = None if gate is None else getattr(gate, "weight", None)
-    if gate is not None and (
-        shared_gate_weight is None
-        or getattr(gate, "bias", None) is not None
+    if shared_gate_weight is not None and (
+        getattr(gate, "bias", None) is not None
         or shared_gate_weight.dim() != 2
         or shared_gate_weight.shape[0] != 1
     ):
@@ -466,11 +401,8 @@ def _shared_slice(runner) -> tuple | None:
     )
 
 
-def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
-    """(shared-expert tensors, expert_parallel, routed scale) for an eligible
-    layer, else None."""
-    from vllm.distributed import get_tensor_model_parallel_world_size
-
+def _admit(runner, n_ranks: int) -> tuple[tuple, bool] | None:
+    """(shared-expert tensors, expert_parallel) for an eligible layer, else None."""
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -482,9 +414,6 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         sharded_ok = par.ep_size == n_ranks and par.dp_size == 1
     else:
         sharded_ok = par.tp_size == n_ranks
-    # TP attention over the whole mesh: every rank holds every token and one
-    # shared-expert slice, and MoERunner runs no DP/PCP collective after the op.
-    sharded_ok = sharded_ok and get_tensor_model_parallel_world_size() == n_ranks
     if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
         return None
     if qm._tpu_activation_str != "silu":
@@ -502,16 +431,26 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         or runner.routed_output_transform is not None
     ):
         return None
-    if runner.shared_expert_gate is not None:
-        return None
-    routed_scale = float(getattr(runner, "routed_scaling_factor", 1.0))
-    if routed_scale != 1.0 and getattr(cfg, "in_dtype", None) == torch.float16:
-        # FP16: vLLM divides the shared output instead; not mirrored here.
+    # A routed scaling factor (GLM-5.2: 2.5) moves from the runner into the op,
+    # which applies it to the routed output alone. Exact in bf16, so GMM MoE
+    # scales the bf16 routed output exactly as the runner does.
+    # Under FP16 the runner divides the shared output by the scale instead and
+    # the decoder compensates, so the op's sum would be off by that factor.
+    routed_scale = getattr(runner, "routed_scaling_factor", 1.0)
+    if (
+        not math.isfinite(routed_scale)
+        or float(jnp.bfloat16(routed_scale)) != routed_scale
+        or (routed_scale != 1.0 and getattr(cfg, "in_dtype", None) == torch.float16)
+        or runner.shared_expert_gate is not None
+    ):
         return None
     shared = _shared_slice(runner)
     if shared is None:
         return None
     shared_w1, _, shared_w2, _, shared_gate_weight = shared
+    # A gated shared expert with a routed scale: no model or test has both.
+    if shared_gate_weight is not None and routed_scale != 1.0:
+        return None
     w1, w2 = layer.w13_weight, layer.w2_weight
     w1_scale, w2_scale = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     e, h, two_i = w1.shape
@@ -530,7 +469,7 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         or (shared_gate_weight is not None and shared_gate_weight.numel() != h)
     ):
         return None
-    return shared, expert_parallel, routed_scale
+    return shared, expert_parallel
 
 
 def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
@@ -549,38 +488,10 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
         )
 
 
-def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
-    """Raise unless every EP rank computed the same arming signature: a rank
-    that serves a layer with the GMM path while its peers run the kernel hangs
-    the slice, so failing at load with every rank's answer is the safe outcome."""
-    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
-
-    group = get_ep_group()
-    if group is None:
-        return
-    gathered: list = [None] * int(group.world_size)
-    torch.distributed.all_gather_object(gathered, signature, group=group.cpu_group)
-    if any(g != gathered[0] for g in gathered):
-        summary = sorted({(len(g[1]), str(g)[:120]) for g in gathered})
-        raise RuntimeError(
-            f"fused MoE decode kernel ({what}): EP ranks disagree on which layers "
-            f"to arm; refusing to serve a collective kernel on some ranks only: "
-            f"{summary}"
-        )
-
-
-def _serves_prefill_kernel(expert_parallel: bool) -> bool:
-    """FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only for now: an EP
-    layer keeps the GMM path above the cap, which at GLM-5.2 shapes was faster
-    than the prefill kernel's blocked mode at 4,096 tokens."""
-    return envs.FUSED_MOE_PREFILL_KERNEL and not expert_parallel
-
-
-def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
-    """Arm every eligible MoE layer of `model`; returns how many were armed.
-
-    Collective over the EP group when EP is on: every rank must call it."""
-    if not envs.FUSED_MOE_DECODE_KERNEL:
+def arm_fused_moe_decode(model: torch.nn.Module) -> int:
+    """Arm every eligible MoE layer of `model` for the decode and/or prefill
+    kernel; returns how many were armed."""
+    if not (envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL):
         return 0
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -591,41 +502,46 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         mesh = build_ep_mesh()
     except Exception as exc:  # refuse rather than serve a wrong reduction
         logger.warning("Fused MoE decode kernel not armed: no mesh (%s)", exc)
-        mesh = None
-    n_ranks = mesh.shape[EP_AXIS_NAME] if mesh is not None else 0
-    global _RANK_BUFFER, _RANK_BUFFER_START, _RANK_BUFFER_INDEX
+        return 0
+    if mesh is None:
+        return 0
+    n_ranks = mesh.shape[EP_AXIS_NAME]
+    global _RANK_BUFFER, _RANK_BUFFER_START
     from vllm_torchtpu.layers.adapter.moe_routing import get_experts_start
 
-    max_tokens = envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
-    if max_tokens < 1:
-        raise ValueError(
-            f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
-        )
-    plan = []
-    for runner in runners if mesh is not None else ():
-        admitted = _admit(runner, n_ranks)
-        if admitted is not None:
-            plan.append((runner, *admitted))
-    signature = (
-        n_ranks,
-        tuple(
-            (getattr(r, "layer_name", "?"), ep, shared[4] is not None, scale)
-            for r, shared, ep, scale in plan
-        ),
-    )
-    _check_same_arming_on_every_rank(signature, what)
+    # 0: the decode kernel is off and GMM MoE serves what prefill does not.
+    max_tokens = 0
+    if envs.FUSED_MOE_DECODE_KERNEL:
+        max_tokens = envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
+        if max_tokens < 1:
+            raise ValueError(
+                f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
+            )
+    min_tokens = prefill_min_tokens()
     armed = 0
-    for runner, shared, expert_parallel, routed_scale in plan:
+    for runner in runners:
+        admitted = _admit(runner, n_ranks)
+        if admitted is None:
+            continue
+        shared, expert_parallel = admitted
         layer = runner.routed_experts
-        w13_weight = cast(torch.Tensor, layer.w13_weight)
-        _check_vmem(max_tokens, layer, shared[2].shape[0], n_ranks)
+        # A layer without a shared-expert gate or with a routed scale (GLM-5.2)
+        # is armed with TP experts only: with EP experts the decode and prefill
+        # kernels' weight rings hold three whole experts, more than VMEM for
+        # GLM-5.2's, and only TP is tested.
+        gated = shared[4] is not None
+        routed_scale = float(runner.routed_scaling_factor)
+        if (not gated or routed_scale != 1.0) and expert_parallel:
+            continue
+        layer_max_tokens = max_tokens
+        if layer_max_tokens:
+            _check_vmem(layer_max_tokens, layer, shared[2].shape[0], n_ranks)
         start = get_experts_start(layer) or 0
         if _RANK_BUFFER is None:
-            _RANK_BUFFER_INDEX = ep_mesh_index()
             _RANK_BUFFER = torch.tensor(
-                [[_RANK_BUFFER_INDEX, start]],
+                [[ep_mesh_index(), start]],
                 dtype=torch.int32,
-                device=w13_weight.device,
+                device=cast(torch.Tensor, layer.w13_weight).device,
             )
             _RANK_BUFFER_START = start
         elif start != _RANK_BUFFER_START:
@@ -633,17 +549,6 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
             raise RuntimeError(
                 "fused MoE decode kernel: layers on this rank start at different "
                 f"experts ({_RANK_BUFFER_START} vs {start})"
-            )
-        shared_gated = shared[4] is not None
-        if not shared_gated:
-            # Placeholder for the op's fixed gate operand; the program ignores it.
-            shared = (
-                *shared[:4],
-                torch.zeros(
-                    (1, w13_weight.shape[1]),
-                    dtype=torch.bfloat16,
-                    device=w13_weight.device,
-                ),
             )
         setattr(
             runner._quant_method,
@@ -653,44 +558,39 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 n_ranks,
                 layer.moe_config.experts_per_token,
                 expert_parallel,
-                max_tokens,
-                shared_gated,
+                layer_max_tokens,
+                min_tokens,
+                gated,
                 routed_scale,
-                _serves_prefill_kernel(expert_parallel),
             ),
         )
+        if not gated:
+            # The op's operands are all tensors: a stand-in the program ignores.
+            placeholder = torch.zeros(
+                1,
+                1,
+                dtype=torch.bfloat16,
+                device=cast(torch.Tensor, layer.w13_weight).device,
+            )
+            shared = (*shared[:4], placeholder)
         for name, tensor in zip(_SHARED_BUFFERS, shared):
             layer.register_buffer(name, tensor, persistent=False)
         runner._shared_experts = None
-        # The op scales the routed experts only; the runner would scale the
-        # op's shared + routed sum.
+        # The op scales the routed output; the runner must not scale the sum.
         runner.routed_scaling_factor = 1.0
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1
-    # Every rank logs: the evidence that all ranks armed the same layers.
-    logger.info(
-        "Armed the fused MoE decode kernel on %d of %d MoE layers of the %s "
-        "(ep_mesh_index %s, experts_start %s, %d ranks, shared gate %s, "
-        "routed_scale %s, up to %d tokens; %s above)",
-        armed,
-        len(runners),
-        what,
-        _RANK_BUFFER_INDEX if armed else None,
-        _RANK_BUFFER_START if armed else None,
-        n_ranks,
-        sorted({s[2] for s in signature[1]}),
-        sorted({s[3] for s in signature[1]}),
-        max_tokens,
-        "the fused MoE prefill kernel"
-        if any(_serves_prefill_kernel(s[1]) for s in signature[1])
-        else "GMM MoE",
-    )
-    if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
+    if armed:
         logger.info(
-            "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "
-            "layers keep the GMM MoE path above %d tokens",
+            "Armed fused MoE kernels on %d of %d MoE layers (%d ranks; decode "
+            "kernel up to %d tokens, prefill kernel from %s tokens, GMM MoE "
+            "otherwise)",
+            armed,
+            len(runners),
+            n_ranks,
             max_tokens,
+            "-" if min_tokens is None else min_tokens,
         )
     return armed
 
@@ -701,8 +601,8 @@ def fused_moe_decode(
     """Forward for an armed layer: the all-reduced (shared + routed) output.
 
     One torch op for every token count; above the cap the exported program
-    runs the prefill kernel or the GMM MoE path (each with its own
-    all-reduce), so an armed layer always returns the reduced sum.
+    runs the GMM MoE path (with its own all-reduce), so an armed layer always
+    returns the reduced sum.
     """
     shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_gate_weight = (
         getattr(layer, name) for name in _SHARED_BUFFERS
@@ -729,11 +629,11 @@ def arm_runner_models(model_runner: Any) -> int:
     """Arm the target model and, when it is a separate module, the drafter's
     model (the MTP layer). Called once after the drafter has loaded, when every
     module has its final weight layout."""
-    armed = arm_fused_moe_decode(model_runner.model, "target model")
+    armed = arm_fused_moe_decode(model_runner.model)
     for name in ("drafter", "_async_drafter"):
         drafter = getattr(model_runner, name, None)
         draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
         if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
-            armed += arm_fused_moe_decode(draft, "draft model")
+            armed += arm_fused_moe_decode(draft)
             break
     return armed
