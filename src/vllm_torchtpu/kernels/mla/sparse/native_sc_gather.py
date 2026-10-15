@@ -841,8 +841,10 @@ def _union_kernel(
     pos_smem,
     uid_smem,
     misc_smem,
+    ovf_smem,
     ibuf,
     cbuf,
+    mtok,
     ulist,
     htab,
     nope_sh,
@@ -959,88 +961,112 @@ def _union_kernel(
         def clear(i):
             htab[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full((NUM_LANES,), -1, jnp.int32)
 
-        plsc.parallel_loop(0, htab.shape[0] // NUM_LANES, unroll=8)(clear)
+        def clear_list(i):
+            ulist[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full((NUM_LANES,), -1, jnp.int32)
 
-    # Units are visited token-major (all of token 0's atoms, then token 1's,
-    # ...) so that rows past the cap, which are assigned last, fall in as few
-    # units as possible (the last tokens').
-    def unit_body(t, a, carry):
-        base, nlu, novf = carry
-        # ibuf position (= unit id u) and output rows of (token t, atom a).
-        u = jnp.where(whole, t * atoms_w + a, a * half + t)
-        j0 = a * atom
-        pos = jnp.where(
-            whole,
-            base_out + h * half * atoms_w * atom + u * atom,
-            base_out + a * block + h * half * atom + t * atom,
+        plsc.parallel_loop(0, htab.shape[0] // NUM_LANES, unroll=8)(clear)
+        plsc.parallel_loop(0, ulist.shape[0] // NUM_LANES, unroll=8)(clear_list)
+
+    def vec_dedup(rows, live, base):
+        """One 16-lane vector of one token's live slots -> (map, base, lanes
+        past the cap). A token's rows are distinct, so its vectors may run in
+        any order (`parallel_loop`): two vectors meet only on a colliding table
+        entry of a different row, which the stored-row check rejects (the
+        union list is cleared to -1, so a not-yet-written entry never matches)."""
+        hsh = jnp.bitwise_and(
+            jnp.bitwise_xor(
+                jnp.bitwise_xor(rows, jnp.right_shift(rows, 11)),
+                jnp.right_shift(rows, 22),
+            ),
+            mask_h,
         )
+        uo = plsc.load_gather(htab, [hsh], mask=live)
+        known = live & (uo >= 0)
+        r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
+        hit = known if fault == "noverify" else known & (r == rows)
+        miss = live & jnp.logical_not(hit)
+        newu = base + plsc.cumsum(miss.astype(jnp.int32)) - 1
+        ok = miss & (newu < cap_u)
+        plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
+        plsc.store_scatter(htab, [hsh], newu, mask=ok)
+        base = base + plsc.all_reduce_population_count(ok)[0]
+        over = plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
+        m_hit = uo
+        if fault == "map_off":
+            m_hit = jnp.minimum(jnp.bitwise_xor(uo, 1), jnp.maximum(base - 1, 0))
+        m = jnp.where(hit, m_hit, jnp.where(ok, newu, 0))
+        return m, base, over
+
+    # Tokens in order (rows past the cap are assigned last, so they land in the
+    # last tokens' units); within a token, its vectors in parallel (pass 1),
+    # then its units in order (pass 2: keep / HBM-direct / skip).
+    def token_body(t, carry):
+        base, nlu, novf = carry
         kv_t = kv_smem[h * half + t]
         if fault == "kv_lo":
             kv_t = kv_t - 1
-        nlive = jnp.clip(kv_t - j0, 0, atom)
-        ms = []
-        over = jnp.int32(0)
-        for v in range(atom // NUM_LANES):
-            lane = v * NUM_LANES + iota
-            live = lane < nlive
-            rows = ibuf[pl.ds(pl.multiple_of(u * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)]
-            hsh = jnp.bitwise_and(
-                jnp.bitwise_xor(
-                    jnp.bitwise_xor(rows, jnp.right_shift(rows, 11)),
-                    jnp.right_shift(rows, 22),
-                ),
-                mask_h,
+        nvec = (jnp.clip(kv_t, 0, a_live * atom) + NUM_LANES - 1) // NUM_LANES
+
+        def unit_of(a):
+            return jnp.where(whole, t * atoms_w + a, a * half + t)
+
+        def vec_step(jv, base):
+            a = jnp.right_shift(jv, 2)
+            v16 = jnp.bitwise_and(jv, 3) * NUM_LANES
+            lane = v16 + iota
+            live = lane < kv_t - a * atom
+            rows = ibuf[pl.ds(pl.multiple_of(unit_of(a) * atom + v16, NUM_LANES), NUM_LANES)]
+            m, base, over = vec_dedup(rows, live, base)
+            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = m
+            ovf_smem[jv] = over
+            return base
+
+        base = plsc.parallel_loop(0, nvec, carry=base)(vec_step)
+
+        def unit_step(a, c):
+            nlu, novf = c
+            u = unit_of(a)
+            pos = jnp.where(
+                whole,
+                base_out + h * half * atoms_w * atom + u * atom,
+                base_out + a * block + h * half * atom + t * atom,
             )
-            uo = plsc.load_gather(htab, [hsh], mask=live)
-            known = live & (uo >= 0)
-            r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
-            hit = known if fault == "noverify" else known & (r == rows)
-            miss = live & jnp.logical_not(hit)
-            newu = base + plsc.cumsum(miss.astype(jnp.int32)) - 1
-            ok = miss & (newu < cap_u)
-            plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
-            plsc.store_scatter(htab, [hsh], newu, mask=ok)
-            base = base + plsc.all_reduce_population_count(ok)[0]
-            over = over + plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
-            m_hit = uo
-            if fault == "map_off":
-                m_hit = jnp.minimum(jnp.bitwise_xor(uo, 1), jnp.maximum(base - 1, 0))
-            # Pad lanes read a distinct already-loaded row (the attention masks
-            # them); a repeated index is the degenerate bank conflict.
-            fill = jnp.where(lane < base, lane, 0)
-            m = jnp.where(hit, m_hit, jnp.where(ok, newu, fill))
-            ms.append(jnp.where(live, m, fill))
-        unit_live = nlive > 0
-        to_union = unit_live & (over == 0)
-        to_hbm = unit_live & (over > 0)
+            nlive = jnp.clip(kv_t - a * atom, 0, atom)
+            over = jnp.int32(0)
+            for v in range(atom // NUM_LANES):
+                over = over + jnp.where(v * NUM_LANES < nlive, ovf_smem[4 * a + v], 0)
+            unit_live = nlive > 0
+            to_union = unit_live & (over == 0)
+            to_hbm = unit_live & (over > 0)
 
-        @pl.when(to_union)
-        def _keep():
-            for v, m in enumerate(ms):
-                cbuf[pl.ds(pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)] = (
-                    m + region
-                )
-            pos_smem[nlu] = pos
-            uid_smem[nlu] = u
+            @pl.when(to_union)
+            def _keep():
+                for v in range(atom // NUM_LANES):
+                    lane = v * NUM_LANES + iota
+                    # Pad lanes read a distinct already-loaded row (the attention
+                    # masks them); a repeated index is the degenerate bank conflict.
+                    fill = jnp.where(lane < base, lane, 0)
+                    m = mtok[pl.ds(pl.multiple_of((4 * a + v) * NUM_LANES, NUM_LANES), NUM_LANES)]
+                    m = jnp.where(lane < nlive, m, fill)
+                    cbuf[pl.ds(pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)] = (
+                        m + region
+                    )
+                pos_smem[nlu] = pos
+                uid_smem[nlu] = u
 
-        @pl.when(to_hbm)
-        def _direct():
-            pos_smem[max_units + novf] = pos
-            uid_smem[max_units + novf] = u
+            @pl.when(to_hbm)
+            def _direct():
+                pos_smem[max_units + novf] = pos
+                uid_smem[max_units + novf] = u
 
-        return (
-            base,
-            nlu + to_union.astype(jnp.int32),
-            novf + to_hbm.astype(jnp.int32),
-        )
+            return nlu + to_union.astype(jnp.int32), novf + to_hbm.astype(jnp.int32)
+
+        nlu, novf = lax.fori_loop(0, a_live, unit_step, (nlu, novf))
+        return base, nlu, novf
 
     def dedup(base0):
         """Assign union ids to this subcore's live slots from `base0`; leaves
-        (ids used, live units, HBM-direct units) in misc_smem[1..3]."""
-
-        def token_body(t, carry):
-            return lax.fori_loop(0, a_live, functools.partial(unit_body, t), carry)
-
+        (ids used, live units, HBM-direct units) in misc_smem[1, 2, 0]."""
         num_u, n_units, n_ovf = lax.fori_loop(
             0, half, token_body, (base0, jnp.int32(0), jnp.int32(0))
         )
@@ -1348,6 +1374,8 @@ def dsa_gather_native_sc_union(
         "pos_smem": pltpu.SMEM((2 * max_units,), jnp.int32),
         "uid_smem": pltpu.SMEM((2 * max_units,), jnp.int32),
         "misc_smem": pltpu.SMEM((8,), jnp.int32),
+        "ovf_smem": pltpu.SMEM((atoms_w * UNION_UNIT_ROWS // NUM_LANES,), jnp.int32),
+        "mtok": pltpu.VMEM((atoms_w * UNION_UNIT_ROWS,), jnp.int32),
         "ibuf": pltpu.VMEM((max(max_units * UNION_UNIT_ROWS, occurrences_per_batch),), jnp.int32),
         "cbuf": pltpu.VMEM((max_units * UNION_UNIT_ROWS,), jnp.int32),
         "ulist": pltpu.VMEM(((2 if pair_union else 1) * cap_rows + UNION_LOAD_ROWS,), jnp.int32),
