@@ -992,39 +992,24 @@ def _union_kernel(
         plsc.parallel_loop(0, htab.shape[0] // NUM_LANES, unroll=8)(clear)
         plsc.parallel_loop(0, ulist.shape[0] // NUM_LANES, unroll=8)(clear_list)
 
-    def vec_dedup(rows, live, base):
-        """One 16-lane vector of one token's live slots -> (map, base, lanes
-        past the cap). A token's rows are distinct, so its vectors may run in
-        any order (`parallel_loop`): two vectors meet only on a colliding table
-        entry of a different row, which the stored-row check rejects (the
-        union list is cleared to -1, so a not-yet-written entry never matches)."""
-        hsh = jnp.bitwise_and(
+    def hash_of(rows):
+        return jnp.bitwise_and(
             jnp.bitwise_xor(
                 jnp.bitwise_xor(rows, jnp.right_shift(rows, 11)),
                 jnp.right_shift(rows, 22),
             ),
             mask_h,
         )
-        uo = plsc.load_gather(htab, [hsh], mask=live)
-        known = live & (uo >= 0)
-        r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
-        hit = known if fault == "noverify" else known & (r == rows)
-        miss = live & jnp.logical_not(hit)
-        newu = base + plsc.cumsum(miss.astype(jnp.int32)) - 1
-        ok = miss & (newu < cap_u)
-        plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
-        plsc.store_scatter(htab, [hsh], newu, mask=ok)
-        base = base + plsc.all_reduce_population_count(ok)[0]
-        over = plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
-        m_hit = uo
-        if fault == "map_off":
-            m_hit = jnp.minimum(jnp.bitwise_xor(uo, 1), jnp.maximum(base - 1, 0))
-        m = jnp.where(hit, m_hit, jnp.where(ok, newu, 0))
-        return m, base, over
 
     # Tokens in order (rows past the cap are assigned last, so they land in the
-    # last tokens' units); within a token, its vectors in parallel (pass 1),
-    # then its units in order (pass 2: keep / HBM-direct / skip).
+    # last tokens' units). Within a token, three passes with no loop-carried
+    # dependence inside a pass: (A) look every live slot up in the table, in
+    # parallel -- a token's rows are distinct, so its own slots can only hit
+    # entries of earlier tokens; (B) a scalar prefix of each vector's misses;
+    # (C) assign ids and insert, in parallel (two of the token's vectors meet
+    # only on a colliding entry of a different row; whichever insert lands,
+    # its id and stored row agree). Then its units in order (keep / HBM-direct
+    # / skip).
     def token_body(t, carry):
         base, nlu, novf = carry
         kv_t = kv_smem[h * half + t]
@@ -1035,18 +1020,53 @@ def _union_kernel(
         def unit_of(a):
             return jnp.where(whole, t * atoms_w + a, a * half + t)
 
-        def vec_step(jv, base):
+        def rows_of(jv):
             a = jnp.right_shift(jv, 2)
             v16 = jnp.bitwise_and(jv, 3) * NUM_LANES
-            lane = v16 + iota
-            live = lane < kv_t - a * atom
+            live = v16 + iota < kv_t - a * atom
             rows = ibuf[pl.ds(pl.multiple_of(unit_of(a) * atom + v16, NUM_LANES), NUM_LANES)]
-            m, base, over = vec_dedup(rows, live, base)
-            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = m
-            ovf_smem[jv] = over
-            return base
+            return rows, live
 
-        base = plsc.parallel_loop(0, nvec, carry=base)(vec_step)
+        def look(jv):
+            rows, live = rows_of(jv)
+            uo = plsc.load_gather(htab, [hash_of(rows)], mask=live)
+            known = live & (uo >= 0)
+            r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
+            hit = known if fault == "noverify" else known & (r == rows)
+            miss = live & jnp.logical_not(hit)
+            # hit: its id; miss: -1; padding: -2
+            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = jnp.where(
+                hit, uo, jnp.where(live, -1, -2)
+            )
+            ovf_smem[jv] = plsc.all_reduce_population_count(miss)[0]
+
+        plsc.parallel_loop(0, nvec)(look)
+
+        def prefix(jv, run):
+            c = ovf_smem[jv]
+            ovf_smem[jv] = run
+            return run + c
+
+        total = lax.fori_loop(0, nvec, prefix, jnp.int32(0))
+
+        def insert(jv):
+            rows, _ = rows_of(jv)
+            m0 = mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)]
+            miss = m0 == -1
+            newu = base + ovf_smem[jv] + plsc.cumsum(miss.astype(jnp.int32)) - 1
+            ok = miss & (newu < cap_u)
+            plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
+            plsc.store_scatter(htab, [hash_of(rows)], newu, mask=ok)
+            m_hit = m0
+            if fault == "map_off":
+                m_hit = jnp.minimum(jnp.bitwise_xor(m0, 1), jnp.maximum(base - 1, 0))
+            mtok[pl.ds(pl.multiple_of(jv * NUM_LANES, NUM_LANES), NUM_LANES)] = jnp.where(
+                m0 >= 0, m_hit, jnp.where(ok, newu, 0)
+            )
+            ovf_smem[jv] = plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
+
+        plsc.parallel_loop(0, nvec)(insert)
+        base = jnp.minimum(base + total, cap_u)
 
         def unit_step(a, c):
             nlu, novf = c
