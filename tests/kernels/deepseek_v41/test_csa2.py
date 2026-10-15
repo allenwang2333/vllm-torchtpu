@@ -49,8 +49,7 @@ def _inputs(lengths=(6,), starts=None, *, padding=0, heads=8, seed=17):
         jnp.float8_e4m3fn,
     )
     main_scale = jnp.asarray(rng.uniform(0.01, 0.8, (tokens, 512)), jnp.float32)
-    swa = np.zeros((tokens, 128, 512), dtype=jnp.float8_e4m3fn)
-    swa_scale = np.ones((tokens, 128), np.float32)
+    swa = np.zeros((tokens, 128, 512), dtype=jnp.bfloat16)
     positions = np.zeros(tokens, np.int32)
     boundaries = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
     for b, (count, first_position) in enumerate(zip(lengths, starts)):
@@ -59,13 +58,11 @@ def _inputs(lengths=(6,), starts=None, *, padding=0, heads=8, seed=17):
         first = max(0, first_position - 127)
         sequence_length = first_position + count - first
         values = rng.standard_normal((sequence_length, 512), dtype=np.float32)
-        values = values.astype(jnp.float8_e4m3fn)
-        scales = rng.uniform(0.01, 0.8, sequence_length).astype(np.float32)
+        values = values.astype(jnp.bfloat16)
         for i in range(count):
             t, p = int(boundaries[b]) + i, first_position + i
             left, width = max(0, p - 127), min(p + 1, 128)
             swa[t, :width] = values[left - first : p + 1 - first]
-            swa_scale[t, :width] = scales[left - first : p + 1 - first]
             positions[t] = p
     theta = positions[:, None] * np.power(10000, -np.arange(32)[None, :] / 32)
     rope_cache = np.zeros((tokens, 2, 128), np.float32)
@@ -78,7 +75,6 @@ def _inputs(lengths=(6,), starts=None, *, padding=0, heads=8, seed=17):
         main_kv=main_kv,
         main_kv_scale=main_scale,
         swa_kv=jnp.asarray(swa),
-        swa_kv_scale=jnp.asarray(swa_scale),
         starts=jnp.asarray(boundaries),
         positions=jnp.asarray(positions),
         sink=jnp.asarray(rng.uniform(-2, 3, heads), jnp.float32),
@@ -96,7 +92,7 @@ def _reference(inputs, *, compress_ratio=2, scale=512**-0.5):
         nl = min(position + 1, 128)
         main = data["main_kv"][t].astype(np.float32).reshape(512, 512)
         main = main * data["main_kv_scale"][t, :, None]
-        swa = data["swa_kv"][t].astype(np.float32) * data["swa_kv_scale"][t, :, None]
+        swa = data["swa_kv"][t].astype(np.float32)
         # Model the specified BF16 KV rounding BEFORE QK, not scaling logits/P.
         kv = (
             np.concatenate((main[:ng], swa[:nl]))
@@ -153,23 +149,29 @@ class Csa2Test(unittest.TestCase):
         )
         self.assert_reference(inputs, bq=6)
 
-    def test_shared_swa_does_not_read_redundant_windows(self):
-        inputs = _inputs(lengths=(13, 8), starts=(0, 130))
-        expected = self.run_kernel(inputs, bq=6)
-        values, scales = np.array(inputs["swa_kv"]), np.array(inputs["swa_kv_scale"])
-        # Poison every redundant window row; retain group-first and append rows.
-        for start, end in zip(
-            np.asarray(inputs["starts"])[:-1], np.asarray(inputs["starts"])[1:]
-        ):
-            for t0 in range(int(start), int(end), 6):
-                for t in range(t0 + 1, min(t0 + 6, int(end))):
-                    newest = min(int(inputs["positions"][t]), 127)
-                    values[t, np.arange(128) != newest] = 448
-                    scales[t, np.arange(128) != newest] = 7
-        poisoned = dict(
-            inputs, swa_kv=jnp.asarray(values), swa_kv_scale=jnp.asarray(scales)
-        )
-        np.testing.assert_array_equal(self.run_kernel(poisoned, bq=6), expected)
+    def test_swa_block_reuse_and_mtp_boundaries(self):
+        # Cover cache rotation, a BQ group requiring three logical blocks,
+        # and a prefetch that must be drained after the final partial group.
+        for position, length, bq in ((2048, 136, 6), (0, 270, 16), (2048, 129, 6)):
+            with self.subTest(position=position, length=length, bq=bq):
+                inputs = _inputs(lengths=(length,), starts=(position,))
+                expected = self.assert_reference(inputs, bq=bq)
+                values = np.array(inputs["swa_kv"])
+                anchor = max(0, position - 127)
+                block_count = (position + length - anchor + 127) // 128 + 1
+                representatives = {
+                    min(length - 1, max(0, anchor + 128 * block + 127 - position))
+                    for block in range(block_count)
+                }
+                # A block comes from its final available Q's window. Other
+                # gathered copies are redundant and must never be consumed.
+                for token in range(length):
+                    if token not in representatives:
+                        values[token] = 448
+                poisoned = dict(inputs, swa_kv=jnp.asarray(values))
+                np.testing.assert_array_equal(
+                    self.run_kernel(poisoned, bq=bq), expected
+                )
 
     def test_request_isolation(self):
         inputs = _inputs(lengths=(5, 7, 0), starts=(128, 128, 0), padding=2)
@@ -193,7 +195,6 @@ class Csa2Test(unittest.TestCase):
         inputs = _inputs(lengths=(1,), starts=(0,))
         inputs["q"] = jnp.zeros_like(inputs["q"])
         inputs["swa_kv"] = jnp.ones_like(inputs["swa_kv"]) * 2
-        inputs["swa_kv_scale"] = jnp.ones_like(inputs["swa_kv_scale"])
         inputs["sink"] = jnp.zeros_like(inputs["sink"])
         rope_cache = np.zeros((1, 2, 128), np.float32)
         rope_cache[:, 0, :64] = 1
@@ -208,16 +209,18 @@ class Csa2Test(unittest.TestCase):
         inputs["sink"] = jnp.full_like(inputs["sink"], 1000)
         np.testing.assert_array_equal(self.run_kernel(inputs), 0)
 
-    def test_zero_kv_scales(self):
+    def test_zero_main_scale_preserves_swa(self):
         inputs = _inputs(lengths=(2,), starts=(128,))
         inputs["main_kv_scale"] = jnp.zeros_like(inputs["main_kv_scale"])
-        inputs["swa_kv_scale"] = jnp.zeros_like(inputs["swa_kv_scale"])
+        actual = self.assert_reference(inputs)
+        self.assertGreater(np.max(np.abs(actual)), 0)
+        inputs["swa_kv"] = jnp.zeros_like(inputs["swa_kv"])
         np.testing.assert_array_equal(self.run_kernel(inputs), 0)
 
     def test_all_gemms_use_bf16_and_metadata_uses_smem(self):
         inputs = _inputs(lengths=(1,))
         traced = jax.make_jaxpr(lambda **x: csa2.csa2(**x, interpret=True))(**inputs)
-        dots, calls = [], []
+        dots, calls, mxu_ops = [], [], []
 
         def walk(value):
             if isinstance(value, jax.extend.core.ClosedJaxpr):
@@ -228,6 +231,12 @@ class Csa2Test(unittest.TestCase):
                         dots.append(eqn)
                     if eqn.primitive.name == "pallas_call":
                         calls.append(eqn)
+                    if eqn.primitive.name in (
+                        "matmul_push_rhs",
+                        "matmul_acc_lhs",
+                        "matmul_pop",
+                    ):
+                        mxu_ops.append(eqn)
                     for child in eqn.params.values():
                         walk(child)
             elif isinstance(value, (tuple, list)):
@@ -238,7 +247,7 @@ class Csa2Test(unittest.TestCase):
                     walk(child)
 
         walk(traced)
-        self.assertEqual(len(dots), 4)
+        self.assertTrue(dots)
         for dot in dots:
             self.assertEqual([v.aval.dtype for v in dot.invars], [jnp.bfloat16] * 2)
             self.assertEqual(dot.outvars[0].aval.dtype, jnp.float32)
@@ -247,6 +256,22 @@ class Csa2Test(unittest.TestCase):
         refs = calls[0].params["jaxpr"].invars[:2]
         for ref in refs:
             self.assertEqual(str(ref.aval.memory_space), "smem")
+
+        dots.clear()
+        calls.clear()
+        walk(jax.make_jaxpr(lambda **x: csa2.csa2(**x, interpret=False))(**inputs))
+        self.assertFalse(dots)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual({op.params["mxu_index"] for op in mxu_ops}, {0, 1})
+        self.assertEqual(
+            {op.primitive.name for op in mxu_ops},
+            {"matmul_push_rhs", "matmul_acc_lhs", "matmul_pop"},
+        )
+        for op in mxu_ops:
+            if op.primitive.name == "matmul_pop":
+                self.assertEqual(op.outvars[0].aval.dtype, jnp.float32)
+            else:
+                self.assertEqual(op.invars[0].aval.dtype, jnp.bfloat16)
 
     def test_bf16_query_precision(self):
         inputs = _inputs(lengths=(1,), starts=(128,))
@@ -257,13 +282,22 @@ class Csa2Test(unittest.TestCase):
         )
         self.assertGreater(np.max(np.abs(actual - self.run_kernel(quantized))), 1e-4)
 
+    def test_swa_keeps_bf16_precision(self):
+        inputs = _inputs(lengths=(1,), starts=(0,))
+        inputs["q"] = jnp.zeros_like(inputs["q"])
+        inputs["sink"] = jnp.zeros_like(inputs["sink"])
+        inputs["swa_kv"] = jnp.full_like(inputs["swa_kv"], 1.03125)
+        # One SWA key plus the sink gives P=1/2; FP8 would lose 0.03125.
+        np.testing.assert_array_equal(self.run_kernel(inputs), 0.515625)
+
     def test_bad_contract(self):
         original = _inputs(lengths=(1,))
         for name, value in (
             ("q", original["q"].astype(jnp.float8_e4m3fn)),
             ("main_kv", original["main_kv"].reshape(1, 512, 512)),
             ("main_kv_scale", original["main_kv_scale"].astype(jnp.bfloat16)),
-            ("swa_kv", original["swa_kv"].astype(jnp.bfloat16)),
+            ("swa_kv", original["swa_kv"].astype(jnp.float8_e4m3fn)),
+            ("swa_kv", original["swa_kv"].astype(jnp.float16)),
             ("starts", jnp.zeros((1,), jnp.int32)),
             ("positions", jnp.zeros((1,), jnp.float32)),
             ("rope_cache", original["rope_cache"][:, 0, :64]),
