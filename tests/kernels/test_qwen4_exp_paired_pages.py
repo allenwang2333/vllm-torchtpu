@@ -13,7 +13,20 @@ from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
     block_sparse_gqa_prefill,
 )
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
+
+
+def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
+    """Independent fixture for interleaved [K0,V0,K1,V1] cache heads."""
+    key, value = np.asarray(key, np.float32), np.asarray(value, np.float32)
+    if fp8:
+        key = np.clip(key / k_scale, -448, 448).astype(jnp.float8_e4m3fn)
+        value = np.clip(value / v_scale, -448, 448).astype(jnp.float8_e4m3fn)
+    else:
+        key, value = key.astype(jnp.bfloat16), value.astype(jnp.bfloat16)
+    packing = 4 if fp8 else 2
+    rows = np.stack((key, value), axis=2).reshape(len(key), -1, key.shape[-1])
+    rows = np.pad(rows, ((0, 0), (0, (-rows.shape[1]) % packing), (0, 0)))
+    return jnp.asarray(rows.reshape(len(key), -1, packing, key.shape[-1]))
 
 
 @pytest.mark.parametrize("page_size", [128, 1664])
@@ -42,7 +55,7 @@ def test_paired_page_abstract_shape(monkeypatch, page_size):
 
 @pytest.mark.parametrize("page_size", [128, 1664])
 def test_paired_tile_selection_for_shared_pool(monkeypatch, page_size):
-    from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
         get_sparse_prefill_tiles,
     )
 
@@ -146,7 +159,7 @@ def test_production_shape_torch_bridge():
     from torch_tpu._internal import compile as tpu_compile
     from torch_tpu._internal import pallas, sync
 
-    from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
         get_sparse_prefill_tiles,
     )
 
@@ -210,3 +223,99 @@ def test_production_shape_torch_bridge():
     expected[:, :12] = 0.5
     expected[:, 12:] = -1
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def _dense_selected_reference(query, gate, key, value, blocks, lengths, table, ratio):
+    """NumPy attention over explicit token sets, independent of Pallas metadata."""
+    query, gate = np.asarray(query, np.float32), np.asarray(gate, np.float32)
+    key, value = np.asarray(key, np.float32), np.asarray(value, np.float32)
+    out = np.zeros_like(query)
+    per_kv = query.shape[1] // key.shape[2]
+    for row, length in enumerate(lengths):
+        if not length:
+            continue
+        selected = {int(g) for g in blocks[row] if 0 <= g < length // ratio}
+        positions = [
+            p
+            for p in range(int(length))
+            if p // ratio in selected or p >= length // ratio * ratio
+        ]
+        if not positions:
+            continue
+        physical = table[row, np.asarray(positions) // key.shape[1]]
+        offsets = np.asarray(positions) % key.shape[1]
+        keys, values = key[physical, offsets], value[physical, offsets]
+        for head in range(query.shape[1]):
+            scores = (
+                keys[:, head // per_kv] @ query[row, head] / np.sqrt(query.shape[-1])
+            )
+            probability = np.exp(scores - scores.max())
+            probability /= probability.sum()
+            out[row, head] = probability @ values[:, head // per_kv]
+    out = out.astype(jnp.bfloat16).astype(np.float32)
+    sigmoid = (1 / (1 + np.exp(-gate))).astype(jnp.bfloat16).astype(np.float32)
+    return (out * sigmoid).astype(jnp.bfloat16).astype(np.float32)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("ratio,page_size", [(4, 128), (8, 128), (4, 1664)])
+def test_prefill_matches_independent_dense_selected_attention(fp8, ratio, page_size):
+    rng = np.random.default_rng(1964)
+    tokens, pages, heads, kv_heads, dim = 32, 6, 4, 1, 128
+    query = jnp.asarray(rng.normal(0, 0.3, (tokens, heads, dim)), jnp.bfloat16)
+    gate = jnp.asarray(rng.uniform(-3, 3, query.shape), jnp.bfloat16)
+    key = rng.normal(0, 0.3, (pages * page_size, kv_heads, dim)).astype(np.float32)
+    value = rng.normal(0, 0.3, key.shape).astype(np.float32)
+    k_scale, v_scale = (0.375, 2.5) if fp8 else (1.0, 1.0)
+    cache = pack_rows(key, value, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
+    cache = cache.reshape(pages, page_size, 1, 4 if fp8 else 2, dim)
+    # Recover the actually stored values, not the pre-quantized input.
+    stored = np.asarray(cache, np.float32).reshape(pages, page_size, -1, dim)
+    key, value = stored[:, :, 0:1] * k_scale, stored[:, :, 1:2] * v_scale
+    starts = np.array([0, 13, 13, 31], np.int32)
+    owners = np.array([[4, 0, 2], [4, 0, 2], [1, 5, 3]], np.int32)
+    request = np.minimum(
+        np.searchsorted(starts[1:], np.arange(tokens), side="right"), 2
+    )
+    table = owners[request]
+    lengths = np.concatenate(
+        (np.arange(1, 14), page_size + np.arange(1, 19), [0])
+    ).astype(np.int32)
+    blocks = np.full((tokens, 16), -1, np.int32)
+    for row, length in enumerate(lengths):
+        selected = rng.permutation(length // ratio)[:16]
+        blocks[row, : len(selected)] = selected
+    expected = _dense_selected_reference(
+        query, gate, key, value, blocks, lengths, table, ratio
+    )
+    actual, returned = jax.block_until_ready(
+        jax.jit(
+            functools.partial(
+                block_sparse_gqa_attention,
+                kv_heads=kv_heads,
+                ratio=ratio,
+                query_block=32,
+                kv_tile=ratio * 32,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        )(
+            query,
+            gate,
+            jnp.asarray(blocks),
+            jnp.asarray(lengths),
+            jnp.asarray(table),
+            cache,
+            jnp.asarray(starts),
+        )
+    )
+    actual = np.asarray(actual, np.float32)
+    assert np.isfinite(actual).all()
+    np.testing.assert_array_equal(actual[lengths == 0], 0)
+    np.testing.assert_array_equal(
+        np.asarray(returned).view(np.uint8), np.asarray(cache).view(np.uint8)
+    )
+    error = np.linalg.norm((actual - expected).reshape(tokens, -1), axis=1)
+    norm = np.linalg.norm(expected.reshape(tokens, -1), axis=1)
+    assert np.max(error / np.maximum(norm, 1e-12)) < 0.01

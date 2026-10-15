@@ -15,6 +15,7 @@ from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
 )
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 
 streamindex = importlib.import_module(
     "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
@@ -34,7 +35,7 @@ def test_shared_causal_default_keeps_current_group_visible():
         streamindex._effective_row_lengths(*args), [1, 1, 1, 1, 2, 2, 2, 2]
     )
     np.testing.assert_array_equal(
-        streamindex._effective_row_lengths(*args, causal_position_offset=3),
+        streamindex._effective_row_lengths(*args, components=qsa_indexing(3)),
         [0, 0, 0, 1, 1, 1, 1, 2],
     )
 
@@ -77,9 +78,8 @@ def test_blocked_prefill_traces_native_and_pooled_bf16(tokens, dtype, packing, v
                 num_kv_pages_per_block=(8, 8, 8),
                 num_queries_per_block=(1, 128, 128),
                 chunk_tokens=512,
-                causal_position_offset=3,
+                components=qsa_indexing(3),
                 return_scores=True,
-                cache_view_dtype=view,
             ),
             shape((tokens, 4, 256), jnp.bfloat16),
             shape((tokens, 4), jnp.float32),
@@ -107,7 +107,7 @@ def test_completed_groups_for_full_prefill_with_idle_request(context):
         num_tokens=8192,
         num_positions=65536,
         compression_ratio=4,
-        causal_position_offset=3,
+        components=qsa_indexing(3),
     )
     np.testing.assert_array_equal(actual, expected)
 
@@ -161,7 +161,7 @@ def test_nonpooled_prefill_bounds_expansion_and_preserves_request_ownership(
 
 def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
     def transport(q, weights, cache, lengths, table, starts, distribution, **kwargs):
-        assert kwargs["causal_position_offset"] == 3
+        assert kwargs["components"].schedule.causal_position_offset == 3
         np.testing.assert_array_equal(distribution, [0, 0, 3])
         return streamindex._effective_row_lengths(
             lengths,
@@ -170,7 +170,7 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
             len(q),
             65536,
             4,
-            causal_position_offset=kwargs["causal_position_offset"],
+            components=kwargs["components"],
         )
 
     monkeypatch.setattr(pooled_qsa, "streamindex_topk", transport)
@@ -259,13 +259,13 @@ def test_blocked_prefill_bf16_pool_view_matches_native_cache(tokens, carrier):
             num_kv_pages_per_block=(8, 8, 8),
             num_queries_per_block=(1, 128, 128),
             chunk_tokens=512,
-            causal_position_offset=3,
+            components=qsa_indexing(3),
             return_scores=True,
             **kwargs,
         )
 
     expected = select(native)
-    actual = select(packed, cache_view_dtype="bfloat16")
+    actual = select(packed)
     for wanted, got in zip(expected, actual):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
     visible = np.concatenate(

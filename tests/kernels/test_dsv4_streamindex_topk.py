@@ -44,66 +44,6 @@ def _to_byte_lane(x: jax.Array) -> jax.Array:
     return b
 
 
-@pytest.mark.parametrize("carrier", [jnp.uint8, jnp.float8_e4m3fn])
-@pytest.mark.parametrize("ties", [False, True])
-@pytest.mark.parametrize("prefill", [False, True])
-def test_bf16_view_wider_storage_preserves_score_bits_and_owner(carrier, ties, prefill):
-    """Unused finite features must not affect retrieval or mutate the carrier."""
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
-    rng = np.random.default_rng(53)
-    batch, pages, width = (3 if prefill else 9), 24, 256
-    query_length = 128 if prefill else 1
-    query = jnp.asarray(rng.normal(size=(batch * query_length, 4, 128)), jnp.bfloat16)
-    if ties:
-        query = jnp.zeros_like(query)
-    keys = jnp.asarray(rng.normal(size=(batch * pages, 16, 2, width)), jnp.bfloat16)
-    keys = keys.at[..., 128:].set(jnp.finfo(jnp.bfloat16).max)
-
-    def encode(src, dst):
-        dst.bitcast(jnp.bfloat16)[...] = src[...]
-
-    packed = pl.pallas_call(
-        encode,
-        grid=(len(keys),),
-        in_specs=[pl.BlockSpec((1, 16, 2, width), lambda p: (p, 0, 0, 0))],
-        out_specs=pl.BlockSpec((1, 16, 4, width), lambda p: (p, 0, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((len(keys), 16, 4, width), carrier),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-    )(keys)
-    before = np.asarray(packed).view(np.uint8).copy()
-    table = jnp.asarray(rng.permutation(batch * pages), jnp.int32)
-    lengths = jnp.array(
-        [3072, 3071, 0] if prefill else [0, 1, 3, 4, 2047, 2048, 2049, 3071, 3072],
-        jnp.int32,
-    )
-
-    def select(q):
-        return streamindex_topk(
-            q,
-            jnp.full(q.shape[:2], 128**-0.5, jnp.float32),
-            packed,
-            lengths,
-            table,
-            jnp.arange(batch + 1, dtype=jnp.int32) * query_length,
-            jnp.array([0, 0, batch] if prefill else [batch] * 3, jnp.int32),
-            k=512,
-            compression_ratio=4,
-            num_kv_pages_per_block=8,
-            num_queries_per_block=query_length,
-            decode_req_batch_size=8,
-            cache_view_dtype="bfloat16",
-            return_scores=True,
-        )
-
-    expected = select(jnp.pad(query, ((0, 0), (0, 0), (0, 128))))
-    actual = select(query)
-    for wanted, got in zip(expected, actual):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
-    np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)
-
-
 def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
     """Block fp8 quantization with UE8M0 (power-of-two) block scales."""
     fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)

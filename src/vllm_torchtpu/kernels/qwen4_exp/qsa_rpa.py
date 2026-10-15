@@ -190,7 +190,7 @@ def qsa_attention(
         from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
             block_sparse_gqa_attention,
         )
-        from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+        from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
             get_sparse_prefill_tiles,
         )
 

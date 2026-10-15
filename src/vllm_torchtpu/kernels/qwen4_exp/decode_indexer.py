@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 
 
 def decode_query_chunk_size(pages_per_query: int) -> int:
@@ -93,6 +94,7 @@ def select_decode_blocks(
             num_queries_per_block=1,
             decode_req_batch_size=8 if size >= 8 else 4,
             enable_early_exit=True,
+            components=qsa_indexing(),
         )
 
     if batch <= chunk_size:

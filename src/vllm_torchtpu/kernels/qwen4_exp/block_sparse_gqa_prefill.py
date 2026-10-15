@@ -10,8 +10,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
-from vllm_torchtpu.kernels.qwen4_exp.qsa import bf16
-from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import PAIRED_PAGE_VMEM_MIB
+from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
+from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
 def _kernel(

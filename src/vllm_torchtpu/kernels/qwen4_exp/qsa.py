@@ -4,12 +4,7 @@
 import jax
 import jax.numpy as jnp
 
-
-def bf16(x):
-    # Integer RNE makes otherwise removable BF16 boundaries observable to XLA.
-    bits = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
-    bits = (bits + jnp.uint32(0x7FFF) + ((bits >> 16) & 1)) & jnp.uint32(0xFFFF0000)
-    return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
+from .rounding import bf16
 
 
 def gemma_norm(x, weight, norm_eps):

@@ -10,6 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
     _token_metadata,
@@ -521,7 +522,7 @@ def select_blocks(
             num_queries_per_block=1,
             decode_req_batch_size=8 if batch >= 8 else 4,
             enable_early_exit=True,
-            cache_view_dtype="bfloat16" if pool.dtype != jnp.bfloat16 else None,
+            components=qsa_indexing(),
         )
 
     if len(query) > len(context):
@@ -551,8 +552,7 @@ def select_blocks(
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
-            cache_view_dtype="bfloat16" if pool.dtype != jnp.bfloat16 else None,
-            causal_position_offset=ratio - 1,
+            components=qsa_indexing(ratio - 1),
         )
 
     pages_per_query = table.shape[1] * logical_pages
