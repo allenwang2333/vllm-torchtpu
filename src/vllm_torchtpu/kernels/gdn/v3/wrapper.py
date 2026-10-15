@@ -115,6 +115,8 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    qkv_stage_scratch_ref: jax.Array | None = None,
+    qkv_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -141,6 +143,10 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        qkv_stage_scratch_ref: f32 VMEM scratch the row tiles of a
+            `cfg.qkv_row_tiled` qkv are widened into.
+        qkv_scratch_ref: Compact f32 VMEM scratch the rows of a
+            `cfg.qkv_row_tiled` qkv are gathered into.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -175,6 +181,17 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
+    if cfg.qkv_row_tiled:
+        vmem_ldst.widen_row_tiles_to_compact(
+            qkv_slot_ref,
+            qkv_stage_scratch_ref,
+            qkv_scratch_ref,
+            [
+                metadata_ref.p_id_to_r_base[p_id, idx]
+                for idx in range(cfg.seq_tile_size)
+            ],
+        )
+        qkv_slot_ref = qkv_scratch_ref
     qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
@@ -371,6 +388,8 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    qkv_stage_scratch_ref: jax.Array | None,
+    qkv_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -436,6 +455,8 @@ def outer_kernel(
                 weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
+                qkv_stage_scratch_ref,
+                qkv_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -592,7 +613,16 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
+    # A 16-bit qkv is read by the kernel straight out of its HBM row tiles
+    # and widened in VMEM; casting here would write and then re-read an f32
+    # copy in HBM. Verify windows keep the f32 path their VMEM sizing assumes.
+    qkv_row_tiled = (
+        qkv.dtype.itemsize == 2
+        and qkv.shape[-1] % pltpu.get_tpu_info().num_lanes == 0
+        and num_spec_tokens == 0
+    )
+    if not qkv_row_tiled:
+        qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -642,10 +672,10 @@ def fused_conv1d_gdn(
         )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
     act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+    assert a.dtype == b.dtype == jnp.float32
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_in_dtype.itemsize
+    packing = config.QKV_TILE_ROWS if qkv_row_tiled else 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     mixed_tile_size = min(mixed_tile_size, batch_size)
@@ -699,7 +729,15 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    if qkv_row_tiled:
+        qkv = qkv.reshape(
+            padded_batch_size // config.QKV_TILE_ROWS,
+            config.QKV_TILE_ROWS,
+            dim // num_lanes,
+            num_lanes,
+        ).transpose(0, 2, 1, 3)
+    else:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
@@ -745,6 +783,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            qkv_row_tiled=qkv_row_tiled,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,

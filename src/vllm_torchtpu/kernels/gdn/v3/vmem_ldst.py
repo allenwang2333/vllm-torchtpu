@@ -95,6 +95,48 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     return jnp.concat(vreg_list, axis=-1).reshape(new_shape)
 
 
+def store_lane_grouped_as_compact(compact_ref: jax.Ref, grouped: jax.Array) -> None:
+    """Stores [rows * cols / lanes, lanes] values into a [..., 1, cols] ref.
+
+    Both hold the same row-major element order, so the store goes through a
+    lane-preserving view of the ref and moves no data between lanes.
+    """
+    compact_ref.reshape(-1, grouped.shape[-1])[...] = grouped
+
+
+def widen_row_tiles_to_compact(
+    tiles_ref: jax.Ref,
+    stage_ref: jax.Ref,
+    compact_ref: jax.Ref,
+    row_starts: list[jax.Array],
+) -> None:
+    """Gathers token rows out of HBM row tiles into the compact f32 layout.
+
+    Args:
+        tiles_ref: [groups, cols / lanes, tile_rows, lanes] row tiles, the
+            first being the one that holds absolute row `row_starts[0]`.
+        stage_ref: f32 scratch of [groups * cols / lanes * tile_rows, lanes].
+        compact_ref: [seq, chunk, 1, cols] f32; sequence `idx`'s chunk
+            starts at absolute row `row_starts[idx]`.
+        row_starts: Absolute first row of each sequence, ascending.
+    """
+    groups, lane_groups, tile_rows, num_lanes = tiles_ref.shape
+    # One token row is every `tile_rows`-th row of its tile's lane groups.
+    stage_ref[...] = tiles_ref[...].astype(jnp.float32).reshape(-1, num_lanes)
+    first_row = (row_starts[0] // tile_rows) * tile_rows
+    seq_size, chunk_size = compact_ref.shape[:2]
+    rows = []
+    for idx in range(seq_size):
+        for t in range(chunk_size):
+            # Rows past a sequence's end only feed outputs that are never
+            # copied out; the clamp keeps their read inside the stage.
+            row = row_starts[idx] - first_row + t
+            row = jnp.clip(row, 0, groups * tile_rows - 1)
+            start = (row // tile_rows) * (lane_groups * tile_rows) + row % tile_rows
+            rows.append(stage_ref[pl.ds(start, lane_groups, stride=tile_rows), :])
+    store_lane_grouped_as_compact(compact_ref, jnp.concatenate(rows, axis=0))
+
+
 def _region_rows_per_block(
     slot_ref: jax.Ref, region: config.StateRegion
 ) -> tuple[int, int]:

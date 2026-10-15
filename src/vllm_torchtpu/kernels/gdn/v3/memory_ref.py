@@ -205,6 +205,44 @@ class InBufferedRef(BaseBufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class RowTileInBufferedRef(BaseBufferedRef):
+    """Input ref over an activation viewed as its HBM row tiles.
+
+    A grid step's rows are contiguous, so one copy moves every tile they
+    touch, starting with the tile holding the step's first row.
+    """
+
+    def _tile_range(self, p_id):
+        r_base = self.metadata_ref.p_id_to_r_base[p_id, 0]
+        num_rows = 0
+        for idx in range(self.cfg.seq_tile_size):
+            num_rows += self.metadata_ref.p_id_to_r_size[p_id, idx]
+        first = r_base // config.QKV_TILE_ROWS
+        last = pl.cdiv(r_base + num_rows, config.QKV_TILE_ROWS)
+        return first, jnp.where(num_rows > 0, last - first, 0)
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_in_slot
+        first, count = self._tile_range(grid_indices[0])
+        pltpu.make_async_copy(
+            src_ref.at[pl.ds(first, count)],
+            self.window_ref.at[slot, pl.ds(0, count)],
+            self.sem_recvs.at[slot],
+        ).start()
+
+    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_wait_in_slot
+        _, count = self._tile_range(grid_indices[0])
+        wait_ref = self.window_ref.at[slot, pl.ds(0, count)]
+        pltpu.make_async_copy(wait_ref, wait_ref, self.sem_recvs.at[slot]).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -622,6 +660,8 @@ def create_allocs(
         pipeline_mode=pipeline_mode,
     )
 
+    if cfg.qkv_row_tiled:
+        qkv_shape = (cfg.qkv_tile_groups, *qkv_ref.shape[1:])
     qkv_spec = block_spec_partial(block_shape=qkv_shape)
     b_spec = block_spec_partial(block_shape=b_shape)
     a_spec = block_spec_partial(block_shape=a_shape)
@@ -632,7 +672,17 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
+    qkv_alloc = (
+        functools.partial(
+            RowTileInBufferedRef.input,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+        )
+        if cfg.qkv_row_tiled
+        else in_buffered_partial
+    )(spec=qkv_spec, dtype_or_type=qkv_ref)
     b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
     a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
 

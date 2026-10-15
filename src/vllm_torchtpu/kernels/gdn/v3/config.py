@@ -21,6 +21,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+# Rows in one HBM tile of a 16-bit [tokens, dim] activation (XLA lays it out
+# in (8, 128) tiles of row pairs), so viewing it as
+# [tokens / QKV_TILE_ROWS, dim / lanes, QKV_TILE_ROWS, lanes] is a bitcast.
+QKV_TILE_ROWS = 8
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -122,6 +127,9 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # qkv arrives in the activation dtype as its HBM row tiles (see
+    # QKV_TILE_ROWS) and is widened to the compact f32 layout in VMEM.
+    qkv_row_tiled: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -136,6 +144,12 @@ class GDNConfig:
         if self.mode == GDNMode.PER_SEQ:
             return 1
         return self.tile_size
+
+    @property
+    def qkv_tile_groups(self) -> int:
+        """Row tiles a grid step's qkv rows can span, the first one partial."""
+        rows = self.seq_tile_size * self.chunk_size
+        return pl.cdiv(QKV_TILE_ROWS - 1 + rows, QKV_TILE_ROWS)
 
     @property
     def prev_kernel_size(self) -> int:
@@ -257,7 +271,20 @@ class GDNConfig:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
+        qkv_stage_scratch = qkv_scratch = None
+        if self.qkv_row_tiled:
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            stage_rows = self.qkv_tile_groups * QKV_TILE_ROWS
+            qkv_stage_scratch = pltpu.VMEM(
+                (stage_rows * self.dim_size // num_lanes, num_lanes), jnp.float32
+            )
+            qkv_scratch = pltpu.VMEM(
+                (self.seq_tile_size, self.chunk_size, 1, self.dim_size), jnp.float32
+            )
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
+            qkv_stage_scratch_ref=qkv_stage_scratch,
+            qkv_scratch_ref=qkv_scratch,
         )
