@@ -74,6 +74,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Media decoding and waveform resampling for multimodal inputs.
+multimodal = [
+    "av",
+    "scipy",
+    "soundfile",
+    "torchaudio==2.11.0+cpu",
+]
+
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -239,13 +247,17 @@ ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
     "google.protobuf", "google.protobuf.*",
+    "huggingface_hub", "huggingface_hub.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "jinja2", "jinja2.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
+    "PIL", "PIL.*",
     "portpicker", "portpicker.*",
     "ray", "ray.*",
+    "regex", "regex.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
     "torch", "torch.*",
@@ -253,6 +265,8 @@ ignore-missing-imports = [
     "runai_model_streamer", "runai_model_streamer.*",
     "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
+    "tiktoken", "tiktoken.*",
+    "tokenizers", "tokenizers.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",
     "vllm_omni", "vllm_omni.*",
@@ -283,4 +297,12 @@ url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-re
 explicit = true
 
 [tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 torch-tpu = { index = "torch-tpu-registry" }
+torchaudio = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
