@@ -136,7 +136,7 @@ if TYPE_CHECKING:
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
     TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = False
     TPU_INDEXER_QPREP_FUSED: bool = False
-    TPU_INDEXER_QPREP_FUSED_MIN_TOKENS: int = 0
+    TPU_INDEXER_QPREP_FUSED_MIN_TOKENS: int = 128
     TPU_INDEXER_K_WRITE_COMPACT: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -1152,9 +1152,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bit-identical to the unfused path.
     "TPU_INDEXER_QPREP_FUSED": env_bool("TPU_INDEXER_QPREP_FUSED"),
     # Token counts below this keep the same expression in plain XLA (decided on
-    # the static JAX shape inside the op).
+    # the static JAX shape inside the op): at decode buckets the kernel's fixed
+    # cost exceeds the whole XLA chain (twin j-58e2f29b: +0.2 ms per decode step).
     "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS": env_int(
-        "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS", 0
+        "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS", 128
     ),
     # DCP indexer K write: compact this rank's owned rows (about T / dcp) to the
     # front before the Pallas writer, so its scalar walk skips the other

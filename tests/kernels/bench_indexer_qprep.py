@@ -151,10 +151,49 @@ def hlo(dump_dir):
                       f"ops_touching_q={n_big} kinds={kinds}")
 
 
+def variants():
+    """Each kernel body variant x block size: bit-exact vs `reference`, and
+    the chained per-call time."""
+    for t in (1024, 2048, 4096):
+        args = inputs(t)
+        r8, rsc = K.reference(*args, n_head=H, rope_dim=R)
+        fns, ok = {}, {}
+        for v in ("f32", "bf16", "tok"):
+            for bt in (128, 256, 512):
+                fn = lambda q, c, s, v=v, bt=bt: K.indexer_q_prep(  # noqa: E731
+                    q, c, s, n_head=H, rope_dim=R, variant=v, block_tokens=bt
+                )
+                try:
+                    a8, asc = jax.jit(fn)(*args)
+                    mm = (int((a8.view(jnp.uint8) != r8.view(jnp.uint8)).sum()), int((asc != rsc).sum()))
+                    fns[(v, bt)] = {m: chained(fn, m).lower(*args).compile() for m in M_LIST}
+                    ok[(v, bt)] = mm
+                except Exception as e:  # noqa: BLE001
+                    print(f"VAR T={t} variant={v} block={bt} FAILED {type(e).__name__}: {str(e)[:300]}", flush=True)
+        times = {(k, m): [] for k in fns for m in M_LIST}
+        for _ in range(REPS):
+            for k, d in fns.items():
+                for m, c in d.items():
+                    jax.block_until_ready(args)
+                    t0 = time.perf_counter()
+                    jax.block_until_ready(c(*args))
+                    times[(k, m)].append(time.perf_counter() - t0)
+        for k in fns:
+            meds = [statistics.median(times[(k, m)][1:]) * 1e6 for m in M_LIST]
+            mbar, tbar = statistics.mean(M_LIST), statistics.mean(meds)
+            slope = sum((m - mbar) * (x - tbar) for m, x in zip(M_LIST, meds)) / sum(
+                (m - mbar) ** 2 for m in M_LIST
+            )
+            print(f"VAR T={t} variant={k[0]} block={k[1]} per_call_us={slope:.2f} "
+                  f"mismatch_q8/scale={ok[k]}", flush=True)
+
+
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "bench"
     print("devices:", jax.devices()[:1], "jax", jax.__version__)
     if what == "hlo":
         hlo(sys.argv[2])
+    elif what == "variants":
+        variants()
     else:
         bench()

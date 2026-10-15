@@ -44,7 +44,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-DEFAULT_BLOCK_TOKENS = 256
+# Tokens per grid step: 512 above 1024 tokens, else 256 (j-70160033: bf16
+# T=4096 b512 60.5 vs b256 62.1 us; T=1024 b256 18.1 vs b512 20.1 us).
+DEFAULT_BLOCK_TOKENS = None
 # Below this many tokens a block is the whole (padded) array.
 MIN_BLOCK_TOKENS = 8
 
@@ -65,7 +67,7 @@ class Numerics:
     prod_bf16:  y * (1/scale) rounds to bf16 before the clamp and cast.
     """
 
-    rope_bf16: bool = False
+    rope_bf16: bool = True
     y_bf16: bool = True
     scale_mode: str = "b16r16"
     inv_bf16: bool = True
@@ -79,7 +81,22 @@ class Numerics:
         )
 
 
+# Torch's own per-op bf16 rounding; the only combination (with either y_bf16)
+# that reproduces the compiled torch path on v7x (j-41ff6e7c numerics grid:
+# compiled == eager, exact set {r1y0..., r1y1...}).
 DEFAULT_NUMERICS = Numerics()
+
+# Kernel body variants (same values; `tests/kernels/bench_indexer_qprep.py`):
+#   "f32":  transpose the block to [tT, H, D] in f32, all math in f32 with
+#           explicit bf16 roundings.
+#   "bf16": transpose in bf16, elementwise math in bf16 (each op rounds, which
+#           is exactly torch's bf16 semantics), only 1/scale in f32.
+#   "tok":  no transpose of the input: per head, the [tT, D] lane tile is roped
+#           and quantized token-major in bf16; the fp8 result is transposed to
+#           [tT, H, D] (a quarter of the bytes) and the scales concatenated.
+# j-70160033 (chained, v7x, all bit-exact): T=4096 f32 86.4 / bf16 60.5 / tok
+# 63.4 us; T=1024 f32 26.5 / bf16 18.1 / tok 21.2 us (best block each).
+DEFAULT_VARIANT = "bf16"
 
 
 def _bf16(x):
@@ -140,6 +157,20 @@ def _rot_half(x, rope_dim: int):
     return jnp.where(lane < half, fwd, jnp.where(lane < rope_dim, bwd, x))
 
 
+def _quant_rows_bf16(y, q_max: float, quant_dtype):
+    """``quant_rows`` for the torch-exact numerics on a bf16 ``y``: every
+    elementwise op in bf16 (rounds per op), only ``1/scale`` in f32 then
+    rounded, as XLA does."""
+    amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+    recip = jnp.bfloat16(float(ml_dtypes.bfloat16(1.0 / q_max)))
+    scale = amax * recip
+    scale_f = scale.astype(jnp.float32)
+    inv = (jnp.float32(1.0) / scale_f).astype(jnp.bfloat16)
+    inv = jnp.where(scale == 0, jnp.bfloat16(0), inv)
+    v = jnp.clip(y * inv, jnp.bfloat16(-q_max), jnp.bfloat16(q_max))
+    return v.astype(quant_dtype), scale_f
+
+
 def _kernel(
     x_ref,
     c_ref,
@@ -152,9 +183,35 @@ def _kernel(
     rope_dim: int,
     numerics: Numerics,
     q_max: float,
+    variant: str = DEFAULT_VARIANT,
 ):
     """One ``[tT, H*D]`` block -> fp8 ``[tT, H, D]`` + f32 scales ``[tT, H]``."""
     t = x_ref.shape[0]
+    if variant in ("bf16", "tok"):
+        assert numerics == DEFAULT_NUMERICS or numerics == dataclasses.replace(
+            DEFAULT_NUMERICS, y_bf16=False
+        ), numerics
+        c = c_ref[...]
+        s = s_ref[...]
+        if variant == "bf16":
+            heads = [x_ref[:, h * head_dim : (h + 1) * head_dim] for h in range(n_head)]
+            x = jnp.stack(heads, axis=0).transpose(1, 0, 2)  # bf16 [tT, H, D]
+            c3, s3 = c.reshape(t, 1, head_dim), s.reshape(t, 1, head_dim)
+            y = x * c3 + _rot_half(x, rope_dim) * s3
+            q, scale = _quant_rows_bf16(y, q_max, q_ref.dtype)
+            q_ref[...] = q
+            scale_ref[...] = scale.reshape(scale_ref.shape)
+            return
+        qs, scales = [], []
+        for h in range(n_head):
+            x = x_ref[:, h * head_dim : (h + 1) * head_dim]  # bf16 [tT, D]
+            y = x * c + _rot_half(x, rope_dim) * s
+            q_h, s_h = _quant_rows_bf16(y, q_max, q_ref.dtype)
+            qs.append(q_h)
+            scales.append(s_h)
+        q_ref[...] = jnp.stack(qs, axis=0).transpose(1, 0, 2)
+        scale_ref[...] = jnp.concatenate(scales, axis=1)
+        return
     # Head h is lane tile h: cut, stack head-major, transpose in registers.
     heads = [
         x_ref[:, h * head_dim : (h + 1) * head_dim].astype(jnp.float32)
@@ -185,6 +242,7 @@ def _block_tokens(num_tokens: int, block_tokens: int) -> int:
         "quant_dtype",
         "block_tokens",
         "interpret",
+        "variant",
     ),
 )
 def indexer_q_prep(
@@ -196,8 +254,9 @@ def indexer_q_prep(
     rope_dim: int,
     numerics: Numerics = DEFAULT_NUMERICS,
     quant_dtype=jnp.float8_e4m3fn,
-    block_tokens: int = DEFAULT_BLOCK_TOKENS,
+    block_tokens: int | None = DEFAULT_BLOCK_TOKENS,
     interpret: bool = False,
+    variant: str = DEFAULT_VARIANT,
 ) -> tuple[jax.Array, jax.Array]:
     """Returns ``(q8 [T, H, D] quant_dtype, scale f32 [T, H])``.
 
@@ -213,6 +272,8 @@ def indexer_q_prep(
         c = jnp.pad(c, ((0, pad), (0, 0)))
         s = jnp.pad(s, ((0, pad), (0, 0)))
     rows = num_tokens + pad
+    if block_tokens is None:
+        block_tokens = 512 if rows > 1024 else 256
     bt = _block_tokens(rows, block_tokens)
     q_max = float(jnp.finfo(quant_dtype).max)
     q8, scale = pl.pallas_call(
@@ -223,6 +284,7 @@ def indexer_q_prep(
             rope_dim=rope_dim,
             numerics=numerics,
             q_max=q_max,
+            variant=variant,
         ),
         grid=(rows // bt,),
         in_specs=[
@@ -242,7 +304,7 @@ def indexer_q_prep(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=64 * 1024 * 1024,
         ),
-        name=f"indexer_qprep_h{n_head}_d{head_dim}_r{rope_dim}_b{bt}_{numerics.tag}",
+        name=f"indexer_qprep_{variant}_h{n_head}_d{head_dim}_r{rope_dim}_b{bt}_{numerics.tag}",
         interpret=interpret,
     )(q, c, s)
     if pad:

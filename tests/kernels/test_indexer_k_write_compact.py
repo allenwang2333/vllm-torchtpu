@@ -81,7 +81,7 @@ def test_bound_never_exceeded():
 
 
 @functools.partial(jax.jit, static_argnames=("layout", "compact"), donate_argnums=0)
-def _append(cache, k, seq_lens, pages, cu, rank, *, layout, compact):
+def _append(cache, k, seq_lens, cu, pages, rank, *, layout, compact):
     return kv_cache_append.coalesced_kv_append_dcp(
         cache, k, seq_lens, pages, cu, rank, dcp_size=DCP, interleave_size=IL,
         kv_layout=layout, compact=compact,

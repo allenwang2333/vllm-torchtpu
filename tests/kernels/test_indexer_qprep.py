@@ -39,6 +39,10 @@ SOFTMAX_SCALE = D**-0.5
 MAX_POS = 1 << 19
 FP8 = torch.float8_e4m3fn
 
+# The forward builds the op at rebind, outside Dynamo; do the same here.
+for _m in (0, 128):
+    M._get_indexer_qprep_op(H, R, _m)
+
 
 class _Rope:
     """What `rope_half_split_leading` reads off a RotaryEmbedding: the cos|sin
@@ -111,11 +115,14 @@ def _mismatch(a, b):
     return tuple(out)
 
 
-def _kernel_jax(q, pos, rope, numerics, body=None):
-    """Run the kernel directly (no torch op) for the numerics grid."""
+def _kernel_jax(q, pos, rope, numerics, variant="f32"):
+    """Run the kernel directly (no torch op) for the numerics grid (the f32
+    body is the one that takes every rounding switch)."""
     c, s = M.rope_half_split_leading_cs(rope, pos, q, D, R)
     to_j = lambda t: jnp.asarray(t.cpu().float().numpy()).astype(jnp.bfloat16)  # noqa: E731
-    q8, sc = K.indexer_q_prep(to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, numerics=numerics)
+    q8, sc = K.indexer_q_prep(
+        to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, numerics=numerics, variant=variant
+    )
     q8 = torch.from_numpy(np.asarray(q8.view(jnp.uint8))).view(FP8)
     sc = torch.from_numpy(np.asarray(sc)).view(-1, H, 1)
     return q8, sc
@@ -150,7 +157,9 @@ CASES = [(t, k) for t in (4, 8, 16, 64, 1024, 2048, 4096) for k in ("normal", "s
 def test_bit_exact(vllm_config_context, t, kind, compiled):
     rope = _Rope()
     q, pos, w = _inputs(t, 100 + t, kind)
-    ref = _compiled(unfused)(q, pos, w, rope)
+    # Like with like: the weight fold itself rounds differently eager vs
+    # compiled (unrelated to this change), so eager is held against eager.
+    ref = (_compiled(unfused) if compiled else unfused)(q, pos, w, rope)
     f = _compiled(fused) if compiled else fused
     got = f(q, pos, w, rope)
     mm = _mismatch(got, ref)
@@ -169,6 +178,23 @@ def test_min_tokens_xla_path_bit_exact(vllm_config_context, t):
     mm = _mismatch(got, ref)
     print(f"MINTOK T={t} q8/scale/weights={mm}")
     assert mm == (0, 0, 0)
+
+
+@pytest.mark.parametrize("variant", ["f32", "bf16", "tok"])
+@pytest.mark.parametrize("t", [1024, 4096])
+def test_variants_bit_exact(vllm_config_context, variant, t):
+    """Every kernel body variant reproduces the compiled torch path."""
+    rope = _Rope()
+    q, pos, w = _inputs(t, 500 + t, "special")
+    ref = _compiled(unfused)(q, pos, w, rope)
+    c, s = M.rope_half_split_leading_cs(rope, pos, q, D, R)
+    to_j = lambda x: jnp.asarray(x.cpu().float().numpy()).astype(jnp.bfloat16)  # noqa: E731
+    q8, sc = K.indexer_q_prep(to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, variant=variant)
+    q8 = torch.from_numpy(np.asarray(q8.view(jnp.uint8))).view(FP8)
+    sc = torch.from_numpy(np.asarray(sc)).view(-1, H, 1)
+    mm = _mismatch((q8, sc), ref[:2])
+    print(f"VARIANT {variant} T={t} q8/scale={mm}")
+    assert mm == (0, 0)
 
 
 # --- top-k identity -----------------------------------------------------------
@@ -224,13 +250,16 @@ def _fault(name, q, pos, w, rope):
         q8, sc = op(q, torch.ones_like(c), torch.zeros_like(s))
         sc = sc.view(-1, H, 1)
         return q8, sc, _fold(w, sc)
+    # Numerics faults (y_bf16=False is not one: with per-op rope rounding y is
+    # already bf16, an equivalent formulation -- j-70160033).
     nm = {
-        "y_unrounded": K.Numerics(y_bf16=False),
+        "inv_f32": dataclass_replace(K.DEFAULT_NUMERICS, inv_bf16=False),
         "scale_f32": K.Numerics(scale_mode="f32", inv_bf16=False, prod_bf16=False),
-        "prod_f32": dataclass_replace(K.DEFAULT_NUMERICS, prod_bf16=not K.DEFAULT_NUMERICS.prod_bf16),
+        "prod_f32": dataclass_replace(K.DEFAULT_NUMERICS, prod_bf16=False),
+        "rope_f32": dataclass_replace(K.DEFAULT_NUMERICS, rope_bf16=False),
     }[name]
-    q8, sc = _kernel_jax(q, pos, rope, nm)
-    return q8, sc, _fold(w, sc.to("tpu"))
+    q8, sc = _kernel_jax(q, pos, rope, nm, variant="f32")
+    return q8, sc, None
 
 
 def dataclass_replace(x, **kw):
@@ -239,12 +268,14 @@ def dataclass_replace(x, **kw):
     return dataclasses.replace(x, **kw)
 
 
-@pytest.mark.parametrize("name", ["head_swap", "no_rope", "y_unrounded", "scale_f32", "prod_f32"])
+@pytest.mark.parametrize("name", ["head_swap", "no_rope", "inv_f32", "scale_f32", "prod_f32", "rope_f32"])
 def test_fault_control(vllm_config_context, name):
     rope = _Rope()
     q, pos, w = _inputs(1024, 21, "special")
     ref = _compiled(unfused)(q, pos, w, rope)
     bad = _fault(name, q, pos, w, rope)
+    if bad[2] is None:  # numerics faults: the kernel's own outputs
+        bad, ref = bad[:2], ref[:2]
     mm = _mismatch(bad, ref)
     print(f"FAULT {name} q8/scale/weights={mm} caught={sum(mm) > 0}")
     if name == "head_swap":
