@@ -35,7 +35,7 @@ def _weights(seed=0):
 @pytest.mark.parametrize(
     "rows,max_rows,expect_quantized",
     [
-        (16, 0, True),  # default: W8A8 everywhere
+        (16, 0, True),  # 0: W8A8 everywhere
         (16, 16, False),
         (17, 16, True),
         (64, 64, False),
@@ -58,6 +58,23 @@ def test_activation_quantization_follows_threshold(
     out = _quantized_matmul_jax(jnp.ones((rows, _K), jnp.bfloat16), w_q, w_s)
     assert out.shape == (rows, _N)
     assert out.dtype == jnp.bfloat16
+    assert seen["quantize_activation"] is expect_quantized
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rows,expect_quantized", [(64, False), (65, True)])
+def test_default_threshold_is_64_rows(monkeypatch, rows, expect_quantized):
+    monkeypatch.delenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", raising=False)
+    seen = {}
+    real = linear_common.xla_quantized_matmul
+
+    def spy(x, w_q, w_s, quantize_activation=True):
+        seen["quantize_activation"] = quantize_activation
+        return real(x, w_q, w_s, quantize_activation=quantize_activation)
+
+    monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
+    w_q, w_s = _weights()
+    _quantized_matmul_jax(jnp.ones((rows, _K), jnp.bfloat16), w_q, w_s)
     assert seen["quantize_activation"] is expect_quantized
 
 
