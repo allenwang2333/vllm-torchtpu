@@ -1368,9 +1368,25 @@ def rope_q_block(x: jax.Array, tab: jax.Array, fault: str | None = None) -> jax.
     return jnp.where(lane < 64, r, 0.0).astype(x.dtype)
 
 
-MIXED_BODY_LEVERS = ("tr", "zu", "pv512", "noinf", "pbf16")
+MIXED_BODY_LEVERS = (
+    "tr",
+    "zu",
+    "pv512",
+    "noinf",
+    "pbf16",
+    # Stage-A levers (TPU_DCP_MLA_MIXED_KERNEL_V2), documented at
+    # `_attention_kernel`.
+    "fxskip",
+    "q128",
+    "pair",
+    "xqk",
+)
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
+# The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
+# "q128" is not among them: at 32 q heads it slowed the capped-overflow
+# fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
+MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
 # Buckets up to this many tokens keep the plain live body: at 64 tokens the
 # levers measured within noise to +2.5 % (partly filled bucket).
 MIXED_BODY_MAX_SKIP_TOKENS = 64
@@ -1518,6 +1534,13 @@ def _attention_kernel(
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    # Body lever "pair" (see below): its unpacked-KV ring is the last scratch
+    # ref, after every other one.
+    kv_stage_ref = None
+    if "pair" in body_levers:
+        assert "xqk" not in body_levers
+        kv_stage_ref = refs[-1]  # [2, 2, bkv_sz, head_dim] unpacked KV ring
+        refs = refs[:-1]
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
     tab_hbm_ref = None
@@ -1589,8 +1612,25 @@ def _attention_kernel(
     #            just those), instead of all head_dim columns.
     #   "noinf"  drop the artificial prev_out -> q dependency.
     #   "pbf16"  feed P to the PV matmul as q's dtype (not bit-exact).
+    #   "fxskip" run the capped overflow fix-up only on a grid step where some
+    #            token's kv_len exceeds bkv_sz (one scalar max over the step's
+    #            kv_lens); the fix-up is a no-op for every other step.
+    #   "q128"   (with in-kernel q rope) DMA only lanes 128:256 of the raw q
+    #            head -- the only lanes `load_bq` reads -- into a 128-lane
+    #            q_pe buffer.
+    #   "pair"   two tokens per softmax: their QK scores stacked into one
+    #            [2 * heads, w] tile (row max / exp / sum per row, exactly as
+    #            per token), each token's unpacked KV tile staged in a VMEM
+    #            ring (`kv_stage`, the last scratch ref) and read back by the
+    #            pair's PV, which runs after the next pair's softmax.
+    #   "xqk"    transposed scores: s^T = kv . q^T [w, heads], softmax over
+    #            sublanes, PV with a transposed-LHS contraction; the lse
+    #            arrives lane-dense (not bit-exact: reduction order).
+    # Every stage-A lever except "xqk" is bitwise-identical.
     assert not body_levers or group_tab_ref is not None
     assert set(body_levers) <= set(MIXED_BODY_LEVERS), body_levers
+    q128 = "q128" in body_levers
+    assert not q128 or q_rope
     fix_refs = None
     if capped_windows is not None:
         assert sparsecore_layout
@@ -1849,7 +1889,20 @@ def _attention_kernel(
                 sem,
                 wait,
             )
-            if split_q:
+            if split_q and q128:
+                # "q128": only lanes 128:256 of the raw head, the lanes
+                # `load_bq` reads, into the 128-lane q_pe buffer.
+                _async_copy(
+                    q_pe_hbm_ref.at[
+                        pl.ds(seq_idx_start, batch_size),
+                        :,
+                        pl.ds(Q_ROPE_HEAD_DIM - 128, 128),
+                    ],
+                    bq_pe_x2_ref.at[bq_sem_idx, :],
+                    sem,
+                    wait,
+                )
+            elif split_q:
                 # Same semaphore; the waits below mirror both starts.
                 _async_copy(
                     q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
@@ -1975,7 +2028,10 @@ def _attention_kernel(
         if q_rope:
             # The caller's rope + concat + zero pad, rebuilt in VMEM: lanes
             # 128:256 of the raw head are one aligned vreg column.
-            raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
+            if q128:
+                raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]
+            else:
+                raw = bq_pe_x2_ref.at[bq_sem_idx, batch_idx][:, 128:Q_ROPE_HEAD_DIM]
             tab = bq_tab_x2_ref.at[bq_sem_idx, batch_idx][...]
             q = jnp.concatenate([q, rope_q_block(raw, tab, fault)], -1)
         elif split_q:
@@ -2369,7 +2425,132 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
+        def pair_finish(k, par, p, l_sum, m, levers):
+            """PV, normalise and stores of token pair k (staged in slot par)."""
+            h = num_q_heads
+            for j in range(2):
+                kv = kv_stage_ref.at[par, j, pl.ds(0, p.shape[1])][...]
+                p_j = p[j * h : (j + 1) * h]
+                l_j = l_sum[j * h : (j + 1) * h]
+                m_j = m[j * h : (j + 1) * h]
+                out = attention_step2_pv(p_j, kv, l_j, levers)
+                store_out(bo_sem_idx, 2 * k + j, out)
+                write_blse(2 * k + j, m_j, l_j)
+
+        def run_pairs(rows, levers):
+            """Body lever "pair": QK of tokens 2k, 2k+1 stacked into one
+            [2 * heads, w] score tile with one row max / exp / sum, their
+            unpacked KV staged in `kv_stage_ref[k % 2]`; pair k's PV runs
+            after pair k + 1's softmax and reads its KV back from VMEM."""
+            assert batch_size % 2 == 0
+            h = num_q_heads
+            prev = None
+            for k in range(batch_size // 2):
+                par = k % 2
+                t0, t1 = 2 * k, 2 * k + 1
+                kv_len0 = kv_lens_ref[batch_start_seq_idx + t0]
+                kv_len1 = kv_lens_ref[batch_start_seq_idx + t1]
+                kv0 = load_bkv(bi_sem_idx, t0, rows, levers)
+                kv1 = load_bkv(bi_sem_idx, t1, rows, levers)
+                w = kv0.shape[0]
+                kv_stage_ref.at[par, 0, pl.ds(0, w)][...] = kv0
+                kv_stage_ref.at[par, 1, pl.ds(0, w)][...] = kv1
+                q0 = load_bq(bi_sem_idx, t0)
+                q1 = load_bq(bi_sem_idx, t1)
+                s = jnp.concatenate(
+                    [
+                        jnp.einsum("nd,md->nm", q0, kv0, preferred_element_type=jnp.float32),
+                        jnp.einsum("nd,md->nm", q1, kv1, preferred_element_type=jnp.float32),
+                    ],
+                    axis=0,
+                )
+                s *= sm_scale
+                if k_scale != 1.0:
+                    s *= k_scale
+                pair_row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+                pair_lim = jnp.where(pair_row < h, kv_len0, kv_len1)
+                pair_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+                s = jnp.where(pair_span < pair_lim, s, jnp.finfo(jnp.float32).min)
+                m = jnp.max(s, axis=1, keepdims=True)
+                p = jnp.exp(s - m)
+                l_sum = jnp.sum(p, axis=1, keepdims=True)
+                if prev is not None:
+                    pair_finish(k - 1, *prev, levers)
+                prev = (par, p, l_sum, m)
+            pair_finish(batch_size // 2 - 1, *prev, levers)
+
+        def xqk_row_to_col(row):
+            """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
+            h = num_q_heads
+            eye = lax.broadcasted_iota(jnp.int32, (h, h), 0) == (
+                lax.broadcasted_iota(jnp.int32, (h, h), 1)
+            )
+            return jnp.max(
+                jnp.where(eye, jnp.broadcast_to(row, (h, h)), -jnp.inf),
+                axis=1,
+                keepdims=True,
+            )
+
+        def xqk_step1(q, kv, kv_len):
+            st = jnp.einsum("md,nd->mn", kv, q, preferred_element_type=jnp.float32)
+            st *= sm_scale
+            if k_scale != 1.0:
+                st *= k_scale
+            xqk_key = lax.broadcasted_iota(jnp.int32, st.shape, 0)
+            st = jnp.where(xqk_key < kv_len, st, jnp.finfo(jnp.float32).min)
+            m = jnp.max(st, axis=0, keepdims=True)  # [1, heads]
+            p = jnp.exp(st - m)
+            l_sum = jnp.sum(p, axis=0, keepdims=True)  # [1, heads]
+            return p, l_sum, m
+
+        def xqk_step2(p, kv, l_sum, levers):
+            if "pv512" in levers and split_q:
+                kv = kv[:, : o_dim]
+            pv = jnp.einsum("mn,md->nd", p, kv, preferred_element_type=jnp.float32)
+            if k_scale != 1.0:
+                pv *= k_scale
+            l_col = xqk_row_to_col(l_sum)
+            if q_dtype == jnp.float32:
+                return lax.div(pv, l_col)
+            return (pv * pl.reciprocal(l_col, approx=True)).astype(q_dtype)
+
+        def xqk_write_blse(batch_idx, m, l_sum):
+            if not return_lse:
+                return
+            lse_row = m + jnp.log(l_sum)  # [1, heads]
+            if lse_mask_empty:
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                lse_row = lse_row + jnp.where(
+                    kv_len == 0, jnp.float32(-jnp.inf), jnp.float32(0.0)
+                )
+            if lse_lane_dense and not send:
+                blse_x2_ref.at[bo_sem_idx][pl.ds(batch_idx, 1), :] = lse_row
+            else:
+                store_blse(bo_sem_idx, batch_idx, xqk_row_to_col(lse_row))
+
+        def run_steps_xqk(rows, levers):
+            """Body lever "xqk": per token s^T [w, heads], token t's softmax
+            overlapping token t - 1's PV, as `run_steps`."""
+            prev = None
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
+                bq = load_bq(bi_sem_idx, batch_idx)
+                p, l_sum, m = xqk_step1(bq, bkv, kv_len)
+                if prev is not None:
+                    out = xqk_step2(prev[0], prev[1], prev[2], levers)
+                    store_out(bo_sem_idx, batch_idx - 1, out)
+                    xqk_write_blse(batch_idx - 1, prev[3], prev[2])
+                prev = (p, bkv, l_sum, m)
+            out = xqk_step2(prev[0], prev[1], prev[2], levers)
+            store_out(bo_sem_idx, batch_size - 1, out)
+            xqk_write_blse(batch_size - 1, prev[3], prev[2])
+
         def run_steps(rows=None, levers=()):
+            if "pair" in levers:
+                return run_pairs(rows, levers)
+            if "xqk" in levers:
+                return run_steps_xqk(rows, levers)
             prev_p = None
             prev_bkv = None
             prev_l_sum = None
@@ -2435,7 +2616,17 @@ def _attention_kernel(
             with_row_width(batch_start_seq_idx, wait_and_run)
         else:
             run_steps(None, tuple(body_levers))
-        if capped_windows is not None:
+        if capped_windows is not None and "fxskip" in body_levers:
+            # "fxskip": the fix-up only where some token overflows bkv_sz.
+            fix_base = batch_start_seq_idx
+            fix_need = kv_lens_ref[fix_base]
+            for b in range(1, batch_size):
+                fix_need = jnp.maximum(fix_need, kv_lens_ref[fix_base + b])
+            need_fix = fix_need > bkv_sz
+            pl.when(need_fix)(
+                functools.partial(fixup_capped_overflow, bi_sem_idx, bo_sem_idx)
+            )
+        elif capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
         if lse_fill and not send:
@@ -2928,6 +3119,12 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
+    if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
+        raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
+    if q_rope_table is None:
+        # "q128" narrows the in-kernel q rope's raw-head DMA; without it
+        # there is nothing to narrow.
+        mixed_body_levers = tuple(v for v in mixed_body_levers if v != "q128")
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
@@ -3588,10 +3785,26 @@ def sparse_attention_chunk(
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, *q_rope_table.shape[1:]), jnp.float32)
             )
+        stage_levers = tuple(group_levers) if live_views is not None else ()
         if split_q:
-            # q_pe double buffer; always the last scratch ref.
+            # q_pe double buffer; the last scratch ref (but for "pair"'s ring).
+            # "q128": only the 128 lanes `load_bq` reads.
+            pe_lanes = 128 if "q128" in stage_levers else q_pe.shape[-1]
             scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
+                pltpu.VMEM((2, batch_size, num_q_heads, pe_lanes), q_pe.dtype)
+            )
+        if "pair" in stage_levers:
+            # Body lever "pair": unpacked KV of a token pair, two pair slots.
+            pair_head_dim = (
+                align_to(q.shape[-1] + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128)
+                if split_q
+                else q.shape[-1]
+            )
+            assert sparsecore_layout
+            scratch_shapes.append(
+                pltpu.VMEM(
+                    (2, 2, cache_kv_nope.shape[1], pair_head_dim), jnp.float8_e4m3fn
+                )
             )
 
         bounds = [start_seq_idx, end_seq_idx]
