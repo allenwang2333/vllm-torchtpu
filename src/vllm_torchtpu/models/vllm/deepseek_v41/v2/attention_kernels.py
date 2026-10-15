@@ -1,17 +1,33 @@
 """Paged attention, exact index selection and index-cache publication."""
 
+import contextlib
+import dataclasses
 import functools
 import math
+from collections.abc import Iterator
 from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
     indexer,
     tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    decode as decode_index_selection,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    scores as prefill_index_scores,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    streaming_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    tuned_block_sizes as prefill_tuning,
 )
 
 from .cache import (
@@ -34,6 +50,56 @@ _fp8_attention_op = None
 _fp8_attention_2bank_op = None
 _fp8_attention_qo_op = None
 _fp8_attention_qo_2bank_op = None
+_gather_bf16_op = None
+_gather_fp8_op = None
+_attention_tp_size = 1
+
+
+@dataclasses.dataclass
+class _GatheredKVCache:
+    """One live gather group; records are immutable within a forward stage."""
+
+    source: Any = None
+    records: torch.Tensor | None = None
+    layout: tuple = ()
+    values: tuple[torch.Tensor, torch.Tensor | None] | None = None
+
+    def get(
+        self, source: Any, records: torch.Tensor, layout: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        if self.source is source and self.records is records and self.layout == layout:
+            return self.values
+        return None
+
+    def put(
+        self,
+        source: Any,
+        records: torch.Tensor,
+        layout: tuple,
+        values: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self.source, self.records, self.layout, self.values = (
+            source,
+            records,
+            layout,
+            values,
+        )
+        return values
+
+
+_active_gathered_kv: _GatheredKVCache | None = None
+
+
+@contextlib.contextmanager
+def gathered_kv_cache_scope() -> Iterator[None]:
+    """Reuse KV payloads across layers, never across scheduler steps/stages."""
+    global _active_gathered_kv
+    previous = _active_gathered_kv
+    _active_gathered_kv = _GatheredKVCache()
+    try:
+        yield
+    finally:
+        _active_gathered_kv = previous
 
 
 def _attention_state(q):
@@ -45,7 +111,7 @@ def _attention_state(q):
     )
 
 
-def _attend(q, pool, records, state, scale, tile=64):
+def _attend(q, pool, records, state, scale, tile=64, gathered=None):
     """Online-softmax accumulate one record set into (max, denominator, numerator)."""
     tokens, _, dim = q.shape
     width = records.shape[1]
@@ -58,7 +124,8 @@ def _attend(q, pool, records, state, scale, tile=64):
     # pieces contracted in one dot; attention is invariant to a shared
     # permutation of the head dimension. Keep `pieces` on axis 0 (`pthd`) so
     # `(heads, 128)` stays on the minor tiled axes without sublane padding.
-    gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
+    if gathered is None:
+        gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
     count = gathered.shape[0]
     gathered = gathered.reshape(count, tokens, records.shape[1], -1)
 
@@ -272,6 +339,7 @@ def paged_attention_jax(
     main_records: jax.Array,
     sink: jax.Array,
     scale: float,
+    gathered: jax.Array | None = None,
 ) -> jax.Array:
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
@@ -281,6 +349,7 @@ def paged_attention_jax(
         main_records,
         _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
         scale,
+        gathered=gathered,
     )
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
     return (numerator / denominator[..., None]).astype(q.dtype)
@@ -502,6 +571,16 @@ def _csa_gather_pool(
     top_k: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather NoPE and RoPE rows from a 1-bank or 2-bank paged pool."""
+    if isinstance(nope_cache, tuple) and jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+
+        return csa_gather.csa_gather(
+            nope_cache,
+            rope_cache,
+            indices,
+            num_valid_indices=num_valid_indices,
+            top_k=top_k,
+        )
     if isinstance(nope_cache, tuple):
         assert isinstance(rope_cache, tuple)
         nope_lo, nope_hi = nope_cache
@@ -578,6 +657,60 @@ def _csa_gather_pool(
     return u_nope, u_rope
 
 
+def gather_sparse_kv_chunk(
+    cache_kv_nope: jax.Array | tuple[jax.Array, jax.Array],
+    cache_kv_rope: jax.Array | tuple[jax.Array, jax.Array],
+    chunk_records: jax.Array,
+    chunk_seq_ids: jax.Array,
+    page_indices: jax.Array,
+    *,
+    max_num_seqs: int,
+    start_pos: int,
+    batch_end: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather packed selected KV, preserving SparseMLA's per-token RoPE layout."""
+    total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
+    chunk_size, topk = chunk_records.shape
+    seq_page_ids = chunk_records // page_size
+    token_offset = chunk_records % page_size
+    if jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+
+        page_ids = sparse_mla.gather_page_ids(
+            page_indices,
+            seq_page_ids,
+            chunk_seq_ids,
+            max_num_seqs,
+            # The page gather pads tail rows internally. Keep TPU blocks aligned
+            # even when the whole stage has, for example, twelve token rows.
+            block_tokens=8,
+        )
+    else:
+        page_table = page_indices.reshape(max_num_seqs, -1)
+        page_ids = page_table[chunk_seq_ids[:, None], jnp.clip(seq_page_ids, 0)]
+
+    is_padding = chunk_records == -1
+    flat_idx = start_pos * topk + jnp.arange(
+        chunk_size * topk, dtype=jnp.int32
+    ).reshape(chunk_size, topk)
+    scattered_page_ids = (flat_idx * 104729) % total_num_pages
+    scattered_token_offset = (flat_idx * 15485863) % page_size
+    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+    token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
+    direct_indices = (page_ids * page_size + token_offset).reshape(-1)
+    g_nope, g_rope = _csa_gather_pool(
+        cache_kv_nope,
+        cache_kv_rope,
+        direct_indices,
+        num_valid_indices=jnp.maximum(0, batch_end - start_pos) * topk,
+        top_k=topk,
+    )
+    return (
+        g_nope.reshape(chunk_size, topk, -1),
+        g_rope.reshape(chunk_size, topk // 4, -1),
+    )
+
+
 def gather_sparse_kv_chunk_with_union_fallback(
     cache_kv_nope: jax.Array | tuple[jax.Array, jax.Array],
     cache_kv_rope: jax.Array | tuple[jax.Array, jax.Array],
@@ -601,8 +734,6 @@ def gather_sparse_kv_chunk_with_union_fallback(
     union_cap``, ``jax.lax.cond`` falls back to direct ``[chunk_size, topk]``
     gather so that ``num_unique > union_cap`` never truncates KV rows.
     """
-    total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
-    chunk_size = chunk_records.shape[0]
     union_cap = union_phys_chunk.shape[0]
     has_valid = batch_end > start_pos
 
@@ -624,41 +755,15 @@ def gather_sparse_kv_chunk_with_union_fallback(
         return remap_union_kv_to_chunk(u_nope, u_rope, inv_idx_chunk, topk)
 
     def _direct_branch(_: None) -> tuple[jax.Array, jax.Array]:
-        seq_page_ids = chunk_records // page_size
-        token_offset = chunk_records % page_size
-        if jax.default_backend() == "tpu":
-            from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
-
-            page_ids = sparse_mla.gather_page_ids(
-                page_indices,
-                seq_page_ids,
-                chunk_seq_ids,
-                max_num_seqs,
-                block_tokens=sparse_mla._largest_divisor(chunk_size, 8),
-            )
-        else:
-            page_table = page_indices.reshape(max_num_seqs, -1)
-            page_ids = page_table[chunk_seq_ids[:, None], jnp.clip(seq_page_ids, 0)]
-
-        is_padding = chunk_records == -1
-        flat_idx = start_pos * topk + jnp.arange(
-            chunk_size * topk, dtype=jnp.int32
-        ).reshape(chunk_size, topk)
-        scattered_page_ids = (flat_idx * 104729) % total_num_pages
-        scattered_token_offset = (flat_idx * 15485863) % page_size
-        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
-        direct_indices = (page_ids * page_size + token_offset).reshape(-1)
-        g_nope, g_rope = _csa_gather_pool(
+        return gather_sparse_kv_chunk(
             cache_kv_nope,
             cache_kv_rope,
-            direct_indices,
-            num_valid_indices=jnp.maximum(0, batch_end - start_pos) * topk,
-            top_k=topk,
-        )
-        return (
-            g_nope.reshape(chunk_size, topk, -1),
-            g_rope.reshape(chunk_size, topk // 4, -1),
+            chunk_records,
+            chunk_seq_ids,
+            page_indices,
+            max_num_seqs=max_num_seqs,
+            start_pos=start_pos,
+            batch_end=batch_end,
         )
 
     if not use_union:
@@ -686,9 +791,11 @@ def sparse_ragged_paged_attention_union_gather(
     *,
     sm_scale: float = 1.0,
     gather_and_attention_chunk_size: int = 128,
-    attention_kernel_batch_size: int = 16,
+    attention_kernel_batch_size: int | None = None,
     union_cap: int = 4096,
     union_gather: bool = True,
+    gathered_nope: jax.Array | None = None,
+    gathered_rope: jax.Array | None = None,
 ) -> jax.Array:
     """``sparse_ragged_paged_attention`` with per-chunk SparseCore Union Gather."""
     from jax.experimental import pallas as pl
@@ -711,6 +818,27 @@ def sparse_ragged_paged_attention_union_gather(
     total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
     _, num_q_heads, _ = q.shape
     topk = topk_indices.shape[-1]
+    if gathered_nope is not None:
+        assert gathered_rope is not None
+        assert gathered_nope.shape == (q.shape[0], topk, ROW_WORDS)
+        assert gathered_rope.shape == (q.shape[0], topk // 4, ROW_WORDS)
+        # These buffers already cover the stage. Keep them resident in one
+        # attention pipeline instead of materializing per-chunk HBM slices.
+        gather_and_attention_chunk_size = q.shape[0]
+    if attention_kernel_batch_size is None:
+        attention_kernel_batch_size = 16
+        if (
+            gathered_nope is not None
+            and q.shape[0] >= 128
+            and jax.default_backend() == "tpu"
+        ):
+            from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
+                tuned_block_sizes as sparse_tuning,
+            )
+
+            attention_kernel_batch_size = sparse_tuning.prefill_batch_size(
+                str(pltpu.get_tpu_info().chip_version), q.shape[1], head_dim, topk
+            )
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
     union_cap_aligned = max(topk, sparse_mla.align_to(union_cap, topk))
     max_num_seqs = cu_q_lens.shape[0] - 1
@@ -722,7 +850,7 @@ def sparse_ragged_paged_attention_union_gather(
     )
 
     num_chunks = sparse_mla.cdiv(q.shape[0], gather_and_attention_chunk_size)
-    if union_gather:
+    if union_gather and gathered_nope is None:
         union_phys, inv_idx_all, num_unique_all = compute_chunk_union_gather_indices(
             topk_indices,
             page_indices,
@@ -753,6 +881,16 @@ def sparse_ragged_paged_attention_union_gather(
             )
             * kbs
         )
+        if gathered_nope is not None:
+            assert gathered_rope is not None
+            return (
+                gathered_nope[start_pos:end_pos],
+                gathered_rope[start_pos:end_pos],
+                start_pos,
+                batch_end,
+                kbs,
+                chunk_size,
+            )
         gathered_nope_buffer, gathered_rope_buffer = (
             gather_sparse_kv_chunk_with_union_fallback(
                 cache_kv_nope,
@@ -887,6 +1025,8 @@ def sparse_fp8_attention_jax(
     precompacted: bool = False,
     union_gather: bool = False,
     union_cap: int = 4096,
+    gathered_nope: jax.Array | None = None,
+    gathered_rope: jax.Array | None = None,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -903,15 +1043,38 @@ def sparse_fp8_attention_jax(
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
     )
+    from vllm_torchtpu.kernels.mla import tuned_window_attention, window_attention
 
-    state = _attend_window(
-        q,
-        swa_pool,
-        swa_records,
-        _attention_state(q),
-        scale,
-        max_requests=max_requests,
-    )
+    if (
+        max_requests == 1
+        and jax.default_backend() == "tpu"
+        and window_attention.supports_window_attention(q, swa_records)
+    ):
+        union, mask, uncovered = _window_union(swa_records, 64)
+        kv = gather_cache_pieces(swa_pool, union.reshape(-1), q.shape[-1])
+        kv = kv.reshape(kv.shape[0], *union.shape, kv.shape[-1])
+        key = (q.shape[1], q.shape[2], swa_records.shape[1])
+        state = window_attention.attend_windows(
+            q,
+            kv,
+            mask,
+            scale,
+            query_block=tuned_window_attention.QUERY_BLOCKS[key],
+        )
+        # Match the branch-free window path's failure for noncontiguous records.
+        state = tuple(
+            jnp.where(uncovered.reshape(-1, *([1] * (value.ndim - 1))), jnp.nan, value)
+            for value in state
+        )
+    else:
+        state = _attend_window(
+            q,
+            swa_pool,
+            swa_records,
+            _attention_state(q),
+            scale,
+            max_requests=max_requests,
+        )
     # The SWA conditional holds SparseCore gathers, and XLA completes every
     # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
     # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA
@@ -929,7 +1092,7 @@ def sparse_fp8_attention_jax(
     )
     nope_3d = _reshape_paged_pool(main_pool, page_size)
     rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
-    if union_gather or isinstance(main_pool, tuple):
+    if gathered_nope is not None or union_gather or isinstance(main_pool, tuple):
         return sparse_ragged_paged_attention_union_gather(
             q,
             nope_3d,
@@ -945,6 +1108,8 @@ def sparse_fp8_attention_jax(
             sm_scale=scale,
             union_cap=union_cap,
             union_gather=union_gather,
+            gathered_nope=gathered_nope,
+            gathered_rope=gathered_rope,
         )
     assert not isinstance(nope_3d, tuple) and not isinstance(rope_3d, tuple)
     return sparse_ragged_paged_attention(
@@ -981,10 +1146,93 @@ def slice_token_parallel_attention_inputs(
     return swa_local, main_local, q_loc_local
 
 
+def gather_bf16_kv_jax(
+    pool: jax.Array,
+    pool_hi: jax.Array | None,
+    records: jax.Array,
+    dim: int,
+) -> jax.Array:
+    """Materialize the split BF16 pieces consumed by `_attend`."""
+    records = jnp.pad(
+        records, ((0, 0), (0, -records.shape[1] % 64)), constant_values=-1
+    )
+    return gather_cache_pieces(
+        pool if pool_hi is None else (pool, pool_hi), records.reshape(-1), dim
+    )
+
+
+def gather_fp8_kv_jax(
+    pool: jax.Array,
+    pool_hi: jax.Array | None,
+    rope: jax.Array,
+    rope_hi: jax.Array | None,
+    records: jax.Array,
+    pages: jax.Array,
+    starts: jax.Array,
+    rank: jax.Array,
+    page_size: int,
+    shards: int,
+    precompacted: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather once per source/index group, retaining packed FP8 and BF16 RoPE."""
+    if shards > 1:
+        tokens = records.shape[0] // shards
+        start = rank.reshape(()) * tokens
+        records = jax.lax.dynamic_slice_in_dim(records, start, tokens, axis=0)
+        starts = jnp.clip(starts - start, 0, tokens)
+        records = jnp.pad(records, ((0, -tokens % 8), (0, 0)), constant_values=-1)
+    compacted = (
+        _pad_compacted_records(records) if precompacted else compact_records(records)
+    )
+    nope_pool = _reshape_paged_pool(
+        pool if pool_hi is None else (pool, pool_hi), page_size
+    )
+    rope_pool = _reshape_paged_pool(
+        rope if rope_hi is None else (rope, rope_hi), page_size // 4
+    )
+    seq_ids = jnp.repeat(
+        jnp.arange(pages.shape[0], dtype=jnp.int32),
+        starts[1:] - starts[:-1],
+        total_repeat_length=compacted.shape[0],
+    )
+    return gather_sparse_kv_chunk(
+        nope_pool,
+        rope_pool,
+        compacted,
+        seq_ids,
+        pages.reshape(-1),
+        max_num_seqs=pages.shape[0],
+        start_pos=0,
+        batch_end=starts[-1],
+    )
+
+
+def _fp8_query_shards(
+    tokens: int, tp_size: int, token_parallel: bool, local_tokens: int | None = None
+) -> int:
+    """Use the same query partition for the gather and attention bridges."""
+    if local_tokens is not None:
+        use_shards = (
+            tp_size > 1
+            and tokens >= 128 * tp_size
+            and tokens % (128 * tp_size) == 0
+            and local_tokens * tp_size == tokens
+        )
+    else:
+        use_shards = (
+            token_parallel
+            and tp_size > 1
+            and tokens >= 6 * tp_size
+            and tokens % tp_size == 0
+        )
+    return tp_size if use_shards else 1
+
+
 def initialize_paged_attention():
     global _attention_op, _attention_2bank_op
     global _fp8_attention_op, _fp8_attention_2bank_op
     global _fp8_attention_qo_op, _fp8_attention_qo_2bank_op
+    global _gather_bf16_op, _gather_fp8_op, _attention_tp_size
     if _attention_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -995,11 +1243,12 @@ def initialize_paged_attention():
         get_vllm_model_wrapper_context,
     )
 
+    # jax_op's type stub omits PartitionSpec and None for static arguments.
     _attention_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
+        input_partition_specs=cast(Any, (P(),) * 6 + (None, P())),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1013,6 +1262,7 @@ def initialize_paged_attention():
         main_records: jax.Array,
         sink: jax.Array,
         scale: float,
+        gathered: jax.Array | None = None,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -1022,13 +1272,14 @@ def initialize_paged_attention():
             main_records,
             sink,
             scale,
+            gathered,
         )
 
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None,),
+        input_partition_specs=cast(Any, (P(),) * 8 + (None, P())),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1042,7 +1293,82 @@ def initialize_paged_attention():
         tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
     else:
         tp_mesh = mesh
-    in_specs = (P(),) * 11
+    _attention_tp_size = tp_size
+    _gather_bf16_op = pallas.jax_op(
+        "pallas::dsv41v2_gather_bf16_kv",
+        gather_bf16_kv_jax,
+        mesh=mesh,
+        input_partition_specs=cast(Any, (P(),) * 3 + (None,)),
+    )
+    _gather_bf16_op.register_fake(
+        lambda pool, pool_hi, records, dim: pool.new_empty(
+            (
+                max(2, dim // 128),
+                records.shape[0] * (-(-records.shape[1] // 64) * 64),
+                min(128, dim // 2),
+            ),
+            dtype=torch.bfloat16,
+        )
+    )
+
+    def gather_fp8_bridge(
+        pool: jax.Array,
+        pool_hi: jax.Array | None,
+        rope: jax.Array,
+        rope_hi: jax.Array | None,
+        records: jax.Array,
+        pages: jax.Array,
+        starts: jax.Array,
+        rank: jax.Array,
+        page_size: int,
+        shards: int,
+        precompacted: bool,
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            functools.partial(
+                gather_fp8_kv_jax,
+                page_size=page_size,
+                shards=shards,
+                precompacted=precompacted,
+            ),
+            mesh=tp_mesh,
+            in_specs=(P(),) * 8,
+            out_specs=(P(), P()),
+            check_vma=False,
+        )(pool, pool_hi, rope, rope_hi, records, pages, starts, rank)
+
+    _gather_fp8_op = pallas.jax_op(
+        "pallas::dsv41v2_gather_fp8_kv",
+        gather_fp8_bridge,
+        mesh=tp_mesh,
+        input_partition_specs=cast(Any, (P(),) * 8 + (None,) * 3),
+    )
+
+    def fake_gather_fp8(
+        pool,
+        pool_hi,
+        rope,
+        rope_hi,
+        records,
+        pages,
+        starts,
+        rank,
+        page_size,
+        shards,
+        precompacted,
+    ):
+        tokens = (
+            records.shape[0]
+            if shards == 1
+            else -(-(records.shape[0] // shards) // 8) * 8
+        )
+        topk = max(128, -(-records.shape[1] // 128) * 128)
+        return pool.new_empty((tokens, topk, ROW_WORDS)), rope.new_empty(
+            (tokens, topk // 4, ROW_WORDS)
+        )
+
+    _gather_fp8_op.register_fake(fake_gather_fp8)
+    in_specs = (P(),) * 13
     out_spec = P()
 
     def fp8_attention(
@@ -1064,21 +1390,18 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         tokens = q.shape[0]
-        use_token_parallel = (
-            token_parallel
-            and tp_size > 1
-            and tokens >= 6 * tp_size
-            and tokens % tp_size == 0
-        )
+        use_token_parallel = _fp8_query_shards(tokens, tp_size, token_parallel) > 1
         if use_token_parallel:
             tokens_local = tokens // tp_size
             padded_local = -(-tokens_local // 8) * 8
             pad_rows = padded_local - tokens_local
 
             def _token_parallel_body(
-                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id
+                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id, g_n, g_r
             ):
                 q_tok = jax.lax.all_to_all(
                     q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
@@ -1110,6 +1433,8 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
                 if pad_rows:
                     out_tok = out_tok[:-pad_rows]
@@ -1135,12 +1460,26 @@ def initialize_paged_attention():
                 sink,
                 full_sink,
                 tp_rank,
+                gathered_nope,
+                gathered_rope,
             )
 
         # Mosaic calls require explicit manual partitioning on a multi-device
         # mesh; each device attends over its own replicated cache.
         return jax.shard_map(
-            lambda q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, _f_snk, _r_id: (
+            lambda q_l,
+            s_p,
+            m_p,
+            r_p,
+            s_r,
+            m_r,
+            pgs,
+            q_loc,
+            snk,
+            _f_snk,
+            _r_id,
+            g_n,
+            g_r: (
                 sparse_fp8_attention_jax(
                     q_l,
                     s_p,
@@ -1157,6 +1496,8 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
             ),
             mesh=tp_mesh,
@@ -1175,13 +1516,15 @@ def initialize_paged_attention():
             sink,
             full_sink,
             tp_rank,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=tp_mesh,
-        input_partition_specs=in_specs + (None,) * 7,
+        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1207,6 +1550,8 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention(
             q,
@@ -1227,13 +1572,15 @@ def initialize_paged_attention():
             token_parallel,
             union_gather,
             union_cap,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 14 + (None,) * 7,
+        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1266,6 +1613,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
 
@@ -1294,12 +1643,7 @@ def initialize_paged_attention():
             max_requests=max_requests,
             precompacted=precompacted,
         )
-        if (
-            tp_size > 1
-            and tokens >= 128 * tp_size
-            and tokens % (128 * tp_size) == 0
-            and tokens_local * tp_size == tokens
-        ):
+        if _fp8_query_shards(tokens, tp_size, True, tokens_local) > 1:
 
             def _local_body(
                 q_in,
@@ -1319,6 +1663,8 @@ def initialize_paged_attention():
                 w,
                 ws,
                 ok,
+                g_n,
+                g_r,
             ):
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
@@ -1341,6 +1687,8 @@ def initialize_paged_attention():
                     q_loc_tok,
                     f_snk,
                     **attn_kwargs,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
                 out_tok = jnp.where(
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
@@ -1355,7 +1703,7 @@ def initialize_paged_attention():
             return jax.shard_map(
                 _local_body,
                 mesh=tp_mesh,
-                in_specs=(P(),) * 17,
+                in_specs=(P(),) * 19,
                 out_specs=out_spec,
                 check_vma=False,
             )(
@@ -1376,10 +1724,29 @@ def initialize_paged_attention():
                 wo_a_full,
                 wo_a_full_scale,
                 valid,
+                gathered_nope,
+                gathered_rope,
             )
 
         def _sharded_body(
-            q_in, wq, wqs, pos, cs, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, w, ws, ok
+            q_in,
+            wq,
+            wqs,
+            pos,
+            cs,
+            s_p,
+            m_p,
+            r_p,
+            s_r,
+            m_r,
+            pgs,
+            q_loc,
+            snk,
+            w,
+            ws,
+            ok,
+            g_n,
+            g_r,
         ):
             if tp_size > 1 and q_in.shape[0] < tokens:
                 q_in = jax.lax.all_gather(q_in, axis_name="tp", axis=0, tiled=True)[
@@ -1388,7 +1755,18 @@ def initialize_paged_attention():
             q = _quantized_matmul_jax(q_in, wq, wqs)
             q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
             out = sparse_fp8_attention_jax(
-                q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **attn_kwargs
+                q,
+                s_p,
+                m_p,
+                r_p,
+                s_r,
+                m_r,
+                pgs,
+                q_loc,
+                snk,
+                **attn_kwargs,
+                gathered_nope=g_n,
+                gathered_rope=g_r,
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
             return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
@@ -1396,7 +1774,7 @@ def initialize_paged_attention():
         return jax.shard_map(
             _sharded_body,
             mesh=tp_mesh,
-            in_specs=(P(),) * 16,
+            in_specs=(P(),) * 18,
             out_specs=out_spec,
             check_vma=False,
         )(
@@ -1416,13 +1794,15 @@ def initialize_paged_attention():
             wo_a,
             wo_a_scale,
             valid,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 23 + (None,) * 5,
+        input_partition_specs=cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1461,6 +1841,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -1491,13 +1873,15 @@ def initialize_paged_attention():
             max_requests,
             precompacted,
             head_dim,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 26 + (None,) * 5,
+        input_partition_specs=cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
@@ -1522,6 +1906,33 @@ def _resolve_fp8_pages(main, main_records, tokens):
         ).unsqueeze(0)
     starts = main_records.new_tensor([0, tokens])
     return page_size, pages, starts
+
+
+def _gather_fp8_for_stage(
+    main, records, pages, starts, rank, page_size, shards, precompacted
+):
+    cache = _active_gathered_kv
+    if cache is None:
+        return None, None
+    layout = ("fp8", page_size, shards, precompacted)
+    values = cache.get(main, records, layout)
+    if values is not None:
+        return values
+    assert _gather_fp8_op is not None
+    values = _gather_fp8_op(
+        main.raw,
+        main.raw_hi,
+        main.rope,
+        main.rope_hi,
+        records.int(),
+        pages.int(),
+        starts.int(),
+        rank.reshape(1).int(),
+        page_size,
+        shards,
+        precompacted,
+    )
+    return cache.put(main, records, layout, values)
 
 
 def sparse_fp8_attention_qo(
@@ -1559,6 +1970,11 @@ def sparse_fp8_attention_qo(
         page_size, pages, starts = _resolve_fp8_pages(
             main, main_records, positions.shape[0]
         )
+    tokens = positions.shape[0]
+    shards = _fp8_query_shards(tokens, _attention_tp_size, True, qr_local.shape[0])
+    gathered = _gather_fp8_for_stage(
+        main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
+    )
     tail_args = (
         swa_records.int(),
         main_records.int(),
@@ -1577,6 +1993,7 @@ def sparse_fp8_attention_qo(
         max_requests,
         precompacted,
         head_dim,
+        *gathered,
     )
     if _has_hi_bank(main):
         assert (
@@ -1618,6 +2035,25 @@ def sparse_fp8_attention_qo(
 
 
 def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
+    gathered = None
+    cache = _active_gathered_kv
+    if cache is not None and main_records.shape[1]:
+        layout = ("bf16", q.shape[-1])
+        values = cache.get(main, main_records, layout)
+        if values is None:
+            assert _gather_bf16_op is not None
+            values = cache.put(
+                main,
+                main_records,
+                layout,
+                (
+                    _gather_bf16_op(
+                        main.raw, main.raw_hi, main_records.int(), q.shape[-1]
+                    ),
+                    None,
+                ),
+            )
+        gathered = values[0]
     if _has_hi_bank(main):
         assert _attention_2bank_op is not None and swa.raw_hi is not None
         return _attention_2bank_op(
@@ -1630,10 +2066,18 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
             main_records.int(),
             sink,
             scale,
+            gathered,
         )
     assert _attention_op is not None
     return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
+        q,
+        swa.raw,
+        main.raw,
+        swa_records.int(),
+        main_records.int(),
+        sink,
+        scale,
+        gathered,
     )
 
 
@@ -1666,6 +2110,11 @@ def sparse_fp8_attention(
         tp_rank = main_records.new_zeros((1,), dtype=torch.int32)
     else:
         tp_rank = tp_rank.reshape(1).int()
+    tokens = q.shape[0]
+    shards = _fp8_query_shards(tokens, _attention_tp_size, token_parallel)
+    gathered = _gather_fp8_for_stage(
+        main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
+    )
     tail_args = (
         swa_records.int(),
         main_records.int(),
@@ -1681,6 +2130,7 @@ def sparse_fp8_attention(
         token_parallel,
         union_gather,
         union_cap,
+        *gathered,
     )
     if _has_hi_bank(main):
         assert (
@@ -1720,6 +2170,17 @@ _INDEX_MAX_TILE = 16384
 # The packed scorer unrolls its query loop. Keep shared decode groups small;
 # large prefill groups use the existing shared matmul.
 _INDEX_MAX_SHARED_QUERIES = 8
+# Packed word-row scoring (`index_word_scores`) streams pool rows straight into
+# the kernel, so a loop iteration costs one paged gather + one kernel launch +
+# one score write regardless of size. At TP1/DP8 C384 decode (288 rows, ~96K
+# context) the `_INDEX_KEYS_PER_ITER` budget gives 512-key tiles: ~200 tiny
+# iterations per layer, dominated by per-iteration overhead. Word-row paths
+# use a 4.5x larger key budget; grouped rows size the tile by request rows.
+_INDEX_WORD_KEYS_PER_ITER = 4608 * 256  # 4096-key tiles at 288 rows; prefill keeps 512
+# Decode-shaped batches (few queries per request row) skip query tiling in
+# `paged_indexer_jax` while their full [queries, context] FP32 score buffer
+# stays within this many elements (512 MiB), keeping grouped scoring intact.
+_INDEX_UNTILED_SCORE_ELEMENTS = 1 << 27
 
 
 def paged_index_scores_jax(
@@ -1757,11 +2218,32 @@ def paged_index_scores_jax(
         )
         else tokens
     )
+    word_rows = (
+        page_records is not None
+        and dim == index_word_scores.DIM
+        and q.dtype == jnp.bfloat16
+    )
+    keys_per_iter = _INDEX_WORD_KEYS_PER_ITER if word_rows else _INDEX_KEYS_PER_ITER
     budget = min(
-        max(512, min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(eff_tokens, 1))),
+        max(512, min(_INDEX_MAX_TILE, keys_per_iter // max(eff_tokens, 1))),
         -(-width // 128) * 128,
     )
     tile = 1 << (budget.bit_length() - 1)
+    if (
+        word_rows
+        and requests is not None
+        and records.shape[0] > 1
+        and records.shape[0] < tokens <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+    ):
+        # Grouped decode scoring reads `requests * tile` keys per iteration,
+        # not `tokens * tile`: size the tile by request rows.
+        grouped = min(
+            _INDEX_MAX_TILE,
+            _INDEX_KEYS_PER_ITER // records.shape[0],
+            -(-width // 128) * 128,
+        )
+        if grouped > tile:
+            tile = 1 << (grouped.bit_length() - 1)
     padded_width = width + (-width % tile)
     scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
@@ -1959,6 +2441,85 @@ def paged_index_scores_jax(
 
 _indexer_op = None
 _indexer_2bank_op = None
+
+
+def _decode_select(
+    q,
+    weights,
+    pool,
+    pages,
+    lengths,
+    *,
+    page_records,
+    candidate_count=0,
+    candidate_block_size=1,
+):
+    """Run the complete TC/SC decode pipeline inside the manual wrapper mesh."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    select = functools.partial(
+        decode_index_selection.decode_indexer,
+        page_records=page_records,
+        key_tile=4096,
+        candidate_count=candidate_count,
+        candidate_block_size=candidate_block_size,
+    )
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return select(q, weights, pool, pages, lengths)
+    return jax.shard_map(
+        select, mesh=mesh, in_specs=(P(),) * 5, out_specs=P(), check_vma=False
+    )(q, weights, pool, pages, lengths)
+
+
+def _prefill_score(q, weights, pool, pages, limit, *, page_records):
+    """Resident-query scorer, manually replicated across the wrapper mesh."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    score = functools.partial(
+        prefill_index_scores.prefill_index_scores,
+        page_records=page_records,
+        query_tile=prefill_tuning.QUERY_TILE,
+        key_tile=prefill_tuning.KEY_TILE,
+    )
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return score(q, weights, pool, pages, limit)
+    return jax.shard_map(
+        score, mesh=mesh, in_specs=(P(),) * 5, out_specs=P(), check_vma=False
+    )(q, weights, pool, pages, limit)
+
+
+def _prefill_top_k(scores, lengths):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    def select(s, n):
+        ids = streaming_topk.streaming_topk(s, valid_lengths=n, k=512)
+        values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
+        ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
+        return _compact_selected(ids)
+
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return select(scores, lengths)
+    return jax.shard_map(
+        select, mesh=mesh, in_specs=(P(), P()), out_specs=P(), check_vma=False
+    )(scores, lengths)
 
 
 def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
@@ -2217,6 +2778,7 @@ def paged_indexer_jax(
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -2225,76 +2787,266 @@ def paged_indexer_jax(
     ``gcd(block_size, page_records)`` records (a block lies in one page).
     """
 
-    def score_context(records, query_tile):
+    def score_context(records, query_tile, mode="baseline"):
         # Finish selection before reusing a query tile's score buffer. Key
         # tiling alone still materializes [all queries, max context]: at
         # 2048 x 1M a single FP32 score matrix is 8 GiB, before top-k copies.
         # Reuse the native indexer's query tile and score/selection pipeline.
         rows = q.shape[0]
-        tile = min(rows, query_tile)
-        padding = -rows % tile
         longest = lengths.max() if batch_max is None else batch_max
-        inputs = jax.tree.map(
-            lambda x: jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1)),
-            (q, weights, lengths, candidates, requests),
-        )
+        group_tokens = -(-rows // records.shape[0])
+        use_prefill = mode != "baseline"
 
-        def prepare(i):
-            return jax.tree.map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, i * tile, tile), inputs
-            )
+        def run(grouped):
+            tile = min(rows, query_tile)
+            inputs = (q, weights, lengths, candidates, requests)
+            if grouped:
+                # Keep a request's queries together and slice its records too:
+                # flat query tiles otherwise gather the same keys per query.
+                group_rows = min(records.shape[0], tile // group_tokens)
+                tile = group_rows * group_tokens
+                token_ids = jax.vmap(
+                    lambda mask: jnp.nonzero(mask, size=group_tokens, fill_value=rows)[
+                        0
+                    ]
+                )(belongs).reshape(-1)
+                token_ids = jnp.pad(
+                    token_ids, (0, -token_ids.size % tile), constant_values=rows
+                )
+                inputs = jax.tree.map(
+                    lambda x: jnp.pad(x, ((0, 1),) + ((0, 0),) * (x.ndim - 1))[
+                        token_ids
+                    ],
+                    inputs,
+                )
+                local_requests = jnp.repeat(jnp.arange(group_rows), group_tokens)
+                record_tiles = jnp.pad(
+                    records,
+                    ((0, -records.shape[0] % group_rows), (0, 0)),
+                    constant_values=-1,
+                )
+                count = token_ids.size
+            else:
+                count = rows + (-rows % tile)
+                inputs = jax.tree.map(
+                    lambda x: jnp.pad(
+                        x, ((0, count - rows),) + ((0, 0),) * (x.ndim - 1)
+                    ),
+                    inputs,
+                )
 
-        def score(args):
-            queries, row_weights, row_lengths, _, row_requests = args
-            scores = paged_index_scores_jax(
-                queries,
-                pool,
-                records,
-                row_weights,
-                row_lengths,
-                row_requests,
-                page_records,
-            )
-            return jnp.where(
-                jnp.take(records >= 0, row_requests, axis=0), scores, -jnp.inf
-            )
+            def prepare(i):
+                values = jax.tree.map(
+                    lambda x: jax.lax.dynamic_slice_in_dim(x, i * tile, tile), inputs
+                )
+                if grouped:
+                    row_records = jax.lax.dynamic_slice_in_dim(
+                        record_tiles, i * group_rows, group_rows
+                    )
+                    return (*values[:-1], local_requests, row_records)
+                return (*values, records)
 
-        def select(i, scores):
-            _, _, row_lengths, row_candidates, _ = prepare(i)
-            return select_indices_jax(
-                scores,
-                row_lengths,
-                row_candidates,
-                topk,
-                block_size,
-                candidate_write,
-                candidate_filter,
-                unordered,
-                longest,
-            )
+            def score(args):
+                queries, row_weights, row_lengths, _, row_requests, row_records = args
+                if use_prefill:
+                    # The outer route proves every live query shares a request.
+                    # Entries are first-record addresses, not page numbers.
+                    request = requests[jnp.argmax(lengths)]
+                    pages = jax.lax.dynamic_slice_in_dim(row_records, request, 1)
+                    scores = _prefill_score(
+                        split_halves(queries),
+                        row_weights.astype(jnp.float32)[:, :, None],
+                        pool,
+                        pages[:, ::page_records],
+                        jnp.max(row_lengths, keepdims=True),
+                        page_records=page_records,
+                    )
+                else:
+                    scores = paged_index_scores_jax(
+                        queries,
+                        pool,
+                        row_records,
+                        row_weights,
+                        row_lengths,
+                        row_requests,
+                        page_records,
+                    )
+                return jnp.where(
+                    jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
+                )
 
-        if rows <= tile:
-            return select(jnp.int32(0), score(inputs))
+            def select(i, scores):
+                _, _, row_lengths, row_candidates, _, _ = prepare(i)
+                if use_prefill:
+                    selected = _prefill_top_k(scores, row_lengths)
+                    return selected, row_candidates
+                return select_indices_jax(
+                    scores,
+                    row_lengths,
+                    row_candidates,
+                    topk,
+                    block_size,
+                    candidate_write,
+                    candidate_filter,
+                    unordered,
+                    longest,
+                )
 
-        def write(i, selected, output):
-            return jax.tree.map(
-                lambda dst, src: jax.lax.dynamic_update_slice_in_dim(
-                    dst, src, i * tile, axis=0
+            if not grouped and rows <= tile:
+                return select(jnp.int32(0), score(prepare(jnp.int32(0))))
+
+            def write(i, selected, output):
+                if grouped:
+                    ids = jax.lax.dynamic_slice_in_dim(token_ids, i * tile, tile)
+                    return jax.tree.map(
+                        lambda dst, src: dst.at[ids].set(src, mode="drop"),
+                        output,
+                        selected,
+                    )
+                return jax.tree.map(
+                    lambda dst, src: jax.lax.dynamic_update_slice_in_dim(
+                        dst, src, i * tile, axis=0
+                    ),
+                    output,
+                    selected,
+                )
+
+            if grouped:
+                # Zero-length queries were omitted from the request groups.
+                published = (
+                    jnp.full_like(candidates, -1)
+                    if candidate_write
+                    and candidates.shape[1] * block_size < records.shape[1]
+                    else candidates
+                )
+            else:
+                published = jnp.zeros((count, candidates.shape[1]), candidates.dtype)
+            output = (
+                jnp.full(
+                    (rows if grouped else count, min(topk, records.shape[1])),
+                    -1,
+                    jnp.int32,
                 ),
-                output,
-                selected,
+                published,
+            )
+            selected, published = indexer.pipeline_score_topk(
+                count // tile, prepare, score, select, write, output
+            )
+            return selected[:rows], published[:rows]
+
+        if (
+            not use_prefill
+            and page_records is not None
+            and q.dtype == jnp.bfloat16
+            and q.shape[-1] == index_word_scores.DIM
+            and records.shape[0] > 1
+            and 1 < group_tokens <= min(query_tile, _INDEX_MAX_SHARED_QUERIES)
+        ):
+            belongs = (jnp.arange(records.shape[0])[:, None] == requests) & (
+                lengths > 0
+            )
+            fits = jnp.all(belongs.sum(axis=1) <= group_tokens)
+            return jax.lax.cond(fits, lambda _: run(True), lambda _: run(False), None)
+        return run(False)
+
+    def prefill_context():
+        widths = prefill_index_scores.context_buckets(records.shape[1])
+
+        def run(columns):
+            bounded_records = records[:, :columns]
+            bounded_records = jnp.pad(
+                bounded_records,
+                ((0, 0), (0, columns - bounded_records.shape[1])),
+                constant_values=-1,
+            )
+            return score_context(
+                bounded_records, prefill_tuning.QUERY_TILE, prefill_mode
             )
 
-        output = (
-            jnp.full((rows + padding, min(topk, records.shape[1])), -1, jnp.int32),
-            jnp.zeros((rows + padding, candidates.shape[1]), candidates.dtype),
+        def all_indices(_):
+            # No ranking is necessary when every visible key fits in TopK.
+            ids = jnp.broadcast_to(
+                jnp.arange(min(topk, records.shape[1]), dtype=jnp.int32),
+                (q.shape[0], min(topk, records.shape[1])),
+            )
+            valid = (ids < lengths[:, None]) & (
+                jnp.take(records[:, : ids.shape[1]], requests, axis=0) >= 0
+            )
+            return _compact_selected(jnp.where(valid, ids, -1)), candidates
+
+        def ranked(_):
+            branch = jnp.searchsorted(
+                jnp.asarray(widths[:-1]), lengths.max(), side="left"
+            )
+            return jax.lax.switch(branch, [functools.partial(run, b) for b in widths])
+
+        return jax.lax.cond(lengths.max() <= topk, all_indices, ranked, None)
+
+    def decode_context():
+        count = records.shape[0]
+        queries = q.shape[0] // count
+        # Pad the compact page table, not the full per-token record matrix.
+        width = max(4096, 1 << (records.shape[1] - 1).bit_length())
+        pages = jnp.pad(
+            records[:, ::page_records],
+            ((0, 0), (0, (width - records.shape[1]) // page_records)),
+            constant_values=-1,
         )
-        selected, published = indexer.pipeline_score_topk(
-            (rows + padding) // tile, prepare, score, select, write, output
+        publish = (
+            candidate_write and candidates.shape[1] * block_size < records.shape[1]
         )
-        return selected[:rows], published[:rows]
+        result = _decode_select(
+            split_halves(q).reshape(count, queries, *q.shape[1:]),
+            weights.astype(jnp.float32).reshape(count, queries, q.shape[1], 1),
+            pool,
+            pages,
+            lengths.reshape(count, queries),
+            page_records=page_records,
+            candidate_count=candidates.shape[1] if publish else 0,
+            candidate_block_size=block_size,
+        )
+        return result if publish else (result, candidates)
 
     def full_context(_):
+        if (
+            jax.default_backend() == "tpu"
+            and unordered
+            and not candidate_filter
+            and (
+                not candidate_write
+                or (
+                    block_size > 0
+                    and 4096 % block_size == 0
+                    and candidates.shape[1] > 0
+                    and candidates.shape[1] % 16 == 0
+                )
+            )
+            and topk == 512
+            and decode_index_selection.supports_decode(q, pool, records, page_records)
+        ):
+            expected = jnp.repeat(
+                jnp.arange(records.shape[0], dtype=jnp.int32),
+                q.shape[0] // records.shape[0],
+            )
+            # Draft/mixed batches can share the padded shape but have different
+            # request boundaries. Never reinterpret those rows as uniform groups.
+            regular = jnp.all((requests == expected) | (lengths == 0))
+            return jax.lax.cond(regular, decode_context, existing_context)
+        return existing_context()
+
+    def existing_context():
+        rows = q.shape[0]
+        if (
+            records.shape[0] > 1
+            and records.shape[0] < rows <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+            and rows * records.shape[1] <= _INDEX_UNTILED_SCORE_ELEMENTS
+        ):
+            # Decode-shaped batch (e.g. DSpark verify: 48 requests x 6 rows).
+            # Query tiles of 32/128 rows hold fewer rows than request rows, so
+            # `paged_index_scores_jax` could not share each request's key tile
+            # across its queries and would gather every row's context again.
+            # The untiled score buffer is small here; keep one query tile.
+            return score_context(records, rows)
         columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
         if (
             not candidate_write
@@ -2305,13 +3057,34 @@ def paged_indexer_jax(
         ):
             # Select a smaller working shape without limiting request length.
             # Publication/filtering retain their full-width candidate contract.
+            def bounded(_):
+                return score_context(records[:, :columns], query_tile)
+
             return jax.lax.cond(
                 lengths.max() <= columns,
-                lambda _: score_context(records[:, :columns], query_tile),
+                bounded,
                 lambda _: score_context(records, indexer.QUERY_TILE),
                 None,
             )
         return score_context(records, indexer.QUERY_TILE)
+
+    if (
+        prefill_mode != "baseline"
+        and jax.default_backend() == "tpu"
+        and unordered
+        and not candidate_write
+        and not candidate_filter
+        and topk == 512
+        and records.shape[1] >= topk
+        and prefill_index_scores.supports_chunked_prefill(q, pool, page_records)
+    ):
+        live = lengths > 0
+        request = requests[jnp.argmax(lengths)]
+        # Infer eligibility from live rows, not a prefill/decode phase flag.
+        # Short contexts need no ranking; padding does not select a request.
+        prefill = (live.sum() >= prefill_tuning.QUERY_TILE) | (lengths.max() <= topk)
+        prefill &= jnp.all((requests == request) | ~live)
+        return jax.lax.cond(prefill, prefill_context, lambda: full_context(None))
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:
@@ -2467,6 +3240,7 @@ def update_and_select_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
     updated = write_index_keys(pool, write_records, keys)
@@ -2485,6 +3259,7 @@ def update_and_select_jax(
         unordered,
         batch_max,
         page_records or None,
+        prefill_mode,
     )
     return updated, selected, published
 
@@ -2507,6 +3282,7 @@ def update_and_select_2bank_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (updated_lo, updated_hi), selected, published = cast(
         Any,
@@ -2527,12 +3303,16 @@ def update_and_select_2bank_jax(
             candidate_filter,
             unordered,
             page_records,
+            prefill_mode,
         ),
     )
     return updated_lo, updated_hi, selected, published
 
 
 def initialize_indexer():
+    from .candidate_cache import initialize_candidate_cache
+
+    initialize_candidate_cache()
     global _indexer_op, _indexer_2bank_op
     if _indexer_op is not None:
         return
@@ -2548,7 +3328,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 10 + (None,) * 6,
+        input_partition_specs=(P(),) * 10 + (None,) * 7,
     )
 
     def fake(
@@ -2568,6 +3348,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prefill_mode="streaming",
     ):
         return (
             torch.empty_like(pool),
@@ -2583,7 +3364,7 @@ def initialize_indexer():
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 6,
+        input_partition_specs=(P(),) * 11 + (None,) * 7,
     )
 
     def fake_2bank(
@@ -2604,6 +3385,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prefill_mode="streaming",
     ):
         return (
             torch.empty_like(pool_lo),
@@ -2635,6 +3417,7 @@ def paged_indexer(
     unordered=False,
     batch_max=None,
     page_records=None,
+    prefill_mode=None,
 ):
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -2642,6 +3425,10 @@ def paged_indexer(
     whole batch when the queries are only part of it. ``page_records``: see
     `paged_index_scores_jax`.
     """
+    # Resolve the comparison selector in the torch-to-JAX wrapper and pass it
+    # explicitly: compiled JAX functions must not read environment state.
+    if prefill_mode is None:
+        prefill_mode = envs.TPU_DEEPSEEK_V41_PREFILL_INDEXER
     assert _indexer_op is not None
     if batch_max is None:
         batch_max = lengths.max()
@@ -2660,6 +3447,7 @@ def paged_indexer(
         candidate_filter,
         unordered,
         page_records or 0,
+        prefill_mode,
     )
     if _has_hi_bank(cache):
         assert _indexer_2bank_op is not None

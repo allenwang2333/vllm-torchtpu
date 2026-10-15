@@ -149,7 +149,8 @@ def _fake_file_meta(offset, names_and_sizes):
     )
 
 
-def test_request_plan_groups_contiguous_kept_runs():
+@pytest.mark.parametrize("filter_model_weights", [False, True])
+def test_request_plan_groups_contiguous_kept_runs(filter_model_weights):
     """Kept tensors separated by a skipped one become separate byte-range
     requests, offsets account for the skipped bytes, and skipped tensors are
     never part of any request."""
@@ -164,6 +165,9 @@ def test_request_plan_groups_contiguous_kept_runs():
             (f"{e}.5.w1.weight_packed", 10),  # skip   @1012
             (f"{e}.5.w1.weight_scale", 2),  # skip   @1022
             ("m.layers.0.dense.weight", 7),  # kept   @1024
+            ("mtp.0.ffn.experts.0.w1.weight", 10),  # kept @1031
+            ("mtp.0.ffn.experts.5.w1.weight", 10),  # skip @1041
+            ("mtp.0.main_proj.weight", 4),  # kept @1051
         ],
     )
 
@@ -203,16 +207,26 @@ def test_request_plan_groups_contiguous_kept_runs():
                 ["gs://bucket/file0.safetensors"],
                 local_expert_ids={0},
                 use_tqdm_on_load=False,
+                weight_filter=(
+                    (lambda name: name.startswith("mtp."))
+                    if filter_model_weights
+                    else None
+                ),
             )
         )
 
     requests = captured["requests"]
-    assert [(r.offset, r.chunks) for r in requests] == [
-        (1000, [10, 2]),  # expert 0's contiguous run
-        (1024, [7]),  # dense weight after the skipped gap
-    ]
-    total_requested = sum(sum(r.chunks) for r in requests)
-    assert total_requested == 19  # 31 bytes in file, 12 skipped
+    if not filter_model_weights:
+        expected = [
+            ([1000, 1010], [10, 2]),
+            ([1024, 1031], [7, 10]),
+            ([1051], [4]),
+        ]
+    else:
+        expected = [([1031], [10]), ([1051], [4])]
+    assert [(r.offsets, r.sizes) for r in requests] == expected
+    total_requested = sum(sum(r.sizes) for r in requests)
+    assert total_requested == (14 if filter_model_weights else 33)
 
 
 def test_zero_size_kept_tensor_bypasses_fetch_plan():
@@ -278,7 +292,7 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
 
     requests = captured["requests"]
     # One contiguous run through the zero-byte tensor; no 0-length chunk.
-    assert [(r.offset, r.chunks) for r in requests] == [(100, [8, 4])]
+    assert [(r.offsets, r.sizes) for r in requests] == [([100, 108], [8, 4])]
     # The zero-size tensor is still yielded (as an empty tensor).
     assert "m.layers.0.empty.weight" in yielded
 
@@ -320,7 +334,7 @@ def test_row_sliced_tensor_fetches_only_its_rows():
 
         def get_chunks(self):
             for request in captured["requests"]:
-                for index, size in enumerate(request.chunks):
+                for index, size in enumerate(request.sizes):
                     yield request.id, index, torch.empty(size, dtype=torch.uint8)
 
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
@@ -349,10 +363,10 @@ def test_row_sliced_tensor_fetches_only_its_rows():
             )
         }
 
-    assert [(r.offset, r.chunks) for r in captured["requests"]] == [
-        (100, [8]),
-        (108 + 3 * 4, [5 * 4]),  # rows 3..7 only
-        (148, [8]),
+    assert [(r.offsets, r.sizes) for r in captured["requests"]] == [
+        ([100], [8]),
+        ([108 + 3 * 4], [5 * 4]),  # rows 3..7 only
+        ([148], [8]),
     ]
     assert yielded["layers.1.engram.embed.weight"] == (5, 4)
     # The file's metadata keeps the full shape for any other consumer.
@@ -373,8 +387,8 @@ def test_row_slice_matches_dotted_suffix_only():
 def test_streamer_split_preserves_chunk_index_mapping():
     """Pin the library contract this loader depends on: when
     RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
-    FileChunks across several sub-requests, get_global_file_and_chunk must
-    keep reporting (our request id, index within OUR chunk list)."""
+    FileChunks across several sub-requests, get_global_file_and_range must
+    keep reporting (our request id, index within OUR range list)."""
     # The Run:AI streamer ships with PR #331; skip until it is in the image.
     pytest.importorskip("runai_model_streamer")
     from runai_model_streamer.file_streamer.requests_iterator import (
@@ -384,7 +398,7 @@ def test_streamer_split_preserves_chunk_index_mapping():
 
     # One request of 5 chunks, memory limit 6 -> split into [3,3],[3,3],[3]
     chunks = [3, 3, 3, 3, 3]
-    it = FilesRequestsIterator(6, [FileChunks(7, "/f", 100, list(chunks))])
+    it = FilesRequestsIterator(6, [FileChunks.contiguous(7, "/f", 100, list(chunks))])
 
     seen = []
     while True:
@@ -392,9 +406,9 @@ def test_streamer_split_preserves_chunk_index_mapping():
         if req is None:
             break
         for local_file_idx, fc in enumerate(req.files):
-            for local_chunk_idx in range(len(fc.chunks)):
-                file_id, global_idx = it.get_global_file_and_chunk(
-                    local_file_idx, local_chunk_idx
+            for local_range_idx in range(len(fc.sizes)):
+                file_id, global_idx = it.get_global_file_and_range(
+                    req, local_file_idx, local_range_idx
                 )
                 seen.append((file_id, global_idx))
     assert seen == [(7, i) for i in range(len(chunks))]
@@ -422,3 +436,86 @@ def test_patch_falls_back_when_filter_inactive():
             loader = FakeLoader()
             FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
         original.assert_called_once_with(loader, "gs://b/m", None)
+
+
+@pytest.mark.parametrize("with_filter", [False, True])
+@pytest.mark.parametrize("override", [None, "gs://b/override"])
+def test_patch_passes_model_filter_for_each_load(with_filter, override):
+    """The callback belongs to this model load, not the loader instance."""
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    class FakeLoader:
+        _get_weights_iterator = MagicMock()
+        _prepare_weights = MagicMock(return_value=["weights.safetensors"])
+        load_config = SimpleNamespace(use_tqdm_on_load=False)
+
+    config = SimpleNamespace(
+        model="gs://b/model", model_weights=override, revision="revision"
+    )
+    model = SimpleNamespace(load_weights=MagicMock())
+    if with_filter:
+        model.should_load_weight = lambda name: name.endswith(".weight")
+    weights = iter(())
+    with (
+        patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch.object(mlp, "_compute_local_expert_ids", return_value={0}),
+        patch.object(
+            mlp, "_sharded_runai_weights_iterator", return_value=weights
+        ) as stream,
+    ):
+        mlp.patch_runai_sharded_expert_streaming()
+        loader = FakeLoader()
+        loader.load_weights(model, config)
+        FakeLoader._prepare_weights.assert_called_once_with(
+            override or config.model, config.revision
+        )
+        stream.assert_called_once_with(
+            ["weights.safetensors"],
+            {0},
+            False,
+            weight_filter=getattr(model, "should_load_weight", None),
+        )
+        model.load_weights.assert_called_once_with(weights)
+
+        # Reusing this loader for another model must not retain the callback.
+        loader.load_weights(SimpleNamespace(load_weights=MagicMock()), config)
+        assert stream.call_args.kwargs["weight_filter"] is None
+
+
+def test_model_filter_preserves_original_checkpoint_names():
+    """Filtering runs on metadata; remapping remains the model's job."""
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    kept_name = "checkpoint.block.weight"
+    skipped_name = "checkpoint.unused.weight"
+    file_meta = _fake_file_meta(100, [(skipped_name, 8), (kept_name, 4)])
+    tensor = MagicMock()
+    tensor.clone.return_value = tensor
+    keep = MagicMock(side_effect=lambda name: name == kept_name)
+    streamer = MagicMock()
+    streamer.__enter__.return_value = streamer
+    streamer.file_streamer = streamer
+    streamer.get_chunks.return_value = iter([(0, 0, memoryview(b"data"))])
+    with (
+        patch.object(
+            safetensors_streamer, "SafetensorsStreamer", return_value=streamer
+        ),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[file_meta]),
+        patch.object(sp, "create_torch_tensor", return_value=tensor),
+    ):
+        result = list(
+            _sharded_runai_weights_iterator(
+                ["weights.safetensors"],
+                local_expert_ids=set(),
+                use_tqdm_on_load=False,
+                weight_filter=keep,
+            )
+        )
+    assert result == [(kept_name, tensor)]
+    assert [call.args[0] for call in keep.call_args_list] == [skipped_name, kept_name]
+    requests = streamer.stream_files.call_args.args[0]
+    assert [(request.offsets, request.sizes) for request in requests] == [([108], [4])]
