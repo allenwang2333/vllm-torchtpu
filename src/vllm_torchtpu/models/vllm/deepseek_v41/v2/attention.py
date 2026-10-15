@@ -448,24 +448,30 @@ def _query_split(count, ranks):
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
 
 
-def _request_row_slots(cache, block_table, width):
+def _request_row_slots(
+    cache, block_table, width, *, page_stride=None, dtype=torch.int64
+):
     """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
 
     Every token of a request scans the same capacity-wide rows, so address
     them once per request instead of once per token.
     """
     rows_per_page = cache.shape[1]
-    # Logical row r lives in table column r // rows_per_page, so repeating each
-    # column rows_per_page times lines blocks up with rows 0..width-1 without
-    # a full-width gather (16-40x slower on TPU, see _row_slots).
+    stride = rows_per_page if page_stride is None else page_stride
+    table_cols = block_table.shape[1] * rows_per_page
+    # Logical row r lives in table column r // rows_per_page, so scaling each
+    # column by `stride` before repeating `rows_per_page` times lines blocks up
+    # with rows 0..width-1 without a full-width gather or 2D div/mod.
+    scaled_blocks = block_table.to(dtype) * stride
     blocks = (
-        block_table[:, :, None]
+        scaled_blocks[:, :, None]
         .expand(-1, -1, rows_per_page)
         .reshape(block_table.shape[0], -1)
-        .long()
     )
     offsets = (
-        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
+        torch.arange(width, device=block_table.device, dtype=dtype).clamp(
+            max=table_cols - 1
+        )
         % rows_per_page
     )
     if width > blocks.shape[1]:
@@ -473,7 +479,10 @@ def _request_row_slots(cache, block_table, width):
         blocks = torch.cat(
             (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
         )
-    return blocks[:, :width] * rows_per_page + offsets
+    return blocks[:, :width] + offsets
+
+
+_DEFAULT_REQUEST_ROW_SLOTS = _request_row_slots
 
 
 def _read_rows(cache, block_table, requests, logical):
@@ -1181,9 +1190,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             has_fast_idx_offset = isinstance(
                                 getattr(index_cache, "row_offset", None), int
                             )
+                            idx_table = _block_table(keys_meta)
                             idx_req_key = (
                                 "index_req_slots",
-                                indexer.k_cache.prefix,
+                                idx_table.shape,
+                                getattr(indexer.k_cache, "compress_ratio", None),
                                 index_cache.shape[1] if has_fast_idx_offset else None,
                                 (
                                     index_cache.page_stride
@@ -1192,25 +1203,50 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 ),
                                 capacity,
                             )
-                            cached_idx_req = (
+                            cached_idx_entry = (
                                 stage_cache.get(idx_req_key)
                                 if stage_cache is not None
                                 else None
                             )
-                            if cached_idx_req is None:
-                                req_slots = _request_row_slots(
-                                    index_cache, _block_table(keys_meta), capacity
-                                )
-                                cached_idx_req = (
-                                    req_slots
-                                    // index_cache.shape[1]
-                                    * index_cache.page_stride
-                                    + req_slots % index_cache.shape[1]
-                                    if has_fast_idx_offset
-                                    else req_slots
-                                )
+                            if (
+                                cached_idx_entry is None
+                                or cached_idx_entry[0] is not keys_meta.block_tables
+                            ):
+                                if _request_row_slots is _DEFAULT_REQUEST_ROW_SLOTS:
+                                    cached_idx_req = _request_row_slots(
+                                        index_cache,
+                                        idx_table,
+                                        capacity,
+                                        page_stride=(
+                                            index_cache.page_stride
+                                            if has_fast_idx_offset
+                                            else None
+                                        ),
+                                        dtype=(
+                                            torch.int32
+                                            if has_fast_idx_offset
+                                            else torch.int64
+                                        ),
+                                    )
+                                else:
+                                    req_slots = _request_row_slots(
+                                        index_cache, idx_table, capacity
+                                    )
+                                    cached_idx_req = (
+                                        req_slots
+                                        // index_cache.shape[1]
+                                        * index_cache.page_stride
+                                        + req_slots % index_cache.shape[1]
+                                        if has_fast_idx_offset
+                                        else req_slots
+                                    )
                                 if stage_cache is not None:
-                                    stage_cache[idx_req_key] = cached_idx_req
+                                    stage_cache[idx_req_key] = (
+                                        keys_meta.block_tables,
+                                        cached_idx_req,
+                                    )
+                            else:
+                                cached_idx_req = cached_idx_entry[1]
                             index_records = (
                                 index_cache.row_offset + cached_idx_req
                                 if has_fast_idx_offset
@@ -1308,7 +1344,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     if pages is not None:
                         # SparseMLA resolves pages itself (Pallas), avoiding a
                         # [tokens, topk] XLA gather of the block table here.
-                        main_records = selected.masked_fill(~valid_compressed, -1)
+                        main_records = (
+                            selected
+                            if selected.shape[0] < count
+                            else selected.masked_fill(~valid_compressed, -1)
+                        )
                         starts = source_meta.query_start_loc
                     else:
                         slots = _row_slots(
@@ -1595,8 +1635,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 ).index_select(0, mine)
         else:
+            cached_cand_part = None
             qr_part, weights_part, candidates_part = qr, weights, candidates
         q_part = self._project_index_q(qr_part, positions_part)
+        candidate_write_mode = (
+            2
+            if cand_part_key is not None
+            and stage_cache is not None
+            and candidate_write
+            and bool(getattr(self, "_fp8_kv", False))
+            else candidate_write
+        )
+        candidate_filter_mode = (
+            2
+            if cached_cand_part is not None and bool(getattr(self, "_fp8_kv", False))
+            else (has_candidates and not candidate_write)
+        )
         updated_cache, selected, published = paged_indexer(
             q_part,
             index_cache,
@@ -1609,8 +1663,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             requests_part,
             topk=self._config["index_topk"],
             block_size=max(1, self.candidate_block_size),
-            candidate_write=candidate_write,
-            candidate_filter=has_candidates and not candidate_write,
+            candidate_write=candidate_write_mode,
+            candidate_filter=candidate_filter_mode,
             # FP8 attention re-sorts the selection (compact_records).
             unordered=self._fp8_kv,
             batch_max=batch_max,
@@ -1630,11 +1684,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and count >= 6 * ranks
         )
         if split:
-            if keep_local_selected:
-                selected = selected.masked_fill(
-                    (selected < 0) | (selected >= lengths_part), -1
-                )
-            else:
+            if not keep_local_selected:
                 selected = _gather_query_rows(selected)[:count]
             if candidate_write:
                 if cand_part_key is not None and stage_cache is not None:
