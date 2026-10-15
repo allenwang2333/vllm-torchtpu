@@ -157,10 +157,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         kv_transfer_cfg = getattr(
             getattr(self, "vllm_config", None), "kv_transfer_config", None
         )
-        kv_role = getattr(kv_transfer_cfg, "kv_role", None)
+        from vllm_torchtpu.platforms.tpu_platform import _effective_disagg_kv_role
+
+        disagg_role = _effective_disagg_kv_role(kv_transfer_cfg)
+        kv_role = disagg_role or getattr(kv_transfer_cfg, "kv_role", None)
         self._is_disagg = (
-            kv_transfer_cfg is not None
-            or getattr(self, "connector", None) is not None
+            disagg_role in ("kv_producer", "kv_consumer")
+            or kv_role in ("kv_producer", "kv_consumer")
+            or (
+                kv_transfer_cfg is None and getattr(self, "connector", None) is not None
+            )
         )
         self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
         self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
@@ -549,9 +555,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
         return cached
 
-    def _free_request(
-        self, request: Request, delay_free_blocks: bool = False
-    ):
+    def _free_request(self, request: Request, delay_free_blocks: bool = False):
         retention = getattr(self, "_retention", None)
         if retention is not None:
             drain_fn = getattr(self, "_drain_deferred_frees", None)
@@ -603,9 +607,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             poll_fn = getattr(connector, "poll_and_complete_transfers", None)
             if callable(poll_fn):
                 try:
-                    _kv_wait_ns, _early_reqs, _waited_reqs, _waited = poll_fn(
-                        self
-                    )
+                    _kv_wait_ns, _early_reqs, _waited_reqs, _waited = poll_fn(self)
                 except Exception:
                     logger.exception(
                         "PrefixAwareScheduler: poll_and_complete_transfers failed."
@@ -643,9 +645,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         finish_steps, finish_max_defer, _ = self._get_finish_decode_knobs()
         if finish_steps > 0 and decoding:
-            tokens_per_dec = 1 + max(
-                int(getattr(self, "num_spec_tokens", 3) or 0), 0
-            )
+            tokens_per_dec = 1 + max(int(getattr(self, "num_spec_tokens", 3) or 0), 0)
             finish_thresh = finish_steps * tokens_per_dec
             near_finish_ids = {
                 id(r)
@@ -656,9 +656,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._step_has_near_finish_decoder = bool(near_finish_ids)
             prev_nf_ids = getattr(self, "_prev_near_finish_ids", None)
             if prev_nf_ids and (prev_nf_ids - near_finish_ids):
-                total_nf_defer = int(
-                    getattr(self, "_total_nf_defer_streak", 0) or 0
-                )
+                total_nf_defer = int(getattr(self, "_total_nf_defer_streak", 0) or 0)
                 if total_nf_defer < 2 * finish_max_defer:
                     self._finish_decode_defer_streak = 0
             self._prev_near_finish_ids = near_finish_ids
@@ -709,12 +707,10 @@ class PrefixAwareScheduler(AsyncScheduler):
                 )
                 if getattr(self, "_step_finish_decode_deferred", False):
                     self._finish_decode_defer_streak = (
-                        int(getattr(self, "_finish_decode_defer_streak", 0) or 0)
-                        + 1
+                        int(getattr(self, "_finish_decode_defer_streak", 0) or 0) + 1
                     )
                     self._total_nf_defer_streak = (
-                        int(getattr(self, "_total_nf_defer_streak", 0) or 0)
-                        + 1
+                        int(getattr(self, "_total_nf_defer_streak", 0) or 0) + 1
                     )
             now = time.monotonic()
             if now - getattr(self, "_last_sched_log_t", 0.0) >= 60.0:
@@ -888,9 +884,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        num_new_tokens = self._cap_cold_prefill_tokens(
-            request, start, num_new_tokens
-        )
+        num_new_tokens = self._cap_cold_prefill_tokens(request, start, num_new_tokens)
         if num_new_tokens <= 0:
             return 0
         retention = getattr(self, "_retention", None)

@@ -206,10 +206,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 continue
             if finished_job.job_id in self._jobs:
                 completed_jobs[finished_job.job_id] = num_workers
-            if (
-                finished_job.op == AdmissionOp.LOAD
-                and finished_job.req_id is not None
-            ):
+            if finished_job.op == AdmissionOp.LOAD and finished_job.req_id is not None:
                 load_req_ids.append(finished_job.req_id)
 
         finished_recving: set[str] = set()
@@ -227,20 +224,36 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 finished_recving.add(req_id)
 
         if completed_jobs or finished_recving:
+            worker_meta: Any = RaidenOffloadingWorkerMetadata(
+                # pyrefly: ignore[unexpected-keyword]
+                completed_jobs=completed_jobs,
+                fenced_jobs={},
+            )
+            outer_conn = getattr(scheduler, "connector", None)
+            sub_conns = getattr(outer_conn, "sub_connectors", None)
+            if sub_conns is None:
+                sub_conns = getattr(outer_conn, "_connectors", None)
+            if sub_conns is not None:
+                from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                    multi_connector as mc_mod,
+                )
+
+                worker_meta = mc_mod.MultiKVConnectorWorkerMetadata(
+                    metadata=tuple(
+                        worker_meta
+                        if getattr(c, "connector_scheduler", None) is self
+                        else None
+                        for c in sub_conns
+                    )
+                )
             kv_out = KVConnectorOutput(
                 finished_recving=finished_recving,
-                kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
-                    # pyrefly: ignore[unexpected-keyword]
-                    completed_jobs=completed_jobs,
-                    fenced_jobs={},
-                ),
+                kv_connector_worker_meta=worker_meta,
             )
             scheduler._update_from_kv_xfer_finished(kv_out)
         return len(finished_recving)
 
-    def poll_and_complete_transfers(
-        self, scheduler: Any
-    ) -> tuple[int, int, int, bool]:
+    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
         """Poll Raiden C++ transfer completions at the start of ``schedule()``
         so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
         the very next step instead of waiting 2 steps for the worker echo."""
@@ -270,9 +283,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if wait_ms > 0.0:
                     if not getattr(scheduler, "running", None):
                         wait_ms = max(wait_ms, 5.0)
-                    deadline_ns = time.perf_counter_ns() + int(
-                        wait_ms * 1_000_000.0
-                    )
+                    deadline_ns = time.perf_counter_ns() + int(wait_ms * 1_000_000.0)
                     waited = True
                     while time.perf_counter_ns() < deadline_ns:
                         time.sleep(0.0001)
@@ -376,9 +387,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     else:
                         assert failed_job.req_id is not None
                         finished_loads[failed_job.job_id] = failed_job.req_id
-                        failed_load_block_ids.extend(
-                            failed_job.failed_device_block_ids
-                        )
+                        failed_load_block_ids.extend(failed_job.failed_device_block_ids)
                 pending_failed.clear()
         else:
             # Collect completed/drained jobs for the worker echo channel.
@@ -388,9 +397,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 else:
                     assert finished_job.req_id is not None
                     finished_loads[finished_job.job_id] = finished_job.req_id
-                    failed_load_block_ids.extend(
-                        finished_job.failed_device_block_ids
-                    )
+                    failed_load_block_ids.extend(finished_job.failed_device_block_ids)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -426,9 +433,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         without emitting duplicate lookup events."""
         req_status.num_locally_computed_tokens = base_tokens
         tracker = getattr(self, "_events_tracker", None)
-        orig_record = (
-            getattr(tracker, "record_lookup", None) if tracker else None
-        )
+        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
         orig_partial = (
             getattr(tracker, "record_partial_lookup", None) if tracker else None
         )
@@ -633,13 +638,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return self.connector_scheduler.take_events()
         return []
 
-    def poll_and_complete_transfers(
-        self, scheduler: Any
-    ) -> tuple[int, int, int, bool]:
+    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
         if isinstance(self.connector_scheduler, TPURaidenOffloadingScheduler):
-            return self.connector_scheduler.poll_and_complete_transfers(
-                scheduler
-            )
+            return self.connector_scheduler.poll_and_complete_transfers(scheduler)
         return (0, 0, 0, False)
 
     # -- worker-side hooks -------------------------------------------------
@@ -723,9 +724,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (fence_job_ids, _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

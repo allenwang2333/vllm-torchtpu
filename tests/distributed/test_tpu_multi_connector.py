@@ -145,3 +145,48 @@ def test_conflicting_group_indices_across_children_raise():
 
     with pytest.raises(RuntimeError, match="Conflicting"):
         connector.get_block_ids_with_load_errors_group_index()
+
+
+def test_multi_connector_sets_disable_singleton_worker(monkeypatch):
+    monkeypatch.delenv("RAIDEN_DISABLE_SINGLETON_WORKER", raising=False)
+    _build()
+    import os
+
+    assert os.environ.get("RAIDEN_DISABLE_SINGLETON_WORKER") == "1"
+
+
+def test_divergent_local_hybrid_hits_and_poll_forwarded():
+    connector = _build()
+    raiden, offload = connector._connectors
+    raiden.supports_divergent_local_hybrid_hits = False
+    offload.supports_divergent_local_hybrid_hits = True
+    offload.resolve_divergent_local_hit_tokens = MagicMock(return_value=1408)
+    offload.poll_and_complete_transfers = MagicMock(return_value=(500, 2, 1, True))
+
+    assert connector.supports_divergent_local_hybrid_hits is True
+    req = SimpleNamespace(request_id="req-1")
+    assert connector.resolve_divergent_local_hit_tokens(req, 1536, 1280, 1280) == 1408
+    offload.resolve_divergent_local_hit_tokens.assert_called_once_with(
+        req, 1536, 1280, 1280
+    )
+    assert connector.poll_and_complete_transfers("sched") == (500, 2, 1, True)
+
+
+def test_effective_disagg_kv_role_resolves_multi_connector():
+    from vllm_torchtpu.platforms.tpu_platform import (
+        _effective_disagg_kv_role,
+        _has_offloading_connector,
+    )
+
+    cfg = KVTransferConfig(
+        kv_connector="TPUMultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "TPURaidenConnector", "kv_role": "kv_producer"},
+                {"kv_connector": "TPURaidenOffloadingConnector", "kv_role": "kv_both"},
+            ]
+        },
+    )
+    assert _effective_disagg_kv_role(cfg) == "kv_producer"
+    assert _has_offloading_connector(cfg) is True

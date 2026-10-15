@@ -103,8 +103,11 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         else 0
     )
     credit = (
-        (_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots
-    ) * 3 * hidden * inter
+        ((_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots)
+        * 3
+        * hidden
+        * inter
+    )
     mk_tp = (
         os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
         in ("1", "true", "yes", "on")
@@ -449,6 +452,44 @@ def _register_tpu_kv_connectors() -> None:
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
     ):
         KVConnectorFactory.register_connector(name, module_path, name)
+
+
+def _effective_disagg_kv_role(kv_transfer_config: object) -> str | None:
+    """Resolve the disaggregation role ('kv_producer' or 'kv_consumer') even
+    when wrapped inside TPUMultiConnector alongside an offloading child."""
+    if kv_transfer_config is None:
+        return None
+    conn = getattr(kv_transfer_config, "kv_connector", None)
+    if conn in ("TPUMultiConnector", "MultiConnector"):
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        for sub in extra.get("connectors", ()):
+            if isinstance(sub, dict) and sub.get("kv_connector") in (
+                "TPUConnector",
+                "TPURaidenConnector",
+            ):
+                role = sub.get("kv_role")
+                return role if isinstance(role, str) else None
+        return None
+    if conn in ("TPURaidenOffloadingConnector", "OffloadingConnector"):
+        return None
+    role = getattr(kv_transfer_config, "kv_role", None)
+    return role if isinstance(role, str) else None
+
+
+def _has_offloading_connector(kv_transfer_config: object) -> bool:
+    if kv_transfer_config is None:
+        return False
+    conn = getattr(kv_transfer_config, "kv_connector", None)
+    if conn == "TPURaidenOffloadingConnector":
+        return True
+    if conn in ("TPUMultiConnector", "MultiConnector"):
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        return any(
+            isinstance(sub, dict)
+            and sub.get("kv_connector") == "TPURaidenOffloadingConnector"
+            for sub in extra.get("connectors", ())
+        )
+    return False
 
 
 class TpuPlatform(Platform):
@@ -813,10 +854,10 @@ class TpuPlatform(Platform):
                 "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
             )
         kv_cache_layout = get_flashinfer_layout_string(layout)
+        disagg_kv_role = _effective_disagg_kv_role(vllm_config.kv_transfer_config)
         if (
             vllm_config.speculative_config is not None
-            and vllm_config.kv_transfer_config is not None
-            and vllm_config.kv_transfer_config.kv_role == "kv_producer"
+            and disagg_kv_role == "kv_producer"
             and parallel_config.prefill_context_parallel_size > 1
             and vllm_config.speculative_config.num_speculative_tokens != 1
         ):
@@ -832,12 +873,13 @@ class TpuPlatform(Platform):
             vllm_config.speculative_config.synthetic_acceptance_length = None
         elif (
             vllm_config.speculative_config is not None
-            and vllm_config.kv_transfer_config is not None
-            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+            and disagg_kv_role == "kv_consumer"
             and vllm_config.speculative_config.num_speculative_tokens >= 3
             and vllm_config.speculative_config.rejection_sample_method == "standard"
         ):
-            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "3.39").strip()
+            synth_len_env = os.environ.get(
+                "SYNTHETIC_ACCEPTANCE_LENGTH", "3.39"
+            ).strip()
             if synth_len_env and float(synth_len_env) > 0:
                 synth_len = float(synth_len_env)
                 vllm_config.speculative_config.rejection_sample_method = "synthetic"
@@ -993,23 +1035,25 @@ class TpuPlatform(Platform):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
             kv_tc = vllm_config.kv_transfer_config
+            disagg_role = _effective_disagg_kv_role(kv_tc)
             is_kv_consumer = bool(
-                kv_tc is not None and not getattr(kv_tc, "is_kv_producer", False)
+                disagg_role == "kv_consumer"
+                or (
+                    disagg_role is None
+                    and kv_tc is not None
+                    and not getattr(kv_tc, "is_kv_producer", False)
+                )
             )
             default_retention = "0" if is_kv_consumer else "1"
-            if (
-                os.environ.get("TPU_HYBRID_STATE_RETENTION", default_retention)
-                .strip()
-                .lower()
-                in ("1", "true", "yes", "on")
-            ):
+            if os.environ.get(
+                "TPU_HYBRID_STATE_RETENTION", default_retention
+            ).strip().lower() in ("1", "true", "yes", "on"):
                 if hasattr(cache_config, "prefix_cache_retention_interval"):
                     cache_config.prefix_cache_retention_interval = 0
                 if (
                     not is_kv_consumer
                     and hasattr(cache_config, "prefix_match_unit")
-                    and getattr(cache_config, "prefix_match_unit", None)
-                    in (None, 0, 1)
+                    and getattr(cache_config, "prefix_match_unit", None) in (None, 0, 1)
                 ):
                     cache_config.prefix_match_unit = 128
             dcp_size = int(
@@ -1070,7 +1114,7 @@ class TpuPlatform(Platform):
             # (PCP shards, prefill-sized activations) OOMs at it, so leave that
             # leg on gpu_memory_utilization.
             kv_cfg = vllm_config.kv_transfer_config
-            if kv_cfg is not None and kv_cfg.kv_role == "kv_producer":
+            if _effective_disagg_kv_role(kv_cfg) == "kv_producer":
                 logger.info(
                     "Qwen3.5-397B kv_cache_memory_bytes left to the prefill "
                     "leg (requested %s; mixed-engine auto would be %d).",
@@ -1299,8 +1343,7 @@ class TpuPlatform(Platform):
                 f"'{kv_transfer_config.kv_connector}'."
             )
             is_hybrid_offloading = (
-                kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
-                and is_hybrid
+                _has_offloading_connector(kv_transfer_config) and is_hybrid
             )
             if is_hybrid_offloading and not unified_kv_layout_enabled(vllm_config):
                 # Hybrid model offloading transfers uniform pool rows; the non-unified

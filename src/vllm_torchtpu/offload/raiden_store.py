@@ -410,6 +410,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # holds nothing for the key. Every other store/skip/touch decision
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
+        self._inflight_load_keys: set[OffloadKey] = set()
 
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
@@ -550,7 +551,7 @@ class RaidenOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if key in self._inflight_store_keys:
+        if key in self._inflight_store_keys or key in self._inflight_load_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
@@ -568,6 +569,8 @@ class RaidenOffloadingManager(OffloadingManager):
         for sub_hash, block in matches:
             status = block.status
             if status in (self._block_status.HOST, self._block_status.HOST_AND_HBM):
+                if sub_hash in self._hash_to_admission:
+                    return LookupResult.HIT_PENDING
                 continue
             if status == self._block_status.HBM:
                 if sub_hash in self._hash_to_admission:
@@ -708,6 +711,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
+        self._inflight_load_keys.update(keys)
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
@@ -946,6 +950,7 @@ class RaidenOffloadingManager(OffloadingManager):
         if not pinned:
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
+            self._inflight_load_keys.difference_update(keys)
             self._finished.append(
                 FinishedJob(
                     job_id=job_id,
@@ -1062,7 +1067,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # transition (cleanup, finished-job report).
         self._admissions.pop(admission.job_id, None)
         for sub_hash in admission.sub_hashes:
-            self._hash_to_admission.pop(sub_hash, None)
+            if self._hash_to_admission.get(sub_hash) is admission:
+                self._hash_to_admission.pop(sub_hash, None)
         success = not (admission.failed or admission.poisoned)
         # Give back only what the job still holds. A transfer that landed
         # already spent its pin and a peer read never took one, so the release
@@ -1080,6 +1086,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            self._inflight_load_keys.difference_update(admission.keys)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -1683,7 +1690,9 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         host, _, port = self._controller_address.rpartition(":")
         host = host.strip("[]")
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
+            with socket.create_connection((host, int(port)), timeout=1.0) as sock:
+                if sock.getsockname() == sock.getpeername():
+                    return False
                 return True
         except OSError:
             return False
