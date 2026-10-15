@@ -23,6 +23,9 @@ from vllm_torchtpu.kernels.gdn.v3 import config
 
 # Value heads the chunked (PER_SEQ) step computes per slab of the carried state.
 CHUNK_HEAD_GROUP = 64
+# Heads packed side by side along lanes, one MXU pass per group, in the
+# blocked triangular inverse.
+INV_HEADS_PER_PASS = 2
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -126,6 +129,98 @@ def _forward_sub_paired(t_mat: jax.Array, b_mat: jax.Array) -> jax.Array:
     x_pair = jnp.stack(x_list, axis=1)
     x = jnp.stack([x_pair[..., :cols], x_pair[..., cols:]], axis=1)
     return x.reshape(heads, rows, cols)
+
+
+def pack_heads(x: jax.Array, g: int) -> jax.Array:
+    """[heads, n, m] -> [heads // g, n, g * m]: head g * p + j on lanes
+    [j * m, (j + 1) * m) of group p."""
+    heads, n, m = x.shape
+    grouped = x.reshape(heads // g, g, n, m)
+    return jnp.concatenate([grouped[:, j] for j in range(g)], axis=-1)
+
+
+def unpack_heads(x: jax.Array, g: int) -> jax.Array:
+    """Inverse of `pack_heads`."""
+    groups, n, width = x.shape
+    m = width // g
+    out = jnp.stack([x[..., j * m : (j + 1) * m] for j in range(g)], axis=1)
+    return out.reshape(groups * g, n, m)
+
+
+def _can_invert_blocked(l_mat: jax.Array) -> bool:
+    """Whether `invert_unit_lower_blocked` applies to [heads, n, n] L: f32,
+    a power-of-two n, and heads that pack into lane-dense groups of
+    `INV_HEADS_PER_PASS`."""
+    heads, rows, cols = l_mat.shape
+    return (
+        rows == cols
+        and rows & (rows - 1) == 0
+        and heads % INV_HEADS_PER_PASS == 0
+        and (INV_HEADS_PER_PASS * cols) % pltpu.get_tpu_info().num_lanes == 0
+        and l_mat.dtype == jnp.float32
+    )
+
+
+def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Array:
+    """(I + L)^-1 for strictly lower-triangular L, two heads per vreg row.
+
+    The arithmetic of `invert_triangular_matrix`: each block of `block_size`
+    rows takes the earlier blocks' contribution as one MXU matmul, then is
+    solved by forward substitution in f32 on the VPU. The substitution runs
+    column by column: once row s is final, t[r, s] * x_s is subtracted from
+    every row r below it, so no step needs a sublane reduction. Row s's
+    coefficients t[r, s] reach their head's lanes by one lane gather whose
+    pattern is the same for every group.
+
+    `l_pack` and the result are [groups, n, g * n] in the `pack_heads`
+    layout. The matmul's right operand is expanded to the block diagonal of
+    its group's heads, so one matmul serves the whole group.
+    """
+    groups, n, width = l_pack.shape
+    g = width // n
+    block_size = min(block_size, n)
+    sublanes = pltpu.get_tpu_info().num_sublanes
+    shape = (1, n, width)
+    lane_head = jax.lax.broadcasted_iota(jnp.int32, shape, 2) // n
+    row = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+    col = jax.lax.broadcasted_iota(jnp.int32, shape, 2) % n
+    identity = jnp.where(row == col, 1.0, 0.0).astype(l_pack.dtype)
+    gather_shape = (groups * block_size, width)
+    head_base = jax.lax.broadcasted_iota(jnp.int32, gather_shape, 1) // n * n
+
+    x_blocks = []
+    for start in range(0, n, block_size):
+        l_rows = l_pack[:, start : start + block_size]
+        rhs = jnp.broadcast_to(
+            identity[:, start : start + block_size], (groups, block_size, width)
+        )
+        if start:
+            solved = jnp.concat(
+                x_blocks + [jnp.zeros((groups, n - start, width), l_pack.dtype)],
+                axis=1,
+            )
+            solved_diag = jnp.concat(
+                [jnp.where(lane_head == j, solved, 0) for j in range(g)], axis=1
+            )
+            prev_sum = jax.lax.dot(
+                jnp.where(col[:, start : start + block_size] < start, l_rows, 0),
+                solved_diag,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            rhs = rhs - prev_sum
+        for s in range(block_size - 1):
+            # Only rows from the vreg holding row s + 1 down change.
+            r0 = (s + 1) // sublanes * sublanes
+            rows = block_size - r0
+            coef = _lane_gather(
+                l_rows[:, r0:].reshape(groups * rows, width),
+                head_base[: groups * rows] + start + s,
+            ).reshape(groups, rows, width)
+            update = rhs[:, r0:] - coef * rhs[:, s : s + 1]
+            rhs = jnp.concat([rhs[:, :r0], update], axis=1) if r0 else update
+        x_blocks.append(rhs)
+    return jnp.concat(x_blocks, axis=1)
 
 
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
@@ -265,10 +360,16 @@ def chunked_gdn_heads(
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
-    t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
 
     # [heads, chunk, chunk]
-    t_inv = invert_triangular_matrix(t)
+    if _can_invert_blocked(gating_beta_k_k_t):
+        g = INV_HEADS_PER_PASS
+        t_inv = unpack_heads(
+            invert_unit_lower_blocked(pack_heads(gating_beta_k_k_t, g)), g
+        )
+    else:
+        t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
+        t_inv = invert_triangular_matrix(t)
 
     # [heads, chunk, v_head_dim]
     v_beta_large = v_large * beta_large
