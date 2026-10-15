@@ -142,7 +142,9 @@ local quantization = cdk.var('QUANTIZATION', 'deepseek_v4_fp8');
 local kvCacheDtype = cdk.var('KV_CACHE_DTYPE', 'fp8_e4m3');
 // Raising this enlarges the KV cache but shrinks the HBM left for compiling the largest token bucket after
 // it is allocated; vLLM's profile run under-counts that compile. See MAX_NUM_BATCHED_TOKENS above for 0.93.
-local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.96');
+// 0.98 at MNBT128 (c=160): +15% KV (1.875M -> 2.156M tokens/rank) and booted cleanly in j-7d2883be and,
+// with intra-chip attention TP, j-9ce4b7ed (3.35M tokens/rank). Re-check if MNBT grows.
+local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.98');
 local enablePrefixCaching = cdk.boolVar('ENABLE_PREFIX_CACHING', true);
 // Token interval between retained sliding-window prefix-cache checkpoints (vLLM CacheConfig
 // prefix_cache_retention_interval). 32768 and the env-var spelling are the InferenceX B200 setup
@@ -315,6 +317,17 @@ local offloadWindowCheckpointInterval = cdk.var('TPU_OFFLOAD_WINDOW_CHECKPOINT_I
 // The DP routing hook sends a new session that shares >= 12 x 512 prompt tokens with a routed prompt
 // (a subagent and its parent) to that prompt's engine.
 local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFINITY', '1');
+// Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
+// to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
+// mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40).
+local attnIntraChipTp = cdk.var('TPU_DSV4_ATTN_INTRA_CHIP_TP', '1');
+// Sliding-window groups keep each request's replay-boundary checkpoint until the request is freed, so the next
+// turn can hit there after a long decode (j-0cda3671: uncached/request 5926 -> 5771).
+local kvHoldReplayCheckpoint = cdk.var('TPU_KV_HOLD_REPLAY_CHECKPOINT', '1');
+// Block-table staging: rotate 3 host scratch buffers (H2D uploads are not fenced against the next step's
+// staging) and zero only the rows written last time.
+local blockTableStageRing = cdk.var('TPU_BLOCK_TABLE_STAGE_RING', '3');
+local blockTableStageSparseZero = cdk.var('TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO', '1');
 
 // --- Benchmark client --------------------------------------------------------
 local fastMode = cdk.boolVar('FAST', false) || cdk.boolVar('FAST_MODE', false);
@@ -738,6 +751,9 @@ local serverJob = cdk.job(
           'TPU_STEP_TIMING_LOG_STEPS',
           'VLLM_TPU_DSV4_INDEXER_KV_LAYOUT',
           'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL',
+          'TPU_DSV4_ATTN_INTRA_CHIP_TP',
+          'TPU_BLOCK_TABLE_STAGE_RING',
+          'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -771,6 +787,10 @@ local serverJob = cdk.job(
         [if srptHoldProgressGuard != '' then 'TPU_SRPT_HOLD_PROGRESS_GUARD']: srptHoldProgressGuard,
         [if offloadWindowCheckpointInterval != '' then 'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL']: offloadWindowCheckpointInterval,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
+        [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
+        [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
+        [if blockTableStageRing != '' then 'TPU_BLOCK_TABLE_STAGE_RING']: blockTableStageRing,
+        [if blockTableStageSparseZero != '' then 'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO']: blockTableStageSparseZero,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
         [if prefillGateMinCadences != '' then 'TPU_PREFILL_GATE_MIN_CADENCES']: prefillGateMinCadences,
         [if prefillGateLogSteps != '' then 'TPU_PREFILL_GATE_LOG_STEPS']: prefillGateLogSteps,
