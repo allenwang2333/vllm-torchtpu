@@ -1699,9 +1699,15 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
         )
 
 
-def test_pooled_qkv_conversion_is_opt_in_and_separates_cached_ops(
-    cpu_vllm_config_context,
-):
+def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
+    class PreparedAttention(VllmGatedDeltaNetAttention):
+        def _prepare_pooled_gdn_input(self, mixed_qkv, seq_lens, mesh):
+            return mixed_qkv + 1
+
     captured = []
 
     def build(name, function, **kwargs):
@@ -1713,21 +1719,22 @@ def test_pooled_qkv_conversion_is_opt_in_and_separates_cached_ops(
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
     ):
-        for index, enabled in enumerate((None, False, True, True)):
+        for index, cls in enumerate(
+            (VllmGatedDeltaNetAttention, PreparedAttention, PreparedAttention)
+        ):
             attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
-            if enabled is not None:
-                attn._use_compact_qkv = enabled
+            attn.__class__ = cls
             attn._build_pooled_gdn_op()
 
     assert len(captured) == 2
     assert captured[0][0] != captured[1][0]
     operands = [torch.zeros((1, 1)) for _ in range(12)]
     operands[5] = None
-    for (_, function), enabled in zip(captured, (False, True)):
+    for index, (_, function) in enumerate(captured):
         with patch.object(
             gdn_attention_op,
             "run_jax_gdn_attention_pooled",
             return_value=(operands[3], operands[0]),
         ) as dispatch:
             function(*operands)
-        assert dispatch.call_args.kwargs["use_compact_qkv"] is enabled
+        torch.testing.assert_close(dispatch.call_args.args[0], operands[0] + index)

@@ -37,11 +37,9 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
-    VllmGatedDeltaNetAttention,
-)
 
 from .config import gdn_cache_spec, use_unified_pool
+from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
 from .pd_identity import LoadedWeightIdentity
@@ -104,13 +102,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
             cfg.compilation_config.static_forward_context[prefix + ".ple"] = self.ple
         self.layer_type = t.layer_types[index]
         if self.layer_type == "linear_attention":
-            self.linear_attn = VllmGatedDeltaNetAttention(
+            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 t,
                 vllm_config=cfg,
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False,
                 pooled_conv_state_dtype=POOLED_GDN_CONV_STATE_DTYPE,
-                use_compact_qkv=True,
             )
         else:
             self.self_attn = Qwen4ExpQSA(

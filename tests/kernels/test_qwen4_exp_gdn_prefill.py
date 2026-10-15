@@ -6,6 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.models.vllm.qwen4_exp.gdn import prepare_gdn_input
+
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [4096, 8192])
@@ -74,8 +76,9 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
         )
 
     def pooled(pool, qkv, b, a, context):
+        prepared = prepare_gdn_input(qkv, 1, mesh)
         return gdn_attention_op.gdn_attention_pooled_core_tpu(
-            qkv,
+            prepared,
             b,
             a,
             pool,
@@ -94,7 +97,6 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
             kernel_size=4,
             pool_block_tokens=page,
             mesh=mesh,
-            use_compact_qkv=True,
             recurrent_state_dtype=jnp.bfloat16,
             conv_state_dtype=jnp.float32,
         )

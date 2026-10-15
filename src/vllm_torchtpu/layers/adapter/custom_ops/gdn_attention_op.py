@@ -52,6 +52,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -174,7 +175,7 @@ def gdn_attention_core_tpu(
 
 
 def gdn_attention_pooled_core_tpu(
-    mixed_qkv: jax.Array,
+    mixed_qkv: jax.Array | Conv1DInput,
     b: jax.Array,
     a: jax.Array,
     recurrent_state: jax.Array,
@@ -198,7 +199,6 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
-    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -224,7 +224,6 @@ def gdn_attention_pooled_core_tpu(
         pool_block_tokens=pool_block_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
-        use_compact_qkv=use_compact_qkv,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
     )
@@ -371,7 +370,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
-    _use_compact_qkv: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
@@ -382,12 +380,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self,
         *args,
         pooled_conv_state_dtype: torch.dtype = torch.bfloat16,
-        use_compact_qkv: bool = False,
         **kwargs,
     ):
         _to_jax_ssm_state_dtype(pooled_conv_state_dtype)
         self._pooled_conv_state_dtype = pooled_conv_state_dtype
-        self._use_compact_qkv = use_compact_qkv
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
@@ -720,6 +716,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
+    def _prepare_pooled_gdn_input(
+        self,
+        mixed_qkv: jax.Array,
+        seq_lens: jax.Array,
+        mesh: jax.sharding.Mesh,
+    ) -> jax.Array | Conv1DInput:
+        """Keep the ordinary projection input unchanged."""
+        return mixed_qkv
+
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
@@ -731,7 +736,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         kernel_size = self.conv_kernel_size
         recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
         conv_state_dtype = _to_jax_ssm_state_dtype(self._pooled_conv_state_dtype)
-        use_compact_qkv = self._use_compact_qkv
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -761,8 +765,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
+            prepared_qkv = self._prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh)
             result = gdn_attention_pooled_core_tpu(
-                mixed_qkv,
+                prepared_qkv,
                 b,
                 a,
                 pool,
@@ -791,7 +796,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 conv_state_dtype=conv_state_dtype,
-                use_compact_qkv=use_compact_qkv,
                 num_spec_tokens=num_spec_tokens,
             )
             if not block_major:
@@ -818,6 +822,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         gdn_jax_op = _get_shared_gdn_op(
             "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
             (
+                type(self)._prepare_pooled_gdn_input,
                 id(mesh),
                 id(vllm_config),
                 n_kq,
@@ -827,7 +832,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 conv_state_dtype,
-                use_compact_qkv,
                 num_spec_tokens,
             ),
             build_op,

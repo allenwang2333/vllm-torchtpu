@@ -116,12 +116,12 @@ def test_qwen_decoder_opts_into_compact_gdn_inputs(monkeypatch):
     monkeypatch.setattr(
         model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
     )
-    monkeypatch.setattr(model, "VllmGatedDeltaNetAttention", attention)
+    monkeypatch.setattr(model, "Qwen4ExpGatedDeltaNetAttention", attention)
     monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity())
     monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: nn.Identity())
 
     layer = model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
 
     assert layer.linear_attn is attention.return_value
-    assert attention.call_args.kwargs["use_compact_qkv"] is True
+    assert "use_compact_qkv" not in attention.call_args.kwargs
     assert attention.call_args.kwargs["pooled_conv_state_dtype"] == torch.float32

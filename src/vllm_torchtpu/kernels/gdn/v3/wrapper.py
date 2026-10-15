@@ -29,39 +29,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     metadata,
     vmem_ldst,
 )
-
-
-def _compact_qkv_kernel(qkv_ref: jax.Array, out_ref: jax.Array) -> None:
-    out_ref[...] = qkv_ref[...].astype(jnp.float32)[:, None, :]
-
-
-def _compact_qkv_input(qkv: jax.Array) -> jax.Array:
-    """Cast directly into Conv1D's compact layout without an FP32 HBM copy."""
-    tokens, width = qkv.shape
-    tile_tokens = 128
-    # Double-buffered input/output windows use at most 24 MiB, leaving room
-    # within the default 32 MiB scoped budget for compiler temporaries.
-    window_bytes = 2 * tile_tokens * width * (qkv.dtype.itemsize + 4)
-    if (
-        qkv.dtype != jnp.bfloat16
-        or tokens < tile_tokens
-        or tokens % tile_tokens
-        or width % 128
-        or window_bytes > 24 * 1024**2
-    ):
-        return qkv.astype(jnp.float32).reshape(tokens, 1, width)
-
-    # A normal cast followed by reshape materializes a 2D FP32 buffer before
-    # converting T(8,128) to T(1,128). Do that conversion tilewise in VMEM.
-    return pl.pallas_call(
-        _compact_qkv_kernel,
-        grid=(tokens // tile_tokens,),
-        in_specs=(pl.BlockSpec((tile_tokens, width), lambda tile: (tile, 0)),),
-        out_specs=pl.BlockSpec((tile_tokens, 1, width), lambda tile: (tile, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((tokens, 1, width), jnp.float32),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name="gdn_compact_qkv_input",
-    )(qkv)
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 
 
 def inner_kernel(
@@ -368,7 +336,6 @@ def outer_kernel(
         "d_v",
         "kernel_size",
         "num_spec_tokens",
-        "use_compact_qkv",
         "decode_tile_size",
         "mixed_tile_size",
         "batched_only",
@@ -381,7 +348,7 @@ def outer_kernel(
     ),
 )
 def fused_conv1d_gdn(
-    qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
+    qkv: jax.Array | Conv1DInput,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     conv_state: jax.Array | None,  # [num_seqs + 1, kernel_size - 1, dim_size]
@@ -407,7 +374,6 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
-    use_compact_qkv: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -420,7 +386,8 @@ def fused_conv1d_gdn(
 
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
-            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+            where `dim_size = n_kq * d_k * 2 + n_v * d_v`, or a prepared
+            Conv1DInput with FP32 values and the original output dtype.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
@@ -455,8 +422,6 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
-        use_compact_qkv: Opt into direct FP32 Conv1D input conversion. The default
-            retains the original FP32 cast before padding and final reshape.
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -496,7 +461,14 @@ def fused_conv1d_gdn(
         out: Fused output tensor.
     """
     # Conv1D consumes FP32 while outputs retain the projection activation dtype.
-    act_out_dtype = qkv.dtype
+    prepared_qkv = isinstance(qkv, Conv1DInput)
+    if isinstance(qkv, Conv1DInput):
+        act_out_dtype = qkv.output_dtype
+        qkv = qkv.values
+        if qkv.ndim != 3 or qkv.shape[1] != 1 or qkv.dtype != jnp.float32:
+            raise ValueError("Conv1DInput requires FP32 [tokens, 1, features]")
+    else:
+        act_out_dtype = qkv.dtype
     pooled = state_plan is not None
     if pooled:
         assert conv_state is None and recurrent_state is None
@@ -513,7 +485,7 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    if not use_compact_qkv:
+    if not prepared_qkv:
         qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
@@ -538,7 +510,7 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape
+    batch_size, dim = qkv.shape[0], qkv.shape[-1]
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -620,15 +592,12 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
+    qkv = jnp.pad(qkv, qkv_padding)
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = (
-        _compact_qkv_input(qkv)
-        if use_compact_qkv
-        else qkv.reshape(padded_batch_size, 1, -1)
-    )
+    qkv = qkv.reshape(padded_batch_size, 1, -1)
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 

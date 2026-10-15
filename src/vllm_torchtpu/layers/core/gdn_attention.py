@@ -38,6 +38,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
@@ -850,7 +851,7 @@ def _build_v3_pool_state_plan(
 
 
 def run_jax_gdn_attention_pooled_local(
-    mixed_qkv: jnp.ndarray,
+    mixed_qkv: jnp.ndarray | Conv1DInput,
     b: jnp.ndarray,
     a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -873,7 +874,6 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
-    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -928,13 +928,12 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
-        use_compact_qkv=use_compact_qkv,
     )
     return recurrent_state, output
 
 
 def run_jax_gdn_attention_pooled(
-    j_mixed_qkv: jnp.ndarray,
+    j_mixed_qkv: jnp.ndarray | Conv1DInput,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -958,7 +957,6 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
-    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
@@ -1000,7 +998,11 @@ def run_jax_gdn_attention_pooled(
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
-        P(None, "model"),  # j_mixed_qkv
+        (
+            jax.tree.map(lambda _: P(None, None, "model"), j_mixed_qkv)
+            if isinstance(j_mixed_qkv, Conv1DInput)
+            else P(None, "model")
+        ),  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
@@ -1044,7 +1046,6 @@ def run_jax_gdn_attention_pooled(
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
-        use_compact_qkv=use_compact_qkv,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

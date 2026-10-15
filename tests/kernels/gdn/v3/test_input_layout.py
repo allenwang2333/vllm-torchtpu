@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput, compact_qkv_input
 
 
 @pytest.mark.parametrize(
@@ -35,7 +36,7 @@ def test_compact_qkv_preserves_value_bits(tokens, width, dtype):
     qkv = jnp.asarray(values, dtype=dtype)
     expected = qkv.astype(jnp.float32).reshape(tokens, 1, width)
 
-    actual = jax.jit(wrapper._compact_qkv_input)(qkv)
+    actual = jax.jit(compact_qkv_input)(qkv)
 
     assert actual.shape == expected.shape
     assert actual.dtype == jnp.float32
@@ -45,10 +46,11 @@ def test_compact_qkv_preserves_value_bits(tokens, width, dtype):
     )
 
 
-@pytest.mark.parametrize("enabled", [None, False, True])
-def test_default_qkv_preparation_keeps_cast_before_padding(monkeypatch, enabled):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_prepared_input_preserves_output_dtype_and_default_conversion(
+    monkeypatch, prepared
+):
     from types import SimpleNamespace
-    from unittest.mock import Mock
 
     class InputsPrepared(Exception):
         pass
@@ -63,15 +65,14 @@ def test_default_qkv_preparation_keeps_cast_before_padding(monkeypatch, enabled)
         pad_dtypes.append(value.dtype)
         return original_pad(value, *args, **kwargs)
 
-    compact = Mock(side_effect=lambda x: x.astype(jnp.float32)[:, None, :])
-    monkeypatch.setattr(wrapper, "_compact_qkv_input", compact)
     monkeypatch.setattr(wrapper.jnp, "pad", record_pad)
     monkeypatch.setattr(
         wrapper.pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128)
     )
     monkeypatch.setattr(wrapper.memory_ref, "ConvWeightsRef", stop_before_kernel)
     qkv = jnp.zeros((128, 384), jnp.bfloat16)
-    options = {} if enabled is None else {"use_compact_qkv": enabled}
+    if prepared:
+        qkv = Conv1DInput(qkv.astype(jnp.float32)[:, None, :], qkv.dtype)
     with pytest.raises(InputsPrepared):
         wrapper.fused_conv1d_gdn(
             qkv,
@@ -92,7 +93,5 @@ def test_default_qkv_preparation_keeps_cast_before_padding(monkeypatch, enabled)
             d_k=128,
             d_v=128,
             kernel_size=4,
-            **options,
         )
-    assert pad_dtypes[0] == (jnp.bfloat16 if enabled else jnp.float32)
-    assert compact.call_count == int(bool(enabled))
+    assert pad_dtypes[0] == jnp.float32
