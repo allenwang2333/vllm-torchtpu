@@ -58,6 +58,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     _align_to,
     _pick_partition,
     _row_cap_dma_chunk,
+    _row_cap_partition,
     _use_row_cap,
     sparsecore_topk,
 )
@@ -530,6 +531,26 @@ ROW_CAP_EDGES = (
     40000,
     65535,
     65536,
+    # Past the 64K single-slice edge: the P>1 length-balanced split. The
+    # GLM-5.2 DCP8 mixed-c8k per-rank lengths (2,560+ / 41,472+ / 66,048+),
+    # split points that land on and just past a 4096-word DMA chunk, and the
+    # 1M-context row.
+    1025,
+    2560,
+    3073,
+    8192,
+    8193,
+    16385,
+    41472,
+    65537,
+    66048,
+    66560,
+    73729,
+    98304,
+    122881,
+    130048,
+    131071,
+    131072,
 )
 
 ROW_CAP_SHAPES = [
@@ -541,6 +562,13 @@ ROW_CAP_SHAPES = [
     # n not a multiple of 4096: the DMA chunk shrinks to divide n.
     pytest.param(64, 40960, 2048, id="b64-n40960"),
     pytest.param(64, 33024, 512, id="b64-n33024-k512"),
+    # P=2 capped (DCP8 per-rank rows; the default path runs P=4): the
+    # indexer's b=256 call, a ragged and a single exact wave.
+    pytest.param(256, 131072, 2048, id="b256-n131072"),
+    pytest.param(40, 131072, 2048, id="b40-n131072"),
+    pytest.param(32, 131072, 2048, id="b32-n131072"),
+    # P=4 capped (DCP4 per-rank rows; the default path runs P=8).
+    pytest.param(64, 262144, 2048, id="b64-n262144"),
 ]
 
 
@@ -589,11 +617,28 @@ def test_row_cap_retargets_exactly_these_shapes(b, n, k):
     assert _use_row_cap(b, n, True)
     assert not _use_row_cap(b, n, False)
     assert _pick_partition(b, n, k) >= 2
-    assert n % _row_cap_dma_chunk(n) == 0
-    # Out of scope: fewer rows than subcores, one-slice rows, 1M rows.
+    p = _row_cap_partition(b, n, True)
+    assert p < _pick_partition(b, n, k)
+    assert (n // p) <= 2 * MAX_SLICE_WORDS
+    assert (n // p) % _row_cap_dma_chunk(n // p) == 0
+    # Out of scope: fewer rows than subcores, one-slice rows.
     assert not _use_row_cap(16, 65536, True)
+    assert not _use_row_cap(16, 131072, True)
     assert not _use_row_cap(256, 32768, True)
-    assert not _use_row_cap(256, 131072, True)
+
+
+def test_row_cap_partition_per_dcp():
+    """P=1 up to 64K-word rows (DCP16 unchanged), then n / 64K."""
+    assert _row_cap_partition(256, 65536, True) == 1
+    assert _row_cap_partition(256, 98304, True) == 2
+    # n must split into p LANES-aligned slices.
+    assert _row_cap_partition(256, 65552, True) == 0
+    assert _row_cap_partition(256, 131072, True) == 2
+    assert _row_cap_partition(256, 262144, True) == 4
+    assert _row_cap_partition(256, 524288, True) == 8
+    assert _row_cap_partition(256, 1048576, True) == 16
+    assert _row_cap_partition(256, 2097152, True) == 0
+    assert _row_cap_partition(256, 131072, False) == 0
 
 
 @pytest.mark.tpu_test
@@ -619,7 +664,8 @@ def test_row_cap_is_bitwise_identical(b, n, k, kind, return_scores):
         row_cap=True,
         return_scores=return_scores,
     ).as_text()
-    assert "_p1_cap" in cap_hlo, "row_cap=True did not take the capped path"
+    p = _row_cap_partition(b, n, True)
+    assert f"_p{p}_cap" in cap_hlo, "row_cap=True did not take the capped path"
 
     base_idx, base_keys = _run_cap(scores, k, lengths, False, return_scores)
     cap_idx, cap_keys = _run_cap(scores, k, lengths, True, return_scores)
@@ -646,6 +692,40 @@ def test_row_cap_comparison_detects_a_difference():
 
     swapped = cap_idx.copy()
     row = int(np.flatnonzero(lengths >= 30720)[0])
+    swapped[row, [0, 1]] = swapped[row, [1, 0]]
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(swapped, cap_idx)
+
+    short = lengths.copy()
+    short[row] -= 4096
+    base_short, _ = _run_cap(scores, k, short, False, False)
+    differs = np.flatnonzero((base_short != cap_idx).any(axis=1))
+    assert differs.tolist() == [row], differs[:8]
+
+
+@pytest.mark.tpu_test
+def test_row_cap_p2_comparison_detects_a_difference():
+    """Positive control for the P=2 capped comparison at the DCP8 row size.
+
+    (1) A row longer than 64K words shortened by 4096: the default path's
+    output differs from the capped one on that row only, so the capped kernel
+    reads the lengths it is given past the first slice. (2) A row whose
+    winners all sit past the 64K split (a strictly increasing row): the
+    capped kernel must return exactly the last k columns, so a second subcore
+    that dropped or misplaced its half would fail. (3) Two winners swapped in
+    a row: the bitwise assertion rejects it.
+    """
+    b, n, k = 256, 131072, 2048
+    rng = np.random.default_rng(SEED)
+    lengths = _row_cap_lengths(b, n, rng)
+    scores = _row_cap_scores("random", b, n, lengths, rng)
+    row = int(np.flatnonzero(lengths >= 98304)[0])
+    scores[row, :] = np.arange(n, dtype=np.float32)
+    cap_idx, _ = _run_cap(scores, k, lengths, True, False)
+    L = int(lengths[row])
+    assert sorted(cap_idx[row].tolist()) == list(range(L - k, L))
+
+    swapped = cap_idx.copy()
     swapped[row, [0, 1]] = swapped[row, [1, 0]]
     with pytest.raises(AssertionError):
         np.testing.assert_array_equal(swapped, cap_idx)

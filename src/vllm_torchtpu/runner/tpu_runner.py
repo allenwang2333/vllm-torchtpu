@@ -5102,6 +5102,17 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
+        # After the drafter, so its MTP layer is armed too. With
+        # USE_MOE_TP_DECODE_KERNEL it runs after that arming instead (below):
+        # moe_tp_decode's op carries the prefill kernel for the layers it arms.
+        fused_moe_arming = (
+            envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL
+        )
+        if fused_moe_arming and not envs.USE_MOE_TP_DECODE_KERNEL:
+            from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
+
+            arm_runner_models(self)
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
@@ -5127,6 +5138,12 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        if envs.TPU_FUSED_ADD_RMSNORM and envs.TPU_FUSED_ADD_RMSNORM_QUANT:
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
+
+            n_pairs = arm_prequant(self.model)
+            logger.info("TPU_FUSED_ADD_RMSNORM_QUANT: %d norm -> fp8 linear pairs", n_pairs)
+
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.moe_tp_decode import arm, should_arm
@@ -5136,6 +5153,26 @@ class TPUModelRunner(GPUModelRunner):
                     self._async_drafter.draft_model if self._is_async_drafter else None
                 )
                 arm(self.model, draft)
+            if (
+                envs.TPU_FUSED_ADD_RMSNORM
+                and envs.TPU_FUSED_ADD_RMSNORM_QUANT_MOE
+                and envs.FUSED_MOE_PREFILL_KERNEL
+            ):
+                from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant_moe
+
+                n_moe_pairs = arm_prequant_moe(self.model)
+                logger.info(
+                    "TPU_FUSED_ADD_RMSNORM_QUANT_MOE: %d norm -> fused MoE prefill pairs",
+                    n_moe_pairs,
+                )
+            if fused_moe_arming:
+                # Layers moe_tp_decode armed have no shared expert left, so
+                # fused_moe_decode admits only the ones it refused.
+                from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+                    arm_runner_models,
+                )
+
+                arm_runner_models(self)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()

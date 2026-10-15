@@ -278,10 +278,10 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
 
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses_g, group):
+    def wrong(output, lse_f32, lses_g, group, **kw):
         if int(group.rank_in_group) == 1:
             lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses_g, group)
+        return real(output, lse_f32, lses_g, group, **kw)
 
     cp_mla._weighted_reduce_scatter = wrong
     try:

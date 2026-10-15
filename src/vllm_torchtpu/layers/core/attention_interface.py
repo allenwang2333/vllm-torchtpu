@@ -1009,13 +1009,40 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
-def _mixed_body_levers(value: str) -> tuple[str, ...]:
-    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set)."""
+def _mixed_union_gather(value: str) -> dict:
+    """TPU_DCP_MLA_MIXED_UNION_GATHER -> the union-gather kwargs of
+    `sparse_ragged_paged_attention` ("1" = UNION_GATHER_DEFAULT)."""
+    if not value or value == "0":
+        return {}
+    modes = (
+        native_sc_gather.UNION_GATHER_DEFAULT
+        if value == "1"
+        else tuple(v.strip() for v in value.split(",") if v.strip())
+    )
+    unknown = set(modes) - {"solo", "pair", "rope"}
+    if unknown or ("solo" in modes and "pair" in modes):
+        raise ValueError(f"TPU_DCP_MLA_MIXED_UNION_GATHER={value!r}")
+    return {
+        "mixed_union_gather": True,
+        "mixed_union_gather_pair": "pair" in modes,
+        "mixed_union_gather_rope": "rope" in modes,
+    }
+
+
+def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
+    plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
     if not value or value == "0":
         return ()
     if value == "1":
-        return sparse_mla_kernel.MIXED_BODY_DEFAULT
-    return tuple(v.strip() for v in value.split(",") if v.strip())
+        levers = sparse_mla_kernel.MIXED_BODY_DEFAULT
+    else:
+        levers = tuple(v.strip() for v in value.split(",") if v.strip())
+    if kernel_v2:
+        levers += tuple(
+            v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
+        )
+    return levers
 
 
 def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
@@ -1121,7 +1148,8 @@ def sparse_mla_attention_dcp(
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    send_layout: bool = False,
+) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
@@ -1148,6 +1176,15 @@ def sparse_mla_attention_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
         the `all_to_all` of an iota. Same result.
+      send_layout: TPU_DCP_MLA_SEND_LAYOUT, decode buckets with the prologue
+        (`q_rope_table`) and TPU_DCP_MLA_MASK_IN_KERNEL only: the kernel writes
+        the packed real-rows merge exchange's send buffer itself
+        (`sparse_mla_kernel.SEND_PAD_ROWS`), and the op returns `(kv_cache_nope,
+        kv_cache_rope, send)` with `send` int16 `[dcp_size * dcp_size,
+        SEND_PAD_ROWS + num_tokens * num_heads // dcp_size, lkv_dim]`, sharded
+        over `dcp_axis_name` (each rank's `[dcp_size, ...]` block, destination
+        major). Its sent rows are bit for bit the rows
+        `cp_mla_attention._all_to_all_packed` builds from `(output, lse)`.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1221,6 +1258,15 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None, None),  # partial output
         P(dcp_axis_name, None),  # partial lse
     )
+    if send_layout:
+        if not (q_rope and envs.TPU_DCP_MLA_MASK_IN_KERNEL):
+            raise ValueError(
+                "send_layout needs the prologue (q_rope_table) and "
+                "TPU_DCP_MLA_MASK_IN_KERNEL"
+            )
+        if num_tokens > sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
+            raise ValueError(f"send_layout is decode-only, got {num_tokens} tokens")
+        out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # send
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1335,6 +1381,8 @@ def sparse_mla_attention_dcp(
                     lse_in_kernel=mask_in_kernel and decode_bucket,
                     prologue_fault=prologue_fault,
                 )
+                if send_layout:
+                    split_kwargs["send_world"] = dcp_size
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1347,7 +1395,10 @@ def sparse_mla_attention_dcp(
         ):
             topk_cap = None
         chunk_kwargs = (
-            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            {
+                "gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+                "capped_live_rows": envs.TPU_SPARSE_MLA_LIVE_GATHER,
+            }
             if topk_cap
             else {}
         )
@@ -1365,6 +1416,21 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
             )
+        # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
+        # merge's reduce-scatter k waits only for the attention chunks that
+        # produce its rows (mixed buckets with the in-kernel lse mask).
+        merge_pieces = 0
+        if (
+            envs.TPU_DCP_MLA_MERGE_PIECES
+            and not decode_bucket
+            and mask_in_kernel
+            and split_q_lse
+            and topk_cap
+            and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+        ):
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
+
+            merge_pieces = _merge_chunks(topk_idx.shape[0])
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1394,10 +1460,13 @@ def sparse_mla_attention_dcp(
                 envs.TPU_DCP_MLA_MIXED_LIVE_WIDTHS,
                 topk_cap or 0,
             ),
-            mixed_body_levers=_mixed_body_levers(envs.TPU_DCP_MLA_MIXED_BODY),
+            mixed_body_levers=_mixed_body_levers(
+                envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+            ),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
+            **_mixed_union_gather(envs.TPU_DCP_MLA_MIXED_UNION_GATHER),
             decode_row_widths=(
                 _row_widths(
                     "TPU_MLA_DECODE_ROW_WIDTHS",
@@ -1407,12 +1476,16 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            out_pieces=merge_pieces,
+            out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
             **split_kwargs,
         )
         output, lse = attn[:2]
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
+        if send_layout:
+            return (kv_cache_nope, kv_cache_rope, lse)  # `lse` is the send buffer
         if not mask_in_kernel:
             assert owns is not None
             lse = jnp.where(owns[:, None], lse, -jnp.inf)
