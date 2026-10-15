@@ -1,6 +1,5 @@
 """V4.1 paged cache allocation, row addressing and mutation."""
 
-import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
@@ -1101,23 +1100,34 @@ def initialize_cache_ops():
         lambda cache, records, values, after: torch.empty_like(cache)
     )
 
-    def read_native_keys(cache, records, elements):
+    def read_native_keys(
+        cache: jax.Array, records: jax.Array, elements: int
+    ) -> jax.Array:
         return gather_cache_values(cache, records, elements, native=True)
 
-    def read_native_keys_2bank(cache_lo, cache_hi, records, elements):
+    def read_native_keys_2bank(
+        cache_lo: jax.Array, cache_hi: jax.Array, records: jax.Array, elements: int
+    ) -> jax.Array:
         return gather_cache_values(
             cast(Any, (cache_lo, cache_hi)), records, elements, native=True
         )
 
+    def scatter_native_index_keys(
+        cache: jax.Array, records: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        return scatter_index_keys(cache, records, values, native=True)
+
     write_native_keys = jax.shard_map(
-        functools.partial(scatter_index_keys, native=True),
+        scatter_native_index_keys,
         mesh=mesh,
         in_specs=(P(), P(), P()),
         out_specs=P(),
         check_vma=False,
     )
 
-    def write_native_keys_after(cache, records, values, after):
+    def write_native_keys_after(
+        cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
+    ) -> jax.Array:
         cache, _ = jax.lax.optimization_barrier((cache, after))
         return write_native_keys(cache, records, values)
 
