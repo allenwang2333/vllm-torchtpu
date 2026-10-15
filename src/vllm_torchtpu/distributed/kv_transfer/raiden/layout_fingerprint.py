@@ -13,7 +13,9 @@ import hashlib
 import importlib.metadata
 import json
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Protocol
+
+import os
 
 from vllm_torchtpu import envs as tpu_envs
 
@@ -49,6 +51,63 @@ FA_LAYOUT_FINGERPRINT_SCHEMA = "qwen35-fa-raw-layout-fingerprint-v1"
 GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA = "glm-mla-raw-layout-fingerprint-v1"
 KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA = "kimi-k3-row-layout-fingerprint-v1"
 DSV4_LAYOUT_FINGERPRINT_SCHEMA = "dsv4-raw-layout-fingerprint-v1"
+
+
+class LayoutFingerprintPolicy(Protocol):
+    """Protocol encapsulating Raiden physical layout fingerprint evaluation."""
+
+    def compute(self, payload: Mapping[str, Any]) -> str:
+        """Compute the canonical layout fingerprint string for a payload."""
+        ...
+
+
+class StrictFingerprintPolicy:
+    """Legacy strict policy: hashes all environment and package metadata."""
+
+    def compute(self, payload: Mapping[str, Any]) -> str:
+        return canonical_layout_fingerprint(payload)
+
+
+class SemanticCrossGenFingerprintPolicy:
+    """Cross-generation policy: hashes hardware-invariant physical tensor geometry only."""
+
+    _INVARIANT_KEYS = (
+        "schema",
+        "minor_to_major",
+        "tiles",
+        "element_size_in_bits",
+        "gdn_conv_layout",
+        "page_tokens",
+        "layouts",
+    )
+
+    def compute(self, payload: Mapping[str, Any]) -> str:
+        invariant_payload = {
+            k: payload[k] for k in self._INVARIANT_KEYS if k in payload
+        }
+        return canonical_layout_fingerprint(invariant_payload)
+
+
+def resolve_fingerprint_policy(
+    policy: LayoutFingerprintPolicy | None = None,
+    *,
+    allow_cross_generation: bool | None = None,
+) -> LayoutFingerprintPolicy:
+    """Resolve the active layout fingerprint policy with dependency injection."""
+    if policy is not None:
+        return policy
+    flag = (allow_cross_generation
+            if allow_cross_generation is not None else
+            (bool(getattr(tpu_envs, "TPU_RAIDEN_ALLOW_CROSS_GENERATION", False)) or
+             os.environ.get("TPU_RAIDEN_ALLOW_CROSS_GENERATION", "0") in ("1", "true", "True")))
+    return SemanticCrossGenFingerprintPolicy() if flag else StrictFingerprintPolicy()
+
+
+def _default_package_version(package_name: str) -> str:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "uninstalled"
 
 
 def canonical_layout_fingerprint(value: str | Mapping[str, Any]) -> str:
@@ -116,6 +175,8 @@ def measured_fa_layout_fingerprint(
     block_major: bool = False,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
+    allow_cross_generation: bool | None = None,
+    policy: LayoutFingerprintPolicy | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Measure the admitted FA storage layout and return its E0' identity.
 
@@ -166,7 +227,7 @@ def measured_fa_layout_fingerprint(
             f"measured={element_bits} expected=8"
         )
 
-    version = package_version or importlib.metadata.version
+    version = package_version or _default_package_version
     payload = {
         "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
@@ -185,7 +246,10 @@ def measured_fa_layout_fingerprint(
             "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
         ),
     }
-    return canonical_layout_fingerprint(payload), payload
+    active_policy = resolve_fingerprint_policy(
+        policy, allow_cross_generation=allow_cross_generation
+    )
+    return active_policy.compute(payload), payload
 
 
 __all__ = [
@@ -196,6 +260,9 @@ __all__ = [
     "FA_LAYOUT_FINGERPRINT_SCHEMA",
     "GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA",
     "KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA",
+    "LayoutFingerprintPolicy",
+    "SemanticCrossGenFingerprintPolicy",
+    "StrictFingerprintPolicy",
     "canonical_layout_fingerprint",
     "expected_fa_minor_to_major",
     "fa_page_tokens",
@@ -203,6 +270,7 @@ __all__ = [
     "measured_fa_layout_fingerprint",
     "measured_glm_layout_fingerprint",
     "measured_kimi_k3_layout_fingerprint",
+    "resolve_fingerprint_policy",
 ]
 
 
