@@ -6942,17 +6942,13 @@ class TPUModelRunner(GPUModelRunner):
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
-        # gather the target_logits rows for the rejection sampler, in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
-        # logits[indices] gathers + argmax at the verify site), these are eager
-        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
-        # into per-context programs (the cold target-side recompiles). index_select
-        # is value-identical to logits[indices]. Same pattern as the draft wraps.
-        bonus_token_ids = torch.argmax(
-            torch.index_select(logits, 0, bonus_logits_indices), dim=-1
-        )
-        target_logits = torch.index_select(logits, 0, target_logits_indices)
+        # Spec-decode greedy verify prelude: compute argmax once across the chunk's
+        # logits rows and gather 1D token IDs for bonus_token_ids and target_logits
+        # in ONE compiled region keyed on [num_tokens, num_reqs] shapes, avoiding
+        # a 2D [num_tokens, vocab_size] HBM gather + second argmax in rejection_sampler.
+        logits_argmax = torch.argmax(logits, dim=-1)
+        bonus_token_ids = torch.index_select(logits_argmax, 0, bonus_logits_indices)
+        target_logits = torch.index_select(logits_argmax, 0, target_logits_indices)
         return bonus_token_ids, target_logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

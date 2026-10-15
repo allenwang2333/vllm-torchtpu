@@ -264,7 +264,7 @@ class DSparkDeepseekV41Model(nn.Module):
             if hasattr(attn, "kv_norm") and hasattr(attn, "q_lora_rank"):
                 kv = attn.kv_norm(qr_kv[:, attn.q_lora_rank :])
             else:
-                _, kv = attn._split_qkv_and_norm(qr_kv)
+                kv = attn._split_qkv_and_norm(qr_kv)[1]
             layer_md = None if metadata is None else metadata[i]
             _insert_context_kv(attn, kv, positions, layer_md)
         return main_x

@@ -407,7 +407,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else None
             )
-            if context.dp_metadata is not None:
+            if getattr(context, "dp_metadata", None) is not None:
                 plan = coordinate_decoder_replay(plan, positions.shape[0])
             # SWA bounded replay: the encoder reads no SWA row below a prefix
             # hit's replay start and leaves cached KV of replayed tokens. The
@@ -521,28 +521,26 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_padding = torch.arange(
                 plan.padded_num_tokens, device=positions.device
             ) >= len(plan.indices)
-        decoder_context = replace(
-            context,
-            dp_metadata=(
-                replace(
-                    context.dp_metadata,
-                    num_tokens_across_dp_cpu=torch.full_like(
-                        context.dp_metadata.num_tokens_across_dp_cpu,
-                        decoder_positions.shape[0],
-                    ),
-                    local_sizes=None,
-                )
-                if context.dp_metadata is not None
-                else None
-            ),
-            attn_metadata=decoder_metadata,
-            is_padding=decoder_padding,
-            additional_kwargs={
+        dp_metadata = getattr(context, "dp_metadata", None)
+        decoder_ctx_kwargs = {
+            "attn_metadata": decoder_metadata,
+            "is_padding": decoder_padding,
+            "additional_kwargs": {
                 **context.additional_kwargs,
                 "deepseek_v41_replay_starts": replay_starts,
                 "token_padding_mask": decoder_padding,
             },
-        )
+        }
+        if dp_metadata is not None:
+            decoder_ctx_kwargs["dp_metadata"] = replace(
+                dp_metadata,
+                num_tokens_across_dp_cpu=torch.full_like(
+                    dp_metadata.num_tokens_across_dp_cpu,
+                    decoder_positions.shape[0],
+                ),
+                local_sizes=None,
+            )
+        decoder_context = replace(context, **decoder_ctx_kwargs)
         with override_forward_context(decoder_context):
             output = self.decoder_stage(
                 decoder_ids,
@@ -562,6 +560,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         total_rows = positions.shape[0]
         if isinstance(output, (list, tuple)) and len(output) == 2:
             dec_hidden, dec_aux = output
+            if not encoder_aux and isinstance(metadata, dict) and dp_metadata is None:
+                metadata.update(decoder_metadata)
+                return _scatter_decoder_rows(dec_hidden, indices, total_rows), list(
+                    dec_aux
+                )
             return (
                 _scatter_decoder_rows(dec_hidden, indices, total_rows),
                 [
