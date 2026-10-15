@@ -2974,6 +2974,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
         _topk_candidate_blocks=lambda: 0,
         _precompile_timed=lambda _name: contextlib.nullcontext(),
+        _sampler_light_variants=lambda: [],
         sample_from_logits_func=fake_sample_from_logits,
     )
     TPUModelRunner._precompile_sample_from_logits(precompile_runner)
@@ -2994,6 +2995,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         ),
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_fused_chain=False,
+        _sampler_kwargs=lambda: {},
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -3021,6 +3024,33 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_u_dtypes == [torch.float32]
     assert seen_recover_dtypes == [torch.float32]
     seen_u_dtypes.clear()
+
+    # 2b. _sample_spec_verify_chunk under TPU_SAMPLER_FUSED_CHAIN
+    seen_fused_dtypes: list[tuple[torch.dtype, ...]] = []
+
+    def fake_spec_sample_verify_fused(*args, **kwargs):
+        bonus_u, accept_u, recover_u = args[10:13]
+        seen_fused_dtypes.append((bonus_u.dtype, accept_u.dtype, recover_u.dtype))
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner._sampler_fused_chain = True
+    spec_runner._build_padded_sampling_params = (
+        lambda start, end, logits, **kw: sampling_params
+    )
+    spec_runner.spec_sample_verify_fused = fake_spec_sample_verify_fused
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_fused_dtypes == [(torch.float32,) * 3]
+    assert seen_u_dtypes == []
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
     for spec_method in (None, "ngram"):
@@ -3064,6 +3094,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             ),
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3072,6 +3104,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_kwargs=lambda: {},
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,

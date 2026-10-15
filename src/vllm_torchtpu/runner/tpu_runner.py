@@ -4452,11 +4452,12 @@ class TPUModelRunner(GPUModelRunner):
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
             assert self.speculative_config is not None
-            # The unfused path's draws: rand_like(bonus_logits), then accept_u,
-            # then rand_like(target_logits, f32) -- same shapes, dtypes, order.
+            # The unfused path's draws: rand_like(bonus_logits, f32), then
+            # accept_u, then rand_like(target_logits, f32) -- same shapes,
+            # dtypes, order.
             bonus_u = torch.rand(
                 (md.bonus_logits_indices.shape[0], logits.shape[-1]),
-                dtype=logits.dtype,
+                dtype=torch.float32,
                 device=logits.device,
                 generator=sampling_generator,
             )
@@ -6230,9 +6231,7 @@ class TPUModelRunner(GPUModelRunner):
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
         vocab = dummy_logits.shape[-1]
-        bonus_u = torch.zeros((num_reqs, vocab), dtype=dummy_logits.dtype).to(
-            self.device
-        )
+        bonus_u = torch.zeros((num_reqs, vocab), dtype=torch.float32).to(self.device)
         accept_u = torch.zeros(draft_token_ids.shape, dtype=torch.float32).to(
             self.device
         )

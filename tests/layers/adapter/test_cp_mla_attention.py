@@ -165,6 +165,7 @@ def test_projection_applies_the_per_head_output_scale():
 def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
     """TPU_DCP_RS_OUT_PRECISION rounds the terms to the output dtype before the
     reduce-scatter; off, they cross in f32. The result keeps the output dtype."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
     monkeypatch.setattr(
         cp_mla.envs,
         "TPU_DCP_RS_OUT_PRECISION",
@@ -215,6 +216,7 @@ def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
     """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
     with the flag at its default, the merge passes rs_dtype=bf16."""
     monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
     dcp, heads, kv_lora_rank = 16, 64, 512
     outputs, lses = _partials(
         np.random.default_rng(52),
