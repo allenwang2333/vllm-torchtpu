@@ -837,7 +837,6 @@ def _union_kernel(
     rope_out_hbm_ref,
     sem_ref,
     load_sem_ref,
-    meta_sem,
     vec_ref,
     tab_smem,
     kv_smem,
@@ -881,20 +880,21 @@ def _union_kernel(
 
     # The chunk's group table (A | off), its live-index bound, and its tokens'
     # kv_lens arrive as HBM vectors; SparseCore scalars come from SMEM.
-    # (three small DMAs in flight together: each is latency-bound)
+    # (three small DMAs in flight together: each is latency-bound; on semaphores
+    # no pipeline holds yet -- a SparseCore has few)
     nl_base = chunk_index // NUM_LANES * NUM_LANES
     nl_size = min(NUM_LANES, num_chunks - nl_base)
     meta = [
         pltpu.make_async_copy(
-            tab_hbm_ref.at[pl.ds(chunk_index * gpc, gpc)], vec_ref.at[pl.ds(0, gpc)], meta_sem.at[0]
+            tab_hbm_ref.at[pl.ds(chunk_index * gpc, gpc)], vec_ref.at[pl.ds(0, gpc)], sem_ref.at[0]
         ),
         pltpu.make_async_copy(
             tab_hbm_ref.at[pl.ds(num_groups + chunk_index * gpc, gpc)],
             vec_ref.at[pl.ds(gpc, gpc)],
-            meta_sem.at[1],
+            sem_ref.at[1],
         ),
         pltpu.make_async_copy(
-            live_hbm_ref.at[pl.ds(nl_base, nl_size)], vec_ref.at[pl.ds(2 * gpc, nl_size)], meta_sem.at[2]
+            live_hbm_ref.at[pl.ds(nl_base, nl_size)], vec_ref.at[pl.ds(2 * gpc, nl_size)], sem_ref.at[2]
         ),
     ]
     for cp in meta:
@@ -937,7 +937,7 @@ def _union_kernel(
     def prep_slots():
         tok0 = chunk_index * chunk_size + g * bz
         kv_cp = pltpu.make_async_copy(
-            kv_hbm_ref.at[pl.ds(pl.multiple_of(tok0, bz), bz)], vec_ref.at[pl.ds(0, bz)], meta_sem.at[3]
+            kv_hbm_ref.at[pl.ds(pl.multiple_of(tok0, bz), bz)], vec_ref.at[pl.ds(0, bz)], load_sem_ref.at[1, 1]
         )
         kv_cp.start()
 
@@ -951,14 +951,14 @@ def _union_kernel(
                     pl.ds(pl.multiple_of((goff + a) * block + h * half * atom, atom), half * atom)
                 ],
                 ibuf.at[pl.ds(pl.multiple_of(a * half * atom, atom), half * atom)],
-                meta_sem.at[4],
+                load_sem_ref.at[0, 0],
             )
 
         span = half * atoms_w * atom
         whole_cp = pltpu.make_async_copy(
             indices_hbm_ref.at[pl.ds(pl.multiple_of(goff * block + h * span, atom), span)],
             ibuf.at[pl.ds(0, span)],
-            meta_sem.at[4],
+            load_sem_ref.at[0, 0],
         )
 
         @pl.when(jnp.logical_not(whole))
@@ -1415,7 +1415,6 @@ def dsa_gather_native_sc_union(
     scratch_types = {
         "sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,)),
         "load_sem_ref": pltpu.SemaphoreType.DMA((2, UNION_LOAD_ROWS // NUM_LANES)),
-        "meta_sem": pltpu.SemaphoreType.DMA((5,)),
         "vec_ref": pltpu.VMEM((3 * NUM_LANES + NUM_LANES,), jnp.int32),
         "tab_smem": pltpu.SMEM((2 * (chunk_size // bz),), jnp.int32),
         "kv_smem": pltpu.SMEM((bz,), jnp.int32),
