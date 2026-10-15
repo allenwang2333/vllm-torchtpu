@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = False
     FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
@@ -946,6 +947,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
         "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
     ),
+    # With FUSED_MOE_PREFILL_KERNEL: run the stage-A build of the prefill kernel
+    # (kernels/experimental/fused_moe_prefill/fused_moe_prefill_kernel_v2.py,
+    # STAGE_A): both matmuls on the explicit MXU with the down epilogue per
+    # 256-column N-tile (no spilled f32 accumulator), 256-row tiles from 4096
+    # tokens, combine descriptors from a carried flat pointer. Same numerics as
+    # the default build, bit for bit.
+    "FUSED_MOE_PREFILL_KERNEL_V2": env_bool("FUSED_MOE_PREFILL_KERNEL_V2"),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),

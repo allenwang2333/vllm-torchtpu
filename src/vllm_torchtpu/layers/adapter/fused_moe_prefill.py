@@ -23,6 +23,9 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill as _kernel_body,
 )
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    fused_moe_prefill_kernel_v2 as _v2,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -62,7 +65,30 @@ def prefill_layer(
     `routed_scale` multiplies the routed output alone (GLM-5.2: 2.5)."""
     # Trace-time, once per token bucket: the evidence that the prefill kernel
     # serves this shape.
-    logger.info("Fused MoE prefill kernel traced for %d tokens", x.shape[0])
+    logger.info(
+        "Fused MoE prefill kernel%s traced for %d tokens",
+        " (V2, stage A)" if envs.FUSED_MOE_PREFILL_KERNEL_V2 else "",
+        x.shape[0],
+    )
+    if envs.FUSED_MOE_PREFILL_KERNEL_V2:
+        return _v2.fused_moe_prefill(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight,
+            tw,
+            ti,
+            axis_name=EP_AXIS_NAME,
+            expert_start=start,
+            routed_scale=routed_scale,
+            **_v2.STAGE_A,
+        )
     return _kernel_body(
         x,
         w1,

@@ -229,3 +229,100 @@ def reference(x, residual, weight, eps):
     y = (s * jax.lax.rsqrt(var + eps)).astype(weight.dtype) * weight
     y = y.astype(orig)
     return (y, new_res) if residual is not None else y
+
+
+def _moe_quant_kernel(x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, *, eps: float, q_max: float):
+    """``_kernel`` plus the fused MoE prefill kernel's own activation quant
+    (``fused_moe_prefill_kernel._quantize_rows``) on the bf16 ``y``, op for op:
+
+        amax  = max|y|                          (bf16, exact)
+        scale = f32(amax) / q_max;  usable = finite & > 0;  scale = usable ? scale : 0
+        inv   = usable ? 1 / scale : 0
+        x_q   = fp8(usable ? y * bf16(inv) : 0)  (bf16 multiply)
+
+    written straight into the [rows, hidden / 128, 128] per-row layout the
+    expert kernel gathers rows from: the natural fp8 tile viewed as u32 (four
+    rows per word) is byte-transposed four lane blocks at a time and stored
+    with sublane-strided u32 stores (the inverse of the expert kernel's LHS
+    build)."""
+    from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (
+        _byte_transpose4,
+    )
+
+    lanes = 128
+    s = x_ref[...].astype(jnp.float32) + r_ref[...].astype(jnp.float32)
+    ro_ref[...] = s.astype(ro_ref.dtype)
+    var = jnp.mean(s * s, axis=-1, keepdims=True)
+    normed = (s * jax.lax.rsqrt(var + eps)).astype(x_ref.dtype)
+    y = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(x_ref.dtype)
+    y_ref[...] = y
+    amax = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+    scale = amax.astype(jnp.float32) / q_max
+    usable = jnp.isfinite(scale) & (scale > 0)
+    scale = jnp.where(usable, scale, 0.0)
+    inv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
+    q = jnp.where(usable, y * inv.astype(y.dtype), jnp.zeros_like(y)).astype(q_ref.dtype)
+    s_ref[...] = scale
+    rows, hidden = y.shape
+    lane_blocks = hidden // lanes
+    wpr = lane_blocks // 4
+    # byte t of word (s, c) of qn is row 4s + t, column c
+    qn = pltpu.bitcast(q, jnp.uint32)
+    # word-row r * wpr + k of q32 holds lane blocks 4k..4k+3 of row r (block 4k + j in byte j)
+    q32 = q_ref.bitcast(jnp.uint32).reshape(rows * wpr, lanes)
+    for k in range(wpr):
+        a = [qn[:, (4 * k + j) * lanes : (4 * k + j + 1) * lanes] for j in range(4)]
+        b = _byte_transpose4(a)  # b[t]: byte j = row 4s + t, lane block 4k + j
+        for t in range(4):
+            q32[pl.ds(t * wpr + k, rows // 4, stride=lane_blocks)] = b[t]
+
+
+@functools.partial(jax.jit, static_argnames=("eps", "block_rows", "interpret"))
+def fused_add_rms_norm_quant_moe(
+    x: jax.Array,
+    residual: jax.Array,
+    weight: jax.Array,
+    *,
+    eps: float,
+    block_rows: int = DEFAULT_BLOCK_ROWS,
+    interpret: bool = False,
+):
+    """The add + RMSNorm pass that also emits the fused MoE prefill kernel's
+    activation rows, so the op skips its own amax / convert passes over ``y``
+    (t4-moe-prefill A6; pass the results to fused_moe_prefill_kernel_v2's
+    ``x_q`` / ``x_scale``).
+
+    Returns ``(y [rows, hidden], x_q fp8 [rows, hidden / 128, 128],
+    x_scale f32 [rows], new_residual)``; ``(x_q, x_scale)`` are bit for bit
+    ``_quantize_rows(y)``. ``y`` is still written: the router reads it.
+    """
+    rows, hidden = x.shape
+    if rows % block_rows or hidden % 512:
+        raise ValueError(f"{rows=} {hidden=} {block_rows=}")
+    q_dtype = jnp.float8_e4m3fn
+    q_max = float(jnp.finfo(q_dtype).max)
+    lane_blocks = hidden // 128
+    row_spec = pl.BlockSpec((block_rows, hidden), lambda i: (i, 0))
+    q_spec = pl.BlockSpec((block_rows, lane_blocks, 128), lambda i: (i, 0, 0))
+    s_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
+    w_spec = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    tile = block_rows * hidden * 4
+    y, x_q, scale, new_res = pl.pallas_call(
+        functools.partial(_moe_quant_kernel, eps=eps, q_max=q_max),
+        grid=(rows // block_rows,),
+        in_specs=[row_spec, row_spec, w_spec],
+        out_specs=[row_spec, q_spec, s_spec, row_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+            jax.ShapeDtypeStruct((rows, lane_blocks, 128), q_dtype),
+            jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+            jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=min(100 * 1024 * 1024, max(32 * 1024 * 1024, 14 * tile)),
+        ),
+        name=f"fused_add_rmsnorm_quant_moe_b{block_rows}_h{hidden}",
+        interpret=interpret,
+    )(x, residual, weight.reshape(1, hidden))
+    return y, x_q, scale.reshape(-1), new_res
