@@ -143,6 +143,19 @@ class Csa2Test(unittest.TestCase):
     def test_early_windows_across_groups(self):
         self.assert_reference(_inputs(lengths=(14,), starts=(0,), padding=1), bq=6)
 
+    def test_pv_pipeline_capacity_and_tails(self):
+        # Ten MRB slots fit H96; H104/H128 must use the six-slot schedule.
+        # Exercise single-Q startup, both tail parities and a BQ rollover.
+        for heads in (96, 104, 128):
+            with self.subTest(heads=heads):
+                inputs = _inputs(
+                    lengths=(0, 1, 2, 3, 5, 17),
+                    starts=(0, 0, 127, 2048, 2048, 2048),
+                    padding=2,
+                    heads=heads,
+                )
+                self.assert_reference(inputs, bq=16)
+
     def test_48_requests_six_queries(self):
         inputs = _inputs(
             lengths=(6,) * 48, starts=tuple(b * 64 for b in range(48)), heads=64
