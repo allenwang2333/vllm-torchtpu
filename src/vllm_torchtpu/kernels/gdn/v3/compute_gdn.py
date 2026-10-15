@@ -248,6 +248,51 @@ def packed_block_diag_dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
     return unpack_heads(out, g)
 
 
+def pack_columns(x: jax.Array, g: int) -> jax.Array:
+    """[heads, n, 1] -> [heads // g, n, g * n]: each head's column broadcast
+    over its lanes of the `pack_heads` layout."""
+    heads, n, _ = x.shape
+    grouped = x.reshape(heads // g, g, n, 1)
+    lane_head = jax.lax.broadcasted_iota(jnp.int32, (1, n, g * n), 2) // n
+    out = grouped[:, g - 1]
+    for j in range(g - 2, -1, -1):
+        out = jnp.where(lane_head == j, grouped[:, j], out)
+    return out
+
+
+def packed_diag_blocks_dot_t(a: jax.Array, b: jax.Array, g: int) -> jax.Array:
+    """Per-head `a @ b^T` in the `pack_heads` layout: [heads, n, d] x
+    [heads, n, d] -> [heads // g, n, g * n]. A group's heads are stacked
+    along M and N of one matmul and its diagonal blocks kept."""
+    heads, n, d = a.shape
+    full = jax.lax.dot(
+        a.reshape(heads // g, g * n, d),
+        b.reshape(heads // g, g * n, d),
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+    lane_head = jax.lax.broadcasted_iota(jnp.int32, (1, n, g * n), 2) // n
+    out = full[:, (g - 1) * n :]
+    for j in range(g - 2, -1, -1):
+        out = jnp.where(lane_head == j, full[:, j * n : (j + 1) * n], out)
+    return out
+
+
+def _can_pack_chunk_maps(heads: int, cfg: config.GDNConfig, head_slice: slice) -> bool:
+    """Whether a slab's [chunk, chunk] maps can be held `INV_HEADS_PER_PASS`
+    heads per vreg row: the blocked inverse applies and every group sits
+    within one kq head."""
+    g = INV_HEADS_PER_PASS
+    chunk = cfg.chunk_size
+    return (
+        _can_invert_blocked(
+            jax.ShapeDtypeStruct((heads, chunk, chunk), cfg.dtypes.compute)
+        )
+        and cfg.v_per_kq_head % g == 0
+        and head_slice.start % g == 0
+    )
+
+
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     """Compute invert matrix of a given triauglar matrix."""
@@ -353,45 +398,54 @@ def chunked_gdn_heads(
     q_repeat = repeat(q_kq)
     k_repeat = repeat(k_kq)
 
-    # [heads, 1, chunk]
-    g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
-    # [heads, chunk, chunk]
-    g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
-    gating_map = jnp.exp(g_cum_sum_diff_log)
-    # [heads, chunk, 1]
-    gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
     # [heads, chunk, 1]
     gating_forward = jnp.exp(g_cum_sum_log)
     # [heads, 1, 1]
     gating_last = gating_forward[:, -1:]
+    # [heads, 1, chunk]
+    g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
+    # [heads, chunk, kq_head_dim]
+    k_beta_repeat = k_repeat * beta_large
+
+    # The [chunk, chunk] maps hold two heads per vreg row when packed:
+    # [heads // g, chunk, g * chunk] in the `pack_heads` layout.
+    g = INV_HEADS_PER_PASS
+    packed = _can_pack_chunk_maps(v_large.shape[0], cfg, head_slice)
+    if packed:
+        # [heads, chunk, 1]: -(g - g_last), as the unpacked map's last column.
+        gating_backward = jnp.exp(-(g_cum_sum_log - g_cum_sum_log[:, -1:]))
+        g_cum_sum_diff_log = pack_columns(g_cum_sum_log, g) - pack_heads(
+            g_cum_sum_log_t, g
+        )
+        beta_k_k_t = packed_diag_blocks_dot_t(k_beta_repeat, k_repeat, g)
+    else:
+        # [heads, chunk, chunk]
+        g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
+        # [heads, chunk, 1]
+        gating_backward = jnp.exp(-g_cum_sum_diff_log[..., -1:])
+        # [heads, chunk, chunk]
+        beta_k_k_t = jax.lax.dot(
+            k_beta_repeat,
+            k_repeat,
+            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
+    beta_k_k_t = beta_k_k_t.astype(cfg.dtypes.compute)
+    gating_map = jnp.exp(g_cum_sum_diff_log)
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     iota_r = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 1)
     iota_c = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 2)
+    if packed:
+        iota_c = iota_c % cfg.chunk_size
     identity_mask = iota_r == iota_c
     strictly_lower_mask = iota_r > iota_c
     lower_mask = iota_r >= iota_c
-    # [heads, chunk, chunk]
     gating_map_masked = jnp.where(strictly_lower_mask, gating_map, 0)
-
-    # [heads, chunk, kq_head_dim]
-    k_beta_repeat = k_repeat * beta_large
-
-    # [heads, chunk, chunk]
-    beta_k_k_t = jax.lax.dot(
-        k_beta_repeat,
-        k_repeat,
-        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
 
-    # [heads, chunk, chunk], or [heads // g, chunk, g * chunk] when packed.
-    t_inv_packed = _can_invert_blocked(gating_beta_k_k_t)
-    if t_inv_packed:
-        t_inv = invert_unit_lower_blocked(
-            pack_heads(gating_beta_k_k_t, INV_HEADS_PER_PASS)
-        )
+    if packed:
+        t_inv = invert_unit_lower_blocked(gating_beta_k_k_t)
     else:
         t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
         t_inv = invert_triangular_matrix(t)
@@ -405,7 +459,7 @@ def chunked_gdn_heads(
     # along lane dim is free - making this optimization strictly beneficial.
     # [heads, chunk, v_head_dim + kq_head_dim]
     merged_v_k = jnp.concat([v_beta_large, k_beta_gating], axis=-1)
-    if t_inv_packed:
+    if packed:
         merged_uw = packed_block_diag_dot(t_inv, merged_v_k)
     else:
         merged_uw = jax.lax.dot(
@@ -455,26 +509,34 @@ def chunked_gdn_heads(
     state_updated = state_prev * gating_last
     state = state_updated + state_new
 
-    # [kq heads, chunk, chunk]
+    # [kq heads, chunk, chunk], or [kq heads, chunk, g * chunk] holding g
+    # copies side by side when packed.
     out_qk = jax.lax.dot(
         q_kq,
-        k_kq,
+        jnp.concat([k_kq] * g, axis=1) if packed else k_kq,
         dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
     # NOTE: must perform repeat after matmul to reduce required compute.
-    # [heads, chunk, chunk]
-    out_qk = repeat(out_qk)
+    if packed:
+        out_qk = jnp.repeat(out_qk, cfg.v_per_kq_head // g, axis=0)[
+            head_slice.start // g : head_slice.stop // g
+        ]
+    else:
+        out_qk = repeat(out_qk)
     out_qk *= gating_map
     out_qk = jnp.where(lower_mask, out_qk, 0)
 
     # [heads, chunk, v_head_dim]
-    out_new = jax.lax.dot(
-        out_qk,
-        u_ws,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    )
+    if packed:
+        out_new = packed_block_diag_dot(out_qk, u_ws)
+    else:
+        out_new = jax.lax.dot(
+            out_qk,
+            u_ws,
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
     out = out_updated + out_new
 
     return out, state
