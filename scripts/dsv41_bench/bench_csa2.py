@@ -160,11 +160,26 @@ def main() -> None:
             "no cache gather or cache-format conversion"
         ),
     }
+    if args.baseline_snapshot is not None:
+        manifest["baseline"] = json.loads(
+            (args.baseline_snapshot / "provenance.json").read_text()
+        )
+        manifest["baseline_scope"] = (
+            "native staged-KV attention, including packed SWA gather, "
+            "fused window attention and full-stage SparseMLA; inverse RoPE adapter"
+        )
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest), flush=True)
+    if args.profile:
+        import torch
+        import torch_tpu  # noqa: F401
+        from torch_tpu._internal.profiler import TpuProfilerConfig
+
+        # Initialize the profiler's PJRT client before the first capture.
+        torch.tpu.synchronize()
     cases = (
-        ("decode_encoder", (6,) * 48, (98304,) * 48, 96, 2),
-        ("decode_decoder", (6,) * 48, (98304,) * 48, 96, 1),
+        ("decode_encoder", (6,) * 48, (98304,) * 48, 0, 2),
+        ("decode_decoder", (6,) * 48, (98304,) * 48, 0, 1),
         ("prefill_encoder", (2044,), (100220,), 4, 2),
     )
     metrics = args.output / "rank-0/benchmark/metrics.jsonl"
@@ -272,10 +287,6 @@ def main() -> None:
                 stream.write(json.dumps(row) + "\n")
             print("RESULT " + json.dumps(row), flush=True)
             if args.profile:
-                import torch
-                import torch_tpu  # noqa: F401
-                from torch_tpu._internal.profiler import TpuProfilerConfig
-
                 path = args.output / "rank-0/profiling/xprof" / (name + "-" + variant)
                 path.mkdir(parents=True, exist_ok=True)
                 # Match the serving benchmark's profiler. JAX's plugin profiler
@@ -288,9 +299,9 @@ def main() -> None:
                     on_trace_ready=torch.profiler.tensorboard_trace_handler(str(path)),
                     experimental_config=TpuProfilerConfig(
                         run_dir=str(path),
-                        host_tracer_level=2,
+                        host_tracer_level=1,
                         device_tracer_level=1,
-                        python_tracer_level=1,
+                        python_tracer_level=0,
                         experimental_options={"tpu_trace_mode": "TRACE_COMPUTE"},
                     ),
                 ):

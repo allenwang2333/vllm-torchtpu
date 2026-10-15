@@ -170,10 +170,29 @@ def main_kernel(
                     swa_prefetched_id[0] = wanted + 1
 
         def dequant(i):
-            main_bf16_ref[i] = (
-                main_fp8_ref[i].reshape(512, 512).astype(jnp.float32)
-                * main_scale_ref[i, 0][:, None]
-            ).astype(jnp.bfloat16)
+            # Byte g of each word holds feature g * 128 + lane.
+            words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
+            for row in range(0, 512, 128):
+                rows = pl.ds(row, 128)
+                words = words_ref[rows, :]
+                scales = main_scale_ref[i, 0, rows][:, None]
+                for group in range(4):
+                    if interpret:
+                        # unpack_elementwise has no CPU lowering.
+                        bits = (words >> (8 * group)) & 0xFF
+                    else:
+                        bits = pltpu.unpack_elementwise(
+                            words,
+                            index=group,
+                            packed_dtype=jnp.uint8,
+                            unpacked_dtype=jnp.uint32,
+                        )
+                    values = lax.bitcast_convert_type(
+                        bits.astype(jnp.uint8), main_fp8_ref.dtype
+                    ).astype(jnp.float32)
+                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
+                        values * scales
+                    ).astype(jnp.bfloat16)
 
         @pl.loop(0, count)
         def finish_query(i):

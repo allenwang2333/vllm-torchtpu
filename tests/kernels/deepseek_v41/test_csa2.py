@@ -204,6 +204,20 @@ class Csa2Test(unittest.TestCase):
             with self.subTest(ratio=ratio):
                 self.assert_reference(inputs, compress_ratio=ratio, scale=0.125)
 
+    def test_fp8_byte_planes_and_row_scales(self):
+        inputs = _inputs(lengths=(3,), starts=(2048,))
+        token, row, group, lane = np.indices((3, 512, 4, 128))
+        bits = ((71 * token + 13 * row + 53 * group + lane) % 256).astype(np.uint8)
+        # Cover every finite E4M3FN encoding, including signed subnormals.
+        bits[(bits & 0x7F) == 0x7F] -= 1
+        inputs["main_kv"] = jax.lax.bitcast_convert_type(
+            jnp.asarray(bits), jnp.float8_e4m3fn
+        )
+        inputs["main_kv_scale"] *= 0.02
+        inputs["q"] = jnp.zeros_like(inputs["q"])
+        inputs["swa_kv"] = jnp.zeros_like(inputs["swa_kv"])
+        self.assert_reference(inputs, bq=2)
+
     def test_sink_and_inverse_rope_analytic(self):
         inputs = _inputs(lengths=(1,), starts=(0,))
         inputs["q"] = jnp.zeros_like(inputs["q"])

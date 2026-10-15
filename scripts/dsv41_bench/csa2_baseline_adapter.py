@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Load historical compute functions for a native-input CSA2 comparison.
+"""Load the GitHub baseline's native attention route for a CSA2 comparison.
 
-The snapshot comes from PR #1912's measured ebbc20148 commit. Its SparseMLA
-kernel is identical to PR #1890's measured 34215ece1 commit. AST selection
-avoids importing the full serving application; selected function bodies are
-unchanged. The existing mla_tc_only benchmark removes compressed-KV gather.
-SWA keeps its original packed-cache gather and union-window algorithm.
+AST selection avoids importing the full serving application. Only imports
+are rebound to snapshot definitions; compute function bodies are unchanged.
+The staged-KV entrypoint preserves the baseline's fused SWA and full-stage
+SparseMLA pipeline, including its measured tile tables.
 
 Packing here is outside timing. This is a compute-path comparison, not a
 drop-in serving benchmark: the candidate consumes a different cache format.
@@ -25,6 +24,7 @@ drop-in serving benchmark: the candidate consumes a different cache format.
 
 import ast
 import functools
+import logging
 import pathlib
 import types
 
@@ -37,23 +37,30 @@ from jax.experimental.pallas import tpu as pltpu
 
 
 def select_functions(path: pathlib.Path, names, namespace):
-    """Execute selected original definitions, retaining source locations."""
+    """Execute snapshot definitions and constants, rebinding package imports."""
     tree = ast.parse(path.read_text(), filename=str(path))
-    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    if {n.name for n in body} != set(names):
+    definitions = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            definitions[node.name] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            definitions[node.target.id] = node
+        elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            definitions[node.targets[0].id] = node
+    if not set(names) <= definitions.keys():
         raise ValueError(f"Missing baseline functions in {path}")
-    # Only the benchmark helper imports its kernel by package name. Bind the
-    # same snapshot module explicitly instead of loading the serving package.
-    for node in body:
-        if node.name == "_mla_tc_only_jax":
-            node.body = [
-                n
-                for n in node.body
-                if not (
-                    isinstance(n, ast.ImportFrom)
-                    and n.module == "vllm_torchtpu.kernels.deepseek_v4.core_attention"
-                )
-            ]
+
+    class SnapshotImports(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            if node.module in (
+                "vllm_torchtpu.kernels.deepseek_v4.core_attention",
+                "vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla",
+                "vllm_torchtpu.kernels.mla",
+            ):
+                return None
+            return node
+
+    body = [SnapshotImports().visit(definitions[name]) for name in names]
     code = compile(
         ast.Module(body=body, type_ignores=[]), str(path), "exec", flags=0x1000000
     )
@@ -72,8 +79,10 @@ def load(path: pathlib.Path):
         ROW_WORDS=128,
         NOPE_DIM=448,
         NOPE_SCALE_PERIOD=64,
+        logger=types.SimpleNamespace(warning_once=logging.getLogger(__name__).warning),
     )
     kernel_functions = (
+        "DEFAULT_VMEM_LIMIT_BYTES",
         "cdiv",
         "align_to",
         "get_dtype_bitwidth",
@@ -87,7 +96,21 @@ def load(path: pathlib.Path):
     )
     select_functions(path / "sparse_mla.py", kernel_functions, env)
     env["sparse_mla"] = types.SimpleNamespace(**{n: env[n] for n in kernel_functions})
-    select_functions(path / "bench_sparse_mla_swa.py", ("_mla_tc_only_jax",), env)
+    select_functions(
+        path / "tuned_block_sizes.py", ("PREFILL_BATCHES", "prefill_batch_size"), env
+    )
+    env["sparse_tuning"] = types.SimpleNamespace(
+        prefill_batch_size=env["prefill_batch_size"]
+    )
+    select_functions(path / "tuned_window_attention.py", ("QUERY_BLOCKS",), env)
+    env["tuned_window_attention"] = types.SimpleNamespace(
+        QUERY_BLOCKS=env["QUERY_BLOCKS"]
+    )
+    window_functions = ("supports_window_attention", "_kernel", "attend_windows")
+    select_functions(path / "window_attention.py", window_functions, env)
+    env["window_attention"] = types.SimpleNamespace(
+        **{n: env[n] for n in window_functions}
+    )
     select_functions(
         path / "cache.py",
         (
@@ -112,6 +135,11 @@ def load(path: pathlib.Path):
             "_window_union",
             "_attend_window",
             "repack_chunk_rope_words",
+            "_pad_compacted_records",
+            "_paged_pool_shape",
+            "_reshape_paged_pool",
+            "sparse_ragged_paged_attention_union_gather",
+            "sparse_fp8_attention_jax",
         ),
         env,
     )
@@ -121,27 +149,26 @@ def load(path: pathlib.Path):
     ):
         del positions
         tokens = q.shape[0]
-        maximum, denominator, numerator = env["_attend_window"](
+        valid = jnp.arange(tokens) < starts[-1]
+        records = jnp.where(valid[:, None], jnp.arange(512)[None], -1)
+        # Pool contents/page addresses are unused when staged buffers are
+        # supplied. Keep native shapes without allocating a second cache.
+        output = env["sparse_fp8_attention_jax"](
             q,
             swa_pool,
+            nope.reshape(-1, 128),
+            rope.reshape(-1, 128),
             swa_records,
-            env["_attention_state"](q),
-            512**-0.5,
-            max_requests=1 if starts.shape[0] == 2 else None,
-        )
-        kv_lens = jnp.where(jnp.arange(tokens) < starts[-1], 512, 0).astype(jnp.int32)
-        output = env["_mla_tc_only_jax"](
-            q,
-            nope.reshape(-1, 128, 512, 128),
-            rope.reshape(-1, 128, 128, 128),
-            kv_lens,
+            records,
+            jnp.zeros((starts.shape[0] - 1, 1), jnp.int32),
             starts,
             sink,
-            numerator,
-            denominator,
-            maximum,
             scale=512**-0.5,
-            max_num_seqs=starts.shape[0] - 1,
+            page_size=4,
+            max_requests=1 if starts.shape[0] == 2 else None,
+            precompacted=True,
+            gathered_nope=nope,
+            gathered_rope=rope,
         )
         # Same mathematical inverse RoPE and BF16 boundary as the candidate.
         # This is an adapter, not the serving wo_a projection fusion.
