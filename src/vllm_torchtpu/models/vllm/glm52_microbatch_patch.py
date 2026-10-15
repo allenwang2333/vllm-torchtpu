@@ -11,279 +11,384 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Two-window token micro-batching for GLM-5.2 / DeepSeek-V3.2 MLA + MoE models.
+"""Barrier-staged post-attention micro-batching for GLM-5.2 / DeepSeek-V3.2 MLA.
 
-When `TPU_TOKEN_MICROBATCHES=2` and the padded token bucket is at least
-`TPU_MICROBATCH_MIN_TOKENS` (default 1024), splits each `DeepseekV2Model`
-backbone step into two token windows `[0:mid]` and `[mid:N]` (`mid = N // 2`)
-across the decoder layer stack while keeping the three Pallas/SparseCore
-custom ops (`streamindex_topk_dcp`, `sparse_mla_dcp_op`, and `fused_moe_func`)
-as single full-batch `[0:N]` kernel launches per layer:
+When `TPU_TOKEN_MICROBATCHES >= 2` and the padded token bucket is at least
+`TPU_MICROBATCH_MIN_TOKENS` (default 1024):
 
-  1. Window 0 pre-attention + indexer projections (`input_layernorm`,
-     `fused_qkv_a_proj`, `q_a_layernorm`, `q_b_proj`, `kv_a_layernorm`, RoPE,
-     indexer `wq_b` / `wk_weights_proj` / `k_norm` / RoPE / FP8 quant, and
-     `W_UK_T` BMM) are emitted first so XLA overlaps them with Layer `l-1`'s
-     Window 1 MoE TP All-Reduce.
-  2. Window 1 pre-attention + indexer projections run next, followed by a
-     single full-batch `[0:N]` call to `streamindex_topk_dcp` and a single
-     full-batch `[0:N]` call to `sparse_mla_dcp_op`.
-  3. Window 0 merges its DCP attention partials (`cp_lse_ag_out_rs`), runs
-     `W_UV` BMM and `o_proj` (launching Window 0's `o_proj` TP All-Reduce),
-     while Window 1 merges its DCP partials and runs `W_UV` BMM and `o_proj`.
-  4. Window 0 runs `post_attention_layernorm`, `mlp.gate`, and
-     `moe_tp_decode_pre_mb2` (Window 0 routing + shared expert GEMMs) while
-     Window 1's `o_proj` TP All-Reduce is in flight.
-  5. Window 1 runs `post_attention_layernorm` and `mlp.gate`, then
-     `moe_tp_decode_combine_mb2` runs Window 1 routing, a single full-batch
-     `[0:N]` `fused_moe_func` call, Window 0's MoE TP All-Reduce overlapped
-     with Window 1's shared expert GEMMs, and Window 1's MoE TP All-Reduce
-     overlapped with Layer `l+1`'s Window 0 pre-attention stack.
+  1. Pre-Attention (`input_layernorm`, `fused_qkv_a_proj`, `q_a_layernorm`,
+     `q_b_proj`, `kv_a_layernorm`, RoPE, `indexer` + `streamindex_topk_dcp`,
+     `W_UK_T` BMM, `quantize_kv`, and `sparse_mla_dcp_op`) executes on the full
+     contiguous `[0:N]` batch without any tensor splitting or `torch.cat`
+     overhead, preserving 100% of XLA's native overlap of `q_b_proj` with
+     `sc_gather_pack_owned` and `W_UK_T` BMM with `sc_native_sc_gather`.
+  2. Post-Attention (`dcp_lse_ag_and_weight` -> `dcp_reduce_scatter` ->
+     `W_UV` BMM -> `output_gate` -> `o_proj` GEMM -> `o_proj` TP `all-reduce`)
+     is pipelined across `K = max(TPU_TOKEN_MICROBATCHES, TPU_DCP_MERGE_CHUNKED)`
+     token chunks using `jax.lax.optimization_barrier` so that chunk `c`'s
+     SparseCore-offloaded `reduce-scatter` executes concurrently with chunk
+     `c - 1`'s TensorCore `W_UV` BMM + `o_proj` GEMM + `o_proj` TP `all-reduce`
+     AND chunk `c + 1`'s TensorCore `all-gather(lse)` + `logsumexp` + `weighted`
+     multiply. Running `W_UV` BMM per chunk directly on `dcp_reduce_scatter`'s
+     output also eliminates the `{2,0,1} -> {2,1,0} -> {2,0,1}` transpose-cat-
+     transpose overhead.
+  3. Post-Attention LayerNorm + MoE (`post_attention_layernorm`, `mlp`) executes
+     on the full contiguous `[0:N]` batch, with `lax.optimization_barrier`
+     decoupling `shared_experts.down_proj` from `routed` so `down_proj` overlaps
+     with SparseCore EP combine (`sc_ragged_gather_reduce_v2`).
 """
 
-from __future__ import annotations
+from typing import Any, cast
 
-from itertools import islice
-from typing import Any, NamedTuple, cast
-
+import jax
 import torch
+from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
-from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.linear import DCPGroupColumnParallelLinear
-from vllm.model_executor.models import deepseek_v2
-from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.dcp_comm import (
+    dcp_lse_ag_and_weight,
+    dcp_reduce_scatter,
+)
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+from vllm_torchtpu.layers.adapter.custom_ops import (
+    mla_attention_op as _mla_attention_op,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUMLAAttention,
     VllmTPUMultiHeadLatentAttentionWrapper,
-    rope_half_split,
-    rope_half_split_leading,
-    rope_half_split_leading_supported,
 )
-from vllm_torchtpu.layers.adapter.moe_tp_decode import (
-    moe_tp_decode_combine_mb2,
-    moe_tp_decode_pre_mb2,
-    moe_tp_decode_supported,
-)
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.layers.core.quantization import quantize_kv, quantize_tensor
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+from vllm_torchtpu.layers.core.quantization import quantize_kv
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-UPSTREAM_DEEPSEEK_V2_MODEL_FORWARD = deepseek_v2.DeepseekV2Model.forward
+UPSTREAM_MLA_WRAPPER_FORWARD = VllmTPUMultiHeadLatentAttentionWrapper.forward
+UPSTREAM_MOE_APPLY_QUANT_METHOD = VllmMoERunner._apply_quant_method
 
 
-class _WindowAttnPre(NamedTuple):
-    ql_nope_flat: torch.Tensor
-    q_pe_flat: torch.Tensor
-    kv_c_normed_flat: torch.Tensor
-    k_pe_flat: torch.Tensor
-    input_dtype: torch.dtype
-    use_qrep: bool
-    output_gate: torch.Tensor | None
-    idx_q_fp8: torch.Tensor | None
-    idx_weights: torch.Tensor | None
-    idx_k_packed: torch.Tensor | None
+def _opt_barrier_2_jax(
+    a: jax.Array, b: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    return jax.lax.optimization_barrier((a, b))
 
 
-def _has_bound_kv_cache(model: deepseek_v2.DeepseekV2Model) -> bool:
-    """False during `profile_run` (before KV caches are allocated), True once bound."""
-    if model.start_layer >= model.end_layer:
+def _fake_opt_barrier_2(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(a), torch.empty_like(b)
+
+
+_OPT_BARRIER_2_OP = pallas.jax_op(
+    "pallas::glm52_opt_barrier_2", _opt_barrier_2_jax
+)
+_OPT_BARRIER_2_OP.register_fake(_fake_opt_barrier_2)
+
+
+def _opt_barrier_3_jax(
+    a: jax.Array, b: jax.Array, c: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return jax.lax.optimization_barrier((a, b, c))
+
+
+def _fake_opt_barrier_3(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(a), torch.empty_like(b), torch.empty_like(c)
+
+
+_OPT_BARRIER_3_OP = pallas.jax_op(
+    "pallas::glm52_opt_barrier_3", _opt_barrier_3_jax
+)
+_OPT_BARRIER_3_OP.register_fake(_fake_opt_barrier_3)
+
+
+def _opt_barrier_2(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.device.type != "tpu":
+        return a, b
+    return _OPT_BARRIER_2_OP(a, b)
+
+
+def _opt_barrier_3(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if a.device.type != "tpu":
+        return a, b, c
+    return _OPT_BARRIER_3_OP(a, b, c)
+
+
+def _staged_post_chunks(num_tokens: int) -> int:
+    if num_tokens < envs.TPU_MICROBATCH_MIN_TOKENS:
+        return 1
+    merge_chunks_fn = getattr(_cp_mla_attention, "_merge_chunks", None)
+    base_chunks = (
+        merge_chunks_fn(num_tokens)
+        if callable(merge_chunks_fn)
+        else int(envs.TPU_DCP_MERGE_CHUNKED)
+    )
+    target = max(int(envs.TPU_TOKEN_MICROBATCHES), base_chunks)
+    if target > 1 and num_tokens % (8 * target) == 0:
+        return target
+    mb = int(envs.TPU_TOKEN_MICROBATCHES)
+    if mb > 1 and num_tokens % (8 * mb) == 0:
+        return mb
+    return 1
+
+
+def _can_use_staged_dcp_post(
+    wrapper: VllmTPUMultiHeadLatentAttentionWrapper,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    prefill_group: Any,
+) -> bool:
+    if envs.TPU_TOKEN_MICROBATCHES < 2:
         return False
-    first_layer = model.layers[model.start_layer]
-    self_attn = getattr(first_layer, "self_attn", None)
-    wrapper = getattr(self_attn, "mla_attn", None)
+    if vllm_compilation_backends.model_tag != "backbone":
+        return False
+    if prefill_group is not None:
+        return False
+    if not wrapper.is_sparse:
+        return False
+    if getattr(wrapper, "kimi_preprocess", None) is not None:
+        return False
+    if getattr(wrapper, "g_proj", None) is not None:
+        return False
     mla_layer = getattr(wrapper, "mla_attn", None)
     if not isinstance(mla_layer, VllmTPUMLAAttention):
+        return False
+    impl = cast(PallasMLAttentionBackendImpl, mla_layer.impl)
+    if impl.dcp_size <= 1:
+        return False
+    dcp_group = get_dcp_group()
+    if dcp_group is None or int(dcp_group.world_size) <= 1:
         return False
     _, _, kv_cache, _ = get_attention_context(mla_layer.layer_name)
     if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() == 0:
         return False
-    return True
-
-
-def _can_use_mb2(
-    model: deepseek_v2.DeepseekV2Model,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-) -> bool:
-    if envs.TPU_TOKEN_MICROBATCHES != 2:
-        return False
-    if vllm_compilation_backends.model_tag != "backbone":
-        return False
-    if model.use_mha:
-        return False
-    if not _has_bound_kv_cache(model):
-        return False
-    for layer in islice(model.layers, model.start_layer, model.end_layer):
-        if getattr(layer, "use_sequence_parallel_moe", False):
-            return False
-        wrapper = getattr(getattr(layer, "self_attn", None), "mla_attn", None)
-        if not isinstance(wrapper, VllmTPUMultiHeadLatentAttentionWrapper):
-            return False
-        if getattr(wrapper, "kimi_preprocess", None) is not None:
-            return False
-        if getattr(wrapper, "g_proj", None) is not None:
-            return False
     if hidden_states.shape[0] != positions.shape[0]:
         return False
-    num_tokens = positions.shape[0]
-    return num_tokens >= envs.TPU_MICROBATCH_MIN_TOKENS and (num_tokens % 16 == 0)
+    num_tokens = hidden_states.shape[0]
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return False
+    return _staged_post_chunks(num_tokens) >= 2
 
 
-def _attn_pre_window(
+def _attn_post_window(
     wrapper: VllmTPUMultiHeadLatentAttentionWrapper,
-    pos_w: torch.Tensor,
-    h_w: torch.Tensor,
-    llama_4_scaling_w: torch.Tensor | None,
-) -> _WindowAttnPre:
+    mla_layer: VllmTPUMLAAttention,
+    outputs_w: torch.Tensor,
+    input_dtype: torch.dtype,
+    output_gate_w: torch.Tensor | None,
+) -> torch.Tensor:
+    outputs_t = outputs_w.reshape(
+        -1, mla_layer.num_heads, mla_layer.kv_lora_rank
+    ).transpose(0, 1)
+    w_uv = (
+        mla_layer.W_UV.to(outputs_t.dtype)
+        if mla_layer.W_UV.dtype != outputs_t.dtype
+        else mla_layer.W_UV
+    )
+    out_proj = torch.bmm(outputs_t, w_uv)
+    if hasattr(mla_layer, "W_UV_scale"):
+        out_proj = out_proj * mla_layer.W_UV_scale
+    attn_out_w = (
+        out_proj.transpose(0, 1)
+        .to(input_dtype)
+        .reshape(-1, mla_layer.num_heads * mla_layer.v_head_dim)
+    )
+    if output_gate_w is not None:
+        attn_out_w = attn_out_w * output_gate_w.sigmoid()
+    return wrapper.o_proj(attn_out_w)[0]
+
+
+def _staged_dcp_attn_post(
+    wrapper: VllmTPUMultiHeadLatentAttentionWrapper,
+    mla_layer: VllmTPUMLAAttention,
+    partial_full: torch.Tensor,
+    lse_full: torch.Tensor,
+    input_dtype: torch.dtype,
+    output_gate: torch.Tensor | None,
+    group: Any,
+    num_chunks: int,
+) -> torch.Tensor:
+    step = partial_full.shape[0] // num_chunks
+    partials = [
+        partial_full[c * step : (c + 1) * step] for c in range(num_chunks)
+    ]
+    lses = [lse_full[c * step : (c + 1) * step] for c in range(num_chunks)]
+    gates = [
+        output_gate[c * step : (c + 1) * step]
+        if output_gate is not None
+        else None
+        for c in range(num_chunks)
+    ]
+
+    # Prologue (TensorCore): chunk 0 LSE all-gather + logsumexp + weight multiply.
+    weighted_c = dcp_lse_ag_and_weight(partials[0], lses[0], group)
+
+    # Stage 0: SparseCore reduce-scatter(chunk 0) overlapped with
+    # TensorCore LSE all-gather + weight(chunk 1).
+    weighted_0, lse_1 = _opt_barrier_2(weighted_c, lses[1])
+    outputs_prev = dcp_reduce_scatter(weighted_0, input_dtype, group)
+    weighted_c = dcp_lse_ag_and_weight(partials[1], lse_1, group)
+
+    h_attn_chunks: list[torch.Tensor] = []
+
+    # Interior Stages c = 1 .. num_chunks - 2:
+    # SparseCore reduce-scatter(chunk c) overlapped with
+    # TensorCore _attn_post_window(chunk c - 1) [W_UV BMM + o_proj + TP AR] AND
+    # TensorCore LSE all-gather + weight(chunk c + 1).
+    for c in range(1, num_chunks - 1):
+        outputs_prev, weighted_c, lse_next = _opt_barrier_3(
+            outputs_prev, weighted_c, lses[c + 1]
+        )
+        outputs_c = dcp_reduce_scatter(weighted_c, input_dtype, group)
+        h_attn_prev = _attn_post_window(
+            wrapper, mla_layer, outputs_prev, input_dtype, gates[c - 1]
+        )
+        weighted_next = dcp_lse_ag_and_weight(
+            partials[c + 1], lse_next, group
+        )
+        h_attn_prev, outputs_prev = _opt_barrier_2(h_attn_prev, outputs_c)
+        h_attn_chunks.append(h_attn_prev)
+        weighted_c = weighted_next
+
+    # Final Reduce-Scatter Stage c = num_chunks - 1:
+    # SparseCore reduce-scatter(chunk K - 1) overlapped with
+    # TensorCore _attn_post_window(chunk K - 2) [W_UV BMM + o_proj + TP AR].
+    outputs_prev, weighted_last = _opt_barrier_2(outputs_prev, weighted_c)
+    outputs_last = dcp_reduce_scatter(weighted_last, input_dtype, group)
+    h_attn_prev = _attn_post_window(
+        wrapper, mla_layer, outputs_prev, input_dtype, gates[num_chunks - 2]
+    )
+    h_attn_prev, outputs_last = _opt_barrier_2(h_attn_prev, outputs_last)
+    h_attn_chunks.append(h_attn_prev)
+
+    # Epilogue (TensorCore): _attn_post_window(chunk K - 1).
+    h_attn_last = _attn_post_window(
+        wrapper, mla_layer, outputs_last, input_dtype, gates[num_chunks - 1]
+    )
+    h_attn_chunks.append(h_attn_last)
+
+    return torch.cat(h_attn_chunks, dim=0)
+
+
+def patched_mla_wrapper_forward(
+    self: VllmTPUMultiHeadLatentAttentionWrapper,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    llama_4_scaling: torch.Tensor | None = None,
+    prefill_group: Any = None,
+) -> torch.Tensor:
+    if not _can_use_staged_dcp_post(
+        self, positions, hidden_states, prefill_group
+    ):
+        return UPSTREAM_MLA_WRAPPER_FORWARD(
+            self, positions, hidden_states, llama_4_scaling, prefill_group
+        )
+
     q_c = None
     kv_lora = None
     output_gate = None
 
-    if wrapper.q_lora_rank is not None:
-        assert wrapper.fused_qkv_a_proj is not None
-        assert wrapper.q_a_layernorm is not None
-        assert wrapper.q_b_proj is not None
+    if self.q_lora_rank is not None:
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_a_layernorm is not None
+        assert self.q_b_proj is not None
 
-        qkv_lora = wrapper.fused_qkv_a_proj(h_w)[0]
-        if wrapper.gate_is_fused:
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        if self.gate_is_fused:
             q_c, kv_lora, output_gate = qkv_lora.split(
                 [
-                    wrapper.q_lora_rank,
-                    wrapper.kv_lora_rank + wrapper.qk_rope_head_dim,
-                    wrapper.num_heads * wrapper.v_head_dim,
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self.num_heads * self.v_head_dim,
                 ],
                 dim=-1,
             )
         else:
             q_c, kv_lora = qkv_lora.split(
-                [wrapper.q_lora_rank, wrapper.kv_lora_rank + wrapper.qk_rope_head_dim],
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-        q_c = wrapper.q_a_layernorm(q_c)
-        q = wrapper.q_b_proj(q_c)[0]
+        q_c = self.q_a_layernorm(q_c)
+        q = self.q_b_proj(q_c)[0]
     else:
-        assert wrapper.kv_a_proj_with_mqa is not None
-        assert wrapper.q_proj is not None
-        kv_lora = wrapper.kv_a_proj_with_mqa(h_w)[0]
-        q = wrapper.q_proj(h_w)[0]
+        assert self.kv_a_proj_with_mqa is not None
+        assert self.q_proj is not None
+        kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+        q = self.q_proj(hidden_states)[0]
 
     assert kv_lora is not None
     kv_c, k_pe = kv_lora.split(
-        [wrapper.kv_lora_rank, wrapper.qk_rope_head_dim], dim=-1
+        [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
     )
-    kv_c_normed = wrapper.kv_a_layernorm(kv_c)
+    kv_c_normed = self.kv_a_layernorm(kv_c)
 
-    q = q.view(-1, wrapper.num_heads * wrapper.dcp_group_size, wrapper.qk_head_dim)
-    q_nope, q_pe = q.split([wrapper.qk_nope_head_dim, wrapper.qk_rope_head_dim], dim=-1)
+    q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
+    q_nope, q_pe = q.split(
+        [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+    )
     k_pe = k_pe.unsqueeze(1)
 
-    if wrapper.rotary_emb is not None:
+    if self.rotary_emb is not None:
         q_pe_dtype = q_pe.dtype
         k_pe_dtype = k_pe.dtype
-        if getattr(wrapper, "_rope_neox_permuted", False):
-            q_pe, k_pe = rope_half_split(wrapper.rotary_emb, pos_w, q_pe, k_pe)
+        rope_half_split_fn = getattr(
+            _mla_attention_op, "rope_half_split", None
+        )
+        if getattr(self, "_rope_neox_permuted", False) and callable(
+            rope_half_split_fn
+        ):
+            q_pe, k_pe = rope_half_split_fn(
+                self.rotary_emb, positions, q_pe, k_pe
+            )
         else:
-            q_pe, k_pe = wrapper.rotary_emb(pos_w, q_pe, k_pe)
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q_pe = q_pe.to(dtype=q_pe_dtype)
         k_pe = k_pe.to(dtype=k_pe_dtype)
 
-    idx_q_fp8 = None
-    idx_weights = None
-    idx_k_packed = None
-    if wrapper.is_sparse and wrapper.indexer is not None and not wrapper.skip_topk:
-        indexer = wrapper.indexer
-        rotary_emb = wrapper.indexer_rope_emb
-        assert q_c is not None
-        idx_q, _ = indexer.wq_b(q_c)
-        idx_q = idx_q.view(-1, indexer.n_head, indexer.head_dim)
-        kw, _ = indexer.wk_weights_proj(h_w)
-        idx_k = kw[:, : indexer.head_dim]
-        idx_weights = kw[:, indexer.head_dim :]
-
-        idx_k = indexer.k_norm(idx_k)
-        permuted = getattr(indexer, "_rope_neox_permuted", False)
-        if permuted and rope_half_split_leading_supported(rotary_emb):
-            idx_q = rope_half_split_leading(
-                rotary_emb, pos_w, idx_q, indexer.rope_dim
-            )
-            idx_k = rope_half_split_leading(
-                rotary_emb, pos_w, idx_k, indexer.rope_dim
-            )
-        else:
-            assert rotary_emb is not None
-            idx_q_pe, idx_q_nope = torch.split(
-                idx_q, [indexer.rope_dim, indexer.head_dim - indexer.rope_dim], dim=-1
-            )
-            idx_k_pe, idx_k_nope = torch.split(
-                idx_k, [indexer.rope_dim, indexer.head_dim - indexer.rope_dim], dim=-1
-            )
-            if permuted:
-                idx_q_pe, idx_k_pe = rope_half_split(
-                    rotary_emb, pos_w, idx_q_pe, idx_k_pe.unsqueeze(1)
-                )
-            else:
-                idx_q_pe, idx_k_pe = rotary_emb(
-                    pos_w, idx_q_pe, idx_k_pe.unsqueeze(1)
-                )
-            idx_q_pe = idx_q_pe.reshape(-1, indexer.n_head, indexer.rope_dim)
-            idx_k_pe = idx_k_pe.reshape(-1, 1, indexer.rope_dim)
-            idx_q = torch.cat([idx_q_pe, idx_q_nope], dim=-1)
-            idx_k = torch.cat([idx_k_pe.squeeze(-2), idx_k_nope], dim=-1)
-
-        idx_q = idx_q.view(-1, indexer.head_dim)
-        idx_q_fp8, idx_q_scale = quantize_tensor(
-            idx_q, torch.float8_e4m3fn, axis=-1, use_ue8m0=False
+    if self.indexer is not None and not self.skip_topk:
+        topk_index = self.indexer(
+            hidden_states, q_c, positions, self.indexer_rope_emb
         )
-        idx_q_fp8 = idx_q_fp8.view(-1, indexer.n_head, indexer.head_dim)
-        idx_q_scale = idx_q_scale.view(-1, indexer.n_head, 1)
+    else:
+        topk_index = self.topk_indices_buffer
+    assert topk_index is not None
+    topk_indices = topk_index[: hidden_states.shape[0]]
 
-        weights_dtype = idx_weights.dtype
-        idx_weights = (
-            idx_weights.unsqueeze(-1)
-            * idx_q_scale
-            * indexer.softmax_scale
-            * indexer.n_head**-0.5
-        )
-        idx_weights = idx_weights.squeeze(-1).to(weights_dtype)
-
-        k_quant, k_scale = quantize_tensor(
-            idx_k,
-            torch.float8_e4m3fn,
-            axis=-1,
-            use_ue8m0=True,
-        )
-        idx_k_packed = torch.cat([k_quant.view(torch.uint8), k_scale], dim=-1)
-
-    if llama_4_scaling_w is not None:
-        q_nope = q_nope * llama_4_scaling_w
-        q_pe = q_pe * llama_4_scaling_w
+    if llama_4_scaling is not None:
+        q_nope = q_nope * llama_4_scaling
+        q_pe = q_pe * llama_4_scaling
 
     q_dcp_replicated = None
-    if wrapper.dcp_q_replicate:
-        if wrapper.is_sparse:
+    if self.dcp_q_replicate:
+        if self.is_sparse:
             q_dcp_replicated = (q_nope, q_pe)
         local_view = cast(
-            DCPGroupColumnParallelLinear, wrapper._q_proj_layer()
+            DCPGroupColumnParallelLinear, self._q_proj_layer()
         )._local_view
         q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
-    mla_layer = wrapper.mla_attn
+    mla_layer = self.mla_attn
     impl = cast(PallasMLAttentionBackendImpl, mla_layer.impl)
+    attn_metadata, _, kv_cache, _ = get_attention_context(mla_layer.layer_name)
     input_dtype = q_nope.dtype
+
     use_qrep = (
         q_dcp_replicated is not None
         and impl.dcp_size > 1
-        and wrapper.is_sparse
+        and topk_indices is not None
     )
     if use_qrep:
         assert mla_layer.W_UK_T_dcp_qrep is not None
@@ -328,461 +433,87 @@ def _attn_pre_window(
     kv_c_normed_flat = kv_c_normed.view(-1, mla_layer.kv_lora_rank)
     k_pe_flat = k_pe.view(-1, mla_layer.qk_rope_head_dim)
 
-    return _WindowAttnPre(
-        ql_nope_flat=ql_nope_flat,
-        q_pe_flat=q_pe_flat,
-        kv_c_normed_flat=kv_c_normed_flat,
-        k_pe_flat=k_pe_flat,
-        input_dtype=input_dtype,
-        use_qrep=use_qrep,
-        output_gate=output_gate,
-        idx_q_fp8=idx_q_fp8,
-        idx_weights=idx_weights,
-        idx_k_packed=idx_k_packed,
-    )
-
-
-def _merge_window_lse(
-    partial_w: torch.Tensor,
-    lse_w: torch.Tensor,
-    full_num_tokens: int,
-) -> torch.Tensor:
-    group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return partial_w
-    if (
-        envs.TPU_DCP_LSE_MERGE_A2A
-        and full_num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2
+    assert getattr(mla_layer, "sparse_mla_dcp_op", None) is not None
+    if use_qrep:
+        ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
+    elif (
+        envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
+        and ql_nope_flat.dtype == q_pe_flat.dtype
     ):
-        return _cp_mla_attention.merge_lse_partials_all_to_all(
-            partial_w, lse_w, group
+        ql_nope_dcp, q_pe_dcp = _cp_mla_attention.all_gather_q_nope_pe_heads(
+            ql_nope_flat, q_pe_flat, mla_layer.kv_lora_rank
         )
-    full_chunks = _cp_mla_attention._merge_chunks(full_num_tokens)
-    window_chunks = max(1, full_chunks // 2)
-    if window_chunks > 1 and partial_w.shape[0] % (8 * window_chunks) == 0:
-        return _cp_mla_attention._merge_chunked(
-            partial_w, lse_w, group, window_chunks
-        )
-    return cp_lse_ag_out_rs(partial_w, lse_w, group)
+    else:
+        ql_nope_dcp = _cp_mla_attention.all_gather_heads(ql_nope_flat)
+        q_pe_dcp = _cp_mla_attention.all_gather_heads(q_pe_flat)
 
-
-def _attn_post_window(
-    wrapper: VllmTPUMultiHeadLatentAttentionWrapper,
-    mla_layer: VllmTPUMLAAttention,
-    outputs_w: torch.Tensor,
-    input_dtype: torch.dtype,
-    output_gate_w: torch.Tensor | None,
-) -> torch.Tensor:
-    outputs_t = outputs_w.reshape(
-        -1, mla_layer.num_heads, mla_layer.kv_lora_rank
-    ).transpose(0, 1)
-    w_uv = (
-        mla_layer.W_UV.to(outputs_t.dtype)
-        if mla_layer.W_UV.dtype != outputs_t.dtype
-        else mla_layer.W_UV
+    partial_full, lse_full = mla_layer.sparse_mla_dcp_op(
+        kv_cache,
+        ql_nope_dcp,
+        q_pe_dcp,
+        kv_c_normed_flat,
+        k_pe_flat,
+        topk_indices,
+        attn_metadata.seq_lens,
+        attn_metadata.block_tables,
+        attn_metadata.query_start_loc,
+        attn_metadata.request_distribution,
     )
-    out_proj = torch.bmm(outputs_t, w_uv)
-    if hasattr(mla_layer, "W_UV_scale"):
-        out_proj = out_proj * mla_layer.W_UV_scale
-    attn_out_w = (
-        out_proj.transpose(0, 1)
-        .to(input_dtype)
-        .reshape(-1, mla_layer.num_heads * mla_layer.v_head_dim)
+
+    dcp_group = get_dcp_group()
+    assert dcp_group is not None
+    num_chunks = _staged_post_chunks(hidden_states.shape[0])
+    return _staged_dcp_attn_post(
+        self,
+        mla_layer,
+        partial_full,
+        lse_full,
+        input_dtype,
+        output_gate,
+        dcp_group,
+        num_chunks,
     )
-    if output_gate_w is not None:
-        attn_out_w = attn_out_w * output_gate_w.sigmoid()
-    return wrapper.o_proj(attn_out_w)[0]
 
 
-def _forward_layer_mb2(
-    layer: deepseek_v2.DeepseekV2DecoderLayer,
-    pos0: torch.Tensor,
-    pos1: torch.Tensor,
-    h0: torch.Tensor,
-    h1: torch.Tensor,
-    res0: torch.Tensor | None,
-    res1: torch.Tensor | None,
-    llama_4_scaling_0: torch.Tensor | None,
-    llama_4_scaling_1: torch.Tensor | None,
-    full_num_tokens: int,
-    mid: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # 1. Input LayerNorm + Pre-Attention + Indexer projections:
-    # Emit Window 0 first so XLA overlaps it with Layer l-1's Window 1 MoE All-Reduce.
-    if res0 is None:
-        res0 = h0
-        h0 = layer.input_layernorm(h0)
-    else:
-        h0, res0 = layer.input_layernorm(h0, res0)
-
-    wrapper = cast(VllmTPUMultiHeadLatentAttentionWrapper, layer.self_attn.mla_attn)
-    pre0 = _attn_pre_window(wrapper, pos0, h0, llama_4_scaling_0)
-
-    if res1 is None:
-        res1 = h1
-        h1 = layer.input_layernorm(h1)
-    else:
-        h1, res1 = layer.input_layernorm(h1, res1)
-
-    pre1 = _attn_pre_window(wrapper, pos1, h1, llama_4_scaling_1)
-
-    # 2. Full-batch Pallas Indexer Top-K + Sparse MLA Attention (1x per layer on [0:N]):
-    topk_indices = None
-    if wrapper.is_sparse:
-        if wrapper.indexer is not None and not wrapper.skip_topk:
-            indexer_op = wrapper.indexer.indexer_op
-            assert pre0.idx_q_fp8 is not None and pre1.idx_q_fp8 is not None
-            assert pre0.idx_weights is not None and pre1.idx_weights is not None
-            assert pre0.idx_k_packed is not None and pre1.idx_k_packed is not None
-
-            attn_metadata_dict = get_forward_context().attn_metadata
-            idx_metadata = None
-            if isinstance(attn_metadata_dict, dict):
-                idx_metadata = attn_metadata_dict.get(indexer_op.k_cache.prefix)
-            kv_cache_idx = indexer_op.k_cache.kv_cache
-            if (
-                not isinstance(idx_metadata, AttentionMetadata)
-                or kv_cache_idx.numel() == 0
-            ):
-                topk_index = indexer_op.topk_indices_buffer
-            else:
-                q_bytes_full = torch.cat(
-                    [
-                        pre0.idx_q_fp8.view(torch.uint8),
-                        pre1.idx_q_fp8.view(torch.uint8),
-                    ],
-                    dim=0,
-                )
-                weights_full = torch.cat([pre0.idx_weights, pre1.idx_weights], dim=0)
-                k_packed_full = torch.cat(
-                    [pre0.idx_k_packed, pre1.idx_k_packed], dim=0
-                )
-                seq_lens = idx_metadata.seq_lens
-                page_indices = idx_metadata.block_tables
-                cu_q_lens = idx_metadata.query_start_loc
-                rd = idx_metadata.request_distribution
-                distribution = torch.stack([rd[0], rd[0], rd[2]])
-                if indexer_op.topk_op_dcp is not None:
-                    raw_topk = indexer_op.topk_op_dcp(
-                        q_bytes_full,
-                        weights_full,
-                        kv_cache_idx,
-                        k_packed_full,
-                        seq_lens,
-                        page_indices,
-                        cu_q_lens,
-                        distribution,
-                    )
-                else:
-                    raw_topk = indexer_op.topk_op(
-                        q_bytes_full,
-                        weights_full,
-                        kv_cache_idx,
-                        k_packed_full,
-                        seq_lens,
-                        page_indices,
-                        cu_q_lens,
-                        distribution,
-                    )
-                rows = indexer_op._write_topk_rows(full_num_tokens, raw_topk)
-                if envs.TPU_INDEXER_TOPK_SHARED_READ:
-                    topk_index = indexer_op.topk_indices_buffer
-                else:
-                    topk_index = rows
-        else:
-            topk_index = wrapper.topk_indices_buffer
-        assert topk_index is not None
-        topk_indices = topk_index[:full_num_tokens]
-
-    mla_layer = wrapper.mla_attn
-    impl = cast(PallasMLAttentionBackendImpl, mla_layer.impl)
-    attn_metadata_mla, _, kv_cache_mla, _ = get_attention_context(mla_layer.layer_name)
-
-    ql_nope_full = torch.cat([pre0.ql_nope_flat, pre1.ql_nope_flat], dim=0)
-    q_pe_full = torch.cat([pre0.q_pe_flat, pre1.q_pe_flat], dim=0)
-    kv_c_normed_full = torch.cat([pre0.kv_c_normed_flat, pre1.kv_c_normed_flat], dim=0)
-    k_pe_full = torch.cat([pre0.k_pe_flat, pre1.k_pe_flat], dim=0)
-
-    # 3. Post-Attention DCP Merge + W_UV BMM + o_proj + TP All-Reduce per window:
-    # Emit Window 0's complete post-attention + o_proj All-Reduce before Window 1's
-    # so Window 0's o_proj All-Reduce overlaps with Window 1's LSE merge + W_UV + o_proj.
-    if topk_indices is not None:
-        assert isinstance(kv_cache_mla, (tuple, list)) and len(kv_cache_mla) == 2
-        if impl.dcp_size > 1:
-            assert getattr(mla_layer, "sparse_mla_dcp_op", None) is not None
-            if pre0.use_qrep:
-                ql_nope_dcp, q_pe_dcp = ql_nope_full, q_pe_full
-            elif (
-                envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
-                and ql_nope_full.dtype == q_pe_full.dtype
-            ):
-                ql_nope_dcp, q_pe_dcp = _cp_mla_attention.all_gather_q_nope_pe_heads(
-                    ql_nope_full, q_pe_full, mla_layer.kv_lora_rank
-                )
-            else:
-                ql_nope_dcp = _cp_mla_attention.all_gather_heads(ql_nope_full)
-                q_pe_dcp = _cp_mla_attention.all_gather_heads(q_pe_full)
-
-            partial_full, lse_full = mla_layer.sparse_mla_dcp_op(
-                kv_cache_mla,
-                ql_nope_dcp,
-                q_pe_dcp,
-                kv_c_normed_full,
-                k_pe_full,
-                topk_indices,
-                attn_metadata_mla.seq_lens,
-                attn_metadata_mla.block_tables,
-                attn_metadata_mla.query_start_loc,
-                attn_metadata_mla.request_distribution,
-            )
-            partial_0, partial_1 = partial_full[:mid], partial_full[mid:]
-            lse_0, lse_1 = lse_full[:mid], lse_full[mid:]
-
-            outputs_0 = _merge_window_lse(partial_0, lse_0, full_num_tokens)
-            h_attn_0 = _attn_post_window(
-                wrapper, mla_layer, outputs_0, pre0.input_dtype, pre0.output_gate
-            )
-
-            outputs_1 = _merge_window_lse(partial_1, lse_1, full_num_tokens)
-            h_attn_1 = _attn_post_window(
-                wrapper, mla_layer, outputs_1, pre1.input_dtype, pre1.output_gate
-            )
-        else:
-            if not hasattr(mla_layer, "sparse_mla_op") or mla_layer.sparse_mla_op is None:
-                mla_layer.sparse_mla_op = impl._build_sparse_mla_op(mla_layer)
-            outputs_full = mla_layer.sparse_mla_op(
-                kv_cache_mla,
-                ql_nope_full,
-                q_pe_full,
-                kv_c_normed_full,
-                k_pe_full,
-                topk_indices,
-                attn_metadata_mla.seq_lens,
-                attn_metadata_mla.block_tables,
-                attn_metadata_mla.query_start_loc,
-                attn_metadata_mla.request_distribution,
-            )
-            outputs_0, outputs_1 = outputs_full[:mid], outputs_full[mid:]
-            h_attn_0 = _attn_post_window(
-                wrapper, mla_layer, outputs_0, pre0.input_dtype, pre0.output_gate
-            )
-            h_attn_1 = _attn_post_window(
-                wrapper, mla_layer, outputs_1, pre1.input_dtype, pre1.output_gate
-            )
-    else:
-        q_scale, k_scale, v_scale = impl._get_kv_scales(mla_layer)
-        if not hasattr(mla_layer, "mla_op") or mla_layer.mla_op is None:
-            mla_layer.mla_op = impl._build_mla_op(
-                mla_layer, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
-            )
-        assert isinstance(kv_cache_mla, torch.Tensor)
-        outputs_full = mla_layer.mla_op(
-            kv_cache_mla,
-            ql_nope_full,
-            q_pe_full,
-            kv_c_normed_full,
-            k_pe_full,
-            attn_metadata_mla.seq_lens,
-            attn_metadata_mla.block_tables,
-            attn_metadata_mla.query_start_loc,
-            attn_metadata_mla.request_distribution,
-        )
-        outputs_0, outputs_1 = outputs_full[:mid], outputs_full[mid:]
-        h_attn_0 = _attn_post_window(
-            wrapper, mla_layer, outputs_0, pre0.input_dtype, pre0.output_gate
-        )
-        h_attn_1 = _attn_post_window(
-            wrapper, mla_layer, outputs_1, pre1.input_dtype, pre1.output_gate
-        )
-
+def patched_moe_apply_quant_method(
+    self: VllmMoERunner,
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None = None,
+    shared_experts_overlapping: bool = False,
+) -> tuple[torch.Tensor | None, Any]:
+    shared_out, fused_out = UPSTREAM_MOE_APPLY_QUANT_METHOD(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=input_ids,
+        shared_experts_overlapping=shared_experts_overlapping,
+    )
     if (
-        not isinstance(layer.self_attn, deepseek_v2.DeepseekAttention)
-        and h_attn_0.dtype == torch.float16
+        envs.TPU_TOKEN_MICROBATCHES >= 2
+        and vllm_compilation_backends.model_tag == "backbone"
+        and hidden_states.shape[0] >= envs.TPU_MICROBATCH_MIN_TOKENS
+        and shared_out is not None
+        and isinstance(fused_out, torch.Tensor)
     ):
-        h_attn_0 = h_attn_0 * (1.0 / layer.routed_scaling_factor)
-        h_attn_1 = h_attn_1 * (1.0 / layer.routed_scaling_factor)
-        if layer.layer_idx == 0:
-            res0 = res0 * (1.0 / layer.routed_scaling_factor)
-            res1 = res1 * (1.0 / layer.routed_scaling_factor)
-
-    # 4. Post-Attention LayerNorm + MLP / MoE:
-    # Emit Window 0's pre-MoE (or dense MLP) BEFORE consuming `h_attn_1` so
-    # Window 0 overlaps with Window 1's o_proj TP All-Reduce.
-    h_mlp_in_0, res0 = layer.post_attention_layernorm(h_attn_0, res0)
-    mlp = layer.mlp
-    if isinstance(mlp, deepseek_v2.DeepseekV2MoE):
-        runner = mlp.experts
-        routed_experts = runner.routed_experts
-        if moe_tp_decode_supported(routed_experts.quant_method):
-            logits_0, _ = runner.gate(h_mlp_in_0)
-            w_0, ids_0, shared_0 = moe_tp_decode_pre_mb2(
-                routed_experts.quant_method,
-                routed_experts,
-                h_mlp_in_0,
-                logits_0,
-            )
-            h_mlp_in_1, res1 = layer.post_attention_layernorm(h_attn_1, res1)
-            logits_1, _ = runner.gate(h_mlp_in_1)
-            h0, h1 = moe_tp_decode_combine_mb2(
-                routed_experts.quant_method,
-                routed_experts,
-                h_mlp_in_0,
-                h_mlp_in_1,
-                w_0,
-                ids_0,
-                shared_0,
-                logits_1,
-            )
-        else:
-            h0 = mlp(h_mlp_in_0)
-            h_mlp_in_1, res1 = layer.post_attention_layernorm(h_attn_1, res1)
-            h1 = mlp(h_mlp_in_1)
-    else:
-        h0 = mlp(h_mlp_in_0)
-        h_mlp_in_1, res1 = layer.post_attention_layernorm(h_attn_1, res1)
-        h1 = mlp(h_mlp_in_1)
-        if isinstance(mlp, deepseek_v2.DeepseekV2MLP) and h0.dtype == torch.float16:
-            h0 = h0 * (1.0 / layer.routed_scaling_factor)
-            h1 = h1 * (1.0 / layer.routed_scaling_factor)
-
-    return h0, h1, res0, res1
-
-
-def patched_deepseek_v2_model_forward(
-    self: deepseek_v2.DeepseekV2Model,
-    input_ids: torch.Tensor | None,
-    positions: torch.Tensor,
-    intermediate_tensors: IntermediateTensors | None,
-    inputs_embeds: torch.Tensor | None = None,
-) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-    if get_pp_group().is_first_rank:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            if input_ids is None:
-                raise ValueError(
-                    "Either input_ids or inputs_embeds must be provided "
-                    "to DeepseekV2Model.forward"
-                )
-            hidden_states = self.embed_input_ids(input_ids)
-        residual = None
-    else:
-        assert intermediate_tensors is not None
-        hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
-
-    llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
-    llama_4_scaling: torch.Tensor | None
-    if llama_4_scaling_config is not None:
-        llama_4_scaling = deepseek_v2._get_llama_4_scaling(
-            original_max_position_embeddings=llama_4_scaling_config[
-                "original_max_position_embeddings"
-            ],
-            scaling_beta=llama_4_scaling_config["beta"],
-            positions=positions,
-        )
-    else:
-        llama_4_scaling = None
-
-    aux_hidden_states = []
-    if _can_use_mb2(self, positions, hidden_states):
-        full_num_tokens = positions.shape[0]
-        mid = full_num_tokens // 2
-        pos0, pos1 = positions[:mid], positions[mid:]
-        h0, h1 = hidden_states[:mid], hidden_states[mid:]
-        if residual is None:
-            res0: torch.Tensor | None = None
-            res1: torch.Tensor | None = None
-        else:
-            res0, res1 = residual[:mid], residual[mid:]
-        if llama_4_scaling is None:
-            l4_0 = None
-            l4_1 = None
-        else:
-            l4_0, l4_1 = llama_4_scaling[:mid], llama_4_scaling[mid:]
-
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if idx in self.aux_hidden_state_layers:
-                assert res0 is not None and res1 is not None
-                aux_hidden_states.append(torch.cat([h0 + res0, h1 + res1], dim=0))
-            h0, h1, res0, res1 = _forward_layer_mb2(
-                layer,
-                pos0,
-                pos1,
-                h0,
-                h1,
-                res0,
-                res1,
-                l4_0,
-                l4_1,
-                full_num_tokens,
-                mid,
-            )
-
-        hidden_states = torch.cat([h0, h1], dim=0)
-        assert res0 is not None and res1 is not None
-        residual = torch.cat([res0, res1], dim=0)
-    else:
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if (
-                hidden_states.shape[0] != positions.shape[0]
-                and not layer.use_sequence_parallel_moe
-            ):
-                combined_states = torch.cat([hidden_states, residual], dim=-1)
-                combined_states = tensor_model_parallel_all_gather(combined_states, 0)
-                combined_states = combined_states[: positions.shape[0]]
-                hidden_states, residual = combined_states.split(
-                    [self.hidden_size, self.hidden_size], dim=-1
-                )
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_state = hidden_states + residual
-                if aux_hidden_state.shape[0] != positions.shape[0]:
-                    aux_hidden_state = tensor_model_parallel_all_gather(
-                        aux_hidden_state, 0
-                    )
-                    aux_hidden_state = aux_hidden_state[: positions.shape[0]]
-                aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, llama_4_scaling
-            )
-
-    if not get_pp_group().is_last_rank:
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
-
-    if hidden_states.shape[0] != positions.shape[0]:
-        combined_states = torch.cat([hidden_states, residual], dim=-1)
-        combined_states = tensor_model_parallel_all_gather(combined_states, 0)
-        combined_states = combined_states[: positions.shape[0]]
-        hidden_states, residual = combined_states.split(
-            [self.hidden_size, self.hidden_size], dim=-1
-        )
-
-    if self.end_layer in self.aux_hidden_state_layers:
-        aux_hidden_states.append(hidden_states + residual)
-
-    hidden_states, _ = self.norm(hidden_states, residual)
-    if len(aux_hidden_states) > 0:
-        return hidden_states, aux_hidden_states
-    return hidden_states
+        shared_out, fused_out = _opt_barrier_2(shared_out, fused_out)
+    return shared_out, fused_out
 
 
 def maybe_patch_glm52_microbatch(*args: object, **kwargs: object) -> None:
-    """Install two-window token micro-batching on `DeepseekV2Model.forward`."""
-    if envs.TPU_TOKEN_MICROBATCHES != 2:
+    """Install barrier-staged post-attention micro-batching on MLA wrapper."""
+    if envs.TPU_TOKEN_MICROBATCHES < 2:
         return None
-    deepseek_v2.DeepseekV2Model.forward = patched_deepseek_v2_model_forward
+    VllmTPUMultiHeadLatentAttentionWrapper.forward = patched_mla_wrapper_forward
+    VllmMoERunner._apply_quant_method = patched_moe_apply_quant_method
     logger.info(
-        "Applied TPU patch: DeepseekV2Model / GLM-5.2 two-window token micro-batching "
-        "(TPU_TOKEN_MICROBATCHES=%d, TPU_MICROBATCH_MIN_TOKENS=%d).",
+        "Applied TPU patch: GLM-5.2 barrier-staged post-attention micro-batching "
+        "(TPU_TOKEN_MICROBATCHES=%d, TPU_MICROBATCH_MIN_TOKENS=%d, TPU_DCP_RS_BF16=%s).",
         envs.TPU_TOKEN_MICROBATCHES,
         envs.TPU_MICROBATCH_MIN_TOKENS,
+        envs.TPU_DCP_RS_BF16,
     )
     return None
