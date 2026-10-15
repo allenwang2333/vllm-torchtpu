@@ -370,6 +370,7 @@ def _cp_scatter_indexer_k(
     writer: str = "xla",
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     rank_ids: jax.Array | None = None,
+    compact: bool = False,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -413,6 +414,7 @@ def _cp_scatter_indexer_k(
                 dcp_size=cp_size,
                 interleave_size=interleave_size,
                 kv_layout=kv_layout,
+                compact=compact,
             )
 
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
@@ -671,6 +673,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # i32 operand (one element per rank) instead of the iota all_to_all.
         rank_operand = envs.TPU_DCP_RANK_OPERAND
         rank_tensor = dcp_rank_operand() if rank_operand else None
+        k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -702,6 +705,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 writer=writer,
                 kv_layout=kv_layout,
                 rank_ids=rank_ids_arg,
+                compact=k_write_compact,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -1057,6 +1061,60 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return rows
 
 
+_qprep_ops: dict[tuple[int, int, int], Any] = {}
+
+
+def _get_indexer_qprep_op(n_head: int, rope_dim: int, min_tokens: int):
+    """TPU_INDEXER_QPREP_FUSED: the torch op around `kernels.indexer_qprep`.
+
+    Built at rebind (model construction), never under Dynamo. Token counts
+    below `min_tokens` take the same expression in plain XLA instead; that
+    choice is made on the static JAX shape, so torch traces one op for every
+    bucket."""
+    key = (n_head, rope_dim, min_tokens)
+    op = _qprep_ops.get(key)
+    if op is not None:
+        return op
+    from vllm_torchtpu.kernels import indexer_qprep
+
+    def fn(q: jax.Array, c: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+        if q.shape[0] < min_tokens:
+            return indexer_qprep.reference(q, c, s, n_head=n_head, rope_dim=rope_dim)
+        return indexer_qprep.indexer_q_prep(q, c, s, n_head=n_head, rope_dim=rope_dim)
+
+    def fake(q, c, s):
+        return (
+            torch.empty(
+                (q.shape[0], n_head, c.shape[-1]),
+                dtype=torch.float8_e4m3fn,
+                device=q.device,
+            ),
+            torch.empty((q.shape[0], n_head), dtype=torch.float32, device=q.device),
+        )
+
+    op = pallas.jax_op(f"pallas::indexer_qprep_h{n_head}_r{rope_dim}_m{min_tokens}", fn)
+    op.register_fake(fake)
+    _qprep_ops[key] = op
+    return op
+
+
+def rope_half_split_leading_cs(
+    rotary_emb, positions: torch.Tensor, like: torch.Tensor, d: int, rope_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The `C` and `S` rows of `rope_half_split_leading`, `[T, d]` each, built
+    by the same ops (so XLA shares them with the k rope)."""
+    t = positions.flatten().shape[0]
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(like).index_select(
+        0, positions.flatten()
+    )
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    parts_c, parts_s = [cos, cos], [-sin, sin]
+    if d > rope_dim:
+        parts_c.append(cos.new_ones(t, d - rope_dim))
+        parts_s.append(sin.new_zeros(t, d - rope_dim))
+    return torch.cat(parts_c, dim=-1), torch.cat(parts_s, dim=-1)
+
+
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
 
@@ -1093,6 +1151,13 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
+        indexer._qprep_op = None
+        if envs.TPU_INDEXER_QPREP_FUSED:
+            indexer._qprep_op = _get_indexer_qprep_op(
+                indexer.n_head,
+                indexer.rope_dim,
+                envs.TPU_INDEXER_QPREP_FUSED_MIN_TOKENS,
+            )
         return cast("VllmTPUIndexer", indexer)
 
     def permute_rope_to_half_split(self) -> None:
@@ -1157,6 +1222,26 @@ class VllmTPUIndexer(Indexer):
 
         k = self.k_norm(k)
         permuted = getattr(self, "_rope_neox_permuted", False)
+        qprep_op = getattr(self, "_qprep_op", None)
+        if (
+            qprep_op is not None
+            and permuted
+            and rope_half_split_leading_supported(rotary_emb)
+        ):
+            # TPU_INDEXER_QPREP_FUSED: q rope + per-(token, head) amax + fp8
+            # cast in one pass over the [T, H*D] wq_b output, written straight
+            # in the [T, H, D] layout the top-k op reads.
+            k = rope_half_split_leading(rotary_emb, positions, k, self.rope_dim)
+            c, s_ = rope_half_split_leading_cs(
+                rotary_emb, positions, q, self.head_dim, self.rope_dim
+            )
+            q_fp8, q_scale = qprep_op(
+                q.reshape(-1, self.n_head * self.head_dim), c, s_
+            )
+            q_scale = q_scale.view(-1, self.n_head, 1)
+            return self._finish_forward(
+                hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+            )
         if permuted and rope_half_split_leading_supported(rotary_emb):
             # Half-split columns: rope the whole head in place, no split/cat.
             q = rope_half_split_leading(rotary_emb, positions, q, self.rope_dim)
@@ -1192,7 +1277,11 @@ class VllmTPUIndexer(Indexer):
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
+        return self._finish_forward(
+            hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer
+        )
 
+    def _finish_forward(self, hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer):
         # q_scale is fp32, so fold it in and cast back: the kernel expects the
         # weights in the activation dtype.
         weights_dtype = weights.dtype
