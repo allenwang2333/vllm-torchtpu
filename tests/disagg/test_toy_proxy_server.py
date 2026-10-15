@@ -93,3 +93,26 @@ def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
         assert "token_ids" in str(exc)
     else:
         raise AssertionError("malformed render response should fail")
+
+
+def test_attach_reused_chat_prompt_token_ids(monkeypatch) -> None:
+    attach = _toy_proxy_server._attach_reused_chat_prompt_token_ids
+    kv_orig = {"uuid": "u-123", "num_tokens": 5}
+    resp_json = {
+        "prompt_token_ids": [10, 20, 30, 40, 50],
+        "kv_transfer_params": kv_orig,
+    }
+    monkeypatch.setenv("PROXY_REUSE_CHAT_TOKEN_IDS", "1")
+    kv_out, n_prompt = attach("/v1/chat/completions", resp_json, kv_orig)
+    assert n_prompt == 5
+    assert kv_out is not None and kv_out is not kv_orig
+    assert kv_out["prompt_token_ids"] == [10, 20, 30, 40, 50]
+    assert "prompt_token_ids" not in kv_orig
+
+    # Disabled when PROXY_REUSE_CHAT_TOKEN_IDS=0
+    monkeypatch.setenv("PROXY_REUSE_CHAT_TOKEN_IDS", "0")
+    kv_out_off, n_prompt_off = attach("/v1/chat/completions", resp_json, kv_orig)
+    assert n_prompt_off == 5
+    assert kv_out_off == kv_orig
+    assert "prompt_token_ids" not in (kv_out_off or {})
+

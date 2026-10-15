@@ -227,6 +227,40 @@ _MAX_ATTEMPTS = max(1, _env_int("PROXY_MAX_ATTEMPTS", 5))
 _RETRY_BASE_DELAY_S = _env_float("PROXY_RETRY_BASE_DELAY_S", 0.5)
 
 
+def _reuse_chat_token_ids_enabled() -> bool:
+    return os.getenv("PROXY_REUSE_CHAT_TOKEN_IDS", "1") == "1"
+
+
+def _attach_reused_chat_prompt_token_ids(
+    api: str,
+    response_json: dict[str, Any],
+    kv_transfer_params: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, int | None]:
+    """Attach Prefill's prompt_token_ids into kv_transfer_params for Decode reuse."""
+    prompt_token_ids = response_json.get("prompt_token_ids")
+    valid_ids = (
+        isinstance(prompt_token_ids, list)
+        and bool(prompt_token_ids)
+        and isinstance(prompt_token_ids[0], int)
+    )
+    usage = response_json.get("usage")
+    num_prompt_tokens = (
+        len(prompt_token_ids)
+        if valid_ids
+        else (usage.get("prompt_tokens") if isinstance(usage, dict) else None)
+    )
+    if (
+        _reuse_chat_token_ids_enabled()
+        and api == "/v1/chat/completions"
+        and isinstance(kv_transfer_params, dict)
+        and kv_transfer_params
+        and valid_ids
+    ):
+        kv_transfer_params = kv_transfer_params.copy()
+        kv_transfer_params["prompt_token_ids"] = prompt_token_ids
+    return kv_transfer_params, num_prompt_tokens
+
+
 def _log_unsafe_transport_failure(
     phase: str, request_id: str, exc: Exception, detail: str = ""
 ) -> None:
@@ -523,6 +557,8 @@ async def send_request_to_prefill(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    if _reuse_chat_token_ids_enabled() and endpoint == "/v1/chat/completions":
+        req_data.setdefault("return_token_ids", True)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -689,7 +725,19 @@ async def _handle_completions(api: str, request: Request):
         response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
         kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
+        kv_num_tokens = (
+            kv_transfer_params.get("num_tokens")
+            if isinstance(kv_transfer_params, dict)
+            else None
+        )
+        kv_transfer_params, num_prompt_tokens = _attach_reused_chat_prompt_token_ids(
+            api, response_json, kv_transfer_params
+        )
         kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
+        if num_prompt_tokens is not None:
+            kv_uuid_log += f" prompt_tokens={num_prompt_tokens}"
+        if kv_num_tokens is not None:
+            kv_uuid_log += f" kv_tokens={kv_num_tokens}"
         print(
             f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
             f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",

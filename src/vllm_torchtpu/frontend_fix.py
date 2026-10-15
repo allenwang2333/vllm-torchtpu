@@ -667,3 +667,176 @@ def maybe_install_ttft_stage_tracker() -> bool:
     )
     return True
 
+
+# ---------------------------------------------------------------------------
+# Decode-side Chat Prompt Token ID Reuse (QX_REUSE_CHAT_TOKEN_IDS=1).
+#
+# In PD disaggregated serving, the proxy forwards Prefill's ``prompt_token_ids``
+# inside ``request.kv_transfer_params["prompt_token_ids"]``.  If the installed
+# vLLM version already has ``OnlineRenderer._reused_prompt_token_ids``, we hook
+# ``OnlineRenderer.preprocess_chat`` to record token-reuse telemetry and populate
+# ``_TTFTStageStats`` (render_ms=0, tokenize_ms=0, tok_hit=True).  If the
+# installed vLLM lacks ``_reused_prompt_token_ids``, we pop ``prompt_token_ids``
+# from ``kv_transfer_params`` and short-circuit ``BaseRenderer.render_chat_async``
+# so Decode skips Jinja chat templating and Rust BPE tokenization completely.
+# ---------------------------------------------------------------------------
+
+_CTR_P = "[QX_CHAT_TOK_REUSE]"
+_CTR_INSTALLED = False
+
+
+class _ChatTokenReuseStats:
+    reused: int = 0
+    rendered: int = 0
+    reused_tokens: int = 0
+    last_log: float = 0.0
+
+    @classmethod
+    def reset(cls, now: float | None = None) -> None:
+        cls.reused = 0
+        cls.rendered = 0
+        cls.reused_tokens = 0
+        cls.last_log = time.monotonic() if now is None else now
+
+
+def _pop_reused_prompt_token_ids(request) -> list[int] | None:
+    kv = getattr(request, "kv_transfer_params", None)
+    if not isinstance(kv, dict):
+        return None
+    ids = kv.pop("prompt_token_ids", None)
+    if isinstance(ids, list) and ids and isinstance(ids[0], int):
+        return ids
+    return None
+
+
+def maybe_install_chat_token_id_reuse() -> bool:
+    global _CTR_INSTALLED
+    if _CTR_INSTALLED or os.environ.get("QX_REUSE_CHAT_TOKEN_IDS", "1") != "1":
+        return False
+    pname = multiprocessing.current_process().name
+    if not (pname == "MainProcess" or pname.startswith("ApiServer")):
+        return False
+    try:
+        import asyncio
+        import contextvars
+
+        from vllm.renderers import base as rbase
+        from vllm.renderers import online_renderer as orend
+    except Exception as e:
+        logger.warning(
+            "%s cannot import vLLM online_renderer (%r); not enabled", _CTR_P, e
+        )
+        return False
+
+    has_native_reuse = hasattr(orend, "_reused_prompt_token_ids")
+    orig_preprocess_chat = orend.OnlineRenderer.preprocess_chat
+    log_s = float(os.environ.get("QX_CHAT_TOK_REUSE_LOG_S", "60"))
+    _ChatTokenReuseStats.reset(time.monotonic())
+    reused_ctx: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+        "_qx_reused_chat_token_ids", default=None
+    )
+
+    if not has_native_reuse:
+        orig_rc_async = rbase.BaseRenderer.render_chat_async
+
+        async def _rc_async_with_reuse(
+            self,
+            conversations,
+            chat_params,
+            tok_params=None,
+            *,
+            prompt_extras=None,
+            skip_mm_cache: bool = False,
+        ):
+            reuse_ids = reused_ctx.get()
+            if reuse_ids and len(conversations) == 1:
+                arrival_time = time.time()
+                t_done = time.perf_counter()
+                tok_prompts = [self._build_tokens_prompt(list(reuse_ids), {})]
+                self._apply_prompt_extras(tok_prompts, prompt_extras)
+                eng_prompts = await asyncio.gather(
+                    *(
+                        self.process_for_engine_async(
+                            p, arrival_time, skip_mm_cache=skip_mm_cache
+                        )
+                        for p in tok_prompts
+                    )
+                )
+                for ep in eng_prompts:
+                    _TTFTStageStats.put_pending(ep, t_done, 0.0, 0.0, True)
+                return [[]], eng_prompts
+            return await orig_rc_async(
+                self,
+                conversations,
+                chat_params,
+                tok_params,
+                prompt_extras=prompt_extras,
+                skip_mm_cache=skip_mm_cache,
+            )
+
+        _rc_async_with_reuse.__qx_chat_tok_reuse__ = True
+        _rc_async_with_reuse.__wrapped__ = orig_rc_async
+        rbase.BaseRenderer.render_chat_async = _rc_async_with_reuse
+
+    async def preprocess_chat(self, request, *args, **kwargs):
+        kv = getattr(request, "kv_transfer_params", None)
+        peek_ids = kv.get("prompt_token_ids") if isinstance(kv, dict) else None
+        has_ids = (
+            isinstance(peek_ids, list)
+            and bool(peek_ids)
+            and isinstance(peek_ids[0], int)
+        )
+        token = None
+        if has_ids and not has_native_reuse:
+            popped = _pop_reused_prompt_token_ids(request)
+            token = reused_ctx.set(popped)
+        try:
+            conv, engine_inputs = await orig_preprocess_chat(
+                self, request, *args, **kwargs
+            )
+        finally:
+            if token is not None:
+                reused_ctx.reset(token)
+
+        try:
+            if has_ids:
+                _ChatTokenReuseStats.reused += 1
+                _ChatTokenReuseStats.reused_tokens += len(peek_ids)
+                if has_native_reuse:
+                    t_done = time.perf_counter()
+                    for ep in engine_inputs:
+                        _TTFTStageStats.put_pending(ep, t_done, 0.0, 0.0, True)
+            else:
+                _ChatTokenReuseStats.rendered += 1
+            now = time.monotonic()
+            if now - _ChatTokenReuseStats.last_log >= log_s:
+                _ChatTokenReuseStats.last_log = now
+                total = _ChatTokenReuseStats.reused + _ChatTokenReuseStats.rendered
+                pct = (100.0 * _ChatTokenReuseStats.reused / total) if total else 0.0
+                logger.warning(
+                    "%s stats reused=%d/%d (%.1f%%) reused_tokens=%d",
+                    _CTR_P,
+                    _ChatTokenReuseStats.reused,
+                    total,
+                    pct,
+                    _ChatTokenReuseStats.reused_tokens,
+                )
+        except Exception:
+            pass
+        return conv, engine_inputs
+
+    preprocess_chat.__qx_chat_tok_reuse__ = True
+    preprocess_chat.__wrapped__ = orig_preprocess_chat
+    orend.OnlineRenderer.preprocess_chat = preprocess_chat
+    _CTR_INSTALLED = True
+    logger.warning(
+        "%s installed OnlineRenderer.preprocess_chat token reuse hook "
+        "(native=%s, pid %d, %s)",
+        _CTR_P,
+        has_native_reuse,
+        os.getpid(),
+        pname,
+    )
+    return True
+
+
