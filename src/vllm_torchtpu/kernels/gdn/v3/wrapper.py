@@ -184,12 +184,29 @@ def inner_kernel(
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
+    def window_rows(last_row: int) -> jax.Array:
+        # Read the checkpoint's rows at their dynamic offset instead of
+        # selecting among every candidate window.
+        pk = cfg.prev_kernel_size
+        rows = []
+        for idx in range(cfg.seq_tile_size):
+            r = metadata_ref.p_id_to_r_size[p_id, idx]
+            start = jnp.where((r >= 1) & (r < last_row), r, last_row)
+            # Windows starting at or past the input tile lie inside it.
+            picked = qkv_slot_ref[idx, pl.ds(jnp.maximum(start - pk, 0), pk)]
+            picked = picked.astype(jnp.float32)
+            for s in range(1, pk):
+                picked = jnp.where(start == s, qkv_in_compact[idx, s : s + pk], picked)
+            rows.append(picked)
+        return jnp.stack(rows)
+
     qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
         real_sizes=real_sizes,
         lhs=qkv_in_compact,
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         cfg=cfg,
+        window_rows=window_rows,
     )
 
     if cfg.state_plan is None:

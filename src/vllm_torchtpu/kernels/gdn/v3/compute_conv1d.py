@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 
@@ -24,6 +26,7 @@ def causal_conv1d(
     conv_weight: jax.Array,  # [prev_kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
+    window_rows: Callable[[int], jax.Array] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform causal Conv1D. Returns Conv1D output and convolution states.
 
@@ -31,6 +34,10 @@ def causal_conv1d(
     w holds the last prev_kernel_size inputs ending at token
     `chunk_size - window_size + w`, clamped to the last real token, i.e. the
     state a sequence resuming right after that token must start from.
+
+    `window_rows(last_row)`, when given, returns that checkpoint directly:
+    per sequence, rows [s, s + prev_kernel_size) of `lhs` with
+    s = real_size if 1 <= real_size < last_row else last_row.
     """
 
     assert lhs.ndim == 4
@@ -65,6 +72,9 @@ def causal_conv1d(
         last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
         # Checkpoint of sequences whose last real token is at or past this
         # window position; shorter ones are picked by the masking loop below.
+        if window_rows is not None and last_row > 1:
+            state_list.append(window_rows(last_row))
+            continue
         new_conv_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
         for c_idx in range(1, last_row):
             new_conv_state = jnp.where(
