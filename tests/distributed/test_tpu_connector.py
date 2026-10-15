@@ -7752,7 +7752,7 @@ class TestPipelineParallelRegisterAheadWorker:
         worker, facade = self._stage_worker()
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["early"] = _stage3_send(
-            1234, expiration_time=time.perf_counter() - 1.0
+            1234, expiration_time=time.time() - 1.0
         )
         # The store has no row yet (a lagging stage would see UNKNOWN too).
         facade.request_block_statuses[("early", 1234)] = 1
@@ -7760,6 +7760,8 @@ class TestPipelineParallelRegisterAheadWorker:
             _stage3_worker_env(),
             patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+            patch(f"{_MOD}.time.time", return_value=1_700_000_000.0),
+            patch(f"{_MOD}.time.perf_counter", return_value=100.0),
         ):
             worker.process_send_load(meta)
             pending = worker._stage3_registered_sends["early"]
@@ -7774,7 +7776,7 @@ class TestPipelineParallelRegisterAheadWorker:
             assert worker.get_finished({"early"}) == (set(), set())
             registration = worker._stage3_registered_sends["early"]
             assert not registration.finish_pending
-            assert registration.expiration_time > time.perf_counter()
+            assert registration.expiration_time == 1_700_000_030.0
             # Armed, the probe runs as for a finish-time registration.
             assert worker.get_finished() == ({"early"}, set())
 
@@ -7787,7 +7789,7 @@ class TestPipelineParallelRegisterAheadWorker:
         worker, facade = self._stage_worker()
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["early"] = _stage3_send(
-            1234, expiration_time=time.perf_counter() - 1.0
+            1234, expiration_time=time.time() - 1.0
         )
         with (
             _stage3_worker_env(),
