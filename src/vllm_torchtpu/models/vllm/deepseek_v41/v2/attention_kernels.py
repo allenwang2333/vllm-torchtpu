@@ -2791,10 +2791,19 @@ def paged_indexer_jax(
         rows = q.shape[0]
         if (
             records.shape[0] > 1
-            and records.shape[0] < rows <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+            and (
+                records.shape[0] < rows <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+                or (
+                    rows <= records.shape[0]
+                    and rows <= 64
+                    and rows >= 6
+                    and rows % 6 == 0
+                )
+            )
             and rows * records.shape[1] <= _INDEX_UNTILED_SCORE_ELEMENTS
         ):
-            # Decode-shaped batch (e.g. DSpark verify: 48 requests x 6 rows).
+            # Decode-shaped batch (e.g. DSpark verify: 48 requests x 6 rows, or
+            # TP-sharded 8 requests x 6 rows = 48 rows <= 64 requests).
             # Query tiles of 32/128 rows hold fewer rows than request rows, so
             # `paged_index_scores_jax` could not share each request's key tile
             # across its queries and would gather every row's context again.

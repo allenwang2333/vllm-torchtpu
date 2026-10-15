@@ -480,6 +480,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else torch.zeros_like(positions, dtype=torch.bool)
             )
+        elif (
+            plan.padded_num_tokens == positions.shape[0]
+            and len(plan.indices) == positions.shape[0]
+            and plan.indices == tuple(range(positions.shape[0]))
+        ):
+            decoder_metadata = metadata
+            decoder_positions, decoder_ids = positions, input_ids
+            decoder_hidden, decoder_mix = hidden, pre_mix
+            replay_starts = torch.tensor(
+                plan.replay_starts, dtype=positions.dtype, device=positions.device
+            )
+            indices = None
+            decoder_padding = torch.zeros_like(positions, dtype=torch.bool)
         else:
             # The extra output row absorbs padded scatter writes. Reusing row
             # zero for padding would overwrite a real request's first result.
