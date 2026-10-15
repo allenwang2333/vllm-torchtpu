@@ -1282,9 +1282,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         :count, : min(capacity, self.topk_indices_buffer.shape[-1])
                     ]
                 main_cache = source.kv_cache
-                valid_compressed = (
-                    (selected >= 0) & (selected < lengths) & swa_valid[:, None]
-                )
+                if selected.shape[0] < count:
+                    valid_compressed = selected >= 0
+                else:
+                    valid_compressed = (
+                        (selected >= 0) & (selected < lengths) & swa_valid[:, None]
+                    )
                 if tiled:
                     if self._fp8_kv:
                         pages_key = (
@@ -1559,13 +1562,38 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 lengths_part,
                 requests_part,
             ) = cached_query_split
+        cand_part_key = (
+            (
+                "candidate_blocks_part",
+                id(self.candidate_block_buffer),
+                ranks,
+            )
+            if split and stage_cache is not None and has_candidates
+            else None
+        )
         if split:
-            qr_part, weights_part, candidates_part = (
+            qr_part, weights_part = (
                 torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
                     0, mine
                 )
-                for x, fill in ((qr, 0), (weights, 0), (candidates, -1))
+                for x, fill in ((qr, 0), (weights, 0))
             )
+            cached_cand_part = (
+                stage_cache.get(cand_part_key)
+                if stage_cache is not None
+                and cand_part_key is not None
+                and not candidate_write
+                else None
+            )
+            if cached_cand_part is not None:
+                candidates_part = cached_cand_part
+            else:
+                candidates_part = torch.cat(
+                    (
+                        candidates,
+                        candidates.new_full((padding, *candidates.shape[1:]), -1),
+                    )
+                ).index_select(0, mine)
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
         q_part = self._project_index_q(qr_part, positions_part)
@@ -1590,15 +1618,34 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # instead of one per record.
             page_records=_index_page_records(index_cache),
         )
+        part = q_part.shape[0]
+        keep_local_selected = (
+            split
+            and stage_cache is not None
+            and bool(getattr(self, "_fp8_kv", False))
+            and bool(getattr(self, "_token_parallel_attn", False))
+            and not bool(getattr(self, "_local_q_attn", False))
+            and isinstance(count, int)
+            and part * ranks == count
+            and count >= 6 * ranks
+        )
         if split:
-            selected = _gather_query_rows(selected)[:count]
+            if keep_local_selected:
+                selected = selected.masked_fill(
+                    (selected < 0) | (selected >= lengths_part), -1
+                )
+            else:
+                selected = _gather_query_rows(selected)[:count]
             if candidate_write:
-                published = _gather_query_rows(published)[:count]
+                if cand_part_key is not None and stage_cache is not None:
+                    stage_cache[cand_part_key] = published
+                else:
+                    published = _gather_query_rows(published)[:count]
         if isinstance(updated_cache, tuple):
             index_cache.copy_raw(updated_cache)
         else:
             index_cache.raw.copy_(updated_cache)
-        if candidate_write:
+        if candidate_write and (cand_part_key is None or stage_cache is None):
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(
                     published,

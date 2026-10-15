@@ -1078,7 +1078,11 @@ def slice_token_parallel_attention_inputs(
     rank_idx = tp_rank.reshape(())
     start = rank_idx * tokens_local
     swa_local = jax.lax.dynamic_slice_in_dim(swa_records, start, tokens_local, axis=0)
-    main_local = jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
+    main_local = (
+        main_records
+        if main_records.shape[0] == tokens_local
+        else jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
+    )
     q_loc_local = jnp.clip(query_start_loc - start, 0, tokens_local)
     return swa_local, main_local, q_loc_local
 
@@ -1112,7 +1116,12 @@ def gather_fp8_kv_jax(
     precompacted: bool,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather once per source/index group, retaining packed FP8 and BF16 RoPE."""
-    if shards > 1:
+    if shards < 0:
+        tokens = records.shape[0]
+        start = rank.reshape(()) * tokens
+        starts = jnp.clip(starts - start, 0, tokens)
+        records = jnp.pad(records, ((0, -tokens % 8), (0, 0)), constant_values=-1)
+    elif shards > 1:
         tokens = records.shape[0] // shards
         start = rank.reshape(()) * tokens
         records = jax.lax.dynamic_slice_in_dim(records, start, tokens, axis=0)
@@ -1297,6 +1306,8 @@ def initialize_paged_attention():
         tokens = (
             records.shape[0]
             if shards == 1
+            else -(-records.shape[0] // 8) * 8
+            if shards < 0
             else -(-(records.shape[0] // shards) // 8) * 8
         )
         topk = max(128, -(-records.shape[1] // 128) * 128)
@@ -2049,6 +2060,8 @@ def sparse_fp8_attention(
         tp_rank = tp_rank.reshape(1).int()
     tokens = q.shape[0]
     shards = _fp8_query_shards(tokens, _attention_tp_size, token_parallel)
+    if shards > 1 and main_records.shape[0] * shards == tokens:
+        shards = -shards
     gathered = _gather_fp8_for_stage(
         main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
     )
