@@ -18,6 +18,10 @@ separate staging memory. Causal/window masks advance without shifting KV lanes.
 An MTP group that needs a third block is split; overlapping request-tail blocks
 are masked to disjoint ranges. MXU RHS loading performs the K transposes.
 
+Two input banks prefetch the next BQ group during the current group. Each bank
+has independent DMA semaphores; only Q, packed KV, scales and RoPE are doubled.
+The BF16 KV workspace and output buffers are reused after their consumers finish.
+
 CSA dequantizes KV to BF16 once for QK/PV reuse. All GEMMs use BF16 operands
 and FP32 accumulators, softmax uses FP32, and probabilities are stored in BF16.
 Each QK launches before the preceding Q's softmax. CSA PV starts as soon as
@@ -54,16 +58,16 @@ def main_kernel(
     rope_hbm_ref: Any,
     output_hbm_ref: Any,
     sink_ref: Any,
-    q_ref: Any,
-    main_fp8_ref: Any,
-    main_scale_ref: Any,
+    q_buffer_ref: Any,
+    main_fp8_buffer_ref: Any,
+    main_scale_buffer_ref: Any,
     main_bf16_ref: Any,
     swa_first_ref: Any,
     swa_shared_ref: Any,
     swa_cache_ids: Any,
     swa_cache_bases: Any,
     swa_prefetched_id: Any,
-    rope_ref: Any,
+    rope_buffer_ref: Any,
     swa_score_ref: Any,
     main_p_ref: Any,
     swa_p_ref: Any,
@@ -84,7 +88,7 @@ def main_kernel(
     sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
     sink_dma.start()
     # Incomplete groups still participate in the grouped SWA QK.
-    q_ref[...] = jnp.zeros(q_ref.shape, q_ref.dtype)
+    q_buffer_ref[...] = jnp.zeros(q_buffer_ref.shape, q_buffer_ref.dtype)
     sink_dma.wait()
     sink = jnp.broadcast_to(sink_ref[...][None, :], (128, num_heads)).T[:, :1]
 
@@ -104,39 +108,58 @@ def main_kernel(
             swa_kv_hbm_ref.at[source_q], swa_first_ref, dma_sem.at[1]
         )
 
-    def process_group(t0):
-        p0 = positions_ref[t0]
-        first_position = jnp.maximum(0, p0 - 127)
-        block_id = (first_position - anchor) // 128
-        # Split a BQ group whose +MTP tail would require a third block.
-        count = jnp.minimum(
+    def group_count(t0):
+        # Split before a group would need a third SWA block.
+        p0 = positions_ref[jnp.minimum(t0, q_hbm_ref.shape[0] - 1)]
+        block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
+        return jnp.minimum(
             jnp.minimum(bq, end - t0), anchor + (block_id + 2) * 128 - p0
         )
 
-        def query_dmas(i):
-            return tuple(
-                pltpu.make_async_copy(src, dst, dma_sem.at[2 + 4 * i + k])
-                for k, (src, dst) in enumerate(
-                    (
-                        (q_hbm_ref.at[t0 + i], q_ref.at[i]),
-                        (main_kv_hbm_ref.at[t0 + i], main_fp8_ref.at[i]),
-                        (main_scale_hbm_ref.at[t0 + i], main_scale_ref.at[i]),
-                        (rope_hbm_ref.at[t0 + i], rope_ref.at[i]),
-                    )
+    def query_dmas(t0, i, bank):
+        return tuple(
+            pltpu.make_async_copy(src, dst, dma_sem.at[2 + 4 * (bank * bq + i) + k])
+            for k, (src, dst) in enumerate(
+                (
+                    (q_hbm_ref.at[t0 + i], q_buffer_ref.at[bank, i]),
+                    (main_kv_hbm_ref.at[t0 + i], main_fp8_buffer_ref.at[bank, i]),
+                    (main_scale_hbm_ref.at[t0 + i], main_scale_buffer_ref.at[bank, i]),
+                    (rope_hbm_ref.at[t0 + i], rope_buffer_ref.at[bank, i]),
                 )
             )
+        )
 
-        @pl.loop(0, count)
+    def start_group(t0, bank):
+        @pl.loop(0, group_count(t0))
         def start_query(i):
-            for dma in query_dmas(i):
+            for dma in query_dmas(t0, i, bank):
                 dma.start()
+
+    @pl.when(start < end)
+    def prime_group():
+        start_group(start, 0)
+
+    def process_group(state):
+        t0, bank = state
+        q_ref = q_buffer_ref.at[bank]
+        main_fp8_ref = main_fp8_buffer_ref.at[bank]
+        main_scale_ref = main_scale_buffer_ref.at[bank]
+        rope_ref = rope_buffer_ref.at[bank]
+        p0 = positions_ref[t0]
+        block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
+        count = group_count(t0)
+        next_t0 = t0 + count
+
+        @pl.when(next_t0 < end)
+        def prefetch_group():
+            start_group(next_t0, 1 - bank)
 
         for offset in range(2):
             wanted = block_id + offset
             slot = wanted % 2
 
             @pl.when(swa_cache_ids[slot] != wanted)
-            def fill_block():
+            def fill_block(*, wanted=wanted, slot=slot):
                 # Gathered windows expose a complete block at its last Q.
                 # At request end the available window overlaps the previous
                 # block; the score mask removes that overlap, including +5 MTP.
@@ -196,7 +219,7 @@ def main_kernel(
 
         @pl.loop(0, count)
         def finish_query(i):
-            for dma in query_dmas(i):
+            for dma in query_dmas(t0, i, bank):
                 dma.wait()
 
         def csa_launch(i, addr, *, pv):
@@ -376,7 +399,7 @@ def main_kernel(
                 pltpu.make_async_copy(
                     output_ref.at[i],
                     output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 4 * bq + i],
+                    dma_sem.at[2 + 8 * bq + i],
                 ).start()
 
             def finish_tile(first, slot, *, size=2):
@@ -482,7 +505,7 @@ def main_kernel(
                 pltpu.make_async_copy(
                     output_ref.at[i],
                     output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 4 * bq + i],
+                    dma_sem.at[2 + 8 * bq + i],
                 ).start()
 
             def advance(i, slot, *, has_next=True):
@@ -522,12 +545,12 @@ def main_kernel(
         @pl.loop(0, count)
         def wait_output(i):
             pltpu.make_async_copy(
-                output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 4 * bq + i]
+                output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
             ).wait()
 
-        return t0 + count
+        return next_t0, 1 - bank
 
-    lax.while_loop(lambda t: t < end, process_group, start)
+    lax.while_loop(lambda state: state[0] < end, process_group, (start, jnp.int32(0)))
 
     @pl.when(swa_prefetched_id[0] >= 0)
     def drain_block_prefetch():
@@ -547,7 +570,7 @@ def main_kernel(
                 pltpu.make_async_copy(
                     output_ref.at[i],
                     output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 4 * bq + i],
+                    dma_sem.at[2 + 8 * bq + i],
                 ).start()
 
             @pl.loop(0, count)
@@ -555,7 +578,7 @@ def main_kernel(
                 pltpu.make_async_copy(
                     output_ref.at[i],
                     output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 4 * bq + i],
+                    dma_sem.at[2 + 8 * bq + i],
                 ).wait()
 
 
@@ -652,21 +675,21 @@ def csa2(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
                 pltpu.VMEM((num_heads,), jnp.float32),
-                pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
-                pltpu.VMEM((bq, 512, 4, 128), jnp.float8_e4m3fn),
-                pltpu.VMEM((bq, 1, 512), jnp.float32),
+                pltpu.VMEM((2, bq, num_heads, 512), jnp.bfloat16),
+                pltpu.VMEM((2, bq, 512, 4, 128), jnp.float8_e4m3fn),
+                pltpu.VMEM((2, bq, 1, 512), jnp.float32),
                 pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
                 pltpu.VMEM((128, 512), jnp.bfloat16),
                 pltpu.VMEM((shared_window_size, 512), jnp.bfloat16),
                 pltpu.SMEM((2,), jnp.int32),
                 pltpu.SMEM((2,), jnp.int32),
                 pltpu.SMEM((1,), jnp.int32),
-                pltpu.VMEM((bq, 2, 128), jnp.float32),
+                pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.float32),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2 + 5 * bq,)),
+                pltpu.SemaphoreType.DMA((2 + 9 * bq,)),
             ),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),

@@ -22,6 +22,7 @@ import pathlib
 import unittest
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 
