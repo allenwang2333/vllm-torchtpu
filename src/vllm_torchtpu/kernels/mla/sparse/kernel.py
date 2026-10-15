@@ -2817,6 +2817,7 @@ def prepare_outputs(
         "mixed_fused_prep",
         "mixed_union_gather",
         "mixed_union_gather_rope",
+        "mixed_union_gather_pair",
         "mixed_union_gather_fault",
         "decode_row_widths",
         "send_world",
@@ -2873,6 +2874,7 @@ def sparse_ragged_paged_attention(
     out_pieces: int = 0,
     mixed_union_gather: bool = False,
     mixed_union_gather_rope: bool = False,
+    mixed_union_gather_pair: bool = False,
     mixed_union_gather_fault: str | None = None,
     out_pieces_fault: str | None = None,
     out_pieces_gather_first: bool = False,
@@ -3001,6 +3003,9 @@ def sparse_ragged_paged_attention(
         the outputs are bit-identical.
       mixed_union_gather_rope: with `mixed_union_gather`: the rope rows come
         from the union too (fewer rows fit in SparseCore memory).
+      mixed_union_gather_pair: with `mixed_union_gather`: the two SparseCore
+        subcores of a grid step share one union of its 16 tokens (more rows
+        fit; the second subcore's dedup follows the first's).
       mixed_union_gather_fault: test-only (`native_sc_gather.UNION_FAULTS`).
       send_world: TPU_DCP_MLA_SEND_LAYOUT. With `lse_in_kernel` taking effect
         (lane-dense lse, one chunk) and split q, on `send_layout_supported`
@@ -3441,7 +3446,12 @@ def sparse_ragged_paged_attention(
             kv_write_fault=kv_write_fault,
             send_world=send_world,
             union_gather=(
-                (group_num_live, mixed_union_gather_fault, mixed_union_gather_rope)
+                (
+                    group_num_live,
+                    mixed_union_gather_fault,
+                    mixed_union_gather_rope,
+                    mixed_union_gather_pair,
+                )
                 if mixed_union_gather and group_tab is not None
                 else None
             ),
@@ -3625,7 +3635,7 @@ def sparse_attention_chunk(
     out_piece: tuple[int, int, jax.Array | None] | None = None,
     gather_only: bool = False,
     pre_gathered: tuple | None = None,
-    union_gather: tuple[jax.Array, str | None, bool] | None = None,
+    union_gather: tuple[jax.Array, str | None, bool, bool] | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4073,7 +4083,7 @@ def sparse_attention_chunk(
             ):
                 # TPU_DCP_MLA_MIXED_UNION_GATHER: the same rows on every live
                 # slot, each half grid step's distinct rows read once.
-                group_num_live_all, union_fault, union_rope = union_gather
+                group_num_live_all, union_fault, union_rope, union_pair = union_gather
                 gathered = native_sc_gather.dsa_gather_native_sc_union(
                     cache_kv_nope,
                     cache_kv_rope,
@@ -4088,6 +4098,7 @@ def sparse_attention_chunk(
                     topk_cap=topk_cap,
                     atoms_per_batch=gather_atoms,
                     rope_union=union_rope,
+                    pair_union=union_pair,
                     fault=union_fault,
                 )
             else:

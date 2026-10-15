@@ -1501,9 +1501,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             )
             self.assertTrue(np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all())
         # Positive controls: a wrong union row on hits, a dropped last slot.
-        faults = ["kv_lo"] + (["map_off"] if overlap else []) + (
-            ["no_fallback"] if overflow else []
-        )
+        # ("no_fallback" leaves rows unwritten, which in-process buffer reuse
+        # can refill with the previous run's correct rows; its control runs
+        # first on fresh buffers in the kernel_work gather check instead.)
+        faults = ["kv_lo"] + (["map_off"] if overlap else [])
         for fault in faults:
             bad, _ = jax.block_until_ready(
                 run(topk_raw, mixed_union_gather=True, mixed_union_gather_fault=fault)

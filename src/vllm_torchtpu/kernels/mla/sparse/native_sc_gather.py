@@ -705,6 +705,10 @@ def dsa_gather_native_sc(
 # nope + rope (160 words; `rope_union`).
 UNION_CAP_ROWS = 736
 UNION_CAP_ROWS_ROPE = 576
+# `pair_union`: a pair's two regions hold one union (2 x these rows), less the
+# table + list hand-off area in Spmem.
+UNION_CAP_ROWS_PAIR = 704
+UNION_CAP_ROWS_ROPE_PAIR = 576
 # Rows per step of the union load pipeline (two 16-row indirect streams).
 UNION_LOAD_ROWS = 32
 # Entries of the per-subcore open-addressing hash table (TileSPMEM, i32).
@@ -843,6 +847,7 @@ def _union_kernel(
     htab,
     nope_sh,
     rope_sh=None,
+    hand_sh=None,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -858,6 +863,7 @@ def _union_kernel(
     atoms_w: int,
     cap: int,
     rope_union: bool,
+    pair: bool,
     fault: str | None,
 ):
     gpc = chunk_size // bz
@@ -894,6 +900,7 @@ def _union_kernel(
         use_union = jnp.bool_(True)
 
     misc_smem[0] = jnp.int32(0)  # units this subcore reads from HBM directly
+    misc_smem[2] = jnp.int32(0)  # live units expanded from the union
     core = lax.axis_index(core_axis_name)
     sub = lax.axis_index(subcore_axis_name)
     # Subcore pair (2i, 2i + 1) of core c serves group c * (subcores / 2) + i:
@@ -903,9 +910,18 @@ def _union_kernel(
     a_live = tab_smem[g]
     goff = tab_smem[gpc + g]
 
-    @pl.when(use_union & (a_live > 0))
-    def _union():
-        whole = a_live == atoms_w
+    work = use_union & (a_live > 0)
+    whole = a_live == atoms_w
+    base_out = goff * block
+    mask_h = htab.shape[0] - 1
+    streams = UNION_LOAD_ROWS // NUM_LANES
+    # With `pair`, the two subcores of a pair share one union (their 16 tokens,
+    # ids in [0, 2 cap), rows in the pair's two adjacent Spmem regions); else
+    # each subcore has its own (8 tokens, ids in [0, cap)).
+    cap_u = 2 * cap if pair else cap
+    region = (sub - h) * cap if pair else sub * cap
+
+    def prep_slots():
         tok0 = chunk_index * chunk_size + g * bz
         pltpu.sync_copy(
             kv_hbm_ref.at[pl.ds(pl.multiple_of(tok0, bz), bz)], vec_ref.at[pl.ds(0, bz)]
@@ -939,118 +955,129 @@ def _union_kernel(
                 ibuf.at[pl.ds(0, span)],
             )
 
+    def clear_table():
         def clear(i):
             htab[pl.ds(i * NUM_LANES, NUM_LANES)] = jnp.full((NUM_LANES,), -1, jnp.int32)
 
         plsc.parallel_loop(0, htab.shape[0] // NUM_LANES, unroll=8)(clear)
 
-        base_out = goff * block
-        mask_h = htab.shape[0] - 1
-
-        # Units are visited token-major (all of token 0's atoms, then token
-        # 1's, ...) so that rows past the cap, which are assigned last, fall in
-        # as few units as possible (the last tokens').
-        def unit_body(t, a, carry):
-            base, nlu, novf = carry
-            # ibuf position (= unit id u) and output rows of (token t, atom a).
-            u = jnp.where(whole, t * atoms_w + a, a * half + t)
-            j0 = a * atom
-            pos = jnp.where(
-                whole,
-                base_out + h * half * atoms_w * atom + u * atom,
-                base_out + a * block + h * half * atom + t * atom,
+    # Units are visited token-major (all of token 0's atoms, then token 1's,
+    # ...) so that rows past the cap, which are assigned last, fall in as few
+    # units as possible (the last tokens').
+    def unit_body(t, a, carry):
+        base, nlu, novf = carry
+        # ibuf position (= unit id u) and output rows of (token t, atom a).
+        u = jnp.where(whole, t * atoms_w + a, a * half + t)
+        j0 = a * atom
+        pos = jnp.where(
+            whole,
+            base_out + h * half * atoms_w * atom + u * atom,
+            base_out + a * block + h * half * atom + t * atom,
+        )
+        kv_t = kv_smem[h * half + t]
+        if fault == "kv_lo":
+            kv_t = kv_t - 1
+        nlive = jnp.clip(kv_t - j0, 0, atom)
+        ms = []
+        over = jnp.int32(0)
+        for v in range(atom // NUM_LANES):
+            lane = v * NUM_LANES + iota
+            live = lane < nlive
+            rows = ibuf[pl.ds(pl.multiple_of(u * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)]
+            hsh = jnp.bitwise_and(
+                jnp.bitwise_xor(
+                    jnp.bitwise_xor(rows, jnp.right_shift(rows, 11)),
+                    jnp.right_shift(rows, 22),
+                ),
+                mask_h,
             )
-            kv_t = kv_smem[h * half + t]
-            if fault == "kv_lo":
-                kv_t = kv_t - 1
-            nlive = jnp.clip(kv_t - j0, 0, atom)
-            ms = []
-            over = jnp.int32(0)
-            for v in range(atom // NUM_LANES):
-                lane = v * NUM_LANES + iota
-                live = lane < nlive
-                rows = ibuf[pl.ds(pl.multiple_of(u * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)]
-                hsh = jnp.bitwise_and(
-                    jnp.bitwise_xor(
-                        jnp.bitwise_xor(rows, jnp.right_shift(rows, 11)),
-                        jnp.right_shift(rows, 22),
-                    ),
-                    mask_h,
+            uo = plsc.load_gather(htab, [hsh], mask=live)
+            known = live & (uo >= 0)
+            r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
+            hit = known if fault == "noverify" else known & (r == rows)
+            miss = live & jnp.logical_not(hit)
+            newu = base + plsc.cumsum(miss.astype(jnp.int32)) - 1
+            ok = miss & (newu < cap_u)
+            plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
+            plsc.store_scatter(htab, [hsh], newu, mask=ok)
+            base = base + plsc.all_reduce_population_count(ok)[0]
+            over = over + plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
+            m_hit = uo
+            if fault == "map_off":
+                m_hit = jnp.minimum(jnp.bitwise_xor(uo, 1), jnp.maximum(base - 1, 0))
+            # Pad lanes read a distinct already-loaded row (the attention masks
+            # them); a repeated index is the degenerate bank conflict.
+            fill = jnp.where(lane < base, lane, 0)
+            m = jnp.where(hit, m_hit, jnp.where(ok, newu, fill))
+            ms.append(jnp.where(live, m, fill))
+        unit_live = nlive > 0
+        to_union = unit_live & (over == 0)
+        to_hbm = unit_live & (over > 0)
+
+        @pl.when(to_union)
+        def _keep():
+            for v, m in enumerate(ms):
+                cbuf[pl.ds(pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)] = (
+                    m + region
                 )
-                uo = plsc.load_gather(htab, [hsh], mask=live)
-                known = live & (uo >= 0)
-                r = plsc.load_gather(ulist, [jnp.where(known, uo, 0)], mask=known)
-                hit = known if fault == "noverify" else known & (r == rows)
-                miss = live & jnp.logical_not(hit)
-                newu = base + plsc.cumsum(miss.astype(jnp.int32)) - 1
-                ok = miss & (newu < cap)
-                plsc.store_scatter(ulist, [jnp.where(ok, newu, 0)], rows, mask=ok)
-                plsc.store_scatter(htab, [hsh], newu, mask=ok)
-                base = base + plsc.all_reduce_population_count(ok)[0]
-                over = over + plsc.all_reduce_population_count(miss & jnp.logical_not(ok))[0]
-                m_hit = uo
-                if fault == "map_off":
-                    m_hit = jnp.minimum(jnp.bitwise_xor(uo, 1), jnp.maximum(base - 1, 0))
-                # Pad lanes read a distinct already-loaded row (the attention
-                # masks them); a repeated index is the degenerate bank conflict.
-                fill = jnp.where(lane < base, lane, 0)
-                m = jnp.where(hit, m_hit, jnp.where(ok, newu, fill))
-                ms.append(jnp.where(live, m, fill))
-            unit_live = nlive > 0
-            to_union = unit_live & (over == 0)
-            to_hbm = unit_live & (over > 0)
+            pos_smem[nlu] = pos
+            uid_smem[nlu] = u
 
-            @pl.when(to_union)
-            def _keep():
-                for v, m in enumerate(ms):
-                    cbuf[pl.ds(pl.multiple_of(nlu * atom + v * NUM_LANES, NUM_LANES), NUM_LANES)] = (
-                        m + sub * cap
-                    )
-                pos_smem[nlu] = pos
-                uid_smem[nlu] = u
+        @pl.when(to_hbm)
+        def _direct():
+            pos_smem[max_units + novf] = pos
+            uid_smem[max_units + novf] = u
 
-            @pl.when(to_hbm)
-            def _direct():
-                pos_smem[max_units + novf] = pos
-                uid_smem[max_units + novf] = u
+        return (
+            base,
+            nlu + to_union.astype(jnp.int32),
+            novf + to_hbm.astype(jnp.int32),
+        )
 
-            return (
-                base,
-                nlu + to_union.astype(jnp.int32),
-                novf + to_hbm.astype(jnp.int32),
-            )
+    def dedup(base0):
+        """Assign union ids to this subcore's live slots from `base0`; leaves
+        (ids used, live units, HBM-direct units) in misc_smem[1..3]."""
 
         def token_body(t, carry):
             return lax.fori_loop(0, a_live, functools.partial(unit_body, t), carry)
 
         num_u, n_units, n_ovf = lax.fori_loop(
-            0, half, token_body, (jnp.int32(0), jnp.int32(0), jnp.int32(0))
+            0, half, token_body, (base0, jnp.int32(0), jnp.int32(0))
         )
+        misc_smem[1] = num_u
+        misc_smem[2] = n_units
         if fault != "skip_ovf":
             misc_smem[0] = n_ovf
 
-        # Union rows HBM -> TileSPMEM (indirect) -> this subcore's Spmem region.
-        nld = (num_u + UNION_LOAD_ROWS - 1) // UNION_LOAD_ROWS
-        streams = UNION_LOAD_ROWS // NUM_LANES
+    def round_up(x):
+        return (x + UNION_LOAD_ROWS - 1) // UNION_LOAD_ROWS * UNION_LOAD_ROWS
 
-        @pl.when((num_u > 0) & (fault != "rm_load"))
+    def load_rows(lo, hi):
+        """ulist[lo:hi] nope (and rope) rows HBM -> TileSPMEM (indirect) ->
+        Spmem rows region + [lo, hi). `lo` is a multiple of the load step; the
+        tail up to the next step is filled with distinct loaded rows."""
+        nld = (hi - lo + UNION_LOAD_ROWS - 1) // UNION_LOAD_ROWS
+
+        @pl.when((hi > lo) & (fault != "rm_load"))
         def _load():
             first = ulist[pl.ds(0, NUM_LANES)]
-            filler = jnp.where(iota < num_u, first, jnp.broadcast_to(first[0], (NUM_LANES,)))
+            filler = jnp.where(iota < hi, first, jnp.broadcast_to(first[0], (NUM_LANES,)))
             for q in range(streams):
-                p = pl.multiple_of((nld - 1) * UNION_LOAD_ROWS + q * NUM_LANES, NUM_LANES)
+                p = pl.multiple_of(lo + (nld - 1) * UNION_LOAD_ROWS + q * NUM_LANES, NUM_LANES)
                 cur = ulist[pl.ds(p, NUM_LANES)]
-                ulist[pl.ds(p, NUM_LANES)] = jnp.where(p + iota >= num_u, filler, cur)
+                ulist[pl.ds(p, NUM_LANES)] = jnp.where(p + iota >= hi, filler, cur)
 
             def lvalues(p, stream):
-                return ulist[pl.ds(p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES)]
+                return ulist[
+                    pl.ds(pl.multiple_of(lo + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES), NUM_LANES)
+                ]
 
             def lbody(*refs):
                 p = pl.program_id(0)
                 cps = []
                 for stream in range(streams):
                     dst = pl.ds(
-                        pl.multiple_of(sub * cap + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES),
+                        pl.multiple_of(region + lo + p * UNION_LOAD_ROWS + stream * NUM_LANES, NUM_LANES),
                         NUM_LANES,
                     )
                     c1 = pltpu.make_async_copy(refs[stream], nope_sh.at[dst], load_sem_ref.at[0, stream])
@@ -1077,27 +1104,81 @@ def _union_kernel(
                 *([nope_hbm_ref] * streams), *([rope_hbm_ref] * len(rspecs))
             )
 
-        unit_off = lambda k: k * atom  # noqa: E731
-        own_rows = lambda k: uid_smem[k] * atom  # noqa: E731
+    if not pair:
 
-        # Expansion: every live unit's nope rows from the union in Spmem (rope
-        # from the union too, or from HBM by its own rows).
-        @pl.when((n_units > 0) & (fault != "rm_expand"))
-        def _expand():
-            _expand_units(
-                nope_sh,
-                rope_sh if rope_union else rope_hbm_ref,
-                cbuf,
-                unit_off,
-                cbuf if rope_union else ibuf,
-                unit_off if rope_union else own_rows,
-                lambda k: pos_smem[k],
-                nope_out_hbm_ref,
-                rope_out_hbm_ref,
-                sem_ref,
-                n_units,
-            )
+        @pl.when(work)
+        def _solo():
+            prep_slots()
+            clear_table()
+            dedup(jnp.int32(0))
+            load_rows(jnp.int32(0), misc_smem[1])
 
+    else:
+        # Subcore 2i dedups its tokens, hands its table and union list to
+        # subcore 2i + 1 through Spmem, and loads its rows while 2i + 1
+        # continues the same union (ids from a load-step boundary) and loads
+        # the rows it added; a barrier then makes every row visible to both.
+        pair_idx = jnp.right_shift(sub, 1)
+        ht = htab.shape[0]
+
+        @pl.when(work & (h == 0))
+        def _first():
+            prep_slots()
+            clear_table()
+            dedup(jnp.int32(0))
+            u0 = misc_smem[1]
+            u0r = round_up(u0)
+            # pad [u0, u0r) with distinct loaded rows (2i's load fills it too)
+            first = ulist[pl.ds(0, NUM_LANES)]
+            filler = jnp.where(iota < u0, first, jnp.broadcast_to(first[0], (NUM_LANES,)))
+            for q in range(streams):
+                p = pl.multiple_of(jnp.maximum(u0r - UNION_LOAD_ROWS, 0) + q * NUM_LANES, NUM_LANES)
+                cur = ulist[pl.ds(p, NUM_LANES)]
+                ulist[pl.ds(p, NUM_LANES)] = jnp.where(p + iota >= u0, filler, cur)
+            vec_ref[pl.ds(0, NUM_LANES)] = jnp.broadcast_to(u0r, (NUM_LANES,))
+            pltpu.sync_copy(htab, hand_sh.at[pair_idx, pl.ds(0, ht)])
+            pltpu.sync_copy(ulist.at[pl.ds(0, cap_u)], hand_sh.at[pair_idx, pl.ds(ht, cap_u)])
+            pltpu.sync_copy(vec_ref.at[pl.ds(0, NUM_LANES)], hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)])
+
+        plsc.subcore_barrier()
+
+        @pl.when(work & (h == 1))
+        def _second():
+            prep_slots()
+            pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(0, ht)], htab)
+            pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(ht, cap_u)], ulist.at[pl.ds(0, cap_u)])
+            pltpu.sync_copy(hand_sh.at[pair_idx, pl.ds(ht + cap_u, NUM_LANES)], vec_ref.at[pl.ds(0, NUM_LANES)])
+            u0r = vec_ref[pl.ds(0, NUM_LANES)][0]
+            dedup(u0r)
+            load_rows(u0r, misc_smem[1])
+
+        @pl.when(work & (h == 0))
+        def _first_load():
+            load_rows(jnp.int32(0), misc_smem[1])
+
+        plsc.subcore_barrier()
+
+    n_units = misc_smem[2]
+    unit_off = lambda k: k * atom  # noqa: E731
+    own_rows = lambda k: uid_smem[k] * atom  # noqa: E731
+
+    # Expansion: every live unit's nope rows from the union in Spmem (rope from
+    # the union too, or from HBM by its own rows).
+    @pl.when(work & (n_units > 0) & (fault != "rm_expand"))
+    def _expand():
+        _expand_units(
+            nope_sh,
+            rope_sh if rope_union else rope_hbm_ref,
+            cbuf,
+            unit_off,
+            cbuf if rope_union else ibuf,
+            unit_off if rope_union else own_rows,
+            lambda k: pos_smem[k],
+            nope_out_hbm_ref,
+            rope_out_hbm_ref,
+            sem_ref,
+            n_units,
+        )
 
     # Units read from HBM directly, through one pipeline: this subcore's
     # units past the union cap, or -- when the chunk reaches past window 0 --
@@ -1176,6 +1257,7 @@ def union_gather_supported(chunk_size: int, kernel_batch_size: int, topk_cap: in
         "atoms_per_batch",
         "cap_rows",
         "rope_union",
+        "pair_union",
         "fault",
     ),
 )
@@ -1195,6 +1277,7 @@ def dsa_gather_native_sc_union(
     atoms_per_batch: int = 16,
     cap_rows: int | None = None,
     rope_union: bool = False,
+    pair_union: bool = False,
     fault: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """The live-group chunk gather of `dsa_gather_native_sc` (linear indices,
@@ -1232,7 +1315,11 @@ def dsa_gather_native_sc_union(
     if not union_gather_supported(chunk_size, bz, topk_cap):
         raise ValueError(f"union gather unsupported: chunk {chunk_size}, bz {bz}, cap {topk_cap}")
     if cap_rows is None:
-        cap_rows = UNION_CAP_ROWS_ROPE if rope_union else UNION_CAP_ROWS
+        cap_rows = (
+            (UNION_CAP_ROWS_ROPE_PAIR if rope_union else UNION_CAP_ROWS_PAIR)
+            if pair_union
+            else (UNION_CAP_ROWS_ROPE if rope_union else UNION_CAP_ROWS)
+        )
     if cap_rows % UNION_LOAD_ROWS:
         raise ValueError(f"cap_rows {cap_rows} must be a multiple of {UNION_LOAD_ROWS}")
     num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, num_batches = (
@@ -1263,10 +1350,14 @@ def dsa_gather_native_sc_union(
         "misc_smem": pltpu.SMEM((8,), jnp.int32),
         "ibuf": pltpu.VMEM((max(max_units * UNION_UNIT_ROWS, occurrences_per_batch),), jnp.int32),
         "cbuf": pltpu.VMEM((max_units * UNION_UNIT_ROWS,), jnp.int32),
-        "ulist": pltpu.VMEM((cap_rows + UNION_LOAD_ROWS,), jnp.int32),
+        "ulist": pltpu.VMEM(((2 if pair_union else 1) * cap_rows + UNION_LOAD_ROWS,), jnp.int32),
         "htab": pltpu.VMEM((UNION_HASH_SIZE,), jnp.int32),
         "nope_sh": pltpu.VMEM_SHARED((num_subcores * cap_rows, 128), jnp.uint32),
     }
+    if pair_union:
+        scratch_types["hand_sh"] = pltpu.VMEM_SHARED(
+            (num_subcores // 2, UNION_HASH_SIZE + 2 * cap_rows + NUM_LANES), jnp.int32
+        )
     if rope_union:
         scratch_types["rope_sh"] = pltpu.VMEM_SHARED(
             (num_subcores * cap_rows, ROPE_WORDS), jnp.uint32
@@ -1287,6 +1378,7 @@ def dsa_gather_native_sc_union(
         atoms_w=atoms_w,
         cap=cap_rows,
         rope_union=rope_union,
+        pair=pair_union,
         fault=fault,
     )
 
@@ -1306,7 +1398,10 @@ def dsa_gather_native_sc_union(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_native_sc_gather_union{'_rope' if rope_union else ''}_c{chunk_index}",
+        name=(
+            f"sc_native_sc_gather_union{'_rope' if rope_union else ''}"
+            f"{'_pair' if pair_union else ''}_c{chunk_index}"
+        ),
     )(
         nope_cache.reshape(-1, 128),
         rope_cache.reshape(-1, ROPE_WORDS),
