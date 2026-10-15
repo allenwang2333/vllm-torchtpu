@@ -184,6 +184,10 @@ class PhaseBasedProfiler:
             InferencePhase.DECODE_ONLY: False,
             InferencePhase.DECODE_HEAVY: False,
             InferencePhase.BALANCED: False,
+            # Prefill share 0.2-0.4 or 0.6-0.9: a chunked-prefill server at
+            # capacity (one prefill chunk plus verifying decodes per step)
+            # spends nearly all of its steps here.
+            InferencePhase.AMBIGUOUS: False,
         }
         self.current_phase: str = ""
         self.worker_rank = worker_rank
