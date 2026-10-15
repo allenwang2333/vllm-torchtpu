@@ -6808,3 +6808,26 @@ class TestGlmPipelineParallelProducer:
         assert [reg.tag for reg in spans] == ["mla.nope.l1", "mla.rope.l1"]
         assert all(len(reg.spans) == 3 for reg in spans)
         assert call["block_ids"] == [10, 11, 12]
+
+
+def test_maybe_truncate_prompt_for_handoff_tail_offload(monkeypatch):
+    monkeypatch.setenv("TPU_PREFILL_TAIL_OFFLOAD_MAX_TOKENS", "128")
+    sched = object.__new__(TPURaidenConnectorScheduler)
+    sched.block_size = 1280
+    sched.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(prefix_match_unit=128)
+    )
+    req = SimpleNamespace(
+        num_prompt_tokens=13250,
+        prompt_token_ids=list(range(13250)),
+        _all_token_ids=list(range(13250)),
+        block_hashes=[f"h{i}" for i in range(13250 // 128)],
+        kv_transfer_params=None,
+    )
+    sched._maybe_truncate_prompt_for_handoff(req)
+    # 13249 // 128 * 128 = 13184 -> target_tokens = 13185 (drop_count = 65).
+    assert req.num_prompt_tokens == 13185
+    assert len(req.prompt_token_ids) == 13185
+    assert len(req._all_token_ids) == 13185
+    assert len(req.block_hashes) == 103
+    assert req.kv_transfer_params == {"_p_side_truncated": True}

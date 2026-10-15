@@ -21,6 +21,7 @@ import concurrent.futures
 import dataclasses
 import importlib
 import json
+import os
 import queue
 import threading
 import time
@@ -1131,26 +1132,43 @@ class TPUConnectorScheduler:
         if request.prompt_token_ids is None:
             return
         old_num_prompt_tokens = request.num_prompt_tokens
-        request.prompt_token_ids.pop()
-        request._all_token_ids.pop()
-        request.num_prompt_tokens -= 1
-        block_hashes = getattr(request, "block_hashes", None)
-        if block_hashes:
-            hash_unit = (
-                getattr(
-                    getattr(self.vllm_config, "cache_config", None),
-                    "prefix_match_unit",
-                    None,
-                )
-                or self.block_size
+        hash_unit = (
+            getattr(
+                getattr(self.vllm_config, "cache_config", None),
+                "prefix_match_unit",
+                None,
             )
+            or self.block_size
+        )
+        drop_count = 1
+        tail_offload_max = int(
+            os.environ.get("TPU_PREFILL_TAIL_OFFLOAD_MAX_TOKENS", "0") or 0
+        )
+        if (
+            tail_offload_max > 1
+            and isinstance(hash_unit, int)
+            and 0 < hash_unit < self.block_size
+        ):
+            last_block_start = (
+                (old_num_prompt_tokens - 1) // self.block_size
+            ) * self.block_size
+            fine_boundary = ((old_num_prompt_tokens - 1) // hash_unit) * hash_unit
+            target_tokens = fine_boundary + 1
+            candidate_drop = old_num_prompt_tokens - target_tokens
             if (
-                isinstance(hash_unit, int)
-                and hash_unit > 0
-                and old_num_prompt_tokens % hash_unit == 0
-                and len(block_hashes) > request.num_prompt_tokens // hash_unit
+                fine_boundary >= last_block_start
+                and fine_boundary > 0
+                and 1 < candidate_drop <= tail_offload_max
             ):
-                block_hashes.pop()
+                drop_count = candidate_drop
+        del request.prompt_token_ids[-drop_count:]
+        del request._all_token_ids[-drop_count:]
+        request.num_prompt_tokens -= drop_count
+        block_hashes = getattr(request, "block_hashes", None)
+        if block_hashes and isinstance(hash_unit, int) and hash_unit > 0:
+            max_hashes = request.num_prompt_tokens // hash_unit
+            if len(block_hashes) > max_hashes:
+                del block_hashes[max_hashes:]
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
