@@ -223,6 +223,31 @@ def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Ar
     return jnp.concat(x_blocks, axis=1)
 
 
+def packed_block_diag_dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+    """Per-head `lhs @ rhs` with `lhs` in the `pack_heads` layout:
+    [heads // g, n, g * k] x [heads, k, m] -> [heads, n, m], one matmul per
+    group against the block diagonal of its heads' right-hand sides."""
+    groups, n, width = lhs.shape
+    heads, k, m = rhs.shape
+    g = heads // groups
+    rhs = rhs.reshape(groups, g, k, m)
+    zeros = jnp.zeros((groups, k, m), rhs.dtype)
+    rhs_diag = jnp.concat(
+        [
+            jnp.concat([rhs[:, j] if i == j else zeros for i in range(g)], axis=-1)
+            for j in range(g)
+        ],
+        axis=1,
+    )
+    out = jax.lax.dot(
+        lhs,
+        rhs_diag,
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+        preferred_element_type=jnp.float32,
+    )
+    return unpack_heads(out, g)
+
+
 # NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
 def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     """Compute invert matrix of a given triauglar matrix."""
@@ -361,11 +386,11 @@ def chunked_gdn_heads(
     ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
 
-    # [heads, chunk, chunk]
-    if _can_invert_blocked(gating_beta_k_k_t):
-        g = INV_HEADS_PER_PASS
-        t_inv = unpack_heads(
-            invert_unit_lower_blocked(pack_heads(gating_beta_k_k_t, g)), g
+    # [heads, chunk, chunk], or [heads // g, chunk, g * chunk] when packed.
+    t_inv_packed = _can_invert_blocked(gating_beta_k_k_t)
+    if t_inv_packed:
+        t_inv = invert_unit_lower_blocked(
+            pack_heads(gating_beta_k_k_t, INV_HEADS_PER_PASS)
         )
     else:
         t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
@@ -380,12 +405,16 @@ def chunked_gdn_heads(
     # along lane dim is free - making this optimization strictly beneficial.
     # [heads, chunk, v_head_dim + kq_head_dim]
     merged_v_k = jnp.concat([v_beta_large, k_beta_gating], axis=-1)
-    merged_uw = jax.lax.dot(
-        t_inv,
-        merged_v_k,
-        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    ).astype(cfg.dtypes.compute)
+    if t_inv_packed:
+        merged_uw = packed_block_diag_dot(t_inv, merged_v_k)
+    else:
+        merged_uw = jax.lax.dot(
+            t_inv,
+            merged_v_k,
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
+    merged_uw = merged_uw.astype(cfg.dtypes.compute)
 
     # [heads, chunk, v_head_dim]
     u, w = jnp.split(merged_uw, [cfg.v_head_dim], axis=-1)
