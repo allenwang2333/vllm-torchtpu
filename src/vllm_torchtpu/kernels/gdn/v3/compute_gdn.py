@@ -161,6 +161,42 @@ def _can_invert_blocked(l_mat: jax.Array) -> bool:
     )
 
 
+def split_bf16x3(x: jax.Array, n: int, c0: int, cols: int) -> jax.Array:
+    """Columns [c0, c0 + cols) of each head's span of f32 x (`pack_heads`
+    layout, head span n) -> three bf16-exact parts hi + mid + lo == x, each
+    keeping the next 8 significant bits of the remainder, at lanes
+    [0, cols), [cols, 2 * cols) and [2 * cols, 3 * cols) of the head's span.
+    Needs 3 * cols <= n."""
+    axis = x.ndim - 1
+    width = x.shape[axis]
+    lane = jax.lax.broadcasted_iota(jnp.int32, x.shape, axis) % n
+    x = jnp.where((lane >= c0) & (lane < c0 + cols), x, 0)
+
+    def top8(v):
+        bits = jax.lax.bitcast_convert_type(v, jnp.uint32) & jnp.uint32(0xFFFF0000)
+        return jax.lax.bitcast_convert_type(bits, v.dtype)
+
+    hi = top8(x)
+    rem = x - hi
+    mid = top8(rem)
+    lo = rem - mid
+    return sum(
+        pltpu.roll(part, (i * cols - c0) % width, axis) if (i * cols - c0) % width else part
+        for i, part in enumerate((hi, mid, lo))
+    )
+
+
+def column_selectors(width: int, n: int, cols: int) -> list[jax.Array]:
+    """For each c < cols, the [width, width] 0/1 bf16 matrix that maps
+    `split_bf16x3` parts to column c of every head, broadcast over the
+    head's span of n lanes."""
+    shape = (width, width)
+    head0 = jax.lax.broadcasted_iota(jnp.int32, shape, 1) // n * n
+    off = (jax.lax.broadcasted_iota(jnp.int32, shape, 0) - head0) % width
+    col = jnp.where(off < 3 * cols, off % cols, -1)
+    return [jnp.where(col == c, 1.0, 0.0).astype(jnp.bfloat16) for c in range(cols)]
+
+
 def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Array:
     """(I + L)^-1 for strictly lower-triangular L, two heads per vreg row.
 
@@ -169,8 +205,9 @@ def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Ar
     solved by forward substitution in f32 on the VPU. The substitution runs
     column by column: once row s is final, t[r, s] * x_s is subtracted from
     every row r below it, so no step needs a sublane reduction. Row s's
-    coefficients t[r, s] reach their head's lanes by one lane gather whose
-    pattern is the same for every group.
+    coefficients t[r, s] reach their head's lanes by one exact MXU matmul
+    of the block's `split_bf16x3` parts against a 0/1 selector, shared by
+    every group.
 
     `l_pack` and the result are [groups, n, g * n] in the `pack_heads`
     layout. The matmul's right operand is expanded to the block diagonal of
@@ -185,9 +222,7 @@ def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Ar
     row = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     col = jax.lax.broadcasted_iota(jnp.int32, shape, 2) % n
     identity = jnp.where(row == col, 1.0, 0.0).astype(l_pack.dtype)
-    gather_shape = (groups * block_size, width)
-    head_base = jax.lax.broadcasted_iota(jnp.int32, gather_shape, 1) // n * n
-
+    selectors = column_selectors(width, n, block_size)
     x_blocks = []
     for start in range(0, n, block_size):
         l_rows = l_pack[:, start : start + block_size]
@@ -209,13 +244,17 @@ def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Ar
                 preferred_element_type=jnp.float32,
             )
             rhs = rhs - prev_sum
+        l_parts = split_bf16x3(l_rows, n, start, block_size).astype(jnp.bfloat16)
         for s in range(block_size - 1):
             # Only rows from the vreg holding row s + 1 down change.
             r0 = (s + 1) // sublanes * sublanes
             rows = block_size - r0
-            coef = _lane_gather(
-                l_rows[:, r0:].reshape(groups * rows, width),
-                head_base[: groups * rows] + start + s,
+            # Exact: one product per output is nonzero, and the three
+            # parts of an element sum back to it.
+            coef = jax.lax.dot(
+                l_parts[:, r0:].reshape(groups * rows, width),
+                selectors[s],
+                preferred_element_type=jnp.float32,
             ).reshape(groups, rows, width)
             update = rhs[:, r0:] - coef * rhs[:, s : s + 1]
             rhs = jnp.concat([rhs[:, :r0], update], axis=1) if r0 else update
