@@ -47,6 +47,11 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      ulps of sum_r w_r |o_r| against the f64 reference (1.5 for mode 2, a
      proof; 7 for mode 1) on hard and on spread partials, eager and compiled,
      and the same bound fails when one rank's weight is 25 % too large.
+  9. Merging pre-split token groups (`merge_lse_partials_scatter_heads_grouped`
+     under `TPU_DCP_MERGE_PIPELINED`) returns the unsplit chunked merge bit for
+     bit across `chunks` x `RS_BF16` x `LSE_AG` x `T` (eager and compiled),
+     replaces the collapsed cross-group LSE gather with per-group gathers, and
+     fails the corresponding check under each positive-control fault.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -79,7 +84,34 @@ _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A_PACK": False,
     "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
     "TPU_DCP_MERGE_RS_BF16": 0,
+    "TPU_DCP_MERGE_PIPELINED": True,
 }
+_PIPELINED_FAULT_EXPECTED_CHECK = {
+    "boundary_off_by_one": "check_pipelined_bitwise",
+    "neighbour_lse": "check_pipelined_bitwise",
+    "swapped_groups": "check_pipelined_bitwise",
+    "collapsed_cross_group_gather": "check_pipelined_gather_shapes",
+    "pipelined_on_a2a": "check_pipelined_collectives_match",
+    "pipelined_on_drafter": "check_pipelined_collectives_match",
+    "nan_padding_leak": "check_pipelined_finite",
+    "nonzero_padding_row": "check_pipelined_padding_zero",
+}
+_PIPELINED_EAGER_MATRIX = [
+    (tokens, chunks, rs_bf16, lse_ag, cap)
+    for tokens in (1024, 2048, 4096)
+    for chunks in (4, 8)
+    for rs_bf16 in (0, 1, 2)
+    for lse_ag, cap in ((False, 2048), (True, 2048), (True, 1024))
+]
+_PIPELINED_COMPILED_MATRIX = [
+    *(
+        (tokens, 8, rs_bf16, lse_ag, 2048)
+        for tokens in (2048, 4096)
+        for rs_bf16 in (0, 1, 2)
+        for lse_ag in (False, True)
+    ),
+    *((1024, 4, 1, lse_ag, 2048) for lse_ag in (False, True)),
+]
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {
     "today": {},
@@ -245,6 +277,11 @@ def _scale_ulp_stats(got, outputs, lses, rank, world):
     }
 
 
+def _log_case(rank: int, key: str, t0: float) -> None:
+    if rank == 0:
+        print(f"CASE {key} {time.perf_counter() - t0:.3f}s", flush=True)
+
+
 def _rs_bf16_checks(rank, world, cp_mla, merge):
     """TPU_DCP_MERGE_RS_BF16 arms (and today's chunk8 for scale) vs the f64
     reference on hard and on spread partials; the wrong-weight control."""
@@ -262,6 +299,7 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
         for arm in ("chunk8", "chunk8_ag1", *RS_BF16_ARMS):
             for how in ("eager", "compiled"):
                 key = f"rsbf16/{case}/{arm}/{how}"
+                t0 = time.perf_counter()
                 try:
                     _set_arm(cp_mla, arm)
                     fn = merge if how == "eager" else _compile(merge)
@@ -273,15 +311,23 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[key] = {"error": repr(exc)[:400]}
+                _log_case(rank, key, t0)
     # Positive control: rank 1 weighs its partial 25 % too heavily.
+    # Add a per-rank device tensor rather than branching on rank_in_group in
+    # Python: a trace-time rank branch makes ranks compile different programs,
+    # so the collectives desynchronize.
     import math
 
     real = cp_mla._weighted_reduce_scatter
+    offset = torch.full(
+        (1, 1),
+        math.log(1.25) if rank == 1 else 0.0,
+        dtype=torch.float32,
+        device="tpu",
+    )
 
     def wrong(output, lse_f32, lses_g, group):
-        if int(group.rank_in_group) == 1:
-            lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses_g, group)
+        return real(output, lse_f32 + offset, lses_g, group)
 
     cp_mla._weighted_reduce_scatter = wrong
     try:
@@ -290,6 +336,7 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
         for arm in RS_BF16_ARMS:
             for how in ("eager", "compiled"):
                 key = f"control_wrong_weight/{arm}/{how}"
+                t0 = time.perf_counter()
                 try:
                     _set_arm(cp_mla, arm)
                     fn = merge if how == "eager" else _compile(merge)
@@ -298,6 +345,7 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[key] = {"error": repr(exc)[:400]}
+                _log_case(rank, key, t0)
     finally:
         cp_mla._weighted_reduce_scatter = real
     return report
@@ -352,6 +400,7 @@ def _real_rows_checks(rank, world, cp_mla, merge):
         qsl = torch.tensor([0, real, real], dtype=torch.int32).to("tpu")
         for how in ("eager", "compiled"):
             key = f"real_rows/T{tokens}/n{real}/{how}"
+            t0 = time.perf_counter()
             try:
                 _set_arm(cp_mla, "a2a_pack")
                 fn = merge if how == "eager" else _compile(merge)
@@ -371,6 +420,7 @@ def _real_rows_checks(rank, world, cp_mla, merge):
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[key] = {"error": repr(exc)[:400]}
+            _log_case(rank, key, t0)
     # Positive control: the exchange sized one row short.
     real_ragged = cp_mla._ragged_all_to_all
     cp_mla._ragged_all_to_all = lambda x, rows, g: real_ragged(x, rows - 1, g)
@@ -381,6 +431,7 @@ def _real_rows_checks(rank, world, cp_mla, merge):
         qsl = torch.tensor([0, real], dtype=torch.int32).to("tpu")
         for how in ("eager", "compiled"):
             key = f"control_short_row/a2a_pack_real/{how}"
+            t0 = time.perf_counter()
             try:
                 _set_arm(cp_mla, "a2a_pack")
                 fn = merge if how == "eager" else _compile(merge)
@@ -398,6 +449,7 @@ def _real_rows_checks(rank, world, cp_mla, merge):
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[key] = {"error": repr(exc)[:400]}
+            _log_case(rank, key, t0)
     finally:
         cp_mla._ragged_all_to_all = real_ragged
     return report
@@ -417,6 +469,8 @@ def _nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local):
     real_guard = cp_mla._zero_nan
     _set_arm(cp_mla, "a2a")
     for how in ("eager", "compiled"):
+        key = f"nan/a2a/{how}"
+        t0 = time.perf_counter()
         try:
             fn = merge if how == "eager" else _compile(merge)
             clean = fn(o_dev, l_dev).cpu()
@@ -435,13 +489,14 @@ def _nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local):
             c["owned_rows_bitwise_vs_unguarded"] = bool(same[owned].all())
             c["frac_bitwise_vs_unguarded"] = float(same.float().mean())
             c["unowned_rows_zero"] = bool((clean[~owned] == 0).all())
-            report[f"nan/a2a/{how}"] = c
+            report[key] = c
             report[f"control_unguarded_nan/a2a/{how}"] = _error_stats(ctl, ref)
         except Exception as exc:  # noqa: BLE001 - reported to the parent
             traceback.print_exc()
-            report[f"nan/a2a/{how}"] = {"error": repr(exc)[:400]}
+            report[key] = {"error": repr(exc)[:400]}
         finally:
             cp_mla._zero_nan = real_guard
+        _log_case(rank, key, t0)
     return report
 
 
@@ -481,10 +536,12 @@ def _check(rank, world, group, cp_mla):
     for arm in ARMS:  # "today" first
         _set_arm(cp_mla, arm)
         for how in ("eager", "compiled"):
+            key = f"{arm}/{how}"
+            t0 = time.perf_counter()
             try:
                 fn = merge if how == "eager" else _compile(merge)
                 got = fn(o_dev, l_dev).cpu()
-                report[f"{arm}/{how}"] = {
+                report[key] = {
                     "shape": list(got.shape),
                     "dtype": str(got.dtype),
                     **_error_stats(got, ref),
@@ -497,12 +554,10 @@ def _check(rank, world, group, cp_mla):
                     same = got.view(torch.int16) == got_today[("a2a", how)].view(
                         torch.int16
                     )
-                    report[f"{arm}/{how}"]["bitwise_vs_a2a"] = bool(same.all())
-                    report[f"{arm}/{how}"]["frac_bitwise_vs_a2a"] = float(
-                        same.float().mean()
-                    )
+                    report[key]["bitwise_vs_a2a"] = bool(same.all())
+                    report[key]["frac_bitwise_vs_a2a"] = float(same.float().mean())
                 elif arm in LSE_AG_ARMS and ("chunk8", how) in got_today:
-                    report[f"{arm}/{how}"]["bitwise_vs_chunk8"] = bool(
+                    report[key]["bitwise_vs_chunk8"] = bool(
                         torch.equal(
                             got.view(torch.int16),
                             got_today[("chunk8", how)].view(torch.int16),
@@ -510,12 +565,11 @@ def _check(rank, world, group, cp_mla):
                     )
                 elif how in got_today and got.shape == got_today[how].shape:
                     same = got.view(torch.int16) == got_today[how].view(torch.int16)
-                    report[f"{arm}/{how}"]["frac_bitwise_vs_today"] = float(
-                        same.float().mean()
-                    )
+                    report[key]["frac_bitwise_vs_today"] = float(same.float().mean())
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
-                report[f"{arm}/{how}"] = {"error": repr(exc)[:400]}
+                report[key] = {"error": repr(exc)[:400]}
+            _log_case(rank, key, t0)
 
     # Diagnostics, reported but not asserted: the compiled local merge with an
     # explicit per-rank f32 accumulation, and under HIGHEST op precision. They
@@ -525,22 +579,28 @@ def _check(rank, world, group, cp_mla):
 
     _set_arm(cp_mla, "a2a")
     for name, variant in MERGE_VARIANTS.items():
+        key = f"diag/{name}/compiled"
+        t0 = time.perf_counter()
         try:
             cp_mla._merge_received = variant
             got = _compile(merge)(o_dev, l_dev).cpu()
-            report[f"diag/{name}/compiled"] = _error_stats(got, ref)
+            report[key] = _error_stats(got, ref)
         except Exception as exc:  # noqa: BLE001 - reported to the parent
-            report[f"diag/{name}/compiled"] = {"error": repr(exc)[:400]}
+            report[key] = {"error": repr(exc)[:400]}
         finally:
             cp_mla._merge_received = real_merge
+        _log_case(rank, key, t0)
+    key = "diag/a2a_highest/compiled"
+    t0 = time.perf_counter()
     try:
         from torch_tpu._internal.precision import Precision, precision
 
         with precision(Precision.HIGHEST):
             got = _compile(merge)(o_dev, l_dev).cpu()
-        report["diag/a2a_highest/compiled"] = _error_stats(got, ref)
+        report[key] = _error_stats(got, ref)
     except Exception as exc:  # noqa: BLE001 - reported to the parent
-        report["diag/a2a_highest/compiled"] = {"error": repr(exc)[:400]}
+        report[key] = {"error": repr(exc)[:400]}
+    _log_case(rank, key, t0)
 
     report.update(_nan_check(rank, world, cp_mla, merge, ref, outputs, lses, local))
 
@@ -552,13 +612,16 @@ def _check(rank, world, group, cp_mla):
         for arm in ("a2a",):
             _set_arm(cp_mla, arm)
             for how in ("eager", "compiled"):
+                key = f"control_rotated/{arm}/{how}"
+                t0 = time.perf_counter()
                 try:
                     fn = merge if how == "eager" else _compile(merge)
                     got = fn(o_dev, l_dev).cpu()
-                    report[f"control_rotated/{arm}/{how}"] = _error_stats(got, ref)
+                    report[key] = _error_stats(got, ref)
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
-                    report[f"control_rotated/{arm}/{how}"] = {"error": repr(exc)[:400]}
+                    report[key] = {"error": repr(exc)[:400]}
+                _log_case(rank, key, t0)
     finally:
         cp_mla._all_to_all = real
 
@@ -580,6 +643,7 @@ def _check(rank, world, group, cp_mla):
             _set_arm(cp_mla, arm)
             for how in ("eager", "compiled"):
                 key = f"control_lse_rows_rotated/{arm}/{how}"
+                t0 = time.perf_counter()
                 try:
                     fn = merge if how == "eager" else _compile(merge)
                     got = fn(o_dev, l_dev).cpu()
@@ -593,6 +657,7 @@ def _check(rank, world, group, cp_mla):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[key] = {"error": repr(exc)[:400]}
+                _log_case(rank, key, t0)
     finally:
         cp_mla._all_to_all = real
 
@@ -606,13 +671,16 @@ def _check(rank, world, group, cp_mla):
     try:
         _set_arm(cp_mla, "chunk4")
         for how in ("eager", "compiled"):
+            key = f"control_misaligned/chunk4/{how}"
+            t0 = time.perf_counter()
             try:
                 fn = merge if how == "eager" else _compile(merge)
                 got = fn(o_dev, l_dev).cpu()
-                report[f"control_misaligned/chunk4/{how}"] = _error_stats(got, ref)
+                report[key] = _error_stats(got, ref)
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
-                report[f"control_misaligned/chunk4/{how}"] = {"error": repr(exc)[:400]}
+                report[key] = {"error": repr(exc)[:400]}
+            _log_case(rank, key, t0)
     finally:
         cp_mla.cp_lse_ag_out_rs = real_rs
 
@@ -625,6 +693,7 @@ def _check(rank, world, group, cp_mla):
             _set_arm(cp_mla, arm)
             for how in ("eager", "compiled"):
                 key = f"control_misaligned/{arm}/{how}"
+                t0 = time.perf_counter()
                 try:
                     fn = merge if how == "eager" else _compile(merge)
                     got = fn(o_dev, l_dev).cpu()
@@ -638,8 +707,372 @@ def _check(rank, world, group, cp_mla):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[key] = {"error": repr(exc)[:400]}
+                _log_case(rank, key, t0)
     finally:
         cp_mla._gather_lse = real_ag
+    return report
+
+
+_PIPELINED_ENV_KEYS = (
+    "TPU_DCP_MERGE_PIPELINED",
+    "TPU_DCP_MLA_SPLIT_Q_LSE",
+    "TPU_DCP_MLA_MIXED_MASK_IN_KERNEL",
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK",
+    "TPU_DCP_MERGE_CHUNKED",
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS",
+    "TPU_DCP_MERGE_RS_BF16",
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG",
+    "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS",
+    "TPU_DCP_LSE_MERGE_A2A",
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS",
+    "TPU_DCP_LSE_MERGE_A2A_PACK",
+    "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS",
+    "TPU_MTP_DCP_MERGE_SIZED",
+)
+
+
+def _set_pipelined_envs(cp_mla, chunks, rs_bf16, lse_ag, cap):
+    cp_mla.envs.TPU_DCP_MERGE_PIPELINED = True
+    cp_mla.envs.TPU_DCP_MLA_SPLIT_Q_LSE = True
+    cp_mla.envs.TPU_DCP_MLA_MIXED_MASK_IN_KERNEL = True
+    cp_mla.envs.TPU_DCP_MLA_TOPK_CAP_CHUNK = 256
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED = chunks
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 1024
+    cp_mla.envs.TPU_DCP_MERGE_RS_BF16 = rs_bf16
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_LSE_AG = lse_ag
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS = cap
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = True
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 64
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_PACK = False
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS = False
+    cp_mla.envs.TPU_MTP_DCP_MERGE_SIZED = False
+
+
+def _slice_token_groups(t, group_rows, *, boundary_off_by_one=False):
+    import torch
+
+    n_groups = t.shape[0] // group_rows
+    groups = [t[i * group_rows : (i + 1) * group_rows].clone() for i in range(n_groups)]
+    if boundary_off_by_one and n_groups >= 2:
+        groups[1] = torch.cat([groups[0][-1:], groups[1][:-1]], dim=0).clone()
+    return groups
+
+
+def _pipelined_partials_for_rank(rank, world, tokens):
+    import torch
+
+    outputs, lses = _global_partials(world, tokens, seed=20261015 + tokens)
+    real_tokens = tokens - min(64, max(4, tokens // 4))
+    lses[:, real_tokens:] = float("-inf")
+    poisoned = outputs.clone()
+    poisoned[~torch.isfinite(lses)] = float("nan")
+    qsl = torch.tensor([0, real_tokens], dtype=torch.int32).to("tpu")
+    return poisoned[rank].to("tpu"), lses[rank].to("tpu"), qsl, real_tokens
+
+
+def _run_pipelined_with_call_log(group, cp_mla, fn):
+    calls = []
+    real_ag = group.all_gather
+    real_rs = group.reduce_scatter
+    real_a2a = cp_mla._all_to_all
+
+    def logged_ag(x, dim=0):
+        calls.append(["all_gather", [int(x.shape[-2]), int(x.shape[-1])]])
+        return real_ag(x, dim=dim)
+
+    def logged_rs(x, dim=0):
+        calls.append(["reduce_scatter", list(x.shape)])
+        return real_rs(x, dim=dim)
+
+    def logged_a2a(x, g):
+        calls.append(["all_to_all", list(x.shape)])
+        return real_a2a(x, g)
+
+    group.all_gather = logged_ag
+    group.reduce_scatter = logged_rs
+    cp_mla._all_to_all = logged_a2a
+    try:
+        out = fn()
+    finally:
+        group.all_gather = real_ag
+        group.reduce_scatter = real_rs
+        cp_mla._all_to_all = real_a2a
+    return out, calls
+
+
+def _verify_pipelined_result(
+    got,
+    want,
+    real_tokens,
+    expected_groups,
+    group_rows,
+    num_groups,
+    ref_calls,
+    grp_calls,
+):
+    import torch
+
+    if not torch.isfinite(want.float()).all() or not torch.isfinite(got.float()).all():
+        raise AssertionError(
+            "check_pipelined_finite: non-finite values in merged output"
+        )
+    if (got.shape[0] > 3 and not (got[3] == 0).all()) or (
+        real_tokens < got.shape[0] and not (got[real_tokens:] == 0).all()
+    ):
+        raise AssertionError(
+            "check_pipelined_padding_zero: all-(-inf) or padding rows are not zero"
+        )
+    if expected_groups > 1 and num_groups == expected_groups:
+        ag_shapes = [shape for op, shape in grp_calls if op == "all_gather"]
+        want_ag = [[group_rows, HEADS]] * expected_groups
+        if ag_shapes != want_ag:
+            raise AssertionError(
+                f"check_pipelined_gather_shapes: expected {want_ag}, got {ag_shapes}"
+            )
+    else:
+        if grp_calls != ref_calls:
+            raise AssertionError(
+                f"check_pipelined_collectives_match: {grp_calls} != {ref_calls}"
+            )
+    if not torch.equal(got.view(torch.int16), want.view(torch.int16)):
+        raise AssertionError(
+            "check_pipelined_bitwise: grouped output differs from unsplit reference"
+        )
+
+
+def _run_pipelined_fault(rank, world, group, cp_mla, fault, cache):
+    import torch
+
+    tokens = 32 if fault == "pipelined_on_a2a" else 1024
+    group_rows = 8 if fault == "pipelined_on_a2a" else 256
+    is_backbone = fault != "pipelined_on_drafter"
+    if tokens not in cache:
+        cache[tokens] = _pipelined_partials_for_rank(rank, world, tokens)
+    o_dev, l_dev, qsl, real_tokens = cache[tokens]
+
+    _set_pipelined_envs(
+        cp_mla,
+        chunks=4,
+        rs_bf16=1 if fault in ("nan_padding_leak", "nonzero_padding_row") else 0,
+        lse_ag=True,
+        cap=2048,
+    )
+    outs_g = _slice_token_groups(
+        o_dev, group_rows, boundary_off_by_one=(fault == "boundary_off_by_one")
+    )
+    lses_g = _slice_token_groups(
+        l_dev, group_rows, boundary_off_by_one=(fault == "boundary_off_by_one")
+    )
+    if fault == "neighbour_lse" and len(lses_g) >= 2:
+        lses_g = [lses_g[0], torch.roll(lses_g[1], 1, dims=0), *lses_g[2:]]
+    elif fault == "swapped_groups" and len(outs_g) >= 3:
+        outs_g = [outs_g[0], outs_g[2], outs_g[1], *outs_g[3:]]
+        lses_g = [lses_g[0], lses_g[2], lses_g[1], *lses_g[3:]]
+
+    expected_groups = cp_mla.pipelined_merge_groups(tokens, is_backbone)
+    want, ref_calls = _run_pipelined_with_call_log(
+        group,
+        cp_mla,
+        lambda: cp_mla.merge_lse_partials_scatter_heads(
+            o_dev, l_dev, is_backbone=is_backbone, query_start_loc=qsl
+        ),
+    )
+
+    real_gate = cp_mla.pipelined_merge_groups
+    real_grouped = cp_mla.merge_lse_partials_scatter_heads_grouped
+    real_wrs = cp_mla._weighted_reduce_scatter
+    try:
+        if fault in ("pipelined_on_a2a", "pipelined_on_drafter"):
+            cp_mla.pipelined_merge_groups = lambda _n, _b: len(outs_g)
+        elif fault == "collapsed_cross_group_gather":
+            cp_mla.merge_lse_partials_scatter_heads_grouped = (
+                lambda os_seq, ls_seq, **_kw: cp_mla._retain_rank(
+                    cp_mla._merge_chunked_lse_gathered(
+                        torch.cat(list(os_seq), dim=0),
+                        torch.cat(list(ls_seq), dim=0),
+                        cp_mla.get_dcp_group(),
+                        len(os_seq),
+                    )
+                )
+            )
+        elif fault == "nan_padding_leak":
+
+            def _unguarded_weighted_rs(output, lse_f32, lses_all, grp):
+                shift = torch.where(
+                    torch.isfinite(lses_all),
+                    lses_all,
+                    torch.full_like(lses_all, float("-inf")),
+                ).amax(dim=0)
+                shift = torch.where(
+                    torch.isfinite(shift), shift, torch.zeros_like(shift)
+                )
+                w = torch.exp(lses_all - shift)
+                den = w.sum(dim=0)
+                w_r = torch.exp(lse_f32 - shift) / torch.where(
+                    den > 0, den, torch.ones_like(den)
+                )
+                return cp_mla._scatter_sum(output.float() * w_r.unsqueeze(-1), grp)
+
+            cp_mla._weighted_reduce_scatter = _unguarded_weighted_rs
+        elif fault == "nonzero_padding_row":
+
+            def _nonzero_padding_wrs(output, lse_f32, lses_all, grp):
+                merged_lse = torch.logsumexp(lses_all, dim=0)
+                weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+                weighted = output.to(torch.float32) * weight
+                zeroed = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+                weighted = torch.where(
+                    torch.isfinite(merged_lse).unsqueeze(-1),
+                    zeroed,
+                    torch.ones_like(zeroed),
+                )
+                return cp_mla._scatter_sum(weighted, grp).to(output.dtype)
+
+            cp_mla._weighted_reduce_scatter = _nonzero_padding_wrs
+
+        got, grp_calls = _run_pipelined_with_call_log(
+            group,
+            cp_mla,
+            lambda: cp_mla.merge_lse_partials_scatter_heads_grouped(
+                outs_g, lses_g, is_backbone=is_backbone, query_start_loc=qsl
+            ),
+        )
+    finally:
+        cp_mla.pipelined_merge_groups = real_gate
+        cp_mla.merge_lse_partials_scatter_heads_grouped = real_grouped
+        cp_mla._weighted_reduce_scatter = real_wrs
+
+    _verify_pipelined_result(
+        got.cpu(),
+        want.cpu(),
+        real_tokens,
+        expected_groups,
+        group_rows,
+        len(outs_g),
+        ref_calls,
+        grp_calls,
+    )
+
+
+def _pipelined_checks(rank, world, group, cp_mla):
+    """Pre-split grouped merge (`merge_lse_partials_scatter_heads_grouped`) over
+    real collectives: eager 54-case matrix, compiled 14-case matrix, structural
+    per-group `_gather_lse` shape verification, and 8 positive-control faults."""
+    saved_envs = {k: getattr(cp_mla.envs, k) for k in _PIPELINED_ENV_KEYS}
+    try:
+        return _pipelined_checks_body(rank, world, group, cp_mla)
+    finally:
+        for k, v in saved_envs.items():
+            setattr(cp_mla.envs, k, v)
+
+
+def _pipelined_checks_body(rank, world, group, cp_mla):
+    import torch
+
+    report = {}
+    cache = {
+        tokens: _pipelined_partials_for_rank(rank, world, tokens)
+        for tokens in (1024, 2048, 4096)
+    }
+
+    for tokens, chunks, rs_bf16, lse_ag, cap in _PIPELINED_EAGER_MATRIX:
+        tag = f"T{tokens}/c{chunks}/rs{rs_bf16}/ag{int(lse_ag)}/cap{cap}"
+        key = f"pipelined/{tag}/eager"
+        t0 = time.perf_counter()
+        try:
+            _set_pipelined_envs(cp_mla, chunks, rs_bf16, lse_ag, cap)
+            o_dev, l_dev, qsl, real_tokens = cache[tokens]
+            group_rows = max(tokens // chunks, 256)
+            outs_g = _slice_token_groups(o_dev, group_rows)
+            lses_g = _slice_token_groups(l_dev, group_rows)
+            want, ref_calls = _run_pipelined_with_call_log(
+                group,
+                cp_mla,
+                lambda o=o_dev, lse=l_dev, q=qsl: (
+                    cp_mla.merge_lse_partials_scatter_heads(
+                        o, lse, is_backbone=True, query_start_loc=q
+                    )
+                ),
+            )
+            got, grp_calls = _run_pipelined_with_call_log(
+                group,
+                cp_mla,
+                lambda os_g=outs_g, ls_g=lses_g, q=qsl: (
+                    cp_mla.merge_lse_partials_scatter_heads_grouped(
+                        os_g, ls_g, is_backbone=True, query_start_loc=q
+                    )
+                ),
+            )
+            want_cpu, got_cpu = want.cpu(), got.cpu()
+            report[key] = {
+                "finite": bool(
+                    torch.isfinite(want_cpu.float()).all()
+                    and torch.isfinite(got_cpu.float()).all()
+                ),
+                "padding_zero": bool(
+                    (got_cpu[3] == 0).all() and (got_cpu[real_tokens:] == 0).all()
+                ),
+                "bitwise": bool(
+                    torch.equal(got_cpu.view(torch.int16), want_cpu.view(torch.int16))
+                ),
+                "ref_ag_shapes": [s for op, s in ref_calls if op == "all_gather"],
+                "grp_ag_shapes": [s for op, s in grp_calls if op == "all_gather"],
+            }
+        except Exception as exc:  # noqa: BLE001 - reported to the parent
+            traceback.print_exc()
+            report[key] = {"error": repr(exc)[:400]}
+        _log_case(rank, key, t0)
+
+    for tokens, chunks, rs_bf16, lse_ag, cap in _PIPELINED_COMPILED_MATRIX:
+        tag = f"T{tokens}/c{chunks}/rs{rs_bf16}/ag{int(lse_ag)}/cap{cap}"
+        key = f"pipelined/{tag}/compiled"
+        t0 = time.perf_counter()
+        try:
+            _set_pipelined_envs(cp_mla, chunks, rs_bf16, lse_ag, cap)
+            o_dev, l_dev, qsl, real_tokens = cache[tokens]
+            group_rows = max(tokens // chunks, 256)
+            outs_g = _slice_token_groups(o_dev, group_rows)
+            lses_g = _slice_token_groups(l_dev, group_rows)
+            want = _compile(cp_mla.merge_lse_partials_scatter_heads)(
+                o_dev, l_dev, is_backbone=True, query_start_loc=qsl
+            ).cpu()
+            got = _compile(cp_mla.merge_lse_partials_scatter_heads_grouped)(
+                outs_g, lses_g, is_backbone=True, query_start_loc=qsl
+            ).cpu()
+            report[key] = {
+                "finite": bool(
+                    torch.isfinite(want.float()).all()
+                    and torch.isfinite(got.float()).all()
+                ),
+                "padding_zero": bool(
+                    (got[3] == 0).all() and (got[real_tokens:] == 0).all()
+                ),
+                "bitwise": bool(
+                    torch.equal(got.view(torch.int16), want.view(torch.int16))
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001 - reported to the parent
+            traceback.print_exc()
+            report[key] = {"error": repr(exc)[:400]}
+        _log_case(rank, key, t0)
+
+    for fault in _PIPELINED_FAULT_EXPECTED_CHECK:
+        key = f"pipelined_fault/{fault}"
+        t0 = time.perf_counter()
+        try:
+            _run_pipelined_fault(rank, world, group, cp_mla, fault, cache)
+            report[key] = {"failed_check": None, "message": "did not fail"}
+        except AssertionError as exc:
+            msg = str(exc)
+            report[key] = {
+                "failed_check": msg.split(":", 1)[0],
+                "message": msg,
+            }
+        except Exception as exc:  # noqa: BLE001 - reported to the parent
+            traceback.print_exc()
+            report[key] = {"error": repr(exc)[:400]}
+        _log_case(rank, key, t0)
+
     return report
 
 
@@ -703,7 +1136,9 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
     return out
 
 
-def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
+def _run_worker(
+    result_dir: Path, bench_tokens: list[int], check_set: str = "base"
+) -> None:
     import torch
     import torch_tpu  # noqa: F401
     from torch import distributed as dist
@@ -711,7 +1146,7 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     result_path = result_dir / f"rank_{rank}.json"
-    result: dict[str, object] = {"rank": rank, "world": world}
+    result: dict[str, object] = {"rank": rank, "world": world, "check_set": check_set}
     initialized = False
     try:
         dist.init_process_group(backend="tpu_dist")
@@ -750,9 +1185,12 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
 
         dcp_mod.get_dcp_group = lambda: group
         cp_mla.prebuild_ragged_all_to_all(world)
-        result["check"] = _check(rank, world, group, cp_mla)
-        if bench_tokens:
-            result["bench"] = _bench(rank, cp_mla, bench_tokens)
+        if check_set == "pipelined":
+            result["check"] = _pipelined_checks(rank, world, group, cp_mla)
+        else:
+            result["check"] = _check(rank, world, group, cp_mla)
+            if bench_tokens:
+                result["bench"] = _bench(rank, cp_mla, bench_tokens)
     except BaseException as exc:  # noqa: BLE001 - reported to the parent
         traceback.print_exc()
         result["error"] = repr(exc)
@@ -771,10 +1209,17 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
 
 # --------------------------------------------------------------------- pytest
 def _launch(result_dir: Path, extra: list[str]) -> subprocess.CompletedProcess[str]:
+    env = _prepare_worker_env()
+    tpu_env = {
+        k: env[k]
+        for k in sorted(env)
+        if k.startswith(("TPU_", "TORCH_TPU_", "MEGASCALE_"))
+    }
+    print(f"WORKER TPU ENV: {json.dumps(tpu_env, sort_keys=True)}", flush=True)
     process = subprocess.Popen(
         _worker_command(result_dir, extra),
         cwd=Path(__file__).resolve().parents[3],
-        env=_prepare_worker_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -937,22 +1382,86 @@ def assert_merge_results(results: list[dict]) -> None:
                 )
 
 
+def assert_pipelined_merge_results(results: list[dict]) -> None:
+    errors = [r for r in results if "error" in r]
+    assert not errors, f"worker failures: {errors}"
+    for r in results:
+        check = r["check"]
+        for tokens, chunks, rs_bf16, lse_ag, cap in _PIPELINED_EAGER_MATRIX:
+            tag = f"T{tokens}/c{chunks}/rs{rs_bf16}/ag{int(lse_ag)}/cap{cap}"
+            key = f"pipelined/{tag}/eager"
+            c = check[key]
+            assert "error" not in c, (r["rank"], key, c)
+            assert c["finite"] and c["padding_zero"] and c["bitwise"], (
+                r["rank"],
+                key,
+                c,
+            )
+            group_rows = max(tokens // chunks, 256)
+            if tokens // chunks >= 256 and lse_ag and tokens <= cap:
+                assert c["ref_ag_shapes"] == [[tokens, HEADS]], (r["rank"], key, c)
+                assert c["grp_ag_shapes"] == [[group_rows, HEADS]] * chunks, (
+                    r["rank"],
+                    key,
+                    c,
+                )
+        for tokens, chunks, rs_bf16, lse_ag, cap in _PIPELINED_COMPILED_MATRIX:
+            tag = f"T{tokens}/c{chunks}/rs{rs_bf16}/ag{int(lse_ag)}/cap{cap}"
+            key = f"pipelined/{tag}/compiled"
+            c = check[key]
+            assert "error" not in c, (r["rank"], key, c)
+            assert c["finite"] and c["padding_zero"] and c["bitwise"], (
+                r["rank"],
+                key,
+                c,
+            )
+        for fault, expected_check in _PIPELINED_FAULT_EXPECTED_CHECK.items():
+            fc = check[f"pipelined_fault/{fault}"]
+            assert "error" not in fc, (r["rank"], fault, fc)
+            assert fc["failed_check"] == expected_check, (
+                "positive control: pipelined fault must fail its expected check",
+                r["rank"],
+                fault,
+                fc,
+            )
+            assert fc["message"].startswith(f"{expected_check}:"), (
+                r["rank"],
+                fault,
+                fc,
+            )
+
+
 def test_all_to_all_merge_on_real_collectives(tmp_path):
     result_dir = tmp_path / "dcp_merge"
     result_dir.mkdir()
-    extra = []
+    extra = ["--check-set", "base"]
     if os.environ.get("DCP_MERGE_BENCH_TOKENS"):
-        extra = ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
+        extra += ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
     completed = _launch(result_dir, extra)
     results = _results(result_dir, WORLD_SIZE)
     for line in (completed.stdout or "").splitlines():
-        if line.startswith("BENCH "):
+        if line.startswith(("BENCH ", "CASE ")):
             print(line)
+    if completed.returncode != 0 or any("error" in r for r in results):
+        print((completed.stdout or "")[-30000:], flush=True)
     print(json.dumps(results[0], indent=1))
-    assert completed.returncode == 0 or any("error" in r for r in results), (
-        completed.stdout[-12000:]
-    )
+    assert completed.returncode == 0, (completed.stdout or "")[-30000:]
     assert_merge_results(results)
+
+
+def test_pipelined_grouped_merge_on_real_collectives(tmp_path):
+    result_dir = tmp_path / "dcp_merge_pipelined"
+    result_dir.mkdir()
+    completed = _launch(result_dir, ["--check-set", "pipelined"])
+    results = _results(result_dir, WORLD_SIZE)
+    for line in (completed.stdout or "").splitlines():
+        if line.startswith("CASE "):
+            print(line)
+    if completed.returncode != 0 or any("error" in r for r in results):
+        print((completed.stdout or "")[-30000:], flush=True)
+    print(json.dumps(results[0], indent=1))
+    assert completed.returncode == 0, (completed.stdout or "")[-30000:]
+    assert_pipelined_merge_results(results)
 
 
 def _main() -> None:
@@ -960,6 +1469,11 @@ def _main() -> None:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--bench-tokens", default="")
+    parser.add_argument(
+        "--check-set",
+        choices=("base", "pipelined"),
+        default="base",
+    )
     parser.add_argument(
         "--assert-results",
         type=int,
@@ -970,14 +1484,17 @@ def _main() -> None:
     if args.assert_results:
         results = _results(args.result_dir, args.assert_results)
         print(json.dumps(results[0], indent=1))
-        assert_merge_results(results)
+        if args.check_set == "pipelined":
+            assert_pipelined_merge_results(results)
+        else:
+            assert_merge_results(results)
         print(f"ASSERT OK over {args.assert_results} ranks")
         return
     args.result_dir.mkdir(parents=True, exist_ok=True)
     if not args.worker:
         raise ValueError("expected --worker")
     tokens = [int(t) for t in args.bench_tokens.split(",") if t]
-    _run_worker(args.result_dir, tokens)
+    _run_worker(args.result_dir, tokens, args.check_set)
 
 
 if __name__ == "__main__":
