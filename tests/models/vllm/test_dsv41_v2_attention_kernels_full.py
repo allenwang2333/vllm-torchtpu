@@ -2281,7 +2281,7 @@ def test_fp8_stage_reuse_refreshes_source_indices_and_step(monkeypatch):
     consumed = []
 
     def attend(*args):
-        consumed.append(args[-2:])
+        consumed.append(args[-3:-1])
         return args[0]
 
     monkeypatch.setattr(ak, "_gather_fp8_op", gather)

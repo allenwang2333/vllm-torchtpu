@@ -1511,7 +1511,7 @@ def initialize_paged_attention():
         )
 
     _gather_fp8_op.register_fake(fake_gather_fp8)
-    in_specs = (P(),) * 13
+    in_specs = (P(),) * 14
     out_spec = P()
 
     def fp8_attention(
@@ -1535,6 +1535,7 @@ def initialize_paged_attention():
         union_cap: int,
         gathered_nope: jax.Array | None = None,
         gathered_rope: jax.Array | None = None,
+        positions: jax.Array | None = None,
     ) -> jax.Array:
         tokens = q.shape[0]
         use_token_parallel = _fp8_query_shards(tokens, tp_size, token_parallel) > 1
@@ -1544,7 +1545,20 @@ def initialize_paged_attention():
             pad_rows = padded_local - tokens_local
 
             def _token_parallel_body(
-                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id, g_n, g_r
+                q_l,
+                s_p,
+                m_p,
+                r_p,
+                s_r,
+                m_r,
+                pgs,
+                q_loc,
+                _snk,
+                f_snk,
+                r_id,
+                g_n,
+                g_r,
+                pos,
             ):
                 q_tok = jax.lax.all_to_all(
                     q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
@@ -1552,6 +1566,11 @@ def initialize_paged_attention():
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
                 )
+                pos_tok = None
+                if pos is not None:
+                    pos_tok = jax.lax.dynamic_slice_in_dim(
+                        pos, r_id.reshape(()) * tokens_local, tokens_local, axis=0
+                    )
                 if pad_rows:
                     q_tok = jnp.pad(q_tok, ((0, pad_rows), (0, 0), (0, 0)))
                     s_r_tok = jnp.pad(
@@ -1560,6 +1579,8 @@ def initialize_paged_attention():
                     m_r_tok = jnp.pad(
                         m_r_tok, ((0, pad_rows), (0, 0)), constant_values=-1
                     )
+                    if pos_tok is not None:
+                        pos_tok = jnp.pad(pos_tok, (0, pad_rows))
                 out_tok = sparse_fp8_attention_jax(
                     q_tok,
                     s_p,
@@ -1578,6 +1599,7 @@ def initialize_paged_attention():
                     union_cap=union_cap,
                     gathered_nope=g_n,
                     gathered_rope=g_r,
+                    positions=pos_tok,
                 )
                 if pad_rows:
                     out_tok = out_tok[:-pad_rows]
@@ -1605,6 +1627,7 @@ def initialize_paged_attention():
                 tp_rank,
                 gathered_nope,
                 gathered_rope,
+                positions,
             )
 
         # Mosaic calls require explicit manual partitioning on a multi-device
@@ -1622,7 +1645,8 @@ def initialize_paged_attention():
             _f_snk,
             _r_id,
             g_n,
-            g_r: (
+            g_r,
+            pos: (
                 sparse_fp8_attention_jax(
                     q_l,
                     s_p,
@@ -1641,6 +1665,7 @@ def initialize_paged_attention():
                     union_cap=union_cap,
                     gathered_nope=g_n,
                     gathered_rope=g_r,
+                    positions=pos,
                 )
             ),
             mesh=tp_mesh,
@@ -1661,13 +1686,14 @@ def initialize_paged_attention():
             tp_rank,
             gathered_nope,
             gathered_rope,
+            positions,
         )
 
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
+        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 3),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1695,6 +1721,7 @@ def initialize_paged_attention():
         union_cap: int,
         gathered_nope: jax.Array | None = None,
         gathered_rope: jax.Array | None = None,
+        positions: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention(
             q,
@@ -1717,13 +1744,14 @@ def initialize_paged_attention():
             union_cap,
             gathered_nope,
             gathered_rope,
+            positions,
         )
 
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
+        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 3),
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -2243,6 +2271,7 @@ def sparse_fp8_attention(
     tp_rank=None,
     union_gather=False,
     union_cap=4096,
+    positions=None,
 ):
     """``main_records`` are raw rows, or rows paged by ``pages`` (main.pages)."""
     assert _fp8_attention_op is not None and main.rope is not None
@@ -2276,6 +2305,7 @@ def sparse_fp8_attention(
         union_gather,
         union_cap,
         *gathered,
+        positions.int() if positions is not None else None,
     )
     if _has_hi_bank(main):
         assert (

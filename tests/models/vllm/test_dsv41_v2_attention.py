@@ -298,6 +298,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        positions,
     ):
         sparse_fp8_called.append(
             {
@@ -306,6 +307,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
                 "main_records": main_records.clone(),
                 "full_sink": full_sink,
                 "tp_rank": tp_rank,
+                "positions": positions,
             }
         )
         return torch.ones(
@@ -327,6 +329,7 @@ def test_prepare_tpu_indexer_all_indices_fit_masking(monkeypatch):
     assert call["precompacted"] is True
     assert call["token_parallel"] is True
     assert call["tp_rank"].item() == 0
+    torch.testing.assert_close(call["positions"], positions)
 
     # Verify _all_indices_fit mask logic:
     # Token 2 (index 2) had swa_slots == -1, so all its main_records must be -1
@@ -437,6 +440,7 @@ def test_prepare_tpu_non_source_layer_buffer_reuse(monkeypatch):
         token_parallel,
         full_sink,
         tp_rank,
+        positions,
     ):
         captured_records.append(main_records)
         return torch.zeros(

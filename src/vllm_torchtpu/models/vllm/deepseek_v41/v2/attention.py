@@ -1386,6 +1386,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     token_parallel=self._token_parallel_attn,
                     full_sink=self._full_attn_sink,
                     tp_rank=self._tp_rank_1d,
+                    positions=positions,
                 )
             else:
                 result = paged_attention(
