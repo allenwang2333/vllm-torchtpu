@@ -78,6 +78,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OP_ATTR = "_moe_tp_decode_op"
+# TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the op variant that also takes the norm's fp8
+# rows and scales (set by rmsnorm.arm_prequant_moe), and the slot it reads them
+# from on the FusedMoE layer.
+_OP_PREQUANT_ATTR = "_moe_tp_decode_op_prequant"
+PREQUANT_MOE_ATTR = "_tpu_prequant_moe_slot"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -399,10 +404,26 @@ def _tp_chain(
 def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     """The op's per-rank body under shard_map over `axis`: the fused kernel at
     the token counts it admits, else this rank's partial from the usual path
-    and a psum."""
+    and a psum. The prequant variant also takes x_q / x_scale (the norm's fp8
+    rows of x); only the prefill kernel reads them."""
 
     def body(
-        x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+        x,
+        scores,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+        x_q=None,
+        x_scale=None,
     ):
         n = x.shape[0]  # static: torch_tpu exports one program per token count
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
@@ -470,6 +491,8 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 ti.astype(jnp.int32),
                 None,
                 statics.routed_scale,
+                x_q=x_q,
+                x_scale=x_scale,
             )
         partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
         return lax.psum(partial, axis)
@@ -477,21 +500,28 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     return body
 
 
-def _get_op(mesh, statics: _OpStatics):
-    """One jax_op per distinct closure; built at arming, never in a trace."""
-    key = (mesh, statics)
+def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
+    """One jax_op per distinct closure; built at arming, never in a trace.
+    `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
+    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE)."""
+    key = (mesh, statics, prequant)
     op = _OPS.get(key)
     if op is not None:
         return op
     axis = mesh.axis_names[0]
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
-    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * 10
+    specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
     body = _op_body(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
     )
+
+    def run(*args):
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
 
     # torch_tpu reads the operand types from these annotations.
     def fn(
@@ -510,32 +540,41 @@ def _get_op(mesh, statics: _OpStatics):
         rank: jax.Array,
         e0: jax.Array,
     ) -> jax.Array:
-        args = (
-            x,
-            scores,
-            bias,
-            pad_mask,
-            w13,
-            w2,
-            s13,
-            s2,
-            sw13,
-            ss13,
-            sw2,
-            ss2,
-            rank,
-            e0,
-        )
-        return sharded(
-            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        return run(x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0)
+
+    def fn_prequant(
+        x: jax.Array,
+        scores: jax.Array,
+        bias: jax.Array,
+        pad_mask: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        s13: jax.Array,
+        s2: jax.Array,
+        sw13: jax.Array,
+        ss13: jax.Array,
+        sw2: jax.Array,
+        ss2: jax.Array,
+        rank: jax.Array,
+        e0: jax.Array,
+        x_q: jax.Array,
+        x_scale: jax.Array,
+    ) -> jax.Array:
+        return run(
+            x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0, x_q, x_scale
         )
 
-    name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
+    name = "pallas::moe_tp_decode" + ("_prequant" if prequant else "")
+    name += f"_{len(_OPS)}" if _OPS else ""
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
     # jax_op takes PartitionSpecs at runtime, as main's other call sites pass them.
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
+        name,
+        fn_prequant if prequant else fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
     )
     # vLLM traces with a dynamic token dimension; rows in == rows out.
     op.register_fake(lambda x, *args, **kwargs: torch.empty_like(x))
@@ -747,7 +786,18 @@ def moe_tp_decode_forward(
     sw13, ss13, sw2, ss2, bias, rank, e0 = (getattr(layer, n) for n in _BUFFERS)
     # Production's scoring op; everything after it is the op.
     scores = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits)
-    return getattr(quant_method, _OP_ATTR)(
+    # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the norm that produced `x` filled the slot
+    # only on its Pallas (prefill-sized) branch, so this is not a token-count
+    # branch of its own; the rows are the op's own quantization, bit for bit.
+    slot = getattr(layer, PREQUANT_MOE_ATTR, None)
+    prequant = None if slot is None else slot.value
+    op = getattr(quant_method, _OP_ATTR)
+    extra = ()
+    if prequant is not None:
+        slot.value = None
+        op = getattr(quant_method, _OP_PREQUANT_ATTR)
+        extra = prequant
+    return op(
         x,
         scores,
         bias,
@@ -762,4 +812,23 @@ def moe_tp_decode_forward(
         ss2,
         rank,
         e0,
+        *extra,
     )
+
+
+def arm_prequant_op(layer: Any) -> int | None:
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: build (at load, outside Dynamo) the
+    prequant variant of an armed layer's op. Returns the token count from
+    which its prefill kernel runs, or None when the layer is not armed or has
+    no prefill kernel (nothing to pair)."""
+    op = getattr(layer.quant_method, _OP_ATTR, None)
+    if op is None:
+        return None
+    entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
+    if entry is None:
+        return None
+    (mesh, statics, prequant), _ = entry
+    if prequant or statics.prefill_min_tokens is None:
+        return None
+    setattr(layer.quant_method, _OP_PREQUANT_ATTR, _get_op(mesh, statics, True))
+    return statics.prefill_min_tokens

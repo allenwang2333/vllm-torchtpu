@@ -118,3 +118,35 @@ def test_norm_quant_moe_is_quantize_rows(setup, m):
         np.asarray(_run(mesh, fed, x_q, x_scale, tw, ti, *weights)),
         np.asarray(_run(mesh, own, y_ref, tw, ti, *weights)),
     )
+
+
+@pytest.mark.parametrize("v2_flag", [False, True])
+def test_prefill_layer_on_norm_rows(setup, monkeypatch, v2_flag):
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE's op path: prefill_layer fed the norm's
+    (x_q, x_scale) equals prefill_layer quantizing y itself, with
+    FUSED_MOE_PREFILL_KERNEL_V2 off (v2 at v1's levers vs v1) and on."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import fused_moe_prefill as adapter
+
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL_V2", v2_flag, raising=False)
+    weights, mesh = setup
+    m = 1024
+    x0 = jax.random.normal(jax.random.key(11), (m, H)).astype(jnp.bfloat16)
+    r0 = (jax.random.normal(jax.random.key(12), (m, H)) * 0.5).astype(jnp.bfloat16)
+    nw = (1.0 + 0.05 * jax.random.normal(jax.random.key(13), (H,))).astype(jnp.bfloat16)
+    y, x_q, x_scale, _ = fnorm.fused_add_rms_norm_quant_moe(x0, r0, nw, eps=1e-5)
+    tw, ti = _routing(m, 21, True)
+
+    def own(y, tw, ti, *w):
+        w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+        return adapter.prefill_layer(y, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, None, tw, ti, None, ROUTED_SCALE)
+
+    def fed(y, x_q, x_scale, tw, ti, *w):
+        w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+        return adapter.prefill_layer(y, w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s, None, tw, ti, None, ROUTED_SCALE,
+                                     x_q=x_q, x_scale=x_scale)
+
+    np.testing.assert_array_equal(
+        np.asarray(_run(mesh, fed, y, x_q, x_scale, tw, ti, *weights)),
+        np.asarray(_run(mesh, own, y, tw, ti, *weights)),
+    )

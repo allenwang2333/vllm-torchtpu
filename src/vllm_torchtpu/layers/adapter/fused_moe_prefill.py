@@ -58,19 +58,27 @@ def prefill_layer(
     ti,
     start,
     routed_scale=1.0,
+    x_q=None,
+    x_scale=None,
 ):
     """Per rank, inside shard_map: the all-reduced shared + routed output.
     `start` is the rank's first global expert under EP, None under TP.
     `shared_gate_weight` is None for a shared expert without a gate, and
-    `routed_scale` multiplies the routed output alone (GLM-5.2: 2.5)."""
+    `routed_scale` multiplies the routed output alone (GLM-5.2: 2.5).
+    `x_q` / `x_scale` (TPU_FUSED_ADD_RMSNORM_QUANT_MOE): x's fp8 rows and
+    scales as the preceding norm emitted them, bit for bit the kernel's own
+    _quantize_rows(x); the v2 build takes them (at v1's levers unless
+    FUSED_MOE_PREFILL_KERNEL_V2) and skips its own quantization."""
     # Trace-time, once per token bucket: the evidence that the prefill kernel
     # serves this shape.
     logger.info(
         "Fused MoE prefill kernel%s traced for %d tokens",
-        " (V2, stage A)" if envs.FUSED_MOE_PREFILL_KERNEL_V2 else "",
+        (" (V2, stage A)" if envs.FUSED_MOE_PREFILL_KERNEL_V2 else "")
+        + (" on the norm's fp8 rows" if x_q is not None else ""),
         x.shape[0],
     )
-    if envs.FUSED_MOE_PREFILL_KERNEL_V2:
+    if envs.FUSED_MOE_PREFILL_KERNEL_V2 or x_q is not None:
+        levers = _v2.STAGE_A if envs.FUSED_MOE_PREFILL_KERNEL_V2 else {}
         return _v2.fused_moe_prefill(
             x,
             w1,
@@ -87,7 +95,9 @@ def prefill_layer(
             axis_name=EP_AXIS_NAME,
             expert_start=start,
             routed_scale=routed_scale,
-            **_v2.STAGE_A,
+            x_q=x_q,
+            x_scale=x_scale,
+            **levers,
         )
     return _kernel_body(
         x,

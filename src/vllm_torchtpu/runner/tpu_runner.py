@@ -5123,6 +5123,18 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+            if (
+                envs.TPU_FUSED_ADD_RMSNORM
+                and envs.TPU_FUSED_ADD_RMSNORM_QUANT_MOE
+                and envs.FUSED_MOE_PREFILL_KERNEL
+            ):
+                from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant_moe
+
+                n_moe_pairs = arm_prequant_moe(self.model)
+                logger.info(
+                    "TPU_FUSED_ADD_RMSNORM_QUANT_MOE: %d norm -> fused MoE prefill pairs",
+                    n_moe_pairs,
+                )
             if fused_moe_arming:
                 # Layers moe_tp_decode armed have no shared expert left, so
                 # fused_moe_decode admits only the ones it refused.
