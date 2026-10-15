@@ -16,9 +16,13 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
 from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.adapter.quantization import fp8
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 
 _K, _N = 256, 128
 
@@ -45,7 +49,6 @@ def _weights(seed=0):
 def test_activation_quantization_follows_threshold(
     monkeypatch, rows, max_rows, expect_quantized
 ):
-    monkeypatch.setenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", str(max_rows))
     seen = {}
     real = linear_common.xla_quantized_matmul
 
@@ -55,16 +58,16 @@ def test_activation_quantization_follows_threshold(
 
     monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
     w_q, w_s = _weights()
-    out = _quantized_matmul_jax(jnp.ones((rows, _K), jnp.bfloat16), w_q, w_s)
+    out = _quantized_matmul_jax(
+        jnp.ones((rows, _K), jnp.bfloat16), w_q, w_s, w8a16_max_rows=max_rows
+    )
     assert out.shape == (rows, _N)
     assert out.dtype == jnp.bfloat16
     assert seen["quantize_activation"] is expect_quantized
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("rows,expect_quantized", [(64, False), (65, True)])
-def test_default_threshold_is_64_rows(monkeypatch, rows, expect_quantized):
-    monkeypatch.delenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", raising=False)
+def test_direct_jax_bridge_defaults_to_w8a8(monkeypatch):
     seen = {}
     real = linear_common.xla_quantized_matmul
 
@@ -74,12 +77,53 @@ def test_default_threshold_is_64_rows(monkeypatch, rows, expect_quantized):
 
     monkeypatch.setattr(linear_common, "xla_quantized_matmul", spy)
     w_q, w_s = _weights()
-    _quantized_matmul_jax(jnp.ones((rows, _K), jnp.bfloat16), w_q, w_s)
-    assert seen["quantize_activation"] is expect_quantized
+    _quantized_matmul_jax(jnp.ones((16, _K), jnp.bfloat16), w_q, w_s)
+    assert seen["quantize_activation"] is True
 
 
 @pytest.mark.cpu_test
-def test_w8a16_is_at_least_as_accurate_as_w8a8(monkeypatch):
+@pytest.mark.parametrize("env_val,expected", [(None, 64), ("0", 0), ("16", 16)])
+def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expected):
+    if env_val is None:
+        monkeypatch.delenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", raising=False)
+    else:
+        monkeypatch.setenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", env_val)
+
+    method = VllmFp8LinearMethodTPU(Fp8Config(is_checkpoint_fp8_serialized=True))
+    assert method.w8a16_max_rows == expected
+
+    seen = {}
+
+    def fake_quantized_matmul(x, w_q, w_s, w8a16_max_rows=0):
+        seen["w8a16_max_rows"] = w8a16_max_rows
+        return torch.zeros((x.shape[0], w_q.shape[-1]), dtype=x.dtype)
+
+    monkeypatch.setattr(fp8, "quantized_matmul", fake_quantized_matmul)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((_K, _N), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((_N,), dtype=torch.float32), requires_grad=False
+    )
+    method.apply(layer, torch.ones((16, _K), dtype=torch.bfloat16))
+    assert seen["w8a16_max_rows"] == expected
+
+
+@pytest.mark.cpu_test
+def test_quantized_matmul_op_accepts_w8a16_max_rows():
+    op = linear_common._get_quantized_matmul_op()
+    with torch.device("meta"):
+        x = torch.empty((16, _K), dtype=torch.bfloat16)
+        w_q = torch.empty((_K, _N), dtype=torch.float8_e4m3fn)
+        w_s = torch.empty((_N,), dtype=torch.float32)
+        out = op(x, w_q, w_s, 64)
+    assert out.shape == (16, _N)
+    assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.cpu_test
+def test_w8a16_is_at_least_as_accurate_as_w8a8():
     w_q, w_s = _weights()
     x = jnp.asarray(
         np.random.default_rng(1).standard_normal((16, _K)), dtype=jnp.bfloat16
@@ -89,10 +133,10 @@ def test_w8a16_is_at_least_as_accurate_as_w8a8(monkeypatch):
         np.asarray(w_q.astype(jnp.float32)) * np.asarray(w_s)[None, :]
     )
 
-    monkeypatch.setenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", "0")
-    w8a8 = np.asarray(_quantized_matmul_jax(x, w_q, w_s), np.float32)
-    monkeypatch.setenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", "16")
-    w8a16 = np.asarray(_quantized_matmul_jax(x, w_q, w_s), np.float32)
+    w8a8 = np.asarray(_quantized_matmul_jax(x, w_q, w_s, w8a16_max_rows=0), np.float32)
+    w8a16 = np.asarray(
+        _quantized_matmul_jax(x, w_q, w_s, w8a16_max_rows=16), np.float32
+    )
 
     err_w8a8 = np.abs(w8a8 - ref).max()
     err_w8a16 = np.abs(w8a16 - ref).max()

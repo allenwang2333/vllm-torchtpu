@@ -1379,6 +1379,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
+        self.w8a16_max_rows = (
+            linear_config.w8a16_max_rows
+            if linear_config is not None
+            else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+        )
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1667,7 +1672,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
-            out = quantized_matmul(x, weight, layer.weight_scale)
+            out = quantized_matmul(
+                x,
+                weight,
+                layer.weight_scale,
+                w8a16_max_rows=self.w8a16_max_rows,
+            )
         if bias is not None:
             out = out + bias
         return out

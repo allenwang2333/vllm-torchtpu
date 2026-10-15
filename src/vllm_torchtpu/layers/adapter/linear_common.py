@@ -22,7 +22,6 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -64,7 +63,12 @@ def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
     raise ValueError(f"Unsupported quantized dtype: {w_q_dtype}")
 
 
-def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+def _quantized_matmul_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w8a16_max_rows: int = 0,
+) -> jax.Array:
     """FP8 dense matmul on the canonical (k, n) weight layout.
 
     `w_q` is `[n_in, n_out]`, so this is a plain `(m, k) @ (k, n)` contraction
@@ -106,7 +110,7 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             zero_initialize=True,
         )
     # Rows is static at trace time, so each token bucket picks one path.
-    quantize_activation = x.shape[0] > envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+    quantize_activation = x.shape[0] > w8a16_max_rows
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=quantize_activation)
 
 
@@ -126,9 +130,12 @@ def _get_quantized_matmul_op() -> Callable:
         op = pallas.jax_op("pallas::quantized_matmul_kernel", _quantized_matmul_jax)
 
         def _fake_quantized_matmul(
-            x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+            x: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w8a16_max_rows: int = 0,
         ):
-            del w_s
+            del w_s, w8a16_max_rows
             return torch.empty(
                 x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
             )
@@ -139,7 +146,10 @@ def _get_quantized_matmul_op() -> Callable:
 
 
 def quantized_matmul(
-    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w8a16_max_rows: int = 0,
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
@@ -157,7 +167,7 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
+    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
 
 
