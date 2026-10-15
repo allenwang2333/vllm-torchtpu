@@ -1412,6 +1412,7 @@ def sparse_mla_attention_dcp(
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
+            mixed_union_gather=envs.TPU_DCP_MLA_MIXED_UNION_GATHER,
             decode_row_widths=(
                 tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
                 if topk_cap
