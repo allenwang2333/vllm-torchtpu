@@ -2,9 +2,9 @@
 
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.interfaces import supports_pp
+from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 
 from vllm_torchtpu.models.vllm import register_models
-from vllm_torchtpu.models.vllm.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 
 
 def test_qwen35_mtp_drafts_declare_pipeline_support():
@@ -12,24 +12,21 @@ def test_qwen35_mtp_drafts_declare_pipeline_support():
     assert supports_pp(Qwen3_5MoeMTP)
 
 
-def test_qwen35_mtp_drafts_are_registered_over_upstream():
+def test_qwen35_mtp_drafts_use_upstream_models():
     register_models()
     for arch, cls in (("Qwen3_5MTP", Qwen3_5MTP), ("Qwen3_5MoeMTP", Qwen3_5MoeMTP)):
         assert ModelRegistry.models[arch].load_model_cls() is cls
 
 
 def test_predictor_forward_embeds_on_a_non_first_pipeline_rank(monkeypatch):
-    """The embedding branch runs whenever no intermediate tensors are given,
-    on a stage whose PP group says it is not the first rank."""
+    """Embeds draft inputs on the last pipeline stage."""
     from types import SimpleNamespace
 
     import torch
     from vllm.model_executor.models import qwen3_5_mtp as upstream
 
-    import vllm_torchtpu.models.vllm.qwen3_5_mtp as ours
-
     monkeypatch.setattr(
-        ours,
+        upstream,
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=False, is_last_rank=True),
     )
