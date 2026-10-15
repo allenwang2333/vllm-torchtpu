@@ -308,7 +308,11 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
         kv_cache_quantized_dtype=None, layer_name=name, scale=0.1, mla_kv_spec=(1, 2)
     )
     impl = mock.Mock(_dcp_mesh=mesh)
-    env = {"TPU_DCP_RANK_OPERAND": "1"} if rank else {}
+    # The sized drafter merge (on by default) prebuilds for the full DCP mesh;
+    # this schema check runs on a one-device mesh.
+    env = {"TPU_MTP_DCP_MERGE_SIZED": "0"}
+    if rank:
+        env["TPU_DCP_RANK_OPERAND"] = "1"
     with (
         mock.patch.dict(os.environ, env),
         mock.patch.object(
