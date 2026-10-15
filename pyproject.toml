@@ -68,7 +68,11 @@ dependencies = [
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.50",
+    #
+    # glm-agentx stays on 0.0.47 (main is on 0.0.50, #1802): under 0.0.50 the
+    # GLM-5.2 DCP16 server fails to precompile the 4096-token bucket ("support
+    # for annotation groups with gaps doesn't exist yet" on a pallas_call).
+    "libtpu==0.0.47",
     "ray[default]",
     "ray[data]",
 ]
