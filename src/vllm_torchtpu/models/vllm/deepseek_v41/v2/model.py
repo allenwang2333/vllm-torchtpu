@@ -39,11 +39,7 @@ from .ced import (
     prefix_replay_enabled,
 )
 from .engram import Engram, NgramHashState
-from .host_engram import (
-    HOST_ENGRAM_KEY,
-    gather_host_engram_hashes,
-    install_host_engram_inputs,
-)
+from .host_engram import HOST_ENGRAM_KEY, install_host_engram_inputs
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
@@ -320,15 +316,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
-                if self._has_cpu_offloaded_engram():
-                    # Idle/decode replicas may hash on device while a prefill
-                    # replica hashes on host. All must use the CPU collective.
-                    engram_hashes = engram_hashes.to("cpu")
-                gathered_hashes = gather_host_engram_hashes(
-                    engram_hashes,
-                    dp_shared_memory=self.engram_dp_shared_memory,
-                    gather_fn=upstream.gather_engram_hashes,
+                # A DP-shared host table needs no DP collective: each replica
+                # looks up only its own tokens.
+                gathered_hashes = upstream.gather_engram_hashes(
+                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
                 )
                 if self._has_cpu_offloaded_engram():
                     gathered_hashes = gathered_hashes.to("cpu")
@@ -864,6 +855,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
 
 
+def _require_dp_shared_engram(vllm_config) -> None:
+    engram_config = vllm_config.engram_config
+    if engram_config is None or not engram_config.dp_shared_memory:
+        raise NotImplementedError(
+            "V4.1 TPU DP requires engram_config.dp_shared_memory: co-located "
+            "replicas map one host Engram table from /dev/shm, which must hold "
+            "every table (about 190 GiB for DeepSeek-V4.1-Flash); increase "
+            "--shm-size or the /dev/shm volume"
+        )
+
+
 class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
     model_cls = DeepseekV41Model
 
@@ -876,7 +878,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         return super().forward(*args, **kwargs)
 
     def __init__(self, *, vllm_config, prefix=""):
-        # Limit DP to the node-local host-sharded topology implemented here.
+        # Limit DP to node-local replicas sharing one host Engram table.
         parallel = vllm_config.parallel_config
         if parallel.pipeline_parallel_size != 1:
             raise NotImplementedError("V4.1 TPU currently requires PP1")
@@ -889,16 +891,12 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
                 raise NotImplementedError(
                     "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
                 )
-            if vllm_config.engram_config.dp_shared_memory:
-                raise NotImplementedError(
-                    "V4.1 TPU DP uses head-sharded host Engram tables; "
-                    "set engram_config.dp_shared_memory=False"
-                )
             if upstream.get_engram_dp_size() != parallel.data_parallel_size:
                 raise NotImplementedError(
                     "V4.1 TPU DP requires one node-local Engram group covering "
                     "all DP replicas; refusing to replicate host tables"
                 )
+            _require_dp_shared_engram(vllm_config)
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",
@@ -918,6 +916,9 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        if parallel.data_parallel_size > 1:
+            # Upstream turns sharing off when /dev/shm cannot hold the tables.
+            _require_dp_shared_engram(vllm_config)
         # TPU's existing FP8 linear adapter registers weight_scale_inv; the
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
