@@ -1252,7 +1252,7 @@ class GDNAttentionTest(parameterized.TestCase):
         init_conv = jnp.broadcast_to(
             block_ids[:, None, None] * jnp.float32(1e-2),
             (num_seqs, kernel_size - 1, dim),
-        ).astype(jnp.bfloat16)
+        ).astype(jnp.float32)
         init_rec = jnp.broadcast_to(
             block_ids[:, None, None, None] * jnp.float32(1e-2),
             (num_seqs, n_v, d_k, d_v),
