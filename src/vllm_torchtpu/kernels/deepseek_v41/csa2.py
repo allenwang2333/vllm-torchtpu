@@ -296,22 +296,16 @@ def main_kernel(
             swa_logits = jnp.where(
                 (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
             )
-            maximum = jnp.maximum(
-                sink,
-                jnp.maximum(
-                    jnp.max(main_logits, axis=1, keepdims=True),
-                    jnp.max(swa_logits, axis=1, keepdims=True),
-                ),
+            # Keep both branches in one FP32 softmax tile; round only P.
+            logits = jnp.concatenate((main_logits, swa_logits), axis=1)
+            maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+            exponentials = jnp.exp(logits - maximum)
+            denominator = jnp.exp(sink - maximum) + jnp.sum(
+                exponentials, axis=1, keepdims=True
             )
-            main_exp = jnp.exp(main_logits - maximum)
-            swa_exp = jnp.exp(swa_logits - maximum)
-            denominator = (
-                jnp.exp(sink - maximum)
-                + jnp.sum(main_exp, axis=1, keepdims=True)
-                + jnp.sum(swa_exp, axis=1, keepdims=True)
-            )
-            main_p_ref[i] = (main_exp / denominator).astype(jnp.bfloat16)
-            swa_p_ref[i] = (swa_exp / denominator).astype(jnp.bfloat16)
+            probabilities = (exponentials / denominator).astype(jnp.bfloat16)
+            main_p_ref[i] = probabilities[:, :512]
+            swa_p_ref[i] = probabilities[:, 512:]
 
         # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
         if 10 * mrb_stride <= 256:
