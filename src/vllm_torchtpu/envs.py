@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
+    TPU_DCP_MERGE_CHUNKED_SMALL: int = 0
     TPU_DCP_MERGE_RS_BF16: int = 0
     TPU_DCP_MLA_MERGE_PIECES: int = 0
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
@@ -550,6 +551,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": env_int(
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS", 0
     ),
+    # The chunked merge's chunk count for the buckets that gather their lse
+    # once (TPU_DCP_MERGE_CHUNKED_LSE_AG, <= ..._LSE_AG_MAX_TOKENS: c1k, c2k)
+    # instead of TPU_DCP_MERGE_CHUNKED (kept for the larger buckets). Their
+    # V-space reduce-scatters compile synchronous, so each chunk pays the
+    # collective's fixed cost on the critical path; fewer, larger chunks pay it
+    # fewer times. Per-row arithmetic is unchanged (bit-identical). 0 = off;
+    # values below 2 are ignored (an unsplit bucket lifts another input set).
+    "TPU_DCP_MERGE_CHUNKED_SMALL": env_int("TPU_DCP_MERGE_CHUNKED_SMALL", 0),
     # NOT bitwise (needs the accuracy gate): the chunked merge
     # (TPU_DCP_MERGE_CHUNKED) sends its LSE-weighted partial in bf16 instead
     # of f32, halving the bytes of the SparseCore-bound reduce-scatter chain.
