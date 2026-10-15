@@ -70,10 +70,10 @@ def _on_tpu():
         return False
 
 
-
-
 def _q(key, shape):
-    return jnp.clip(jax.random.normal(key, shape, jnp.float32) * 48, -448, 448).astype(F8)
+    return jnp.clip(jax.random.normal(key, shape, jnp.float32) * 48, -448, 448).astype(
+        F8
+    )
 
 
 class _Layer:
@@ -162,16 +162,22 @@ class _Layer:
         for b in range(NB):
             cols = slice(b * BLK, (b + 1) * BLK)
             g = jnp.einsum(
-                "nh,ehk->nek", xf, self.gate[b].astype(f32) * self.s13[:, None, 0, cols],
+                "nh,ehk->nek",
+                xf,
+                self.gate[b].astype(f32) * self.s13[:, None, 0, cols],
                 precision=hp,
             )
             u = jnp.einsum(
-                "nh,ehk->nek", xf, self.up[b].astype(f32) * self.s13[:, None, 1, cols],
+                "nh,ehk->nek",
+                xf,
+                self.up[b].astype(f32) * self.s13[:, None, 1, cols],
                 precision=hp,
             )
             act = jax.nn.silu(g) * u * coef[..., None]
             routed = routed + jnp.einsum(
-                "nek,ekh->nh", act, self.w2[b].astype(f32) * self.s2[:, None, :],
+                "nek,ekh->nh",
+                act,
+                self.w2[b].astype(f32) * self.s2[:, None, :],
                 precision=hp,
             )
         shared = jnp.zeros(xf.shape, f32)
@@ -310,7 +316,10 @@ def _run_all():
             rng = np.random.default_rng(0)
             idx = np.sort(
                 np.concatenate(
-                    [np.arange(64), rng.choice(np.arange(64, n_valid), REF_ROWS - 64, False)]
+                    [
+                        np.arange(64),
+                        rng.choice(np.arange(64, n_valid), REF_ROWS - 64, False),
+                    ]
                 )
             )
         want = layer.reference(x[idx], scores[idx])
@@ -321,7 +330,8 @@ def _run_all():
             "tp_vs_ref": _metrics(a, want),
             "ep_vs_ref": _metrics(b, want),
             "tp_vs_ep_all_rows": _metrics(
-                out_tp[0, :n_valid].astype(np.float64), out_ep[0, :n_valid].astype(np.float64)
+                out_tp[0, :n_valid].astype(np.float64),
+                out_ep[0, :n_valid].astype(np.float64),
             ),
             "ranks_identical": {"tp": same_tp, "ep": same_ep},
             # The decode kernel writes +0 past n_valid; the prefill kernel and

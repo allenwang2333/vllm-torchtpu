@@ -166,10 +166,7 @@ def _fault_body(*refs, eps, emit_y, q_max, fault):
     if fault == "scale_bf16":
         scale = scale.astype(jnp.bfloat16).astype(jnp.float32)
     s_ref[...] = scale
-    if fault == "recip_multiply":
-        q = yf * (1.0 / scale)
-    else:
-        q = yf / scale
+    q = yf * (1.0 / scale) if fault == "recip_multiply" else yf / scale
     q_ref[...] = jnp.clip(q, -q_max, q_max).astype(q_ref.dtype)
 
 
@@ -221,5 +218,7 @@ def test_tpu_fault_control():
             for c in CELLS
         ]
         print(f"FAULT {fault:17s} must={','.join(must)} | " + " ".join(row))
-    blind = [(f, c) for f, cells in FAULTS.items() for c in cells if not caught[(f, c)][0]]
+    blind = [
+        (f, c) for f, cells in FAULTS.items() for c in cells if not caught[(f, c)][0]
+    ]
     assert not blind, f"fault control blind on {blind}"

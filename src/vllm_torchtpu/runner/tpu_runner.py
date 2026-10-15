@@ -5132,9 +5132,7 @@ class TPUModelRunner(GPUModelRunner):
         # After the drafter, so its MTP layer is armed too. With
         # USE_MOE_TP_DECODE_KERNEL it runs after that arming instead (below):
         # moe_tp_decode's op carries the prefill kernel for the layers it arms.
-        fused_moe_arming = (
-            envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL
-        )
+        fused_moe_arming = envs.FUSED_MOE_DECODE_KERNEL or envs.FUSED_MOE_PREFILL_KERNEL
         if fused_moe_arming and not envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
@@ -5169,7 +5167,9 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
 
             n_pairs = arm_prequant(self.model)
-            logger.info("TPU_FUSED_ADD_RMSNORM_QUANT: %d norm -> fp8 linear pairs", n_pairs)
+            logger.info(
+                "TPU_FUSED_ADD_RMSNORM_QUANT: %d norm -> fp8 linear pairs", n_pairs
+            )
 
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:

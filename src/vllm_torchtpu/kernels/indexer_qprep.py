@@ -39,8 +39,8 @@ import dataclasses
 import functools
 
 import jax
-import ml_dtypes
 import jax.numpy as jnp
+import ml_dtypes  # pyrefly: ignore[missing-import]
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -112,10 +112,7 @@ def _bf16_xla(x):
 
 def rope_rows(x, rot, c, s, numerics: Numerics, rnd=_bf16):
     """``x * C + rot * S`` in f32 carrying the requested roundings."""
-    if numerics.rope_bf16:
-        y = rnd(rnd(x * c) + rnd(rot * s))
-    else:
-        y = x * c + rot * s
+    y = rnd(rnd(x * c) + rnd(rot * s)) if numerics.rope_bf16 else x * c + rot * s
     return rnd(y) if numerics.y_bf16 else y
 
 
@@ -312,8 +309,16 @@ def indexer_q_prep(
     return q8, scale
 
 
-def reference(q, c, s, *, n_head: int, rope_dim: int, numerics: Numerics = DEFAULT_NUMERICS,
-              quant_dtype=jnp.float8_e4m3fn):
+def reference(
+    q,
+    c,
+    s,
+    *,
+    n_head: int,
+    rope_dim: int,
+    numerics: Numerics = DEFAULT_NUMERICS,
+    quant_dtype=jnp.float8_e4m3fn,
+):
     """The same switches in plain XLA, on the ``[T, H, D]`` view (the torch
     path's layout)."""
     num_tokens = q.shape[0]

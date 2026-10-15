@@ -133,6 +133,7 @@ def _quant_kernel(*refs, eps: float, emit_y: bool, q_max: float):
         x_ref.dtype
     )
     if emit_y:
+        assert y_ref is not None
         y_ref[...] = y
     yf = y.astype(jnp.float32)
     amax = jnp.max(jnp.abs(yf), axis=-1, keepdims=True)
@@ -177,7 +178,9 @@ def fused_add_rms_norm_quant(
     )
 
 
-def _quant_call(x, residual, weight, *, eps, quant_dtype, emit_y, block_rows, interpret, body):
+def _quant_call(
+    x, residual, weight, *, eps, quant_dtype, emit_y, block_rows, interpret, body
+):
     """The wrapper; ``body`` is a kernel with ``_quant_kernel``'s signature
     (tests pass fault-injected bodies through the same grid and specs)."""
     rows, hidden = x.shape

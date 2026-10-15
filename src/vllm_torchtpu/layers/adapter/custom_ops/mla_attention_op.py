@@ -1227,9 +1227,7 @@ class VllmTPUIndexer(Indexer):
             c, s_ = rope_half_split_leading_cs(
                 rotary_emb, positions, q, self.head_dim, self.rope_dim
             )
-            q_fp8, q_scale = qprep_op(
-                q.reshape(-1, self.n_head * self.head_dim), c, s_
-            )
+            q_fp8, q_scale = qprep_op(q.reshape(-1, self.n_head * self.head_dim), c, s_)
             q_scale = q_scale.view(-1, self.n_head, 1)
             return self._finish_forward(
                 hidden_states, qr, q_fp8, q_scale, k, weights, q_b_layer

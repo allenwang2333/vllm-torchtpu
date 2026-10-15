@@ -2103,6 +2103,7 @@ def _attention_kernel(
         if send:
             # No lse output: keep the step's rows for the word build.
             if not wait:
+                assert fill_ref is not None
                 fill_ref[lax.div(seq_idx_start, batch_size)] = vmem_ref[...]
             return
         if not wait:
@@ -2191,12 +2192,17 @@ def _attention_kernel(
         words = pltpu.bitcast(out[:, :o_dim], jnp.int16)
         if not isinstance(batch_idx, int):
             for b in range(batch_size):
-                pl.when(batch_idx == b)(functools.partial(store_out, bo_sem_idx, b, out))
+                pl.when(batch_idx == b)(
+                    functools.partial(store_out, bo_sem_idx, b, out)
+                )
             return
         rows = pl.ds(batch_idx * send_per, send_per)
+        assert bo_x2_ref is not None
         for w in range(send_world):
             dest = (w + 1) % send_world if fault == "send_dest_rotate" else w
-            bo_x2_ref[bo_sem_idx, dest, rows, :] = words[w * send_per : (w + 1) * send_per]
+            bo_x2_ref[bo_sem_idx, dest, rows, :] = words[
+                w * send_per : (w + 1) * send_per
+            ]
 
     def build_send_lse_words():
         """Every destination's lse word row from `fill_ref`, as the int16
@@ -2253,9 +2259,12 @@ def _attention_kernel(
         r = lax.broadcasted_iota(jnp.int32, tile_shape, 1)
         tile = jnp.where(
             r == SEND_PAD_ROWS // 2 - 1,
-            jnp.broadcast_to(lax.shift_left(acc, jnp.int32(16))[:, None, :], tile_shape),
+            jnp.broadcast_to(
+                lax.shift_left(acc, jnp.int32(16))[:, None, :], tile_shape
+            ),
             0,
         )
+        assert send_wbuf is not None
         send_wbuf[...] = pltpu.bitcast(tile, jnp.int16)
 
     def send_words_copy():
@@ -2604,8 +2613,12 @@ def _attention_kernel(
                 q1 = load_bq(bi_sem_idx, t1)
                 s = jnp.concatenate(
                     [
-                        jnp.einsum("nd,md->nm", q0, kv0, preferred_element_type=jnp.float32),
-                        jnp.einsum("nd,md->nm", q1, kv1, preferred_element_type=jnp.float32),
+                        jnp.einsum(
+                            "nd,md->nm", q0, kv0, preferred_element_type=jnp.float32
+                        ),
+                        jnp.einsum(
+                            "nd,md->nm", q1, kv1, preferred_element_type=jnp.float32
+                        ),
                     ],
                     axis=0,
                 )
@@ -2622,6 +2635,7 @@ def _attention_kernel(
                 if prev is not None:
                     pair_finish(k - 1, *prev, levers)
                 prev = (par, p, l_sum, m)
+            assert prev is not None
             pair_finish(batch_size // 2 - 1, *prev, levers)
 
         def xqk_row_to_col(row):
@@ -2650,7 +2664,7 @@ def _attention_kernel(
 
         def xqk_step2(p, kv, l_sum, levers):
             if "pv512" in levers and split_q:
-                kv = kv[:, : o_dim]
+                kv = kv[:, :o_dim]
             pv = jnp.einsum("mn,md->nd", p, kv, preferred_element_type=jnp.float32)
             if k_scale != 1.0:
                 pv *= k_scale
@@ -3584,7 +3598,9 @@ def sparse_ragged_paged_attention(
     piece_outs: list[jax.Array] = []
     piece_lses: list[jax.Array] = []
 
-    def run_chunk(i, chunk_lse, q_in=None, **extra):
+    def run_chunk(i, chunk_lse, q_in=None, **extra) -> Any:
+        # Any: the checker cannot tell the return_lse / kv_write tuple shapes
+        # of sparse_attention_chunk apart.
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         return sparse_attention_chunk(
@@ -3668,6 +3684,7 @@ def sparse_ragged_paged_attention(
         pre = [run_chunk(i, None, gather_only=True) for i in range(num_chunks)]
     chunks_per_piece = max(1, piece_rows // gather_and_attention_chunk_size)
 
+    prev_out = None
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         out_piece = None
@@ -4038,9 +4055,7 @@ def sparse_attention_chunk(
                 pltpu.VMEM(
                     (q.shape[0] // batch_size, batch_size, send_lanes), jnp.float32
                 ),
-                pltpu.VMEM(
-                    (send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16
-                ),
+                pltpu.VMEM((send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16),
                 pltpu.SemaphoreType.DMA(()),
             ]
         elif lse_fill:
@@ -4291,7 +4306,9 @@ def sparse_attention_chunk(
                 # `window_indices` is then the fused prep's 128-lane form: hand it
                 # to the gather flat (a bitcast, no relayout); its live vector
                 # sits right after the chunk's rows.
-                live_kwargs = dict(live_vec_offset=chunk_size * topk, linear_indices=True)
+                live_kwargs = dict(
+                    live_vec_offset=chunk_size * topk, linear_indices=True
+                )
             elif group_tab is not None:
                 # Live-group prep: 128-lane linear rows, bound from the table.
                 assert window_indices is not None and group_num_live is not None
@@ -4300,19 +4317,22 @@ def sparse_attention_chunk(
                 live_tokens = batch_end - start_pos
                 token_windows = jnp.where(
                     jnp.arange(chunk_size) < live_tokens,
-                    (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
+                    (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1)
+                    // topk_cap,
                     1,
                 )
                 live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
-                num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
-                    0, live_tokens
-                ) * topk_cap
+                num_live_capped = (
+                    live_windows - 1
+                ) * chunk_size * topk_cap + jnp.maximum(0, live_tokens) * topk_cap
                 live_kwargs = dict(num_live_indices=num_live_capped)
                 if capped_live_rows:
                     # TPU_SPARSE_MLA_LIVE_GATHER (#1948): window w of a gridded
                     # token holds prefix-packed slots [w*cap, (w+1)*cap); gather
                     # only each (window, token) row's live 64-slot atoms.
-                    window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
+                    window_start = topk_cap * jnp.arange(
+                        capped_windows, dtype=jnp.int32
+                    )
                     live_slots = jnp.clip(
                         kv_lens[start_pos:end_pos][None, :] - window_start[:, None],
                         0,
@@ -4383,13 +4403,18 @@ def sparse_attention_chunk(
                 capped_windows * chunk_size, topk_cap, 128
             )
             gathered_rope_buffer = gathered_rope_buffer.reshape(
-                capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
+                capped_windows * chunk_size,
+                topk_cap // native_sc_gather.ROPE_PACKING,
+                128,
             )
             if group_tab is not None:
                 block = kernel_batch_size * GATHER_ATOM_ROWS
                 live_views = (
                     gathered_nope_buffer.reshape(
-                        chunk_size * topk // block, kernel_batch_size, GATHER_ATOM_ROWS, 128
+                        chunk_size * topk // block,
+                        kernel_batch_size,
+                        GATHER_ATOM_ROWS,
+                        128,
                     ),
                     gathered_rope_buffer.reshape(
                         chunk_size * topk // block,

@@ -103,7 +103,10 @@ def _check(rank, cp_mla, path):
                 c = {
                     "tokens": tokens,
                     "elements": int(res["off"].numel()),
-                    "chunked": bool(cp_mla._merge_chunks(int(z[f"s{step}_off_out"].shape[0]) // dcp) > 1),
+                    "chunked": bool(
+                        cp_mla._merge_chunks(int(z[f"s{step}_off_out"].shape[0]) // dcp)
+                        > 1
+                    ),
                 }
                 for name in ("t3", "mp", "on", "ctl"):
                     u = t4m._ulp(res[name], res["off"])
@@ -113,9 +116,9 @@ def _check(rank, cp_mla, path):
                 c["on_vs_t3_ndiff"] = int((u > 0).sum())
                 c["on_vs_t3_maxulp"] = int(u.max()) if u.numel() else 0
                 for name in ("off", "t3", "on", "ctl"):
-                    c[f"{name}_scale"] = t3m._scale_err(res[name], outs, lses, rank, dcp)[
-                        "max_ulp"
-                    ]
+                    c[f"{name}_scale"] = t3m._scale_err(
+                        res[name], outs, lses, rank, dcp
+                    )["max_ulp"]
                 report[key] = c
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()

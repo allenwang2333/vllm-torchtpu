@@ -24,7 +24,6 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -121,7 +120,13 @@ def _kernel_jax(q, pos, rope, numerics, variant="f32"):
     c, s = M.rope_half_split_leading_cs(rope, pos, q, D, R)
     to_j = lambda t: jnp.asarray(t.cpu().float().numpy()).astype(jnp.bfloat16)  # noqa: E731
     q8, sc = K.indexer_q_prep(
-        to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, numerics=numerics, variant=variant
+        to_j(q),
+        to_j(c),
+        to_j(s),
+        n_head=H,
+        rope_dim=R,
+        numerics=numerics,
+        variant=variant,
     )
     q8 = torch.from_numpy(np.asarray(q8.view(jnp.uint8))).view(FP8)
     sc = torch.from_numpy(np.asarray(sc)).view(-1, H, 1)
@@ -136,9 +141,15 @@ def test_numerics_grid(vllm_config_context):
     print("NUMERICS eager-vs-compiled", _mismatch(eager[:2], ref[:2]))
     exact = []
     for rb, yb, sm, ib, pb in itertools.product(
-        (False, True), (False, True), ("b16r16", "b16r32", "f32"), (False, True), (False, True)
+        (False, True),
+        (False, True),
+        ("b16r16", "b16r32", "f32"),
+        (False, True),
+        (False, True),
     ):
-        nm = K.Numerics(rope_bf16=rb, y_bf16=yb, scale_mode=sm, inv_bf16=ib, prod_bf16=pb)
+        nm = K.Numerics(
+            rope_bf16=rb, y_bf16=yb, scale_mode=sm, inv_bf16=ib, prod_bf16=pb
+        )
         got = _kernel_jax(q, pos, rope, nm)
         mm = _mismatch(got, ref[:2])
         mme = _mismatch(got, eager[:2])
@@ -149,7 +160,9 @@ def test_numerics_grid(vllm_config_context):
     assert K.DEFAULT_NUMERICS.tag in exact
 
 
-CASES = [(t, k) for t in (4, 8, 16, 64, 1024, 2048, 4096) for k in ("normal", "special")]
+CASES = [
+    (t, k) for t in (4, 8, 16, 64, 1024, 2048, 4096) for k in ("normal", "special")
+]
 
 
 @pytest.mark.parametrize("compiled", [True, False])
@@ -189,7 +202,9 @@ def test_variants_bit_exact(vllm_config_context, variant, t):
     ref = _compiled(unfused)(q, pos, w, rope)
     c, s = M.rope_half_split_leading_cs(rope, pos, q, D, R)
     to_j = lambda x: jnp.asarray(x.cpu().float().numpy()).astype(jnp.bfloat16)  # noqa: E731
-    q8, sc = K.indexer_q_prep(to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, variant=variant)
+    q8, sc = K.indexer_q_prep(
+        to_j(q), to_j(c), to_j(s), n_head=H, rope_dim=R, variant=variant
+    )
     q8 = torch.from_numpy(np.asarray(q8.view(jnp.uint8))).view(FP8)
     sc = torch.from_numpy(np.asarray(sc)).view(-1, H, 1)
     mm = _mismatch((q8, sc), ref[:2])
@@ -224,12 +239,17 @@ def _topk(q8, wts, seed=0):
 def test_topk_identical(vllm_config_context):
     rope = _Rope()
     q, pos, w = _inputs(256, 11)
-    pos = (torch.arange(256, dtype=torch.int32) + 2048 - 256).to("tpu")  # last 256 of 2048
+    pos = (torch.arange(256, dtype=torch.int32) + 2048 - 256).to(
+        "tpu"
+    )  # last 256 of 2048
     ref = _compiled(unfused)(q, pos, w, rope)
     got = _compiled(fused)(q, pos, w, rope)
     a, b = _topk(ref[0], ref[2]), _topk(got[0], got[2])
     n = int((a != b).sum())
-    print(f"TOPK identical: mismatching index entries {n} of {a.size}; valid={int((a >= 0).sum())}")
+    print(
+        f"TOPK identical: mismatching index entries {n} of {a.size}; "
+        f"valid={int((a >= 0).sum())}"
+    )
     assert n == 0
 
 
@@ -268,7 +288,9 @@ def dataclass_replace(x, **kw):
     return dataclasses.replace(x, **kw)
 
 
-@pytest.mark.parametrize("name", ["head_swap", "no_rope", "inv_f32", "scale_f32", "prod_f32", "rope_f32"])
+@pytest.mark.parametrize(
+    "name", ["head_swap", "no_rope", "inv_f32", "scale_f32", "prod_f32", "rope_f32"]
+)
 def test_fault_control(vllm_config_context, name):
     rope = _Rope()
     q, pos, w = _inputs(1024, 21, "special")

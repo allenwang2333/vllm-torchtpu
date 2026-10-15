@@ -228,9 +228,9 @@ def _merge_send_every_rank(sends, real, tokens):
     with (
         mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
         mock.patch.object(cp_mla, "get_dcp_group", lambda: local.group),
+        concurrent.futures.ThreadPoolExecutor(world) as pool,
     ):
-        with concurrent.futures.ThreadPoolExecutor(world) as pool:
-            return torch.cat(list(pool.map(run, range(world))), dim=1)
+        return torch.cat(list(pool.map(run, range(world))), dim=1)
 
 
 def _dcp_size():
@@ -242,9 +242,8 @@ def test_dcp_send_layout_bit_identical_and_merges():
     dcp = _dcp_size()
     if dcp < 2:
         pytest.skip("DCP needs at least 2 devices")
-    import torch
-
     import test_t4_combined_composition as comb  # noqa: PLC0415
+    import torch
 
     env = dict(prologue.PROD_ENV, **SEND_ENV)
     with mock.patch.dict(os.environ, env):
@@ -265,15 +264,20 @@ def test_dcp_send_layout_bit_identical_and_merges():
         sends = _rank_sends(b, dcp)
         for r in range(dcp):
             nw, no = _diffs(
-                sends[r].numpy(), outs[r].view(torch.int16).numpy(), lses[r].numpy(),
-                dcp, real,
+                sends[r].numpy(),
+                outs[r].view(torch.int16).numpy(),
+                lses[r].numpy(),
+                dcp,
+                real,
             )
             assert nw == 0 and no == 0, f"step {i} rank {r}: {nw} / {no}"
         want = comb._merge_every_rank(outs, lses, on=True, real=real)
         one = _merge_send_every_rank(sends, real, tokens)
         diff = int((one.view(torch.int16) != want.view(torch.int16)).sum())
-        print(f"step {i} ({tokens} tokens, {real} real): sent rows identical on "
-              f"{dcp} ranks; merge diffs {diff} over {want.numel()} elements")
+        print(
+            f"step {i} ({tokens} tokens, {real} real): sent rows identical on "
+            f"{dcp} ranks; merge diffs {diff} over {want.numel()} elements"
+        )
         assert diff == 0, f"step {i}"
         assert torch.isfinite(one.float()).all()
         assert (one[:real] != 0).any()
@@ -314,9 +318,8 @@ def test_dcp_send_layout_positive_control_fails(fault):
     dcp = _dcp_size()
     if dcp < 2:
         pytest.skip("DCP needs at least 2 devices")
-    import torch
-
     import test_t4_combined_composition as comb  # noqa: PLC0415
+    import torch
 
     env = dict(prologue.PROD_ENV, **SEND_ENV)
     with mock.patch.dict(os.environ, env):
@@ -356,7 +359,9 @@ def test_sparse_mla_dcp_send_op_schema(rank):
     with (
         mock.patch.dict(os.environ, env),
         mock.patch.object(
-            attention, "dcp_rank_operand", return_value=torch.zeros(1, dtype=torch.int32)
+            attention,
+            "dcp_rank_operand",
+            return_value=torch.zeros(1, dtype=torch.int32),
         ),
     ):
         if not rank:
@@ -373,7 +378,9 @@ def test_sparse_mla_dcp_send_op_schema(rank):
     assert len(schema.returns) == 3, schema
 
 
-@pytest.mark.parametrize("world,tokens,per", [(16, 16, 4), (16, 32, 4), (8, 16, 8), (8, 32, 8)])
+@pytest.mark.parametrize(
+    "world,tokens,per", [(16, 16, 4), (16, 32, 4), (8, 16, 8), (8, 32, 8)]
+)
 def test_jax_merge_matches_torch_merge(world, tokens, per):
     """TPU_DCP_MLA_SEND_LAYOUT_MERGE's jnp merge == `_merge_received` compiled
     by torch on one device, bit for bit, at the mirror (W=16) and twin (W=8)
@@ -415,7 +422,9 @@ def test_jax_merge_matches_torch_merge(world, tokens, per):
         )
         want_j = np.asarray(f(o_bf, jnp.asarray(lse))).view(np.int16)
         diffs[name] = int((got_t != want_j).sum())
-    print(f"W={world} T={tokens} L={per}: jax vs torch merge diffs {diffs} / {got_t.size}")
+    print(
+        f"W={world} T={tokens} L={per}: jax vs torch merge diffs {diffs} / {got_t.size}"
+    )
     # Known not bitwise (TPU_DCP_MLA_SEND_LAYOUT_MERGE stays experimental):
     # report, and only bound the drift.
     assert diffs[cp_mla.MERGE_JAX_VARIANTS[0]] <= max(8, got_t.size // 10000), diffs

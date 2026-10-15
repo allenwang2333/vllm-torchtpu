@@ -107,9 +107,7 @@ class VllmMoERunner(MoERunner):
         if (
             moe_tp_decode_supported(self._quant_method)
             or getattr(self, "_fused_moe_decode_armed", False)
-        ) and not getattr(
-            self.moe_config, "skip_final_all_reduce", False
-        ):
+        ) and not getattr(self.moe_config, "skip_final_all_reduce", False):
             return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False

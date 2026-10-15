@@ -80,7 +80,6 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
         return op
 
 
-
 _quant_ops: dict[tuple[float, bool], object] = {}
 
 
@@ -181,8 +180,10 @@ def arm_prequant(model: torch.nn.Module) -> int:
         ln_post = getattr(layer, "post_attention_layernorm", None)
         attn = getattr(layer, "self_attn", None)
         mlp = getattr(layer, "mlp", None)
-        if ln_in is None or attn is None or getattr(
-            layer, "use_sequence_parallel_moe", False
+        if (
+            ln_in is None
+            or attn is None
+            or getattr(layer, "use_sequence_parallel_moe", False)
         ):
             continue
         wrappers = [
@@ -319,13 +320,10 @@ class TpuRMSNorm(RMSNorm):
             ):
                 return self._materialized_add_norm(x, residual)
             return super().forward(x, residual)
-        if (
-            self._prequant_slot is not None
-            and residual is not None
-            and x.dim() == 2
-        ):
+        if self._prequant_slot is not None and residual is not None and x.dim() == 2:
             # The same rows predicate as the plain Pallas path above: no new
             # token-count branch. The paired linear takes (y_q, scale).
+            assert self._op_quant is not None
             y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
             self._prequant_slot.value = (y_q, scale)
             return y, new_res

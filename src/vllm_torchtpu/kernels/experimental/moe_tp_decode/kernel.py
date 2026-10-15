@@ -603,8 +603,7 @@ def moe_tp_decode(
         # small_all_reduce_valid_rows passes n_valid and rank, instead of one
         # stacked int32[3] that XLA materializes with its own fusion per call.
         metas = tuple(
-            jnp.asarray(v, jnp.int32).reshape(1)
-            for v in (n_valid, rank, experts_start)
+            jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
         )
     else:
         metas = (

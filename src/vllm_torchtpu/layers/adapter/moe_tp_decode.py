@@ -535,7 +535,9 @@ def _get_op(mesh, statics: _OpStatics):
         rank: jax.Array,
         e0: jax.Array,
     ) -> jax.Array:
-        return run(x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0)
+        return run(
+            x, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, e0
+        )
 
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
