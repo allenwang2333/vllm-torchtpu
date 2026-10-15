@@ -18,6 +18,11 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
 
+The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
+`LIBTPU_INIT_ARGS`. The two DP8 Buildkite benchmarks run only on non-PR builds
+of `epic/dsv41` while cold startup takes about an hour. Remove their step-level
+`if` conditions to restore pre-merge coverage after startup improves.
+
 The harness has three scripts:
 
 - `run.py`: launch configuration, cold/reuse cache lifecycle and cleanup.
@@ -39,7 +44,8 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --out /path/to/dsv41-code-96k-c128.json
 ```
 
-The client verifies the frozen input SHA256:
+The launcher and client verify the frozen input SHA256 after normalizing only
+the tokenizer mount path to `/models/DeepSeek-V4.1-Flash`:
 `9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064`.
 The first eight deterministic code windows are used for this scenario. They
 have distinct prefixes, but come from adjacent windows of the same document;
@@ -135,7 +141,6 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py summarize \
 python scripts/dsv41_bench/server_steps/bench_cached_extend.py startup \
   /path/to/results/candidate-cold/server.log \
   --out /path/to/startup-phases.json
-python -m pytest tests/scripts/test_dsv41_cached_extend.py -q
 ```
 
 Preserve input provenance, source revisions and diffs, runtime package versions,
