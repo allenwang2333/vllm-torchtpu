@@ -1539,6 +1539,117 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         bad, _ = jax.block_until_ready(run(moved, mixed_fused_prep=True))
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
 
+    @parameterized.product(
+        (
+            {"query_tokens": 512, "seq_q": (4, 4, 504)},
+            {"query_tokens": 1024, "seq_q": (4, 4, 1016)},
+        ),
+        overlap=(True, False),
+        overflow=(False, True),
+    )
+    def test_mixed_union_gather_bit_identical(self, query_tokens, seq_q, overlap, overflow):
+        """TPU_DCP_MLA_MIXED_UNION_GATHER on the served mixed config (raw top-k,
+        fused prep, live gather, widths, V2 levers): every real row's output
+        and lse bit for bit, with heavy cross-token overlap (union hits) and
+        without (union rows past the cap -> units read from HBM), and with a
+        row past the cap window (that chunk takes the incumbent work)."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261015 + query_tokens + 2 * overlap + int(overflow))
+        problem, _, _, _, page_table, cu_q_lens, distribution = self._split_q_lse_case(
+            query_tokens, seq_q, rng
+        )
+        counts = np.clip(rng.normal(256, 40, size=query_tokens), 0, 448).astype(int)
+        counts[16:20] = 0
+        if overflow:
+            counts[300] = 700  # chunk 1 reaches past window 0
+        topk = np.asarray(problem["topk"]).copy()
+        if overlap:
+            # each token picks from a 600-entry pool of its sequence (served-like
+            # reuse across neighbouring tokens)
+            pool = topk[0, :600]
+            for t in range(query_tokens):
+                topk[t, :600] = rng.permutation(pool)
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), jnp.asarray(topk), -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+        levers = sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS
+
+        def run(topk_in, **kw):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                attention_kernel_batch_size=16,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=levers,
+                mixed_fused_prep=True,
+                **kw,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run(topk_raw))
+        for kw in (
+            {"mixed_union_gather": True},
+            {"mixed_union_gather": True, "mixed_union_gather_rope": True},
+            {"mixed_union_gather": True, "mixed_union_gather_pair": True},
+            {
+                "mixed_union_gather": True,
+                "mixed_union_gather_rope": True,
+                "mixed_union_gather_pair": True,
+            },
+        ):
+            out, lse = jax.block_until_ready(run(topk_raw, **kw))
+            np.testing.assert_array_equal(
+                bits(out)[:real_tokens], bits(ref)[:real_tokens], err_msg=str(kw)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(lse)[:real_tokens].view(np.uint32),
+                np.asarray(ref_lse)[:real_tokens].view(np.uint32),
+                err_msg=str(kw),
+            )
+            self.assertTrue(np.isfinite(np.asarray(out, np.float32)[:real_tokens]).all())
+        # Positive controls: a wrong union row on hits, a dropped last slot.
+        # ("no_fallback" leaves rows unwritten, which in-process buffer reuse
+        # can refill with the previous run's correct rows; its control runs
+        # first on fresh buffers in the kernel_work gather check instead.)
+        faults = ["kv_lo"] + (["map_off"] if overlap else [])
+        for fault in faults:
+            for pair in (False, True):
+                bad, _ = jax.block_until_ready(
+                    run(
+                        topk_raw,
+                        mixed_union_gather=True,
+                        mixed_union_gather_pair=pair,
+                        mixed_union_gather_fault=fault,
+                    )
+                )
+                self.assertFalse(
+                    np.array_equal(bits(bad)[:real_tokens], bits(ref)[:real_tokens]),
+                    (fault, pair),
+                )
+
     def _merge_pieces_run(self, query_tokens, seq_q):
         """The served mixed config (fused prep, live gather, widths, levers,
         in-kernel mask) at `query_tokens`; returns (run, counts, real)."""

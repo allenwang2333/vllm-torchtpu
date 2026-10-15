@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     TPU_MLA_DECODE_ROW_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = False
+    TPU_DCP_MLA_MIXED_UNION_GATHER: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
     JAX_PLATFORMS: str = ""
@@ -706,6 +707,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # alone.
     "TPU_DCP_MLA_MIXED_KERNEL_V2": env_bool(
         "TPU_DCP_MLA_MIXED_KERNEL_V2", default=False
+    ),
+    # DCP sparse MLA, mixed buckets on the live-group path
+    # (TPU_DCP_MLA_MIXED_LIVE): the SparseCore gather reads each half grid
+    # step's distinct cache rows from HBM once into SparseCore shared memory
+    # and writes every live slot from there (kernels/mla/sparse/
+    # native_sc_gather.py dsa_gather_native_sc_union). The rows on every live
+    # slot are the same; chunks with a token past the cap window gather as
+    # before.
+    # "1" = the measured default (native_sc_gather.UNION_GATHER_DEFAULT), or a
+    # comma list of "solo" | "pair" (one union per subcore / per grid step)
+    # and "rope" (rope rows from the union too). Empty / "0" = off.
+    "TPU_DCP_MLA_MIXED_UNION_GATHER": lambda: os.getenv(
+        "TPU_DCP_MLA_MIXED_UNION_GATHER", ""
     ),
     # DCP sparse MLA, mixed / prefill buckets (> 32 tokens): the mixed-step
     # counterpart of TPU_DCP_MLA_MASK_IN_KERNEL. Drop the per-layer owns mask,
