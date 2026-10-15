@@ -465,7 +465,7 @@ class VllmDeepseekV4MLAAttention(
             isinstance(linear.quant_method, VllmFp8LinearMethodTPU)
             and linear.tp_size == 1
             and linear.weight.dtype == torch.float8_e4m3fn
-            and linear.weight_scale.ndim == 1
+            and cast(torch.Tensor, linear.weight_scale).ndim == 1
             and linear.bias is None
             and not getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
         )
@@ -896,6 +896,7 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        *,
         quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass for DeepSeek-V4 attention layer."""

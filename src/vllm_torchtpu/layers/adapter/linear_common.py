@@ -415,4 +415,5 @@ def get_prequantized_bf16_matmul_op() -> Callable:
 
         op.register_fake(fake)
         _prequantized_bf16_matmul_op = op
+    assert _prequantized_bf16_matmul_op is not None
     return _prequantized_bf16_matmul_op

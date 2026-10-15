@@ -19,7 +19,7 @@ pre as a single kernel.
 """
 
 import functools
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -389,7 +389,7 @@ def _mhc_broadcast_pre_norm_quant_op(constants: norm_quant_kernel.GateConstants)
             name,
             functools.partial(_mhc_broadcast_pre_norm_quant_jax, constants=constants),
             mesh=get_pallas_op_mesh(),
-            input_partition_specs=(P(),) * 5,
+            input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(),) * 5),
         )
         op.register_fake(_fake_broadcast_pre_norm_quant)
         _mhc_op_cache[name] = op
@@ -455,7 +455,9 @@ def _mhc_norm_quant_op(constants: norm_quant_kernel.GateConstants, *, fused: boo
                 constants=constants,
             ),
             mesh=mesh,
-            input_partition_specs=(P(),) * (8 if fused else 5),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * (8 if fused else 5)
+            ),
         )
         op.register_fake(_fake_fused_norm_quant if fused else _fake_pre_norm_quant)
         _mhc_op_cache[name] = op
@@ -502,7 +504,7 @@ def _mhc_fused_norm_op(constants: norm_quant_kernel.GateConstants):
             name,
             functools.partial(_mhc_fused_norm_jax, constants=constants),
             mesh=get_pallas_op_mesh(),
-            input_partition_specs=(P(),) * 8,
+            input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(),) * 8),
         )
         op.register_fake(_fake_fused_norm)
         _mhc_op_cache[name] = op
