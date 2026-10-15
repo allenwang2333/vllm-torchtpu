@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     )
     TPU_TOKEN_MICROBATCHES: int = 1
     TPU_MICROBATCH_MIN_TOKENS: int = 1024
+    TPU_DCP_RS_BF16: bool = False
 
 
 def env_with_choices(
@@ -1244,6 +1245,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_TOKEN_MICROBATCHES": env_int("TPU_TOKEN_MICROBATCHES", 1),
     "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
+    "TPU_DCP_RS_BF16": env_bool("TPU_DCP_RS_BF16", False),
 }
 
 
