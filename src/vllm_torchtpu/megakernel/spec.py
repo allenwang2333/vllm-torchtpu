@@ -97,6 +97,7 @@ class Tiles:
     kv_blk: int = 2048  # KV tokens per block
     nkv: int = 3  # KV ring depth
     vmem_mib: int = 62  # VMEM limit in MiB
+    smem_mib: int = 1  # SMEM limit in MiB
     bounds_checks: bool = False
     lazy: bool = True  # Refill attention/MoE dense slots after their streams
     pipe: bool = True  # Software-pipeline single-tile experts
@@ -173,6 +174,10 @@ class ExecSpec:
     R: int = 8  # Tensor-parallel / expert-parallel ranks
     ctx: int = 2048  # Max KV sequence length
     stack_e: bool = False  # True: 4D stacked expert weights; False: per-layer 3D
+    paged_kv: bool = False  # True: stream KV from paged FP8 pools via page_table
+    page_size: int = 128  # Tokens per KV page
+    num_pages: int = 4096  # Total pages per attention pool per rank
+    max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     tiles: Tiles | None = None  # None -> default_tiles(B)
     debug: DebugOptions = DebugOptions()
@@ -180,6 +185,14 @@ class ExecSpec:
     @property
     def resolved_tiles(self) -> Tiles:
         return self.tiles if self.tiles is not None else default_tiles(self.B)
+
+    @property
+    def resolved_max_pages_per_seq(self) -> int:
+        return (
+            self.max_pages_per_seq
+            if self.max_pages_per_seq > 0
+            else max(1, self.ctx // self.page_size)
+        )
 
     @property
     def NS(self) -> int:

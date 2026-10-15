@@ -338,9 +338,17 @@ def build(
     )
     aliases: dict[int, int] = {}
     if tiles.inplace:
-        for k, st in p.state_decls.items():
+        assert ex.R == 1, (
+            "tiles.inplace cannot alias rw states inside a communicating "
+            "R > 1 pallas_call"
+        )
+        s_leaf_offset = 0
+        for k in st_names:
+            st = p.state_decls[k]
+            n_s_leaves = len(ssh[k]) if st.tupled else 1
             if st.access == "rw" and k in o_names:
-                aliases[2 + n_w_leaves + st_names.index(k)] = o_names.index(k)
+                aliases[2 + n_w_leaves + s_leaf_offset] = o_names.index(k)
+            s_leaf_offset += n_s_leaves
 
     call = pl.pallas_call(
         kernel,
@@ -371,6 +379,11 @@ def build(
         "vmem_scratch_bytes": core_plan.vmem_bytes,
         "vmem_shapes": {
             k: (sh, jnp.dtype(dt).name) for k, (sh, dt) in core_plan.vmem_shapes.items()
+        },
+        "smem_scratch_bytes": core_plan.smem_bytes,
+        "smem_shapes": {
+            k: (sh, jnp.dtype(dt).name)
+            for k, (sh, dt) in (core_plan.smem_shapes or {}).items()
         },
         "s_names": s_names,
         "wshape": wsh,
@@ -412,25 +425,68 @@ def make_step(
             else weights[k][0]
             for k in w_names
         ]
-        s = [states[k] for k in st_names]
+        s = [
+            tuple(
+                x.squeeze(0) if x.ndim == len(p.state_decls[k].shape) + 1 else x
+                for x in states[k]
+            )
+            if isinstance(states[k], tuple)
+            else (
+                states[k].squeeze(0)
+                if (
+                    p.state_decls[k].memory_space == "smem"
+                    and states[k].ndim == len(p.state_decls[k].shape) + 1
+                )
+                else states[k]
+            )
+            for k in st_names
+        ]
         out_vals = call(pos, hidden, *w, *s, *extra)
         if not isinstance(out_vals, (tuple, list)):
             out_vals = (out_vals,)
         hid = out_vals[0]
         raw_outs = dict(zip(o_names[1:], out_vals[1:]))
-        new_states = dict(states)
+        new_states = {k: v for k, v in states.items() if _is_mutable_state(k)}
         for b in blocks:
             new_states.update(b.host_update_states(g, ex, pos, new_states, raw_outs))
         return hid, new_states
 
-    def _raw_step(pos, hidden, weights, states, *extra):
+    def _is_mutable_state(k: str) -> bool:
+        return k not in p.state_decls or (
+            not p.state_decls[k].tupled and p.state_decls[k].memory_space == "hbm"
+        )
+
+    def _state_pspec(k: str, val: Any):
+        if isinstance(val, tuple):
+            return tuple(P("tp") for _ in val)
+        if k in p.state_decls and p.state_decls[k].memory_space == "smem":
+            exp_sh = p.state_decls[k].shape
+            if val.shape == exp_sh or val.shape == (1, *exp_sh):
+                return P()
+            if ex.R > 1 and (
+                val.shape == (ex.R, *exp_sh)
+                or (
+                    val.ndim == len(exp_sh)
+                    and val.shape[0] == ex.R * exp_sh[0]
+                    and val.shape[1:] == exp_sh[1:]
+                )
+            ):
+                return P("tp")
+            raise ValueError(
+                f"SMEM state {k!r} has shape {val.shape}, expected {exp_sh} "
+                f"or ({ex.R * exp_sh[0]}, *{exp_sh[1:]})"
+            )
+        return P("tp")
+
+    def _raw_step(pos, hidden, weights, mut_states, ro_states, *extra):
+        states = {**mut_states, **ro_states}
         ws = {
             k: tuple(P("tp") for _ in weights[k])
             if isinstance(weights[k], tuple)
             else P("tp")
             for k in weights
         }
-        ss = {k: P("tp") for k in states}
+        ss = {k: _state_pspec(k, states[k]) for k in states}
         in_specs = (
             (P(), P("tp"), ws, ss)
             + ((P("tp"),) if ex.forced_routing else ())
@@ -445,5 +501,22 @@ def make_step(
         )(pos, hidden, weights, states, *extra)
 
     donate_argnums = (3,) if donate_states else ()
-    step = jax.jit(_raw_step, donate_argnums=donate_argnums)
-    return step, info
+    _jitted_step = jax.jit(_raw_step, donate_argnums=donate_argnums)
+
+    def _split_states(
+        states: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        mut = {k: v for k, v in states.items() if _is_mutable_state(k)}
+        ro = {k: v for k, v in states.items() if not _is_mutable_state(k)}
+        return mut, ro
+
+    class _StepFn:
+        def __call__(self, pos, hidden, weights, states, *extra):
+            mut, ro = _split_states(states)
+            return _jitted_step(pos, hidden, weights, mut, ro, *extra)
+
+        def lower(self, pos, hidden, weights, states, *extra):
+            mut, ro = _split_states(states)
+            return _jitted_step.lower(pos, hidden, weights, mut, ro, *extra)
+
+    return _StepFn(), info

@@ -42,6 +42,10 @@ from .kernel import (
     make_step,
     unfold,
 )
+from .models.qwen35_pool import (
+    kv_to_raw_page,
+    raw_page_to_kv,
+)
 from .spec import (
     Block,
     DebugOptions,
@@ -88,11 +92,13 @@ __all__ = [
     "default_tiles",
     "fold",
     "kernel",
+    "kv_to_raw_page",
     "make_step",
     "models",
     "ops",
     "planner",
     "pool_alias",
+    "raw_page_to_kv",
     "spec",
     "stream",
     "unfold",

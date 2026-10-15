@@ -434,7 +434,7 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
         split=True,
         gdn_rows=gdn_rows,
         gdn_bufs=2,
-        inplace=not T > 1,
+        inplace=R == 1 and not T > 1,
     )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
@@ -521,7 +521,7 @@ def test_m2_qwen35_hybrid_r8_multi_rank_interpret(T: int):
         split=True,
         hier=1,
         mb8=2,
-        inplace=not T > 1,
+        inplace=False,
     )
     ex = ExecSpec(B=2 * T, T=T, R=8, ctx=256, tiles=tiles, interpret=True)
 

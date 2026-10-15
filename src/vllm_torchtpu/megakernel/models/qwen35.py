@@ -141,6 +141,18 @@ class Qwen35Geometry:
         assert self.e_slots == 0 or self.e_slots >= (
             self.E if self.moe_tp else self.ER(R)
         )
+        if ex.paged_kv:
+            assert (
+                ex.page_size == 128
+                and ex.ctx % ex.page_size == 0
+                and ex.num_pages >= 1
+                and ex.resolved_max_pages_per_seq >= ex.ctx // ex.page_size
+            ), (
+                ex.page_size,
+                ex.ctx,
+                ex.num_pages,
+                ex.resolved_max_pages_per_seq,
+            )
         for n in (
             self.H,
             self.HD,
@@ -154,6 +166,10 @@ class Qwen35Geometry:
             assert lay.vh <= 64, lay.vh
             for n in (lay.KD, lay.VD, lay.QKV, lay.Z):
                 assert n % 128 == 0, n
+
+    def to_model_spec(self) -> ModelSpec:
+        """Convert this geometry into its declarative `ModelSpec`."""
+        return qwen35_spec(self)
 
 
 # Alias for callers using MKConfig name
@@ -345,10 +361,12 @@ def pack_inputs(
     hid_mk = jnp.tile(hid_pad[None, :, :], (R, 1, 1)).reshape(R * M, g.H)
 
     def tile_w(arr: jax.Array, kind: str) -> jax.Array:
-        *lead, K_, N_ = arr.shape
+        *lead, k_in, n_in = arr.shape
         nt_, tk_ = p.nt[kind], p.tk[kind]
-        assert nt_ * tk_ == K_, (kind, K_, nt_, tk_)
-        return arr.reshape((*lead, nt_, tk_, N_))
+        exp_n = p.kinds[kind][1]
+        assert nt_ * tk_ == k_in, (kind, k_in, nt_, tk_)
+        assert n_in == exp_n, (kind, n_in, exp_n)
+        return arr.reshape((*lead, nt_, tk_, n_in))
 
     # Pack smalls [R, L, 1, S]
     lay = p.smalls_layout
@@ -362,6 +380,7 @@ def pack_inputs(
         o, w = lay[name]
         if val.ndim == 2:
             val = jnp.broadcast_to(val[None, :, :], (R, L, val.shape[-1]))
+        assert val.shape[-1] <= w, (name, val.shape[-1], w)
         vw = min(w, val.shape[-1])
         sm = sm.at[:, :, 0, o : o + vw].set(val[:, :, :vw].astype(F32))
 
@@ -372,6 +391,7 @@ def pack_inputs(
         o, w = lay[name]
         if val_l.ndim == 1:
             val_l = jnp.broadcast_to(val_l[None, :], (R, val_l.shape[-1]))
+        assert val_l.shape[-1] <= w, (name, val_l.shape[-1], w)
         vw = min(w, val_l.shape[-1])
         sm = sm.at[:, lyr, 0, o : o + vw].set(val_l[:, :vw].astype(F32))
 
@@ -448,7 +468,7 @@ def pack_inputs(
     )
 
     states_mk: dict[str, Any] = {}
-    if ngdn > 0:
+    if ngdn > 0 and "conv" in logical_states and "rec" in logical_states:
         conv_l = logical_states["conv"]
         rec_l = logical_states["rec"]
         qkv = g.QKV(R)
@@ -470,8 +490,39 @@ def pack_inputs(
         states_mk["conv"] = kernel.fold(conv_p.astype(F32))
         states_mk["rec"] = kernel.fold(rec_p.astype(BF16))
 
-    states_mk["kc"] = kernel.fold(logical_states["kc"])
-    states_mk["vc"] = kernel.fold(logical_states["vc"])
+    if ex.paged_kv:
+        if "raw" not in logical_states or "page_table" not in logical_states:
+            raise ValueError(
+                "pack_inputs with ex.paged_kv=True requires 'raw' and "
+                "'page_table' in logical_states"
+            )
+        states_mk["raw"] = tuple(
+            kernel.fold(r) if r.ndim == 6 else r for r in logical_states["raw"]
+        )
+        pt_in = logical_states["page_table"]
+        max_pt = ex.resolved_max_pages_per_seq
+        if pt_in.ndim == 2:
+            if pt_in.shape[0] not in (NS, R * NS) or pt_in.shape[1] < max_pt:
+                raise ValueError(
+                    f"page_table has shape {pt_in.shape}, expected "
+                    f"({NS}, >={max_pt}) or ({R * NS}, >={max_pt})"
+                )
+            pt_in = pt_in[:, :max_pt]
+            states_mk["page_table"] = (
+                pt_in if pt_in.shape[0] == R * NS else jnp.tile(pt_in, (R, 1))
+            )
+        elif pt_in.ndim == 3:
+            if pt_in.shape[:2] != (R, NS) or pt_in.shape[2] < max_pt:
+                raise ValueError(
+                    f"page_table has shape {pt_in.shape}, expected "
+                    f"({R}, {NS}, >={max_pt})"
+                )
+            states_mk["page_table"] = kernel.fold(pt_in[:, :, :max_pt])
+        else:
+            raise ValueError(f"page_table must be 2D or 3D, got shape {pt_in.shape}")
+    elif "kc" in logical_states and "vc" in logical_states:
+        states_mk["kc"] = kernel.fold(logical_states["kc"])
+        states_mk["vc"] = kernel.fold(logical_states["vc"])
 
     if mesh is not None:
         rep = NamedSharding(mesh, P())
@@ -484,7 +535,12 @@ def pack_inputs(
             else jax.device_put(v, tp)
             for k, v in weights_mk.items()
         }
-        states_mk = {k: jax.device_put(v, tp) for k, v in states_mk.items()}
+        states_mk = {
+            k: tuple(jax.device_put(x, tp) for x in v)
+            if isinstance(v, tuple)
+            else jax.device_put(v, tp)
+            for k, v in states_mk.items()
+        }
 
     return pos, hid_mk, weights_mk, states_mk
 
@@ -508,6 +564,8 @@ def reference_step(
     hidden: jax.Array,
     logical_weights: dict[str, Any],
     logical_states: dict[str, Any],
+    *,
+    paged_kv: bool | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank reference oracle consuming logical model weights."""
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
@@ -517,9 +575,13 @@ def reference_step(
     kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     QKV, Z, BA, A_OFF = lay_gdn.QKV, lay_gdn.Z, lay_gdn.BA, lay_gdn.A_OFF
     CR, HR = rup(3 * B, 8), rup(3 + T, 8)
+    use_paged_kv = ex.paged_kv if paged_kv is None else bool(paged_kv)
 
     kc_all = logical_states["kc"]  # [R, NATT, NS, ctx, HD]
     vc_all = logical_states["vc"]  # [R, NATT, NS, ctx, HD]
+    if use_paged_kv:
+        kc_all = jnp.clip(kc_all.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
+        vc_all = jnp.clip(vc_all.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
     conv_in = logical_states.get("conv", jnp.zeros((R, ngdn, NS, 3, QKV), dtype=F32))
     rec_in = logical_states.get("rec", jnp.zeros((R, ngdn, NS, vh, KD, VD), dtype=BF16))
     if rec_in.ndim == 5:
@@ -587,6 +649,9 @@ def reference_step(
                     vb = y[b : b + 1, koff + HD : koff + 2 * HD]
                     qb = rnd(rope_partial(qb, cos, sin, g.ROT) * (HD**-0.5))
                     kb = rope_partial(kb, cos, sin, g.ROT)
+                    if use_paged_kv:
+                        kb = jnp.clip(kb, -448.0, 448.0).astype(FP8).astype(F32)
+                        vb = jnp.clip(vb, -448.0, 448.0).astype(FP8).astype(F32)
                     q_all.append(qb)
                     k_new_r.append(kb[0])
                     v_new_r.append(vb[0])

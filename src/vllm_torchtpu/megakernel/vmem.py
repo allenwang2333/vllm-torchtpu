@@ -122,6 +122,8 @@ class CorePlan:
     NY: int
     KX2: int
     NMIX: int
+    smem_bytes: int = 0
+    smem_shapes: dict[str, tuple[tuple[int, ...], Any]] | None = None
 
     def block(self, name: str) -> Any:
         return self.blocks[name]
@@ -300,13 +302,26 @@ def build_scratch(
 
     vmem_bytes = 0
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {}
+    smem_bytes = B * 4  # pos_ref [B] int32
+    smem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {"pos": ((B,), jnp.int32)}
+    if ex.row_mask:
+        smem_bytes += B * 4
+        smem_shapes["moe_rows"] = ((B,), jnp.int32)
+    for k, st in p.state_decls.items():
+        if st.memory_space == "smem":
+            l_cnt = max(1, p.block_layer_counts[p.state_owners[k]])
+            sh = (l_cnt, *st.shape) if st.per_layer else st.shape
+            smem_bytes += math.prod(sh) * jnp.dtype(st.dtype).itemsize
+            smem_shapes[k] = (tuple(sh), st.dtype)
     for k, v in scratch.items():
-        if (
-            hasattr(v, "shape")
-            and "VMEM" in str(getattr(v, "memory_space", "")).upper()
-        ):
-            vmem_bytes += math.prod(v.shape) * jnp.dtype(v.dtype).itemsize
-            vmem_shapes[k] = (tuple(v.shape), v.dtype)
+        if hasattr(v, "shape"):
+            ms_str = str(getattr(v, "memory_space", "")).upper()
+            if "VMEM" in ms_str:
+                vmem_bytes += math.prod(v.shape) * jnp.dtype(v.dtype).itemsize
+                vmem_shapes[k] = (tuple(v.shape), v.dtype)
+            elif "SMEM" in ms_str:
+                smem_bytes += math.prod(v.shape) * jnp.dtype(v.dtype).itemsize
+                smem_shapes[k] = (tuple(v.shape), v.dtype)
 
     vmem_limit_bytes = tiles.vmem_mib * 1024 * 1024
     if vmem_bytes > vmem_limit_bytes:
@@ -327,6 +342,15 @@ def build_scratch(
             f"exceeds tiles.vmem_mib budget "
             f"({tiles.vmem_mib} MiB = {vmem_limit_bytes:,} B). "
             f"Top buffers: {top_str}"
+        )
+
+    smem_limit_bytes = tiles.smem_mib * 1024 * 1024
+    if smem_bytes > smem_limit_bytes:
+        smem_kib = smem_bytes / 1024
+        raise ValueError(
+            f"SMEM allocation ({smem_kib:.2f} KiB = {smem_bytes:,} B) "
+            f"exceeds tiles.smem_mib budget "
+            f"({tiles.smem_mib} MiB = {smem_limit_bytes:,} B)."
         )
 
     sp = StreamParams(
@@ -386,5 +410,7 @@ def build_scratch(
         NY=NY,
         KX2=KX2,
         NMIX=NMIX,
+        smem_bytes=smem_bytes,
+        smem_shapes=smem_shapes,
     )
     return core_plan, scratch

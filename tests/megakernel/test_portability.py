@@ -76,11 +76,28 @@ def test_megakernel_portability_ast_guard():
             if isinstance(node, ast.Import):
                 level = 0
                 modules = [alias.name for alias in node.names]
+                imported_names: list[str] = []
             elif isinstance(node, ast.ImportFrom):
                 level = node.level
                 modules = [node.module] if node.module else []
+                imported_names = [alias.name for alias in node.names]
             else:
                 continue
+
+            # `__init__.py` is the public package facade and may re-export
+            # model helpers; all other core modules outside `models/` must not.
+            facade_allowlist = {"__init__.py"}
+            if rel not in facade_allowlist and not rel.startswith("models/"):
+                for mod in modules:
+                    assert mod != "models" and not mod.startswith("models."), (
+                        f"{rel}:{node.lineno} imports '{mod}'; core megakernel "
+                        "modules must be model-agnostic and never import models/."
+                    )
+                if not modules:
+                    assert "models" not in imported_names, (
+                        f"{rel}:{node.lineno} imports 'models'; core megakernel "
+                        "modules must be model-agnostic and never import models/."
+                    )
 
             for mod in modules:
                 root = mod.split(".")[0]
