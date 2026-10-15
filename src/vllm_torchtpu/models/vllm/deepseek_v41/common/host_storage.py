@@ -2,20 +2,20 @@
 """Node-local Engram storage without CUDA registration or accelerator views."""
 
 import os
-import tempfile
 from contextlib import ExitStack
 
 import torch
 import torch.distributed as dist
-from vllm.distributed.device_communicators.shm_broadcast import (
-    SHM_PATH,
-    check_shm_free_space,
-)
 from vllm.models.deepseek_v41.common.engram import DPSharedEngramStorage
+from vllm.utils.cpu_resource_utils import check_cgroup_memory_available
 
 
 class HostSharedEngramStorage(DPSharedEngramStorage):
-    """Reuse upstream packed FP8/scale views with a CPU-only shared mapping."""
+    """Share packed FP8/scale views among workers in one host PID namespace.
+
+    memfd is RAM backed and charged to the workers' memory cgroup, without
+    requiring a /dev/shm mount large enough for the full embedding tables.
+    """
 
     def _allocate(self, num_bytes: int) -> torch.Tensor:
         # Adapted from vLLM common/engram.py:DPSharedEngramStorage._allocate.
@@ -25,12 +25,12 @@ class HostSharedEngramStorage(DPSharedEngramStorage):
             path = error = None
             if group.rank_in_group == 0:
                 try:
-                    check_shm_free_space(num_bytes)
+                    check_cgroup_memory_available(num_bytes, "Engram shared table")
                     backing = stack.enter_context(
-                        tempfile.NamedTemporaryFile(prefix="vllm_engram_", dir=SHM_PATH)
+                        os.fdopen(os.memfd_create("vllm_engram", os.MFD_CLOEXEC), "w+b")
                     )
                     backing.truncate(num_bytes)
-                    path = backing.name
+                    path = f"/proc/{os.getpid()}/fd/{backing.fileno()}"
                 except (OSError, RuntimeError) as exc:
                     error = f"{type(exc).__name__}: {exc}"
             path, error = group.broadcast_object((path, error))
@@ -39,7 +39,7 @@ class HostSharedEngramStorage(DPSharedEngramStorage):
             tensor = None
             try:
                 # Reserve pages before loading to report ENOSPC instead of SIGBUS.
-                # Each rank faults its portion on its own host NUMA node.
+                # Allocation follows each rank's NUMA policy for its portion.
                 start = num_bytes * group.rank_in_group // group.world_size
                 end = num_bytes * (group.rank_in_group + 1) // group.world_size
                 with open(path, "r+b") as backing:
@@ -59,7 +59,7 @@ class HostSharedEngramStorage(DPSharedEngramStorage):
             if failures:
                 raise RuntimeError("Engram shared-memory mapping failed: " + failures)
             assert tensor is not None
-            # All ranks mapped the file before the leader unlinks its name.
+            # Every mapping retains the memfd after the leader closes its fd.
             return tensor
 
     def get_views(

@@ -3,7 +3,6 @@
 
 import errno
 from datetime import timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -24,7 +23,7 @@ def _broadcast(value):
     return values[0]
 
 
-def _worker(rank: int, rendezvous: str, directory: str, failure: bool) -> None:
+def _worker(rank: int, rendezvous: str, failure: bool) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -41,7 +40,6 @@ def _worker(rank: int, rendezvous: str, directory: str, failure: bool) -> None:
     )
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(host_storage, "SHM_PATH", directory)
             patch.setattr(engram.upstream, "get_engram_dp_group", lambda: group)
             patch.setattr(engram.upstream, "get_engram_dp_size", lambda: 2)
             patch.setattr(torch.accelerator, "current_device_index", lambda: 0)
@@ -84,8 +82,6 @@ def _worker(rank: int, rendezvous: str, directory: str, failure: bool) -> None:
                 assert isinstance(
                     embedding._shared_memory, host_storage.HostSharedEngramStorage
                 )
-                dist.barrier()
-                assert not list(Path(directory).glob("vllm_engram_*"))
                 start, count = embedding.load_row_slice
                 parts = [None, None]
                 dist.all_gather_object(parts, (start, count))
@@ -161,6 +157,6 @@ def _worker(rank: int, rendezvous: str, directory: str, failure: bool) -> None:
 def test_shared_host_table(tmp_path, failure):
     mp.spawn(
         _worker,
-        args=((tmp_path / "gloo").as_uri(), str(tmp_path), failure),
+        args=((tmp_path / "gloo").as_uri(), failure),
         nprocs=2,
     )
