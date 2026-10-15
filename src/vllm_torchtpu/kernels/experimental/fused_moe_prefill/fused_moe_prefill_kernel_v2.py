@@ -62,13 +62,14 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
 logger = init_logger(__name__)
 
 _COMBINE_CHUNK_TOKENS = 2048
-# What FUSED_MOE_PREFILL_KERNEL_V2 serves (t4-moe-prefill probe 03, v7x, GLM-5.2 TP16 per-rank shapes; device
-# time per call of the whole op against the default build, uniform / skewed routing): 4096 tokens -117 / -74 us,
-# 2048 -26 / -23, 1024 -7 / -6, 512 and 256 unchanged. down="xmxu" carries 2048 and below and 30-37 us of 4096;
-# tile_min=4096 the rest of 4096 (it lost 42 us under skewed routing only beside issue="inline"); flat 0.1-3.6 us.
-# Left at v1's values: issue="inline" (+7..+18 us: its predicated issue takes bundles for every block of every
-# tile). nb 3 and 4 measure within 3 us; 4 is what was measured with the rest.
-STAGE_A = dict(nb=4, down="xmxu", tile_min=4096, flat=True)
+# What FUSED_MOE_PREFILL_KERNEL_V2 serves (t4-moe-prefill probes 03-04, v7x, GLM-5.2 TP16 per-rank shapes;
+# device time per call of the whole op against the default build). 4096 tokens: -134 us uniform routing, -85
+# Zipf s 0.3, -78 s 0.6, -72 s 1.0, -65 top-heavy; 2048 -26 / -23; 1024 -7; 512 and 256 unchanged.
+# down="xmxu" carries 2048 and below and 32-52 us of 4096; tile_min=4096 on 32-row rungs (tall_rung_rows) the
+# rest of 4096 -- on v1's 64-row rungs the taller tile pads visit tails and lost 18 us under top-heavy routing;
+# flat 0.1-3.6 us. issue="inline" stays off (+7..+18 us: its predicated issue takes bundles for every block of
+# every tile); nb 3 and 4 measure within 3 us. Shapes the explicit-MXU body does not handle run v1's build.
+STAGE_A = dict(nb=4, down="xmxu", tile_min=4096, flat=True, tall_rung_rows=32)
 
 _NT = 256  # explicit-MXU N-tile width (MXU column size on v7x)
 
