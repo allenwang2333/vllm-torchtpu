@@ -1,0 +1,200 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Each engine occupies one 2x2x4 slice. The CPU client owns the verdict;
+# its success ends the JobSet and tears down both serving roles.
+# The FP8 index reports 2,496,066,252,544 weight bytes, so each copy needs 3Ti.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    tpu-ci.google.com/defaults: standard
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  network:
+    enableDNSHostnames: true
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+    - client
+  replicatedJobs:
+  - name: prefill
+    groupName: prefill
+    replicas: 1
+    template:
+      spec:
+        parallelism: 4
+        completions: 4
+        completionMode: Indexed
+        activeDeadlineSeconds: 21600
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-topology: 2x2x4
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            containers:
+            - name: workload
+              image: ${IMAGE}
+              command:
+              - /bin/bash
+              - /workspace/vllm-torchtpu/.buildkite/kubernetes/qwen38_mtp.sh
+              - prefill
+              env:
+              - name: ROLE_HOST_PREFIX
+                value: ${WORKLOAD_NAME}-prefill-0-
+              - name: ROLE_HOST_DOMAIN
+                value: ${WORKLOAD_NAME}
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: TPU_ACCELERATOR_TYPE
+                value: tpu7x
+              - name: VLLM_XLA_CACHE_PATH
+                value: /cache/jax/qwen38-mtp/xla
+              - name: VLLM_CACHE_ROOT
+                value: /cache/jax/qwen38-mtp/vllm
+              ports:
+              - containerPort: 8000
+              resources:
+                limits:
+                  google.com/tpu: '4'
+                requests:
+                  google.com/tpu: '4'
+              volumeMounts:
+              - name: vllm-profile-cache
+                mountPath: /cache/jax/qwen38-mtp/vllm/profile_cache
+              - name: checkpoint
+                mountPath: /ckpt
+            volumes:
+            - name: vllm-profile-cache
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+            - name: checkpoint
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    accessModes:
+                    - ReadWriteOnce
+                    storageClassName: premium-rwo
+                    resources:
+                      requests:
+                        storage: 3Ti
+  - name: decode
+    groupName: decode
+    replicas: 1
+    template:
+      spec:
+        parallelism: 4
+        completions: 4
+        completionMode: Indexed
+        activeDeadlineSeconds: 21600
+        backoffLimit: 0
+        template:
+          spec:
+            nodeSelector:
+              cloud.google.com/gke-tpu-topology: 2x2x4
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+            containers:
+            - name: workload
+              image: ${IMAGE}
+              command:
+              - /bin/bash
+              - /workspace/vllm-torchtpu/.buildkite/kubernetes/qwen38_mtp.sh
+              - decode
+              env:
+              - name: ROLE_HOST_PREFIX
+                value: ${WORKLOAD_NAME}-decode-0-
+              - name: ROLE_HOST_DOMAIN
+                value: ${WORKLOAD_NAME}
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    fieldPath: status.podIP
+              - name: TPU_ACCELERATOR_TYPE
+                value: tpu7x
+              - name: VLLM_XLA_CACHE_PATH
+                value: /cache/jax/qwen38-mtp/xla
+              - name: VLLM_CACHE_ROOT
+                value: /cache/jax/qwen38-mtp/vllm
+              ports:
+              - containerPort: 8000
+              resources:
+                limits:
+                  google.com/tpu: '4'
+                requests:
+                  google.com/tpu: '4'
+              volumeMounts:
+              - name: vllm-profile-cache
+                mountPath: /cache/jax/qwen38-mtp/vllm/profile_cache
+              - name: checkpoint
+                mountPath: /ckpt
+            volumes:
+            - name: vllm-profile-cache
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Gi
+            - name: checkpoint
+              ephemeral:
+                volumeClaimTemplate:
+                  spec:
+                    accessModes:
+                    - ReadWriteOnce
+                    storageClassName: premium-rwo
+                    resources:
+                      requests:
+                        storage: 3Ti
+  - name: client
+    dependsOn:
+    - name: prefill
+      status: Ready
+    - name: decode
+      status: Ready
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        activeDeadlineSeconds: 21600
+        completionMode: Indexed
+        backoffLimit: 0
+        template:
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/compute-class: worker-cpu
+            serviceAccountName: tpu-workload
+            containers:
+            - name: workload
+              image: ${IMAGE}
+              env:
+              - name: PREFILL_HOST
+                value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
+              - name: DECODE_HOST
+                value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+              - name: ARTIFACTS_DIR
+                value: perf_eval_results
+              - name: VLLM_PLUGINS
+                value: ''
+              - name: VLLM_TARGET_DEVICE
+                value: cpu
+              - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                value: '0'
+              - name: PYTHONUNBUFFERED
+                value: '1'
+              - name: HF_HUB_OFFLINE
+                value: '0'
+              command:
+              - /bin/bash
+              - /workspace/vllm-torchtpu/.buildkite/kubernetes/qwen38_mtp.sh
+              - client
+              resources:
+                requests:
+                  cpu: '6'
+                  memory: 16Gi
+                  ephemeral-storage: 20Gi
+                limits:
+                  cpu: '6'
+                  memory: 16Gi
+                  ephemeral-storage: 20Gi

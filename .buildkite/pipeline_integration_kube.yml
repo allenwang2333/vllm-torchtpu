@@ -278,3 +278,17 @@ steps:
       - *kube_plugin
     commands:
       - .buildkite/kubernetes/run_multihost.sh --manifest dsv4-pd-disagg.yaml
+
+  - label: ":kubernetes: Integration: Nightly Qwen3.8 PP MTP 1P1D"
+    key: "integration_nightly_qwen38_mtp_1p1d"
+    depends_on: "build_docker"
+    if: 'build.env("NIGHTLY") == "1"'
+    concurrency_group: "tpu/v7x-2x2x4"
+    concurrency: 1
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.8-mtp-1p1d.yaml
