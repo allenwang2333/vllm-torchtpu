@@ -26,6 +26,10 @@ from jax.experimental.pallas import tpu as pltpu
 # [tokens / QKV_TILE_ROWS, dim / lanes, QKV_TILE_ROWS, lanes] is a bitcast.
 QKV_TILE_ROWS = 8
 
+# Output rows one DMA clears when a launch zeroes the rows past the last
+# real token itself (`GDNConfig.zero_out_tail`).
+OUT_ZERO_ROWS = 16
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -130,6 +134,10 @@ class GDNConfig:
     # qkv arrives in the activation dtype as its HBM row tiles (see
     # QKV_TILE_ROWS) and is widened to the compact f32 layout in VMEM.
     qkv_row_tiled: bool = False
+    # This launch creates the output and zeroes its rows from
+    # `MetadataRef.out_zero_row` on; the rows before it are all computed by
+    # this launch or the PER_SEQ one that follows.
+    zero_out_tail: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -282,9 +290,19 @@ class GDNConfig:
                 (self.seq_tile_size, self.chunk_size, 1, self.dim_size), jnp.float32
             )
 
+        out_zero_scratch = out_zero_sem = None
+        if self.zero_out_tail:
+            out_zero_scratch = pltpu.VMEM(
+                (OUT_ZERO_ROWS, self.num_v_heads, self.v_head_dim),
+                self.dtypes.act_out,
+            )
+            out_zero_sem = pltpu.SemaphoreType.DMA
+
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             qkv_stage_scratch_ref=qkv_stage_scratch,
             qkv_scratch_ref=qkv_scratch,
+            out_zero_scratch_ref=out_zero_scratch,
+            out_zero_sem_ref=out_zero_sem,
         )

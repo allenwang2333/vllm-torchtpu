@@ -27,6 +27,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    out_zero_row: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -60,6 +61,7 @@ def compute_batched_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        out_zero_row=out_zero_row,
     )
 
 

@@ -90,6 +90,9 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # Scalar first output row that no launch computes; set only for a
+    # `GDNConfig.zero_out_tail` launch, which zeroes the rows from it on.
+    out_zero_row: Any = None
 
     @classmethod
     def create(
@@ -105,6 +108,7 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        out_zero_row: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -119,6 +123,7 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            out_zero_row=out_zero_row,
         )
 
     def __len__(self) -> int:
@@ -604,6 +609,27 @@ class ExternalStateBufferedRef(StateBufferedRef):
         # descriptor may nominally exceed it, see wait_in's NOTE).
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+def zero_rows_from(
+    out_ref: jax.Ref, zero_ref: jax.Ref, sem: jax.Ref, first_row: jax.Array
+) -> tuple[jax.Array, Any]:
+    """(count, copy(i)) of the DMAs that zero `out_ref` rows from `first_row`.
+
+    Each copy moves up to `zero_ref`'s rows of zeros; all of them signal
+    `sem`, so start every one before waiting on any.
+    """
+    num_rows = out_ref.shape[0]
+    chunk = zero_ref.shape[0]
+
+    def copy(i):
+        row = first_row + i * chunk
+        size = jnp.minimum(chunk, num_rows - row)
+        return pltpu.make_async_copy(
+            zero_ref.at[pl.ds(0, size)], out_ref.at[pl.ds(row, size)], sem
+        )
+
+    return pl.cdiv(num_rows - first_row, chunk), copy
 
 
 def create_allocs(

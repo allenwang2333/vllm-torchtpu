@@ -390,11 +390,29 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     qkv_stage_scratch_ref: jax.Array | None,
     qkv_scratch_ref: jax.Array | None,
+    out_zero_scratch_ref: jax.Array | None,
+    out_zero_sem_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
+
+    if cfg.zero_out_tail:
+        # Disjoint from every row the pipeline writes, so these overlap it.
+        out_zero_scratch_ref[...] = jnp.zeros(
+            out_zero_scratch_ref.shape, out_zero_scratch_ref.dtype
+        )
+        num_zero_copies, zero_copy = memory_ref.zero_rows_from(
+            out_ref,
+            out_zero_scratch_ref,
+            out_zero_sem_ref,
+            metadata_ref.out_zero_row[...],
+        )
+
+        @pl.loop(0, num_zero_copies)
+        def _(i):
+            zero_copy(i).start()
 
     if cfg.state_plan is not None:
         # Both state regions stream from the single external source ref,
@@ -462,6 +480,12 @@ def outer_kernel(
         )
 
     _run()
+
+    if cfg.zero_out_tail:
+
+        @pl.loop(0, num_zero_copies)
+        def _(i):
+            zero_copy(i).wait()
 
 
 @jax.jit(
@@ -777,6 +801,16 @@ def fused_conv1d_gdn(
             tile_size = decode_tile_size
             window_size = num_spec_tokens + 1
 
+        # With both launches, every row up to the last real token is
+        # computed by one of them, so the creating launch zeroes only the
+        # rest instead of the whole buffer being zero-filled first.
+        zero_out_tail = (
+            mode == config.GDNMode.BATCHED
+            and in_act is None
+            and zero_initialize_out
+            and not batched_only
+        )
+
         cfg = config.GDNConfig(
             mode=mode,
             batch_size=padded_batch_size,
@@ -784,6 +818,7 @@ def fused_conv1d_gdn(
             tile_size=tile_size,
             window_size=window_size,
             qkv_row_tiled=qkv_row_tiled,
+            zero_out_tail=zero_out_tail,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -814,6 +849,9 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
+                out_zero_row=(
+                    query_start_loc[distribution[-1]] if zero_out_tail else None
+                ),
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -839,7 +877,7 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out:
+        if in_act is None and zero_initialize_out and not zero_out_tail:
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
