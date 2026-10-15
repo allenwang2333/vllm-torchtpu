@@ -261,20 +261,147 @@ def test_patch_runai_pull_once_partial_then_full_pull_and_refresh(
     assert os.path.exists(os.path.join(tok_dir, "merges.txt"))
 
     # 2. Subsequent launch on the same host with model == tokenizer must pull
-    # the remaining tokenizer/template files (merges.txt, chat_template.jinja).
+    # the remaining tokenizer/template files (merges.txt, chat_template.jinja),
+    # even though the partial pull from step 1 is still within the reuse window
+    # (the completion marker is keyed on the pull arguments).
     model_dir_2, tok_dir_2 = simulate_upstream_pull(MODEL_URI, MODEL_URI)
     assert model_dir_2 == model_dir == tok_dir_2
     assert os.path.exists(os.path.join(model_dir, "merges.txt"))
     assert os.path.exists(os.path.join(model_dir, "chat_template.jinja"))
     assert not os.path.exists(os.path.join(model_dir, "model.safetensors"))
 
-    # 3. Bucket updates are picked up on subsequent pulls, and no temp dirs leak.
+    # 3. A later restart (markers older than the reuse window) picks up bucket
+    # updates, and no temp dirs leak.
     bucket[MODEL_URI + "/"]["config.json"] = '{"arch": "v2"}'
+    _age_pull_markers(model_dir, by_s=10_000)
     simulate_upstream_pull(MODEL_URI, MODEL_URI)
     with open(os.path.join(model_dir, "config.json")) as f:
         assert f.read() == '{"arch": "v2"}'
     leftover_tmp = [name for name in os.listdir(cache_root) if ".tmp." in name]
     assert leftover_tmp == []
+
+
+def _age_pull_markers(pulled_dir: str, by_s: float) -> None:
+    """Rewrite every completion marker in ``pulled_dir`` as if it were written
+    ``by_s`` seconds earlier (simulates a later server restart)."""
+    import time
+
+    from vllm_torchtpu import runai_pull_patches as rpp
+
+    for name in os.listdir(pulled_dir):
+        if name.startswith(rpp._MARKER_PREFIX):
+            with open(os.path.join(pulled_dir, name), "w") as f:
+                f.write(f"{time.time() - by_s:.3f}\n")
+
+
+def _install_counting_fake_osm(cache_root, monkeypatch, count_dir):
+    """Install a fake ObjectStorageModel whose pull_files records one file per
+    call in ``count_dir`` (works across fork()ed processes)."""
+    import sys
+    from types import ModuleType
+    from typing import Any
+
+    os.makedirs(count_dir, exist_ok=True)
+
+    class FakeObjectStorageModel:
+        def __init__(self, url: str):
+            self.dir = os.path.join(str(cache_root), url.rsplit("/", 1)[1])
+            os.makedirs(self.dir, exist_ok=True)
+
+        def pull_files(self, model_path="", allow_pattern=None, ignore_pattern=None):
+            tag = f"{os.getpid()}-{len(os.listdir(count_dir))}-{os.urandom(4).hex()}"
+            with open(os.path.join(count_dir, tag), "w") as f:
+                f.write(f"{model_path} {allow_pattern} {ignore_pattern}\n")
+            with open(os.path.join(self.dir, "config.json"), "w") as f:
+                f.write('{"arch": "v1"}')
+
+    fake_runai_utils: Any = ModuleType("vllm.transformers_utils.runai_utils")
+    fake_runai_utils.ObjectStorageModel = FakeObjectStorageModel
+    monkeypatch.setitem(
+        sys.modules, "vllm.transformers_utils.runai_utils", fake_runai_utils
+    )
+    return FakeObjectStorageModel
+
+
+def test_patch_runai_pull_once_siblings_share_one_pull(cache_root, monkeypatch):
+    """Within the reuse window, processes of one server start pull each
+    distinct (model_path, allow, ignore) once per host; a later restart
+    (expired marker) or TPU_RUNAI_PULL_REUSE_S=0 pulls again."""
+    from vllm_torchtpu import runai_pull_patches as rpp
+
+    count_dir = str(cache_root / "_pull_count")
+    FakeOSM = _install_counting_fake_osm(cache_root, monkeypatch, count_dir)
+    monkeypatch.delenv(rpp._REUSE_ENV, raising=False)
+    rpp.patch_runai_pull_once()
+
+    def pulls() -> int:
+        return len(os.listdir(count_dir))
+
+    allow = ["*.model", "*.py", "*.json"]
+    ignore = ["*.pt", "*.safetensors", "*.bin"]
+
+    # 9 "processes" (launcher + 8 API servers), each doing upstream's two pulls.
+    for _ in range(9):
+        osm = FakeOSM(MODEL_URI)
+        osm.pull_files(MODEL_URI, allow_pattern=allow)
+        osm.pull_files(MODEL_URI, ignore_pattern=ignore)
+    assert pulls() == 2  # one per distinct pull, not 18
+
+    # Pattern order does not create a new key.
+    FakeOSM(MODEL_URI).pull_files(MODEL_URI, allow_pattern=list(reversed(allow)))
+    assert pulls() == 2
+
+    # A different URI into a different dir is its own pull.
+    FakeOSM(TOK_URI).pull_files(TOK_URI, ignore_pattern=ignore)
+    assert pulls() == 3
+
+    # Expired markers (a later restart) re-pull.
+    _age_pull_markers(os.path.join(str(cache_root), "k3"), by_s=10_000)
+    FakeOSM(MODEL_URI).pull_files(MODEL_URI, allow_pattern=allow)
+    assert pulls() == 4
+
+    # Reuse disabled: every call pulls, and no marker is written.
+    monkeypatch.setenv(rpp._REUSE_ENV, "0")
+    before = pulls()
+    for _ in range(3):
+        FakeOSM(TOK_URI).pull_files(TOK_URI, allow_pattern=allow)
+    assert pulls() == before + 3
+
+    # The lock file lives in the assets cache, not in /tmp.
+    assert any(name.endswith(".lock") for name in os.listdir(cache_root))
+
+
+def test_patch_runai_pull_once_concurrent_processes_pull_once(
+    cache_root, monkeypatch
+):
+    """8 processes starting at the same moment (the API-server fan-out, or a
+    Kubernetes pod resume) must result in a single download per host."""
+    import multiprocessing
+
+    from vllm_torchtpu import runai_pull_patches as rpp
+
+    count_dir = str(cache_root / "_pull_count")
+    FakeOSM = _install_counting_fake_osm(cache_root, monkeypatch, count_dir)
+    monkeypatch.delenv(rpp._REUSE_ENV, raising=False)
+    rpp.patch_runai_pull_once()
+
+    ctx = multiprocessing.get_context("fork")
+    start = ctx.Barrier(8)
+
+    def worker() -> None:
+        start.wait()
+        FakeOSM(MODEL_URI).pull_files(MODEL_URI, allow_pattern=["*.json"])
+
+    procs = [ctx.Process(target=worker) for _ in range(8)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+
+    assert len(os.listdir(count_dir)) == 1
+    with open(os.path.join(str(cache_root), "k3", "config.json")) as f:
+        assert f.read() == '{"arch": "v1"}'
 
 
 def test_patch_runai_pull_once_multiprocess_no_torn_reads(cache_root, monkeypatch):
@@ -311,6 +438,9 @@ def test_patch_runai_pull_once_multiprocess_no_torn_reads(cache_root, monkeypatc
     monkeypatch.setitem(
         sys.modules, "vllm.transformers_utils.runai_utils", fake_runai_utils
     )
+    # Disable pull reuse so every writer really rewrites the file; this test
+    # is about readers never seeing a torn file, not about deduplication.
+    monkeypatch.setenv(rpp._REUSE_ENV, "0")
 
     rpp.patch_runai_pull_once()
 
