@@ -8,6 +8,7 @@ serving routing and candidate filtering remain outside this API.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +22,10 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import
     get_decode_request_tile,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_word_scores import DIM, ROW_WORDS, SLOTS
+
+# Key tiles buffered per request. A 1 MiB tile with one fetch in flight
+# streams ~0.6 TB/s from HBM on TPU7x; four buffers keep three in flight.
+DECODE_KEY_DEPTH = int(os.environ.get("TPU_DSV41_DECODE_KEY_DEPTH", "4"))
 
 
 def supports_decode(
@@ -73,6 +78,7 @@ def _request_kernel(
     prefetch,
     profile_stages,
     fuse_mask,
+    depth,
 ):
     request = pl.program_id(0)
     # Keep the scalar-prefetch address space flat: a 2D SMEM row subview
@@ -95,6 +101,7 @@ def _request_kernel(
         profile_stages=profile_stages,
         row_lengths=query_limits if fuse_mask else None,
         row_offset=request * q.shape[0],
+        depth=depth,
     )
 
 
@@ -108,6 +115,7 @@ def _request_kernel(
         "interpret",
         "score_window",
         "fuse_mask",
+        "depth",
     ),
 )
 def grouped_decode_scores(
@@ -124,6 +132,7 @@ def grouped_decode_scores(
     interpret: bool = False,
     score_window: int = 32768,
     fuse_mask: bool = False,
+    depth: int = DECODE_KEY_DEPTH,
 ) -> jax.Array:
     """Score split-order Q [requests, queries, heads, 128] against paged keys.
 
@@ -146,6 +155,7 @@ def grouped_decode_scores(
         or page_records % 16
         or key_tile % page_records
         or width % key_tile
+        or depth < 2
         or any(
             bank.dtype != jnp.int32
             or bank.shape[1] != ROW_WORDS
@@ -165,6 +175,7 @@ def grouped_decode_scores(
             prefetch=prefetch,
             profile_stages=profile_stages,
             fuse_mask=fuse_mask,
+            depth=depth,
         ),
         out_shape=jax.ShapeDtypeStruct((requests * queries, 1, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -177,9 +188,13 @@ def grouped_decode_scores(
             ),
             out_specs=pl.BlockSpec((queries, 1, window), lambda i, j, *_: (i, 0, j)),
             scratch_shapes=(
-                pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
+                pltpu.VMEM((depth, key_tile // SLOTS, ROW_WORDS), jnp.int32),
                 pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),
-                pltpu.SemaphoreType.DMA,
+                (
+                    pltpu.SemaphoreType.DMA((depth,))
+                    if depth > 2
+                    else pltpu.SemaphoreType.DMA
+                ),
             ),
         ),
         compiler_params=pltpu.CompilerParams(

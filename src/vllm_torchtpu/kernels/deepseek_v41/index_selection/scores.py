@@ -72,7 +72,13 @@ def _kernel(
     profile_stages,
     row_lengths=None,
     row_offset=0,
+    depth=2,
 ):
+    """``depth`` key tiles are buffered: ``depth - 1`` fetches stay in flight.
+
+    Depth 2 shares one DMA semaphore (one fetch in flight at every wait).
+    Deeper pipelines need ``words`` [depth, ...] and ``sem`` DMA[depth].
+    """
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
         rows, heads, _ = q_ref.shape
@@ -84,7 +90,10 @@ def _kernel(
         steps = pl.cdiv(jnp.clip(limit[0] - window_start, 0, out.shape[1]), tile)
         out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
 
-        def copy(address, count, dest):
+        def slot_sem(bank):
+            return sem.at[bank] if depth > 2 else sem
+
+        def copy(address, count, dest, sem):
             if isinstance(pool, tuple):
                 lo, hi = pool
 
@@ -134,13 +143,14 @@ def _kernel(
                         address,
                         page_rows,
                         words.at[bank, pl.ds(p * page_rows, page_rows), :],
+                        slot_sem(bank),
                     )
 
             if coalesce:
 
                 @pl.when(contiguous)
                 def contiguous_copy():
-                    copy(first, tile // SLOTS, words.at[bank])
+                    copy(first, tile // SLOTS, words.at[bank], slot_sem(bank))
 
                 @pl.when(~contiguous)
                 def scattered_copy():
@@ -149,26 +159,29 @@ def _kernel(
                 scattered()
 
         if prefetch:
+            for ahead in range(depth - 1):
 
-            @pl.when(steps > 0)
-            def first_fetch():
-                with scope("prefill_k_prologue_dma"):
-                    fetch(jnp.int32(0), jnp.int32(0))
+                @pl.when(ahead < steps)
+                def first_fetch():
+                    with scope("prefill_k_prologue_dma"):
+                        fetch(jnp.int32(ahead), jnp.int32(ahead))
 
         def body(block, _):
-            bank = block % 2
+            bank = block % depth
             if not prefetch:
                 with scope("prefill_k_serial_dma"):
                     fetch(block, bank)
             with scope("prefill_k_dma_wait"):
-                pltpu.make_async_copy(words.at[bank], words.at[bank], sem).wait()
+                pltpu.make_async_copy(
+                    words.at[bank], words.at[bank], slot_sem(bank)
+                ).wait()
 
             if prefetch:
-
-                @pl.when(block + 1 < steps)
+                # The slot of block - 1, whose compute has finished.
+                @pl.when(block + depth - 1 < steps)
                 def next_fetch():
                     with scope("prefill_k_prefetch_dma"):
-                        fetch(block + 1, 1 - bank)
+                        fetch(block + depth - 1, (block + depth - 1) % depth)
 
             # Keep the fused vector/MXU region in one scope: splitting dot and
             # reduction introduces materialization/spills in the Mosaic compiler.
