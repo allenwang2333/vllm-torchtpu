@@ -1489,6 +1489,12 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         for kw in (
             {"mixed_union_gather": True},
             {"mixed_union_gather": True, "mixed_union_gather_rope": True},
+            {"mixed_union_gather": True, "mixed_union_gather_pair": True},
+            {
+                "mixed_union_gather": True,
+                "mixed_union_gather_rope": True,
+                "mixed_union_gather_pair": True,
+            },
         ):
             out, lse = jax.block_until_ready(run(topk_raw, **kw))
             np.testing.assert_array_equal(
@@ -1506,12 +1512,19 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         # first on fresh buffers in the kernel_work gather check instead.)
         faults = ["kv_lo"] + (["map_off"] if overlap else [])
         for fault in faults:
-            bad, _ = jax.block_until_ready(
-                run(topk_raw, mixed_union_gather=True, mixed_union_gather_fault=fault)
-            )
-            self.assertFalse(
-                np.array_equal(bits(bad)[:real_tokens], bits(ref)[:real_tokens]), fault
-            )
+            for pair in (False, True):
+                bad, _ = jax.block_until_ready(
+                    run(
+                        topk_raw,
+                        mixed_union_gather=True,
+                        mixed_union_gather_pair=pair,
+                        mixed_union_gather_fault=fault,
+                    )
+                )
+                self.assertFalse(
+                    np.array_equal(bits(bad)[:real_tokens], bits(ref)[:real_tokens]),
+                    (fault, pair),
+                )
 
     def _merge_pieces_run(self, query_tokens, seq_q):
         """The served mixed config (fused prep, live gather, widths, levers,
