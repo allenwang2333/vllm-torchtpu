@@ -137,6 +137,9 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MLA_ROPE_NEOX_PERMUTE: bool = False
     TPU_INDEXER_ROPE_NEOX_PERMUTE: bool = False
+    TPU_INDEXER_QPREP_FUSED: bool = False
+    TPU_INDEXER_QPREP_FUSED_MIN_TOKENS: int = 128
+    TPU_INDEXER_K_WRITE_COMPACT: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -1161,6 +1164,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INDEXER_ROPE_NEOX_PERMUTE": env_bool(
         "TPU_INDEXER_ROPE_NEOX_PERMUTE", default=False
     ),
+    # Indexer q prep (rope + per-(token, head) amax + fp8 cast) as one Pallas
+    # pass over the wq_b output, written in the top-k op's [T, H, D] layout
+    # (kernels/indexer_qprep.py). Needs TPU_INDEXER_ROPE_NEOX_PERMUTE.
+    # Bit-identical to the unfused path.
+    "TPU_INDEXER_QPREP_FUSED": env_bool("TPU_INDEXER_QPREP_FUSED"),
+    # Token counts below this keep the same expression in plain XLA (decided on
+    # the static JAX shape inside the op): at decode buckets the kernel's fixed
+    # cost exceeds the whole XLA chain (twin j-58e2f29b: +0.2 ms per decode step).
+    "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS": env_int(
+        "TPU_INDEXER_QPREP_FUSED_MIN_TOKENS", 128
+    ),
+    # DCP indexer K write: compact this rank's owned rows (about T / dcp) to the
+    # front before the Pallas writer, so its scalar walk skips the other
+    # ranks' rows. Same rows written, same order.
+    "TPU_INDEXER_K_WRITE_COMPACT": env_bool("TPU_INDEXER_K_WRITE_COMPACT"),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
