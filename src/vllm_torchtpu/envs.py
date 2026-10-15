@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = False
     FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
@@ -246,6 +247,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
+    TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_SAMPLER_VOCAB_PARALLEL: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
@@ -967,6 +969,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
         "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
     ),
+    # With FUSED_MOE_PREFILL_KERNEL: run the stage-A build of the prefill kernel
+    # (kernels/experimental/fused_moe_prefill/fused_moe_prefill_kernel_v2.py,
+    # STAGE_A): both matmuls on the explicit MXU with the down epilogue per
+    # 256-column N-tile (no spilled f32 accumulator), 256-row tiles on 32-row
+    # rungs from 4096 tokens, combine descriptors from a carried flat pointer.
+    # Same numerics as the default build, bit for bit. Per-rank shapes the
+    # stage-A body does not handle (gate|up wider than 256 columns, e.g. TP8)
+    # run the default build.
+    "FUSED_MOE_PREFILL_KERNEL_V2": env_bool("FUSED_MOE_PREFILL_KERNEL_V2"),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
@@ -1660,6 +1671,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the bf16 output. Bit-identical. Only where the Pallas norm already runs
     # (the same rows predicate); decode buckets are untouched.
     "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
+    # With TPU_FUSED_ADD_RMSNORM, USE_MOE_TP_DECODE_KERNEL and
+    # FUSED_MOE_PREFILL_KERNEL: each MoE layer's post-attention norm also emits
+    # the fused MoE prefill kernel's own fp8 rows and scales (bit for bit its
+    # _quantize_rows) on the norm's Pallas branch, and the MoE op's prefill
+    # kernel takes them instead of quantizing again. The router still reads
+    # the bf16 output. Steps below the norm's Pallas rows threshold unchanged.
+    "TPU_FUSED_ADD_RMSNORM_QUANT_MOE": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT_MOE"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
