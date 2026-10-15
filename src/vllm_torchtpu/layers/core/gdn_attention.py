@@ -873,6 +873,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -927,6 +928,7 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        use_compact_qkv=use_compact_qkv,
     )
     return recurrent_state, output
 
@@ -956,6 +958,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
@@ -1041,6 +1044,7 @@ def run_jax_gdn_attention_pooled(
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
+        use_compact_qkv=use_compact_qkv,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

@@ -198,6 +198,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    use_compact_qkv: bool = False,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -223,6 +224,7 @@ def gdn_attention_pooled_core_tpu(
         pool_block_tokens=pool_block_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
+        use_compact_qkv=use_compact_qkv,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
     )
@@ -369,6 +371,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
     _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
+    _use_compact_qkv: bool = False
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
@@ -376,10 +379,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     conv1d: GdnColumnParallelLinear
 
     def __init__(
-        self, *args, pooled_conv_state_dtype: torch.dtype = torch.bfloat16, **kwargs
+        self,
+        *args,
+        pooled_conv_state_dtype: torch.dtype = torch.bfloat16,
+        use_compact_qkv: bool = False,
+        **kwargs,
     ):
         _to_jax_ssm_state_dtype(pooled_conv_state_dtype)
         self._pooled_conv_state_dtype = pooled_conv_state_dtype
+        self._use_compact_qkv = use_compact_qkv
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
@@ -723,6 +731,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         kernel_size = self.conv_kernel_size
         recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
         conv_state_dtype = _to_jax_ssm_state_dtype(self._pooled_conv_state_dtype)
+        use_compact_qkv = self._use_compact_qkv
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -782,6 +791,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 conv_state_dtype=conv_state_dtype,
+                use_compact_qkv=use_compact_qkv,
                 num_spec_tokens=num_spec_tokens,
             )
             if not block_major:
@@ -817,6 +827,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 conv_state_dtype,
+                use_compact_qkv,
                 num_spec_tokens,
             ),
             build_op,

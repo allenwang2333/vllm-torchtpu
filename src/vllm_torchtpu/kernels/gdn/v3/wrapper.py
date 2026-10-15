@@ -368,6 +368,7 @@ def outer_kernel(
         "d_v",
         "kernel_size",
         "num_spec_tokens",
+        "use_compact_qkv",
         "decode_tile_size",
         "mixed_tile_size",
         "batched_only",
@@ -406,6 +407,7 @@ def fused_conv1d_gdn(
     state_source: jax.Array | None = None,
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
+    use_compact_qkv: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -453,6 +455,8 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
+        use_compact_qkv: Opt into direct FP32 Conv1D input conversion. The default
+            retains the original FP32 cast before padding and final reshape.
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -509,6 +513,8 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
+    if not use_compact_qkv:
+        qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -618,7 +624,11 @@ def fused_conv1d_gdn(
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = _compact_qkv_input(qkv)
+    qkv = (
+        _compact_qkv_input(qkv)
+        if use_compact_qkv
+        else qkv.reshape(padded_batch_size, 1, -1)
+    )
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 

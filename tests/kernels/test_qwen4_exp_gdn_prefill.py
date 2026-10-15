@@ -13,7 +13,9 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
     from vllm_torchtpu import envs
     from vllm_torchtpu.kernels import pool_adapters
     from vllm_torchtpu.kernels.gdn.v3 import wrapper
-    from vllm_torchtpu.layers.core import gdn_attention
+    from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
 
     monkeypatch.setattr(envs, "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
     n_kq, n_v, dim, width, page = 16, 48, 128, 10240, 1664
@@ -72,7 +74,7 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
         )
 
     def pooled(pool, qkv, b, a, context):
-        return gdn_attention.run_jax_gdn_attention_pooled_local(
+        return gdn_attention_op.gdn_attention_pooled_core_tpu(
             qkv,
             b,
             a,
@@ -81,8 +83,8 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
             bias,
             a_log,
             dt_bias,
-            jnp.array([0, len(qkv)], jnp.int32),
             indices,
+            jnp.array([0, len(qkv)], jnp.int32),
             jnp.array([0, 1, 1] if len(qkv) > 1 else [1, 1, 1], jnp.int32),
             jnp.array([context + len(qkv)], jnp.int32),
             n_kq=n_kq,
@@ -91,6 +93,8 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
             d_v=dim,
             kernel_size=4,
             pool_block_tokens=page,
+            mesh=mesh,
+            use_compact_qkv=True,
             recurrent_state_dtype=jnp.bfloat16,
             conv_state_dtype=jnp.float32,
         )
@@ -123,6 +127,8 @@ def test_qwen_prefill_then_decode_preserves_bf16_ssm_and_fp32_conv(tokens, monke
             (actual_ssm, ssm[1:]),
             (actual_conv, conv[1:]),
         ):
+            assert np.isfinite(np.asarray(got, np.float32)).all()
+            assert np.isfinite(np.asarray(wanted, np.float32)).all()
             np.testing.assert_allclose(
                 np.asarray(got, np.float32),
                 np.asarray(wanted, np.float32),

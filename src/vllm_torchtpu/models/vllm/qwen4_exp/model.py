@@ -110,6 +110,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False,
                 pooled_conv_state_dtype=POOLED_GDN_CONV_STATE_DTYPE,
+                use_compact_qkv=True,
             )
         else:
             self.self_attn = Qwen4ExpQSA(

@@ -43,3 +43,56 @@ def test_compact_qkv_preserves_value_bits(tokens, width, dtype):
         np.asarray(actual).view(np.uint32),
         np.asarray(expected).view(np.uint32),
     )
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_default_qkv_preparation_keeps_cast_before_padding(monkeypatch, enabled):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    class InputsPrepared(Exception):
+        pass
+
+    def stop_before_kernel(**kwargs):
+        raise InputsPrepared
+
+    original_pad = jnp.pad
+    pad_dtypes = []
+
+    def record_pad(value, *args, **kwargs):
+        pad_dtypes.append(value.dtype)
+        return original_pad(value, *args, **kwargs)
+
+    compact = Mock(side_effect=lambda x: x.astype(jnp.float32)[:, None, :])
+    monkeypatch.setattr(wrapper, "_compact_qkv_input", compact)
+    monkeypatch.setattr(wrapper.jnp, "pad", record_pad)
+    monkeypatch.setattr(
+        wrapper.pltpu, "get_tpu_info", lambda: SimpleNamespace(num_lanes=128)
+    )
+    monkeypatch.setattr(wrapper.memory_ref, "ConvWeightsRef", stop_before_kernel)
+    qkv = jnp.zeros((128, 384), jnp.bfloat16)
+    options = {} if enabled is None else {"use_compact_qkv": enabled}
+    with pytest.raises(InputsPrepared):
+        wrapper.fused_conv1d_gdn(
+            qkv,
+            jnp.zeros((128, 1), jnp.bfloat16),
+            jnp.zeros((128, 1), jnp.bfloat16),
+            jnp.zeros((2, 3, 384), jnp.float32),
+            jnp.zeros((2, 1, 128, 128), jnp.bfloat16),
+            jnp.zeros((384, 1, 4), jnp.bfloat16),
+            None,
+            jnp.zeros((1,), jnp.float32),
+            jnp.zeros((1,), jnp.float32),
+            jnp.array([0, 128], jnp.int32),
+            jnp.array([1], jnp.int32),
+            jnp.array([0, 1, 1], jnp.int32),
+            jnp.array([128], jnp.int32),
+            n_kq=1,
+            n_v=1,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            **options,
+        )
+    assert pad_dtypes[0] == (jnp.bfloat16 if enabled else jnp.float32)
+    assert compact.call_count == int(bool(enabled))

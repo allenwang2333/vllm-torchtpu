@@ -1697,3 +1697,37 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
         assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             jnp.float32
         )
+
+
+def test_pooled_qkv_conversion_is_opt_in_and_separates_cached_ops(
+    cpu_vllm_config_context,
+):
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append((name, function))
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        for index, enabled in enumerate((None, False, True, True)):
+            attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
+            if enabled is not None:
+                attn._use_compact_qkv = enabled
+            attn._build_pooled_gdn_op()
+
+    assert len(captured) == 2
+    assert captured[0][0] != captured[1][0]
+    operands = [torch.zeros((1, 1)) for _ in range(12)]
+    operands[5] = None
+    for (_, function), enabled in zip(captured, (False, True)):
+        with patch.object(
+            gdn_attention_op,
+            "run_jax_gdn_attention_pooled",
+            return_value=(operands[3], operands[0]),
+        ) as dispatch:
+            function(*operands)
+        assert dispatch.call_args.kwargs["use_compact_qkv"] is enabled
