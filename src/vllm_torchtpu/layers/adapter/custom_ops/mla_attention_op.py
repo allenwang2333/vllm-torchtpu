@@ -76,7 +76,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -86,32 +86,26 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
-# Token buckets at or below this size take `TPU_STREAMIDX_SMALL_BUCKET_BQ`
-# (and `TPU_STREAMIDX_SMALL_BUCKET_BKVP`) as the MIXED-pass block sizes.
-STREAMIDX_SMALL_BUCKET_TOKENS = 16
-# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
-# Picked by a DCP16 per-rank sweep (GLM-5.2, 32 indexer heads, 4/8 real rows in
-# a 16-token bucket, 5k/18k KV per rank): bq 4 with bkvp 8 was fastest at every
-# decode shape, and bkvp 8 alone cut the 18k-KV call by a further 30-45% over
-# bkvp 2 at bq 4. The recommended pairing is TPU_STREAMIDX_SMALL_BUCKET_BQ=4.
-STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
-# Block sizes outside the small-bucket path ("tuned based on microbenchmark
-# results"), as (decode, prefill, MIXED).
+# StreamIdx block sizes as (decode, prefill, MIXED), tuned by microbenchmark.
 STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
+STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 
 
 def _streamidx_block_sizes(
-    num_tokens: int, small_bucket_bq: int | None, small_bucket_bkvp: int | None
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """(num_kv_pages_per_block, num_queries_per_block) for a token bucket.
+    """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
-    `num_tokens` is the static padded bucket size, so this picks one kernel
-    variant per compiled shape. Under MTP every decode request has
-    q_len = gamma + 1 and runs in the MIXED pass; for small buckets that pass
-    takes the knob's query block instead of 128 rows of mostly padding.
+    MIXED-pass query blocks hold one sequence each, so an MTP request
+    (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
+    to `small_bucket_tokens` take the small-bucket sizes instead.
     """
-    if small_bucket_bq is None or num_tokens > STREAMIDX_SMALL_BUCKET_TOKENS:
+    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
         return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
     bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
@@ -456,13 +450,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
         )
-        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
-        small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
 
         def _streamidx_topk_jax(
@@ -519,7 +516,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], small_bucket_bq, small_bucket_bkvp
+                q.shape[0], *small_bucket
             )
             topk_indices = streamindex_topk(
                 q,
@@ -573,13 +570,16 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
         )
-        small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
-        small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
 
         def _streamidx_topk_dcp_jax(
@@ -613,7 +613,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], small_bucket_bq, small_bucket_bkvp
+                q.shape[0], *small_bucket
             )
             local_topk = streamindex_topk_dcp(
                 q,
@@ -938,12 +938,6 @@ class VllmTPUIndexer(Indexer):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
-
-
 # --- MLA rope in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE) ---------------
 #
 # GPT-J (interleaved) rope pairs channels (2i, 2i+1); NeoX rope pairs
@@ -983,7 +977,7 @@ def _index_select_bits(t: torch.Tensor, axis: int, index: torch.Tensor):
     and no dtype-specific gather support is needed on the device."""
     as_int = t.view(_SAME_WIDTH_INT[t.element_size()])
     out = torch.index_select(as_int, axis, index.to(t.device))
-    return _fresh(out.view(t.dtype))
+    return fresh_buffer(out.view(t.dtype))
 
 
 def permute_linear_output_channels(layer: torch.nn.Module, index: torch.Tensor):
@@ -1227,15 +1221,15 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
             self.W_UV = Parameter(W_UV, requires_grad=False)
             self.W_UK_T_scale = Parameter(
-                _fresh(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
             )
             self.W_UV_scale = Parameter(
-                _fresh(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
             )
 
         # move W_UK_T and W_UV into fresh contiguous buffers
-        self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
-        self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
+        self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
+        self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)
 
         # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
         # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
@@ -1259,20 +1253,20 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = _fresh(
+            self.W_UK_T_dcp_qrep = fresh_buffer(
                 dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
             )
             if hasattr(self, "W_UK_T_scale"):
-                self.W_UK_T_dcp_qrep_scale = _fresh(
+                self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
             # The group's W_UV too, so W_UV can run before the merge.
             if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
-                self.W_UV_dcp_qrep = _fresh(
+                self.W_UV_dcp_qrep = fresh_buffer(
                     dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
                 )
                 if hasattr(self, "W_UV_scale"):
-                    self.W_UV_dcp_qrep_scale = _fresh(
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
                         dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
                     )
 

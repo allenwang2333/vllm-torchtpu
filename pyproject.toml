@@ -42,21 +42,22 @@ dependencies = [
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20261008082921",
+    "tpu-sync-torch==0.0.1.dev20261012084241",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
-    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
-    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
-    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
-    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    # vLLM 0.31.0 allows >=5.10.4,<5.18; vllm-omni 0.29.0rc1 needs
+    # >=5.13,<5.15. Keep the shared upper bound for Omni compatibility.
+    # A previous upgrade to 5.17.0 changed greedy structured-output results;
+    # rerun that regression before widening the upper bound.
     "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
     # when installing vllm as a plain PyPI dependency for our TPU platform.
     "numba==0.65.0",
+    # sentencepiece 0.2.2 wheel is not available in the transient torch-tpu registry
+    "sentencepiece<0.2.2",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
@@ -67,7 +68,7 @@ dependencies = [
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.47",
+    "libtpu==0.0.50",
     "ray[default]",
     "ray[data]",
 ]
@@ -116,8 +117,8 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 # on top would overwrite it. Opt in with `pip install -e . --group vllm`.
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    # Keep vllm_test_utils on the same upstream tag below.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.0",
 ]
 
 # Required for running tests
@@ -130,7 +131,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.31.0#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]

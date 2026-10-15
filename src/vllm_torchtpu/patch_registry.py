@@ -74,6 +74,7 @@ PATCHES = (
         _ACTIVE,
     ),
     # KV cache, scheduling, and offloading.
+    Patch("vllm_torchtpu:_patch_vllm_compact_mamba_streaming_input", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
         _ENGINE,
@@ -134,11 +135,6 @@ PATCHES = (
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
     # See docs/developers_guide/tpu_patch_mechanism.md for details.
-    Patch(
-        "vllm_torchtpu.models.vllm.qwen2_5_vl_patch:maybe_patch_qwen2_5_vl",
-        ("platform_activation", "model_load"),
-        model_config=True,
-    ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_vl_patch:maybe_patch_qwen3_vl",
         ("platform_activation", "model_load"),
