@@ -12,51 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP32 Sinkhorn for one four-stream mHC token."""
-
-import functools
+"""FP32 post gates and Sinkhorn embedded in four-stream mHC kernels."""
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-
-
-def _sinkhorn_kernel(
-    logits_ref,
-    output_ref,
-    *,
-    eps: float,
-    repeats: int,
-) -> None:
-    # Keep the matrix 2D: Mosaic cannot lower the generic (1, 4, 4) reshape.
-    value = jax.nn.softmax(logits_ref[...], axis=-1) + eps
-    value = value / (jnp.sum(value, axis=0, keepdims=True) + eps)
-
-    def normalize(_, matrix):
-        matrix = matrix / (jnp.sum(matrix, axis=1, keepdims=True) + eps)
-        return matrix / (jnp.sum(matrix, axis=0, keepdims=True) + eps)
-
-    output_ref[...] = jax.lax.fori_loop(0, repeats - 1, normalize, value)
-
-
-def sinkhorn_single_token(
-    logits: jax.Array,
-    eps: float,
-    repeats: int,
-) -> jax.Array:
-    """Normalize (1, 4, 4) FP32 logits without intermediate HBM tensors."""
-    assert logits.shape == (1, 4, 4)
-    assert logits.dtype == jnp.float32
-    assert repeats >= 1
-    matrix = logits.reshape(4, 4)
-    result = pl.pallas_call(
-        functools.partial(_sinkhorn_kernel, eps=eps, repeats=repeats),
-        out_shape=jax.ShapeDtypeStruct(matrix.shape, jnp.float32),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=()),
-        name="mhc_sinkhorn_fp32_single_token",
-    )(matrix)
-    return result.reshape(logits.shape)
 
 
 def single_token_post_comb(

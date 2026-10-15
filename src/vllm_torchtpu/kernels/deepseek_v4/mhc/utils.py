@@ -18,10 +18,6 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.deepseek_v4.mhc.sinkhorn_kernel import (
-    sinkhorn_single_token,
-)
-
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
 
@@ -125,19 +121,6 @@ def mhc_pre_gates(
     comb_logits = mixes[:, 2 * hc_mult :].reshape(
         num_tokens, hc_mult, hc_mult
     ) * hc_scale[2] + hc_base[2 * hc_mult :].reshape(1, hc_mult, hc_mult)
-    # One decode token fits a single four-stream matrix. Larger token batches
-    # retain the vectorized XLA path; this is a shape specialization, not a
-    # batch-size performance threshold. Keep CPU reference execution available.
-    if (
-        num_tokens == 1
-        and hc_mult == 4
-        and comb_logits.dtype == jnp.float32
-        and sinkhorn_repeat >= 1
-        and jax.default_backend() == "tpu"
-    ):
-        comb_mix = sinkhorn_single_token(comb_logits, hc_sinkhorn_eps, sinkhorn_repeat)
-        return pre_mix, post_mix, comb_mix
-
     comb_mix = jax.nn.softmax(comb_logits, axis=-1) + hc_sinkhorn_eps
     comb_mix = comb_mix / (jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_repeat - 1):

@@ -591,8 +591,8 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
 
 
 @pytest.mark.tpu_test
-class MhcSingleTokenSinkhornTest(parameterized.TestCase):
-    """Fused decode gates retain FP32 normalization and generic-shape parity."""
+class MhcGenericGatesTest(parameterized.TestCase):
+    """Generic gates retain FP32 normalization for one or multiple tokens."""
 
     def setUp(self):
         super().setUp()
@@ -651,8 +651,7 @@ class MhcSingleTokenSinkhornTest(parameterized.TestCase):
         for actual, wanted in zip(got, expected):
             self.assertEqual(actual.dtype, jnp.float32)
             np.testing.assert_allclose(actual, wanted, rtol=1e-5, atol=1e-6)
-        has_kernel = "mhc_sinkhorn_fp32_single_token" in compiled.as_text()
-        self.assertEqual(has_kernel, num_tokens == 1)
+        self.assertNotIn("mhc_sinkhorn_fp32_single_token", compiled.as_text())
 
 
 @pytest.mark.tpu_test
@@ -923,10 +922,9 @@ def test_fused_sinkhorn_preserves_fp32_reduction_tree(repeats, logit_scale, eps)
 
     from vllm_torchtpu.kernels.deepseek_v4.mhc.sinkhorn_kernel import (
         single_token_post_comb,
-        sinkhorn_single_token,
     )
 
-    def kernel(base_ref, output_ref):
+    def kernel(base_ref, logits_ref, output_ref, reference_ref):
         _, comb = single_token_post_comb(
             jnp.zeros((1, 24), jnp.float32),
             jnp.ones((1, 3), jnp.float32),
@@ -936,16 +934,26 @@ def test_fused_sinkhorn_preserves_fp32_reduction_tree(repeats, logit_scale, eps)
             repeats,
         )
         output_ref[...] = comb
+        # Matrix-axis reference, independent of the fused lane-replicated layout.
+        value = jax.nn.softmax(logits_ref[...], axis=-1) + eps
+        value = value / (jnp.sum(value, axis=0, keepdims=True) + eps)
 
-    fused = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32))
+        def normalize(_, matrix):
+            matrix = matrix / (jnp.sum(matrix, axis=1, keepdims=True) + eps)
+            return matrix / (jnp.sum(matrix, axis=0, keepdims=True) + eps)
+
+        reference_ref[...] = jax.lax.fori_loop(0, repeats - 1, normalize, value)
+
+    shape = jax.ShapeDtypeStruct((4, 4), jnp.float32)
+    fused = pl.pallas_call(kernel, out_shape=(shape, shape))
     for seed in (913, 1210):
         rng = np.random.default_rng(seed)
         logits = jnp.asarray(rng.normal(size=(1, 4, 4)) * logit_scale, jnp.float32)
         base = jnp.concatenate(
             [jnp.zeros((1, 8), jnp.float32), logits.reshape(1, 16)], axis=1
         )
-        expected = sinkhorn_single_token(logits, eps, repeats)
-        np.testing.assert_array_equal(_to_np(fused(base)), _to_np(expected[0]))
+        actual, expected = fused(base, logits[0])
+        np.testing.assert_array_equal(_to_np(actual), _to_np(expected))
 
 
 if __name__ == "__main__":
