@@ -59,6 +59,15 @@ _KV_PAGES_PER_BLOCK = {
     "seq_along_lane": (32, 32, 16),
 }
 
+# Token buckets up to which the mixed pass scores 32-token q blocks over 8-page KV
+# blocks instead of 128-token q blocks over 16 pages. Its sequences there are
+# chunks of at most a few dozen tokens next to the verify windows, and a
+# 128-row q block is mostly padding. Measured on tpu7x (4-chip, kernel time,
+# T128): 30-90 token chunks at 40-150k context -15% to -65%, a 120-token chunk
+# at 4.5k -36%, a 128-token chunk at 100k +11%; at T256/T512 the large block
+# stays ahead.
+_SMALL_MIXED_BLOCK_MAX_TOKENS = 128
+
 BATCH_AXIS = None
 
 
@@ -107,6 +116,15 @@ def _indexer_jax(
             q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
         )
 
+        kv_pages_per_block = _KV_PAGES_PER_BLOCK[kv_layout]
+        mixed_q_block = 128
+        if (
+            kv_layout == "seq_along_lane"
+            and q.shape[0] <= _SMALL_MIXED_BLOCK_MAX_TOKENS
+        ):
+            kv_pages_per_block = (*kv_pages_per_block[:2], 8)
+            mixed_q_block = 32
+
         # Fold the query quantization scales into the weights.
         weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
 
@@ -120,8 +138,8 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            num_kv_pages_per_block=_KV_PAGES_PER_BLOCK[kv_layout],
-            num_queries_per_block=(1, 128, 128),
+            num_kv_pages_per_block=kv_pages_per_block,
+            num_queries_per_block=(1, 128, mixed_q_block),
             decode_req_batch_size=1,
             uniform_q_len=uniform_q_len,
             kv_layout=kv_layout,
