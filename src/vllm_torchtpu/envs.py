@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
+    TPU_DEEPSEEK_V41_ATTENTION: str = "native"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
@@ -366,6 +367,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_SP": env_bool("TPU_DEEPSEEK_V41_SP"),
     # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
+    # Migration selector for CSA2 integration measurements. Remove after the
+    # native cache adapter and per-mode performance are validated for default use.
+    "TPU_DEEPSEEK_V41_ATTENTION": env_with_choices(
+        "TPU_DEEPSEEK_V41_ATTENTION", "native", ["native", "csa2"]
+    ),
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
     ),

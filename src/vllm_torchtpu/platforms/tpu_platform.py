@@ -382,6 +382,7 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
+        "TPU_DEEPSEEK_V41_ATTENTION",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",

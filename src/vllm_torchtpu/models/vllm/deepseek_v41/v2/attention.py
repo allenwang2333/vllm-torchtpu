@@ -492,6 +492,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _sp_sharded_input = False
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
+    _csa2_tp1 = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -589,7 +590,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         qr_local = (
             qr
-            if self._sp_sharded_input
+            if (self._sp_sharded_input or self._csa2_tp1)
             and getattr(self, "_local_q_attn", False)
             and (
                 swa_kv is None
@@ -1425,6 +1426,32 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         weights. FP8 tensors are gathered as bytes.
         """
         tp_size = get_tensor_model_parallel_world_size()
+        if (
+            envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2"
+            and tp_size == 1
+            and self._fp8_kv
+            and self.compress_ratio
+            and self.n_local_heads == 64
+            and self.head_dim == 512
+            and self.window_size == 128
+            and not getattr(self, "non_causal_multi_token_decode", False)
+        ):
+            # TP1 has no SP shard to gather. Reuse the existing projection
+            # weights and route both encoder and CED decoder through CSA2's
+            # q/attention/wo_a bridge, which consumes inverse-rotated output.
+            wq_scale = getattr(self.wq_b, "weight_scale", None)
+            wo_scale = getattr(self.wo_a, "weight_scale", None)
+            if wq_scale is None or wq_scale.ndim != 1 or wo_scale is None:
+                raise ValueError("CSA2 TP1 requires per-channel FP8 Q/O weights")
+            for name, value in (
+                ("_wq_b_full", self.wq_b.weight),
+                ("_wq_b_full_scale", wq_scale),
+                ("_wo_a_full", self.wo_a.weight),
+                ("_wo_a_full_scale", wo_scale.reshape(-1)),
+            ):
+                object.__setattr__(self, name, value)
+            self._local_q_attn = self._csa2_tp1 = True
+            return
         if (
             not envs.TPU_DEEPSEEK_V41_LOCAL_Q
             or tp_size <= 1

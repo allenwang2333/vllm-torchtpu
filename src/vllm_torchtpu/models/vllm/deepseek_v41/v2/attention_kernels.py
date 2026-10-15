@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     tuned_block_sizes as prefill_tuning,
 )
+from vllm_torchtpu.logger import init_logger
 
 from .cache import (
     ROPE_WORDS,
@@ -43,6 +44,8 @@ from .cache import (
     split_halves,
     split_pieces,
 )
+
+logger = init_logger(__name__)
 
 _attention_op = None
 _attention_2bank_op = None
@@ -1228,6 +1231,71 @@ def _fp8_query_shards(
     return tp_size if use_shards else 1
 
 
+def csa2_attention_jax(
+    q: jax.Array,
+    swa_pool: jax.Array | tuple[jax.Array, jax.Array],
+    swa_records: jax.Array,
+    main_records: jax.Array,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin_cache: jax.Array,
+    gathered_nope: jax.Array,
+    gathered_rope: jax.Array,
+    *,
+    scale: float,
+    interpret: bool = False,
+) -> jax.Array:
+    """Adapt native KV without requantization; return inverse-rotated output.
+
+    The serving record mask is authoritative, including CED replay truncation.
+    Native dequantization and SWA gather are inside the compiled attention call
+    and therefore included in end-to-end measurements.
+    """
+    from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
+
+    tokens = q.shape[0]
+    positions = positions.astype(jnp.int32)
+    sink = sink.astype(jnp.float32)
+    main_lengths = jnp.sum(main_records >= 0, axis=1, dtype=jnp.int32)
+
+    # Serving SWA records are right-aligned at short contexts; CSA2 windows
+    # are left-aligned. Preserve slots for replay-masked historical positions.
+    columns = jnp.minimum(
+        jnp.arange(128)[None, :] + jnp.maximum(127 - positions, 0)[:, None], 127
+    )
+    records = jnp.take_along_axis(swa_records, columns, axis=1)
+    swa = gather_cache_values(swa_pool, records.reshape(-1), 512).reshape(
+        tokens, 128, 512
+    )
+    swa = jnp.where(records[:, :, None] >= 0, swa, 0)
+    swa_begin = positions + 1 - jnp.sum(swa_records >= 0, axis=1, dtype=jnp.int32)
+    cs = cos_sin_cache[positions].astype(jnp.float32)
+    cos = jnp.concatenate(
+        (jnp.ones((tokens, 64), jnp.float32), jnp.repeat(cs[:, :32], 2, axis=1)), axis=1
+    )
+    sin = jnp.concatenate(
+        (jnp.zeros((tokens, 64), jnp.float32), jnp.repeat(cs[:, 32:], 2, axis=1)),
+        axis=1,
+    )
+    sin *= jnp.where(jnp.arange(128) % 2 == 0, 1, -1)
+    return csa2(
+        q,
+        gathered_nope,
+        None,
+        swa,
+        jnp.minimum(starts, tokens),
+        positions,
+        sink,
+        jnp.stack((cos, sin), axis=1),
+        main_rope=gathered_rope,
+        main_lengths=main_lengths,
+        swa_begin=swa_begin,
+        scale=scale,
+        interpret=interpret,
+    )
+
+
 def initialize_paged_attention():
     global _attention_op, _attention_2bank_op
     global _fp8_attention_op, _fp8_attention_2bank_op
@@ -1283,6 +1351,8 @@ def initialize_paged_attention():
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
+    use_csa2 = envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2"
+    logger.info("V4.1 attention backend selected: %s", "csa2" if use_csa2 else "native")
     try:
         tp_group = get_tp_group().device_group
         tp_size = tp_group.size() if tp_group is not None else 1
@@ -1754,6 +1824,37 @@ def initialize_paged_attention():
                 ]
             q = _quantized_matmul_jax(q_in, wq, wqs)
             q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
+            if (
+                use_csa2
+                and tp_size == 1
+                and head_dim == 512
+                and q.shape[1] == 64
+                and cs.shape[1] == 64
+                and s_r.shape[1] == 128
+                and m_r.shape[1] == 512
+            ):
+                if not precompacted or g_n is None or g_r is None:
+                    raise ValueError("CSA2 requires compacted records and staged KV")
+                from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+                    wo_a_projection,
+                )
+
+                out = csa2_attention_jax(
+                    q,
+                    s_p,
+                    s_r,
+                    m_r,
+                    q_loc,
+                    pos,
+                    snk,
+                    cs,
+                    g_n,
+                    g_r,
+                    scale=scale,
+                )
+                out = jnp.where(ok[:, None, None] != 0, out, 0)
+                return wo_a_projection(out, w, ws.reshape(-1), None)
+
             out = sparse_fp8_attention_jax(
                 q,
                 s_p,
