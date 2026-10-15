@@ -124,6 +124,7 @@ def test_mode_gate(monkeypatch):
 
     monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR", raising=False)
     assert attention.mla_absorb_mode(4096) is None
+    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A", raising=False)
     monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "1")
     assert attention.mla_absorb_mode(4096) == "pallas"
     assert attention.mla_absorb_mode(64) == "pallas"
@@ -135,6 +136,23 @@ def test_mode_gate(monkeypatch):
     assert attention.mla_absorb_mode(2048) == "einsum"
     # The MTP drafter is traced once for all buckets: never on the new path.
     assert attention.mla_absorb_mode(4096, is_backbone=False) is None
+
+
+def test_mode_gate_starts_above_the_a2a_merge_cap(monkeypatch):
+    """`T >= 64` here and the DCP merge's `T <= 64` in one trace pinned the
+    64-token bucket to a constant (GLM-5.2 trial-4 warmup: ShapeSpecialization
+    / ConstraintViolationError). With the a2a merge on, the gate starts above
+    its cap."""
+    from vllm_torchtpu.layers.adapter import attention
+
+    monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "1")
+    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A", "1")
+    monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", raising=False)
+    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", raising=False)
+    assert attention.mla_absorb_mode(64) is None
+    assert attention.mla_absorb_mode(128) == "pallas"
+    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", "32")
+    assert attention.mla_absorb_mode(64) == "pallas"
 
 
 @pytest.mark.tpu_test
