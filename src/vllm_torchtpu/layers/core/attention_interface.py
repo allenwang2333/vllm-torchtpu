@@ -1009,6 +1009,26 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def _mixed_union_gather(value: str) -> dict:
+    """TPU_DCP_MLA_MIXED_UNION_GATHER -> the union-gather kwargs of
+    `sparse_ragged_paged_attention` ("1" = UNION_GATHER_DEFAULT)."""
+    if not value or value == "0":
+        return {}
+    modes = (
+        native_sc_gather.UNION_GATHER_DEFAULT
+        if value == "1"
+        else tuple(v.strip() for v in value.split(",") if v.strip())
+    )
+    unknown = set(modes) - {"solo", "pair", "rope"}
+    if unknown or ("solo" in modes and "pair" in modes):
+        raise ValueError(f"TPU_DCP_MLA_MIXED_UNION_GATHER={value!r}")
+    return {
+        "mixed_union_gather": True,
+        "mixed_union_gather_pair": "pair" in modes,
+        "mixed_union_gather_rope": "rope" in modes,
+    }
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1412,7 +1432,7 @@ def sparse_mla_attention_dcp(
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,
             mixed_fused_prep=envs.TPU_DCP_MLA_MIXED_FUSED_PREP,
-            mixed_union_gather=envs.TPU_DCP_MLA_MIXED_UNION_GATHER,
+            **_mixed_union_gather(envs.TPU_DCP_MLA_MIXED_UNION_GATHER),
             decode_row_widths=(
                 tuple(int(w) for w in envs.TPU_MLA_DECODE_ROW_WIDTHS.split(",") if w)
                 if topk_cap

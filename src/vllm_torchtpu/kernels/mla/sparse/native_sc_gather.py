@@ -705,6 +705,8 @@ def dsa_gather_native_sc(
 # nope + rope (160 words; `rope_union`).
 UNION_CAP_ROWS = 736
 UNION_CAP_ROWS_ROPE = 576
+# TPU_DCP_MLA_MIXED_UNION_GATHER=1: the measured default mode (t4-mla-mixed probes 12-14).
+UNION_GATHER_DEFAULT = ("pair", "rope")
 # `pair_union`: a pair's two regions hold one union (2 x these rows), less the
 # table + list hand-off area in Spmem.
 UNION_CAP_ROWS_PAIR = 704
