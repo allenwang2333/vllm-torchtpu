@@ -20,6 +20,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     produce,
     quantize_kv,
 )
+from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
 from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
     attend_in_chunks,
 )
@@ -124,6 +125,47 @@ def rpa_attention(
     return attend_in_chunks(attend, q, gate, blocks, lengths, table, cache)
 
 
+def _prefill_attention(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+        block_sparse_gqa_attention,
+    )
+    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+        get_sparse_prefill_tiles,
+    )
+
+    query_block, kv_tile = get_sparse_prefill_tiles(
+        query, cache, kv_heads=kv_heads, ratio=ratio
+    )
+    return block_sparse_gqa_attention(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        query_block=query_block,
+        kv_tile=kv_tile,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+
 def qsa_attention(
     query,
     gate,
@@ -138,92 +180,84 @@ def qsa_attention(
     k_scale=1.0,
     v_scale=1.0,
 ):
-    """Use block reuse for prefill and fused decode within its supported envelope."""
-    if len(query) > len(starts) - 1:
-        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
-            block_sparse_gqa_attention,
-        )
-        from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-            get_sparse_prefill_tiles,
-        )
-        from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
-            adaptive_prefill,
-            is_supported_by_adaptive_prefill,
+    """Compose fused decode, adaptive prefill and mixed-request splitting."""
+    options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+    if len(query) <= len(starts) - 1:
+        from vllm_torchtpu.kernels.sparse_gqa_decode import (
+            is_supported_by_fused_decode,
+            qsa_decode_attention,
         )
 
-        if is_supported_by_adaptive_prefill(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
-            cache,
-            starts,
-            kv_heads=kv_heads,
-            ratio=ratio,
-            k_scale=k_scale,
-            v_scale=v_scale,
+        if is_supported_by_fused_decode(
+            query, gate, blocks, lengths, table, cache, **options
         ):
-            return adaptive_prefill(query, gate, blocks, lengths, table, cache, starts)
+            return qsa_decode_attention(
+                query, gate, blocks, lengths, table, cache, **options
+            )
+        return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
 
-        query_block, kv_tile = get_sparse_prefill_tiles(
-            query, cache, kv_heads=kv_heads, ratio=ratio
-        )
-        return block_sparse_gqa_attention(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
-            cache,
-            starts,
-            kv_heads=kv_heads,
-            ratio=ratio,
-            query_block=query_block,
-            kv_tile=kv_tile,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-    from vllm_torchtpu.kernels.sparse_gqa_decode import (
-        is_supported_by_fused_decode,
-        qsa_decode_attention,
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
+        adaptive_prefill,
+        is_supported_by_adaptive_prefill,
     )
 
-    if is_supported_by_fused_decode(
+    if is_supported_by_adaptive_prefill(
         query,
         gate,
         blocks,
         lengths,
         table,
         cache,
+        starts,
         kv_heads=kv_heads,
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
     ):
-        return qsa_decode_attention(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
+        return adaptive_prefill(query, gate, blocks, lengths, table, cache, starts)
+
+    count = decode_prefix(starts)
+    capacity = len(starts) - 1
+
+    def split(_):
+        decode_lengths = jnp.where(jnp.arange(capacity) < count, lengths[:capacity], 0)
+        decoded, owner = rpa_attention(
+            query[:capacity],
+            gate[:capacity],
+            blocks[:capacity],
+            decode_lengths,
+            table[:capacity],
             cache,
-            kv_heads=kv_heads,
-            ratio=ratio,
-            k_scale=k_scale,
-            v_scale=v_scale,
+            **options,
         )
-    return rpa_attention(
-        query,
-        gate,
-        blocks,
-        lengths,
-        table,
-        cache,
-        kv_heads=kv_heads,
-        ratio=ratio,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        # Keep bucket shapes fixed while removing the decode prefix on device.
+        rows = jnp.arange(len(query))
+        ids = jnp.minimum(rows + count, len(query) - 1)
+        prefill_lengths = jnp.where(rows < starts[-1] - count, lengths[ids], 0)
+        prefilled, owner = _prefill_attention(
+            query[ids],
+            gate[ids],
+            blocks[ids],
+            prefill_lengths,
+            table[ids],
+            owner,
+            jnp.maximum(starts - count, 0),
+            **options,
+        )
+        output = jnp.where(
+            (rows < count)[:, None, None],
+            decoded[jnp.minimum(rows, capacity - 1)],
+            prefilled[jnp.maximum(rows - count, 0)],
+        )
+        return jnp.where((lengths > 0)[:, None, None], output, 0), owner
+
+    return jax.lax.cond(
+        (count > 0) & (count < starts[-1]),
+        split,
+        lambda _: _prefill_attention(
+            query, gate, blocks, lengths, table, cache, starts, **options
+        ),
+        None,
     )
 
 
