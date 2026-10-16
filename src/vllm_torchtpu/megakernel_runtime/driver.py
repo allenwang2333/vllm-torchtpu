@@ -33,6 +33,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
@@ -47,6 +48,7 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
     verify_pooled_step_hlo,
+    verify_torchtpu_compiled_step_ir,
 )
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     find_backbone,
@@ -120,7 +122,7 @@ def _percentile(sorted_vals: list[float], q: float) -> float:
 
 
 class _LatencySeries:
-    """Bounded-memory sample accumulator keeping count, mean, and quantiles."""
+    """Bounded-memory ring-buffer sample accumulator (exact mean + recent quantiles)."""
 
     __slots__ = ("cap", "count", "samples", "sum_ms")
 
@@ -294,10 +296,16 @@ def prepare_step_inputs_eager(
 
     bt = block_tables
     if bt.ndim == 1:
-        if bt.numel() % max_pages_per_seq == 0:
+        n_rows_bt = int(s0.shape[0])
+        if n_rows_bt > 0 and bt.numel() % n_rows_bt == 0:
+            bt = bt.reshape(n_rows_bt, bt.numel() // n_rows_bt)
+        elif max_pages_per_seq > 0 and bt.numel() % max_pages_per_seq == 0:
             bt = bt.reshape(-1, max_pages_per_seq)
         else:
-            bt = bt.reshape(int(s0.shape[0]), -1)
+            raise ValueError(
+                f"1-D block_tables of length {bt.numel()} is not divisible by "
+                f"s0.shape[0]={n_rows_bt} or max_pages_per_seq={max_pages_per_seq}"
+            )
     pt_b = _slice_or_pad_2d(bt, nseq_bkt, max_pages_per_seq).to(torch.int32)
 
     ckpt_rows: list[torch.Tensor] = []
@@ -326,17 +334,23 @@ def prepare_step_inputs_eager(
                 ckpt_g = ckpt_1d.unsqueeze(1).expand(nseq_bkt, T).contiguous()
                 roff_g = torch.zeros_like(roff_g)
         else:
+            # For T=1, build 2-column `[read_slot, write_slot]` so `gather_gdn`
+            # reads from `c_b[s, roff[s]]` while `scatter_gdn` (`ckpt_t_off=1`)
+            # writes the updated state back to the group base slot `s_b`.
             if use_ckpt_2d and has_roff and c_raw.ndim == 2 and c_raw.shape[1] > 1:
                 c_b = _slice_or_pad_2d(c_raw, nseq_bkt, int(c_raw.shape[1])).to(
                     torch.int32
                 )
                 r_idx = roff_g.to(torch.long).clamp(min=0, max=c_raw.shape[1] - 1)
-                ckpt_g = c_b.gather(1, r_idx.unsqueeze(1))
+                read_col = c_b.gather(1, r_idx.unsqueeze(1))
             else:
-                ckpt_g = s_b.unsqueeze(1)
+                read_col = s_b.unsqueeze(1)
+            write_col = s_b.unsqueeze(1)
+            ckpt_g = torch.cat([read_col, write_col], dim=1)
             roff_g = torch.zeros_like(roff_g)
 
-        active_g = ckpt_g[:, 0] > 0
+        active_g = (s_b > 0) & (ckpt_g[:, 0] > 0)
+        ckpt_g = torch.where(active_g.unsqueeze(1), ckpt_g, torch.zeros_like(ckpt_g))
         roff_g = torch.where(active_g, roff_g, torch.zeros_like(roff_g))
         ckpt_rows.append(ckpt_g)
         roff_rows.append(roff_g)
@@ -349,9 +363,8 @@ def prepare_step_inputs_eager(
     ids_b = torch.where(
         active_tok, _slice_or_pad_1d(input_ids, B).to(torch.int32), zero_b
     )
-    pos_b = torch.where(
-        active_tok, _slice_or_pad_1d(positions, B).to(torch.int32), zero_b
-    )
+    pos_1d = positions[0] if positions.ndim == 2 else positions
+    pos_b = torch.where(active_tok, _slice_or_pad_1d(pos_1d, B).to(torch.int32), zero_b)
     return ids_b, pos_b, pt_b, ckpt_b, roff_b
 
 
@@ -417,8 +430,12 @@ def prepare_step_metadata(
     if fb_1d is None:
         fb_1d = torch.zeros((max(1, num_reqs),), dtype=torch.int32, device=dev)
 
-    if positions is not None and positions.numel() >= active_rows:
-        pos_in = positions.reshape(-1)[:active_rows]
+    if positions is not None:
+        pos_flat = positions[0] if positions.ndim == 2 else positions.reshape(-1)
+    else:
+        pos_flat = None
+    if pos_flat is not None and pos_flat.numel() >= active_rows:
+        pos_in = pos_flat[:active_rows]
     elif T > 1:
         seq_l = _slice_or_pad_1d(fb_1d, num_reqs).to(torch.int32)
         offsets = torch.arange(1 - T, 1, dtype=torch.int32, device=dev).unsqueeze(0)
@@ -432,6 +449,19 @@ def prepare_step_metadata(
     s2, c2, r2, has_r2, use_c2 = _extract_group_mamba_tensors(mamba_mds[2], fb_1d)
     has_roff = bool(has_r0 or has_r1 or has_r2)
     use_ckpt_2d = bool(use_c0 or use_c1 or use_c2)
+
+    if bt.ndim == 1:
+        n_rows_bt = int(s0.shape[0])
+        if n_rows_bt > 0 and bt.numel() % n_rows_bt == 0:
+            bt = bt.reshape(n_rows_bt, bt.numel() // n_rows_bt)
+        elif max_pages_per_seq > 0 and bt.numel() % int(max_pages_per_seq) == 0:
+            bt = bt.reshape(-1, int(max_pages_per_seq))
+        else:
+            raise ValueError(
+                f"1-D block_tables of length {bt.numel()} is not divisible by "
+                f"s0.shape[0]={n_rows_bt} or max_pages_per_seq={max_pages_per_seq}"
+            )
+    bt = bt[:num_reqs]
 
     dummy_ids = torch.ones((active_rows,), dtype=torch.int32, device=dev)
     prep_fn = (
@@ -560,7 +590,8 @@ class MegakernelDriver:
         self._bucket_ops: dict[tuple[int, int], Any] = {}
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bound = False
-        self._hlo_checked = False
+        self._hlo_checked_t: set[int] = set()
+        self._torchtpu_ir_checked: bool = False
         self._prepared_step: tuple[Any, ...] | None = None
         self._step_mix: dict[str, int] = {}
         self._step_mix_t0: float = time.monotonic()
@@ -580,6 +611,36 @@ class MegakernelDriver:
         except ValueError:
             return None
         if len(getattr(backbone, "layers", ())) != 60:
+            return None
+        if not getattr(runner, "_unified_kv_layout", False):
+            logger.warning(
+                "Qwen3.5 megakernel requires unified KV+GDN cache layout "
+                "(_unified_kv_layout=True); skipping."
+            )
+            return None
+        if getattr(runner, "lora_config", None) is not None:
+            logger.warning(
+                "Qwen3.5 megakernel does not support LoRA adapters; skipping."
+            )
+            return None
+        if not getattr(runner, "_pp_is_first", True) or not getattr(
+            runner, "_pp_is_last", True
+        ):
+            logger.warning(
+                "Qwen3.5 megakernel requires single-stage pipeline (PP=1); skipping."
+            )
+            return None
+        dp_lockstep_fn = getattr(runner, "_dp_lockstep_enabled", None)
+        if callable(dp_lockstep_fn) and dp_lockstep_fn():
+            logger.warning(
+                "Qwen3.5 megakernel does not support EP-DP lockstep; skipping."
+            )
+            return None
+        if getattr(backbone, "aux_hidden_state_layers", ()):
+            logger.warning(
+                "Qwen3.5 megakernel does not support aux_hidden_state_layers "
+                "(EAGLE-3 target capture); skipping."
+            )
             return None
 
         r_cnt = int(runner.mesh.devices.size)
@@ -623,6 +684,11 @@ class MegakernelDriver:
 
     def bind_caches(self, runner: Any) -> None:
         """Bind the `NATT` shared `float8_e4m3fn` raw pools from `backbone.layers`."""
+        _need(
+            bool(getattr(runner, "_unified_kv_layout", True)),
+            "runner._unified_kv_layout must be True "
+            "(unified KV+GDN cache layout required)",
+        )
         natt = self.geom.NATT
         g_per_att = self.geom.att_every - 1
         pools: list[torch.Tensor] = []
@@ -651,11 +717,13 @@ class MegakernelDriver:
             for g_idx in range(g_per_att):
                 la_layer = self.backbone.layers[self.geom.att_every * r + g_idx]
                 la_cache = _unwrap(la_layer.linear_attn.kv_cache)
-                if isinstance(la_cache, torch.Tensor) and la_cache.numel() > 0:
-                    _need(
-                        la_cache.data_ptr() == pool.data_ptr(),
-                        f"region {r} group {g_idx} linear_attn.kv_cache != pool[{r}]",
-                    )
+                _need(
+                    isinstance(la_cache, torch.Tensor)
+                    and la_cache.numel() > 0
+                    and la_cache.data_ptr() == pool.data_ptr(),
+                    f"region {r} group {g_idx} linear_attn.kv_cache must "
+                    f"alias pool[{r}] (unified KV+GDN cache layout is required)",
+                )
 
         self.raw_pools = pools
         self.num_pages = num_pages
@@ -716,6 +784,7 @@ class MegakernelDriver:
         self._bucket_steps.clear()
         self._bucket_ops.clear()
         self._bucket_out_rows.clear()
+        self._hlo_checked_t.clear()
         for b in self.buckets:
             m_rows = max(16, rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
@@ -743,8 +812,13 @@ class MegakernelDriver:
             B=bucket_t,
             T=tokens_per_seq,
         )
-        if not self._hlo_checked:
-            self._hlo_checked = True
+        is_tpu = self.raw_pools[0].device.type == "tpu"
+        ckpt_cols_hlo = 2 if tokens_per_seq == 1 else tokens_per_seq
+        if tokens_per_seq not in self._hlo_checked_t:
+            self._hlo_checked_t.add(tokens_per_seq)
+            compile_hlo = bool(envs.VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK) or (
+                is_tpu and not ex.interpret
+            )
             ok_hlo, reason_hlo = verify_pooled_step_hlo(
                 self.mesh,
                 self.spec,
@@ -752,18 +826,21 @@ class MegakernelDriver:
                 self.w_flat,
                 self.raw_pools,
                 max_pages_per_seq=self.max_pages_per_seq,
-                compile_hlo=bool(envs.VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK),
+                compile_hlo=compile_hlo,
+                ckpt_cols=ckpt_cols_hlo,
             )
             if not ok_hlo:
-                logger.warning(
-                    "Qwen3.5 megakernel HLO pool-donation check reported: %s",
-                    reason_hlo,
+                raise RuntimeError(
+                    "Qwen3.5 megakernel HLO pool-donation check failed for "
+                    f"(T={tokens_per_seq}, B={bucket_t}): {reason_hlo}"
                 )
-            else:
-                logger.info(
-                    "Qwen3.5 megakernel HLO pool-donation check passed (%s)",
-                    reason_hlo,
-                )
+            logger.info(
+                "Qwen3.5 megakernel HLO pool-donation check passed for "
+                "(T=%d, B=%d): %s",
+                tokens_per_seq,
+                bucket_t,
+                reason_hlo,
+            )
 
         op_name = (
             f"megakernel_runtime::qwen35_t{tokens_per_seq}_b{bucket_t}_{self.mode}"
@@ -781,7 +858,6 @@ class MegakernelDriver:
         out_rows = int(out_pad_rows) if out_pad_rows is not None else m_rows
         max_pages = self.max_pages_per_seq
         embed = self.embed_tokens
-        is_tpu = self.raw_pools[0].device.type == "tpu"
 
         def _step_impl(
             input_ids: torch.Tensor,
@@ -835,166 +911,368 @@ class MegakernelDriver:
                 weights,
                 pools,
             )
-            return hid_out[:out_rows]
+            if hid_out.shape[0] > out_rows:
+                hid_out = hid_out[:out_rows].clone()
+            elif hid_out.shape[0] < out_rows:
+                hid_out = F.pad(hid_out, (0, 0, 0, out_rows - hid_out.shape[0]))
+            return hid_out
 
         if is_tpu:
+            num_pages = self.num_pages
+            page_size = self.page_size
+            kvh = max(1, int(self.raw_pools[0].shape[3]) // 4)
+            hd = self.geom.HD
+            natt = self.geom.NATT
+
+            def _on_torchtpu_compile(debug: Any) -> None:
+                fwd_texts = getattr(debug, "stablehlo_forward_text", None) or ()
+                if not fwd_texts:
+                    return
+                ir_text = "\n".join(fwd_texts)
+                ok_ir, reason_ir = verify_torchtpu_compiled_step_ir(
+                    ir_text,
+                    num_pages=num_pages,
+                    page_size=page_size,
+                    kvh=kvh,
+                    hd=hd,
+                    num_pools=natt,
+                )
+                if not ok_ir:
+                    raise RuntimeError(
+                        "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
+                        f"check failed for (T={tokens_per_seq}, B={bucket_t}): "
+                        f"{reason_ir}"
+                    )
+                self._torchtpu_ir_checked = True
+
+            compile_opts: dict[str, Any] = {"debug_callback": _on_torchtpu_compile}
+            if not self._torchtpu_ir_checked:
+                compile_opts["serializable"] = False
             return torch.compile(
-                _step_impl, backend="tpu", fullgraph=True, dynamic=False
+                _step_impl,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+                options=compile_opts,
             )
         return _step_impl
 
+    def reset_stats(self) -> None:
+        """Reset step-mix counters and A/B latency accumulators."""
+        self._step_mix.clear()
+        self._step_mix_t0 = time.monotonic()
+        self.ab_calibrator.reset()
+
     @torch.no_grad()
-    def warmup(self, runner: Any = None) -> None:
+    def warmup(self, runner: Any = None, *, eager_only: bool = False) -> None:
         """Warm compiled bucket steps and run the sentinel pool-write check."""
         if not self._bound:
             raise RuntimeError("bind_caches() must be called before warmup()")
         dev = self.raw_pools[0].device
         ckpt_cols = max(1, int(self._ckpt_window))
         n_save = min(25, self.num_pages)
-        saved_page0 = [p[:n_save].clone() for p in self.raw_pools]
+        # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
+        # slice writes on a 2.30 GiB pool to as_strided_copy_inverse, allocating
+        # a full 2.30 GiB temporary buffer per pool).
+        saved_page0 = (
+            [p[:n_save].clone() for p in self.raw_pools] if dev.type != "tpu" else None
+        )
+        runner_tok_pads = tuple(
+            int(x) for x in getattr(runner, "num_tokens_paddings", ())
+        )
+        req_block_pairs: list[tuple[int, int]] = []
+        if runner is not None:
+            r_max = getattr(runner, "num_reqs_max_model_len", None)
+            b_max = getattr(runner, "max_num_blocks_per_req", None)
+            if r_max is not None and b_max is not None:
+                req_block_pairs.append((int(r_max), int(b_max)))
+            if getattr(runner, "most_model_len", None) is not None:
+                r_most = getattr(runner, "num_reqs_most_model_len", None)
+                b_most = getattr(runner, "num_blocks_per_most_len_req", None)
+                if r_most is not None and b_most is not None:
+                    pair = (int(r_most), int(b_most))
+                    if pair not in req_block_pairs:
+                        req_block_pairs.append(pair)
+        roff_buf = (
+            getattr(runner, "mamba_slot_read_offsets", None)
+            if runner is not None
+            else None
+        )
+        assert self._zero_roff_1d is not None
+        r_raw = roff_buf if isinstance(roff_buf, torch.Tensor) else self._zero_roff_1d
+        uses_mrope = bool(getattr(runner, "uses_mrope", False))
+        is_eager = bool(eager_only or getattr(runner, "enforce_eager", False))
         sentinel_checked = False
         try:
             for T, b_list in ((1, self.buckets), (4, self.verify_buckets)):
                 for b in b_list:
+                    if is_eager and sentinel_checked:
+                        break
                     step_fn = self._bucket_steps[(T, b)]
                     nseq = b // T
-                    ids_b = torch.zeros((b,), dtype=torch.int32, device=dev)
-                    pos_b = torch.zeros((b,), dtype=torch.int32, device=dev)
-                    bt_b = torch.zeros(
-                        (nseq, self.max_pages_per_seq),
-                        dtype=torch.int32,
-                        device=dev,
-                    )
-                    s0_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                    s1_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                    s2_b = torch.zeros((nseq,), dtype=torch.int32, device=dev)
-                    c0_b = torch.zeros(
-                        (nseq, max(T, ckpt_cols)), dtype=torch.int32, device=dev
-                    )
-                    c1_b = torch.zeros(
-                        (nseq, max(T, ckpt_cols)), dtype=torch.int32, device=dev
-                    )
-                    c2_b = torch.zeros(
-                        (nseq, max(T, ckpt_cols)), dtype=torch.int32, device=dev
-                    )
-                    r_b = torch.zeros((1,), dtype=torch.int32, device=dev)
+                    if runner_tok_pads and req_block_pairs:
+                        tok_pad = next(
+                            (p for p in runner_tok_pads if p >= b),
+                            runner_tok_pads[-1],
+                        )
+                        shapes_to_warm = [
+                            (tok_pad, req_pad, blk_pad)
+                            for req_pad, blk_pad in req_block_pairs
+                        ]
+                    else:
+                        shapes_to_warm = [(b, nseq, self.max_pages_per_seq)]
 
-                    do_sentinel = not sentinel_checked
-                    sent_kv = None
-                    sent_gdn = None
-                    if do_sentinel:
-                        if dev.type != "tpu":
-                            self.raw_pools[0][0].view(torch.uint8).fill_(0x5A)
-                            self.raw_pools[0][5:10].view(torch.uint8).fill_(0x5A)
-                        sent_kv = self.raw_pools[0][0].view(torch.uint8).cpu().clone()
-                        sent_gdn = (
-                            self.raw_pools[0][5:10].view(torch.uint8).cpu().clone()
+                    for tok_pad, req_pad, blk_pad in shapes_to_warm:
+                        if is_eager and sentinel_checked:
+                            break
+                        ids_b = torch.zeros((tok_pad,), dtype=torch.int32, device=dev)
+                        pos_shape = (3, tok_pad) if uses_mrope else (tok_pad,)
+                        pos_b = torch.zeros(pos_shape, dtype=torch.int32, device=dev)
+                        bt_b = torch.zeros(
+                            (req_pad * blk_pad,),
+                            dtype=torch.int32,
+                            device=dev,
                         )
-                        ids_b[0] = 1
-                        s0_b[0] = 1
-                        s1_b[0] = 1
-                        s2_b[0] = 1
-                        c0_b[0, :T] = torch.arange(
-                            1, 1 + T, dtype=torch.int32, device=dev
-                        )
-                        c1_b[0, :T] = torch.arange(
-                            1, 1 + T, dtype=torch.int32, device=dev
-                        )
-                        c2_b[0, :T] = torch.arange(
-                            1, 1 + T, dtype=torch.int32, device=dev
-                        )
+                        s0_b = torch.zeros((req_pad,), dtype=torch.int32, device=dev)
+                        s1_b = torch.zeros((req_pad,), dtype=torch.int32, device=dev)
+                        s2_b = torch.zeros((req_pad,), dtype=torch.int32, device=dev)
+                        c_cols = max(T, ckpt_cols)
+                        if c_cols > 1:
+                            c0_b = torch.zeros(
+                                (req_pad, c_cols), dtype=torch.int32, device=dev
+                            )
+                            c1_b = torch.zeros(
+                                (req_pad, c_cols), dtype=torch.int32, device=dev
+                            )
+                            c2_b = torch.zeros(
+                                (req_pad, c_cols), dtype=torch.int32, device=dev
+                            )
+                        else:
+                            c0_b, c1_b, c2_b = s0_b, s1_b, s2_b
+                        r_call = r_raw
 
-                    _ = step_fn(
-                        ids_b,
-                        pos_b,
-                        bt_b,
-                        s0_b,
-                        c0_b,
-                        s1_b,
-                        c1_b,
-                        s2_b,
-                        c2_b,
-                        r_b,
-                        self.w_flat,
-                        self.raw_pools,
-                    )
-                    if do_sentinel:
-                        sentinel_checked = True
-                        assert sent_kv is not None and sent_gdn is not None
-                        kv_ok = not torch.equal(
-                            self.raw_pools[0][0].view(torch.uint8).cpu(), sent_kv
+                        do_sentinel = not sentinel_checked and self.num_pages >= 5 * (
+                            T + 1
                         )
-                        gdn_ok = not torch.equal(
-                            self.raw_pools[0][5:10].view(torch.uint8).cpu(),
-                            sent_gdn,
+                        sent_kv: list[torch.Tensor] | None = None
+                        sent_gdn: list[torch.Tensor] | None = None
+                        if do_sentinel:
+                            if dev.type != "tpu":
+                                for p in self.raw_pools:
+                                    p[0].view(torch.uint8).fill_(0x5A)
+                                    p[5:10].view(torch.uint8).fill_(0x5A)
+                            sent_kv = [
+                                p[0].view(torch.uint8).cpu().clone()
+                                for p in self.raw_pools
+                            ]
+                            sent_gdn = [
+                                p[5:9].view(torch.uint8).cpu().clone()
+                                for p in self.raw_pools
+                            ]
+                            ids_b[0] = 1
+                            s0_b[0] = 1
+                            s1_b[0] = 1
+                            s2_b[0] = 1
+                            if c_cols > 1:
+                                blk_ids = torch.arange(
+                                    1,
+                                    1 + min(T, c_cols),
+                                    dtype=torch.int32,
+                                    device=dev,
+                                )
+                                c0_b[0, : blk_ids.numel()] = blk_ids
+                                c1_b[0, : blk_ids.numel()] = blk_ids
+                                c2_b[0, : blk_ids.numel()] = blk_ids
+
+                        out_b = step_fn(
+                            ids_b,
+                            pos_b,
+                            bt_b,
+                            s0_b,
+                            c0_b,
+                            s1_b,
+                            c1_b,
+                            s2_b,
+                            c2_b,
+                            r_call,
+                            self.w_flat,
+                            self.raw_pools,
                         )
-                        _need(
-                            kv_ok and gdn_ok,
-                            "warmup sentinel check failed "
-                            f"(kv_ok={kv_ok}, gdn_ok={gdn_ok})",
-                        )
+                        if dev.type == "tpu":
+                            from vllm_torchtpu.utils import synchronize_tensors
+
+                            synchronize_tensors([out_b, *self.raw_pools])
+                        if do_sentinel:
+                            sentinel_checked = True
+                            assert sent_kv is not None and sent_gdn is not None
+                            for idx, p in enumerate(self.raw_pools):
+                                kv_ok = not torch.equal(
+                                    p[0].view(torch.uint8).cpu(), sent_kv[idx]
+                                )
+                                gdn_ok = not torch.equal(
+                                    p[5:9].view(torch.uint8).cpu(),
+                                    sent_gdn[idx],
+                                )
+                                if not (kv_ok and gdn_ok):
+                                    raise RuntimeError(
+                                        "MegakernelDriver: warmup sentinel check "
+                                        f"failed on pool[{idx}] "
+                                        f"(kv_ok={kv_ok}, gdn_ok={gdn_ok})"
+                                    )
+            self.reset_stats()
         finally:
-            for p, saved in zip(self.raw_pools, saved_page0, strict=True):
-                p[:n_save].copy_(saved)
+            if saved_page0 is not None:
+                for p, saved in zip(self.raw_pools, saved_page0, strict=True):
+                    p[:n_save].copy_(saved)
 
     @staticmethod
-    def _inspect_step_detail(
-        attn_md: Any, m0: Any, runner: Any = None
-    ) -> tuple[bool, int, int, str]:
-        if runner is not None and getattr(runner, "input_batch", None) is not None:
-            ib = runner.input_batch
-            num_reqs = int(getattr(ib, "num_reqs", 0))
-            if num_reqs <= 0:
-                return False, 0, 0, "stock_n0"
-            num_sched = getattr(runner, "_Last_num_scheduled_tokens_np", None)
-            if num_sched is None:
-                num_sched = getattr(runner, "_last_num_scheduled_tokens", None)
-            if num_sched is not None and len(num_sched) >= num_reqs:
-                q0 = int(num_sched[0])
-                if all(int(num_sched[i]) == q0 for i in range(num_reqs)):
-                    return True, num_reqs, q0, "ok"
-                return False, num_reqs, 0, "stock_mixed"
-
-        qsl_cpu = getattr(attn_md, "query_start_loc_cpu", None)
-        num_seqs_val = getattr(attn_md, "num_seqs", None)
-        if qsl_cpu is not None and num_seqs_val is not None:
-            n_val = (
-                int(num_seqs_val.item())
-                if isinstance(num_seqs_val, torch.Tensor)
-                else int(num_seqs_val)
-            )
-            if n_val <= 0 or int(qsl_cpu.shape[0]) <= n_val:
-                return False, 0, 0, "stock_n0"
-            qsl_list = qsl_cpu[: n_val + 1].tolist()
-            total_toks = int(qsl_list[n_val])
-            if total_toks == n_val:
-                if all(qsl_list[i] == i for i in range(n_val + 1)):
-                    return True, n_val, 1, "ok"
-                return False, n_val, 0, "stock_mixed"
-            if total_toks == 4 * n_val:
-                if all(qsl_list[i] == 4 * i for i in range(n_val + 1)):
-                    return True, n_val, 4, "ok"
-                return False, n_val, 0, "stock_mixed"
-            return (
-                False,
-                n_val,
-                0,
-                f"stock_q{total_toks // max(1, n_val)}",
-            )
-
-        s_idx = getattr(m0, "mamba_state_indices", None)
-        if s_idx is None:
-            s_idx = getattr(m0, "mamba_ckpt_indices", None)
-        if s_idx is None:
-            return False, 0, 0, "stock_nomamba"
-        n_rows = int(s_idx.shape[0])
-        c_idx = getattr(m0, "mamba_ckpt_indices", None)
-        t_per_seq = (
-            int(c_idx.shape[1])
-            if (c_idx is not None and c_idx.ndim == 2 and c_idx.shape[1] == 4)
-            else 1
+    def _check_qsl_uniform(qsl_host: Any, num_reqs: int) -> tuple[bool, int, int, str]:
+        if num_reqs <= 0 or len(qsl_host) <= num_reqs:
+            return False, 0, 0, "stock_n0"
+        qsl_slice = qsl_host[: num_reqs + 1]
+        qsl_list = (
+            qsl_slice.tolist()
+            if hasattr(qsl_slice, "tolist")
+            else [int(x) for x in qsl_slice]
         )
-        return True, n_rows, t_per_seq, "ok"
+        if int(qsl_list[0]) != 0:
+            return False, num_reqs, 0, "stock_mixed"
+        q0 = int(qsl_list[1]) - int(qsl_list[0])
+        for i in range(1, num_reqs):
+            if int(qsl_list[i + 1]) - int(qsl_list[i]) != q0:
+                return False, num_reqs, 0, "stock_mixed"
+        if q0 == 1:
+            return True, num_reqs, 1, "ok"
+        if q0 == 4:
+            return True, num_reqs, 4, "ok"
+        return False, num_reqs, 0, f"stock_q{q0}"
+
+    @classmethod
+    def _inspect_step_detail(
+        cls, attn_md: Any, m0: Any, runner: Any = None
+    ) -> tuple[bool, int, int, str]:
+        """Return `(ok, num_reqs, tokens_per_seq, reason)` without host-device sync."""
+        num_reqs: int | None = None
+        if runner is not None:
+            bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+            if bctx is not None and getattr(bctx, "num_reqs", None) is not None:
+                num_reqs = int(bctx.num_reqs)
+
+            has_runner_roff = (
+                getattr(runner, "mamba_slot_read_offsets", None) is not None
+            )
+            comb_key = getattr(runner, "_cached_comb_key", None)
+            comb_cpu: Any = getattr(runner, "_combined_request_distribution_cpu", None)
+            req_dist_cpu: Any = getattr(runner, "_request_distribution_cpu", None)
+            if has_runner_roff and isinstance(comb_key, tuple) and len(comb_key) == 3:
+                _, num_windowed, dist_reqs = (
+                    int(comb_key[0]),
+                    int(comb_key[1]),
+                    int(comb_key[2]),
+                )
+                if num_reqs is None:
+                    num_reqs = dist_reqs
+                if dist_reqs <= 0 or num_reqs <= 0:
+                    return False, 0, 0, "stock_n0"
+                if num_windowed != dist_reqs:
+                    return (
+                        False,
+                        num_reqs,
+                        0,
+                        "stock_prefill" if num_windowed == 0 else "stock_mixed",
+                    )
+            elif (
+                has_runner_roff
+                and comb_cpu is not None
+                and isinstance(comb_cpu, torch.Tensor)
+                and comb_cpu.numel() >= 6
+            ):
+                num_windowed = int(comb_cpu[3].item())
+                dist_reqs = int(comb_cpu[5].item())
+                if num_reqs is None:
+                    num_reqs = dist_reqs
+                if dist_reqs <= 0 or num_reqs <= 0:
+                    return False, 0, 0, "stock_n0"
+                if num_windowed != dist_reqs:
+                    return (
+                        False,
+                        num_reqs,
+                        0,
+                        "stock_prefill" if num_windowed == 0 else "stock_mixed",
+                    )
+            elif (
+                not has_runner_roff
+                and req_dist_cpu is not None
+                and isinstance(req_dist_cpu, torch.Tensor)
+                and req_dist_cpu.numel() >= 3
+                and int(req_dist_cpu[2].item()) > 0
+            ):
+                num_decode = int(req_dist_cpu[0].item())
+                dist_reqs = int(req_dist_cpu[2].item())
+                if num_reqs is None:
+                    num_reqs = dist_reqs
+                if num_decode != dist_reqs:
+                    return (
+                        False,
+                        num_reqs,
+                        0,
+                        "stock_prefill" if num_decode == 0 else "stock_mixed",
+                    )
+
+            qsl_host = getattr(runner, "query_start_loc_np", None)
+            if qsl_host is None:
+                qsl_host = getattr(runner, "query_start_loc_cpu", None)
+            if qsl_host is not None and num_reqs is not None:
+                return cls._check_qsl_uniform(qsl_host, num_reqs)
+
+        # Fallback for unit tests passing CPU metadata without a full runner instance.
+        # Never read device tensors on TPU; fail closed if host/CPU qsl is absent.
+        dist: Any = getattr(m0, "mamba_request_distribution", None)
+        if dist is None:
+            dist = getattr(attn_md, "mamba_request_distribution", None)
+        if dist is None:
+            dist = getattr(attn_md, "request_distribution", None)
+        if (
+            dist is not None
+            and isinstance(dist, torch.Tensor)
+            and dist.device.type == "cpu"
+            and dist.numel() >= 3
+        ):
+            d_end = int(dist[0].item())
+            total_reqs = int(dist[2].item())
+            if total_reqs <= 0:
+                return False, 0, 0, "stock_n0"
+            if d_end != total_reqs:
+                return (
+                    False,
+                    total_reqs,
+                    0,
+                    "stock_prefill" if d_end == 0 else "stock_mixed",
+                )
+            if num_reqs is None:
+                num_reqs = total_reqs
+
+        num_seqs_attr = getattr(attn_md, "__dict__", {}).get("num_seqs")
+        if num_reqs is None and num_seqs_attr is not None:
+            if isinstance(num_seqs_attr, torch.Tensor):
+                if num_seqs_attr.device.type == "cpu":
+                    num_reqs = int(num_seqs_attr.item())
+            else:
+                num_reqs = int(num_seqs_attr)
+
+        qsl_md = getattr(attn_md, "__dict__", {}).get("query_start_loc_cpu")
+        if qsl_md is None:
+            qsl_dev: Any = getattr(attn_md, "query_start_loc", None)
+            if (
+                qsl_dev is not None
+                and isinstance(qsl_dev, torch.Tensor)
+                and qsl_dev.device.type == "cpu"
+            ):
+                qsl_md = qsl_dev
+        if qsl_md is not None and num_reqs is not None:
+            return cls._check_qsl_uniform(qsl_md, num_reqs)
+
+        return False, 0, 0, "stock_no_qsl"
 
     def can_run(
         self,
@@ -1004,8 +1282,13 @@ class MegakernelDriver:
         intermediate_tensors: Any = None,
         runner: Any = None,
     ) -> bool:
-        """Return `True` if the current forward step should run on the megakernel."""
+        """Return `True` if the current forward step should run on the megakernel.
+
+        Note: Called once per `TPUModelRunner.forward_model` invocation; records
+        step-mix statistics and A/B arm selection via `_note_step`.
+        """
         self._prepared_step = None
+        self.ab_calibrator.last_decision = ("stock_early", "stock")
         if not self._bound:
             return False
         if (
@@ -1014,6 +1297,24 @@ class MegakernelDriver:
             or intermediate_tensors is not None
         ):
             return False
+        if getattr(self.backbone, "aux_hidden_state_layers", ()):
+            return False
+        if runner is not None:
+            if getattr(runner, "_in_dummy_run", False) or getattr(
+                runner, "_in_precompile_backbone", False
+            ):
+                return False
+            if not getattr(runner, "_unified_kv_layout", True):
+                return False
+            if getattr(runner, "lora_config", None) is not None:
+                return False
+            if not getattr(runner, "_pp_is_first", True) or not getattr(
+                runner, "_pp_is_last", True
+            ):
+                return False
+            dp_lockstep_fn = getattr(runner, "_dp_lockstep_enabled", None)
+            if callable(dp_lockstep_fn) and dp_lockstep_fn():
+                return False
 
         ctx = get_forward_context()
         md = getattr(ctx, "attn_metadata", None)
@@ -1043,6 +1344,32 @@ class MegakernelDriver:
             return self._note_step(reason, False)
 
         active_rows = num_reqs * tokens_per_seq
+        if positions is not None and positions.ndim == 2:
+            if int(positions.shape[0]) != 3 or int(positions.shape[1]) < active_rows:
+                return self._note_step("stock_mrope", False)
+            mrope_buf = getattr(runner, "mrope_positions", None) if runner else None
+            mrope_np = getattr(mrope_buf, "np", None)
+            if mrope_np is not None and mrope_np.shape[1] >= active_rows:
+                if not (
+                    np.array_equal(mrope_np[0, :active_rows], mrope_np[1, :active_rows])
+                    and np.array_equal(
+                        mrope_np[0, :active_rows], mrope_np[2, :active_rows]
+                    )
+                ):
+                    return self._note_step("stock_mrope", False)
+            elif positions.device.type == "cpu":
+                if not (
+                    torch.equal(positions[0, :active_rows], positions[1, :active_rows])
+                    and torch.equal(
+                        positions[0, :active_rows], positions[2, :active_rows]
+                    )
+                ):
+                    return self._note_step("stock_mrope", False)
+            else:
+                return self._note_step("stock_mrope", False)
+        elif positions is not None and positions.ndim > 2:
+            return self._note_step("stock_mrope", False)
+
         if tokens_per_seq == 4:
             if not self.verify_buckets or active_rows > self.max_verify_bucket:
                 return self._note_step(f"stock_t4_n{num_reqs}", False)
@@ -1050,9 +1377,9 @@ class MegakernelDriver:
             step_fn = self._bucket_steps.get((4, bkt))
             if step_fn is None:
                 return self._note_step("stock_t4_nobkt", False)
-            if self._bucket_out_rows.get((4, bkt), input_ids.shape[0]) != int(
-                input_ids.shape[0]
-            ):
+            if self._runner_token_paddings and self._bucket_out_rows.get(
+                (4, bkt), input_ids.shape[0]
+            ) != int(input_ids.shape[0]):
                 return self._note_step(f"stock_t4_rows{bkt}", False)
             self._prepared_step = (
                 step_fn,
@@ -1072,6 +1399,10 @@ class MegakernelDriver:
             step_fn = self._bucket_steps.get((1, bkt)) or self._bucket_steps.get(bkt)
             if step_fn is None:
                 return self._note_step("stock_t1_nobkt", False)
+            if self._runner_token_paddings and self._bucket_out_rows.get(
+                (1, bkt), input_ids.shape[0]
+            ) != int(input_ids.shape[0]):
+                return self._note_step(f"stock_t1_rows{bkt}", False)
             self._prepared_step = (
                 step_fn,
                 attn_md,
@@ -1143,7 +1474,7 @@ class MegakernelDriver:
             _, num_reqs, tokens_per_seq, _ = self._inspect_step_detail(
                 attn_md, m0, runner=runner
             )
-            active_rows = num_reqs * tokens_per_seq
+            active_rows = max(tokens_per_seq, num_reqs * tokens_per_seq)
             if tokens_per_seq == 4:
                 bkt = select_bucket(
                     max(4, min(active_rows, self.max_verify_bucket)),
@@ -1191,8 +1522,11 @@ class MegakernelDriver:
             assert self._zero_roff_1d is not None
             roff = self._zero_roff_1d
 
-        active_rows = num_reqs * tokens_per_seq
-        if positions is not None and positions.numel() >= active_rows:
+        active_rows = max(tokens_per_seq, num_reqs * tokens_per_seq)
+        if positions is not None and (
+            (positions.ndim == 2 and positions.shape[1] >= active_rows)
+            or (positions.ndim == 1 and positions.numel() >= active_rows)
+        ):
             pos_in = positions
         elif tokens_per_seq > 1:
             offsets = torch.arange(

@@ -1026,7 +1026,7 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
         self._qwen35_mk: Any = None
-        self._in_precompile_backbone: bool = False
+        self._in_dummy_run: bool = False
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
@@ -5600,12 +5600,16 @@ class TPUModelRunner(GPUModelRunner):
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
-            out, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=position_ids,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-            )
+            self._in_dummy_run = True
+            try:
+                out, _ = self.forward_model(
+                    input_ids=input_ids,
+                    positions=position_ids,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                )
+            finally:
+                self._in_dummy_run = False
             if isinstance(out, IntermediateTensors):
                 if through_handoff:
                     # The output leaves padded to the hand-off buffer; it is
@@ -6439,8 +6443,7 @@ class TPUModelRunner(GPUModelRunner):
         if getattr(self, "_qwen35_mk", None) is not None:
             with self._precompile_timed("Qwen3.5 megakernel"):
                 self._qwen35_mk.bind_caches(self)
-                if not self.enforce_eager:
-                    self._qwen35_mk.warmup(self)
+                self._qwen35_mk.warmup(self, eager_only=self.enforce_eager)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -6652,40 +6655,35 @@ class TPUModelRunner(GPUModelRunner):
         one executable per bucket either way (see
         vllm_torchtpu.compilation.shape_variants).
         """
-        self._in_precompile_backbone = True
-        try:
-            with shape_variants.warmup() as buckets:
-                for num_tokens in self.num_tokens_paddings:
-                    logger.info("  -- num_tokens: %d", num_tokens)
-                    if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
+        with shape_variants.warmup() as buckets:
+            for num_tokens in self.num_tokens_paddings:
+                logger.info("  -- num_tokens: %d", num_tokens)
+                if buckets.needs_retrace(num_tokens):
+                    shape_variants.retrace(self.model, self.vllm_config)
+                self._dummy_run(
+                    num_tokens,
+                    self.num_reqs_max_model_len,
+                    self.max_num_blocks_per_req,
+                    use_max_model_len=True,
+                )
+                if self.most_model_len is not None:
+                    assert self.num_reqs_most_model_len is not None
+                    assert self.num_blocks_per_most_len_req is not None
                     self._dummy_run(
                         num_tokens,
-                        self.num_reqs_max_model_len,
-                        self.max_num_blocks_per_req,
-                        use_max_model_len=True,
+                        self.num_reqs_most_model_len,
+                        self.num_blocks_per_most_len_req,
+                        use_max_model_len=False,
                     )
-                    if self.most_model_len is not None:
-                        assert self.num_reqs_most_model_len is not None
-                        assert self.num_blocks_per_most_len_req is not None
-                        self._dummy_run(
-                            num_tokens,
-                            self.num_reqs_most_model_len,
-                            self.num_blocks_per_most_len_req,
-                            use_max_model_len=False,
-                        )
-                if buckets.refused:
-                    # A refusal that no trace picked up leaves a raising closure in
-                    # the live graph, which would surface as a failed request. Fail
-                    # the start instead, where it can be read.
-                    raise shape_variants.ShapeSpecializationError(
-                        "warmup left token buckets uncompiled: "
-                        f"{sorted(buckets.refused)}"
-                    )
-            if self._pp_wave is not None:
-                self._warmup_handoff_forwards()
-        finally:
-            self._in_precompile_backbone = False
+            if buckets.refused:
+                # A refusal that no trace picked up leaves a raising closure in
+                # the live graph, which would surface as a failed request. Fail
+                # the start instead, where it can be read.
+                raise shape_variants.ShapeSpecializationError(
+                    f"warmup left token buckets uncompiled: {sorted(buckets.refused)}"
+                )
+        if self._pp_wave is not None:
+            self._warmup_handoff_forwards()
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
@@ -7539,24 +7537,36 @@ class TPUModelRunner(GPUModelRunner):
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         mk = getattr(self, "_qwen35_mk", None)
+        ab_t0: float | None = None
         if (
             mk is not None
+            and not getattr(self, "_in_dummy_run", False)
             and not getattr(self, "_in_precompile_backbone", False)
-            and mk.can_run(
+        ):
+            use_mk = mk.can_run(
                 input_ids,
                 positions,
                 inputs_embeds=inputs_embeds,
                 intermediate_tensors=intermediate_tensors,
                 runner=self,
             )
-        ):
-            out = mk(
-                input_ids,
-                positions,
-                num_tokens=int(positions.shape[-1]),
-                runner=self,
-            )
-            return out, None
+            if mk.ab_calibrator.enabled:
+                ab_t0 = time.perf_counter()
+            if use_mk:
+                out = mk(
+                    input_ids,
+                    positions,
+                    num_tokens=int(positions.shape[-1]),
+                    runner=self,
+                )
+                if ab_t0 is not None:
+                    if self.device.type == "tpu":
+                        synchronize_tensors([out])
+                    mk.record_ab_step(
+                        (time.perf_counter() - ab_t0) * 1000.0,
+                        padded_tokens=int(positions.shape[-1]),
+                    )
+                return out, None
 
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
@@ -7582,6 +7592,13 @@ class TPUModelRunner(GPUModelRunner):
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
+        if ab_t0 is not None and mk is not None:
+            if self.device.type == "tpu" and isinstance(out, torch.Tensor):
+                synchronize_tensors([out])
+            mk.record_ab_step(
+                (time.perf_counter() - ab_t0) * 1000.0,
+                padded_tokens=int(positions.shape[-1]),
+            )
         return out, aux_hidden_states
 
     def _pp_intermediate_tensors(
