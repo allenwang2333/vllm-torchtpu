@@ -63,12 +63,6 @@ vllm serve Qwen/Qwen3-8B \
   }'
 ```
 
-During chunked prefill, DFlash and DSpark update the draft context KV for
-new prompt tokens. They skip candidate generation when every request in the
-step remains inside its prompt. Final prefill and decode retain proposals.
-EP-DP peers coordinate this decision so mixed and idle ranks keep matching
-collective calls. This applies to synchronous and asynchronous scheduling.
-
 ---
 
 ## 4. Draft-Model-Free Speculative Decoding (`ngram` & `suffix`)
