@@ -105,6 +105,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
+    NO_TOP_K_TOP_P,
     apply_top_k_top_p,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -5857,7 +5858,7 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                variants = [(False, 0), (True, 0)]
+                variants = [(False, 0), (True, 0), (False, NO_TOP_K_TOP_P)]
                 if blocks := self._topk_candidate_blocks():
                     variants.append((False, blocks))
                 for all_greedy, topk_candidates in variants:
@@ -6078,23 +6079,10 @@ class TPUModelRunner(GPUModelRunner):
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
                     ).to(self.device)
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_ng,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        temperatures=warm_temps,
-                        top_k=warm_top_k,
-                        top_p=warm_top_p,
-                        accept_u=warm_accept_u,
-                        recover_u=warm_recover_u,
-                        do_sampling=True,
-                    )
-                    synchronize_tensors(out)
+                    filter_variants = [0, NO_TOP_K_TOP_P]
                     if blocks := self._topk_candidate_blocks():
+                        filter_variants.append(blocks)
+                    for topk_candidates in filter_variants:
                         out = self.rejection_sampler(
                             draft_token_ids=draft_token_ids,
                             num_draft_tokens=draft_lengths,
@@ -6109,7 +6097,7 @@ class TPUModelRunner(GPUModelRunner):
                             accept_u=warm_accept_u,
                             recover_u=warm_recover_u,
                             do_sampling=True,
-                            topk_candidates=blocks,
+                            topk_candidates=topk_candidates,
                         )
                         synchronize_tensors(out)
                     logger.info(
@@ -7306,11 +7294,18 @@ class TPUModelRunner(GPUModelRunner):
 
         Candidates match the full-vocab result only when every active request
         keeps 1 <= top_k <= num_blocks // 2 and no grammar mask applies.
+        NO_TOP_K_TOP_P when no active request sets top-k or top-p, which is
+        what `_build_padded_sampling_params` pads with.
         """
+        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
+        top_p = self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
+        if bool(
+            (((top_k <= 0) | (top_k >= self.vocab_size)) & (top_p >= 1.0)).all()
+        ):
+            return NO_TOP_K_TOP_P
         num_blocks = self._topk_candidate_blocks()
         if num_blocks == 0 or grammar_output is not None:
             return 0
-        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
         if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
             return 0
         logger.info_once(

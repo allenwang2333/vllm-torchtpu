@@ -143,7 +143,8 @@ def test_sampler_topk_candidates_gating(monkeypatch):
     monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 64)
 
     input_batch = SimpleNamespace(
-        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64)
+        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64),
+        top_p_cpu_tensor=torch.ones(4),
     )
     runner.input_batch = input_batch
 
@@ -167,4 +168,38 @@ def test_rejection_sampler_topk_candidates_cpu_parity():
 
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=0)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=64)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_sampler_skips_top_k_top_p_when_no_request_sets_them(monkeypatch):
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.vocab_size = 248320
+    monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 64)
+    # vLLM stores a disabled top_k as the vocab size.
+    input_batch = SimpleNamespace(
+        top_k_cpu_tensor=torch.tensor([0, 248320, 0, 248320], dtype=torch.int64),
+        top_p_cpu_tensor=torch.ones(4),
+    )
+    runner.input_batch = input_batch
+    assert runner._sampler_topk_candidates(0, 4, None) == sampling.NO_TOP_K_TOP_P
+    assert runner._sampler_topk_candidates(0, 4, object()) == sampling.NO_TOP_K_TOP_P
+
+    input_batch.top_p_cpu_tensor = torch.tensor([1.0, 1.0, 0.95, 1.0])
+    assert runner._sampler_topk_candidates(0, 4, None) == 0
+    assert runner._sampler_topk_candidates(0, 2, None) == sampling.NO_TOP_K_TOP_P
+
+    input_batch.top_p_cpu_tensor = torch.ones(4)
+    input_batch.top_k_cpu_tensor = torch.tensor([0, 50, 0, 0], dtype=torch.int64)
+    assert runner._sampler_topk_candidates(0, 4, None) == 0
+
+
+def test_no_top_k_top_p_matches_neutral_masks():
+    gen = torch.Generator().manual_seed(3)
+    logits = torch.randn(6, 128 * 40, generator=gen) * 4
+    top_k = torch.zeros((6, 1), dtype=torch.int32)
+    top_p = torch.ones((6, 1))
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p(
+        logits, top_k, top_p, topk_candidates=sampling.NO_TOP_K_TOP_P
+    )
     torch.testing.assert_close(result, expected, rtol=0, atol=0)

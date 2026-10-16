@@ -26,8 +26,10 @@ from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     MASKED_LOGIT_VALUE,
+    NO_TOP_K_TOP_P,
     apply_top_k_top_p,
 )
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 pytestmark = pytest.mark.tpu_test
 
@@ -990,3 +992,59 @@ def test_random_rejection_sample_with_candidate_blocks_matches_full_vocab(device
     expected = sampler(**kwargs)
     result = sampler(**kwargs, topk_candidates=64)
     torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_random_rejection_sample_without_top_k_top_p_matches_masked_path(
+    device, synthetic
+):
+    # Production shape: every row at temperature 1, top_k off, top_p 1.0.
+    num_reqs, k, vocab_size = 8, 6, 129280
+    tokens = num_reqs * k
+    gen = torch.Generator().manual_seed(1)
+    logits = (torch.randn(tokens, vocab_size, generator=gen) * 4).to(torch.bfloat16)
+    random_drafts = torch.randint(0, vocab_size, (tokens,), generator=gen)
+    even = torch.arange(tokens) % 2 == 0
+    drafts = torch.where(even, logits.float().argmax(dim=-1), random_drafts)
+    kwargs = dict(
+        draft_token_ids=drafts.to(torch.int32).to(device),
+        num_draft_tokens=torch.full((num_reqs,), k, dtype=torch.int32, device=device),
+        target_logits=logits.to(device),
+        bonus_token_ids=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        segment_ids=torch.arange(num_reqs, device=device).repeat_interleave(k),
+        group_indices=torch.arange(k, device=device).repeat(num_reqs),
+        max_draft_tokens=k,
+        temperatures=torch.ones((tokens, 1), dtype=torch.bfloat16, device=device),
+        top_k=torch.zeros((tokens, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((tokens, 1), device=device),
+        accept_u=torch.rand(tokens, generator=gen).to(device),
+        recover_u=torch.rand(tokens, vocab_size, generator=gen).to(device),
+        do_sampling=True,
+    )
+    sampler = (
+        _synthetic_sampler([0.9, 0.7, 0.5, 0.4, 0.3, 0.2], device)
+        if synthetic
+        else RejectionSampler()
+    )
+    expected = sampler(**kwargs)
+    result = sampler(**kwargs, topk_candidates=NO_TOP_K_TOP_P)
+    assert torch.equal(result, expected)
+
+
+@pytest.mark.tpu_test
+def test_sample_from_logits_without_top_k_top_p_matches_masked_path(device):
+    rows, vocab_size = 8, 129280
+    gen = torch.Generator().manual_seed(2)
+    logits = (torch.randn(rows, vocab_size, generator=gen) * 4).to(torch.bfloat16)
+    args = (
+        logits.to(device),
+        torch.ones((rows, 1), dtype=torch.bfloat16, device=device),
+        torch.rand(rows, vocab_size, generator=gen).to(torch.bfloat16).to(device),
+        torch.zeros((rows, 1), dtype=torch.int32, device=device),
+        torch.ones((rows, 1), device=device),
+    )
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    expected = runner.sample_from_logits(*args)
+    result = runner.sample_from_logits(*args, topk_candidates=NO_TOP_K_TOP_P)
+    assert torch.equal(result, expected)
