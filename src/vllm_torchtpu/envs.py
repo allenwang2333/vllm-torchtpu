@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_VALID_READS: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
+    TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -1405,6 +1406,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # num_tokens is short of the table height (decode). Same values either way.
     "TPU_INDEXER_TOPK_SHARED_READ": env_bool(
         "TPU_INDEXER_TOPK_SHARED_READ", default=False
+    ),
+    # Query-token chunk size for sparse MLA attention (GLM-5.2 / DSv3.2-style):
+    # each chunk gathers its tokens' top-k KV rows into one buffer and then
+    # attends over it. The chunk loop is unrolled at trace time, so a graph
+    # holds `num_tokens / chunk` gather + attention kernel pairs per layer;
+    # bigger chunks compile faster but need a bigger gather buffer
+    # (chunk * top-k rows) and pipeline gather with attention more coarsely.
+    # Unset keeps the kernel default (64).
+    "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
+        "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
