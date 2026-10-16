@@ -388,6 +388,17 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
 
+    # Non-strict so an unrelated JAX bump that fixes this does not turn CI red;
+    # remove the mark once this test XPASSes.
+    @pytest.mark.xfail(
+        raises=jax.errors.JaxRuntimeError,
+        reason=(
+            "Pallas interpret mode cannot resolve DMAs on bitcast refs "
+            "('BitcastTransform' object has no attribute 'indices'), and every "
+            "V3 state DMA goes through granule_view (bitcast to uint32). A "
+            "detected race still fails the test with an AssertionError."
+        ),
+    )
     def test_state_pipeline_has_no_dma_race(self):
         """Pallas interpret-mode vector-clock detector finds zero DMA races."""
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
