@@ -939,9 +939,14 @@ class Eagle3Proposer:
                     propose_step0=True,
                 )
             if envs.TPU_MTP_STEP0_POST_ATTN_GATHER and mk.verify_buckets:
+                # Step 0 arrives padded to the runner's token bucket (28
+                # requests verify 112 rows, padded to 128), and use_for_step
+                # admits the padded count.
                 max_verify_rows = min(
                     mk.verify_buckets[-1] * 2,
-                    (1 + K) * int(getattr(self.runner, "max_num_reqs", 0) or 1024),
+                    mk.padded_rows(
+                        (1 + K) * int(getattr(self.runner, "max_num_reqs", 0) or 1024)
+                    ),
                 )
                 step0_buckets = tuple(
                     b
