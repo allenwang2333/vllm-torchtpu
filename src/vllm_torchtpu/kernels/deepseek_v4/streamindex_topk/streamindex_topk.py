@@ -1957,6 +1957,10 @@ def streamindex_topk_dcp(
             ov_in = (*tied, *ov_args[1:])
         else:
             (idxs, scores), ov_in = local, tuple(ov_args)
+        if flat_merge:
+            # Flat from here on, so the overlap barrier below holds the local
+            # kernel's own [T * k] output rather than a 2-D relayout of it.
+            scores = scores.reshape(-1)
 
         ov = None
         if overlap_fn is not None:
@@ -2002,7 +2006,7 @@ def streamindex_topk_dcp(
         # gather is rank-major over whole [T * k] lists, which the merge reads
         # in place.
         scores = lax.all_gather(
-            scores.reshape(-1) if flat_merge else scores,
+            scores,
             dcp_axis_name,
             axis=0 if flat_merge else 1,
             tiled=True,
