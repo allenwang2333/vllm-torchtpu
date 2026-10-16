@@ -192,6 +192,9 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        from vllm_torchtpu.worker.numa_bind import maybe_bind_worker
+
+        maybe_bind_worker(binding.local_rank, max(binding.local_world_size, 1))
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
