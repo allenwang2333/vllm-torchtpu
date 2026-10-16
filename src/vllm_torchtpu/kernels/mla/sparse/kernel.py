@@ -1420,6 +1420,7 @@ def _attention_kernel(
     return_lse: bool = False,
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
+    is_dcp_mode: bool = False,
     split_q: bool = False,
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
@@ -1600,20 +1601,30 @@ def _attention_kernel(
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
 
+    def get_batch_max_kv_len(seq_idx_start):
+        max_kv = jnp.int32(0)
+        for b in range(batch_size):
+            max_kv = jnp.maximum(max_kv, kv_lens_ref[seq_idx_start + b])
+        return max_kv
+
+    # DCP slice rungs: shared by the fetch and compute ladders so a compute rung
+    # never reads VMEM rows its fetch rung did not fill.
+    kv_rungs = [bkv_sz]
+    for div in (8, 4, 2):
+        if bkv_sz % div == 0 and bkv_sz // div >= 64 and (bkv_sz // div) % 64 == 0:
+            kv_rungs = [bkv_sz // div * k for k in (1, 2, 4, 8) if k <= div]
+            break
+
     def attention_step1_qk_softmax(
         q,  # [num_q_heads, head_dim]
-        kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
+        kv,  # [slice_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
         kv_len,  # i32[] number of valid (non "-1") top-k rows in kv
     ):
         assert len(q.shape) == 2
         assert len(kv.shape) == 2
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim) or (
-            (live_widths or row_widths)
-            and kv.shape[1] == head_dim
-            and kv.shape[0] in (*live_widths, *row_widths)
-        )
+        assert kv.shape[1] == head_dim
 
         # Single-block softmax: each query attends exactly one gathered kv
         # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
@@ -1671,62 +1682,147 @@ def _attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
-        sem_nope = sems.at[0, bkv_sem_idx]
-        sem_rope = sems.at[3, bkv_sem_idx]
+    if is_dcp_mode:
 
-        bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
-        bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
-
-        # The index into cache_kv_hbm_ref should be relative to the current
-        # chunk.
-        page_idx_start = seq_idx_start - start_seq_idx
-        if rows is not None:
-            # `row_widths`: only the first `rows` rows of each token's tile.
-            rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
-            nope_src = cache_kv_nope_hbm_ref.at[
-                pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+        def _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, slice_sz, *, wait=False):
+            sem_nope = sems.at[0, bkv_sem_idx]
+            sem_rope = sems.at[3, bkv_sem_idx]
+            nope_rows = (
+                slice_sz if sparsecore_layout else slice_sz * kv_cache_utils.WORD_BYTES
+            )
+            rope_rows = (
+                slice_sz // native_sc_gather.ROPE_PACKING
+                if sparsecore_layout
+                else slice_sz
+            )
+            bkv_nope_vmem_ref = bkv_nope_x2_ref.at[
+                bkv_sem_idx, :, pl.ds(0, nope_rows), :
             ]
-            rope_src = cache_kv_rope_hbm_ref.at[
-                pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows)
+            bkv_rope_vmem_ref = bkv_rope_x2_ref.at[
+                bkv_sem_idx, :, pl.ds(0, rope_rows), :
             ]
-            nope_dst = bkv_nope_vmem_ref.at[:, pl.ds(0, rows)]
-            rope_dst = bkv_rope_vmem_ref.at[:, pl.ds(0, rope_rows)]
-            if wait:
-                _async_copy(nope_dst, nope_dst, sem_nope, True)
-                _async_copy(rope_dst, rope_dst, sem_rope, True)
+            page_idx_start = seq_idx_start - start_seq_idx
+            if not wait:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[
+                        pl.ds(page_idx_start, batch_size), pl.ds(0, nope_rows), :
+                    ],
+                    bkv_nope_vmem_ref,
+                    sem_nope,
+                    wait,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[
+                        pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows), :
+                    ],
+                    bkv_rope_vmem_ref,
+                    sem_rope,
+                    wait,
+                )
             else:
-                _async_copy(nope_src, nope_dst, sem_nope, False)
-                _async_copy(rope_src, rope_dst, sem_rope, False)
-            return
-        if group_tab_ref is not None:
-            _fetch_live_blocks(
-                seq_idx_start,
-                bkv_nope_vmem_ref,
-                bkv_rope_vmem_ref,
-                sem_nope,
-                sem_rope,
-                wait,
-            )
-            return
-        if not wait:
-            _async_copy(
-                cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
-                bkv_nope_vmem_ref,
-                sem_nope,
-                wait,
-            )
-            _async_copy(
-                cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
-                bkv_rope_vmem_ref,
-                sem_rope,
-                wait,
-            )
-        else:
-            dst_nope = bkv_nope_vmem_ref
-            _async_copy(src=dst_nope, dst=dst_nope, sem=sem_nope, wait=True)
-            dst_rope = bkv_rope_vmem_ref
-            _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
+                _async_copy(
+                    src=bkv_nope_vmem_ref,
+                    dst=bkv_nope_vmem_ref,
+                    sem=sem_nope,
+                    wait=True,
+                )
+                _async_copy(
+                    src=bkv_rope_vmem_ref,
+                    dst=bkv_rope_vmem_ref,
+                    sem=sem_rope,
+                    wait=True,
+                )
+
+        def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
+            if group_tab_ref is not None:
+                # Live groups: the step's live atom blocks hold every row of
+                # its tokens' kv_len; rows past them are zeroed and masked.
+                _fetch_live_blocks(
+                    seq_idx_start,
+                    bkv_nope_x2_ref.at[bkv_sem_idx, :],
+                    bkv_rope_x2_ref.at[bkv_sem_idx, :],
+                    sems.at[0, bkv_sem_idx],
+                    sems.at[3, bkv_sem_idx],
+                    wait,
+                )
+                return
+            if row_widths:
+                # `row_widths` picks the width (`with_row_width`), not the rungs.
+                _fetch_bkv_slice(
+                    seq_idx_start,
+                    bkv_sem_idx,
+                    bkv_sz if rows is None else rows,
+                    wait=wait,
+                )
+                return
+            batch_max_kv = get_batch_max_kv_len(seq_idx_start)
+            lo = 0
+            for i, rung in enumerate(kv_rungs):
+                hi_ok = True if i == len(kv_rungs) - 1 else batch_max_kv <= rung
+                pl.when((batch_max_kv > lo) & hi_ok)(
+                    functools.partial(
+                        _fetch_bkv_slice, seq_idx_start, bkv_sem_idx, rung, wait=wait
+                    )
+                )
+                lo = rung
+    else:
+
+        def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
+            sem_nope = sems.at[0, bkv_sem_idx]
+            sem_rope = sems.at[3, bkv_sem_idx]
+
+            bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
+            bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
+
+            # The index into cache_kv_hbm_ref should be relative to the current
+            # chunk.
+            page_idx_start = seq_idx_start - start_seq_idx
+            if rows is not None:
+                # `row_widths`: only the first `rows` rows of each token's tile.
+                rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
+                nope_src = cache_kv_nope_hbm_ref.at[
+                    pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+                ]
+                rope_src = cache_kv_rope_hbm_ref.at[
+                    pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows)
+                ]
+                nope_dst = bkv_nope_vmem_ref.at[:, pl.ds(0, rows)]
+                rope_dst = bkv_rope_vmem_ref.at[:, pl.ds(0, rope_rows)]
+                if wait:
+                    _async_copy(nope_dst, nope_dst, sem_nope, True)
+                    _async_copy(rope_dst, rope_dst, sem_rope, True)
+                else:
+                    _async_copy(nope_src, nope_dst, sem_nope, False)
+                    _async_copy(rope_src, rope_dst, sem_rope, False)
+                return
+            if group_tab_ref is not None:
+                _fetch_live_blocks(
+                    seq_idx_start,
+                    bkv_nope_vmem_ref,
+                    bkv_rope_vmem_ref,
+                    sem_nope,
+                    sem_rope,
+                    wait,
+                )
+                return
+            if not wait:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                    bkv_nope_vmem_ref,
+                    sem_nope,
+                    wait,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
+                    bkv_rope_vmem_ref,
+                    sem_rope,
+                    wait,
+                )
+            else:
+                dst_nope = bkv_nope_vmem_ref
+                _async_copy(src=dst_nope, dst=dst_nope, sem=sem_nope, wait=True)
+                dst_rope = bkv_rope_vmem_ref
+                _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
 
     def _fetch_live_blocks(seq_idx_start, nope_dst, rope_dst, sem_nope, sem_rope, wait):
         num_groups = group_tab_ref.shape[0] // 2
@@ -1936,7 +2032,6 @@ def _attention_kernel(
 
     def load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers):
         """`load_bkv` for the live body with `body_levers` (see above)."""
-        rows = bkv_sz if rows is None else rows
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
         rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
         rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
@@ -1986,38 +2081,50 @@ def _attention_kernel(
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
-    def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
+    def load_bkv(bkv_sem_idx, batch_idx, slice_sz=bkv_sz, levers=()):
         if levers:
-            return load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers)
+            return load_bkv_levers(bkv_sem_idx, batch_idx, slice_sz, levers)
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
         rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
-        if rows is not None:
-            nope_ref = nope_ref.at[pl.ds(0, rows)]
-            rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
         return unpack_bkv(
             nope_ref,
             rope_ref,
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+            slice_sz=slice_sz,
         )
 
-    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
-        bkv_nope = bkv_nope_ref[...]
+    def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len, slice_sz=bkv_sz):
+        # slice_sz < bkv_sz reads only the rung the batch's longest row needs.
+        if slice_sz == bkv_sz:
+            bkv_nope = bkv_nope_ref[...]
+        elif sparsecore_layout:
+            bkv_nope = bkv_nope_ref.at[pl.ds(0, slice_sz), :][...]
+        else:
+            bkv_nope = bkv_nope_ref.at[
+                pl.ds(0, slice_sz * kv_cache_utils.WORD_BYTES), :
+            ][...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
             # expands the packed byte lanes before folding them into the
             # logical 512-byte NOPE vector.
             bkv_nope = pltpu.bitcast(bkv_nope, jnp.uint8)
-        rows = bkv_nope_ref.shape[0] if sparsecore_layout else bkv_sz
-        bkv_nope = bkv_nope.reshape(rows, nope_dim)
+        bkv_nope = bkv_nope.reshape(slice_sz, nope_dim)
         bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
 
-        bkv_rope = bkv_rope_ref[...]
+        if slice_sz == bkv_sz:
+            bkv_rope = bkv_rope_ref[...]
+        elif sparsecore_layout:
+            bkv_rope = bkv_rope_ref.at[
+                pl.ds(0, slice_sz // native_sc_gather.ROPE_PACKING), :
+            ][...]
+        else:
+            bkv_rope = bkv_rope_ref.at[pl.ds(0, slice_sz), :][...]
         if sparsecore_layout:
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
             # contiguous 128-byte row per selected token.
             bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
-            bkv_rope = bkv_rope.reshape(rows, 128)
+            bkv_rope = bkv_rope.reshape(slice_sz, 128)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
@@ -2167,12 +2274,6 @@ def _attention_kernel(
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
 
-        prev_p = None
-        prev_bkv = None
-        prev_l_sum = None
-        prev_m = None
-        prev_out = None
-
         def write_blse(batch_idx, m, l_sum):
             # log-sum-exp in the *unshifted* frame, so a peer holding a
             # disjoint slice of the same token's top-k can merge with
@@ -2180,11 +2281,9 @@ def _attention_kernel(
             if not return_lse:
                 return
             lse_col = m + jnp.log(l_sum)
-            if lse_mask_empty:
+            if is_dcp_mode or lse_mask_empty:
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                lse_col = lse_col + jnp.where(
-                    kv_len == 0, jnp.float32(-jnp.inf), jnp.float32(0.0)
-                )
+                lse_col = jnp.where(kv_len > 0, lse_col, -jnp.inf)
             store_blse(bo_sem_idx, batch_idx, lse_col)
 
         # Wait for cur blocks if not ready yet
@@ -2204,22 +2303,22 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        def run_steps(rows=None, levers=()):
+        def run_steps(slice_sz=bkv_sz, levers=()):
             prev_p = None
             prev_bkv = None
             prev_l_sum = None
             prev_m = None
             prev_out = None
+
             for batch_idx in range(batch_size):
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
+                bkv = load_bkv(bi_sem_idx, batch_idx, slice_sz=slice_sz, levers=levers)
                 bq = load_bq(bi_sem_idx, batch_idx)
 
                 if prev_out is not None and "noinf" not in levers:
-                    # Artificial dependency to force MXU/VPU interleaving by limiting
-                    # LLO's QK runahead
-                    # We use jnp.where to prevent XLA from optimizing the dependency away.
-                    # prev_out won't be inf in practice.
+                    # Artificial dependency: limits LLO's QK runahead so the
+                    # MXU and VPU interleave. jnp.where stops XLA folding it
+                    # away; prev_out won't be inf in practice.
                     dep = prev_out
                     if dep.shape != bq.shape:  # "pv512": a NOPE-wide output
                         dep = dep[:, :1]
@@ -2247,29 +2346,70 @@ def _attention_kernel(
             bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
             write_blse(batch_size - 1, prev_m, prev_l_sum)
 
-        if live_widths:
-            atom_rows = live_nope_hbm_ref.shape[2]
-            need = group_tab_ref[batch_start_seq_idx // batch_size] * atom_rows
-            lower = None
-            for width in tuple(live_widths) + (bkv_sz,):
-                fits = need <= width if lower is None else (need > lower) & (need <= width)
-                pl.when(fits)(
-                    functools.partial(
-                        run_steps,
-                        width if width < bkv_sz else None,
-                        tuple(body_levers),
+        if group_tab_ref is not None:
+            # Live groups (DCP mixed buckets): the step's live atom blocks size
+            # the body (`live_widths`) and `body_levers` pick its form. Rows
+            # past each token's kv_len are zeroed / masked, and an all-empty
+            # step's lse is -inf (`is_dcp_mode` / `lse_mask_empty`).
+            if live_widths:
+                atom_rows = live_nope_hbm_ref.shape[2]
+                need = group_tab_ref[batch_start_seq_idx // batch_size] * atom_rows
+                lower = None
+                for width in tuple(live_widths) + (bkv_sz,):
+                    fits = (
+                        need <= width
+                        if lower is None
+                        else (need > lower) & (need <= width)
                     )
-                )
-                lower = width
+                    pl.when(fits)(
+                        functools.partial(run_steps, width, tuple(body_levers))
+                    )
+                    lower = width
+            else:
+                run_steps(bkv_sz, tuple(body_levers))
+        elif is_dcp_mode:
+            batch_max_kv_len = get_batch_max_kv_len(batch_start_seq_idx)
+
+            @pl.when(batch_max_kv_len == 0)
+            def _zero_batch():
+                # o_dim and store_blse keep split-q and lane-dense lse working.
+                zero_out = jnp.zeros((num_q_heads, o_dim), dtype=q_dtype)
+                neg_inf_lse = jnp.full((num_q_heads, 1), -jnp.inf, dtype=jnp.float32)
+                for batch_idx in range(batch_size):
+                    bo_x2_ref.at[bo_sem_idx, batch_idx][...] = zero_out
+                    if return_lse:
+                        store_blse(bo_sem_idx, batch_idx, neg_inf_lse)
+
+            if row_widths:
+
+                def wait_and_run(rows):
+                    # Every batch started a fetch of one width; wait on it
+                    # even when the batch is all-empty.
+                    wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
+                    pl.when(batch_max_kv_len > 0)(
+                        functools.partial(run_steps, bkv_sz if rows is None else rows)
+                    )
+
+                with_row_width(batch_start_seq_idx, wait_and_run)
+            else:
+                lo = 0
+                for i, rung in enumerate(kv_rungs):
+                    hi_ok = (
+                        True if i == len(kv_rungs) - 1 else batch_max_kv_len <= rung
+                    )
+                    pl.when((batch_max_kv_len > lo) & hi_ok)(
+                        functools.partial(run_steps, rung)
+                    )
+                    lo = rung
         elif row_widths:
 
             def wait_and_run(rows):
                 wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
-                run_steps(rows, tuple(body_levers))
+                run_steps(bkv_sz if rows is None else rows, tuple(body_levers))
 
             with_row_width(batch_start_seq_idx, wait_and_run)
         else:
-            run_steps(None, tuple(body_levers))
+            run_steps()
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -2399,6 +2539,8 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "is_dcp_mode",
+        "capped_live_rows",
         "lse_lane_dense",
         "lse_mask_empty",
         "fused_window_prep",
@@ -2442,6 +2584,8 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    is_dcp_mode: bool = False,
+    capped_live_rows: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
     lse_mask_empty: bool = False,
@@ -2516,6 +2660,11 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      is_dcp_mode: whether to enable DCP mode (skips gather and attention compute
+        for padding and uses dynamic KV cache slice sizing).
+      capped_live_rows: With `topk_cap`, the native gather also skips each
+        (window, token) row's 64-slot atoms past its live count; the kernel
+        never reads those slots (`kv_len` masks), so outputs are unchanged.
       q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
         num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
         multiple of the dtype packing, and `q_pe` `[max_num_tokens,
@@ -2737,6 +2886,14 @@ def sparse_ragged_paged_attention(
         # Only the attention kernel reads kv_lens here: the fused prep counts
         # live entries itself, so XLA may run this reduce in the gather's shadow.
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        if is_dcp_mode:
+            # Same padding-token zeroing as the unfused window prep below.
+            kv_lens = jnp.where(
+                jnp.arange(kv_lens.shape[0], dtype=jnp.int32)
+                < cu_q_lens[distribution[2]],
+                kv_lens,
+                0,
+            )
         physical_indices = None
         prep_small, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
@@ -2779,6 +2936,14 @@ def sparse_ragged_paged_attention(
         assert topk_cap is not None
         chunk_window_rows = topk * uniform_chunk // 128
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        if is_dcp_mode:
+            # Same padding-token zeroing as the window prep below.
+            kv_lens = jnp.where(
+                jnp.arange(kv_lens.shape[0], dtype=jnp.int32)
+                < cu_q_lens[distribution[2]],
+                kv_lens,
+                0,
+            )
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
@@ -2836,6 +3001,14 @@ def sparse_ragged_paged_attention(
         assert topk_cap is not None
         chunk_window_rows = topk // topk_cap * uniform_chunk
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        if is_dcp_mode:
+            # Same padding-token zeroing as prepare_gather_indices' DCP path.
+            kv_lens = jnp.where(
+                jnp.arange(kv_lens.shape[0], dtype=jnp.int32)
+                < cu_q_lens[distribution[2]],
+                kv_lens,
+                0,
+            )
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
@@ -2868,6 +3041,8 @@ def sparse_ragged_paged_attention(
             cu_q_lens,
             page_size=page_size,
             total_num_pages=cache_kv_nope.shape[0],
+            is_dcp_mode=is_dcp_mode,
+            num_valid_tokens=cu_q_lens[distribution[2]],
         )
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
@@ -2907,12 +3082,14 @@ def sparse_ragged_paged_attention(
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+            is_dcp_mode=is_dcp_mode,
             small_chunk_tokens=small_chunk_tokens,
             small_chunk_batch_size=small_chunk_batch_size,
             small_chunk_live_gather=small_chunk_live_gather,
             small_chunk_gather_atoms=small_chunk_gather_atoms,
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
+            capped_live_rows=capped_live_rows,
             topk_override=topk,
             window_indices=(
                 window_indices_all
@@ -2966,6 +3143,8 @@ def prepare_gather_indices(
     *,
     page_size: int,
     total_num_pages: int,
+    is_dcp_mode: bool = False,
+    num_valid_tokens: jax.Array | None = None,  # i32
 ) -> tuple[jax.Array, jax.Array]:
     """Per-token valid top-k counts and flat cache row indices to gather.
 
@@ -2975,6 +3154,11 @@ def prepare_gather_indices(
     num_tokens, topk = topk_indices.shape
     # TODO: skip gather for padding tokens in topk_indices.
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+    if is_dcp_mode and num_valid_tokens is not None:
+        # Padding tokens own no rows, so the kernel can skip them outright.
+        kv_lens = jnp.where(
+            jnp.arange(num_tokens, dtype=jnp.int32) < num_valid_tokens, kv_lens, 0
+        )
     is_padding = topk_indices == -1
     flat_element_index = jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(
         num_tokens, topk
@@ -3044,7 +3228,9 @@ def sparse_attention_chunk(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
+    capped_live_rows: bool = False,
     topk_override: int | None = None,
+    is_dcp_mode: bool = False,
     window_indices: jax.Array | None = None,
     gather_live_in_indices: bool = False,
     q_pe: jax.Array | None = None,
@@ -3135,6 +3321,7 @@ def sparse_attention_chunk(
         end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
+        is_dcp_mode: bool = False,
         live_views: tuple[jax.Array, jax.Array] | None = None,
     ):
         batch_size = kernel_batch_size
@@ -3254,6 +3441,7 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            is_dcp_mode=is_dcp_mode,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
             lse_mask_empty=lse_mask_empty,
@@ -3338,6 +3526,39 @@ def sparse_attention_chunk(
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
 
+    tc_num_row_subchunks = 32
+    dcp_gather_atoms = sparsecore_atoms_per_batch
+    gather_step = native_sc_gather.OCCURRENCES_PER_ATOM
+    if (
+        is_dcp_mode
+        and capped_windows is None
+        and topk >= gather_step
+        and topk % gather_step == 0
+    ):
+        # Point whole dead gather windows at SKIP_INDEX so the gather drops
+        # them instead of reading the scattered pad rows. Capped mode packs
+        # rows window-major and bounds the gather with `num_live_capped`
+        # instead, so this rewrite would contradict it.
+        tc_steps_per_window = _largest_divisor(topk // gather_step, 4)
+        tc_num_row_subchunks = tc_steps_per_window * 4
+        dcp_gather_atoms = _largest_divisor(
+            topk // gather_step, sparsecore_atoms_per_batch
+        )
+        gather_window_size = (
+            dcp_gather_atoms * gather_step
+            if sparsecore_layout
+            else tc_steps_per_window * gather_step
+        )
+        window_start = (
+            jnp.arange(topk, dtype=jnp.int32) // gather_window_size
+        ) * gather_window_size
+        if indices is not None:
+            indices = jnp.where(
+                window_start[None, :] >= kv_lens[start_pos:end_pos, None],
+                dsa_gather.SKIP_INDEX,
+                indices,
+            )
+
     # Batching
     small_chunk, kernel_batch_size = _chunk_kernel_batch_size(
         chunk_size,
@@ -3375,6 +3596,7 @@ def sparse_attention_chunk(
         gather_atoms = sparsecore_atoms_per_batch
         if small_chunk and small_chunk_live_gather:
             gather_atoms = small_chunk_gather_atoms
+        live_tokens = batch_end - start_pos
         if gather_live_in_indices:
             # `window_indices` is then the fused prep's 128-lane form: hand it
             # to the gather flat (a bitcast, no relayout); its live vector
@@ -3385,7 +3607,6 @@ def sparse_attention_chunk(
             assert window_indices is not None and group_num_live is not None
             live_kwargs = dict(num_live_indices=group_num_live, linear_indices=True)
         else:
-            live_tokens = batch_end - start_pos
             token_windows = jnp.where(
                 jnp.arange(chunk_size) < live_tokens,
                 (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
@@ -3403,6 +3624,19 @@ def sparse_attention_chunk(
                 .transpose(1, 0, 2)
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
+        row_live_atoms = None
+        if capped_live_rows and group_tab is None:
+            # (Live groups already bound the gather per grid step, on a
+            # layout that is not window-major rows.)
+            # Window w of a gridded token holds prefix-packed slots [w*cap, (w+1)*cap).
+            window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
+            live_slots = jnp.clip(
+                kv_lens[start_pos:end_pos][None, :] - window_start[:, None], 0, topk_cap
+            )
+            live_slots = jnp.where(jnp.arange(chunk_size) < live_tokens, live_slots, 0)
+            row_live_atoms = (
+                (live_slots + GATHER_ATOM_ROWS - 1) // GATHER_ATOM_ROWS
+            ).reshape(-1)
         gathered = native_sc_gather.dsa_gather_native_sc(
             cache_kv_nope,
             cache_kv_rope,
@@ -3411,8 +3645,11 @@ def sparse_attention_chunk(
             atoms_per_batch=gather_atoms,
             wait_mode=sparsecore_gather_wait_mode,
             serve_pipelined=sparsecore_gather_pipelined,
+            # No is_dcp_mode: capped liveness is `num_live_capped` (or the
+            # fused prep's `live_vec`, or the live-group bound), not -1.
             live_multiple=kernel_batch_size
             * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
+            row_live_atoms=row_live_atoms,
             kv_write=kv_write,
             write_fault=kv_write_fault,
             **live_kwargs,
@@ -3459,9 +3696,10 @@ def sparse_attention_chunk(
                 cache_kv_rope,
                 indices,
                 out_size=chunk_size * topk,
-                atoms_per_batch=gather_atoms,
+                atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                **({"is_dcp_mode": True} if is_dcp_mode else {}),
                 **live_kwargs,
             )
         )
@@ -3476,6 +3714,12 @@ def sparse_attention_chunk(
             cache_kv_rope,
             indices.reshape(-1),
             num_valid_indices=num_valid_indices,
+            # Non-DCP calls stay byte-identical to the pre-#1477 signature.
+            **(
+                {"num_row_subchunks": tc_num_row_subchunks, "is_dcp_mode": True}
+                if is_dcp_mode
+                else {}
+            ),
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
             chunk_size,
@@ -3495,6 +3739,7 @@ def sparse_attention_chunk(
         end_seq_idx=batch_end,
         kernel_batch_size=kernel_batch_size,
         lse=lse,
+        is_dcp_mode=is_dcp_mode,
         live_views=live_views,
     )
     if kv_write is not None:

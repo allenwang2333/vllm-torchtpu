@@ -16,7 +16,8 @@
 An optional traced live-row count (``num_live_indices``) bounds the outer
 emit_pipeline grid so only the logical batches holding live rows are gathered;
 rows beyond are left unwritten (the attention grid never reads them). Without
-it every row is gathered.
+it every row is gathered. An optional per-row live-atom count
+(``row_live_atoms``) further skips each index row's dead 64-slot atoms.
 
 An optional write phase (``kv_write``, TPU_MLA_KV_WRITE_IN_GATHER) first DMAs
 this step's packed new tokens into both caches in place, then fences, so the
@@ -57,6 +58,35 @@ def _delta_swap(x, y, shift, mask):
     )
 
 
+def live_atom_lanes(
+    row_live_atoms: jax.Array, num_batches: int, atoms_per_batch: int, row_atoms: int
+) -> jax.Array:
+    """Per logical batch: [live atoms, exclusive live start of rows 1..R-1]."""
+    per_row = jnp.clip(row_live_atoms.astype(jnp.int32), 0, row_atoms)
+    if atoms_per_batch % row_atoms == 0:
+        rows_per_batch = atoms_per_batch // row_atoms
+        ends = jnp.cumsum(per_row.reshape(num_batches, rows_per_batch), axis=1)
+        return jnp.concatenate([ends[:, -1:], ends[:, :-1]], axis=1)
+    if row_atoms % atoms_per_batch == 0:
+        # A row spans several batches; each keeps its share of the live prefix.
+        split = row_atoms // atoms_per_batch
+        first = (jnp.arange(num_batches, dtype=jnp.int32) % split) * atoms_per_batch
+        live = jnp.clip(jnp.repeat(per_row, split) - first, 0, atoms_per_batch)
+        return live[:, None]
+    raise ValueError(
+        f"atoms_per_batch ({atoms_per_batch}) and row atoms ({row_atoms}) "
+        "must divide one another"
+    )
+
+
+def live_atom_of(step: Any, starts: list[Any], row_atoms: int) -> Any:
+    """Maps a packed live step to its batch atom, skipping each row's dead tail."""
+    shift = 0
+    for r, start in enumerate(starts, 1):
+        shift = jnp.where(step >= start, r * row_atoms - start, shift)
+    return step + shift
+
+
 def _kernel(
     nope_hbm_ref: Any,
     rope_hbm_ref: Any,
@@ -76,6 +106,10 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    is_dcp_mode: bool = False,
+    row_atoms_hbm_ref: Any = None,
+    row_atoms: int = 0,
+    rows_per_batch: int = 1,
     linear_indices: bool = False,
     write_refs: tuple[Any, ...] | None = None,
     write_scratch: tuple[Any, ...] | None = None,
@@ -108,10 +142,24 @@ def _kernel(
         # the per-owner trip count; only lane 0 of a vector is ever extracted.
         live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
 
-    def serve_batch(indices_ref):
+    def serve_batch(indices_ref, row_atoms_ref=None):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
+
+        num_atoms = atoms_per_batch
+        starts = []
+        if row_atoms_ref is not None:
+            # Lane block k broadcasts [live atoms, start of row 1, ...]; a scalar
+            # comes only from a rank-1 (16,) load + element extract on SC.
+            num_atoms = row_atoms_ref[pl.ds(0, NUM_LANES)][0]
+            starts = [
+                row_atoms_ref[pl.ds(r * NUM_LANES, NUM_LANES)][0]
+                for r in range(1, rows_per_batch)
+            ]
+
+        def atom_of(step):
+            return live_atom_of(step, starts, row_atoms)
 
         def values(atom, stream):
             if linear_indices:
@@ -128,7 +176,7 @@ def _kernel(
             )
 
         def body(*refs):
-            atom = pl.program_id(0)
+            atom = atom_of(pl.program_id(0))
             nope_inputs = refs[:ROPE_PACKING]
             rope_inputs = refs[ROPE_PACKING : 2 * ROPE_PACKING]
             rope_output = refs[-1]
@@ -172,26 +220,26 @@ def _kernel(
         nope_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(NUM_LANES), 128),
-                lambda atom, stream=stream: (values(atom, stream), 0),
+                lambda atom, stream=stream: (values(atom_of(atom), stream), 0),
             )
             for stream in range(ROPE_PACKING)
         )
         rope_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(NUM_LANES), 32),
-                lambda atom, stream=stream: (values(atom, stream), 0),
+                lambda atom, stream=stream: (values(atom_of(atom), stream), 0),
             )
             for stream in range(ROPE_PACKING)
         )
         rope_out_spec = pl.BlockSpec(
             (QUADS_PER_ATOM, 128),
-            lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+            lambda atom: (logical_batch * atoms_per_batch + atom_of(atom), 0),
         )
 
         def run_inner():
             pltpu.emit_pipeline(
                 body,
-                grid=(atoms_per_batch,),
+                grid=(num_atoms,),
                 in_specs=nope_specs + rope_specs,
                 out_specs=(rope_out_spec,),
                 no_pipelining=not serve_pipelined,
@@ -201,12 +249,21 @@ def _kernel(
                 rope_out_hbm_ref,
             )
 
+        pred = None
+        if is_dcp_mode:
+            # Skip a batch whose first index is the -1 pad.
+            pred = values(0, 0)[0] >= 0
         if live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
-            pl.when(logical_batch < live_batches)(run_inner)
-        else:
+            tail_ok = logical_batch < live_batches
+            pred = tail_ok if pred is None else (pred & tail_ok)
+        if row_atoms_ref is not None:
+            pred = num_atoms > 0 if pred is None else (pred & (num_atoms > 0))
+        if pred is None:
             run_inner()
+        else:
+            pl.when(pred)(run_inner)
 
     if linear_indices:
         indices_spec = pl.BlockSpec(
@@ -218,12 +275,22 @@ def _kernel(
             (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
             lambda batch: (owner + batch * num_owners, 0, 0, 0),
         )
+    in_specs = (indices_spec,)
+    in_refs = (indices_hbm_ref,)
+    if row_atoms_hbm_ref is not None:
+        in_specs += (
+            pl.BlockSpec(
+                (rows_per_batch * NUM_LANES,),
+                lambda batch: (owner + batch * num_owners,),
+            ),
+        )
+        in_refs += (row_atoms_hbm_ref,)
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
             grid=(batches_per_owner,),
-            in_specs=(indices_spec,),
-        )(indices_hbm_ref)
+            in_specs=in_specs,
+        )(*in_refs)
     else:
         # Traced grid length for emit_pipeline on a VectorSubcoreMesh, and
         # pl.when around it for the zero-trip case -- both lower on v7x SC.
@@ -240,8 +307,8 @@ def _kernel(
             pltpu.emit_pipeline(
                 serve_batch,
                 grid=(owner_batches,),
-                in_specs=(indices_spec,),
-            )(indices_hbm_ref)
+                in_specs=in_specs,
+            )(*in_refs)
 
     if late_drain is not None:
         late_drain()
@@ -452,6 +519,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "is_dcp_mode",
         "linear_indices",
         "live_vec_offset",
         "write_fault",
@@ -468,6 +536,8 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    is_dcp_mode: bool = False,
+    row_live_atoms: jax.Array | None = None,
     live_vec: jax.Array | None = None,
     linear_indices: bool = False,
     live_vec_offset: int | None = None,
@@ -486,6 +556,10 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    ``row_live_atoms`` (traced i32[query], optional) gathers only the first
+    ``row_live_atoms[i]`` 64-slot atoms of index row ``i``; the other atoms'
+    output rows are left unwritten. Composes with ``num_live_indices``.
 
     ``live_vec`` (traced i32[2 * NUM_LANES], optional; exclusive with
     ``num_live_indices``) is that live bound already in the kernel's own
@@ -516,6 +590,16 @@ def dsa_gather_native_sc(
     both caches in place before anything is gathered, and the call then also
     returns the updated ``(nope_cache, rope_cache)``. Bytes identical to
     `scatter.scatter` / `tc_scatter.scatter_caches` with the same rows.
+
+    Args:
+      nope_cache: explicit native-SC uint32[..., 128] cache.
+      rope_cache: quarter-major uint32[..., 128] cache.
+      indices: int32[query, topk] token indices.
+      out_size: total number of gathered tokens (indices.size).
+      atoms_per_batch: number of atoms per batch.
+      wait_mode: "overlap_rope" or "before_rope".
+      serve_pipelined: whether to pipeline the gather serving loop.
+      is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -607,13 +691,34 @@ def dsa_gather_native_sc(
         # multiple of num_owners * occurrences_per_batch (at topk=2048,
         # atoms=1: 32 * 64 = 2048 = one token, so decode needs no guard).
         guard_tail = live_multiple % owner_batch_size != 0
+    row_kwargs = {}
+    if row_live_atoms is not None:
+        # Rows of the first `out_size` indices; a `live_vec_offset` operand
+        # carries its live vector past them, so the width is not its shape.
+        num_rows = row_live_atoms.shape[0] if row_live_atoms.ndim == 1 else 0
+        row_len = out_size // num_rows if num_rows else 0
+        if (
+            not num_rows
+            or num_rows * row_len != out_size
+            or row_len % OCCURRENCES_PER_ATOM
+        ):
+            raise ValueError("row_live_atoms must be i32[query] with 64-slot rows")
+        row_atoms = row_len // OCCURRENCES_PER_ATOM
+        vals = live_atom_lanes(row_live_atoms, num_batches, atoms_per_batch, row_atoms)
+        rows_per_batch = vals.shape[1]
+        operands.append(
+            jnp.broadcast_to(
+                vals[:, :, None], (num_batches, rows_per_batch, NUM_LANES)
+            ).reshape(-1)
+        )
+        row_kwargs = dict(row_atoms=row_atoms, rows_per_batch=rows_per_batch)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    num_base = len(operands)  # nope, rope, indices[, live_vec]
+    num_base = len(operands)  # nope, rope, indices[, live_vec][, row atoms]
     if kv_write is not None:
         write_rows = (
             kv_write if isinstance(kv_write, jax.Array) else pack_write_rows(*kv_write)
@@ -648,19 +753,25 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        is_dcp_mode=is_dcp_mode,
         linear_indices=linear_indices,
         write_tokens=write_tokens,
         write_fault=write_fault,
+        **row_kwargs,
     )
 
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
         ins, (nope_o, rope_o) = refs[:-2], refs[-2:]
         nope, rope, idx = ins[:3]
+        extras = list(ins[3:num_base])  # [live_vec][, row atoms]
         kw = {}
         if live_vec_offset is not None:
+            # The fused prep's live vector rides in the indices operand itself.
             kw["live_hbm_ref"] = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
         elif live:
-            kw["live_hbm_ref"] = ins[3]
+            kw["live_hbm_ref"] = extras.pop(0)
+        if row_kwargs:
+            kw["row_atoms_hbm_ref"] = extras.pop(0)
         if kv_write is not None:
             kw["write_refs"] = tuple(ins[num_base:])
             kw["write_scratch"] = (write_dst_vmem, write_dst_sem, write_sem)
@@ -682,6 +793,7 @@ def dsa_gather_native_sc(
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
+            f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
         ),
     )(*operands)
