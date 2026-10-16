@@ -1149,7 +1149,7 @@ def sparse_mla_attention_dcp(
         q head view `[num_tokens, num_heads, 256]` and this the per-token f32
         `[num_tokens, 2, 128]` rope table (`sparse_ragged_paged_attention`):
         the kernel ropes q_pe in VMEM, and on decode buckets also owns the lse
-        sentinel. Requires TPU_DCP_MLA_SPLIT_Q_LSE.
+        sentinel. Requires TPU_MLA_SPARSE_SPLIT_Q.
       kv_write_fault: test-only positive controls for
         TPU_MLA_KV_WRITE_IN_GATHER: `"wrong_owner"` (rows addressed as the
         next DCP rank's) or one of `native_sc_gather.WRITE_FAULTS`.
@@ -1220,8 +1220,8 @@ def sparse_mla_attention_dcp(
     )
     q_rope = q_rope_table is not None
     if q_rope:
-        if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
-            raise ValueError("q_rope_table requires TPU_DCP_MLA_SPLIT_Q_LSE")
+        if not envs.TPU_MLA_SPARSE_SPLIT_Q:
+            raise ValueError("q_rope_table requires TPU_MLA_SPARSE_SPLIT_Q")
         in_specs = in_specs + (P(None, None, None),)  # q_rope_table
     out_specs = (
         P(dcp_axis_name),  # nope cache shard

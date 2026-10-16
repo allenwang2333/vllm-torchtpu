@@ -643,7 +643,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA with query replication: rope q_pe inside the attention
     # kernel from the raw q head (no torch-side q rope / q_pe concat), and on
     # decode buckets let the kernel lay down the lse sentinel itself (no
-    # XLA-initialised aliased lse). Needs TPU_DCP_MLA_SPLIT_Q_LSE and
+    # XLA-initialised aliased lse). Needs TPU_MLA_SPARSE_SPLIT_Q and
     # TPU_MLA_ROPE_NEOX_PERMUTE.
     "TPU_MLA_DECODE_PROLOGUE": env_bool("TPU_MLA_DECODE_PROLOGUE", default=False),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
