@@ -51,6 +51,20 @@ if [[ -z "${K3_ENGINE_IMAGE:-}" ]]; then
 fi
 export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
 
+# Whether that pair's pods get the fleet's caches (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else `none` for a
+# megakernel point and empty, which keeps them, for anything else. A megakernel
+# boot needs the host memory the gcsfuse file cache would hold; see the
+# manifest. Tested for set rather than empty, so a step can keep the caches by
+# setting it empty.
+if [[ -z "${K3_FLEET_CACHES+set}" ]]; then
+  case "${K3_PD_CONFIG:-}" in
+    kimi-k3-megakernel*/*) K3_FLEET_CACHES=none ;;
+    *) K3_FLEET_CACHES="" ;;
+  esac
+fi
+export K3_FLEET_CACHES
+
 # Anything exported here must also be named in FORWARD below: the launcher
 # forwards only what --env names.
 export FORCE_COLOR="1"
@@ -104,7 +118,8 @@ FORWARD=(
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
-  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh:
+  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
+  # and the megakernel recipe:
   # the eval-only job (the eval step's own env, distinct from the
   # K3_AGENTX_EVAL_ONLY build trigger), the eval smoke, and skipping the
   # post-replay eval.

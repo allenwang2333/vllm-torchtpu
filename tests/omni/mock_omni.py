@@ -64,6 +64,8 @@ class _MockSDPAImpl:
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
+        self.softmax_scale = kwargs.get("softmax_scale", scale)
+        self.causal = kwargs.get("causal", False)
 
     def _forward_impl(
         self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
@@ -120,6 +122,18 @@ class _MockQwenEmbedLayer3DRope:
     forward = _forward_mock_qwen_rope
 
 
+class _MockColumnParallelGELU(torch.nn.Module):
+    """vLLM-Omni's Wan FFN up-projection + tanh GELU."""
+
+    def __init__(self, dim_in, dim_out, approximate="tanh"):
+        super().__init__()
+        self.proj = torch.nn.Linear(dim_in, dim_out)
+        self.approximate = approximate
+
+    def forward(self, x):
+        return torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
+
+
 class _MockRotaryEmbeddingWan(torch.nn.Module):
     """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
 
@@ -138,6 +152,22 @@ class _MockRotaryEmbeddingWan(torch.nn.Module):
         return rotated.flatten(-2, -1).to(x.dtype)
 
 
+class _MockRMSNorm(torch.nn.Module):
+    """vLLM-Omni's RMSNorm parameters (weight, variance_epsilon)."""
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+
+class _MockWanSelfAttention(torch.nn.Module):
+    """vLLM-Omni's Wan self-attention; reports that its forward ran."""
+
+    def forward(self, hidden_states, rotary_emb=None, attn_metadata=None):
+        return "native"
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -153,6 +183,10 @@ qwen_transformer_mock = (
 qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
 qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
 vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
+vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
+_wan2_2 = vllm_omni_mock.diffusion.models.wan2_2
+_wan2_2.wan2_2_transformer.ColumnParallelGELU = _MockColumnParallelGELU
+_wan2_2.wan2_2_transformer.WanSelfAttention = _MockWanSelfAttention
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -183,5 +217,10 @@ sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
 sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
     vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
 )
+sys.modules["vllm_omni.diffusion.models.wan2_2"] = _wan2_2
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
+    _wan2_2.wan2_2_transformer
+)
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope
+sys.modules["vllm_omni.diffusion.layers.norm"] = vllm_omni_mock.diffusion.layers.norm
