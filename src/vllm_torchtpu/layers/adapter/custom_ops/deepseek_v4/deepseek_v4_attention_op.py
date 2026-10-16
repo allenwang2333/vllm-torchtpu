@@ -57,6 +57,7 @@ def _run_swa(
     logical_page_size: int,
     swa_only: bool,
     non_causal_block: bool = False,
+    lane_padded_lm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
@@ -89,6 +90,7 @@ def _run_swa(
         q_compute_block_size=4,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
+        lane_padded_lm=lane_padded_lm,
     )
 
 
@@ -139,6 +141,8 @@ def _attention_hca(
         logical_page_size=logical_page_size,
         swa_only=swa_only,
         non_causal_block=non_causal_block,
+        # The HCA kernel reads l/m at 128 lanes; skip the slice-then-pad.
+        lane_padded_lm=True,
     )
 
     if swa_only:
