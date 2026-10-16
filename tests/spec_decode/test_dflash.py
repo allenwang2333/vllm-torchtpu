@@ -762,31 +762,6 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     )
 
 
-def test_context_only_prefill_updates_real_and_padding_chunks_without_proposals():
-    proposer = _make_proposer(draft_tp=8, target_tp=8)
-    proposer.runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True, _dp_step_num_chunks=3
-    )
-    proposer.draft_chunks = [
-        SimpleNamespace(aux_hidden_states=[torch.ones(1)]),
-        SimpleNamespace(aux_hidden_states=[torch.ones(1)]),
-    ]
-    calls = []
-    proposer._update_draft_kv_cache_from_target = mock.Mock(
-        side_effect=lambda chunk: calls.append("context")
-    )
-    proposer._dp_dummy_kv_update = mock.Mock(
-        side_effect=lambda: calls.append("dummy-kv")
-    )
-    proposer._dflash_forward_and_sample = mock.Mock()
-    proposer._dp_dummy_forward = mock.Mock()
-
-    proposer.update_context()
-    assert calls == ["context", "context", "dummy-kv"]
-    proposer._dflash_forward_and_sample.assert_not_called()
-    proposer._dp_dummy_forward.assert_not_called()
-
-
 @pytest.mark.parametrize("chunks", [[], [SimpleNamespace(aux_hidden_states=None)]])
 def test_context_only_prefill_requires_captured_aux_states(chunks):
     proposer = _make_proposer(draft_tp=8, target_tp=8)

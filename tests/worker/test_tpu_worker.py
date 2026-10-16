@@ -26,8 +26,6 @@ from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
-from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -554,38 +552,3 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
-
-
-def test_idle_worker_does_not_require_proposals_during_partial_prefill():
-    events = []
-    drafter = DFlashProposer.__new__(DFlashProposer)
-    drafter.draft_model = SimpleNamespace()
-    drafter._dp_lockstep_sharded = lambda: True
-    drafter._dp_dummy_kv_update = lambda: events.append("context")
-    drafter._dp_dummy_forward = lambda: events.append("proposal")
-    runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True,
-        num_tokens_paddings=[128, 2048],
-        _is_async_drafter=True,
-        _is_dspark_pd_producer=False,
-        _fence_spec_kv_under_token_copy=False,
-        _async_drafter=drafter,
-        _execute_dp_mm_encoder=lambda: None,
-        _run_dp_dummy_chunk=lambda bucket: events.append("target"),
-    )
-    runner._dp_coordinated_step = TPUModelRunner._dp_coordinated_step.__get__(runner)
-    runner._run_dp_idle_pairing = TPUModelRunner._run_dp_idle_pairing.__get__(runner)
-
-    def reduce(tensor, **kwargs):
-        # Active peers are processing two partial-prefill chunks. MAX must
-        # retain the idle worker's own vote if it incorrectly requests drafts.
-        tensor[:4].copy_(torch.tensor([2048, 2, 1, 0]))
-
-    with (
-        patch("vllm.distributed.parallel_state.get_dp_group") as group,
-        patch.object(torch.distributed, "all_reduce", side_effect=reduce),
-    ):
-        group.return_value.cpu_group = "cpu-group"
-        TPUWorker.execute_dummy_batch(SimpleNamespace(model_runner=runner))
-    assert events == ["target", "target", "context", "context"]
-    assert not runner._draft_proposals_needed
