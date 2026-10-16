@@ -18,28 +18,29 @@ from __future__ import annotations
 import dataclasses
 import gc
 import hashlib
-import importlib.util
 import json
-import os
 import pathlib
 import sys
 import time
 from typing import Any
 
+_THIS_DIR = str(pathlib.Path(__file__).resolve().parent)
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SRC_DIR = str(_REPO_ROOT / "src")
-if _SRC_DIR not in sys.path:
-    sys.path.insert(0, _SRC_DIR)
+for _p in (_SRC_DIR, _THIS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+from frozen_utils import load_frozen_qwen35  # noqa: E402
 from jax import lax  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
-from vllm_torchtpu.megakernel import kernel, planner  # noqa: E402
+from vllm_torchtpu.megakernel import cache, kernel, planner  # noqa: E402
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
@@ -49,7 +50,7 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     I32,
     rup,
 )
-from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
+from vllm_torchtpu.megakernel.spec import ExecSpec, default_tiles  # noqa: E402
 
 
 def _has_tpu_v7x8() -> bool:
@@ -60,22 +61,14 @@ def _has_tpu_v7x8() -> bool:
 
 
 def _load_frozen_mk():
-    env_dir = os.environ.get("MK_FROZEN_QWEN35_DIR")
-    frozen_dir = pathlib.Path(env_dir) if env_dir else (_REPO_ROOT / "frozen_qwen35")
-    if not frozen_dir.exists():
-        pytest.skip(
-            f"Set MK_FROZEN_QWEN35_DIR to frozen qwen35 path (checked {frozen_dir})"
-        )
-    if str(frozen_dir) not in sys.path:
-        sys.path.insert(0, str(frozen_dir))
-    spec_f = importlib.util.spec_from_file_location(
-        "_frozen_qwen35_mk", frozen_dir / "megakernel.py"
-    )
-    assert spec_f is not None and spec_f.loader is not None
-    frozen_mk = importlib.util.module_from_spec(spec_f)
-    sys.modules[spec_f.name] = frozen_mk
-    spec_f.loader.exec_module(frozen_mk)
+    frozen_mk, _ = load_frozen_qwen35()
     return frozen_mk
+
+
+def _load_frozen_pool_io(frozen_mk):
+    del frozen_mk
+    _, frozen_pio = load_frozen_qwen35()
+    return frozen_pio
 
 
 def _init_shared_weights_on_tpu(
@@ -898,3 +891,1081 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
     print("\n=== M1_B64_TPU_V7X8_BENCH_JSON_START ===")
     print(json.dumps(m1_results, indent=2))
     print("=== M1_B64_TPU_V7X8_BENCH_JSON_END ===", flush=True)
+
+
+def _init_pooled_bucket_on_tpu(
+    mesh: Mesh,
+    g: qwen35.Qwen35Geometry,
+    ex: ExecSpec,
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    tuple[jax.Array, ...],
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
+    """Allocate `(pos, hid, raw_pools, page_table, ckpt_indices, read_offsets)`."""
+    rep = NamedSharding(mesh, P())
+    R, B, T, M, NS, ctx = ex.R, ex.B, ex.T, ex.M, ex.NS, ex.ctx
+    G = g.G(R)
+    H = g.H
+    G_PER_ATT = max(1, g.att_every - 1)
+    pages_per_seq = ctx // ex.page_size
+    kv_pages_total = NS * pages_per_seq
+    n_ckpt_slots = G_PER_ATT * NS * (T + 1)
+    base_slot = (kv_pages_total + 4) // 5
+    base_page = base_slot * 5
+    gdn_pages = n_ckpt_slots * 5
+    min_num_pages = base_page + gdn_pages
+    assert ex.num_pages >= min_num_pages, (ex.num_pages, min_num_pages)
+
+    pt_cols = max(ex.resolved_max_pages_per_seq, pages_per_seq)
+    pt_np = np.zeros((NS, pt_cols), dtype=np.int32)
+    for s in range(NS):
+        pt_np[s, :pages_per_seq] = np.arange(
+            s * pages_per_seq, (s + 1) * pages_per_seq, dtype=np.int32
+        )
+
+    ckpt_np = np.zeros((G_PER_ATT, NS, T + 1), dtype=np.int32)
+    for sub in range(G_PER_ATT):
+        for s in range(NS):
+            for k in range(T + 1):
+                ckpt_np[sub, s, k] = base_slot + (sub * NS + s) * (T + 1) + k
+    roff_np = np.zeros((G_PER_ATT, NS), dtype=np.int32)
+
+    pt = jax.device_put(jnp.asarray(pt_np), rep)
+    ckpt = jax.device_put(jnp.asarray(ckpt_np), rep)
+    roff = jax.device_put(jnp.asarray(roff_np), rep)
+
+    base_p = 65536 if ctx > 4096 else 2048
+    base_pos = jnp.int32(base_p) + jnp.arange(NS, dtype=I32) * jnp.int32(16)
+    if T == 1:
+        pos_host = base_pos
+    else:
+        pos_host = (base_pos[:, None] + jnp.arange(T, dtype=I32)[None, :]).reshape(B)
+    pos = jax.device_put(pos_host, rep)
+
+    raw_spec = tuple(P("tp") for _ in range(g.NATT))
+
+    def _local_pool_init():
+        me = lax.axis_index("tp")
+        kv_grp = lax.div(me, G)
+        root = jax.random.PRNGKey(88000 + T * 100 + B + (ctx // 1024))
+        k_hid = jax.random.fold_in(root, 1)
+        hid_b = jax.random.normal(k_hid, (B, H), dtype=BF16) * jnp.bfloat16(0.1)
+        hid_m = jnp.pad(hid_b, ((0, M - B), (0, 0)))
+
+        k_kv_base = jax.random.fold_in(root, 10 + kv_grp)
+        k_gdn_base = jax.random.fold_in(root, 100 + me)
+        kv_tile = jax.random.normal(
+            k_kv_base,
+            (1, 16, 2, 64, 4, ex.page_size),
+            dtype=BF16,
+        ) * jnp.bfloat16(0.08)
+        gdn_tile = jax.random.normal(
+            k_gdn_base,
+            (1, gdn_pages, 2, 64, 2, ex.page_size),
+            dtype=BF16,
+        ) * jnp.bfloat16(0.02)
+
+        pools = []
+        assert ex.num_pages % 16 == 0, ex.num_pages
+        n_rep = ex.num_pages // 16
+        for g_idx in range(g.NATT):
+            scale = jnp.bfloat16(1.0 - 0.01 * g_idx)
+            kv_p = jnp.tile(
+                (kv_tile * scale).astype(FP8),
+                (1, n_rep, 1, 1, 1, 1),
+            )
+            gdn_bf16 = gdn_tile * scale
+            gdn_fp8 = (
+                lax.bitcast_convert_type(gdn_bf16, FP8)
+                .swapaxes(-2, -1)
+                .reshape(1, gdn_pages, 2, 64, 4, ex.page_size)
+            )
+            pool_g = lax.dynamic_update_slice(
+                kv_p, gdn_fp8, (0, base_page, 0, 0, 0, 0)
+            ).reshape(ex.num_pages, 2, 64, 4, ex.page_size)
+            pools.append(pool_g)
+        return hid_m, tuple(pools)
+
+    init_fn = jax.jit(
+        jax.shard_map(
+            _local_pool_init,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=(P("tp"), raw_spec),
+            check_vma=False,
+        )
+    )
+    hid, raw_pools = init_fn()
+    jax.block_until_ready(hid)
+    return pos, hid, raw_pools, pt, ckpt, roff
+
+
+def _time_pooled_step_fn(
+    step_fn,
+    pos: jax.Array,
+    hid: jax.Array,
+    weights: dict[str, Any],
+    raw_pools: tuple[jax.Array, ...],
+    pt: jax.Array,
+    ckpt: jax.Array,
+    roff: jax.Array,
+    *,
+    warmup: int = 15,
+    batches: int = 10,
+    steps_per_batch: int = 10,
+) -> tuple[dict[str, float], tuple[jax.Array, ...]]:
+    """Warm up and measure pooled step latency over `batches * steps_per_batch`."""
+    for _ in range(warmup):
+        out_hid, raw_pools = step_fn(pos, hid, weights, raw_pools, pt, ckpt, roff)
+    jax.block_until_ready(out_hid)
+
+    batch_us = []
+    for _ in range(batches):
+        t0 = time.perf_counter()
+        for _ in range(steps_per_batch):
+            out_hid, raw_pools = step_fn(pos, hid, weights, raw_pools, pt, ckpt, roff)
+        jax.block_until_ready(out_hid)
+        dt_us = (time.perf_counter() - t0) * 1e6 / steps_per_batch
+        batch_us.append(dt_us)
+
+    arr = np.asarray(batch_us, dtype=np.float64)
+    stats = {
+        "median_us": float(np.median(arr)),
+        "mean_us": float(np.mean(arr)),
+        "p10_us": float(np.percentile(arr, 10)),
+        "p90_us": float(np.percentile(arr, 90)),
+        "min_us": float(np.min(arr)),
+    }
+    return stats, raw_pools
+
+
+def test_m3_tpu_v7x8_paged_eplb_tp_bench():
+    """Run M3 TPU v7x-8 benchmark: PallasWriter, stack_e=False, EPLB, and moe_tp."""
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    tpu_devs = jax.devices("tpu")
+    frozen_mk = _load_frozen_mk()
+    frozen_pio = _load_frozen_pool_io(frozen_mk)
+    mesh = Mesh(tpu_devs[:8], ("tp",))
+
+    g = dataclasses.replace(qwen35.FULL_EP, L=60, att_every=4)
+    ex_init = ExecSpec(B=4, T=1, R=8, ctx=4096, stack_e=True)
+    c_f_init = frozen_mk.MKConfig(
+        R=8,
+        B=4,
+        T=1,
+        L=60,
+        att_every=4,
+        moe_tp=False,
+        ctx=4096,
+        stack_e=True,
+    )
+    f_lay, f_S = frozen_mk.smalls_layout(c_f_init)
+
+    t_w0 = time.perf_counter()
+    w_lib, w_f = _init_shared_weights_on_tpu(mesh, g, ex_init, f_lay, f_S)
+    dt_w = time.perf_counter() - t_w0
+    print(
+        f"\n[M3 TPU v7x-8 Bench] Allocated shared 60-layer hybrid FULL_EP "
+        f"weights on 8 TPU cores in {dt_w:.2f}s",
+        flush=True,
+    )
+
+    # -----------------------------------------------------------------------
+    # Part 1: PallasWriter (make_pooled_step) across (T, B) + ctx=128K bucket
+    # -----------------------------------------------------------------------
+    pooled_buckets = [
+        (1, 4, 4096, 4096),
+        (1, 16, 4096, 4096),
+        (1, 32, 4096, 4096),
+        (1, 64, 4096, 4096),
+        (4, 4, 4096, 4096),
+        (4, 16, 4096, 4096),
+        (4, 64, 4096, 4096),
+        (1, 4, 131072, 4608),  # 128K context (1,024 pages/seq, pos=65536)
+    ]
+    pooled_results = []
+
+    for T, B, ctx, num_pages in pooled_buckets:
+        ex = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=ctx,
+            paged_kv=True,
+            num_pages=num_pages,
+            stack_e=True,
+        )
+        c_f = frozen_mk.MKConfig(
+            R=8,
+            B=B,
+            T=T,
+            L=60,
+            att_every=4,
+            moe_tp=False,
+            ctx=ctx,
+            paged_kv=True,
+            num_pages=num_pages,
+            max_pages_per_seq=ex.resolved_max_pages_per_seq,
+            stack_e=True,
+        )
+        tiles_f = frozen_mk.default_tiles(c_f)
+        # Override 1 for B > 48 on frozen baseline: use nbe=6 to match default_tiles(B)
+        # so the 64-row MoE scratch fits within the 64 MiB VMEM budget.
+        if B > 48:
+            tiles_f = dataclasses.replace(tiles_f, nbe=6)
+
+        # --- Library PallasWriter ---
+        pos, hid_lib, raw_lib, pt, ckpt, roff = _init_pooled_bucket_on_tpu(mesh, g, ex)
+        step_lib, info_lib = cache.PallasWriter().make_step(mesh, g, ex, donate=True)
+        vmem_lib = info_lib["vmem_scratch_bytes"]
+        smem_lib = info_lib["smem_scratch_bytes"]
+        out_hid_lib, raw_lib = step_lib(pos, hid_lib, w_lib, raw_lib, pt, ckpt, roff)
+        jax.block_until_ready(out_hid_lib)
+        hid_lib_np = np.asarray(jax.device_get(kernel.unfold(out_hid_lib, 8)))
+        # Snapshot updated KV pages and GDN checkpoint slots across all NS sequences
+        # and attention pools in uint8 so raw FP8 bytes (including 0x7f/0xff in
+        # bitcast F32/BF16 GDN states) are compared bit-for-bit.
+        pos_host_np = np.asarray(jax.device_get(pos))
+        pt_host_np = np.asarray(jax.device_get(pt))
+        ckpt_host_np = np.asarray(jax.device_get(ckpt))
+        kv_page_ids = jnp.asarray(
+            [
+                int(pt_host_np[b // T, int(pos_host_np[b]) // ex.page_size])
+                for b in range(B)
+            ],
+            dtype=jnp.int32,
+        )
+        gdn_page_ids = jnp.asarray(
+            [
+                int(ckpt_host_np[sub, s, t_k]) * 5 + p_off
+                for sub in range(3)
+                for s in range(ex.NS)
+                for t_k in range(1, 1 + T)
+                for p_off in range(5)
+            ],
+            dtype=jnp.int32,
+        )
+        raw_lib_kv = [
+            np.asarray(
+                jax.device_get(
+                    lax.bitcast_convert_type(
+                        kernel.unfold(raw_lib[g_i], 8)[:, kv_page_ids], jnp.uint8
+                    )
+                )
+            )
+            for g_i in range(g.NATT)
+        ]
+        raw_lib_gdn = [
+            np.asarray(
+                jax.device_get(
+                    lax.bitcast_convert_type(
+                        kernel.unfold(raw_lib[g_i], 8)[:, gdn_page_ids], jnp.uint8
+                    )
+                )
+            )
+            for g_i in range(g.NATT)
+        ]
+        raw_lib_sha256 = [
+            hashlib.sha256(
+                np.asarray(
+                    jax.device_get(lax.bitcast_convert_type(raw_lib[g_i], jnp.uint8))
+                ).tobytes()
+            ).hexdigest()
+            for g_i in range(g.NATT)
+        ]
+        lib_stats, raw_lib = _time_pooled_step_fn(
+            step_lib, pos, hid_lib, w_lib, raw_lib, pt, ckpt, roff
+        )
+        del pos, hid_lib, raw_lib, pt, ckpt, roff, out_hid_lib, step_lib
+        gc.collect()
+
+        # --- Frozen pool_io (fused_pool_io=False) ---
+        # Override 2 for NS > 32 on frozen baseline: frozen pool_io.gather_gdn_states
+        # omitted vmem_limit_bytes on pltpu.CompilerParams, so at NS=64 (T=1, B=64,
+        # 37.12 MiB VMEM) it hits Pallas's 32 MiB default cap unless vmem_limit_bytes
+        # is set to 62 MiB (matching scatter_pool_states in qwen35_pool.py).
+        pos_f, hid_f, raw_f, pt_f, ckpt_f, roff_f = _init_pooled_bucket_on_tpu(
+            mesh, g, ex
+        )
+        raw_step_f, info_f = frozen_pio.make_pooled_step(
+            mesh, c_f, tiles_f, fused_pool_io=False
+        )
+        vmem_f = info_f["vmem_scratch_bytes"]
+        step_f = jax.jit(
+            lambda p_, h_, w_, r_, pt_, ck_, ro_, _fn=raw_step_f: _fn(
+                p_, h_, w_, r_, pt_, ck_, ro_
+            ),
+            donate_argnums=(3,),
+        )
+        orig_cp = frozen_pio.pltpu.CompilerParams
+        vmem_lim = min(tiles_f.vmem_mib, 62) << 20
+        if (B // T) > 32:
+            frozen_pio.pltpu.CompilerParams = (
+                lambda _orig=orig_cp, _lim=vmem_lim, **kw: _orig(
+                    **{
+                        "vmem_limit_bytes": _lim,
+                        **kw,
+                    }
+                )
+            )
+        try:
+            out_hid_f, raw_f = step_f(pos_f, hid_f, w_f, raw_f, pt_f, ckpt_f, roff_f)
+            jax.block_until_ready(out_hid_f)
+        finally:
+            frozen_pio.pltpu.CompilerParams = orig_cp
+        hid_f_np = np.asarray(jax.device_get(kernel.unfold(out_hid_f, 8)))
+        raw_f_kv = [
+            np.asarray(
+                jax.device_get(
+                    lax.bitcast_convert_type(
+                        kernel.unfold(raw_f[g_i], 8)[:, kv_page_ids], jnp.uint8
+                    )
+                )
+            )
+            for g_i in range(g.NATT)
+        ]
+        raw_f_gdn = [
+            np.asarray(
+                jax.device_get(
+                    lax.bitcast_convert_type(
+                        kernel.unfold(raw_f[g_i], 8)[:, gdn_page_ids], jnp.uint8
+                    )
+                )
+            )
+            for g_i in range(g.NATT)
+        ]
+        raw_f_sha256 = [
+            hashlib.sha256(
+                np.asarray(
+                    jax.device_get(lax.bitcast_convert_type(raw_f[g_i], jnp.uint8))
+                ).tobytes()
+            ).hexdigest()
+            for g_i in range(g.NATT)
+        ]
+        frozen_stats, raw_f = _time_pooled_step_fn(
+            step_f, pos_f, hid_f, w_f, raw_f, pt_f, ckpt_f, roff_f
+        )
+        del (
+            pos_f,
+            hid_f,
+            raw_f,
+            pt_f,
+            ckpt_f,
+            roff_f,
+            out_hid_f,
+            step_f,
+            raw_step_f,
+        )
+        gc.collect()
+
+        live_lib = hid_lib_np[:, :B, :].astype(np.float32)
+        live_f = hid_f_np[:, :B, :].astype(np.float32)
+        assert np.all(np.isfinite(live_lib)), (
+            f"Non-finite pooled output at T={T}, B={B}, ctx={ctx}"
+        )
+        hid_bit_exact = bool(
+            np.array_equal(
+                hid_lib_np[:, :B, :].view(np.uint8),
+                hid_f_np[:, :B, :].view(np.uint8),
+            )
+        )
+        pool_kv_bit_exact = all(
+            np.array_equal(a, b) for a, b in zip(raw_lib_kv, raw_f_kv)
+        )
+        pool_gdn_bit_exact = all(
+            np.array_equal(a, b) for a, b in zip(raw_lib_gdn, raw_f_gdn)
+        )
+        pool_full_sha256_match = raw_lib_sha256 == raw_f_sha256
+        max_abs_diff = float(np.max(np.abs(live_lib - live_f)))
+        delta_pct = (
+            (lib_stats["median_us"] - frozen_stats["median_us"])
+            / frozen_stats["median_us"]
+            * 100.0
+        )
+        row = {
+            "mode": "pallas_writer",
+            "T": T,
+            "B": B,
+            "NS": B // T,
+            "ctx": ctx,
+            "max_pages_per_seq": ex.resolved_max_pages_per_seq,
+            "lib_median_us": round(lib_stats["median_us"], 1),
+            "frozen_median_us": round(frozen_stats["median_us"], 1),
+            "delta_pct": round(delta_pct, 2),
+            "lib_mean_us": round(lib_stats["mean_us"], 1),
+            "frozen_mean_us": round(frozen_stats["mean_us"], 1),
+            "vmem_lib_mib": round(vmem_lib / (1024 * 1024), 2),
+            "vmem_frozen_mib": round(vmem_f / (1024 * 1024), 2),
+            "smem_lib_kib": round(smem_lib / 1024.0, 2),
+            "hid_bit_exact": hid_bit_exact,
+            "pool_kv_bit_exact": pool_kv_bit_exact,
+            "pool_gdn_bit_exact": pool_gdn_bit_exact,
+            "pool_full_sha256_match": pool_full_sha256_match,
+            "max_abs_diff": max_abs_diff,
+        }
+        pooled_results.append(row)
+        pt_cols = ex.resolved_max_pages_per_seq
+        print(
+            f"[M3 PallasWriter T={T} B={B:2d} ctx={ctx:6d} (pt_cols={pt_cols:4d})] "
+            f"lib={row['lib_median_us']:6.1f} us vs "
+            f"frozen={row['frozen_median_us']:6.1f} us ({row['delta_pct']:+.2f}%) | "
+            f"VMEM {row['vmem_lib_mib']} MiB | SMEM {row['smem_lib_kib']} KiB | "
+            f"bit_exact(hid={hid_bit_exact}, kv={pool_kv_bit_exact}, "
+            f"gdn={pool_gdn_bit_exact}, sha={pool_full_sha256_match})",
+            flush=True,
+        )
+        assert hid_bit_exact, (
+            f"PallasWriter hid not bit-exact at T={T}, B={B}, ctx={ctx}"
+        )
+        assert pool_kv_bit_exact, (
+            f"PallasWriter KV pool not bit-exact at T={T}, B={B}, ctx={ctx}"
+        )
+        assert pool_gdn_bit_exact, (
+            f"PallasWriter GDN pool not bit-exact at T={T}, B={B}, ctx={ctx}"
+        )
+        assert pool_full_sha256_match, (
+            f"PallasWriter full pool SHA-256 mismatch at T={T}, B={B}, ctx={ctx}"
+        )
+        assert row["delta_pct"] <= 2.0, (
+            f"PallasWriter latency regression {row['delta_pct']:+.2f}% > +2.0%"
+        )
+
+    # Also compile & verify HLO for (64, 1024) page_table on TPU (B=64, T=1, ctx=128K)
+    ex_128k_b64 = ExecSpec(
+        B=64,
+        T=1,
+        R=8,
+        ctx=131072,
+        paged_kv=True,
+        num_pages=4608,
+        max_pages_per_seq=1024,
+        stack_e=True,
+    )
+    step_128k_b64, info_128k_b64 = cache.PallasWriter().make_step(
+        mesh, g, ex_128k_b64, donate=True
+    )
+    assert info_128k_b64["smem_shapes"]["page_table"] == ((64, 1024), "int32")
+    assert info_128k_b64["smem_scratch_bytes"] <= 1024 * 1024
+    rep_s = NamedSharding(mesh, P())
+    tp_s = NamedSharding(mesh, P("tp"))
+    lowered_128k_b64 = step_128k_b64.lower(
+        jax.ShapeDtypeStruct((64,), jnp.int32, sharding=rep_s),
+        jax.ShapeDtypeStruct((8 * 64, g.H), BF16, sharding=tp_s),
+        w_lib,
+        tuple(
+            jax.ShapeDtypeStruct((8 * 4608, 2, 64, 4, 128), FP8, sharding=tp_s)
+            for _ in range(g.NATT)
+        ),
+        jax.ShapeDtypeStruct((64, 1024), jnp.int32, sharding=rep_s),
+        jax.ShapeDtypeStruct((3, 64, 2), jnp.int32, sharding=rep_s),
+        jax.ShapeDtypeStruct((3, 64), jnp.int32, sharding=rep_s),
+    )
+    compiled_128k_b64 = lowered_128k_b64.compile()
+    ok_128k, msg_128k = cache.check_pooled_step_hlo(
+        compiled_128k_b64.as_text(), page_size=128
+    )
+    assert ok_128k, msg_128k
+    del step_128k_b64, lowered_128k_b64, compiled_128k_b64
+    gc.collect()
+
+    # -----------------------------------------------------------------------
+    # Part 2: stack_e=False (per-layer expert views) at (1, 16) and (4, 16)
+    # -----------------------------------------------------------------------
+    unstacked_results = []
+    e13_unstacked = tuple(w_lib["e13"][:, lyr] for lyr in range(g.L))
+    del w_lib["e13"], w_f["e13"]
+    gc.collect()
+    e2_unstacked = tuple(w_lib["e2"][:, lyr] for lyr in range(g.L))
+    del w_lib["e2"], w_f["e2"]
+    gc.collect()
+    w_lib_unstacked = {
+        **w_lib,
+        "e13": e13_unstacked,
+        "e2": e2_unstacked,
+    }
+    w_f_unstacked = {
+        **w_f,
+        "e13": e13_unstacked,
+        "e2": e2_unstacked,
+    }
+
+    # Verify & time PallasWriter with stack_e=False on TPU at T=1, B=16 vs frozen
+    ex_pw_u = ExecSpec(
+        B=16, T=1, R=8, ctx=4096, paged_kv=True, num_pages=4096, stack_e=False
+    )
+    c_f_pw_u = frozen_mk.MKConfig(
+        R=8,
+        B=16,
+        T=1,
+        L=60,
+        att_every=4,
+        moe_tp=False,
+        ctx=4096,
+        paged_kv=True,
+        num_pages=4096,
+        max_pages_per_seq=ex_pw_u.resolved_max_pages_per_seq,
+        stack_e=False,
+    )
+    tiles_f_pw_u = frozen_mk.default_tiles(c_f_pw_u)
+
+    pos_pu, hid_pu, raw_pu, pt_pu, ckpt_pu, roff_pu = _init_pooled_bucket_on_tpu(
+        mesh, g, ex_pw_u
+    )
+    pw_u_step, info_pw_u = cache.PallasWriter().make_step(mesh, g, ex_pw_u, donate=True)
+    out_pu, raw_pu = pw_u_step(
+        pos_pu, hid_pu, w_lib_unstacked, raw_pu, pt_pu, ckpt_pu, roff_pu
+    )
+    jax.block_until_ready(out_pu)
+    hid_pu_np = np.asarray(jax.device_get(kernel.unfold(out_pu, 8)))
+    pos_pu_np = np.asarray(jax.device_get(pos_pu))
+    pt_pu_np = np.asarray(jax.device_get(pt_pu))
+    ckpt_pu_np = np.asarray(jax.device_get(ckpt_pu))
+    pu_kv_ids = jnp.asarray(
+        [int(pt_pu_np[b, int(pos_pu_np[b]) // ex_pw_u.page_size]) for b in range(16)],
+        dtype=jnp.int32,
+    )
+    pu_gdn_ids = jnp.asarray(
+        [
+            int(ckpt_pu_np[sub, s, 1]) * 5 + p_off
+            for sub in range(3)
+            for s in range(16)
+            for p_off in range(5)
+        ],
+        dtype=jnp.int32,
+    )
+    raw_pu_kv = [
+        np.asarray(
+            jax.device_get(
+                lax.bitcast_convert_type(
+                    kernel.unfold(raw_pu[g_i], 8)[:, pu_kv_ids], jnp.uint8
+                )
+            )
+        )
+        for g_i in range(g.NATT)
+    ]
+    raw_pu_gdn = [
+        np.asarray(
+            jax.device_get(
+                lax.bitcast_convert_type(
+                    kernel.unfold(raw_pu[g_i], 8)[:, pu_gdn_ids], jnp.uint8
+                )
+            )
+        )
+        for g_i in range(g.NATT)
+    ]
+    raw_pu_sha256 = [
+        hashlib.sha256(
+            np.asarray(
+                jax.device_get(lax.bitcast_convert_type(raw_pu[g_i], jnp.uint8))
+            ).tobytes()
+        ).hexdigest()
+        for g_i in range(g.NATT)
+    ]
+    pw_u_stats, raw_pu = _time_pooled_step_fn(
+        pw_u_step, pos_pu, hid_pu, w_lib_unstacked, raw_pu, pt_pu, ckpt_pu, roff_pu
+    )
+    del pos_pu, hid_pu, raw_pu, pt_pu, ckpt_pu, roff_pu, out_pu, pw_u_step
+    gc.collect()
+
+    pos_puf, hid_puf, raw_puf, pt_puf, ckpt_puf, roff_puf = _init_pooled_bucket_on_tpu(
+        mesh, g, ex_pw_u
+    )
+    raw_step_puf, info_puf = frozen_pio.make_pooled_step(
+        mesh, c_f_pw_u, tiles_f_pw_u, fused_pool_io=False
+    )
+    step_puf = jax.jit(
+        lambda p_, h_, w_, r_, pt_, ck_, ro_, _fn=raw_step_puf: _fn(
+            p_, h_, w_, r_, pt_, ck_, ro_
+        ),
+        donate_argnums=(3,),
+    )
+    out_puf, raw_puf = step_puf(
+        pos_puf, hid_puf, w_f_unstacked, raw_puf, pt_puf, ckpt_puf, roff_puf
+    )
+    jax.block_until_ready(out_puf)
+    hid_puf_np = np.asarray(jax.device_get(kernel.unfold(out_puf, 8)))
+    raw_puf_kv = [
+        np.asarray(
+            jax.device_get(
+                lax.bitcast_convert_type(
+                    kernel.unfold(raw_puf[g_i], 8)[:, pu_kv_ids], jnp.uint8
+                )
+            )
+        )
+        for g_i in range(g.NATT)
+    ]
+    raw_puf_gdn = [
+        np.asarray(
+            jax.device_get(
+                lax.bitcast_convert_type(
+                    kernel.unfold(raw_puf[g_i], 8)[:, pu_gdn_ids], jnp.uint8
+                )
+            )
+        )
+        for g_i in range(g.NATT)
+    ]
+    raw_puf_sha256 = [
+        hashlib.sha256(
+            np.asarray(
+                jax.device_get(lax.bitcast_convert_type(raw_puf[g_i], jnp.uint8))
+            ).tobytes()
+        ).hexdigest()
+        for g_i in range(g.NATT)
+    ]
+    puf_stats, raw_puf = _time_pooled_step_fn(
+        step_puf, pos_puf, hid_puf, w_f_unstacked, raw_puf, pt_puf, ckpt_puf, roff_puf
+    )
+    del (
+        pos_puf,
+        hid_puf,
+        raw_puf,
+        pt_puf,
+        ckpt_puf,
+        roff_puf,
+        out_puf,
+        step_puf,
+        raw_step_puf,
+    )
+    gc.collect()
+
+    pu_hid_exact = bool(
+        np.array_equal(
+            hid_pu_np[:, :16, :].view(np.uint8),
+            hid_puf_np[:, :16, :].view(np.uint8),
+        )
+    )
+    pu_kv_exact = all(np.array_equal(a, b) for a, b in zip(raw_pu_kv, raw_puf_kv))
+    pu_gdn_exact = all(np.array_equal(a, b) for a, b in zip(raw_pu_gdn, raw_puf_gdn))
+    pu_sha256_exact = raw_pu_sha256 == raw_puf_sha256
+    pu_delta = (
+        (pw_u_stats["median_us"] - puf_stats["median_us"])
+        / puf_stats["median_us"]
+        * 100.0
+    )
+    pu_row = {
+        "mode": "pallas_writer_stack_e_false",
+        "T": 1,
+        "B": 16,
+        "lib_median_us": round(pw_u_stats["median_us"], 1),
+        "frozen_median_us": round(puf_stats["median_us"], 1),
+        "delta_pct": round(pu_delta, 2),
+        "vmem_lib_mib": round(info_pw_u["vmem_scratch_bytes"] / (1024 * 1024), 2),
+        "vmem_frozen_mib": round(info_puf["vmem_scratch_bytes"] / (1024 * 1024), 2),
+        "hid_bit_exact": pu_hid_exact,
+        "pool_kv_bit_exact": pu_kv_exact,
+        "pool_gdn_bit_exact": pu_gdn_exact,
+        "pool_full_sha256_match": pu_sha256_exact,
+    }
+    unstacked_results.append(pu_row)
+    print(
+        f"[M3 PallasWriter+stack_e=False T=1 B=16] "
+        f"lib={pu_row['lib_median_us']:6.1f} us vs "
+        f"frozen={pu_row['frozen_median_us']:6.1f} us "
+        f"({pu_row['delta_pct']:+.2f}%) | "
+        f"bit_exact(hid={pu_hid_exact}, kv={pu_kv_exact}, "
+        f"gdn={pu_gdn_exact}, sha={pu_sha256_exact})",
+        flush=True,
+    )
+    assert pu_hid_exact and pu_kv_exact and pu_gdn_exact and pu_sha256_exact
+    assert pu_row["delta_pct"] <= 2.0
+
+    for T, B in [(1, 16), (4, 16)]:
+        ex_u = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=False)
+        c_f_u = frozen_mk.MKConfig(
+            R=8,
+            B=B,
+            T=T,
+            L=60,
+            att_every=4,
+            moe_tp=False,
+            ctx=4096,
+            stack_e=False,
+        )
+        tiles_f_u = frozen_mk.default_tiles(c_f_u)
+        donate = T == 1
+
+        pos_u, hid_u, st_u = _init_bucket_inputs_on_tpu(mesh, g, ex_u)
+        step_u_lib, info_u_lib = qwen35.make_step(mesh, g, ex_u, donate_states=donate)
+        out_hid_u_lib, st_u_out = step_u_lib(pos_u, hid_u, w_lib_unstacked, st_u)
+        jax.block_until_ready(out_hid_u_lib)
+        if donate:
+            st_u = st_u_out
+        hid_u_lib_np = np.asarray(jax.device_get(kernel.unfold(out_hid_u_lib, 8)))
+        del st_u_out
+        u_lib_stats, st_u = _time_step_fn(
+            step_u_lib, pos_u, hid_u, w_lib_unstacked, st_u, T=T
+        )
+        del pos_u, hid_u, st_u, out_hid_u_lib, step_u_lib
+        gc.collect()
+
+        pos_uf, hid_uf, st_uf = _init_bucket_inputs_on_tpu(mesh, g, ex_u)
+        raw_step_uf, info_uf = frozen_mk.make_step(mesh, c_f_u, tiles_f_u)
+        step_uf = jax.jit(raw_step_uf, donate_argnums=(3,) if donate else ())
+        out_hid_uf, st_uf_out = step_uf(pos_uf, hid_uf, w_f_unstacked, st_uf)
+        jax.block_until_ready(out_hid_uf)
+        if donate:
+            st_uf = st_uf_out
+        hid_uf_np = np.asarray(jax.device_get(kernel.unfold(out_hid_uf, 8)))
+        del st_uf_out
+        u_f_stats, st_uf = _time_step_fn(
+            step_uf, pos_uf, hid_uf, w_f_unstacked, st_uf, T=T
+        )
+        del pos_uf, hid_uf, st_uf, out_hid_uf, step_uf, raw_step_uf
+        gc.collect()
+
+        u_bit_exact = bool(
+            np.array_equal(
+                hid_u_lib_np[:, :B, :].view(np.uint8),
+                hid_uf_np[:, :B, :].view(np.uint8),
+            )
+        )
+        u_delta = (
+            (u_lib_stats["median_us"] - u_f_stats["median_us"])
+            / u_f_stats["median_us"]
+            * 100.0
+        )
+        u_row = {
+            "mode": "stack_e_false",
+            "T": T,
+            "B": B,
+            "lib_median_us": round(u_lib_stats["median_us"], 1),
+            "frozen_median_us": round(u_f_stats["median_us"], 1),
+            "delta_pct": round(u_delta, 2),
+            "vmem_lib_mib": round(info_u_lib["vmem_scratch_bytes"] / (1024 * 1024), 2),
+            "vmem_frozen_mib": round(info_uf["vmem_scratch_bytes"] / (1024 * 1024), 2),
+            "hid_bit_exact": u_bit_exact,
+        }
+        unstacked_results.append(u_row)
+        print(
+            f"[M3 stack_e=False T={T} B={B:2d}] "
+            f"lib={u_row['lib_median_us']:6.1f} us vs "
+            f"frozen={u_row['frozen_median_us']:6.1f} us "
+            f"({u_row['delta_pct']:+.2f}%) | bit_exact={u_bit_exact}",
+            flush=True,
+        )
+        assert u_bit_exact, f"stack_e=False not bit-exact at T={T}, B={B}"
+        assert u_row["delta_pct"] <= 2.0, (
+            f"stack_e=False latency regression {u_row['delta_pct']:+.2f}% > +2.0%"
+        )
+
+    del e13_unstacked, e2_unstacked, w_lib_unstacked, w_f_unstacked
+    del w_lib["es"], w_f["es"]
+    gc.collect()
+    jax.clear_caches()
+
+    # -----------------------------------------------------------------------
+    # Part 3: EPLB (e_slots=72, ecopy_opt=0 & ecopy_opt=1 Po2C) at (1, 16), (4, 16)
+    # -----------------------------------------------------------------------
+    g_eplb = dataclasses.replace(g, e_slots=72)
+    ecopy_host = qwen35.encode_eplb_ecopy(g_eplb, 8)
+    p_base = planner.plan(qwen35.qwen35_spec(g), ExecSpec(B=16, T=1, R=8, ctx=4096))
+    p_eplb = planner.plan(
+        qwen35.qwen35_spec(g_eplb), ExecSpec(B=16, T=1, R=8, ctx=4096)
+    )
+    c_f_e0 = frozen_mk.MKConfig(
+        R=8, B=16, T=1, L=60, att_every=4, moe_tp=False, e_slots=72, ctx=4096
+    )
+    f_lay_e, f_S_e = frozen_mk.smalls_layout(c_f_e0)
+
+    sm_lib_host = np.asarray(jax.device_get(w_lib["smalls"]))
+    sm_eplb_np = np.zeros((8, 60, 1, p_eplb.smalls_width), dtype=np.float32)
+    for name, (o0, w0) in p_base.smalls_layout.items():
+        oe, _ = p_eplb.smalls_layout[name]
+        sm_eplb_np[:, :, 0, oe : oe + w0] = sm_lib_host[:, :, 0, o0 : o0 + w0]
+    oe_ec, w_ec = p_eplb.smalls_layout["ecopy"]
+    sm_eplb_np[:, :, 0, oe_ec : oe_ec + w_ec] = np.asarray(ecopy_host)[None, :, :]
+
+    sm_fe_np = np.zeros((8, 60, 1, f_S_e), dtype=np.float32)
+    for name, (oe, we) in p_eplb.smalls_layout.items():
+        fo, _ = f_lay_e[name]
+        sm_fe_np[:, :, 0, fo : fo + we] = sm_eplb_np[:, :, 0, oe : oe + we]
+
+    sm_lib_eplb = jax.device_put(jnp.asarray(sm_eplb_np), NamedSharding(mesh, P("tp")))
+    sm_f_eplb = jax.device_put(jnp.asarray(sm_fe_np), NamedSharding(mesh, P("tp")))
+
+    def _init_eplb_experts():
+        me = lax.axis_index("tp")
+        root = jax.random.PRNGKey(20261014)
+        k_e13_base = jax.random.fold_in(jax.random.fold_in(root, 7), me)
+        k_e2_base = jax.random.fold_in(jax.random.fold_in(root, 8), me)
+        k_es = jax.random.fold_in(jax.random.fold_in(root, 9), me)
+
+        e13_tile = (
+            jax.random.normal(k_e13_base, (1, 2, 72, 8, 512, 2048), dtype=BF16)
+            * jnp.bfloat16(0.125)
+        ).astype(FP8)
+        e2_tile = (
+            jax.random.normal(k_e2_base, (1, 2, 72, 4, 256, 4096), dtype=BF16)
+            * jnp.bfloat16(0.125)
+        ).astype(FP8)
+        es = (
+            jnp.abs(jax.random.normal(k_es, (1, 60, 72, 1, 6144), dtype=F32)) * 0.008
+            + 0.004
+        )
+        return (
+            jnp.tile(e13_tile, (1, 30, 1, 1, 1, 1)),
+            jnp.tile(e2_tile, (1, 30, 1, 1, 1, 1)),
+            es,
+        )
+
+    e13_72, e2_72, es_72 = jax.jit(
+        jax.shard_map(
+            _init_eplb_experts,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=(P("tp"), P("tp"), P("tp")),
+            check_vma=False,
+        )
+    )()
+    jax.block_until_ready(e13_72)
+
+    w_lib_eplb = {
+        **w_lib,
+        "smalls": sm_lib_eplb,
+        "e13": e13_72,
+        "e2": e2_72,
+        "es": es_72,
+    }
+    w_f_eplb = {
+        **w_f,
+        "smalls": sm_f_eplb,
+        "e13": e13_72,
+        "e2": e2_72,
+        "es": es_72,
+    }
+
+    eplb_results = []
+    for ecopy_opt in (0, 1):
+        for T, B in [(1, 16), (4, 16)]:
+            tiles_lib_e = dataclasses.replace(default_tiles(B), ecopy_opt=ecopy_opt)
+            ex_e = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True, tiles=tiles_lib_e)
+            c_f_e = frozen_mk.MKConfig(
+                R=8,
+                B=B,
+                T=T,
+                L=60,
+                att_every=4,
+                moe_tp=False,
+                e_slots=72,
+                ctx=4096,
+                stack_e=True,
+            )
+            tiles_f_e = dataclasses.replace(
+                frozen_mk.default_tiles(c_f_e), ecopy_opt=ecopy_opt
+            )
+            donate = T == 1
+
+            pos_e, hid_e, st_e = _init_bucket_inputs_on_tpu(mesh, g_eplb, ex_e)
+            step_e_lib, info_e_lib = qwen35.make_step(
+                mesh, g_eplb, ex_e, donate_states=donate
+            )
+            out_hid_e_lib, st_e_out = step_e_lib(pos_e, hid_e, w_lib_eplb, st_e)
+            jax.block_until_ready(out_hid_e_lib)
+            if donate:
+                st_e = st_e_out
+            hid_e_lib_np = np.asarray(jax.device_get(kernel.unfold(out_hid_e_lib, 8)))
+            del st_e_out
+            e_lib_stats, st_e = _time_step_fn(
+                step_e_lib, pos_e, hid_e, w_lib_eplb, st_e, T=T
+            )
+            del pos_e, hid_e, st_e, out_hid_e_lib, step_e_lib
+            gc.collect()
+
+            pos_ef, hid_ef, st_ef = _init_bucket_inputs_on_tpu(mesh, g_eplb, ex_e)
+            raw_step_ef, info_ef = frozen_mk.make_step(mesh, c_f_e, tiles_f_e)
+            step_ef = jax.jit(raw_step_ef, donate_argnums=(3,) if donate else ())
+            out_hid_ef, st_ef_out = step_ef(pos_ef, hid_ef, w_f_eplb, st_ef)
+            jax.block_until_ready(out_hid_ef)
+            if donate:
+                st_ef = st_ef_out
+            hid_ef_np = np.asarray(jax.device_get(kernel.unfold(out_hid_ef, 8)))
+            del st_ef_out
+            e_f_stats, st_ef = _time_step_fn(
+                step_ef, pos_ef, hid_ef, w_f_eplb, st_ef, T=T
+            )
+            del pos_ef, hid_ef, st_ef, out_hid_ef, step_ef, raw_step_ef
+            gc.collect()
+
+            e_bit_exact = bool(
+                np.array_equal(
+                    hid_e_lib_np[:, :B, :].view(np.uint8),
+                    hid_ef_np[:, :B, :].view(np.uint8),
+                )
+            )
+            e_delta = (
+                (e_lib_stats["median_us"] - e_f_stats["median_us"])
+                / e_f_stats["median_us"]
+                * 100.0
+            )
+            e_row = {
+                "mode": f"eplb_e72_opt{ecopy_opt}",
+                "e_slots": 72,
+                "ecopy_opt": ecopy_opt,
+                "T": T,
+                "B": B,
+                "lib_median_us": round(e_lib_stats["median_us"], 1),
+                "frozen_median_us": round(e_f_stats["median_us"], 1),
+                "delta_pct": round(e_delta, 2),
+                "vmem_lib_mib": round(
+                    info_e_lib["vmem_scratch_bytes"] / (1024 * 1024), 2
+                ),
+                "vmem_frozen_mib": round(
+                    info_ef["vmem_scratch_bytes"] / (1024 * 1024), 2
+                ),
+                "hid_bit_exact": e_bit_exact,
+            }
+            eplb_results.append(e_row)
+            print(
+                f"[M3 EPLB (e_slots=72, ecopy_opt={ecopy_opt}) T={T} B={B:2d}] "
+                f"lib={e_row['lib_median_us']:6.1f} us vs "
+                f"frozen={e_row['frozen_median_us']:6.1f} us "
+                f"({e_row['delta_pct']:+.2f}%) | bit_exact={e_bit_exact}",
+                flush=True,
+            )
+            assert e_bit_exact, (
+                f"EPLB ecopy_opt={ecopy_opt} not bit-exact at T={T}, B={B}"
+            )
+            assert e_row["delta_pct"] <= 2.0, (
+                f"EPLB latency regression {e_row['delta_pct']:+.2f}% > +2.0%"
+            )
+
+    del w_lib_eplb, w_f_eplb, e13_72, e2_72, es_72, sm_lib_eplb, sm_f_eplb
+    gc.collect()
+    jax.clear_caches()
+
+    # -----------------------------------------------------------------------
+    # Part 4: TP MoE (moe_tp=True, FULL_TP) at (1, 16) and (4, 16)
+    # -----------------------------------------------------------------------
+    g_tp = dataclasses.replace(g, moe_tp=True, e_slots=0)
+
+    def _init_tp_experts():
+        me = lax.axis_index("tp")
+        root = jax.random.PRNGKey(20261015)
+        k_e13_base = jax.random.fold_in(jax.random.fold_in(root, 7), me)
+        k_e2_base = jax.random.fold_in(jax.random.fold_in(root, 8), me)
+        k_es = jax.random.fold_in(jax.random.fold_in(root, 9), me)
+
+        e13_tile = (
+            jax.random.normal(k_e13_base, (1, 2, 512, 1, 4096, 256), dtype=BF16)
+            * jnp.bfloat16(0.125)
+        ).astype(FP8)
+        e2_tile = (
+            jax.random.normal(k_e2_base, (1, 2, 512, 1, 128, 4096), dtype=BF16)
+            * jnp.bfloat16(0.125)
+        ).astype(FP8)
+        es = (
+            jnp.abs(jax.random.normal(k_es, (1, 60, 512, 1, 4352), dtype=F32)) * 0.008
+            + 0.004
+        )
+        return (
+            jnp.tile(e13_tile, (1, 30, 1, 1, 1, 1)),
+            jnp.tile(e2_tile, (1, 30, 1, 1, 1, 1)),
+            es,
+        )
+
+    e13_tp, e2_tp, es_tp = jax.jit(
+        jax.shard_map(
+            _init_tp_experts,
+            mesh=mesh,
+            in_specs=(),
+            out_specs=(P("tp"), P("tp"), P("tp")),
+            check_vma=False,
+        )
+    )()
+    jax.block_until_ready(e13_tp)
+
+    w_lib_tp = {**w_lib, "e13": e13_tp, "e2": e2_tp, "es": es_tp}
+    w_f_tp = {**w_f, "e13": e13_tp, "e2": e2_tp, "es": es_tp}
+
+    tp_results = []
+    for T, B in [(1, 16), (4, 16)]:
+        ex_tp = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True)
+        c_f_tp = frozen_mk.MKConfig(
+            R=8,
+            B=B,
+            T=T,
+            L=60,
+            att_every=4,
+            moe_tp=True,
+            ctx=4096,
+            stack_e=True,
+        )
+        tiles_f_tp = frozen_mk.default_tiles(c_f_tp)
+        donate = T == 1
+
+        pos_t, hid_t, st_t = _init_bucket_inputs_on_tpu(mesh, g_tp, ex_tp)
+        step_t_lib, info_t_lib = qwen35.make_step(
+            mesh, g_tp, ex_tp, donate_states=donate
+        )
+        out_hid_t_lib, st_t_out = step_t_lib(pos_t, hid_t, w_lib_tp, st_t)
+        jax.block_until_ready(out_hid_t_lib)
+        if donate:
+            st_t = st_t_out
+        hid_t_lib_np = np.asarray(jax.device_get(kernel.unfold(out_hid_t_lib, 8)))
+        del st_t_out
+        t_lib_stats, st_t = _time_step_fn(step_t_lib, pos_t, hid_t, w_lib_tp, st_t, T=T)
+        del pos_t, hid_t, st_t, out_hid_t_lib, step_t_lib
+        gc.collect()
+
+        pos_tf, hid_tf, st_tf = _init_bucket_inputs_on_tpu(mesh, g_tp, ex_tp)
+        raw_step_tf, info_tf = frozen_mk.make_step(mesh, c_f_tp, tiles_f_tp)
+        step_tf = jax.jit(raw_step_tf, donate_argnums=(3,) if donate else ())
+        out_hid_tf, st_tf_out = step_tf(pos_tf, hid_tf, w_f_tp, st_tf)
+        jax.block_until_ready(out_hid_tf)
+        if donate:
+            st_tf = st_tf_out
+        hid_tf_np = np.asarray(jax.device_get(kernel.unfold(out_hid_tf, 8)))
+        del st_tf_out
+        t_f_stats, st_tf = _time_step_fn(step_tf, pos_tf, hid_tf, w_f_tp, st_tf, T=T)
+        del pos_tf, hid_tf, st_tf, out_hid_tf, step_tf, raw_step_tf
+        gc.collect()
+
+        t_bit_exact = bool(
+            np.array_equal(
+                hid_t_lib_np[:, :B, :].view(np.uint8),
+                hid_tf_np[:, :B, :].view(np.uint8),
+            )
+        )
+        t_delta = (
+            (t_lib_stats["median_us"] - t_f_stats["median_us"])
+            / t_f_stats["median_us"]
+            * 100.0
+        )
+        t_row = {
+            "mode": "moe_tp_true",
+            "T": T,
+            "B": B,
+            "lib_median_us": round(t_lib_stats["median_us"], 1),
+            "frozen_median_us": round(t_f_stats["median_us"], 1),
+            "delta_pct": round(t_delta, 2),
+            "vmem_lib_mib": round(info_t_lib["vmem_scratch_bytes"] / (1024 * 1024), 2),
+            "vmem_frozen_mib": round(info_tf["vmem_scratch_bytes"] / (1024 * 1024), 2),
+            "hid_bit_exact": t_bit_exact,
+        }
+        tp_results.append(t_row)
+        print(
+            f"[M3 TP MoE (moe_tp=True) T={T} B={B:2d}] "
+            f"lib={t_row['lib_median_us']:6.1f} us vs "
+            f"frozen={t_row['frozen_median_us']:6.1f} us "
+            f"({t_row['delta_pct']:+.2f}%) | bit_exact={t_bit_exact}",
+            flush=True,
+        )
+        assert t_bit_exact, f"moe_tp=True not bit-exact at T={T}, B={B}"
+        assert t_row["delta_pct"] <= 2.0, (
+            f"moe_tp=True latency regression {t_row['delta_pct']:+.2f}% > +2.0%"
+        )
+
+    m3_summary = {
+        "pallas_writer": pooled_results,
+        "stack_e_false": unstacked_results,
+        "eplb": eplb_results,
+        "moe_tp": tp_results,
+    }
+    print("\n=== M3_TPU_V7X8_BENCH_JSON_START ===")
+    print(json.dumps(m3_summary, indent=2))
+    print("=== M3_TPU_V7X8_BENCH_JSON_END ===", flush=True)

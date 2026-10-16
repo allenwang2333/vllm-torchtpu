@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -435,7 +436,26 @@ def encode_ecopy(E: int, ER: int, EW: int, moe_tp: bool, cores: Any) -> list[flo
     }
     for r1, lst in enumerate(cores):
         for k, g in enumerate(lst[ER:EW]):
-            v = vid.get(int(g))
-            if v is not None and v // ER != r1:
-                out[v] = float(1 + r1 * extra + k)
+            g_int = int(g)
+            if g_int < 0:
+                continue
+            v = vid.get(g_int)
+            if v is None:
+                continue
+            if v // ER == r1:
+                warnings.warn(
+                    f"encode_ecopy: expert {g_int} (vid={v}) has a redundant slot "
+                    f"(rank={r1}, slot={k}) on the same rank as its primary slot; "
+                    "ignoring same-rank replica.",
+                    stacklevel=2,
+                )
+                continue
+            if out[v] != 0.0:
+                warnings.warn(
+                    f"encode_ecopy: expert {g_int} (vid={v}) has multiple "
+                    "secondary replicas; overwriting previous replica with "
+                    f"(rank={r1}, slot={k}).",
+                    stacklevel=2,
+                )
+            out[v] = float(1 + r1 * extra + k)
     return out

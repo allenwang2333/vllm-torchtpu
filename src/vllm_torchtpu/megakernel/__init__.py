@@ -66,6 +66,7 @@ from .models.qwen35_pool import (
     states_to_pool,
 )
 from .ops import rup
+from .planner import encode_ecopy
 from .spec import (
     Block,
     DebugOptions,
@@ -119,6 +120,7 @@ __all__ = [
     "conv_to_raw_page",
     "default_pool_layout",
     "default_tiles",
+    "encode_ecopy",
     "fold",
     "gather_gdn_states",
     "kernel",

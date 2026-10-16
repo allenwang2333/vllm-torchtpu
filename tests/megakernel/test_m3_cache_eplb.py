@@ -1178,3 +1178,385 @@ def test_unstacked_expert_weights_equivalence(T: int, B: int):
                 name="e13",
                 allow_expert_reshape=True,
             )
+
+
+@pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
+def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
+    """Verify `split_hf_weights` (R=1 vs R=2), `encode_ecopy`, EPLB, and TP MoE."""
+    # Verify encode_ecopy warns when an expert has > 1 secondary replicas
+    with pytest.warns(UserWarning, match="multiple secondary replicas"):
+        mk.encode_ecopy(
+            E=6,
+            ER=2,
+            EW=3,
+            moe_tp=False,
+            cores=[[0, 1, 2], [2, 3, 0], [4, 5, 0]],
+        )
+    # Verify encode_ecopy warns when a redundant slot is placed on the same rank
+    with pytest.warns(UserWarning, match="same rank as its primary slot"):
+        mk.encode_ecopy(
+            E=4,
+            ER=2,
+            EW=3,
+            moe_tp=False,
+            cores=[[0, 1, 0], [2, 3, 1]],
+        )
+
+    mesh = _cpu_mesh(2)
+    g_ep = _tiny_geom(L=4, att_every=4, moe_tp=False, e_slots=0)
+    g_eplb = _tiny_geom(L=4, att_every=4, moe_tp=False, e_slots=68)
+    g_tp = _tiny_geom(L=4, att_every=4, moe_tp=True, e_slots=0)
+
+    ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
+    ex_opt0 = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=0)
+    ex_po2c = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1)
+    ex_eplb_unstacked = _tiny_exec(
+        R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1, stack_e=False
+    )
+
+    key = jax.random.key(202 + T)
+    k_hf, k_in = jax.random.split(key)
+    hf_w = qwen35.random_hf_weights(k_hf, g_ep)
+
+    # Bias router strongly toward experts 0 and 1 (replicated onto rank 1 slots 64..65
+    # on layer 0) and replicate KV head 0 across both KV heads so R=1 (NKV=1) and R=2
+    # (NKV=2) execute the exact same mathematical model.
+    router_biased = hf_w["router"].at[:, :, :2].add(jnp.bfloat16(100.0))
+    hf_w = dict(
+        hf_w,
+        router=router_biased,
+        k_proj=jnp.repeat(hf_w["k_proj"][:, :1], 2, axis=1),
+        k_proj_s=jnp.repeat(hf_w["k_proj_s"][:, :1], 2, axis=1),
+        v_proj=jnp.repeat(hf_w["v_proj"][:, :1], 2, axis=1),
+        v_proj_s=jnp.repeat(hf_w["v_proj_s"][:, :1], 2, axis=1),
+        kn=jnp.repeat(hf_w["kn"][:, :1], 2, axis=1),
+    )
+
+    pos, hid_l, _, st_l = qwen35.random_logical_inputs(k_in, g_ep, ex_base)
+    st_l = dict(
+        st_l,
+        kc=jnp.repeat(st_l["kc"][:1], 2, axis=0),
+        vc=jnp.repeat(st_l["vc"][:1], 2, axis=0),
+    )
+
+    # Pass only unfused HF projection keys to verify real HF tensor splitting
+    fused_keys = (
+        "att_q",
+        "att_q_s",
+        "att_kv",
+        "att_kv_s",
+        "sh13",
+        "sh13_s",
+        "e13",
+        "e13_s",
+    )
+    hf_unfused = {k: v for k, v in hf_w.items() if k not in fused_keys}
+    w_ep_l = qwen35.split_hf_weights(hf_unfused, g_ep, ex_base)
+    w_eplb_l = qwen35.split_hf_weights(hf_unfused, g_eplb, ex_base)
+    w_tp_l = qwen35.split_hf_weights(hf_unfused, g_tp, ex_base)
+    assert "ecopy" in w_eplb_l
+    assert jnp.any(w_eplb_l["ecopy"] > 0)
+
+    # Unsharded R=1 forward pass comparison for split_hf_weights
+    g_r1 = replace(g_ep, NKV=1)
+    ex_r1 = replace(ex_base, R=1)
+    hf_r1 = dict(
+        hf_unfused,
+        k_proj=hf_unfused["k_proj"][:, :1],
+        k_proj_s=hf_unfused["k_proj_s"][:, :1],
+        v_proj=hf_unfused["v_proj"][:, :1],
+        v_proj_s=hf_unfused["v_proj_s"][:, :1],
+        kn=hf_unfused["kn"][:, :1],
+    )
+    w_r1_l = qwen35.split_hf_weights(hf_r1, g_r1, ex_r1)
+    qk = (g_ep.KH // ex_base.R) * g_ep.KD
+    st_r1 = {
+        "kc": st_l["kc"][:1],
+        "vc": st_l["vc"][:1],
+        "conv": jnp.concatenate(
+            [
+                st_l["conv"][0, :, :, :, :qk],
+                st_l["conv"][1, :, :, :, :qk],
+                st_l["conv"][0, :, :, :, qk : 2 * qk],
+                st_l["conv"][1, :, :, :, qk : 2 * qk],
+                st_l["conv"][0, :, :, :, 2 * qk :],
+                st_l["conv"][1, :, :, :, 2 * qk :],
+            ],
+            axis=-1,
+        )[None, ...],
+        "rec": jnp.concatenate([st_l["rec"][0], st_l["rec"][1]], axis=2)[None, ...],
+    }
+    ref_r1, _ = qwen35.reference_step(g_r1, ex_r1, pos, hid_l, w_r1_l, st_r1)
+
+    # Directly verify GDN `lin_in` & `lin_in_s` layout against unsharded HF tensors
+    lay_gdn = mk.GDNBlock.lin_in_layout(g_ep, ex_base)
+    vh = lay_gdn.vh
+    assert w_ep_l["lin_in"].shape == (ex_base.R, g_ep.NGDN, g_ep.H, lay_gdn.NLI)
+    assert w_ep_l["lin_in_s"].shape == (ex_base.R, g_ep.NGDN, lay_gdn.NLI)
+    exp_a = jnp.transpose(
+        hf_unfused["lin_a"].reshape(g_ep.NGDN, g_ep.H, ex_base.R, vh),
+        (2, 0, 1, 3),
+    )
+    exp_b = jnp.transpose(
+        hf_unfused["lin_b"].reshape(g_ep.NGDN, g_ep.H, ex_base.R, vh),
+        (2, 0, 1, 3),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(w_ep_l["lin_in"][..., lay_gdn.BA : lay_gdn.BA + vh]).view(np.uint8),
+        np.asarray(exp_b).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(w_ep_l["lin_in"][..., lay_gdn.A_OFF : lay_gdn.A_OFF + vh]).view(
+            np.uint8
+        ),
+        np.asarray(exp_a).view(np.uint8),
+    )
+    assert jnp.all(
+        w_ep_l["lin_in"][..., lay_gdn.BA + vh : lay_gdn.A_OFF].astype(jnp.float32) == 0
+    )
+    assert jnp.all(
+        w_ep_l["lin_in"][..., lay_gdn.A_OFF + vh : lay_gdn.NLI].astype(jnp.float32) == 0
+    )
+
+    ref_ep, _ = qwen35.reference_step(g_ep, ex_base, pos, hid_l, w_ep_l, st_l)
+    ref_tp, _ = qwen35.reference_step(g_tp, ex_base, pos, hid_l, w_tp_l, st_l)
+    assert jnp.allclose(
+        ref_ep.astype(jnp.float32), ref_r1.astype(jnp.float32), atol=1e-2, rtol=1e-2
+    )
+
+    def run_cfg(g_cfg, ex_cfg, w_logical):
+        p_in, h_mk, w_mk, s_mk = qwen35.pack_inputs(
+            pos, hid_l, w_logical, st_l, g_cfg, ex_cfg, mesh=mesh
+        )
+        step, _ = qwen35.make_step(mesh, g_cfg, ex_cfg)
+        out_h, _ = step(p_in, h_mk, w_mk, s_mk)
+        return mk.unfold(out_h, ex_cfg.R)[0, :B]
+
+    out_ep = run_cfg(g_ep, ex_base, w_ep_l)
+    out_eplb_opt0 = run_cfg(g_eplb, ex_opt0, w_eplb_l)
+    out_eplb_opt1 = run_cfg(g_eplb, ex_po2c, w_eplb_l)
+    out_eplb_unstacked = run_cfg(g_eplb, ex_eplb_unstacked, w_eplb_l)
+    out_tp = run_cfg(g_tp, ex_base, w_tp_l)
+
+    # Prove that replica routing actually occurred: corrupting redundant slots [64:68]
+    # changes the output of both load-balanced ecopy_opt=0 and deduplicated ecopy_opt=1.
+    er = g_eplb.ER(ex_base.R)
+    w_eplb_zero_rep = dict(
+        w_eplb_l,
+        e2=w_eplb_l["e2"].at[:, :, er:].set(jnp.zeros_like(w_eplb_l["e2"][:, :, er:])),
+        e2_s=w_eplb_l["e2_s"]
+        .at[:, :, er:]
+        .set(jnp.zeros_like(w_eplb_l["e2_s"][:, :, er:])),
+    )
+    for ex_opt, ref_opt_out in ((ex_opt0, out_eplb_opt0), (ex_po2c, out_eplb_opt1)):
+        out_eplb_zero_rep = run_cfg(g_eplb, ex_opt, w_eplb_zero_rep)
+        assert not jnp.allclose(
+            out_eplb_zero_rep.astype(jnp.float32),
+            ref_opt_out.astype(jnp.float32),
+            atol=1e-3,
+        )
+
+    np.testing.assert_array_equal(
+        np.asarray(out_eplb_unstacked), np.asarray(out_eplb_opt1)
+    )
+    assert jnp.allclose(
+        out_eplb_opt0.astype(jnp.float32),
+        out_ep.astype(jnp.float32),
+        atol=1.6e-2,
+        rtol=1.6e-2,
+    )
+    assert jnp.allclose(
+        out_eplb_opt1.astype(jnp.float32),
+        out_ep.astype(jnp.float32),
+        atol=1.6e-2,
+        rtol=1.6e-2,
+    )
+    assert jnp.allclose(
+        out_ep.astype(jnp.float32), ref_ep.astype(jnp.float32), atol=3e-2, rtol=3e-2
+    )
+    assert jnp.allclose(
+        out_ep.astype(jnp.float32), ref_r1.astype(jnp.float32), atol=3e-2, rtol=3e-2
+    )
+    assert jnp.allclose(
+        out_tp.astype(jnp.float32), ref_tp.astype(jnp.float32), atol=3e-2, rtol=3e-2
+    )
+    tp_ep_diff = float(
+        jnp.max(jnp.abs(out_tp.astype(jnp.float32) - out_ep.astype(jnp.float32)))
+    )
+    assert tp_ep_diff <= 1.6e-2, f"TP vs EP max diff too large: {tp_ep_diff}"
+
+
+import sys  # noqa: E402
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from frozen_utils import DEFAULT_FROZEN_DIR, load_frozen_qwen35  # noqa: E402
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(os.environ.get("MK_FROZEN_QWEN35_DIR", DEFAULT_FROZEN_DIR)),
+    reason="Set MK_FROZEN_QWEN35_DIR to canonical c196d2500 frozen qwen35 path",
+)
+@pytest.mark.parametrize("T,B", [(1, 2)])
+def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
+    """Bit-exact check vs canonical `c196d2500` frozen `pool_io` and `R=2` EPLB."""
+    frozen_mk, frozen_pio = load_frozen_qwen35()
+
+    # 1. Pooled step (`pool_io.make_pooled_step`) bit-exact comparison
+    mesh1 = _cpu_mesh(1)
+    tp1 = NamedSharding(mesh1, P("tp"))
+
+    g_pool = replace(_tiny_geom(L=4, att_every=4, e_slots=0), NKV=1)
+    ex_pool = _tiny_exec(
+        R=1, B=B, T=T, ctx=256, paged_kv=True, num_pages=96, stack_e=False
+    )
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(303 + T), g_pool, ex_pool
+    )
+    _, hid_mk, w_lib, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g_pool, ex_pool, mesh=mesh1, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g_pool, ex_pool)
+    raw_pools = tuple(
+        jax.device_put(r, tp1)
+        for r in mk.states_to_pool(g_pool, ex_pool, st_l, pt, ckpt, roff)
+    )
+
+    step_lib, info_lib = qwen35.make_pooled_step(
+        mesh1, g_pool, ex_pool, donate_pools=False
+    )
+    out_hid_lib, raw_out_lib = step_lib(pos, hid_mk, w_lib, raw_pools, pt, ckpt, roff)
+
+    tiles_f = replace(
+        frozen_mk.TINY_TILES,
+        bank=512 << 10,
+        kv_blk=min(frozen_mk.TINY_TILES.kv_blk, 256),
+    )
+    c_f = frozen_mk.MKConfig(
+        R=1,
+        B=B,
+        T=T,
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=False,
+        e_slots=0,
+        ctx=256,
+        paged_kv=True,
+        num_pages=96,
+        max_pages_per_seq=2,
+        stack_e=False,
+    )
+    f_lay, f_S = frozen_mk.smalls_layout(c_f)
+    l_lay = info_lib["plan"].smalls_layout
+    sm_f = jnp.zeros((ex_pool.R, g_pool.L, 1, f_S), dtype=jnp.float32)
+    for name, (lo, w) in l_lay.items():
+        fo, _ = f_lay[name]
+        sm_f = sm_f.at[:, :, 0, fo : fo + w].set(w_lib["smalls"][:, :, 0, lo : lo + w])
+
+    w_f = {**w_lib, "smalls": jax.device_put(sm_f, tp1)}
+    step_f, _ = frozen_pio.make_pooled_step(
+        mesh1, c_f, tiles_f, interpret=True, fused_pool_io=False
+    )
+    out_hid_f, raw_out_f = jax.jit(step_f)(pos, hid_mk, w_f, raw_pools, pt, ckpt, roff)
+
+    np.testing.assert_array_equal(np.asarray(out_hid_lib), np.asarray(out_hid_f))
+    for r_lib, r_f in zip(raw_out_lib, raw_out_f):
+        np.testing.assert_array_equal(
+            np.asarray(r_lib).view(np.uint8),
+            np.asarray(r_f).view(np.uint8),
+        )
+
+    # 2. Multi-rank (R=2) EPLB bit-exact comparison with non-zero ecopy
+    mesh2 = _cpu_mesh(2)
+    tp2 = NamedSharding(mesh2, P("tp"))
+    g_eplb = _tiny_geom(L=4, att_every=4, moe_tp=False, e_slots=68)
+    ex_eplb = _tiny_exec(
+        R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1, stack_e=False
+    )
+    pos_e, hid_le, w_le, st_le = qwen35.random_logical_inputs(
+        jax.random.key(404 + T), g_eplb, ex_eplb
+    )
+    assert "ecopy" in w_le and jnp.any(w_le["ecopy"] > 0)
+    # Bias router strongly toward experts 0 and 1 (replicated on rank 1 slots 64..65)
+    # so Po2C deterministically routes tokens to secondary replicas.
+    w_le = dict(
+        w_le,
+        router=w_le["router"].at[:, :, :2].add(jnp.bfloat16(100.0)),
+    )
+    _, hid_mke, w_libe, st_mke = qwen35.pack_inputs(
+        pos_e, hid_le, w_le, st_le, g_eplb, ex_eplb, mesh=mesh2
+    )
+
+    step_lib_e, info_lib_e = qwen35.make_step(mesh2, g_eplb, ex_eplb)
+    out_hid_lib_e, out_st_lib_e = step_lib_e(pos_e, hid_mke, w_libe, st_mke)
+
+    # Assert that secondary replica slots were actually exercised
+    er_e = g_eplb.ER(ex_eplb.R)
+    w_le_zero_rep = dict(
+        w_le,
+        e2=w_le["e2"].at[:, :, er_e:].set(jnp.zeros_like(w_le["e2"][:, :, er_e:])),
+    )
+    _, _, w_libe_zero, _ = qwen35.pack_inputs(
+        pos_e, hid_le, w_le_zero_rep, st_le, g_eplb, ex_eplb, mesh=mesh2
+    )
+    out_hid_zero_rep, _ = step_lib_e(pos_e, hid_mke, w_libe_zero, st_mke)
+    assert not jnp.allclose(
+        out_hid_zero_rep.astype(jnp.float32),
+        out_hid_lib_e.astype(jnp.float32),
+        atol=1e-3,
+    )
+
+    c_fe = replace(
+        c_f,
+        R=2,
+        NKV=2,
+        paged_kv=False,
+        e_slots=68,
+    )
+    tiles_fe = replace(tiles_f, ecopy_opt=1)
+    f_lay_e, f_Se = frozen_mk.smalls_layout(c_fe)
+    l_lay_e = info_lib_e["plan"].smalls_layout
+    sm_fe = jnp.zeros((ex_eplb.R, g_eplb.L, 1, f_Se), dtype=jnp.float32)
+    for name, (lo, w) in l_lay_e.items():
+        fo, _ = f_lay_e[name]
+        sm_fe = sm_fe.at[:, :, 0, fo : fo + w].set(
+            w_libe["smalls"][:, :, 0, lo : lo + w]
+        )
+    w_fe = {**w_libe, "smalls": jax.device_put(sm_fe, tp2)}
+    step_fe, _ = frozen_mk.make_step(mesh2, c_fe, tiles_fe, interpret=True)
+    out_hid_fe, out_st_fe = jax.jit(step_fe)(pos_e, hid_mke, w_fe, st_mke)
+
+    np.testing.assert_array_equal(
+        np.asarray(out_hid_lib_e).view(np.uint8),
+        np.asarray(out_hid_fe).view(np.uint8),
+    )
+    conv_key = "conv" if T == 1 else "conv_ckpt"
+    rec_key = "rec" if T == 1 else "rec_ckpt"
+    np.testing.assert_array_equal(
+        np.asarray(out_st_lib_e[conv_key]).view(np.uint8),
+        np.asarray(out_st_fe["conv"]).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_st_lib_e[rec_key]).view(np.uint8),
+        np.asarray(out_st_fe["rec"]).view(np.uint8),
+    )
+    for k in ("kc", "vc"):
+        np.testing.assert_array_equal(
+            np.asarray(out_st_lib_e[k]).view(np.uint8),
+            np.asarray(out_st_fe[k]).view(np.uint8),
+        )
