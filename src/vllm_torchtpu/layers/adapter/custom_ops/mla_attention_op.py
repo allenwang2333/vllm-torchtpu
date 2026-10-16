@@ -1739,9 +1739,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and self.rotary_emb is not None
         )
         if self.decode_prologue:
-            if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+            if not envs.TPU_MLA_SPARSE_SPLIT_Q:
                 raise NotImplementedError(
-                    "TPU_MLA_DECODE_PROLOGUE needs TPU_DCP_MLA_SPLIT_Q_LSE"
+                    "TPU_MLA_DECODE_PROLOGUE needs TPU_MLA_SPARSE_SPLIT_Q"
                 )
             if (self.qk_nope_head_dim, self.qk_rope_head_dim) != (192, 64):
                 raise NotImplementedError(

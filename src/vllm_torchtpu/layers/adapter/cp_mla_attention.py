@@ -236,7 +236,7 @@ def _merge_chunked(
     """
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
-        return _merge_chunked_lse_gathered(output, lse, group, chunks)
+        return _merge_chunked_lse_gathered(output, lse, group, chunks, rs_dtype)
     if envs.TPU_DCP_MERGE_RS_BF16:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype.
         lse_f32 = lse.to(torch.float32)
@@ -246,6 +246,7 @@ def _merge_chunked(
                 lse_f32[c * step : (c + 1) * step],
                 _gather_lse(lse_f32[c * step : (c + 1) * step], group),
                 group,
+                rs_dtype,
             )
             for c in range(chunks)
         ]
@@ -276,7 +277,11 @@ def _gather_lse(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 def _weighted_reduce_scatter(
-    output: torch.Tensor, lse_f32: torch.Tensor, lses: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse_f32: torch.Tensor,
+    lses: torch.Tensor,
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
     `[world, T, H]` for exactly `output`'s `T` rows."""
@@ -285,10 +290,12 @@ def _weighted_reduce_scatter(
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-    return _scatter_sum(weighted, group).to(output.dtype)
+    return _scatter_sum(weighted, group, rs_dtype).to(output.dtype)
 
 
-def _scatter_sum(weighted: torch.Tensor, group: Any) -> torch.Tensor:
+def _scatter_sum(
+    weighted: torch.Tensor, group: Any, rs_dtype: torch.dtype | None = None
+) -> torch.Tensor:
     """Sum `[T, H, V]` f32 `weighted` over the ranks and keep this rank's
     head block `[T, H / world, V]`: the merge's reduce-scatter.
 
@@ -296,6 +303,8 @@ def _scatter_sum(weighted: torch.Tensor, group: Any) -> torch.Tensor:
     1 reduce-scatters it in bf16 (the collective accumulates in bf16); 2
     exchanges the same bf16 bytes by all-to-all and sums the received ranks
     locally in f32. Either halves the bytes of the f32 reduce-scatter.
+    Unset, the reduce-scatter runs in `rs_dtype` (TPU_DCP_RS_OUT_PRECISION),
+    as `cp_lse_ag_out_rs` does; None keeps f32.
     """
     mode = envs.TPU_DCP_MERGE_RS_BF16
     if mode == 1:
@@ -309,11 +318,17 @@ def _scatter_sum(weighted: torch.Tensor, group: Any) -> torch.Tensor:
             .transpose(0, 1)
         )
         return _all_to_all(send, group).to(torch.float32).sum(dim=0)
+    if rs_dtype is not None:
+        weighted = weighted.to(rs_dtype)
     return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
 def _merge_chunked_lse_gathered(
-    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    chunks: int,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`_merge_chunked` with one lse all-gather for every chunk
     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
@@ -335,6 +350,7 @@ def _merge_chunked_lse_gathered(
             lse_f32[c * step : (c + 1) * step],
             gathered[:, c * step : (c + 1) * step],
             group,
+            rs_dtype,
         )
         for c in range(chunks)
     ]
