@@ -58,10 +58,15 @@ def test_absorb_starts_above_the_a2a_cap(cap, first_absorb, monkeypatch):
     reduce-scatter merge without absorb), at bucket 128 for cap 64."""
     from vllm_torchtpu.layers.adapter import attention
 
-    monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "1")
-    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A", "1")
-    monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", raising=False)
-    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", str(cap))
+    # Module attributes, not env vars: robust to an envs cache another test
+    # enabled and to the image's own env.
+    for name, value in dict(
+        TPU_MLA_ABSORB_TOKEN_MAJOR="1",
+        TPU_DCP_LSE_MERGE_A2A=True,
+        TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS=64,
+        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=cap,
+    ).items():
+        monkeypatch.setattr(attention.envs, name, value, raising=False)
     for t in LADDER[2:13]:
         absorb = attention.mla_absorb_mode(t) is not None
         assert absorb == (t >= first_absorb), (cap, t)
