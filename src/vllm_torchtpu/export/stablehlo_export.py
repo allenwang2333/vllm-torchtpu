@@ -933,7 +933,7 @@ def _write_exported_module(
     for inp in annotated_inputs:
         if inp.get("is_weight") and inp.get("weight_name"):
             w_name = str(inp["weight_name"])
-            existing_entry = existing_weights.get(w_name)
+            existing_entry = existing_weights.get(w_name) or weight_map.get(w_name)
             if isinstance(existing_entry, dict) and isinstance(
                 existing_entry.get("index"), int
             ):
