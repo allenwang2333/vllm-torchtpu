@@ -1430,7 +1430,9 @@ DECODE_BODY_LEVERS = (
     # width; the rows past kv_len are zeroed and masked either way.
     "lrows",
 )
-DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "pair", "fxskip", "nofill")
+# The measured set (decode probes 02 / 04): with TPU_DCP_MLA_SMALL_CHUNK_BATCH=8
+# "quad" stacks a step's 8 tokens; "nofill" and "q128" measured no gain.
+DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows")
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).

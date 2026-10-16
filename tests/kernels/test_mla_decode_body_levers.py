@@ -51,7 +51,7 @@ RW = _load("kernels/test_mla_decode_row_widths.py")
 P = RW.P
 
 
-def _call(p, levers, fault=None, send_world=0):
+def _call(p, levers, fault=None, send_world=0, batch=4):
     cache = P._cos_sin_cache()
     res = sparse_mla.sparse_ragged_paged_attention(
         p["ql_nope"],
@@ -67,7 +67,7 @@ def _call(p, levers, fault=None, send_world=0):
         cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
         gather_and_attention_chunk_size=256,
         topk_cap=512,
-        small_chunk_batch_size=4,
+        small_chunk_batch_size=batch,
         small_chunk_tokens=32,
         lse_lane_dense=True,
         lse_mask_empty=True,
@@ -127,6 +127,11 @@ def test_bit_identical(query_tokens, seq_q, send_world, shift):
     for levers in LEVER_SETS:
         got = _call(p, levers, send_world=send_world)
         assert _same(got, ref), levers
+    # Eight tokens per grid step (TPU_DCP_MLA_SMALL_CHUNK_BATCH=8) with the
+    # default levers: the same bits as the served four-token steps.
+    if query_tokens >= 8:
+        got = _call(p, sparse_mla.DECODE_BODY_DEFAULT, send_world=send_world, batch=8)
+        assert _same(got, ref), "bz 8"
 
 
 def test_positive_control_fails():
