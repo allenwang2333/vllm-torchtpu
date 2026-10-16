@@ -265,6 +265,16 @@ Two layers, as on the prefill side:
   DMA commit writes the batch results back to the bank. It preserves
   untouched slots and last-write ordering for duplicate slot indices,
   including padded null-slot rows.
+- **Under attention DP2** (loader `"attention_dp": 2`, DCP over each 16-rank
+  group) the batched path speculates too. Each group's requests fill half of
+  a compiled request count (2, 4, 8, 16 or 32; a lone request runs with a
+  null partner). The verify op places each group's rows on the batch rows
+  that group attends, so every sequence stays inside its group's attention
+  and KDA, and returns the logits and auxiliary rows in request order; each
+  group's ranks commit their requests' accepted KDA rows. The draft stays
+  TP32 over all 32 ranks, drafting at most 16 requests per fused call (a
+  32-request verify drafts in two). A step whose fuller group exceeds every
+  compiled verify decodes plainly.
 - **Cold warmup:** `megakernel/compilation.py` submits at most eight large
   decoder/draft compilations per worker, with larger row counts first. The
   default maximum of four requests has six plain programs (B1/B2/B4, greedy
@@ -322,6 +332,8 @@ words, min_tokens; `platforms/tpu_platform.py`).
   batches 1–8, and 3 at batches 9–16 (compiled request buckets 1, 2, 4, 8
   and 16, up to `--max-num-seqs`), and 0 anywhere; the per-batch-size
   schedule chooses among them and the decoder rejects any other at startup.
+  Under attention DP2, 3 drafts reach 32 requests (a 128-row verify, 64 per
+  group); 64 requests would need a 256-row verify, which no layout compiles.
 - Besides its pages, each decode request holds one KDA state block per KDA
   group of the decode KV budget (two while it crosses a page), 7.5 MiB a
   rank each. Under KV pressure a request can hang: its Stage-3 transfer

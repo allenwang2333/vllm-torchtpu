@@ -59,6 +59,14 @@ def add_arguments(parser, profile: bool = False) -> None:
         "the flag B1 is the plain step",
     )
     decode.add_argument(
+        "--spec-drafts",
+        type=int,
+        choices=(0, 3, 7),
+        default=0,
+        help="with --dspark, every batch speculates with this many drafts "
+        "(the batched verify + draft); 0: B1 only, with 7",
+    )
+    decode.add_argument(
         "--save-tokens",
         default="",
         help="file: rank 0 saves each case's timed greedy tokens [steps, batch] (npz)",
@@ -156,7 +164,8 @@ def run_decode(args, records: harness.Records) -> None:
     )
     pools = k3.Pools(blocks, pages, 1, pattern=True)
     draft = None
-    if args.dspark and any(batch == 1 for batch, _ in cases):
+    spec_all = bool(args.dspark and args.spec_drafts)
+    if args.dspark and (spec_all or any(batch == 1 for batch, _ in cases)):
         from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
 
         draft = DsparkDraft(
@@ -170,8 +179,15 @@ def run_decode(args, records: harness.Records) -> None:
         max_num_seqs=max_num_seqs,
         max_model_len=pages * k3.logical(),
         draft=draft,
-        # The bench speculates on batch-one rows only (7 drafts).
-        schedule=((1, 1, 7), (2, max(2, max_num_seqs), 0)) if draft else None,
+        # The bench speculates on batch-one rows only (7 drafts), or with
+        # --spec-drafts at every batch.
+        schedule=(
+            ((1, max_num_seqs, args.spec_drafts),)
+            if spec_all
+            else ((1, 1, 7), (2, max(2, max_num_seqs), 0))
+        )
+        if draft
+        else None,
     )
     harness.sync()
     decoder.warmup()
@@ -187,7 +203,9 @@ def run_decode(args, records: harness.Records) -> None:
         out = []
         for r in range(batch):
             table = pools.scheduled([1 + r // dp * pages + p for p in range(pages)], r)
-            query = 8 if batch == 1 and draft is not None and not first else 1
+            query = 1
+            if draft is not None and not first and (spec_all or batch == 1):
+                query = (args.spec_drafts or 7) + 1
             tokens = [1000 + 37 * r] if first else np.zeros(query, np.int32)
             computed = per_row[r] - 1 if first else 0
             out.append(k3.request(f"{tag}-{r}", tokens, table, sampling, computed))
@@ -212,14 +230,15 @@ def run_decode(args, records: harness.Records) -> None:
                 bridge.materialize(outs[-1])
                 times.append(1e3 * (time.perf_counter() - started) / args.steps)
         ms = statistics.median(times)
-        dspark = batch == 1 and draft is not None
+        dspark = draft is not None and (spec_all or batch == 1)
         if dspark:
-            tokens = torch.cat([o[:1] for o in outs]).cpu()
-            per_step = float((tokens >= 0).sum()) / len(outs)
-            rate = 1e3 * per_step / ms
+            tokens = torch.cat([o[:batch] for o in outs]).cpu()
+            per_step = float((tokens >= 0).sum()) / (len(outs) * batch)
+            rate = 1e3 * per_step * batch / ms
             line = (
-                f"B1 ctx {label}: DSpark {ms:.2f} ms per step, "
-                f"{per_step:.2f} tokens per step (synthetic) -> {rate:.0f} tok/s"
+                f"B{batch} ctx {label}: DSpark {ms:.2f} ms per step, "
+                f"{per_step:.2f} tokens per request-step (synthetic) -> "
+                f"{rate:.0f} tok/s"
             )
         else:
             rate = batch * 1e3 / ms

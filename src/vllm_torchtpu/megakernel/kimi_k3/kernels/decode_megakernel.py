@@ -4719,10 +4719,12 @@ def mla_dcp_shards(
     communication_workspace: AttentionCommunicationWorkspace,
     dcp,
     epsilon: float = 1e-5,
+    sequence_rows: int = 1,
 ) -> None:
     """One MLA layer of attention DP under DCP: the rank's held TP32 shards
     (3 heads each) attend in one ``mla_dcp.DcpAttention`` call over the DP
     group's latent pages, so a page is read once for every held head.
+    ``sequence_rows`` as in :func:`mla`, over the group's rows.
 
     The q/kv latents are computed once; each shard's queries come from its
     chunk of the query-up stream and are absorbed with its W_UK columns (the
@@ -4747,7 +4749,8 @@ def mla_dcp_shards(
 
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards)
+    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
+                                         sequence_rows=sequence_rows)
     dcp_attention.prime()
     scope = _phase_start("q6_mla_projections")
     if "query_down" in streams:
@@ -6159,14 +6162,14 @@ def stack(
         batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
         and batch_size % (sp_owners * attention_dp) == 0
         and sequence_parallel_pre_attention
-        and sequence_rows == 1
+        and (batch_size // attention_dp) % sequence_rows == 0
         and not select_state_row
         and POOLED_WEIGHTS
     ):
         raise ValueError(
             "Attention DP needs a supported batch divisible by 4*DP, the "
-            "sequence-parallel token-scatter layout, one row per sequence "
-            "and pooled weights"
+            "sequence-parallel token-scatter layout, whole sequences in each "
+            "group's rows and pooled weights"
         )
     if attention_dp_ownership and (
         attention_dp == 1
@@ -7374,6 +7377,7 @@ def stack(
                                     if overlap_kda_state_writes and order == attention_dp - 1
                                     else None
                                 ),
+                                sequence_rows=sequence_rows,
                                 streams=streams,
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
@@ -7475,6 +7479,7 @@ def stack(
                                 chunk=kda_row_chunk,
                                 chunks=attention_dp * chunks_per_shard,
                                 slots=slots_ref if slot_reads else None,
+                                sequence_rows=sequence_rows,
                             )
                             shared_state_stream.prime()
                         for shard in range(attention_dp):
@@ -7497,6 +7502,7 @@ def stack(
                                     chunk=kda_row_chunk,
                                     chunks=chunks_per_shard,
                                     slots=slots_ref.at[rows] if slot_reads else None,
+                                    sequence_rows=sequence_rows,
                                 )
                                 state_stream.prime()
                             else:
@@ -7535,6 +7541,7 @@ def stack(
                                 epsilon=eps,
                                 synchronize_devices=False,
                                 weights_are_prefetched=True,
+                                sequence_rows=sequence_rows,
                                 streams=streams,
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
@@ -7756,6 +7763,7 @@ def stack(
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             epsilon=eps,
+                            sequence_rows=sequence_rows,
                         )
                     else:
                         mla(

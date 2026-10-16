@@ -147,13 +147,16 @@ def engine_config(
     | None = None,
 ):
     """The serving configuration's megakernel view, for the TP32 / DCP32
-    deployment with the configured cache (``configure_cache``)."""
+    deployment (DCP over each group under the installed kernel config's
+    attention DP) with the configured cache (``configure_cache``)."""
     from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+    from vllm_torchtpu.megakernel.kimi_k3 import config
 
+    dp = config.active().attention_dp
     return MegakernelEngineConfig(
         role=role,
         tensor_parallel_size=32,
-        decode_context_parallel_size=DCP,
+        decode_context_parallel_size=DCP // dp,
         block_size=PAGE,
         kv_cache_dtype=CACHE_DTYPE,
         max_num_seqs=max_num_seqs,
@@ -161,6 +164,7 @@ def engine_config(
         max_num_batched_tokens=max_num_batched_tokens,
         num_speculative_tokens=num_speculative_tokens,
         num_speculative_tokens_per_batch_size=num_speculative_tokens_per_batch_size,
+        attention_dp=dp,
     )
 
 

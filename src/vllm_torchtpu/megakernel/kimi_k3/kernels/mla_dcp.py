@@ -229,10 +229,16 @@ def chunked(batch) -> bool:
     return batch > MAX_ROWS
 
 
+GROUPED_SPEC_SHAPES = ((4, 4), (8, 4), (8, 8), (16, 8), (32, 8), (32, 4), (64, 8), (64, 4))
+
+
 def _grouped_spec(batch, group, heads, sequence_rows):
-    """Verifier shapes supported by grouped FP8 QK/PV and query transport."""
-    return (group == 32 and heads == HEADS_PER_RANK
-            and (batch, sequence_rows) in ((4, 4), (8, 4), (8, 8), (16, 8), (32, 8), (32, 4), (64, 8), (64, 4)))
+    """Verifier shapes (rows per call, rows per sequence) supported by grouped
+    FP8 QK/PV and query transport: DCP32 with three heads per rank, or
+    attention DP2's DCP16 with six (the same 96-row score tile)."""
+    if group == 16 and heads == 6:
+        return (batch, sequence_rows) in (*GROUPED_SPEC_SHAPES, (16, 4))
+    return group == 32 and heads == HEADS_PER_RANK and (batch, sequence_rows) in GROUPED_SPEC_SHAPES
 
 
 def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
@@ -249,8 +255,10 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
     if chunked(batch):
         chunk, ring = chunk_layout(batch, heads)
         rows = packet_layout(batch, heads)[0] * chunk
-        if query_dtype == jnp.uint8:
+        if query_dtype == jnp.uint8 and not (group == 16 and sequence_rows > 1):
             # The smaller query buffers make two-chunk lookahead fit at B64.
+            # Attention DP's verifies keep one chunk: two change their outputs
+            # at 128 rows.
             ring = 4
         return (
             tpu.VMEM((ring, group, rows, LANES), query_dtype),

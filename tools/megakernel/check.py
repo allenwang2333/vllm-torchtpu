@@ -50,6 +50,13 @@ def add_arguments(parser) -> None:
     spec.add_argument("--single-drafts", type=int, choices=(3, 7), default=7)
     spec.add_argument("--small-batch-drafts", type=int, choices=(3, 7), default=7)
     spec.add_argument(
+        "--large-batches",
+        default="",
+        help="also speculate with three drafts at these request counts (the "
+        "fixture prompts reused), e.g. 16,32 (32: attention DP2 only), against "
+        "plain steps of the same requests",
+    )
+    spec.add_argument(
         "--dspark", required=True, help="the DSpark speculator checkpoint"
     )
     handoff = sub.add_parser(
@@ -171,10 +178,16 @@ def run_spec(args, records: harness.Records) -> None:
 
     from vllm_torchtpu.megakernel import bridge
     from vllm_torchtpu.megakernel import program as mk
-    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import Control, DecodeOps
+    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
+        Control,
+        DecodeOps,
+        decode_batch_sizes,
+    )
     from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
 
     count, generate, rows = args.prompt_tokens, args.generate, args.single_drafts + 1
+    large = sorted(int(n) for n in args.large_batches.split(",") if n)
+    most = max([8, *large])
     all_ids, tokenizer = k3.fixed_prompt(count + 4000, args.model)
     ids = np.asarray(all_ids[:count], np.int32)
 
@@ -195,11 +208,14 @@ def run_spec(args, records: harness.Records) -> None:
     # shortens A. All fixtures must fit both the pool and the draft's RoPE.
     longest_prompt = max(map(len, prompts.values()))
     pages = -(-(longest_prompt + 4 * generate + 64) // k3.LOGICAL) + 1
-    # One copy of the weights for the three decoders below (max_num_seqs 8).
+    # One copy of the weights for the decoders below (max_num_seqs 8, or the
+    # largest --large-batches count).
     ops = DecodeOps(
-        args.presharded, num_slots=Control.total_slots(17), batch_sizes=(1, 2, 4, 8)
+        args.presharded,
+        num_slots=Control.total_slots(2 * most + 1),
+        batch_sizes=decode_batch_sizes(most),
     )
-    pools = k3.Pools(10 * pages + 1, pages, 1)
+    pools = k3.Pools((10 + max([0, *large])) * pages + 1, pages, 1)
     draft = DsparkDraft(
         max_position=longest_prompt + 8 * generate + 64,
         checkpoint=args.dspark,
@@ -207,10 +223,12 @@ def run_spec(args, records: harness.Records) -> None:
     )
 
     def decoder(schedule=None):
+        # Every decoder over these ops takes its slot count (attention DP's
+        # group shares of the KDA banks follow it).
         return k3.decoder(
             ops,
             pools,
-            max_num_seqs=8,
+            max_num_seqs=most,
             max_model_len=pages * k3.LOGICAL,
             draft=draft,
             schedule=schedule,
@@ -224,8 +242,11 @@ def run_spec(args, records: harness.Records) -> None:
         ((1, 1, args.single_drafts), (2, 4, args.small_batch_drafts), (5, 8, 3))
     )
     harness.sync()
+    # Under attention DP the fixtures alternate between the groups.
     tables = {
-        name: np.arange(1 + n * pages, 1 + (n + 1) * pages, dtype=np.int32)
+        name: pools.scheduled(
+            np.arange(1 + n * pages, 1 + (n + 1) * pages, dtype=np.int32), n
+        )
         for n, name in enumerate(("A", "B", "ref", "C", "D", "E", "F", "G", "H"))
     }
 
@@ -554,6 +575,85 @@ def run_spec(args, records: harness.Records) -> None:
             f"greedy rates above {sum(rates) / spec_ms:.3f} vs "
             f"{requests / plain_ms:.3f}"
         )
+    large_results = {}
+    if large:
+        # Larger batches: each request a fixture prompt (its first 256 tokens:
+        # prompts replay one token a step) on its own pages, against plain
+        # steps of the same requests.
+        # The batched decoder's schedule carries three drafts past eight.
+        spec_large, plain_large = batched, plain
+        letters = tuple(prompts)
+        source = [letters[i % len(letters)] for i in range(most)]
+        group_tables = [
+            pools.scheduled(
+                np.arange(1 + (9 + i) * pages, 1 + (10 + i) * pages, dtype=np.int32),
+                9 + i,
+            )
+            for i in range(most)
+        ]
+
+        def group_streams(dec, n, query, steps, tag):
+            first = [
+                row(f"{tag}{i}", prompts[source[i]][:256], group_tables[i])
+                for i in range(n)
+            ]
+            following = [
+                row(f"{tag}{i}", np.zeros(query), group_tables[i]) for i in range(n)
+            ]
+            outs = [decode(dec, first)[:n]]
+            for _ in range(steps):
+                outs.append(decode(dec, following)[:n])
+            dec.forget(tuple(f"{tag}{i}" for i in range(n)))
+            stacked = torch.stack(outs).cpu().numpy()
+            streams = [
+                [int(t) for t in stacked[:, r].reshape(-1) if t >= 0] for r in range(n)
+            ]
+            rates = [float((stacked[1:, r] >= 0).sum(axis=1).mean()) for r in range(n)]
+            return streams, rates
+
+        def group_ms(dec, n, query, steps=40):
+            decode(
+                dec,
+                [
+                    row(f"w{i}", prompts[source[i]][:256], group_tables[i])
+                    for i in range(n)
+                ],
+            )
+            following = [
+                row(f"w{i}", np.zeros(query), group_tables[i]) for i in range(n)
+            ]
+            for _ in range(4):
+                out = decode(dec, following)
+            bridge.materialize(out)
+            started = time.perf_counter()
+            for _ in range(steps):
+                out = decode(dec, following)
+            bridge.materialize(out)
+            dec.forget(tuple(f"w{i}" for i in range(n)))
+            return 1e3 * (time.perf_counter() - started) / steps
+
+        for n in large:
+            k = spec_large.spec_tokens[n] + 1
+            spec_streams, spec_rates = group_streams(spec_large, n, k, 32, f"s{n}_")
+            plain_streams, _ = group_streams(plain_large, n, 1, 112, f"p{n}_")
+            follow = [
+                _agree(st, pt)
+                for st, pt in zip(spec_streams, plain_streams, strict=True)
+            ]
+            spec_ms, plain_ms = group_ms(spec_large, n, k), group_ms(plain_large, n, 1)
+            large_results[str(n)] = dict(
+                follow=follow,
+                tokens_per_step=[round(r, 2) for r in spec_rates],
+                ms=[round(spec_ms, 3), round(plain_ms, 3)],
+            )
+            harness.log(
+                f"batched greedy, {n} x {k} rows vs plain batch-{n}: the streams "
+                f"follow for {sorted(follow)} tokens (of up to "
+                f"{min(len(st) for st in spec_streams)}+), "
+                f"{np.mean(spec_rates):.2f} tokens per request-step; step "
+                f"{spec_ms:.2f} ms vs plain {plain_ms:.2f} ms; tokens per ms "
+                f"{sum(spec_rates) / spec_ms:.3f} vs {n / plain_ms:.3f}"
+            )
     records.add(
         case="spec",
         single_drafts=args.single_drafts,
@@ -582,8 +682,10 @@ def run_spec(args, records: harness.Records) -> None:
         batched_ms={str(b): t for b, t in timing.items()},
         churn_worst_ms=[round(churn_join), round(churn_steady)],
         transferred_arrival_first_tokens=arrivals,
+        large_batches=large_results,
     )
     ok = reproducible and varies and same > 0
+    ok = ok and all(a > 0 for r in large_results.values() for a in r["follow"])
     ok = ok and b_reproducible and b_varies and same_pa > 0 and same_pb > 0
     ok = ok and all(a > 0 for a in four_agree + three_agree + eight_agree + five_agree)
     ok = ok and all(a[:1] == j[:1] for a, j in arrivals.values())
