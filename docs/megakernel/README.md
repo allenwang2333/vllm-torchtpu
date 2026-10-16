@@ -273,8 +273,12 @@ Two layers, as on the prefill side:
   and KDA, and returns the logits and auxiliary rows in request order; each
   group's ranks commit their requests' accepted KDA rows. The draft stays
   TP32 over all 32 ranks, drafting at most 16 requests per fused call (a
-  32-request verify drafts in two). A step whose fuller group exceeds every
-  compiled verify decodes plainly.
+  32-request verify drafts in two). The MLA draft (`Inferact/Kimi-K3-DSpark`)
+  drafts at most eight requests per call, as many of each group's; only its
+  attention follows the groups: each rank attends its group's requests with
+  its two held TP32 shards' heads over the group's pages and commits only
+  their context latents. A step whose fuller group exceeds every compiled
+  verify decodes plainly.
 - **Cold warmup:** `megakernel/compilation.py` submits at most eight large
   decoder/draft compilations per worker, with larger row counts first. The
   default maximum of four requests has six plain programs (B1/B2/B4, greedy

@@ -112,14 +112,6 @@ class KimiDecoder:
         # compiled verifier/drafter shape is derived from it.
         self.spec_tokens = (spec_tokens_per_batch(config) or ()) if draft else ()
         self.groups = int(ops.attention_dp)
-        if (
-            draft is not None
-            and self.groups > 1
-            and not getattr(draft, "attention_dp", True)
-        ):
-            raise ValueError(
-                "K3 decode: this DSpark draft needs attention DP 1 (DCP32 draft pools)"
-            )
         shapes = set()
         for b, k in enumerate(self.spec_tokens):
             if k and self.groups > 1:

@@ -14,7 +14,8 @@ kv_a_proj_with_mqa(context_norm(context_proj(aux)))``, where ``aux`` is the
 concatenated residual streams entering target layers ``aux_layers``. The
 latents live in five pools shaped like the target's MLA pools, read and
 written through the target's block tables (decode context parallel: global
-page ``g`` on rank ``g % 32``).
+page ``g`` on rank ``g % 32``; under attention DP2 on member ``g % 16`` of the
+request's group, whose ranks attend it with their two held shards' heads).
 
 Block: the anchor (the last verified token) and ``block - 1`` mask tokens at
 the positions after it; every block row attends every context token before
@@ -491,8 +492,9 @@ def save_kernel_shards(shards: dict[str, np.ndarray], directory, *, ranks: int =
     (directory / "index.json").write_text(json.dumps(index, indent=1))
 
 
-def load_rank_shards(directory, rank: int) -> dict[str, np.ndarray]:
-    """``save_kernel_shards``' arrays for ``rank`` (views of one read)."""
+def load_rank_shards(directory, rank: int, names=None) -> dict[str, np.ndarray]:
+    """``save_kernel_shards``' arrays for ``rank`` (views of one read;
+    ``names``: copies of only those arrays' bytes)."""
     import ml_dtypes
 
     directory = Path(directory)
@@ -500,10 +502,34 @@ def load_rank_shards(directory, rank: int) -> dict[str, np.ndarray]:
     if (index.get("kind") != DRAFT_KIND or index.get("format") != KERNEL_SHARD_FORMAT
             or int(index.get("ranks", 0)) != RANKS):
         raise ValueError(f"{directory}: not a 32-rank MLA DSpark kernel shard set")
-    raw = np.fromfile(directory / f"rank{rank:02d}.bin", dtype=np.uint8)
+    path = directory / f"rank{rank:02d}.bin"
+    raw = np.fromfile(path, dtype=np.uint8) if names is None else np.memmap(path, dtype=np.uint8, mode="r")
     out = {}
     for name, spec in index["arrays"].items():
+        if names is not None and name not in names:
+            continue
         dtype = np.dtype(ml_dtypes.bfloat16) if spec["dtype"] == "bfloat16" else np.dtype(spec["dtype"])
         count = int(np.prod(spec["shape"]))
-        out[name] = raw[spec["offset"]: spec["offset"] + count * dtype.itemsize].view(dtype).reshape(spec["shape"])
+        value = raw[spec["offset"]: spec["offset"] + count * dtype.itemsize].view(dtype).reshape(spec["shape"])
+        out[name] = value if names is None else np.array(value)
     return out
+
+
+# The head-sharded arrays and the axis their TP32 shards stack on under
+# attention DP (each ``[layers, ...]``).
+HELD_AXES = {"q_b": 2, "w_uk": 1, "w_uv": 1, "o": 1}
+
+
+def held_shards(directory, rank: int, dp: int, own: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Attention DP: ``rank``'s head-sharded arrays (``HELD_AXES``) holding
+    its TP32 shards ``rank % (32 / dp) + k (32 / dp)`` in order ``k``, as the
+    decoder's attention holds them (``decode_megakernel.to_attention_dp``);
+    ``own`` is ``rank``'s shard. The shards share the rank's host lane, so
+    their ``o`` chunk permutations agree."""
+    group = RANKS // dp
+    if group % 8:
+        raise ValueError(f"attention DP{dp}: groups of {group} ranks are not whole hosts")
+    shards = [own if rank % group + k * group == rank
+              else load_rank_shards(directory, rank % group + k * group, names=HELD_AXES)
+              for k in range(dp)]
+    return {name: np.concatenate([shard[name] for shard in shards], axis=axis) for name, axis in HELD_AXES.items()}

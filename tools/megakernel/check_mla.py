@@ -10,6 +10,11 @@ forced accepted count and anchor drafts; rank 0 recomputes that step on the
 host CPU from the checkpoint (unwritten positions are zero latents, as the
 pools hold) and compares the context latents the kernel emits and its drafts
 (with the reference's top-2 margin at each mismatch).
+
+Under attention DP (``--set attention_dp=2 dcp_group=16``) the first half of
+the requests are group 0's and the rest group 1's, request ``j`` of each group
+on the same pool rows (as ``megakernel.dp_blocks`` places them): each group's
+context must stay its own.
 """
 
 from __future__ import annotations
@@ -43,12 +48,17 @@ def run_mladraft(args, records: harness.Records) -> None:
 
     from tools.megakernel import k3
     from vllm_torchtpu.megakernel.bridge import register_op
+    from vllm_torchtpu.megakernel.kimi_k3 import config
     from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
     from vllm_torchtpu.megakernel.kimi_k3.draft_mla import MlaDsparkDraft
     from vllm_torchtpu.megakernel.kimi_k3.program import kernel_modules
 
-    mla, kernel, paged = kernel_modules("dspark_mla", "dspark_mla_kernel", "paged")
+    mla, kernel = kernel_modules("dspark_mla", "dspark_mla_kernel")
     R, steps, stride = args.requests, args.steps, args.stride
+    dp, group = config.active().attention_dp, config.active().dcp_group
+    if R % dp:
+        raise SystemExit(f"attention DP{dp}: --requests must be a multiple of {dp}")
+    shared = R // dp  # requests per group, each group's request j on the same rows
     final = steps * stride  # the final verify's first position
     ops = DecodeOps(args.presharded, num_slots=4)
     ops.load_weights()
@@ -61,19 +71,19 @@ def run_mladraft(args, records: harness.Records) -> None:
     packing = 4 if dtype == torch.float8_e4m3fn else 2
     page_tokens = 128 * packing
     entries = -(
-        -(final + 8) // (page_tokens * 32)
+        -(final + 8) // (page_tokens * group)
     )  # local block-table entries per request
     pages = max(entries, 2)
-    blocks = 1 + R * pages
+    blocks = 1 + shared * pages
     draft.bind_pools(
         torch.zeros((blocks, 128, packing, 640), dtype=dtype).to("tpu"), None
     )
     tables = np.zeros((R, pages), np.int32)
     for j in range(R):
-        tables[j, :entries] = 1 + j * pages + np.arange(entries)
+        tables[j, :entries] = 1 + j % shared * pages + np.arange(entries)
     harness.log(
         f"pools {blocks} blocks x {page_tokens} tokens ({k3.CACHE_DTYPE}), "
-        f"context {final}, {R} requests"
+        f"context {final}, {R} requests, attention DP{dp}"
     )
 
     rng = np.random.default_rng(args.seed)
@@ -83,7 +93,9 @@ def run_mladraft(args, records: harness.Records) -> None:
     layers = c.layers
 
     def build(requests):
-        fused = kernel.fused_draft_local(c, requests=requests, pages=pages)
+        fused = kernel.fused_draft_local(
+            c, requests=requests, pages=pages, attention_dp=dp
+        )
 
         def body(*a):
             weights = {name: a[i][0] for i, name in enumerate(names)}
@@ -102,16 +114,11 @@ def run_mladraft(args, records: harness.Records) -> None:
                 forced_anchor,
                 table,
             )
-            rows = latents.transpose(1, 0, 2)
             positions = (
                 position[:, None] + jnp.arange(8, dtype=jnp.int32)[None, :]
             ).reshape(-1)
-            pools = paged.commit_latent_rows(
-                pools,
-                rows,
-                jnp.repeat(table, 8, axis=0),
-                positions,
-                tuple(range(layers)),
+            pools = draft._commit(
+                pools, latents, jnp.repeat(table, 8, axis=0), positions
             )
             return (vector, latents, *pools)
 

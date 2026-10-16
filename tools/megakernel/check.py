@@ -190,7 +190,7 @@ def run_spec(args, records: harness.Records) -> None:
         DecodeOps,
         decode_batch_sizes,
     )
-    from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
+    from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
 
     count, generate, rows = args.prompt_tokens, args.generate, args.single_drafts + 1
     large = sorted(int(n) for n in args.large_batches.split(",") if n)
@@ -223,7 +223,7 @@ def run_spec(args, records: harness.Records) -> None:
         batch_sizes=decode_batch_sizes(most),
     )
     pools = k3.Pools((10 + max([0, *large])) * pages + 1, pages, 1)
-    draft = DsparkDraft(
+    draft = draft_class(args.dspark)(
         max_position=longest_prompt + 8 * generate + 64,
         checkpoint=args.dspark,
         presharded=args.presharded,

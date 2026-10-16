@@ -106,16 +106,20 @@ def _rope(x_bf16, rot_bf16, cos32, sin32):
     return _bf16(_f32(x_bf16) * cos32 + rotated * sin32)
 
 
-def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_table, plan: dict):
+def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_table, plan: dict, dp: int = 1):
     R = requests
     T = R * ROWS
     L = c.layers
+    heads = HEADS_PER_RANK * dp  # the held TP32 shards' heads (attention DP)
+    group_requests, group_rows = R // dp, T // dp
+    q_shard = HEADS_PER_RANK * (c.nope + TILE)  # a shard's q_b columns: nopes, then ropes padded to a tile
     vocab = c.vocab // RANKS
     hidden = c.hidden
     eps = c.eps
     scale = c.softmax_scale
     drafts_count = ROWS - 1  # verify rows after the anchor
     streamed = R > 4  # o / down stream one 896-column chunk at a time (VMEM)
+    streamed_o = streamed or dp > 1  # attention DP's o holds two shards
     KEYS = 2 * ROWS  # per request: its eight context rows, then its eight block rows
     n_persist = len(mla_dcp.PERSISTENT_NAMES)
     n_scoped = len(mla_dcp.SCOPED_NAMES)
@@ -152,6 +156,25 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         rank = jax.lax.axis_index("tp")
         lane = rank % 8
         host = rank // 8
+        data_group = rank // (RANKS // dp)
+
+        def own_group(value):
+            """This rank's DP group's share of ``value`` (group-major rows)."""
+            if dp == 1:
+                return value
+            parts = jnp.split(value, dp, axis=0)
+            selected = parts[0]
+            for g in range(1, dp):
+                selected = jnp.where(data_group == g, parts[g], selected)
+            return selected
+
+        def place_group(value):
+            """``own_group``'s inverse: the group's rows in place, zeros elsewhere."""
+            if dp == 1:
+                return value
+            zeros = jnp.zeros_like(value)
+            return jnp.concatenate([jnp.where(data_group == g, value, zeros) for g in range(dp)], axis=0)
+
         new_position = jnp.stack([scalars[j] for j in range(R)])  # [R]: the verify's first position
         forced_count = jnp.stack([scalars[R + j] for j in range(R)])
         forced_anchor = jnp.stack([scalars[2 * R + j] for j in range(R)])
@@ -337,10 +360,11 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         tokens_v[...] = result
 
         # Each request's new keys: context rows up to its accepted count, its
-        # block rows (non-causal); the padding block row is no key.
+        # block rows (non-causal); the padding block row is no key. (Attention
+        # DP: the rank's group's requests, whose rows it attends.)
         key_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 1, KEYS), 2)
-        valid_vmem[...] = (((key_lane < ROWS) & (key_lane <= count[:, None, None]))
-                           | ((key_lane >= ROWS) & (key_lane < ROWS + block))).astype(jnp.int32)
+        valid_vmem[...] = own_group((((key_lane < ROWS) & (key_lane <= count[:, None, None]))
+                                     | ((key_lane >= ROWS) & (key_lane < ROWS + block))).astype(jnp.int32))
 
         # ---------------- Markov w1 rows, RoPE rows, anchor embeddings ----------------
         w1_copies: list[list[Any]] = [[None] * R, [None] * R]
@@ -460,15 +484,22 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             latents_vmem[layer] = latent_rows(context_kv, layer, cos_context, sin_context)
 
         # ---------------- DCP attention over the draft pools ----------------
+        # Attention DP: the group's rows over its pages (DCP over the group).
+        first_request = data_group * group_requests if dp > 1 else 0
+        page_owner = None
+        if owner_table is not None:
+            page_owner = mla_dcp.owner_index(owner_table)
+            page_owner = page_owner % mla_dcp.GROUP if dp > 1 else page_owner
         cache = mla_dcp.DcpCache(
             pool_ref=pools,
             table_ref=_Scalars(scalars, 3 * R),
             pages=pages,
             layer=jnp.int32(0),
             group=mla_dcp.GROUP,
-            owner=mla_dcp.owner_index(owner_table) if owner_table is not None else None,
-            table_row=lambda row: row // ROWS,
+            owner=page_owner,
+            table_row=lambda row: first_request + row // ROWS,
         )
+        cos_query, sin_query = own_group(cos_block), own_group(sin_block)
         workspace = mla_dcp.DcpWorkspace(*persistent, *dcp_scoped)
 
         # Each layer buffer refills with the next layer's weights as soon as
@@ -478,7 +509,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
                 "q_b": (weights["q_b"].at[layer], q_buf, 2),
                 "w_uk": (weights["w_uk"].at[layer], w_uk_buf, 3),
                 "w_uv": (weights["w_uv"].at[layer], w_uv_buf, 4),
-                "o": (weights["o"].at[layer, :, pl.ds(0, o_buf.shape[-1])], o_buf.at[0] if streamed else o_buf, 5),
+                "o": (weights["o"].at[layer, :, pl.ds(0, o_buf.shape[-1])], o_buf.at[0] if streamed_o else o_buf, 5),
                 "gate": (weights["gate"].at[layer], gate_buf, 6),
                 "up": (weights["up"].at[layer], up_buf, 7),
                 "down": (weights["down"].at[layer, :, pl.ds(0, down_buf.shape[-1])],
@@ -506,33 +537,36 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
                 tile_copies[slot].start()
             q_a = _bf16(jnp.concatenate(tiles[:Q_TILES], axis=1))  # [T, 1536]
             block_kv = _bf16(jnp.concatenate(tiles[Q_TILES:], axis=1))  # [T, 640]
-            q_c = _rms_norm(q_a, small["q_norm"][layer], eps)  # [T, 1536]
-            block_latents = latent_rows(block_kv, layer, cos_block, sin_block)
-            context_latents = latents_vmem[layer]
-            for j in range(R):
+            q_c = own_group(_rms_norm(q_a, small["q_norm"][layer], eps))  # [group rows, 1536]
+            block_latents = own_group(latent_rows(block_kv, layer, cos_block, sin_block))
+            context_latents = own_group(latents_vmem[layer])
+            for j in range(group_requests):
                 keys_vmem[j] = jnp.concatenate(
                     (_f32(context_latents[j * ROWS:(j + 1) * ROWS]), _f32(block_latents[j * ROWS:(j + 1) * ROWS])), axis=0)
 
             _phase_end(scope)
             scope = _phase_start("d_query")
             pending["q_b"].wait()
-            q = _bf16(_dot(q_c, q_buf[...]))  # [T, Q_WIDTH]
+            q = _bf16(_dot(q_c, q_buf[...]))  # [group rows, dp Q_WIDTH]: each held shard's columns
             refill("q_b", layer)
             pending["w_uk"].wait()
             queries = []
-            for head in range(HEADS_PER_RANK):
-                q_abs = _bf16(_dot(q[:, head * c.nope:(head + 1) * c.nope], w_uk_buf[head]))  # [T, 512]
-                pe = HEADS_PER_RANK * c.nope + head * 128
-                q_pe = _rope(q[:, pe:pe + c.rope], small["rot"][...], cos_block, sin_block)
+            for head in range(heads):
+                shard, within = divmod(head, HEADS_PER_RANK)
+                nope = shard * q_shard + within * c.nope
+                q_abs = _bf16(_dot(q[:, nope:nope + c.nope], w_uk_buf[head]))  # [group rows, 512]
+                pe = shard * q_shard + HEADS_PER_RANK * c.nope + within * 128
+                q_pe = _rope(q[:, pe:pe + c.rope], small["rot"][...], cos_query, sin_query)
                 queries.append(jnp.concatenate(
-                    (_f32(q_abs) * scale, _f32(q_pe) * scale, jnp.zeros((T, LANES - c.latent), jnp.float32)), axis=1))
-            queries = jnp.stack(queries, axis=1)  # [T, 2, 640]
+                    (_f32(q_abs) * scale, _f32(q_pe) * scale, jnp.zeros((group_rows, LANES - c.latent), jnp.float32)),
+                    axis=1))
+            queries = jnp.stack(queries, axis=1)  # [group rows, heads, 640]
             refill("w_uk", layer)
             _phase_end(scope)
             scope = _phase_start("d_attend")
             attention = mla_dcp.DcpAttention(
                 dataclasses_replace(cache, layer=jnp.int32(layer)), workspace,
-                _Scalars(scalars, 0, ROWS), T, sequence_rows=ROWS, heads=HEADS_PER_RANK,
+                _Scalars(scalars, first_request, ROWS), group_rows, sequence_rows=ROWS, heads=heads,
             )
             # The block's padding row carries the partials' lse: the combine
             # sends 512 lanes, not 640.
@@ -546,18 +580,19 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             if PHASE_SCOPES:
                 attention.trace = "a_"
             attention.prime()
-            merged = attention.attend(queries, jnp.zeros((T, LANES), jnp.float32), layer % 2,
-                                      keys=keys_vmem, key_valid=valid_vmem)  # [T, 2, 512]
+            merged = attention.attend(queries, jnp.zeros((group_rows, LANES), jnp.float32), layer % 2,
+                                      keys=keys_vmem, key_valid=valid_vmem)  # [group rows, heads, 512]
             _phase_end(scope)
             scope = _phase_start("d_o")
             wuv_scope = _phase_start("d_wuv")
             pending["w_uv"].wait()
-            attended = jnp.concatenate(
-                [_bf16(_dot(_bf16(merged[:, head]), w_uv_buf[head])) for head in range(HEADS_PER_RANK)], axis=1)  # [T, 256]
+            # [T, heads 128]: the other groups' rows are zero (their ranks add theirs).
+            attended = place_group(jnp.concatenate(
+                [_bf16(_dot(_bf16(merged[:, head]), w_uv_buf[head])) for head in range(heads)], axis=1))
             refill("w_uv", layer)
             pending["o"].wait()
             _phase_end(wuv_scope)
-            x = _bf16(_f32(x) + all_reduce(attended, o_buf, 1, refill=weights["o"].at[layer] if streamed else None, refill_sems=(5, SEM_O2),
+            x = _bf16(_f32(x) + all_reduce(attended, o_buf, 1, refill=weights["o"].at[layer] if streamed_o else None, refill_sems=(5, SEM_O2),
                                            tag="o"))
             refill("o", layer)
 
@@ -649,11 +684,16 @@ def dataclasses_replace(value, **fields):
 
 
 def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: int | None = None,
-                      owner_table=None):
+                      owner_table=None, attention_dp: int = 1):
     """The per-shard fused draft (call inside a TP32 ``shard_map``):
     ``(weights, pools, aux, logits, previous, positions0, forced_counts,
     forced_anchors, tables)`` -> ``(vectors [R, 128] int32, latents [layers,
     T, 640] bf16)``.
+
+    Under ``attention_dp`` (DCP over each group, ``mla_dcp.GROUP``) the first
+    ``R / dp`` requests are group 0's, and so on: a rank attends its group's
+    requests with its held TP32 shards' heads (``q_b``, ``w_uk``, ``w_uv``
+    and ``o`` hold ``dp`` shards, ``dspark_mla.held_shards``).
 
     ``weights``: ``WEIGHT_NAMES`` (this rank's arrays, including the target's
     ``lm_head`` ``[7168, 5120]`` and ``embed`` ``[5120, 7168]``); ``pools``:
@@ -669,6 +709,10 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
     T = R * ROWS
     if not 1 <= R <= 8:
         raise ValueError("the fused MLA draft takes 1 to 8 requests")
+    dp = attention_dp
+    if R % dp or mla_dcp.GROUP * dp != RANKS:
+        raise ValueError(f"attention DP{dp}: {R} requests over DCP{mla_dcp.GROUP} groups")
+    heads, group_rows = HEADS_PER_RANK * dp, T // dp
     packed = T * CHUNK // 256
     streamed = R > 4
 
@@ -678,25 +722,25 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
         cache_dtype = pools[0].dtype
         page_tokens = pools[0].shape[1] * pools[0].shape[2]
         chunks = block < ROWS and mla_dcp.GROUP == RANKS  # the two-stage combine (see the body)
-        plan = mla_dcp.page_plan(T, HEADS_PER_RANK, ROWS, cache_dtype, force_chunks=chunks)
+        plan = mla_dcp.page_plan(group_rows, heads, ROWS, cache_dtype, force_chunks=chunks)
         scalars = jnp.concatenate((position, forced_count, forced_anchor, tables.reshape(-1))).astype(jnp.int32)
         small_shapes = {"aux": aux, "previous": previous, **weights}
         # FP8 caches: FP8 query packets (the operand the receiver would
         # quantize to anyway), half the gather's bytes.
-        persistent = mla_dcp.persistent_scratch(T, mla_dcp.GROUP, HEADS_PER_RANK, cache_dtype=cache_dtype,
+        persistent = mla_dcp.persistent_scratch(group_rows, mla_dcp.GROUP, heads, cache_dtype=cache_dtype,
                                                 sequence_rows=ROWS, fp8_wire=True, force_chunks=chunks)
-        ring = persistent[0].shape[0] if mla_dcp.chunked(T, chunks) else 1
+        ring = persistent[0].shape[0] if mla_dcp.chunked(group_rows, chunks) else 1
         hosts = RANKS // mla_dcp.HOST_LANES
         scratch = (
             *(tpu.VMEM(small_shapes[n].shape, small_shapes[n].dtype) for n in SMALL_NAMES),
             *persistent,
-            *mla_dcp.scoped_scratch(T, plan["span"], plan["buffers"], heads=HEADS_PER_RANK, group=mla_dcp.GROUP,
+            *mla_dcp.scoped_scratch(group_rows, plan["span"], plan["buffers"], heads=heads, group=mla_dcp.GROUP,
                                     cache_dtype=cache_dtype, page_tokens=page_tokens, sequence_rows=ROWS,
                                     force_chunks=chunks),
-            tpu.VMEM((c.q_lora, 4 * 128), jnp.bfloat16),  # q_buf
-            tpu.VMEM((HEADS_PER_RANK, c.nope, c.kv_lora), jnp.bfloat16),  # w_uk_buf
-            tpu.VMEM((HEADS_PER_RANK, c.kv_lora, c.v_head), jnp.bfloat16),  # w_uv_buf
-            tpu.VMEM((2, HEADS_PER_RANK * c.v_head, CHUNK) if streamed else (HEADS_PER_RANK * c.v_head, c.hidden),
+            tpu.VMEM((c.q_lora, dp * HEADS_PER_RANK * (c.nope + TILE)), jnp.bfloat16),  # q_buf
+            tpu.VMEM((heads, c.nope, c.kv_lora), jnp.bfloat16),  # w_uk_buf
+            tpu.VMEM((heads, c.kv_lora, c.v_head), jnp.bfloat16),  # w_uv_buf
+            tpu.VMEM((2, heads * c.v_head, CHUNK) if streamed or dp > 1 else (heads * c.v_head, c.hidden),
                      jnp.bfloat16),  # o_buf (streamed: two chunk slots)
             tpu.VMEM((c.hidden, MLP_PADDED), jnp.bfloat16),  # gate_buf
             tpu.VMEM((c.hidden, MLP_PADDED), jnp.bfloat16),  # up_buf
@@ -715,8 +759,8 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # gather_recv
             tpu.VMEM((2, RANKS, R, 128), jnp.int32),  # tiny_recv
             tpu.VMEM((RANKS, 8, 128), jnp.int32),  # argmax_recv: rows along lanes
-            tpu.VMEM((R, 2 * ROWS, LANES), jnp.float32),  # keys_vmem
-            tpu.VMEM((R, 1, 2 * ROWS), jnp.int32),  # valid_vmem
+            tpu.VMEM((R // dp, 2 * ROWS, LANES), jnp.float32),  # keys_vmem (the group's requests)
+            tpu.VMEM((R // dp, 1, 2 * ROWS), jnp.int32),  # valid_vmem
             tpu.VMEM((c.layers, T, LANES), jnp.bfloat16),  # latents_vmem
             tpu.VMEM((2, c.hidden, TILE), jnp.bfloat16),  # tile_buf: q_a | kv_a projection tiles
             tpu.VMEM((2, RANKS, T * TILE // 256, 128), jnp.float32),  # tile_recv (packed BF16)
@@ -729,7 +773,7 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
         )
-        body = _make_body(c, block, R, pages, owner_table, plan)
+        body = _make_body(c, block, R, pages, owner_table, plan, dp)
         operands = (aux, logits, previous, *[weights[n] for n in WEIGHT_NAMES], *pools)
         in_specs = [pl.BlockSpec(memory_space=tpu.HBM) for _ in operands]
         return pl.pallas_call(

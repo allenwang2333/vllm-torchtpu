@@ -867,8 +867,8 @@ class DcpAttention:
         the first, the low parts in the second (BF16, as lanes 512:514 hold
         them). Each peer's [1, 128] lane vector is a 0/1 product, exact."""
         ws, group, slots, rows = self.ws, self.group, self.slots, self.sequence_rows
-        if slots != 2 or (end - first) % rows:
-            raise ValueError("lse_in_padding takes two head slots and whole sequences")
+        if slots < 2 or slots * (rows - 1) > 128 or (end - first) % rows:
+            raise ValueError("lse_in_padding takes two or more head slots, one lane each, and whole sequences")
         head_rows = lses[first][0].shape[0]
         slot_row = jax.lax.broadcasted_iota(jnp.int32, (head_rows, 128), 0)
         lane = jax.lax.broadcasted_iota(jnp.int32, (head_rows, 128), 1)

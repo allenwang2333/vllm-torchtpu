@@ -13,6 +13,12 @@ its target pages; a request without them (no prefill-written context) drafts
 from what it has, which is only slower (the emitted tokens are the
 target's). The draft's per-request state is its last output vector.
 
+A fused call drafts at most eight requests; a wider verify drafts in parts
+(:meth:`MlaDsparkDraft.parts`). Under attention DP2 a request's pages are on
+its DP group's ranks, which attend its rows with their two held TP32 shards'
+heads (``dspark_mla.held_shards``) and alone commit its latents; each part
+takes as many requests of each group.
+
 The kernel-layout shards (``kernels.dspark_mla.save_kernel_shards``) are in
 the pre-shard directory, ``dspark-<the draft revision's first 8 characters>``;
 the target's LM head and embedding are the decoder's own.
@@ -37,12 +43,14 @@ from vllm_torchtpu.megakernel.bridge import (
     register_op,
     upload,
 )
+from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, kernel_modules
 
 logger = init_logger(__name__)
 
 AXIS = "tp"
 TARGET_WEIGHTS = {"lm_head": "lm_head", "embed": "embedding"}
+MAX_REQUESTS = 8  # per fused call (kernels.dspark_mla_kernel)
 
 
 @dataclasses.dataclass
@@ -60,11 +68,134 @@ def _settled(state: MlaDraftState) -> MlaDraftState:
     return state
 
 
+def _batched_fn(
+    dspark: Any,
+    fused: Any,
+    commit: Any,
+    control: Any,
+    names: tuple[str, ...],
+    layers: int,
+    index: tuple[int, ...],
+    verified: int,
+    rows_per: int,
+) -> Any:
+    """The batched draft op's global-view function for the requests
+    ``index`` of a verify of ``verified`` requests (``MlaDsparkDraft.parts``):
+    their rows of the verify's operands, one ``fused`` call, ``commit`` of
+    their context latents, then their control entries. Module-level so tests
+    can drive it with stubs."""
+    width, pages = dspark.ROWS, control.pages
+    count = len(names)
+    R, k = len(index), rows_per
+    total = R * k
+    whole = index == tuple(range(verified))
+    picked = np.asarray(index, np.int32)
+    rows = (picked[:, None] * k + np.arange(k, dtype=np.int32)[None, :]).reshape(-1)
+
+    def fn(*args):
+        import jax.numpy as jnp
+
+        weights = {name: args[i][0] for i, name in enumerate(names)}
+        pools = args[count : count + layers]
+        previous = jnp.concatenate(
+            args[count + layers : count + layers + R], axis=0
+        )  # [R, 128]
+        aux, logits, ids, state, decisions = args[count + layers + R :]
+        n = verified * k  # the verify's rows
+        tokens, positions = ids[:n], ids[n : 2 * n]
+        indices = ids[3 * n : 4 * n]
+        tables = ids[4 * n :].reshape(verified, pages)
+        plan_all, _ = control.fields(state, verified)
+        plan = plan_all
+        if not whole:
+            tokens, positions, indices = (x[rows] for x in (tokens, positions, indices))
+            aux, logits = aux[:, rows], logits[:, rows]
+            tables = tables[picked]
+            plan, decisions = plan[picked], decisions[picked]
+        bases = positions.reshape(R, k)[:, 0]
+        aux_padded = jnp.pad(
+            aux.reshape(aux.shape[0], R, k, aux.shape[-1]),
+            ((0, 0), (0, 0), (0, width - k), (0, 0)),
+        ).reshape(aux.shape[0], R * width, aux.shape[-1])
+        logits_padded = jnp.pad(
+            logits[0].reshape(R, k, logits.shape[-1]),
+            ((0, 0), (0, width - k), (0, 0)),
+        )
+        vectors, latents = fused(
+            weights,
+            pools,
+            aux_padded,
+            logits_padded,
+            previous,
+            bases,
+            decisions[:, 0],
+            decisions[:, 1],
+            tables,
+        )
+        # Commit each request's real verify rows (its first k).
+        latents = latents.reshape(layers, R, width, -1)[:, :, :k].reshape(
+            layers, total, -1
+        )
+        row_positions = (
+            bases[:, None] + jnp.arange(k, dtype=jnp.int32)[None, :]
+        ).reshape(total)
+        pools = commit(pools, latents, jnp.repeat(tables, k, axis=0), row_positions)
+        accepted_all, bonus_all = (
+            vectors[:, dspark.OUT_COUNT],
+            vectors[:, dspark.OUT_BONUS],
+        )
+        tokens_r, indices_r = tokens.reshape(R, k), indices.reshape(R, k)
+        row = jnp.arange(width, dtype=jnp.int32)[None, :]
+        emitted = jnp.where(
+            row < accepted_all[:, None],
+            tokens_r[:, jnp.minimum(jnp.arange(width) + 1, k - 1)],
+            jnp.where(row == accepted_all[:, None], bonus_all[:, None], -1),
+        ).astype(jnp.int32)
+        slots = plan[:, control.SLOT]
+        writer = jnp.max(
+            jnp.where(
+                jnp.arange(control.slots)[:, None] == slots[None, :],
+                jnp.arange(R)[None, :],
+                -1,
+            ),
+            axis=1,
+        )
+        updates = jnp.stack(
+            (
+                bonus_all,
+                bases + accepted_all + 1,
+                jnp.take_along_axis(indices_r, accepted_all[:, None], axis=1)[:, 0],
+            )
+        )
+        banks = jnp.where(
+            writer[None, :] >= 0,
+            updates[:, jnp.maximum(writer, 0)],
+            state[: control.plan_start].reshape(3, control.slots),
+        )
+        plan = jnp.where(
+            (jnp.arange(control.FIELDS)[None, :] == control.RESET)
+            & (slots[:, None] != 0),
+            0,
+            plan,
+        )
+        if not whole:
+            plan = plan_all.at[picked].set(plan)
+        state = jnp.concatenate(
+            (
+                banks.reshape(-1),
+                plan.reshape(-1),
+                state[control.plan_start + verified * control.FIELDS :],
+            )
+        )
+        return (*(vectors[j : j + 1] for j in range(R)), *pools, emitted, state)
+
+    return fn
+
+
 class MlaDsparkDraft:
     """The fused MLA DSpark draft: weights, pools and the step ops."""
 
     imports_ring = False  # the context is in the draft pools, not a KDA-row ring
-    attention_dp = False  # the kernel attends the DCP32 pools of a TP32 decoder
 
     def __init__(
         self,
@@ -81,6 +212,9 @@ class MlaDsparkDraft:
         self.synthetic_rates_by_width = synthetic_rates_by_width
         self.config = self.mla.MlaDraftConfig.from_checkpoint(Path(checkpoint))
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
+        self.attention_dp = kernel_config.active().attention_dp
+        if self.attention_dp not in (1, 2):
+            raise ValueError("the MLA DSpark draft runs on TP32 or under attention DP2")
         self.max_position = int(max_position)
         self.names = tuple(self.kernel.WEIGHT_NAMES)
         self.weights: dict[str, torch.Tensor] = {}
@@ -113,6 +247,12 @@ class MlaDsparkDraft:
         """This rank's kernel shards and the RoPE table (to ``max_position``)."""
         started = time.perf_counter()
         shards = dict(self.mla.load_rank_shards(self._presharded, self.rank))
+        if self.attention_dp > 1:
+            shards.update(
+                self.mla.held_shards(
+                    self._presharded, self.rank, self.attention_dp, shards
+                )
+            )
         # The kernel computes one 128-lane tile of the fused q_a | kv_a
         # projection per rank and gathers the rest.
         shards["qkv_tile"], shards["context_tile"] = self.mla.qkv_tiles(
@@ -218,7 +358,19 @@ class MlaDsparkDraft:
 
     def _commit(self, pools, latents, tables, positions):
         """Commit ``latents`` ``[layers, T, 640]`` (T rows at ``positions``,
-        ``tables`` ``[T, pages]``) to the draft pools on their owners."""
+        ``tables`` ``[T, pages]``) to the draft pools on their owners. Under
+        attention DP the rows are group-major and each group commits only its
+        own: its ranks' pool rows hold other requests' pages for the other
+        groups' block ids."""
+        dp = self.attention_dp
+        if dp > 1:
+            import jax
+
+            group = jax.lax.axis_index(AXIS) // (TP_SIZE // dp)
+            size = positions.shape[0] // dp
+            latents = jax.lax.dynamic_slice_in_dim(latents, group * size, size, 1)
+            tables = jax.lax.dynamic_slice_in_dim(tables, group * size, size)
+            positions = jax.lax.dynamic_slice_in_dim(positions, group * size, size)
         rows = latents.transpose(1, 0, 2)
         return self.paged.commit_latent_rows(
             pools,
@@ -313,114 +465,49 @@ class MlaDsparkDraft:
         )
         return self._ops[key]
 
-    def _build_batched(self, control: Any, requests: int, rows_per: int) -> Any:
-        key = ("batched", control.key(), requests, rows_per)
+    @staticmethod
+    def parts(requests: int, dp: int = 1) -> list[tuple[int, ...]]:
+        """The verify's requests each fused call drafts: at most
+        ``MAX_REQUESTS``; under attention DP (``dp``) as many of each group's
+        (group ``g``'s are the verify's ``g``-th share), group-major as the
+        kernel attends them."""
+        share = requests // dp
+        per = min(requests, MAX_REQUESTS) // dp
+        return [
+            tuple(g * share + first + i for g in range(dp) for i in range(per))
+            for first in range(0, share, per)
+        ]
+
+    def _build_batched(
+        self, control: Any, index: tuple[int, ...], verified: int, rows_per: int
+    ) -> Any:
+        """The draft after a batched verify of ``verified`` requests for its
+        requests ``index`` (``parts``)."""
+        key = ("batched", control.key(), index, verified, rows_per)
         if key in self._ops:
             return self._ops[key]
-        dspark, width, names = self.dspark, self.dspark.ROWS, self.names
-        count, layers, pages = len(names), self.config.layers, control.pages
-        R, k = requests, rows_per
-        total = R * k
+        names = self.names
+        count, layers = len(names), self.config.layers
+        dp = self.attention_dp
+        R, k = len(index), rows_per
+        whole = index == tuple(range(verified))
         fused = self.kernel.fused_draft_local(
-            self.config, requests=R, pages=pages, owner_table=self.owner_table
+            self.config,
+            requests=R,
+            pages=control.pages,
+            owner_table=self.owner_table,
+            attention_dp=dp,
         )
-
-        def body(*args):
-            import jax.numpy as jnp
-
-            weights = {name: args[i][0] for i, name in enumerate(names)}
-            pools = args[count : count + layers]
-            previous = jnp.concatenate(
-                args[count + layers : count + layers + R], axis=0
-            )  # [R, 128]
-            aux, logits, ids, state, decisions = args[count + layers + R :]
-            tokens, positions = ids[:total], ids[total : 2 * total]
-            indices = ids[3 * total : 4 * total]
-            tables = ids[4 * total :].reshape(R, pages)
-            plan, _ = control.fields(state, R)
-            bases = positions.reshape(R, k)[:, 0]
-            aux_padded = jnp.pad(
-                aux.reshape(aux.shape[0], R, k, aux.shape[-1]),
-                ((0, 0), (0, 0), (0, width - k), (0, 0)),
-            ).reshape(aux.shape[0], R * width, aux.shape[-1])
-            logits_padded = jnp.pad(
-                logits[0].reshape(R, k, logits.shape[-1]),
-                ((0, 0), (0, width - k), (0, 0)),
-            )
-            vectors, latents = fused(
-                weights,
-                pools,
-                aux_padded,
-                logits_padded,
-                previous,
-                bases,
-                decisions[:, 0],
-                decisions[:, 1],
-                tables,
-            )
-            # Commit each request's real verify rows (its first k).
-            latents = latents.reshape(layers, R, width, -1)[:, :, :k].reshape(
-                layers, total, -1
-            )
-            row_positions = (
-                bases[:, None] + jnp.arange(k, dtype=jnp.int32)[None, :]
-            ).reshape(total)
-            pools = self._commit(
-                pools, latents, jnp.repeat(tables, k, axis=0), row_positions
-            )
-            accepted_all, bonus_all = (
-                vectors[:, dspark.OUT_COUNT],
-                vectors[:, dspark.OUT_BONUS],
-            )
-            tokens_r, indices_r = tokens.reshape(R, k), indices.reshape(R, k)
-            row = jnp.arange(width, dtype=jnp.int32)[None, :]
-            emitted = jnp.where(
-                row < accepted_all[:, None],
-                tokens_r[:, jnp.minimum(jnp.arange(width) + 1, k - 1)],
-                jnp.where(row == accepted_all[:, None], bonus_all[:, None], -1),
-            ).astype(jnp.int32)
-            slots = plan[:, control.SLOT]
-            writer = jnp.max(
-                jnp.where(
-                    jnp.arange(control.slots)[:, None] == slots[None, :],
-                    jnp.arange(R)[None, :],
-                    -1,
-                ),
-                axis=1,
-            )
-            updates = jnp.stack(
-                (
-                    bonus_all,
-                    bases + accepted_all + 1,
-                    jnp.take_along_axis(indices_r, accepted_all[:, None], axis=1)[:, 0],
-                )
-            )
-            banks = jnp.where(
-                writer[None, :] >= 0,
-                updates[:, jnp.maximum(writer, 0)],
-                state[: control.plan_start].reshape(3, control.slots),
-            )
-            plan = jnp.where(
-                (jnp.arange(control.FIELDS)[None, :] == control.RESET)
-                & (slots[:, None] != 0),
-                0,
-                plan,
-            )
-            state = jnp.concatenate(
-                (
-                    banks.reshape(-1),
-                    plan.reshape(-1),
-                    state[control.plan_start + R * control.FIELDS :],
-                )
-            )
-            return (*(vectors[j : j + 1] for j in range(R)), *pools, emitted, state)
-
+        body = _batched_fn(
+            self.dspark, fused, self._commit, control, names, layers, index, verified, k
+        )
         in_specs = (
             (P(AXIS),) * (count + layers) + (P(),) * R + (P(), P(AXIS), P(), P(), P())
         )
         out_specs = (P(),) * R + (P(AXIS),) * layers + (P(), P())
+        part = "" if whole else f"_part{index[0]}of{verified}"
         self._ops[key] = register_op(
-            f"pallas::k3_dspark_mla_draft_r{R}x{k}",
+            f"pallas::k3_dspark_mla_draft_r{R}x{k}{part}",
             self.mesh,
             body,
             in_specs,
@@ -430,8 +517,10 @@ class MlaDsparkDraft:
                 (
                     "dspark_mla_batched",
                     control.key(),
-                    R,
+                    index,
+                    verified,
                     k,
+                    dp,
                     names,
                     self.max_position,
                     dataclasses.astuple(self.config),
@@ -467,23 +556,42 @@ class MlaDsparkDraft:
     def step_batched(
         self, states, aux, logits, ids, control_state, decisions, control, rows_per
     ):
-        R = len(states)
-        op = self._build_batched(control, R, rows_per)
-        out = op(
-            *self._operands(),
-            *self.pools,
-            *(s.vector for s in states),
-            aux,
-            logits,
-            ids,
-            control_state,
-            decisions,
-        )
-        layers = self.config.layers
-        vectors, pools = out[:R], out[R : R + layers]
-        emitted, control_state = out[R + layers :]
-        self._adopt(pools)
-        return [_settled(MlaDraftState(v)) for v in vectors], emitted, control_state
+        verified, layers = len(states), self.config.layers
+        new: list[Any] = [None] * verified
+        emitted, order = [], []
+        for index in self.parts(verified, self.attention_dp):
+            R = len(index)
+            op = self._build_batched(control, index, verified, rows_per)
+            out = op(
+                *self._operands(),
+                *self.pools,
+                *(states[j].vector for j in index),
+                aux,
+                logits,
+                ids,
+                control_state,
+                decisions,
+            )
+            vectors, pools = out[:R], out[R : R + layers]
+            part_emitted, control_state = out[R + layers :]
+            self._adopt(pools)
+            for j, vector in zip(index, vectors, strict=True):
+                new[j] = _settled(MlaDraftState(vector))
+            emitted.append(part_emitted)
+            order.extend(index)
+        tokens = emitted[0] if len(emitted) == 1 else torch.cat(emitted)
+        if order != list(range(verified)):
+            tokens = tokens.index_select(0, self._request_rows(tuple(order)))
+        return new, tokens, control_state
+
+    def _request_rows(self, order: tuple[int, ...]) -> torch.Tensor:
+        """The row of each request in the parts' concatenated tokens."""
+        key = ("rows", order)
+        if key not in self._ops:
+            self._ops[key] = torch.tensor(
+                np.argsort(np.asarray(order)), dtype=torch.int64
+            ).to("tpu")
+        return self._ops[key]
 
     def compilation_calls(self, control: Any, spec_alone: bool, spec_shapes) -> list:
         from vllm_torchtpu.megakernel.compilation import CompileCall
@@ -529,17 +637,18 @@ class MlaDsparkDraft:
             )
         for requests, spec_rows in spec_shapes:
             rows = requests * spec_rows
-            calls.append(
-                CompileCall(
-                    self._build_batched(control, requests, spec_rows),
-                    (
-                        *operands,
-                        *self.pools,
-                        *((vector,) * requests),
-                        *tail(rows, 4 * rows + requests * control.pages, requests),
-                    ),
-                    {},
-                    priority=2 * rows,
+            for index in self.parts(requests, self.attention_dp):
+                calls.append(
+                    CompileCall(
+                        self._build_batched(control, index, requests, spec_rows),
+                        (
+                            *operands,
+                            *self.pools,
+                            *((vector,) * len(index)),
+                            *tail(rows, 4 * rows + requests * control.pages, requests),
+                        ),
+                        {},
+                        priority=2 * rows,
+                    )
                 )
-            )
         return calls
