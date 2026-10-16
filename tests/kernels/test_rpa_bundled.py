@@ -24,6 +24,7 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     get_kv_cache_shape,
     ragged_paged_attention,
     ragged_paged_attention_bundled,
+    ref_ragged_paged_attention,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -407,4 +408,59 @@ def test_bundled_interface_forwards_scale_softcap_causal():
     assert not np.array_equal(np.asarray(out_default), np.asarray(out_b)), (
         "non-default sm_scale/soft_cap produced the default-param output — "
         "the bundled interface dropped attention parameters"
+    )
+
+
+def test_rpa_v3_large_attention_sink_logits_precision():
+    """Verifies that RPA v3 maintains float32 softmax accumulator precision when
+    Q@K^T logits have large magnitudes (e.g. Qwen2-57B-A14B k_proj attention-sink
+    biases where (q @ k.T) * sm_scale ~ 400). Downcasting Q@K^T to bfloat16 before
+    subtracting row-max m_curr causes ULP=2.0 catastrophic cancellation in exp(s - m).
+    """
+    _require_tpu()
+    c = _cfg()
+    pls = _per_layer_shape(c)
+    wl_np = _workload(c, "prefill", seed=42)
+    # Without chunk_prefill_size, prefill sequences run in the MIXED range [dist[1], dist[2]).
+    wl_np["distribution"] = np.array([0, 0, 1], dtype=np.int32)
+    # Add a large constant attention-sink bias to k and aligned query component
+    # so (q @ k.T) * sm_scale reaches ~400 with subtle token-to-token differences.
+    sink_bias = np.full((1, 1, c["head_dim"]), 20.0, dtype=np.float32)
+    wl_np["q"] = wl_np["q"] + sink_bias
+    wl_np["k"] = wl_np["k"] + sink_bias
+
+    sm_scale = 1.0 / (c["head_dim"] ** 0.5)
+    kv_pallas = jnp.zeros(pls, dtype=c["kv_dtype"])
+    w_p = _to_jax_workload(wl_np, c["kv_dtype"])
+    out_pallas, _ = ragged_paged_attention(
+        w_p["q"],
+        w_p["k"],
+        w_p["v"],
+        kv_pallas,
+        w_p["kv_lens"],
+        w_p["page_indices"],
+        w_p["cu_q_lens"],
+        w_p["distribution"],
+        sm_scale=sm_scale,
+    )
+
+    kv_ref = jnp.zeros(pls, dtype=c["kv_dtype"])
+    w_r = _to_jax_workload(wl_np, c["kv_dtype"])
+    out_ref, _ = ref_ragged_paged_attention(
+        w_r["q"],
+        w_r["k"],
+        w_r["v"],
+        kv_ref,
+        w_r["kv_lens"],
+        w_r["page_indices"],
+        w_r["cu_q_lens"],
+        w_r["distribution"],
+        sm_scale=sm_scale,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(out_pallas[:64].astype(jnp.float32)),
+        np.asarray(out_ref[:64].astype(jnp.float32)),
+        atol=2e-2,
+        rtol=2e-2,
     )

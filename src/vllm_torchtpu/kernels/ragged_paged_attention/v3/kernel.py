@@ -95,7 +95,7 @@ def ref_ragged_paged_attention(
     v_scale: float | None = None,
 ):
     if out_dtype is None:
-        out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
+        out_dtype = jnp.float32
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
@@ -204,7 +204,7 @@ def ref_ragged_paged_attention(
             attn = jnp.where(mask, attn, mask_value)
         attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
-        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
+        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         if v_scale is not None:
             out *= v_scale
 
@@ -1081,9 +1081,9 @@ def _ragged_paged_attention_kernel_loop(
             l = broadcast_minor(l_ref[...], acc.shape)  # noqa
             out = (
                 acc * pl.reciprocal(l, approx=True)
-                if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
+                if (l.dtype == jnp.float32 and q_dtype != jnp.float32)
                 else lax.div(acc, l)
-            ).astype(out_dtype)
+            ).astype(q_dtype)
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1713,7 +1713,7 @@ def ragged_paged_attention(
     tpu_version = get_tpu_version()
 
     if out_dtype is None:
-        out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
+        out_dtype = jnp.float32
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
