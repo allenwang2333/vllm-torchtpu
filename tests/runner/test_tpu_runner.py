@@ -64,6 +64,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 
 
+class _RunnerState(SimpleNamespace):
+    _draft_context_only = TPUModelRunner._draft_context_only
+    _scheduled_seq_len = TPUModelRunner._scheduled_seq_len
+
+
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
@@ -3156,34 +3161,29 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
 
 @pytest.mark.parametrize("drafter_type", [tpu_runner.DFlashProposer, DSparkProposer])
 @pytest.mark.parametrize(
-    "computed,scheduled,prompts,num_tokens,needed",
+    "computed,scheduled,num_tokens,needed",
     [
-        ([0], [2048], [4096], [4096], False),
-        ([2048], [2048], [4096], [4096], True),
-        ([4096], [6], [4096], [4096], True),
-        ([0, 4096], [2048, 6], [4096, 4096], [4096, 4096], True),
-        ([0, 1024], [2048, 2048], [4096, 4096], [4096, 4096], False),
+        ([0], [2048], [4096], False),
+        ([2048], [2048], [4096], True),
+        ([4096], [6], [4096], True),
+        ([0, 4096], [2048, 6], [4096, 4096], True),
+        ([0, 1024], [2048, 2048], [4096, 4096], False),
         # A resumed request recomputes prompt and previously generated tokens.
-        ([4096], [128], [4096], [4352], False),
-        ([4224], [128], [4096], [4352], True),
+        ([4096], [128], [4352], False),
+        ([4224], [128], [4352], True),
     ],
 )
 def test_dflash_proposes_only_when_a_sampled_token_is_kept(
-    computed, scheduled, prompts, num_tokens, needed, drafter_type
+    computed, scheduled, num_tokens, needed, drafter_type
 ):
     ids = [str(i) for i in range(len(computed))]
-    runner = SimpleNamespace(
+    runner = _RunnerState(
         drafter=drafter_type.__new__(drafter_type),
         requests={
-            key: SimpleNamespace(
-                num_computed_tokens=done, num_tokens=total, num_prompt_tokens=prompt
-            )
-            for key, done, total, prompt in zip(
-                ids, computed, num_tokens, prompts, strict=True
-            )
+            key: SimpleNamespace(num_computed_tokens=done, num_tokens=total)
+            for key, done, total in zip(ids, computed, num_tokens, strict=True)
         },
     )
-    runner._scheduled_seq_len = TPUModelRunner._scheduled_seq_len.__get__(runner)
     output = SimpleNamespace(
         num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
     )
@@ -3226,7 +3226,7 @@ def test_idle_dflash_rank_pairs_context_and_optional_proposals(
     drafter._dp_lockstep_sharded = lambda: True
     drafter._dp_dummy_kv_update = lambda: order.append("context")
     drafter._dp_dummy_forward = lambda: order.append("proposal")
-    runner = SimpleNamespace(
+    runner = _RunnerState(
         _is_async_drafter=True,
         _is_dspark_pd_producer=pd_producer,
         _fence_spec_kv_under_token_copy=fence,
@@ -3236,7 +3236,6 @@ def test_idle_dflash_rank_pairs_context_and_optional_proposals(
         drafter=drafter,
         _async_drafter=drafter,
     )
-    runner._draft_context_only = TPUModelRunner._draft_context_only.fget(runner)
     with patch(
         "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
         side_effect=lambda: order.append("sync"),
