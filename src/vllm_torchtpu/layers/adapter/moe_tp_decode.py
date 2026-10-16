@@ -182,6 +182,8 @@ class _OpStatics:
     # run the fused MoE prefill kernel (layers/adapter/fused_moe_prefill.py)
     # instead of the psum path; None keeps the psum path for every count.
     prefill_min_tokens: int | None = None
+    # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
+    fast: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -390,6 +392,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
         # The prefill kernel's weight ring holds whole experts: TP experts only.
         prefill_min_tokens=None if par.use_ep else prefill_min_tokens(),
+        fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )
     return _Admitted(
         shared=shared,
@@ -504,6 +507,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     routed_scale=statics.routed_scale,
                     topk=statics.topk,
                     n_ranks=n_ranks,
+                    fast=statics.fast,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -519,6 +523,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 routed_scale=statics.routed_scale,
                 topk=statics.topk,
                 n_ranks=n_ranks,
+                fast=statics.fast,
             )
         if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
             # Prefill-sized steps: the fused MoE prefill kernel (shared +

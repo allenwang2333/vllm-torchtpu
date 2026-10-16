@@ -31,6 +31,19 @@ inside the kernel, so no XLA all-reduce follows:
 
 Rows >= n_valid come out exactly +0 and only rows < n_valid travel.
 
+Fast schedule (fast=True, TPU_MOE_TP_DECODE_FAST): the same arithmetic and the
+same output bits, scheduled for the hardware. Routing picks every column equal
+to the row maximum instead of reducing the lowest such column per pick (one
+dependent cross-lane reduction per pick instead of three); a valid row that did
+not pick exactly topk columns (a tie, or NaN) reruns the exact routing. The
+compaction runs on the vector units (_compact_vector) and travels to the scalar
+core with the hit table, and one loop after it starts the first ring items: the
+incumbent's scalar compaction costs ~20 bundles per local expert, and its DMA
+starts inside a pl.when compile to predicated straight-line code on every hit
+expert that does not overlap the work after it. The ring loop runs in two parts with unconditional waits and
+refills, and the last item is peeled, so no ring DMA sits under a pl.when and
+no matmul reads a stale slot.
+
 Expert range (EP x TP weights, e.g. TPU_MOE_EP_TP_SIZE): a rank may hold only
 the experts [experts_start, experts_start + local) of the E the router scores,
 each at an I-column TP slice. Routing still runs over all E columns; only the
@@ -136,7 +149,9 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     return need, min(limit, info.vmem_capacity_bytes)
 
 
-def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts=None) -> str:
+def kernel_name(
+    experts, m, h, i, shared_inter, n_ranks, num_experts=None, fast=False
+) -> str:
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
         f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
@@ -146,6 +161,8 @@ def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts=None) -> st
     if num_experts is not None and num_experts != experts:
         # Expert range: `experts` of the router's num_experts.
         name += f"-ne_{num_experts}"
+    if fast:
+        name += "-fast"
     return name
 
 
@@ -238,6 +255,69 @@ def _route(scores, bias, n_valid, *, topk):
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0)
 
 
+def _route_fast(scores, bias, n_valid, *, topk):
+    """_route without the per-pick lowest-column reduction: a pick is every
+    column equal to the row maximum. Returns (weights, flag); the weights equal
+    _route's bit for bit when every valid row picked exactly topk columns, and
+    flag ([1, 1] f32) is 1 when some valid row did not (a tie, or NaN), in
+    which case the caller must use _route instead."""
+    rows, n = scores.shape
+    masked = float(jnp.finfo(jnp.float32).min)
+    x = scores + bias
+    x = jnp.where(x > ROUTER_NEG, x, ROUTER_NEG)
+    wsum = jnp.zeros((rows, 1), jnp.float32)
+    for _ in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        pick = x == m
+        # Off the dependent chain; pick-order sum as _route.
+        wsum = wsum + jnp.sum(jnp.where(pick, scores, 0.0), axis=1, keepdims=True)
+        x = jnp.where(pick, masked, x)
+    chosen = x == masked
+    denom = jnp.where(wsum < SUM_FLOOR, SUM_FLOOR, wsum)
+    w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
+    valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
+    count = jnp.sum(jnp.where(chosen, 1.0, 0.0), axis=1, keepdims=True)
+    valid_row = lax.broadcasted_iota(jnp.int32, (rows, 1), 0) < n_valid
+    bad = jnp.where(jnp.logical_and(valid_row, count != float(topk)), 1.0, 0.0)
+    flag = jnp.max(bad, axis=0, keepdims=True)
+    return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0), flag
+
+
+def _compact_vector(wtab, e0, local):
+    """The compaction on the vector units: ([1, W] f32, [1, 1] f32) = the local
+    ids (0 <= id < local) of the experts any row of wtab picked, ascending, in
+    lanes [0, count), and count; W = local rounded up to the lane count.
+
+    A one-hot matmul moves the window [e0, e0 + local) of the hit row to lanes
+    [0, local) (e0 is runtime data); expert e is the j-th active one when j
+    experts below it are hit and it is hit. All sums are of 0/1 values or of
+    one id, so f32 holds them exactly."""
+    f32 = jnp.float32
+    e_pad = wtab.shape[1]
+    lanes = 128
+    w = pl.cdiv(local, lanes) * lanes
+    hit = jnp.any(wtab != 0, axis=0, keepdims=True).astype(f32)
+    rows = lax.broadcasted_iota(jnp.int32, (e_pad, w), 0)
+    cols = lax.broadcasted_iota(jnp.int32, (e_pad, w), 1)
+    window = jnp.where(jnp.logical_and(rows == cols + e0, cols < local), 1.0, 0.0)
+    loc = jnp.dot(
+        jnp.broadcast_to(hit, (8, e_pad)), window, preferred_element_type=f32
+    )[0:1]
+    sub = lax.broadcasted_iota(jnp.int32, (w, w), 0)
+    lane = lax.broadcasted_iota(jnp.int32, (w, w), 1)
+    loc_b = jnp.broadcast_to(loc, (w, w))
+    below = jnp.sum(jnp.where(lane < sub, loc_b, 0.0), axis=1, keepdims=True)
+    own = jnp.sum(jnp.where(lane == sub, loc_b, 0.0), axis=1, keepdims=True)
+    nth = jnp.logical_and(below == lane.astype(f32), own > 0)
+    ids = jnp.sum(jnp.where(nth, sub.astype(f32), 0.0), axis=0, keepdims=True)
+    return ids, jnp.sum(loc, axis=1, keepdims=True)
+
+
+def _unused(fn):
+    """Decorator that leaves fn untraced (the schedule not selected)."""
+    return fn
+
+
 def _row_scale(amax):
     """quantize_tensor's per-row scale: amax / FP8 max, 0 replaced by 1."""
     scale = amax / FP8_MAX
@@ -323,6 +403,7 @@ def _kernel(
     topk,
     routed_scale,
     ar_spec,
+    fast=False,
 ):
     all_reduce.prologue(ar_spec)
     m, h = x_ref.shape
@@ -345,18 +426,54 @@ def _kernel(
     for copy in shared_copies:
         copy.start()
 
-    wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
-    hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
-    hits_v_ref[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
-    hit_copy = pltpu.make_async_copy(hits_v_ref, hits_s_ref, hit_sem.at[0])
-    hit_copy.start()
-    hit_copy.wait()
+    def store_hits():
+        hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
+        hits_v_ref[0:1, :] = jnp.where(hit, 1, 0).astype(jnp.int32)
+
+    def copy_hits():
+        hit_copy = pltpu.make_async_copy(hits_v_ref, hits_s_ref, hit_sem.at[0])
+        hit_copy.start()
+        hit_copy.wait()
+
+    def store_active():
+        # Rows 2 and 3 of the hit table: the active local experts, ascending,
+        # and their count (the vector compaction replaces the scalar one).
+        ids, n_active = _compact_vector(wtab_ref[...], e0, local_experts)
+        hits_v_ref[2:3, 0 : ids.shape[1]] = ids.astype(jnp.int32)
+        hits_v_ref[3:4, :] = jnp.broadcast_to(n_active, (1, hits_v_ref.shape[1])).astype(
+            jnp.int32
+        )
+
+    if fast:
+        # Row 1 of the hit table carries _route_fast's flag to the scalar core.
+        wtab, flag = _route_fast(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+        wtab_ref[...] = wtab
+        store_active()
+        hits_v_ref[1:2, :] = jnp.broadcast_to(flag, (1, hits_v_ref.shape[1])).astype(
+            jnp.int32
+        )
+        copy_hits()
+
+        @pl.when(hits_s_ref[1, 0] != 0)
+        def _exact_routing():
+            wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+            store_active()
+            copy_hits()
+
+    else:
+        wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+        store_hits()
+        copy_hits()
+
+    def active(j):
+        """Local id of the j-th active expert."""
+        return hits_s_ref[2, j] if fast else active_ids_ref[j]
 
     def transfers(step):
         if nc > 1:
             return chunk_transfers(step)
         # UPDATE: active_ids_ref / ring_sem names; otherwise #1512's transfers.
-        e, slot = active_ids_ref[step], step % nb
+        e, slot = active(step), step % nb
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], ring_sem.at[slot, 0]),
             pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot], ring_sem.at[slot, 1]),
@@ -372,7 +489,7 @@ def _kernel(
         # UPDATE: ring item `step` is chunk step % nc of active expert
         # step // nc: w13's gate and up column chunks side by side, the
         # matching w2 rows, their scales, and the expert's w2 scale.
-        e = active_ids_ref[lax.div(step, nc)]
+        e = active(lax.div(step, nc))
         c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
         slot = step % nb
         sem = ring_sem.at[slot]
@@ -417,8 +534,19 @@ def _kernel(
 
         return count + (hit_e != 0).astype(jnp.int32)
 
-    # UPDATE: local_experts is #1512's `experts`.
-    count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+    if fast:
+        count = hits_s_ref[3, 0]
+    else:
+        # UPDATE: local_experts is #1512's `experts`.
+        count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+    if fast:
+
+        def prime(item, carry):
+            for copy in transfers(item):
+                copy.start()
+            return carry
+
+        lax.fori_loop(0, jnp.minimum(count * nc, nb), prime, 0)
 
     # UPDATE: zeroing and x quantization run after the compaction (#1512 does
     # them before it), so the first weight copies start earlier.
@@ -438,7 +566,7 @@ def _kernel(
         return jnp.matmul(xq_ref[...], w1_ref[slot], preferred_element_type=jnp.float32)
 
     def finish(step, slot, acc1):
-        e = active_ids_ref[lax.div(step, nc)] if nc > 1 else active_ids_ref[step]
+        e = active(lax.div(step, nc)) if nc > 1 else active(step)
         # UPDATE: global column e0 + e of the in-kernel routing table over all
         # E experts, not the caller's coefficient table.
         coeff = jnp.sum(
@@ -467,7 +595,36 @@ def _kernel(
     # UPDATE: ring items, nc per active expert.
     items = count * nc
 
-    @pl.when(items > 0)
+    def ring_step(step, acc1, refill):
+        """Wait for item step + 1, issue its gate_up, finish item step, and
+        (refill) start item step + nb into the slot item step leaves."""
+        nxt = step + 1
+        for copy in transfers(nxt):
+            copy.wait()
+        acc1_next = gate_up(nxt % nb)
+        finish(step, step % nb, acc1)
+        if refill:
+            for copy in transfers(step + nb):
+                copy.start()
+        return acc1_next
+
+    # Only one schedule is traced: the other function is defined, not called.
+    @(pl.when(items > 0) if fast else _unused)
+    def run_experts_fast():
+        for copy in transfers(jnp.int32(0)):
+            copy.wait()
+        # Steps [0, items - nb) refill; the rest only drain; the last item is
+        # finished outside the loops (no gate_up past it).
+        n_refill = jnp.maximum(items - nb, 0)
+        acc1 = lax.fori_loop(
+            0, n_refill, lambda s, a: ring_step(s, a, True), gate_up(0)
+        )
+        acc1 = lax.fori_loop(
+            n_refill, items - 1, lambda s, a: ring_step(s, a, False), acc1
+        )
+        finish(items - 1, (items - 1) % nb, acc1)
+
+    @(_unused if fast else pl.when(items > 0))
     def run_experts():
         # UPDATE: no prime here (it runs in the compaction loop above).
         for copy in transfers(jnp.int32(0)):
@@ -510,7 +667,9 @@ def _kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("routed_scale", "topk", "n_ranks"))
+@functools.partial(
+    jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "fast")
+)
 def moe_tp_decode(
     x,
     scores,
@@ -530,6 +689,7 @@ def moe_tp_decode(
     routed_scale: float,
     topk: int,
     n_ranks: int,
+    fast: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -551,6 +711,7 @@ def moe_tp_decode(
       routed_scale: routed_scaling_factor, exact in bf16.
       topk: experts per token.
       n_ranks: TP ranks.
+      fast: the fast schedule (module docstring); the same output bits.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -611,6 +772,7 @@ def moe_tp_decode(
             topk=topk,
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
+            fast=fast,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -632,8 +794,8 @@ def moe_tp_decode(
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, e_pad), jnp.float32),
-                pltpu.VMEM((1, e_pad), jnp.int32),
-                pltpu.SMEM((1, e_pad), jnp.int32),
+                pltpu.VMEM((4 if fast else 1, e_pad), jnp.int32),
+                pltpu.SMEM((4 if fast else 1, e_pad), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((nb, 4 if i == ic else 6)),
                 pltpu.SemaphoreType.DMA((4,)),
@@ -644,7 +806,7 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts),
+        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts, fast),
     )(
         *metas,
         x,

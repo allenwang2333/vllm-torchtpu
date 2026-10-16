@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_MOE_TP_DECODE_FAST: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
     TPU_MOE_TP_DECODE_SHARED_META: bool = False
     TPU_RMSNORM_DECODE_MATERIALIZE: bool = False
@@ -1057,6 +1058,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the usual path. Remove once the path is the default for these layers or
     # is replaced by another fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # With USE_MOE_TP_DECODE_KERNEL: the kernel's fast schedule (same arithmetic,
+    # bit-identical output): top-k without the per-pick index reduction (exact
+    # fallback on ties), the expert compaction on the vector units, ring primes
+    # issued after the compaction instead of inside it, and a ring loop without
+    # conditional DMAs or a stale matmul. Default off.
+    "TPU_MOE_TP_DECODE_FAST": env_bool("TPU_MOE_TP_DECODE_FAST"),
     # moe_tp_decode: pass n_valid, rank and the expert offset as three [1]
     # scalar operands instead of one stacked int32[3] (one XLA fusion per MoE
     # layer, ~0.6 us in situ). Exact; default off.
