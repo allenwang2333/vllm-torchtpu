@@ -1860,3 +1860,24 @@ def use_raiden_glm_admission() -> bool:
 def is_indexer_kv_cache_mode_explicit() -> bool:
     """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
     return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ
+
+
+def bucket_gate_edge(min_tokens: int) -> int:
+    """The cap `c` a lower token gate "buckets of at least `min_tokens`" is
+    written against: callers test `T > c`, never `T >= min_tokens`.
+
+    Token-count gates that pick a code path are `T <= cap` / `T > cap` with
+    `cap` a power of 2 (a compile-bucket edge), so a lower gate and an upper
+    gate at the same edge are disjoint instead of both holding at one bucket
+    (two gates true at a single value pin the traced token count to it: the
+    trial-4 bucket-64 ShapeSpecializationError). For a power-of-2
+    `min_tokens` the edge is the bucket below it, `min_tokens // 2`: on the
+    power-of-2 bucket ladder `T > min_tokens // 2` picks exactly the buckets
+    `T >= min_tokens` did. A `min_tokens` of 0 or 1 is every bucket (`T > 0`);
+    a non-power-of-2 one keeps its exact meaning (`T > min_tokens - 1`)."""
+    m = int(min_tokens)
+    if m <= 1:
+        return 0
+    if m & (m - 1) == 0:
+        return m // 2
+    return m - 1

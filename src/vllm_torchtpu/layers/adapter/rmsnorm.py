@@ -372,7 +372,10 @@ class TpuRMSNorm(RMSNorm):
         ):
             return False
         rows = x.numel() // self.hidden_size
-        return rows >= self._min_rows and kernel.supports(rows, self.hidden_size)
+        # Cap rule: `rows > edge` (the bucket below `_min_rows`).
+        return rows > envs.bucket_gate_edge(self._min_rows) and kernel.supports(
+            rows, self.hidden_size
+        )
 
     def _materialized_add_norm(self, x: torch.Tensor, residual: torch.Tensor):
         """vllm.ir fused_add_rms_norm op for op, with the f32 sum and the

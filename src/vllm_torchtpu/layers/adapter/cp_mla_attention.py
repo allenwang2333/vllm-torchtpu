@@ -233,7 +233,9 @@ def vspace_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     if _merge_chunks(num_tokens) <= 1:
         return False
     min_tokens = envs.TPU_DCP_MERGE_VSPACE_MIN_TOKENS
-    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and num_tokens < min_tokens:
+    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and not (
+        num_tokens > envs.bucket_gate_edge(min_tokens)
+    ):
         return False
     return True
 
@@ -251,7 +253,9 @@ def _merge_chunks(num_tokens: int) -> int:
     makes for the same bucket, so no new shape guard; JAX (the kernel's merge
     pieces) calls this with the static row count and gets the same answer."""
     chunks = envs.TPU_DCP_MERGE_CHUNKED
-    if chunks <= 1 or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS:
+    if chunks <= 1 or not (
+        num_tokens > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS)
+    ):
         return 1
     small = envs.TPU_DCP_MERGE_CHUNKED_SMALL
     if small >= 2 and _lse_gathered_once(num_tokens):
@@ -656,7 +660,7 @@ def send_layout_applies(
         and dtype == torch.bfloat16
         and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
         and num_tokens <= sparse_kernel.FUSED_PREP_MAX_TOKENS
-        and num_tokens >= envs.TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS
+        and num_tokens > envs.bucket_gate_edge(envs.TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS)
     ):
         return False
     # The kernel runs one chunk of `num_tokens` (the capped chunk is larger

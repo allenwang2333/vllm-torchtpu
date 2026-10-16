@@ -634,15 +634,18 @@ def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
     mode = envs.TPU_MLA_ABSORB_TOKEN_MAJOR
     if mode in (None, "0") or not is_backbone:
         return None
-    min_tokens = envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS
+    # Cap rule: absorb is `T > edge` (edge a power of 2), MIN_TOKENS (the
+    # smallest bucket that absorbs) giving the edge below it.
+    edge = envs.bucket_gate_edge(envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS)
     if envs.TPU_DCP_LSE_MERGE_A2A:
-        # The DCP merge takes the all-to-all at `T <= cap` (same trace). A
-        # `T >= min_tokens` here with min_tokens <= cap would leave a trace
-        # where both hold; at min_tokens == cap that pins the token count to
-        # one constant (ConstraintViolationError, and the bucket's inputs lose
-        # a SymInt). Starting above the cap reuses the merge's own comparison.
-        min_tokens = max(min_tokens, envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS + 1)
-    if num_tokens < min_tokens:
+        # The DCP merge takes the all-to-all at `T <= cap` (same trace). An
+        # absorb gate that also held at a bucket `<= cap` would leave a trace
+        # where both hold; at the cap bucket that pins the token count to one
+        # constant (ConstraintViolationError, and the bucket's inputs lose a
+        # SymInt). Starting above the cap reuses the merge's own comparison:
+        # absorb `T > cap`, the merge's reduce-scatter side.
+        edge = max(edge, envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS)
+    if not num_tokens > edge:
         return None
     return "pallas" if mode == "1" else mode
 

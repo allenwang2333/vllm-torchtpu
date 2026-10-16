@@ -29,7 +29,7 @@ def use_kernel(chunk_rows: int) -> bool:
     merge chunk (static rows); the chunked merge splits every bucket it takes
     into TPU_DCP_MERGE_CHUNKED equal chunks."""
     bucket = chunk_rows * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
-    return bucket >= envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS
+    return bucket > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
 
 
 def _build(o: jax.Array, w: jax.Array, out_dtype) -> jax.Array:

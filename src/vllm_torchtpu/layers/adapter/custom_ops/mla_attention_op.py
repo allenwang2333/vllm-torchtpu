@@ -279,9 +279,11 @@ def _dcp_indexer_a2a_for_bucket(
 
     `num_tokens` is the static padded bucket, so this picks one merge per
     compiled variant: decode-sized buckets keep the all-gather merge and
-    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    prefill-sized ones (buckets of at least `min_tokens`, tested as
+    `num_tokens > envs.bucket_gate_edge(min_tokens)`: the cap rule) take the
+    all-to-all.
     """
-    return enabled and num_tokens >= min_tokens
+    return enabled and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
 def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
