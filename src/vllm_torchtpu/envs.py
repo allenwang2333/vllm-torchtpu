@@ -1123,6 +1123,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
     "TPU_DCP_RS_BF16": env_bool("TPU_DCP_RS_BF16", False),
     "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 4),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS", default=False
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS": env_int(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS", 256
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16", default=True
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER", default=True
+    ),
 }
 
 

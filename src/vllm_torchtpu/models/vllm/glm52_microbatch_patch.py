@@ -493,7 +493,7 @@ def patched_moe_apply_quant_method(
         shared_experts_overlapping=shared_experts_overlapping,
     )
     if (
-        envs.TPU_TOKEN_MICROBATCHES >= 2
+        (envs.TPU_TOKEN_MICROBATCHES >= 2 or envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS)
         and vllm_compilation_backends.model_tag == "backbone"
         and hidden_states.shape[0] >= envs.TPU_MICROBATCH_MIN_TOKENS
         and shared_out is not None
@@ -505,6 +505,17 @@ def patched_moe_apply_quant_method(
 
 def maybe_patch_glm52_microbatch(*args: object, **kwargs: object) -> None:
     """Install barrier-staged post-attention micro-batching on MLA wrapper."""
+    if envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS:
+        VllmMoERunner._apply_quant_method = patched_moe_apply_quant_method
+        logger.info(
+            "Applied TPU patch: GLM-5.2 in-kernel per-chunk DCP AG+RS "
+            "(TPU_SPARSE_MLA_DCP_CHUNK_AG_RS=True, min_tokens=%d, bf16=%s, barrier=%s, chunk=%s) + MoE EP overlap.",
+            envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS,
+            envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16,
+            envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER,
+            envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+        )
+        return None
     if envs.TPU_TOKEN_MICROBATCHES < 2:
         return None
     VllmTPUMultiHeadLatentAttentionWrapper.forward = patched_mla_wrapper_forward
