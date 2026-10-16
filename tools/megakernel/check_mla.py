@@ -3,7 +3,7 @@
 reference (``kernels.dspark_mla.reference_*``) on synthetic inputs.
 
 Every rank runs the kernel (``kernels.dspark_mla_kernel``) over a context it
-builds itself: ``--steps`` steps accepting all eight verify rows, at bases
+builds itself: ``--steps`` steps accepting all verify rows, at bases
 ``--stride`` tokens apart (so the committed latents spread over pages on every
 DCP owner), from random aux features. A final step at ``--context`` with a
 forced accepted count and anchor drafts; rank 0 recomputes that step on the
@@ -19,6 +19,8 @@ context must stay its own.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 
 from tools.megakernel import harness
@@ -30,6 +32,7 @@ def add_arguments(sub) -> None:
     )
     parser.add_argument("--dspark", required=True, help="the MLA DSpark checkpoint")
     parser.add_argument("--requests", type=int, default=1)
+    parser.add_argument("--drafts", type=int, choices=(3, 7), default=7)
     parser.add_argument("--steps", type=int, default=24, help="context-building steps")
     parser.add_argument(
         "--stride", type=int, default=600, help="positions between building steps"
@@ -65,13 +68,14 @@ def run_mladraft(args, records: harness.Records) -> None:
     draft = MlaDsparkDraft(final + 64, args.dspark, args.presharded)
     draft.load_weights()
     draft.attach_target(ops.weights)
-    c = draft.config
+    c = dataclasses.replace(draft.config, block=args.drafts)
+    rows_per = args.drafts + 1
     rank = draft.rank
     dtype = torch.float8_e4m3fn if k3.CACHE_DTYPE == "fp8" else torch.bfloat16
     packing = 4 if dtype == torch.float8_e4m3fn else 2
     page_tokens = 128 * packing
     entries = -(
-        -(final + 8) // (page_tokens * group)
+        -(final + rows_per) // (page_tokens * group)
     )  # local block-table entries per request
     pages = max(entries, 2)
     blocks = 1 + shared * pages
@@ -94,7 +98,7 @@ def run_mladraft(args, records: harness.Records) -> None:
 
     def build(requests):
         fused = kernel.fused_draft_local(
-            c, requests=requests, pages=pages, attention_dp=dp
+            c, requests=requests, pages=pages, rows=rows_per, attention_dp=dp
         )
 
         def body(*a):
@@ -115,10 +119,10 @@ def run_mladraft(args, records: harness.Records) -> None:
                 table,
             )
             positions = (
-                position[:, None] + jnp.arange(8, dtype=jnp.int32)[None, :]
+                position[:, None] + jnp.arange(rows_per, dtype=jnp.int32)[None, :]
             ).reshape(-1)
             pools = draft._commit(
-                pools, latents, jnp.repeat(table, 8, axis=0), positions
+                pools, latents, jnp.repeat(table, rows_per, axis=0), positions
             )
             return (vector, latents, *pools)
 
@@ -136,14 +140,16 @@ def run_mladraft(args, records: harness.Records) -> None:
     context_aux = {}  # position -> [5 * hidden] float32 (bf16 values), per request
 
     def step(base_positions, forced_count, forced_anchor):
-        aux = rng.standard_normal((len(c.aux_layers), R * 8, hidden)).astype(np.float32)
+        aux = rng.standard_normal((len(c.aux_layers), R * rows_per, hidden)).astype(
+            np.float32
+        )
         aux = np.asarray(jnp.asarray(aux, jnp.bfloat16).astype(jnp.float32))
         for j in range(R):
-            for k in range(8):
+            for k in range(rows_per):
                 context_aux[(j, int(base_positions[j]) + k)] = aux[
-                    :, j * 8 + k
+                    :, j * rows_per + k
                 ].reshape(-1)
-        logits = rng.standard_normal((1, R, 8, vocab)).astype(np.float32)
+        logits = rng.standard_normal((1, R, rows_per, vocab)).astype(np.float32)
         previous = np.full((R, 128), -1, np.int32)
         out = op(
             *draft._operands(),
@@ -161,11 +167,11 @@ def run_mladraft(args, records: harness.Records) -> None:
         return vector, latents
 
     for s in range(steps):
-        step([s * stride + j for j in range(R)], [7] * R, [1000 + s] * R)
+        step([s * stride + j for j in range(R)], [args.drafts] * R, [1000 + s] * R)
     anchors = [int(rng.integers(1000, 100000)) for _ in range(R)]
     vector, latents = step([final + j for j in range(R)], [args.count] * R, anchors)
     vector = vector.cpu().numpy()
-    latents = latents.to(torch.float32).cpu().numpy()  # [layers, 8 R, 640]
+    latents = latents.to(torch.float32).cpu().numpy()  # [layers, rows_per R, 640]
     harness.log(f"kernel drafts {[vector[j, : c.block].tolist() for j in range(R)]}")
 
     # ---------------- the reference ----------------
@@ -241,8 +247,10 @@ def run_mladraft(args, records: harness.Records) -> None:
                     lat = np.asarray(
                         mla.reference_latents(w, c, layer, ctx, pos).astype(jnp.float32)
                     )  # [n, 576]
-                    own = lat[[index[own_first + k] for k in range(8)]]
-                    kernel_own = latents[layer, j * 8 : (j + 1) * 8, : c.latent]
+                    own = lat[[index[own_first + k] for k in range(rows_per)]]
+                    kernel_own = latents[
+                        layer, j * rows_per : (j + 1) * rows_per, : c.latent
+                    ]
                     errors.append(
                         float(
                             np.max(np.abs(kernel_own - own))
@@ -320,5 +328,10 @@ def run_mladraft(args, records: harness.Records) -> None:
             )
         harness.log(f"drafts matching: {total_match}/{R * c.block}")
         records.add(
-            requests=R, steps=steps, stride=stride, cache=k3.CACHE_DTYPE, report=report
+            requests=R,
+            drafts=args.drafts,
+            steps=steps,
+            stride=stride,
+            cache=k3.CACHE_DTYPE,
+            report=report,
         )

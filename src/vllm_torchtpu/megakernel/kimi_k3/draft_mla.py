@@ -13,7 +13,7 @@ its target pages; a request without them (no prefill-written context) drafts
 from what it has, which is only slower (the emitted tokens are the
 target's). The draft's per-request state is its last output vector.
 
-A fused call drafts at most eight requests; a wider verify drafts in parts
+A fused call drafts at most 64 rows; a wider verify drafts in parts
 (:meth:`MlaDsparkDraft.parts`). Under attention DP2 a request's pages are on
 its DP group's ranks, which attend its rows with their two held TP32 shards'
 heads (``dspark_mla.held_shards``) and alone commit its latents; each part
@@ -50,7 +50,7 @@ logger = init_logger(__name__)
 
 AXIS = "tp"
 TARGET_WEIGHTS = {"lm_head": "lm_head", "embed": "embedding"}
-MAX_REQUESTS = 8  # per fused call (kernels.dspark_mla_kernel)
+MAX_ROWS = 64
 
 
 @dataclasses.dataclass
@@ -113,28 +113,16 @@ def _batched_fn(
             tables = tables[picked]
             plan, decisions = plan[picked], decisions[picked]
         bases = positions.reshape(R, k)[:, 0]
-        aux_padded = jnp.pad(
-            aux.reshape(aux.shape[0], R, k, aux.shape[-1]),
-            ((0, 0), (0, 0), (0, width - k), (0, 0)),
-        ).reshape(aux.shape[0], R * width, aux.shape[-1])
-        logits_padded = jnp.pad(
-            logits[0].reshape(R, k, logits.shape[-1]),
-            ((0, 0), (0, width - k), (0, 0)),
-        )
         vectors, latents = fused(
             weights,
             pools,
-            aux_padded,
-            logits_padded,
+            aux,
+            logits[0].reshape(R, k, logits.shape[-1]),
             previous,
             bases,
             decisions[:, 0],
             decisions[:, 1],
             tables,
-        )
-        # Commit each request's real verify rows (its first k).
-        latents = latents.reshape(layers, R, width, -1)[:, :, :k].reshape(
-            layers, total, -1
         )
         row_positions = (
             bases[:, None] + jnp.arange(k, dtype=jnp.int32)[None, :]
@@ -466,13 +454,13 @@ class MlaDsparkDraft:
         return self._ops[key]
 
     @staticmethod
-    def parts(requests: int, dp: int = 1) -> list[tuple[int, ...]]:
+    def parts(requests: int, dp: int = 1, rows_per: int = 8) -> list[tuple[int, ...]]:
         """The verify's requests each fused call drafts: at most
-        ``MAX_REQUESTS``; under attention DP (``dp``) as many of each group's
+        ``MAX_ROWS // rows_per``; under attention DP (``dp``) as many of each group's
         (group ``g``'s are the verify's ``g``-th share), group-major as the
         kernel attends them."""
         share = requests // dp
-        per = min(requests, MAX_REQUESTS) // dp
+        per = min(requests, MAX_ROWS // rows_per) // dp
         return [
             tuple(g * share + first + i for g in range(dp) for i in range(per))
             for first in range(0, share, per)
@@ -495,6 +483,8 @@ class MlaDsparkDraft:
             self.config,
             requests=R,
             pages=control.pages,
+            block=min(self.config.block, k - 1),
+            rows=k,
             owner_table=self.owner_table,
             attention_dp=dp,
         )
@@ -559,7 +549,7 @@ class MlaDsparkDraft:
         verified, layers = len(states), self.config.layers
         new: list[Any] = [None] * verified
         emitted, order = [], []
-        for index in self.parts(verified, self.attention_dp):
+        for index in self.parts(verified, self.attention_dp, rows_per):
             R = len(index)
             op = self._build_batched(control, index, verified, rows_per)
             out = op(
@@ -637,7 +627,7 @@ class MlaDsparkDraft:
             )
         for requests, spec_rows in spec_shapes:
             rows = requests * spec_rows
-            for index in self.parts(requests, self.attention_dp):
+            for index in self.parts(requests, self.attention_dp, spec_rows):
                 calls.append(
                     CompileCall(
                         self._build_batched(control, index, requests, spec_rows),

@@ -8,6 +8,8 @@ agree until a near-tie), requests joining and leaving across the single and
 batched speculation widths (each stream against its plain reference), seeded
 sampling (one seed reproduces, another differs) and that no step after warmup
 compiles; it reports tokens per step and pipelined step times.
+``--require-verifier-parity`` requires complete output equality against
+one-token steps of the same verifier shape for every ``--large-batches`` case.
 
 **handoff** runs the prefill program over chunked prompts and prefix-cache hits
 into stand-in pools, binds the decode program to the same pools and decodes
@@ -55,6 +57,12 @@ def add_arguments(parser) -> None:
         help="also speculate with three drafts at these request counts (the "
         "fixture prompts reused), e.g. 16,32 (32: attention DP2 only), against "
         "plain steps of the same requests",
+    )
+    spec.add_argument(
+        "--require-verifier-parity",
+        action="store_true",
+        help="require every generated token in --large-batches to match "
+        "one-token steps of the same verifier shape",
     )
     spec.add_argument(
         "--dspark", required=True, help="the DSpark speculator checkpoint"
@@ -194,6 +202,8 @@ def run_spec(args, records: harness.Records) -> None:
 
     count, generate, rows = args.prompt_tokens, args.generate, args.single_drafts + 1
     large = sorted(int(n) for n in args.large_batches.split(",") if n)
+    if args.require_verifier_parity and not large:
+        harness.fail("--require-verifier-parity requires --large-batches")
     most = max([8, *large])
     all_ids, tokenizer = k3.fixed_prompt(count + 4000, args.model)
     ids = np.asarray(all_ids[:count], np.int32)
@@ -647,9 +657,42 @@ def run_spec(args, records: harness.Records) -> None:
                 _agree(st, pt)
                 for st, pt in zip(spec_streams, plain_streams, strict=True)
             ]
+            verify_follow = None
+            if args.require_verifier_parity:
+                verify_streams, _ = group_streams(
+                    spec_large,
+                    n,
+                    k - 1,
+                    max(map(len, spec_streams)) - 1,
+                    f"v{n}_",
+                )
+                expected = max(map(len, spec_streams))
+                if any(len(stream) != expected for stream in verify_streams):
+                    harness.fail("the sequential verifier must emit one token per step")
+                verify_follow = [
+                    _agree(st, vt)
+                    for st, vt in zip(spec_streams, verify_streams, strict=True)
+                ]
+                exact = all(
+                    agree == len(stream)
+                    for agree, stream in zip(verify_follow, spec_streams, strict=True)
+                )
+                harness.log(
+                    f"batch-{n} same-verifier sequential reference: "
+                    f"{sum(verify_follow)}/{sum(map(len, spec_streams))} "
+                    f"tokens match; exact {exact}"
+                )
+                if not exact:
+                    harness.fail(
+                        f"batch-{n} speculative output differs from sequential "
+                        f"steps of its verifier: {verify_follow} versus "
+                        f"{list(map(len, spec_streams))} tokens"
+                    )
             spec_ms, plain_ms = group_ms(spec_large, n, k), group_ms(plain_large, n, 1)
             large_results[str(n)] = dict(
                 follow=follow,
+                verifier_follow=verify_follow,
+                generated_tokens=list(map(len, spec_streams)),
                 tokens_per_step=[round(r, 2) for r in spec_rates],
                 ms=[round(spec_ms, 3), round(plain_ms, 3)],
             )

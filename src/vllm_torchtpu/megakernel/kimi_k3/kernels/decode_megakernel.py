@@ -4539,7 +4539,8 @@ def mla(
     # invalid; timing only.
     dcp_skip = _config().dcp_skip
     dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, batch_size, sequence_rows=sequence_rows,
-                                         skip=dcp_skip)
+                                         skip=dcp_skip,
+                                         cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn)
     dcp_attention.prime()
 
     if "query_down" in streams:

@@ -66,16 +66,17 @@ MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
 
 
-def chunk_layout(batch: int, heads: int = HEADS_PER_RANK) -> tuple[int, int]:
+def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None) -> tuple[int, int]:
     """``(chunk rows, ring slots)`` of a chunked call (``batch > MAX_ROWS``):
     8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
     attention DP2's B128: 64 group rows of six heads, for VMEM); ring slots
     4 at B32 with three heads per rank, 3 for 8-row chunks, else 2
-    (``persistent_scratch`` uses 4 for FP8 query packets)."""
+    (``persistent_scratch`` uses 4 for FP8 query packets). ``chunk_rows``
+    overrides the width and keeps at least three slots for a staged combine."""
     wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
-    rows = 8 if wide else 4
-    ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide else 2
-    if batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
+    rows = chunk_rows if chunk_rows is not None else 8 if wide else 4
+    ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide or chunk_rows is not None else 2
+    if rows not in (4, 8) or batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
         raise ValueError(f"DCP chunks: {rows} rows must divide the batch {batch} (<= {MAX_ROWS}), ring 2, 3 or 4")
     return rows, ring
 
@@ -244,7 +245,8 @@ def _grouped_spec(batch, group, heads, sequence_rows):
 
 
 def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
-                       cache_dtype=jnp.bfloat16, sequence_rows=1, fp8_wire=False, force_chunks=False):
+                       cache_dtype=jnp.bfloat16, sequence_rows=1, fp8_wire=False, force_chunks=False,
+                       chunk_rows=None):
     # Send the receiver's identical FP8 operand and lossless FP32 scale
     # (``fp8_wire``: for any shape, e.g. the MLA DSpark draft's two heads).
     # Plain attention DP2 holds six heads for B/2 rows. Speculative attention
@@ -256,7 +258,7 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
                    and (plain or fp8_wire or _grouped_spec(batch, group, heads, sequence_rows))
                    else jnp.bfloat16)
     if chunked(batch, force_chunks):
-        chunk, ring = chunk_layout(batch, heads)
+        chunk, ring = chunk_layout(batch, heads, chunk_rows=chunk_rows)
         rows = packet_layout(batch, heads)[0] * chunk
         if query_dtype == jnp.uint8 and not (group == 16 and sequence_rows > 1):
             # The smaller query buffers make two-chunk lookahead fit at B64.
@@ -308,7 +310,7 @@ def staged_folds(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.b
 
 def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, group=GROUP,
                    cache_dtype=jnp.bfloat16, page_tokens=PAGE_TOKENS, *, sequence_rows=1,
-                   force_chunks=False):
+                   force_chunks=False, chunk_rows=None):
     rows = packet_layout(batch, heads)[0] * batch
     tile = head_rows(batch, group, heads)
     packing = 4 // jnp.dtype(cache_dtype).itemsize
@@ -327,7 +329,7 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
     span = max(1, span) * staged_folds(batch, heads, sequence_rows, cache_dtype)
     pages = ((buffers, span * page_tokens, LANES) if native_pages(batch, heads, sequence_rows, cache_dtype)
              else (buffers, span * page_tokens // packing, packing, LANES))
-    held = chunk_layout(batch, heads)[0] if chunked(batch, force_chunks) else batch  # rows whose attention state is live at once
+    held = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0] if chunked(batch, force_chunks) else batch  # rows whose attention state is live at once
     return (
         tpu.VMEM((held, tile, LANES), cache_dtype),
         tpu.VMEM(pages, cache_dtype),
@@ -335,9 +337,9 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
         tpu.VMEM((held, tile, 1), jnp.float32),
         tpu.VMEM((held, tile, 1), jnp.float32),
         tpu.VMEM((held, tile, LATENT), jnp.float32),
-        *((tpu.VMEM(chunk_rows_shape(batch, LANES, heads), jnp.float32),
-           tpu.VMEM(chunk_rows_shape(batch, LANES, heads), jnp.float32),
-           tpu.VMEM(chunk_rows_shape(batch, LATENT, heads), jnp.float32)) if chunked(batch, force_chunks) else
+        *((tpu.VMEM(chunk_rows_shape(batch, LANES, heads, chunk_rows=chunk_rows), jnp.float32),
+           tpu.VMEM(chunk_rows_shape(batch, LANES, heads, chunk_rows=chunk_rows), jnp.float32),
+           tpu.VMEM(chunk_rows_shape(batch, LATENT, heads, chunk_rows=chunk_rows), jnp.float32)) if chunked(batch, force_chunks) else
           (tpu.VMEM((rows, LANES), jnp.float32),
            tpu.VMEM((rows, LANES), jnp.float32),
            tpu.VMEM((8, 128), jnp.float32))),
@@ -353,11 +355,11 @@ def head_rows(batch, group=GROUP, heads=HEADS_PER_RANK):
     return -(-slots // 16) * 16
 
 
-def chunk_rows_shape(batch, lanes, heads=HEADS_PER_RANK):
+def chunk_rows_shape(batch, lanes, heads=HEADS_PER_RANK, *, chunk_rows=None):
     """Chunked calls: per-chunk row buffers ``[chunks, rows padded to 8,
     lanes]`` (a chunk's packet rows, ``slots x chunk``, need not be a
     multiple of the f32 tile; chunks are indexed on the leading dim)."""
-    chunk = chunk_layout(batch, heads)[0]
+    chunk = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0]
     rows = packet_layout(batch, heads)[0] * chunk
     return (batch // chunk, -(-rows // 8) * 8, lanes)
 
@@ -371,9 +373,10 @@ class DcpAttention:
     """One DCP attention invocation for ``batch`` rows at ``position_ref``."""
 
     def __init__(self, cache: DcpCache, workspace: DcpWorkspace, position_ref, batch, *,
-                 probability_hilo=False, skip=(), sequence_rows=1, heads=HEADS_PER_RANK):
+                 probability_hilo=False, skip=(), sequence_rows=1, heads=HEADS_PER_RANK,
+                 chunk_rows=None, cache_verify_rows=False):
         if batch > MAX_ROWS:
-            chunk = chunk_layout(batch, heads)[0]  # validates
+            chunk = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0]  # validates
             if chunk % sequence_rows:
                 raise ValueError(
                     f"DCP chunks of {chunk} rows must hold whole {sequence_rows}-row sequences")
@@ -386,6 +389,8 @@ class DcpAttention:
         # sequence's consecutive tokens. All rows attend the pool below the
         # group's first position; its new tokens fold in causally after the merge.
         self.sequence_rows = sequence_rows
+        self.chunk_rows = chunk_rows
+        self.cache_verify_rows = cache_verify_rows
         self.heads = heads
         self.slots, self.groups = packet_layout(batch, heads)
         self.group = cache.group
@@ -412,9 +417,12 @@ class DcpAttention:
         # first row owns its steps and each step folds into all its rows.
         self.shared = sequence_rows > 1 and all(
             first % sequence_rows == 0 and end % sequence_rows == 0 for first, end in self.row_groups())
+        if cache_verify_rows and not (self.shared and self.fp8):
+            raise ValueError("cached verify rows need shared FP8 sequences")
         self.counts, starts = [], [0]
         for b in range(batch):
-            needed = (self._limit(b) + self.page_tokens - 1) // self.page_tokens
+            limit = self._limit(b) + (sequence_rows - 1 if cache_verify_rows else 0)
+            needed = (limit + self.page_tokens - 1) // self.page_tokens
             count = jnp.maximum(needed - self.owner + self.group - 1, 0) // self.group
             self.counts.append(count if not self.shared or b % sequence_rows == 0 else 0)
             starts.append(starts[-1] + (self.counts[-1] + self.span - 1) // self.span)
@@ -485,14 +493,18 @@ class DcpAttention:
         if "pagecompute" in self.skip:
             return
         row, visible, load = self._step_pages(step)
-        if self.shared and self.fp8 and self.group_fold and self.sequence_rows == 8:
-            # The MLA DSpark draft: its seven real rows as groups of four and
-            # three (the padding row skipped when lse_in_padding).
+        if self.cache_verify_rows:
+            self._attend_cached_verify(step, row, load, base)
+        elif self.shared and self.fp8 and self.group_fold and self.sequence_rows in (4, 8):
             active = self.sequence_rows - (1 if self.lse_in_padding else 0)
-            first = self._group_scores(load, visible, row - base, 4)
-            second = self._group_scores(load, visible, row - base + 4, active - 4)
-            self._group_fold(first, load, row - base, 4)
-            self._group_fold(second, load, row - base + 4, active - 4)
+            first_rows = min(4, active)
+            first = self._group_scores(load, visible, row - base, first_rows)
+            if active > 4:
+                second = self._group_scores(load, visible, row - base + 4, active - 4)
+                self._group_fold(first, load, row - base, first_rows)
+                self._group_fold(second, load, row - base + 4, active - 4)
+            else:
+                self._group_fold(first, load, row - base, first_rows)
         elif self.shared and self.fp8 and _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
             # Four independent queries fill the matrix row dimension together.
             # Preserve each query's softmax reduction and FP8 conversion; only
@@ -526,6 +538,50 @@ class DcpAttention:
                 self._fold_pages(load, visible, row - base + r)
         else:
             self._fold_pages(load, visible, row - base)
+
+    def _cache_verify_row(self, slot, local_step, row):
+        position = self.position_ref[row]
+        page = position // self.page_tokens
+        local_page = page // self.group - local_step * self.span
+
+        @pl.when((page % self.group == self.owner) & (local_page >= 0) & (local_page < self.span))
+        def write():
+            if chunked(self.batch, self.force_chunked):
+                chunk = chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
+                latent = self.ws.new_rows[row // chunk, self.slots * (row % chunk)]
+            else:
+                latent = self.ws.new_rows[self.slots * row]
+            offset = local_page * self.page_tokens + position % self.page_tokens
+            tile_tokens = 8 * self.packing
+            first = pl.multiple_of(offset // tile_tokens * 8, 8)
+            words = (self.ws.pages.bitcast(jnp.uint32).at[slot] if self.native
+                     else self.ws.pages.bitcast(jnp.uint32).at[slot].reshape(self.span * self.page_rows, LANES))
+            block = pltpu.bitcast(words[pl.ds(first, 8)], self.cache.dtype)
+            token = jax.lax.broadcasted_iota(jnp.int32, block.shape, 0)
+            block = jnp.where(token == offset % tile_tokens, latent[None, :].astype(self.cache.dtype), block)
+            words[pl.ds(first, 8)] = pltpu.bitcast(block, jnp.uint32)
+
+    def _attend_cached_verify(self, step, row, load, base):
+        # Earlier verify tokens use the cache's FP8 QK/PV, like sequential decode.
+        _, local_step, _ = self._locate(step)
+
+        @pl.loop(0, self.sequence_rows - 1)
+        def cache(r):
+            self._cache_verify_row(step % self.buffers, local_step, row + r)
+
+        offset = jax.lax.broadcasted_iota(jnp.int32, (1, self.span * self.page_tokens), 1)
+        page = (local_step * self.span + offset // self.page_tokens) * self.group + self.owner
+        token = page * self.page_tokens + offset % self.page_tokens
+        if _grouped_spec(self.batch, self.group, self.heads, self.sequence_rows):
+            for first in range(0, self.sequence_rows, 4):
+                query = jax.lax.broadcasted_iota(jnp.int32, (4 * self.tile, 1), 0) // self.tile
+                visible = token < self.position_ref[row] + first + query
+                score = self._group_scores(load, visible, row - base + first, 4)
+                self._group_fold(score, load, row - base + first, 4)
+        else:
+            @pl.loop(0, self.sequence_rows)
+            def query(r):
+                self._fold_pages(load, token < self.position_ref[row + r], row - base + r)
 
     def _step_pages(self, step):
         """Step ``step``'s row, the mask of its visible tokens and a reader of
@@ -562,7 +618,7 @@ class DcpAttention:
                 or (self.span != 2 and not (_config().mla_decode_ktile == 2048 and self.span == 4))))
                 or "attend" in self.skip or "pagecompute" in self.skip):
             return self._attend_pipeline(first, end, base)
-        chunk = chunk_layout(self.batch, self.heads)[0]
+        chunk = chunk_layout(self.batch, self.heads, chunk_rows=self.chunk_rows)[0]
 
         def split():
             @pl.loop(0, chunk)
@@ -908,7 +964,7 @@ class DcpAttention:
     # bound the exchange); the merged partials round to BF16 once more.
     host_combine: Any = None
     force_chunked = False  # run even one chunk through _attend_chunked (scratch: force_chunks)
-    # FP8 explicit-keys sequences of eight rows: QK/PV for several rows in one
+    # FP8 explicit-keys sequences: QK/PV for several rows in one
     # dot (the grouped path's arithmetic, per row as the ungrouped fold).
     group_fold = False
     _lane_major = False  # packing for host_combine: send packet of peer p at (p % 8) hosts + p // 8
@@ -1056,7 +1112,7 @@ class DcpAttention:
                                      ws.own_rows[pl.ds(rows * s, rows), :], keys[s], key_valid[s], group,
                                      lse_rows=self.slots if self.lse_in_padding else 0)
                 for s in range(sequences)], axis=0)
-        elif self.sequence_rows == 1:
+        elif self.sequence_rows == 1 or self.cache_verify_rows:
             new_score = jnp.sum(ws.own_rows[...] * ws.new_rows[...], axis=1, keepdims=True)  # [rows, 1]
             top = jnp.maximum(jnp.max(lse, axis=0), new_score)
             weights = jnp.exp(lse - top[None])
@@ -1248,7 +1304,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     slot's queries. The chunk loop is rolled, so code and spills stay O(1) in
     the batch."""
     ws, group, member, base, batch = self.ws, self.group, self.member, self.base, self.batch
-    chunk, slots = chunk_layout(batch, self.heads)[0], self.slots
+    chunk, slots = chunk_layout(batch, self.heads, chunk_rows=self.chunk_rows)[0], self.slots
     if keys is not None and chunk != self.sequence_rows:
         raise ValueError("explicit new keys need one sequence per chunk")
     ring_slots = ws.gathered.shape[0]
@@ -1389,7 +1445,7 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
     def merge(c):
         if "merge" in self.skip:
             return
-        if self.sequence_rows == 1:
+        if self.sequence_rows == 1 or self.cache_verify_rows:
             # Attention DP2's B128 and FP8 B96 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
                 ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,

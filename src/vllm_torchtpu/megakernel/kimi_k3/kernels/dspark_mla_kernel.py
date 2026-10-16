@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The fused TP32 kernel of the MLA DSpark draft (``kernels.dspark_mla``).
 
-One call per decode step after the verify, over ``R`` requests of
-``ROWS = 8`` rows (the verify's rows, padded), on the decoder's 32-rank mesh:
+One call per decode step after the verify, over ``R`` requests with four or
+eight verify rows each, on the decoder's 32-rank mesh:
 
 1. **Acceptance.** The verify's vocabulary-sharded logits give each row's
    target (one 31-peer exchange); the accepted count is the leading drafts
@@ -106,9 +106,9 @@ def _rope(x_bf16, rot_bf16, cos32, sin32):
     return _bf16(_f32(x_bf16) * cos32 + rotated * sin32)
 
 
-def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_table, plan: dict, dp: int = 1):
+def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: int, owner_table, plan: dict, dp: int = 1):
     R = requests
-    T = R * ROWS
+    T = R * rows
     L = c.layers
     heads = HEADS_PER_RANK * dp  # the held TP32 shards' heads (attention DP)
     group_requests, group_rows = R // dp, T // dp
@@ -117,10 +117,10 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
     hidden = c.hidden
     eps = c.eps
     scale = c.softmax_scale
-    drafts_count = ROWS - 1  # verify rows after the anchor
-    streamed = R > 4  # o / down stream one 896-column chunk at a time (VMEM)
-    streamed_o = streamed or dp > 1  # attention DP's o holds two shards
-    KEYS = 2 * ROWS  # per request: its eight context rows, then its eight block rows
+    drafts_count = rows - 1  # verify rows after the anchor
+    streamed = T > 32  # o / down stream one 896-column chunk at a time (VMEM)
+    streamed_o = streamed or dp > 1
+    KEYS = 2 * rows
     n_persist = len(mla_dcp.PERSISTENT_NAMES)
     n_scoped = len(mla_dcp.SCOPED_NAMES)
 
@@ -304,12 +304,12 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         for item in small_copies:
             item.wait()
         logits_copy.wait()
-        verify_logits = logits_vmem[...]  # [R, 8, 5120] FP32
-        vocab_iota = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, vocab), 2)
-        local_best = jnp.max(verify_logits, axis=2, keepdims=True)
-        local_id = jnp.min(jnp.where(verify_logits == local_best, vocab_iota, vocab), axis=2, keepdims=True)
-        local_second = jnp.max(jnp.where(vocab_iota == local_id, NEG, verify_logits), axis=2, keepdims=True)
-        out_lane = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, 128), 2)
+        verify_logits = logits_vmem[...]  # [T, 5120] FP32
+        vocab_iota = jax.lax.broadcasted_iota(jnp.int32, (T, vocab), 1)
+        local_best = jnp.max(verify_logits, axis=1, keepdims=True)
+        local_id = jnp.min(jnp.where(verify_logits == local_best, vocab_iota, vocab), axis=1, keepdims=True)
+        local_second = jnp.max(jnp.where(vocab_iota == local_id, NEG, verify_logits), axis=1, keepdims=True)
+        out_lane = jax.lax.broadcasted_iota(jnp.int32, (T, 128), 1)
         packet = jnp.where(
             out_lane == 0, jax.lax.bitcast_convert_type(local_best, jnp.int32),
             jnp.where(out_lane == 1, local_id + rank * vocab,
@@ -317,7 +317,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         )
         # Rows along lanes: one [8, 128] tile a peer (lane t: row t; sublanes
         # best, id, second), not [T, 128].
-        square = jnp.pad(packet.reshape(T, 128), ((0, 128 - T), (0, 0)))
+        square = jnp.pad(packet, ((0, 128 - T), (0, 0)))
         argmax_recv[rank] = jnp.transpose(square)[:8]
         exchange(lambda o: argmax_recv.at[rank], lambda o: argmax_recv.at[rank], range(1, 32), SEM_TINY, 1)
         gathered = argmax_recv[...]  # [RANKS, 8, 128]
@@ -331,30 +331,30 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         lanes_back = jnp.concatenate((target_lanes, jax.lax.bitcast_convert_type(best - runner_up, jnp.int32),
                                       jnp.zeros((126, 128), jnp.int32)), axis=0)
         rows_back = jnp.transpose(lanes_back)[:T]  # [T, 128]: lane 0 target, lane 1 margin
-        targets = rows_back[:, 0:1].reshape(R, ROWS, 1)
-        margins = jax.lax.bitcast_convert_type(rows_back[:, 1:2], jnp.float32).reshape(R, ROWS, 1)
+        targets = rows_back[:, 0:1].reshape(R, rows, 1)
+        margins = jax.lax.bitcast_convert_type(rows_back[:, 1:2], jnp.float32).reshape(R, rows, 1)
         previous_vector = small["previous"][...]  # [R, 128]
-        row_iota_col = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, 1), 1)
+        row_iota_col = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 1), 1)
         proposals = jnp.sum(
-            jnp.where(jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, 128), 2) == row_iota_col + OUT_DRAFTS,
-                      jnp.broadcast_to(previous_vector[:, None, :], (R, ROWS, 128)), 0),
+            jnp.where(jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 2) == row_iota_col + OUT_DRAFTS,
+                      jnp.broadcast_to(previous_vector[:, None, :], (R, rows, 128)), 0),
             axis=2, keepdims=True,
         )  # proposal k was verify row k + 1
         match_rows = (row_iota_col < drafts_count) & (proposals == targets)
-        first_miss = jnp.min(jnp.where(match_rows | (row_iota_col >= drafts_count), ROWS, row_iota_col), axis=1)[:, 0]
+        first_miss = jnp.min(jnp.where(match_rows | (row_iota_col >= drafts_count), rows, row_iota_col), axis=1)[:, 0]
         count = jnp.where(forced_count >= 0, forced_count, jnp.minimum(first_miss, drafts_count))  # [R]
         anchor_token = jnp.sum(jnp.where(row_iota_col[:, :, 0] == count[:, None], targets[:, :, 0], 0), axis=1)
         anchor_token = jnp.where(forced_anchor >= 0, forced_anchor, anchor_token)
         anchor_position = new_position + count + 1  # [R]
         result_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
-        field_row = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, 128), 1)
-        field_lane = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, 128), 2)
+        field_row = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 1)
+        field_lane = jax.lax.broadcasted_iota(jnp.int32, (R, rows, 128), 2)
         targets_row = jnp.sum(jnp.where(field_lane == field_row + OUT_TARGETS, targets, 0), axis=1)
         margins_row = jnp.sum(jnp.where(field_lane == field_row + OUT_MARGINS,
                                         jax.lax.bitcast_convert_type(margins, jnp.int32), 0), axis=1)
         result = jnp.zeros((R, 128), jnp.int32) - 1
-        result = jnp.where((result_lane >= OUT_TARGETS) & (result_lane < OUT_TARGETS + ROWS), targets_row, result)
-        result = jnp.where((result_lane >= OUT_MARGINS) & (result_lane < OUT_MARGINS + ROWS), margins_row, result)
+        result = jnp.where((result_lane >= OUT_TARGETS) & (result_lane < OUT_TARGETS + rows), targets_row, result)
+        result = jnp.where((result_lane >= OUT_MARGINS) & (result_lane < OUT_MARGINS + rows), margins_row, result)
         result = jnp.where(result_lane == OUT_COUNT, count[:, None], result)
         result = jnp.where(result_lane == OUT_BONUS, anchor_token[:, None], result)
         tokens_v[...] = result
@@ -363,8 +363,8 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         # block rows (non-causal); the padding block row is no key. (Attention
         # DP: the rank's group's requests, whose rows it attends.)
         key_lane = jax.lax.broadcasted_iota(jnp.int32, (R, 1, KEYS), 2)
-        valid_vmem[...] = own_group((((key_lane < ROWS) & (key_lane <= count[:, None, None]))
-                                     | ((key_lane >= ROWS) & (key_lane < ROWS + block))).astype(jnp.int32))
+        valid_vmem[...] = own_group((((key_lane < rows) & (key_lane <= count[:, None, None]))
+                                     | ((key_lane >= rows) & (key_lane < rows + block))).astype(jnp.int32))
 
         # ---------------- Markov w1 rows, RoPE rows, anchor embeddings ----------------
         w1_copies: list[list[Any]] = [[None] * R, [None] * R]
@@ -454,8 +454,8 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
         scope = _phase_start("d_input")
         for item in rope_copies:
             item.wait()
-        rope_block = jnp.concatenate([_select_rows(rope_blk[0, j], anchor_position[j] % 8, ROWS) for j in range(R)], axis=0)
-        rope_context = jnp.concatenate([_select_rows(rope_blk[1, j], new_position[j] % 8, ROWS) for j in range(R)], axis=0)
+        rope_block = jnp.concatenate([_select_rows(rope_blk[0, j], anchor_position[j] % 8, rows) for j in range(R)], axis=0)
+        rope_context = jnp.concatenate([_select_rows(rope_blk[1, j], new_position[j] % 8, rows) for j in range(R)], axis=0)
         cos_block, sin_block = rope_block[:, :c.rope], rope_block[:, c.rope:]  # [T, 64] FP32
         cos_context, sin_context = rope_context[:, :c.rope], rope_context[:, c.rope:]
         for j in range(R):
@@ -464,7 +464,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
                 remote(bcast_buf.at[j], bcast_buf.at[j], SEM_BCAST + j, rank).wait_recv()
         anchor_rows = jnp.concatenate([unpack(bcast_buf[j], 1, hidden) for j in range(R)], axis=0)  # [R, 7168]
         mask_row = _f32(small["mask_embed"][...])
-        x_row = jax.lax.broadcasted_iota(jnp.int32, (R, ROWS, hidden), 1)
+        x_row = jax.lax.broadcasted_iota(jnp.int32, (R, rows, hidden), 1)
         x = _bf16(jnp.where(x_row == 0, anchor_rows[:, None, :], mask_row[:, None, :])).reshape(T, hidden)
 
         def latent_rows(kv_bf16, layer, cos32, sin32):
@@ -497,7 +497,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             layer=jnp.int32(0),
             group=mla_dcp.GROUP,
             owner=page_owner,
-            table_row=lambda row: first_request + row // ROWS,
+            table_row=lambda row: first_request + row // rows,
         )
         cos_query, sin_query = own_group(cos_block), own_group(sin_block)
         workspace = mla_dcp.DcpWorkspace(*persistent, *dcp_scoped)
@@ -542,7 +542,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             context_latents = own_group(latents_vmem[layer])
             for j in range(group_requests):
                 keys_vmem[j] = jnp.concatenate(
-                    (_f32(context_latents[j * ROWS:(j + 1) * ROWS]), _f32(block_latents[j * ROWS:(j + 1) * ROWS])), axis=0)
+                    (_f32(context_latents[j * rows:(j + 1) * rows]), _f32(block_latents[j * rows:(j + 1) * rows])), axis=0)
 
             _phase_end(scope)
             scope = _phase_start("d_query")
@@ -566,13 +566,13 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             scope = _phase_start("d_attend")
             attention = mla_dcp.DcpAttention(
                 dataclasses_replace(cache, layer=jnp.int32(layer)), workspace,
-                _Scalars(scalars, first_request, ROWS), group_rows, sequence_rows=ROWS, heads=heads,
+                _Scalars(scalars, first_request, rows), group_rows, sequence_rows=rows, heads=heads, chunk_rows=rows,
             )
             # The block's padding row carries the partials' lse: the combine
             # sends 512 lanes, not 640.
-            attention.lse_in_padding = block < ROWS
+            attention.lse_in_padding = block < rows
             attention.group_fold = True
-            if block < ROWS and mla_dcp.GROUP == RANKS:
+            if block < rows and mla_dcp.GROUP == RANKS:
                 # Merge each host's partials before crossing hosts (chunked
                 # calls, one request a chunk, even one request).
                 attention.force_chunked = True
@@ -636,7 +636,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
                 logits = _f32(_bf16(_dot(hidden_rows, buffers[k % 2][...])))
                 if k + 2 < LM_CHUNKS:
                     copies[k % 2] = chunk_copy(k + 2)
-                logits_vmem[:, :, pl.ds(k * LM_CHUNK, LM_CHUNK)] = logits.reshape(R, ROWS, LM_CHUNK)
+                logits_vmem[:, pl.ds(k * LM_CHUNK, LM_CHUNK)] = logits
 
         pl.run_scoped(lm_phase, tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16), tpu.VMEM((hidden, LM_CHUNK), jnp.bfloat16))
 
@@ -654,7 +654,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, pages: int, owner_t
             for item in w1_copies[slot % 2]:
                 item.wait()
             bias = _dot(w1_rows_for(previous, slot % 2), w2t_buf[...])  # [R, 5120]
-            scores = jnp.concatenate([logits_vmem[j, slot:slot + 1, :] for j in range(R)], axis=0) + bias
+            scores = jnp.concatenate([logits_vmem[j * rows + slot:j * rows + slot + 1, :] for j in range(R)], axis=0) + bias
             best_value = jnp.max(scores, axis=1, keepdims=True)
             best_id = jnp.min(jnp.where(scores == best_value, vocab_lane, vocab), axis=1, keepdims=True)
             row = jnp.where(token_lane == 0, jax.lax.bitcast_convert_type(best_value, jnp.int32),
@@ -684,7 +684,7 @@ def dataclasses_replace(value, **fields):
 
 
 def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: int | None = None,
-                      owner_table=None, attention_dp: int = 1):
+                      rows: int = ROWS, owner_table=None, attention_dp: int = 1):
     """The per-shard fused draft (call inside a TP32 ``shard_map``):
     ``(weights, pools, aux, logits, previous, positions0, forced_counts,
     forced_anchors, tables)`` -> ``(vectors [R, 128] int32, latents [layers,
@@ -698,45 +698,47 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
     ``weights``: ``WEIGHT_NAMES`` (this rank's arrays, including the target's
     ``lm_head`` ``[7168, 5120]`` and ``embed`` ``[5120, 7168]``); ``pools``:
     the draft layers' local pools ``[blocks, 128, packing, 640]``; ``aux``
-    ``[aux layers, T, hidden]`` and ``logits`` ``[R, 8, vocab / 32]`` the
-    verify's (``T = 8 R`` rows, padded); ``previous`` ``[R, 128]`` the last
-    vectors; ``positions0`` ``[R]`` each verify's first position;
+    ``[aux layers, T, hidden]`` and ``logits`` ``[R, rows, vocab / 32]`` the
+    verify's (``T = rows * R``; four or eight rows per request); ``previous``
+    ``[R, 128]`` the last vectors; ``positions0`` ``[R]`` each verify's first position;
     ``forced_*`` ``[R]`` (``>= 0``: given); ``tables`` ``[R, pages]``."""
-    block = block or c.block
-    if not 2 <= block <= ROWS:
-        raise ValueError(f"block must be 2..{ROWS}")
+    block = c.block if block is None else block
+    if rows not in (4, ROWS):
+        raise ValueError("the fused MLA draft takes 4 or 8 rows per request")
+    if not 2 <= block <= rows:
+        raise ValueError(f"block must be 2..{rows}")
     R = requests
-    T = R * ROWS
-    if not 1 <= R <= 8:
-        raise ValueError("the fused MLA draft takes 1 to 8 requests")
+    T = R * rows
+    if not 1 <= R <= 16 or T > 64:
+        raise ValueError("the fused MLA draft takes up to 8 requests at 8 rows, or 16 at 4 rows")
     dp = attention_dp
     if R % dp or mla_dcp.GROUP * dp != RANKS:
         raise ValueError(f"attention DP{dp}: {R} requests over DCP{mla_dcp.GROUP} groups")
     heads, group_rows = HEADS_PER_RANK * dp, T // dp
     packed = T * CHUNK // 256
-    streamed = R > 4
+    streamed = T > 32
 
     def call(weights, pools, aux, logits, previous, position, forced_count, forced_anchor, tables):
         pools = tuple(pools)
-        logits = logits.astype(jnp.float32)
+        logits = logits.reshape(T, c.vocab // RANKS).astype(jnp.float32)
         cache_dtype = pools[0].dtype
         page_tokens = pools[0].shape[1] * pools[0].shape[2]
-        chunks = block < ROWS and mla_dcp.GROUP == RANKS  # the two-stage combine (see the body)
-        plan = mla_dcp.page_plan(group_rows, heads, ROWS, cache_dtype, force_chunks=chunks)
+        chunks = block < rows and mla_dcp.GROUP == RANKS  # the two-stage combine (see the body)
+        plan = mla_dcp.page_plan(group_rows, heads, rows, cache_dtype, force_chunks=chunks)
         scalars = jnp.concatenate((position, forced_count, forced_anchor, tables.reshape(-1))).astype(jnp.int32)
         small_shapes = {"aux": aux, "previous": previous, **weights}
         # FP8 caches: FP8 query packets (the operand the receiver would
         # quantize to anyway), half the gather's bytes.
         persistent = mla_dcp.persistent_scratch(group_rows, mla_dcp.GROUP, heads, cache_dtype=cache_dtype,
-                                                sequence_rows=ROWS, fp8_wire=True, force_chunks=chunks)
+                                                sequence_rows=rows, fp8_wire=True, force_chunks=chunks, chunk_rows=rows)
         ring = persistent[0].shape[0] if mla_dcp.chunked(group_rows, chunks) else 1
         hosts = RANKS // mla_dcp.HOST_LANES
         scratch = (
             *(tpu.VMEM(small_shapes[n].shape, small_shapes[n].dtype) for n in SMALL_NAMES),
             *persistent,
             *mla_dcp.scoped_scratch(group_rows, plan["span"], plan["buffers"], heads=heads, group=mla_dcp.GROUP,
-                                    cache_dtype=cache_dtype, page_tokens=page_tokens, sequence_rows=ROWS,
-                                    force_chunks=chunks),
+                                    cache_dtype=cache_dtype, page_tokens=page_tokens, sequence_rows=rows,
+                                    force_chunks=chunks, chunk_rows=rows),
             tpu.VMEM((c.q_lora, dp * HEADS_PER_RANK * (c.nope + TILE)), jnp.bfloat16),  # q_buf
             tpu.VMEM((heads, c.nope, c.kv_lora), jnp.bfloat16),  # w_uk_buf
             tpu.VMEM((heads, c.kv_lora, c.v_head), jnp.bfloat16),  # w_uv_buf
@@ -750,7 +752,7 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
             tpu.VMEM((16, c.hidden), jnp.bfloat16),  # embed_blk
             tpu.VMEM((R, ROW_PACKED, 128), jnp.float32),  # bcast_buf
             tpu.VMEM((2, R, 16, 2 * c.rope), jnp.float32),  # rope_blk (block, context)
-            tpu.VMEM((R, ROWS, c.vocab // RANKS), jnp.float32),  # logits_vmem
+            tpu.VMEM((T, c.vocab // RANKS), jnp.float32),  # logits_vmem
             tpu.VMEM((T, CHUNK), jnp.float32),  # fc_part
             tpu.VMEM((R, 128), jnp.int32),  # tokens_v
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # stage
@@ -759,21 +761,21 @@ def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: in
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # gather_recv
             tpu.VMEM((2, RANKS, R, 128), jnp.int32),  # tiny_recv
             tpu.VMEM((RANKS, 8, 128), jnp.int32),  # argmax_recv: rows along lanes
-            tpu.VMEM((R // dp, 2 * ROWS, LANES), jnp.float32),  # keys_vmem (the group's requests)
-            tpu.VMEM((R // dp, 1, 2 * ROWS), jnp.int32),  # valid_vmem
+            tpu.VMEM((R // dp, 2 * rows, LANES), jnp.float32),  # keys_vmem (the group's requests)
+            tpu.VMEM((R // dp, 1, 2 * rows), jnp.int32),  # valid_vmem
             tpu.VMEM((c.layers, T, LANES), jnp.bfloat16),  # latents_vmem
             tpu.VMEM((2, c.hidden, TILE), jnp.bfloat16),  # tile_buf: q_a | kv_a projection tiles
             tpu.VMEM((2, RANKS, T * TILE // 256, 128), jnp.float32),  # tile_recv (packed BF16)
             # The two-stage DCP combine (chunked calls; see mla_dcp.host_combine).
-            tpu.VMEM((ring, hosts, HEADS_PER_RANK * ROWS, mla_dcp.LANES), jnp.bfloat16),  # stage2_recv
-            tpu.VMEM((hosts, HEADS_PER_RANK * ROWS, mla_dcp.LANES), jnp.bfloat16),  # stage2_send
+            tpu.VMEM((ring, hosts, HEADS_PER_RANK * rows, mla_dcp.LANES), jnp.bfloat16),  # stage2_recv
+            tpu.VMEM((hosts, HEADS_PER_RANK * rows, mla_dcp.LANES), jnp.bfloat16),  # stage2_send
             tpu.SemaphoreType.DMA((2, ring)),  # stage2_sems
             tpu.SemaphoreType.DMA((19 + 5 * R,)),
             tpu.SemaphoreType.DMA((len(SMALL_NAMES),)),
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
             tpu.SemaphoreType.DMA((2 * SEMS_PER_SLOT,)),
         )
-        body = _make_body(c, block, R, pages, owner_table, plan, dp)
+        body = _make_body(c, block, R, rows, pages, owner_table, plan, dp)
         operands = (aux, logits, previous, *[weights[n] for n in WEIGHT_NAMES], *pools)
         in_specs = [pl.BlockSpec(memory_space=tpu.HBM) for _ in operands]
         return pl.pallas_call(

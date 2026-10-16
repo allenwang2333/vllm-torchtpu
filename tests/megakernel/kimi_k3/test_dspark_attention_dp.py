@@ -104,7 +104,7 @@ def _stub_mla_fused(
     out = jnp.zeros((bases.shape[0], 128), jnp.int32)
     out = out.at[:, dspark.OUT_COUNT].set(count).at[:, dspark.OUT_BONUS].set(anchor)
     # Outputs that depend on each request's own operands.
-    out = out.at[:, 40].set(aux[0, :: dspark.ROWS, 0].astype(jnp.int32))
+    out = out.at[:, 40].set(aux[0, :: logits.shape[1], 0].astype(jnp.int32))
     out = out.at[:, 41].set(logits[:, 0, 0].astype(jnp.int32))
     out = out.at[:, 42].set(tables[:, 0]).at[:, 43].set(previous[:, 0])
     rows = aux[0, :, :1].astype(jnp.float32)
