@@ -402,6 +402,42 @@ def unfold(x, R: int):
     return x.reshape((R, x.shape[0] // R) + x.shape[1:])
 
 
+def is_tupled_weight(wsh_entry: Any) -> bool:
+    """Return True if a `wshape[k]` entry describes a per-layer weight tuple."""
+    return isinstance(wsh_entry, tuple) and hasattr(wsh_entry[0], "shape")
+
+
+def target_weight_shape(wsh_entry: Any) -> tuple[int, ...]:
+    """Return the per-rank target tensor shape for a `wshape[k]` entry."""
+    if is_tupled_weight(wsh_entry):
+        return wsh_entry[0].shape
+    return wsh_entry[0]
+
+
+def unpack_local_weight(
+    x: jax.Array,
+    target_sh: tuple[int, ...],
+    *,
+    name: str = "",
+    allow_expert_reshape: bool = False,
+) -> jax.Array:
+    """Unpack a shard_map-local weight shard to `target_sh`, validating its shape."""
+    if x.shape == (1, *target_sh):
+        return x[0]
+    if x.shape == target_sh:
+        return x
+    if allow_expert_reshape and len(target_sh) >= 4:
+        unpacked_sh = (*target_sh[:-3], target_sh[-3] * target_sh[-2], target_sh[-1])
+        if x.shape == (1, *unpacked_sh):
+            return x[0].reshape(target_sh)
+        if x.shape == unpacked_sh:
+            return x.reshape(target_sh)
+    raise ValueError(
+        f"Weight {name!r} local shard has shape {x.shape}, expected "
+        f"{(1, *target_sh)} or {target_sh}"
+    )
+
+
 def make_step(
     mesh,
     model_spec: ModelSpec,
@@ -416,13 +452,27 @@ def make_step(
     w_names = p.w_names
     st_names = p.s_names
     o_names = p.o_names
+    wsh = info["wshape"]
     blocks = model_spec.all_blocks()
 
     def local(pos, hidden, weights, states, *extra):
         w = [
-            tuple(x[0] for x in weights[k])
+            tuple(
+                unpack_local_weight(
+                    x,
+                    target_weight_shape(wsh[k]),
+                    name=k,
+                    allow_expert_reshape=k in p.dynamic_kinds,
+                )
+                for x in weights[k]
+            )
             if isinstance(weights[k], tuple)
-            else weights[k][0]
+            else unpack_local_weight(
+                weights[k],
+                target_weight_shape(wsh[k]),
+                name=k,
+                allow_expert_reshape=k in p.dynamic_kinds,
+            )
             for k in w_names
         ]
         s = [

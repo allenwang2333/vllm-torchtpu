@@ -1076,3 +1076,105 @@ def test_donate_pools_all_call_shapes_no_pool_copy():
         "%c = f8e4m3fn[64,2,64,4,128] copy(%p)"
     )
     assert not bad_copy
+
+
+@pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
+def test_unstacked_expert_weights_equivalence(T: int, B: int):
+    """Verify `stack_e=False` (per-layer tuples, 3D/5D, flat step) is bit-exact."""
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    ex_stacked = _tiny_exec(
+        R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=96, stack_e=True
+    )
+    ex_unstacked = replace(ex_stacked, stack_e=False)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(66 + T), g, ex_stacked
+    )
+
+    _, hid_mk, w_stacked, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_stacked, mesh=mesh, build_default_pool=True
+    )
+    # Pass per-layer expert tuples directly into pack_inputs without a stacked tensor
+    w_l_per_layer = dict(
+        w_l,
+        e13=tuple(w_l["e13"][:, lyr] for lyr in range(g.L)),
+        e2=tuple(w_l["e2"][:, lyr] for lyr in range(g.L)),
+    )
+    _, _, w_unstacked, _ = qwen35.pack_inputs(
+        pos,
+        hid_l,
+        w_l_per_layer,
+        st_l,
+        g,
+        ex_unstacked,
+        mesh=mesh,
+        build_default_pool=True,
+    )
+    assert isinstance(w_unstacked["e13"], tuple) and len(w_unstacked["e13"]) == g.L
+    assert isinstance(w_unstacked["e2"], tuple) and len(w_unstacked["e2"]) == g.L
+
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex_stacked)
+    raw_pools = tuple(
+        jax.device_put(r, tp)
+        for r in mk.states_to_pool(g, ex_stacked, st_l, pt, ckpt, roff)
+    )
+
+    spec = qwen35.qwen35_spec(g)
+    step_stacked, _ = mk.PallasWriter().make_step(mesh, spec, ex_stacked, donate=False)
+    step_unstacked, info_u = mk.PallasWriter().make_step(
+        mesh, spec, ex_unstacked, donate=False
+    )
+    out_s, raw_s = step_stacked(pos, hid_mk, w_stacked, raw_pools, pt, ckpt, roff)
+    out_u, raw_u = step_unstacked(pos, hid_mk, w_unstacked, raw_pools, pt, ckpt, roff)
+
+    np.testing.assert_array_equal(np.asarray(out_u), np.asarray(out_s))
+    for r_u, r_s in zip(raw_u, raw_s):
+        np.testing.assert_array_equal(
+            np.asarray(r_u).view(np.uint8), np.asarray(r_s).view(np.uint8)
+        )
+
+    if T == 1:
+        # Exercise 3D per-rank `(EW, K, N)` (global `(R * EW, K, N)`) reshape branch
+        # and `make_flat_pooled_step` with `stack_e=False`.
+        e13_3d = tuple(
+            jax.device_put(mk.fold(w_l["e13"][:, lyr]), tp) for lyr in range(g.L)
+        )
+        e2_3d = tuple(
+            jax.device_put(mk.fold(w_l["e2"][:, lyr]), tp) for lyr in range(g.L)
+        )
+        assert e13_3d[0].ndim == 3 and e2_3d[0].ndim == 3
+        w_unstacked_3d = dict(w_unstacked, e13=e13_3d, e2=e2_3d)
+
+        w_flat_u: list[jax.Array] = []
+        for k in info_u["plan"].w_names:
+            if k in ("e13", "e2"):
+                w_flat_u.extend(w_unstacked_3d[k])
+            else:
+                w_flat_u.append(w_unstacked_3d[k])
+
+        flat_u, _, _, _ = mk.make_flat_pooled_step(
+            mesh, spec, ex_unstacked, donate_pools=False
+        )
+        flat_res = flat_u(pos, hid_mk, *w_flat_u, *raw_pools, pt, ckpt, roff)
+        np.testing.assert_array_equal(np.asarray(flat_res[0]), np.asarray(out_s))
+        for r_f, r_s in zip(flat_res[1:], raw_s):
+            np.testing.assert_array_equal(
+                np.asarray(r_f).view(np.uint8), np.asarray(r_s).view(np.uint8)
+            )
+
+        # Verify unpack_local_weight rejects transposed non-expert and expert tensors
+        with pytest.raises(ValueError, match="local shard has shape"):
+            mk.kernel.unpack_local_weight(
+                jnp.zeros((1, 4, 32, 16, 128), dtype=jnp.bfloat16),
+                (4, 16, 128, 32),
+                name="router",
+                allow_expert_reshape=False,
+            )
+        with pytest.raises(ValueError, match="local shard has shape"):
+            mk.kernel.unpack_local_weight(
+                jnp.zeros((8, 64, 256), dtype=jnp.float8_e4m3fn),
+                (8, 2, 128, 64),
+                name="e13",
+                allow_expert_reshape=True,
+            )

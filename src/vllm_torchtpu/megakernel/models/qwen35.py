@@ -452,14 +452,18 @@ def pack_inputs(
     router_rep = jnp.broadcast_to(
         logical_weights["router"][None, ...], (R, L, g.H, g.E)
     )
-    e13_tiled = tile_w(logical_weights["e13"], "e13")
-    e2_tiled = tile_w(logical_weights["e2"], "e2")
-    if ex.stack_e:
-        e13_mk: Any = e13_tiled
-        e2_mk: Any = e2_tiled
-    else:
-        e13_mk = tuple(e13_tiled[:, lyr] for lyr in range(L))
-        e2_mk = tuple(e2_tiled[:, lyr] for lyr in range(L))
+
+    def _pack_expert(raw_e: Any, kind: str) -> Any:
+        if ex.stack_e:
+            if isinstance(raw_e, (tuple, list)):
+                raw_e = jnp.stack(raw_e, axis=1)
+            return tile_w(raw_e, kind)
+        if isinstance(raw_e, (tuple, list)):
+            return tuple(tile_w(raw_e[lyr], kind) for lyr in range(L))
+        return tuple(tile_w(raw_e[:, lyr], kind) for lyr in range(L))
+
+    e13_mk = _pack_expert(logical_weights["e13"], "e13")
+    e2_mk = _pack_expert(logical_weights["e2"], "e2")
 
     es_mk = jnp.concatenate(
         [logical_weights["e13_s"], logical_weights["e2_s"]], axis=-1

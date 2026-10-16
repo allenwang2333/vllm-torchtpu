@@ -201,10 +201,14 @@ def make_flat_pooled_step(
     w_names = p.w_names
     s_names = p.s_names
     o_names = p.o_names
+    wsh = info["wshape"]
     num_pools = pb.num_pools
     has_rec = pb.has_recurrent_pool
 
-    n_w_flat = len(w_names)
+    w_tuple_lens = [
+        len(wsh[k]) if kernel.is_tupled_weight(wsh[k]) else 1 for k in w_names
+    ]
+    n_w_flat = sum(w_tuple_lens)
     pool_start = 2 + n_w_flat
     pool_end = pool_start + num_pools
     donate_argnums = tuple(range(pool_start, pool_end)) if donate_pools else ()
@@ -228,7 +232,33 @@ def make_flat_pooled_step(
             n_w_flat + num_pools : n_w_flat + num_pools + 3
         ]
 
-        w_args = [w_flat[idx][0] for idx in range(n_w_flat)]
+        w_args: list[Any] = []
+        w_idx = 0
+        for k, t_len in zip(w_names, w_tuple_lens):
+            t_sh = kernel.target_weight_shape(wsh[k])
+            allow_exp = k in p.dynamic_kinds
+            if kernel.is_tupled_weight(wsh[k]):
+                w_args.append(
+                    tuple(
+                        kernel.unpack_local_weight(
+                            w_flat[w_idx + i],
+                            t_sh,
+                            name=k,
+                            allow_expert_reshape=allow_exp,
+                        )
+                        for i in range(t_len)
+                    )
+                )
+            else:
+                w_args.append(
+                    kernel.unpack_local_weight(
+                        w_flat[w_idx],
+                        t_sh,
+                        name=k,
+                        allow_expert_reshape=allow_exp,
+                    )
+                )
+            w_idx += t_len
 
         _validate_page_table_shape(page_table, ex_paged)
         if page_table.ndim == 3:
@@ -309,6 +339,7 @@ def make_pooled_step(
     w_names = p.w_names
     s_names = p.s_names
     o_names = p.o_names
+    wsh = info["wshape"]
     has_rec = pb.has_recurrent_pool
     rec_slots = pb.recurrent_slots_per_pool
     pool_key = pb.pool_state_name
@@ -345,9 +376,22 @@ def make_pooled_step(
             active_seqs = active_seqs.squeeze(0)
 
         w = [
-            tuple(x[0] for x in weights[k])
+            tuple(
+                kernel.unpack_local_weight(
+                    x,
+                    kernel.target_weight_shape(wsh[k]),
+                    name=k,
+                    allow_expert_reshape=k in p.dynamic_kinds,
+                )
+                for x in weights[k]
+            )
             if isinstance(weights[k], tuple)
-            else weights[k][0]
+            else kernel.unpack_local_weight(
+                weights[k],
+                kernel.target_weight_shape(wsh[k]),
+                name=k,
+                allow_expert_reshape=k in p.dynamic_kinds,
+            )
             for k in w_names
         ]
 
