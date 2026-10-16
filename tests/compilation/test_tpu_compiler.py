@@ -648,6 +648,52 @@ class TestTpuCompilerCache:
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
         assert os.listdir(b.cache_dir) == [key]
 
+    @staticmethod
+    def _rank_graph(rank, dead=None, live_slice=False):
+        """A graph with a rank baked in: in a dead view (`dead="view"`, like
+        vLLM's q-replicate `_local_view`), in a dead non-view op
+        (`dead="op"`), or in a live slice (`live_slice=True`)."""
+        import torch
+
+        def f(x):
+            if dead == "view":
+                x[..., rank * 4 : rank * 4 + 4].contiguous()
+            elif dead == "op":
+                torch.add(x, rank)
+            if live_slice:
+                return x[..., rank * 4 : rank * 4 + 4] * 2
+            return x * 2 + 1
+
+        return torch.fx.symbolic_trace(f)
+
+    def test_a_rank_in_a_dead_view_does_not_split_the_fingerprint(self):
+        from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+        a, b = self._rank_graph(0, dead="view"), self._rank_graph(1, dead="view")
+        assert a.code != b.code  # the premise: the code carries the rank
+        assert _graph_fingerprint(a) == _graph_fingerprint(b)
+        # Only the hash ignores it: the graph itself keeps its dead nodes.
+        assert "contiguous" in a.code
+
+    def test_a_rank_in_a_dead_op_or_a_live_slice_splits_the_fingerprint(self):
+        from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+        for kwargs in ({"dead": "op"}, {"live_slice": True}):
+            a, b = self._rank_graph(0, **kwargs), self._rank_graph(1, **kwargs)
+            assert _graph_fingerprint(a) != _graph_fingerprint(b), kwargs
+
+    def test_a_peer_artifact_differing_in_a_dead_view_is_replayed(
+        self, tmp_path, monkeypatch
+    ):
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, self._rank_graph(0, dead="view"))
+        compile(b, self._rank_graph(1, dead="view"))
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+
     def test_a_peer_artifact_of_another_graph_is_not_replayed(
         self, tmp_path, monkeypatch
     ):
