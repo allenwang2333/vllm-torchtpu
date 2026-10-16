@@ -66,7 +66,14 @@ class NgramHashState(upstream.NgramHashState):
         lookback_dead_mask,
         slot_mapping,
         block_table,
+        hash_rows: int | None = None,
     ):
+        """Hash every row, or only the first ``hash_rows`` rows.
+
+        The generated-token slot cache is still written for every row, so a
+        caller that hashes the remaining prompt rows on the host (``hash_on_host``)
+        leaves the same history behind as the full device pass.
+        """
         count = input_ids.numel()
         layers, ngram = self.multipliers.shape
         if count == 0:
@@ -82,6 +89,10 @@ class NgramHashState(upstream.NgramHashState):
             )
             valid = slot_mapping >= 0
             self.write_cache(self._cache, slot_mapping, mapped, valid)
+        if hash_rows is not None and hash_rows < count:
+            input_ids = input_ids[:hash_rows]
+            positions = positions[:hash_rows]
+            dead_mask = dead_mask[:hash_rows]
 
         def fallback(past, reqs, window):
             if not self.use_slot_cache:
@@ -626,6 +637,7 @@ class Engram(upstream.Engram):
             self._prefetch_done = None
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
+        self._pending_split: tuple[int, int] | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         if getattr(self.embed_tokens, "host_offload", False):
@@ -752,6 +764,105 @@ class Engram(upstream.Engram):
             self._active_raw = self._staged_views(num_tokens)
             return
         super().prepare_embeddings(hash_ids)
+
+    # -- Split staging -------------------------------------------------------
+    # A mixed prefill+decode step under async speculative decoding knows the
+    # prompt rows' hashes on the host long before the decode rows' (which wait
+    # on the previous step's accepted and drafted tokens). `prepare_tail` stages
+    # rows [head_rows, num_tokens) while the previous step still runs, and
+    # `prepare_head` stages rows [0, head_rows) once the device hashes land, so
+    # only the small head crosses H2D on the inter-step critical path. Both
+    # parts are 1-D int32 slice uploads into one packed device tensor of the
+    # `num_tokens` bucket; the compiled stage keeps reading a single
+    # `[num_tokens, words_per_tok]` view. Each bucket alternates between two
+    # device tensors so the early tail upload never touches the buffer the
+    # running step reads, whatever TorchTPU's slice-copy aliasing does.
+
+    def supports_split_staging(self) -> bool:
+        if self._staged_raw is None or self.embed_tokens.dp_size != 1:
+            return False
+        cols = self._host_raw.shape[1]
+        blocks = self._host_scale.shape[-1]
+        return (cols * blocks) % 4 == 0
+
+    def _split_layout(self, num_tokens: int) -> tuple[int, int, int]:
+        _, cols, head_dim = self._host_raw.shape
+        blocks = self._host_scale.shape[-1]
+        raw_words_per_tok = (cols * head_dim) // 4
+        scale_words_per_tok = (cols * blocks) // 4
+        return raw_words_per_tok, scale_words_per_tok, num_tokens * raw_words_per_tok
+
+    def _split_staged(self, num_tokens: int, advance: bool) -> torch.Tensor:
+        slots = getattr(self, "_split_staged_by_tokens", None)
+        if slots is None:
+            slots = self._split_staged_by_tokens = {}
+        pair = slots.get(num_tokens)
+        if pair is None:
+            raw_wpt, scale_wpt, _ = self._split_layout(num_tokens)
+            words = num_tokens * (raw_wpt + scale_wpt)
+            dev = self._staged_raw.device
+            pair = slots[num_tokens] = [
+                torch.zeros(words, dtype=torch.int32, device=dev),
+                torch.zeros(words, dtype=torch.int32, device=dev),
+                0,
+            ]
+        if advance:
+            pair[2] ^= 1
+        return pair[pair[2]]
+
+    def _upload_rows(
+        self, staged: torch.Tensor, num_tokens: int, row_start: int, row_end: int
+    ) -> None:
+        raw_wpt, scale_wpt, raw_words = self._split_layout(num_tokens)
+        host_words = self._host_packed_buf.view(torch.int32)
+        scale_words = self._host_scale_buf.view(torch.int32)
+        s0, s1 = row_start * scale_wpt, row_end * scale_wpt
+        host_words[raw_words + s0 : raw_words + s1].copy_(scale_words[s0:s1])
+        r0, r1 = row_start * raw_wpt, row_end * raw_wpt
+        staged[r0:r1].copy_(host_words[r0:r1])
+        staged[raw_words + s0 : raw_words + s1].copy_(
+            host_words[raw_words + s0 : raw_words + s1]
+        )
+
+    def prepare_tail(
+        self, hash_ids: torch.Tensor, head_rows: int, num_tokens: int
+    ) -> None:
+        """Gather and upload rows ``[head_rows, num_tokens)`` ahead of time."""
+        assert self.supports_split_staging()
+        assert head_rows + hash_ids.shape[0] == num_tokens, (
+            head_rows,
+            hash_ids.shape,
+            num_tokens,
+        )
+        if num_tokens > self._host_raw.shape[0]:
+            raise ValueError("Engram hashes exceed the configured staging slots")
+        self.embed_tokens.gather_raw(
+            hash_ids,
+            self._host_raw[head_rows:num_tokens],
+            self._host_scale[head_rows:num_tokens],
+        )
+        staged = self._split_staged(num_tokens, advance=True)
+        self._upload_rows(staged, num_tokens, head_rows, num_tokens)
+        self._pending_split = (head_rows, num_tokens)
+
+    def prepare_head(self, hash_ids: torch.Tensor) -> None:
+        """Gather and upload rows ``[0, head_rows)``; activate the bucket."""
+        pending = getattr(self, "_pending_split", None)
+        assert pending is not None and pending[0] == hash_ids.shape[0], (
+            "prepare_tail must precede prepare_head with matching head rows"
+        )
+        self._pending_split = None
+        head_rows, num_tokens = pending
+        self.embed_tokens.gather_raw(
+            hash_ids, self._host_raw[:head_rows], self._host_scale[:head_rows]
+        )
+        staged = self._split_staged(num_tokens, advance=False)
+        self._upload_rows(staged, num_tokens, 0, head_rows)
+        raw_wpt, scale_wpt, _ = self._split_layout(num_tokens)
+        view = staged.view(num_tokens, raw_wpt + scale_wpt)
+        if num_tokens >= 2:
+            torch._dynamo.mark_dynamic(view, 0)
+        self._active_raw = view
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:

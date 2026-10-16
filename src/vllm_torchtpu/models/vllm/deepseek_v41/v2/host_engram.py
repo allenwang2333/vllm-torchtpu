@@ -50,6 +50,10 @@ class HostEngramInputs:
     lookback_token_ids: torch.Tensor
     all_prompt: bool
     host_ready: bool | None = None
+    # First token row from which every scheduled request is prompt-only (its
+    # ids, positions and lookback are final on the host even when earlier
+    # decode rows still hold async placeholders). None when unknown.
+    prompt_row_start: int | None = None
 
     @property
     def can_hash_on_host(self) -> bool:
@@ -100,6 +104,26 @@ def _resolve_decode_lookback_cpu(
     return lookback
 
 
+def _prompt_row_start(
+    runner, num_reqs: int, start_index: int, seq_lens, prompt_lens
+) -> int | None:
+    """Row index after the last request that may carry generated tokens.
+
+    Requests are ordered decodes first, so the prompt-only requests form a
+    suffix of the batch; their rows can be hashed on the host before the
+    previous step's sampled and drafted tokens are known.
+    """
+    if start_index != 0 or num_reqs <= 0:
+        return None
+    is_prompt = np.asarray(seq_lens) <= np.asarray(prompt_lens)
+    not_prompt = np.flatnonzero(~is_prompt)
+    first_prompt_req = int(not_prompt[-1]) + 1 if not_prompt.size else 0
+    qsl = runner.query_start_loc_cpu
+    if first_prompt_req >= num_reqs or qsl is None or qsl.shape[0] <= num_reqs:
+        return None
+    return int(qsl[first_prompt_req])
+
+
 def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None:
     """Snapshot the runner's host hash inputs, or None if they do not apply."""
     from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
@@ -145,6 +169,9 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             lookback_token_ids=runner.lookback_token_ids.cpu,
             all_prompt=all_prompt,
             host_ready=False,
+            prompt_row_start=_prompt_row_start(
+                runner, chunk_num_reqs, start_index, seq_lens, prompt_lens
+            ),
         )
 
     lookback = _resolve_decode_lookback_cpu(runner, batch, chunk_num_reqs, start_index)

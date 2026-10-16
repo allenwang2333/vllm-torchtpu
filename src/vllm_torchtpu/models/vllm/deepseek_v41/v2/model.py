@@ -218,13 +218,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 return True
         return False
 
-    def _host_hash_inputs(self, input_ids, swa_metadata, lookback_token_ids):
+    def _host_hash_inputs(
+        self, input_ids, swa_metadata, lookback_token_ids, *, allow_partial=False
+    ):
         """CPU ``hash_on_host`` arguments for this step, or None.
 
         Applies only to Host-DRAM Engram tables outside compilation, when the
         runner published host-ready copies (``host_engram.py``). Slices follow
         the device tensors' static shapes, so the host hashes cover exactly the
-        device rows.
+        device rows. With ``allow_partial`` the arguments are also returned
+        when only the prompt-only suffix of the batch is host-ready (see
+        ``HostEngramInputs.prompt_row_start``).
         """
         if (
             lookback_token_ids is None
@@ -233,7 +237,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         ):
             return None
         host = upstream.get_forward_context().additional_kwargs.get(HOST_ENGRAM_KEY)
-        if host is None or not host.can_hash_on_host:
+        if host is None or not (host.can_hash_on_host or allow_partial):
             return None
         ids = host.input_ids[: input_ids.shape[0]]
         lookback = host.lookback_token_ids[: lookback_token_ids.shape[0]]
@@ -245,6 +249,83 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             lookback,
             upstream.image_sentinel_mask(lookback),
         )
+
+    def _engram_split_rows(self, host, input_ids, stage: str) -> int | None:
+        """Decode-row prefix length for split Engram staging, or None.
+
+        Applies when the host snapshot cannot hash the decode rows (async
+        speculative decoding) but every row from ``prompt_row_start`` on is a
+        prompt row. The device hashes the fixed ``max_num_seqs * (1 + K)``
+        prefix (one compiled shape per token bucket); the host hashes the rest.
+        """
+        device_rows = getattr(self, "_engram_device_rows", 0)
+        if (
+            host is None
+            or host.can_hash_on_host
+            or host.prompt_row_start is None
+            or not device_rows
+            or stage == "decoder"
+            or upstream.get_engram_dp_size() > 1
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        num_tokens = int(input_ids.shape[0])
+        if num_tokens <= device_rows or host.prompt_row_start > device_rows:
+            return None
+        layers = [
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if getattr(layer, "engram", None) is not None
+        ]
+        if not layers or not all(e.supports_split_staging() for e in layers):
+            return None
+        return device_rows
+
+    def _prepare_engram_split(
+        self,
+        input_ids,
+        positions,
+        lookback_token_ids,
+        swa_metadata,
+        host,
+        device_rows: int,
+        *,
+        end_layer: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = int(input_ids.shape[0])
+        engrams = [
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, end_layer)
+            if getattr(layer, "engram", None) is not None
+        ]
+        # 1. Prompt tail on the host: ids, positions and lookback of prompt-only
+        #    requests are final before the previous step completes, so the
+        #    gather and its H2D overlap the running step. Rows below
+        #    `device_rows` are recomputed on the device below.
+        tail_hashes = self.engram_hash.hash_on_host(*host)[device_rows:num_tokens]
+        for engram in engrams:
+            engram.prepare_tail(
+                tail_hashes[:, engram.layer_hash_index], device_rows, num_tokens
+            )
+        # 2. Decode-row prefix on the device (writes the slot cache for every
+        #    row, hashes only the prefix), then the small D2H + gather + H2D.
+        image_mask = upstream.image_sentinel_mask(input_ids)
+        head_hashes = self.engram_hash(
+            input_ids,
+            positions,
+            swa_metadata.query_start_loc,
+            image_mask,
+            lookback_token_ids,
+            upstream.image_sentinel_mask(lookback_token_ids),
+            _cache_slots(
+                self.engram_hash.swa_cache_module.kv_cache, swa_metadata, positions
+            ),
+            _block_table(swa_metadata),
+            hash_rows=device_rows,
+        ).to("cpu")
+        for engram in engrams:
+            engram.prepare_head(head_hashes[:, engram.layer_hash_index])
+        return head_hashes, ~image_mask
 
     def _prepare_engram(
         self,
@@ -294,6 +375,42 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 host = self._host_hash_inputs(
                     input_ids, swa_metadata, lookback_token_ids
                 )
+                snapshot = (
+                    getattr(upstream.get_forward_context(), "additional_kwargs", None)
+                    or {}
+                ).get(HOST_ENGRAM_KEY)
+                split_rows = (
+                    self._engram_split_rows(snapshot, input_ids, stage)
+                    if snapshot is not None
+                    else None
+                )
+                host_args = (
+                    self._host_hash_inputs(
+                        input_ids,
+                        swa_metadata,
+                        lookback_token_ids,
+                        allow_partial=True,
+                    )
+                    if split_rows is not None
+                    else None
+                )
+                if split_rows is not None and host_args is not None:
+                    # Async speculative mixed step: hash the prompt-only tail
+                    # on the host and stage it before the device sync, then
+                    # hash only the fixed decode-row prefix on the device.
+                    return self._prepare_engram_split(
+                        input_ids,
+                        positions,
+                        lookback_token_ids,
+                        swa_metadata,
+                        host_args,
+                        split_rows,
+                        end_layer=(
+                            getattr(self, "_ced_boundary", self.end_layer)
+                            if stage == "encoder"
+                            else self.end_layer
+                        ),
+                    )
                 if host is not None:
                     engram_hashes = self.engram_hash.hash_on_host(*host)
                     engram_mask = ~upstream.image_sentinel_mask(host[0])
@@ -817,6 +934,15 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self._ced_enabled, self._ced_boundary = _ced_config(
             vllm_config, warn_prefix_caching=True, fallback_config=self.config
         )
+        # Split Engram staging (see `_prepare_engram_split`): the device hashes
+        # at most this many leading rows, enough for every decode request's
+        # `1 + K` verify tokens; the remaining prompt rows hash on the host.
+        self._engram_device_rows = 0
+        if spec_cfg is not None and envs.TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING:
+            self._engram_device_rows = int(
+                vllm_config.scheduler_config.max_num_seqs
+                * (1 + int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0))
+            )
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n

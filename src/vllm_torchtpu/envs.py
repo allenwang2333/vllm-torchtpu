@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING: bool = True
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -363,6 +364,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.
     # Upstream enables it only with DP>1 or MegaMoE.
     "TPU_DEEPSEEK_V41_SP": env_bool("TPU_DEEPSEEK_V41_SP"),
+    # Host-DRAM Engram under async speculative decoding: hash and stage the
+    # prompt rows of a mixed step on the host before the previous step's
+    # sync; the device hashes only the decode-row prefix.
+    "TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING": lambda: bool(
+        int(os.getenv("TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING") or "1")
+    ),
     # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
