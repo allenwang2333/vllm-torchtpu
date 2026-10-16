@@ -334,10 +334,16 @@ local kvHoldReplayCheckpoint = cdk.var('TPU_KV_HOLD_REPLAY_CHECKPOINT', '1');
 // Prefix-cache hits land on multiples of this many tokens instead of the 1024-token block: the
 // full-attention block holding the hit point is copied on write (vllm_torchtpu core/fine_prefix_hits.py).
 // Needs VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=1. Empty = off (hits stay block-aligned).
-local finePrefixHitTokens = cdk.var('TPU_FINE_PREFIX_HIT_TOKENS', '');
+// c=192 (forge run 362mfwyj): 128 with the HCA-state drop below took uncached prompt tokens 5,011 -> 4,584
+// per request and total tok/s 411,873 (j-68312e1d) -> 435,126 (j-72b25bfc), n=1 each.
+local finePrefixHitTokens = cdk.var('TPU_FINE_PREFIX_HIT_TOKENS', '128');
 // The 128-ratio compressor state needs no prefix-cache checkpoint: never cached, held or host-offloaded
 // (vllm_torchtpu core/hca_state_checkpoint.py), 4 of the 8 windowed keys per checkpoint. Empty = off.
-local dropHcaStateCheckpoint = cdk.var('TPU_KV_DROP_HCA_STATE_CHECKPOINT', '');
+local dropHcaStateCheckpoint = cdk.var('TPU_KV_DROP_HCA_STATE_CHECKPOINT', '1');
+// The indexer's mixed pass runs as two pieces split on the long sequence's q-block boundary, so the first
+// piece's SparseCore top-k overlaps the second piece's scoring (vllm-torchtpu TPU_STREAMIDX_SPLIT_MIXED).
+// With the fine hits above it took the T128 period mean 87.7 -> 84.7 ms (j-72b25bfc -> j-dba370be). Empty = off.
+local streamidxSplitMixed = cdk.var('TPU_STREAMIDX_SPLIT_MIXED', '1');
 // Block-table staging: rotate 3 host scratch buffers (H2D uploads are not fenced against the next step's
 // staging) and zero only the rows written last time.
 local blockTableStageRing = cdk.var('TPU_BLOCK_TABLE_STAGE_RING', '3');
@@ -768,6 +774,7 @@ local serverJob = cdk.job(
           'TPU_DSV4_ATTN_INTRA_CHIP_TP',
           'TPU_BLOCK_TABLE_STAGE_RING',
           'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO',
+          'TPU_STREAMIDX_SPLIT_MIXED',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -807,6 +814,7 @@ local serverJob = cdk.job(
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
         [if finePrefixHitTokens != '' then 'TPU_FINE_PREFIX_HIT_TOKENS']: finePrefixHitTokens,
         [if dropHcaStateCheckpoint != '' then 'TPU_KV_DROP_HCA_STATE_CHECKPOINT']: dropHcaStateCheckpoint,
+        [if streamidxSplitMixed != '' then 'TPU_STREAMIDX_SPLIT_MIXED']: streamidxSplitMixed,
         [if blockTableStageRing != '' then 'TPU_BLOCK_TABLE_STAGE_RING']: blockTableStageRing,
         [if blockTableStageSparseZero != '' then 'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO']: blockTableStageSparseZero,
         // Read by the scheduler in the EngineCore processes, not by Ray workers.
