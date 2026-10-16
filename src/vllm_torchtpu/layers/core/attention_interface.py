@@ -1034,14 +1034,15 @@ def sparse_mla_attention(
 def dcp_mla_topk_cap(dcp_size: int) -> int:
     """`TPU_DCP_MLA_TOPK_CAP` as it applies at `dcp_size`; 0 is uncapped.
 
-    The default (-1) is auto: 512 from DCP16, as #1510 shipped it for GLM-5.2
-    AgentX, and off below. A rank owns ~topk/dcp_size slots, so a cap of 512
-    rarely binds at DCP16 and overflows every row at DCP2 (~30% slower
-    prefill there). An explicit value applies at any DCP size.
+    The default (-1) is auto: 512 from DCP8 (#1510 shipped it from DCP16 for
+    GLM-5.2 AgentX; trial 4 served it at DCP8), and off below. A rank owns
+    ~topk/dcp_size slots, so a cap of 512 rarely binds at DCP16, binds
+    sometimes at DCP8 and overflows every row at DCP2 (~30% slower prefill
+    there). An explicit value applies at any DCP size.
     """
     topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
     if topk_cap < 0:
-        return 512 if dcp_size >= 16 else 0
+        return 512 if dcp_size >= 8 else 0
     return topk_cap
 
 

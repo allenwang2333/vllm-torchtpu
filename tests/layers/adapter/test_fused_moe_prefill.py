@@ -17,6 +17,8 @@ H = 8
 def test_prefill_envs(monkeypatch):
     monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
     monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", raising=False)
+    assert envs.FUSED_MOE_PREFILL_KERNEL is True  # trial-4 default
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "0")
     assert envs.FUSED_MOE_PREFILL_KERNEL is False
     assert envs.FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS == 256
     monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", "1024")

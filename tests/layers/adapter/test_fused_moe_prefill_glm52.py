@@ -227,7 +227,7 @@ def test_glm52_layer_armed_by_decode_kernel_alone(monkeypatch, arming):
     # kernel.
     built, vmem = arming
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1")
-    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "0")
     glm = _Runner()
     qwen = _Runner(gate=_gate(), routed_scaling_factor=1.0)
     assert bridge.arm_fused_moe_decode(_model(glm, qwen)) == 2

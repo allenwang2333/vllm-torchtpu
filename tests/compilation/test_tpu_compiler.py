@@ -296,10 +296,13 @@ class TestTpuCompilerCache:
     )
     def test_env_override_sc_offload_threshold(self, value, expected_threshold):
         """An explicit value is used as given, unset/empty/auto resolves
-        from the chip family, and 0 sets no flag at all."""
+        from the chip family, and 0 sets no flag at all. (The fused MoE
+        prefill kernel, on by default, lowers the all-reduce one; see
+        test_env_override_sc_all_reduce_floor_with_prefill_kernel.)"""
         env_mock = {
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
             "TPU_ACCELERATOR_TYPE": "v6e-8",
+            "FUSED_MOE_PREFILL_KERNEL": "0",
         }
         with patch.dict(os.environ, env_mock, clear=True):
             import vllm_torchtpu.env_override
