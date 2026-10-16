@@ -1931,6 +1931,8 @@ def sparse_fp8_attention_qo(
         )
     tokens = positions.shape[0]
     shards = _fp8_query_shards(tokens, _attention_tp_size, True)
+    if shards > 1 and main_records.shape[0] * shards == tokens:
+        shards = -shards
     gathered = _gather_fp8_for_stage(
         main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
     )

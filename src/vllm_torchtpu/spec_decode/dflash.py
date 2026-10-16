@@ -331,6 +331,14 @@ class DFlashProposer:
         num_reqs = chunk.num_reqs
         block_size = self.block_size
         total_draft_tokens = num_reqs * block_size
+        if (
+            next_tokens_device is not None
+            and next_tokens_device.shape[0] > num_reqs
+            and not self._dp_lockstep_sharded()
+        ):
+            bucket_draft_tokens = int(next_tokens_device.shape[0]) * block_size
+            if bucket_draft_tokens <= max(self.runner.num_tokens_paddings):
+                total_draft_tokens = bucket_draft_tokens
 
         # Round up to the nearest static padded length to avoid XLA recompilation
         if self._dp_lockstep_sharded():
@@ -368,7 +376,7 @@ class DFlashProposer:
                 query_start_loc_device,
                 position_ids_device,
                 draft_lengths,
-                num_reqs,
+                0,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -379,7 +387,7 @@ class DFlashProposer:
                 device_seed,
                 query_start_loc_device,
                 position_ids_device,
-                num_reqs,
+                0,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -573,7 +581,16 @@ class DFlashProposer:
         # 3. Extract K tokens from logits
         if return_device:
             if len(draft_logits_per_chunk) == 1:
-                return draft_logits_per_chunk[0][: chunks[0].num_reqs]
+                out_rows = chunks[0].num_reqs
+                if (
+                    next_tokens_per_chunk
+                    and len(next_tokens_per_chunk) == 1
+                    and next_tokens_per_chunk[0].shape[0] > out_rows
+                    and next_tokens_per_chunk[0].shape[0]
+                    <= draft_logits_per_chunk[0].shape[0]
+                ):
+                    out_rows = int(next_tokens_per_chunk[0].shape[0])
+                return draft_logits_per_chunk[0][:out_rows]
             sliced_chunks = [
                 logits
                 if logits.shape[0] == chunk.num_reqs
@@ -1023,8 +1040,19 @@ class DFlashProposer:
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
-        valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
+        if num_reqs > 0:
+            safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
+            valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
+        else:
+            # Derive live request count on-device from query_start_loc so
+            # torch.compile(dynamic=False) does not guard or recompile on
+            # the host Python int num_reqs across 1..max_num_seqs.
+            num_reqs_t = (query_start_loc[1:] > query_start_loc[:-1]).sum(
+                dtype=torch.int32
+            )
+            max_req = torch.clamp(num_reqs_t - 1, min=0)
+            safe_req_indices = torch.minimum(req_indices, max_req)
+            valid_mask = (req_indices < num_reqs_t).unsqueeze(1).to(torch.int32)
         start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
         last_positions = position_ids[end_indices].unsqueeze(1)

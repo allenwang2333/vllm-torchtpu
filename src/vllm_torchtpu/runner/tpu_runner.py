@@ -2423,7 +2423,7 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _prefix_replay_tokens(self) -> int:
-        config = self.kv_cache_config
+        config = getattr(self, "kv_cache_config", None)
         if config is None:
             return 0
         return max(
@@ -2483,9 +2483,11 @@ class TPUModelRunner(GPUModelRunner):
             | (scheduler_output.preempted_req_ids or set())
             | scheduler_output.scheduled_cached_reqs.resumed_req_ids
         )
+        replay_starts = getattr(self, "_replay_starts", None)
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
-            self._replay_starts.pop(req_id, None)
+            if replay_starts is not None:
+                replay_starts.pop(req_id, None)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
@@ -2713,23 +2715,40 @@ class TPUModelRunner(GPUModelRunner):
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
         # proposals, even if they did not verify drafts in the current step.
+        single_chunk = len(next_tokens_per_chunk) == 1
         for nt_chunk, num_reqs, md in zip(
             next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
         ):
-            drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
-            if md is not None:
+            if (
+                single_chunk
+                and md is not None
+                and nt_chunk.shape[0] > num_reqs
+                and drafts.shape[0] >= nt_chunk.shape[0]
+                and md.draft_lengths.shape[0] == nt_chunk.shape[0]
+            ):
+                padded_reqs = int(nt_chunk.shape[0])
+                drafts_chunk = drafts[:padded_reqs]
+                src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, padded_reqs)
                 num_rejected_chunks.append(
-                    compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
+                    compute_num_rejected(nt_chunk, md.draft_lengths)
                 )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
             else:
-                # No drafts were verified this step, so there is no rejection
-                # correction or speculative output-placeholder rollback.
-                num_rejected_chunks.append(
-                    torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
-                )
+                drafts_chunk = drafts[req_offset : req_offset + num_reqs]
+                src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
+                if md is not None:
+                    num_rejected_chunks.append(
+                        compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
+                    )
+                    for r in range(num_reqs):
+                        num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
+                else:
+                    # No drafts were verified this step, so there is no rejection
+                    # correction or speculative output-placeholder rollback.
+                    num_rejected_chunks.append(
+                        torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
+                    )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
                 next_token_indices[req_offset + r] = req_offset + r

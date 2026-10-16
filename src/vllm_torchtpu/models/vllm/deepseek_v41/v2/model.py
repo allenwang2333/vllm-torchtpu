@@ -598,8 +598,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
         elif (
             plan.padded_num_tokens == positions.shape[0]
-            and len(plan.indices) == positions.shape[0]
-            and plan.indices == tuple(range(positions.shape[0]))
+            and plan.indices == tuple(range(len(plan.indices)))
+            and (
+                len(plan.indices) == positions.shape[0]
+                or getattr(first, "query_start_loc_cpu", None)
+                == tuple(plan.query_start_loc)
+            )
         ):
             decoder_metadata = metadata
             decoder_positions, decoder_ids = positions, input_ids
@@ -608,7 +612,15 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 plan.replay_starts, dtype=positions.dtype, device=positions.device
             )
             indices = None
-            decoder_padding = torch.zeros_like(positions, dtype=torch.bool)
+            decoder_padding = (
+                torch.arange(positions.shape[0], device=positions.device)
+                >= first.query_start_loc[-1]
+                if (
+                    first is not None
+                    and getattr(first, "query_start_loc", None) is not None
+                )
+                else torch.zeros_like(positions, dtype=torch.bool)
+            )
         else:
             # The extra output row absorbs padded scatter writes. Reusing row
             # zero for padding would overwrite a real request's first result.
@@ -633,9 +645,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 )
                 for key, value in metadata.items()
             }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
+            decoder_padding = (
+                torch.arange(plan.padded_num_tokens, device=positions.device)
+                >= bounds[-1]
+            )
             if encoder_sp and hidden.device.type == "tpu":
                 # Materialize the eager inter-stage SP all-gather before
                 # slicing and launching the compiled decoder stage so
@@ -942,9 +955,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # at most this many leading rows, enough for every decode request's
         # `1 + K` verify tokens; the remaining prompt rows hash on the host.
         self._engram_device_rows = 0
-        if spec_cfg is not None and envs.TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING:
+        sched_cfg = getattr(vllm_config, "scheduler_config", None)
+        if (
+            spec_cfg is not None
+            and sched_cfg is not None
+            and envs.TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING
+        ):
             self._engram_device_rows = int(
-                vllm_config.scheduler_config.max_num_seqs
+                sched_cfg.max_num_seqs
                 * (1 + int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0))
             )
         self._ced_window = self.layers[self._ced_boundary].attn.window_size

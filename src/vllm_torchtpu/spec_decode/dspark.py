@@ -113,6 +113,9 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        prepare_shard = getattr(self.draft_model, "prepare_markov_vocab_shard", None)
+        if callable(prepare_shard):
+            prepare_shard()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
@@ -139,17 +142,22 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
+        ids_3d = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )
+        prev = ids_3d[:, 0]
+        sample_start = 0 if self.sample_from_anchor else 1
+        sample_fn = getattr(self.draft_model, "sample_greedy_markov", None)
+        if callable(sample_fn):
+            draft_tokens_chunk = sample_fn(valid_hidden, prev, block_size, sample_start)
+            return draft_tokens_chunk, hidden
+
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
-        ids_3d = input_ids[: padded_num_reqs * block_size].view(
-            padded_num_reqs, block_size
-        )
-        prev = ids_3d[:, 0]
         draft_tokens = []
-        sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(

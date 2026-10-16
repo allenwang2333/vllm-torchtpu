@@ -78,7 +78,7 @@ class SpeculativeDecodingManager:
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
-            return DraftTokenIds(req_ids, drafts_cpu.tolist())
+            return DraftTokenIds(req_ids, drafts_cpu[: len(req_ids)].tolist())
         if self._draft_token_ids is None:
             return None
         num_reqs = self.runner.input_batch.num_reqs
@@ -98,8 +98,8 @@ class SpeculativeDecodingManager:
         is called after the next step's execute_model mutates input_batch.
         """
         num_reqs = self.runner.input_batch.num_reqs
-        assert drafts.shape[0] == num_reqs, (
-            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
+        assert drafts.shape[0] >= num_reqs, (
+            f"drafts rows {drafts.shape[0]} < num_reqs {num_reqs}"
         )
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
         drafts_cpu = drafts.to("cpu", non_blocking=True)

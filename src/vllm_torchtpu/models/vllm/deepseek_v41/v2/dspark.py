@@ -12,6 +12,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -29,6 +30,7 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
     collapse,
@@ -323,6 +325,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self._markov_w2_shard: nn.Parameter | None = None
 
     # --- Hooks consumed by DFlashProposer / DSparkProposer -----------------
 
@@ -372,6 +375,89 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def prepare_markov_vocab_shard(self) -> None:
+        """Pre-slice Markov W2 along the shared TP-sharded lm_head vocab."""
+        if (
+            self.lm_head is None
+            or getattr(self.lm_head, "tp_size", 1) <= 1
+            or getattr(self.lm_head, "shard_indices", None) is None
+            or self.draft_id_to_target_id is not None
+            or self.logits_processor.soft_cap is not None
+        ):
+            self._markov_w2_shard = None
+            return
+        si = self.lm_head.shard_indices
+        if (
+            si.added_vocab_start_index != si.added_vocab_end_index
+            or int(si.num_org_vocab_padding) != 0
+        ):
+            self._markov_w2_shard = None
+            return
+        shard_vocab_size = int(self.lm_head.weight.shape[0])
+        tp_size = int(self.lm_head.tp_size)
+        if shard_vocab_size >= int(
+            self.config.vocab_size
+        ) or shard_vocab_size * tp_size != int(self.config.vocab_size):
+            self._markov_w2_shard = None
+            return
+        vocab_start = int(si.org_vocab_start_index)
+        vocab_end = int(si.org_vocab_end_index)
+        if vocab_end - vocab_start != shard_vocab_size:
+            self._markov_w2_shard = None
+            return
+        w2 = self.model.markov_head.markov_w2.weight
+        shard = w2[vocab_start:vocab_end].contiguous()
+        if shard.device.type == "tpu":
+            synchronize_tensors(shard)
+        self._markov_w2_shard = nn.Parameter(shard, requires_grad=False)
+
+    def sample_greedy_markov(
+        self,
+        valid_hidden: torch.Tensor,
+        prev: torch.Tensor,
+        block_size: int,
+        sample_start: int,
+    ) -> torch.Tensor:
+        """Greedy Markov sampling with vocab-parallel reduction under TP."""
+        padded_num_reqs = valid_hidden.shape[0] // block_size
+        w2_shard = getattr(self, "_markov_w2_shard", None)
+        if w2_shard is None or self.lm_head is None:
+            logits = self.compute_draft_logits(valid_hidden)
+            logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+            draft_tokens = []
+            for i in range(sample_start, block_size):
+                bias = self.markov_bias(self.markov_embed(prev))
+                step = self.map_draft_to_target((logits_3d[:, i] + bias).argmax(dim=-1))
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1)
+
+        normed = self.model.norm(valid_hidden)
+        local_logits = self.logits_processor._get_logits(
+            normed, self.lm_head, None, skip_gather=True
+        )
+        if self.logits_processor.scale != 1.0:
+            local_logits = local_logits * self.logits_processor.scale
+        shard_vocab_size = local_logits.shape[-1]
+        local_logits_3d = local_logits.view(
+            padded_num_reqs, block_size, shard_vocab_size
+        )
+        bias_w2 = getattr(self.model.markov_head.markov_w2, "bias", None)
+        draft_tokens = []
+        for i in range(sample_start, block_size):
+            m_emb = self.markov_embed(prev)
+            local_bias = torch.nn.functional.linear(m_emb, w2_shard, bias_w2)
+            step_logits = local_logits_3d[:, i] + local_bias
+            top1_logits, top1_indices = step_logits.max(dim=-1, keepdim=True)
+            top1_logits = tensor_model_parallel_all_gather(top1_logits)
+            top1_indices = tensor_model_parallel_all_gather(top1_indices)
+            best = top1_logits.argmax(dim=-1, keepdim=True)
+            local_idx = top1_indices.gather(-1, best).squeeze(-1).to(torch.int64)
+            step = best.squeeze(-1) * shard_vocab_size + local_idx
+            draft_tokens.append(step)
+            prev = step
+        return torch.stack(draft_tokens, dim=1)
 
     def compute_confidence(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor

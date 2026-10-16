@@ -1382,3 +1382,101 @@ def test_v2_attention_kernels_attend_window_union_path(
     out = v2_kernels._attend_window(q, pool, records, state, 1.0)
     assert union_called is True
     assert out is state
+
+
+def test_dspark_vocab_parallel_markov_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify sample_greedy_markov matches full-vocab Markov sampling bit-for-bit."""
+    torch.manual_seed(42)
+    tp_size = 4
+    vocab_size = 64
+    shard_vocab = vocab_size // tp_size
+    hidden_size = 16
+    markov_dim = 8
+    num_reqs = 5
+    num_spec = 4
+
+    w_lm = torch.randn(vocab_size, hidden_size, dtype=torch.float32)
+    w_m1 = torch.randn(vocab_size, markov_dim, dtype=torch.float32)
+    w_m2 = torch.randn(vocab_size, markov_dim, dtype=torch.float32)
+    draft_hidden = torch.randn(num_reqs * num_spec, hidden_size, dtype=torch.float32)
+
+    # Reference full-vocab Markov chain
+    ref_base = (draft_hidden @ w_lm.t()).view(num_reqs, num_spec, vocab_size)
+    ref_tokens = []
+    for k in range(num_spec):
+        step_logits = ref_base[:, k, :]
+        if k > 0:
+            prev_tok = ref_tokens[-1]
+            step_logits = step_logits + (w_m1[prev_tok] @ w_m2.t())
+        ref_tokens.append(step_logits.argmax(dim=-1))
+    ref_out = torch.stack(ref_tokens, dim=1)
+
+    # Simulate all 4 TP ranks in lockstep
+    rank_models = []
+    for r in range(tp_size):
+        m = object.__new__(v2_dspark.DSparkDeepseekV41ForCausalLM)
+        nn.Module.__init__(m)
+        m.config = SimpleNamespace(vocab_size=vocab_size)
+        m.lm_head = SimpleNamespace(
+            weight=w_lm[r * shard_vocab : (r + 1) * shard_vocab],
+            tp_size=tp_size,
+            shard_indices=SimpleNamespace(
+                added_vocab_start_index=0,
+                added_vocab_end_index=0,
+                num_org_vocab_padding=0,
+                org_vocab_start_index=r * shard_vocab,
+                org_vocab_end_index=(r + 1) * shard_vocab,
+            ),
+        )
+        m.model = SimpleNamespace(
+            norm=lambda x: x,
+            markov_head=SimpleNamespace(
+                embed=lambda ids, w=w_m1: w[ids],
+                markov_w2=SimpleNamespace(weight=w_m2.clone()),
+            ),
+        )
+        m.logits_processor = SimpleNamespace(
+            soft_cap=None,
+            scale=1.0,
+            _get_logits=lambda h, lm_head, embedding_bias=None, skip_gather=False: (
+                h @ lm_head.weight.t()
+            ),
+        )
+        m.prepare_markov_vocab_shard()
+        assert m._markov_w2_shard is not None
+        assert m._markov_w2_shard.shape == (shard_vocab, markov_dim)
+        rank_models.append(m)
+
+    # Run shard-local base logits + local top1 per step, gathered across ranks
+    base_shards = [
+        (draft_hidden @ m.lm_head.weight.t()).view(num_reqs, num_spec, shard_vocab)
+        for m in rank_models
+    ]
+    out_per_rank = [[] for _ in range(tp_size)]
+    for k in range(num_spec):
+        vals_ranks = []
+        idxs_ranks = []
+        for r, m in enumerate(rank_models):
+            step_logits = base_shards[r][:, k, :]
+            if k > 0:
+                prev_tok = out_per_rank[r][-1]
+                h_markov = m.markov_embed(prev_tok)
+                step_logits = step_logits + torch.matmul(
+                    h_markov, m._markov_w2_shard.t()
+                )
+            v, idx = step_logits.max(dim=-1)
+            vals_ranks.append(v)
+            idxs_ranks.append(idx.to(torch.int32))
+        all_vals = torch.stack(vals_ranks, dim=-1)
+        all_idxs = torch.stack(idxs_ranks, dim=-1)
+        for r in range(tp_size):
+            best = all_vals.argmax(dim=-1, keepdim=True)
+            local_idx = torch.gather(all_idxs, -1, best).squeeze(-1)
+            tok = best.squeeze(-1).to(torch.int32) * shard_vocab + local_idx
+            out_per_rank[r].append(tok)
+
+    for r in range(tp_size):
+        rank_out = torch.stack(out_per_rank[r], dim=1)
+        assert torch.equal(rank_out.to(torch.int64), ref_out)

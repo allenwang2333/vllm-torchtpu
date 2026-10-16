@@ -1685,7 +1685,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and stage_cache is not None
             and bool(getattr(self, "_fp8_kv", False))
             and bool(getattr(self, "_token_parallel_attn", False))
-            and not bool(getattr(self, "_local_q_attn", False))
             and isinstance(count, int)
             and part * ranks == count
             and count >= 6 * ranks
