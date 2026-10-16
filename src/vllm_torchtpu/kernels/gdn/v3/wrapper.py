@@ -181,7 +181,13 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    if cfg.qkv_row_tiled:
+    qkv_in_ref = qkv_slot_ref
+    if cfg.qkv_row_tiled and cfg.seq_tile_size == 1:
+        vmem_ldst.widen_row_tiles_as_compact(qkv_slot_ref, qkv_stage_scratch_ref)
+        row_in_tile = metadata_ref.p_id_to_r_base[p_id, 0] % config.QKV_TILE_ROWS
+        qkv_in_ref = qkv_stage_scratch_ref.at[:, pl.ds(row_in_tile, cfg.chunk_size)]
+        qkv_slot_ref = qkv_scratch_ref
+    elif cfg.qkv_row_tiled:
         vmem_ldst.widen_row_tiles_to_compact(
             qkv_slot_ref,
             qkv_stage_scratch_ref,
@@ -191,8 +197,8 @@ def inner_kernel(
                 for idx in range(cfg.seq_tile_size)
             ],
         )
-        qkv_slot_ref = qkv_scratch_ref
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+        qkv_in_ref = qkv_slot_ref = qkv_scratch_ref
+    qkv_in_compact = qkv_in_ref[...].astype(jnp.float32)
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -210,7 +216,7 @@ def inner_kernel(
             r = metadata_ref.p_id_to_r_size[p_id, idx]
             start = jnp.where((r >= 1) & (r < last_row), r, last_row)
             # Windows starting at or past the input tile lie inside it.
-            picked = qkv_slot_ref[idx, pl.ds(jnp.maximum(start - pk, 0), pk)]
+            picked = qkv_in_ref[idx, pl.ds(jnp.maximum(start - pk, 0), pk)]
             picked = picked.astype(jnp.float32)
             for s in range(1, pk):
                 picked = jnp.where(start == s, qkv_in_compact[idx, s : s + pk], picked)

@@ -283,9 +283,13 @@ class GDNConfig:
         if self.qkv_row_tiled:
             num_lanes = pltpu.get_tpu_info().num_lanes
             stage_rows = self.qkv_tile_groups * QKV_TILE_ROWS
-            qkv_stage_scratch = pltpu.VMEM(
-                (stage_rows * self.dim_size // num_lanes, num_lanes), jnp.float32
-            )
+            if self.seq_tile_size == 1:
+                # Every staged row in compact layout; the tile's rows start
+                # at a dynamic offset into it.
+                stage_shape = (1, stage_rows, 1, self.dim_size)
+            else:
+                stage_shape = (stage_rows * self.dim_size // num_lanes, num_lanes)
+            qkv_stage_scratch = pltpu.VMEM(stage_shape, jnp.float32)
             qkv_scratch = pltpu.VMEM(
                 (self.seq_tile_size, self.chunk_size, 1, self.dim_size), jnp.float32
             )

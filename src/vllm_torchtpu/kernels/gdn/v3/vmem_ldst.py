@@ -137,6 +137,24 @@ def widen_row_tiles_to_compact(
     store_lane_grouped_as_compact(compact_ref, jnp.concatenate(rows, axis=0))
 
 
+def widen_row_tiles_as_compact(tiles_ref: jax.Ref, rows_ref: jax.Ref) -> None:
+    """Widens HBM row tiles into compact f32 rows, in row order.
+
+    Args:
+        tiles_ref: [groups, cols / lanes, tile_rows, lanes] row tiles.
+        rows_ref: [1, groups * tile_rows, 1, cols] f32; row `j` receives row
+            `j` of the tiles.
+    """
+    groups, lane_groups, tile_rows, num_lanes = tiles_ref.shape
+    flat_ref = rows_ref.reshape(-1, num_lanes)
+    block = tile_rows * lane_groups
+    for g in range(groups):
+        tile = tiles_ref[g].astype(jnp.float32)
+        flat_ref[pl.ds(g * block, block), :] = jnp.swapaxes(tile, 0, 1).reshape(
+            block, num_lanes
+        )
+
+
 def _region_rows_per_block(
     slot_ref: jax.Ref, region: config.StateRegion
 ) -> tuple[int, int]:
