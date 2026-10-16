@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_LIVE: bool = False
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     TPU_MLA_DECODE_ROW_WIDTHS: str = ""
+    TPU_MLA_DECODE_BODY_LEVERS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = False
     TPU_DCP_MLA_MIXED_UNION_GATHER: str = ""
@@ -697,6 +698,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tiles, w the smallest width covering the batch's largest per-rank kv_len.
     # Rows past kv_len are masked either way: same results. "" = off.
     "TPU_MLA_DECODE_ROW_WIDTHS": lambda: os.getenv("TPU_MLA_DECODE_ROW_WIDTHS", ""),
+    # With TPU_MLA_DECODE_ROW_WIDTHS (fused-prep decode buckets): attention-body
+    # levers on the decode body -- "1" = the bitwise default set (byte-transpose
+    # NOPE unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
+    # MXU/VPU dependency, one stacked softmax per grid step, fix-up only on
+    # overflowing steps, live-row KV fetches, eight tokens per attention grid
+    # step), or a comma list of lever names (kernels/mla/sparse/kernel.py
+    # DECODE_BODY_LEVERS). Empty = off.
+    "TPU_MLA_DECODE_BODY_LEVERS": lambda: os.getenv("TPU_MLA_DECODE_BODY_LEVERS", ""),
     # With TPU_DCP_MLA_MIXED_LIVE: attention-body rewrites of the live grid
     # steps -- "1" = the bitwise-identical default set (byte-transpose NOPE
     # unpack, per-row zeroing on the packed words, NOPE-only PV, no forced

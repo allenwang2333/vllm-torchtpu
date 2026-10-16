@@ -1407,6 +1407,41 @@ MIXED_BODY_LEVERS = (
 )
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
+# Decode body levers (`decode_body_levers`, TPU_MLA_DECODE_BODY_LEVERS): the
+# bitwise mixed-body levers on the decode (row-widths) body, plus "nofill" --
+# with the kernel-owned lse on a bucket one grid step covers whole (tokens <=
+# batch size, no send layout), the step's own lse store defines every row, so
+# the sentinel fill DMA (and its wait) runs only when there is no work.
+DECODE_BODY_LEVERS = (
+    "tr",
+    "zu",
+    "pv512",
+    "noinf",
+    "pair",
+    "fxskip",
+    "q128",
+    "nofill",
+    # "quad": all of a step's tokens in one stacked [bz * heads, w] softmax
+    # (row max / exp / sum per row, exactly as per token), their unpacked KV
+    # staged in VMEM for the PVs that follow (one group per grid step).
+    "quad",
+    # "lrows": each token's KV fetch moves only its live rows (kv_len rounded
+    # up to 32, at least 32, at most the step's width) instead of the step's
+    # width; the rows past kv_len are zeroed and masked either way.
+    "lrows",
+    # "step8": the attention grid walks DECODE_STEP8_TOKENS tokens per step
+    # (largest divisor of the chunk) while the window prep and the SparseCore
+    # gather keep the small-chunk batch: fewer, larger grid steps, and the
+    # gather still writes only the real tokens' batches. A step that runs past
+    # the real tokens reads unwritten tiles for the padding tokens, whose
+    # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
+    "step8",
+)
+DECODE_STEP8_TOKENS = 8
+# The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
+# attention grid step and "quad" stacks them in one softmax; "nofill" and
+# "q128" measured no gain.
+DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", "step8")
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
@@ -1561,9 +1596,10 @@ def _attention_kernel(
     # Body lever "pair" (see below): its unpacked-KV ring is the last scratch
     # ref, after every other one.
     kv_stage_ref = None
-    if "pair" in body_levers:
+    if "pair" in body_levers or "quad" in body_levers:
         assert "xqk" not in body_levers
-        kv_stage_ref = refs[-1]  # [2, 2, bkv_sz, head_dim] unpacked KV ring
+        # [2, 2, bkv_sz, head_dim] unpacked KV ring ("quad": [1, bsz, ...])
+        kv_stage_ref = refs[-1]
         refs = refs[:-1]
     q_pe_hbm_ref = None
     bq_pe_x2_ref = None
@@ -1651,8 +1687,11 @@ def _attention_kernel(
     #            sublanes, PV with a transposed-LHS contraction; the lse
     #            arrives lane-dense (not bit-exact: reduction order).
     # Every stage-A lever except "xqk" is bitwise-identical.
-    assert not body_levers or group_tab_ref is not None
-    assert set(body_levers) <= set(MIXED_BODY_LEVERS), body_levers
+    assert not body_levers or group_tab_ref is not None or row_widths
+    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {"nofill", "quad", "lrows", "step8"}, (
+        body_levers
+    )
+    assert not ("quad" in body_levers and "pair" in body_levers)
     q128 = "q128" in body_levers
     assert not q128 or q_rope
     fix_refs = None
@@ -1694,6 +1733,13 @@ def _attention_kernel(
     assert q_hbm_ref.shape[1:] == o_hbm_ref.shape[1:]
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    # "nofill" (decode levers): the one grid step stores every row's lse.
+    nofill = (
+        "nofill" in body_levers
+        and lse_fill
+        and not send
+        and num_tokens <= batch_size
+    )
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
     if split_q:
@@ -1811,6 +1857,40 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
+        if rows is not None and "lrows" in body_levers:
+            # "lrows": token b moves rows [0, n_b), n_b = its kv_len rounded
+            # up to 32 (>= 32, <= rows); one DMA per (token, cache) on the
+            # cache's semaphore, waited with the same descriptors.
+            page_idx_start = seq_idx_start - start_seq_idx
+            rope_div = bkv_sz // cache_kv_rope_hbm_ref.shape[1]
+            for b in range(batch_size):
+                kv_b = kv_lens_ref[seq_idx_start + b]
+                n_b = jnp.clip((kv_b + 31) // 32 * 32, 32, rows)
+                n_b = pl.multiple_of(n_b, 32)
+                r_b = pl.multiple_of(n_b // rope_div, 8)
+                nope_dst = bkv_nope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, n_b)]
+                rope_dst = bkv_rope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, r_b)]
+                if wait:
+                    _async_copy(nope_dst, nope_dst, sem_nope, True)
+                    _async_copy(rope_dst, rope_dst, sem_rope, True)
+                else:
+                    _async_copy(
+                        cache_kv_nope_hbm_ref.at[
+                            pl.ds(page_idx_start + b, 1), pl.ds(0, n_b)
+                        ],
+                        nope_dst,
+                        sem_nope,
+                        False,
+                    )
+                    _async_copy(
+                        cache_kv_rope_hbm_ref.at[
+                            pl.ds(page_idx_start + b, 1), pl.ds(0, r_b)
+                        ],
+                        rope_dst,
+                        sem_rope,
+                        False,
+                    )
+            return
         if rows is not None:
             # `row_widths`: only the first `rows` rows of each token's tile.
             rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
@@ -2503,6 +2583,45 @@ def _attention_kernel(
                 prev = (par, p, l_sum, m)
             pair_finish(batch_size // 2 - 1, *prev, levers)
 
+        def run_quad(rows, levers):
+            """Decode lever "quad": the step's bsz tokens' QK scores stacked
+            into one [bsz * heads, w] tile (row max / exp / sum per row),
+            their unpacked KV staged in `kv_stage_ref[0]` and read back by
+            the PVs after the softmax."""
+            h = num_q_heads
+            scores = []
+            kv_lens = []
+            w = None
+            for t in range(batch_size):
+                kv_lens.append(kv_lens_ref[batch_start_seq_idx + t])
+                kv = load_bkv(bi_sem_idx, t, rows, levers)
+                w = kv.shape[0]
+                kv_stage_ref.at[0, t, pl.ds(0, w)][...] = kv
+                q = load_bq(bi_sem_idx, t)
+                scores.append(
+                    jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
+                )
+            s = jnp.concatenate(scores, axis=0)
+            s *= sm_scale
+            if k_scale != 1.0:
+                s *= k_scale
+            row = lax.broadcasted_iota(jnp.int32, s.shape, 0)
+            lim = jnp.full(s.shape, kv_lens[batch_size - 1], jnp.int32)
+            for t in range(batch_size - 2, -1, -1):
+                lim = jnp.where(row < (t + 1) * h, kv_lens[t], lim)
+            span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(span < lim, s, jnp.finfo(jnp.float32).min)
+            m = jnp.max(s, axis=1, keepdims=True)
+            p = jnp.exp(s - m)
+            l_sum = jnp.sum(p, axis=1, keepdims=True)
+            for t in range(batch_size):
+                kv = kv_stage_ref.at[0, t, pl.ds(0, w)][...]
+                out = attention_step2_pv(
+                    p[t * h : (t + 1) * h], kv, l_sum[t * h : (t + 1) * h], levers
+                )
+                store_out(bo_sem_idx, t, out)
+                write_blse(t, m[t * h : (t + 1) * h], l_sum[t * h : (t + 1) * h])
+
         def xqk_row_to_col(row):
             """[1, heads] -> [heads, 1] exactly (one live entry per row)."""
             h = num_q_heads
@@ -2573,6 +2692,8 @@ def _attention_kernel(
         def run_steps(rows=None, levers=()):
             if "pair" in levers:
                 return run_pairs(rows, levers)
+            if "quad" in levers:
+                return run_quad(rows, levers)
             if "xqk" in levers:
                 return run_steps_xqk(rows, levers)
             prev_p = None
@@ -2653,7 +2774,7 @@ def _attention_kernel(
         elif capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
-        if lse_fill and not send:
+        if lse_fill and not send and not nofill:
             # The sentinel fill must land before this step's rows overwrite it.
             @pl.when(pl.program_id(0) == 0)
             def _():
@@ -2678,6 +2799,15 @@ def _attention_kernel(
             fill_ref[...] = jnp.full(fill_ref.shape, sentinel, jnp.float32)
             if send:
                 return  # VMEM only: the word build reads it.
+            if nofill:
+                # The only step stores every row; the fill is needed only
+                # when there is no work (no step stores anything).
+                @pl.when(jnp.logical_not(has_work))
+                def _():
+                    fill_copy().start()
+                    fill_copy().wait()
+
+                return
             fill_copy().start()
 
             @pl.when(jnp.logical_not(has_work))
@@ -2821,6 +2951,7 @@ def prepare_outputs(
         "mixed_union_gather_pair",
         "mixed_union_gather_fault",
         "decode_row_widths",
+        "decode_body_levers",
         "send_world",
         "out_pieces",
         "out_pieces_fault",
@@ -2874,6 +3005,7 @@ def sparse_ragged_paged_attention(
     decode_row_widths: tuple[int, ...] = (),
     send_world: int = 0,
     out_pieces: int = 0,
+    decode_body_levers: tuple[str, ...] = (),
     mixed_union_gather: bool = False,
     mixed_union_gather_rope: bool = False,
     mixed_union_gather_pair: bool = False,
@@ -3176,10 +3308,21 @@ def sparse_ragged_paged_attention(
         raise ValueError(f"unknown mixed_union_gather_fault {mixed_union_gather_fault}")
     if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
         raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
+    if not set(decode_body_levers) <= set(DECODE_BODY_LEVERS):
+        raise ValueError(
+            f"decode_body_levers {decode_body_levers} not in {DECODE_BODY_LEVERS}"
+        )
+    if "quad" in decode_body_levers and "pair" in decode_body_levers:
+        raise ValueError("decode_body_levers: 'pair' and 'quad' are alternatives")
+    if "zu" in decode_body_levers and "pv512" not in decode_body_levers:
+        # "zu" leaves ROPE rows past kv_len as gathered; only a NOPE-only PV
+        # keeps them out of the output.
+        raise ValueError("decode_body_levers: 'zu' needs 'pv512'")
     if q_rope_table is None:
         # "q128" narrows the in-kernel q rope's raw-head DMA; without it
         # there is nothing to narrow.
         mixed_body_levers = tuple(v for v in mixed_body_levers if v != "q128")
+        decode_body_levers = tuple(v for v in decode_body_levers if v != "q128")
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
@@ -3448,6 +3591,11 @@ def sparse_ragged_paged_attention(
                 if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
                 else ()
             ),
+            row_levers=(
+                decode_body_levers
+                if group_tab is None and fused_prep and decode_row_widths
+                else ()
+            ),
             q_rope_table=q_rope_table,
             lse_fill=lse_fill,
             prologue_fault=prologue_fault,
@@ -3635,6 +3783,7 @@ def sparse_attention_chunk(
     group_num_live: jax.Array | None = None,
     group_widths: tuple[int, ...] = (),
     group_levers: tuple[str, ...] = (),
+    row_levers: tuple[str, ...] = (),
     q_rope_table: jax.Array | None = None,
     lse_fill: bool = False,
     prologue_fault: str | None = None,
@@ -3856,7 +4005,9 @@ def sparse_attention_chunk(
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, *q_rope_table.shape[1:]), jnp.float32)
             )
-        stage_levers = tuple(group_levers) if live_views is not None else ()
+        stage_levers = (
+            tuple(group_levers) if live_views is not None else tuple(row_levers)
+        )
         if split_q:
             # q_pe double buffer; the last scratch ref (but for "pair"'s ring).
             # "q128": only the 128 lanes `load_bq` reads.
@@ -3864,8 +4015,9 @@ def sparse_attention_chunk(
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, num_q_heads, pe_lanes), q_pe.dtype)
             )
-        if "pair" in stage_levers:
-            # Body lever "pair": unpacked KV of a token pair, two pair slots.
+        if "pair" in stage_levers or "quad" in stage_levers:
+            # Body lever "pair": unpacked KV of a token pair, two pair slots
+            # ("quad": one slot of the whole step's tokens).
             pair_head_dim = (
                 align_to(q.shape[-1] + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128)
                 if split_q
@@ -3874,7 +4026,10 @@ def sparse_attention_chunk(
             assert sparsecore_layout
             scratch_shapes.append(
                 pltpu.VMEM(
-                    (2, 2, cache_kv_nope.shape[1], pair_head_dim), jnp.float8_e4m3fn
+                    (1, batch_size, cache_kv_nope.shape[1], pair_head_dim)
+                    if "quad" in stage_levers
+                    else (2, 2, cache_kv_nope.shape[1], pair_head_dim),
+                    jnp.float8_e4m3fn,
                 )
             )
 
@@ -3909,6 +4064,9 @@ def sparse_attention_chunk(
             out_row_offset=out_offset,
             out_in=out_carried is not None,
         )
+        if live_views is None and row_levers and row_widths and capped_windows:
+            # Decode body levers on the row-widths body.
+            kernel_body = functools.partial(kernel_body, body_levers=tuple(row_levers))
         if live_views is not None:
             group_body = functools.partial(
                 kernel_body,
@@ -4023,6 +4181,14 @@ def sparse_attention_chunk(
     # `kernel_batch_size`.
     valid_rows = jnp.maximum(0, jnp.minimum(token_end, end_pos) - start_pos)
     batch_end = start_pos + cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
+    # Decode lever "step8": the attention grid's own step (the prep and the
+    # gather above keep `kernel_batch_size`).
+    attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
+    if "step8" in row_levers and small_chunk:
+        attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
+        attn_batch_end = (
+            start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
+        )
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
     # For prefilling of short sequences (or early in the sequence), there are
@@ -4219,8 +4385,8 @@ def sparse_attention_chunk(
         gathered_rope_buffer,
         kv_lens,
         start_seq_idx=start_pos,
-        end_seq_idx=batch_end,
-        kernel_batch_size=kernel_batch_size,
+        end_seq_idx=attn_batch_end,
+        kernel_batch_size=attn_batch_size,
         lse=lse,
         live_views=live_views,
     )
