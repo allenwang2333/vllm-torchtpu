@@ -730,17 +730,26 @@ def _topk_body(
         row = flat
         active_row = row < b
         num_dmas = jnp.where(active_row, rank_major_dcp, 0)
+        # The row's rank and local slots are only read at emission: fetch them
+        # on their own semaphore, in flight with the score pieces, rather than
+        # as two serial copies ahead of them.
+        meta_copies = (
+            pltpu.make_async_copy(
+                lengths_hbm.at[pl.ds(pl.multiple_of(row * LANES, LANES), LANES)],
+                lenall_vmem.at[pl.ds(0, LANES)],
+                dma_sem.at[1],
+            ),
+            pltpu.make_async_copy(
+                local_idxs_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
+                lidx_vmem.at[pl.ds(0, k)],
+                dma_sem.at[1],
+            ),
+        )
 
         @pl.when(active_row)
         def _():
-            pltpu.sync_copy(
-                lengths_hbm.at[pl.ds(pl.multiple_of(row * LANES, LANES), LANES)],
-                lenall_vmem.at[pl.ds(0, LANES)],
-            )
-            pltpu.sync_copy(
-                local_idxs_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
-                lidx_vmem.at[pl.ds(0, k)],
-            )
+            for c in meta_copies:
+                c.start()
 
         @pl.loop(0, num_dmas)
         def _(r):
@@ -749,6 +758,11 @@ def _topk_body(
                 rowdata_vmem.at[pl.ds(pl.multiple_of(r * k, LANES), k)],
                 dma_sem.at[0],
             ).start()
+
+        @pl.when(active_row)
+        def _():
+            for c in meta_copies:
+                c.wait()
 
         _run_step(
             rowdata_vmem,
@@ -994,7 +1008,7 @@ def _sc_topk_direct(
             *scratch_types,
             pltpu.VMEM((slice_len,), jnp.int32),  # rowdata_vmem
             pltpu.VMEM((LANES,), jnp.int32),  # lenall_vmem: this row's rank
-            pltpu.SemaphoreType.DMA((1,)),  # dma_sem
+            pltpu.SemaphoreType.DMA((2,)),  # dma_sem: [scores, rank + slots]
             pltpu.VMEM((k,), jnp.int32),  # lidx_vmem: this row's local idxs
         )
 
