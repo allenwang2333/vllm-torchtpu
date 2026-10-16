@@ -74,30 +74,152 @@ def _unwrap(x: Any) -> Any:
     return x
 
 
-def parse_mk_buckets(env_val: str | None = None) -> tuple[int, ...]:
-    """Parse comma-separated `T=1` decode batch buckets (or `'0'` to disable)."""
-    raw = env_val if env_val is not None else envs.VLLM_TPU_QWEN35_MK_BUCKETS
-    if raw.strip().lower() in ("0", "none", "off", "false", ""):
+def _parse_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", "none", ""):
+        return False
+    raise ValueError(f"MegakernelDriver: invalid boolean value {val!r}")
+
+
+def parse_mk_buckets(val: str | Sequence[int] | None = None) -> tuple[int, ...]:
+    """Parse `T=1` decode batch buckets from a string or sequence (`'0'` disables)."""
+    if val is None:
+        cfg = parse_megakernel_config()
+        return cfg["buckets"]
+    if not isinstance(val, str):
+        buckets = sorted({int(x) for x in val})
+        if not buckets:
+            return ()
+        _need(
+            all(1 <= b <= 64 for b in buckets),
+            f"invalid decode buckets={val!r}",
+        )
+        return tuple(buckets)
+    raw = val.strip()
+    if raw.lower() in ("0", "none", "off", "false", ""):
         return ()
-    buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
+    parts = raw.replace(":", ",").split(",")
+    buckets = sorted({int(x.strip()) for x in parts if x.strip()})
     _need(
         len(buckets) > 0 and all(1 <= b <= 64 for b in buckets),
-        f"invalid VLLM_TPU_QWEN35_MK_BUCKETS={raw!r}",
+        f"invalid decode buckets={val!r}",
     )
     return tuple(buckets)
 
 
-def parse_mk_verify_buckets(env_val: str | None = None) -> tuple[int, ...]:
-    """Parse comma-separated `T=4` MTP verify row buckets (or `'0'` to disable)."""
-    raw = env_val if env_val is not None else envs.VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS
-    if raw.strip().lower() in ("0", "none", "off", "false", ""):
+def parse_mk_verify_buckets(val: str | Sequence[int] | None = None) -> tuple[int, ...]:
+    """Parse `T=4` MTP verify row buckets from a string or sequence (`'0'` disables)."""
+    if val is None:
+        cfg = parse_megakernel_config()
+        return cfg["verify_buckets"]
+    if not isinstance(val, str):
+        buckets = sorted({int(x) for x in val})
+        if not buckets:
+            return ()
+        _need(
+            all(4 <= b <= 64 and b % 4 == 0 for b in buckets),
+            f"invalid verify_buckets={val!r}",
+        )
+        return tuple(buckets)
+    raw = val.strip()
+    if raw.lower() in ("0", "none", "off", "false", ""):
         return ()
-    buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
+    parts = raw.replace(":", ",").split(",")
+    buckets = sorted({int(x.strip()) for x in parts if x.strip()})
     _need(
         len(buckets) > 0 and all(4 <= b <= 64 and b % 4 == 0 for b in buckets),
-        f"invalid VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS={raw!r}",
+        f"invalid verify_buckets={val!r}",
     )
     return tuple(buckets)
+
+
+def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, Any]:
+    """Parse `VLLM_TPU_MEGAKERNEL` and `vllm_config.additional_config['megakernel']`.
+
+    Supported `VLLM_TPU_MEGAKERNEL` formats:
+    - `""` / `"0"` / `"false"`: disabled (default)
+    - `"1"` / `"true"`: enabled with default settings
+    - `"ep"` / `"tp"`: enabled with explicit sharding mode
+    - `"mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1,stats_period_s=30"`
+    - JSON object string, e.g. `'{"mode": "tp", "buckets": [8, 16], "ab": true}'`
+    """
+    cfg: dict[str, Any] = {
+        "enabled": False,
+        "mode": "",
+        "buckets": _DEFAULT_BUCKETS,
+        "verify_buckets": _DEFAULT_VERIFY_BUCKETS,
+        "ab": False,
+        "stats_period_s": 60.0,
+        "compile_hlo_check": False,
+    }
+
+    def _apply_dict(d: dict[str, Any]) -> None:
+        cfg["enabled"] = _parse_bool(d.get("enabled", True))
+        if "mode" in d and d["mode"] is not None:
+            m = str(d["mode"]).strip().lower()
+            _need(m in ("", "auto", "ep", "tp"), f"invalid mode={d['mode']!r}")
+            cfg["mode"] = "" if m == "auto" else m
+        if "buckets" in d and d["buckets"] is not None:
+            cfg["buckets"] = parse_mk_buckets(d["buckets"])
+        if "verify_buckets" in d and d["verify_buckets"] is not None:
+            cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
+        if "ab" in d and d["ab"] is not None:
+            cfg["ab"] = _parse_bool(d["ab"])
+        if "stats_period_s" in d and d["stats_period_s"] is not None:
+            cfg["stats_period_s"] = float(d["stats_period_s"])
+        if "compile_hlo_check" in d and d["compile_hlo_check"] is not None:
+            cfg["compile_hlo_check"] = _parse_bool(d["compile_hlo_check"])
+
+    sources: list[Any] = [envs.VLLM_TPU_MEGAKERNEL if raw is None else raw]
+    if runner is not None:
+        vllm_cfg = getattr(runner, "vllm_config", None)
+        add_cfg = getattr(vllm_cfg, "additional_config", None)
+        if isinstance(add_cfg, dict) and "megakernel" in add_cfg:
+            sources.append(add_cfg["megakernel"])
+
+    for src in sources:
+        if src is None:
+            continue
+        if isinstance(src, bool):
+            cfg["enabled"] = src
+            continue
+        if isinstance(src, dict):
+            _apply_dict(src)
+            continue
+        s = str(src).strip()
+        if not s or s.lower() in ("0", "false", "no", "off", "none"):
+            cfg["enabled"] = False
+            continue
+        if s.lower() in ("1", "true", "yes", "on"):
+            cfg["enabled"] = True
+            continue
+        if s.lower() in ("ep", "tp"):
+            cfg["enabled"] = True
+            cfg["mode"] = s.lower()
+            continue
+        if s.startswith("{"):
+            parsed = json.loads(s)
+            _need(isinstance(parsed, dict), f"expected JSON object in {s!r}")
+            _apply_dict(parsed)
+            continue
+        kv_dict: dict[str, Any] = {}
+        for item in s.split(","):
+            part = item.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(f"Invalid VLLM_TPU_MEGAKERNEL entry {part!r} in {s!r}")
+            k, v = part.split("=", 1)
+            kv_dict[k.strip()] = v.strip()
+        _apply_dict(kv_dict)
+
+    return cfg
 
 
 def select_bucket(num_tokens: int, buckets: Sequence[int] = _DEFAULT_BUCKETS) -> int:
@@ -506,6 +628,9 @@ class MegakernelDriver:
         buckets: Sequence[int] = _DEFAULT_BUCKETS,
         verify_buckets: Sequence[int] = _DEFAULT_VERIFY_BUCKETS,
         reshard_ep_to_tp: bool = False,
+        ab: bool | None = None,
+        stats_period_s: float | None = None,
+        compile_hlo_check: bool | None = None,
     ) -> None:
         _need(mode in ("ep", "tp"), f"invalid mode={mode!r}; expected 'ep' or 'tp'")
         self.model = model
@@ -585,6 +710,7 @@ class MegakernelDriver:
             time.perf_counter() - t0,
         )
 
+        default_cfg = parse_megakernel_config()
         self.raw_pools: list[torch.Tensor] = []
         self.num_pages: int = 0
         self.page_size: int = 128
@@ -603,16 +729,24 @@ class MegakernelDriver:
         self._prepared_step: tuple[Any, ...] | None = None
         self._step_mix: dict[str, int] = {}
         self._step_mix_t0: float = time.monotonic()
-        self._step_mix_period_s: float = float(envs.VLLM_TPU_QWEN35_MK_STATS_PERIOD_S)
+        self._step_mix_period_s: float = float(
+            default_cfg["stats_period_s"] if stats_period_s is None else stats_period_s
+        )
+        self._compile_hlo_check: bool = bool(
+            default_cfg["compile_hlo_check"]
+            if compile_hlo_check is None
+            else compile_hlo_check
+        )
         self.ab_calibrator = MKABCalibrator(
-            enabled=bool(envs.VLLM_TPU_QWEN35_MK_AB),
+            enabled=bool(default_cfg["ab"] if ab is None else ab),
             period_s=self._step_mix_period_s,
         )
 
     @classmethod
     def maybe_create(cls, runner: Any) -> MegakernelDriver | None:
         """Create a `MegakernelDriver` for `runner` if enabled and compatible."""
-        if not envs.VLLM_TPU_QWEN35_MEGAKERNEL:
+        cfg = parse_megakernel_config(runner=runner)
+        if not cfg["enabled"]:
             return None
         try:
             backbone = find_backbone(runner.model)
@@ -666,16 +800,16 @@ class MegakernelDriver:
         w13_0 = routed0.w13_weight
         loaded_ep = int(w13_0.shape[0]) < 512
 
-        req_mode = envs.VLLM_TPU_QWEN35_MK_MODE.lower()
+        req_mode = str(cfg["mode"]).lower()
         if req_mode not in ("", "ep", "tp"):
             raise ValueError(
-                f"Invalid VLLM_TPU_QWEN35_MK_MODE={req_mode!r}; expected 'ep' or 'tp'"
+                f"Invalid megakernel mode={req_mode!r}; expected 'ep' or 'tp'"
             )
         mode = req_mode if req_mode else ("ep" if loaded_ep else "tp")
         reshard = mode == "tp" and loaded_ep
         mesh = build_ep_mesh() if mode == "ep" else runner.mesh
-        buckets = parse_mk_buckets()
-        verify_buckets = parse_mk_verify_buckets()
+        buckets = tuple(cfg["buckets"])
+        verify_buckets = tuple(cfg["verify_buckets"])
         if not buckets and not verify_buckets:
             logger.info("Qwen3.5 megakernel disabled (both bucket lists empty).")
             return None
@@ -688,6 +822,9 @@ class MegakernelDriver:
             buckets=buckets,
             verify_buckets=verify_buckets,
             reshard_ep_to_tp=reshard,
+            ab=bool(cfg["ab"]),
+            stats_period_s=float(cfg["stats_period_s"]),
+            compile_hlo_check=bool(cfg["compile_hlo_check"]),
         )
 
     def bind_caches(self, runner: Any) -> None:
@@ -824,9 +961,7 @@ class MegakernelDriver:
         ckpt_cols_hlo = 2 if tokens_per_seq == 1 else tokens_per_seq
         if tokens_per_seq not in self._hlo_checked_t:
             self._hlo_checked_t.add(tokens_per_seq)
-            compile_hlo = bool(envs.VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK) or (
-                is_tpu and not ex.interpret
-            )
+            compile_hlo = bool(self._compile_hlo_check) or (is_tpu and not ex.interpret)
             ok_hlo, reason_hlo = verify_pooled_step_hlo(
                 self.mesh,
                 self.spec,

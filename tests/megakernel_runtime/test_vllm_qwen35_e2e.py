@@ -45,6 +45,7 @@ from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     MegakernelDriver,
     MKABCalibrator,
+    parse_megakernel_config,
     parse_mk_buckets,
     parse_mk_verify_buckets,
     prepare_step_inputs_eager,
@@ -330,17 +331,58 @@ def _make_backbone_from_logical_weights(
 
 
 def test_bucket_parsing_and_selection() -> None:
-    """Verify decode/verify bucket parsing, sorting, and smallest-fit selection."""
+    """Verify decode/verify bucket parsing, sorting, config parsing, and selection."""
     assert parse_mk_buckets("16, 4, 8, 4") == (4, 8, 16)
+    assert parse_mk_buckets("16:4:8") == (4, 8, 16)
     assert parse_mk_buckets("0") == ()
     assert parse_mk_buckets("off") == ()
-    with pytest.raises(ValueError, match="invalid VLLM_TPU_QWEN35_MK_BUCKETS"):
+    with pytest.raises(ValueError, match="invalid decode buckets"):
         parse_mk_buckets("128")
 
     assert parse_mk_verify_buckets("16, 4, 8") == (4, 8, 16)
+    assert parse_mk_verify_buckets("16:4:8") == (4, 8, 16)
     assert parse_mk_verify_buckets("none") == ()
-    with pytest.raises(ValueError, match="invalid VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS"):
+    with pytest.raises(ValueError, match="invalid verify_buckets"):
         parse_mk_verify_buckets("6")
+
+    # Single VLLM_TPU_MEGAKERNEL string forms + additional_config["megakernel"]
+    assert not parse_megakernel_config(raw="")["enabled"]
+    assert not parse_megakernel_config(raw="0")["enabled"]
+    cfg_on = parse_megakernel_config(raw="1")
+    assert cfg_on["enabled"] and cfg_on["mode"] == ""
+    cfg_tp = parse_megakernel_config(raw="tp")
+    assert cfg_tp["enabled"] and cfg_tp["mode"] == "tp"
+    cfg_kv = parse_megakernel_config(
+        raw="mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1"
+    )
+    assert cfg_kv["enabled"]
+    assert cfg_kv["mode"] == "tp"
+    assert cfg_kv["buckets"] == (8, 16, 32)
+    assert cfg_kv["verify_buckets"] == (4, 8)
+    assert cfg_kv["ab"] is True
+    assert cfg_kv["stats_period_s"] == pytest.approx(12.5)
+    assert cfg_kv["compile_hlo_check"] is True
+
+    cfg_json = parse_megakernel_config(
+        raw='{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], "ab": false}'
+    )
+    assert cfg_json["enabled"]
+    assert cfg_json["mode"] == "ep"
+    assert cfg_json["buckets"] == (4, 8)
+    assert cfg_json["verify_buckets"] == (4,)
+
+    fake_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={
+                "megakernel": {"mode": "tp", "buckets": [16, 32], "ab": True}
+            }
+        )
+    )
+    cfg_runner = parse_megakernel_config(runner=fake_runner, raw="")
+    assert cfg_runner["enabled"]
+    assert cfg_runner["mode"] == "tp"
+    assert cfg_runner["buckets"] == (16, 32)
+    assert cfg_runner["ab"] is True
 
     buckets = (2, 4, 8)
     assert select_bucket(1, buckets) == 2
