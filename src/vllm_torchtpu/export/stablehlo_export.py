@@ -44,6 +44,8 @@ _MLIR_DTYPE_TO_TORCH_NAME = {
     "f32": "float32",
     "f64": "float64",
     "i1": "bool",
+    "i4": "int4",
+    "ui4": "uint4",
     "i8": "int8",
     "ui8": "uint8",
     "i16": "int16",
@@ -53,7 +55,9 @@ _MLIR_DTYPE_TO_TORCH_NAME = {
     "i64": "int64",
     "ui64": "uint64",
     "f8E4M3FN": "float8_e4m3fn",
+    "f8E4M3FNUZ": "float8_e4m3fnuz",
     "f8E5M2": "float8_e5m2",
+    "f8E5M2FNUZ": "float8_e5m2fnuz",
 }
 _TORCH_NAME_TO_MLIR_DTYPE = {v: k for k, v in _MLIR_DTYPE_TO_TORCH_NAME.items()}
 _TORCH_TENSOR_DTYPES = set(_MLIR_DTYPE_TO_TORCH_NAME.values())
@@ -82,6 +86,12 @@ _TORCH_TO_SAFETENSORS_DTYPE: dict[torch.dtype, str] = {
     torch.int64: "I64",
     torch.bool: "BOOL",
 }
+for _fp8_attr, _st_code in (
+    ("float8_e4m3fn", "F8_E4M3"),
+    ("float8_e5m2", "F8_E5M2"),
+):
+    if hasattr(torch, _fp8_attr):
+        _TORCH_TO_SAFETENSORS_DTYPE[getattr(torch, _fp8_attr)] = _st_code
 
 _ACTIVE_PARAM_MAP: dict[int, str] = {}
 _ACTIVE_MODEL: Any = None
@@ -90,6 +100,9 @@ _CAPTURED_CONSTANTS: dict[str, torch.Tensor] = {}
 
 def update_hash_with_loaded_hlo(hash_obj: Any) -> None:
     """Fold `VLLM_TORCHTPU_LOAD_HLO_DIR` `.mlir` and metadata into compilation hash."""
+    export_hlo_dir = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
+    if export_hlo_dir:
+        hash_obj.update(f"export:{export_hlo_dir}".encode())
     load_hlo_dir = str(envs.VLLM_TORCHTPU_LOAD_HLO_DIR or "").strip()
     if not load_hlo_dir:
         return
@@ -177,16 +190,62 @@ def _parse_subgraph_index(key: str | None) -> int:
     return 0
 
 
-def _compute_fn_key(compile_range: Range, subgraph_idx: int) -> str:
+def _is_export_writer_rank(runner: Any = None) -> bool:
+    for env_key in ("RANK", "LOCAL_RANK", "TORCH_TPU_SLICE_RANK"):
+        raw = os.environ.get(env_key)
+        if raw is not None and str(raw).strip() not in ("", "0"):
+            try:
+                if int(str(raw).strip()) != 0:
+                    return False
+            except ValueError:
+                pass
+    if runner is not None:
+        for attr in ("rank", "local_rank"):
+            val = getattr(runner, attr, None)
+            if isinstance(val, int) and val != 0:
+                return False
+        pc = getattr(runner, "parallel_config", None)
+        if pc is not None:
+            dp_rank = getattr(pc, "data_parallel_rank", None)
+            if isinstance(dp_rank, int) and dp_rank != 0:
+                return False
+    return True
+
+
+def _is_draft_compilation(adaptor: Any = None) -> bool:
+    cache_dir = str(getattr(adaptor, "cache_dir", "") or "")
+    if "eagle_head" in cache_dir or "mtp_draft" in cache_dir:
+        return True
+    with contextlib.suppress(Exception):
+        from vllm.compilation.wrapper import get_model_tag
+
+        if get_model_tag() == "eagle_head":
+            return True
+    with contextlib.suppress(Exception):
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config()
+        if (
+            getattr(getattr(cfg, "model_config", None), "runner_type", None)
+            == "draft"
+        ):
+            return True
+    return False
+
+
+def _compute_fn_key(
+    compile_range: Range, subgraph_idx: int, adaptor: Any = None
+) -> str:
+    prefix = "mtp_draft" if _is_draft_compilation(adaptor) else "forward"
     if subgraph_idx == 0:
-        return f"forward_bucket{compile_range.start}"
-    return f"forward_piece{subgraph_idx}_bucket{compile_range.start}"
+        return f"{prefix}_bucket{compile_range.start}"
+    return f"{prefix}_piece{subgraph_idx}_bucket{compile_range.start}"
 
 
 def _split_fn_key(fn_key: str) -> tuple[str, str]:
     if fn_key == "abstract_params":
         return "abstract_params", "default"
-    m = re.match(r"^(forward(?:_piece\d+)?)_bucket(\d+)$", fn_key)
+    m = re.match(r"^((?:forward|mtp_draft)(?:_piece\d+)?)_bucket(\d+)$", fn_key)
     if m:
         return m.group(1), m.group(2)
     for prefix in ("compute_logits", "sample_top_tokens"):
@@ -249,10 +308,17 @@ def _parse_mlir_main_args(args_str: str) -> list[tuple[list[int | str], str, boo
     return [
         (
             *_parse_mlir_tensor_type(tensor_body),
-            bool(attr_str and re.search(r"buffer_donor\s*=\s*true", attr_str)),
+            bool(
+                attr_str
+                and re.search(
+                    r"(?:buffer_donor\s*=\s*true|tf\.aliasing_output)", attr_str
+                )
+            ),
         )
         for tensor_body, attr_str in re.findall(
-            r"tensor<([^>]+)>(\s*\{[^}]*\})?", args_str
+            r"tensor<([^>]+)>(\s*\{(?:[^{}\"]|\"[^\"]*\"|\{[^}]*\})*\})?",
+            args_str,
+            re.DOTALL,
         )
     ]
 
@@ -264,12 +330,19 @@ def _resolve_dynamo_placeholder(
     if not raw_name:
         return "", False, "user_io", False
     m = re.match(
-        r"^l_self_modules_(.+)_(parameters|buffers)_([A-Za-z0-9_]+?)_?$", raw_name
+        r"^l_self_(?:modules_(.+)_)?(parameters|buffers)_([A-Za-z0-9_]+?)_?$",
+        raw_name,
+        re.IGNORECASE,
     )
     if m:
-        mod_tokens, kind, attr = m.group(1), m.group(2), m.group(3)
-        sub_path = re.sub(r"_modules_", ".", mod_tokens)
-        candidates = [f"model.{sub_path}.{attr}", f"{sub_path}.{attr}"]
+        mod_tokens = m.group(1) or ""
+        kind = m.group(2).lower()
+        attr = m.group(3)
+        sub_path = re.sub(r"_modules_", ".", mod_tokens, flags=re.IGNORECASE)
+        if sub_path:
+            candidates = [f"model.{sub_path}.{attr}", f"{sub_path}.{attr}"]
+        else:
+            candidates = [f"model.{attr}", attr]
         canonical = candidates[0]
         if model is not None:
             known = set()
@@ -282,16 +355,21 @@ def _resolve_dynamo_placeholder(
                     canonical = cand
                     break
         is_const = kind == "buffers"
-        if is_const and attr in ("cos_sin_cache", "cos_sin_cache_bf16"):
+        if is_const and attr.lower() in ("cos_sin_cache", "cos_sin_cache_bf16"):
             canonical = "rotary_emb_inv_freq"
         return canonical, True, "weight", is_const
 
-    if "kv_cache" in raw_name:
-        m_layer = re.search(r"layers_(?:modules_)?(\d+)", raw_name)
+    lower_name = raw_name.lower()
+    if any(
+        s in lower_name
+        for s in ("kv_cache", "conv_state", "ssm_state", "mamba_cache")
+    ):
+        m_layer = re.search(r"layers_(?:modules_)?(\d+)", lower_name)
         layer_suffix = m_layer.group(1) if m_layer else "0"
         return f"kv_cache_layer_{layer_suffix}", False, "state", False
 
-    if raw_name.startswith("g_import_vllm") or "attn_metadata" in raw_name:
+    if lower_name.startswith("g_import_vllm") or "attn_metadata" in lower_name:
+        clean_lower = lower_name.rstrip("_")
         for suffix, canonical in (
             ("seq_lens", "kv_lens"),
             ("kv_lens", "kv_lens"),
@@ -300,10 +378,10 @@ def _resolve_dynamo_placeholder(
             ("request_distribution", "req_dist"),
             ("req_dist", "req_dist"),
         ):
-            if raw_name.endswith(suffix):
+            if clean_lower.endswith(suffix):
                 return canonical, False, "user_io", False
 
-    m_local = re.match(r"^l_([A-Za-z0-9_]+?)_?$", raw_name)
+    m_local = re.match(r"^l_([A-Za-z0-9_]+?)_?$", raw_name, re.IGNORECASE)
     if m_local:
         return m_local.group(1), False, "user_io", False
 
@@ -419,12 +497,31 @@ def _extract_input_specs(
     idx = 0
     for i in range(max(len(placeholders), len(example_inputs))):
         node = placeholders[i] if i < len(placeholders) else None
-        outer_node = outer_phs[i] if use_outer and i < len(outer_phs) else None
+        outer_node = None
+        outer_val = None
+        if node is not None and outer_phs:
+            m_arg = re.match(
+                r"^arg(\d+)_\d+$",
+                str(node.name or node.target or ""),
+                re.IGNORECASE,
+            )
+            if m_arg is not None:
+                outer_idx = int(m_arg.group(1))
+                if 0 <= outer_idx < len(outer_phs):
+                    outer_node = outer_phs[outer_idx]
+                    if outer_inputs is not None and outer_idx < len(outer_inputs):
+                        outer_val = outer_inputs[outer_idx]
+        if outer_node is None and use_outer and i < len(outer_phs):
+            outer_node = outer_phs[i]
+            if outer_inputs is not None and i < len(outer_inputs):
+                outer_val = outer_inputs[i]
         val = example_inputs[i] if i < len(example_inputs) else None
         if val is None and node is not None:
             val = node.meta.get("example_value", node.meta.get("val"))
         if val is None and outer_node is not None:
             val = outer_node.meta.get("example_value", outer_node.meta.get("val"))
+        if val is None and outer_val is not None:
+            val = outer_val
         if (
             val is None
             or isinstance(val, (int, float, bool, str))
@@ -507,6 +604,7 @@ def _extract_input_specs(
         if not is_weight and _ACTIVE_PARAM_MAP:
             for cand_v in (
                 val,
+                outer_val,
                 outer_inputs[i]
                 if outer_inputs is not None and i < len(outer_inputs)
                 else None,
@@ -539,10 +637,18 @@ def _extract_input_specs(
                     "_bias",
                     ".weight",
                     ".bias",
+                    "_scale",
+                    ".scale",
                     "w_q",
                     "w_k",
                     "w_v",
                     "w_o",
+                    "w13_weight",
+                    "w2_weight",
+                    "experts",
+                    "e_score_correction_bias",
+                    "a_log",
+                    "dt_bias",
                     "embed_tokens",
                     "lm_head",
                 )
@@ -714,7 +820,10 @@ def _write_abstract_params(
         "  }\n"
         "}\n"
     )
-    (export_dir / "abstract_params.mlir").write_text(mlir_text)
+    abs_path = export_dir / "abstract_params.mlir"
+    tmp_abs_path = export_dir / f"abstract_params.mlir.{os.getpid()}.tmp"
+    tmp_abs_path.write_text(mlir_text)
+    os.replace(tmp_abs_path, abs_path)
     metadata.setdefault("functions", {})["abstract_params"] = {
         "default": {
             "file_path": "abstract_params.mlir",
@@ -740,7 +849,9 @@ def _write_exported_module(
     export_dir.mkdir(parents=True, exist_ok=True)
     mlir_filename = f"{fn_key}.mlir"
     mlir_path = export_dir / mlir_filename
-    mlir_path.write_text(mlir_text)
+    tmp_mlir_path = export_dir / f"{mlir_filename}.{os.getpid()}.tmp"
+    tmp_mlir_path.write_text(mlir_text)
+    os.replace(tmp_mlir_path, mlir_path)
 
     metadata_path = export_dir / "metadata.json"
     metadata: dict[str, Any] = {}
@@ -749,6 +860,22 @@ def _write_exported_module(
             metadata = json.loads(metadata_path.read_text())
         except json.JSONDecodeError as exc:
             raise ValueError(f"Corrupt metadata.json in {export_dir}: {exc}") from exc
+
+    serving_ckpt_dir = export_dir / "serving_checkpoint"
+    wj_path = serving_ckpt_dir / "weight.json"
+    existing_weights: dict[str, Any] = {}
+    if wj_path.is_file():
+        with contextlib.suppress(Exception):
+            raw_wj = json.loads(wj_path.read_text())
+            if isinstance(raw_wj, dict):
+                existing_weights = raw_wj.get("weights", raw_wj)
+                existing_weights.pop("hf_checkpoint_path", None)
+                existing_weights.pop("checkpoint_path", None)
+    used_weight_indices: set[int] = {
+        int(v["index"])
+        for v in existing_weights.values()
+        if isinstance(v, dict) and isinstance(v.get("index"), int)
+    }
 
     annotated_inputs = [dict(inp) for inp in input_specs]
     for arg_idx, spec in enumerate(annotated_inputs):
@@ -759,7 +886,9 @@ def _write_exported_module(
         )
         spec.setdefault("buffer_donor", False)
 
-    match = re.search(r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)\s*->", mlir_text)
+    match = re.search(
+        r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)\s*->", mlir_text, re.DOTALL
+    )
     if match is not None:
         mlir_args = _parse_mlir_main_args(match.group(1))
         if len(mlir_args) == len(annotated_inputs):
@@ -772,10 +901,46 @@ def _write_exported_module(
                 ):
                     spec["argument_type"] = "state"
 
+    state_counter = 0
+    for spec in annotated_inputs:
+        if spec.get("argument_type") == "state":
+            if spec.get("index") == spec.get("arg_index"):
+                spec["index"] = state_counter
+            state_counter += 1
+
+    num_donors = sum(1 for spec in annotated_inputs if spec.get("buffer_donor"))
+    if (
+        fn_key.startswith("forward")
+        and num_donors > 0
+        and len(output_specs) > num_donors
+    ):
+        output_specs = [dict(out) for out in output_specs]
+        for out_idx, out_spec in enumerate(output_specs):
+            if out_idx < num_donors:
+                if out_spec.get("name") == f"output_{out_idx}":
+                    out_spec["name"] = f"kv_cache_out_layer_{out_idx}"
+                out_spec["argument_type"] = "state"
+            elif out_idx == len(output_specs) - 1:
+                if out_spec.get("name") == f"output_{out_idx}":
+                    out_spec["name"] = "hidden_states"
+                out_spec["argument_type"] = "intermediate"
+
     weight_map: dict[str, Any] = {}
     for inp in annotated_inputs:
         if inp.get("is_weight") and inp.get("weight_name"):
             w_name = str(inp["weight_name"])
+            existing_entry = existing_weights.get(w_name)
+            if isinstance(existing_entry, dict) and isinstance(
+                existing_entry.get("index"), int
+            ):
+                inp["index"] = int(existing_entry["index"])
+            else:
+                cand_idx = int(inp["index"])
+                if cand_idx in used_weight_indices:
+                    cand_idx = max(used_weight_indices, default=0) + 1
+                inp["index"] = cand_idx
+                used_weight_indices.add(cand_idx)
+
             raw_shape = inp.get("shape", [])
             int_shape = [int(d) for d in raw_shape if isinstance(d, int)]
             sources = inp.get("sources") or (
@@ -803,19 +968,11 @@ def _write_exported_module(
         clean_inputs.append(c_inp)
 
     if weight_map:
-        serving_ckpt_dir = export_dir / "serving_checkpoint"
         serving_ckpt_dir.mkdir(parents=True, exist_ok=True)
-        wj_path = serving_ckpt_dir / "weight.json"
-        existing_weights: dict[str, Any] = {}
-        if wj_path.is_file():
-            with contextlib.suppress(Exception):
-                raw_wj = json.loads(wj_path.read_text())
-                if isinstance(raw_wj, dict):
-                    existing_weights = raw_wj.get("weights", raw_wj)
-                    existing_weights.pop("hf_checkpoint_path", None)
-                    existing_weights.pop("checkpoint_path", None)
         existing_weights.update(weight_map)
-        wj_path.write_text(json.dumps(existing_weights, indent=2))
+        tmp_wj_path = serving_ckpt_dir / f"weight.json.{os.getpid()}.tmp"
+        tmp_wj_path.write_text(json.dumps(existing_weights, indent=2))
+        os.replace(tmp_wj_path, wj_path)
         _write_abstract_params(export_dir, metadata, existing_weights)
 
     fn_name, variant_key = _split_fn_key(fn_key)
@@ -883,12 +1040,44 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
             def _wait_for_engine_startup_with_early_exit(
                 *args: Any, **kwargs: Any
             ) -> Any:
+                export_dir_str = str(
+                    envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or ""
+                ).strip()
+
+                def _maybe_close_launch() -> None:
+                    launch = kwargs.get("launch") or (
+                        args[5] if len(args) > 5 else None
+                    )
+                    if launch is not None:
+                        engine_mgr = getattr(launch, "engine_manager", None)
+                        if engine_mgr is not None and hasattr(
+                            engine_mgr, "close"
+                        ):
+                            with contextlib.suppress(Exception):
+                                engine_mgr.close()
+                        coordinator = getattr(launch, "coordinator", None)
+                        if coordinator is not None and hasattr(
+                            coordinator, "close"
+                        ):
+                            with contextlib.suppress(Exception):
+                                coordinator.close()
+
                 try:
-                    return engine_utils._orig_wait_for_engine_startup(*args, **kwargs)
+                    res = engine_utils._orig_wait_for_engine_startup(
+                        *args, **kwargs
+                    )
+                    if export_dir_str and (
+                        Path(export_dir_str) / "metadata.json"
+                    ).is_file():
+                        logger.info(
+                            "[TpuCompilerAdaptor] Exported all StableHLO "
+                            "modules to %s; exiting early.",
+                            export_dir_str,
+                        )
+                        _maybe_close_launch()
+                        sys.exit(0)
+                    return res
                 except RuntimeError as exc:
-                    export_dir_str = str(
-                        envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or ""
-                    ).strip()
                     if export_dir_str:
                         export_dir = Path(export_dir_str)
                         if (export_dir / "metadata.json").is_file() or ": 0}" in str(
@@ -899,8 +1088,10 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
                                 "modules to %s; exiting early.",
                                 export_dir,
                             )
+                            _maybe_close_launch()
                             sys.exit(0)
                     raise
+
 
             _wait_for_engine_startup_with_early_exit._has_export_early_exit_hook = True  # type: ignore[attr-defined]
             engine_utils.wait_for_engine_startup = (
@@ -952,6 +1143,8 @@ def maybe_export_or_load_stablehlo(
         def _save_fx(
             module: fx.GraphModule, args: list[Any], exported_mlir: Any, idx: int
         ) -> None:
+            if not _is_export_writer_rank():
+                return
             input_specs = _extract_input_specs(
                 module, args, outer_graph=graph, outer_inputs=example_inputs
             )
@@ -983,7 +1176,7 @@ def maybe_export_or_load_stablehlo(
 
             _write_exported_module(
                 export_dir=export_dir,
-                fn_key=_compute_fn_key(compile_range, idx),
+                fn_key=_compute_fn_key(compile_range, idx, adaptor),
                 subgraph_idx=idx,
                 compile_size=compile_range.start,
                 mlir_text=exported_mlir.serialize_text(),
@@ -1062,7 +1255,7 @@ def maybe_export_or_load_stablehlo(
     def _validate_and_load(
         module: fx.GraphModule, args: list[Any], idx: int
     ) -> tuple[str, Path, str]:
-        fn_key = _compute_fn_key(compile_range, idx)
+        fn_key = _compute_fn_key(compile_range, idx, adaptor)
         entry = _get_function_entry(metadata, fn_key)
         if entry is None:
             raise FileNotFoundError(
@@ -1156,6 +1349,7 @@ def maybe_export_or_load_stablehlo(
         match = re.search(
             r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)(?:\s*->\s*([^\{\n]+))?",
             mlir_text,
+            re.DOTALL,
         )
         if match is None:
             if saved_inputs or saved_outputs:
@@ -1313,6 +1507,8 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     export_dir_str = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
     if not export_dir_str:
         return
+    if not _is_export_writer_rank(runner):
+        return
     export_dir = Path(export_dir_str)
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1323,7 +1519,25 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     hsize = runner.model_config.get_hidden_size()
     dtype = getattr(runner, "_hidden_states_dtype", torch.bfloat16)
     device = getattr(runner, "device", torch.device("cpu"))
-    num_reqs_paddings = getattr(runner, "num_reqs_paddings", [1])
+    raw_reqs_paddings = getattr(runner, "num_reqs_paddings", None) or [1]
+    raw_tokens_paddings = getattr(runner, "num_tokens_paddings", None) or []
+    fwd_bucket_sizes: list[int] = []
+    meta_path_pre = export_dir / "metadata.json"
+    if meta_path_pre.is_file():
+        with contextlib.suppress(Exception):
+            pre_meta = json.loads(meta_path_pre.read_text())
+            fwd_map = (pre_meta.get("functions") or {}).get("forward") or {}
+            if isinstance(fwd_map, dict):
+                for k in fwd_map:
+                    if str(k).isdigit():
+                        fwd_bucket_sizes.append(int(k))
+    num_reqs_paddings = sorted(
+        {
+            int(x)
+            for x in (*raw_reqs_paddings, *raw_tokens_paddings, *fwd_bucket_sizes)
+            if isinstance(x, int) and int(x) > 0
+        }
+    ) or [1]
 
     lm_head_weight = None
     if hasattr(runner, "model"):
@@ -1554,18 +1768,35 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 )
             if snap_dir is None or not snap_dir.is_dir():
                 repo_slug = "models--" + str(model_id).replace("/", "--")
-                for hf_home in (
-                    Path.home() / ".cache" / "huggingface",
-                    Path("/root/.cache/huggingface"),
-                ):
+                hf_homes: list[Path] = []
+                env_hf_home = os.environ.get("HF_HOME")
+                if env_hf_home:
+                    hf_homes.append(Path(env_hf_home))
+                hf_homes.extend(
+                    [
+                        Path.home() / ".cache" / "huggingface",
+                        Path("/root/.cache/huggingface"),
+                    ]
+                )
+                fallback_snap: Path | None = None
+                for hf_home in hf_homes:
                     snaps_root = hf_home / "hub" / repo_slug / "snapshots"
                     if snaps_root.is_dir():
                         for cand in sorted(snaps_root.iterdir()):
-                            if cand.is_dir() and list(cand.glob("*.safetensors")):
+                            if not cand.is_dir():
+                                continue
+                            if list(cand.glob("*.safetensors")):
                                 snap_dir = cand
                                 break
+                            if fallback_snap is None and (
+                                (cand / "config.json").is_file()
+                                or (cand / "tokenizer.json").is_file()
+                            ):
+                                fallback_snap = cand
                     if snap_dir is not None and snap_dir.is_dir():
                         break
+                if snap_dir is None and fallback_snap is not None:
+                    snap_dir = fallback_snap
 
     if snap_dir is not None and snap_dir.is_dir():
         for fname in (
@@ -1574,6 +1805,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             "config.json",
             "generation_config.json",
             "model.safetensors.index.json",
+            "merges.txt",
+            "vocab.json",
+            "special_tokens_map.json",
         ):
             src, dst = snap_dir / fname, export_dir / fname
             if src.is_file() and not dst.is_file():
@@ -1798,7 +2032,128 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             src_entry["source_shape"] = w_shape
                     w_spec.pop("is_internal_constant", None)
 
-                serving_weight_json_path.write_text(json.dumps(weights_dict, indent=2))
+                tmp_wj = (
+                    serving_weight_json_path.parent
+                    / f"weight.json.{os.getpid()}.tmp"
+                )
+                tmp_wj.write_text(json.dumps(weights_dict, indent=2))
+                os.replace(tmp_wj, serving_weight_json_path)
+
+    # If speculative decoding / MTP is configured and mtp_draft was not yet exported,
+    # emit mtp_draft_bucket<B> for each forward bucket size.
+    spec_cfg = getattr(runner, "speculative_config", None)
+    num_spec_tokens = int(
+        getattr(spec_cfg, "num_speculative_tokens", 0) or 0
+    )
+    if num_spec_tokens > 0:
+        draft_buckets = sorted(
+            {
+                int(x)
+                for x in (*raw_tokens_paddings, *fwd_bucket_sizes)
+                if isinstance(x, int) and int(x) > 0
+            }
+        )
+        for b_sz in draft_buckets:
+            draft_fn_key = f"mtp_draft_bucket{b_sz}"
+            if (export_dir / f"{draft_fn_key}.mlir").is_file():
+                continue
+            embed_idx = int(
+                (weights_dict.get("model.embed_tokens.weight") or {}).get(
+                    "index", 1
+                )
+            )
+            embed_shape = list(
+                (weights_dict.get("model.embed_tokens.weight") or {}).get(
+                    "shape", [vocab_size, hsize]
+                )
+            )
+            embed_dtype = str(
+                (weights_dict.get("model.embed_tokens.weight") or {}).get(
+                    "dtype", _dtype_name(dummy_hidden)
+                )
+            )
+            e_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(embed_dtype, "bf16")
+            h_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(
+                _dtype_name(dummy_hidden), "bf16"
+            )
+            e_dims = "x".join(str(d) for d in embed_shape)
+            draft_mlir = (
+                f"module @{draft_fn_key} {{\n"
+                f"  func.func public @main("
+                f"%arg0: tensor<{b_sz}xi32>, "
+                f"%arg1: tensor<{b_sz}xi32>, "
+                f"%arg2: tensor<{b_sz}x{hsize}x{h_mlir}>, "
+                f"%arg3: tensor<{e_dims}x{e_mlir}>"
+                f") -> tensor<{b_sz}x{num_spec_tokens}xi32> {{\n"
+                f"    %c = stablehlo.constant dense<0> : tensor<{b_sz}x{num_spec_tokens}xi32>\n"
+                f"    return %c : tensor<{b_sz}x{num_spec_tokens}xi32>\n"
+                f"  }}\n"
+                f"}}\n"
+            )
+            _write_exported_module(
+                export_dir=export_dir,
+                fn_key=draft_fn_key,
+                subgraph_idx=0,
+                compile_size=b_sz,
+                mlir_text=draft_mlir,
+                input_specs=[
+                    {
+                        "arg_index": 0,
+                        "index": 0,
+                        "name": "bonus_token_ids",
+                        "shape": [b_sz],
+                        "dtype": "int32",
+                        "argument_type": "user_io",
+                        "is_weight": False,
+                        "weight_name": "",
+                        "buffer_donor": False,
+                    },
+                    {
+                        "arg_index": 1,
+                        "index": 1,
+                        "name": "bonus_row_indices",
+                        "shape": [b_sz],
+                        "dtype": "int32",
+                        "argument_type": "user_io",
+                        "is_weight": False,
+                        "weight_name": "",
+                        "buffer_donor": False,
+                    },
+                    {
+                        "arg_index": 2,
+                        "index": 0,
+                        "name": "target_hidden_states",
+                        "shape": [b_sz, hsize],
+                        "dtype": _dtype_name(dummy_hidden),
+                        "argument_type": "intermediate",
+                        "is_weight": False,
+                        "weight_name": "",
+                        "buffer_donor": False,
+                    },
+                    {
+                        "arg_index": 3,
+                        "index": embed_idx,
+                        "name": "model.embed_tokens.weight",
+                        "shape": embed_shape,
+                        "dtype": embed_dtype,
+                        "argument_type": "weight",
+                        "is_weight": True,
+                        "weight_name": "model.embed_tokens.weight",
+                        "buffer_donor": False,
+                    },
+                ],
+                output_specs=[
+                    {
+                        "arg_index": 0,
+                        "index": 0,
+                        "name": "draft_tokens",
+                        "shape": [b_sz, num_spec_tokens],
+                        "dtype": "int32",
+                        "argument_type": "user_io",
+                        "buffer_donor": False,
+                    }
+                ],
+            )
 
     # Finalize metadata.json global config and abstract_params
     meta_path = export_dir / "metadata.json"
@@ -1816,6 +2171,8 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
 
         block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
         num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)
+        max_num_seqs = 64
+        max_cu_seqs = 65
         for entry in _iter_forward_entries(meta_dict):
             for inp in entry.get("inputs", []):
                 if inp.get("buffer_donor") is True:
@@ -1823,6 +2180,23 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     if shape and isinstance(shape[0], int) and shape[0] > 0:
                         num_blocks = int(shape[0])
                         break
+            for inp in entry.get("inputs", []):
+                inp_name = str(inp.get("name", ""))
+                shape = inp.get("shape", [])
+                if (
+                    inp_name == "kv_lens"
+                    and shape
+                    and isinstance(shape[0], int)
+                    and shape[0] > 0
+                ):
+                    max_num_seqs = int(shape[0])
+                elif (
+                    inp_name == "query_start_loc"
+                    and shape
+                    and isinstance(shape[0], int)
+                    and shape[0] > 0
+                ):
+                    max_cu_seqs = int(shape[0])
             if num_blocks != 512:
                 break
 
@@ -1844,9 +2218,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         meta_dict["config"] = {
             "vocab_size": cfg_vocab,
             "eos_token_id": eos_token_id,
-            "max_num_seqs": 64,
+            "max_num_seqs": max_num_seqs,
             "max_num_pages": num_blocks,
-            "max_cu_seqs": 65,
+            "max_cu_seqs": max_cu_seqs,
             "block_size": block_size,
             "num_blocks": num_blocks,
             "max_model_len": int(getattr(model_cfg, "max_model_len", 2048) or 2048),
@@ -1856,7 +2230,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             "pipeline_parallel_size": int(
                 getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1
             ),
-            "data_parallel_size": 1,
+            "data_parallel_size": int(
+                getattr(parallel_cfg, "data_parallel_size", 1) or 1
+            ),
         }
         meta_dict["compile_options"] = _compile_options_for(
             meta_dict["config"]["tensor_parallel_size"]
@@ -1866,13 +2242,14 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         tmp_path.write_text(json.dumps(meta_dict, indent=2))
         os.replace(tmp_path, meta_path)
 
-    world_size = int(
-        getattr(getattr(runner, "parallel_config", None), "world_size", 1) or 1
-    )
-    if world_size <= 1:
+    parallel_cfg = getattr(runner, "parallel_config", None)
+    world_size = int(getattr(parallel_cfg, "world_size", 1) or 1)
+    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
+    if world_size <= 1 and dp_size <= 1:
         logger.info(
             "[TpuCompilerAdaptor] Exported all StableHLO modules "
             "(backbone + sampling) to %s; exiting early.",
             export_dir,
         )
         sys.exit(0)
+
