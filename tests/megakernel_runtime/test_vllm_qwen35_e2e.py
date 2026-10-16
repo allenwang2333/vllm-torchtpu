@@ -384,6 +384,17 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_runner["buckets"] == (16, 32)
     assert cfg_runner["ab"] is True
 
+    import vllm_torchtpu.megakernel_runtime as mk_rt
+
+    assert mk_rt._is_megakernel_requested(fake_runner)
+    fake_runner_disabled = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={"megakernel": {"enabled": False, "mode": "tp"}}
+        )
+    )
+    assert not mk_rt._is_megakernel_requested(fake_runner_disabled)
+    assert mk_rt.maybe_create(fake_runner_disabled) is None
+
     buckets = (2, 4, 8)
     assert select_bucket(1, buckets) == 2
     assert select_bucket(4, buckets) == 4
@@ -573,8 +584,22 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     assert not driver._bound
     assert runner_fallback._megakernel is None
 
-    # Restore valid pool and verify `_verify_torchtpu_compile_debug` fails closed
+    # Restore valid pool and verify `bind_and_warmup` does NOT swallow `ValueError`
+    # raised inside `warmup()` as a cache-layout error.
     backbone.layers[3].self_attn.attn.kv_cache = [raw_pools_t[0]]
+    orig_warmup = driver.warmup
+
+    def _raise_val_err(*_args: Any, **_kwargs: Any) -> None:
+        raise ValueError("synthetic warmup ValueError")
+
+    driver.warmup = _raise_val_err  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ValueError, match="synthetic warmup ValueError"):
+            driver.bind_and_warmup(runner_ok)
+    finally:
+        driver.warmup = orig_warmup  # type: ignore[method-assign]
+
+    # Verify `_verify_torchtpu_compile_debug` fails closed on `stablehlo_forward_text`
     driver.bind_caches(runner_ok)
     with pytest.raises(RuntimeError, match="empty stablehlo_forward_text"):
         driver._verify_torchtpu_compile_debug(
@@ -616,39 +641,21 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         "%arg0: tensor<96x2x64x4x128xf8E4M3FN>",
         "%arg0: tensor<96x2x64x4x128xf8E4M3FN> {jax.buffer_donor = true}",
     )
-    fake_exe_bad = SimpleNamespace(
-        hlo_text=lambda: (
-            "HloModule jit_step, input_output_alias={ {1}: (0, {}, may-alias) }\n"
-            "ENTRY %main {\n"
-            "  %copy.99 = f8e4m3fn[96,2,64,4,128] copy(f8e4m3fn[96,2,64,4,128] %p0)\n"
-            "}\n"
-        )
+    donor_with_copy_ir = valid_donor_ir.replace(
+        "    return %0#0, %0#1",
+        "    %cp = stablehlo.copy %0#1 : tensor<96x2x64x4x128xf8E4M3FN>\n"
+        "    return %0#0, %cp",
     )
     with pytest.raises(RuntimeError, match="full-pool copy"):
         driver._verify_torchtpu_compile_debug(
-            SimpleNamespace(
-                stablehlo_forward_text=[valid_donor_ir],
-                compiled_executables=[fake_exe_bad],
-            ),
+            SimpleNamespace(stablehlo_forward_text=[donor_with_copy_ir]),
             tokens_per_seq=1,
             bucket_t=2,
         )
 
     driver._torchtpu_ir_error = None
-    fake_exe_ok = SimpleNamespace(
-        hlo_text=lambda: (
-            "HloModule jit_step, input_output_alias={ {1}: (0, {}, may-alias) }\n"
-            "ENTRY %main {\n"
-            "  %cc = (bf16[16,256], f8e4m3fn[96,2,64,4,128]) custom-call(%p0), "
-            'custom_call_target="tpu_custom_call"\n'
-            "}\n"
-        )
-    )
     driver._verify_torchtpu_compile_debug(
-        SimpleNamespace(
-            stablehlo_forward_text=[valid_donor_ir],
-            compiled_executables=[fake_exe_ok],
-        ),
+        SimpleNamespace(stablehlo_forward_text=[valid_donor_ir]),
         tokens_per_seq=1,
         bucket_t=2,
     )

@@ -76,8 +76,31 @@ def _is_megakernel_requested(runner: Any = None) -> bool:
     if runner is not None:
         vllm_cfg = getattr(runner, "vllm_config", None)
         add_cfg = getattr(vllm_cfg, "additional_config", None)
-        if isinstance(add_cfg, dict) and add_cfg.get("megakernel"):
-            return True
+        if isinstance(add_cfg, dict):
+            mk_cfg = add_cfg.get("megakernel")
+            if isinstance(mk_cfg, dict):
+                en = mk_cfg.get("enabled", True)
+                if isinstance(en, str):
+                    return en.strip().lower() not in (
+                        "",
+                        "0",
+                        "false",
+                        "no",
+                        "off",
+                        "none",
+                    )
+                return bool(en)
+            if isinstance(mk_cfg, str):
+                return mk_cfg.strip().lower() not in (
+                    "",
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                    "none",
+                )
+            if mk_cfg:
+                return True
     return False
 
 

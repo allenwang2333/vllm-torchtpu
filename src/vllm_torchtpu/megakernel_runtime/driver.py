@@ -1133,7 +1133,7 @@ class MegakernelDriver:
         tokens_per_seq: int,
         bucket_t: int,
     ) -> None:
-        """Validate `TpuCompileDebug` pre-XLA StableHLO and post-XLA HLO."""
+        """Validate `TpuCompileDebug.stablehlo_forward_text` pool donation."""
         fwd_texts = getattr(debug, "stablehlo_forward_text", None) or ()
         if not fwd_texts or not any(str(t).strip() for t in fwd_texts):
             msg = (
@@ -1145,45 +1145,6 @@ class MegakernelDriver:
             raise RuntimeError(msg)
 
         ir_text = "\n".join(str(t) for t in fwd_texts)
-        hlo_parts: list[str] = []
-        for attr in ("hlo_text", "optimized_hlo_text", "post_xla_hlo_text"):
-            val = getattr(debug, attr, None)
-            if isinstance(val, str) and val.strip():
-                hlo_parts.append(val)
-            elif isinstance(val, (list, tuple)):
-                hlo_parts.extend(str(x) for x in val if str(x).strip())
-        for exe in getattr(debug, "compiled_executables", None) or ():
-            if exe is None:
-                continue
-            for method_name in ("as_text", "hlo_text"):
-                fn = getattr(exe, method_name, None)
-                if callable(fn):
-                    try:
-                        txt = fn()
-                    except Exception:
-                        txt = None
-                    if isinstance(txt, str) and txt.strip():
-                        hlo_parts.append(txt)
-                elif isinstance(fn, str) and fn.strip():
-                    hlo_parts.append(fn)
-            for mod_fn_name in ("hlo_modules", "get_hlo_modules"):
-                mod_fn = getattr(exe, mod_fn_name, None)
-                if callable(mod_fn):
-                    try:
-                        mods = mod_fn() or ()
-                    except Exception:
-                        mods = ()
-                    for m in mods:
-                        to_str = getattr(m, "to_string", None)
-                        if callable(to_str):
-                            try:
-                                s = to_str()
-                            except Exception:
-                                s = None
-                            if isinstance(s, str) and s.strip():
-                                hlo_parts.append(s)
-
-        hlo_text = "\n".join(hlo_parts) if hlo_parts else None
         kvh = max(1, int(self.raw_pools[0].shape[1]) // 2)
         ok_ir, reason_ir = verify_torchtpu_compiled_step_ir(
             ir_text,
@@ -1192,7 +1153,6 @@ class MegakernelDriver:
             kvh=kvh,
             hd=self.geom.HD,
             num_pools=self.geom.NATT,
-            hlo_text=hlo_text,
         )
         if not ok_ir:
             msg = (
@@ -1389,22 +1349,35 @@ class MegakernelDriver:
         """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets."""
         precompile_timed = getattr(runner, "_precompile_timed", None)
         eager_only = bool(getattr(runner, "enforce_eager", False))
-        try:
-            if callable(precompile_timed):
-                with precompile_timed("megakernel"):
+        if callable(precompile_timed):
+            with precompile_timed("megakernel"):
+                try:
                     self.bind_caches(runner)
-                    self.warmup(runner, eager_only=eager_only)
-            else:
-                self.bind_caches(runner)
+                except ValueError as exc:
+                    logger.warning(
+                        "Disabling Qwen3.5 megakernel due to incompatible KV cache "
+                        "layout: %s",
+                        exc,
+                    )
+                    self._bound = False
+                    if runner is not None and hasattr(runner, "_megakernel"):
+                        runner._megakernel = None
+                    return
                 self.warmup(runner, eager_only=eager_only)
-        except ValueError as exc:
-            logger.warning(
-                "Disabling Qwen3.5 megakernel due to incompatible KV cache layout: %s",
-                exc,
-            )
-            self._bound = False
-            if runner is not None and hasattr(runner, "_megakernel"):
-                runner._megakernel = None
+        else:
+            try:
+                self.bind_caches(runner)
+            except ValueError as exc:
+                logger.warning(
+                    "Disabling Qwen3.5 megakernel due to incompatible KV cache "
+                    "layout: %s",
+                    exc,
+                )
+                self._bound = False
+                if runner is not None and hasattr(runner, "_megakernel"):
+                    runner._megakernel = None
+                return
+            self.warmup(runner, eager_only=eager_only)
 
     @staticmethod
     def _check_qsl_uniform(qsl_host: Any, num_reqs: int) -> tuple[bool, int, int, str]:
