@@ -700,9 +700,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_MLA_DECODE_ROW_WIDTHS (fused-prep decode buckets): attention-body
     # levers on the decode body -- "1" = the bitwise default set (byte-transpose
     # NOPE unpack, per-row zeroing on the packed words, NOPE-only PV, no forced
-    # MXU/VPU dependency, two-token softmax, fix-up only on overflowing steps,
-    # no lse sentinel fill on a one-step bucket), or a comma list of lever
-    # names (kernels/mla/sparse/kernel.py DECODE_BODY_LEVERS). Empty = off.
+    # MXU/VPU dependency, one stacked softmax per grid step, fix-up only on
+    # overflowing steps, live-row KV fetches, eight tokens per attention grid
+    # step), or a comma list of lever names (kernels/mla/sparse/kernel.py
+    # DECODE_BODY_LEVERS). Empty = off.
     "TPU_MLA_DECODE_BODY_LEVERS": lambda: os.getenv("TPU_MLA_DECODE_BODY_LEVERS", ""),
     # With TPU_DCP_MLA_MIXED_LIVE: attention-body rewrites of the live grid
     # steps -- "1" = the bitwise-identical default set (byte-transpose NOPE

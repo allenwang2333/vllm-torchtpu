@@ -1429,10 +1429,19 @@ DECODE_BODY_LEVERS = (
     # up to 32, at least 32, at most the step's width) instead of the step's
     # width; the rows past kv_len are zeroed and masked either way.
     "lrows",
+    # "step8": the attention grid walks DECODE_STEP8_TOKENS tokens per step
+    # (largest divisor of the chunk) while the window prep and the SparseCore
+    # gather keep the small-chunk batch: fewer, larger grid steps, and the
+    # gather still writes only the real tokens' batches. A step that runs past
+    # the real tokens reads unwritten tiles for the padding tokens, whose
+    # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
+    "step8",
 )
-# The measured set (decode probes 02 / 04): with TPU_DCP_MLA_SMALL_CHUNK_BATCH=8
-# "quad" stacks a step's 8 tokens; "nofill" and "q128" measured no gain.
-DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows")
+DECODE_STEP8_TOKENS = 8
+# The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
+# attention grid step and "quad" stacks them in one softmax; "nofill" and
+# "q128" measured no gain.
+DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", "step8")
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
@@ -1679,7 +1688,7 @@ def _attention_kernel(
     #            arrives lane-dense (not bit-exact: reduction order).
     # Every stage-A lever except "xqk" is bitwise-identical.
     assert not body_levers or group_tab_ref is not None or row_widths
-    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {"nofill", "quad", "lrows"}, (
+    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {"nofill", "quad", "lrows", "step8"}, (
         body_levers
     )
     assert not ("quad" in body_levers and "pair" in body_levers)
@@ -4172,6 +4181,14 @@ def sparse_attention_chunk(
     # `kernel_batch_size`.
     valid_rows = jnp.maximum(0, jnp.minimum(token_end, end_pos) - start_pos)
     batch_end = start_pos + cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
+    # Decode lever "step8": the attention grid's own step (the prep and the
+    # gather above keep `kernel_batch_size`).
+    attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
+    if "step8" in row_levers and small_chunk:
+        attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
+        attn_batch_end = (
+            start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
+        )
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
     # For prefilling of short sequences (or early in the sequence), there are
@@ -4368,8 +4385,8 @@ def sparse_attention_chunk(
         gathered_rope_buffer,
         kv_lens,
         start_seq_idx=start_pos,
-        end_seq_idx=batch_end,
-        kernel_batch_size=kernel_batch_size,
+        end_seq_idx=attn_batch_end,
+        kernel_batch_size=attn_batch_size,
         lse=lse,
         live_views=live_views,
     )

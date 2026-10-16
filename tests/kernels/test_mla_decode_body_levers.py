@@ -131,6 +131,8 @@ LEVER_SETS = (
     ("q128",),
     ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "nofill"),
     ("lrows",),
+    ("step8",),
+    ("tr", "zu", "pv512", "noinf", "pair", "fxskip", "lrows", "step8"),
 )
 
 
@@ -142,17 +144,26 @@ def test_bit_identical(query_tokens, seq_q, send_world, shift):
     counts = RW.COUNTS[shift:] + RW.COUNTS[:shift]
     p = RW._with_counts(p, counts)
     ref = _call(p, (), send_world=send_world)
+    real, heads = int(sum(seq_q)), p["ql_nope"].shape[1]
+    world = send_world or 1
+
+    def same_real(got):
+        g, r = _real(got, real, heads, world), _real(ref, real, heads, world)
+        return all(np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r))
+
     for levers in LEVER_SETS:
         got = _call(p, levers, send_world=send_world)
-        assert _same(got, ref), levers
-    # Eight tokens per grid step (TPU_DCP_MLA_SMALL_CHUNK_BATCH=8) with the
-    # default levers: the same bits as the served four-token steps.
+        if "step8" in levers:
+            # Eight-token attention steps compute the padding tokens of a
+            # partial last step (never exchanged): the real tokens' bits.
+            assert same_real(got), levers
+        else:
+            assert _same(got, ref), levers
+    # Eight tokens per grid step for the prep and gather too
+    # (TPU_DCP_MLA_SMALL_CHUNK_BATCH=8) with the default levers.
     if query_tokens >= 8:
         got = _call(p, sparse_mla.DECODE_BODY_DEFAULT, send_world=send_world, batch=8)
-        real, heads = int(sum(seq_q)), p["ql_nope"].shape[1]
-        world = send_world or 1
-        g, r = _real(got, real, heads, world), _real(ref, real, heads, world)
-        assert all(np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r)), "bz 8"
+        assert same_real(got), "bz 8"
 
 
 def test_positive_control_fails():
