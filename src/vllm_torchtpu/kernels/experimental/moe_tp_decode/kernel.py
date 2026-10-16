@@ -32,10 +32,12 @@ inside the kernel, so no XLA all-reduce follows:
 Rows >= n_valid come out exactly +0 and only rows < n_valid travel.
 
 Fast schedule (fast=True, TPU_MOE_TP_DECODE_FAST): the same arithmetic and the
-same output bits, scheduled for the hardware. Routing picks every column equal
-to the row maximum instead of reducing the lowest such column per pick (one
-dependent cross-lane reduction per pick instead of three); a valid row that did
-not pick exactly topk columns (a tie, or NaN) reruns the exact routing. The
+same output bits, scheduled for the hardware. Routing reduces one per-row
+unique key per pick (biased score, ties to the lower column, packed in one f32)
+instead of the max, the lowest attaining column and the pick's score (one
+dependent cross-lane reduction per pick instead of three); only a row whose
+picks reach below the key's window (2^22 f32 ordinals under the row maximum)
+reruns the exact routing. The
 compaction runs on the vector units (_compact_vector) and travels to the scalar
 core with the hit table, and one loop after it starts the first ring items: the
 incumbent's scalar compaction costs ~20 bundles per local expert, and its DMA
@@ -69,6 +71,8 @@ FP8_MAX = float(jnp.finfo(FP8).max)
 ROW_BUCKETS = (16, 32, 64)
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
+# _route_fast: routing keys are positive normal f32 bit patterns from here.
+KEY_BASE = 0x00800000
 # moe_routing: weights / clamp(sum, min=1e-20).
 SUM_FLOOR = 1e-20
 # The shared expert quantizes x in QUANT_BLOCK-column chunks.
@@ -256,29 +260,58 @@ def _route(scores, bias, n_valid, *, topk):
 
 
 def _route_fast(scores, bias, n_valid, *, topk):
-    """_route without the per-pick lowest-column reduction: a pick is every
-    column equal to the row maximum. Returns (weights, flag); the weights equal
-    _route's bit for bit when every valid row picked exactly topk columns, and
-    flag ([1, 1] f32) is 1 when some valid row did not (a tie, or NaN), in
-    which case the caller must use _route instead."""
+    """_route with one cross-lane reduction per pick instead of three, ties
+    included. Each column gets a key that is unique in its row and orders
+    columns as _route picks them -- larger biased score first, the lower
+    column on equal scores -- so a pick is the one column equal to the row's
+    largest key and the picks come in _route's order (same wsum additions).
+
+    The key is a positive normal f32 whose bits are KEY_BASE + (rank << lb) +
+    (n - 1 - column), lb = bits of a column index: `rank` is the biased score's
+    distance in f32 ordinals below the row maximum, inverted, over a window of
+    2^(30 - lb) - 2 ordinals; a column beyond the window gets rank 0. Returns
+    (weights, flag); the weights equal _route's bit for bit unless some valid
+    row's topk-th pick lies beyond the window (flag ([1, 1] f32) = 1, the
+    caller must use _route): its picks would need ordinals the key drops. With
+    E = 256 the window is 2^22 ordinals (e.g. 4.0 below a row maximum in
+    [8, 16), 0.25 in [0.5, 1)). NaN scores clamp to ROUTER_NEG as in _route."""
     rows, n = scores.shape
+    lb = max(1, (n - 1).bit_length())
+    window = (1 << (30 - lb)) - 1  # ranks 1 .. window - 1 in the window, 0 beyond
     masked = float(jnp.finfo(jnp.float32).min)
     x = scores + bias
     x = jnp.where(x > ROUTER_NEG, x, ROUTER_NEG)
+    x = jnp.where(x == 0.0, 0.0, x)  # -0.0 == +0.0 in _route: one ordinal
+    xm = jnp.max(x, axis=1, keepdims=True)
+
+    def ordinal(v):  # monotone f32 -> i32, equal floats <-> equal ordinals
+        b = lax.bitcast_convert_type(v, jnp.int32)
+        return jnp.where(b < 0, b ^ 0x7FFFFFFF, b)
+
+    d = ordinal(xm) - ordinal(x)  # >= 0; wraps negative beyond 2^31
+    inside = jnp.logical_and(d >= 0, d < window - 1)
+    rank = jnp.where(inside, (window - 1) - d, 0)
+    lane = lax.broadcasted_iota(jnp.int32, (rows, n), 1)
+    key = lax.bitcast_convert_type(
+        KEY_BASE + jnp.left_shift(rank, lb) + ((n - 1) - lane), jnp.float32
+    )
     wsum = jnp.zeros((rows, 1), jnp.float32)
+    km = None
     for _ in range(topk):
-        m = jnp.max(x, axis=1, keepdims=True)
-        pick = x == m
-        # Off the dependent chain; pick-order sum as _route.
+        km = jnp.max(key, axis=1, keepdims=True)
+        pick = key == km
+        # Exactly one nonzero term: the unbiased score of this pick (_route's).
         wsum = wsum + jnp.sum(jnp.where(pick, scores, 0.0), axis=1, keepdims=True)
-        x = jnp.where(pick, masked, x)
-    chosen = x == masked
+        key = jnp.where(pick, 0.0, key)  # below every key (all >= 2^-126)
+    chosen = key == 0.0
     denom = jnp.where(wsum < SUM_FLOOR, SUM_FLOOR, wsum)
     w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
     valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
-    count = jnp.sum(jnp.where(chosen, 1.0, 0.0), axis=1, keepdims=True)
+    # The last pick's rank is 0 iff it (and so some pick) lay beyond the window.
+    last_bits = lax.bitcast_convert_type(km, jnp.int32)
+    beyond = last_bits < KEY_BASE + (1 << lb)
     valid_row = lax.broadcasted_iota(jnp.int32, (rows, 1), 0) < n_valid
-    bad = jnp.where(jnp.logical_and(valid_row, count != float(topk)), 1.0, 0.0)
+    bad = jnp.where(jnp.logical_and(valid_row, beyond), 1.0, 0.0)
     flag = jnp.max(bad, axis=0, keepdims=True)
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0), flag
 
