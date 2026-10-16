@@ -1025,8 +1025,7 @@ class TPUModelRunner(GPUModelRunner):
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
-        self._qwen35_mk: Any = None
-        self._in_dummy_run: bool = False
+        self._megakernel: Any = None
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
@@ -5218,10 +5217,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
-        if envs.VLLM_TPU_QWEN35_MEGAKERNEL:
-            from vllm_torchtpu.megakernel_runtime import MegakernelDriver
+        from vllm_torchtpu import megakernel_runtime
 
-            self._qwen35_mk = MegakernelDriver.maybe_create(self)
+        self._megakernel = megakernel_runtime.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5600,16 +5598,12 @@ class TPUModelRunner(GPUModelRunner):
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
             started = time.perf_counter()
-            self._in_dummy_run = True
-            try:
-                out, _ = self.forward_model(
-                    input_ids=input_ids,
-                    positions=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                )
-            finally:
-                self._in_dummy_run = False
+            out, _ = self.forward_model(
+                input_ids=input_ids,
+                positions=position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+            )
             if isinstance(out, IntermediateTensors):
                 if through_handoff:
                     # The output leaves padded to the hand-off buffer; it is
@@ -6440,10 +6434,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
-        if getattr(self, "_qwen35_mk", None) is not None:
-            with self._precompile_timed("Qwen3.5 megakernel"):
-                self._qwen35_mk.bind_caches(self)
-                self._qwen35_mk.warmup(self, eager_only=self.enforce_eager)
+        if self._megakernel is not None:
+            self._megakernel.bind_and_warmup(self)
         if self.enforce_eager:
             return
         with self.maybe_setup_dummy_loras(self.lora_config):
@@ -7536,36 +7528,11 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
-        mk = getattr(self, "_qwen35_mk", None)
-        ab_t0: float | None = None
-        if (
-            mk is not None
-            and not getattr(self, "_in_dummy_run", False)
-            and not getattr(self, "_in_precompile_backbone", False)
-        ):
-            use_mk = mk.can_run(
-                input_ids,
-                positions,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-                runner=self,
+        if self._megakernel is not None:
+            hit, out = self._megakernel.try_forward(
+                self, input_ids, positions, inputs_embeds, intermediate_tensors
             )
-            if mk.ab_calibrator.enabled:
-                ab_t0 = time.perf_counter()
-            if use_mk:
-                out = mk(
-                    input_ids,
-                    positions,
-                    num_tokens=int(positions.shape[-1]),
-                    runner=self,
-                )
-                if ab_t0 is not None:
-                    if self.device.type == "tpu":
-                        synchronize_tensors([out])
-                    mk.record_ab_step(
-                        (time.perf_counter() - ab_t0) * 1000.0,
-                        padded_tokens=int(positions.shape[-1]),
-                    )
+            if hit:
                 return out, None
 
         # @support_torch_compile annotations will be put on the vLLM model if it
@@ -7592,13 +7559,6 @@ class TPUModelRunner(GPUModelRunner):
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
-        if ab_t0 is not None and mk is not None:
-            if self.device.type == "tpu" and isinstance(out, torch.Tensor):
-                synchronize_tensors([out])
-            mk.record_ab_step(
-                (time.perf_counter() - ab_t0) * 1000.0,
-                padded_tokens=int(positions.shape[-1]),
-            )
         return out, aux_hidden_states
 
     def _pp_intermediate_tensors(

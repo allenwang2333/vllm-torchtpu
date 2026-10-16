@@ -30,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -551,6 +551,12 @@ class MegakernelDriver:
         self.base_exec = base_exec
 
         if reshard_ep_to_tp and mode == "tp":
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            from vllm_torchtpu.layers.adapter.fused_moe import (
+                prebuild_fused_moe_kernel,
+            )
+
             logger.info(
                 "Resharding Qwen3.5 MoE experts from EP to TP across %d layers "
                 "(rank=%d)...",
@@ -563,6 +569,8 @@ class MegakernelDriver:
                     tp_rank=self.tp_rank,
                     g=self.geom,
                     ex=self.base_exec,
+                    all_gather_fn=lambda t: tensor_model_parallel_all_gather(t, dim=0),
+                    prebuild_moe_fn=prebuild_fused_moe_kernel,
                 )
 
         t0 = time.perf_counter()
@@ -1125,6 +1133,18 @@ class MegakernelDriver:
                 for p, saved in zip(self.raw_pools, saved_page0, strict=True):
                     p[:n_save].copy_(saved)
 
+    def bind_and_warmup(self, runner: Any) -> None:
+        """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets."""
+        precompile_timed = getattr(runner, "_precompile_timed", None)
+        eager_only = bool(getattr(runner, "enforce_eager", False))
+        if callable(precompile_timed):
+            with precompile_timed("megakernel"):
+                self.bind_caches(runner)
+                self.warmup(runner, eager_only=eager_only)
+        else:
+            self.bind_caches(runner)
+            self.warmup(runner, eager_only=eager_only)
+
     @staticmethod
     def _check_qsl_uniform(qsl_host: Any, num_reqs: int) -> tuple[bool, int, int, str]:
         if num_reqs <= 0 or len(qsl_host) <= num_reqs:
@@ -1300,8 +1320,11 @@ class MegakernelDriver:
         if getattr(self.backbone, "aux_hidden_state_layers", ()):
             return False
         if runner is not None:
-            if getattr(runner, "_in_dummy_run", False) or getattr(
-                runner, "_in_precompile_backbone", False
+            bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
+            if (
+                getattr(runner, "_in_dummy_run", False)
+                or getattr(runner, "_in_precompile_backbone", False)
+                or getattr(bctx, "position_ids_override", None) is not None
             ):
                 return False
             if not getattr(runner, "_unified_kv_layout", True):
@@ -1557,5 +1580,119 @@ class MegakernelDriver:
             return hidden_out[:out_rows]
         return F.pad(hidden_out, (0, 0, 0, out_rows - hidden_out.shape[0]))
 
+    def try_forward(
+        self,
+        runner: Any,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+    ) -> tuple[bool, Any]:
+        """Try to execute the current forward step on the megakernel.
+
+        Returns `(True, hidden_states)` when handled by the megakernel (or timed
+        by the A/B calibrator), or `(False, None)` to fall through to the runner's
+        default model forward.
+        """
+        use_mk = self.can_run(
+            input_ids,
+            positions,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+            runner=runner,
+        )
+        ab_t0 = time.perf_counter() if self.ab_calibrator.enabled else None
+        if use_mk:
+            assert input_ids is not None and positions is not None
+            num_tok = int(positions.shape[-1])
+            out = self(
+                input_ids,
+                positions,
+                num_tokens=num_tok,
+                runner=runner,
+            )
+            if ab_t0 is not None:
+                if getattr(getattr(runner, "device", None), "type", None) == "tpu":
+                    from vllm_torchtpu.utils import synchronize_tensors
+
+                    synchronize_tensors([out])
+                self.record_ab_step(
+                    (time.perf_counter() - ab_t0) * 1000.0,
+                    padded_tokens=num_tok,
+                )
+            return True, out
+
+        if (
+            ab_t0 is not None
+            and self.ab_calibrator.last_decision[0] != "stock_early"
+            and positions is not None
+            and intermediate_tensors is None
+            and callable(getattr(runner, "model", None))
+            and not getattr(self.backbone, "aux_hidden_state_layers", ())
+        ):
+            out = runner.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+            )
+            if isinstance(out, (list, tuple)) and len(out) == 1:
+                out = out[0]
+            if getattr(
+                getattr(runner, "device", None), "type", None
+            ) == "tpu" and isinstance(out, torch.Tensor):
+                from vllm_torchtpu.utils import synchronize_tensors
+
+                synchronize_tensors([out])
+            self.record_ab_step(
+                (time.perf_counter() - ab_t0) * 1000.0,
+                padded_tokens=int(positions.shape[-1]),
+            )
+            return True, out
+
+        return False, None
+
 
 Qwen35Megakernel = MegakernelDriver
+
+_MODEL_DRIVER_REGISTRY: dict[str, Callable[[Any], Any]] = {
+    "Qwen3_5MoeForConditionalGeneration": MegakernelDriver.maybe_create,
+    "Qwen3_5ForConditionalGeneration": MegakernelDriver.maybe_create,
+    "qwen3_5_moe": MegakernelDriver.maybe_create,
+    "qwen3_5": MegakernelDriver.maybe_create,
+}
+
+
+def register_megakernel_driver(
+    arch_or_model_type: str, factory: Callable[[Any], Any]
+) -> None:
+    """Register a megakernel driver factory for a model architecture or `model_type`."""
+    _MODEL_DRIVER_REGISTRY[arch_or_model_type] = factory
+
+
+def maybe_create(runner: Any) -> Any:
+    """Create a megakernel driver for `runner` if enabled for its model architecture."""
+    model_cfg = getattr(runner, "model_config", None)
+    hf_cfg = getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+    candidates: list[str] = []
+    if hf_cfg is not None:
+        archs = getattr(hf_cfg, "architectures", None) or ()
+        candidates.extend(str(a) for a in archs)
+        mtype = getattr(hf_cfg, "model_type", None)
+        if mtype:
+            candidates.append(str(mtype))
+        txt_cfg = getattr(hf_cfg, "text_config", None)
+        txt_mtype = (
+            getattr(txt_cfg, "model_type", None) if txt_cfg is not None else None
+        )
+        if txt_mtype:
+            candidates.append(str(txt_mtype))
+    model_cls = type(getattr(runner, "model", None)).__name__
+    if model_cls and model_cls != "NoneType":
+        candidates.append(model_cls)
+    for key in candidates:
+        factory = _MODEL_DRIVER_REGISTRY.get(key)
+        if factory is not None:
+            return factory(runner)
+    if hf_cfg is None:
+        return MegakernelDriver.maybe_create(runner)
+    return None

@@ -19,10 +19,12 @@ from .driver import (
     MegakernelDriver,
     MKABCalibrator,
     Qwen35Megakernel,
+    maybe_create,
     parse_mk_buckets,
     parse_mk_verify_buckets,
     prepare_step_inputs_eager,
     prepare_step_metadata,
+    register_megakernel_driver,
     select_bucket,
 )
 from .exported_bridge import (
@@ -68,6 +70,7 @@ __all__ = [
     "find_backbone",
     "get_routed_experts",
     "make_typed_step_wrapper",
+    "maybe_create",
     "pack_att_in_layer",
     "pack_att_out_layer",
     "pack_expert_views_layer",
@@ -81,6 +84,7 @@ __all__ = [
     "prepare_step_inputs_eager",
     "prepare_step_metadata",
     "quantize_ba_weight",
+    "register_megakernel_driver",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
     "select_bucket",

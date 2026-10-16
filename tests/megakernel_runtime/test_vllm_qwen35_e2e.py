@@ -658,7 +658,15 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     qsl_np[:3] = [0, 1, 2]
     assert driver.can_run(ids_2, pos_2, runner=runner)
 
-    # 6. `_in_dummy_run=True` gates off MK
+    # 6. Dummy runs (`bctx.position_ids_override is not None` or `_in_dummy_run=True`)
+    #    gate off MK without needing runner-side flags in `_dummy_run`
+    runner._attn_metadata_builder_ctx.position_ids_override = pos_2
+    assert not driver.can_run(ids_2, pos_2, runner=runner)
+    hit_dummy, out_dummy = driver.try_forward(runner, ids_2, pos_2)
+    assert not hit_dummy and out_dummy is None
+    runner._attn_metadata_builder_ctx.position_ids_override = None
+    assert driver.can_run(ids_2, pos_2, runner=runner)
+
     runner._in_dummy_run = True
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     runner._in_dummy_run = False
@@ -689,6 +697,17 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     backbone.aux_hidden_state_layers = (1,)
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     backbone.aux_hidden_state_layers = ()
+
+    # 9. `megakernel_runtime.maybe_create` model-architecture registry check
+    non_qwen_runner = SimpleNamespace(
+        model=SimpleNamespace(),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], model_type="llama"
+            )
+        ),
+    )
+    assert driver_mod.maybe_create(non_qwen_runner) is None
 
 
 def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
@@ -765,12 +784,12 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         buckets=(2,),
         verify_buckets=(4,),
     )
-    driver.bind_caches(runner)
     orig_data_ptrs = [p.data_ptr() for p in raw_pools_t]
     orig_storage_ptrs = [p.untyped_storage().data_ptr() for p in raw_pools_t]
 
-    # 1. Warmup compiles (1, 2) and (4, 4), runs sentinel check, and restores pools
-    driver.warmup(runner)
+    # 1. `bind_and_warmup` binds pools, compiles (1, 2) and (4, 4), runs sentinel check,
+    #    and restores pools
+    driver.bind_and_warmup(runner)
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
         assert p.untyped_storage().data_ptr() == orig_storage_ptrs[idx]
@@ -828,8 +847,8 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     positions_t1 = torch.tensor([5, 9], dtype=torch.int32)
     ref_pools_j = tuple(_torch_to_jax(p.clone(), tp) for p in raw_pools_t)
 
-    assert driver.can_run(input_ids_t1, positions_t1, runner=runner)
-    out_t1 = driver(input_ids_t1, positions_t1, num_tokens=2, runner=runner)
+    hit_t1, out_t1 = driver.try_forward(runner, input_ids_t1, positions_t1)
+    assert hit_t1 and out_t1 is not None
     assert out_t1.shape == (2, g.H)
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
