@@ -8,6 +8,7 @@ ascending logical blocks; membership is applied before selection for every Q.
 
 import functools
 import math
+import os
 from typing import NamedTuple
 
 import jax
@@ -17,6 +18,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode, tuned_block_sizes
+
+# Experimental knobs. SKIP: score only key tiles that hold union blocks (exact).
+# NOMASK: drop the membership/causal mask (wrong results; VPU-cost probe only).
+_SKIP_EMPTY_TILES = os.environ.get("TPU_DSV41_CAND_SKIP", "0") == "1"
+_NO_MASK = os.environ.get("TPU_DSV41_CAND_NOMASK", "0") == "1"
 
 
 class UnionMetadata(NamedTuple):
@@ -140,6 +146,24 @@ def unpack_candidate_words(words: jax.Array, *, interpret: bool = False) -> jax.
 
 
 def _score_kernel(q, weights, keys, ids, membership, lengths, out, *scratch):
+    _score_body(q, weights, keys, ids, membership, lengths, out, *scratch)
+
+
+def _skip_score_kernel(
+    tiles, q, weights, keys, ids, membership, lengths, out, *scratch
+):
+    """`_score_kernel` for tiles holding union blocks; -inf for the empty tail."""
+
+    @pl.when(pl.program_id(1) < tiles[pl.program_id(0)])
+    def _():
+        _score_body(q, weights, keys, ids, membership, lengths, out, *scratch)
+
+    @pl.when(pl.program_id(1) >= tiles[pl.program_id(0)])
+    def _():
+        out[...] = jnp.full(out.shape, -jnp.inf, out.dtype)
+
+
+def _score_body(q, weights, keys, ids, membership, lengths, out, *scratch):
     queries, heads, dim = q.shape[1:]
     kk = _unpack_words(keys[0], scratch[0]) if scratch else keys[0]
     logits = jax.lax.dot_general(
@@ -149,6 +173,9 @@ def _score_kernel(q, weights, keys, ids, membership, lengths, out, *scratch):
         preferred_element_type=jnp.float32,
     ).reshape(queries, heads, kk.shape[0])
     values = (jnp.maximum(logits, 0) * weights[0][:, :, None]).sum(1)
+    if _NO_MASK:
+        out[0] = values
+        return
     logical = ids[0, 0]
     allow = ((membership[0, 0][None, :] >> jnp.arange(queries)[:, None]) & 1) != 0
     allow &= (logical[None, :] >= 0) & (logical[None, :] < lengths[0, 0][:, None])
@@ -191,6 +218,51 @@ def candidate_scores(
     logical += jnp.arange(width)[None, :] % block_size
     logical = jnp.where(jnp.repeat(ids >= 0, block_size, 1), logical, -1)
     members = jnp.repeat(membership, block_size, 1)
+    if _SKIP_EMPTY_TILES:
+        # Union IDs are compacted to the front, so tiles past the last valid
+        # block hold only -1 IDs: skip their DMA (clamped index) and compute.
+        valid_records = jnp.sum(ids >= 0, axis=1).astype(jnp.int32) * block_size
+        tiles = jnp.maximum(pl.cdiv(valid_records, key_tile), 1).astype(jnp.int32)
+        rows = key_tile // 2 if packed else key_tile
+
+        def clamp(g, t, tl):
+            return jnp.minimum(t, tl[g] - 1)
+
+        return pl.pallas_call(
+            _skip_score_kernel,
+            out_shape=jax.ShapeDtypeStruct((groups, queries, width), jnp.float32),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                grid=(groups, width // key_tile),
+                in_specs=[
+                    pl.BlockSpec(
+                        (1, queries, heads, dim), lambda g, t, tl: (g, 0, 0, 0)
+                    ),
+                    pl.BlockSpec((1, queries, heads), lambda g, t, tl: (g, 0, 0)),
+                    pl.BlockSpec(
+                        (1, rows, dim), lambda g, t, tl: (g, clamp(g, t, tl), 0)
+                    ),
+                    pl.BlockSpec(
+                        (1, 1, key_tile), lambda g, t, tl: (g, 0, clamp(g, t, tl))
+                    ),
+                    pl.BlockSpec(
+                        (1, 1, key_tile), lambda g, t, tl: (g, 0, clamp(g, t, tl))
+                    ),
+                    pl.BlockSpec((1, 1, queries), lambda g, t, tl: (g, 0, 0)),
+                ],
+                out_specs=pl.BlockSpec(
+                    (1, queries, key_tile), lambda g, t, tl: (g, 0, t)
+                ),
+                scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)]
+                if packed
+                else [],
+            ),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
+            interpret=interpret,
+            name="candidate_union_packed_scores"
+            if packed
+            else "candidate_union_scores",
+        )(tiles, q, weights, keys, logical[:, None], members[:, None], lengths[:, None])
     return pl.pallas_call(
         _score_kernel,
         out_shape=jax.ShapeDtypeStruct((groups, queries, width), jnp.float32),
@@ -264,9 +336,15 @@ def candidate_indexer(
 
     def select(i, values):
         group_ids = prepare(i)[3]
+        if _SKIP_EMPTY_TILES:
+            # Scan only the compacted union, not the empty capacity tail.
+            union = jnp.sum(group_ids >= 0, axis=1).astype(jnp.int32) * block_size
+            scan = jnp.repeat(jnp.maximum(union, 1), queries)
+        else:
+            scan = jnp.full((request_tile * queries,), width, jnp.int32)
         selected = decode._select(
             values,
-            jnp.full((request_tile * queries,), width, jnp.int32),
+            scan,
             k,
             8192,
             8192,
