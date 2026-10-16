@@ -19,6 +19,8 @@ from absl.testing import absltest, parameterized
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     LANE,
+    fused_reverse_rope_wo_a_projection,
+    fused_reverse_rope_wo_a_projection_pair,
     gather_cos_sin,
     wo_a_projection,
 )
@@ -134,6 +136,59 @@ class OProjectionTest(parameterized.TestCase):
             np.asarray(expected, dtype=np.float32),
             rtol=1e-2,
             atol=1e-2,
+        )
+
+    @parameterized.product(num_tokens=(8, 32, 64, 128, 256), rank=(0, 1))
+    def test_pair_matches_fused_bitwise(self, *, num_tokens, rank):
+        """The pair op == the fused op on the assembled [2T, G*H, D] input.
+
+        Rank 0's first half is its own all-head `o` (heads [0, G*H)) and its
+        second half is rows [T, 2T) of a gathered buffer; rank 1's first half
+        is gathered rows [0, T) and its second half its `o` from head G*H.
+        """
+        num_groups, lora_rank = 8, 1024
+        heads = num_groups * HEADS_PER_GROUP
+        rng = np.random.default_rng(2)
+        own = jnp.asarray(
+            rng.standard_normal((num_tokens, 2 * heads, HEAD_DIM)), jnp.bfloat16
+        )
+        gathered = jnp.asarray(
+            rng.standard_normal((2 * num_tokens, heads, HEAD_DIM)), jnp.bfloat16
+        )
+        _, wo_a, wo_a_scale = make_inputs(
+            rng, num_tokens=1, num_groups=num_groups, lora_rank=lora_rank
+        )
+        positions = jnp.asarray(
+            rng.integers(0, MAX_POSITION, size=(2 * num_tokens,)), dtype=jnp.int32
+        )
+        cos_sin_cache = jnp.asarray(
+            make_cos_sin_cache(MAX_POSITION, ROTARY_DIM), dtype=jnp.float32
+        )
+        if rank == 0:
+            assembled = jnp.concatenate([own[:, :heads], gathered[num_tokens:]])
+            first, second, second_row0, second_head0 = own, gathered, num_tokens, 0
+        else:
+            assembled = jnp.concatenate([gathered[:num_tokens], own[:, heads:]])
+            first, second, second_row0, second_head0 = gathered, own, 0, heads
+        expected = fused_reverse_rope_wo_a_projection(
+            assembled, positions, cos_sin_cache, wo_a, wo_a_scale, head_dim=HEAD_DIM
+        )
+        actual = fused_reverse_rope_wo_a_projection_pair(
+            first,
+            second,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            first_row0=0,
+            first_head0=0,
+            second_row0=second_row0,
+            second_head0=second_head0,
+            num_heads=heads,
+            head_dim=HEAD_DIM,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
         )
 
 

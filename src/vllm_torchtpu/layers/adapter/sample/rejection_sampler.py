@@ -126,7 +126,8 @@ class RejectionSampler:
           do_sampling: Whether to use probabilistic rejection sampling. False
             keeps the existing greedy rejection path.
           topk_candidates: Candidate vocab blocks for small top-k; 0 searches
-            the full vocab. See `apply_top_k_top_p_candidates`.
+            the full vocab; NO_TOP_K_TOP_P skips the masks. See
+            `apply_top_k_top_p`.
           target_argmax: The target's greedy token per row, standing in for
             target_logits on the greedy path (TPU_GREEDY_TOP_TOKENS).
 

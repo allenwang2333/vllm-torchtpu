@@ -28,6 +28,9 @@ MASKED_LOGIT_VALUE = -1e12
 # and gathers run without tail padding. At 64 blocks, candidate bisection
 # evaluates 8,192 logits instead of 248,320.
 CANDIDATE_BLOCK = 128
+# `topk_candidates` value for a batch where no row sets top-k or top-p: every
+# mask would be discarded, so its ~65 vocab-wide search passes are skipped.
+NO_TOP_K_TOP_P = -1
 
 
 def _int32_bsearch(
@@ -251,6 +254,8 @@ def apply_top_k_top_p(
     top_p: torch.Tensor,
     topk_candidates: int = 0,
 ) -> torch.Tensor:
+    if topk_candidates == NO_TOP_K_TOP_P:
+        return logits
     if topk_candidates > 0:
         return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])

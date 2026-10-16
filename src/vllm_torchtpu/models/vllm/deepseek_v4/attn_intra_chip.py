@@ -22,12 +22,24 @@ TPU_DSV4_ATTN_INTRA_CHIP_TP=1.
 
 from __future__ import annotations
 
+import functools
+
+import jax
 import torch
+from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
+from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    fused_reverse_rope_wo_a_projection_pair,
+)
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
+from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
+    VllmDeepseekV4MLAAttention,
+    _pallas_op_cache,
+)
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
 logger = init_logger(__name__)
 
@@ -104,6 +116,46 @@ def _use_my_slice(layer: torch.nn.Module, rank: int, size: int) -> None:
             param.tp_rank, param.tp_size = rank, size
 
 
+def _o_proj_pair_jax(
+    first: jax.Array,
+    second: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    wo_a: jax.Array,
+    wo_a_scale: jax.Array,
+    *,
+    rank: int,
+    half: int,
+    head_dim: int,
+) -> jax.Array:
+    """wo_a over [core 0 tokens; core 1 tokens]; see `o_proj_pair_op`."""
+    num_tokens = positions.shape[0] // 2
+    # Rank 0: first = my o (heads [0, H/2)), second = gathered rows [T, 2T).
+    # Rank 1: first = gathered rows [0, T), second = my o (heads [H/2, H)).
+    second_row0, second_head0 = (num_tokens, 0) if rank == 0 else (0, half)
+    return fused_reverse_rope_wo_a_projection_pair(
+        first,
+        second,
+        positions,
+        cos_sin_cache,
+        wo_a,
+        wo_a_scale.reshape(-1),
+        first_row0=0,
+        first_head0=0,
+        second_row0=second_row0,
+        second_head0=second_head0,
+        num_heads=half,
+        head_dim=head_dim,
+    )
+
+
+def _fake_o_proj_pair(first, second, positions, cos_sin_cache, wo_a, *args, **kw):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty(
+        (positions.shape[0], wo_a.shape[-1]), dtype=first.dtype, device=first.device
+    )
+
+
 def _swap_with_peer(group, mine: torch.Tensor, theirs: torch.Tensor):
     """Send `theirs` to the peer core; return what the peer sent us.
 
@@ -164,6 +216,37 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
         )
 
+    @property
+    def o_proj_pair_op(self):
+        """The fused inverse-RoPE + wo_a op over [core 0 tokens; core 1
+        tokens] with my heads, read from `o` and the gathered peer rows.
+
+        Core 0's tokens are its own `o` rows (heads from 0) or the peer's
+        gathered rows [0, T); core 1's tokens are the gathered rows [T, 2T) or
+        its own `o` rows (heads from H/2). Built by the runner's op pre-build.
+        """
+        op = self.__dict__.get("_o_proj_pair_op_instance")
+        if op is not None:
+            return op
+        rank = self._chip_pair.rank_in_group
+        head_dim = int(self.head_dim)
+        half = self.n_local_heads // 2
+        op_name = f"pallas::deepseek_v4_o_proj_pair_d{head_dim}_r{rank}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(
+                    _o_proj_pair_jax, rank=rank, half=half, head_dim=head_dim
+                ),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=tuple(P() for _ in range(6)),
+            )
+            op.register_fake(_fake_o_proj_pair)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_o_proj_pair_op_instance", op)
+        return op
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         # The base reshapes wo_a by the local head and group counts, which are
         # halved for these weights but not for attention, so swap them in here.
@@ -210,18 +293,19 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
     def _o_proj(self, o, positions):
         group = self._chip_pair
         rank = group.rank_in_group
-        num_tokens = o.shape[0]
         half = self.n_local_heads // 2
-        o = o.reshape(num_tokens, 2, half, self.head_dim)
-        # Peer's tokens with my heads arrive; my tokens with my heads stay.
-        peer = _swap_with_peer(group, o[:, rank], o[:, 1 - rank])
-        pieces = [o[:, rank], peer] if rank == 0 else [peer, o[:, rank]]
-        o_half = torch.cat(pieces, dim=0).contiguous()
+        # The peer's tokens with my heads arrive as its rows of the gathered
+        # buffer; my tokens with my heads stay in `o`. wo_a reads both in
+        # place, core 0's tokens first (see `o_proj_pair_op`).
+        theirs = o[:, (1 - rank) * half : (2 - rank) * half]
+        gathered = group.all_gather(theirs.contiguous(), dim=0)
+        first, second = (o, gathered) if rank == 0 else (gathered, o)
         positions_all = group.all_gather(
             positions.to(torch.int32).contiguous(), dim=0
         ).to(positions.dtype)
-        z = self.o_proj_op(
-            o_half,
+        z = self.o_proj_pair_op(
+            first,
+            second,
             positions_all,
             self.rotary_emb.cos_sin_cache,
             self.wo_a.weight,
