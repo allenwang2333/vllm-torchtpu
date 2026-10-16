@@ -25,6 +25,11 @@ _SKIP_EMPTY_TILES = os.environ.get("TPU_DSV41_CAND_SKIP", "0") == "1"
 _NO_MASK = os.environ.get("TPU_DSV41_CAND_NOMASK", "0") == "1"
 # TILE: key_tile override for candidate_indexer (default 4096).
 _KEY_TILE = int(os.environ.get("TPU_DSV41_CAND_TILE", "0"))
+# FLAT: emit request-major [requests * queries, width] scores directly (R requests
+# per grid step, R * queries % 8 == 0), removing the padded [G, 6, W] -> [G*6, W]
+# HBM relayout copy before top-k. FLAT_WRITE picks the in-kernel row assembly.
+_FLAT = int(os.environ.get("TPU_DSV41_CAND_FLAT", "0"))
+_FLAT_WRITE = os.environ.get("TPU_DSV41_CAND_FLAT_WRITE", "slice")
 
 
 class UnionMetadata(NamedTuple):
@@ -288,6 +293,135 @@ def candidate_scores(
     )(q, weights, keys, logical[:, None], members[:, None], lengths[:, None])
 
 
+def _flat_score_kernel(
+    tiles, q, weights, keys, ids, membership, lengths, out, *, write
+):
+    """R whole requests per step; rows r*Q..r*Q+Q-1 of the out block are request r."""
+    group_tile, queries, heads, dim = q.shape
+    key_tile = keys.shape[1]
+
+    @pl.when(pl.program_id(1) < tiles[pl.program_id(0)])
+    def _():
+        rows = []
+        for r in range(group_tile):
+            logits = jax.lax.dot_general(
+                q[r].reshape(queries * heads, dim),
+                keys[r],
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).reshape(queries, heads, key_tile)
+            values = (jnp.maximum(logits, 0) * weights[r][:, :, None]).sum(1)
+            logical = ids[r, 0]
+            allow = (
+                (membership[r, 0][None, :] >> jnp.arange(queries)[:, None]) & 1
+            ) != 0
+            allow &= (logical[None, :] >= 0) & (
+                logical[None, :] < lengths[r, 0][:, None]
+            )
+            value = jnp.where(allow, values, -jnp.inf)
+            if write == "slice":
+                out[r * queries : (r + 1) * queries, :] = value
+            else:
+                rows.append(value)
+        if write == "concat":
+            out[...] = jnp.concatenate(rows, axis=0)
+        elif write == "stack":
+            out[...] = jnp.stack(rows).reshape(out.shape)
+
+    @pl.when(pl.program_id(1) >= tiles[pl.program_id(0)])
+    def _():
+        out[...] = jnp.full(out.shape, -jnp.inf, out.dtype)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "block_size",
+        "key_tile",
+        "group_tile",
+        "skip",
+        "write",
+        "interpret",
+    ),
+)
+def candidate_scores_flat(
+    q: jax.Array,
+    weights: jax.Array,
+    keys: jax.Array,
+    ids: jax.Array,
+    membership: jax.Array,
+    lengths: jax.Array,
+    *,
+    block_size: int,
+    key_tile: int = 4096,
+    group_tile: int = 4,
+    skip: bool = True,
+    write: str = "slice",
+    interpret: bool = False,
+) -> jax.Array:
+    """`candidate_scores` as request-major [groups * queries, width]; BF16 keys."""
+    groups, queries, heads, dim = q.shape
+    width = ids.shape[1] * block_size
+    if (
+        keys.dtype != jnp.bfloat16
+        or keys.shape != (groups, width, dim)
+        or groups % group_tile
+        or (group_tile * queries) % 8
+        or width % key_tile
+    ):
+        raise ValueError("Expected BF16 keys and an 8-row-aligned request tile")
+    logical = jnp.repeat(ids, block_size, 1) * block_size
+    logical += jnp.arange(width)[None, :] % block_size
+    logical = jnp.where(jnp.repeat(ids >= 0, block_size, 1), logical, -1)
+    members = jnp.repeat(membership, block_size, 1)
+    steps = groups // group_tile
+    if skip:
+        # Union IDs are compacted to the front: tiles past the last valid block
+        # of every request in the step hold only masked (-1) slots.
+        valid = jnp.sum(ids >= 0, axis=1).astype(jnp.int32) * block_size
+        valid = valid.reshape(steps, group_tile).max(1)
+        tiles = jnp.maximum(pl.cdiv(valid, key_tile), 1).astype(jnp.int32)
+    else:
+        tiles = jnp.full((steps,), width // key_tile, jnp.int32)
+
+    def clamp(s, t, tl):
+        return jnp.minimum(t, tl[s] - 1)
+
+    return pl.pallas_call(
+        functools.partial(_flat_score_kernel, write=write),
+        out_shape=jax.ShapeDtypeStruct((groups * queries, width), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(steps, width // key_tile),
+            in_specs=[
+                pl.BlockSpec(
+                    (group_tile, queries, heads, dim), lambda s, t, tl: (s, 0, 0, 0)
+                ),
+                pl.BlockSpec((group_tile, queries, heads), lambda s, t, tl: (s, 0, 0)),
+                pl.BlockSpec(
+                    (group_tile, key_tile, dim),
+                    lambda s, t, tl: (s, clamp(s, t, tl), 0),
+                ),
+                pl.BlockSpec(
+                    (group_tile, 1, key_tile), lambda s, t, tl: (s, 0, clamp(s, t, tl))
+                ),
+                pl.BlockSpec(
+                    (group_tile, 1, key_tile), lambda s, t, tl: (s, 0, clamp(s, t, tl))
+                ),
+                pl.BlockSpec((group_tile, 1, queries), lambda s, t, tl: (s, 0, 0)),
+            ],
+            out_specs=pl.BlockSpec(
+                (group_tile * queries, key_tile), lambda s, t, tl: (s, t)
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",) * 2, vmem_limit_bytes=96 * 1024 * 1024
+        ),
+        interpret=interpret,
+        name="candidate_union_scores_flat",
+    )(tiles, q, weights, keys, logical[:, None], members[:, None], lengths[:, None])
+
+
 @functools.partial(
     jax.jit,
     static_argnames=("block_size", "key_tile", "request_tile", "k", "overlap"),
@@ -334,6 +468,15 @@ def candidate_indexer(
         )
 
     def score(args):
+        if _FLAT and keys.dtype == jnp.bfloat16 and request_tile % _FLAT == 0:
+            return candidate_scores_flat(
+                *args,
+                block_size=block_size,
+                key_tile=key_tile,
+                group_tile=_FLAT,
+                skip=_SKIP_EMPTY_TILES,
+                write=_FLAT_WRITE,
+            )
         return candidate_scores(
             *args, block_size=block_size, key_tile=key_tile
         ).reshape(request_tile * queries, width)
