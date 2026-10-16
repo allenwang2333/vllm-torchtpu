@@ -57,6 +57,7 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadKey,
     OffloadPolicy,
+    get_offload_group_idx,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -71,6 +72,7 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -184,6 +186,40 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._fence_pending: dict[int, _ParkedStore] = {}
         self._scheduler: Any = None
         self._pending_failed_jobs: list[Any] = []
+        self._init_store_split()
+        self._init_state_demotion(spec.dedup_layout is not None)
+
+    def _init_store_split(self) -> None:
+        """Sets up the per-class count of launched store keys.
+
+        Keys of the full-attention groups count as split_fa_keys and all
+        others as split_mamba_keys in the `offload-tier store-split` line.
+        """
+        self._fa_group_ids = frozenset(
+            g.group_idx
+            for g in self.config.kv_group_configs
+            if g.sliding_window_size_in_chunks is None and not g.requires_cow_source
+        )
+
+    def _init_state_demotion(self, default_on: bool) -> None:
+        """Sets up demotion of superseded Mamba/GDN boundary states.
+
+        A conversation's next turn resumes from the newest boundary state its
+        last turn stored; older boundaries of the same chain serve only forks.
+        With TPU_RAIDEN_TIER_DEMOTE_STATE on (default: on with the deduplicated
+        layout), a finished request's boundary states below its newest one,
+        and the boundary it was admitted from, are demoted: they still answer
+        lookups, but the tier evicts them before any live entry.
+        """
+        env = os.environ.get("TPU_RAIDEN_TIER_DEMOTE_STATE")
+        self._demote_stale_state = (env == "1") if env is not None else default_on
+        self._state_group_ids = frozenset(
+            g.group_idx for g in self.config.kv_group_configs if g.requires_cow_source
+        )
+        # req_id -> boundary tokens -> the state keys stored for that boundary.
+        self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
+        # req_id -> (boundary tokens, state keys) of the admission's hit.
+        self._state_hits: dict[str, tuple[int, list[OffloadKey]]] = {}
 
     def _complete_jobs_directly(
         self,
@@ -294,6 +330,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                             break
 
         elapsed_ns = time.perf_counter_ns() - t0_ns
+        tel = self._raiden_manager.telemetry
+        tel["poll_ns"] += elapsed_ns
+        if waited:
+            tel["wait_ns"] += elapsed_ns
+            tel["waited_polls"] += 1
         return elapsed_ns, early_reqs, waited_reqs, waited
 
     def build_connector_meta(
@@ -396,6 +437,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     failed_load_block_ids.extend(
                         finished_job.failed_device_block_ids
                     )
+
+        if self._demote_stale_state:
+            self._demote_superseded_states(scheduler_output.finished_req_ids or ())
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -517,6 +561,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                         req_status.num_locally_computed_tokens = orig_local
                         req_status.partial_tail_boundary = orig_partial
                     if probe_hit is None or probe_hit > 0:
+                        self._raiden_manager.telemetry["load_cap_deferrals"] += 1
                         return None, False
         num_hit_tokens, load_async = super().get_num_new_matched_tokens(
             request, num_computed_tokens
@@ -553,6 +598,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         req_status = self._req_status.get(request.request_id)
         if req_status is not None:
+            self._record_state_hit(
+                request, req_status.num_locally_computed_tokens + num_external_tokens
+            )
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -563,6 +611,54 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     # re-storing any HBM-resident prefix chunks displaced from
                     # the host LRU).
                     group_state.next_stored_chunk_idx = 0
+
+    def _build_aligned_boundary_store_jobs(
+        self, handoffs: dict[str, list[tuple[int, int, int]]]
+    ) -> dict[int, Any]:
+        jobs = super()._build_aligned_boundary_store_jobs(handoffs)
+        if self._demote_stale_state:
+            for req_id, entries in handoffs.items():
+                req_status = self._req_status.get(req_id)
+                if req_status is None:
+                    continue
+                boundaries = self._state_boundaries.setdefault(req_id, {})
+                for group_idx, _, boundary in entries:
+                    if group_idx in self._state_group_ids:
+                        boundaries.setdefault(boundary, []).append(
+                            self._make_boundary_key(req_status.req, group_idx, boundary)
+                        )
+        return jobs
+
+    def _record_state_hit(self, request: Request, hit_tokens: int) -> None:
+        if not self._demote_stale_state or hit_tokens <= 0 or not self._state_group_ids:
+            return
+        if hit_tokens // self.config.tokens_per_hash > len(request.block_hashes):
+            return
+        self._state_hits[request.request_id] = (
+            hit_tokens,
+            [
+                self._make_boundary_key(request, group_idx, hit_tokens)
+                for group_idx in sorted(self._state_group_ids)
+            ],
+        )
+
+    def _demote_superseded_states(self, finished_req_ids: Iterable[str]) -> None:
+        for req_id in finished_req_ids:
+            boundaries = self._state_boundaries.pop(req_id, None)
+            hit = self._state_hits.pop(req_id, None)
+            if not boundaries:
+                continue
+            newest = max(boundaries)
+            stale = [
+                key
+                for boundary, keys in boundaries.items()
+                if boundary < newest
+                for key in keys
+            ]
+            if hit is not None and hit[0] < newest:
+                stale.extend(hit[1])
+            if stale:
+                self._raiden_manager.demote(stale)
 
     def _touch(self, req_status: Any) -> None:
         local_tokens = int(
@@ -709,7 +805,15 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     del self._fence_pending[job_id]
                     ready_jobs.append((job_id, parked))
             ready_jobs.sort(key=lambda item: (-len(item[1].keys), item[0]))
+            tel = self._raiden_manager.telemetry
             for job_id, parked in ready_jobs:
+                fa = sum(
+                    1
+                    for key in parked.keys
+                    if get_offload_group_idx(key) in self._fa_group_ids
+                )
+                tel["split_fa_keys"] += fa
+                tel["split_mamba_keys"] += len(parked.keys) - fa
                 self._raiden_manager.submit_store_job(
                     job_id, parked.keys, parked.device_block_ids
                 )

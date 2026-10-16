@@ -978,9 +978,11 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
-        sched.config = SimpleNamespace(num_workers=num_workers)
+        sched.config = SimpleNamespace(num_workers=num_workers, kv_group_configs=())
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        sched._init_store_split()
+        sched._init_state_demotion(False)
         return sched
 
     def _stock_meta(self, store_jobs=None, load_jobs=None, jobs_to_flush=None):
@@ -1221,6 +1223,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         sched._current_batch_jobs_to_flush = set()
         sched._connector_stats = MagicMock()
         sched._events_tracker = MagicMock()
+        sched._init_store_split()
+        sched._init_state_demotion(False)
         return sched
 
     def _track(self, sched, req, keys, block_ids):
@@ -3223,6 +3227,65 @@ class TestStoragePlumbing(unittest.TestCase):
         plain, tiered = self.manager_kwargs
         self.assertNotIn("backend_configs", plain)
         self.assertEqual(tiered["backend_configs"], [cfg])
+
+
+class TestStoreSplitTelemetry(unittest.TestCase):
+    """Launched store keys counted by the class of their KV cache group."""
+
+    def _make_sched(self, manager):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            GroupOffloadConfig,
+            SchedulerOffloadConfig,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        def group(idx, recurrent):
+            return GroupOffloadConfig(
+                group_idx=idx,
+                tokens_per_block=4,
+                tokens_per_chunk=4,
+                hashes_per_chunk=1,
+                kv_event_group_spec=MagicMock(),
+                sliding_window_size_in_chunks=1 if recurrent else None,
+                requires_cow_source=recurrent,
+            )
+
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SchedulerOffloadConfig(
+            kv_group_configs=(group(0, False), group(1, True)),
+            blocks_per_chunk=1,
+            tokens_per_hash=4,
+            num_workers=2,
+            offload_prompt_only=False,
+            supports_partial_tail=False,
+        )
+        sched._raiden_manager = manager
+        sched._fence_pending = {}
+        sched._init_store_split()
+        sched._init_state_demotion(False)
+        return sched
+
+    def test_split_counts_fa_and_recurrent_keys(self):
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store, num_blocks=64)
+        sched = self._make_sched(manager)
+        keys = [
+            make_offload_key(b"h000", 0),
+            make_offload_key(b"h001", 1),
+            make_offload_key(b"h002", 1),
+        ]
+        manager.prepare_store(keys, _ctx())
+        fence = TestSchedulerFenceFlow()
+        fence._build_meta(
+            sched,
+            fence._stock_meta(store_jobs={7: fence._store_job(keys, [1, 2, 3])}),
+        )
+        fence._ack(sched, [7], count=2)
+        self.assertEqual(manager.telemetry["split_fa_keys"], 1)
+        self.assertEqual(manager.telemetry["split_mamba_keys"], 2)
 
 
 if __name__ == "__main__":
