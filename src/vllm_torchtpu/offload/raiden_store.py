@@ -335,6 +335,47 @@ class RaidenOffloadingManager(OffloadingManager):
                 "until %d worker(s) register",
                 world_size,
             )
+            ready_marker = f"/tmp/raiden_controller_ready_{raiden_controller_port}"
+            try:
+                os.unlink(ready_marker)
+            except OSError:
+                pass
+
+            def _mark_ready_when_listening(port: int, marker: str) -> None:
+                port_hex = f":{port:04X}"
+                for _ in range(600):
+                    time.sleep(0.25)
+                    listening = False
+                    for netf in ("/proc/net/tcp", "/proc/net/tcp6"):
+                        try:
+                            with open(netf) as f:
+                                for line in f:
+                                    parts = line.split()
+                                    if (
+                                        len(parts) > 3
+                                        and parts[1].upper().endswith(port_hex)
+                                        and parts[3] == "0A"
+                                    ):
+                                        listening = True
+                                        break
+                        except OSError:
+                            pass
+                        if listening:
+                            break
+                    if listening:
+                        try:
+                            with open(marker + ".tmp", "w") as mf:
+                                mf.write(str(os.getpid()))
+                            os.replace(marker + ".tmp", marker)
+                        except OSError:
+                            pass
+                        return
+
+            threading.Thread(
+                target=_mark_ready_when_listening,
+                args=(raiden_controller_port, ready_marker),
+                daemon=True,
+            ).start()
             store = store_types.KVCacheStore(
                 capacity=kernel_physical_blocks_capacity,
                 raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
@@ -1669,6 +1710,11 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._controller_address = controller_address
         self._rank = rank
         self._mgr = None
+        _, _, port_str = controller_address.rpartition(":")
+        try:
+            os.unlink(f"/tmp/raiden_controller_ready_{int(port_str)}")
+        except (OSError, ValueError):
+            pass
         self._stop_registration = threading.Event()
         self._register_thread = threading.Thread(
             target=self._register_loop,
@@ -1682,8 +1728,13 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         precondition for registering, not proof of registration)."""
         host, _, port = self._controller_address.rpartition(":")
         host = host.strip("[]")
+        if host in ("127.0.0.1", "localhost", "::1"):
+            if not os.path.exists(f"/tmp/raiden_controller_ready_{int(port)}"):
+                return False
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
+            with socket.create_connection((host, int(port)), timeout=1.0) as s:
+                if s.getsockname() == s.getpeername():
+                    return False
                 return True
         except OSError:
             return False
@@ -2217,6 +2268,17 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in "
                 "kv_connector_extra_config (--kv-offloading-size)"
             )
+        os.environ.setdefault("RAIDEN_NUMA_POLICY", "preferred")
+        max_cpu_bytes = int(
+            os.environ.get("TPU_RAIDEN_MAX_CPU_BYTES", "560000000000")
+        )
+        if int(cpu_bytes_to_use) > max_cpu_bytes:
+            logger.info(
+                "TPURaidenOffloadingConnector: capping cpu_bytes_to_use from %s to %d for 1P1D host RAM safety",
+                cpu_bytes_to_use,
+                max_cpu_bytes,
+            )
+            cpu_bytes_to_use = max_cpu_bytes
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -2279,6 +2341,24 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             self.extra_config.get("global_registry_address", "")
         )
         self.store_server_ip = str(self.extra_config.get("store_server_ip", ""))
+        self._auto_global_registry = os.environ.get(
+            "TPU_ENABLE_GLOBAL_KV_REGISTRY", ""
+        ).strip().lower() in ("1", "true", "yes")
+        if self._auto_global_registry and not self.global_registry_address:
+            os.environ.setdefault("PYTHONHASHSEED", "0")
+            job_set_name = os.environ.get("JOB_SET_NAME", "").strip()
+            reg_port = int(os.environ.get("TPU_GLOBAL_KV_REGISTRY_PORT", "48500"))
+            reg_host = os.environ.get("TPU_GLOBAL_KV_REGISTRY_HOST", "").strip() or (
+                f"{job_set_name}-prefill-0-0.{job_set_name}"
+                if job_set_name
+                else "127.0.0.1"
+            )
+            self.global_registry_address = f"{reg_host}:{reg_port}"
+            if not self.store_server_ip:
+                self.store_server_ip = (
+                    os.environ.get("TPU_RAIDEN_ADVERTISE_HOST", "").strip()
+                    or "127.0.0.1"
+                )
         # KV pool group this store's KVTransferSpec is published under; the
         # store nodes absorbing this pool's evictions name the same group.
         # Empty falls back to the raiden job name, which the DP suffix below
@@ -2326,11 +2406,20 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        self.raiden_controller_port = dp_rank_local + int(
+        base_ctrl_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
+        if base_ctrl_port >= 32768:
+            base_ctrl_port -= 20000
+        self.raiden_controller_port = dp_rank_local + base_ctrl_port
+        job_idx = os.environ.get("JOBSET_JOB_INDEX", "0").strip() or "0"
+        default_job_name = (
+            f"vllm-offload-prefill-{job_idx}"
+            if self._auto_global_registry
+            else f"vllm-offload-{config.engine_id}"
+        )
         self.raiden_job_name = str(
-            self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
+            self.extra_config.get("raiden_job_name", default_job_name)
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
@@ -2342,6 +2431,47 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
+            if self._auto_global_registry and self.global_registry_address:
+                import shutil
+                import subprocess
+
+                reg_host, _, reg_port_str = self.global_registry_address.rpartition(":")
+                reg_port = int(reg_port_str or "48500")
+                job_idx = os.environ.get("JOBSET_JOB_INDEX", "0").strip() or "0"
+                if job_idx == "0" and not self.vllm_config.parallel_config.data_parallel_rank:
+                    bin_path = shutil.which("global_registry_server")
+                    if bin_path:
+                        try:
+                            with socket.create_connection(
+                                ("127.0.0.1", reg_port), timeout=0.5
+                            ):
+                                pass
+                        except OSError:
+                            logger.info(
+                                "TPURaidenOffloadingConnector: starting global_registry_server on :%d",
+                                reg_port,
+                            )
+                            subprocess.Popen(
+                                [bin_path, f"--port={reg_port}"],
+                                start_new_session=True,
+                            )
+                logger.info(
+                    "TPURaidenOffloadingConnector: waiting for global_registry_server at %s...",
+                    self.global_registry_address,
+                )
+                deadline = time.monotonic() + 600.0
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(
+                            (reg_host, reg_port), timeout=2.0
+                        ):
+                            logger.info(
+                                "TPURaidenOffloadingConnector: global_registry_server at %s is reachable!",
+                                self.global_registry_address,
+                            )
+                            break
+                    except OSError:
+                        time.sleep(1.0)
             secondary_backend_configs: list[object] = []
             storage = self.storage_config
             if storage is not None:

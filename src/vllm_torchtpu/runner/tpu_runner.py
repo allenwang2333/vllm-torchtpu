@@ -2703,9 +2703,11 @@ class TPUModelRunner(GPUModelRunner):
         fixed). Unified pool, align mode, per-region pools only."""
         cached = self.__dict__.get("_mamba_seg_enabled_cached")
         if cached is None:
+            kv_transfer_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+            kv_role = getattr(kv_transfer_cfg, "kv_role", None)
             cached = bool(
                 envs.TPU_SCHED_SINGLE_STEP_PREFILL
-                and getattr(self.vllm_config, "kv_transfer_config", None) is None
+                and (kv_transfer_cfg is None or kv_role == "kv_producer")
                 and getattr(self.cache_config, "prefix_cache_retention_interval", None) == 0
                 and not self._pcp_enabled
                 and self._unified_kv_layout
@@ -9080,19 +9082,37 @@ class TPUModelRunner(GPUModelRunner):
                         shape_variants.retrace(
                             self.drafter.draft_model, self.drafter.draft_vllm_config
                         )
+                    # When MTP megakernel step-0 is active, P == 1 + K (4) has
+                    # q_len == 1 + K and is intercepted by _mtp_mk_step0, which
+                    # would skip tracing draft_model on the s0 <= 4 partition.
+                    # Warm p_req = 1 first (pads to bucket 4 with q_len = 1,
+                    # routing to draft_model) before p_req = P (routing to
+                    # _mtp_mk_step0).
+                    p_candidates = (
+                        (1, int(P))
+                        if (
+                            self._qwen35_mtp_mk is not None
+                            and int(P)
+                            == 1 + self.speculative_config.num_speculative_tokens
+                        )
+                        else (int(P),)
+                    )
                     # Greedy and non-greedy (do_sampling=True) verify+sample are
                     # DISTINCT fused programs, so sweep both at every prompt bucket.
-                    for greedy in (True, False):
-                        if not self._warmup_one_spec_request(
-                            int(P), idx=i, quiet=True, greedy=greedy
-                        ):
-                            # First attempt cold-compiles the draft forward; a
-                            # SymInt from that cold compile can leak into the
-                            # dynamic=False gather wrapper on the first bucket. Retry
-                            # once now that the forward is compiled and returns
-                            # concrete-shaped tensors (this attempt logs loudly if it
-                            # also fails).
-                            self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                    for p_req in p_candidates:
+                        for greedy in (True, False):
+                            if not self._warmup_one_spec_request(
+                                p_req, idx=i, quiet=True, greedy=greedy
+                            ):
+                                # First attempt cold-compiles the draft forward; a
+                                # SymInt from that cold compile can leak into the
+                                # dynamic=False gather wrapper on the first bucket. Retry
+                                # once now that the forward is compiled and returns
+                                # concrete-shaped tensors (this attempt logs loudly if it
+                                # also fails).
+                                self._warmup_one_spec_request(
+                                    p_req, idx=i, greedy=greedy
+                                )
             # (2) The propose+verify+sampling fusions AND the fused MTP loop
             # program (_mtp_fused_loop) are keyed on both the decode token
             # bucket T = pad(R * (1 + K)) and the draft loop carry bucket
