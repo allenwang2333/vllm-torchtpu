@@ -2288,7 +2288,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
         "    %arg2: tensor<8xbf16>,\n"
         "    %arg3: tensor<64x4xbf16>,\n"
         "    %arg4: tensor<16xi32>,\n"
-        "    %arg5: tensor<128x16x2x2x4xbf16> {tf.aliasing_output = 0 : i32, mhlo.sharding = \"{replicated}\", jax.buffer_donor = true},\n"
+        '    %arg5: tensor<128x16x2x2x4xbf16> {tf.aliasing_output = 0 : i32, mhlo.sharding = "{replicated}", jax.buffer_donor = true},\n'
         "    %arg6: tensor<8xi32>,\n"
         "    %arg7: tensor<128xi32>,\n"
         "    %arg8: tensor<9xi32>,\n"
@@ -2341,7 +2341,9 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
 
     # Verify dummy-load HF cache snapshot (with config.json & tokenizer.json but no *.safetensors) is copied
     fake_hf_home = tmp_path / "hf_cache"
-    snap = fake_hf_home / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "dummy_hash"
+    snap = (
+        fake_hf_home / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "dummy_hash"
+    )
     snap.mkdir(parents=True)
     (snap / "config.json").write_text('{"vocab_size": 32}')
     (snap / "tokenizer.json").write_text('{"version": "1.0"}')
@@ -2350,7 +2352,9 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
     class DummyRunner:
         def __init__(self) -> None:
             self.model = torch.nn.Module()
-            self.model.lm_head = torch.nn.Linear(8, 32, bias=False, dtype=torch.bfloat16)
+            self.model.lm_head = torch.nn.Linear(
+                8, 32, bias=False, dtype=torch.bfloat16
+            )
             self._greedy_head_owner = MagicMock()
             self.num_reqs_paddings = [8]
             self.num_tokens_paddings = [16]
@@ -2390,9 +2394,183 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
     assert (export_dir / "config.json").is_file()
     assert (export_dir / "tokenizer.json").is_file()
     assert (export_dir / "serving_checkpoint" / "constants.safetensors").is_file()
-    wj_final = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
+    wj_final = json.loads(
+        (export_dir / "serving_checkpoint" / "weight.json").read_text()
+    )
     assert "model.embed_tokens.weight" in wj_final
     assert "rotary_emb_inv_freq" in wj_final
     assert "lm_head.weight" in wj_final
+    assert wj_final["model.embed_tokens.weight"]["sources"][0]["path"] == str(
+        (snap / "model.safetensors").absolute()
+    )
 
 
+def test_scalar_buffer_constants_and_extra_snapshot_assets(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify 0-D scalar buffers (e.g. VocabParallelEmbedding indices) and extra HF assets."""
+    export_dir = tmp_path / "export_scalar_buf"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    stablehlo_export._CAPTURED_CONSTANTS.clear()
+
+    class VocabParallelDummyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Module()
+            self.model.embed_tokens.register_buffer(
+                "org_vocab_start_index", torch.tensor(0, dtype=torch.int64)
+            )
+            self.model.embed_tokens.register_buffer(
+                "org_vocab_end_index", torch.tensor(16, dtype=torch.int64)
+            )
+            self.model.embed_tokens.weight = torch.nn.Parameter(
+                torch.zeros((16, 8), dtype=torch.bfloat16)
+            )
+            self.lm_head = torch.nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+
+    active_model = VocabParallelDummyModel()
+    stablehlo_export.register_active_model(active_model)
+
+    outer_g = fx.Graph()
+    outer_g.placeholder("L_input_ids_")
+    outer_g.placeholder(
+        "L_self_modules_model_modules_embed_tokens_buffers_org_vocab_start_index_"
+    )
+    outer_g.placeholder(
+        "L_self_modules_model_modules_embed_tokens_buffers_org_vocab_end_index_"
+    )
+    outer_g.placeholder("L_self_modules_model_modules_embed_tokens_parameters_weight_")
+    outer_ph = [n for n in outer_g.nodes if n.op == "placeholder"]
+    outer_g.output((outer_ph[0],))
+    outer_gm = fx.GraphModule(torch.nn.Module(), outer_g)
+
+    inner_g = fx.Graph()
+    for k in range(4):
+        inner_g.placeholder(f"arg{k}_1")
+    inner_ph = [n for n in inner_g.nodes if n.op == "placeholder"]
+    inner_g.output((inner_ph[0],))
+    inner_gm = fx.GraphModule(torch.nn.Module(), inner_g)
+
+    # Simulate FakeTensor inner args so _CAPTURED_CONSTANTS is not populated during _save_fx
+    class FakeScalarTensor:
+        def __init__(self, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            self.shape = torch.Size(shape)
+            self.dtype = dtype
+
+    FakeScalarTensor.__name__ = "FakeTensor"
+    fake_inner_args = [
+        FakeScalarTensor((16,), torch.int32),
+        FakeScalarTensor((), torch.int64),
+        FakeScalarTensor((), torch.int64),
+        FakeScalarTensor((16, 8), torch.bfloat16),
+    ]
+    outer_inputs = [
+        torch.zeros((16,), dtype=torch.int32),
+        active_model.model.embed_tokens.org_vocab_start_index,
+        active_model.model.embed_tokens.org_vocab_end_index,
+        active_model.model.embed_tokens.weight,
+    ]
+
+    mlir_text = """module @forward_bucket16 {
+  func.func public @main(
+    %arg0: tensor<16xi32>,
+    %arg1: tensor<i64>,
+    %arg2: tensor<i64>,
+    %arg3: tensor<16x8xbf16>
+  ) -> (tensor<16x8xbf16>) {
+    %0 = stablehlo.constant dense<0.0> : tensor<16x8xbf16>
+    return %0 : tensor<16x8xbf16>
+  }
+}
+"""
+    specs = stablehlo_export._extract_input_specs(
+        inner_gm, fake_inner_args, outer_graph=outer_gm, outer_inputs=outer_inputs
+    )
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="forward_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=mlir_text,
+        input_specs=specs,
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "hidden_states",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "intermediate",
+                "buffer_donor": False,
+            }
+        ],
+    )
+
+    fake_hf_home = tmp_path / "hf_cache_2"
+    snap = (
+        fake_hf_home
+        / "hub"
+        / "models--moonshotai--Kimi-Linear-48B-A3B-Instruct"
+        / "snapshots"
+        / "main"
+    )
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text('{"vocab_size": 16}')
+    (snap / "tiktoken.model").write_text("dummy_tiktoken")
+    (snap / "configuration_kimi.py").write_text("# custom config")
+    monkeypatch.setenv("HF_HOME", str(fake_hf_home))
+
+    class DummyRunner2:
+        def __init__(self) -> None:
+            self.model = active_model
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [8]
+            self.num_tokens_paddings = [16]
+            self.model_config = MagicMock()
+            self.model_config.model = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
+            self.model_config.get_hidden_size.return_value = 8
+            self.model_config.vocab_size = 16
+            self.model_config.max_model_len = 2048
+            self.model_config.eos_token_id = 2
+            self.parallel_config = MagicMock()
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.data_parallel_size = 1
+            self.cache_config = MagicMock()
+            self.cache_config.block_size = 16
+            self.cache_config.num_gpu_blocks = 64
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    def _fake_fx_to_mlir_3(gm: Any, args: list[Any], **_kw: Any) -> Any:
+        n = int(args[0].shape[0])
+        m = MagicMock()
+        m.is_noop = False
+        m.module = MagicMock()
+        m.serialize_text.return_value = (
+            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
+            f"%arg1: tensor<16x8xbf16>) -> tensor<{n}x1xi64> {{ "
+            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
+            f"return %0 : tensor<{n}x1xi64> }} }}"
+        )
+        return m
+
+    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir_3):
+        stablehlo_export.maybe_export_sampling_subgraphs(DummyRunner2())
+
+    assert (export_dir / "tiktoken.model").is_file()
+    assert (export_dir / "configuration_kimi.py").is_file()
+    const_st = export_dir / "serving_checkpoint" / "constants.safetensors"
+    assert const_st.is_file()
+    wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
+    assert wj["model.embed_tokens.org_vocab_start_index"]["shape"] == []
+    assert wj["model.embed_tokens.org_vocab_start_index"]["sources"][0]["path"] == str(
+        const_st.absolute()
+    )
+    assert wj["model.embed_tokens.org_vocab_end_index"]["sources"][0]["path"] == str(
+        const_st.absolute()
+    )
