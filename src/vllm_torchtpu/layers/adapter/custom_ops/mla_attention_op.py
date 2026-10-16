@@ -81,6 +81,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    _fp8_linear_pallas_hbm_pinned_jax,
     _fp8_linear_pallas_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
@@ -674,6 +675,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rank_operand = envs.TPU_DCP_RANK_OPERAND
         rank_tensor = dcp_rank_operand() if rank_operand else None
         k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
+        qb_overlap_fn = _fp8_linear_pallas_jax
+        if qb_overlap:
+            # TPU_FP8_SKINNY_HBM_PIN_SITES: the overlapped q_b runs what the q_b
+            # layer's own op would, so it pins its weight when that layer does.
+            from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+                fp8_skinny_hbm_pin_selected,
+            )
+
+            layer_prefix = self.k_cache.prefix.split(".self_attn")[0]
+            if fp8_skinny_hbm_pin_selected(f"{layer_prefix}.self_attn.q_b_proj"):
+                qb_overlap_fn = _fp8_linear_pallas_hbm_pinned_jax
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -719,7 +731,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             overlap = {}
             if qb_overlap:
                 overlap = dict(
-                    overlap_fn=_fp8_linear_pallas_jax,
+                    overlap_fn=qb_overlap_fn,
                     overlap_args=tuple(qb_args),
                     # Decode buckets only: the skinny kernel's M range.
                     overlap_pin_max_tokens=fp8_skinny.MAX_M,

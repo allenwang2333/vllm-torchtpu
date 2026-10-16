@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
+    TPU_DCP_MLA_SEND_DENSE: bool = False
+    TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -250,6 +252,8 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_MOE_ROUTER_HBM_PIN: bool = False
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
@@ -540,6 +544,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS", 0
     ),
+    # With TPU_DCP_MLA_SEND_LAYOUT: exchange the kernel's send buffer with a
+    # dense all-to-all of whole destination blocks (one JAX op, with the
+    # unpack) instead of the ragged real-rows one, and zero the received
+    # partial rows past the real tokens' as the ragged exchange leaves them.
+    # XLA's ragged all-to-all runs on a row-contiguous [rows, 2, 256] copy of
+    # the kernel's tiled buffer and copies the result back; the dense one
+    # takes the tiled blocks as they are. Same bits on every row the merge
+    # reads, same merge.
+    "TPU_DCP_MLA_SEND_DENSE": env_bool("TPU_DCP_MLA_SEND_DENSE", default=False),
+    # With TPU_DCP_MLA_SEND_LAYOUT (and not TPU_DCP_MLA_SEND_DENSE): run the
+    # ragged exchange over groups of this many rows (8 or 16: whole (8,128)
+    # tiles of the int16 buffer, so XLA keeps the kernel's tiled layout
+    # instead of copying it to and from [rows, 2, 256]), from the group
+    # holding the lse word row to the one holding the last real partial row;
+    # received partial rows past the real ones are zeroed as the row-ragged
+    # exchange leaves them. 0 = the row-ragged exchange. Same bits on every
+    # row the merge reads, same merge. Applies where the block splits into
+    # whole groups (fixed per bucket at trace time).
+    "TPU_DCP_MLA_SEND_GROUP_ROWS": env_int("TPU_DCP_MLA_SEND_GROUP_ROWS", 0),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
@@ -1710,6 +1733,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer at decode. Applies to the sites in fp8_skinny.SCALE_DMA_SITES (o_proj).
     # Outputs are bit-identical.
     "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
+    # With TPU_FP8_LINEAR_PALLAS: comma-separated layer-prefix suffixes ("."-bounded,
+    # as TPU_FP8_LINEAR_PALLAS_SITES) whose skinny kernel takes its weight operand
+    # constrained to HBM (pltpu.with_memory_space_constraint). The kernel streams the
+    # weight from HBM itself; without the constraint XLA's memory-space assignment
+    # may stage it into VMEM with a copy the call then waits on (o_proj 6.29 MB, q_b
+    # 16.8 MB at TP16 x DCP8 decode), exposed whenever too little runs between the
+    # copy's start and the call. Per site, not global: a site whose staging copy is
+    # hidden (qkv_a under its prefetch override) keeps it. Bit-identical outputs.
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    # MoE router logits (the bf16 gate GEMM, [T, hidden] x [E, hidden]^T) of a layer
+    # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
+    # Pallas kernel that streams the router weight from HBM (operand constrained
+    # to HBM), instead of an XLA dot whose weight XLA stages into VMEM with a copy
+    # (exposed at decode once the window before it shrinks). NOT bit-identical:
+    # Mosaic's MXU accumulation order differs from XLA's, ~1 in 10^4 logits lands on
+    # the neighbouring bf16 (a top-k flip needs a logit within an ulp of the
+    # boundary); needs an accuracy check. Prefill sizes unchanged.
+    "TPU_MOE_ROUTER_HBM_PIN": env_bool("TPU_MOE_ROUTER_HBM_PIN"),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
