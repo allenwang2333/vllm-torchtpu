@@ -1989,7 +1989,7 @@ def test_generic_dynamo_placeholder_and_packed_module_reflection() -> None:
     stablehlo_export.register_active_model(None)
 
 
-def test_multi_rank_writer_guard_sampling_bucket_union_and_mtp_draft_collision_free_indices(
+def test_multi_rank_writer_guard_and_mtp_draft_collision_free_indices(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     export_dir = tmp_path / "export_mtp_and_buckets"
@@ -2131,7 +2131,7 @@ def test_multi_rank_writer_guard_sampling_bucket_union_and_mtp_draft_collision_f
     assert draft_inputs[2]["arg_index"] == 2
     assert draft_inputs[2]["index"] == 3
 
-    # 3. Non-writer rank (RANK=1) must not overwrite or exit in maybe_export_sampling_subgraphs
+    # 3. Non-writer rank (RANK=1) must not overwrite or exit in sampling export
     class MockModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -2197,7 +2197,7 @@ def test_multi_rank_writer_guard_sampling_bucket_union_and_mtp_draft_collision_f
 def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_assets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify AOT `arg{K}_1` outer mapping, uppercase Dynamo `L_`/`G_` names, and dummy HF snapshots."""
+    """Verify AOT `arg{K}_1` outer mapping, uppercase Dynamo names, and snapshots."""
     export_dir = tmp_path / "export_qwen_aot"
     monkeypatch.setattr(
         stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
@@ -2248,7 +2248,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
         torch.zeros((3,), dtype=torch.int32),
     ]
 
-    # Inner AOT graph skips arg1_1 (SymInt) and reorders arg5_1 (cos_sin_cache) before arg4_1 (positions)
+    # Inner AOT graph skips arg1_1 and reorders arg5_1 before arg4_1
     inner_g = fx.Graph()
     inner_order = [0, 2, 3, 5, 4, 6, 7, 8, 9, 10]
     inner_phs = [inner_g.placeholder(f"arg{k}_1") for k in inner_order]
@@ -2279,7 +2279,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
     assert specs[8]["name"] == "query_start_loc"
     assert specs[9]["name"] == "req_dist"
 
-    # Verify _write_exported_module labels donor state outputs and final hidden_states output
+    # Verify _write_exported_module labels donor state and final hidden_states outputs
     fwd_mlir = (
         "module @fwd {\n"
         "  func.func public @main(\n"
@@ -2288,7 +2288,9 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
         "    %arg2: tensor<8xbf16>,\n"
         "    %arg3: tensor<64x4xbf16>,\n"
         "    %arg4: tensor<16xi32>,\n"
-        '    %arg5: tensor<128x16x2x2x4xbf16> {tf.aliasing_output = 0 : i32, mhlo.sharding = "{replicated}", jax.buffer_donor = true},\n'
+        "    %arg5: tensor<128x16x2x2x4xbf16> "
+        '{tf.aliasing_output = 0 : i32, mhlo.sharding = "{replicated}", '
+        "jax.buffer_donor = true},\n"
         "    %arg6: tensor<8xi32>,\n"
         "    %arg7: tensor<128xi32>,\n"
         "    %arg8: tensor<9xi32>,\n"
@@ -2339,7 +2341,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
     assert fwd_entry["outputs"][1]["name"] == "hidden_states"
     assert fwd_entry["outputs"][1]["argument_type"] == "intermediate"
 
-    # Verify dummy-load HF cache snapshot (with config.json & tokenizer.json but no *.safetensors) is copied
+    # Verify dummy-load HF cache snapshot (without *.safetensors) is copied
     fake_hf_home = tmp_path / "hf_cache"
     snap = (
         fake_hf_home / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "dummy_hash"
@@ -2408,7 +2410,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
 def test_scalar_buffer_constants_and_extra_snapshot_assets(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """Verify 0-D scalar buffers (e.g. VocabParallelEmbedding indices) and extra HF assets."""
+    """Verify 0-D scalar buffers and extra HF snapshot assets."""
     export_dir = tmp_path / "export_scalar_buf"
     monkeypatch.setattr(
         stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
@@ -2454,7 +2456,7 @@ def test_scalar_buffer_constants_and_extra_snapshot_assets(
     inner_g.output((inner_ph[0],))
     inner_gm = fx.GraphModule(torch.nn.Module(), inner_g)
 
-    # Simulate FakeTensor inner args so _CAPTURED_CONSTANTS is not populated during _save_fx
+    # Simulate FakeTensor inner args so _CAPTURED_CONSTANTS is not populated in _save_fx
     class FakeScalarTensor:
         def __init__(self, shape: tuple[int, ...], dtype: torch.dtype) -> None:
             self.shape = torch.Size(shape)
@@ -2574,3 +2576,92 @@ def test_scalar_buffer_constants_and_extra_snapshot_assets(
     assert wj["model.embed_tokens.org_vocab_end_index"]["sources"][0]["path"] == str(
         const_st.absolute()
     )
+
+
+def test_nvfp4_weights_and_mlir_signature_shape_reconciliation(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify NVFP4 weights are extracted and @main shapes reconciled."""
+    export_dir = tmp_path / "export_nvfp4"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    stablehlo_export.register_active_model(None)
+
+    class FakeFp4Tensor:
+        def __init__(self, shape: tuple[int, ...], dtype_str: str) -> None:
+            self.shape = torch.Size(shape)
+            self.dtype = dtype_str
+
+    FakeFp4Tensor.__name__ = "FakeTensor"
+
+    outer_g = fx.Graph()
+    outer_g.placeholder("L_input_ids_")
+    outer_g.placeholder(
+        "L_self_modules_layers_modules_0_modules_mlp_modules_experts_parameters_w13_weight_"
+    )
+    outer_g.placeholder(
+        "G_import_vllm_dot_forward_context_forward_context_attn_metadata_model_layers_0_self_attn_attn_request_distribution"
+    )
+    outer_ph = [n for n in outer_g.nodes if n.op == "placeholder"]
+    outer_g.output((outer_ph[0],))
+    outer_gm = fx.GraphModule(torch.nn.Module(), outer_g)
+
+    inner_g = fx.Graph()
+    for k in range(3):
+        inner_g.placeholder(f"arg{k}_1")
+    inner_ph = [n for n in inner_g.nodes if n.op == "placeholder"]
+    inner_g.output((inner_ph[0],))
+    inner_gm = fx.GraphModule(torch.nn.Module(), inner_g)
+
+    inner_args = [
+        FakeFp4Tensor((16,), "torch.int32"),
+        FakeFp4Tensor((64, 6144, 2048), "torch.float4_e2m1fn_x2"),
+        FakeFp4Tensor((3,), "torch.int32"),
+    ]
+    specs = stablehlo_export._extract_input_specs(
+        inner_gm, inner_args, outer_graph=outer_gm, outer_inputs=inner_args
+    )
+    assert len(specs) == 3
+    assert specs[1]["is_weight"] is True
+    assert specs[1]["weight_name"] == "model.layers.0.mlp.experts.w13_weight"
+
+    # In MLIR @main, NVFP4 weight is unpacked and req_dist is sharded to 6xi32
+    mlir_text = """module @forward_bucket16 {
+  func.func public @main(
+    %arg0: tensor<16xi32>,
+    %arg1: tensor<64x6144x4096xf4E2M1FN>,
+    %arg2: tensor<6xi32>
+  ) -> (tensor<16x8xbf16>) {
+    %0 = stablehlo.custom_call @AllocateBuffer() : () -> tensor<16x8xbf16>
+    return %0 : tensor<16x8xbf16>
+  }
+}
+"""
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="forward_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=mlir_text,
+        input_specs=specs,
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "hidden_states",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "intermediate",
+                "buffer_donor": False,
+            }
+        ],
+    )
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    fwd_in = meta["functions"]["forward"]["16"]["inputs"]
+    assert len(fwd_in) == 3
+    assert fwd_in[1]["shape"] == [64, 6144, 4096]
+    assert fwd_in[1]["dtype"] == "float4_e2m1fn"
+    assert fwd_in[2]["shape"] == [6]
+    abs_mlir = (export_dir / "abstract_params.mlir").read_text()
+    assert "tensor<64x6144x4096xf4E2M1FN>" in abs_mlir
