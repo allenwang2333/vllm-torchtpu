@@ -39,6 +39,7 @@ def _chunked_gdn_in_place(
     out_slot_ref: jax.Array,
     metadata_ref: memory_ref.MetadataRef,
     carry_recurrent_scratch_ref: jax.Array,
+    out_stage_scratch_ref: jax.Array | None,
     real_sizes: jax.Array,
     a_log: jax.Array,
     dt_bias: jax.Array,
@@ -70,9 +71,24 @@ def _chunked_gdn_in_place(
 
     def store_out(idx: int, h0: int, values: jax.Array) -> None:
         # [heads, chunk, v_head_dim] -> [chunk, heads, v_head_dim]
-        out_slot_ref[idx, :, pl.ds(h0, values.shape[0])] = values.swapaxes(
-            0, 1
-        ).astype(out_slot_ref.dtype)
+        num_heads, chunk, _ = values.shape
+        if out_stage_scratch_ref is None:
+            out_slot_ref[idx, :, pl.ds(h0, num_heads)] = values.swapaxes(
+                0, 1
+            ).astype(out_slot_ref.dtype)
+            return
+        # Through the stage: each head's rows go in whole, each token's come
+        # out by one strided load.
+        stride = cfg.out_stage_row_stride
+        for h in range(num_heads):
+            out_stage_scratch_ref[pl.ds(h * stride, chunk)] = values[h]
+        rows = [
+            out_stage_scratch_ref[pl.ds(t, num_heads, stride=stride)]
+            for t in range(chunk)
+        ]
+        out_slot_ref[idx, :, pl.ds(h0, num_heads)] = jnp.stack(rows).astype(
+            out_slot_ref.dtype
+        )
 
     compute_gdn.chunked_gdn(
         real_sizes=real_sizes,
@@ -117,6 +133,7 @@ def inner_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     qkv_stage_scratch_ref: jax.Array | None = None,
     qkv_scratch_ref: jax.Array | None = None,
+    out_stage_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -147,6 +164,8 @@ def inner_kernel(
             `cfg.qkv_row_tiled` qkv are widened into.
         qkv_scratch_ref: Compact f32 VMEM scratch the rows of a
             `cfg.qkv_row_tiled` qkv are gathered into.
+        out_stage_scratch_ref: f32 VMEM scratch the chunked step's output
+            passes through on its way to `out_slot_ref`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -326,6 +345,7 @@ def inner_kernel(
             out_slot_ref=out_slot_ref,
             metadata_ref=metadata_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+            out_stage_scratch_ref=out_stage_scratch_ref,
             real_sizes=real_sizes,
             a_log=a_log,
             dt_bias=dt_bias,
@@ -436,6 +456,7 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     qkv_stage_scratch_ref: jax.Array | None,
     qkv_scratch_ref: jax.Array | None,
+    out_stage_scratch_ref: jax.Array | None,
     out_zero_scratch_ref: jax.Array | None,
     out_zero_sem_ref: jax.Array | None,
     *,
@@ -521,6 +542,7 @@ def outer_kernel(
                 carry_recurrent_scratch_ref,
                 qkv_stage_scratch_ref,
                 qkv_scratch_ref,
+                out_stage_scratch_ref,
             ),
             allocations=allocations,
         )

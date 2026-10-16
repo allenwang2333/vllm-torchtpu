@@ -184,6 +184,14 @@ class GDNConfig:
         return QKV_TILE_ROWS | 1
 
     @property
+    def out_stage_row_stride(self) -> int:
+        """Rows between consecutive heads in the chunked step's output stage.
+        Odd, so 8 heads' rows of one token are a single strided load and the
+        [heads, chunk] -> [chunk, heads] swap moves no data between
+        sublanes."""
+        return self.chunk_size | 1
+
+    @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
 
@@ -330,6 +338,13 @@ class GDNConfig:
                 )
             qkv_scratch = pltpu.VMEM(qkv_scratch_shape, jnp.float32)
 
+        out_stage_scratch = None
+        if self.mode == GDNMode.PER_SEQ and not self.use_recurrent and not self.is_kda:
+            out_stage_scratch = pltpu.VMEM(
+                (self.num_v_heads * self.out_stage_row_stride, self.v_head_dim),
+                jnp.float32,
+            )
+
         out_zero_scratch = out_zero_sem = None
         if self.zero_out_tail:
             out_zero_scratch = pltpu.VMEM(
@@ -343,6 +358,7 @@ class GDNConfig:
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             qkv_stage_scratch_ref=qkv_stage_scratch,
             qkv_scratch_ref=qkv_scratch,
+            out_stage_scratch_ref=out_stage_scratch,
             out_zero_scratch_ref=out_zero_scratch,
             out_zero_sem_ref=out_zero_sem,
         )
