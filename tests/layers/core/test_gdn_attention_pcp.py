@@ -1008,7 +1008,9 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         recurrent_state_dtype=recurrent_state_dtype,
     )
     # Compare raw bytes: fp8 NaN patterns must not go through a float path.
-    new_pool_bytes = np.asarray(jax.lax.bitcast_convert_type(new_pool, jnp.uint8))
+    # Reinterpret on host: a standalone fp8 -> uint8 bitcast on TPU (JAX
+    # 0.11.2 / libtpu 0.0.50) canonicalizes NaN 0xFF to 0x7F.
+    new_pool_bytes = np.asarray(new_pool).view(np.uint8)
     np.testing.assert_array_equal(
         new_pool_bytes[~touched_rows], initial_pool_bytes[~touched_rows]
     )
