@@ -163,7 +163,14 @@ def merge_lse_partials_scatter_heads(
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
     if chunks > 1:
         return _retain_rank(_merge_chunked(output, lse, group, chunks))
-    return _retain_rank(cp_lse_ag_out_rs(output, lse, group))
+    # Unchunked reduce-scatter buckets (above the a2a cap, below the chunk
+    # gate): TPU_DCP_RS_OUT_PRECISION sends the weighted terms in the
+    # output's dtype (bf16), as TPU_DCP_MERGE_RS_BF16=1 does for the chunked
+    # buckets. Backbone only; the drafter keeps f32 (upstream #1808).
+    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    if rs_dtype is None:
+        return _retain_rank(cp_lse_ag_out_rs(output, lse, group))
+    return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
 def merge_lse_partials_scatter_heads_vspace(

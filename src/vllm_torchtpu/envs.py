@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 0
     TPU_DCP_MERGE_RS_BF16: int = 0
+    TPU_DCP_RS_OUT_PRECISION: bool = False
     TPU_DCP_MLA_MERGE_PIECES: int = 0
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = False
@@ -607,6 +608,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 2 = bf16 all-to-all of the same bytes, then a local f32 sum over the
     # ranks (bf16 wire, f32 accumulation). 0 = f32 reduce-scatter (today).
     "TPU_DCP_MERGE_RS_BF16": env_int("TPU_DCP_MERGE_RS_BF16", 0),
+    # NOT bitwise (needs the accuracy gate): the backbone's UNCHUNKED
+    # reduce-scatter merge buckets (above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS when
+    # the a2a merge is on, below the TPU_DCP_MERGE_CHUNKED gate) send the
+    # LSE-weighted partial in the output's precision (bf16) instead of f32:
+    # half the reduce-scatter bytes; the collective sums in bf16. The chunked
+    # buckets have TPU_DCP_MERGE_RS_BF16. The MTP drafter keeps f32. Port of
+    # upstream vllm-torchtpu #1808 (default on there; off here).
+    "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=False),
     # With TPU_DCP_MERGE_CHUNKED, mixed / prefill buckets the merge chunks: the
     # DCP sparse MLA kernel writes each merge chunk's rows (output and lse)
     # into that chunk's own buffer instead of one q-aliased buffer threaded
