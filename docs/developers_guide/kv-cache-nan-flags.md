@@ -55,6 +55,10 @@ KV cache NaN detected: role=target round=12 layer_ids=[0, 1, 2] isnan=[false, tr
 cache 和其他 Mamba 实现。不支持的组合在检测器初始化入口报错。
 异步多 TP rank 需要配置 KV connector，以保证每个 rank 的结果被消费。
 
+检测器安装时，FA backend 的 shape 查询在 runner 自身的
+`set_current_vllm_config(runner.vllm_config)` 范围内执行；调用方不需要预先设置
+current config，查询结束后恢复外层配置。该上下文只属于诊断初始化路径。
+
 CPU 验证命令（需要项目的 TorchTPU / vLLM / JAX 依赖及 pytest；可在项目镜像中执行）：
 
 ```bash
@@ -84,6 +88,12 @@ pytest -q -p kv_cache_nan_cpu \
 JAX `0.10.2`。Ruff、格式、文档和环境变量检查通过。
 完整依赖环境的 pyrefly 检查在基础源码及修改后均报告 17 个既有错误，无新增错误；
 这不等同于仓库完整类型检查通过。
+
+2026-10-16 在 R43 镜像 `ba898e8ddf08` 中，以 Release `9a7f6622e` 加初始化
+修复运行上述 CPU 命令，95 项通过。新增回归组合覆盖普通 / batched RPA backend
+和无外层配置 / 已有其他外层配置，使用真实 backend shape 查询与 vLLM 配置上下文，
+并检查安装后上下文恢复。修复前，两个 batched 组合分别复现
+`Current vLLM config is not set` 和误读外层未解析布局的异常；修复后四个组合通过。
 
 CPU 测试中的 TPU event / 数据传输使用测试替身，页表读取和归约执行真实 JAX 逻辑；
 CPU 验证不能代替真实 TPU 编译、异步执行和模型端到端验收。实机验收需在独立诊断

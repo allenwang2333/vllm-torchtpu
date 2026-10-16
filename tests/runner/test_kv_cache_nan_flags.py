@@ -2,6 +2,7 @@
 """Cache summaries retain round ownership without retaining live cache data."""
 
 import logging
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -64,13 +65,20 @@ def test_multiple_cache_modules_in_one_decoder_layer_share_one_flag():
     assert detector.flags.tolist() == [True]
 
 
-def test_install_binds_target_layers_and_reads_current_device_metadata(monkeypatch):
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("nested_config", [False, True])
+def test_install_binds_target_layers_and_reads_current_device_metadata(
+    monkeypatch, batched, nested_config
+):
+    from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
     from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     from vllm_torchtpu.layers.adapter.attention import (
         PallasAttentionBackend,
         PallasAttentionBackendImpl,
+        PallasBatchedRPAAttentionBackend,
     )
     from vllm_torchtpu.layers.adapter.custom_ops.kv_cache_nan_flags_op import (
         inspect_attention_cache,
@@ -85,7 +93,9 @@ def test_install_binds_target_layers_and_reads_current_device_metadata(monkeypat
         module.impl = PallasAttentionBackendImpl.__new__(PallasAttentionBackendImpl)
         module.impl._bm_region = None
         module.impl._pool_is_seq_along_lane = False
-        module.attn_backend = PallasAttentionBackend
+        module.attn_backend = (
+            PallasBatchedRPAAttentionBackend if batched else PallasAttentionBackend
+        )
         module.kv_cache = torch.zeros((4, 4, 1, 2, 128), dtype=torch.bfloat16)
         return module
 
@@ -122,6 +132,12 @@ def test_install_binds_target_layers_and_reads_current_device_metadata(monkeypat
     spec = FullAttentionSpec(
         block_size=4, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
     )
+    config = VllmConfig()
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    config.compilation_config.static_forward_context = {
+        name: attention,
+        draft_name: draft,
+    }
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
@@ -141,16 +157,21 @@ def test_install_binds_target_layers_and_reads_current_device_metadata(monkeypat
                 )
             ]
         ),
-        vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(
-                static_forward_context={name: attention, draft_name: draft},
-            )
-        ),
+        vllm_config=config,
         model=model,
         _kv_cache_bundle=None,
         _kv_cache_bundle_layer_index={},
     )
-    detector = kv_cache_nan_flags.install_kv_cache_nan_detector(runner)
+    # capture_model installs the detector outside a current-config scope. The
+    # real batched backend reads that scope even for its ordinary LBNHC shape.
+    outer_config = VllmConfig() if nested_config else None
+    with set_current_vllm_config(outer_config) if nested_config else nullcontext():
+        detector = kv_cache_nan_flags.install_kv_cache_nan_detector(runner)
+        if nested_config:
+            assert get_current_vllm_config() is outer_config
+        else:
+            with pytest.raises(AssertionError, match="Current vLLM config is not set"):
+                get_current_vllm_config()
     assert detector.layer_ids == (7,)
     detector.arm()
     detector.begin_round(["r"])

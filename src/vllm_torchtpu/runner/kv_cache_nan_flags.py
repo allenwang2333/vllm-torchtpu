@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch_tpu._internal import pallas
 from torch_tpu._internal.stream.streams import TpuEvent
+from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 from vllm.v1.worker.utils import extract_layer_index
@@ -113,13 +114,14 @@ def _attention_inspector(runner, name, module, spec):
     seq_along_lane = impl._pool_is_seq_along_lane and spec.head_size != 64
     page_shape = source.shape[2:] if block_major else source.shape[1:]
     page_size = page_shape[-1] if seq_along_lane else page_shape[0]
-    native_shape = module.get_attn_backend().get_kv_cache_shape(
-        1,
-        page_size,
-        spec.num_kv_heads,
-        spec.head_size,
-        spec.dtype,
-    )
+    with set_current_vllm_config(runner.vllm_config):
+        native_shape = module.get_attn_backend().get_kv_cache_shape(
+            1,
+            page_size,
+            spec.num_kv_heads,
+            spec.head_size,
+            spec.dtype,
+        )
     op = attention_nan_op(
         tuple(native_shape),
         spec.num_kv_heads,
