@@ -4585,7 +4585,8 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
         copy = pltpu.make_async_copy(
             local_ref.at[local_rows], window_ref.at[window_rows(0, positions[0])], own_sem)
         copy.start()
-        copy.wait()
+        if local_ref.shape[0] not in (16, 32, 64, 128, 256):
+            copy.wait()
 
     for stream, (family, direction, col, width) in enumerate(_half_ring_streams(local_ref.shape[1])):
         cols, hops, position = pl.ds(col, width), HALF_HOPS[direction], positions[family]
@@ -4613,6 +4614,16 @@ def _half_gather_step(tables_ref, local_ref, window_ref, send_sems, recv_sems, o
         @pl.when((step >= 1) & (step < hops))
         def forward(send=send):
             send(step, None).start()
+
+    # The local destination is disjoint from every remote stripe. Let the
+    # copy run while the half rings progress, then join before KDA consumes
+    # this block and before own_sem is reused for the next block.
+    if local_ref.shape[0] in (16, 32, 64, 128, 256):
+        @pl.when(step == HALF_STEPS - 1)
+        def finish_local():
+            pltpu.make_async_copy(
+                local_ref.at[local_rows], window_ref.at[window_rows(0, positions[0])], own_sem
+            ).wait()
 
 
 def _half_reduce_step(
