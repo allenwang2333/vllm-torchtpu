@@ -1737,8 +1737,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
     # Pallas kernel that streams the router weight from HBM (operand constrained
     # to HBM), instead of an XLA dot whose weight XLA stages into VMEM with a copy
-    # (exposed at decode once the window before it shrinks). Same f32-accumulated
-    # dot rounded once to bf16: bit-identical logits. Prefill sizes unchanged.
+    # (exposed at decode once the window before it shrinks). NOT bit-identical:
+    # Mosaic's MXU accumulation order differs from XLA's, ~1 in 10^4 logits lands on
+    # the neighbouring bf16 (a top-k flip needs a logit within an ulp of the
+    # boundary); needs an accuracy check. Prefill sizes unchanged.
     "TPU_MOE_ROUTER_HBM_PIN": env_bool("TPU_MOE_ROUTER_HBM_PIN"),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of

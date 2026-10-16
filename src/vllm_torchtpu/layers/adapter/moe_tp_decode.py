@@ -126,8 +126,8 @@ def get_router_logits_op() -> Any:
 class RouterHbmPinMethod:
     """The gate's linear method under TPU_MOE_ROUTER_HBM_PIN: a bias-free bf16
     router's logits from `router_gemm_hbm.router_logits` (decode token counts stream
-    the weight from HBM; other counts run the same dot as before). Everything else
-    is the wrapped method's."""
+    the weight from HBM, ~1e-4 of logits one bf16 ulp off the XLA dot's; other
+    counts run the same dot as before). Everything else is the wrapped method's."""
 
     def __init__(self, base: Any, op: Any) -> None:
         self._base = base

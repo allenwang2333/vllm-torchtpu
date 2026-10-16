@@ -12,9 +12,17 @@ and walks it through a small VMEM ring of contiguous row tiles `w[j*t:(j+1)*t, :
 one grid step, computing each tile as it lands (the fp8_skinny ring).
 
 Numerics: each tile is one `dot_general(x, w_tile)` contracting k on both sides with
-f32 accumulation, cast once to bf16 -- the XLA dot's arithmetic (f32 MXU accumulation,
-one rounding to the bf16 result). Bit-identity with the XLA dot is asserted by the
-unit test on hardware, not assumed.
+f32 accumulation, cast once to bf16. This is NOT bit-identical to the XLA dot: Mosaic's
+and XLA's MXU accumulation orders differ, so the f32 sums differ in the last bits and
+about 1 in 10^4 logits (GLM-5.2 shapes, random data) rounds to the neighbouring bf16
+(measured, j-4a606e4c; every Mosaic k-chunking tried gives the same bits as this one).
+A routing decision can flip only where a logit sits within one bf16 ulp of the top-k
+boundary, so the flag needs an accuracy check before it ships.
+
+Tiling: one tile (the whole weight in one DMA, one dot) is the fastest of row tiles
+32..256 x ring depth 2..4 at e = 256, k = 6144 (probe j-4a606e4c: 3.7 vs 4.3-7.1 us per
+call in a serial chain); a K-major [k, e] copy would be ~0.5 us faster still but costs a
+second copy of the weight.
 """
 
 from __future__ import annotations
@@ -30,11 +38,14 @@ MAX_M = 16
 LANE = 128
 
 
-def pick_config(e: int, k: int) -> tuple[int, int]:
-    """(tile rows, ring depth): 4 row tiles when they stay lane- and sublane-friendly."""
-    for t in (64, 32, 16, 8):
-        if e % t == 0 and e // t >= 4:
-            return t, 3
+def pick_config(e: int, k: int, itemsize: int = 2) -> tuple[int, int]:
+    """(tile rows, ring depth): the whole weight as one tile up to 4 MiB, else row
+    tiles of at most 4 MiB in a 2-deep ring."""
+    if e * k * itemsize <= 4 << 20:
+        return e, 1
+    for t in (256, 128, 64, 32, 16, 8):
+        if e % t == 0 and t * k * itemsize <= 4 << 20:
+            return t, 2
     return e, 1
 
 
@@ -52,7 +63,7 @@ def supports(m: int, x: jax.Array, w: jax.Array) -> bool:
     )
 
 
-def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, t, n_tiles, nbuf):
+def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, t, n_tiles, nbuf, kc, nt):
     def copy(j):
         return pltpu.make_async_copy(
             w_hbm.at[pl.ds(j * t, t), :], wbuf.at[j % nbuf], sem.at[j % nbuf]
@@ -60,25 +71,40 @@ def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, t, n_tiles, nbuf):
 
     for j in range(min(nbuf, n_tiles)):
         copy(j).start()
-    x = x_ref[...]
+    k = x_ref.shape[1]
+    kc = kc or k
     dn = (((1,), (1,)), ((), ()))
     for j in range(n_tiles):
         copy(j).wait()
-        y = jax.lax.dot_general(
-            x, wbuf[j % nbuf], dn, preferred_element_type=jnp.float32
-        )
+        y = None
+        for c in range(k // kc):
+            ks = slice(c * kc, (c + 1) * kc)
+            if nt:
+                # [t, kc] . [m, kc]^T -> [t, m], transposed back after the sum
+                p = jax.lax.dot_general(
+                    wbuf[j % nbuf, :, ks], x_ref[:, ks], dn,
+                    preferred_element_type=jnp.float32,
+                )
+            else:
+                p = jax.lax.dot_general(
+                    x_ref[:, ks], wbuf[j % nbuf, :, ks], dn,
+                    preferred_element_type=jnp.float32,
+                )
+            y = p if y is None else y + p
+        if nt:
+            y = y.T
         o_ref[:, j * t : (j + 1) * t] = y.astype(o_ref.dtype)
         if j + nbuf < n_tiles:
             copy(j + nbuf).start()
 
 
 @functools.cache
-def _build(m, k, e, dtype, t, nbuf):
+def _build(m, k, e, dtype, t, nbuf, kc=None, nt=False):
     if e % t:
         raise ValueError(f"tile {t} does not divide {e} router rows")
     n_tiles = e // t
     nbuf = max(1, min(nbuf, n_tiles))
-    kern = functools.partial(_kernel, t=t, n_tiles=n_tiles, nbuf=nbuf)
+    kern = functools.partial(_kernel, t=t, n_tiles=n_tiles, nbuf=nbuf, kc=kc, nt=nt)
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, e), dtype),
@@ -93,7 +119,8 @@ def _build(m, k, e, dtype, t, nbuf):
             pltpu.SemaphoreType.DMA((nbuf,)),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        name=f"router_gemm_hbm_t{t}_b{nbuf}_m{m}_k{k}_e{e}",
+        name=f"router_gemm_hbm_t{t}_b{nbuf}{f'_kc{kc}' if kc else ''}{'_nt' if nt else ''}"
+        f"_m{m}_k{k}_e{e}",
     )
 
 
@@ -106,13 +133,20 @@ def _call_hbm_pinned(call, x, w):
 
 
 def router_gemm_hbm(
-    x: jax.Array, w: jax.Array, *, config: tuple[int, int] | None = None
+    x: jax.Array,
+    w: jax.Array,
+    *,
+    config: tuple[int, int] | None = None,
+    kc: int | None = None,
+    nt: bool = False,
 ) -> jax.Array:
-    """x [m <= 16, k] bf16, w [e, k] bf16 -> x @ w.T [m, e] bf16, weight read from HBM."""
+    """x [m <= 16, k] bf16, w [e, k] bf16 -> x @ w.T [m, e] bf16, weight read from HBM.
+    `kc`: sum the dot over k chunks of this size in f32 (None: one dot over k);
+    `nt`: compute w_tile . x^T and transpose (the MXU holds x, not the weight)."""
     m, k = x.shape
     e = w.shape[0]
     t, nbuf = config or pick_config(e, k)
-    return _call_hbm_pinned(_build(m, k, e, x.dtype, t, nbuf), x, w)
+    return _call_hbm_pinned(_build(m, k, e, x.dtype, t, nbuf, kc, nt), x, w)
 
 
 def router_logits(x: jax.Array, w: jax.Array) -> jax.Array:

@@ -335,8 +335,12 @@ def test_hbm_pin_stacked_eager_bit_identical():
             )
 
 
-@pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 8192), (2048, 16384)])
-def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n):
+# staged: whether XLA stages the unpinned weight in this standalone module (the
+# positive control). q_b's 16 MiB is not staged standalone; it is in the model.
+@pytest.mark.parametrize(
+    "k,n,staged", [(1024, 6144, True), (2048, 8192, True), (2048, 16384, False)]
+)
+def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n, staged):
     """Pinned: the custom call carries `input_memory_space_colors` and the compiled
     module never stages the weight in VMEM (no copy-start / copy-done / slice-start
     and no S(1) result of its shape). Positive control: the unpinned module does
@@ -359,5 +363,6 @@ def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n):
     print(f"unpinned VMEM staging of the weight ({k},{n}):")
     for ln in _weight_vmem_lines(unpinned_hlo, k, n):
         print("  ", ln[:200])
-    assert _weight_vmem_lines(unpinned_hlo, k, n), "no staging to remove here"
+    if staged:
+        assert _weight_vmem_lines(unpinned_hlo, k, n), "no staging to remove here"
     assert _weight_vmem_lines(pinned_hlo, k, n) == []
