@@ -119,6 +119,7 @@ def _kernel(
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
     if write_refs is not None and write_fault != "late_write":
+        assert write_scratch is not None
         late_drain = _write_phase(
             write_refs,
             write_scratch,
@@ -314,6 +315,7 @@ def _kernel(
         late_drain()
     if write_refs is not None and write_fault == "late_write":
         # Positive control: the write lands after the gather (stale reads).
+        assert write_scratch is not None
         _write_phase(
             write_refs,
             write_scratch,
@@ -637,8 +639,9 @@ def dsa_gather_native_sc(
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     if write_fault not in WRITE_FAULTS:
         raise ValueError(f"unknown {write_fault=}")
-    nope_rows_view = nope_cache.reshape(-1, 128)
-    rope_rows_view = rope_cache.reshape(-1, 32)
+    # Arrays, or refs the kernel writes in place under `kv_write`.
+    nope_rows_view: Any = nope_cache.reshape(-1, 128)
+    rope_rows_view: Any = rope_cache.reshape(-1, 32)
     write_tokens = 0
     if kv_write is not None:
         # The caches become refs the kernel writes in place (as

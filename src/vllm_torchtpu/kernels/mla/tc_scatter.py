@@ -88,6 +88,7 @@ def _pack_words(values: jax.Array, token_bytes: int, word_dtype: Any) -> jax.Arr
         if b:
             part = part << (8 * b)
         words = part if words is None else words | part
+    assert words is not None
     return words
 
 

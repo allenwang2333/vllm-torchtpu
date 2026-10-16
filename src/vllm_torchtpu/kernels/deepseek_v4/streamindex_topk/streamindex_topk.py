@@ -1096,7 +1096,7 @@ def streamindex_topk(
     skip_empty_decode: bool = False,
     skip_empty_decode_chunked: bool = False,
     final_sc_tie: tuple = (),
-) -> jax.Array | tuple[jax.Array, ...]:
+) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
     Args:
@@ -1834,21 +1834,20 @@ def streamindex_topk_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): each shard reads its own rank from its
         one element instead of an `all_to_all` of an iota. Same result.
-      overlap_fn: optional TensorCore work, independent of the top-k, to run
-        while the TensorCore would otherwise idle on the SparseCore calls.
-        `overlap_fn(*overlap_args)` (replicated args; result replicated) is
-        pinned between the local top-k's input scores and the candidate
-        all-gather by `optimization_barrier`s -- the only window it can then
-        land in is the local SparseCore call's. Only `overlap_args[0]` (the
-        activation) goes through the first barrier; the rest (weights) are
-        passed as they are, since a barrier on a parameter makes XLA copy it.
-        `merge_overlap_fn(result)`, if given, is pinned the same way between the all-gather and the
-        merge's consumers, i.e. under the merge call. The barriers only add
-        ordering edges: the top-k and the work compute the same values as
-        apart. XLA scheduling groups (`_scheduling_group_id`) cannot do this:
-        `legalize-scheduling-annotations` strips groups that hold a
-        SparseCore kernel (it is not yet an async op there). With chunking
-        or the a2a merge the work runs unpinned.
+      overlap_fn: optional TensorCore work, independent of the top-k, to run while the
+        TensorCore would otherwise idle on the SparseCore calls.
+        `overlap_fn(*overlap_args)` (replicated args; result replicated) is pinned
+        between the local top-k's input scores and the candidate all-gather by
+        `optimization_barrier`s -- the only window it can then land in is the local
+        SparseCore call's. Only `overlap_args[0]` (the activation) goes through the
+        first barrier; the rest (weights) are passed as they are, since a barrier on a
+        parameter makes XLA copy it. `merge_overlap_fn(result)`, if given, is pinned the
+        same way between the all-gather and the merge's consumers, i.e. under the merge
+        call. The barriers only add ordering edges: the top-k and the work compute the
+        same values as apart. XLA scheduling groups (`_scheduling_group_id`) cannot do
+        this: `legalize-scheduling-annotations` strips groups that hold a SparseCore
+        kernel (it is not yet an async op there). With chunking or the a2a merge the
+        work runs unpinned.
       overlap_args: tuple of replicated arrays `overlap_fn` takes.
       merge_overlap_fn: see `overlap_fn`.
       overlap_pin_max_tokens: pin only buckets of at most this many tokens

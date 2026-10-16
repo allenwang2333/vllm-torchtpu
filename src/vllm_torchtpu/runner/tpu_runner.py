@@ -4382,7 +4382,7 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
-            trim_kwargs = {}
+            trim_kwargs: dict[str, Any] = {}
             if rows := self._verify_trim_rows(
                 md.target_logits_indices.shape[0], md.draft_lengths_cpu
             ):

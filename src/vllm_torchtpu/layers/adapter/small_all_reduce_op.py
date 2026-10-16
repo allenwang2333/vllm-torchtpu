@@ -294,11 +294,13 @@ def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
     all-reduce when armed and the block has a fold path, else the
     two-shot/one-shot kernel (with the mask read, so every bucket lifts the
     same buffers)."""
+    assert _AR_OP is not None, "init_small_all_reduce builds the ops first"
     mask = _padding_mask()
     if mask is None:
         return _AR_OP(x, _RANK)
     rows, hidden = x.shape
     if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
+        assert _AR_VALID_OP is not None
         return _AR_VALID_OP(x, _valid_rows(rows, mask), _RANK)
     return _AR_OP(retain(x), _RANK)
 

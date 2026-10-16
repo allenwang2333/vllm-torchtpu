@@ -56,7 +56,7 @@ class SegmentTokenizer:
         self._backend.no_padding()
         added = self._backend.get_added_tokens_decoder()
         self._added_id = {tok.content: tid for tid, tok in added.items()}
-        alts = sorted(self._added_id, key=len, reverse=True)
+        alts: list[str] = sorted(self._added_id, key=len, reverse=True)
         # Python's alternation takes the first alternative matching at the
         # leftmost position; longest-first order makes that leftmost-longest,
         # the same rule as tokenizers' Aho-Corasick added-token matcher.

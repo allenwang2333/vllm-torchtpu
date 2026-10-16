@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from threading import Lock
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -204,8 +205,11 @@ def _fp8_linear_pallas(
             # cut back to `n_out` follows it, i.e. without a padded copy.
             if w_k is not None:
                 raise ValueError("a scheduling group needs an unpadded weight")
-            out = xla_metadata.set_xla_metadata(
-                out, _scheduling_group_id=scheduling_group_id
+            out = cast(
+                jax.Array,
+                xla_metadata.set_xla_metadata(
+                    out, _scheduling_group_id=scheduling_group_id
+                ),
             )
         return out
     return xla_quantized_matmul(x, w_q, w_s)

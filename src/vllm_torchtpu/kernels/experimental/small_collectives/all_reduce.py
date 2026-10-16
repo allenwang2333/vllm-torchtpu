@@ -174,7 +174,9 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
     load), the fold path on [tile_rows, LANES] chunks of the folded tile."""
     rows, hidden = x.shape
     own = hidden // n
-    k, fr = fold_geometry(rows, hidden, n, tile_rows)
+    geometry = fold_geometry(rows, hidden, n, tile_rows)
+    assert geometry is not None, "callers check fold_geometry first"
+    k, fr = geometry
     hk = hidden // k  # folded width; a core's chunk of it is LANES wide
 
     def exchange(rows_x, width, me, mine, slices, gathered, sems, write_out):

@@ -14,6 +14,7 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -1549,7 +1550,7 @@ def _attention_kernel(
         refs = refs[:-6]
     if lse_fill:
         # No aliased lse input: the kernel defines every row itself.
-        refs = (None, *refs)
+        refs = (cast(Any, None), *refs)
     if return_lse:
         (
             _lse_in_hbm_ref,  # aliased with lse_hbm_ref; never read
@@ -1831,6 +1832,8 @@ def _attention_kernel(
                 _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
 
     def _fetch_live_blocks(seq_idx_start, nope_dst, rope_dst, sem_nope, sem_rope, wait):
+        assert group_tab_ref is not None
+        assert live_nope_hbm_ref is not None and live_rope_hbm_ref is not None
         num_groups = group_tab_ref.shape[0] // 2
         atom_rows = live_nope_hbm_ref.shape[2]
         rope_atom_rows = live_rope_hbm_ref.shape[2]
@@ -1982,6 +1985,7 @@ def _attention_kernel(
         lower = None
         for upper, width in zip((*row_widths, None), widths):
             if lower is None:
+                assert upper is not None  # row_widths is non-empty here
                 fits = need <= upper
             elif upper is None:
                 fits = need > lower
@@ -2362,6 +2366,7 @@ def _attention_kernel(
             # past each token's kv_len are zeroed / masked, and an all-empty
             # step's lse is -inf (`is_dcp_mode` / `lse_mask_empty`).
             if live_widths:
+                assert live_nope_hbm_ref is not None
                 atom_rows = live_nope_hbm_ref.shape[2]
                 need = group_tab_ref[batch_start_seq_idx // batch_size] * atom_rows
                 lower = None
@@ -2443,6 +2448,7 @@ def _attention_kernel(
             sentinel = -jnp.inf if lse_mask_empty else jnp.finfo(jnp.float32).min
             if fault == "skip_lse_fill":
                 sentinel = 0.0  # positive control: a wrong sentinel
+            assert fill_ref is not None
             fill_ref[...] = jnp.full(fill_ref.shape, sentinel, jnp.float32)
             fill_copy().start()
 
@@ -2719,9 +2725,9 @@ def sparse_ragged_paged_attention(
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
         `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form.
-        The SparseCore gather writes them into both caches in place before it gathers (see
-        `native_sc_gather.dsa_gather_native_sc`), and the updated caches are
-        returned after the other outputs.
+        The SparseCore gather writes them into both caches in place before it
+        gathers (see `native_sc_gather.dsa_gather_native_sc`), and the updated
+        caches are returned after the other outputs.
       kv_write_fault: test-only (`native_sc_gather.WRITE_FAULTS`).
       mixed_fused_prep: With `mixed_live_gather` taken and
         `mixed_fused_prep_supported`: build kv_lens, the group table and the
@@ -2875,7 +2881,7 @@ def sparse_ragged_paged_attention(
         and page_indices is not None
         and q.shape[0] % uniform_chunk == 0
     )
-    window_indices_all = None
+    window_indices_all: Any = None  # one array, or one per chunk
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
     group_tab = None
     group_num_live = None
@@ -2890,7 +2896,7 @@ def sparse_ragged_paged_attention(
     if kv_write is not None and not fused_prep:
         raise ValueError("kv_write needs the fused-prep decode path (one gather)")
     if fused_prep:
-        assert topk_cap is not None
+        assert topk_cap is not None and page_indices is not None
         # Only the attention kernel reads kv_lens here: the fused prep counts
         # live entries itself, so XLA may run this reduce in the gather's shadow.
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
@@ -2928,6 +2934,7 @@ def sparse_ragged_paged_attention(
         window_prep
         and mixed_live_gather
         and q.shape[0] > FUSED_PREP_MAX_TOKENS
+        and topk_cap is not None
         and live_group_supported(
             uniform_chunk,
             _chunk_kernel_batch_size(
@@ -2941,7 +2948,7 @@ def sparse_ragged_paged_attention(
     ):
         # Mixed / prefill buckets: window 0 in live-group order, so each
         # chunk gathers and each grid step fetches only its live atom blocks.
-        assert topk_cap is not None
+        assert topk_cap is not None and page_indices is not None
         chunk_window_rows = topk * uniform_chunk // 128
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
         if is_dcp_mode:
@@ -3006,7 +3013,7 @@ def sparse_ragged_paged_attention(
                 total_num_pages=cache_kv_nope.shape[0],
             )
     elif window_prep:
-        assert topk_cap is not None
+        assert topk_cap is not None and page_indices is not None
         chunk_window_rows = topk // topk_cap * uniform_chunk
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
         if is_dcp_mode:
@@ -3072,7 +3079,7 @@ def sparse_ragged_paged_attention(
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-        result = sparse_attention_chunk(
+        result: Any = sparse_attention_chunk(
             q,
             cache_kv_nope,
             cache_kv_rope,
@@ -3412,12 +3419,14 @@ def sparse_attention_chunk(
             ]
         if lse_fill:
             # The sentinel tile for the whole lse output, and its DMA semaphore.
+            assert lse_shape is not None
             scratch_shapes += [
                 pltpu.VMEM(lse_shape, jnp.float32),
                 pltpu.SemaphoreType.DMA(()),
             ]
         if q_rope:
             # Rope table double buffer; just before q_pe's.
+            assert q_rope_table is not None
             scratch_shapes.append(
                 pltpu.VMEM((2, batch_size, *q_rope_table.shape[1:]), jnp.float32)
             )

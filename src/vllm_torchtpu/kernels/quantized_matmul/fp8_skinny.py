@@ -99,6 +99,7 @@ def _kernel(
     # Weight slice: 0 in production (a [1, ...] view); a stack index in the benchmark.
     s = idx_ref[0]
 
+    ws_copy = None
     if scale_dma:
         # The per-channel scale arrives as an HBM ref; copy it to VMEM here, issued
         # ahead of the weight ring so its latency hides under the first tile's.
@@ -140,6 +141,7 @@ def _kernel(
                 xq_ref[...], w, dn, preferred_element_type=jnp.float32
             )
             if scale_dma and j == 0:
+                assert ws_copy is not None
                 ws_copy.wait()
             o_ref[:, cols] = (y * xs_ref[...] * ws_ref[:, cols]).astype(o_ref.dtype)
         else:
@@ -157,6 +159,7 @@ def _kernel(
             copy(j + nbuf).start()
     if split == "k":
         if scale_dma:
+            assert ws_copy is not None
             ws_copy.wait()
         o_ref[...] = (acc[0][...] * xs_ref[...] * ws_ref[...]).astype(o_ref.dtype)
 

@@ -24,7 +24,9 @@ Imported only when the flag is set, so the flag-off model builds the stock
 ``RMSNorm`` class.
 """
 
+from collections.abc import Callable
 from threading import Lock
+from typing import Any
 
 import jax
 import torch
@@ -34,11 +36,11 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import fused_add_rmsnorm as kernel
 
-_ops: dict[tuple[float, bool], object] = {}
+_ops: dict[tuple[float, bool], Callable[..., Any]] = {}
 _ops_lock = Lock()
 
 
-def _get_op(eps: float, has_residual: bool):
+def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
     """Build (once, at model construction -- outside Dynamo) the torch op."""
     key = (float(eps), has_residual)
     op = _ops.get(key)

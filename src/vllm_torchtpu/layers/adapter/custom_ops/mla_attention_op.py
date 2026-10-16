@@ -1018,7 +1018,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        rows = self._write_topk_rows(hidden_states.shape[0], topk_indices)
+        # The top-k ops return a (topk, q) pair only with a q_b layer, which
+        # this path never passes.
+        rows = self._write_topk_rows(
+            hidden_states.shape[0],
+            topk_indices,  # pyrefly: ignore[bad-argument-type]
+        )
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
             # Read back what the skip_topk layers will read, so the attention
             # index prep is one CSE class across them.
@@ -1123,7 +1128,8 @@ class VllmTPUIndexer(Indexer):
             synchronize_tensors(updated)
         self._rope_neox_permuted = True
 
-    def forward(
+    # Widens Indexer.forward: an optional q_b_layer, and (topk, q) when given.
+    def forward(  # pyrefly: ignore[bad-override]
         self,
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
@@ -1938,6 +1944,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # q_pe is roped in the attention kernel from the raw q head.
             k_pe_dtype = k_pe.dtype
             _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            assert k_pe is not None
             k_pe = k_pe.to(dtype=k_pe_dtype)
             q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
         elif self.rotary_emb is not None:

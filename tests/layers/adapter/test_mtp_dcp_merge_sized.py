@@ -55,6 +55,7 @@ def _partials(rng, world, tokens, local=4, vdim=128):
 
 def _run(o, lse, cap, fn=cp_mla.sized_merge_local):
     world = o.shape[0]
+
     def body(a, b):
         return fn(a, b, world=world, a2a_max_tokens=cap, axis_name=AXIS)
 
@@ -173,9 +174,7 @@ def test_routing(flag, is_backbone, built, expect, monkeypatch):
     def ag_out_rs(o, lse, group, **kwargs):  # kwargs: rs_dtype (#1808)
         return o[:, :1]
 
-    monkeypatch.setattr(
-        cp_mla, "_SIZED_MERGE_OPS", {4: sized_merge} if built else {}
-    )
+    monkeypatch.setattr(cp_mla, "_SIZED_MERGE_OPS", {4: sized_merge} if built else {})
     monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", ag_out_rs)
     o = torch.zeros(16, 4, 8, dtype=torch.bfloat16)
     cp_mla.merge_lse_partials_scatter_heads(
