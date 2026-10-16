@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Forked from vllm_torchtpu/kernels/gdn/v3/wrapper.py (inner_kernel only).
-# Upstream V3 changes ported by hand through #1422.
+# Upstream V3 changes ported by hand through #1422, plus #1927's split of
+# the state windows into input and output buffers.
 # This copy is owned by the PCP workstream and must not import from
 # kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
 # see README.md in this directory.
@@ -38,10 +39,12 @@ def inner_kernel(
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
     b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
+    conv_state_in_slot_ref: jax.Array,  # [seq, 1, prev_kernel_size, 1, dim_size]
+    recurrent_in_slot_ref: jax.Array,  # [seq, 1, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Array,  # [seq, chunk, num_v_heads, v_head]
+    conv_state_out_slot_ref: jax.Array,  # [seq, window, prev_kernel_size, 1, dim]
+    recurrent_out_slot_ref: jax.Array,  # [seq, window, num_v_heads, kq, v]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
@@ -62,11 +65,11 @@ def inner_kernel(
         qkv_slot_ref: qkv VMEM ref that stores data loaded from HBM.
         b_slot_ref: b VMEM ref that stores data loaded from HBM.
         a_slot_ref: a VMEM ref that stores data loaded from HBM.
-        conv_state_slot_ref: Convolution state VMEM ref that stores data loaded from
-            HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
-        recurrent_slot_ref: Recurrent state VMEM ref that stores data loaded from
-            HBM. Data written into this VMEM ref will be used for VMEM to HBM write.
+        conv_state_in_slot_ref: Convolution state VMEM ref loaded from HBM.
+        recurrent_in_slot_ref: Recurrent state VMEM ref loaded from HBM.
         out_slot_ref: Output VMEM ref that will be used for VMEM to HBM write.
+        conv_state_out_slot_ref: Convolution state VMEM ref written to HBM.
+        recurrent_out_slot_ref: Recurrent state VMEM ref written to HBM.
         metadata_ref: Metadata reference containing grid and sequence mappings.
         weights_ref: Weight references for Conv1D and GDN in VMEM.
         carry_conv_scratch_ref: Optional VMEM scratch reference for inter-tile
@@ -86,8 +89,8 @@ def inner_kernel(
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
         metadata_ref=metadata_ref,
         p_id=p_id,
-        conv_state_slot_ref=conv_state_slot_ref,
-        recurrent_slot_ref=recurrent_slot_ref,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
@@ -116,7 +119,7 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    conv_state_slot_ref[...] = new_conv_state
+    conv_state_out_slot_ref[...] = new_conv_state
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -188,7 +191,7 @@ def inner_kernel(
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     # Round to the state dtype, then pack into the uint32 window.
-    recurrent_slot_ref[...] = pltpu.bitcast(
+    recurrent_out_slot_ref[...] = pltpu.bitcast(
         new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
     )
 

@@ -1,6 +1,7 @@
 # gdn_pcp_fused: fused GDN prefill-context-parallel (PCP) kernel fork
 
-This directory is a fork of `kernels/gdn/v3` (synced through #1422), plus the
+This directory is a fork of `kernels/gdn/v3` (synced through #1422, plus
+#1927's split of the state windows into input and output buffers), plus the
 PCP-specific kernel code that used to live there (`pcp_wrapper.py`,
 `pcp_metadata.py`, `projection_scale.py`).
 
