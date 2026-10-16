@@ -163,6 +163,67 @@ class Csa2Test(unittest.TestCase):
         )
         self.assert_reference(inputs, bq=6)
 
+    def test_request_transitions_empty_gaps_and_padding(self) -> None:
+        # Request transitions must discard old SWA state and outstanding
+        # prefetches, including after empty gaps or a long request's last tile.
+        cases = (
+            (
+                "empty_gaps",
+                96,
+                128,
+                1,
+                7,
+                1,
+                (
+                    (1, 2, 0),
+                    (8, 1, 127),
+                    (46, 3, 1021),
+                    (47, 2, 98304),
+                    (48, 3, 0),
+                    (49, 1, 123),
+                    (80, 2, 100220),
+                    (94, 3, 252),
+                ),
+            ),
+            (
+                "long_request_then_new_window",
+                96,
+                64,
+                16,
+                5,
+                2,
+                (
+                    (0, 2, 0),
+                    (46, 132, 100220),
+                    (47, 3, 127),
+                    (48, 2, 1021),
+                    (95, 1, 98304),
+                ),
+            ),
+            ("all_empty", 96, 128, 16, 7, 2, ()),
+            (
+                "partial_final_request_group",
+                49,
+                128,
+                6,
+                3,
+                2,
+                ((0, 1, 0), (47, 3, 252), (48, 7, 1021)),
+            ),
+        )
+        for name, batch, heads, bq, padding, ratio, requests in cases:
+            with self.subTest(case=name, heads=heads, bq=bq):
+                lengths, positions = [0] * batch, [0] * batch
+                for request, length, position in requests:
+                    lengths[request], positions[request] = length, position
+                inputs = _inputs(
+                    lengths=tuple(lengths),
+                    starts=tuple(positions),
+                    padding=padding,
+                    heads=heads,
+                )
+                self.assert_reference(inputs, bq=bq, compress_ratio=ratio)
+
     def test_swa_block_reuse_and_mtp_boundaries(self):
         # Cover cache rotation, a BQ group requiring three logical blocks,
         # and a prefetch that must be drained after the final partial group.

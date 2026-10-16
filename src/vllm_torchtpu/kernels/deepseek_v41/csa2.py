@@ -18,9 +18,11 @@ separate staging memory. Causal/window masks advance without shifting KV lanes.
 An MTP group that needs a third block is split; overlapping request-tail blocks
 are masked to disjoint ranges. MXU RHS loading performs the K transposes.
 
-Two input banks prefetch the next BQ group during the current group. Each bank
-has independent DMA semaphores; only Q, packed KV, scales and RoPE are doubled.
-The BF16 KV workspace and output buffers are reused after their consumers finish.
+One persistent program traverses nonempty requests. Two input banks prefetch
+the next BQ group, including across request boundaries. Two additional SWA
+staging blocks fetch the next request's initial windows during current compute.
+DMA semaphores are independent; BF16 KV and output workspaces are reused only
+after their consumers finish.
 
 CSA dequantizes KV to BF16 once for QK/PV reuse. All GEMMs use BF16 operands
 and FP32 accumulators, softmax uses FP32, and probabilities are stored in BF16.
@@ -72,6 +74,7 @@ def main_kernel(
     main_p_ref: Any,
     swa_p_ref: Any,
     output_ref: Any,
+    request_swa_ref: Any,
     dma_sem: Any,
     *,
     scale: float,
@@ -79,8 +82,7 @@ def main_kernel(
     bq: int,
     interpret: bool,
 ) -> None:
-    request_index = pl.program_id(0)
-    start, end = starts_ref[request_index], starts_ref[request_index + 1]
+    request_limit = starts_ref.shape[0] - 1
     num_heads = q_hbm_ref.shape[1]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
@@ -92,24 +94,17 @@ def main_kernel(
     sink_dma.wait()
     sink = jnp.broadcast_to(sink_ref[...][None, :], (128, num_heads)).T[:, :1]
 
-    # Two physical 128-token slots never shift: key validity moves instead.
-    swa_cache_ids[0] = -1
-    swa_cache_ids[1] = -1
-    swa_prefetched_id[0] = -1
-    first_query_position = positions_ref[jnp.minimum(start, q_hbm_ref.shape[0] - 1)]
-    anchor = jnp.maximum(0, first_query_position - 127)
+    def next_nonempty(request_index):
+        def is_empty(index):
+            safe = jnp.minimum(index, starts_ref.shape[0] - 2)
+            return (index < request_limit) & (starts_ref[safe] == starts_ref[safe + 1])
 
-    def block_dma(wanted):
-        source_q = jnp.minimum(
-            end - 1,
-            start + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
-        )
-        return pltpu.make_async_copy(
-            swa_kv_hbm_ref.at[source_q], swa_first_ref, dma_sem.at[1]
-        )
+        return lax.while_loop(is_empty, lambda index: index + 1, request_index)
 
-    def group_count(t0):
-        # Split before a group would need a third SWA block.
+    def group_count(request_index, t0):
+        start, end = starts_ref[request_index], starts_ref[request_index + 1]
+        first_position = positions_ref[jnp.minimum(start, q_hbm_ref.shape[0] - 1)]
+        anchor = jnp.maximum(0, first_position - 127)
         p0 = positions_ref[jnp.minimum(t0, q_hbm_ref.shape[0] - 1)]
         block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
         return jnp.minimum(
@@ -129,30 +124,123 @@ def main_kernel(
             )
         )
 
-    def start_group(t0, bank):
-        @pl.loop(0, group_count(t0))
-        def start_query(i):
-            for dma in query_dmas(t0, i, bank):
-                dma.start()
+    def request_swa_dma(request_index, offset):
+        start, end = starts_ref[request_index], starts_ref[request_index + 1]
+        first_position = positions_ref[start]
+        anchor = jnp.maximum(0, first_position - 127)
+        source_q = jnp.minimum(
+            end - 1,
+            start + jnp.maximum(0, anchor + offset * 128 + 127 - first_position),
+        )
+        return pltpu.make_async_copy(
+            swa_kv_hbm_ref.at[source_q],
+            request_swa_ref.at[offset],
+            dma_sem.at[2 + 9 * bq + offset],
+        )
 
-    @pl.when(start < end)
+    def bulk_dmas(t0, bank):
+        return tuple(
+            pltpu.make_async_copy(src, dst, dma_sem.at[2 + 4 * bank * bq + k])
+            for k, (src, dst) in enumerate(
+                (
+                    (q_hbm_ref.at[pl.ds(t0, bq)], q_buffer_ref.at[bank]),
+                    (main_kv_hbm_ref.at[pl.ds(t0, bq)], main_fp8_buffer_ref.at[bank]),
+                    (
+                        main_scale_hbm_ref.at[pl.ds(t0, bq)],
+                        main_scale_buffer_ref.at[bank],
+                    ),
+                    (rope_hbm_ref.at[pl.ds(t0, bq)], rope_buffer_ref.at[bank]),
+                )
+            )
+        )
+
+    def transfer_group(request_index, t0, bank, *, wait=False):
+        def per_query():
+            @pl.loop(0, group_count(request_index, t0))
+            def transfer_query(i):
+                for dma in query_dmas(t0, i, bank):
+                    if wait:
+                        dma.wait()
+                    else:
+                        dma.start()
+
+        if q_hbm_ref.shape[0] >= bq:
+
+            def bulk():
+                for dma in bulk_dmas(t0, bank):
+                    if wait:
+                        dma.wait()
+                    else:
+                        dma.start()
+
+            lax.cond(group_count(request_index, t0) == bq, bulk, per_query)
+        else:
+            per_query()
+
+    def start_group(request_index, t0, bank):
+        transfer_group(request_index, t0, bank)
+
+    first_request = next_nonempty(jnp.int32(0))
+    first_t0 = starts_ref[first_request]
+
+    @pl.when(first_request < request_limit)
     def prime_group():
-        start_group(start, 0)
+        for offset in range(2):
+            request_swa_dma(first_request, offset).start()
+        start_group(first_request, first_t0, 0)
 
     def process_group(state):
-        t0, bank = state
+        request_index, t0, bank = state
+        start, end = starts_ref[request_index], starts_ref[request_index + 1]
+        first_query_position = positions_ref[start]
+        anchor = jnp.maximum(0, first_query_position - 127)
+
+        def block_dma(wanted):
+            source_q = jnp.minimum(
+                end - 1,
+                start
+                + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
+            )
+            return pltpu.make_async_copy(
+                swa_kv_hbm_ref.at[source_q], swa_first_ref, dma_sem.at[1]
+            )
+
+        @pl.when(t0 == start)
+        def reset_request_window():
+            for offset in range(2):
+                request_swa_dma(request_index, offset).wait()
+                swa_shared_ref[pl.ds(offset * 128, 128), :] = request_swa_ref[offset]
+                swa_cache_ids[offset] = offset
+                source_q = jnp.minimum(
+                    end - 1,
+                    start
+                    + jnp.maximum(
+                        0, anchor + offset * 128 + 127 - first_query_position
+                    ),
+                )
+                swa_cache_bases[offset] = jnp.maximum(0, positions_ref[source_q] - 127)
+            swa_prefetched_id[0] = -1
+
+            @pl.when(anchor + 2 * 128 - 1 <= positions_ref[end - 1])
+            def prefetch_following_window():
+                block_dma(2).start()
+                swa_prefetched_id[0] = 2
+
         q_ref = q_buffer_ref.at[bank]
         main_fp8_ref = main_fp8_buffer_ref.at[bank]
         main_scale_ref = main_scale_buffer_ref.at[bank]
         rope_ref = rope_buffer_ref.at[bank]
         p0 = positions_ref[t0]
         block_id = (jnp.maximum(0, p0 - 127) - anchor) // 128
-        count = group_count(t0)
-        next_t0 = t0 + count
-
-        @pl.when(next_t0 < end)
-        def prefetch_group():
-            start_group(next_t0, 1 - bank)
+        count = group_count(request_index, t0)
+        next_request = lax.cond(
+            t0 + count < end,
+            lambda: request_index,
+            lambda: next_nonempty(request_index + 1),
+        )
+        next_t0 = jnp.where(
+            next_request == request_index, t0 + count, starts_ref[next_request]
+        )
 
         for offset in range(2):
             wanted = block_id + offset
@@ -217,10 +305,19 @@ def main_kernel(
                         values * scales
                     ).astype(jnp.bfloat16)
 
-        @pl.loop(0, count)
-        def finish_query(i):
-            for dma in query_dmas(t0, i, bank):
-                dma.wait()
+        transfer_group(request_index, t0, bank, wait=True)
+
+        # Current inputs and SWA are ready. Prefetch across the request
+        # boundary before current QK/dequant/softmax/PV begins, preserving the
+        # two-bank reuse discipline of the intra-request pipeline.
+        @pl.when(next_request < request_limit)
+        def prefetch_group():
+            @pl.when(next_request != request_index)
+            def prefetch_next_request_swa():
+                for offset in range(2):
+                    request_swa_dma(next_request, offset).start()
+
+            start_group(next_request, next_t0, 1 - bank)
 
         def csa_launch(i, addr, *, pv):
             for k in range(2):
@@ -548,38 +645,42 @@ def main_kernel(
                 output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
             ).wait()
 
-        return next_t0, 1 - bank
+        @pl.when((next_request != request_index) & (swa_prefetched_id[0] >= 0))
+        def drain_request_prefetch():
+            # Do not carry an unfinished SWA staging transfer into a new
+            # request, whose source positions and cache block IDs differ.
+            block_dma(swa_prefetched_id[0]).wait()
+            swa_prefetched_id[0] = -1
 
-    lax.while_loop(lambda state: state[0] < end, process_group, (start, jnp.int32(0)))
+        return next_request, next_t0, 1 - bank
 
-    @pl.when(swa_prefetched_id[0] >= 0)
-    def drain_block_prefetch():
-        # A final partial BQ can finish before the prefetched block is needed.
-        block_dma(swa_prefetched_id[0]).wait()
+    lax.while_loop(
+        lambda state: state[0] < request_limit,
+        process_group,
+        (first_request, first_t0, jnp.int32(0)),
+    )
 
-    @pl.when(request_index == starts_ref.shape[0] - 2)
-    def clear_padding():
-        output_ref[...] = jnp.zeros(output_ref.shape, jnp.bfloat16)
+    output_ref[...] = jnp.zeros(output_ref.shape, jnp.bfloat16)
 
-        @pl.loop(end, q_hbm_ref.shape[0], step=bq)
-        def padding_group(t0):
-            count = jnp.minimum(bq, q_hbm_ref.shape[0] - t0)
+    @pl.loop(starts_ref[starts_ref.shape[0] - 1], q_hbm_ref.shape[0], step=bq)
+    def padding_group(t0):
+        count = jnp.minimum(bq, q_hbm_ref.shape[0] - t0)
 
-            @pl.loop(0, count)
-            def start_zero(i):
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
+        @pl.loop(0, count)
+        def start_zero(i):
+            pltpu.make_async_copy(
+                output_ref.at[i],
+                output_hbm_ref.at[t0 + i],
+                dma_sem.at[2 + 8 * bq + i],
+            ).start()
 
-            @pl.loop(0, count)
-            def wait_zero(i):
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).wait()
+        @pl.loop(0, count)
+        def wait_zero(i):
+            pltpu.make_async_copy(
+                output_ref.at[i],
+                output_hbm_ref.at[t0 + i],
+                dma_sem.at[2 + 8 * bq + i],
+            ).wait()
 
 
 @functools.partial(
@@ -670,7 +771,7 @@ def csa2(
         out_shape=jax.ShapeDtypeStruct(q.shape, jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
-            grid=(starts.shape[0] - 1,),
+            grid=(1,),
             in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 6,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
@@ -689,7 +790,8 @@ def csa2(
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2 + 9 * bq,)),
+                pltpu.VMEM((2, 128, 512), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((4 + 9 * bq,)),
             ),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
