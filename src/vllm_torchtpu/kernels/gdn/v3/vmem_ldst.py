@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 
 import jax
@@ -24,29 +25,46 @@ from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
 
 
 def load_strided_heads(
-    vmem_ref: jax.Ref, num_heads: int, head_dim: int, lane_offset: int = 0
+    vmem_ref: jax.Ref,
+    num_heads: int,
+    head_dim: int,
+    lane_offset: int = 0,
+    row_stride: int | None = None,
 ) -> jax.Array:
     """Use strided LDST to split heads along the last dim and transpose.
 
     Args:
-        vmem_ref: One slot's VMEM reference of shape [chunk_size, 1, cols].
+        vmem_ref: One slot's VMEM reference of shape [chunk_size, 1, cols],
+            or, with `row_stride`, [chunk_size * row_stride, lanes] holding
+            token rows `row_stride` lane rows apart.
         num_heads: Number of heads to split out.
         head_dim: Width of one head, in elements.
         lane_offset: Lane the first head starts at, for a region that is part
             of a larger tensor (k and v within the fused qkv).
+        row_stride: Lane rows between token rows of a 2D `vmem_ref`.
 
     Returns:
         [num_heads, chunk_size, head_dim]
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
-    lanes_per_col = vmem_ref.shape[-1] // num_lanes
     lanes_per_head = head_dim // num_lanes
 
-    flat_ref = vmem_ref.reshape(-1, num_lanes)
+    if row_stride is None:
+        row_stride = vmem_ref.shape[-1] // num_lanes
+        flat_ref = vmem_ref.reshape(-1, num_lanes)
+    else:
+        flat_ref = vmem_ref
+    num_rows = flat_ref.shape[0] // row_stride
     head_list = []
     for head in range(num_heads):
         head_lanes = [
-            flat_ref[lane_offset + head * lanes_per_head + lane :: lanes_per_col]
+            flat_ref[
+                pl.ds(
+                    lane_offset + head * lanes_per_head + lane,
+                    num_rows,
+                    stride=row_stride,
+                )
+            ]
             for lane in range(lanes_per_head)
         ]
         head_list.append(jnp.concat(head_lanes, axis=-1))
@@ -427,29 +445,42 @@ def load_activation_as_large(
     a_vmem_ref: jax.Ref,
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Load activations from VMEM as a large layout."""
+    """Load activations from VMEM as a large layout.
 
-    qkv_vmem_ref[...] = qkv_vreg
+    A 2D `qkv_vmem_ref` holds one sequence's token rows
+    `cfgs.qkv_row_stride` lane rows apart.
+    """
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
+
+    if qkv_vmem_ref.ndim == 2:
+        assert cfgs.seq_tile_size == 1
+        stride = cfgs.qkv_row_stride
+        cols = cfgs.dim_size // num_lanes
+        for t in range(cfgs.chunk_size):
+            qkv_vmem_ref[pl.ds(t * stride, cols), :] = qkv_vreg[0, t].reshape(
+                cols, num_lanes
+            )
+        slots = [functools.partial(load_strided_heads, qkv_vmem_ref, row_stride=stride)]
+    else:
+        qkv_vmem_ref[...] = qkv_vreg
+        slots = [
+            functools.partial(load_strided_heads, qkv_vmem_ref.at[idx])
+            for idx in range(cfgs.seq_tile_size)
+        ]
 
     q_large_list = []
     k_large_list = []
     v_large_list = []
     a_large_list = []
-    for idx in range(cfgs.seq_tile_size):
-        qkv_slot = qkv_vmem_ref.at[idx]
-        q_large_list.append(
-            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim)
-        )
+    for idx, load_heads in enumerate(slots):
+        q_large_list.append(load_heads(cfgs.num_kq_heads, cfgs.kq_head_dim))
         k_large_list.append(
-            load_strided_heads(qkv_slot, cfgs.num_kq_heads, cfgs.kq_head_dim, kq_lanes)
+            load_heads(cfgs.num_kq_heads, cfgs.kq_head_dim, kq_lanes)
         )
         v_large_list.append(
-            load_strided_heads(
-                qkv_slot, cfgs.num_v_heads, cfgs.v_head_dim, 2 * kq_lanes
-            )
+            load_heads(cfgs.num_v_heads, cfgs.v_head_dim, 2 * kq_lanes)
         )
         if cfgs.is_kda:
             # Per-channel gate: split into heads and transpose like q/k/v.

@@ -169,6 +169,14 @@ class GDNConfig:
         return pl.cdiv(QKV_TILE_ROWS - 1 + rows, QKV_TILE_ROWS)
 
     @property
+    def qkv_row_stride(self) -> int:
+        """Lane rows between consecutive token rows of the 2D qkv scratch the
+        chunked step reads heads from. Odd, so one head's lane group over 8
+        token rows is a single strided load: at the even unpadded stride
+        each such load issues as 8 one-sublane loads merged by 7 ORs."""
+        return (self.dim_size // pltpu.get_tpu_info().num_lanes) | 1
+
+    @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
 
@@ -298,9 +306,17 @@ class GDNConfig:
             else:
                 stage_shape = (stage_rows * self.dim_size // num_lanes, num_lanes)
             qkv_stage_scratch = pltpu.VMEM(stage_shape, jnp.float32)
-            qkv_scratch = pltpu.VMEM(
-                (self.seq_tile_size, self.chunk_size, 1, self.dim_size), jnp.float32
-            )
+            if self.seq_tile_size == 1 and not self.use_recurrent:
+                # Token rows `qkv_row_stride` lane rows apart; see there.
+                qkv_scratch_shape = (self.chunk_size * self.qkv_row_stride, num_lanes)
+            else:
+                qkv_scratch_shape = (
+                    self.seq_tile_size,
+                    self.chunk_size,
+                    1,
+                    self.dim_size,
+                )
+            qkv_scratch = pltpu.VMEM(qkv_scratch_shape, jnp.float32)
 
         out_zero_scratch = out_zero_sem = None
         if self.zero_out_tail:
