@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -262,6 +263,93 @@ def invert_unit_lower_blocked(l_pack: jax.Array, block_size: int = 16) -> jax.Ar
     return jnp.concat(x_blocks, axis=1)
 
 
+def solve_scratch(cfg: config.GDNConfig) -> Any:
+    """VMEM for `invert_unit_lower_blocked_rows` in the chunked step, or None
+    where the step does not take it."""
+    if cfg.mode != config.GDNMode.PER_SEQ or cfg.is_kda or cfg.use_recurrent:
+        return None
+    groups = min(CHUNK_HEAD_GROUP, cfg.num_v_heads) // INV_HEADS_PER_PASS
+    rows = max(groups, 1) * (cfg.chunk_size | 1)
+    return pltpu.VMEM((rows, INV_HEADS_PER_PASS * cfg.chunk_size), jnp.float32)
+
+
+def swap_major(x: jax.Array, scratch_ref: jax.Ref) -> jax.Array:
+    """[a, b, lanes] -> [b, a, lanes] through VMEM: each x[i] is stored
+    whole, `b | 1` rows apart, and each output row comes back by one strided
+    load. The odd stride is what keeps that load a single load."""
+    a, b, _ = x.shape
+    stride = b | 1
+    for i in range(a):
+        scratch_ref[pl.ds(i * stride, b), :] = x[i]
+    return jnp.stack(
+        [scratch_ref[pl.ds(j, a, stride=stride), :] for j in range(b)]
+    )
+
+
+def invert_unit_lower_blocked_rows(
+    l_pack: jax.Array, scratch_ref: jax.Ref, block_size: int = 16
+) -> jax.Array:
+    """`invert_unit_lower_blocked` with each block solved row-major.
+
+    Within a block every row r of every group is its own vregs, [groups,
+    g * n] with the groups down the sublanes, so substituting row s touches
+    only the rows below it and needs no sublane broadcast of row s. Rows at
+    or above s, which the packed loop updates by an exact zero, are left
+    alone. Each element of the result goes through the same operations in
+    the same order as `invert_unit_lower_blocked`. Blocks enter and leave
+    the row-major layout through `scratch_ref` (see `swap_major`).
+    """
+    groups, n, width = l_pack.shape
+    g = width // n
+    block_size = min(block_size, n)
+    shape = (1, n, width)
+    lane_head = jax.lax.broadcasted_iota(jnp.int32, shape, 2) // n
+    col = jax.lax.broadcasted_iota(jnp.int32, shape, 2) % n
+    row = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+    identity = jnp.where(row == col, 1.0, 0.0).astype(l_pack.dtype)
+    selectors = column_selectors(width, n, block_size)
+    # [n, groups, width]
+    l_by_row = swap_major(l_pack, scratch_ref)
+    x_blocks = []
+    for start in range(0, n, block_size):
+        rhs = jnp.broadcast_to(
+            identity[:, start : start + block_size], (groups, block_size, width)
+        )
+        if start:
+            l_rows = l_pack[:, start : start + block_size]
+            solved = jnp.concat(
+                x_blocks + [jnp.zeros((groups, n - start, width), l_pack.dtype)],
+                axis=1,
+            )
+            solved_diag = jnp.concat(
+                [jnp.where(lane_head == j, solved, 0) for j in range(g)], axis=1
+            )
+            prev_sum = jax.lax.dot(
+                jnp.where(col[:, start : start + block_size] < start, l_rows, 0),
+                solved_diag,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            )
+            rhs = rhs - prev_sum
+        x = list(swap_major(rhs, scratch_ref))
+        l_parts = split_bf16x3(
+            l_by_row[start : start + block_size], n, start, block_size
+        ).astype(jnp.bfloat16)
+        for s in range(block_size - 1):
+            rows = block_size - 1 - s
+            # Exact: one product per output is nonzero, and the three
+            # parts of an element sum back to it.
+            coef = jax.lax.dot(
+                l_parts[s + 1 :].reshape(rows * groups, width),
+                selectors[s],
+                preferred_element_type=jnp.float32,
+            ).reshape(rows, groups, width)
+            for r in range(s + 1, block_size):
+                x[r] = x[r] - coef[r - s - 1] * x[s]
+        x_blocks.append(swap_major(jnp.stack(x), scratch_ref))
+    return jnp.concat(x_blocks, axis=1)
+
+
 def packed_block_diag_dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
     """Per-head `lhs @ rhs` with `lhs` in the `pack_heads` layout:
     [heads // g, n, g * k] x [heads, k, m] -> [heads, n, m], one matmul per
@@ -422,6 +510,7 @@ def chunked_gdn_heads(
     state_prev: jax.Array,  # [heads, kq_head_dim, v_head_dim]
     head_slice: slice,
     cfg: config.GDNConfig,
+    solve_scratch_ref: jax.Ref | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Chunked GDN over one slab of value heads.
 
@@ -484,7 +573,10 @@ def chunked_gdn_heads(
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
 
     if packed:
-        t_inv = invert_unit_lower_blocked(gating_beta_k_k_t)
+        if solve_scratch_ref is None:
+            t_inv = invert_unit_lower_blocked(gating_beta_k_k_t)
+        else:
+            t_inv = invert_unit_lower_blocked_rows(gating_beta_k_k_t, solve_scratch_ref)
     else:
         t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
         t_inv = invert_triangular_matrix(t)
@@ -594,6 +686,7 @@ def chunked_gdn(
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
+    solve_scratch_ref: jax.Ref | None = None,
 ) -> None:
     """Perform chunked GDN over input [seq, num_heads, chunk, head_dim].
 
@@ -604,6 +697,8 @@ def chunked_gdn(
     lives and `store_out(idx, h0, out)` writes their [n, chunk, v_head_dim]
     output. The chunked path only produces the final state, so it is never
     taken when more than one checkpoint per sequence is required.
+    `solve_scratch_ref`, from `solve_scratch`, lets the triangular inverse
+    solve its blocks row-major.
     """
 
     assert not cfg.use_recurrent
@@ -670,6 +765,7 @@ def chunked_gdn(
                 load_state(idx, h0, group),
                 slice(h0 - kq0 * vpk, h0 - kq0 * vpk + group),
                 cfg,
+                solve_scratch_ref,
             )
             store_state(idx, h0, state)
             store_out(idx, h0, out)

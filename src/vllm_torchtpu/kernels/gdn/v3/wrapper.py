@@ -40,6 +40,7 @@ def _chunked_gdn_in_place(
     metadata_ref: memory_ref.MetadataRef,
     carry_recurrent_scratch_ref: jax.Array,
     out_stage_scratch_ref: jax.Array | None,
+    solve_scratch_ref: jax.Array | None,
     real_sizes: jax.Array,
     a_log: jax.Array,
     dt_bias: jax.Array,
@@ -103,6 +104,7 @@ def _chunked_gdn_in_place(
         a_log=a_log,
         dt_bias=dt_bias,
         cfg=cfg,
+        solve_scratch_ref=solve_scratch_ref,
     )
 
     if cfg.state_plan is not None:
@@ -134,6 +136,7 @@ def inner_kernel(
     qkv_stage_scratch_ref: jax.Array | None = None,
     qkv_scratch_ref: jax.Array | None = None,
     out_stage_scratch_ref: jax.Array | None = None,
+    solve_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -166,6 +169,7 @@ def inner_kernel(
             `cfg.qkv_row_tiled` qkv are gathered into.
         out_stage_scratch_ref: f32 VMEM scratch the chunked step's output
             passes through on its way to `out_slot_ref`.
+        solve_scratch_ref: f32 VMEM scratch of `compute_gdn.solve_scratch`.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -384,6 +388,7 @@ def inner_kernel(
             metadata_ref=metadata_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
             out_stage_scratch_ref=out_stage_scratch_ref,
+            solve_scratch_ref=solve_scratch_ref,
             real_sizes=real_sizes,
             a_log=a_log,
             dt_bias=dt_bias,
@@ -495,6 +500,7 @@ def outer_kernel(
     qkv_stage_scratch_ref: jax.Array | None,
     qkv_scratch_ref: jax.Array | None,
     out_stage_scratch_ref: jax.Array | None,
+    solve_scratch_ref: jax.Array | None,
     out_zero_scratch_ref: jax.Array | None,
     out_zero_sem_ref: jax.Array | None,
     *,
@@ -581,6 +587,7 @@ def outer_kernel(
                 qkv_stage_scratch_ref,
                 qkv_scratch_ref,
                 out_stage_scratch_ref,
+                solve_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -1011,7 +1018,10 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=dict(
+                cfg.get_scratch_shape_dict(),
+                solve_scratch_ref=compute_gdn.solve_scratch(cfg),
+            ),
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
