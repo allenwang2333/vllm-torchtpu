@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     TPU_SCHED_PREFILL_SRPT: bool = False
     TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_FUSED_DRAFT_LOOP_SHARE_MTP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1699,11 +1700,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
-    #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
-    #     KV-sharing draft's fixed positions and seq_lens.
+    #   - Gemma-4 MTP: a KV-sharing draft's fixed positions and seq_lens.
+    #     (GLM-5.2's IndexShare: TPU_FUSED_DRAFT_LOOP_SHARE_MTP.)
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # With VLLM_TPU_FUSED_DRAFT_LOOP: an IndexShare MTP draft (GLM-5.2) runs
+    # its top-k compaction, step-0 lm-head and loop steps 1..K-1 as one
+    # compiled program per chunk, its async input prep as one more, and the
+    # fused programs keep TPU_SAMPLER_VOCAB_PARALLEL's draft argmax.
+    "TPU_FUSED_DRAFT_LOOP_SHARE_MTP": env_bool("TPU_FUSED_DRAFT_LOOP_SHARE_MTP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
