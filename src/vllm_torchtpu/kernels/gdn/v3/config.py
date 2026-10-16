@@ -30,6 +30,9 @@ QKV_TILE_ROWS = 8
 # real token itself (`GDNConfig.zero_out_tail`).
 OUT_ZERO_ROWS = 16
 
+# Fraction of VMEM a launch without verify windows may scope.
+DEFAULT_VMEM_FRACTION = 0.7
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -251,7 +254,6 @@ class GDNConfig:
     # state checkpoint per position in VMEM, so for large-head models the
     # default 0.7 budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
     WINDOWED_VMEM_FRACTION = 0.9
 
     def get_vmem_limit_bytes(self) -> int:
@@ -259,7 +261,7 @@ class GDNConfig:
         fraction = (
             self.WINDOWED_VMEM_FRACTION
             if self.window_size > 1
-            else self.DEFAULT_VMEM_FRACTION
+            else DEFAULT_VMEM_FRACTION
         )
         return int(fraction * tpu_info.vmem_capacity_bytes)
 
