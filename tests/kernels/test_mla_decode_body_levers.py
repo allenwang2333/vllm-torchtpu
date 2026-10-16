@@ -151,14 +151,12 @@ def test_bit_identical(query_tokens, seq_q, send_world, shift):
         g, r = _real(got, real, heads, world), _real(ref, real, heads, world)
         return all(np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r))
 
+    # The real tokens' bits: a padding token's rows are left unwritten by a
+    # grid that stops at the real tokens (whatever the buffer held) and are
+    # computed by an eight-token step that runs past them; never exchanged.
     for levers in LEVER_SETS:
         got = _call(p, levers, send_world=send_world)
-        if "step8" in levers:
-            # Eight-token attention steps compute the padding tokens of a
-            # partial last step (never exchanged): the real tokens' bits.
-            assert same_real(got), levers
-        else:
-            assert _same(got, ref), levers
+        assert same_real(got), levers
     # Eight tokens per grid step for the prep and gather too
     # (TPU_DCP_MLA_SMALL_CHUNK_BATCH=8) with the default levers.
     if query_tokens >= 8:
