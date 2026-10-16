@@ -145,6 +145,22 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@contextlib.contextmanager
+def _mtp_megakernel_no_small_ar_context(mk: Any):
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        mtp_megakernel_context,
+    )
+
+    prev_ar = small_all_reduce_op._AR_OP
+    small_all_reduce_op._AR_OP = None
+    try:
+        with mtp_megakernel_context(mk):
+            yield
+    finally:
+        small_all_reduce_op._AR_OP = prev_ar
+
+
+
 def _collect_topk_indices_buffers(mtp_model) -> list[torch.Tensor]:
     """The distinct `topk_indices_buffer` tensors of a DSA MTP draft.
 
@@ -923,8 +939,16 @@ class Eagle3Proposer:
                     propose_step0=True,
                 )
             if envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
+                max_verify_rows = (1 + K) * int(
+                    getattr(self.runner, "max_num_reqs", 0) or 1024
+                )
+                step0_buckets = tuple(
+                    b
+                    for b in (*mk.verify_buckets, mk.verify_buckets[-1] * 2)
+                    if b <= max_verify_rows
+                )
                 self._mtp_mk_step0 = build(
-                    (*mk.verify_buckets, mk.verify_buckets[-1] * 2),
+                    step0_buckets,
                     build_mtp_loop_step_model,
                     prefix="mtp_mk_step0",
                 )
@@ -1053,12 +1077,8 @@ class Eagle3Proposer:
             and chunk.attn_ctx.position_ids_override is None
             and mk.use_for_step(attn_metadata, num_tokens, step0=False)
         ):
-            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
-                mtp_megakernel_context,
-            )
-
             program, warm_attr = self._mtp_fused_loop_mk, "_mtp_fused_loop_mk_warm"
-            mk_ctx = mtp_megakernel_context(mk)
+            mk_ctx = _mtp_megakernel_no_small_ar_context(mk)
         with (
             set_model_tag("eagle_head"),
             token_padding.use_padding_state(loop_padding_state),
@@ -3027,12 +3047,8 @@ class Eagle3Proposer:
             and model is self.draft_model
             and self._use_mtp_mk_step0(chunk, attn_metadata, num_tokens)
         ):
-            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
-                mtp_megakernel_context,
-            )
-
             model = self._mtp_mk_step0
-            mk_ctx = mtp_megakernel_context(self._mtp_mk)
+            mk_ctx = _mtp_megakernel_no_small_ar_context(self._mtp_mk)
         if model is self._mtp_loop_model:
             loop_padding_state = self._get_loop_token_padding_state()
             if loop_padding_state is not None:

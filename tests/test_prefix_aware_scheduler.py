@@ -532,6 +532,7 @@ def test_mk_max_running_caps_running_seqs_when_megakernel_active(monkeypatch):
 
     monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
     monkeypatch.setenv("VLLM_TPU_QWEN35_MEGAKERNEL", "1")
+    monkeypatch.setenv("VLLM_TPU_QWEN35_MK_SPLIT_WIDE", "0")
     # Auto mode is opt-in (the default 0 leaves max_num_running_reqs alone).
     monkeypatch.setenv("TPU_SCHED_MK_MAX_RUNNING", "-1")
 
@@ -643,6 +644,85 @@ def test_near_finish_decode_protection_in_schedule_loop(monkeypatch):
     s.schedule()
     assert scheduled_chunks[-1] == 4096
     assert s._finish_decode_defer_streak == 0
+
+
+def test_hbm_warm_outranks_cpu_warm_and_cpu_warm_outranks_cold():
+    now = time.time()
+    r_cold = _make_request("cold", num_tokens=90_000, arrival_time=now - 30)
+    r_cpu = _make_request("cpu_warm", num_tokens=90_000, arrival_time=now - 20)
+    r_hbm = _make_request("hbm_warm", num_tokens=90_000, arrival_time=now - 10)
+    s = _make_scheduler(
+        [r_cold, r_cpu, r_hbm],
+        {"cold": 0, "cpu_warm": 0, "hbm_warm": 80_000},
+    )
+    s.block_size = 640
+    connector = MagicMock()
+    connector.estimate_external_hit_tokens.side_effect = (
+        lambda req, local_toks: 88_000 if req.request_id == "cpu_warm" else 0
+    )
+    s.connector = connector
+
+    # Even though cpu_warm has 88,000 external tokens (2,000 uncached) vs
+    # hbm_warm's 80,000 HBM tokens (10,000 uncached), hbm_warm is strictly
+    # preferred over cpu_warm on the first selection, and cpu_warm is promoted
+    # over cold on the next selection.
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert q.pop_request().request_id == "hbm_warm"
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["cpu_warm", "cold"]
+
+
+def test_kv_producer_cold_cap_reserves_budget_for_ready_warm_and_multi_cold():
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_disagg = True
+    s._is_kv_producer = True
+    s._is_kv_consumer = False
+    s.block_size = 640
+    s.max_num_scheduled_tokens = 8192
+    s._cold_chunk_cap = 2048
+    s._cold_threshold = 8192
+    s._cold_min_decoders = 12
+    s._step_num_decoding = 0
+    s._step_decode_tokens = 0
+    s._step_prefill_tokens_by_req = {}
+
+    c1 = _running_request("c1", prompt=90_000, computed=0)
+    c2 = _running_request("c2", prompt=90_000, computed=0)
+    s._step_running_prefill_ids = {id(c1), id(c2)}
+
+    # Step t: CPU-warm request in waiting (needs 0 TPU tokens on Step t, only
+    # needs token_budget > 0 in Phase 2 to start async CPU load).
+    r_cpu = _make_request("cpu_warm", num_tokens=86_200, arrival_time=1.0)
+    s.waiting = [r_cpu]
+    s.skipped_waiting = []
+    s.finished_recving_kv_req_ids = set()
+    s._prefix_warmth = lambda req: 0
+    s._external_warmth = lambda req, loc: 85_000 if req is r_cpu else 0
+
+    assert s._compute_warm_waiting_tokens(8192) == 0
+    # First cold request gets full 8191 (-> 7680 aligned); second gets 0 so
+    # token_budget > 0 is preserved for Phase 2 async load initiation.
+    assert s._cap_cold_prefill_tokens(c1, 0, 8192) == 8191
+    s._step_prefill_tokens_by_req[id(c1)] = 7680
+    assert s._cap_cold_prefill_tokens(c2, 0, 512) == 0
+
+    # Step t+1: CPU load finished -> r_cpu is in skipped_waiting with
+    # finished_recving_kv_req_ids and 1,200 remaining tokens.
+    s._step_prefill_tokens_by_req = {}
+    r_cpu.num_computed_tokens = 85_000
+    s.waiting = []
+    s.skipped_waiting = [r_cpu]
+    s.finished_recving_kv_req_ids = {"cpu_warm"}
+
+    warm_toks = s._compute_warm_waiting_tokens(8192)
+    assert warm_toks == 3 * 640  # ceil(1200/640) + 1 = 3 blocks = 1920
+    # First cold request is capped to 2048; second cold request gets 0!
+    assert s._cap_cold_prefill_tokens(c1, 7680, 8192) == 2048
+    s._step_prefill_tokens_by_req[id(c1)] = 1920
+    assert s._cap_cold_prefill_tokens(c2, 0, 6272) == 0
+
 
 
 

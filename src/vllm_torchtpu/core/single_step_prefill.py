@@ -314,7 +314,10 @@ def install_mamba_manager_patches() -> None:
         )
         if partial_hash is not None:
             self._partial_hit_reqs[request.request_id] = (block_idx, source_block)
-            self.num_cached_block[request.request_id] = num_tokens // self.block_size
+            self.num_cached_block[request.request_id] = max(
+                self.num_cached_block.get(request.request_id, 0),
+                num_tokens // self.block_size,
+            )
             self._producer_partial_tail_reqs[request.request_id] = num_tokens
             self.__dict__.setdefault("_tpu_spec_partial", set()).add(
                 request.request_id
@@ -324,45 +327,55 @@ def install_mamba_manager_patches() -> None:
     @wraps(orig_cache_blocks)
     def cache_blocks(self, request, num_tokens, retention_interval=None):
         orig_cache_blocks(self, request, num_tokens, retention_interval=retention_interval)
-        plan = _plan(self, request.request_id)
-        if plan is None:
-            return
         rid = request.request_id
-        start, full_cut, partial_cut = plan
-        blocks = self.req_to_blocks[rid]
-        bs = self.block_size
-        run_col = (num_tokens - 1) // bs
-        ok_full = 0
-        if full_cut and start < full_cut == run_col * bs < num_tokens:
-            idx = full_cut // bs - 1
-            if idx < len(blocks) and not blocks[idx].is_null:
-                ok_full = full_cut
-        ok_partial = 0
-        spec_idx = run_col + 1
+        plan = _plan(self, rid)
+        if plan is not None:
+            start, full_cut, partial_cut = plan
+            blocks = self.req_to_blocks[rid]
+            bs = self.block_size
+            run_col = (num_tokens - 1) // bs
+            ok_full = 0
+            if full_cut and start < full_cut == run_col * bs < num_tokens:
+                idx = full_cut // bs - 1
+                if idx < len(blocks) and not blocks[idx].is_null:
+                    ok_full = full_cut
+            ok_partial = 0
+            spec_idx = run_col + 1
+            if (
+                partial_cut
+                and self.num_speculative_blocks >= 1
+                and max(start, run_col * bs) < partial_cut < num_tokens
+                and partial_cut // bs == run_col
+                and spec_idx < len(blocks)
+                and not blocks[spec_idx].is_null
+                and blocks[spec_idx].block_hash is None
+                and rid not in self._partial_hit_reqs
+            ):
+                self.__dict__["_tpu_seg_partial_override"] = (rid, spec_idx)
+                try:
+                    # Through the instance attribute so HybridStateRetention's
+                    # hook sees the real boundary (safe-tail prompt, tracking).
+                    partial_hash = self._cache_partial_tail_block(request, partial_cut)
+                finally:
+                    self.__dict__["_tpu_seg_partial_override"] = None
+                if partial_hash is not None:
+                    self.cached_blocks_this_step.add(partial_hash)
+                    ok_partial = partial_cut
+            if ok_full or ok_partial:
+                self.__dict__.setdefault("_tpu_seg_confirmed", {})[rid] = (
+                    ok_full,
+                    ok_partial,
+                )
         if (
-            partial_cut
-            and self.num_speculative_blocks >= 1
-            and max(start, run_col * bs) < partial_cut < num_tokens
-            and partial_cut // bs == run_col
-            and spec_idx < len(blocks)
-            and not blocks[spec_idx].is_null
-            and blocks[spec_idx].block_hash is None
-            and rid not in self._partial_hit_reqs
+            num_tokens >= request.num_prompt_tokens
+            and getattr(request, "max_tokens", None) == 1
+            and rid in self._producer_partial_tail_reqs
+            and rid in self._partial_hit_reqs
         ):
-            self.__dict__["_tpu_seg_partial_override"] = (rid, spec_idx)
-            try:
-                # Through the instance attribute so HybridStateRetention's
-                # hook sees the real boundary (safe-tail prompt, tracking).
-                partial_hash = self._cache_partial_tail_block(request, partial_cut)
-            finally:
-                self.__dict__["_tpu_seg_partial_override"] = None
-            if partial_hash is not None:
-                self.cached_blocks_this_step.add(partial_hash)
-                ok_partial = partial_cut
-        if ok_full or ok_partial:
-            self.__dict__.setdefault("_tpu_seg_confirmed", {})[rid] = (
-                ok_full,
-                ok_partial,
+            _, partial_blk = self._partial_hit_reqs[rid]
+            boundary_tokens = self._producer_partial_tail_reqs.pop(rid)
+            self._pending_boundary_state_offloads.append(
+                (rid, self.kv_cache_group_id, partial_blk, boundary_tokens)
             )
 
     @wraps(orig_allocate)

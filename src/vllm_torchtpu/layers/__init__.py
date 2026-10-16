@@ -14,6 +14,24 @@ def register_layers() -> None:
     _maybe_install_frontend_fix()
     _maybe_install_detok_prompt_tail()
     _maybe_install_ttft_stage_tracker()
+    _maybe_install_chat_token_id_reuse()
+
+
+def _maybe_install_chat_token_id_reuse() -> None:
+    import os
+
+    if os.environ.get("QX_REUSE_CHAT_TOKEN_IDS", "1") != "1":
+        return
+    try:
+        from vllm_torchtpu.frontend_fix import maybe_install_chat_token_id_reuse
+
+        maybe_install_chat_token_id_reuse()
+    except Exception as e:  # never break startup
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[QX_CHAT_TOK_REUSE] install failed: %r", e
+        )
 
 
 def _maybe_install_ttft_stage_tracker() -> None:

@@ -102,9 +102,20 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         )
         else 0
     )
-    return (
+    credit = (
         (_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots
-    ) * 3 * hidden * inter, slots
+    ) * 3 * hidden * inter
+    mk_tp = (
+        os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        and os.environ.get("VLLM_TPU_QWEN35_MK_MODE", "ep").strip().lower() == "tp"
+    )
+    if mk_tp:
+        # In TP MoE mode, each rank holds per-expert FP32 scale tensors
+        # (s13_tp, s2_tp, es_mk) for all 512 experts instead of 64 experts
+        # (~0.94 GB across 60 layers); reserve 1.07 GB of the freed slot credit.
+        credit -= 1_070_230_528
+    return credit, slots
 
 
 def _log_effective_config(vllm_config: VllmConfig) -> None:
@@ -806,7 +817,6 @@ class TpuPlatform(Platform):
             vllm_config.speculative_config is not None
             and vllm_config.kv_transfer_config is not None
             and vllm_config.kv_transfer_config.kv_role == "kv_producer"
-            and parallel_config.prefill_context_parallel_size > 1
             and vllm_config.speculative_config.num_speculative_tokens != 1
         ):
             logger.info(
@@ -826,7 +836,7 @@ class TpuPlatform(Platform):
             and vllm_config.speculative_config.num_speculative_tokens >= 3
             and vllm_config.speculative_config.rejection_sample_method == "standard"
         ):
-            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "3.39").strip()
+            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "").strip()
             if synth_len_env and float(synth_len_env) > 0:
                 synth_len = float(synth_len_env)
                 vllm_config.speculative_config.rejection_sample_method = "synthetic"
@@ -983,6 +993,7 @@ class TpuPlatform(Platform):
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
             if (
                 vllm_config.kv_transfer_config is None
+                or vllm_config.kv_transfer_config.kv_role == "kv_producer"
                 or os.environ.get("TPU_HYBRID_STATE_RETENTION", "0").strip().lower()
                 in ("1", "true", "yes", "on")
             ):
@@ -998,7 +1009,15 @@ class TpuPlatform(Platform):
             ep_size = int(parallel_config.tensor_parallel_size) * int(
                 parallel_config.data_parallel_size
             )
-            if "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
+            mk_tp = (
+                os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+                and os.environ.get("VLLM_TPU_QWEN35_MK_MODE", "ep").strip().lower()
+                == "tp"
+            )
+            if mk_tp:
+                os.environ["TPU_EXPERT_PLACEMENT"] = ""
+            elif "TPU_EXPERT_PLACEMENT" not in os.environ and ep_size == 8:
                 from vllm_torchtpu import expert_placement
 
                 table = expert_placement.auto_table(
@@ -1038,11 +1057,19 @@ class TpuPlatform(Platform):
             keep = requested is not None and os.environ.get(
                 "TPU_KV_BYTES_EXPLICIT", "0"
             ).strip().lower() in ("1", "true", "yes", "on")
-            # The budget is calibrated for a mixed engine. A disagg prefill leg
-            # (PCP shards, prefill-sized activations) OOMs at it, so leave that
-            # leg on gpu_memory_utilization.
+            # The budget is calibrated for a TP8<=8192 engine. A disagg prefill
+            # leg with PCP>1 or >8192 batched tokens has larger activations, so
+            # leave that leg on gpu_memory_utilization.
             kv_cfg = vllm_config.kv_transfer_config
-            if kv_cfg is not None and kv_cfg.kv_role == "kv_producer":
+            if (
+                kv_cfg is not None
+                and kv_cfg.kv_role == "kv_producer"
+                and (
+                    pcp_size > 1
+                    or int(parallel_config.tensor_parallel_size) != 8
+                    or scheduler_config.max_num_batched_tokens > 8192
+                )
+            ):
                 logger.info(
                     "Qwen3.5-397B kv_cache_memory_bytes left to the prefill "
                     "leg (requested %s; mixed-engine auto would be %d).",
