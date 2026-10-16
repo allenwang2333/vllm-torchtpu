@@ -566,19 +566,37 @@ def test_pack_weights_value_parity_against_split_hf_weights() -> None:
             ),
             _ecopy_cores=e_cores[l_idx],
         )
+        f_r = g.ISR(ex.R)
+        sh13_r0 = _jax_to_torch(w_logical["sh13"][0, l_idx])
+        sh13_r1 = _jax_to_torch(w_logical["sh13"][1, l_idx])
+        w_gu_unsharded = torch.cat(
+            [
+                sh13_r0[:, :f_r],
+                sh13_r1[:, :f_r],
+                sh13_r0[:, f_r:],
+                sh13_r1[:, f_r:],
+            ],
+            dim=-1,
+        ).contiguous()
+        s13_r0 = _jax_to_torch(w_logical["sh13_s"][0, l_idx])
+        s13_r1 = _jax_to_torch(w_logical["sh13_s"][1, l_idx])
+        s_gu_unsharded = torch.cat(
+            [s13_r0[:f_r], s13_r1[:f_r], s13_r0[f_r:], s13_r1[f_r:]], dim=0
+        ).contiguous()
         gu_proj = SimpleNamespace(
-            weight=torch.nn.Parameter(
-                _jax_to_torch(w_logical["sh13"][tp_rank, l_idx]), requires_grad=False
-            ),
-            weight_scale=torch.nn.Parameter(
-                _jax_to_torch(w_logical["sh13_s"][tp_rank, l_idx]), requires_grad=False
-            ),
+            weight=torch.nn.Parameter(w_gu_unsharded, requires_grad=False),
+            weight_scale=torch.nn.Parameter(s_gu_unsharded, requires_grad=False),
         )
         setattr(gu_proj, WEIGHT_FLIPPED_ATTR, True)
+        w_d_unsharded = torch.cat(
+            [
+                _jax_to_torch(w_logical["sh2"][0, l_idx]),
+                _jax_to_torch(w_logical["sh2"][1, l_idx]),
+            ],
+            dim=0,
+        ).contiguous()
         down_proj = SimpleNamespace(
-            weight=torch.nn.Parameter(
-                _jax_to_torch(w_logical["sh2"][tp_rank, l_idx]), requires_grad=False
-            ),
+            weight=torch.nn.Parameter(w_d_unsharded, requires_grad=False),
             weight_scale=torch.nn.Parameter(
                 _jax_to_torch(w_logical["sh2_s"][tp_rank, l_idx]), requires_grad=False
             ),
@@ -696,6 +714,9 @@ def test_reshard_layer_experts_ep_to_tp() -> None:
         ),
     )
 
+    with pytest.raises(ValueError, match="all_gather_fn must be provided"):
+        reshard_layer_experts_ep_to_tp(mlp, tp_rank=1, g=g, ex=ex_ep)
+
     # Simulate 2-rank all_gather by repeating primary `ER=64` experts twice -> `E=128`
     reshard_layer_experts_ep_to_tp(
         mlp,
@@ -719,9 +740,8 @@ def test_bridge_and_weight_collector_have_no_vllm_imports() -> None:
     """Verify `exported_bridge` and `weight_collector` are framework-portable.
 
     Neither module may import from `vllm` or `vllm_torchtpu` outside
-    `vllm_torchtpu.megakernel` and `vllm_torchtpu.megakernel_runtime`,
-    so they can be extracted into a standalone library alongside
-    `megakernel`.
+    `vllm_torchtpu.megakernel`, so they can be extracted into a
+    standalone library alongside `megakernel`.
     """
     import ast
     from pathlib import Path
@@ -729,10 +749,7 @@ def test_bridge_and_weight_collector_have_no_vllm_imports() -> None:
     import vllm_torchtpu.megakernel_runtime.exported_bridge as bridge_mod
     import vllm_torchtpu.megakernel_runtime.weight_collector as wc_mod
 
-    allowed_prefixes = (
-        "vllm_torchtpu.megakernel",
-        "vllm_torchtpu.megakernel_runtime",
-    )
+    allowed_prefixes = ("vllm_torchtpu.megakernel",)
     for mod in (bridge_mod, wc_mod):
         path = Path(mod.__file__)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

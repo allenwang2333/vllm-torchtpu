@@ -279,14 +279,14 @@ def test_verify_and_export_pooled_step_hlo() -> None:
 
 
 def test_verify_torchtpu_compiled_step_ir() -> None:
-    """Verify `verify_torchtpu_compiled_step_ir` on StableHLO MLIR and HLO text."""
+    """Verify `verify_torchtpu_compiled_step_ir` on `@main` `jax.buffer_donor`."""
     pool_ty = "tensor<64x2x64x4x128xf8E4M3FN>"
     pool_args = ", ".join(
-        f"%arg{i}: {pool_ty} {{tf.aliasing_output = {i}}}" for i in range(15)
+        f"%arg{i}: {pool_ty} {{jax.buffer_donor = true}}" for i in range(15)
     )
     valid_mlir = (
-        f"module @SyncTensorsGraph {{\n"
-        f"  func.func @main({pool_args}) -> ({', '.join([pool_ty] * 15)}) {{\n"
+        f"module @TorchTpuStep {{\n"
+        f"  func.func public @main({pool_args}) -> ({', '.join([pool_ty] * 15)}) {{\n"
         f"    %0 = stablehlo.custom_call @tpu_custom_call(%arg0) : "
         f"({pool_ty}) -> {pool_ty}\n"
         f"    return {', '.join(f'%arg{i}' for i in range(15))} : "
@@ -299,17 +299,24 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
     )
     assert ok, f"Expected valid StableHLO MLIR to pass: {msg}"
 
-    # Missing one tf.aliasing_output attribute must fail
-    missing_alias_args = ", ".join(
-        f"%arg{i}: {pool_ty}" + (f" {{tf.aliasing_output = {i}}}" if i < 14 else "")
+    # Missing one jax.buffer_donor on @main must fail even if an inlined submodule
+    # carries 15 tf.aliasing_output attributes (cannot pass vacuously)
+    missing_donor_args = ", ".join(
+        f"%arg{i}: {pool_ty}" + (" {jax.buffer_donor = true}" if i < 14 else "")
         for i in range(15)
     )
-    bad_alias_mlir = valid_mlir.replace(pool_args, missing_alias_args)
+    inner_alias_args = ", ".join(
+        f"%arg{i}: {pool_ty} {{tf.aliasing_output = {i}}}" for i in range(15)
+    )
+    bad_donor_mlir = (
+        valid_mlir.replace(pool_args, missing_donor_args)
+        + f"\n  func.func private @inlined_jax({inner_alias_args}) -> () {{ return }}\n"
+    )
     ok_bad, msg_bad = verify_torchtpu_compiled_step_ir(
-        bad_alias_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+        bad_donor_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
     )
     assert not ok_bad
-    assert "expected >= 15 tf.aliasing_output attributes" in msg_bad
+    assert "expected >= 15 donated pool arguments" in msg_bad
 
     # Full-pool dynamic_update_slice / as_strided_copy_inverse must fail
     bad_copy_mlir = valid_mlir.replace(
@@ -323,10 +330,10 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
     assert not ok_copy
     assert "unexpected full-pool copy in torch_tpu IR" in msg_copy
 
-    # Valid HLO text vs HLO text with full-pool copy
+    # Valid HLO text vs empty input_output_alias={} vs HLO text with full-pool copy
     alias_entries = ", ".join(f"{{{{{i}}}, {i + 2}, {{}}}}" for i in range(15))
     valid_hlo = (
-        f"HloModule SyncTensorsGraph, input_output_alias={{ {alias_entries} }}\n"
+        f"HloModule TorchTpuStep, input_output_alias={{ {alias_entries} }}\n"
         f"ENTRY %main {{\n"
         f'  %k = () custom-call(), custom_call_target="tpu_custom_call"\n'
         f"  ROOT %t = () tuple()\n"
@@ -337,12 +344,36 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
     )
     assert ok_hlo, f"Expected valid HLO to pass: {msg_hlo}"
 
+    ok_both, msg_both = verify_torchtpu_compiled_step_ir(
+        valid_mlir,
+        num_pages=64,
+        page_size=128,
+        kvh=1,
+        hd=256,
+        num_pools=15,
+        hlo_text=valid_hlo,
+    )
+    assert ok_both, f"Expected combined MLIR + post-XLA HLO to pass: {msg_both}"
+
+    empty_alias_hlo = valid_hlo.replace(f"{{ {alias_entries} }}", "{}")
+    ok_empty_alias, msg_empty_alias = verify_torchtpu_compiled_step_ir(
+        empty_alias_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert not ok_empty_alias
+    assert "expected >= 15 entries in HloModule input_output_alias" in msg_empty_alias
+
     bad_hlo = valid_hlo.replace(
         "ROOT %t = () tuple()",
         "  %cp = f8e4m3fn[64,2,64,4,128] copy(%p0)\n  ROOT %t = () tuple()",
     )
     ok_bad_hlo, msg_bad_hlo = verify_torchtpu_compiled_step_ir(
-        bad_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+        valid_mlir,
+        num_pages=64,
+        page_size=128,
+        kvh=1,
+        hd=256,
+        num_pools=15,
+        hlo_text=bad_hlo,
     )
     assert not ok_bad_hlo
     assert "unexpected full-pool copy in torch_tpu HLO" in msg_bad_hlo

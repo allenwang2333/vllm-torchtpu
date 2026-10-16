@@ -16,10 +16,11 @@
 Extracts sharded `torch.Tensor` weights from vLLM Qwen3.5 layers and packs them
 into the layout declared by `planner.plan(qwen35.qwen35_spec(g), ex)`:
 - When `ex.stack_e` is `False` (default for serving), dynamic routed-expert
-  weights (`e13`, `e2` — ~18.9 GB per rank at `R=8` for 60 layers) are passed as
-  their original 3D `torch.nn.Parameter` base buffers (`e13[l].data_ptr() ==
-  w13.data_ptr()`), avoiding duplicate expert HBM allocations; the 3D -> 4D
-  reshape happens as a zero-copy XLA bitcast inside `cache.make_flat_pooled_step`.
+  weights (`e13`, `e2` — ~4.25 GB per rank in EP mode at `R=8` for 60 layers) are
+  passed as their original 3D `torch.nn.Parameter` base buffers
+  (`e13[l].data_ptr() == w13.data_ptr()`), avoiding duplicate expert HBM
+  allocations; the 3D -> 4D reshape happens as a zero-copy XLA bitcast inside
+  `cache.make_flat_pooled_step`.
 - Non-expert layer weights (`lin_in`, `lin_out`, `att_in`, `att_out`, `router`,
   `sh13`, `sh2`, `es`, `smalls`, `final_norm` — ~1.5 GB per rank at `R=8` for 60
   layers) are stacked across layers into contiguous base buffers
@@ -472,6 +473,7 @@ def pack_smalls_layer(
     sh_gate: torch.Tensor,
     layer_idx: int | None = None,
     ecopy: torch.Tensor | None = None,
+    expert_placement: Any = None,
 ) -> torch.Tensor:
     """Pack a single layer's small parameters into `[1, S] float32`."""
     dev = in_s.device
@@ -492,7 +494,9 @@ def pack_smalls_layer(
     }
     if "ecopy" in smalls_layout:
         if ecopy is None:
-            ecopy = extract_ecopy_layer(layer_idx, layer, g, ex, dev)
+            ecopy = extract_ecopy_layer(
+                layer_idx, layer, g, ex, dev, expert_placement=expert_placement
+            )
         if ecopy is not None:
             fields["ecopy"] = ecopy.float().reshape(g.E)
 
@@ -624,20 +628,6 @@ def reshard_experts_ep_to_tp_local(
     return w13_tp, w2_tp, s13_tp, s2_tp
 
 
-def _default_all_gather_dim0(t: torch.Tensor) -> torch.Tensor:
-    """Gather `t` along dimension 0 across the default `torch.distributed` group."""
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return t
-    ws = torch.distributed.get_world_size()
-    if ws <= 1:
-        return t
-    out = torch.empty(
-        (ws * int(t.shape[0]),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
-    )
-    torch.distributed.all_gather_into_tensor(out, t.contiguous())
-    return out
-
-
 def apply_tp_moe_flags(experts: Any, *, prebuild_moe_fn: Any = None) -> None:
     """Update a `FusedMoE` module's flags after in-place EP->TP resharding."""
     targets = [experts]
@@ -722,12 +712,17 @@ def reshard_layer_experts_ep_to_tp(
     s2_ep = getattr(experts, s2_attr).data[:er].reshape(er, g.H).contiguous()
 
     if all_gather_fn is None:
-        all_gather_fn = _default_all_gather_dim0
-
-    w13_all = all_gather_fn(w13_ep)
-    w2_all = all_gather_fn(w2_ep)
-    s13_all = all_gather_fn(s13_ep)
-    s2_all = all_gather_fn(s2_ep)
+        _need(
+            ex.R == 1,
+            "all_gather_fn must be provided to reshard_layer_experts_ep_to_tp "
+            "when R > 1",
+        )
+        w13_all, w2_all, s13_all, s2_all = w13_ep, w2_ep, s13_ep, s2_ep
+    else:
+        w13_all = all_gather_fn(w13_ep)
+        w2_all = all_gather_fn(w2_ep)
+        s13_all = all_gather_fn(s13_ep)
+        s2_all = all_gather_fn(s2_ep)
 
     w13_tp, w2_tp, s13_tp, s2_tp = reshard_experts_ep_to_tp_local(
         w13_all, w2_all, s13_all, s2_all, tp_rank=tp_rank, g=g, ex=ex
@@ -764,6 +759,7 @@ def pack_weights(
     ex: ExecSpec,
     *,
     tp_rank: int = 0,
+    expert_placement: Any = None,
 ) -> dict[str, Any]:
     """Pack all `g.L` layers of `backbone` into the megakernel's weight dictionary.
 
@@ -855,6 +851,7 @@ def pack_weights(
             sh2_s=rs["sh2_s"],
             sh_gate=rs["sh_gate"],
             layer_idx=l_idx,
+            expert_placement=expert_placement,
         )
         smalls_mk_list.append(sm_mk)
 

@@ -53,87 +53,10 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.megakernel import cache
 from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
 
-_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
-          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
-      ]"""
-_SHARDED_PLACEHOLDER_LINE = (
-    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
-)
-_SHARDED_CALLABLE_CLS: Any = None
-
 
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
     """Flatten `output_partition_specs` to one `PartitionSpec` per output leaf."""
     return jax.tree.leaves(output_partition_specs, is_leaf=lambda s: isinstance(s, P))
-
-
-def _placeholder(pallas_impl: Any, aval: Any, spec: Any, mesh: Any) -> torch.Tensor:
-    """Build a torch placeholder tensor shaped for this rank's local shard."""
-    if spec is None or not isinstance(aval, jax.core.ShapedArray):
-        return pallas_impl.torch_placeholder(aval, mesh=mesh)
-    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
-    if torch_dtype is None:
-        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
-    shape = tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec))
-    if torch_dtype == torch.float4_e2m1fn_x2 and shape:
-        if shape[-1] % 2:
-            raise ValueError(
-                "expected the last dimension of the JAX local shape to be even "
-                f"to pack into {torch_dtype}, got {shape[-1]} (local={shape}, "
-                f"global={aval.shape}, spec={spec})"
-            )
-        shape = shape[:-1] + (shape[-1] // 2,)
-    return torch.empty(shape, dtype=torch_dtype, device="tpu")
-
-
-def _make_sharded_output_placeholders(
-    pallas_impl: Any,
-) -> Callable[[Any, Any], list[torch.Tensor]]:
-    def _sharded_output_placeholders(lowered: Any, mesh: Any) -> list[torch.Tensor]:
-        shardings = getattr(lowered, "_out_named_shardings", None)
-        if shardings is None or len(shardings) != len(lowered.out_avals):
-            shardings = (None,) * len(lowered.out_avals)
-        return [
-            _placeholder(pallas_impl, aval, getattr(sharding, "spec", None), mesh)
-            for aval, sharding in zip(lowered.out_avals, shardings)
-        ]
-
-    return _sharded_output_placeholders
-
-
-def _get_sharded_callable_cls(pallas_impl: Any) -> Any:
-    """Return a `JaxCallable` class that sizes output placeholders per local shard."""
-    global _SHARDED_CALLABLE_CLS
-    if _SHARDED_CALLABLE_CLS is not None:
-        return _SHARDED_CALLABLE_CLS
-    init_sig = inspect.signature(pallas_impl.JaxCallable.__init__)
-    if "output_partition_specs" in init_sig.parameters:
-        _SHARDED_CALLABLE_CLS = pallas_impl.JaxCallable
-        return _SHARDED_CALLABLE_CLS
-    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
-    if _STOCK_PLACEHOLDER_LINE not in src:
-        _SHARDED_CALLABLE_CLS = pallas_impl.JaxCallable
-        return _SHARDED_CALLABLE_CLS
-    patched = "class _Holder:\n" + src.replace(
-        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
-    )
-    namespace: dict[str, Any] = {}
-    exec(  # noqa: S102
-        compile(patched, pallas_impl.__file__, "exec"),
-        {
-            **pallas_impl.__dict__,
-            "_sharded_output_placeholders": _make_sharded_output_placeholders(
-                pallas_impl
-            ),
-        },
-        namespace,
-    )
-    _SHARDED_CALLABLE_CLS = type(
-        "_ShardedJaxCallable",
-        (pallas_impl.JaxCallable,),
-        {"__call__": namespace["_Holder"].__call__},
-    )
-    return _SHARDED_CALLABLE_CLS
 
 
 def sharded_jax_callable(
@@ -155,7 +78,13 @@ def sharded_jax_callable(
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
-    callable_cls = _get_sharded_callable_cls(pallas_impl)
+    init_sig = inspect.signature(pallas_impl.JaxCallable.__init__)
+    if "output_partition_specs" not in init_sig.parameters:
+        raise RuntimeError(
+            "torch_tpu.JaxCallable.__init__ does not support 'output_partition_specs'; "
+            "upgrade torch_tpu to use sharded_jax_callable."
+        )
+
     signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
     pallas_impl._verify_signature(signature)
     static_argnums = pallas_impl._infer_static_argnums(signature)
@@ -182,21 +111,15 @@ def sharded_jax_callable(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    extra_kwargs: dict[str, Any] = {}
-    init_sig = inspect.signature(callable_cls.__init__)
-    if "output_partition_specs" in init_sig.parameters:
-        extra_kwargs["output_partition_specs"] = _leaf_output_specs(
-            output_partition_specs
-        )
-    return callable_cls(
+    return pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
         mesh=mesh,
         input_partition_specs=input_partition_specs,
+        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
-        **extra_kwargs,
     )
 
 
@@ -379,38 +302,85 @@ def verify_torchtpu_compiled_step_ir(
     kvh: int = 1,
     hd: int = 256,
     num_pools: int = 15,
+    hlo_text: str | None = None,
 ) -> tuple[bool, str]:
-    """Verify that a compiled `torch_tpu` forward step aliases all pools in-place.
+    """Verify that a compiled `torch_tpu` forward step donates and aliases all pools.
 
-    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) or
-    HLO text produced by `torch.compile(backend="tpu")` for the outer step graph
-    that invokes `execute_pooled_step_inplace` (`op(...)` + `dst.copy_(src)`):
-    1. Confirms the custom Pallas kernel call is present.
-    2. Confirms all `num_pools` pool inputs carry `tf.aliasing_output` (MLIR) or
-       `input_output_alias` (HLO) so `dst.copy_(src)` is folded into an in-place
-       buffer alias.
-    3. Confirms no `copy`, `copy-start`, `dynamic_update_slice`, or
+    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) and/or
+    post-XLA HLO text produced by `torch.compile(backend="tpu")` for the outer
+    step graph that invokes `execute_pooled_step_inplace` (`op(...)` +
+    `dst.copy_(src)`):
+    1. Confirms a custom Pallas kernel call op (`stablehlo.custom_call`,
+       `mhlo.custom_call`, or `custom-call(`) is present.
+    2. For StableHLO MLIR, inspects the outer `@main` signature and confirms at
+       least `num_pools` pool arguments carry `jax.buffer_donor = true` (or
+       `tf.aliasing_output = <idx>`), ensuring outer pool inputs are donated
+       rather than passing vacuously on an inlined submodule.
+    3. For HLO text (`ir_text` when it is an `HloModule`, or `hlo_text` when
+       supplied alongside MLIR), confirms `HloModule ... input_output_alias`
+       contains at least `num_pools` alias entries.
+    4. Confirms no `copy`, `copy-start`, `dynamic_update_slice`, or
        `as_strided_copy_inverse` materializes a full-pool buffer.
     """
     if not ir_text or not ir_text.strip():
         return False, "empty torch_tpu compiled IR"
 
     has_custom_call = (
-        "custom_call" in ir_text
-        or "tpu_custom_call" in ir_text
-        or "megakernel_runtime" in ir_text
+        "stablehlo.custom_call" in ir_text
+        or "mhlo.custom_call" in ir_text
+        or "custom-call(" in ir_text
     )
     if not has_custom_call:
         return False, "missing custom kernel call in torch_tpu compiled IR"
 
-    n_mlir_alias = ir_text.count("tf.aliasing_output")
-    n_hlo_alias = ir_text.count("input_output_alias")
-    if n_mlir_alias < num_pools and n_hlo_alias == 0:
-        return (
-            False,
-            f"expected >= {num_pools} tf.aliasing_output attributes on donated "
-            f"pool arguments in torch_tpu IR, found {n_mlir_alias}",
+    has_mlir_main = "func.func" in ir_text
+    has_hlo_module = "HloModule" in ir_text
+    if not has_mlir_main and not has_hlo_module:
+        return False, "unrecognized torch_tpu IR format (missing func.func / HloModule)"
+
+    if has_mlir_main:
+        main_match = re.search(
+            r"func\.func\b[^{]*@main\s*\((.*?)\)\s*->", ir_text, re.DOTALL
         )
+        if main_match is None:
+            return False, "missing func.func @main signature in torch_tpu MLIR"
+        main_params = main_match.group(1)
+        pool_shape_str = f"{num_pages}x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN"
+        pool_arg_pat = re.compile(
+            rf"%arg\d+\s*:\s*tensor<{pool_shape_str}>(?:\s*(\{{[^}}]*\}}))?"
+        )
+        n_donated_main = 0
+        for m in pool_arg_pat.finditer(main_params):
+            attr = m.group(1) or ""
+            if "jax.buffer_donor = true" in attr or re.search(
+                r"tf\.aliasing_output\s*=\s*\d+", attr
+            ):
+                n_donated_main += 1
+        if n_donated_main < num_pools:
+            return (
+                False,
+                f"expected >= {num_pools} donated pool arguments "
+                f"(jax.buffer_donor = true) on @main in torch_tpu IR, "
+                f"found {n_donated_main}",
+            )
+
+    hlo_sources: list[str] = []
+    if has_hlo_module:
+        hlo_sources.append(ir_text)
+    if hlo_text and hlo_text.strip():
+        hlo_sources.append(hlo_text)
+
+    for hlo_src in hlo_sources:
+        hlo_header = hlo_src.split("ENTRY", 1)[0]
+        if "input_output_alias" not in hlo_header:
+            return False, "missing input_output_alias in torch_tpu HLO header"
+        alias_entries = re.findall(r"(?:\{\d*\}\s*:|\{\{\d*\}\s*,\s*\d+)", hlo_header)
+        if len(alias_entries) < num_pools:
+            return (
+                False,
+                f"expected >= {num_pools} entries in HloModule input_output_alias, "
+                f"found {len(alias_entries)}",
+            )
 
     mlir_pool_pat = re.compile(rf"\b(\d+)x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN\b")
     hlo_pool_suffix = f",{2 * kvh},{hd // 4},4,{page_size}]"
@@ -422,28 +392,30 @@ def verify_torchtpu_compiled_step_ir(
         "dynamic-update-slice(",
         "as_strided_copy_inverse",
     )
-    for line in ir_text.splitlines():
-        if "func.func" in line or "ENTRY" in line or "custom_call" in line:
-            continue
-        is_copy_line = any(op in line for op in copy_ops) or (
-            "= f8e4m3fn[" in line and "copy(" in line
-        )
-        if not is_copy_line:
-            continue
-        for m in mlir_pool_pat.finditer(line):
-            if int(m.group(1)) >= num_pages:
-                return (
-                    False,
-                    f"unexpected full-pool copy in torch_tpu IR: {line.strip()}",
-                )
-        if hlo_pool_suffix in line:
-            prefix = line.split(hlo_pool_suffix, 1)[0]
-            dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()
-            if not dim_str.isdigit() or int(dim_str) >= num_pages:
-                return (
-                    False,
-                    f"unexpected full-pool copy in torch_tpu HLO: {line.strip()}",
-                )
+    texts_to_scan = [ir_text] + ([hlo_text] if hlo_text and hlo_text.strip() else [])
+    for txt in texts_to_scan:
+        for line in txt.splitlines():
+            if "func.func" in line or "ENTRY" in line or "custom_call" in line:
+                continue
+            is_copy_line = any(op in line for op in copy_ops) or (
+                "= f8e4m3fn[" in line and "copy(" in line
+            )
+            if not is_copy_line:
+                continue
+            for m in mlir_pool_pat.finditer(line):
+                if int(m.group(1)) >= num_pages:
+                    return (
+                        False,
+                        f"unexpected full-pool copy in torch_tpu IR: {line.strip()}",
+                    )
+            if hlo_pool_suffix in line:
+                prefix = line.split(hlo_pool_suffix, 1)[0]
+                dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()
+                if not dim_str.isdigit() or int(dim_str) >= num_pages:
+                    return (
+                        False,
+                        f"unexpected full-pool copy in torch_tpu HLO: {line.strip()}",
+                    )
     return True, "ok"
 
 
