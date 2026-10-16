@@ -11,12 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM-torchtpu serving integration for `vllm_torchtpu.megakernel`."""
+"""PyTorch/vLLM runtime bridge, weight collector, and driver for `megakernel`."""
 
 from __future__ import annotations
 
+from .driver import (
+    MegakernelDriver,
+    MKABCalibrator,
+    Qwen35Megakernel,
+    parse_mk_buckets,
+    parse_mk_verify_buckets,
+    prepare_step_inputs_eager,
+    prepare_step_metadata,
+    select_bucket,
+)
 from .exported_bridge import (
-    MegakernelConfigError,
     PooledStepExport,
     build_pooled_step_op,
     execute_pooled_step_inplace,
@@ -46,8 +55,10 @@ from .weight_collector import (
 )
 
 __all__ = [
-    "MegakernelConfigError",
+    "MKABCalibrator",
+    "MegakernelDriver",
     "PooledStepExport",
+    "Qwen35Megakernel",
     "apply_tp_moe_flags",
     "build_pooled_step_op",
     "execute_pooled_step_inplace",
@@ -65,9 +76,14 @@ __all__ = [
     "pack_router_and_shared_layer",
     "pack_smalls_layer",
     "pack_weights",
+    "parse_mk_buckets",
+    "parse_mk_verify_buckets",
+    "prepare_step_inputs_eager",
+    "prepare_step_metadata",
     "quantize_ba_weight",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
+    "select_bucket",
     "sharded_jax_callable",
     "verify_pooled_step_hlo",
     "verify_torchtpu_compiled_step_ir",

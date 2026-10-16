@@ -180,6 +180,13 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_QWEN35_MEGAKERNEL: bool = False
+    VLLM_TPU_QWEN35_MK_MODE: str = ""
+    VLLM_TPU_QWEN35_MK_BUCKETS: str = "8,16,32"
+    VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS: str = "4,8,12,16,20,24,32"
+    VLLM_TPU_QWEN35_MK_AB: bool = False
+    VLLM_TPU_QWEN35_MK_STATS_PERIOD_S: float = 60.0
+    VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK: bool = False
 
 
 def env_with_choices(
@@ -1114,6 +1121,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # Enable the fused Pallas megakernel for Qwen3.5 decode and MTP verify steps.
+    "VLLM_TPU_QWEN35_MEGAKERNEL": env_bool("VLLM_TPU_QWEN35_MEGAKERNEL"),
+    # MoE sharding mode for the Qwen3.5 megakernel ("ep" or "tp"; empty = auto).
+    "VLLM_TPU_QWEN35_MK_MODE": env_str("VLLM_TPU_QWEN35_MK_MODE", ""),
+    # Comma-separated T=1 decode batch buckets for the Qwen3.5 megakernel.
+    "VLLM_TPU_QWEN35_MK_BUCKETS": env_str("VLLM_TPU_QWEN35_MK_BUCKETS", "8,16,32"),
+    # Comma-separated T=4 MTP verify row buckets for the Qwen3.5 megakernel.
+    "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS": env_str(
+        "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS", "4,8,12,16,20,24,32"
+    ),
+    # Enable per-bucket MK vs stock A/B latency calibration.
+    "VLLM_TPU_QWEN35_MK_AB": env_bool("VLLM_TPU_QWEN35_MK_AB"),
+    # Logging period in seconds for Qwen3.5 megakernel step-mix / A/B stats.
+    "VLLM_TPU_QWEN35_MK_STATS_PERIOD_S": env_float(
+        "VLLM_TPU_QWEN35_MK_STATS_PERIOD_S", 60.0
+    ),
+    # Compile StableHLO during warmup HLO pool-donation verification.
+    "VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK": env_bool(
+        "VLLM_TPU_QWEN35_MK_COMPILE_HLO_CHECK"
     ),
 }
 
