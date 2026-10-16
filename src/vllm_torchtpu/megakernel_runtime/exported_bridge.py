@@ -306,10 +306,20 @@ def verify_torchtpu_compiled_step_ir(
 ) -> tuple[bool, str]:
     """Verify that a compiled `torch_tpu` forward step donates and aliases all pools.
 
-    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) and/or
-    post-XLA HLO text produced by `torch.compile(backend="tpu")` for the outer
-    step graph that invokes `execute_pooled_step_inplace` (`op(...)` +
-    `dst.copy_(src)`):
+    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) or
+    HLO text produced by `torch.compile(backend="tpu")` for the outer step graph
+    that invokes `execute_pooled_step_inplace` (`op(...)` + `dst.copy_(src)`).
+
+    Note on `torch_tpu` lowering: `JaxCallable` passes `donate_argnums` to C++
+    `PyCallCustomKernel`, which records `DeferredOpParams::donated_inputs`.
+    During `fx_to_mlir`, `Traversal::BuildMlirModule` collects the `mlir::Value`
+    of every custom-kernel donated input and calls `AnnotateBufferDonations` on
+    matching `@main` parameters (independent of `StaticCompiler`'s explicit
+    `donated_inputs` argument). Same-shape contiguous `dst.copy_(src)` calls are
+    lowered by `CopyTpuToTpu` as buffer-handle rebinds (`GetBuffer(src)`) rather
+    than MLIR copy ops.
+
+    Checks performed:
     1. Confirms a custom Pallas kernel call op (`stablehlo.custom_call`,
        `mhlo.custom_call`, or `custom-call(`) is present.
     2. For StableHLO MLIR, inspects the outer `@main` signature and confirms at

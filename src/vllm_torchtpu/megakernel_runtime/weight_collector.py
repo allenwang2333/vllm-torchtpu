@@ -16,8 +16,8 @@
 Extracts sharded `torch.Tensor` weights from vLLM Qwen3.5 layers and packs them
 into the layout declared by `planner.plan(qwen35.qwen35_spec(g), ex)`:
 - When `ex.stack_e` is `False` (default for serving), dynamic routed-expert
-  weights (`e13`, `e2` — ~4.25 GB per rank in EP mode at `R=8` for 60 layers) are
-  passed as their original 3D `torch.nn.Parameter` base buffers
+  weights (`e13`, `e2` — ~45.0 GiB / 48.3 GB per rank at `R=8` for 60 layers)
+  are passed as their original 3D `torch.nn.Parameter` base buffers
   (`e13[l].data_ptr() == w13.data_ptr()`), avoiding duplicate expert HBM
   allocations; the 3D -> 4D reshape happens as a zero-copy XLA bitcast inside
   `cache.make_flat_pooled_step`.
