@@ -574,15 +574,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if aux_layers:
                 return zero_hidden, [zero_hidden for _ in aux_layers]
             return zero_hidden
-        if self._stage_uses_sequence_parallel("encoder"):
+        encoder_sp = self._stage_uses_sequence_parallel("encoder")
+        if encoder_sp:
             # Outside the compiled stages: the replay plan indexes full rows.
-            hidden = upstream.sp_all_gather(hidden)[: positions.shape[0]]
-            pre_mix = upstream.sp_all_gather(pre_mix)[: positions.shape[0]]
-            if hidden.device.type == "tpu":
-                # Materialize the eager inter-stage SP all-gather before
-                # slicing and launching the compiled decoder stage so
-                # DEFER_AND_FUSE does not fuse both stages across the boundary.
-                synchronize_tensors((hidden, pre_mix))
+            n = positions.shape[0]
+            hidden = upstream.sp_all_gather(hidden)
+            pre_mix = upstream.sp_all_gather(pre_mix)
+            hidden = hidden[:n] if hidden.shape[0] != n else hidden
+            pre_mix = pre_mix[:n] if pre_mix.shape[0] != n else pre_mix
 
         if plan is None:
             decoder_metadata = metadata
@@ -622,7 +621,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             gather = indices.clamp(max=positions.shape[0] - 1)
             decoder_positions = positions[gather]
             decoder_ids = input_ids[gather] if input_ids is not None else None
-            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
             bounds = torch.tensor(
                 plan.query_start_loc, dtype=torch.int32, device=positions.device
             )
@@ -638,6 +636,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_padding = torch.arange(
                 plan.padded_num_tokens, device=positions.device
             ) >= len(plan.indices)
+            if encoder_sp and hidden.device.type == "tpu":
+                # Materialize the eager inter-stage SP all-gather before
+                # slicing and launching the compiled decoder stage so
+                # DEFER_AND_FUSE does not fuse both stages across the boundary.
+                synchronize_tensors((hidden, pre_mix))
+            decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
         dp_metadata = getattr(context, "dp_metadata", None)
         decoder_ctx_kwargs = {
             "attn_metadata": decoder_metadata,

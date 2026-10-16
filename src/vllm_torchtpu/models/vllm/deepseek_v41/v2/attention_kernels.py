@@ -1689,7 +1689,8 @@ def initialize_paged_attention():
             m_r,
             pgs,
             q_loc,
-            snk,
+            f_snk,
+            r_id,
             w,
             ws,
             ok,
@@ -1702,19 +1703,28 @@ def initialize_paged_attention():
                 ]
             q = _quantized_matmul_jax(q_in, wq, wqs)
             q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
-            out = sparse_fp8_attention_jax(
-                q,
+            q_tok = jax.lax.all_to_all(
+                q, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
+            )
+            s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
+                s_r, m_r, q_loc, r_id, tp_size, tokens
+            )
+            out_tok = sparse_fp8_attention_jax(
+                q_tok,
                 s_p,
                 m_p,
                 r_p,
-                s_r,
-                m_r,
+                s_r_tok,
+                m_r_tok,
                 pgs,
-                q_loc,
-                snk,
+                q_loc_tok,
+                f_snk,
                 **attn_kwargs,
                 gathered_nope=g_n,
                 gathered_rope=g_r,
+            )
+            out = jax.lax.all_to_all(
+                out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
             return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
@@ -1722,7 +1732,7 @@ def initialize_paged_attention():
         return jax.shard_map(
             _sharded_body,
             mesh=tp_mesh,
-            in_specs=(P(),) * 18,
+            in_specs=(P(),) * 19,
             out_specs=out_spec,
             check_vma=False,
         )(
@@ -1738,7 +1748,8 @@ def initialize_paged_attention():
             main_records,
             pages,
             query_start_loc,
-            sink,
+            full_sink,
+            tp_rank,
             wo_a,
             wo_a_scale,
             valid,
@@ -1919,7 +1930,7 @@ def sparse_fp8_attention_qo(
             main, main_records, positions.shape[0]
         )
     tokens = positions.shape[0]
-    shards = _fp8_query_shards(tokens, _attention_tp_size, True, qr_local.shape[0])
+    shards = _fp8_query_shards(tokens, _attention_tp_size, True)
     gathered = _gather_fp8_for_stage(
         main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
     )

@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention_kernels import (
     gathered_kv_cache_scope,
@@ -1481,21 +1482,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         ):
             return
 
+        def _fresh(t: torch.Tensor) -> torch.Tensor:
+            return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
+
         def gather_columns(weight):
             weight = weight.contiguous()
             gathered = tensor_model_parallel_all_gather(weight.view(torch.uint8), dim=1)
-            return gathered.view(weight.dtype).contiguous()
+            return _fresh(gathered.view(weight.dtype))
 
         buffers = {
             "_wq_b_full": gather_columns(self.wq_b.weight),
-            "_wq_b_full_scale": tensor_model_parallel_all_gather(
-                wq_scale.contiguous(), dim=0
+            "_wq_b_full_scale": _fresh(
+                tensor_model_parallel_all_gather(wq_scale.contiguous(), dim=0)
             ),
             "_wo_a_full": gather_columns(self.wo_a.weight),
-            "_wo_a_full_scale": tensor_model_parallel_all_gather(
-                wo_scale.reshape(-1).contiguous(), dim=0
+            "_wo_a_full_scale": _fresh(
+                tensor_model_parallel_all_gather(
+                    wo_scale.reshape(-1).contiguous(), dim=0
+                )
             ),
         }
+        synchronize_tensors(tuple(buffers.values()))
         for name, value in buffers.items():
             self.register_buffer(name, value, persistent=False)
         self._local_q_attn = True
