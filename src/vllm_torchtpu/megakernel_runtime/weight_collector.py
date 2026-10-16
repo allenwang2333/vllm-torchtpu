@@ -37,12 +37,13 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.spec import ExecSpec
+
+WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -406,6 +407,8 @@ def extract_ecopy_layer(
     g: qwen35.Qwen35Geometry,
     ex: ExecSpec,
     dev: torch.device,
+    *,
+    expert_placement: Any = None,
 ) -> torch.Tensor | None:
     """Build the `[E]` `float32` `ecopy` descriptor vector for `smalls['ecopy']`.
 
@@ -432,9 +435,9 @@ def extract_ecopy_layer(
                 dtype=torch.float32,
                 device=dev,
             )
-    try:
-        from vllm_torchtpu import expert_placement  # type: ignore[attr-defined]
-
+        if expert_placement is None:
+            expert_placement = getattr(routed, "_expert_placement", None)
+    if expert_placement is not None:
         if layer_idx is None and routed is not None:
             prefix = getattr(routed, "layer_name", "") or ""
             layer_idx = expert_placement.layer_index(prefix)
@@ -452,8 +455,6 @@ def extract_ecopy_layer(
                 dtype=torch.float32,
                 device=dev,
             )
-    except ImportError:
-        pass
     return None
 
 
@@ -623,8 +624,22 @@ def reshard_experts_ep_to_tp_local(
     return w13_tp, w2_tp, s13_tp, s2_tp
 
 
-def apply_tp_moe_flags(experts: Any) -> None:
-    """Update a vLLM `FusedMoE` module's flags after in-place EP->TP resharding."""
+def _default_all_gather_dim0(t: torch.Tensor) -> torch.Tensor:
+    """Gather `t` along dimension 0 across the default `torch.distributed` group."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return t
+    ws = torch.distributed.get_world_size()
+    if ws <= 1:
+        return t
+    out = torch.empty(
+        (ws * int(t.shape[0]),) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+    )
+    torch.distributed.all_gather_into_tensor(out, t.contiguous())
+    return out
+
+
+def apply_tp_moe_flags(experts: Any, *, prebuild_moe_fn: Any = None) -> None:
+    """Update a `FusedMoE` module's flags after in-place EP->TP resharding."""
     targets = [experts]
     routed = getattr(experts, "routed_experts", None)
     if routed is not None and routed is not experts:
@@ -665,16 +680,13 @@ def apply_tp_moe_flags(experts: Any) -> None:
                 _try_set(qm, "_fused_moe_ep_op", None)
                 _try_set(qm, "_use_adaptive_fused_moe", False)
         if (
-            moe_cfg is not None
+            prebuild_moe_fn is not None
+            and moe_cfg is not None
             and hasattr(moe_cfg, "experts_per_token")
             and hasattr(tgt, "activation")
         ):
-            from vllm_torchtpu.layers.adapter.fused_moe import (
-                prebuild_fused_moe_kernel,
-            )
-
             act_val = getattr(tgt.activation, "value", tgt.activation)
-            prebuild_fused_moe_kernel(
+            prebuild_moe_fn(
                 topk=moe_cfg.experts_per_token,
                 activation=act_val,
                 use_ep=False,
@@ -688,6 +700,7 @@ def reshard_layer_experts_ep_to_tp(
     ex: ExecSpec,
     *,
     all_gather_fn: Any = None,
+    prebuild_moe_fn: Any = None,
 ) -> None:
     """Reshard `mlp.experts` from EP (`[ER, H, 2*I]`) to TP (`[E, H, 2*IR]`)."""
     experts = get_routed_experts(mlp)
@@ -709,9 +722,7 @@ def reshard_layer_experts_ep_to_tp(
     s2_ep = getattr(experts, s2_attr).data[:er].reshape(er, g.H).contiguous()
 
     if all_gather_fn is None:
-        from vllm.distributed import tensor_model_parallel_all_gather
-
-        all_gather_fn = lambda t: tensor_model_parallel_all_gather(t, dim=0)  # noqa: E731
+        all_gather_fn = _default_all_gather_dim0
 
     w13_all = all_gather_fn(w13_ep)
     w2_all = all_gather_fn(w2_ep)
@@ -732,13 +743,19 @@ def reshard_layer_experts_ep_to_tp(
     setattr(experts, s2_attr, s2_new_param)
 
     if w13_tp.device.type == "tpu":
-        from vllm_torchtpu.utils import synchronize_tensors
+        from torch_tpu._internal import sync
 
-        synchronize_tensors(
-            [experts.w13_weight, experts.w2_weight, s13_new_param, s2_new_param]
+        sync.synchronize(
+            tensors=[
+                experts.w13_weight,
+                experts.w2_weight,
+                s13_new_param,
+                s2_new_param,
+            ],
+            wait=True,
         )
 
-    apply_tp_moe_flags(mlp.experts)
+    apply_tp_moe_flags(mlp.experts, prebuild_moe_fn=prebuild_moe_fn)
 
 
 def pack_weights(

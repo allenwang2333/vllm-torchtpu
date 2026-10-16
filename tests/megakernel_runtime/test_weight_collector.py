@@ -29,8 +29,8 @@ from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
+    WEIGHT_FLIPPED_ATTR,
     _own,
     _stack,
     extract_ecopy_layer,
@@ -713,3 +713,40 @@ def test_reshard_layer_experts_ep_to_tp() -> None:
     assert mlp.experts.moe_config.moe_parallel_config.tp_size == 2
     assert mlp.experts.moe_config.moe_parallel_config.tp_rank == 1
     assert mlp.experts.moe_config.moe_parallel_config.ep_size == 1
+
+
+def test_bridge_and_weight_collector_have_no_vllm_imports() -> None:
+    """Verify `exported_bridge` and `weight_collector` are framework-portable.
+
+    Neither module may import from `vllm` or `vllm_torchtpu` outside
+    `vllm_torchtpu.megakernel` and `vllm_torchtpu.megakernel_runtime`,
+    so they can be extracted into a standalone library alongside
+    `megakernel`.
+    """
+    import ast
+    from pathlib import Path
+
+    import vllm_torchtpu.megakernel_runtime.exported_bridge as bridge_mod
+    import vllm_torchtpu.megakernel_runtime.weight_collector as wc_mod
+
+    allowed_prefixes = (
+        "vllm_torchtpu.megakernel",
+        "vllm_torchtpu.megakernel_runtime",
+    )
+    for mod in (bridge_mod, wc_mod):
+        path = Path(mod.__file__)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.name
+                    if name.startswith("vllm"):
+                        assert name.startswith(allowed_prefixes), (
+                            f"{path.name} has disallowed import {name!r}"
+                        )
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                mod_name = node.module or ""
+                if mod_name.startswith("vllm"):
+                    assert mod_name.startswith(allowed_prefixes), (
+                        f"{path.name} has disallowed from-import {mod_name!r}"
+                    )

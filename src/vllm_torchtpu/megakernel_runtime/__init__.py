@@ -21,6 +21,7 @@ from .exported_bridge import (
     execute_pooled_step_inplace,
     export_pooled_step,
     make_typed_step_wrapper,
+    sharded_jax_callable,
     verify_pooled_step_hlo,
     verify_torchtpu_compiled_step_ir,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "quantize_ba_weight",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
+    "sharded_jax_callable",
     "verify_pooled_step_hlo",
     "verify_torchtpu_compiled_step_ir",
 ]

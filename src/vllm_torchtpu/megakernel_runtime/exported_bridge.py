@@ -37,6 +37,7 @@ Provides:
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -49,9 +50,154 @@ import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.megakernel import cache
 from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
+
+_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
+          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
+      ]"""
+_SHARDED_PLACEHOLDER_LINE = (
+    """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
+)
+_SHARDED_CALLABLE_CLS: Any = None
+
+
+def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
+    """Flatten `output_partition_specs` to one `PartitionSpec` per output leaf."""
+    return jax.tree.leaves(output_partition_specs, is_leaf=lambda s: isinstance(s, P))
+
+
+def _placeholder(pallas_impl: Any, aval: Any, spec: Any, mesh: Any) -> torch.Tensor:
+    """Build a torch placeholder tensor shaped for this rank's local shard."""
+    if spec is None or not isinstance(aval, jax.core.ShapedArray):
+        return pallas_impl.torch_placeholder(aval, mesh=mesh)
+    torch_dtype = pallas_impl.JAX_TO_TORCH_DTYPE_MAP.get(aval.dtype)
+    if torch_dtype is None:
+        raise NotImplementedError(f"Unsupported dtype for pallas kernels: {aval.dtype}")
+    shape = tuple(pallas_impl.get_local_shape(aval.shape, mesh, spec))
+    if torch_dtype == torch.float4_e2m1fn_x2 and shape:
+        if shape[-1] % 2:
+            raise ValueError(
+                "expected the last dimension of the JAX local shape to be even "
+                f"to pack into {torch_dtype}, got {shape[-1]} (local={shape}, "
+                f"global={aval.shape}, spec={spec})"
+            )
+        shape = shape[:-1] + (shape[-1] // 2,)
+    return torch.empty(shape, dtype=torch_dtype, device="tpu")
+
+
+def _make_sharded_output_placeholders(
+    pallas_impl: Any,
+) -> Callable[[Any, Any], list[torch.Tensor]]:
+    def _sharded_output_placeholders(lowered: Any, mesh: Any) -> list[torch.Tensor]:
+        shardings = getattr(lowered, "_out_named_shardings", None)
+        if shardings is None or len(shardings) != len(lowered.out_avals):
+            shardings = (None,) * len(lowered.out_avals)
+        return [
+            _placeholder(pallas_impl, aval, getattr(sharding, "spec", None), mesh)
+            for aval, sharding in zip(lowered.out_avals, shardings)
+        ]
+
+    return _sharded_output_placeholders
+
+
+def _get_sharded_callable_cls(pallas_impl: Any) -> Any:
+    """Return a `JaxCallable` class that sizes output placeholders per local shard."""
+    global _SHARDED_CALLABLE_CLS
+    if _SHARDED_CALLABLE_CLS is not None:
+        return _SHARDED_CALLABLE_CLS
+    init_sig = inspect.signature(pallas_impl.JaxCallable.__init__)
+    if "output_partition_specs" in init_sig.parameters:
+        _SHARDED_CALLABLE_CLS = pallas_impl.JaxCallable
+        return _SHARDED_CALLABLE_CLS
+    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
+    if _STOCK_PLACEHOLDER_LINE not in src:
+        _SHARDED_CALLABLE_CLS = pallas_impl.JaxCallable
+        return _SHARDED_CALLABLE_CLS
+    patched = "class _Holder:\n" + src.replace(
+        _STOCK_PLACEHOLDER_LINE, _SHARDED_PLACEHOLDER_LINE, 1
+    )
+    namespace: dict[str, Any] = {}
+    exec(  # noqa: S102
+        compile(patched, pallas_impl.__file__, "exec"),
+        {
+            **pallas_impl.__dict__,
+            "_sharded_output_placeholders": _make_sharded_output_placeholders(
+                pallas_impl
+            ),
+        },
+        namespace,
+    )
+    _SHARDED_CALLABLE_CLS = type(
+        "_ShardedJaxCallable",
+        (pallas_impl.JaxCallable,),
+        {"__call__": namespace["_Holder"].__call__},
+    )
+    return _SHARDED_CALLABLE_CLS
+
+
+def sharded_jax_callable(
+    name: str,
+    fn: Callable[..., object],
+    *,
+    mesh: jax.sharding.Mesh,
+    input_partition_specs: Sequence[P],
+    output_partition_specs: Any,
+    donate_argnums: Sequence[int] | None = None,
+) -> Any:
+    """Wrap an SPMD JAX function over `mesh` into a `torch_tpu` `JaxCallable`.
+
+    Self-contained so `exported_bridge` does not depend on any `vllm` or
+    `vllm_torchtpu.distributed` modules when extracted to a standalone repo.
+    """
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    if "::" not in name or len(name.split("::")) != 2:
+        raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
+
+    callable_cls = _get_sharded_callable_cls(pallas_impl)
+    signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
+    pallas_impl._verify_signature(signature)
+    static_argnums = pallas_impl._infer_static_argnums(signature)
+    input_partition_specs = tuple(input_partition_specs)
+    out_shardings = jax.tree.map(
+        lambda s: NamedSharding(mesh, s),
+        output_partition_specs,
+        is_leaf=lambda s: isinstance(s, P),
+    )
+
+    jit_fn = jax.jit(
+        fn,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+        out_shardings=out_shardings,
+        keep_unused=True,
+    )
+    trace_key = pallas_impl._get_kernel_invocation_key(
+        f"{name}_{id(fn)}",
+        [],
+        {
+            "static_argnums": static_argnums,
+            "donate_argnums": donate_argnums,
+            "output_partition_specs": str(output_partition_specs),
+        },
+    )
+    extra_kwargs: dict[str, Any] = {}
+    init_sig = inspect.signature(callable_cls.__init__)
+    if "output_partition_specs" in init_sig.parameters:
+        extra_kwargs["output_partition_specs"] = _leaf_output_specs(
+            output_partition_specs
+        )
+    return callable_cls(
+        name=name,
+        jit_fn=jit_fn,
+        trace_key=trace_key,
+        mesh=mesh,
+        input_partition_specs=input_partition_specs,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+        **extra_kwargs,
+    )
 
 
 @dataclass(frozen=True)
