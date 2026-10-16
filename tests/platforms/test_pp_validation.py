@@ -102,6 +102,27 @@ def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
 
 
+def _multi_connector(*children):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": child} for child in children]
+        },
+    )
+
+
+def test_accepts_the_multi_connector_of_raiden_disagg_and_offload():
+    multi = _multi_connector("TPURaidenConnector", "TPURaidenOffloadingConnector")
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=multi))
+
+
+def test_rejects_the_multi_connector_with_a_foreign_child():
+    multi = _multi_connector("TPURaidenConnector", "TPUConnectorHMA")
+    with pytest.raises(NotImplementedError, match="TPURaidenConnector"):
+        validate_pipeline_parallel_config(_config(pp=2, kv_transfer=multi))
+
+
 def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     with pytest.raises(

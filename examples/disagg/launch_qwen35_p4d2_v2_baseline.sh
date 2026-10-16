@@ -107,6 +107,7 @@ DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
+PREFILL_PP="${PREFILL_PP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
@@ -114,7 +115,13 @@ DECODE_DP="${DECODE_DP:-1}"
 # One slicebuilder address per worker in each instance's TorchTPU slice.
 # The count must equal the instance's TorchTPU world size, or
 # _prepare_singlehost_tpu_env falls back to random ports.
-prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP * PREFILL_PP))
+# A pipeline-parallel producer pairs KV pools with its peer by layer; both
+# engines must set this the same way.
+raiden_pool_tags_per_layer=0
+if [[ "${PREFILL_PP}" -gt 1 ]]; then
+  raiden_pool_tags_per_layer=1
+fi
 decode_sb_workers=$((DECODE_TP * DECODE_DP))
 prefill_sb_addresses=""
 for ((i = 0; i < prefill_sb_workers; i++)); do
@@ -329,6 +336,7 @@ CONNECTOR=TPUMultiConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
+PREFILL_PP=${PREFILL_PP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
 DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
@@ -405,12 +413,16 @@ export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
 export TPU_RAIDEN_QWEN35_ADMISSION=1;
 export TPU_KV_RESHARD_TRANSPORT=raiden;
 export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
+export TPU_RAIDEN_POOL_TAGS_PER_LAYER=${raiden_pool_tags_per_layer};
 EOF
 )
 
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
 if [[ "${PREFILL_PCP}" -gt 1 ]]; then
   prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
+fi
+if [[ "${PREFILL_PP}" -gt 1 ]]; then
+  prefill_args+=(--pipeline-parallel-size "${PREFILL_PP}")
 fi
 decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
 if [[ "${DECODE_DP}" -gt 1 ]]; then

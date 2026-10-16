@@ -69,6 +69,8 @@ export PREFILL_SPECULATIVE_CONFIG=""
 export DECODE_SPECULATIVE_CONFIG=""
 export PREFILL_TP="${PREFILL_TP:-1}"
 export PREFILL_PCP="${PREFILL_PCP:-4}"
+# PREFILL_PCP=1 PREFILL_PP=4 serves the prefill engine pipeline-parallel instead.
+export PREFILL_PP="${PREFILL_PP:-1}"
 export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
 export DECODE_TP="${DECODE_TP:-1}"
 export DECODE_DP="${DECODE_DP:-4}"
@@ -132,9 +134,15 @@ for role in prefill decode; do
 done
 
 expected_prefill_block=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
-grep -Fq "scheduler_block_size=${expected_prefill_block} hash_block_size=${expected_prefill_block}" \
-  "${RUN_DIR}/logs/prefill.log" \
-  || fail "prefill did not resolve a ${expected_prefill_block}-token scheduler block"
+if [[ "${PREFILL_PCP}" -gt 1 ]]; then
+  grep -Fq "scheduler_block_size=${expected_prefill_block} hash_block_size=${expected_prefill_block}" \
+    "${RUN_DIR}/logs/prefill.log" \
+    || fail "prefill did not resolve a ${expected_prefill_block}-token scheduler block"
+else
+  # The PCP block-size resolution only logs for PCP > 1.
+  grep -Fq "Using KV cache block size: ${expected_prefill_block}" "${RUN_DIR}/logs/prefill.log" \
+    || fail "prefill did not resolve a ${expected_prefill_block}-token block"
+fi
 grep -Fq "Using KV cache block size: ${DECODE_BLOCK_SIZE}" "${RUN_DIR}/logs/decode.log" \
   || fail "decode did not resolve a ${DECODE_BLOCK_SIZE}-token block"
 
@@ -160,7 +168,7 @@ smoke_lengths() {
 # until decode has pulled them, so a prompt sent to the prefill engine alone
 # can never be reset out of HBM. The counters and the reset address the
 # prefill engine.
-echo "===== offload: seed and restore on the prefill engine (PCP${PREFILL_PCP}) ====="
+echo "===== offload: seed and restore on the prefill engine (PCP${PREFILL_PCP} PP${PREFILL_PP}) ====="
 python3 "${script_dir}/smoke_block_major_offload.py" \
   --base "http://${P4D2_BIND_HOST}:${PROXY_PORT}" \
   --metrics-base "http://${P4D2_BIND_HOST}:${PREFILL_PORT}" \
