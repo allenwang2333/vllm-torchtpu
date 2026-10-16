@@ -2271,11 +2271,15 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             or getattr(getattr(model_cfg, "hf_config", None), "vocab_size", 0)
             or 0
         )
-        eos_token_id = int(
-            getattr(model_cfg, "eos_token_id", 0)
+        raw_eos = (
+            getattr(model_cfg, "eos_token_id", None)
             or getattr(getattr(model_cfg, "hf_config", None), "eos_token_id", 0)
             or 0
         )
+        if isinstance(raw_eos, (list, tuple, set)):
+            eos_token_id = int(next(iter(raw_eos), 0))
+        else:
+            eos_token_id = int(raw_eos)
         meta_dict["config"] = {
             "vocab_size": cfg_vocab,
             "eos_token_id": eos_token_id,
