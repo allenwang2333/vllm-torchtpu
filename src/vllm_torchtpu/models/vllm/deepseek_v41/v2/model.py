@@ -1009,6 +1009,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
     model_cls = DeepseekV41Model
 
+    def compute_greedy_token_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``compute_logits(hidden_states).argmax(-1)`` without the full-vocab
+        all-gather: each TP rank reduces its vocab shard, then only the
+        ``(value, index)`` pairs cross the ICI (see
+        ``LogitsProcessor.get_top_tokens``). Same tie-breaking as a global
+        argmax: the first maximal index, since shards are rank-ordered and
+        both reductions keep the first maximum.
+        """
+        assert self.lm_head is not None
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def forward(self, *args, **kwargs):
         # Materialize upstream's persistent history outside the compiled model.
         # Its lazy first-use zeros allocation must not become an operation that

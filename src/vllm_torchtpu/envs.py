@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING: bool = True
+    TPU_GREEDY_TOKEN_IDS_FASTPATH: bool = True
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -369,6 +370,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sync; the device hashes only the decode-row prefix.
     "TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING": lambda: bool(
         int(os.getenv("TPU_DEEPSEEK_V41_ENGRAM_SPLIT_STAGING") or "1")
+    ),
+    # Spec-decode verify steps whose requests are all greedy, without logprobs
+    # or structured output: reduce the lm_head output to token ids with a
+    # vocab-parallel argmax instead of all-gathering [tokens, vocab] logits.
+    "TPU_GREEDY_TOKEN_IDS_FASTPATH": lambda: bool(
+        int(os.getenv("TPU_GREEDY_TOKEN_IDS_FASTPATH") or "1")
     ),
     # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).

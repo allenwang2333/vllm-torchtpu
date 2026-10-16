@@ -3944,7 +3944,18 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    logits = self.compute_selected_logits(hidden_states, logits_indices)
+                    if self._greedy_token_ids_fastpath(
+                        scheduler_output, spec_decode_metadata
+                    ):
+                        # 1-D token ids stand in for logits; sample_tokens'
+                        # greedy verify branch consumes them directly.
+                        logits = self.compute_selected_greedy_tokens(
+                            hidden_states, logits_indices
+                        )
+                    else:
+                        logits = self.compute_selected_logits(
+                            hidden_states, logits_indices
+                        )
                 else:
                     logits = self.compute_logits_from_hidden_states(
                         sample_hidden_states
@@ -4221,7 +4232,13 @@ class TPUModelRunner(GPUModelRunner):
         selected tokens for the chunk.
         """
         req_temperatures = req_top_k = req_top_p = None
-        if all_greedy and grammar_output is None:
+        if logits.dim() == 1:
+            # Greedy token ids from compute_selected_greedy_tokens.
+            assert all_greedy and grammar_output is None
+            bonus_token_ids, target_logits = self.spec_bonus_and_target_ids(
+                logits, md.bonus_logits_indices, md.target_logits_indices
+            )
+        elif all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
@@ -5600,6 +5617,12 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
+        greedy_ids = (
+            envs.TPU_GREEDY_TOKEN_IDS_FASTPATH
+            and self.speculative_config is not None
+            and not self.is_pooling_model
+            and hasattr(self.model, "compute_greedy_token_ids")
+        )
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
@@ -5610,6 +5633,9 @@ class TPUModelRunner(GPUModelRunner):
                     indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
+                    if greedy_ids:
+                        out = self.compute_selected_greedy_tokens(dummy_hidden, indices)
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs
                     )
@@ -5857,6 +5883,15 @@ class TPUModelRunner(GPUModelRunner):
                             dummy_logits, bonus_logits_indices, target_logits_indices
                         )
                     )
+                    if hasattr(self.model, "compute_greedy_token_ids"):
+                        # Token-id prelude of the greedy fast path; same
+                        # int64 outputs, so the sampler graph below is shared.
+                        warm_ids = self.spec_bonus_and_target_ids(
+                            target_logits_warm.new_zeros(num_tokens),
+                            bonus_logits_indices,
+                            target_logits_indices,
+                        )
+                        synchronize_tensors(warm_ids)
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -6934,6 +6969,43 @@ class TPUModelRunner(GPUModelRunner):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return self.model.compute_logits(hidden_states)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_greedy_tokens(
+        self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
+    ) -> torch.Tensor:
+        """Greedy token ids of the selected rows, vocab-parallel argmax.
+
+        Replaces ``compute_selected_logits`` + ``argmax`` on all-greedy
+        spec-verify chunks: the ``[tokens, vocab]`` all-gather (and its
+        SparseCore relayouts) shrinks to a ``[tokens, 2 * tp]`` exchange.
+        """
+        selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return self.model.compute_greedy_token_ids(selected)
+
+    def _greedy_token_ids_fastpath(self, scheduler_output, spec_decode_metadata):
+        """Whether this chunk's verify can run on token ids instead of logits."""
+        return bool(
+            envs.TPU_GREEDY_TOKEN_IDS_FASTPATH
+            and spec_decode_metadata is not None
+            and not self.is_pooling_model
+            and hasattr(self.model, "compute_greedy_token_ids")
+            and self.input_batch.all_greedy
+            and self.input_batch.max_num_logprobs is None
+            and not scheduler_output.has_structured_output_requests
+        )
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_bonus_and_target_ids(
+        self,
+        token_ids: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``spec_bonus_and_target_logits`` for pre-reduced greedy token ids."""
+        bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices)
+        target_token_ids = torch.index_select(token_ids, 0, target_logits_indices)
+        return bonus_token_ids, target_token_ids
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_bonus_and_target_logits(
