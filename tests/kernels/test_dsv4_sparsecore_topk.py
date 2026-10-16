@@ -56,6 +56,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     LANES,
     MAX_SLICE_WORDS,
     _align_to,
+    _batch_partition,
     _pick_partition,
     sparsecore_topk,
 )
@@ -355,6 +356,51 @@ def test_topk_concentrated_in_the_last_partition():
     scores[:, -(k + 64) :] = rng.standard_normal((b, k + 64)).astype(np.float32)
     row_lengths = np.full(b, n, np.int32)
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+# (b, n, longest row, P the kernel should pick): rows far shorter than the
+# width, in each band of the longest row. `_batch_partition` and
+# `_pick_partition` bound the P the kernel picks; inside a range, P = 1 runs
+# the lone-subcore body and anything larger a runtime cooperative P.
+SHORT_ROWS = [
+    pytest.param(64, N_128K, 40000, 1, id="p1of1to4-b64-n133120"),
+    pytest.param(64, N_128K, 2 * MAX_SLICE_WORDS, 1, id="p1of1to4-b64-longest64K"),
+    pytest.param(64, N_128K, 2 * MAX_SLICE_WORDS + 16, 2, id="p2of1to4-b64"),
+    pytest.param(256, N_128K, 9000, 1, id="p1of1to4-b256-8waves"),
+    pytest.param(16, N_128K, 9000, 2, id="p2of2to4-b16"),
+    pytest.param(16, N_1M, 300000, 8, id="p8of2to16-b16-n1M"),
+    pytest.param(64, N_1M, 9000, 1, id="p1of1to16-b64-n1M"),
+]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,longest,p", SHORT_ROWS)
+def test_short_rows_in_a_wide_score_matrix(b, n, longest, p):
+    """P follows the longest row, not the width n.
+
+    n follows max-model-len, but the rows are usually far shorter, so the
+    kernel picks the smallest P whose parts of its longest row fit a subcore,
+    within [`_batch_partition`, `_pick_partition`]. Lengths straddle that P's
+    part boundaries, and the words past the longest row are huge, so a part
+    read past its row's length is caught.
+    """
+    k = 2048
+    assert _batch_partition(b, n, k) <= p <= _pick_partition(b, n, k)
+    part = -(-longest // p)
+    edges = sorted(
+        {
+            min(max(e, 0), longest)
+            for e in (0, 1, LANES, k, part - 1, part, part + 1, longest - 1, longest)
+        }
+    )
+    row_lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
+    row_lengths[0] = longest
+    rng = np.random.default_rng(SEED)
+    for kind in ("random", "heavy_ties"):
+        scores = np.full((b, n), 1e30, np.float32)
+        scores[:, :longest] = _scores(kind, b, longest, rng)
+        idx = _run(scores, k, row_lengths)
+        assert _mismatch(scores, idx, k, row_lengths) is None, kind
 
 
 @pytest.mark.tpu_test
