@@ -2665,3 +2665,87 @@ def test_nvfp4_weights_and_mlir_signature_shape_reconciliation(
     assert fwd_in[2]["shape"] == [6]
     abs_mlir = (export_dir / "abstract_params.mlir").read_text()
     assert "tensor<64x6144x4096xf4E2M1FN>" in abs_mlir
+
+
+def test_duplicate_weight_name_within_first_exported_module_shares_global_index(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify repeated weight inputs in the first module share one global index."""
+    export_dir = tmp_path / "export_dup_weight"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    stablehlo_export.register_active_model(None)
+
+    specs = [
+        {
+            "arg_index": 0,
+            "index": 0,
+            "name": "input_ids",
+            "shape": [16],
+            "dtype": "int32",
+            "argument_type": "user_io",
+            "is_weight": False,
+            "weight_name": "",
+            "buffer_donor": False,
+        },
+        {
+            "arg_index": 1,
+            "index": 1,
+            "name": "rotary_emb_inv_freq",
+            "shape": [1024, 64],
+            "dtype": "float32",
+            "argument_type": "weight",
+            "is_weight": True,
+            "weight_name": "rotary_emb_inv_freq",
+            "buffer_donor": False,
+        },
+        {
+            "arg_index": 2,
+            "index": 2,
+            "name": "rotary_emb_inv_freq",
+            "shape": [1024, 64],
+            "dtype": "float32",
+            "argument_type": "weight",
+            "is_weight": True,
+            "weight_name": "rotary_emb_inv_freq",
+            "buffer_donor": False,
+        },
+    ]
+    mlir_text = """module @forward_bucket16 {
+  func.func public @main(
+    %arg0: tensor<16xi32>,
+    %arg1: tensor<1024x64xf32>,
+    %arg2: tensor<1024x64xf32>
+  ) -> (tensor<16x8xbf16>) {
+    %0 = stablehlo.constant dense<0.0> : tensor<16x8xbf16>
+    return %0 : tensor<16x8xbf16>
+  }
+}
+"""
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="forward_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=mlir_text,
+        input_specs=specs,
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "hidden_states",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "intermediate",
+                "buffer_donor": False,
+            }
+        ],
+    )
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    fwd_in = meta["functions"]["forward"]["16"]["inputs"]
+    abs_in = meta["functions"]["abstract_params"]["default"]["inputs"]
+    assert len(abs_in) == 1
+    global_idx = abs_in[0]["index"]
+    assert fwd_in[1]["index"] == global_idx
+    assert fwd_in[2]["index"] == global_idx
