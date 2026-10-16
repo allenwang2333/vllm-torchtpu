@@ -61,6 +61,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
 )
+from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -3147,3 +3148,97 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+@pytest.mark.parametrize("drafter_type", [tpu_runner.DFlashProposer, DSparkProposer])
+@pytest.mark.parametrize(
+    "computed,scheduled,prompts,needed",
+    [
+        ([0], [2048], [4096], False),
+        ([2048], [2048], [4096], True),
+        ([4096], [6], [4096], True),
+        ([0, 4096], [2048, 6], [4096, 4096], True),
+        ([0, 1024], [2048, 2048], [4096, 4096], False),
+    ],
+)
+def test_dflash_proposes_only_at_prompt_boundary_or_decode(
+    computed, scheduled, prompts, needed, drafter_type
+):
+    ids = [str(i) for i in range(len(computed))]
+    runner = SimpleNamespace(
+        drafter=drafter_type.__new__(drafter_type),
+        input_batch=SimpleNamespace(
+            req_id_to_index={key: i for i, key in enumerate(ids)},
+            num_computed_tokens_cpu=np.array(computed),
+            num_prompt_tokens=np.array(prompts),
+        ),
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
+    )
+    assert TPUModelRunner._needs_draft_proposals(runner, output) is needed
+
+
+@pytest.mark.parametrize("peer_needs_draft", [False, True])
+def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft):
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[128, 2048],
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.tolist() == [0, 0, 0, 0, 0]
+        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft)]))
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce) as collective,
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        result = TPUModelRunner._dp_coordinated_step(
+            runner, 0, 0, needs_draft_proposals=False
+        )
+    assert result == (2048, 2)
+    assert runner._draft_proposals_needed is peer_needs_draft
+    collective.assert_called_once()
+
+
+def test_non_lockstep_partial_prefill_skips_proposals():
+    runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert TPUModelRunner._dp_coordinated_step(
+        runner, 2048, 1, needs_draft_proposals=False
+    ) == (None, 1)
+    assert not runner._draft_proposals_needed
+
+
+@pytest.mark.parametrize("proposals_needed", [False, True])
+@pytest.mark.parametrize("pd_producer", [False, True])
+def test_idle_dflash_rank_pairs_context_and_optional_proposals(
+    proposals_needed, pd_producer
+):
+    order = []
+    drafter = tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer)
+    drafter.draft_model = SimpleNamespace()
+    drafter._dp_lockstep_sharded = lambda: True
+    drafter._dp_dummy_kv_update = lambda: order.append("context")
+    drafter._dp_dummy_forward = lambda: order.append("proposal")
+    runner = SimpleNamespace(
+        _is_async_drafter=True,
+        _is_dspark_pd_producer=pd_producer,
+        _fence_spec_kv_under_token_copy=False,
+        _draft_proposals_needed=proposals_needed,
+        _execute_dp_mm_encoder=lambda: None,
+        _run_dp_dummy_chunk=lambda bucket: order.append("target"),
+        drafter=drafter,
+        _async_drafter=drafter,
+    )
+    with patch(
+        "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
+        side_effect=lambda: order.append("sync"),
+    ):
+        TPUModelRunner._run_dp_idle_pairing(runner, 2048, 2)
+    assert order == ["target", "target", "context", "context"] + (
+        ["sync"]
+        if pd_producer
+        else (["proposal", "proposal"] if proposals_needed else [])
+    )
