@@ -75,6 +75,7 @@ nav:
     - 'TPU Patch Mechanism': developers_guide/tpu_patch_mechanism.md
     - 'Type Checking': developers_guide/type_checking.md
     - 'Testing & CI': developers_guide/testing_and_ci.md
+    - 'P/D Disaggregation on Kubernetes': developers_guide/pd_disaggregation_on_kubernetes.md
     - 'Benchmarking': developers_guide/benchmarking.md
     - 'Profiling': developers_guide/profiling.md
   - 'Reference':
