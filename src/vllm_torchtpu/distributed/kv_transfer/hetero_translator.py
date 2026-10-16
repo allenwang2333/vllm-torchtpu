@@ -12,6 +12,8 @@ import dataclasses
 import math
 from typing import Any, Literal, Sequence
 
+import torch
+
 from vllm_torchtpu.distributed.kv_transfer.hetero_config import HeteroTierConfig
 
 DTypeStr = Literal["bfloat16", "float16", "float8_e4m3fn", "float8_e5m2", "int8"]
@@ -204,11 +206,23 @@ class DTypeTranslator:
     DTYPE_SIZES: dict[str, int] = {
         "bfloat16": 2,
         "float16": 2,
+        "float32": 4,
         "fp8": 1,
         "fp8_e4m3": 1,
         "float8_e4m3fn": 1,
         "float8_e5m2": 1,
         "int8": 1,
+        "uint8": 1,
+    }
+
+    TORCH_DTYPES: dict[str, torch.dtype] = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "float8_e4m3fn": torch.float8_e4m3fn,
+        "float8_e5m2": torch.float8_e5m2,
+        "int8": torch.int8,
+        "uint8": torch.uint8,
     }
 
     def __init__(
@@ -221,15 +235,121 @@ class DTypeTranslator:
         self.consumer_dtype = self._normalize_dtype(consumer_dtype)
 
     @staticmethod
-    def _normalize_dtype(dtype: str) -> str:
-        d = dtype.strip().lower()
+    def _normalize_dtype(dtype: str | torch.dtype) -> str:
+        if isinstance(dtype, torch.dtype):
+            d = str(dtype).replace("torch.", "").strip().lower()
+        else:
+            d = dtype.strip().lower()
+            if d.startswith("torch."):
+                d = d[len("torch.") :]
         if d in ("fp8", "fp8_e4m3", "float8_e4m3fn"):
             return "float8_e4m3fn"
         if d in ("fp8_e5m2", "float8_e5m2"):
             return "float8_e5m2"
         if d in ("bf16", "bfloat16"):
             return "bfloat16"
+        if d in ("fp16", "half", "float16"):
+            return "float16"
+        if d in ("fp32", "float", "float32"):
+            return "float32"
         return d
+
+    @classmethod
+    def resolve_torch_dtype(cls, dtype: str | torch.dtype) -> torch.dtype:
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        norm = cls._normalize_dtype(dtype)
+        if norm in cls.TORCH_DTYPES:
+            return cls.TORCH_DTYPES[norm]
+        maybe_dtype = getattr(torch, norm, None)
+        if isinstance(maybe_dtype, torch.dtype):
+            return maybe_dtype
+        raise ValueError(f"Unsupported KV cache dtype for translation: {dtype!r}")
+
+    @classmethod
+    def translate_pallas_kv_buffer(
+        cls,
+        src_buf: memoryview | bytes | bytearray,
+        dst_buf: Any,
+        *,
+        dst_offset: int = 0,
+        num_blocks: int,
+        src_dtype: str | torch.dtype,
+        dst_dtype: str | torch.dtype,
+        src_block_shape: Sequence[int],
+        dst_block_shape: Sequence[int],
+    ) -> None:
+        """Translate a Pallas 5D KV cache shard between dtypes/packing layouts in host memory.
+
+        In TPU Pallas 5D KV cache layout ``(num_blocks, page_size, k2_per_pack, kv_packing, head_dim)``,
+        the ``kv_packing`` axis is sublane-packed into each 32-bit word along ``head_dim``.
+        After ``batch_transfer_d2h``, the physical C-contiguous memory layout in host shared memory
+        is ``(num_blocks, page_size, k2_per_pack, head_dim, kv_packing)``.
+        """
+        s_dtype = cls.resolve_torch_dtype(src_dtype)
+        d_dtype = cls.resolve_torch_dtype(dst_dtype)
+        src_writable = (
+            bytearray(src_buf)
+            if isinstance(src_buf, bytes)
+            or (isinstance(src_buf, memoryview) and src_buf.readonly)
+            else src_buf
+        )
+        if len(src_block_shape) != 4 or len(dst_block_shape) != 4:
+            s_count = num_blocks * math.prod(src_block_shape)
+            d_count = num_blocks * math.prod(dst_block_shape)
+            if s_count != d_count:
+                raise ValueError(
+                    f"Cannot translate non-4D block shapes with mismatched element counts: "
+                    f"src={tuple(src_block_shape)} vs dst={tuple(dst_block_shape)}"
+                )
+            src_flat = torch.frombuffer(src_writable, dtype=s_dtype, count=s_count)
+            dst_flat = torch.frombuffer(
+                dst_buf, dtype=d_dtype, count=d_count, offset=dst_offset
+            )
+            dst_flat.copy_(src_flat.to(d_dtype))
+            return
+
+        s_page, s_k2, s_pack, s_hdim = (int(x) for x in src_block_shape)
+        d_page, d_k2, d_pack, d_hdim = (int(x) for x in dst_block_shape)
+        if s_page != d_page or s_hdim != d_hdim:
+            raise ValueError(
+                f"Incompatible Pallas KV block geometry for dtype translation: "
+                f"src={tuple(src_block_shape)} vs dst={tuple(dst_block_shape)}"
+            )
+
+        s_count = num_blocks * s_page * s_k2 * s_pack * s_hdim
+        d_count = num_blocks * d_page * d_k2 * d_pack * d_hdim
+        src_t = torch.frombuffer(
+            src_writable, dtype=s_dtype, count=s_count
+        ).view(num_blocks, s_page, s_k2, s_hdim, s_pack)
+        dst_t = torch.frombuffer(
+            dst_buf, dtype=d_dtype, count=d_count, offset=dst_offset
+        ).view(num_blocks, d_page, d_k2, d_hdim, d_pack)
+
+        if s_k2 == d_k2:
+            if s_pack >= d_pack:
+                dst_t.copy_(src_t[..., :d_pack].to(d_dtype))
+            else:
+                dst_t[..., :s_pack].copy_(src_t.to(d_dtype))
+                dst_t[..., s_pack:].zero_()
+        else:
+            unpacked = src_t.permute(0, 1, 2, 4, 3).reshape(
+                num_blocks, s_page, s_k2 * s_pack, s_hdim
+            )
+            valid_k2 = min(s_k2 * s_pack, d_k2 * d_pack)
+            converted = unpacked[:, :, :valid_k2, :].to(d_dtype)
+            if d_k2 * d_pack > valid_k2:
+                padded = torch.zeros(
+                    (num_blocks, d_page, d_k2 * d_pack, d_hdim),
+                    dtype=d_dtype,
+                )
+                padded[:, :, :valid_k2, :].copy_(converted)
+                converted = padded
+            dst_t.copy_(
+                converted.reshape(num_blocks, d_page, d_k2, d_pack, d_hdim).permute(
+                    0, 1, 2, 4, 3
+                )
+            )
 
     def get_element_size(self, dtype: str) -> int:
         norm = self._normalize_dtype(dtype)

@@ -17,10 +17,12 @@ Free-list is held on rank-0 only. Other ranks compute offsets from
 """
 
 import ctypes
+import math
 import os
 import queue
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 
@@ -32,6 +34,7 @@ import contextlib
 
 import torch
 
+from vllm_torchtpu.distributed.kv_transfer.hetero_translator import DTypeTranslator
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -350,12 +353,23 @@ class HostKVShmPool:
         return out
 
     def unpack_rank_layers(
-        self, slot_idx: int, rank: int, num_blocks: int, layer_buffers: list
+        self,
+        slot_idx: int,
+        rank: int,
+        num_blocks: int,
+        layer_buffers: list,
+        *,
+        src_dtype: torch.dtype | str | None = None,
+        src_layer_shard_shape: Sequence[int] | None = None,
     ) -> None:
         """Inverse of rank_layer_views. `layer_buffers` is a list of
         buffer-protocol objects (zmq.Frame.buffer, memoryview, bytes)
         sized per-layer `used` bytes, one per layer. Each is memcpy'd into
-        its shm slot -- one copy on the consumer instead of two."""
+        its shm slot -- one copy on the consumer instead of two.
+
+        When `src_dtype` differs from `self.spec.dtype` (heterogeneous KV cache
+        dtypes across Prefill and Decode tiers), each layer buffer is translated
+        in-place into the destination Pallas packing layout."""
         spec = self.spec
         if len(layer_buffers) != spec.num_layers:
             raise RuntimeError(
@@ -363,16 +377,55 @@ class HostKVShmPool:
                 f"expected {spec.num_layers}"
             )
         rank_start = slot_idx * spec.per_slot_bytes + rank * spec.per_rank_bytes
-        used = self._used_per_layer(num_blocks)
+        resolved_src_dtype = (
+            DTypeTranslator.resolve_torch_dtype(src_dtype)
+            if src_dtype is not None
+            else spec.dtype
+        )
+        if resolved_src_dtype == spec.dtype:
+            used = self._used_per_layer(num_blocks)
+            for li, buf in enumerate(layer_buffers):
+                src = memoryview(buf)
+                if src.nbytes != used:
+                    raise RuntimeError(
+                        f"unpack_rank_layers: layer {li} size {src.nbytes} != "
+                        f"expected {used} (num_blocks={num_blocks})"
+                    )
+                layer_off = rank_start + li * spec.per_layer_bytes
+                self._copy_into_shm(layer_off, src, used)
+            return
+
+        dst_block_shape = tuple(spec.layer_shard_shape[1:])
+        src_block_shape = (
+            tuple(src_layer_shard_shape)
+            if src_layer_shard_shape is not None
+            else dst_block_shape
+        )
+        expected_src_bytes = (
+            num_blocks
+            * math.prod(src_block_shape)
+            * _dtype_bytes(resolved_src_dtype)
+        )
+        assert self._shm.buf is not None
         for li, buf in enumerate(layer_buffers):
             src = memoryview(buf)
-            if src.nbytes != used:
+            if src.nbytes != expected_src_bytes:
                 raise RuntimeError(
                     f"unpack_rank_layers: layer {li} size {src.nbytes} != "
-                    f"expected {used} (num_blocks={num_blocks})"
+                    f"expected {expected_src_bytes} (num_blocks={num_blocks}, "
+                    f"src_dtype={resolved_src_dtype})"
                 )
             layer_off = rank_start + li * spec.per_layer_bytes
-            self._copy_into_shm(layer_off, src, used)
+            DTypeTranslator.translate_pallas_kv_buffer(
+                src,
+                self._shm.buf,
+                dst_offset=layer_off,
+                num_blocks=num_blocks,
+                src_dtype=resolved_src_dtype,
+                dst_dtype=spec.dtype,
+                src_block_shape=src_block_shape,
+                dst_block_shape=dst_block_shape,
+            )
 
     def _copy_into_shm(self, offset: int, src: memoryview, nbytes: int) -> None:
         """Copy a contiguous source buffer into shm.

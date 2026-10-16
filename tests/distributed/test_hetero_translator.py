@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import unittest
 
+import torch
+
 from vllm_torchtpu.distributed.kv_transfer.hetero_config import HeteroTierConfig, HeteroTierResolver
 from vllm_torchtpu.distributed.kv_transfer.hetero_translator import (
     DTypeTranslator,
@@ -180,6 +182,40 @@ class HeteroTranslatorTest(unittest.TestCase):
         # 67,108,864 / (100e9 / 8) = 67,108,864 / 12,500,000,000 = ~0.00537 s = ~5.37 ms
         latency_ms = plan.estimated_transfer_latency_ms(dcn_bandwidth_gbps=100.0)
         self.assertAlmostEqual(latency_ms, 5.3687, places=3)
+
+    def test_translate_pallas_kv_buffer_fp8_to_bfloat16_and_back(self):
+        """Verify sublane-packed Pallas KV buffer translation between fp8_e4m3fn and bfloat16."""
+        num_blocks = 2
+        page_size = 16
+        head_dim = 128
+        # 1 KV head per rank:
+        # fp8_e4m3fn has logical (B, 16, 1, 4, 128) -> physical (B, 16, 1, 128, 4) with [K, V, 0, 0]
+        # bfloat16 has logical (B, 16, 1, 2, 128) -> physical (B, 16, 1, 128, 2) with [K, V]
+        src_phys = torch.zeros(
+            (num_blocks, page_size, 1, head_dim, 4), dtype=torch.bfloat16
+        )
+        src_phys[..., 0] = -4.5  # K
+        src_phys[..., 1] = 0.125  # V
+        src_fp8 = src_phys.to(torch.float8_e4m3fn).contiguous()
+        src_bytes = memoryview(src_fp8.view(torch.uint8).numpy().tobytes())
+
+        dst_buf = bytearray(num_blocks * page_size * 1 * 2 * head_dim * 2)
+        DTypeTranslator.translate_pallas_kv_buffer(
+            src_bytes,
+            dst_buf,
+            dst_offset=0,
+            num_blocks=num_blocks,
+            src_dtype="torch.float8_e4m3fn",
+            dst_dtype=torch.bfloat16,
+            src_block_shape=(page_size, 1, 4, head_dim),
+            dst_block_shape=(page_size, 1, 2, head_dim),
+        )
+
+        dst_bf16 = torch.frombuffer(dst_buf, dtype=torch.bfloat16).view(
+            num_blocks, page_size, 1, head_dim, 2
+        )
+        self.assertTrue(torch.all(dst_bf16[..., 0] == -4.5))
+        self.assertTrue(torch.all(dst_bf16[..., 1] == 0.125))
 
 
 if __name__ == "__main__":

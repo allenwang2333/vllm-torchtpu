@@ -70,3 +70,37 @@ def test_unpack_rank_layers_rejects_wrong_layer_size():
             )
     finally:
         pool.close()
+
+
+def test_unpack_rank_layers_translates_fp8_to_bfloat16():
+    spec = PoolSpec(
+        num_slots=1,
+        tp_size=1,
+        num_layers=2,
+        max_blocks=4,
+        layer_shard_shape=(4, 16, 1, 2, 128),
+        dtype=torch.bfloat16,
+    )
+    pool = HostKVShmPool.create(spec, f"test_host_kv_{uuid.uuid4().hex}")
+    try:
+        num_blocks = 2
+        src_phys = torch.zeros((num_blocks, 16, 1, 128, 4), dtype=torch.bfloat16)
+        src_phys[..., 0] = 2.5
+        src_phys[..., 1] = -0.0625
+        src_fp8_bytes = src_phys.to(torch.float8_e4m3fn).view(torch.uint8).numpy().tobytes()
+
+        pool.unpack_rank_layers(
+            slot_idx=0,
+            rank=0,
+            num_blocks=num_blocks,
+            layer_buffers=[memoryview(src_fp8_bytes)] * spec.num_layers,
+            src_dtype="torch.float8_e4m3fn",
+            src_layer_shard_shape=(16, 1, 4, 128),
+        )
+
+        for li in range(spec.num_layers):
+            view = pool.layer_view(0, 0, li, num_blocks).view(num_blocks, 16, 1, 128, 2)
+            assert torch.all(view[..., 0] == 2.5)
+            assert torch.all(view[..., 1] == -0.0625)
+    finally:
+        pool.close()

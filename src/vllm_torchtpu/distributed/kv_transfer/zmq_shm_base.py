@@ -59,6 +59,7 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
+from vllm_torchtpu.distributed.kv_transfer.hetero_translator import DTypeTranslator
 from vllm_torchtpu.distributed.kv_transfer.host_kv_shm import HostKVShmPool, PoolSpec
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -1534,6 +1535,10 @@ class ZmqShmKvConnectorBase:
         )
 
         num_layers = self.num_layers
+        host_headers: dict[int, dict[str, Any]] = {}
+        host_header_events: dict[int, threading.Event] = {
+            h: threading.Event() for h in range(num_hosts)
+        }
 
         def _pull_channel(h: int, ch: int):
             """Pull one channel's subset of ranks AND unpack their layer
@@ -1608,6 +1613,22 @@ class ZmqShmKvConnectorBase:
                 if ch == 0:
                     header_frame = frames[idx]
                     idx += 1
+                    try:
+                        hdr_obj = _secure_loads(bytes(header_frame.buffer))
+                        if isinstance(hdr_obj, dict):
+                            host_headers[h] = hdr_obj
+                    except Exception:
+                        pass
+                    finally:
+                        host_header_events[h].set()
+                else:
+                    host_header_events[h].wait(timeout=max(0.1, deadline - time.time()))
+
+                hdr_dict = host_headers.get(h)
+                src_dtype = hdr_dict.get("dtype") if hdr_dict else None
+                src_layer_shard_shape = (
+                    hdr_dict.get("layer_shard_shape") if hdr_dict else None
+                )
 
                 ranks_handled: list[int] = []
                 # Construct reverse mapping global_rank -> local_rank
@@ -1628,15 +1649,35 @@ class ZmqShmKvConnectorBase:
                     if global_rank in global_to_local:
                         local_rank = global_to_local[global_rank]
                         assert self._coord_pool is not None
-                        self._coord_pool.unpack_rank_layers(
-                            entry.slot_idx, local_rank, entry.num_blocks, layer_buffers
-                        )
+                        if (
+                            src_dtype is not None
+                            and hasattr(self._coord_pool, "spec")
+                            and DTypeTranslator.resolve_torch_dtype(src_dtype)
+                            != self._coord_pool.spec.dtype
+                        ):
+                            self._coord_pool.unpack_rank_layers(
+                                entry.slot_idx,
+                                local_rank,
+                                entry.num_blocks,
+                                layer_buffers,
+                                src_dtype=src_dtype,
+                                src_layer_shard_shape=src_layer_shard_shape,
+                            )
+                        else:
+                            self._coord_pool.unpack_rank_layers(
+                                entry.slot_idx,
+                                local_rank,
+                                entry.num_blocks,
+                                layer_buffers,
+                            )
                         ranks_handled.append(global_rank)
                 t_unpack_done = time.perf_counter()
                 wire_ms = (t_wire_done - t0) * 1000.0
                 unpack_ms = (t_unpack_done - t_wire_done) * 1000.0
                 return h, ch, wire_ms, unpack_ms, ranks_handled, header_frame
             finally:
+                if ch == 0:
+                    host_header_events[h].set()
                 sock.close(linger=0)
 
         t_total0 = time.perf_counter()
