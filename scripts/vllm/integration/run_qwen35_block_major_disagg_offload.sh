@@ -63,7 +63,9 @@ export VLLM_SRC="${VLLM_SRC:-${repo_root}}"
 export TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 export USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-1}"
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
-export VLLM_TPU_BLOCK_MAJOR_KV=1
+# VLLM_TPU_BLOCK_MAJOR_KV=0 runs the same gates on the per-region unified
+# pools, e.g. for a pipeline-parallel prefill, which block-major refuses.
+export VLLM_TPU_BLOCK_MAJOR_KV="${VLLM_TPU_BLOCK_MAJOR_KV:-1}"
 export ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
 export PREFILL_SPECULATIVE_CONFIG=""
 export DECODE_SPECULATIVE_CONFIG=""
@@ -125,10 +127,12 @@ bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/lo
 # offload tier.
 for role in prefill decode; do
   log="${RUN_DIR}/logs/${role}.log"
-  grep -m1 "Block-major unified pool:" "${log}" \
-    || fail "the ${role} engine did not allocate the block-major unified pool"
-  grep -m1 "Block-major unified pool contract:" "${log}" \
-    || fail "the ${role} engine did not register the block-major offload contract"
+  if [[ "${VLLM_TPU_BLOCK_MAJOR_KV}" == "1" ]]; then
+    grep -m1 "Block-major unified pool:" "${log}" \
+      || fail "the ${role} engine did not allocate the block-major unified pool"
+    grep -m1 "Block-major unified pool contract:" "${log}" \
+      || fail "the ${role} engine did not register the block-major offload contract"
+  fi
   grep -m1 "KVCacheStore up" "${log}" \
     || fail "no Raiden store came up on the ${role} engine"
 done

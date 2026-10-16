@@ -71,6 +71,9 @@ spec:
                       value: "1"
                     - name: PREFILL_PP
                       value: "4"
+                    # The block-major pool refuses pipeline parallelism.
+                    - name: VLLM_TPU_BLOCK_MAJOR_KV
+                      value: "0"
                   resources:
                     limits:
                       google.com/tpu: "4"
