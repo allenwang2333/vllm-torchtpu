@@ -157,10 +157,11 @@ def _pack_kv_to_raw_pools(
 
 
 def test_raw_page_pack_unpack_roundtrip():
-    """Verify per-page KV raw page pack/unpack helpers round-trip."""
+    """Verify per-page KV, SSM, and conv raw page pack/unpack helpers round-trip."""
     key = jax.random.key(101)
     k1, k2 = jax.random.split(key, 2)
 
+    # 1. KV page [128, 256] fp8 -> [2, 64, 4, 128] fp8 -> [128, 256] fp8
     k_page = (jax.random.normal(k1, (128, 256), dtype=jnp.float32) * 0.2).astype(
         jnp.float8_e4m3fn
     )
@@ -176,6 +177,149 @@ def test_raw_page_pack_unpack_roundtrip():
     np.testing.assert_array_equal(
         np.asarray(v_rt).view(np.uint8), np.asarray(v_page).view(np.uint8)
     )
+
+    # 2. SSM state [vh=2, KD=128, VD=128] bf16 -> [4, 2, 64, 4, 128] fp8 -> bf16
+    rec = (jax.random.normal(k1, (2, 128, 128), dtype=jnp.float32) * 0.1).astype(
+        jnp.bfloat16
+    )
+    raw_ssm = mk.ssm_to_raw_pages(rec)
+    assert raw_ssm.shape == (4, 2, 64, 4, 128)
+    rec_rt = mk.raw_pages_to_ssm(raw_ssm, vh=2, KD=128, VD=128)
+    np.testing.assert_array_equal(np.asarray(rec_rt), np.asarray(rec))
+
+    # 3. Conv state [3, QKV=512] f32 -> [2, 64, 4, 128] fp8 -> [3, 512] f32
+    conv = (
+        (jax.random.normal(k1, (3, 512), dtype=jnp.float32) * 0.1)
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+    )
+    raw_conv = mk.conv_to_raw_page(conv)
+    assert raw_conv.shape == (2, 64, 4, 128)
+    conv_rt = mk.raw_page_to_conv(raw_conv, QKV=512)
+    np.testing.assert_array_equal(np.asarray(conv_rt), np.asarray(conv))
+
+
+@pytest.mark.parametrize("att_every,use_2d_ckpt", [(4, False), (3, True)])
+def test_states_to_pool_roundtrip(att_every: int, use_2d_ckpt: bool):
+    """Verify `states_to_pool` <-> `pool_to_states` round-trip for 3D and 2D ckpt."""
+    L = 4 if att_every == 4 else 6
+    g = _tiny_geom(L=L, att_every=att_every)
+    ex = _tiny_exec(R=2, B=2, T=1, ctx=256, paged_kv=True, num_pages=96)
+    _, _, _, st_l = qwen35.random_logical_inputs(jax.random.key(7 + att_every), g, ex)
+
+    st_in = dict(st_l)
+    st_in["kc"] = st_l["kc"].astype(jnp.float8_e4m3fn)
+    st_in["vc"] = st_l["vc"].astype(jnp.float8_e4m3fn)
+    st_in["conv"] = st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32)
+
+    pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
+    assert ex.num_pages >= min_np
+    # Pages 0..5*G_PER_ATT-1 are reserved; active sequences start at page >= 5*G_PER_ATT
+    assert int(jnp.min(pt[:, : ex.ctx // ex.page_size])) >= 5 * (att_every - 1)
+    assert int(jnp.min(ckpt)) >= 1
+    if use_2d_ckpt:
+        ckpt = ckpt[0]
+        roff = roff[0]
+
+    raw_pools = mk.states_to_pool(g, ex, st_in, pt, ckpt, roff)
+    st_out = mk.pool_to_states(g, ex, raw_pools, pt, ckpt)
+
+    np.testing.assert_array_equal(
+        np.asarray(st_out["kc"]).view(np.uint8),
+        np.asarray(st_in["kc"]).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(st_out["vc"]).view(np.uint8),
+        np.asarray(st_in["vc"]).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(st_out["conv"][:, :, :, 0]), np.asarray(st_in["conv"])
+    )
+    vh = g.vh(ex.R)
+    np.testing.assert_array_equal(
+        np.asarray(st_out["rec"].reshape(ex.R, g.NGDN, ex.NS, vh, g.KD, g.VD)),
+        np.asarray(st_in["rec"]),
+    )
+
+
+@pytest.mark.parametrize(
+    "T,NS,att_every",
+    [(1, 1, 4), (1, 2, 4), (1, 3, 3), (1, 4, 4), (1, 5, 3), (2, 2, 4)],
+)
+def test_gather_gdn_states_cpu_interpret(T: int, NS: int, att_every: int):
+    """Verify `gather_gdn_states` across `NS=1..5` (`n_pairs>1`) and `from_ckpt`."""
+    L = 4 if att_every == 4 else 6
+    B = NS * T
+    g = _tiny_geom(L=L, att_every=att_every)
+    ex = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=96)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(15 + T + NS), g, ex
+    )
+    st_quant = dict(
+        st_l,
+        conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
+    )
+    _, _, _, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_quant, g, ex, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    # Test 2D ckpt_indices when att_every == 3 (G_PER_ATT = 2 != 3)
+    ckpt_use = ckpt[0] if att_every == 3 else ckpt
+    roff_use = roff[0] if att_every == 3 else roff
+    raw_pools = mk.states_to_pool(g, ex, st_quant, pt, ckpt_use, roff_use)
+    raw_r0 = tuple(mk.unfold(r, ex.R)[0] for r in raw_pools)
+
+    conv_g, rec_g = mk.gather_gdn_states(g, ex, raw_r0, ckpt_use, roff_use)
+    conv_exp = mk.unfold(st_mk["conv"], ex.R)[0]
+    rec_exp = mk.unfold(st_mk["rec"], ex.R)[0]
+    np.testing.assert_array_equal(np.asarray(conv_g), np.asarray(conv_exp))
+    np.testing.assert_array_equal(np.asarray(rec_g), np.asarray(rec_exp))
+
+    if NS >= 2:
+        # 1. Explicit active_seqs mask: zero out sequence 1
+        act_mask = jnp.asarray([1] + [0] + [1] * (NS - 2), dtype=jnp.int32)
+        _, rec_act = mk.gather_gdn_states(g, ex, raw_r0, ckpt_use, roff_use, act_mask)
+        vh = g.vh(ex.R)
+        rec_act_seq = rec_act.reshape(g.NGDN, ex.NS, vh, g.KD, g.VD)
+        np.testing.assert_array_equal(
+            np.asarray(rec_act_seq[:, 0]),
+            np.asarray(rec_exp.reshape(g.NGDN, ex.NS, vh, g.KD, g.VD)[:, 0]),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(rec_act_seq[:, 1]),
+            np.zeros_like(np.asarray(rec_act_seq[:, 1])),
+        )
+        # 2. active_seqs=None (default "from_ckpt") and explicit "from_ckpt":
+        # setting sequence 1's slot to 0 marks it inactive
+        ckpt_inact = (
+            ckpt_use.at[:, 1, :].set(0)
+            if ckpt_use.ndim == 3
+            else ckpt_use.at[1, :].set(0)
+        )
+        _, rec_fc = mk.gather_gdn_states(
+            g, ex, raw_r0, ckpt_inact, roff_use, "from_ckpt"
+        )
+        _, rec_def = mk.gather_gdn_states(g, ex, raw_r0, ckpt_inact, roff_use)
+        np.testing.assert_array_equal(np.asarray(rec_fc), np.asarray(rec_act))
+        np.testing.assert_array_equal(np.asarray(rec_def), np.asarray(rec_act))
+        with pytest.raises(ValueError, match="Unsupported active_seqs mode"):
+            mk.gather_gdn_states(g, ex, raw_r0, ckpt_use, roff_use, "invalid")
+        with pytest.raises(ValueError, match="maps to pages"):
+            mk.gather_gdn_states(g, ex, raw_r0, ckpt_use + ex.num_pages, roff_use)
+        if NS == 2 and T == 1 and att_every == 4:
+            from jax.experimental import pallas as pl
+
+            with (
+                pl.enable_debug_checks(True),
+                pytest.raises(
+                    jax.errors.JaxRuntimeError,
+                    match="GDN gather checkpoint slot maps outside",
+                ),
+            ):
+                c_bad, _ = jax.jit(
+                    lambda ck: mk.gather_gdn_states(g, ex, raw_r0, ck, roff_use)
+                )(ckpt_use + ex.num_pages)
+                c_bad.block_until_ready()
 
 
 @pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])

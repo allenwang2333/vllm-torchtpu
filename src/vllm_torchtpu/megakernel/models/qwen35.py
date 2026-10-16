@@ -46,6 +46,7 @@ from ..spec import (
     ModelSpec,
     SwitchSlot,
 )
+from . import qwen35_pool
 
 
 @dataclass(frozen=True)
@@ -350,6 +351,7 @@ def pack_inputs(
     ex: ExecSpec,
     *,
     mesh: Any = None,
+    build_default_pool: bool = False,
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Pack logical model weights and states into the tiled/folded megakernel layout."""
     ms = qwen35_spec(g)
@@ -491,35 +493,47 @@ def pack_inputs(
         states_mk["rec"] = kernel.fold(rec_p.astype(BF16))
 
     if ex.paged_kv:
-        if "raw" not in logical_states or "page_table" not in logical_states:
+        if "raw" in logical_states and "page_table" in logical_states:
+            states_mk["raw"] = tuple(
+                kernel.fold(r) if r.ndim == 6 else r for r in logical_states["raw"]
+            )
+            pt_in = logical_states["page_table"]
+            max_pt = ex.resolved_max_pages_per_seq
+            if pt_in.ndim == 2:
+                if pt_in.shape[0] not in (NS, R * NS) or pt_in.shape[1] < max_pt:
+                    raise ValueError(
+                        f"page_table has shape {pt_in.shape}, expected "
+                        f"({NS}, >={max_pt}) or ({R * NS}, >={max_pt})"
+                    )
+                pt_in = pt_in[:, :max_pt]
+                states_mk["page_table"] = (
+                    pt_in if pt_in.shape[0] == R * NS else jnp.tile(pt_in, (R, 1))
+                )
+            elif pt_in.ndim == 3:
+                if pt_in.shape[:2] != (R, NS) or pt_in.shape[2] < max_pt:
+                    raise ValueError(
+                        f"page_table has shape {pt_in.shape}, expected "
+                        f"({R}, {NS}, >={max_pt})"
+                    )
+                states_mk["page_table"] = kernel.fold(pt_in[:, :, :max_pt])
+            else:
+                raise ValueError(
+                    f"page_table must be 2D or 3D, got shape {pt_in.shape}"
+                )
+        elif build_default_pool:
+            pt, ckpt, roff, _ = qwen35_pool.default_pool_layout(g, ex)
+            raw_pools = qwen35_pool.states_to_pool(
+                g, ex, logical_states, pt, ckpt, roff
+            )
+            states_mk["raw"] = raw_pools
+            states_mk["page_table"] = jnp.tile(
+                pt[:, : ex.resolved_max_pages_per_seq], (R, 1)
+            )
+        else:
             raise ValueError(
                 "pack_inputs with ex.paged_kv=True requires 'raw' and "
-                "'page_table' in logical_states"
+                "'page_table' in logical_states (or pass build_default_pool=True)."
             )
-        states_mk["raw"] = tuple(
-            kernel.fold(r) if r.ndim == 6 else r for r in logical_states["raw"]
-        )
-        pt_in = logical_states["page_table"]
-        max_pt = ex.resolved_max_pages_per_seq
-        if pt_in.ndim == 2:
-            if pt_in.shape[0] not in (NS, R * NS) or pt_in.shape[1] < max_pt:
-                raise ValueError(
-                    f"page_table has shape {pt_in.shape}, expected "
-                    f"({NS}, >={max_pt}) or ({R * NS}, >={max_pt})"
-                )
-            pt_in = pt_in[:, :max_pt]
-            states_mk["page_table"] = (
-                pt_in if pt_in.shape[0] == R * NS else jnp.tile(pt_in, (R, 1))
-            )
-        elif pt_in.ndim == 3:
-            if pt_in.shape[:2] != (R, NS) or pt_in.shape[2] < max_pt:
-                raise ValueError(
-                    f"page_table has shape {pt_in.shape}, expected "
-                    f"({R}, {NS}, >={max_pt})"
-                )
-            states_mk["page_table"] = kernel.fold(pt_in[:, :, :max_pt])
-        else:
-            raise ValueError(f"page_table must be 2D or 3D, got shape {pt_in.shape}")
     elif "kc" in logical_states and "vc" in logical_states:
         states_mk["kc"] = kernel.fold(logical_states["kc"])
         states_mk["vc"] = kernel.fold(logical_states["vc"])
@@ -554,7 +568,9 @@ def random_inputs(
 ) -> tuple[jax.Array, jax.Array, dict[str, Any], dict[str, Any]]:
     """Generate packed megakernel inputs `(pos, hidden, weights, states)`."""
     pos, hid_l, w_l, st_l = random_logical_inputs(key, g, ex)
-    return pack_inputs(pos, hid_l, w_l, st_l, g, ex, mesh=mesh)
+    return pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=ex.paged_kv
+    )
 
 
 def reference_step(
@@ -566,6 +582,7 @@ def reference_step(
     logical_states: dict[str, Any],
     *,
     paged_kv: bool | None = None,
+    pool_io: bool = False,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank reference oracle consuming logical model weights."""
     R, B, T, NS, ctx = ex.R, ex.B, ex.T, ex.NS, ex.ctx
@@ -583,6 +600,8 @@ def reference_step(
         kc_all = jnp.clip(kc_all.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
         vc_all = jnp.clip(vc_all.astype(F32), -448.0, 448.0).astype(FP8).astype(BF16)
     conv_in = logical_states.get("conv", jnp.zeros((R, ngdn, NS, 3, QKV), dtype=F32))
+    if pool_io:
+        conv_in = conv_in.astype(BF16).astype(F32)
     rec_in = logical_states.get("rec", jnp.zeros((R, ngdn, NS, vh, KD, VD), dtype=BF16))
     if rec_in.ndim == 5:
         rec_in = rec_in.reshape(R, ngdn, NS, vh, KD, VD)
@@ -868,6 +887,8 @@ def reference_step(
 
     fn = logical_weights["final_norm"].astype(F32)
     out_b = rmsnorm(res, fn, g.eps, zero_centered=g.zero_centered_norm).astype(BF16)
+    if pool_io:
+        conv_out = conv_out.astype(BF16).astype(F32)
     out_states: dict[str, Any] = {"kc": kc_all, "vc": vc_all}
     if ngdn > 0:
         if ex.VER:
