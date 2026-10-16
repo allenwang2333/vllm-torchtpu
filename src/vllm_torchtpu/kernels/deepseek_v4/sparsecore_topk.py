@@ -73,10 +73,10 @@ def _cdiv_dyn(x):
 
 
 def _topk_body(
-    scores_hbm,  # i32[padded_b * p * slice_len] (fp32 score bits)
-    lengths_hbm,  # i32[padded_b + LANES]; the DCP merge: i32[padded_b * LANES]
-    out_hbm,  # i32[padded_b * k]
-    keys_hbm,  # i32[padded_b * k] | None
+    scores_hbm,  # i32[b * n] (fp32 score bits); the DCP merge: i32[padded_b * n]
+    lengths_hbm,  # i32[align(b, LANES)]; the DCP merge: i32[padded_b * LANES]
+    out_hbm,  # i32[b, k]; the DCP merge: i32[padded_b * k]
+    keys_hbm,  # i32[b, k] | None
     glob_vmem,
     rowbuf_vmem,
     keybuf_vmem,
@@ -122,6 +122,12 @@ def _topk_body(
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
     neg_inf_key = jnp.int32(KEY_NEG_INF)
+
+    def out_row(ref, row):
+        """Output row `row`: a whole row of a (b, k) output, else a flat slice."""
+        if len(ref.shape) == 2:
+            return ref.at[row]
+        return ref.at[pl.ds(pl.multiple_of(row * k, LANES), k)]
 
     def vec_at(ref, idx):
         return ref[pl.ds(idx, LANES)][0]
@@ -450,12 +456,9 @@ def _topk_body(
 
         if p == 1 and out_vmem is None:
             # The wave loop has no pipeline output block: write the row out.
-            out_off = pl.multiple_of(row * k, LANES)
-            pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(out_off, k)])
+            pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_row(out_hbm, row))
             if return_scores:
-                pltpu.sync_copy(
-                    keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)]
-                )
+                pltpu.sync_copy(keybuf_vmem.at[pl.ds(0, k)], out_row(keys_hbm, row))
         elif p == 1:
 
             def copy_out(i):
@@ -570,16 +573,9 @@ def _topk_body(
                     gather_peer
                 )  # pytype: disable=bad-argument-type
 
-                out_off = pl.multiple_of(row * k, LANES)
-                pltpu.sync_copy(
-                    rowbuf_vmem.at[pl.ds(0, k)],
-                    out_hbm.at[pl.ds(out_off, k)],
-                )
+                pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_row(out_hbm, row))
                 if return_scores:
-                    pltpu.sync_copy(
-                        keybuf_vmem.at[pl.ds(0, k)],
-                        keys_hbm.at[pl.ds(out_off, k)],
-                    )
+                    pltpu.sync_copy(keybuf_vmem.at[pl.ds(0, k)], out_row(keys_hbm, row))
 
     cores_per_chip = num_sc_cores * num_subcores
     if dcp_merge:
@@ -630,10 +626,9 @@ def _topk_body(
                 )
 
         plsc.parallel_loop(0, k // LANES, unroll=4)(fill)
-        out_off = pl.multiple_of(row * k, LANES)
-        pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(out_off, k)])
+        pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_row(out_hbm, row))
         if return_scores:
-            pltpu.sync_copy(keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)])
+            pltpu.sync_copy(keybuf_vmem.at[pl.ds(0, k)], out_row(keys_hbm, row))
 
     # Each row is split over its group's p subcores by its OWN length, not by
     # the width of the score matrix: rows are usually far shorter than
@@ -641,8 +636,15 @@ def _topk_body(
     # row while the other p - 1 wait at the barriers. The split is contiguous
     # and in column order, so ties still go to the lowest columns. Each subcore
     # fetches just its part; at p == 1 that is the row's first row_length
-    # words. Every subcore copies all the row lengths in once.
-    pltpu.sync_copy(lengths_hbm, meta_vmem)
+    # words. Every subcore copies all the row lengths in once; the words past
+    # them read as empty rows.
+    rows_words = lengths_hbm.shape[0]
+    pltpu.sync_copy(lengths_hbm, meta_vmem.at[pl.ds(0, rows_words)])
+
+    def zero_meta(i):
+        meta_vmem[pl.ds(rows_words + i * LANES, LANES)] = jnp.zeros((LANES,), jnp.int32)
+
+    plsc.parallel_loop(0, (meta_vmem.shape[0] - rows_words) // LANES)(zero_meta)
     _, half = _slice_buffer(num_waves, slice_len)
 
     def wave_info(wave):
@@ -670,7 +672,7 @@ def _topk_body(
 
     def slice_copy(wave, off, lo, words):
         row = wave * groups_per_chip + core * groups_per_core + group_id
-        src = pl.multiple_of(row * (p * slice_len) + lo, LANES)
+        src = pl.multiple_of(row * n + lo, LANES)
         return pltpu.make_async_copy(
             scores_hbm.at[pl.ds(src, words)],
             slices_vmem.at[pl.ds(pl.multiple_of(off, LANES), words)],
@@ -790,16 +792,22 @@ def _sc_topk_direct(
     num_waves = _cdiv(b, groups_per_chip)
     padded_b = num_waves * groups_per_chip
     pad_b = padded_b - b
-    pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
-        words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
-
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
     wave_loop = local_idxs is None
+    # A (b, k) output's rows are whole 128-lane tiles only if k fills them;
+    # otherwise rows go to a flat output that is reshaped afterwards.
+    rows_2d = wave_loop and k % 128 == 0
     if wave_loop:
-        # One flat copy, padded for the 16-lane reads at its end.
-        lengths_in = jnp.pad(lengths, (0, LANES))
+        # Rows are read at stride n, just their valid prefix, and written
+        # whole into (b, k), so neither the scores nor the outputs need
+        # padding, and the lengths only to whole vectors.
+        lengths_in = row_lengths.astype(jnp.int32)
+        if b % LANES:
+            lengths_in = jnp.pad(lengths_in, (0, LANES - b % LANES))
     else:
+        pad_n = slice_len * p - n
+        if pad_b > 0 or pad_n > 0:
+            words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
+        lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, pad_b))
         lengths_in = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1))).reshape(-1)
 
     extra_inputs = ()
@@ -815,7 +823,7 @@ def _sc_topk_direct(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
+    slot_type = jax.ShapeDtypeStruct((b, k) if rows_2d else (padded_b * k,), jnp.int32)
     out_type = (slot_type, slot_type if return_scores else None)
 
     scratch_types = (
@@ -841,7 +849,9 @@ def _sc_topk_direct(
         pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
-        pltpu.VMEM((padded_b + LANES,), jnp.int32) if wave_loop else None,  # meta_vmem
+        pltpu.VMEM((_align_to(padded_b, LANES) + LANES,), jnp.int32)
+        if wave_loop
+        else None,  # meta_vmem
         pltpu.VMEM((_slice_buffer(num_waves, slice_len)[0],), jnp.int32)
         if wave_loop
         else None,  # slices_vmem
@@ -882,12 +892,13 @@ def _sc_topk_direct(
     # pl.kernel and set_xla_metadata are untyped upstream; both return the
     # out_type pytree here.
     slots, keys = cast(tuple[jax.Array, jax.Array | None], out)
-    slots_2d = slots.reshape(padded_b, k)[:b]
+    if not rows_2d:
+        slots = slots.reshape(padded_b, k)[:b]
+        keys = None if keys is None else keys.reshape(padded_b, k)[:b]
     if return_scores:
         assert keys is not None
-        keys_2d = keys.reshape(padded_b, k)[:b]
-        return slots_2d, keys_2d
-    return slots_2d
+        return slots, keys
+    return slots
 
 
 def _pick_partition(b: int, n: int, k: int) -> int:
