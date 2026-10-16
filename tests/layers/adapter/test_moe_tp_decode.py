@@ -479,3 +479,78 @@ def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_
     assert scores.shape == (16, E * ep_size) and bias.shape == (E * ep_size,)
     assert w13 is layer.w13_weight and w13.shape[0] == E
     assert e0.tolist() == [[ep_rank * E]]
+
+
+@pytest.mark.parametrize(
+    ("prefill", "spec", "want"),
+    [
+        (True, {}, 256),  # TP experts: steps above the cap take the prefill kernel
+        (False, {}, None),
+        (True, {"use_ep": True, "ep_size": 4, "tp_size": 4, "ep_rank": 1}, None),
+    ],
+)
+def test_prefill_kernel_arms_on_tp_experts_only(
+    harness, monkeypatch, prefill, spec, want
+):
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL", prefill)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256)
+    assert moe_tp_decode.arm(harness.model(spec)) == 1
+    assert harness.statics[0].prefill_above == want
+
+
+@pytest.mark.parametrize(("tokens", "prefill"), [(512, True), (256, False), (128, False)])
+def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, prefill):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake_prefill(x, *args):
+        calls.append(("prefill", x.shape[0], args[-1]))
+        return jnp.full_like(x, 7)
+
+    def fake_chain(x, *args):
+        calls.append(("chain", x.shape[0]))
+        return jnp.ones_like(x)
+
+    monkeypatch.setattr(moe_tp_decode, "_prefill_chain", fake_prefill)
+    monkeypatch.setattr(moe_tp_decode, "_tp_chain", fake_chain)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        prefill_above=256,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    operands = (
+        jnp.zeros((tokens, H), jnp.bfloat16),
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        jnp.zeros((tokens,), jnp.bool_),
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    # Two "ranks" under vmap give the psum its named axis.
+    stacked = [jnp.stack([a, a]) for a in operands]
+    out = jax.vmap(body, axis_name="d")(*stacked)
+    if prefill:
+        # The prefill kernel's output is already summed: no psum on top.
+        assert calls == [("prefill", tokens, "d")]
+        assert bool(jnp.all(out == 7))
+    else:
+        assert calls == [("chain", tokens)]
+        assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
