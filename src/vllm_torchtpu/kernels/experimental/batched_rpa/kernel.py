@@ -92,6 +92,8 @@ def calculate_and_store_out(
     cfgs: configs.RpaConfigs,
 ):
     def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+        if flash_attention.static_pv(cfgs):
+            batch_l = batch_l * jnp.asarray(flash_attention.P_SCALE, batch_l.dtype)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
