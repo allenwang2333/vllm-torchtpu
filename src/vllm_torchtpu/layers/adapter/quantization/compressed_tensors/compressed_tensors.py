@@ -256,4 +256,4 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                 return None
 
             case _:
-                return None
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)

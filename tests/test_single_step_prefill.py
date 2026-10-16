@@ -55,6 +55,12 @@ from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 BS = 640
 HB = 128
 NUM_SPEC = 3
+
+pytestmark = pytest.mark.skipif(
+    not ssp.patches_match_vllm(),
+    reason="the single-step MambaManager patches need a port to this vLLM's "
+    "prefill checkpoint API",
+)
 MAMBA_GID = 1
 BUDGET = 8192
 

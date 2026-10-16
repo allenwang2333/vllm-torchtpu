@@ -30,8 +30,18 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
+from typing import NamedTuple
+
 import pytest
 import torch
+import vllm.v1.outputs
+
+if not hasattr(vllm.v1.outputs, "RoutedExpertsLists"):
+
+    class RoutedExpertsLists(NamedTuple):
+        pass
+
+    vllm.v1.outputs.RoutedExpertsLists = RoutedExpertsLists  # type: ignore[attr-defined]
 
 # Test files that need no chip, by path from the repo root. A session of
 # nothing but these runs with JAX pinned to the CPU.

@@ -53,7 +53,7 @@ from vllm_torchtpu.distributed.pcp import (
 )
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
-    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
+    qwen_pooled_gdn_ssm_state_dtype,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import (
@@ -78,6 +78,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -522,21 +523,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
         if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
             # Declare exactly what the pool physically stores. vLLM sizes the
-            # mamba page from the dtype declared HERE and asserts the padded
+            # mamba page from the dtypes declared HERE and asserts the padded
             # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
-            # wider is not conservative, it is a contradiction: the two
-            # disagreed once and every hybrid GDN engine failed to start on
-            # that assert.
+            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE and
+            # qwen_pooled_gdn_ssm_state_dtype. Declaring anything wider is
+            # not conservative, it is a contradiction: the two disagreed once
+            # and every hybrid GDN engine failed to start on that assert. The
+            # pooled kernel and the Raiden manifest read the SSM dtype back
+            # from this declaration.
             conv_state_dtype = getattr(
                 torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
             )
-            if getattr(
-                self.cache_config, "mamba_ssm_cache_dtype", "auto"
-            ) in ("auto", "float32", "fp8", "float8_e4m3fn"):
-                temporal_state_dtype = getattr(
-                    torch, DEFAULT_POOLED_GDN_SSM_STATE_DTYPE.split(".")[1]
-                )
+            temporal_state_dtype = getattr(
+                torch,
+                qwen_pooled_gdn_ssm_state_dtype(temporal_state_dtype).split(".")[1],
+            )
         else:
             # TODO: Support bf16 conv state.
             # Per-layer cache: unlike the pool, the declared dtype IS the
@@ -555,13 +556,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         2-D. torch_tpu hands a compiled executable the buffer behind each
         argument and re-materializes a shape-mismatched argument as a
         standalone `tt_jit_as_strided` program before every forward. One
-        contiguous copy at load time removes that per-step program.
+        `fresh_buffer` copy at load time removes that per-step program.
         """
         del act_dtype
         w = self.conv1d.weight
-        self.conv1d.weight.data = torch.empty(
-            w.shape, dtype=w.dtype, device=w.device
-        ).copy_(w)
+        self.conv1d.weight.data = fresh_buffer(w)
 
     def get_state_shape(
         self,

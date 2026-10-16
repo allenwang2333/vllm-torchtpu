@@ -14,18 +14,21 @@
 """Host-only tests for TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP.
 
 They drive the real PrefixAwareScheduler._mamba_block_aligned_split, which
-calls the pinned upstream Scheduler._mamba_block_aligned_split and the real
-HybridStateRetention prepare/adjust hooks, chunk by chunk over a warm
+calls the pinned upstream Scheduler._mamba_block_aligned_split, the real
+HybridStateRetention prepare/adjust hooks and the upstream
+KVCacheCoordinator.get_replay_boundaries, chunk by chunk over a warm
 prefill, with the Qwen3.5 AgentX geometry (640-token Mamba/scheduler block,
 128-token prefix_match_unit, sparse retention, no EAGLE back-off).
 """
 
 import random
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
 from collections import OrderedDict
+
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
@@ -50,23 +53,36 @@ def _retention(bs=BS, hb=HB, smart_fork=True, safe_tail=4):
     return r
 
 
-def _scheduler(skip, bs=BS, hb=HB, retention_interval=0, retention=True):
+def _coordinator(bs, retention_interval, eagle):
+    c = SimpleNamespace(
+        retention_interval=retention_interval,
+        scheduler_block_size=bs,
+        eagle_group_ids={0} if eagle else set(),
+    )
+    c.get_replay_boundaries = MethodType(KVCacheCoordinator.get_replay_boundaries, c)
+    return c
+
+
+def _scheduler(skip, bs=BS, hb=HB, retention_interval=0, retention=True, eagle=False):
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
-    # Upstream split inputs (vLLM v0.29.0 Scheduler.__init__).
+    # Upstream split inputs (vLLM v0.31.0 Scheduler.__init__).
     s.cache_config = SimpleNamespace(block_size=bs)
     s.block_size = bs
     s.hash_block_size = hb
-    # VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=1 (default) runs the split with
-    # use_eagle=False, i.e. without the one-block back-off.
-    s.use_eagle = False
+    # VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP=1 runs the split with
+    # use_eagle_block_drop=False, i.e. without the one-block back-off, and
+    # clears the coordinator's eagle groups.
+    s.use_eagle_block_drop = eagle
     s.need_mamba_block_aligned_split = True
     s.mamba_has_prefill_checkpoint_blocks = False
+    s.mamba_prefill_checkpoint_alignment = None
     s.mamba_partial_cache_hit = hb < bs
+    s.mamba_shared_prefix_checkpoint = False
     s.max_num_scheduled_tokens = BUDGET
     s.scheduler_config = SimpleNamespace(long_prefill_token_threshold=0)
     s.kv_cache_manager = SimpleNamespace(
         enable_caching=True,
-        coordinator=SimpleNamespace(retention_interval=retention_interval),
+        coordinator=_coordinator(bs, retention_interval, eagle),
     )
     # PrefixAwareScheduler knobs (production defaults; caps idle at c<=16).
     s._cold_chunk_cap = 2048
@@ -85,13 +101,13 @@ def _scheduler(skip, bs=BS, hb=HB, retention_interval=0, retention=True):
     return s
 
 
-def _request(prompt, rid="conv7_3"):
+def _request(prompt, rid="conv7_3", junction=0):
     return SimpleNamespace(
         request_id=rid,
         num_prompt_tokens=prompt,
         num_tokens=prompt,
         num_computed_tokens=0,
-        shared_prefix_boundary=0,
+        shared_prefix_boundary=junction,
         block_hashes=list(range(prompt // HB)),
     )
 
@@ -109,9 +125,11 @@ def _retain_previous_turn(s, hit):
     )
 
 
-def chunk_ends(s, prompt, hit, rid="conv7_3", budget=BUDGET, continuation=True):
+def chunk_ends(
+    s, prompt, hit, rid="conv7_3", budget=BUDGET, continuation=True, junction=0
+):
     """Chunk ends of a prefill from a ``hit``-token prefix-cache hit."""
-    req = _request(prompt, rid)
+    req = _request(prompt, rid, junction)
     if continuation:
         _retain_previous_turn(s, hit)
     ends = []
@@ -161,6 +179,30 @@ def test_refused_under_dense_retention():
     s = _scheduler(True, retention_interval=None)
     assert chunk_ends(s, 96_300, 93_952) == [94_080, 96_000, 96_256, 96_300]
     assert s._n_midblock_stops_skipped == 0
+
+
+def test_refused_when_junction_floors_to_the_boundary():
+    # A full-attention hit to 94,208 sets the junction there; sparse retention
+    # hashes the Mamba block ending at floor640(94,208) = 94,080.
+    for skip in (False, True):
+        assert chunk_ends(_scheduler(skip), 96_300, 93_952, junction=94_208) == [
+            94_080,
+            96_000,
+            96_256,
+            96_300,
+        ]
+    off = chunk_ends(_scheduler(False), 96_300, 93_952, junction=94_720)
+    on = chunk_ends(_scheduler(True), 96_300, 93_952, junction=94_720)
+    assert on == off[1:] == [94_720, 96_000, 96_256, 96_300]
+
+
+def test_refused_at_eagle_replay_boundary():
+    # With the EAGLE block drop, a block-aligned prompt also replays from
+    # floor640(P - 1) - 640 = 94,720 = ceil640(94,208).
+    for skip in (False, True):
+        s = _scheduler(skip, eagle=True)
+        assert chunk_ends(s, 96_000, 94_208) == [94_720, 95_360, 95_872, 96_000]
+        assert s._n_midblock_stops_skipped == 0
 
 
 def test_safe_tail_prompt_keeps_both_tail_stops():

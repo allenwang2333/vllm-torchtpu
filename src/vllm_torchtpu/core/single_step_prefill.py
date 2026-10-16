@@ -41,6 +41,7 @@ a chunk cross any other cacheable boundary.
 
 from __future__ import annotations
 
+import inspect
 from functools import wraps
 from typing import Any
 
@@ -64,8 +65,23 @@ def mamba_managers(kv_cache_manager: Any) -> list[Any]:
     return [m for m in managers if getattr(m, "mamba_cache_mode", None) == "align"]
 
 
+def patches_match_vllm() -> bool:
+    """Checks that MambaManager has the checkpoint API the patches wrap."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    # The patches wrap vLLM 0.29's (request_id, num_tokens, num_computed_tokens)
+    # internal-checkpoint hook. vLLM 0.31 keys checkpoints by position
+    # (query_start, query_end, checkpoint_position, prefill_end) and rebuilt
+    # cache_blocks and _cache_partial_tail_block around them, so the patches
+    # need a port before they can run there.
+    params = inspect.signature(MambaManager._needs_internal_checkpoint).parameters
+    return "num_computed_tokens" in params
+
+
 def supported(scheduler: Any) -> tuple[bool, str]:
     """Whether the single-step split may be used by ``scheduler``."""
+    if not patches_match_vllm():
+        return False, "the MambaManager patches do not match this vLLM's checkpoint API"
     if not getattr(scheduler, "need_mamba_block_aligned_split", False):
         return False, "mamba_cache_mode != align"
     if getattr(scheduler, "mamba_has_prefill_checkpoint_blocks", False):

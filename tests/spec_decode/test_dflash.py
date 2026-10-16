@@ -20,6 +20,10 @@ import pytest
 import torch
 import torch._dynamo
 
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
@@ -337,6 +341,11 @@ def _make_chunk(
             query_start_loc=query_start_loc,
             use_max_model_len=True,
             position_ids_override=None,
+            # [decode_end, prefill_end, num_reqs]: the compiled input builders
+            # read the live request count from its last entry on device.
+            request_distribution=torch.tensor(
+                [0, 0, num_reqs], dtype=torch.int32, device=device
+            ),
         ),
         start_index=start_index,
         num_reqs=num_reqs,
@@ -504,6 +513,94 @@ def test_propose_unit(device):
     proposer._dflash_forward_and_sample.assert_called_once()
 
 
+def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
+    """Run `run()` with the padding mask left in a target step's state and
+    return the mask the draft forward saw."""
+    state = TokenPaddingState.create(32, torch.device("cpu"))
+    # A target step with 3 real rows of 16: stale for any draft forward.
+    state.update(3, 16)
+    seen = []
+
+    def _forward(input_ids, positions, block_size):
+        seen.append(state.get_local_padding_mask(num_rows).tolist())
+        num_reqs = input_ids.shape[0] // block_size
+        return torch.zeros((num_reqs, block_size - 1), dtype=torch.int64), None
+
+    proposer._dflash_forward_and_sample = _forward
+    token_padding.set_padding_state(state)
+    try:
+        run()
+    finally:
+        token_padding.set_padding_state(None)
+    assert len(seen) == 1
+    return seen[0]
+
+
+def test_propose_marks_padding_for_draft_rows():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(num_reqs=2),
+        mesh=None,
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer.draft_chunks = [
+        SimpleNamespace(
+            num_reqs=2,
+            start_index=0,
+            # The live count reaches the builders as a device scalar.
+            attn_ctx=SimpleNamespace(
+                request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)
+            ),
+        )
+    ]
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    # 2 requests x block 4 = 8 real draft rows, padded to a 16-row bucket.
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+    )
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer.propose(
+            [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
+        ),
+        num_rows=16,
+    )
+
+    assert mask == [False] * 8 + [True] * 8
+
+
+def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", lambda *a, **k: None)
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer._dummy_draft_forward(
+            num_tokens=8, use_max_model_len=True, sync=False
+        ),
+        num_rows=8,
+    )
+
+    assert mask == [True] * 8
+
+
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     """An unnamed draft layer must raise, not borrow another group's metadata.
 
@@ -615,3 +712,51 @@ def test_dp_lockstep_sharded_off_without_lockstep():
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
     assert proposer._dp_lockstep_sharded() is False
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("builder", ["next_tokens", "seed"])
+def test_compiled_input_builders_compile_no_program_per_request_count(device, builder):
+    """The builders take the live request count as a device scalar, so one
+    shape bucket is one program however many requests are live."""
+    if device.type != "tpu":
+        pytest.skip("needs the TPU compile cache")
+    K, block, rows, padded_len = 5, 5, 32, 128
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer._max_model_len = 9216
+    proposer.mask_token_id = 7777
+    # rows verify windows of 1 + K tokens; query_start_loc and positions.
+    qsl = torch.arange(0, (rows + 1) * (1 + K), 1 + K, dtype=torch.int32).to(device)
+    pos = torch.arange(rows * (1 + K), dtype=torch.int32).to(device)
+
+    def run(num_reqs: int):
+        nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
+        if builder == "seed":
+            seed = torch.ones(rows, dtype=torch.int32).to(device)
+            return proposer._tpu_build_dflash_inputs_seed(
+                seed, qsl, pos, nr, block, padded_len, 7777
+            )
+        next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
+        draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
+        return proposer._tpu_build_dflash_inputs_next_tokens(
+            next_tokens,
+            qsl,
+            pos,
+            draft_lengths,
+            nr,
+            block,
+            padded_len,
+            7777,
+            INVALID_TOKEN_ID,
+        )
+
+    def programs() -> int:
+        return len(torch.tpu._get_cache_stats().per_entry_stats)
+
+    run(1)  # the first use of the shape may compile
+    before = programs()
+    for num_reqs in (2, 17, 32):
+        run(num_reqs)
+    assert programs() == before, (
+        f"{builder} builder compiled a program per request count"
+    )

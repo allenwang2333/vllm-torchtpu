@@ -42,6 +42,13 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     _hit_signature,
 )
 
+# The memo alone is covered by test_paw_memo_xstep.py.
+pytestmark = pytest.mark.skipif(
+    not ssp.patches_match_vllm(),
+    reason="replays single-step prefill, whose MambaManager patches need a "
+    "port to this vLLM's prefill checkpoint API",
+)
+
 
 @pytest.fixture
 def patched_pool():

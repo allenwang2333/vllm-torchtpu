@@ -8,9 +8,10 @@ vLLM 0.27.0's ``should_skip_weight`` only matches names ending in
 widens the suffix allowlist. No TPU, no network.
 """
 
+import pytest
 import torch
 
-from vllm_torchtpu import model_loader_patches
+from vllm_torchtpu import envs, model_loader_patches
 from vllm_torchtpu.model_loader_patches import (
     _local_tensor_ranges,
     _should_skip_weight_tpu,
@@ -19,6 +20,13 @@ from vllm_torchtpu.model_loader_patches import (
 )
 
 _LOCAL = {0, 1, 27}
+
+
+@pytest.fixture(autouse=True)
+def _contiguous_placement(monkeypatch):
+    """TPU_EXPERT_PLACEMENT defaults to the Qwen3.5 table, which would place
+    these layer names by table instead of by ``local_expert_ids``."""
+    monkeypatch.setattr(envs, "TPU_EXPERT_PLACEMENT", "")
 
 
 def _expert_name(expert_id: int, suffix: str) -> str:

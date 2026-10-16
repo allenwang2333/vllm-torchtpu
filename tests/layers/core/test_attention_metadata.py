@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
+from vllm_torchtpu.layers.core import attention_metadata
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
@@ -702,10 +704,36 @@ class TestBlockTableUploadSkip:
         assert uploaded
         assert torch.equal(staged[0], self._expected(table, 3))
 
-    def test_mamba_staged_products_reused_when_block_cols_invariant(self):
+    def test_mamba_staged_products_reused_when_block_cols_invariant(self, monkeypatch):
         plumbing = TestAttentionMetadataBuilderPlumbing()
         runner = plumbing._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
         runner._unified_kv_layout = True
+        # The stager creates the products cache on first use; an auto-created
+        # MagicMock attribute would read as a cache holding every key.
+        runner._qx_stage_products = None
+        # Only the compiled program's outputs are cached, so present the staged
+        # upload as device resident and run the program body eagerly.
+        upload = runner._block_table_upload
+        uploads = []
+
+        def upload_to_device(host, device):
+            staged = upload(host, device)
+            if not uploads or uploads[-1].tensor is not staged:
+                uploads.append(
+                    SimpleNamespace(tensor=staged, device=SimpleNamespace(type="tpu"))
+                )
+            return uploads[-1]
+
+        programs = []
+
+        def run_program(staged, *args):
+            programs.append(staged)
+            return attention_metadata._staged_walk_products(staged.tensor, *args)
+
+        runner._block_table_upload = upload_to_device
+        monkeypatch.setattr(
+            attention_metadata, "_staged_walk_products_compiled", run_program
+        )
         attn = plumbing._make_builder(runner, kv_cache_group_id=0)
         mambas = [
             plumbing._make_mamba_builder(runner, kv_cache_group_id=gid)
@@ -732,22 +760,29 @@ class TestBlockTableUploadSkip:
         # Step 1: seq_lens [5, 20, 36], max_rejected=3 -> s_lo=[2, 17, 33],
         # all within blocks [0, 1, 2] for block_size=16.
         ctx1 = stage_step([5, 20, 36], max_rejected=3)
+        assert len(programs) == 1
         assert ctx1._stacked_mamba_groups is not None
         assert ctx1._stacked_mamba_groups.shape == (2, 4)
         assert len(ctx1.staged_mamba_products) == 2
         assert len(ctx1._stacked_mamba_groups_ids) == 2
 
         # Step 2: seq_lens [8, 23, 39], max_rejected=3 -> s_lo=[5, 20, 36],
-        # still within blocks [0, 1, 2]; staged_mamba_products must be reused.
+        # still within blocks [0, 1, 2]; the staged mamba products are reused.
         ctx2 = stage_step([8, 23, 39], max_rejected=3)
-        assert ctx2.staged_mamba_products is ctx1.staged_mamba_products
+        assert len(programs) == 1
+        for gid in (1, 2):
+            for reused, first in zip(
+                ctx2.staged_mamba_products[gid], ctx1.staged_mamba_products[gid]
+            ):
+                assert reused is first
         assert ctx2._stacked_mamba_groups is ctx1._stacked_mamba_groups
         assert ctx2._stacked_mamba_groups_ids == ctx1._stacked_mamba_groups_ids
 
         # Step 3: req 0 reaches 18 with max_rejected=3 -> s_lo=15 (block 0) vs
         # s_hi=18 (block 1) straddles the block boundary, forcing recompute.
         ctx3 = stage_step([18, 23, 39], max_rejected=3)
-        assert ctx3.staged_mamba_products is not ctx1.staged_mamba_products
+        assert len(programs) == 2
+        assert ctx3.staged_mamba_products[1][0] is not ctx1.staged_mamba_products[1][0]
         assert not torch.equal(
             ctx3.staged_mamba_products[1][0], ctx1.staged_mamba_products[1][0]
         )

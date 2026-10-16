@@ -155,10 +155,13 @@ def _install_copy_tables(layer: RoutedExperts) -> None:
     )
 
 
+_NEEDS_EP = "it needs expert parallelism"
+
+
 def _unsupported_reason(layer: RoutedExperts, activation: str) -> str | None:
     """Why the kernel cannot serve this layer at all, or None."""
     if not layer.moe_config.moe_parallel_config.use_ep:
-        return "it needs expert parallelism"
+        return _NEEDS_EP
     w13, w2 = layer.w13_weight, layer.w2_weight
     s13, s2 = layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     in_dtype = layer.moe_config.in_dtype
@@ -460,6 +463,11 @@ def log_summary() -> None:
         owner = _owner(verdict.method)
         if owner is not None:
             declined[owner] += 1
+        elif verdict.reason == _NEEDS_EP:
+            # A layout the knob does not cover, not a gap in the kernel: the
+            # layer keeps the non-EP MoE path (fused_moe_gmm, or an armed
+            # FUSED_MOE_DECODE_KERNEL / USE_MOE_TP_DECODE_KERNEL op).
+            declined[verdict.reason] += 1
         elif verdict.entry is None:
             unservable.append(f"{verdict.layer_name}: {verdict.reason}")
         else:

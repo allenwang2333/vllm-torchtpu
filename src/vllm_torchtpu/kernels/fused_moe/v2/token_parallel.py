@@ -9,13 +9,28 @@ import jax.numpy as jnp
 from jax import lax
 
 
+def replica_wire_rows(input_rows, width, row_alignment):
+    """An upper bound on `TokenReplicaLayout.local_rows`, in arithmetic alone.
+
+    The share padded to a whole block even below one, where the layout pads
+    to a power of two instead; equal to it from one block up. Sizing an op's
+    output with this keeps a symbolic `input_rows` free of guards when Dynamo
+    traces the op's fake -- which matters because vLLM traces the MTP drafter
+    once for every token bucket and refuses a graph that assumes any bound on
+    the token count.
+    """
+    share = (input_rows + width - 1) // width
+    return (share + row_alignment - 1) // row_alignment * row_alignment
+
+
 @dataclass(frozen=True)
 class TokenReplicaLayout:
     """Groups are ordered mesh coordinates, independent of expert ownership.
 
     Every member supplies identical input rows. Each computes one contiguous
     slice, then all members recover the original row order. Singleton groups
-    leave the input and output unchanged, including unaligned row counts.
+    pad their rows to an aligned tile like wider groups, and restore slices
+    the output back to input_rows.
     """
 
     groups: tuple[tuple[int, ...], ...]

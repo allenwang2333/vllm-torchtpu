@@ -604,6 +604,12 @@ class TPUWorker(WorkerBase):
     def pp_settle(self):
         return self.model_runner.pp_settle()
 
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this worker's stage drains the slice before each hand-off
+        launch."""
+        wave = self.model_runner._pp_wave
+        return bool(getattr(wave, "drain_before_handoff", False))
+
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
 
@@ -753,14 +759,19 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        if getattr(self, "speculative_config", None) is not None:
+            # Record the warm-up traces under the serving thread count. Other
+            # models keep upstream's warm-up at the startup count.
+            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        # Freeze the heap built by load and compile so per-step GC does not
-        # rescan it, as vLLM's GPU worker does.
+        set_torch_threads_for_runtime()
+        # The warmed worker holds a large static heap (model, compiled
+        # executables, KV bookkeeping); freezing it keeps a gen-2 collection
+        # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
-        set_torch_threads_for_runtime()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

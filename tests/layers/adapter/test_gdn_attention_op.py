@@ -73,6 +73,7 @@ def _vllm_config(
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
             use_kda_recoverssm=False,
+            use_replayssm=False,
         ),
         speculative_config=None,
         num_speculative_tokens=0,
@@ -199,7 +200,8 @@ class TestVllmGatedDeltaNetAttention:
     @pytest.mark.parametrize(
         ("ssm_cache_dtype", "expected_dtype"),
         [
-            ("float32", jnp.float32),
+            # Qwen GDN pools store a configured float32 SSM state in bfloat16.
+            ("float32", jnp.bfloat16),
             ("bfloat16", jnp.bfloat16),
         ],
     )
@@ -478,7 +480,8 @@ class TestVllmGatedDeltaNetAttention:
     @pytest.mark.parametrize(
         ("ssm_cache_dtype", "expected_dtype"),
         [
-            ("float32", jnp.float32),
+            # Qwen GDN pools store a configured float32 SSM state in bfloat16.
+            ("float32", jnp.bfloat16),
             ("bfloat16", jnp.bfloat16),
         ],
     )

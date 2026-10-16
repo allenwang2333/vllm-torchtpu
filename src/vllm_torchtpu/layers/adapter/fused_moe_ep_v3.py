@@ -460,6 +460,21 @@ def check_kernel_threshold(ep: int, tp: int) -> None:
     logger.info_once("MoE kernels: %s.", rule)
 
 
+def _unsupported_simulation_reason() -> str | None:
+    """Why a routing simulation strategy rules out v3, or None.
+
+    v2 hands a `uniform_random` draw to its kernel as routing operands; v3
+    has no such operand and always routes on the real router logits, so it
+    refuses every strategy rather than quietly ignore one.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    if moe_routing._SIMULATION_STRATEGY is not None:
+        return ("VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set; the v3 kernel "
+                "routes on the real router logits")
+    return None
+
+
 def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
                           activation: str) -> None:
     """Resolve the mesh and register the fused-EP op, once per process.
@@ -557,6 +572,7 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool,
 
     reason = (_unsupported_layer_reason(layer, local_experts, ep)
               or _unsupported_routing_reason(layer)
+              or _unsupported_simulation_reason()
               or _unsupported_reason(w1, w2, w1_scale, w2_scale, local_experts,
                                      hidden, inter, activation))
     if reason is not None:

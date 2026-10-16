@@ -7,13 +7,14 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     QWEN_GDN_ARCHITECTURES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_and_scale_state_bytes,
     pooled_gdn_state_dtypes,
     pooled_gdn_state_itemsize,
+    pooled_gdn_state_nbytes,
+    qwen_pooled_gdn_ssm_state_dtype,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
@@ -250,10 +251,12 @@ def _hybrid_mamba_state_layout(
         )
 
     # Byte widths come from the pool's own layout helper. Conv remains fixed
-    # BF16, while SSM follows the model class's configured dtype. Every other
-    # reader of pool bytes (the kernel state plan and the Raiden manifest) is
-    # sourced from the same helper, so slot sizing cannot use a different
-    # dtype source without contradicting the physical layout.
+    # BF16, while SSM follows the model class's configured dtype, mapped by
+    # `qwen_pooled_gdn_ssm_state_dtype` for Qwen GDN exactly as the layer maps
+    # its MambaSpec dtype. Every other reader of pool bytes (the kernel state
+    # plan and the Raiden manifest) is sourced from the same helper, so slot
+    # sizing cannot use a different dtype source without contradicting the
+    # physical layout.
     #
     # Shapes still come from the model class, which is a different kind of
     # fact: kernel taps and head counts are architecture, not layout. They do
@@ -270,48 +273,49 @@ def _hybrid_mamba_state_layout(
             f"(conv, SSM), got dtypes={dtypes}"
         )
     conv_dtype, ssm_dtype = pooled_gdn_state_dtypes(dtypes)
-    if isinstance(ssm_dtype, str):
-        ssm_dtype = getattr(torch, ssm_dtype.removeprefix("torch."), ssm_dtype)
+    qwen_gdn = model_config.architecture in QWEN_GDN_ARCHITECTURES
+    if qwen_gdn:
+        ssm_dtype = qwen_pooled_gdn_ssm_state_dtype(ssm_dtype)
     conv_itemsize = pooled_gdn_state_itemsize(conv_dtype)
-    raw_conv_bytes = math.prod(shapes[0]) * conv_itemsize
-    if "float4_e2m1fn" in str(ssm_dtype):
-        ssm_bytes = math.prod(shapes[1]) // 2
-    else:
-        ssm_itemsize = pooled_gdn_state_itemsize(ssm_dtype)
-        ssm_bytes = math.prod(shapes[1]) * ssm_itemsize
+    conv_bytes = math.prod(shapes[0]) * conv_itemsize
+    ssm_bytes = pooled_gdn_state_nbytes(math.prod(shapes[1]), ssm_dtype)
 
-    if pcp_size > 1 and model_config.architecture not in QWEN_GDN_ARCHITECTURES:
+    if pcp_size > 1 and not qwen_gdn:
         # Same item sizes on both sides of the ratio, so the check compares
         # sharding rather than dtype bookkeeping.
         full_conv_bytes = math.prod(tp_local_shapes[0]) * conv_itemsize
-        full_ssm_bytes = (
-            math.prod(tp_local_shapes[1]) // 2
-            if "float4_e2m1fn" in str(ssm_dtype)
-            else math.prod(tp_local_shapes[1]) * ssm_itemsize
+        full_ssm_bytes = pooled_gdn_state_nbytes(
+            math.prod(tp_local_shapes[1]), ssm_dtype
         )
-        if (raw_conv_bytes + ssm_bytes) * pcp_size != (
-            full_conv_bytes + full_ssm_bytes
-        ):
+        if (conv_bytes + ssm_bytes) * pcp_size != (full_conv_bytes + full_ssm_bytes):
             raise ValueError(
                 "PCP-local Mamba state size must be exactly 1/pcp_size of "
                 "the TP-local state: "
                 f"architecture={model_config.architecture!r}, "
                 f"pcp_size={pcp_size}, full_page_size_bytes="
                 f"{full_conv_bytes + full_ssm_bytes}, local_page_size_bytes="
-                f"{raw_conv_bytes + ssm_bytes}"
+                f"{conv_bytes + ssm_bytes}"
             )
 
-    conv_bytes = pooled_gdn_conv_and_scale_state_bytes(
-        kernel_size=0,
-        conv_dim=0,
-        ssm_dtype=ssm_dtype,
-        raw_conv_bytes=raw_conv_bytes,
+    # The Qwen GDN state plan stores conv rows in whole VREGs (plus a scale
+    # header for a quantized SSM), so its conv region spans more than the live
+    # bytes. KDA gathers and scatters exactly the live conv bytes.
+    conv_extent_bytes = (
+        pooled_gdn_conv_and_scale_state_bytes(
+            kernel_size=0,
+            conv_dim=0,
+            ssm_dtype=ssm_dtype,
+            raw_conv_bytes=conv_bytes,
+        )
+        if qwen_gdn
+        else None
     )
 
     return derive_pooled_gdn_state_layout(
         ssm_bytes=ssm_bytes,
         conv_bytes=conv_bytes,
         token_bytes=fa_physical_bytes_per_token,
+        conv_extent_bytes=conv_extent_bytes,
     )
 
 

@@ -7,6 +7,7 @@ import pytest
 import torch
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 
+from vllm_torchtpu.gdn_pool_layout import PooledGDNStateLayout
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     _hybrid_mamba_state_layout,
     update_tpu_block_size_and_slot_config,
@@ -240,10 +241,11 @@ def test_hybrid_fit_uses_physical_gdn_extent(vllm_config):
 
     _update(vllm_config)
 
-    # SSM=1024 rows, raw conv=24 rows, tiled conv=32 rows.
-    assert vllm_config.cache_config.block_size == 1280
-    assert vllm_config.cache_config.mamba_block_size == 1280
-    assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+    # Qwen GDN stores the declared f32 SSM in bf16: SSM=512 rows, raw conv=24
+    # rows, tiled conv=32 rows. The 544-row fit aligns to 768.
+    assert vllm_config.cache_config.block_size == 768
+    assert vllm_config.cache_config.mamba_block_size == 768
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
 def test_hybrid_fit_uses_configured_bf16_ssm_dtype(vllm_config):
@@ -285,9 +287,9 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
 
     _update(vllm_config)
 
-    # SSM=512 rows, raw conv=12 rows, tiled conv=16 rows.
-    assert vllm_config.cache_config.block_size == 768
-    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
+    # bf16 SSM=256 rows, raw conv=12 rows, tiled conv=16 rows.
+    assert vllm_config.cache_config.block_size == 512
+    assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024
 
 
 def test_fit_has_no_fixed_16_token_alignment(vllm_config):
@@ -305,13 +307,42 @@ def test_fit_has_no_fixed_16_token_alignment(vllm_config):
     assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
 
 
+def test_qwen_gdn_fit_follows_the_state_plan_layout(vllm_config):
+    """Qwen GDN stores a declared f32 SSM in bf16 and gives the conv rows
+    whole bf16 VREGs; any other architecture keeps the declared layout."""
+    _configure_hybrid(vllm_config, tp_size=8)
+    with patch(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        return_value=(FakeQwenMambaModel, None),
+    ):
+        qwen = _hybrid_mamba_state_layout(vllm_config, 1024)
+        vllm_config.model_config.architecture = "CompactHybridForCausalLM"
+        other = _hybrid_mamba_state_layout(vllm_config, 1024)
+
+    # TP8: 1 K/Q head and 2 V heads, conv = 3 * (1 + 1 + 2) * 128 * 2 B.
+    assert qwen == PooledGDNStateLayout(
+        ssm_bytes=2 * 128 * 128 * 2,
+        conv_bytes=3072,
+        token_bytes=1024,
+        ssm_tokens=64,
+        conv_tokens=8,
+    )
+    assert other == PooledGDNStateLayout(
+        ssm_bytes=2 * 128 * 128 * 4,
+        conv_bytes=3072,
+        token_bytes=1024,
+        ssm_tokens=128,
+        conv_tokens=4,
+    )
+
+
 def test_user_block_size_below_fit_is_promoted(vllm_config):
-    _configure_hybrid(vllm_config, block_size=1024, user_specified=True)
+    _configure_hybrid(vllm_config, block_size=512, user_specified=True)
 
     _update(vllm_config)
 
-    assert vllm_config.cache_config.block_size == 1280
-    assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+    assert vllm_config.cache_config.block_size == 768
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
 def test_decode_explicit_nested_block_is_honored(vllm_config):
@@ -329,8 +360,8 @@ def test_disagg_uses_same_fit_as_single_server(vllm_config):
 
     _update(vllm_config)
 
-    assert vllm_config.cache_config.block_size == 1280
-    assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+    assert vllm_config.cache_config.block_size == 768
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
 def test_pcp_uses_effective_tp_mamba_state(vllm_config):
@@ -339,9 +370,10 @@ def test_pcp_uses_effective_tp_mamba_state(vllm_config):
 
     _update(vllm_config)
 
-    # Effective TP = 1 * 4 = 4. Fit = 272 -> aligned to 256 kernel block is 512.
-    assert vllm_config.cache_config.block_size == 512
-    assert vllm_config.cache_config.mamba_page_size_padded == 512 * 1024
+    # Effective TP = 1 * 4 = 4. Fit = 128 bf16 SSM rows + 8 conv rows = 136
+    # -> aligned to 256 kernel block is 256.
+    assert vllm_config.cache_config.block_size == 256
+    assert vllm_config.cache_config.mamba_page_size_padded == 256 * 1024
 
 
 @pytest.mark.parametrize(
@@ -397,11 +429,20 @@ def test_pcp_gdn_pool_sizes_replicated_kq_state(vllm_config):
         model_cls=FakeConfiguredGdnModel,
     )
 
-    # Local SSM: 4*128*128*4 = 256 KiB (256 rows). Local Conv:
+    # Local SSM: 4*128*128*2 = 128 KiB (128 rows) in bf16. Local Conv:
     # 3*(1Q+1K+4V)*128*2 = 4608 B, rounded to 8 physical rows.
-    assert vllm_config.cache_config.block_size == 264
-    assert vllm_config.cache_config.mamba_block_size == 264
-    assert vllm_config.cache_config.mamba_page_size_padded == 264 * 1024
+    assert vllm_config.cache_config.block_size == 136
+    assert vllm_config.cache_config.mamba_block_size == 136
+    assert vllm_config.cache_config.mamba_page_size_padded == 136 * 1024
+    # The whole-VREG conv extent would also cover 4 V heads alone, so check
+    # the live conv bytes for the replicated Q and K heads.
+    with patch(
+        "vllm.model_executor.models.ModelRegistry.resolve_model_cls",
+        return_value=(FakeConfiguredGdnModel, None),
+    ):
+        layout = _hybrid_mamba_state_layout(vllm_config, 1024)
+    assert layout.conv_bytes == 3 * (1 + 1 + 4) * 128 * 2
+    assert layout.ssm_bytes == 4 * 128 * 128 * 2
 
 
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):
@@ -453,9 +494,9 @@ def test_spec_ckpt_blocks_keep_block_size_independent_of_num_spec(
         sizes[num_spec] = vllm_config.cache_config.block_size
 
     assert len(set(sizes.values())) == 1, sizes
-    # One checkpoint's 1056 tokens padded to this backend's 256-token
-    # kernel block = 1280, versus 2560 for K=1 on the affine path.
-    assert sizes[1] == 1280, sizes
+    # One checkpoint's 544 tokens (bf16 SSM) padded to this backend's
+    # 256-token kernel block = 768, versus 2560 for K=1 on the affine path.
+    assert sizes[1] == 768, sizes
 
 
 def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
@@ -464,9 +505,9 @@ def test_hybrid_mode_none_still_sizes_the_envelope_slot(vllm_config):
 
     _update(vllm_config)
 
-    assert vllm_config.cache_config.block_size == 1280
+    assert vllm_config.cache_config.block_size == 768
     assert vllm_config.cache_config.mamba_block_size == 256
-    assert vllm_config.cache_config.mamba_page_size_padded == 1280 * 1024
+    assert vllm_config.cache_config.mamba_page_size_padded == 768 * 1024
 
 
 def test_hybrid_gdn_pcp_rejects_non_sharding_shape_calculator(vllm_config):

@@ -521,6 +521,13 @@ class PrefixAwareScheduler(AsyncScheduler):
         ):
             self.max_num_running_reqs = mk_max_running
         try:
+            # vLLM's Scheduler walks the waiting queue without a selection
+            # hook, so the warmest-first promotion runs here, once per step.
+            queue = getattr(self, "kv_holding_waiting", None) or getattr(
+                self, "waiting", None
+            )
+            if queue is not None:
+                self._promote_warmest(queue)
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
@@ -766,8 +773,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         crossings (``TPUModelRunner._collect_mamba_state_seed_copies``). The
         skip is refused when an upstream-mandated stop (last cacheable block,
         partial-tail boundary, shared-prefix junction) lies in
-        ``(start, boundary]``. Retention stops are applied afterwards from the
-        original ``start``.
+        ``(start, boundary]``, or when the block ending at ``boundary`` is one
+        that sparse retention hashes. Retention stops are applied afterwards
+        from the original ``start``.
         """
         if not getattr(self, "_skip_midblock_align_stop", False):
             return 0
@@ -795,14 +803,25 @@ class PrefixAwareScheduler(AsyncScheduler):
             return 0
         hash_block_size = int(getattr(self, "hash_block_size", 0) or block_size)
         last_cache_position = num_tokens - num_tokens % block_size
+        tail_boundary = prompt // hash_block_size * hash_block_size
+        junction = int(getattr(request, "shared_prefix_boundary", 0) or 0)
         mandatory = (
             last_cache_position,
             last_cache_position - block_size,  # EAGLE back-off variant
-            prompt // hash_block_size * hash_block_size,
-            int(getattr(request, "shared_prefix_boundary", 0) or 0),
+            tail_boundary,
+            tail_boundary - hash_block_size,  # EAGLE block-drop variant
+            junction,
         )
         if any(start < s <= boundary for s in mandatory):
             return 0
+        if getattr(kvm, "enable_caching", False):
+            # MambaManager.reachable_block_mask hashes the state block ending at
+            # the block floor of each replay boundary and of the junction. A
+            # merged chunk leaves the hit's state in the block ending at
+            # ``boundary``, so that block must not be one of them.
+            reachable = (*kvm.coordinator.get_replay_boundaries(request), junction)
+            if any(b // block_size * block_size == boundary for b in reachable):
+                return 0
         return boundary - start
 
     def _reserve_prefill_lookahead(
@@ -1018,7 +1037,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        queue = super()._select_waiting_queue_for_scheduling()
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
         if queue is not None:
             self._promote_warmest(queue)
         return queue

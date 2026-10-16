@@ -117,7 +117,7 @@ for vname in A.variants.split(","):
         if bkv is not None:
             bq = min(1024, -(-T // 256) * 256)
             blocks = configs.BlockSizes(bq_sz=bq, bq_c_sz=bqc, bkv_sz=bkv,
-                                        batch_size=2, n_buffer=3)
+                                        batch_size=2)
         for ctx in CTXs:
             rec = dict(variant=vname, T=T, ctx=ctx, diet=diet, bkv=bkv, bq_c=bqc)
             try:

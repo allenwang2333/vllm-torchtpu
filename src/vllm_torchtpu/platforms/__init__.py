@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # ruff: noqa
 """The TPU platform plugin.
 
@@ -46,6 +59,25 @@ def register_tpu_platform() -> str:
     _log_tpu_info()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
+
+def _install_qx_fastcall() -> None:
+    """Installs the torch.compile hooks the QX_* variables enable."""
+    import os
+
+    fast = os.environ.get("QX_FAST_COMPILED_CALL", "1") == "1"
+    drop_global_state = os.environ.get("QX_TPU_DROP_GLOBAL_STATE_GUARD", "1") == "1"
+    if fast or drop_global_state:
+        from vllm_torchtpu._qx_fastcall import install
+
+        install(fast=fast, drop_global_state=drop_global_state)
+
+
+# Every vLLM process imports this module to resolve its platform, and every
+# import of the TPU platform runs it first, so the hook is in place before the
+# platform, worker, runner and kernel modules apply their module-level
+# torch.compile(backend="tpu") decorators. It imports torch, which the package
+# import must not.
+_install_qx_fastcall()
 
 import vllm  # noqa: E402,F401  # isort: skip
 

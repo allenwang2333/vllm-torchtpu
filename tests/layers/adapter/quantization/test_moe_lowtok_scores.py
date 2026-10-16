@@ -80,7 +80,6 @@ def test_plain_softmax_router_moves_into_the_kernel(enabled):
 @pytest.mark.parametrize(
     "layer, activation, match",
     [
-        (make_layer(use_ep=False), "silu", "expert parallelism"),
         (make_layer(experts=129), "silu", "envelope"),
         (make_layer(inter=128), "silu", "envelope"),
         (make_layer(), "gelu", "envelope"),
@@ -92,6 +91,11 @@ def test_layer_the_kernel_cannot_serve_is_refused_at_the_summary(
     assert scores.prebuild(method(), layer, activation) is None
     with pytest.raises(NotImplementedError, match=f"TPU_MOE_LOWTOK.*{match}"):
         scores.log_summary()
+
+
+def test_layer_without_expert_parallelism_is_declined_not_refused(enabled):
+    assert scores.prebuild(method(), make_layer(use_ep=False), "silu") is None
+    scores.log_summary()
 
 
 @pytest.mark.parametrize("owner", ["adaptive", "v2"])

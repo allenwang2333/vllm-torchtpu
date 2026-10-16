@@ -69,12 +69,16 @@ def _make_runner(
     runner.reorder_batch_threshold = 1
     runner._pcp_enabled = pcp_size > 1
     runner._mtp_enabled = mtp_enabled
+    runner._mtp_prefill_only = mtp_enabled and pcp_size > 1
+    runner._pp_is_first = True
+    runner._pp_is_last = True
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
+        tensor_parallel_size=1,
     )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
@@ -155,6 +159,7 @@ def _make_runner(
     runner._build_mamba_seg_arrays = TPUModelRunner._build_mamba_seg_arrays.__get__(
         runner
     )
+    runner._token_padding_update = TPUModelRunner._token_padding_update.__get__(runner)
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),

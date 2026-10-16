@@ -159,9 +159,11 @@ def test_unified_pool_declares_complete_qk_conv_state(make_gdn_attention, tp_siz
     spec = attention.get_kv_cache_spec(vllm_config)
 
     assert spec.shapes == ((taps, 1, conv_dim), (len(v_heads), HEAD_DIM, HEAD_DIM))
-    assert spec.dtypes == (torch.bfloat16, torch.float32)
+    # The fixture configures a float32 SSM state, which a Qwen GDN pool stores
+    # in bfloat16.
+    assert spec.dtypes == (torch.bfloat16, torch.bfloat16)
     assert spec.page_size_bytes == (
-        taps * conv_dim * 2 + len(v_heads) * HEAD_DIM * HEAD_DIM * 4
+        taps * conv_dim * 2 + len(v_heads) * HEAD_DIM * HEAD_DIM * 2
     )
     # The NHD pool used by the failing startup has 256 lanes per row.
     assert conv_dim % 256 == 0
@@ -171,7 +173,7 @@ def test_unified_pool_declares_complete_qk_conv_state(make_gdn_attention, tp_siz
 def test_pool_budget_includes_replicated_qk_state(
     make_gdn_attention, monkeypatch, tp_size
 ):
-    _, vllm_config = make_gdn_attention(tp_size, 0)
+    attention, vllm_config = make_gdn_attention(tp_size, 0)
     # Exercise the real model's shape/dtype methods used before cache
     # allocation; replacing only registry lookup avoids config discovery.
     monkeypatch.setattr(
@@ -183,7 +185,10 @@ def test_pool_budget_includes_replicated_qk_state(
     k_heads, v_heads = _owned_heads(tp_size, 0)
     conv_dim = (2 * len(k_heads) + len(v_heads)) * HEAD_DIM
     assert layout.conv_bytes == (CONV_KERNEL_SIZE - 1) * conv_dim * 2
-    assert layout.ssm_bytes == len(v_heads) * HEAD_DIM * HEAD_DIM * 4
+    # Sized in the SSM dtype the layer declares to vLLM (bf16 for Qwen GDN).
+    ssm_itemsize = attention.get_state_dtype()[1].itemsize
+    assert ssm_itemsize == 2
+    assert layout.ssm_bytes == len(v_heads) * HEAD_DIM * HEAD_DIM * ssm_itemsize
 
 
 @pytest.mark.parametrize("tp_size", TP_SIZES)

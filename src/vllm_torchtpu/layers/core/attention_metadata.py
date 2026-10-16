@@ -1,5 +1,17 @@
-"""Device-resident attention and hybrid GDN metadata preparation for TPU Runner.
-"""
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Device-resident attention and hybrid GDN metadata preparation for TPU Runner."""
 
 from __future__ import annotations
 
@@ -827,9 +839,7 @@ def stage_block_table_uploads(
         has_ckpt = ctx.mamba_ckpt_window > 1
         ckpt_end = n_tables + 2 * n_mamba if has_ckpt else n_tables + n_mamba
         ckpts = (
-            products[n_tables + n_mamba : ckpt_end]
-            if has_ckpt
-            else (None,) * n_mamba
+            products[n_tables + n_mamba : ckpt_end] if has_ckpt else (None,) * n_mamba
         )
         ctx.staged_mamba_products = {
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)

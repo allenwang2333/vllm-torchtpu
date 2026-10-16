@@ -54,6 +54,11 @@ def setup(monkeypatch):
     ):
         monkeypatch.setenv(flag, "0")
     monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", None)
+    # Load-time builds outside the adaptive selection: the small all-reduce
+    # kernels need a real expert-parallel group, and the low-token entry a
+    # full RoutedExperts layer.
+    monkeypatch.setattr(envs, "TPU_SMALL_ALL_REDUCE", False)
+    monkeypatch.setattr(envs, "TPU_MOE_LOWTOK", False)
     monkeypatch.setattr(
         bridge, "build_ep_mesh", lambda: SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
     )
