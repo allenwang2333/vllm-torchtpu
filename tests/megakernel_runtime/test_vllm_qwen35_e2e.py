@@ -489,6 +489,38 @@ def test_prepare_step_metadata_decode_and_verify() -> None:
     assert roff_4.shape == (3, 2)
     assert roff_4[0].tolist() == [2, 1]
 
+    # 3. `roff` is always slot-indexed even when `roff.numel() <= s_raw.shape[0]`.
+    s_padded_32 = torch.zeros((32,), dtype=torch.int32)
+    s_padded_32[0] = 1
+    s_padded_32[1] = 5
+    c_padded_32 = torch.zeros((32, 4), dtype=torch.int32)
+    c_padded_32[0] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    c_padded_32[1] = torch.tensor([5, 6, 7, 8], dtype=torch.int32)
+    roff_small_8 = torch.zeros((8,), dtype=torch.int32)
+    roff_small_8[1] = 2
+    roff_small_8[5] = 1
+    _, _, _, ckpt_small, roff_small = prepare_step_inputs_eager(
+        torch.ones((8,), dtype=torch.int32),
+        torch.zeros((8,), dtype=torch.int32),
+        attn_md.block_tables,
+        s_padded_32,
+        c_padded_32,
+        roff_small_8,
+        s_padded_32,
+        c_padded_32,
+        roff_small_8,
+        s_padded_32,
+        c_padded_32,
+        roff_small_8,
+        bucket_t=8,
+        tokens_per_seq=4,
+        max_pages_per_seq=2,
+        has_roff=True,
+        use_ckpt_2d=True,
+    )
+    assert ckpt_small[0].tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
+    assert roff_small[0].tolist() == [2, 1]
+
 
 def test_block_tables_1d_reshape_most_model_len() -> None:
     """Verify 1-D `block_tables` reshapes by `s0.shape[0]` (`target_num_reqs`) first."""

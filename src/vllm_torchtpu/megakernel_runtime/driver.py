@@ -439,11 +439,8 @@ def prepare_step_inputs_eager(
             else _slice_or_pad_1d(s_raw, nseq_bkt).to(torch.int32)
         )
         if has_roff:
-            if r_raw.numel() > s_raw.shape[0]:
-                s_idx = s_b.to(torch.long).clamp(min=0, max=r_raw.numel() - 1)
-                roff_g = r_raw.reshape(-1)[s_idx].to(torch.int32)
-            else:
-                roff_g = _slice_or_pad_1d(r_raw, nseq_bkt).to(torch.int32)
+            s_idx = s_b.to(torch.long).clamp(min=0, max=r_raw.numel() - 1)
+            roff_g = r_raw.reshape(-1)[s_idx].to(torch.int32)
         else:
             roff_g = torch.zeros_like(s_b)
 
@@ -626,7 +623,15 @@ def _pcp_or_dcp_enabled(runner: Any) -> bool:
 
 
 class MegakernelDriver:
-    """End-to-end Qwen3.5 megakernel driver for `TPUModelRunner`."""
+    """Model-agnostic megakernel runtime driver for `TPUModelRunner`.
+
+    Subclasses (such as `Qwen35Megakernel`) or callers provide the declarative
+    `ModelSpec` and weight packing via `_build_spec` and
+    `_prepare_and_pack_weights` (or by passing `spec` / `weights` directly).
+    """
+
+    _expected_num_layers: int = 60
+    _total_routed_experts: int = 512
 
     def __init__(
         self,
@@ -635,8 +640,10 @@ class MegakernelDriver:
         *,
         tp_rank: int = 0,
         mode: str = "ep",
-        geom: qwen35.Qwen35Geometry | None = None,
+        spec: Any = None,
+        geom: Any = None,
         base_exec: ExecSpec | None = None,
+        weights: dict[str, Any] | None = None,
         buckets: Sequence[int] = _DEFAULT_BUCKETS,
         verify_buckets: Sequence[int] = _DEFAULT_VERIFY_BUCKETS,
         reshard_ep_to_tp: bool = False,
@@ -662,17 +669,10 @@ class MegakernelDriver:
         )
 
         r_cnt = int(mesh.devices.size)
-        if geom is None:
-            e_slots = 0
-            if mode == "ep":
-                w13_0 = get_routed_experts(self.backbone.layers[0].mlp).w13_weight
-                e_slots = int(w13_0.shape[0])
-            geom = qwen35.Qwen35Geometry(
-                moe_tp=(mode == "tp"),
-                e_slots=0 if mode == "tp" else e_slots,
-            )
-        self.geom = geom
-        self.spec = qwen35.qwen35_spec(geom)
+        if spec is None:
+            spec = self._build_spec(mode=mode, r_cnt=r_cnt, geom=geom)
+        self.spec = spec
+        self.geom = spec.config
 
         if base_exec is None:
             base_exec = ExecSpec(
@@ -688,54 +688,14 @@ class MegakernelDriver:
             )
         self.base_exec = base_exec
 
-        if reshard_ep_to_tp and mode == "tp":
-            from vllm.distributed import tensor_model_parallel_all_gather
-
-            from vllm_torchtpu.layers.adapter.fused_moe import (
-                prebuild_fused_moe_kernel,
+        if weights is None:
+            weights = self._prepare_and_pack_weights(
+                mode=mode,
+                reshard_ep_to_tp=reshard_ep_to_tp,
+                expert_placement=expert_placement,
             )
-
-            logger.info(
-                "Resharding Qwen3.5 MoE experts from EP to TP across %d layers "
-                "(rank=%d)...",
-                self.geom.L,
-                self.tp_rank,
-            )
-            for l_idx in range(self.geom.L):
-                reshard_layer_experts_ep_to_tp(
-                    self.backbone.layers[l_idx].mlp,
-                    tp_rank=self.tp_rank,
-                    g=self.geom,
-                    ex=self.base_exec,
-                    all_gather_fn=lambda t: tensor_model_parallel_all_gather(t, dim=0),
-                    prebuild_moe_fn=prebuild_fused_moe_kernel,
-                )
-
-        if expert_placement is None:
-            try:
-                from vllm_torchtpu import (
-                    expert_placement as _ep_mod,  # type: ignore[attr-defined]
-                )
-
-                expert_placement = _ep_mod
-            except ImportError:
-                expert_placement = None
-
-        t0 = time.perf_counter()
-        self.weights = pack_weights(
-            self.backbone,
-            g=self.geom,
-            ex=self.base_exec,
-            tp_rank=self.tp_rank,
-            expert_placement=expert_placement,
-        )
+        self.weights = weights
         self.w_flat: list[torch.Tensor] = self.weights["w_flat"]
-        logger.info(
-            "Packed Qwen3.5 megakernel weights (%d flat tensors, mode=%s) in %.2fs",
-            len(self.w_flat),
-            self.mode,
-            time.perf_counter() - t0,
-        )
 
         default_cfg = parse_megakernel_config()
         self.raw_pools: list[torch.Tensor] = []
@@ -770,6 +730,76 @@ class MegakernelDriver:
             period_s=self._step_mix_period_s,
         )
 
+    def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
+        del r_cnt
+        if geom is None:
+            e_slots = 0
+            if mode == "ep":
+                w13_0 = get_routed_experts(self.backbone.layers[0].mlp).w13_weight
+                e_slots = int(w13_0.shape[0])
+            geom = qwen35.Qwen35Geometry(
+                moe_tp=(mode == "tp"),
+                e_slots=0 if mode == "tp" else e_slots,
+            )
+        return qwen35.qwen35_spec(geom)
+
+    def _prepare_and_pack_weights(
+        self,
+        *,
+        mode: str,
+        reshard_ep_to_tp: bool,
+        expert_placement: Any,
+    ) -> dict[str, Any]:
+        if reshard_ep_to_tp and mode == "tp":
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            from vllm_torchtpu.layers.adapter.fused_moe import (
+                prebuild_fused_moe_kernel,
+            )
+
+            logger.info(
+                "Resharding %s MoE experts from EP to TP across %d layers (rank=%d)...",
+                self.spec.name,
+                self.geom.L,
+                self.tp_rank,
+            )
+            for l_idx in range(self.geom.L):
+                reshard_layer_experts_ep_to_tp(
+                    self.backbone.layers[l_idx].mlp,
+                    tp_rank=self.tp_rank,
+                    g=self.geom,
+                    ex=self.base_exec,
+                    all_gather_fn=lambda t: tensor_model_parallel_all_gather(t, dim=0),
+                    prebuild_moe_fn=prebuild_fused_moe_kernel,
+                )
+
+        if expert_placement is None:
+            try:
+                from vllm_torchtpu import (
+                    expert_placement as _ep_mod,  # type: ignore[attr-defined]
+                )
+
+                expert_placement = _ep_mod
+            except ImportError:
+                expert_placement = None
+
+        t0 = time.perf_counter()
+        weights = pack_weights(
+            self.backbone,
+            g=self.geom,
+            ex=self.base_exec,
+            tp_rank=self.tp_rank,
+            expert_placement=expert_placement,
+        )
+        logger.info(
+            "Packed %s megakernel weights (%d flat tensors, mode=%s) in %.2fs",
+            self.spec.name,
+            len(weights["w_flat"]),
+            self.mode,
+            time.perf_counter() - t0,
+        )
+        return weights
+
     @classmethod
     def maybe_create(cls, runner: Any) -> MegakernelDriver | None:
         """Create a `MegakernelDriver` for `runner` if enabled and compatible."""
@@ -780,49 +810,45 @@ class MegakernelDriver:
             backbone = find_backbone(runner.model)
         except ValueError:
             return None
-        if len(getattr(backbone, "layers", ())) != 60:
+        if len(getattr(backbone, "layers", ())) != cls._expected_num_layers:
             return None
         if not getattr(runner, "_unified_kv_layout", False):
             logger.warning(
-                "Qwen3.5 megakernel requires unified KV+GDN cache layout "
+                "Megakernel requires unified KV+GDN cache layout "
                 "(_unified_kv_layout=True); skipping."
             )
             return None
         if getattr(runner, "supports_mm_inputs", False):
             logger.warning(
-                "Qwen3.5 megakernel requires text-only input_ids "
+                "Megakernel requires text-only input_ids "
                 "(runner.supports_mm_inputs=True passes inputs_embeds; "
                 'pass --limit-mm-per-prompt \'{"image":0,"video":0}\' for '
                 "text-only serving); skipping."
             )
             return None
         if getattr(runner, "lora_config", None) is not None:
-            logger.warning(
-                "Qwen3.5 megakernel does not support LoRA adapters; skipping."
-            )
+            logger.warning("Megakernel does not support LoRA adapters; skipping.")
             return None
         if not getattr(runner, "_pp_is_first", True) or not getattr(
             runner, "_pp_is_last", True
         ):
             logger.warning(
-                "Qwen3.5 megakernel requires single-stage pipeline (PP=1); skipping."
+                "Megakernel requires single-stage pipeline (PP=1); skipping."
             )
             return None
         if _pcp_or_dcp_enabled(runner):
             logger.warning(
-                "Qwen3.5 megakernel does not support prefill/decode context "
+                "Megakernel does not support prefill/decode context "
                 "parallelism (PCP/DCP); skipping."
             )
             return None
         dp_lockstep_fn = getattr(runner, "_dp_lockstep_enabled", None)
         if callable(dp_lockstep_fn) and dp_lockstep_fn():
-            logger.warning(
-                "Qwen3.5 megakernel does not support EP-DP lockstep; skipping."
-            )
+            logger.warning("Megakernel does not support EP-DP lockstep; skipping.")
             return None
         if getattr(backbone, "aux_hidden_state_layers", ()):
             logger.warning(
-                "Qwen3.5 megakernel does not support aux_hidden_state_layers "
+                "Megakernel does not support aux_hidden_state_layers "
                 "(EAGLE-3 target capture); skipping."
             )
             return None
@@ -830,7 +856,7 @@ class MegakernelDriver:
         r_cnt = int(runner.mesh.devices.size)
         if r_cnt != 8:
             logger.warning(
-                "Qwen3.5 megakernel requires 8 TPU devices in mesh, got %d; skipping.",
+                "Megakernel requires 8 TPU devices in mesh, got %d; skipping.",
                 r_cnt,
             )
             return None
@@ -840,7 +866,7 @@ class MegakernelDriver:
         tp_rank = int(get_tensor_model_parallel_rank())
         routed0 = get_routed_experts(backbone.layers[0].mlp)
         w13_0 = routed0.w13_weight
-        loaded_ep = int(w13_0.shape[0]) < 512
+        loaded_ep = int(w13_0.shape[0]) < cls._total_routed_experts
 
         req_mode = str(cfg["mode"]).lower()
         if req_mode not in ("", "ep", "tp"):
@@ -853,7 +879,7 @@ class MegakernelDriver:
         buckets = tuple(cfg["buckets"])
         verify_buckets = tuple(cfg["verify_buckets"])
         if not buckets and not verify_buckets:
-            logger.info("Qwen3.5 megakernel disabled (both bucket lists empty).")
+            logger.info("Megakernel disabled (both bucket lists empty).")
             return None
 
         return cls(
@@ -876,11 +902,17 @@ class MegakernelDriver:
             "runner._unified_kv_layout must be True "
             "(unified KV+GDN cache layout required)",
         )
-        natt = self.geom.NATT
-        g_per_att = self.geom.att_every - 1
+        pb = getattr(self.spec, "pool_backend", None)
+        natt = int(pb.num_pools) if pb is not None else int(self.geom.NATT)
+        g_per_att = (
+            int(pb.recurrent_slots_per_pool)
+            if pb is not None
+            else int(self.geom.att_every - 1)
+        )
+        att_every = g_per_att + 1
         pools: list[torch.Tensor] = []
         for r in range(natt):
-            att_layer = self.backbone.layers[self.geom.att_every * r + g_per_att]
+            att_layer = self.backbone.layers[att_every * r + g_per_att]
             raw = _unwrap(att_layer.self_attn.attn.kv_cache)
             if isinstance(raw, torch.Tensor) and raw.ndim == 6 and raw.shape[0] == 1:
                 raw = raw[0]
@@ -905,7 +937,7 @@ class MegakernelDriver:
                 f"pool[{r}] shape {tuple(pool.shape)} != {expected_shape}",
             )
             for g_idx in range(g_per_att):
-                la_layer = self.backbone.layers[self.geom.att_every * r + g_idx]
+                la_layer = self.backbone.layers[att_every * r + g_idx]
                 la_cache = _unwrap(la_layer.linear_attn.kv_cache)
                 _need(
                     isinstance(la_cache, torch.Tensor)
@@ -1031,7 +1063,8 @@ class MegakernelDriver:
             )
 
         op_name = (
-            f"megakernel_runtime::qwen35_t{tokens_per_seq}_b{bucket_t}_{self.mode}"
+            f"megakernel_runtime::{self.spec.name}_t{tokens_per_seq}"
+            f"_b{bucket_t}_{self.mode}"
         )
         op, _, _, _ = build_pooled_step_op(
             self.mesh,
@@ -1065,7 +1098,6 @@ class MegakernelDriver:
             c1_2d = c1 if c1.ndim == 2 else c1.reshape(-1, 1)
             c2_2d = c2 if c2.ndim == 2 else c2.reshape(-1, 1)
             r_1d = roff.reshape(-1)
-            has_roff = r_1d.numel() > 1
             use_ckpt_2d = c0_2d.shape[1] > 1
             ids_b, pos_b, pt_b, ckpt_b, roff_b = prepare_step_inputs_eager(
                 input_ids,
@@ -1083,7 +1115,7 @@ class MegakernelDriver:
                 bucket_t,
                 tokens_per_seq,
                 max_pages,
-                has_roff,
+                True,
                 use_ckpt_2d,
             )
             hid = embed(ids_b).to(torch.bfloat16)
@@ -1872,13 +1904,18 @@ class MegakernelDriver:
         return False, None
 
 
-Qwen35Megakernel = MegakernelDriver
+class Qwen35Megakernel(MegakernelDriver):
+    """Qwen3.5 (`Qwen3_5MoeForConditionalGeneration`) megakernel driver."""
+
+    _expected_num_layers = 60
+    _total_routed_experts = 512
+
 
 _MODEL_DRIVER_REGISTRY: dict[str, Callable[[Any], Any]] = {
-    "Qwen3_5MoeForConditionalGeneration": MegakernelDriver.maybe_create,
-    "Qwen3_5ForConditionalGeneration": MegakernelDriver.maybe_create,
-    "qwen3_5_moe": MegakernelDriver.maybe_create,
-    "qwen3_5": MegakernelDriver.maybe_create,
+    "Qwen3_5MoeForConditionalGeneration": Qwen35Megakernel.maybe_create,
+    "Qwen3_5ForConditionalGeneration": Qwen35Megakernel.maybe_create,
+    "qwen3_5_moe": Qwen35Megakernel.maybe_create,
+    "qwen3_5": Qwen35Megakernel.maybe_create,
 }
 
 
@@ -1914,5 +1951,5 @@ def maybe_create(runner: Any) -> Any:
         if factory is not None:
             return factory(runner)
     if hf_cfg is None:
-        return MegakernelDriver.maybe_create(runner)
+        return Qwen35Megakernel.maybe_create(runner)
     return None
