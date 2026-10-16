@@ -2078,6 +2078,18 @@ def _attention_kernel(
     def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=None):
         return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True, rows=rows)
 
+    lrows = "lrows" in body_levers and bool(row_widths)
+
+    def fetch_with_width(seq_idx_start, fn):
+        """The KV fetch / wait for the batch at `seq_idx_start`: per width
+        (`with_row_width`), or -- "lrows" -- once, per token live extents
+        clipped at bkv_sz (a token's rounded kv_len never exceeds the step's
+        width, a multiple of 128 at least the step's max kv_len)."""
+        if lrows:
+            fn(bkv_sz)
+        else:
+            with_row_width(seq_idx_start, fn)
+
     def with_row_width(seq_idx_start, fn):
         """`fn(rows)` for the batch at `seq_idx_start`: `rows` the smallest
         of `row_widths` covering every token's kv_len, None (all bkv_sz rows)
@@ -2473,7 +2485,7 @@ def _attention_kernel(
         def prefetch_next_seq():
             sem_ids_ref[0] = next_bi_sem_idx
             start_fetch_bq_batch(next_seq_idx, next_bi_sem_idx)
-            with_row_width(
+            fetch_with_width(
                 next_seq_idx,
                 functools.partial(start_fetch_bkv_batch, next_seq_idx, next_bi_sem_idx),
             )
@@ -2744,9 +2756,12 @@ def _attention_kernel(
         elif row_widths:
 
             def wait_and_run(rows):
-                wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
+                if not lrows:
+                    wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
                 run_steps(rows, tuple(body_levers))
 
+            if lrows:
+                wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, bkv_sz)
             with_row_width(batch_start_seq_idx, wait_and_run)
         else:
             run_steps(None, tuple(body_levers))
@@ -2806,7 +2821,7 @@ def _attention_kernel(
     @pl.when(jnp.logical_and(batch_start_seq_idx == start_seq_idx, has_work))
     def prologue():
         start_fetch_bq_batch(batch_start_seq_idx, 0)
-        with_row_width(
+        fetch_with_width(
             batch_start_seq_idx,
             functools.partial(start_fetch_bkv_batch, batch_start_seq_idx, 0),
         )
