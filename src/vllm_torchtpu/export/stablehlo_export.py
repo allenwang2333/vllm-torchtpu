@@ -1478,19 +1478,23 @@ def maybe_export_or_load_stablehlo(
     return compiled_fn
 
 
-def _compile_options_for(tensor_parallel_size: int) -> dict[str, Any]:
+def _compile_options_for(
+    tensor_parallel_size: int,
+    data_parallel_size: int = 1,
+) -> dict[str, Any]:
     """Returns the `compile_options` object of metadata.json.
 
-    torch_tpu compiles each TP rank's module with `num_partitions` = TP,
-    `replica_count` = 1 and `use_spmd_partitioning` = true (from XLA dumps of TP=1
-    and TP=4 Qwen3-0.6B runs).
+    torch_tpu compiles each rank's module with `num_partitions` = TP,
+    `replica_count` = DP and `use_spmd_partitioning` = true.
     """
     if tensor_parallel_size < 1:
         raise ValueError(
             f"tensor_parallel_size must be >= 1, got {tensor_parallel_size}"
         )
+    if data_parallel_size < 1:
+        raise ValueError(f"data_parallel_size must be >= 1, got {data_parallel_size}")
     return {
-        "num_replicas": 1,
+        "num_replicas": data_parallel_size,
         "num_partitions": tensor_parallel_size,
         "use_spmd_partitioning": True,
     }
@@ -2300,7 +2304,8 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             ),
         }
         meta_dict["compile_options"] = _compile_options_for(
-            meta_dict["config"]["tensor_parallel_size"]
+            meta_dict["config"]["tensor_parallel_size"],
+            meta_dict["config"]["data_parallel_size"],
         )
         _write_abstract_params(export_dir, meta_dict, weights_dict)
         tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
