@@ -56,6 +56,11 @@ def _recording_connector(events: list[str]) -> MagicMock:
     return connector
 
 
+class _RunnerState(SimpleNamespace):
+    _draft_context_only = TPUModelRunner._draft_context_only
+    _scheduled_seq_len = TPUModelRunner._scheduled_seq_len
+
+
 def _fake_runner(method, is_async, verify, propose, fence=False):
     """The runner state sample_tokens reads for one request sampling token 7
     (drafting token 8 when async)."""
@@ -65,7 +70,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         has_structured_output_requests=False,
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
-    runner = SimpleNamespace(
+    runner = _RunnerState(
         _pp_wave=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
@@ -252,15 +257,17 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
     is_async, partial_prefill, proposals_needed, drafter_type
 ):
     events = []
-    propose = MagicMock(
-        side_effect=lambda **kwargs: events.append("draft")
-        or ([torch.tensor([[8]])] if is_async else None)
-    )
+
+    def record_proposal(**kwargs):
+        events.append("draft")
+        return [torch.tensor([[8]])] if is_async else None
+
+    propose = MagicMock(side_effect=record_proposal)
     runner = _fake_runner("mtp", is_async, False, propose)
     drafter = drafter_type.__new__(drafter_type)
     drafter.update_context = MagicMock(side_effect=lambda: events.append("context"))
     runner.drafter = runner._async_drafter = drafter
-    runner._draft_proposals_needed = proposals_needed
+    runner._dp_step_draft_proposals_needed = proposals_needed
     runner.input_batch.generators = {}
     runner._assemble_async_prefill_bootstrap = MagicMock(
         return_value=([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
@@ -304,16 +311,19 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
 
 
 @pytest.mark.parametrize(
-    "is_async,pd_producer,fence",
+    "is_async,pd_producer,fence,proposals_needed",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (False, False, True),
-        (True, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, True),
+        (False, True, False, False),
+        (False, False, True, False),
+        (True, False, True, False),
     ],
 )
-def test_context_only_cache_writes_precede_connector_save(is_async, pd_producer, fence):
+def test_context_only_cache_writes_precede_connector_save(
+    is_async, pd_producer, fence, proposals_needed
+):
     events = []
     propose = MagicMock()
     runner = _fake_runner("mtp", is_async, False, propose, fence=fence)
@@ -321,7 +331,7 @@ def test_context_only_cache_writes_precede_connector_save(is_async, pd_producer,
     drafter.update_context = lambda: events.append("context")
     runner.drafter = runner._async_drafter = drafter
     runner._is_dspark_pd_producer = pd_producer
-    runner._draft_proposals_needed = pd_producer
+    runner._dp_step_draft_proposals_needed = proposals_needed
     runner.input_batch.generators = {}
     runner.requests["r0"].num_tokens = 10
     connector = _recording_connector(events)
@@ -349,7 +359,7 @@ def test_context_only_cache_writes_precede_connector_save(is_async, pd_producer,
     if is_async:
         output = output.get_output()
     assert output.sampled_token_ids == [[]]
-    assert events == ["context"] + (["sync"] if pd_producer or fence else []) + (
+    assert events == ["context"] + (["sync"] if pd_producer else []) + (
         ["rearm"] if fence else []
     ) + ["save", "poll", "clear"]
     propose.assert_not_called()

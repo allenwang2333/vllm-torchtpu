@@ -801,7 +801,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
-        self._draft_proposals_needed = True
+        self._dp_step_draft_proposals_needed = True
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3531,16 +3531,26 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _scheduled_seq_len(self, req_id: str, num_scheduled_tokens: int) -> int:
+        return self.requests[req_id].num_computed_tokens + num_scheduled_tokens
+
     def _needs_draft_proposals(self, scheduler_output: "SchedulerOutput") -> bool:
-        """DFlash/DSpark candidates are useful only once a prompt is complete."""
+        """Propose when at least one request keeps its sampled token."""
         if not isinstance(self.drafter, DFlashProposer):
             return True
-        for req_id, count in scheduler_output.num_scheduled_tokens.items():
-            index = self.input_batch.req_id_to_index[req_id]
-            computed = int(self.input_batch.num_computed_tokens_cpu[index])
-            if computed + count >= int(self.input_batch.num_prompt_tokens[index]):
-                return True
-        return False
+        # Match the partial-request discard predicate in sample_tokens.
+        return any(
+            self._scheduled_seq_len(req_id, count) >= self.requests[req_id].num_tokens
+            for req_id, count in scheduler_output.num_scheduled_tokens.items()
+        )
+
+    @property
+    def _draft_context_only(self) -> bool:
+        """Whether this step's drafter writes context KV without proposing."""
+        return self._is_dspark_pd_producer or (
+            isinstance(self.drafter, DFlashProposer)
+            and not self._dp_step_draft_proposals_needed
+        )
 
     def _dp_coordinated_step(
         self,
@@ -3550,8 +3560,11 @@ class TPUModelRunner(GPUModelRunner):
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
     ) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
-        self._draft_proposals_needed = needs_draft_proposals
+        """Return the DP-wide token bucket and chunk count, and set step metadata.
+
+        The proposal decision is true if any DP rank keeps a sampled token.
+        """
+        self._dp_step_draft_proposals_needed = needs_draft_proposals
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -3581,7 +3594,7 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
-        self._draft_proposals_needed = bool(t[4].item())
+        self._dp_step_draft_proposals_needed = bool(t[4].item())
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3654,13 +3667,11 @@ class TPUModelRunner(GPUModelRunner):
         # Phase 2: pair the context updates or draft forwards on drafter workers.
         if num_chunks > 0 and self._is_async_drafter:
             drafter = self._async_drafter
-            if self._is_dspark_pd_producer or (
-                isinstance(drafter, DFlashProposer) and not self._draft_proposals_needed
-            ):
+            if self._draft_context_only:
                 assert isinstance(drafter, DFlashProposer)
                 # Context-only busy ranks emit no proposal collectives.
                 drafter.run_dp_dummy_context(num_chunks)
-                if self._is_dspark_pd_producer or self._fence_spec_kv_under_token_copy:
+                if self._is_dspark_pd_producer:
                     synchronize_tensors()
             else:
                 drafter.run_dp_dummy_draft(num_chunks)
@@ -4827,9 +4838,8 @@ class TPUModelRunner(GPUModelRunner):
         for i, req_id in enumerate(req_ids):
             assert req_id is not None
             req_state = self.requests[req_id]
-            seq_len = (
-                req_state.num_computed_tokens
-                + scheduler_output.num_scheduled_tokens[req_id]
+            seq_len = self._scheduled_seq_len(
+                req_id, scheduler_output.num_scheduled_tokens[req_id]
             )
             # Ignore the sampled token from the partial request.
             # Rewind the generator state as if the token was not sampled.
@@ -4870,15 +4880,10 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
-        context_only_draft = (
-            self._is_async_drafter
-            and isinstance(self.drafter, DFlashProposer)
-            and not self._draft_proposals_needed
-        )
+        context_only_draft = self._draft_context_only
         if (
             self._is_async_drafter
             and combined_selected_tokens
-            and not self._is_dspark_pd_producer
             and not context_only_draft
         ):
             if is_spec_step:
@@ -4929,13 +4934,13 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
-        if self._is_dspark_pd_producer or context_only_draft:
+        if context_only_draft:
             assert isinstance(self.drafter, DFlashProposer)
             with self._stage_timing.stage("draft_context_update"):
                 self.drafter.update_context()
-            # Materialize deferred cache writes before a producer publishes
-            # its handoff or its sampled-token copy.
-            if self._is_dspark_pd_producer or self._fence_spec_kv_under_token_copy:
+            # PD handoff needs materialized context KV. Register-ahead only
+            # publishes at prompt completion, when proposals run again.
+            if self._is_dspark_pd_producer:
                 synchronize_tensors()
 
         if copy_state is not None and self._fence_spec_kv_under_token_copy:
