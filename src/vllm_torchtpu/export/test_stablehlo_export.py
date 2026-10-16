@@ -1987,3 +1987,412 @@ def test_generic_dynamo_placeholder_and_packed_module_reflection() -> None:
     assert specs[8]["weight_name"] == "model.layers.0.mlp.gate_up_proj.weight"
     assert len(specs[8]["sources"]) == 2
     stablehlo_export.register_active_model(None)
+
+
+def test_multi_rank_writer_guard_sampling_bucket_union_and_mtp_draft_collision_free_indices(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    export_dir = tmp_path / "export_mtp_and_buckets"
+    monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
+    monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
+
+    # 1. _split_fn_key and _compute_fn_key for mtp_draft
+    assert stablehlo_export._split_fn_key("mtp_draft_bucket16") == ("mtp_draft", "16")
+    draft_adaptor = TpuCompilerAdaptor()
+    draft_adaptor.cache_dir = "/tmp/cache/eagle_head"
+    assert (
+        stablehlo_export._compute_fn_key(Range(16, 16), 0, draft_adaptor)
+        == "mtp_draft_bucket16"
+    )
+
+    # 2. Collision-free global weight indices across forward and mtp_draft
+    fwd_mlir = (
+        "module @fwd { func.func public @main("
+        "%arg0: tensor<16xi32>, %arg1: tensor<16x8xbf16>, %arg2: tensor<8x8xbf16>"
+        ") -> (tensor<16x8xbf16>) { return %arg1 : tensor<16x8xbf16> } }"
+    )
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="forward_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=fwd_mlir,
+        input_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "input_ids",
+                "shape": [16],
+                "dtype": "int32",
+                "argument_type": "user_io",
+                "is_weight": False,
+            },
+            {
+                "arg_index": 1,
+                "index": 1,
+                "name": "model.embed_tokens.weight",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "weight",
+                "is_weight": True,
+                "weight_name": "model.embed_tokens.weight",
+            },
+            {
+                "arg_index": 2,
+                "index": 2,
+                "name": "model.layers.0.self_attn.o_proj.weight",
+                "shape": [8, 8],
+                "dtype": "bfloat16",
+                "argument_type": "weight",
+                "is_weight": True,
+                "weight_name": "model.layers.0.self_attn.o_proj.weight",
+            },
+        ],
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "hidden_states",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "user_io",
+            }
+        ],
+    )
+
+    # Now export mtp_draft_bucket16 where arg_index=1 is shared (embed_tokens)
+    # and arg_index=2 is a new MTP weight (mtp.fc.weight) whose arg_index=2
+    # collides with forward_bucket16's o_proj.weight index=2!
+    draft_mlir = (
+        "module @draft { func.func public @main("
+        "%arg0: tensor<16xi32>, %arg1: tensor<16x8xbf16>, %arg2: tensor<16x8xbf16>"
+        ") -> (tensor<16x1xi32>) { "
+        "%c = stablehlo.constant dense<0> : tensor<16x1xi32> "
+        "return %c : tensor<16x1xi32> } }"
+    )
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="mtp_draft_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=draft_mlir,
+        input_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "input_ids",
+                "shape": [16],
+                "dtype": "int32",
+                "argument_type": "user_io",
+                "is_weight": False,
+            },
+            {
+                "arg_index": 1,
+                "index": 1,
+                "name": "model.embed_tokens.weight",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "weight",
+                "is_weight": True,
+                "weight_name": "model.embed_tokens.weight",
+            },
+            {
+                "arg_index": 2,
+                "index": 2,
+                "name": "model.mtp.fc.weight",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "argument_type": "weight",
+                "is_weight": True,
+                "weight_name": "model.mtp.fc.weight",
+            },
+        ],
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "draft_tokens",
+                "shape": [16, 1],
+                "dtype": "int32",
+                "argument_type": "user_io",
+            }
+        ],
+    )
+
+    wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
+    assert wj["model.embed_tokens.weight"]["index"] == 1
+    assert wj["model.layers.0.self_attn.o_proj.weight"]["index"] == 2
+    assert wj["model.mtp.fc.weight"]["index"] == 3
+
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    draft_inputs = meta["functions"]["mtp_draft"]["16"]["inputs"]
+    assert draft_inputs[1]["arg_index"] == 1
+    assert draft_inputs[1]["index"] == 1
+    assert draft_inputs[2]["arg_index"] == 2
+    assert draft_inputs[2]["index"] == 3
+
+    # 3. Non-writer rank (RANK=1) must not overwrite or exit in maybe_export_sampling_subgraphs
+    class MockModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lm_head = torch.nn.Linear(8, 32, bias=False, dtype=torch.bfloat16)
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    class MockRunner:
+        def __init__(self) -> None:
+            self.model = MockModel()
+            self._greedy_head_owner = MagicMock()
+            # num_reqs_paddings only has [1, 8], while forward_bucket16 has bucket 16
+            self.num_reqs_paddings = [1, 8]
+            self.num_tokens_paddings = [16]
+            self.model_config = MagicMock()
+            self.model_config.get_hidden_size.return_value = 8
+            self.model_config.vocab_size = 32
+            self.model_config.max_model_len = 2048
+            self.model_config.eos_token_id = 2
+            self.parallel_config = MagicMock()
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.data_parallel_size = 4
+            self.cache_config = MagicMock()
+            self.cache_config.block_size = 16
+            self.cache_config.num_gpu_blocks = 256
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    monkeypatch.setenv("RANK", "1")
+    stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+    meta_after_rank1 = json.loads((export_dir / "metadata.json").read_text())
+    assert "sample_top_tokens" not in meta_after_rank1["functions"]
+
+    # 4. Writer rank (RANK=0) exports sampling subgraphs for union of num_reqs_paddings
+    # and forward buckets ([1, 8, 16]) and records data_parallel_size=4
+    monkeypatch.setenv("RANK", "0")
+
+    def _fake_fx_to_mlir(gm: Any, args: list[Any], **_kw: Any) -> Any:
+        n = int(args[0].shape[0])
+        m = MagicMock()
+        m.is_noop = False
+        m.module = MagicMock()
+        m.serialize_text.return_value = (
+            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
+            f"%arg1: tensor<32x8xbf16>) -> tensor<{n}x1xi64> {{ "
+            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
+            f"return %0 : tensor<{n}x1xi64> }} }}"
+        )
+        return m
+
+    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+
+    meta_final = json.loads((export_dir / "metadata.json").read_text())
+    assert set(meta_final["functions"]["sample_top_tokens"].keys()) == {"1", "8", "16"}
+    assert set(meta_final["functions"]["compute_logits"].keys()) == {"1", "8", "16"}
+    assert meta_final["config"]["data_parallel_size"] == 4
+
+
+def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify AOT `arg{K}_1` outer mapping, uppercase Dynamo `L_`/`G_` names, and dummy HF snapshots."""
+    export_dir = tmp_path / "export_qwen_aot"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    monkeypatch.setattr(stablehlo_export.envs, "VLLM_TORCHTPU_LOAD_HLO_DIR", "")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    class _FakeSymInt:
+        pass
+
+    _FakeSymInt.__name__ = "SymInt"
+
+    # Outer Dynamo FX graph with SymInt at index 1 and uppercase L_/G_ names
+    outer_g = fx.Graph()
+    outer_names = [
+        "L_input_ids_",
+        "s72",
+        "L_self_modules_embed_tokens_parameters_weight_",
+        "L_self_modules_layers_modules_0_modules_input_layernorm_parameters_weight_",
+        "L_positions_",
+        "L_self_modules_layers_modules_0_modules_self_attn_modules_rotary_emb_buffers_cos_sin_cache_",
+        "L_self_modules_layers_modules_0_modules_self_attn_modules_attn_kv_cache",
+        "G_import_vllm_dot_forward_context_forward_context_attn_metadata_model_layers_0_self_attn_attn_seq_lens",
+        "G_import_vllm_dot_forward_context_forward_context_attn_metadata_model_layers_0_self_attn_attn_block_tables",
+        "G_import_vllm_dot_forward_context_forward_context_attn_metadata_model_layers_0_self_attn_attn_query_start_loc",
+        "G_import_vllm_dot_forward_context_forward_context_attn_metadata_model_layers_0_self_attn_attn_request_distribution",
+    ]
+    outer_phs = [outer_g.placeholder(n) for n in outer_names]
+    outer_g.output((outer_phs[6], outer_phs[0]))
+    outer_gm = fx.GraphModule(torch.nn.Module(), outer_g)
+    for ph, n in zip(outer_gm.graph.nodes, outer_names):
+        if ph.op == "placeholder":
+            ph.name = n
+            ph.target = n
+
+    outer_inputs: list[Any] = [
+        torch.zeros((16,), dtype=torch.int32),
+        _FakeSymInt(),
+        torch.zeros((32, 8), dtype=torch.bfloat16),
+        torch.zeros((8,), dtype=torch.bfloat16),
+        torch.zeros((16,), dtype=torch.int32),
+        torch.zeros((64, 4), dtype=torch.bfloat16),
+        torch.zeros((128, 16, 2, 2, 4), dtype=torch.bfloat16),
+        torch.zeros((8,), dtype=torch.int32),
+        torch.zeros((128,), dtype=torch.int32),
+        torch.zeros((9,), dtype=torch.int32),
+        torch.zeros((3,), dtype=torch.int32),
+    ]
+
+    # Inner AOT graph skips arg1_1 (SymInt) and reorders arg5_1 (cos_sin_cache) before arg4_1 (positions)
+    inner_g = fx.Graph()
+    inner_order = [0, 2, 3, 5, 4, 6, 7, 8, 9, 10]
+    inner_phs = [inner_g.placeholder(f"arg{k}_1") for k in inner_order]
+    inner_g.output((inner_phs[5], inner_phs[0]))
+    inner_gm = fx.GraphModule(torch.nn.Module(), inner_g)
+    inner_args = [outer_inputs[k] for k in inner_order]
+
+    specs = stablehlo_export._extract_input_specs(
+        inner_gm, inner_args, outer_graph=outer_gm, outer_inputs=outer_inputs
+    )
+    assert len(specs) == 10
+    assert specs[0]["name"] == "input_ids"
+    assert specs[0]["argument_type"] == "user_io"
+    assert specs[1]["name"] == "model.embed_tokens.weight"
+    assert specs[1]["argument_type"] == "weight"
+    assert specs[1]["is_weight"] is True
+    assert specs[2]["name"] == "model.layers.0.input_layernorm.weight"
+    assert specs[2]["argument_type"] == "weight"
+    assert specs[3]["name"] == "rotary_emb_inv_freq"
+    assert specs[3]["argument_type"] == "weight"
+    assert specs[3]["is_internal_constant"] is True
+    assert specs[4]["name"] == "positions"
+    assert specs[4]["argument_type"] == "user_io"
+    assert specs[5]["name"] == "kv_cache_layer_0"
+    assert specs[5]["argument_type"] == "state"
+    assert specs[6]["name"] == "kv_lens"
+    assert specs[7]["name"] == "block_tables"
+    assert specs[8]["name"] == "query_start_loc"
+    assert specs[9]["name"] == "req_dist"
+
+    # Verify _write_exported_module labels donor state outputs and final hidden_states output
+    fwd_mlir = (
+        "module @fwd {\n"
+        "  func.func public @main(\n"
+        "    %arg0: tensor<16xi32>,\n"
+        "    %arg1: tensor<32x8xbf16>,\n"
+        "    %arg2: tensor<8xbf16>,\n"
+        "    %arg3: tensor<64x4xbf16>,\n"
+        "    %arg4: tensor<16xi32>,\n"
+        "    %arg5: tensor<128x16x2x2x4xbf16> {tf.aliasing_output = 0 : i32, mhlo.sharding = \"{replicated}\", jax.buffer_donor = true},\n"
+        "    %arg6: tensor<8xi32>,\n"
+        "    %arg7: tensor<128xi32>,\n"
+        "    %arg8: tensor<9xi32>,\n"
+        "    %arg9: tensor<3xi32>\n"
+        "  ) -> (tensor<128x16x2x2x4xbf16>, tensor<16x8xbf16>) {\n"
+        "    %0 = stablehlo.constant dense<0.0> : tensor<16x8xbf16>\n"
+        "    return %arg5, %0 : tensor<128x16x2x2x4xbf16>, tensor<16x8xbf16>\n"
+        "  }\n"
+        "}\n"
+    )
+    stablehlo_export._write_exported_module(
+        export_dir=export_dir,
+        fn_key="forward_bucket16",
+        subgraph_idx=0,
+        compile_size=16,
+        mlir_text=fwd_mlir,
+        input_specs=specs,
+        output_specs=[
+            {
+                "arg_index": 0,
+                "index": 0,
+                "name": "output_0",
+                "shape": [128, 16, 2, 2, 4],
+                "dtype": "bfloat16",
+                "sharding": None,
+                "argument_type": "user_io",
+                "buffer_donor": False,
+            },
+            {
+                "arg_index": 1,
+                "index": 1,
+                "name": "output_1",
+                "shape": [16, 8],
+                "dtype": "bfloat16",
+                "sharding": None,
+                "argument_type": "user_io",
+                "buffer_donor": False,
+            },
+        ],
+    )
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    fwd_entry = meta["functions"]["forward"]["16"]
+    assert fwd_entry["inputs"][5]["buffer_donor"] is True
+    assert fwd_entry["inputs"][5]["argument_type"] == "state"
+    assert fwd_entry["inputs"][5]["index"] == 0
+    assert fwd_entry["outputs"][0]["name"] == "kv_cache_out_layer_0"
+    assert fwd_entry["outputs"][0]["argument_type"] == "state"
+    assert fwd_entry["outputs"][1]["name"] == "hidden_states"
+    assert fwd_entry["outputs"][1]["argument_type"] == "intermediate"
+
+    # Verify dummy-load HF cache snapshot (with config.json & tokenizer.json but no *.safetensors) is copied
+    fake_hf_home = tmp_path / "hf_cache"
+    snap = fake_hf_home / "hub" / "models--Qwen--Qwen3-0.6B" / "snapshots" / "dummy_hash"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text('{"vocab_size": 32}')
+    (snap / "tokenizer.json").write_text('{"version": "1.0"}')
+    monkeypatch.setenv("HF_HOME", str(fake_hf_home))
+
+    class DummyRunner:
+        def __init__(self) -> None:
+            self.model = torch.nn.Module()
+            self.model.lm_head = torch.nn.Linear(8, 32, bias=False, dtype=torch.bfloat16)
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [8]
+            self.num_tokens_paddings = [16]
+            self.model_config = MagicMock()
+            self.model_config.model = "Qwen/Qwen3-0.6B"
+            self.model_config.get_hidden_size.return_value = 8
+            self.model_config.vocab_size = 32
+            self.model_config.max_model_len = 2048
+            self.model_config.eos_token_id = 2
+            self.parallel_config = MagicMock()
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 1
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.data_parallel_size = 1
+            self.cache_config = MagicMock()
+            self.cache_config.block_size = 16
+            self.cache_config.num_gpu_blocks = 128
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    def _fake_fx_to_mlir_2(gm: Any, args: list[Any], **_kw: Any) -> Any:
+        n = int(args[0].shape[0])
+        m = MagicMock()
+        m.is_noop = False
+        m.module = MagicMock()
+        m.serialize_text.return_value = (
+            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
+            f"%arg1: tensor<32x8xbf16>) -> tensor<{n}x1xi64> {{ "
+            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
+            f"return %0 : tensor<{n}x1xi64> }} }}"
+        )
+        return m
+
+    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir_2):
+        stablehlo_export.maybe_export_sampling_subgraphs(DummyRunner())
+
+    assert (export_dir / "config.json").is_file()
+    assert (export_dir / "tokenizer.json").is_file()
+    assert (export_dir / "serving_checkpoint" / "constants.safetensors").is_file()
+    wj_final = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
+    assert "model.embed_tokens.weight" in wj_final
+    assert "rotary_emb_inv_freq" in wj_final
+    assert "lm_head.weight" in wj_final
+
+
