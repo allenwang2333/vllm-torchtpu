@@ -5203,6 +5203,7 @@ class TPUModelRunner(GPUModelRunner):
                         "qnorm_rope_op",
                         "kv_rope_op",
                         "o_proj_op",
+                        "o_proj_pair_op",
                     ):
                         if hasattr(type(module), op_name):
                             _ = getattr(module, op_name)

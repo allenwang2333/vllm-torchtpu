@@ -416,3 +416,144 @@ def fused_reverse_rope_wo_a_projection(
         quantize_activations=quantize_activations,
         name=name,
     )
+
+
+def _pair_kernel(
+    first_ref: jax.Ref,  # VMEM (T, gps * H, head_dim) bf16, tokens [0, T)
+    second_ref: jax.Ref,  # VMEM (T, gps * H, head_dim) bf16, tokens [T, 2T)
+    w_ref: jax.Ref,  # VMEM (D, gps * tile_r) fp8
+    scale_ref: jax.Ref,  # VMEM (1, gps * tile_r) f32
+    cos_sin_ref: jax.Ref,  # VMEM (2T, 2 * LANE) f32
+    out_ref: jax.Ref,  # VMEM (2T, gps * tile_r)
+    *,
+    sub_t: int,
+    head_dim: int,
+    groups_per_step: int,
+) -> None:
+    """`_kernel` over one 2T-token tile whose rows live in two refs.
+
+    Each sub-tile takes the same rows `_kernel` would, assembled from whichever
+    ref holds them, so every dot sees the same operands.
+    """
+    num_tokens = first_ref.shape[0]
+    cos_sin = cos_sin_ref[...]
+    out_dtype = first_ref.dtype
+    heads = first_ref.shape[1] // groups_per_step
+    cols = w_ref.shape[1] // groups_per_step
+    for j in range(groups_per_step):
+        rhs = w_ref[:, pl.ds(j * cols, cols)]
+        scale = scale_ref[:, pl.ds(j * cols, cols)]
+        for s in range(2 * num_tokens // sub_t):
+            r0, r1 = s * sub_t, (s + 1) * sub_t
+            pieces = []
+            if r0 < num_tokens:
+                pieces.append(
+                    first_ref[r0 : min(r1, num_tokens), pl.ds(j * heads, heads)]
+                )
+            if r1 > num_tokens:
+                pieces.append(
+                    second_ref[
+                        max(r0, num_tokens) - num_tokens : r1 - num_tokens,
+                        pl.ds(j * heads, heads),
+                    ]
+                )
+            x = pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces, axis=0)
+            x = _rope_heads(x, cos_sin[r0:r1], head_dim=head_dim)
+            x = x.reshape(sub_t, -1)
+            amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+            inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
+                jnp.bfloat16
+            )
+            lhs = (x * inv).astype(jnp.float8_e4m3fn)
+            partial = jax.lax.dot_general(
+                lhs,
+                rhs,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            partial = partial * (1.0 / inv.astype(jnp.float32))
+            out_ref[r0:r1, pl.ds(j * cols, cols)] = (partial * scale).astype(out_dtype)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "first_row0",
+        "first_head0",
+        "second_row0",
+        "second_head0",
+        "num_heads",
+        "head_dim",
+        "inverse",
+        "name",
+    ),
+)
+def fused_reverse_rope_wo_a_projection_pair(
+    first: jax.Array,  # [R, heads, head_dim] bf16
+    second: jax.Array,  # [R', heads', head_dim] bf16
+    positions: jax.Array,  # [2T] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    wo_a: jax.Array,  # [D, G * R] fp8
+    wo_a_scale: jax.Array,  # [G * R] float32
+    *,
+    first_row0: int,
+    first_head0: int,
+    second_row0: int,
+    second_head0: int,
+    num_heads: int,
+    head_dim: int,
+    inverse: bool = True,
+    name: str = "wo_a_projection",
+) -> jax.Array:
+    """``fused_reverse_rope_wo_a_projection`` (activation-quantized) of the
+    [2T, G*H, head_dim] input whose tokens [0, T) are
+    ``first[first_row0 + t, first_head0 + h]`` and tokens [T, 2T) are
+    ``second[second_row0 + t, second_head0 + h]``, both read in place.
+    Bit-identical to the fused op on the assembled input, for 2T <= 1024.
+    """
+    num_tokens = positions.shape[0] // 2
+    reduction, out_features = wo_a.shape
+    assert reduction % head_dim == 0 and reduction // head_dim == SUBLANE
+    total = 2 * num_tokens
+    assert total <= 1024, "the pair kernel assumes a single token tile"
+    assert num_heads % SUBLANE == 0
+    num_groups = num_heads // SUBLANE
+    assert out_features % num_groups == 0
+    lora_rank = out_features // num_groups
+    # The fused op's tiling at 2T tokens: one token tile, sub-tiles of
+    # largest_divisor(2T, 128), and two groups per grid step up to 512 tokens.
+    sub_t = _largest_divisor(total, cap=128)
+    gps = 2 if total <= 512 and num_groups % 2 == 0 else 1
+    width = gps * SUBLANE
+    for row0, head0 in ((first_row0, first_head0), (second_row0, second_head0)):
+        assert row0 % num_tokens == 0 and head0 % width == 0
+    f_tile, f_head = first_row0 // num_tokens, first_head0 // width
+    s_tile, s_head = second_row0 // num_tokens, second_head0 // width
+
+    cos_sin = gather_cos_sin(
+        positions, cos_sin_cache, inverse=inverse, name=f"{name}_gather_cos_sin"
+    )
+    return pl.pallas_call(
+        functools.partial(
+            _pair_kernel, sub_t=sub_t, head_dim=head_dim, groups_per_step=gps
+        ),
+        out_shape=jax.ShapeDtypeStruct((total, out_features), first.dtype),
+        grid=(num_groups // gps,),
+        in_specs=[
+            pl.BlockSpec(
+                (num_tokens, width, head_dim), lambda g: (f_tile, f_head + g, 0)
+            ),
+            pl.BlockSpec(
+                (num_tokens, width, head_dim), lambda g: (s_tile, s_head + g, 0)
+            ),
+            pl.BlockSpec((reduction, gps * lora_rank), lambda g: (0, g)),
+            pl.BlockSpec((1, gps * lora_rank), lambda g: (0, g)),
+            pl.BlockSpec((total, 2 * LANE), lambda g: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((total, gps * lora_rank), lambda g: (0, g)),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(first, second, wo_a, wo_a_scale.reshape(1, out_features), cos_sin)
