@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""StableHLO (.mlir) model export and save-load round-trip pipeline (RFC 0001).
+"""StableHLO (.mlir) model export and save-load round-trip pipeline.
 
 External entry points (called outside `vllm_torchtpu/export/`):
 1. `update_hash_with_loaded_hlo(hash_obj)` — `tpu_compiler.py`
-2. `maybe_export_or_load_stablehlo(adaptor, graph, example_inputs, compile_range, key)` — `tpu_compiler.py`
+2. `maybe_export_or_load_stablehlo(...)` — `tpu_compiler.py`
 3. `_install_warmup_early_exit_hook(vllm_config)` — `tpu_platform.py`
 4. `register_active_model(model)` — `tpu_runner.py`
 5. `maybe_export_sampling_subgraphs(runner)` — `tpu_runner.py`
@@ -55,6 +55,7 @@ _MLIR_DTYPE_TO_TORCH_NAME = {
     "f8E4M3FN": "float8_e4m3fn",
     "f8E5M2": "float8_e5m2",
 }
+_TORCH_NAME_TO_MLIR_DTYPE = {v: k for k, v in _MLIR_DTYPE_TO_TORCH_NAME.items()}
 _TORCH_TENSOR_DTYPES = set(_MLIR_DTYPE_TO_TORCH_NAME.values())
 
 _ALLOWED_CUSTOM_CALL_TARGETS = frozenset(
@@ -182,6 +183,42 @@ def _compute_fn_key(compile_range: Range, subgraph_idx: int) -> str:
     return f"forward_piece{subgraph_idx}_bucket{compile_range.start}"
 
 
+def _split_fn_key(fn_key: str) -> tuple[str, str]:
+    if fn_key == "abstract_params":
+        return "abstract_params", "default"
+    m = re.match(r"^(forward(?:_piece\d+)?)_bucket(\d+)$", fn_key)
+    if m:
+        return m.group(1), m.group(2)
+    for prefix in ("compute_logits", "sample_top_tokens"):
+        if fn_key.startswith(f"{prefix}_req"):
+            return prefix, fn_key.removeprefix(f"{prefix}_req")
+    return fn_key, "default"
+
+
+def _get_function_entry(metadata: dict[str, Any], fn_key: str) -> dict[str, Any] | None:
+    fn_name, variant_key = _split_fn_key(fn_key)
+    functions = metadata.get("functions")
+    if isinstance(functions, dict):
+        variants = functions.get(fn_name)
+        if isinstance(variants, dict):
+            entry = variants.get(variant_key)
+            if isinstance(entry, dict):
+                return entry
+    return None
+
+
+def _iter_forward_entries(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    functions = metadata.get("functions")
+    if isinstance(functions, dict):
+        for fn_name, variants in functions.items():
+            if fn_name.startswith("forward") and isinstance(variants, dict):
+                for entry in variants.values():
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+    return entries
+
+
 def _get_target_hardware_fingerprint() -> dict[str, str | None]:
     fingerprint: dict[str, str | None] = {"chip_type": envs.TPU_ACCELERATOR_TYPE}
     for pkg_key, dist_name in (
@@ -223,7 +260,7 @@ def _parse_mlir_main_args(args_str: str) -> list[tuple[list[int | str], str, boo
 def _resolve_dynamo_placeholder(
     raw_name: str, model: Any = None
 ) -> tuple[str, bool, str, bool]:
-    """Resolve a TorchDynamo placeholder name into (canonical_name, is_weight, arg_type, is_const)."""
+    """Resolve a TorchDynamo placeholder into (name, is_weight, arg_type, is_const)."""
     if not raw_name:
         return "", False, "user_io", False
     m = re.match(
@@ -276,7 +313,7 @@ def _resolve_dynamo_placeholder(
 def _build_generic_weight_sources(
     weight_name: str, shape: list[int | str], model: Any = None
 ) -> list[dict[str, Any]] | None:
-    """Build RFC 0001 declarative `sources` by inspecting `model` submodules and `packed_modules_mapping`."""
+    """Build declarative `sources` from `model` and `packed_modules_mapping`."""
     int_shape = [int(d) for d in shape if isinstance(d, int)]
     if not weight_name or not int_shape:
         return None
@@ -475,8 +512,9 @@ def _extract_input_specs(
                 else None,
             ):
                 if (
-                    isinstance(cand_v, torch.Tensor)
-                    and type(cand_v).__name__ != "FakeTensor"
+                    cand_v is not None
+                    and isinstance(cand_v, torch.Tensor)
+                    and cand_v.__class__.__name__ != "FakeTensor"
                 ):
                     with contextlib.suppress(Exception):
                         for ptr in (
@@ -531,16 +569,16 @@ def _extract_input_specs(
 
         shape_list = _shape_to_list(val)
         spec_entry: dict[str, Any] = {
+            "arg_index": idx,
             "index": idx,
             "name": weight_name if is_weight and weight_name else resolved_node_name,
             "shape": shape_list,
             "dtype": _dtype_name(val),
             "sharding": _extract_sharding_spec(node or outer_node, val),
+            "argument_type": "weight" if is_weight else arg_type,
             "is_weight": is_weight,
             "weight_name": weight_name,
         }
-        if outer_node is not None or is_weight or arg_type != "user_io":
-            spec_entry["argument_type"] = "weight" if is_weight else arg_type
         if is_const:
             spec_entry["is_internal_constant"] = True
         if is_weight and weight_name:
@@ -563,11 +601,14 @@ def _extract_output_specs(
     if result_tensors:
         return [
             {
+                "arg_index": idx,
                 "index": idx,
                 "name": f"output_{idx}",
                 "shape": _shape_to_list(val),
                 "dtype": _dtype_name(val),
                 "sharding": _extract_sharding_spec(None, val),
+                "argument_type": "user_io",
+                "buffer_donor": False,
             }
             for idx, val in enumerate(result_tensors)
         ]
@@ -591,14 +632,99 @@ def _extract_output_specs(
                 val = val[idx]
         specs.append(
             {
+                "arg_index": idx,
                 "index": idx,
                 "name": node.name if node is not None else f"output_{idx}",
                 "shape": _shape_to_list(val),
                 "dtype": _dtype_name(val),
                 "sharding": _extract_sharding_spec(node or out_node, val),
+                "argument_type": "user_io",
+                "buffer_donor": False,
             }
         )
     return specs
+
+
+def _write_abstract_params(
+    export_dir: Path, metadata: dict[str, Any], weights_dict: dict[str, Any]
+) -> None:
+    """Emit `abstract_params.mlir` and register `functions.abstract_params.default`."""
+    sorted_weights = sorted(
+        (item for item in weights_dict.items() if isinstance(item[1], dict)),
+        key=lambda item: (int(item[1].get("index", 0)), item[0]),
+    )
+    arg_decls: list[str] = []
+    ret_types: list[str] = []
+    ret_vals: list[str] = []
+    abs_inputs: list[dict[str, Any]] = []
+    abs_outputs: list[dict[str, Any]] = []
+    for arg_idx, (w_name, w_spec) in enumerate(sorted_weights):
+        shape = [int(d) for d in w_spec.get("shape", []) if isinstance(d, int)]
+        dtype_str = str(w_spec.get("dtype", "bfloat16"))
+        mlir_dtype = _TORCH_NAME_TO_MLIR_DTYPE.get(dtype_str, "bf16")
+        dims_str = "x".join(str(d) for d in shape)
+        tensor_type = (
+            f"tensor<{dims_str}x{mlir_dtype}>" if dims_str else f"tensor<{mlir_dtype}>"
+        )
+        arg_decls.append(f"%arg{arg_idx}: {tensor_type} {{jax.buffer_donor = true}}")
+        ret_types.append(tensor_type)
+        ret_vals.append(f"%arg{arg_idx}")
+        global_idx = int(w_spec.get("index", arg_idx))
+        abs_inputs.append(
+            {
+                "arg_index": arg_idx,
+                "index": global_idx,
+                "name": w_name,
+                "shape": shape,
+                "dtype": dtype_str,
+                "sharding": w_spec.get("sharding"),
+                "argument_type": "weight",
+                "is_weight": True,
+                "weight_name": w_name,
+                "buffer_donor": True,
+            }
+        )
+        abs_outputs.append(
+            {
+                "arg_index": arg_idx,
+                "index": global_idx,
+                "name": f"out_{arg_idx}",
+                "shape": shape,
+                "dtype": dtype_str,
+                "sharding": w_spec.get("sharding"),
+                "argument_type": "weight",
+                "buffer_donor": False,
+            }
+        )
+
+    args_joined = ", ".join(arg_decls)
+    rets_joined = ", ".join(ret_types)
+    vals_joined = ", ".join(ret_vals)
+    if ret_types:
+        ret_sig = f"({rets_joined})"
+        body_line = f"    return {vals_joined} : {rets_joined}\n"
+    else:
+        ret_sig = "()"
+        body_line = "    return\n"
+
+    mlir_text = (
+        "module @jit_abstract_params {\n"
+        f"  func.func public @main({args_joined}) -> {ret_sig} {{\n"
+        f"{body_line}"
+        "  }\n"
+        "}\n"
+    )
+    (export_dir / "abstract_params.mlir").write_text(mlir_text)
+    metadata.setdefault("functions", {})["abstract_params"] = {
+        "default": {
+            "file_path": "abstract_params.mlir",
+            "subgraph_index": 0,
+            "compile_size": 0,
+            "target_hardware": _get_target_hardware_fingerprint(),
+            "inputs": abs_inputs,
+            "outputs": abs_outputs,
+        }
+    }
 
 
 def _write_exported_module(
@@ -610,7 +736,7 @@ def _write_exported_module(
     input_specs: list[dict[str, Any]],
     output_specs: list[dict[str, Any]],
 ) -> Path:
-    """Persist `<fn_key>.mlir`, `metadata.json`, and `serving_checkpoint/weight.json`."""
+    """Persist `<fn_key>.mlir`, `metadata.json`, and `weight.json`."""
     export_dir.mkdir(parents=True, exist_ok=True)
     mlir_filename = f"{fn_key}.mlir"
     mlir_path = export_dir / mlir_filename
@@ -625,25 +751,26 @@ def _write_exported_module(
             raise ValueError(f"Corrupt metadata.json in {export_dir}: {exc}") from exc
 
     annotated_inputs = [dict(inp) for inp in input_specs]
+    for arg_idx, spec in enumerate(annotated_inputs):
+        spec.setdefault("arg_index", arg_idx)
+        spec.setdefault("index", arg_idx)
+        spec.setdefault(
+            "argument_type", "weight" if spec.get("is_weight") else "user_io"
+        )
+        spec.setdefault("buffer_donor", False)
+
     match = re.search(r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)\s*->", mlir_text)
     if match is not None:
         mlir_args = _parse_mlir_main_args(match.group(1))
         if len(mlir_args) == len(annotated_inputs):
             for spec, (_, _, is_donor) in zip(annotated_inputs, mlir_args):
                 spec["buffer_donor"] = is_donor
-
-    metadata[fn_key] = {
-        "file_path": mlir_filename,
-        "subgraph_index": subgraph_idx,
-        "compile_size": compile_size,
-        "target_hardware": _get_target_hardware_fingerprint(),
-        "inputs": annotated_inputs,
-        "outputs": output_specs,
-    }
-    metadata.setdefault("format_version", 2)
-    tmp_metadata_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
-    tmp_metadata_path.write_text(json.dumps(metadata, indent=2))
-    os.replace(tmp_metadata_path, metadata_path)
+                if (
+                    is_donor
+                    and not spec.get("is_weight")
+                    and spec.get("argument_type") == "user_io"
+                ):
+                    spec["argument_type"] = "state"
 
     weight_map: dict[str, Any] = {}
     for inp in annotated_inputs:
@@ -668,20 +795,42 @@ def _write_exported_module(
                 entry["is_internal_constant"] = True
             weight_map[w_name] = entry
 
+    clean_inputs: list[dict[str, Any]] = []
+    for inp in annotated_inputs:
+        c_inp = dict(inp)
+        c_inp.pop("sources", None)
+        c_inp.pop("is_internal_constant", None)
+        clean_inputs.append(c_inp)
+
     if weight_map:
         serving_ckpt_dir = export_dir / "serving_checkpoint"
         serving_ckpt_dir.mkdir(parents=True, exist_ok=True)
-        for wj_path in (export_dir / "weight.json", serving_ckpt_dir / "weight.json"):
-            existing_weights: dict[str, Any] = {}
-            if wj_path.is_file():
-                with contextlib.suppress(Exception):
-                    raw_wj = json.loads(wj_path.read_text())
-                    if isinstance(raw_wj, dict):
-                        existing_weights = raw_wj.get("weights", raw_wj)
-                        existing_weights.pop("hf_checkpoint_path", None)
-                        existing_weights.pop("checkpoint_path", None)
-            existing_weights.update(weight_map)
-            wj_path.write_text(json.dumps(existing_weights, indent=2))
+        wj_path = serving_ckpt_dir / "weight.json"
+        existing_weights: dict[str, Any] = {}
+        if wj_path.is_file():
+            with contextlib.suppress(Exception):
+                raw_wj = json.loads(wj_path.read_text())
+                if isinstance(raw_wj, dict):
+                    existing_weights = raw_wj.get("weights", raw_wj)
+                    existing_weights.pop("hf_checkpoint_path", None)
+                    existing_weights.pop("checkpoint_path", None)
+        existing_weights.update(weight_map)
+        wj_path.write_text(json.dumps(existing_weights, indent=2))
+        _write_abstract_params(export_dir, metadata, existing_weights)
+
+    fn_name, variant_key = _split_fn_key(fn_key)
+    metadata.setdefault("format_version", 2)
+    metadata.setdefault("functions", {}).setdefault(fn_name, {})[variant_key] = {
+        "file_path": mlir_filename,
+        "subgraph_index": subgraph_idx,
+        "compile_size": compile_size,
+        "target_hardware": _get_target_hardware_fingerprint(),
+        "inputs": clean_inputs,
+        "outputs": output_specs,
+    }
+    tmp_metadata_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
+    tmp_metadata_path.write_text(json.dumps(metadata, indent=2))
+    os.replace(tmp_metadata_path, metadata_path)
 
     logger.info(
         "[TpuCompilerAdaptor] Exported StableHLO module '%s' to %s",
@@ -692,7 +841,7 @@ def _write_exported_module(
 
 
 def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
-    """Pin `num_gpu_blocks_override` on load and handle multiprocess early exit on export."""
+    """Pin `num_gpu_blocks_override` on load and handle multiprocess early exit."""
     load_dir_str = str(envs.VLLM_TORCHTPU_LOAD_HLO_DIR or "").strip()
     if (
         vllm_config is not None
@@ -705,16 +854,15 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
             with contextlib.suppress(Exception):
                 meta = json.loads(meta_path.read_text())
                 pinned = None
-                for k, entry in meta.items():
-                    if k.startswith("forward_bucket") and isinstance(entry, dict):
-                        for inp in entry.get("inputs", []):
-                            if inp.get("buffer_donor") is True:
-                                shape = inp.get("shape", [])
-                                if shape and isinstance(shape[0], int) and shape[0] > 0:
-                                    pinned = int(shape[0])
-                                    break
-                        if pinned is not None:
-                            break
+                for entry in _iter_forward_entries(meta):
+                    for inp in entry.get("inputs", []):
+                        if inp.get("buffer_donor") is True:
+                            shape = inp.get("shape", [])
+                            if shape and isinstance(shape[0], int) and shape[0] > 0:
+                                pinned = int(shape[0])
+                                break
+                    if pinned is not None:
+                        break
                 if pinned is None:
                     cfg_blocks = (meta.get("config") or {}).get("num_blocks")
                     if isinstance(cfg_blocks, int) and cfg_blocks > 0:
@@ -747,7 +895,8 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
                             exc
                         ):
                             logger.info(
-                                "[TpuCompilerAdaptor] Exported all StableHLO modules to %s; exiting early.",
+                                "[TpuCompilerAdaptor] Exported all StableHLO "
+                                "modules to %s; exiting early.",
                                 export_dir,
                             )
                             sys.exit(0)
@@ -772,7 +921,7 @@ def maybe_export_or_load_stablehlo(
     compile_range: Range,
     key: str | None,
 ) -> Callable[..., Any] | None:
-    """Export FX graph to `.mlir` (`EXPORT_HLO_DIR`) or load/compile `.mlir` (`LOAD_HLO_DIR`)."""
+    """Export FX graph to `.mlir` or load and compile `.mlir`."""
     export_dir_str = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
     load_dir_str = str(envs.VLLM_TORCHTPU_LOAD_HLO_DIR or "").strip()
     if export_dir_str and load_dir_str:
@@ -890,11 +1039,14 @@ def maybe_export_or_load_stablehlo(
                     torch.zeros(s, dtype=dt, device=dev) for s, dt, dev in templates
                 ]
 
+            def _dummy_tuple(*a: Any, **kw: Any) -> tuple[torch.Tensor, ...]:
+                return tuple(_dummy(*a, **kw))
+
             out_node = next((n for n in graph.graph.nodes if n.op == "output"), None)
             if out_node is not None and not isinstance(out_node.args[0], (tuple, list)):
                 compiled_fn = adaptor._unwrap_compiled_fn(_dummy)
             else:
-                compiled_fn = lambda *a, **kw: tuple(_dummy(*a, **kw))
+                compiled_fn = _dummy_tuple
 
         if key is not None and compile_range.is_single_size():
             shape_variants.remember(adaptor.cache_dir, key, graph, compiled_fn)
@@ -911,11 +1063,11 @@ def maybe_export_or_load_stablehlo(
         module: fx.GraphModule, args: list[Any], idx: int
     ) -> tuple[str, Path, str]:
         fn_key = _compute_fn_key(compile_range, idx)
-        if fn_key not in metadata:
+        entry = _get_function_entry(metadata, fn_key)
+        if entry is None:
             raise FileNotFoundError(
                 f"Function key '{fn_key}' missing from metadata.json in {load_dir}"
             )
-        entry = metadata[fn_key]
 
         # Hardware & ABI check
         saved_hw = entry.get("target_hardware")
@@ -1024,7 +1176,8 @@ def maybe_export_or_load_stablehlo(
             for i, ((s, dt, donor), exp) in enumerate(zip(mlir_inputs, saved_inputs)):
                 if s != exp.get("shape") or dt != exp.get("dtype"):
                     raise ValueError(
-                        f"MLIR @main input signature mismatch at index {i} for '{fn_key}'"
+                        f"MLIR @main input signature mismatch at index {i} "
+                        f"for '{fn_key}'"
                     )
                 if exp.get("buffer_donor") is not None and donor != exp.get(
                     "buffer_donor"
@@ -1040,7 +1193,8 @@ def maybe_export_or_load_stablehlo(
             for i, ((s, dt), exp) in enumerate(zip(mlir_outputs, saved_outputs)):
                 if s != exp.get("shape") or dt != exp.get("dtype"):
                     raise ValueError(
-                        f"MLIR @main output signature mismatch at index {i} for '{fn_key}'"
+                        f"MLIR @main output signature mismatch at index {i} "
+                        f"for '{fn_key}'"
                     )
 
         return fn_key, mlir_path, mlir_text
@@ -1116,11 +1270,15 @@ def maybe_export_or_load_stablehlo(
             reconstruct_fx_outputs_fn=lambda args, outputs: outputs,
             updates_default_generator_state=False,
         )
+
+        def _exec_tuple(*a: Any, **kw: Any) -> tuple[Any, ...]:
+            return tuple(exec_fn(*a, **kw))
+
         out_node = next((n for n in graph.graph.nodes if n.op == "output"), None)
         if out_node is not None and not isinstance(out_node.args[0], (tuple, list)):
             compiled_fn = adaptor._unwrap_compiled_fn(exec_fn)
         else:
-            compiled_fn = lambda *a, **kw: tuple(exec_fn(*a, **kw))
+            compiled_fn = _exec_tuple
         logger.info(
             "[TpuCompilerAdaptor] Loaded StableHLO module '%s' from %s",
             resolved_key,
@@ -1133,7 +1291,7 @@ def maybe_export_or_load_stablehlo(
 
 
 def _compile_options_for(tensor_parallel_size: int) -> dict[str, Any]:
-    """Returns the `compile_options` object of metadata.json (rvllm RFC 0001 §3.2.1).
+    """Returns the `compile_options` object of metadata.json.
 
     torch_tpu compiles each TP rank's module with `num_partitions` = TP,
     `replica_count` = 1 and `use_spmd_partitioning` = true (from XLA dumps of TP=1
@@ -1206,17 +1364,13 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     # of the sampling subgraphs, which is also the slot of forward's
     # `model.embed_tokens.weight`, so give it the first slot no forward weight uses.
     used_weight_indices: set[int] = set()
-    for wj_path in (
-        export_dir / "serving_checkpoint" / "weight.json",
-        export_dir / "weight.json",
-    ):
-        if wj_path.is_file():
-            with contextlib.suppress(Exception):
-                raw_wj = json.loads(wj_path.read_text())
-                for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
-                    if w_name != "lm_head.weight" and isinstance(w_spec, dict):
-                        used_weight_indices.add(int(w_spec["index"]))
-            break
+    wj_path = export_dir / "serving_checkpoint" / "weight.json"
+    if wj_path.is_file():
+        with contextlib.suppress(Exception):
+            raw_wj = json.loads(wj_path.read_text())
+            for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
+                if w_name != "lm_head.weight" and isinstance(w_spec, dict):
+                    used_weight_indices.add(int(w_spec["index"]))
     lm_head_index = max(used_weight_indices, default=0) + 1
 
     def _export_bucket(
@@ -1259,20 +1413,26 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             lm_shape = [int(d) for d in lm_head_weight.shape]
             input_specs = [
                 {
+                    "arg_index": 0,
                     "index": 0,
                     "name": "hidden_states",
                     "shape": list(dummy_hidden.shape),
                     "dtype": _dtype_name(dummy_hidden),
+                    "argument_type": "intermediate",
                     "is_weight": False,
                     "weight_name": "",
+                    "buffer_donor": False,
                 },
                 {
+                    "arg_index": 1,
                     "index": lm_head_index,
                     "name": "lm_head.weight",
                     "shape": lm_shape,
                     "dtype": _dtype_name(lm_head_weight),
+                    "argument_type": "weight",
                     "is_weight": True,
                     "weight_name": "lm_head.weight",
+                    "buffer_donor": False,
                     "sources": [
                         {
                             "path": "",
@@ -1283,21 +1443,43 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 },
             ]
             output_specs = [
-                {"index": 0, "name": out_name, "shape": out_shape, "dtype": out_dtype}
+                {
+                    "arg_index": 0,
+                    "index": 0,
+                    "name": out_name,
+                    "shape": out_shape,
+                    "dtype": out_dtype,
+                    "argument_type": "user_io",
+                    "buffer_donor": False,
+                }
             ]
         else:
             input_specs = _extract_input_specs(traced_gm, [dummy_hidden]) or [
                 {
+                    "arg_index": 0,
                     "index": 0,
                     "name": "hidden_states",
                     "shape": list(dummy_hidden.shape),
                     "dtype": _dtype_name(dummy_hidden),
+                    "argument_type": "intermediate",
                     "is_weight": False,
                     "weight_name": "",
+                    "buffer_donor": False,
                 }
             ]
+            for inp in input_specs:
+                if inp.get("name") == "hidden_states" and not inp.get("is_weight"):
+                    inp["argument_type"] = "intermediate"
             output_specs = _extract_output_specs(traced_gm, exported_mlir) or [
-                {"index": 0, "name": out_name, "shape": out_shape, "dtype": out_dtype}
+                {
+                    "arg_index": 0,
+                    "index": 0,
+                    "name": out_name,
+                    "shape": out_shape,
+                    "dtype": out_dtype,
+                    "argument_type": "user_io",
+                    "buffer_donor": False,
+                }
             ]
 
         _write_exported_module(
@@ -1353,72 +1535,6 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     out_dtype="int64",
                 )
 
-    # Finalize metadata.json global config
-    meta_path = export_dir / "metadata.json"
-    if meta_path.is_file():
-        meta_dict = json.loads(meta_path.read_text())
-        model_cfg = getattr(runner, "model_config", None)
-        parallel_cfg = getattr(runner, "parallel_config", None)
-        cache_cfg = getattr(runner, "cache_config", None)
-
-        meta_dict["format_version"] = 2
-        meta_dict["model_name"] = str(getattr(model_cfg, "model", "serving_model"))
-        meta_dict["target_tpu"] = _get_target_hardware_fingerprint().get(
-            "chip_type", "v5p"
-        )
-
-        block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
-        num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)
-        for fn_key, entry in meta_dict.items():
-            if fn_key.startswith("forward_bucket") and isinstance(entry, dict):
-                for inp in entry.get("inputs", []):
-                    if inp.get("buffer_donor") is True:
-                        shape = inp.get("shape", [])
-                        if shape and isinstance(shape[0], int) and shape[0] > 0:
-                            num_blocks = int(shape[0])
-                            break
-                if num_blocks != 512:
-                    break
-
-        cfg_vocab = int(
-            getattr(model_cfg, "vocab_size", 0)
-            or (
-                model_cfg.get_vocab_size()
-                if hasattr(model_cfg, "get_vocab_size")
-                else 0
-            )
-            or getattr(getattr(model_cfg, "hf_config", None), "vocab_size", 0)
-            or 0
-        )
-        eos_token_id = int(
-            getattr(model_cfg, "eos_token_id", 0)
-            or getattr(getattr(model_cfg, "hf_config", None), "eos_token_id", 0)
-            or 0
-        )
-        meta_dict["config"] = {
-            "vocab_size": cfg_vocab,
-            "eos_token_id": eos_token_id,
-            "max_num_seqs": 64,
-            "max_num_pages": num_blocks,
-            "max_cu_seqs": 65,
-            "block_size": block_size,
-            "num_blocks": num_blocks,
-            "max_model_len": int(getattr(model_cfg, "max_model_len", 2048) or 2048),
-            "tensor_parallel_size": int(
-                getattr(parallel_cfg, "tensor_parallel_size", 1) or 1
-            ),
-            "pipeline_parallel_size": int(
-                getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1
-            ),
-            "data_parallel_size": 1,
-        }
-        meta_dict["compile_options"] = _compile_options_for(
-            meta_dict["config"]["tensor_parallel_size"]
-        )
-        tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
-        tmp_path.write_text(json.dumps(meta_dict, indent=2))
-        os.replace(tmp_path, meta_path)
-
     # Bundle checkpoint assets, constants.safetensors, and per-source paths
     model_id = getattr(getattr(runner, "model_config", None), "model", None)
     snap_dir: Path | None = None
@@ -1437,18 +1553,19 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     )
                 )
             if snap_dir is None or not snap_dir.is_dir():
-                hf_home = Path(
-                    os.environ.get(
-                        "HF_HOME", str(Path.home() / ".cache" / "huggingface")
-                    )
-                )
                 repo_slug = "models--" + str(model_id).replace("/", "--")
-                snaps_root = hf_home / "hub" / repo_slug / "snapshots"
-                if snaps_root.is_dir():
-                    for cand in sorted(snaps_root.iterdir()):
-                        if cand.is_dir() and list(cand.glob("*.safetensors")):
-                            snap_dir = cand
-                            break
+                for hf_home in (
+                    Path.home() / ".cache" / "huggingface",
+                    Path("/root/.cache/huggingface"),
+                ):
+                    snaps_root = hf_home / "hub" / repo_slug / "snapshots"
+                    if snaps_root.is_dir():
+                        for cand in sorted(snaps_root.iterdir()):
+                            if cand.is_dir() and list(cand.glob("*.safetensors")):
+                                snap_dir = cand
+                                break
+                    if snap_dir is not None and snap_dir.is_dir():
+                        break
 
     if snap_dir is not None and snap_dir.is_dir():
         for fname in (
@@ -1470,18 +1587,13 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
 
     serving_ckpt_dir = export_dir / "serving_checkpoint"
     serving_ckpt_dir.mkdir(parents=True, exist_ok=True)
-    weight_json_path = export_dir / "weight.json"
     serving_weight_json_path = serving_ckpt_dir / "weight.json"
-    wj_source = (
-        serving_weight_json_path
-        if serving_weight_json_path.is_file()
-        else weight_json_path
-    )
-    if wj_source.is_file():
+    weights_dict: dict[str, Any] = {}
+    if serving_weight_json_path.is_file():
         with contextlib.suppress(Exception):
-            raw_wj = json.loads(wj_source.read_text())
+            raw_wj = json.loads(serving_weight_json_path.read_text())
             if isinstance(raw_wj, dict):
-                weights_dict: dict[str, Any] = raw_wj.get("weights", raw_wj)
+                weights_dict = raw_wj.get("weights", raw_wj)
                 weights_dict.pop("hf_checkpoint_path", None)
                 weights_dict.pop("checkpoint_path", None)
 
@@ -1554,8 +1666,11 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                                                 ):
                                                     buf = getattr(mod, attr, None)
                                                     if (
-                                                        isinstance(buf, torch.Tensor)
-                                                        and type(buf).__name__
+                                                        buf is not None
+                                                        and isinstance(
+                                                            buf, torch.Tensor
+                                                        )
+                                                        and buf.__class__.__name__
                                                         != "FakeTensor"
                                                         and not getattr(
                                                             buf, "is_meta", False
@@ -1683,9 +1798,73 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             src_entry["source_shape"] = w_shape
                     w_spec.pop("is_internal_constant", None)
 
-                formatted = json.dumps(weights_dict, indent=2)
-                serving_weight_json_path.write_text(formatted)
-                weight_json_path.write_text(formatted)
+                serving_weight_json_path.write_text(json.dumps(weights_dict, indent=2))
+
+    # Finalize metadata.json global config and abstract_params
+    meta_path = export_dir / "metadata.json"
+    if meta_path.is_file():
+        meta_dict = json.loads(meta_path.read_text())
+        model_cfg = getattr(runner, "model_config", None)
+        parallel_cfg = getattr(runner, "parallel_config", None)
+        cache_cfg = getattr(runner, "cache_config", None)
+
+        meta_dict["format_version"] = 2
+        meta_dict["model_name"] = str(getattr(model_cfg, "model", "serving_model"))
+        meta_dict["target_tpu"] = _get_target_hardware_fingerprint().get(
+            "chip_type", "v5p"
+        )
+
+        block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
+        num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)
+        for entry in _iter_forward_entries(meta_dict):
+            for inp in entry.get("inputs", []):
+                if inp.get("buffer_donor") is True:
+                    shape = inp.get("shape", [])
+                    if shape and isinstance(shape[0], int) and shape[0] > 0:
+                        num_blocks = int(shape[0])
+                        break
+            if num_blocks != 512:
+                break
+
+        cfg_vocab = int(
+            getattr(model_cfg, "vocab_size", 0)
+            or (
+                model_cfg.get_vocab_size()
+                if hasattr(model_cfg, "get_vocab_size")
+                else 0
+            )
+            or getattr(getattr(model_cfg, "hf_config", None), "vocab_size", 0)
+            or 0
+        )
+        eos_token_id = int(
+            getattr(model_cfg, "eos_token_id", 0)
+            or getattr(getattr(model_cfg, "hf_config", None), "eos_token_id", 0)
+            or 0
+        )
+        meta_dict["config"] = {
+            "vocab_size": cfg_vocab,
+            "eos_token_id": eos_token_id,
+            "max_num_seqs": 64,
+            "max_num_pages": num_blocks,
+            "max_cu_seqs": 65,
+            "block_size": block_size,
+            "num_blocks": num_blocks,
+            "max_model_len": int(getattr(model_cfg, "max_model_len", 2048) or 2048),
+            "tensor_parallel_size": int(
+                getattr(parallel_cfg, "tensor_parallel_size", 1) or 1
+            ),
+            "pipeline_parallel_size": int(
+                getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1
+            ),
+            "data_parallel_size": 1,
+        }
+        meta_dict["compile_options"] = _compile_options_for(
+            meta_dict["config"]["tensor_parallel_size"]
+        )
+        _write_abstract_params(export_dir, meta_dict, weights_dict)
+        tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
+        tmp_path.write_text(json.dumps(meta_dict, indent=2))
+        os.replace(tmp_path, meta_path)
 
     world_size = int(
         getattr(getattr(runner, "parallel_config", None), "world_size", 1) or 1

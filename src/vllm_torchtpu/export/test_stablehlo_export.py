@@ -199,18 +199,20 @@ def test_export_stablehlo_and_metadata(
     assert metadata_path.is_file()
 
     metadata = json.loads(metadata_path.read_text())
-    assert expected_fn_key in metadata
-    entry = metadata[expected_fn_key]
+    assert "functions" in metadata
+    entry = metadata["functions"]["forward"]["16"]
     assert entry["file_path"] == f"{expected_fn_key}.mlir"
     assert entry["subgraph_index"] == 0
     assert entry["compile_size"] == 16
     assert len(entry["inputs"]) == 1
     assert entry["inputs"][0] == {
+        "arg_index": 0,
         "index": 0,
         "name": "hidden_states",
         "shape": [16, 64],
         "dtype": "bfloat16",
         "sharding": "PartitionSpec(None, 'model')",
+        "argument_type": "user_io",
         "buffer_donor": False,
         "is_weight": False,
         "weight_name": "",
@@ -237,28 +239,34 @@ def test_load_stablehlo_success(
     )
     (tmp_path / f"{fn_key}.mlir").write_text(saved_mlir)
     metadata = {
-        fn_key: {
-            "file_path": f"{fn_key}.mlir",
-            "subgraph_index": 0,
-            "compile_size": 16,
-            "inputs": [
-                {
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": "PartitionSpec(None, 'model')",
+        "functions": {
+            "forward": {
+                "16": {
+                    "file_path": f"{fn_key}.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 16,
+                    "inputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "hidden_states",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": "PartitionSpec(None, 'model')",
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "output_0",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": "PartitionSpec(None, 'model')",
+                        }
+                    ],
                 }
-            ],
-            "outputs": [
-                {
-                    "index": 0,
-                    "name": "output_0",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": "PartitionSpec(None, 'model')",
-                }
-            ],
+            }
         }
     }
     (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -310,20 +318,25 @@ def test_load_stablehlo_signature_mismatch_raises(
     fn_key = "forward_bucket16"
     (tmp_path / f"{fn_key}.mlir").write_text("module {}")
     metadata = {
-        fn_key: {
-            "file_path": f"{fn_key}.mlir",
-            "subgraph_index": 0,
-            "compile_size": 16,
-            "inputs": [
-                {
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": [32, 64],
-                    "dtype": "bfloat16",
-                    "sharding": "PartitionSpec(None, 'model')",
+        "functions": {
+            "forward": {
+                "16": {
+                    "file_path": f"{fn_key}.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 16,
+                    "inputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "hidden_states",
+                            "shape": [32, 64],
+                            "dtype": "bfloat16",
+                            "sharding": "PartitionSpec(None, 'model')",
+                        }
+                    ],
+                    "outputs": [],
                 }
-            ],
-            "outputs": [],
+            }
         }
     }
     (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -494,9 +507,9 @@ def test_export_stablehlo_explicit_dir_and_aot_round_trip(
     metadata_file = explicit_export_dir / "metadata.json"
     assert metadata_file.is_file()
     metadata = json.loads(metadata_file.read_text())
-    assert "forward_piece200_bucket16" in metadata
-    fn_key = "forward_piece200_bucket16"
-    mlir_file = explicit_export_dir / metadata[fn_key]["file_path"]
+    assert "forward_piece200" in metadata["functions"]
+    entry = metadata["functions"]["forward_piece200"]["16"]
+    mlir_file = explicit_export_dir / entry["file_path"]
     assert mlir_file.read_text() == exported_mlir_text
 
     modified_mlir_text = (
@@ -558,12 +571,16 @@ def test_load_stablehlo_exact_key_lookup_and_missing_key_raises(
     expected_key = "forward_bucket16"
 
     metadata_other = {
-        "forward_bucket32": {
-            "file_path": "forward_bucket32.mlir",
-            "subgraph_index": 0,
-            "compile_size": 32,
-            "inputs": [],
-            "outputs": [],
+        "functions": {
+            "forward": {
+                "32": {
+                    "file_path": "forward_bucket32.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 32,
+                    "inputs": [],
+                    "outputs": [],
+                }
+            }
         }
     }
     (tmp_path / "metadata.json").write_text(json.dumps(metadata_other, indent=2))
@@ -578,20 +595,25 @@ def test_load_stablehlo_exact_key_lookup_and_missing_key_raises(
         compiler.compile(graph, inputs, {}, compile_range, key=cache_key)
 
     metadata_exact = {
-        expected_key: {
-            "file_path": f"{expected_key}.mlir",
-            "subgraph_index": 0,
-            "compile_size": 16,
-            "inputs": [
-                {
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": [32, 64],
-                    "dtype": "bfloat16",
-                    "sharding": None,
+        "functions": {
+            "forward": {
+                "16": {
+                    "file_path": f"{expected_key}.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 16,
+                    "inputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "hidden_states",
+                            "shape": [32, 64],
+                            "dtype": "bfloat16",
+                            "sharding": None,
+                        }
+                    ],
+                    "outputs": [],
                 }
-            ],
-            "outputs": [],
+            }
         }
     }
     (tmp_path / f"{expected_key}.mlir").write_text("module {}")
@@ -693,28 +715,34 @@ def test_load_stablehlo_mlir_main_signature_mismatch_raises(
     fn_key = "forward_bucket16"
     mlir_path = tmp_path / f"{fn_key}.mlir"
     metadata = {
-        fn_key: {
-            "file_path": f"{fn_key}.mlir",
-            "subgraph_index": 0,
-            "compile_size": 16,
-            "inputs": [
-                {
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": "PartitionSpec(None, 'model')",
+        "functions": {
+            "forward": {
+                "16": {
+                    "file_path": f"{fn_key}.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 16,
+                    "inputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "hidden_states",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": "PartitionSpec(None, 'model')",
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "output_0",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": "PartitionSpec(None, 'model')",
+                        }
+                    ],
                 }
-            ],
-            "outputs": [
-                {
-                    "index": 0,
-                    "name": "output_0",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": "PartitionSpec(None, 'model')",
-                }
-            ],
+            }
         }
     }
     (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -840,35 +868,42 @@ def test_load_stablehlo_disables_async_compile_and_preserves_tuple_outputs(
         "}\n"
     )
     metadata = {
-        fn_key: {
-            "file_path": f"{fn_key}.mlir",
-            "subgraph_index": 0,
-            "compile_size": 16,
-            "inputs": [
-                {
-                    "index": 0,
-                    "name": "x",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": None,
+        "functions": {
+            "forward": {
+                "16": {
+                    "file_path": f"{fn_key}.mlir",
+                    "subgraph_index": 0,
+                    "compile_size": 16,
+                    "inputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "x",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": None,
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "arg_index": 0,
+                            "index": 0,
+                            "name": "output_0",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": None,
+                        },
+                        {
+                            "arg_index": 1,
+                            "index": 1,
+                            "name": "output_1",
+                            "shape": [16, 64],
+                            "dtype": "bfloat16",
+                            "sharding": None,
+                        },
+                    ],
                 }
-            ],
-            "outputs": [
-                {
-                    "index": 0,
-                    "name": "output_0",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": None,
-                },
-                {
-                    "index": 1,
-                    "name": "output_1",
-                    "shape": [16, 64],
-                    "dtype": "bfloat16",
-                    "sharding": None,
-                },
-            ],
+            }
         }
     }
     (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -932,7 +967,7 @@ def test_load_stablehlo_disables_async_compile_and_preserves_tuple_outputs(
     assert getattr(StaticCompiler, "_async_compile", None) is True
 
 
-def test_rfc_contract_safeguards_buffer_donor_hardware_and_custom_call(
+def test_contract_safeguards_buffer_donor_hardware_and_custom_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     graph, inputs = _make_sample_graph_and_inputs(batch_size=16, hidden_size=64)
@@ -965,8 +1000,9 @@ def test_rfc_contract_safeguards_buffer_donor_hardware_and_custom_call(
     fn_key = "forward_bucket16"
     metadata_path = tmp_path / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
-    entry = metadata[fn_key]
+    entry = metadata["functions"]["forward"]["16"]
     assert entry["inputs"][0]["buffer_donor"] is True
+    assert entry["inputs"][0]["argument_type"] == "state"
     assert entry["target_hardware"]["chip_type"] == "v5p-8"
     assert "libtpu" in entry["target_hardware"]
 
@@ -992,9 +1028,10 @@ def test_rfc_contract_safeguards_buffer_donor_hardware_and_custom_call(
     monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v5p-8")
 
     drifted_metadata = copy.deepcopy(metadata)
-    drifted_metadata[fn_key]["target_hardware"]["torch_tpu"] = "0.0.0-different"
-    drifted_metadata[fn_key]["target_hardware"]["jaxlib"] = "0.0.0-different"
-    drifted_metadata[fn_key]["target_hardware"]["libtpu"] = "0.0.0-different"
+    drifted_entry = drifted_metadata["functions"]["forward"]["16"]
+    drifted_entry["target_hardware"]["torch_tpu"] = "0.0.0-different"
+    drifted_entry["target_hardware"]["jaxlib"] = "0.0.0-different"
+    drifted_entry["target_hardware"]["libtpu"] = "0.0.0-different"
     metadata_path.write_text(json.dumps(drifted_metadata, indent=2))
     with (
         patch.object(stablehlo_export.logger, "warning") as mock_warn,
@@ -1173,6 +1210,7 @@ def test_extract_input_specs_filters_non_tensor_symint_placeholders() -> None:
 
     specs = stablehlo_export._extract_input_specs(graph, [16, tensor_input])
     assert len(specs) == 1
+    assert specs[0]["arg_index"] == 0
     assert specs[0]["index"] == 0
     assert specs[0]["name"] == "hidden_states"
     assert specs[0]["shape"] == [16, 64]
@@ -1281,12 +1319,16 @@ def test_export_and_load_serving_artifacts(
         compiler.compile(graph, inputs, {}, compile_range, key=cache_key)
 
     assert (tmp_path / "forward_bucket16.mlir").is_file()
+    assert (tmp_path / "abstract_params.mlir").is_file()
     assert (tmp_path / "metadata.json").is_file()
+    assert not (tmp_path / "weight.json").exists()
     serving_ckpt_dir = tmp_path / "serving_checkpoint"
     assert (serving_ckpt_dir / "weight.json").is_file()
     wj_data = json.loads((serving_ckpt_dir / "weight.json").read_text())
     assert "model.embed_tokens.weight" in wj_data
     assert "sources" in wj_data["model.embed_tokens.weight"]
+    meta_data = json.loads((tmp_path / "metadata.json").read_text())
+    assert "default" in meta_data["functions"]["abstract_params"]
 
     monkeypatch.delenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", raising=False)
     monkeypatch.setenv("VLLM_TORCHTPU_LOAD_HLO_DIR", str(tmp_path))
@@ -1368,6 +1410,7 @@ def test_export_sampling_subgraphs_e2e(
     assert (export_dir / "compute_logits_req2.mlir").exists()
     assert (export_dir / "sample_top_tokens_req1.mlir").exists()
     assert (export_dir / "sample_top_tokens_req2.mlir").exists()
+    assert (export_dir / "abstract_params.mlir").exists()
     assert (export_dir / "metadata.json").exists()
 
 
@@ -1420,7 +1463,6 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
             ],
         },
     }
-    (export_dir / "weight.json").write_text(json.dumps(seed_weights))
     (export_dir / "serving_checkpoint" / "weight.json").write_text(
         json.dumps(seed_weights)
     )
@@ -1447,8 +1489,12 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
 
     mock_mlir_res = MagicMock()
     mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>, %arg1: tensor<32x16xbf16>) "
-        "-> tensor<1x32xbf16> { return %arg0 : tensor<1x32xbf16> } }"
+        "module @subgraph {\n"
+        "  func.func public @main(%arg0: tensor<1x16xbf16>, "
+        "%arg1: tensor<32x16xbf16>) -> tensor<1x32xbf16> {\n"
+        "    return %arg0 : tensor<1x32xbf16>\n"
+        "  }\n"
+        "}\n"
     )
     mock_mlir_res.is_noop = False
     mock_mlir_res.module = MagicMock()
@@ -1466,6 +1512,7 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
 
     constants_st = export_dir / "serving_checkpoint" / "constants.safetensors"
     assert constants_st.is_file()
+    assert not (export_dir / "weight.json").exists()
     wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
     assert wj["rotary_emb_inv_freq"]["sources"][0]["path"] == str(
         constants_st.resolve()
@@ -1477,6 +1524,15 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
         wj["lm_head.weight"]["sources"][0]["source_tensor"]
         == "model.embed_tokens.weight"
     )
+    assert (export_dir / "abstract_params.mlir").is_file()
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    abs_spec = meta["functions"]["abstract_params"]["default"]
+    assert abs_spec["file_path"] == "abstract_params.mlir"
+    assert [inp["name"] for inp in abs_spec["inputs"]] == [
+        "model.embed_tokens.weight",
+        "rotary_emb_inv_freq",
+        "lm_head.weight",
+    ]
 
 
 def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
@@ -1499,11 +1555,9 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
         }
         for name, idx in (("model.embed_tokens.weight", 1), ("model.norm.weight", 9))
     }
-    for wj_path in (
-        export_dir / "weight.json",
-        export_dir / "serving_checkpoint" / "weight.json",
-    ):
-        wj_path.write_text(json.dumps(seed_weights))
+    (export_dir / "serving_checkpoint" / "weight.json").write_text(
+        json.dumps(seed_weights)
+    )
 
     class MockModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -1548,8 +1602,11 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
     lm_head_index = wj["lm_head.weight"]["index"]
     assert lm_head_index not in {1, 9}
     metadata = json.loads((export_dir / "metadata.json").read_text())
-    for fn_key in ("compute_logits_req1", "sample_top_tokens_req1"):
-        assert metadata[fn_key]["inputs"][1]["index"] == lm_head_index
+    for fn_name in ("compute_logits", "sample_top_tokens"):
+        entry_in = metadata["functions"][fn_name]["1"]["inputs"][1]
+        assert entry_in["arg_index"] == 1
+        assert entry_in["index"] == lm_head_index
+        assert entry_in["argument_type"] == "weight"
 
 
 @pytest.mark.parametrize(
@@ -1733,16 +1790,21 @@ def test_load_hlo_dir_pins_num_gpu_blocks_override_from_metadata(
     load_dir = tmp_path / "loaded_hlo"
     load_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "forward_bucket16": {
-            "inputs": [
-                {
-                    "index": 8,
-                    "name": "kv_cache_layer_0",
-                    "shape": [50336, 16, 8, 2, 128],
-                    "dtype": "bfloat16",
-                    "buffer_donor": True,
+        "functions": {
+            "forward": {
+                "16": {
+                    "inputs": [
+                        {
+                            "arg_index": 8,
+                            "index": 8,
+                            "name": "kv_cache_layer_0",
+                            "shape": [50336, 16, 8, 2, 128],
+                            "dtype": "bfloat16",
+                            "buffer_donor": True,
+                        }
+                    ]
                 }
-            ]
+            }
         }
     }
     (load_dir / "metadata.json").write_text(json.dumps(metadata))
