@@ -45,6 +45,7 @@ Core mechanisms:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -75,6 +76,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.base import (
@@ -89,6 +92,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.core import hca_state_checkpoint
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -102,6 +106,9 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_NULL_BLOCK = KVCacheBlock(block_id=0)
+_NULL_BLOCK.is_null = True
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -292,8 +299,22 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         # Per scheduler step: req_id -> windowed keys `prepare_store` admits.
         self._admitted_window_keys: dict[str, set[OffloadKey]] = {}
-        if self._window_checkpoints is not None:
+        # Groups a hit never needs (TPU_KV_DROP_HCA_STATE_CHECKPOINT): never
+        # stored, looked up or loaded.
+        self._skipped_groups: frozenset[int] = frozenset()
+        if hca_state_checkpoint.enabled():
+            self._skipped_groups = hca_state_checkpoint.hca_state_group_ids(
+                kv_cache_config
+            )
+            self._lookup_groups = tuple(
+                g for g in self._lookup_groups if g not in self._skipped_groups
+            )
+            self._sliding_window_groups = tuple(
+                g for g in self._sliding_window_groups if g not in self._skipped_groups
+            )
+        if self._window_checkpoints is not None or self._skipped_groups:
             self._raiden_manager.set_store_key_filter(self._admit_store_key)
+        if self._window_checkpoints is not None:
             logger.info(
                 "TPURaidenOffloadingConnector: offloading window/state groups %s "
                 "only at replay boundaries%s",
@@ -327,9 +348,29 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._touch(req_status)
         return 0, False
 
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        if num_external_tokens and self._skipped_groups:
+            # Null placeholders read as already present, so no load is built
+            # for these groups' freshly allocated blocks.
+            blocks = dataclasses.replace(
+                blocks,
+                blocks=tuple(
+                    [_NULL_BLOCK] * len(group_blocks)
+                    if group_idx in self._skipped_groups
+                    else group_blocks
+                    for group_idx, group_blocks in enumerate(blocks.blocks)
+                ),
+            )
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+
     def _admit_store_key(self, key: OffloadKey, req_context: ReqContext) -> bool:
+        if get_offload_group_idx(key) in self._skipped_groups:
+            return False
         policy = self._window_checkpoints
-        assert policy is not None
+        if policy is None:
+            return True
         if get_offload_group_idx(key) not in policy.windowed_group_ids:
             return True
         req_id = req_context.req_id

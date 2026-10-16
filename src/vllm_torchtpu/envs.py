@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     TPU_OFFLOAD_STATS_LOG_S: int = 0
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_FINE_PREFIX_HIT_TOKENS: int = 0
+    TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
     TPU_SRPT_HOLD_PROGRESS_GUARD: bool = False
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_STEP_TIMING_LOG_STEPS: int = 0
@@ -669,6 +670,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full-attention block holding the hit point is copied on write
     # (core/fine_prefix_hits.py). 0 = off.
     "TPU_FINE_PREFIX_HIT_TOKENS": env_nonnegative_int("TPU_FINE_PREFIX_HIT_TOKENS", 0),
+    # Engine core: DeepSeek-V4's 128-ratio compressor state needs no prefix-cache
+    # checkpoint (never cached, held or host-offloaded); see
+    # core/hca_state_checkpoint.py.
+    "TPU_KV_DROP_HCA_STATE_CHECKPOINT": env_bool("TPU_KV_DROP_HCA_STATE_CHECKPOINT"),
     # SrptPrefillScheduler: after a held step that admits no waiting request,
     # stop holding prefill chunks until a step admits one (breaks the livelock
     # where the held chunks' own KV blocks keep the waiting request out).

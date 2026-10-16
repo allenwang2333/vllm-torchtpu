@@ -74,9 +74,7 @@ def make_scheduler(interval):
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=True)
     )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=None) for _ in DSV4_GROUPS]
-    )
+    kv_cache_config = dsv4_kv_cache_config()
     env = (
         {}
         if interval is None
@@ -92,6 +90,38 @@ def make_scheduler(interval):
             os.environ.pop("TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL", None)
         sched = TPURaidenOffloadingScheduler(spec, vllm_config, kv_cache_config)
     return sched, store
+
+
+# DSV4_GROUPS order, named and typed as the model registers them.
+DSV4_LAYERS = [
+    ["model.layers.0.attn.swa_cache"],
+    ["mtp.0.attn.swa_cache"],
+    ["model.layers.0.attn"],
+    ["model.layers.2.attn.compressor.state_cache"],
+    ["model.layers.0.attn.compressor.state_cache"],
+]
+HCA_STATE_GROUP = 4
+
+
+def dsv4_kv_cache_config():
+    import torch
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    groups = []
+    for (chunk, window, _), names in zip(DSV4_GROUPS, DSV4_LAYERS):
+        spec = (
+            None
+            if window is None
+            else SlidingWindowMLASpec(
+                block_size=chunk,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.uint8,
+                sliding_window={128: 128, 16: 8, 32: 128}[chunk],
+            )
+        )
+        groups.append(SimpleNamespace(kv_cache_spec=spec, layer_names=names))
+    return SimpleNamespace(kv_cache_groups=groups)
 
 
 def make_request(req_id, hashes, num_prompt_tokens):
@@ -240,6 +270,40 @@ class TestWindowCheckpointPolicy(unittest.TestCase):
             self.assertEqual(
                 self._hit(sched, HASHES, longer, local=4096, req_id="c"), 9216 - 4096
             )
+
+    def test_hca_state_group_is_never_stored_looked_up_or_loaded(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        with patch.dict("os.environ", {"TPU_KV_DROP_HCA_STATE_CHECKPOINT": "1"}):
+            sched, store = make_scheduler(0)
+            stored = _Prefill(
+                sched, store, make_request("a", HASHES, self.PROMPT)
+            ).run()
+            self.assertEqual(stored_per_group(stored), [1, 2, 9, 1, 0])
+            longer = self.PROMPT + 3000
+            req = make_request("b", HASHES, longer)
+            sched.on_new_request(req)
+            hit, _ = sched.get_num_new_matched_tokens(req, 0)
+            self.assertEqual(hit, 9216)
+            # Blocks as the KV cache manager allocates them for a 9216-token
+            # external hit: windowed groups hold only their window.
+            next_id = iter(range(1000, 2000))
+            null = KVCacheBlock(block_id=0)
+            null.is_null = True
+            groups = []
+            for chunk, window, eagle in DSV4_GROUPS:
+                n = 9216 // chunk
+                w = n if window is None else window + int(eagle)
+                groups.append(
+                    [null] * (n - w) + [KVCacheBlock(next(next_id)) for _ in range(w)]
+                )
+            sched.update_state_after_alloc(req, KVCacheBlocks(tuple(groups)), hit)
+            (job,) = sched._current_batch_load_jobs.values()
+            loaded = stored_per_group(job.src_spec.keys)
+            self.assertEqual(loaded[HCA_STATE_GROUP], 0)
+            self.assertEqual(job.dst_spec.group_sizes[HCA_STATE_GROUP], 0)
+            self.assertEqual(loaded[FULL_GROUP], 9)
 
     def test_rejects_unaligned_interval(self):
         with self.assertRaisesRegex(ValueError, "multiple of the full-attention chunk"):
