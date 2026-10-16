@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import (
+    dcp_lane_operand,
     dcp_rank_operand,
     get_dcp_group,
     get_or_create_dcp_mesh,
@@ -676,6 +677,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # i32 operand (one element per rank) instead of the iota all_to_all.
         rank_operand = envs.TPU_DCP_RANK_OPERAND
         rank_tensor = dcp_rank_operand() if rank_operand else None
+        # TPU_DCP_INDEXER_SMALL_AG: the kernel all-gather addresses its peers
+        # by (lane, rank), both as data: the lane rides in its own operand
+        # after the rank. (Not folded into the rank tensor: that one is shared
+        # with the attention ops, and the indexer capturing it first is what
+        # keeps its lifted name the same across buckets.)
+        small_ag = bool(
+            envs.TPU_DCP_INDEXER_SMALL_AG
+            and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+            and rank_operand
+        )
+        lane_tensor = dcp_lane_operand() if small_ag else None
         k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
         qb_overlap_fn = _fp8_linear_pallas_jax
         if qb_overlap:
@@ -700,6 +712,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution: jax.Array,
             qb_args: tuple[jax.Array, ...],  # (x, w_q, w_s), replicated, or ()
             rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
+            lane_ids_arg: jax.Array | None = None,  # TPU_DCP_INDEXER_SMALL_AG
         ) -> tuple[jax.Array, ...]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
@@ -762,6 +775,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 ),
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
+                dcp_lane_ids=lane_ids_arg,
+                small_all_gather=small_ag,
                 **overlap,
             )
             if qb_overlap:
@@ -872,12 +887,69 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 rank_ids,
             )
 
+        def _streamidx_topk_dcp_rank_lane_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (),
+                rank_ids,
+                lane_ids,
+            )
+
+        def _streamidx_topk_dcp_qb_rank_lane_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            qb_x: jax.Array,  # q_b input, [num_tokens, q_lora_rank]
+            qb_w: jax.Array,  # fp8 [q_lora_rank, n] (flipped runtime layout)
+            qb_s: jax.Array,  # f32 [n] per-output-channel scale
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (qb_x, qb_w, qb_s),
+                rank_ids,
+                lane_ids,
+            )
+
         jax_fn = {
-            (False, False): _streamidx_topk_dcp_jax,
-            (False, True): _streamidx_topk_dcp_rank_jax,
-            (True, False): _streamidx_topk_dcp_qb_jax,
-            (True, True): _streamidx_topk_dcp_qb_rank_jax,
-        }[(bool(qb_overlap), bool(rank_operand))]
+            (False, False, False): _streamidx_topk_dcp_jax,
+            (False, True, False): _streamidx_topk_dcp_rank_jax,
+            (True, False, False): _streamidx_topk_dcp_qb_jax,
+            (True, True, False): _streamidx_topk_dcp_qb_rank_jax,
+            (False, True, True): _streamidx_topk_dcp_rank_lane_jax,
+            (True, True, True): _streamidx_topk_dcp_qb_rank_lane_jax,
+        }[(bool(qb_overlap), bool(rank_operand), small_ag)]
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
@@ -904,6 +976,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # distribution
                 *((replicated,) * 3 if qb_overlap else ()),  # x, w_q, w_s
                 *((sharded,) if rank_operand else ()),  # rank ids
+                *((sharded,) if small_ag else ()),  # lane ids
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv
@@ -923,7 +996,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
-            *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank ids
+            *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank, lane ids
             **kwargs,
         ):
             del weights, k_packed, seq_lens, page_indices, cu_q_lens, distribution
@@ -942,6 +1015,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         def op(*args):
             if rank_tensor is not None:
                 args = (*args, rank_tensor)
+            if lane_tensor is not None:
+                args = (*args, lane_tensor)
             new_cache, local_topk, *rest = jax_op(*args)
             args[2].copy_(new_cache)
             if qb_overlap:

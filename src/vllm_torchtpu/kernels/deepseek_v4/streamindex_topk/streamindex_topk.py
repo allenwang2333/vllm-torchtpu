@@ -39,6 +39,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+from vllm_torchtpu.kernels.experimental.small_collectives import (
+    all_gather as small_collectives_all_gather,
+)
 
 try:
     from vllm_torchtpu.logger import init_logger
@@ -1691,6 +1694,13 @@ def streamindex_topk(
     )
 
 
+# TPU_DCP_INDEXER_SMALL_AG takes buckets of at most this many tokens
+# (`T <= 8`, a power of 2): there the kernel all-gather halves XLA's (twin,
+# DCP8 on one host: 13.5 -> 7.0 us per call at T = 4, 14.2 -> 9.9 at T = 8);
+# at T = 16 (128 KiB a rank) it ties XLA's and the step got slower.
+SMALL_AG_MAX_TOKENS = 8
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1715,6 +1725,7 @@ def streamindex_topk(
         "merge_overlap_fn",
         "overlap_pin_max_tokens",
         "flat_merge",
+        "small_all_gather",
     ),
 )
 def streamindex_topk_dcp(
@@ -1744,11 +1755,13 @@ def streamindex_topk_dcp(
     skip_empty_decode_chunked: bool = False,
     global_scheduling_group_id: int | None = None,
     dcp_rank_ids: jax.Array | None = None,
+    dcp_lane_ids: jax.Array | None = None,
     overlap_fn=None,
     overlap_args: tuple = (),
     merge_overlap_fn=None,
     overlap_pin_max_tokens: int | None = None,
     flat_merge: bool | None = None,
+    small_all_gather: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1851,6 +1864,17 @@ def streamindex_topk_dcp(
         them in place (`sparsecore_topk_dcp_merge(rank_major=True)`), with no
         32-row pad or 2-D relayout around the merge. None reads
         `TPU_SC_TOPK_DCP_MERGE_FLAT`. Same result.
+      small_all_gather: with `flat_merge` and `padded_num_tokens <=
+        SMALL_AG_MAX_TOKENS` only: run the flat candidate all-gather as one
+        Pallas remote-DMA kernel (`small_collectives.all_gather`) instead of
+        XLA's all-gather. Under
+        a mesh with a lane axis of size > 1 the torch bridge must pass
+        `dcp_lane_ids`. None reads `TPU_DCP_INDEXER_SMALL_AG`. Same
+        bytes, so the same result.
+      dcp_lane_ids: optional i32[dcp_size] sharded over `dcp_axis_name`,
+        each shard holding its index on the mesh's other (lane) axis
+        (`dcp_lane_operand`): the small all-gather's peer addresses under the
+        torch bridge, where `lax.axis_index` is refused. Read only by it.
 
     Returns:
       With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
@@ -1894,6 +1918,19 @@ def streamindex_topk_dcp(
     flat_merge = (
         bool(flat_merge) and not a2a_merge and rank_major_merge_fits(q.shape[0])
     )
+    if small_all_gather is None:
+        from vllm_torchtpu import envs
+
+        small_all_gather = envs.TPU_DCP_INDEXER_SMALL_AG
+    small_all_gather = (
+        bool(small_all_gather) and flat_merge and q.shape[0] <= SMALL_AG_MAX_TOKENS
+    )
+    lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
+    if small_all_gather and len(lane_axes) > 1:
+        raise ValueError(
+            f"small_all_gather takes at most one axis beside {dcp_axis_name!r},"
+            f" got mesh axes {mesh.axis_names}"
+        )
     # Pin only where each stage is one SparseCore call: an unchunked local
     # top-k (as `streamindex_topk` decides it) and the all-gather merge.
     pin = (
@@ -1919,11 +1956,29 @@ def streamindex_topk_dcp(
         # Trailing operands: this shard's rank (TPU_DCP_RANK_OPERAND), then the
         # overlap work's arguments (TPU_INDEXER_QB_OVERLAP).
         n_rank = 0 if dcp_rank_ids is None else 1
-        rank_ids, ov_args = extra[:n_rank], extra[n_rank:]
+        n_lane = 0 if dcp_lane_ids is None else 1
+        rank_ids = extra[:n_rank]
+        lane_ids = extra[n_rank : n_rank + n_lane]
+        ov_args = extra[n_rank + n_lane :]
         if rank_ids:
             dcp_rank = rank_ids[0][0]
         else:
             dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
+        # The small all-gather's lane index, as data where it is given; a
+        # size-1 lane axis is index 0; otherwise the kernel reads the axis.
+        lane_axis = lane_axes[0] if lane_axes else None
+        lane = None
+        if lane_axis is not None:
+            if lane_ids:
+                lane = lane_ids[0]
+            elif mesh.shape[lane_axis] == 1:
+                lane = jnp.zeros((1,), jnp.int32)
+        if lane_ids:
+            # Keep the lane operand live on every bucket: the torch op passes
+            # it on all of them, and JAX prunes an unused argument from the
+            # exported call (which then takes one operand fewer than the op
+            # hands it). Adds zero.
+            dcp_rank = dcp_rank + jnp.int32(0) * lane_ids[0][0]
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
         local = streamindex_topk(
@@ -2005,12 +2060,22 @@ def streamindex_topk_dcp(
         # Stage 1. All-gather the scores; the indices stay home. Flat, the
         # gather is rank-major over whole [T * k] lists, which the merge reads
         # in place.
-        scores = lax.all_gather(
-            scores,
-            dcp_axis_name,
-            axis=0 if flat_merge else 1,
-            tiled=True,
-        )
+        if small_all_gather:
+            scores = small_collectives_all_gather.small_all_gather(
+                scores,
+                num_cores=dcp_size,
+                axis=dcp_axis_name,
+                rank=jnp.reshape(dcp_rank, (1,)),
+                lane_axis=lane_axis,
+                lane=lane,
+            )
+        else:
+            scores = lax.all_gather(
+                scores,
+                dcp_axis_name,
+                axis=0 if flat_merge else 1,
+                tiled=True,
+            )
 
         merge_pinned = pin and merge_overlap_fn is not None
         if merge_pinned:
@@ -2048,6 +2113,7 @@ def streamindex_topk_dcp(
             replicated,  # cu_q_lens
             replicated,  # distribution
             *((P(dcp_axis_name),) if dcp_rank_ids is not None else ()),  # rank ids
+            *((P(dcp_axis_name),) if dcp_lane_ids is not None else ()),  # lane ids
             *(replicated for _ in ov_leaves),  # overlap_args
         ),
         out_specs=(
@@ -2063,5 +2129,6 @@ def streamindex_topk_dcp(
         cu_q_lens,
         distribution,
         *((dcp_rank_ids,) if dcp_rank_ids is not None else ()),
+        *((dcp_lane_ids,) if dcp_lane_ids is not None else ()),
         *ov_leaves,
     )

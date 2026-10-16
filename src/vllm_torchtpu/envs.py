@@ -169,6 +169,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
+    TPU_DCP_INDEXER_SMALL_AG: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -1412,6 +1413,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output slice). T > 32 keeps the padded path. Bitwise identical output.
     "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool(
         "TPU_SC_TOPK_DCP_MERGE_FLAT", default=False
+    ),
+    # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
+    # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
+    # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas
+    # remote-DMA kernel (kernels/experimental/small_collectives/all_gather.py)
+    # instead of XLA's all-gather, which runs serially on the TensorCore at
+    # 13-17 us per idx layer. Needs TPU_DCP_RANK_OPERAND (the kernel's peer
+    # addresses take the rank and lane as data). Same bytes, same result.
+    "TPU_DCP_INDEXER_SMALL_AG": env_bool(
+        "TPU_DCP_INDEXER_SMALL_AG", default=False
     ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
