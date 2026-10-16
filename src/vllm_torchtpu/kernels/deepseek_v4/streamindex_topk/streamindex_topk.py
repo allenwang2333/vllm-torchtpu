@@ -1150,6 +1150,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "split_mixed_blocks",
     ),
 )
 def streamindex_topk(
@@ -1179,6 +1180,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    split_mixed_blocks: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1241,6 +1243,14 @@ def streamindex_topk(
         a static q length and the (decode, prefill, mixed) block sizes' prefill
         entry, instead of the decode passes, which assume one query token. None
         keeps the segment on the decode passes.
+      split_mixed_blocks: run two pieces whose seam sits on a q-block boundary
+        of the first mixed sequence, chosen at run time: the first piece takes
+        every row before the seam (the decode and verify rows and the leading
+        half of the mixed blocks), the second the rest. As with `chunk_tokens`,
+        the first piece's SparseCore top-k overlaps the second piece's scoring,
+        but no q block is cut, so scoring does the same blocks as one pass.
+        Each piece scores into a full-height buffer. Ignored when
+        `chunk_tokens` chunks the call.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1665,6 +1675,23 @@ def streamindex_topk(
             num_chunks, chunk_len = 1, max_num_tokens
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+        mixed_split = split_mixed_blocks and num_chunks == 1 and cp_size == 1
+        if mixed_split:
+            # Seam: the first mixed sequence's start plus the leading
+            # floor(n/2) of its n mixed-pass q blocks. Piece 0 is the window
+            # [seam - T, seam), piece 1 is [seam, seam + T); a window clipped
+            # to the batch keeps the blocks of every sequence it holds aligned
+            # to that sequence's own start, so the seam cuts no block of the
+            # first mixed sequence.
+            mixed_bq = num_queries_per_blocks[2]
+            mixed_start = cu_q_lens[distribution[1]]
+            mixed_rows = cu_q_lens[distribution[2]] - mixed_start
+            first_mixed_rows = jnp.minimum(
+                mixed_rows, cu_q_lens[distribution[1] + 1] - mixed_start
+            )
+            lead_blocks = pl.cdiv(first_mixed_rows, mixed_bq) // 2
+            seam = (mixed_start + lead_blocks * mixed_bq).astype(jnp.int32)
+            num_chunks, chunk_len = 2, max_num_tokens
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
@@ -1672,11 +1699,12 @@ def streamindex_topk(
         if num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
+        if mixed_split:
+            chunk_starts = (seam - max_num_tokens, seam)
+        elif num_chunks == 1:
+            chunk_starts = (None,)
+        else:
+            chunk_starts = tuple(m * chunk_len for m in range(num_chunks))
         passes = tuple(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
             for spec in _pass_specs(decode_batch_end)
@@ -1691,6 +1719,18 @@ def streamindex_topk(
             sc_group = None if m == num_chunks - 1 else group_base + m
 
             start = m * chunk_len
+            if mixed_split:
+                # Buffer row r of piece m holds token chunk_starts[m] + r.
+                tokens = chunk_starts[m] + jnp.arange(chunk_len, dtype=jnp.int32)
+                owned = (tokens >= 0) & (tokens < max_num_tokens)
+                owned &= (tokens < seam) if m == 0 else (tokens >= seam)
+                row_lengths = jnp.where(
+                    owned,
+                    eff_row_lengths[jnp.clip(tokens, 0, max_num_tokens - 1)],
+                    0,
+                )
+            else:
+                row_lengths = eff_row_lengths[start : start + chunk_len]
             scores = _scores_for_chunk(
                 passes,
                 m,
@@ -1711,7 +1751,7 @@ def streamindex_topk(
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=row_lengths,
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
@@ -1721,15 +1761,23 @@ def streamindex_topk(
                 chunk_topk_idxs = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=row_lengths,
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
                 )
             topk_idxs.append(chunk_topk_idxs)
 
-        out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
-        out = out[:max_num_tokens, :k]
+        def assemble(pieces):
+            if mixed_split:
+                # Piece 0 rows [T - seam, T) and piece 1 rows [0, T - seam) are
+                # tokens [0, T) back to back.
+                return lax.dynamic_slice_in_dim(
+                    jnp.concatenate(pieces), max_num_tokens - seam, max_num_tokens
+                )
+            return pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces)
+
+        out = assemble(topk_idxs)[:max_num_tokens, :k]
 
         if cp_size == 1 and not return_scores:
             return out
@@ -1741,12 +1789,7 @@ def streamindex_topk(
         if not return_scores:
             return out
 
-        scores_out = (
-            topk_scores_list[0]
-            if len(topk_scores_list) == 1
-            else jnp.concatenate(topk_scores_list)
-        )
-        scores_out = scores_out[:max_num_tokens, :k]
+        scores_out = assemble(topk_scores_list)[:max_num_tokens, :k]
         return out, scores_out
 
     def _fast_path(_):

@@ -145,6 +145,7 @@ def _indexer_jax(
             uniform_q_len=uniform_q_len,
             kv_layout=kv_layout,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED,
         )
 
     return _indexer_local(
