@@ -1,4 +1,5 @@
-"""ragged_gather_reduce_v4 (SC destination-tiled bf16 combine) vs v2 and a float64 oracle.
+"""ragged_gather_reduce_v4 (SC destination-tiled bf16 combine) vs v2 and a
+float64 oracle.
 
 v4 must be bit-identical to v2 (same float32 products, same per-token summation
 order, round-to-nearest-even cast), and within the bf16 rounding bound of a

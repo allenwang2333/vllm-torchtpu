@@ -558,7 +558,8 @@ def test_streamidx_block_sizes_small_bucket():
 
 
 def test_streamidx_block_sizes_mixed_kv_pages():
-    """TPU_STREAMIDX_MIXED_KV_PAGES sets the MIXED kv pages of non-small buckets only."""
+    """TPU_STREAMIDX_MIXED_KV_PAGES sets the MIXED kv pages of non-small buckets
+    only."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP,
         _streamidx_block_sizes,

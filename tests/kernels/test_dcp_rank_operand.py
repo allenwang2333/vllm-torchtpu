@@ -131,7 +131,9 @@ def test_indexer_k_scatter_rank_operand(dcp_size):
     wrong = run(jnp.copy(init), *args, rank_ids=_rank_ids(mesh, dcp_size, 1))
     assert _tree_differs(wrong, base), "rank_ids is ignored"
 
-    lower = lambda **kw: jax.jit(functools.partial(run, **kw)).lower(init, *args)
+    def lower(**kw):
+        return jax.jit(functools.partial(run, **kw)).lower(init, *args)
+
     n0 = _num_a2a(lower().as_text())
     n1 = _num_a2a(lower(rank_ids=_rank_ids(mesh, dcp_size)).as_text())
     assert n1 == n0 - 1, (n0, n1)

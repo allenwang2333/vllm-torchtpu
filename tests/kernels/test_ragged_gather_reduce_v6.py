@@ -2,8 +2,8 @@
 
 v6 runs v5's steps without the pipeline grid; it must be bit-identical to v5 and
 v4 for every tiling, and within the bf16 rounding bound of a float64 oracle.
-Inputs mirror moe_gmm's EP path: x is the expert-sorted gmm2 output, indices are argsort_revert_indices (token-major),
-valid = local expert; rows past the valid prefix are NaN.
+Inputs mirror moe_gmm's EP path: x is the expert-sorted gmm2 output, indices
+are argsort_revert_indices (token-major), valid = local expert; rows past the valid prefix are NaN.
 """
 
 import jax.numpy as jnp

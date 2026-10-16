@@ -391,10 +391,7 @@ def _cp_scatter_indexer_k(
         )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_arg):
-        if rank_arg:
-            rank = rank_arg[0][0]
-        else:
-            rank = cp_rank_as_data(axis_name, cp_size)
+        rank = rank_arg[0][0] if rank_arg else cp_rank_as_data(axis_name, cp_size)
         if writer == "pallas":
             return coalesced_kv_append_dcp(
                 cache_kv,

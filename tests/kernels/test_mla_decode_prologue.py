@@ -616,9 +616,9 @@ def _merge_every_rank(outputs, lses, pack):
     with (
         mock.patch.object(cp_mla, "_all_to_all", exchange),
         mock.patch.object(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", pack, create=True),
+        concurrent.futures.ThreadPoolExecutor(world) as pool,
     ):
-        with concurrent.futures.ThreadPoolExecutor(world) as pool:
-            return torch.cat(list(pool.map(run, range(world))), dim=1)
+        return torch.cat(list(pool.map(run, range(world))), dim=1)
 
 
 def _rank_partials(step, dcp):

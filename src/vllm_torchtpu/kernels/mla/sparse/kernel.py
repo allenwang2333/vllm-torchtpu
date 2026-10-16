@@ -428,7 +428,9 @@ def _capped_window_live_kernel(
     topk_ref,  # i32[bz, topk_cap] one window of the logical top-k
     out_hbm_ref,  # i32[num_chunks * W * chunk * topk_cap // 128, 128] (HBM)
     stage_ref,  # VMEM i32[2, chunk * topk_cap // 128, 128] window-0 regions
-    phys_ref,  # VMEM i32[topk_cap // 128 * bz, 128]: 128-slot column tile j at rows [j*bz, (j+1)*bz)
+    # VMEM i32[topk_cap // 128 * bz, 128]: 128-slot column tile j at rows
+    # [j*bz, (j+1)*bz)
+    phys_ref,
     tok_ref,  # VMEM i32[bz * topk_cap // 128, 128] token-major rows (w >= 1)
     sems,  # DMA[3]: window-0 region slots 0 / 1, token-major rows
     *,
@@ -452,7 +454,8 @@ def _capped_window_live_kernel(
     are one prefix; the dead blocks fill the region from its end, so the
     region stays a permutation of valid physical rows (an overflowing chunk
     gathers all of it). A group with every atom live keeps its rows
-    token-major at `off(g)` (the kernel then fetches it with one DMA). Windows w >= 1 keep the token-major order of
+    token-major at `off(g)` (the kernel then fetches it with one DMA).
+    Windows w >= 1 keep the token-major order of
     `prepare_capped_window_indices`. The region is staged in VMEM (two slots)
     and written with one DMA per chunk.
     """
@@ -2715,8 +2718,8 @@ def sparse_ragged_paged_attention(
       kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
-        `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form. The SparseCore gather
-        writes them into both caches in place before it gathers (see
+        `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form.
+        The SparseCore gather writes them into both caches in place before it gathers (see
         `native_sc_gather.dsa_gather_native_sc`), and the updated caches are
         returned after the other outputs.
       kv_write_fault: test-only (`native_sc_gather.WRITE_FAULTS`).

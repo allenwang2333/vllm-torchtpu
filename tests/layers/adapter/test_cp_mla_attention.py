@@ -1154,7 +1154,8 @@ def test_bf16_wire_merge_is_within_its_bound(
     e_f32 = _scale_ulp_errors(f32, outputs, lses)
     e_got = _scale_ulp_errors(got, outputs, lses)
     print(
-        f"RS_BF16 mode={mode} dcp={dcp_size} T={tokens} s={spread}: f32 {e_f32} got {e_got}"
+        f"RS_BF16 mode={mode} dcp={dcp_size} T={tokens} s={spread}: "
+        f"f32 {e_f32} got {e_got}"
     )
     assert e_f32["max"] <= _RS_BF16_MAX_ULP[0], e_f32
     assert e_got["max"] <= _RS_BF16_MAX_ULP[mode], e_got

@@ -16,8 +16,8 @@ each rank merges the off partials with TPU_DCP_LSE_MERGE_A2A_PACK off and the
 on partials with PACK + REAL_ROWS on (query_start_loc [0, real]), eager and
 compiled. On the real rows eager must be bit for bit and compiled within one
 bf16 ulp (the pack's known compiled tolerance); the count is reported. With
-real rows the padding rows of the on merge are zero. Positive control: the on partials with every rank's lse
-rolled by one token must fail the same check.
+real rows the padding rows of the on merge are zero. Positive control: the on
+partials with every rank's lse rolled by one token must fail the same check.
 """
 
 import argparse
