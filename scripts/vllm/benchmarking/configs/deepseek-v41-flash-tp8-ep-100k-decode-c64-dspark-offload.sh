@@ -10,7 +10,10 @@ DSPARK_K=5
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:-1}"
-export TPU_DEEPSEEK_V41_SP="${TPU_DEEPSEEK_V41_SP:-0}"
+# Encoder-only sequence parallelism (CED decoder layers never use SP): shards
+# the T=8192 mixed-step elementwise work 8-way. Measured on tpu7x-8:
+# mixed step 320 -> 308 ms, E2E +1.4%, pure-decode step +0.8 ms.
+export TPU_DEEPSEEK_V41_SP="${TPU_DEEPSEEK_V41_SP:-1}"
 export TPU_DEEPSEEK_V41_LOCAL_Q="${TPU_DEEPSEEK_V41_LOCAL_Q:-0}"
 export USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE:-1}"
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
