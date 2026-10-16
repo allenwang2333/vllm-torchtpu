@@ -89,6 +89,24 @@ def _call(p, levers, fault=None, send_world=0, batch=4):
     return P._bits16(out[..., : P.NOPE_DIM]), P._bits32(lse)
 
 
+def _real(res, real, heads, world):
+    """The real tokens' partials and lse only: rows past `real` are bucket
+    padding (their send rows are never exchanged; with a grid step that ends
+    past `real` they are computed instead of left unwritten)."""
+    if isinstance(res, tuple):
+        out, lse = res
+        return out[:real], lse[:real]
+    pad = sparse_mla.SEND_PAD_ROWS
+    per = heads // world
+    tokens = (res.shape[1] - pad) // per
+    rows = res[:, pad : pad + real * per]
+    words = res[:, pad - 1]
+    lse = np.concatenate(
+        [words[:, : real * per], words[:, tokens * per : tokens * per + real * per]], 1
+    )
+    return rows, lse
+
+
 def _same(a, b):
     if isinstance(a, tuple):
         return all(np.array_equal(x, y) for x, y in zip(a, b))
@@ -131,7 +149,10 @@ def test_bit_identical(query_tokens, seq_q, send_world, shift):
     # default levers: the same bits as the served four-token steps.
     if query_tokens >= 8:
         got = _call(p, sparse_mla.DECODE_BODY_DEFAULT, send_world=send_world, batch=8)
-        assert _same(got, ref), "bz 8"
+        real, heads = int(sum(seq_q)), p["ql_nope"].shape[1]
+        world = send_world or 1
+        g, r = _real(got, real, heads, world), _real(ref, real, heads, world)
+        assert all(np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r)), "bz 8"
 
 
 def test_positive_control_fails():
