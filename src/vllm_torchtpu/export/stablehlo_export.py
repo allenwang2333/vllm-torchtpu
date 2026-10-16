@@ -58,12 +58,17 @@ _MLIR_DTYPE_TO_TORCH_NAME = {
     "f8E4M3FNUZ": "float8_e4m3fnuz",
     "f8E5M2": "float8_e5m2",
     "f8E5M2FNUZ": "float8_e5m2fnuz",
+    "f4E2M1FN": "float4_e2m1fn",
 }
-_TORCH_NAME_TO_MLIR_DTYPE = {v: k for k, v in _MLIR_DTYPE_TO_TORCH_NAME.items()}
-_TORCH_TENSOR_DTYPES = set(_MLIR_DTYPE_TO_TORCH_NAME.values())
+_TORCH_NAME_TO_MLIR_DTYPE = {
+    **{v: k for k, v in _MLIR_DTYPE_TO_TORCH_NAME.items()},
+    "float4_e2m1fn_x2": "f4E2M1FN",
+}
+_TORCH_TENSOR_DTYPES = set(_TORCH_NAME_TO_MLIR_DTYPE.keys())
 
 _ALLOWED_CUSTOM_CALL_TARGETS = frozenset(
     {
+        "AllocateBuffer",
         "tpu_custom_call",
         "xla_tpu_custom_call",
         "Sharding",
@@ -224,10 +229,7 @@ def _is_draft_compilation(adaptor: Any = None) -> bool:
         from vllm.config import get_current_vllm_config
 
         cfg = get_current_vllm_config()
-        if (
-            getattr(getattr(cfg, "model_config", None), "runner_type", None)
-            == "draft"
-        ):
+        if getattr(getattr(cfg, "model_config", None), "runner_type", None) == "draft":
             return True
     return False
 
@@ -360,8 +362,7 @@ def _resolve_dynamo_placeholder(
 
     lower_name = raw_name.lower()
     if any(
-        s in lower_name
-        for s in ("kv_cache", "conv_state", "ssm_state", "mamba_cache")
+        s in lower_name for s in ("kv_cache", "conv_state", "ssm_state", "mamba_cache")
     ):
         m_layer = re.search(r"layers_(?:modules_)?(\d+)", lower_name)
         layer_suffix = m_layer.group(1) if m_layer else "0"
@@ -891,7 +892,11 @@ def _write_exported_module(
     if match is not None:
         mlir_args = _parse_mlir_main_args(match.group(1))
         if len(mlir_args) == len(annotated_inputs):
-            for spec, (_, _, is_donor) in zip(annotated_inputs, mlir_args):
+            for spec, (m_shape, m_dtype, is_donor) in zip(annotated_inputs, mlir_args):
+                if "?" not in m_shape and "?" not in (spec.get("shape") or []):
+                    spec["shape"] = m_shape
+                if m_dtype in _TORCH_TENSOR_DTYPES:
+                    spec["dtype"] = m_dtype
                 spec["buffer_donor"] = is_donor
                 if (
                     is_donor
@@ -1037,9 +1042,7 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
             def _wait_for_engine_startup_with_early_exit(
                 *args: Any, **kwargs: Any
             ) -> Any:
-                export_dir_str = str(
-                    envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or ""
-                ).strip()
+                export_dir_str = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
 
                 def _maybe_close_launch() -> None:
                     launch = kwargs.get("launch") or (
@@ -1047,25 +1050,20 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
                     )
                     if launch is not None:
                         engine_mgr = getattr(launch, "engine_manager", None)
-                        if engine_mgr is not None and hasattr(
-                            engine_mgr, "close"
-                        ):
+                        if engine_mgr is not None and hasattr(engine_mgr, "close"):
                             with contextlib.suppress(Exception):
                                 engine_mgr.close()
                         coordinator = getattr(launch, "coordinator", None)
-                        if coordinator is not None and hasattr(
-                            coordinator, "close"
-                        ):
+                        if coordinator is not None and hasattr(coordinator, "close"):
                             with contextlib.suppress(Exception):
                                 coordinator.close()
 
                 try:
-                    res = engine_utils._orig_wait_for_engine_startup(
-                        *args, **kwargs
-                    )
-                    if export_dir_str and (
-                        Path(export_dir_str) / "metadata.json"
-                    ).is_file():
+                    res = engine_utils._orig_wait_for_engine_startup(*args, **kwargs)
+                    if (
+                        export_dir_str
+                        and (Path(export_dir_str) / "metadata.json").is_file()
+                    ):
                         logger.info(
                             "[TpuCompilerAdaptor] Exported all StableHLO "
                             "modules to %s; exiting early.",
@@ -1088,7 +1086,6 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
                             _maybe_close_launch()
                             sys.exit(0)
                     raise
-
 
             _wait_for_engine_startup_with_early_exit._has_export_early_exit_hook = True  # type: ignore[attr-defined]
             engine_utils.wait_for_engine_startup = (
@@ -2103,8 +2100,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     w_spec.pop("is_internal_constant", None)
 
                 tmp_wj = (
-                    serving_weight_json_path.parent
-                    / f"weight.json.{os.getpid()}.tmp"
+                    serving_weight_json_path.parent / f"weight.json.{os.getpid()}.tmp"
                 )
                 tmp_wj.write_text(json.dumps(weights_dict, indent=2))
                 os.replace(tmp_wj, serving_weight_json_path)
@@ -2112,9 +2108,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
     # If speculative decoding / MTP is configured and mtp_draft was not yet exported,
     # emit mtp_draft_bucket<B> for each forward bucket size.
     spec_cfg = getattr(runner, "speculative_config", None)
-    num_spec_tokens = int(
-        getattr(spec_cfg, "num_speculative_tokens", 0) or 0
-    )
+    num_spec_tokens = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
     if num_spec_tokens > 0:
         draft_buckets = sorted(
             {
@@ -2128,9 +2122,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             if (export_dir / f"{draft_fn_key}.mlir").is_file():
                 continue
             embed_idx = int(
-                (weights_dict.get("model.embed_tokens.weight") or {}).get(
-                    "index", 1
-                )
+                (weights_dict.get("model.embed_tokens.weight") or {}).get("index", 1)
             )
             embed_shape = list(
                 (weights_dict.get("model.embed_tokens.weight") or {}).get(
@@ -2143,10 +2135,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 )
             )
             e_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(embed_dtype, "bf16")
-            h_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(
-                _dtype_name(dummy_hidden), "bf16"
-            )
+            h_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(_dtype_name(dummy_hidden), "bf16")
             e_dims = "x".join(str(d) for d in embed_shape)
+            draft_out_ty = f"tensor<{b_sz}x{num_spec_tokens}xi32>"
             draft_mlir = (
                 f"module @{draft_fn_key} {{\n"
                 f"  func.func public @main("
@@ -2154,9 +2145,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 f"%arg1: tensor<{b_sz}xi32>, "
                 f"%arg2: tensor<{b_sz}x{hsize}x{h_mlir}>, "
                 f"%arg3: tensor<{e_dims}x{e_mlir}>"
-                f") -> tensor<{b_sz}x{num_spec_tokens}xi32> {{\n"
-                f"    %c = stablehlo.constant dense<0> : tensor<{b_sz}x{num_spec_tokens}xi32>\n"
-                f"    return %c : tensor<{b_sz}x{num_spec_tokens}xi32>\n"
+                f") -> {draft_out_ty} {{\n"
+                f"    %c = stablehlo.constant dense<0> : {draft_out_ty}\n"
+                f"    return %c : {draft_out_ty}\n"
                 f"  }}\n"
                 f"}}\n"
             )
@@ -2322,4 +2313,3 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             export_dir,
         )
         sys.exit(0)
-
