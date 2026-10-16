@@ -3,12 +3,14 @@
 
 **Decode** times ``KimiDecoder.step`` over vLLM's 24 unified pools for every
 ``--batches`` x ``--contexts`` case (``--mix``: one batch of rows at different
-contexts), or with ``--dspark [CHECKPOINT]`` the DSpark verify + draft step of
-one request. Each request starts at its context over synthetic KV pages and a
-clean KDA state, with distinct tokens per row (they set MoE routing); ``--steps``
-steps are enqueued back to back and timed with one host read, median of
-``--repeats``. DSpark's tokens per step on synthetic contexts are not
-representative.
+contexts), or with ``--dspark [CHECKPOINT]`` the DSpark verify + draft step
+(serving's draft schedule: seven drafts through batch four, three through
+eight; ``--acceptance`` fixes the accepted drafts per position so drafts
+compare at equal acceptance). Each request starts at its context over
+synthetic KV pages and a clean KDA state, with distinct tokens per row (they
+set MoE routing); ``--steps`` steps are enqueued back to back and timed with
+one host read, median of ``--repeats``. DSpark's own tokens per step on
+synthetic contexts are not representative.
 
 **Prefill** times :class:`KimiPrefiller.step` per ``--prompts`` case: ``LENxN``
 is one step of ``N`` prompts of ``LEN`` new tokens, ``LENxN@PREFIX`` appends
@@ -55,16 +57,32 @@ def add_arguments(parser, profile: bool = False) -> None:
         "--dspark",
         default="",
         metavar="CHECKPOINT",
-        help="time B1 as DSpark verify + draft with this speculator; without "
-        "the flag B1 is the plain step",
+        help="time DSpark verify + draft steps with this speculator (batches "
+        "up to eight); without the flag every step is plain",
+    )
+    decode.add_argument(
+        "--drafts",
+        type=int,
+        choices=(3, 7),
+        default=0,
+        help="with --dspark: this many drafts at every batch up to eight "
+        "(default: serving's schedule)",
+    )
+    decode.add_argument(
+        "--acceptance",
+        default="",
+        help="with --dspark: synthetic per-position acceptance rates of the "
+        "seven drafts (comma separated; three drafts take the first three), "
+        "e.g. 0.92,0.83,0.73,0.65,0.57,0.50,0.43; default: the drafts' own",
     )
     decode.add_argument(
         "--spec-drafts",
         type=int,
         choices=(0, 3, 7),
         default=0,
-        help="with --dspark, every batch speculates with this many drafts "
-        "(the batched verify + draft); 0: B1 only, with 7",
+        help="with --dspark: this many drafts at every batch, any size (e.g. "
+        "attention DP2's batched verify + draft); default: --drafts or "
+        "serving's schedule",
     )
     decode.add_argument(
         "--save-tokens",
@@ -111,13 +129,17 @@ def _prompt_tokens(rng, corpus, size):
 
 @contextmanager
 def _trace(directory: str, tag: str, last: bool):
-    """Rank 0 saves an xprof trace of the last repeat under ``directory``."""
-    if not (directory and last and harness.rank() == 0):
+    """Rank 0 saves an xprof trace of the last repeat under ``directory``
+    (``TRACE_RANKS``, e.g. ``0,8,16,24``: those ranks, under ``rank<r>/``)."""
+    ranks = [int(r) for r in os.environ.get("TRACE_RANKS", "0").split(",")]
+    if not (directory and last and harness.rank() in ranks):
         yield
         return
     from torch_tpu._internal.profiler import _impl as profiler
 
     path = os.path.join(directory, tag)
+    if ranks != [0]:
+        path = os.path.join(directory, f"rank{harness.rank()}", tag)
     profiler.start_trace(path)
     try:
         yield
@@ -163,31 +185,55 @@ def run_decode(args, records: harness.Records) -> None:
         batch_sizes=sizes,
     )
     pools = k3.Pools(blocks, pages, 1, pattern=True)
-    draft = None
-    spec_all = bool(args.dspark and args.spec_drafts)
-    if args.dspark and (spec_all or any(batch == 1 for batch, _ in cases)):
-        from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
 
-        draft = DsparkDraft(
+    # Serving's DSpark schedule: seven drafts through batch four, three
+    # through eight, none above. --spec-drafts: that many at every batch;
+    # --drafts: at every batch up to eight.
+    def drafts_at(batch: int) -> int:
+        if args.spec_drafts:
+            return args.spec_drafts
+        if args.drafts:
+            return args.drafts if batch <= 8 else 0
+        return 7 if batch <= 4 else 3 if batch <= 8 else 0
+
+    draft = None
+    if args.dspark and any(drafts_at(batch) for batch, _ in cases):
+        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
+
+        rates = None
+        if args.acceptance:
+            seven = tuple(float(r) for r in args.acceptance.split(","))
+            if len(seven) != 7:
+                raise SystemExit("--acceptance takes seven rates")
+            rates = {7: seven, 3: seven[:3]}
+        draft = draft_class(args.dspark)(
             max_position=max_context + 8 * args.steps * args.repeats + 256,
             checkpoint=args.dspark,
             presharded=args.presharded,
+            synthetic_rates_by_width=rates,
         )
+    schedule = None
+    if draft is not None and args.spec_drafts:
+        schedule = ((1, max_num_seqs, args.spec_drafts),)
+    elif draft is not None and args.drafts:
+        spans = [(1, min(8, max_num_seqs), args.drafts)]
+        if max_num_seqs > 8:
+            spans.append((9, max_num_seqs, 0))
+        schedule = tuple(spans)
+    elif draft is not None:
+        spans = [(1, min(4, max_num_seqs), 7)]
+        if max_num_seqs > 4:
+            spans.append((5, min(8, max_num_seqs), 3))
+        if max_num_seqs > 8:
+            spans.append((9, max_num_seqs, 0))
+        schedule = tuple(spans)
     decoder = k3.decoder(
         ops,
         pools,
         max_num_seqs=max_num_seqs,
         max_model_len=pages * k3.logical(),
         draft=draft,
-        # The bench speculates on batch-one rows only (7 drafts), or with
-        # --spec-drafts at every batch.
-        schedule=(
-            ((1, max_num_seqs, args.spec_drafts),)
-            if spec_all
-            else ((1, 1, 7), (2, max(2, max_num_seqs), 0))
-        )
-        if draft
-        else None,
+        schedule=schedule,
     )
     harness.sync()
     decoder.warmup()
@@ -203,9 +249,8 @@ def run_decode(args, records: harness.Records) -> None:
         out = []
         for r in range(batch):
             table = pools.scheduled([1 + r // dp * pages + p for p in range(pages)], r)
-            query = 1
-            if draft is not None and not first and (spec_all or batch == 1):
-                query = (args.spec_drafts or 7) + 1
+            speculating = draft is not None and drafts_at(batch) and not first
+            query = drafts_at(batch) + 1 if speculating else 1
             tokens = [1000 + 37 * r] if first else np.zeros(query, np.int32)
             computed = per_row[r] - 1 if first else 0
             out.append(k3.request(f"{tag}-{r}", tokens, table, sampling, computed))
@@ -230,15 +275,15 @@ def run_decode(args, records: harness.Records) -> None:
                 bridge.materialize(outs[-1])
                 times.append(1e3 * (time.perf_counter() - started) / args.steps)
         ms = statistics.median(times)
-        dspark = draft is not None and (spec_all or batch == 1)
+        dspark = draft is not None and drafts_at(batch) > 0
         if dspark:
             tokens = torch.cat([o[:batch] for o in outs]).cpu()
-            per_step = float((tokens >= 0).sum()) / (len(outs) * batch)
+            per_step = float((tokens >= 0).sum()) / len(outs) / batch
             rate = 1e3 * per_step * batch / ms
             line = (
-                f"B{batch} ctx {label}: DSpark {ms:.2f} ms per step, "
-                f"{per_step:.2f} tokens per request-step (synthetic) -> "
-                f"{rate:.0f} tok/s"
+                f"B{batch} ctx {label}: DSpark x{drafts_at(batch)} "
+                f"{ms:.2f} ms per step, "
+                f"{per_step:.2f} tokens per request step -> {rate:.0f} tok/s"
             )
         else:
             rate = batch * 1e3 / ms

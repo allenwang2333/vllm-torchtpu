@@ -189,6 +189,18 @@ def _batched_fn(
     return fn
 
 
+def draft_class(checkpoint) -> type:
+    """The draft implementation for the speculator checkpoint: the MLA draft
+    (``Inferact/Kimi-K3-DSpark``, :mod:`draft_mla`) or :class:`DsparkDraft`
+    (``RedHatAI/Kimi-K3-speculator.dspark``)."""
+    (mla,) = kernel_modules("dspark_mla")
+    if mla.is_mla_draft(Path(checkpoint)):
+        from vllm_torchtpu.megakernel.kimi_k3.draft_mla import MlaDsparkDraft
+
+        return MlaDsparkDraft
+    return DsparkDraft
+
+
 class DsparkDraft:
     """The fused DSpark draft: weights, per-sequence rings and the step op."""
 

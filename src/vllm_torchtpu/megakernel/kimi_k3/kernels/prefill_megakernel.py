@@ -5803,8 +5803,11 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
             lambda x: x,
             blocks,
         )
+        tap = prefix
         for offset in range(4):
             index = base + offset
+            if offset == 2:
+                tap = prefix  # entering layer base + 2 (DSpark aux layer 90 in group 22)
             attn_res = choose(common["attn_res"], index)
             attn_norm = choose(common["attn_norm"], index)
             attn_active = scalar((index - 1) // 12 + 1)
@@ -5838,10 +5841,10 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                 ffn_input, after_attention, moe_families,
                 length, scalar(index - 1),
             )
-        return prefix, blocks, kda_states, mla_cache
+        return prefix, blocks, kda_states, mla_cache, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,),
+        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding,
     ))
 
 
@@ -5862,20 +5865,20 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
         arenas = arena.split()
-        middle, blocks, kda_state, mla_state = group4(
+        middle, blocks, kda_state, mla_state, _ = group4(
             prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, first,
             segment_desc, arenas[0],
         )
-        prefix, blocks, kda_state, mla_state = group4(
+        prefix, blocks, kda_state, mla_state, tap = group4(
             middle, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, second,
             segment_desc, arenas[1],
         )
-        return prefix, blocks, kda_state, mla_state, middle
+        return prefix, blocks, kda_state, mla_state, middle, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding,
+        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding,
     ))
 
 
@@ -5936,7 +5939,7 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
 
 
 def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, prefix_capacity,
-                                  mla_flash_tile=256, unroll=False):
+                                  mla_flash_tile=256, unroll=False, tap_layer=None):
     """Layers ``0 .. depth - 1`` over a packed window of ``segments``
     sequences, on family-major K3 weights (the prefill runs the first four
     here, then ``make_regular_group8_sp_indexed`` and
@@ -5951,9 +5954,13 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
     (``[32, 69, segments, ...]``); ``rec_at``/``hist_at`` receive each
     layer's state at each sequence's checkpoint. The MLA state is
     ``(latents,)``, ``[32, 24, T, 576]``: each MLA layer's compressed KV.
+    ``tap_layer`` (``1 .. depth - 1``): also return the residual stream
+    entering that layer (the MLA DSpark draft's aux layer 3).
     """
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("indexed prefill stack requires flat k3_sp TP32 mesh")
+    if tap_layer is not None and not 1 <= tap_layer < depth:
+        raise ValueError("tap_layer must be one of the stack's later layers")
     check_window(seq_len, "indexed prefill stack")
     if not 2 <= depth <= 93:
         raise ValueError("indexed prefill stack needs depth 2..93")
@@ -6018,7 +6025,9 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         )
 
         def body(index, carry):
-            prefix, blocks, kda_states, mla_cache = carry
+            prefix, blocks, kda_states, mla_cache, tap = carry
+            if tap_layer is not None:
+                tap = jnp.where(index == tap_layer, prefix, tap)
             blocks = jax.lax.cond(
                 index % 12 == 0,
                 lambda x: x.at[:, index // 12].set(prefix),
@@ -6064,17 +6073,20 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
                 ffn_input, after_attention, moe_families,
                 length, active(index - 1),
             )
-            return prefix, blocks, kda_states, mla_cache
+            return prefix, blocks, kda_states, mla_cache, tap
 
         result = jax.lax.fori_loop(
             1, depth, body,
-            (prefix, blocks, kda_states, tuple(mla_state)),
+            (prefix, blocks, kda_states, tuple(mla_state), prefix if tap_layer is not None else None),
             unroll=unroll,
         )
+        if tap_layer is not None:
+            return (result[0], result[1], result[2], result[3], result[4])
         return (result[0], result[1], result[2], result[3])
 
     return jax.jit(run, out_shardings=(
         sharding, sharding, (sharding,) * len(kda_outputs), (sharding,),
+        *((sharding,) if tap_layer is not None else ()),
     ))
 
 

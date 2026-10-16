@@ -264,7 +264,23 @@ def write_k3(args, log) -> None:
     log(f"ranks {ranks} converted in {time.perf_counter() - started:.0f} s")
 
 
+def _mla_module():
+    import importlib
+
+    return importlib.import_module(
+        "vllm_torchtpu.megakernel.kimi_k3.kernels.dspark_mla"
+    )
+
+
 def draft_shards(dspark, draft: str, max_position: int):
+    """The draft's kernel-layout shards: the MLA draft (``Inferact/Kimi-K3-
+    DSpark``, ``kernels.dspark_mla``) or the Qwen3-style one (``kernels.dspark``)."""
+    mla = _mla_module()
+    if mla.is_mla_draft(Path(draft)):
+        config = mla.MlaDraftConfig.from_checkpoint(Path(draft))
+        return mla.kernel_weight_shards(
+            config, mla.load_checkpoint_weights(Path(draft), config)
+        )
     config = dspark.DraftConfig.from_checkpoint(Path(draft))
     weights = dspark.load_checkpoint_weights(Path(draft), config)
     return dspark.kernel_weight_shards(config, weights, max_position=max_position)
@@ -280,7 +296,10 @@ def write_dspark(args, log) -> None:
     shards = draft_shards(dspark, args.draft, args.max_position)
     log(f"kernel layout built in {time.perf_counter() - started:.0f} s")
     directory = draft_directory(args.output, args.draft)
-    dspark.save_kernel_shards(shards, directory)
+    mla = _mla_module()
+    (mla if mla.is_mla_draft(Path(args.draft)) else dspark).save_kernel_shards(
+        shards, directory
+    )
     log(f"written to {directory} in {time.perf_counter() - started:.0f} s")
 
 

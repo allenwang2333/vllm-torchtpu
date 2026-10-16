@@ -78,6 +78,9 @@ def add_arguments(parser) -> None:
         default=None,
         help="the DSpark speculator checkpoint: compare the prefill's rings too",
     )
+    from tools.megakernel.check_mla import add_arguments as add_mla_arguments
+
+    add_mla_arguments(sub)
     greedy = sub.add_parser(
         "greedy", help="real prompts replayed on the decoder, then greedy tokens"
     )
@@ -93,6 +96,10 @@ def add_arguments(parser) -> None:
 
 
 def run(args, records: harness.Records) -> None:
+    if args.check == "mladraft":
+        from tools.megakernel.check_mla import run_mladraft
+
+        return run_mladraft(args, records)
     {
         "spec": run_spec,
         "handoff": run_handoff,

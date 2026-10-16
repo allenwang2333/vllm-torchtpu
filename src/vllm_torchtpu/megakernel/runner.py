@@ -148,6 +148,14 @@ class MegakernelModelRunner(TPUModelRunner):
         # The weightless model (its layers declare the KV cache spec), through
         # the megakernel load format.
         super().load_model()
+        # The MLA DSpark draft's latent layers: KV cache layers of both roles.
+        draft = backend.mla_draft(self.vllm_config)
+        if draft is not None:
+            from vllm_torchtpu.megakernel.kimi_k3.draft_layers import (
+                register_draft_layers,
+            )
+
+            self._draft_layers = register_draft_layers(self.vllm_config, draft)
         tp_rank = get_tensor_model_parallel_rank()
         self._is_output_rank = tp_rank == 0
         self.program = build_program(self.vllm_config, tp_rank)

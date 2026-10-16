@@ -127,6 +127,22 @@ def is_mla_layer(layer: int) -> bool:
     return layer in _MLA_INDEX
 
 
+# vLLM numbers a speculator's layers after the target's: the MLA DSpark
+# draft's latent layers are 93.. (MLA pools of the target's MLA group).
+DRAFT_LAYER0 = MLA_LAYERS + KDA_LAYERS
+
+
+def draft_raw_pools(caches: Mapping[str, Any]) -> list[torch.Tensor]:
+    """The MLA DSpark draft layers' pools (layers ``DRAFT_LAYER0`` on, in
+    order), or none."""
+    layers = sorted(
+        (layer_index(name), cache)
+        for name, cache in caches.items()
+        if layer_index(name) >= DRAFT_LAYER0
+    )
+    return [_raw_tensor(cache) for _, cache in layers]
+
+
 def bind_raw_pools(
     caches: Mapping[str, Any],
     kv_cache_dtype: str | None = None,
@@ -148,7 +164,11 @@ def bind_raw_pools(
             raw_pools.append(tensor)
         return index_of_ptr[key]
 
-    layers = sorted((layer_index(name), name, cache) for name, cache in caches.items())
+    layers = sorted(
+        (layer_index(name), name, cache)
+        for name, cache in caches.items()
+        if layer_index(name) < DRAFT_LAYER0  # draft layers: draft_raw_pools
+    )
     mla = [(layer, name, cache) for layer, name, cache in layers if is_mla_layer(layer)]
     kda = [
         (layer, name, cache) for layer, name, cache in layers if not is_mla_layer(layer)

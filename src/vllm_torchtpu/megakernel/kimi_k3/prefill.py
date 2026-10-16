@@ -54,6 +54,7 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
     MLA_LAYERS,
     SSM_ROWS,
     bind_raw_pools,
+    draft_raw_pools,
     kda_blocks_at_column,
     kda_blocks_at_length,
     read_draft_rings,
@@ -400,6 +401,7 @@ class PrefillProgram:
             unroll=True,
             segments=count,
             prefix_capacity=self.capacity,
+            tap_layer=3,  # the MLA DSpark draft's aux layer 3
         )
         regular = self._kernels.make_regular_group8_sp_indexed(
             mesh,
@@ -445,7 +447,7 @@ class PrefillProgram:
             latents = zeros((MLA_LAYERS, window, 576), jnp.bfloat16)
             rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
             hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
-            prefix, blocks, kda_state, mla_state = first(
+            prefix, blocks, kda_state, mla_state, tap = first(
                 hidden,
                 w["common"],
                 w["kda"],
@@ -457,7 +459,7 @@ class PrefillProgram:
                 segment_desc=segments,
                 arena=arena,
             )
-            return (prefix, blocks, *kda_state, *mla_state)
+            return (prefix, blocks, *kda_state, *mla_state, tap)
 
         # prefix, blocks, rec, hist, rec_at, hist_at, latents
         state_specs = (sharded,) * 7
@@ -471,7 +473,7 @@ class PrefillProgram:
             + (sharded,) * 2
             + prefix_specs(1)
             + (sharded,) * self._count("io", *weight_groups),
-            state_specs,
+            state_specs + (sharded,),  # then the stream entering layer 3
             donate_argnums=(3, 4),
             export_key=self._export_key(f"{name}_first", window),
         )
@@ -491,7 +493,7 @@ class PrefillProgram:
         ):
             arena, args = split(args, 2)
             w, _ = self._unflat(args, *weight_groups)
-            prefix, blocks, kda_state, mla_state, middle = regular(
+            prefix, blocks, kda_state, mla_state, middle, tap = regular(
                 prefix,
                 blocks,
                 w["common"],
@@ -505,7 +507,7 @@ class PrefillProgram:
                 segment_desc=segments,
                 arena=arena,
             )
-            return (prefix, blocks, *kda_state, *mla_state, middle)
+            return (prefix, blocks, *kda_state, *mla_state, middle, tap)
 
         ops["group"] = register_global_op(
             self._op_name(f"{name}_group8", window),
@@ -515,7 +517,9 @@ class PrefillProgram:
             + (replicated,) * 3
             + prefix_specs(2)
             + (sharded,) * self._count(*weight_groups),
-            state_specs + (sharded,),  # then the stream between its two groups
+            # then the streams between its two groups and entering its last
+            # group's third layer
+            state_specs + (sharded,) * 2,
             donate_argnums=tuple(range(7)),
             export_key=self._export_key(f"{name}_group", window),
         )
@@ -615,7 +619,7 @@ class PrefillProgram:
         runs on the residual streams before the final op consumes them."""
         ops = self._build(int(shard.shape[-1]) * 32)
         tail = (ids, local)
-        state = ops["first"](
+        *state, tap3 = ops["first"](
             shard,
             extent,
             segments,
@@ -625,9 +629,9 @@ class PrefillProgram:
             *tail,
             *self._flat("io", "common", "kda", "mla", "moe"),
         )
-        middle = None
+        middle = tap90 = None
         for p, pair in enumerate(self._pairs):
-            *state, middle = ops["group"](
+            *state, middle, tap90 = ops["group"](
                 *state,
                 extent,
                 pair,
@@ -639,7 +643,8 @@ class PrefillProgram:
             )
         prefix, blocks, rec, hist, rec_at, hist_at, latents = state
         if ring is not None:
-            ring(blocks, prefix, middle)  # the last pair's middle: entering layer 88
+            # The last pair's middle: entering layer 88; its tap: entering 90.
+            ring(blocks, prefix, middle, tap3, tap90)
         logits, latents = ops["final"](
             prefix,
             blocks,
@@ -1192,12 +1197,34 @@ class KimiPrefiller:
         # With the DSpark speculator: each request's draft ring, computed from
         # the windows' residual streams and written with its KDA state.
         self.ring = None
+        # With the MLA DSpark draft (Inferact/Kimi-K3-DSpark): each window's
+        # draft context latents, written to the draft's KV cache layers.
+        self.draft_latents = None
         if draft_checkpoint is not None:
-            from vllm_torchtpu.megakernel.kimi_k3.draft_ring import PrefillRing
+            (mla,) = kernel_modules("dspark_mla")
+            if mla.is_mla_draft(Path(draft_checkpoint)):
+                from vllm_torchtpu.megakernel.kimi_k3.draft_mla_prefill import (
+                    PrefillDraftLatents,
+                )
 
-            self.ring = PrefillRing(
-                self.program.mesh, self.rank, AXIS, draft_checkpoint, self.presharded
-            )
+                self.draft_latents = PrefillDraftLatents(
+                    self.program.mesh,
+                    self.rank,
+                    AXIS,
+                    Path(draft_checkpoint),
+                    self.presharded,
+                    config.max_model_len,
+                )
+            else:
+                from vllm_torchtpu.megakernel.kimi_k3.draft_ring import PrefillRing
+
+                self.ring = PrefillRing(
+                    self.program.mesh,
+                    self.rank,
+                    AXIS,
+                    draft_checkpoint,
+                    self.presharded,
+                )
 
     def load_weights(self) -> None:
         if self._loaded:
@@ -1206,6 +1233,8 @@ class KimiPrefiller:
         self.program.load_weights(self.presharded)
         if self.ring is not None:
             self.ring.load_weights()
+        if self.draft_latents is not None:
+            self.draft_latents.load_weights()
         self._loaded = True
         if self.rank == 0:
             logger.info(
@@ -1226,6 +1255,8 @@ class KimiPrefiller:
         self._writer = PoolWriter(
             self.program.mesh, self.rank, raw_pools, mla_raw, kda_raw, self._state_perm
         )
+        if self.draft_latents is not None:
+            self.draft_latents.bind(draft_raw_pools(caches))
         of = {name: g for g, group in enumerate(groups) for name in group.layer_names}
         mla_groups = {of[n] for n in mla_names if n in of}
         if len(mla_groups) != 1:
@@ -1259,7 +1290,10 @@ class KimiPrefiller:
             # vLLM's copy-on-write block copies (a prefix hit ending inside a
             # cached block gets a private copy of it), before the windows that
             # read the copies as their prefix.
-            self._writer.copy_blocks([(int(src), int(dst)) for src, dst in copies])
+            pairs = [(int(src), int(dst)) for src, dst in copies]
+            self._writer.copy_blocks(pairs)
+            if self.draft_latents is not None:
+                self.draft_latents.copy_blocks(pairs, COPY_PAIRS)
         for req in step_input.finished:
             self._requests.pop(req, None)
         largest = self.program.windows[-1]
@@ -1511,6 +1545,19 @@ class KimiPrefiller:
         ids, local_bases, write_table = self._cp_operands(rows, by_row, window, members)
         order = self.program.sp_order(window)  # the ranks' rows, rank-major
         ring_hook, ring_out = None, {}
+        if self.draft_latents is not None:
+            draft_positions = np.full(window, -1, np.int32)
+            for piece, offset in members:
+                draft_positions[offset : offset + piece.length] = np.arange(
+                    piece.start, piece.end
+                )
+
+            def ring_hook(blocks, prefix, middle, tap3, tap90):
+                assert self.draft_latents is not None
+                ring_out["draft"] = self.draft_latents.latents(
+                    window, blocks, tap3, tap90, draft_positions, order
+                )
+
         if self.ring is not None:
             positions = np.full(window, -1, np.int32)
             sequences = np.full(window, -1, np.int32)
@@ -1532,7 +1579,7 @@ class KimiPrefiller:
             # The ring update takes rows in ownership order.
             positions, sequences = positions[order], sequences[order]
 
-            def ring_hook(blocks, prefix, middle):
+            def ring_hook(blocks, prefix, middle, *taps):
                 ring_out["after"], ring_out["at"] = self.ring.update(
                     blocks, prefix, middle, positions, sequences, ends, stops, rings
                 )
@@ -1566,14 +1613,19 @@ class KimiPrefiller:
             write_table,
             torch.cat(finals),
             torch.cat(ats),
-            (ring_out["after"], ring_out["at"]) if ring_out else None,
+            (ring_out["after"], ring_out["at"]) if "after" in ring_out else None,
         )
+        if "draft" in ring_out:
+            assert self.draft_latents is not None and self._writer is not None
+            self.draft_latents.write(
+                ring_out["draft"], write_table, self._writer.layout.block_shape
+            )
         for s, ((piece, _), pair) in enumerate(
             zip(members, self.program.split_states(recurrent, conv))
         ):
             state, _ = by_row[piece.row]
             state.state, state.start = pair, piece.end
-            if ring_out:
+            if "after" in ring_out:
                 state.ring = ring_out["after"][s]
         if self.rank == 0:
             logger.info(
@@ -1811,7 +1863,13 @@ class KimiPrefiller:
                 none = np.full(window, -1, np.int32)
 
                 def ring_hook(
-                    blocks, prefix, middle, none=none, ring_out=ring_out, count=count
+                    blocks,
+                    prefix,
+                    middle,
+                    *taps,
+                    none=none,
+                    ring_out=ring_out,
+                    count=count,
                 ):
                     ring_out["after"], ring_out["at"] = self.ring.update(
                         blocks,
@@ -1822,6 +1880,29 @@ class KimiPrefiller:
                         [-1] * count,
                         [-1] * count,
                         [self.ring.zero()] * count,
+                    )
+
+            if self.draft_latents is not None:
+                order = self.program.sp_order(window)
+
+                def ring_hook(
+                    blocks,
+                    prefix,
+                    middle,
+                    tap3,
+                    tap90,
+                    window=window,
+                    order=order,
+                    ring_out=ring_out,
+                ):
+                    assert self.draft_latents is not None
+                    ring_out["draft"] = self.draft_latents.latents(
+                        window,
+                        blocks,
+                        tap3,
+                        tap90,
+                        np.full(window, -1, np.int32),
+                        order,
                     )
 
             logits, latents, recurrent, conv, recurrent_at, conv_at = (
@@ -1848,7 +1929,16 @@ class KimiPrefiller:
                     _rank_zeros_i32(window // self.page_tokens),
                     _zeros_i32(live * KDA_LAYERS),
                     _zeros_i32(live * KDA_LAYERS),
-                    (ring_out["after"], ring_out["at"]) if ring_out else None,
+                    (ring_out["after"], ring_out["at"])
+                    if "after" in ring_out
+                    else None,
+                )
+            if "draft" in ring_out:
+                assert self.draft_latents is not None
+                self.draft_latents.write(
+                    ring_out["draft"],
+                    _rank_zeros_i32(window // self.page_tokens),
+                    writer.layout.block_shape,
                 )
         count = self.slots  # a hit-state read's sequences (_read_hit_states)
         outputs.append(writer.read_states(_zeros_i32(count * KDA_LAYERS))[0])
@@ -1860,6 +1950,8 @@ class KimiPrefiller:
             )
         # Copy-on-write prefix hits (the null block onto itself).
         writer.copy_blocks([(0, 0)])
+        if self.draft_latents is not None:
+            self.draft_latents.copy_blocks([(0, 0)], COPY_PAIRS)
         stacked = torch.zeros(
             (self.config.max_num_seqs, VOCAB), dtype=torch.float32
         ).to("tpu")

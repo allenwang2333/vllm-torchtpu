@@ -48,6 +48,7 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
     KDA_LAYERS,
     KdaImporter,
     SlotMap,
+    draft_raw_pools,
     kda_blocks_at_length,
     tp_rank_permutation,
 )
@@ -111,6 +112,14 @@ class KimiDecoder:
         # compiled verifier/drafter shape is derived from it.
         self.spec_tokens = (spec_tokens_per_batch(config) or ()) if draft else ()
         self.groups = int(ops.attention_dp)
+        if (
+            draft is not None
+            and self.groups > 1
+            and not getattr(draft, "attention_dp", True)
+        ):
+            raise ValueError(
+                "K3 decode: this DSpark draft needs attention DP 1 (DCP32 draft pools)"
+            )
         shapes = set()
         for b, k in enumerate(self.spec_tokens):
             if k and self.groups > 1:
@@ -157,7 +166,8 @@ class KimiDecoder:
         self._group: dict[str, tuple[int, int]] = {}  # request -> (DP group, context)
         # Import each transferred request's DSpark ring: with a DSpark
         # speculative config the transfer carries one (backend.draft_ring_rows).
-        self._ring = draft is not None
+        # (The MLA draft keeps its context in its own pools: no ring.)
+        self._ring = draft is not None and getattr(draft, "imports_ring", True)
         self._ring_reports = 4
         self._importer: KdaImporter | None = None
         self.destination_ranks: tuple[int, ...] | None = None
@@ -202,6 +212,16 @@ class KimiDecoder:
         num_blocks = self._importer.bind(caches, self.config.kv_cache_dtype)
         self._num_blocks = num_blocks
         self.ops.use_unified_pools(self._importer.raw_pools, self._importer.mla_raw)
+        if self.draft is not None and hasattr(self.draft, "bind_pools"):
+            assert self.ops.pool_map is not None
+            # The MLA draft: the target's LM head and embedding, and pools
+            # shaped like the target's MLA pools (same tables and owners).
+            self.draft.attach_target(self.ops.weights)
+            self.draft.bind_pools(
+                self.ops.unified_pools[self.ops.pool_map[0]],
+                self.ops.owner_table,
+                draft_raw_pools(caches),
+            )
         of = {name: g for g, group in enumerate(groups) for name in group.layer_names}
         mla_groups = {of[n] for n in self._importer.mla_layer_names if n in of}
         if len(mla_groups) != 1:

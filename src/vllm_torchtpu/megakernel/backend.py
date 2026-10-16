@@ -105,6 +105,31 @@ def draft(vllm_config: Any) -> Path | None:
     return Path(path) if path else None
 
 
+def mla_draft(vllm_config: Any) -> Path | None:
+    """The MLA DSpark draft checkpoint (``model_type`` ``k3_dspark``,
+    ``Inferact/Kimi-K3-DSpark``) of either role -- the prefill's ``draft``,
+    the decoder's speculative model -- or None. Its latent layers are KV cache
+    layers of both roles (``megakernel.runner``), so the transfer carries them."""
+    import json
+
+    selected = role(vllm_config)
+    if selected == "prefill":
+        path = draft(vllm_config)
+    elif selected == "decode":
+        spec = vllm_config.speculative_config
+        path = (
+            Path(str(spec.model))
+            if spec is not None and spec.method == "dspark" and spec.model
+            else None
+        )
+    else:
+        return None
+    if path is None or not (path / "config.json").is_file():
+        return None
+    config = json.loads((path / "config.json").read_text())
+    return path if config.get("model_type") == "k3_dspark" else None
+
+
 def attention_dp(vllm_config: Any) -> int:
     """The decoder's attention data parallelism (``attention_dp`` in the
     decode role's loader config, default 1): the decode role then runs
@@ -155,8 +180,8 @@ def draft_ring_rows(vllm_config: Any) -> int:
         carries = spec is not None and spec.method == "dspark"
     else:
         return 0
-    if not carries:
-        return 0
+    if not carries or mla_draft(vllm_config) is not None:
+        return 0  # (the MLA draft's context is in its own KV cache layers)
     from vllm_torchtpu.megakernel.kimi_k3.layout import LAYOUT
 
     return LAYOUT.region("draft").rows

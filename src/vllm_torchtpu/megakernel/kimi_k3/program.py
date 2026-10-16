@@ -249,9 +249,9 @@ def build(
     dense = spec_tokens_per_batch(config)
     draft = None
     if draft_checkpoint is not None and dense is not None and any(dense):
-        from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
+        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
 
-        draft = DsparkDraft(
+        draft = draft_class(draft_checkpoint)(
             max_position=config.max_model_len + 16,
             checkpoint=str(draft_checkpoint),
             presharded=Path(presharded),
