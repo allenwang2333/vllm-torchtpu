@@ -106,6 +106,8 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
 fi
 
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+# Decode is one token (max-num-seqs=1); prefill chunks pad up to the 1024 budget.
+COMPILE_SIZES="${COMPILE_SIZES:-16,1024}"
 
 KVT='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${RAIDEN_CONTROLLER_PORT}"',"raiden_job_name":"dsv4-offload-probe"}}'
 
@@ -128,6 +130,7 @@ serve() {
     --tensor-parallel-size="${TP_SIZE}" \
     --no-async-scheduling \
     --enable-expert-parallel \
+    --compilation-config "{\"compile_sizes\":[${COMPILE_SIZES}]}" \
     --port "${PORT}" \
     --kv-transfer-config "$KVT"
 }

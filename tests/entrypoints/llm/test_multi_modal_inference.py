@@ -71,19 +71,22 @@ def _build_qwen2_5_vl_prompt(question: str) -> str:
     )
 
 
+def _clear_encoder_cache(self) -> None:
+    self.model_runner.encoder_cache.clear()
+
+
 def _run_mm_generation_worker(
-    prompts: list[str],
-    images: list,
+    batches: list[tuple[list[str], list, int]],
     cudagraph_mm_encoder: bool,
-    max_tokens: int,
     max_num_seqs: int,
     queue: multiprocessing.Queue,
 ) -> None:
-    """Instantiate LLM and execute multi-modal generation in a child process."""
+    """Instantiate LLM and execute multi-modal batches in a child process."""
     try:
         os.environ["SKIP_JAX_PRECOMPILE"] = "1"
         os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "0"
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         tp_size = _get_tensor_parallel_size()
 
@@ -92,12 +95,20 @@ def _run_mm_generation_worker(
             "cudagraph_capture_sizes": [],
         }
 
+        # One cherry_blossom image at longest_edge=1003520 is <=1280 vision
+        # tokens + ~25 prompt tokens + 64 output tokens (~1369 total), so a
+        # single-sequence run fits in the 2048 bucket and never reaches 4096.
+        # A 2-sequence batch needs ~2610 prefill tokens and caps at 4096.
+        max_tokens_budget = 2048 if max_num_seqs == 1 else 4096
+
         engine_args = EngineArgs(
             model=MODEL_NAME,
-            max_model_len=4096,
+            max_model_len=max_tokens_budget,
+            max_num_batched_tokens=max_tokens_budget,
             tensor_parallel_size=tp_size,
             gpu_memory_utilization=0.5,
             max_num_seqs=max_num_seqs,
+            enable_prefix_caching=False,
             compilation_config=compilation_config,
             mm_processor_kwargs={
                 "size": {"longest_edge": 1003520, "shortest_edge": 3136},
@@ -118,30 +129,54 @@ def _run_mm_generation_worker(
 
         llm = LLM(**args_dict)
 
-        sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=max_tokens,
-        )
-
-        if len(prompts) == 1:
-            inputs = {
-                "prompt": prompts[0],
-                "multi_modal_data": {"image": images[0]},
-            }
-        else:
-            inputs = [
-                {
-                    "prompt": p,
-                    "multi_modal_data": {"image": img},
+        all_results: list[list[str]] = []
+        for idx, (prompts, images, max_tokens) in enumerate(batches):
+            if idx > 0:
+                llm.llm_engine.collective_rpc(_clear_encoder_cache)
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            if len(prompts) == 1:
+                inputs: dict | list[dict] = {
+                    "prompt": prompts[0],
+                    "multi_modal_data": {"image": images[0]},
                 }
-                for p, img in zip(prompts, images)
-            ]
+            else:
+                inputs = [
+                    {
+                        "prompt": p,
+                        "multi_modal_data": {"image": img},
+                    }
+                    for p, img in zip(prompts, images)
+                ]
 
-        outputs = llm.generate(inputs, sampling_params=sampling_params)
-        generated_texts = [o.outputs[0].text.strip() for o in outputs]
-        queue.put(("SUCCESS", generated_texts))
+            outputs = llm.generate(inputs, sampling_params=sampling_params)
+            all_results.append([o.outputs[0].text.strip() for o in outputs])
+
+        queue.put(("SUCCESS", all_results))
     except Exception:
         queue.put(("ERROR", traceback.format_exc()))
+
+
+def run_mm_batches_in_isolated_process(
+    batches: list[tuple[list[str], list, int]],
+    cudagraph_mm_encoder: bool = True,
+    max_num_seqs: int = 1,
+) -> list[list[str]]:
+    """Runs one or more generation batches in an isolated OS process."""
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    p = ctx.Process(
+        target=_run_mm_generation_worker,
+        args=(batches, cudagraph_mm_encoder, max_num_seqs, queue),
+    )
+    p.start()
+    p.join()
+    status, result = queue.get()
+    if status == "ERROR":
+        raise RuntimeError(f"Isolated multimodal worker failed:\n{result}")
+    return result
 
 
 def run_mm_generation_in_isolated_process(
@@ -152,34 +187,56 @@ def run_mm_generation_in_isolated_process(
     max_num_seqs: int = 1,
 ) -> list[str]:
     """Runs generation in an isolated OS process to ensure clean device cleanup."""
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    p = ctx.Process(
-        target=_run_mm_generation_worker,
-        args=(prompts, images, cudagraph_mm_encoder, max_tokens, max_num_seqs, queue),
+    [result] = run_mm_batches_in_isolated_process(
+        batches=[(prompts, images, max_tokens)],
+        cudagraph_mm_encoder=cudagraph_mm_encoder,
+        max_num_seqs=max_num_seqs,
     )
-    p.start()
-    p.join()
-    status, result = queue.get()
-    if status == "ERROR":
-        raise RuntimeError(f"Isolated multimodal worker failed:\n{result}")
     return result
+
+
+@pytest.fixture(scope="module")
+def compiled_mm_encoder_outputs() -> tuple[list[str], list[str]]:
+    """Runs single-image and batched-image checks in one compiled encoder boot."""
+    image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+    single_prompt = _build_qwen2_5_vl_prompt("What is the content of this image?")
+    batch_questions = [
+        "What is the content of this image?",
+        "Describe the colors and scenery in this image.",
+    ]
+    batch_prompts = [_build_qwen2_5_vl_prompt(q) for q in batch_questions]
+
+    single_texts, batch_texts = run_mm_batches_in_isolated_process(
+        batches=[
+            ([single_prompt], [image], 64),
+            (batch_prompts, [image, image], 32),
+        ],
+        cudagraph_mm_encoder=True,
+        max_num_seqs=2,
+    )
+    return single_texts, batch_texts
 
 
 @pytest.mark.timeout(1200)
 @pytest.mark.parametrize("cudagraph_mm_encoder", [True, False])
-def test_multi_modal_inference(cudagraph_mm_encoder: bool):
+def test_multi_modal_inference(
+    cudagraph_mm_encoder: bool,
+    request: pytest.FixtureRequest,
+):
     """Verifies that multi-modal inference accurately describes an image."""
-    image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
-    prompt = _build_qwen2_5_vl_prompt("What is the content of this image?")
-
-    generated_texts = run_mm_generation_in_isolated_process(
-        prompts=[prompt],
-        images=[image],
-        cudagraph_mm_encoder=cudagraph_mm_encoder,
-        max_tokens=64,
-        max_num_seqs=1,
-    )
+    if cudagraph_mm_encoder:
+        single_texts, _ = request.getfixturevalue("compiled_mm_encoder_outputs")
+        generated_texts = single_texts
+    else:
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+        prompt = _build_qwen2_5_vl_prompt("What is the content of this image?")
+        generated_texts = run_mm_generation_in_isolated_process(
+            prompts=[prompt],
+            images=[image],
+            cudagraph_mm_encoder=False,
+            max_tokens=64,
+            max_num_seqs=1,
+        )
 
     generated_text = generated_texts[0]
     similarity_score = max(
@@ -196,23 +253,11 @@ def test_multi_modal_inference(cudagraph_mm_encoder: bool):
 
 
 @pytest.mark.timeout(1200)
-def test_multi_modal_batch_inference_with_mm_encoder_manager():
+def test_multi_modal_batch_inference_with_mm_encoder_manager(
+    compiled_mm_encoder_outputs: tuple[list[str], list[str]],
+):
     """Verifies batch multi-modal inference with MMEncoderManager."""
-    image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
-    questions = [
-        "What is the content of this image?",
-        "Describe the colors and scenery in this image.",
-    ]
-    prompts = [_build_qwen2_5_vl_prompt(q) for q in questions]
-    images = [image, image]
-
-    generated_texts = run_mm_generation_in_isolated_process(
-        prompts=prompts,
-        images=images,
-        cudagraph_mm_encoder=True,
-        max_tokens=32,
-        max_num_seqs=2,
-    )
+    _, generated_texts = compiled_mm_encoder_outputs
 
     assert len(generated_texts) == 2
     for text in generated_texts:

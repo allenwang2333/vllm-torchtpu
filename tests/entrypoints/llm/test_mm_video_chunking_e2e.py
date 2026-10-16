@@ -147,6 +147,143 @@ class GenerationResult:
         return self.num_video_tokens * PATCHES_PER_VIDEO_TOKEN
 
 
+# Budgets as a fraction of the video's total patches, so the split pattern
+# holds regardless of the exact grid. With the default 16 frames (t=8):
+#   half        -> 4 temporal patches per forward, 2 even chunks
+#   three_eighths -> 3 per forward, a ragged [3, 3, 2] split
+#   one_patch   -> budget below one frame, clamped to 1 temporal patch per
+#                  forward, 8 chunks
+_BUDGETS = {
+    "half": lambda total: total // 2,
+    "three_eighths": lambda total: 3 * total // 8,
+    "one_patch": lambda total: 1,
+}
+
+
+# A 16-frame 336x336 video is 8*12*12 = 1152 vision tokens + ~16 prompt tokens
+# + 48 output tokens (~1216 total), and the 2-video batch (16 + 8 frames) is
+# 1728 vision tokens + ~32 prompt tokens (~1760 prefill tokens). Capping both
+# max_model_len and max_num_batched_tokens at 2048 avoids compiling the 4096
+# and 8192 token buckets that no step in this file reaches.
+MAX_MODEL_LEN = 2048
+MAX_NUM_BATCHED_TOKENS = 2048
+
+
+def _set_video_chunk_patch_size(self, chunk_patch_size: int) -> None:
+    os.environ[CHUNK_ENV] = str(chunk_patch_size)
+    self.model_runner.encoder_cache.clear()
+
+
+def _format_video_inputs(
+    prompts: list[str],
+    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "prompt": prompt,
+            "multi_modal_data": {
+                "video": (
+                    video
+                    if isinstance(video, tuple)
+                    else (
+                        video,
+                        getattr(video, "video_metadata", None)
+                        or {
+                            "fps": 1.0,
+                            "duration": float(len(video)),
+                            "total_num_frames": len(video),
+                            "video_backend": "opencv",
+                            "frames_indices": list(range(len(video))),
+                            "do_sample_frames": True,
+                        },
+                    )
+                )
+            },
+        }
+        for prompt, video in zip(prompts, videos)
+    ]
+
+
+def _extract_generation_results(
+    outputs: list[Any],
+    video_pad_id: int,
+) -> list[GenerationResult]:
+    return [
+        GenerationResult(
+            token_ids=tuple(out.outputs[0].token_ids),
+            text=out.outputs[0].text.strip(),
+            prompt_token_ids=tuple(out.prompt_token_ids),
+            num_video_tokens=sum(
+                1 for tok in out.prompt_token_ids if tok == video_pad_id
+            ),
+        )
+        for out in outputs
+    ]
+
+
+def _build_llm(
+    max_num_seqs: int,
+    cudagraph_mm_encoder: bool,
+    initial_chunk_patch_size: int = 0,
+) -> LLM:
+    os.environ["SKIP_JAX_PRECOMPILE"] = "1"
+    os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "0"
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    # Set explicitly, including 0, so an inherited value can't turn the
+    # reference run into a chunked one. Engine-core and worker processes
+    # are spawned from here, after this, so they inherit it.
+    os.environ[CHUNK_ENV] = str(initial_chunk_patch_size)
+
+    compilation_config: dict[str, object] = {
+        "cudagraph_mm_encoder": cudagraph_mm_encoder,
+        "cudagraph_capture_sizes": [],
+    }
+    if cudagraph_mm_encoder:
+        compilation_config["encoder_cudagraph_token_budgets"] = [CHUNK_TOKEN_BUDGET]
+
+    engine_args = EngineArgs(
+        model=MODEL_NAME,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        tensor_parallel_size=_get_tensor_parallel_size(),
+        gpu_memory_utilization=0.5,
+        max_num_seqs=max_num_seqs,
+        enable_prefix_caching=False,
+        compilation_config=compilation_config,
+        limit_mm_per_prompt={"image": 0, "video": 1},
+        enforce_eager=False,
+        disable_log_stats=True,
+    )
+
+    args_dict = asdict(engine_args)
+    args_dict.pop("fault_tolerance_config", None)
+    pass_config = args_dict.get("compilation_config", {}).get("pass_config") or {}
+    args_dict["compilation_config"]["pass_config"] = {
+        k: v for k, v in pass_config.items() if v is not None
+    }
+    return LLM(**args_dict)
+
+
+def _run_with_chunk_budget(
+    llm: LLM,
+    video_pad_id: int,
+    prompts: list[str],
+    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
+    chunk_patch_size: int,
+) -> list[GenerationResult]:
+    os.environ[CHUNK_ENV] = str(chunk_patch_size)
+    llm.llm_engine.collective_rpc(
+        _set_video_chunk_patch_size,
+        args=(chunk_patch_size,),
+    )
+    outputs = llm.generate(
+        _format_video_inputs(prompts, videos),
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
+    )
+    return _extract_generation_results(outputs, video_pad_id)
+
+
 def _run_video_generation_worker(
     prompts: list[str],
     videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
@@ -166,83 +303,17 @@ def _run_video_generation_worker(
         queue: Multiprocessing queue to send back results or errors.
     """
     try:
-        os.environ["SKIP_JAX_PRECOMPILE"] = "1"
-        os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "0"
-        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        # Set explicitly, including 0, so an inherited value can't turn the
-        # reference run into a chunked one. Engine-core and worker processes
-        # are spawned from here, after this, so they inherit it.
-        os.environ[CHUNK_ENV] = str(chunk_patch_size)
-
-        compilation_config: dict[str, object] = {
-            "cudagraph_mm_encoder": cudagraph_mm_encoder,
-            "cudagraph_capture_sizes": [],
-        }
-        if cudagraph_mm_encoder:
-            compilation_config["encoder_cudagraph_token_budgets"] = [CHUNK_TOKEN_BUDGET]
-
-        engine_args = EngineArgs(
-            model=MODEL_NAME,
-            max_model_len=8192,
-            tensor_parallel_size=_get_tensor_parallel_size(),
-            gpu_memory_utilization=0.5,
+        llm = _build_llm(
             max_num_seqs=max_num_seqs,
-            compilation_config=compilation_config,
-            limit_mm_per_prompt={"image": 0, "video": 1},
-            enforce_eager=False,
-            disable_log_stats=True,
+            cudagraph_mm_encoder=cudagraph_mm_encoder,
+            initial_chunk_patch_size=chunk_patch_size,
         )
-
-        args_dict = asdict(engine_args)
-        args_dict.pop("fault_tolerance_config", None)
-        pass_config = args_dict.get("compilation_config", {}).get("pass_config") or {}
-        args_dict["compilation_config"]["pass_config"] = {
-            k: v for k, v in pass_config.items() if v is not None
-        }
-
-        llm = LLM(**args_dict)
         video_pad_id = llm.get_tokenizer().convert_tokens_to_ids("<|video_pad|>")
-
-        inputs = [
-            {
-                "prompt": prompt,
-                "multi_modal_data": {
-                    "video": (
-                        video
-                        if isinstance(video, tuple)
-                        else (
-                            video,
-                            getattr(video, "video_metadata", None)
-                            or {
-                                "fps": 1.0,
-                                "duration": float(len(video)),
-                                "total_num_frames": len(video),
-                                "video_backend": "opencv",
-                                "frames_indices": list(range(len(video))),
-                                "do_sample_frames": True,
-                            },
-                        )
-                    )
-                },
-            }
-            for prompt, video in zip(prompts, videos)
-        ]
         outputs = llm.generate(
-            inputs,
+            _format_video_inputs(prompts, videos),
             sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
         )
-
-        results = [
-            GenerationResult(
-                token_ids=tuple(out.outputs[0].token_ids),
-                text=out.outputs[0].text.strip(),
-                prompt_token_ids=tuple(out.prompt_token_ids),
-                num_video_tokens=sum(
-                    1 for tok in out.prompt_token_ids if tok == video_pad_id
-                ),
-            )
-            for out in outputs
-        ]
+        results = _extract_generation_results(outputs, video_pad_id)
         queue.put(("SUCCESS", results))
     except Exception:
         queue.put(("ERROR", traceback.format_exc()))
@@ -300,6 +371,149 @@ def run_video_generation_in_isolated_process(
     if status == "ERROR":
         raise RuntimeError(
             f"Video generation worker ({CHUNK_ENV}={chunk_patch_size}) "
+            f"failed:\n{result}"
+        )
+    return result
+
+
+@dataclass(frozen=True)
+class EncoderModeSuiteResult:
+    """All video generation results for one `cudagraph_mm_encoder` setting."""
+
+    reference: GenerationResult | None
+    rerun: GenerationResult
+    chunked_by_budget: dict[str, GenerationResult]
+    batched_reference: list[GenerationResult] | None
+    batched_chunked: list[GenerationResult]
+
+
+def _run_encoder_mode_suite_worker(
+    single_prompt: str,
+    single_video: tuple[np.ndarray, dict[str, Any]],
+    batched_prompts: list[str],
+    batched_videos: list[tuple[np.ndarray, dict[str, Any]]],
+    cudagraph_mm_encoder: bool,
+    single_total_patches: int | None,
+    batched_budget: int | None,
+    queue: multiprocessing.Queue,
+) -> None:
+    """Runs all chunk-budget checks for one encoder mode in a single LLM boot."""
+    try:
+        # Both single-video (num_reqs=1) and 2-video (num_reqs=2) runs pad to
+        # MIN_NUM_SEQS=8 on TPU, so one max_num_seqs=2 engine serves both
+        # without compiling any extra sequence or token buckets.
+        llm = _build_llm(
+            max_num_seqs=2,
+            cudagraph_mm_encoder=cudagraph_mm_encoder,
+            initial_chunk_patch_size=0,
+        )
+        video_pad_id = llm.get_tokenizer().convert_tokens_to_ids("<|video_pad|>")
+
+        reference: GenerationResult | None = None
+        if single_total_patches is None:
+            [reference] = _run_with_chunk_budget(
+                llm,
+                video_pad_id,
+                [single_prompt],
+                [single_video],
+                chunk_patch_size=0,
+            )
+            single_total_patches = reference.num_video_patches
+
+        [rerun] = _run_with_chunk_budget(
+            llm,
+            video_pad_id,
+            [single_prompt],
+            [single_video],
+            chunk_patch_size=0,
+        )
+
+        chunked_by_budget: dict[str, GenerationResult] = {}
+        for budget_name, budget_fn in _BUDGETS.items():
+            budget = budget_fn(single_total_patches)
+            [chunked] = _run_with_chunk_budget(
+                llm,
+                video_pad_id,
+                [single_prompt],
+                [single_video],
+                chunk_patch_size=budget,
+            )
+            chunked_by_budget[budget_name] = chunked
+
+        batched_reference: list[GenerationResult] | None = None
+        if batched_budget is None:
+            batched_reference = _run_with_chunk_budget(
+                llm,
+                video_pad_id,
+                batched_prompts,
+                batched_videos,
+                chunk_patch_size=0,
+            )
+            batched_budget = min(r.num_video_patches for r in batched_reference) // 2
+
+        batched_chunked = _run_with_chunk_budget(
+            llm,
+            video_pad_id,
+            batched_prompts,
+            batched_videos,
+            chunk_patch_size=batched_budget,
+        )
+
+        queue.put(
+            (
+                "SUCCESS",
+                EncoderModeSuiteResult(
+                    reference=reference,
+                    rerun=rerun,
+                    chunked_by_budget=chunked_by_budget,
+                    batched_reference=batched_reference,
+                    batched_chunked=batched_chunked,
+                ),
+            )
+        )
+    except Exception:
+        queue.put(("ERROR", traceback.format_exc()))
+
+
+def _run_encoder_mode_suite_in_isolated_process(
+    single_prompt: str,
+    single_video: tuple[np.ndarray, dict[str, Any]],
+    batched_prompts: list[str],
+    batched_videos: list[tuple[np.ndarray, dict[str, Any]]],
+    cudagraph_mm_encoder: bool,
+    single_total_patches: int | None = None,
+    batched_budget: int | None = None,
+) -> EncoderModeSuiteResult:
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_run_encoder_mode_suite_worker,
+        args=(
+            single_prompt,
+            single_video,
+            batched_prompts,
+            batched_videos,
+            cudagraph_mm_encoder,
+            single_total_patches,
+            batched_budget,
+            queue,
+        ),
+    )
+    proc.start()
+    try:
+        status, result = queue.get(timeout=WORKER_TIMEOUT_S)
+    except queue_lib.Empty:
+        proc.kill()
+        proc.join()
+        raise RuntimeError(
+            f"Video suite worker (cudagraph_mm_encoder={cudagraph_mm_encoder}) "
+            f"sent no result within {WORKER_TIMEOUT_S}s; exit code "
+            f"{proc.exitcode}."
+        ) from None
+    proc.join()
+    if status == "ERROR":
+        raise RuntimeError(
+            f"Video suite worker (cudagraph_mm_encoder={cudagraph_mm_encoder}) "
             f"failed:\n{result}"
         )
     return result
@@ -376,24 +590,65 @@ def single_video_prompt() -> str:
 
 
 @pytest.fixture(scope="module")
-def reference_result(
-    single_video: tuple[np.ndarray, dict[str, Any]], single_video_prompt: str
-) -> GenerationResult:
-    """Runs unchunked greedy video generation shared across tests in this module.
+def batched_video_inputs(
+    single_video: tuple[np.ndarray, dict[str, Any]],
+) -> tuple[list[str], list[tuple[np.ndarray, dict[str, Any]]]]:
+    """Builds prompts and videos for the 2-video batched tests."""
+    prompts = [
+        _build_qwen2_5_vl_video_prompt("Describe this video."),
+        _build_qwen2_5_vl_video_prompt("What is the baby doing in this video?"),
+    ]
+    videos = [single_video, _load_video(num_frames=8)]
+    return prompts, videos
 
-    Args:
-        single_video: Test video array fixture.
-        single_video_prompt: Prompt fixture.
 
-    Returns:
-        Unchunked reference GenerationResult.
-    """
-    [result] = run_video_generation_in_isolated_process(
-        prompts=[single_video_prompt],
-        videos=[single_video],
-        chunk_patch_size=0,
+@pytest.fixture(scope="module")
+def eager_encoder_suite(
+    single_video: tuple[np.ndarray, dict[str, Any]],
+    single_video_prompt: str,
+    batched_video_inputs: tuple[list[str], list[tuple[np.ndarray, dict[str, Any]]]],
+) -> EncoderModeSuiteResult:
+    """Runs all cudagraph_mm_encoder=False cases in one isolated LLM boot."""
+    batched_prompts, batched_videos = batched_video_inputs
+    return _run_encoder_mode_suite_in_isolated_process(
+        single_prompt=single_video_prompt,
+        single_video=single_video,
+        batched_prompts=batched_prompts,
+        batched_videos=batched_videos,
+        cudagraph_mm_encoder=False,
     )
-    return result
+
+
+@pytest.fixture(scope="module")
+def compiled_encoder_suite(
+    single_video: tuple[np.ndarray, dict[str, Any]],
+    single_video_prompt: str,
+    batched_video_inputs: tuple[list[str], list[tuple[np.ndarray, dict[str, Any]]]],
+    eager_encoder_suite: EncoderModeSuiteResult,
+) -> EncoderModeSuiteResult:
+    """Runs all cudagraph_mm_encoder=True cases in one isolated LLM boot."""
+    batched_prompts, batched_videos = batched_video_inputs
+    assert eager_encoder_suite.reference is not None
+    assert eager_encoder_suite.batched_reference is not None
+    batched_budget = (
+        min(r.num_video_patches for r in eager_encoder_suite.batched_reference) // 2
+    )
+    return _run_encoder_mode_suite_in_isolated_process(
+        single_prompt=single_video_prompt,
+        single_video=single_video,
+        batched_prompts=batched_prompts,
+        batched_videos=batched_videos,
+        cudagraph_mm_encoder=True,
+        single_total_patches=eager_encoder_suite.reference.num_video_patches,
+        batched_budget=batched_budget,
+    )
+
+
+@pytest.fixture(scope="module")
+def reference_result(eager_encoder_suite: EncoderModeSuiteResult) -> GenerationResult:
+    """Returns unchunked greedy video generation shared across tests in this module."""
+    assert eager_encoder_suite.reference is not None
+    return eager_encoder_suite.reference
 
 
 @pytest.mark.timeout(1800)
@@ -413,9 +668,8 @@ def test_video_inference_reference(reference_result: GenerationResult):
 @pytest.mark.parametrize("cudagraph_mm_encoder", [False, True])
 def test_video_baseline_is_deterministic(
     cudagraph_mm_encoder: bool,
-    single_video: tuple[np.ndarray, dict[str, Any]],
-    single_video_prompt: str,
     reference_result: GenerationResult,
+    request: pytest.FixtureRequest,
 ):
     """Tests that two unchunked runs agree token for token.
 
@@ -423,30 +677,14 @@ def test_video_baseline_is_deterministic(
     reproduces itself. If this fails, a chunked mismatch below is not evidence
     against chunking.
     """
-    [rerun] = run_video_generation_in_isolated_process(
-        prompts=[single_video_prompt],
-        videos=[single_video],
-        chunk_patch_size=0,
-        cudagraph_mm_encoder=cudagraph_mm_encoder,
+    suite: EncoderModeSuiteResult = request.getfixturevalue(
+        "compiled_encoder_suite" if cudagraph_mm_encoder else "eager_encoder_suite"
     )
     _assert_bit_exact(
         reference_result,
-        rerun,
+        suite.rerun,
         f"Unchunked rerun (cudagraph_mm_encoder={cudagraph_mm_encoder})",
     )
-
-
-# Budgets as a fraction of the video's total patches, so the split pattern
-# holds regardless of the exact grid. With the default 16 frames (t=8):
-#   half        -> 4 temporal patches per forward, 2 even chunks
-#   three_eighths -> 3 per forward, a ragged [3, 3, 2] split
-#   one_patch   -> budget below one frame, clamped to 1 temporal patch per
-#                  forward, 8 chunks
-_BUDGETS = {
-    "half": lambda total: total // 2,
-    "three_eighths": lambda total: 3 * total // 8,
-    "one_patch": lambda total: 1,
-}
 
 
 @pytest.mark.timeout(1800)
@@ -455,9 +693,8 @@ _BUDGETS = {
 def test_video_chunking_is_bit_exact(
     cudagraph_mm_encoder: bool,
     budget_name: str,
-    single_video: tuple[np.ndarray, dict[str, Any]],
-    single_video_prompt: str,
     reference_result: GenerationResult,
+    request: pytest.FixtureRequest,
 ):
     """Tests that chunked greedy output is identical to unchunked reference."""
     total_patches = reference_result.num_video_patches
@@ -467,12 +704,10 @@ def test_video_chunking_is_bit_exact(
         f"run would take the unchunked path and prove nothing."
     )
 
-    [chunked] = run_video_generation_in_isolated_process(
-        prompts=[single_video_prompt],
-        videos=[single_video],
-        chunk_patch_size=budget,
-        cudagraph_mm_encoder=cudagraph_mm_encoder,
+    suite: EncoderModeSuiteResult = request.getfixturevalue(
+        "compiled_encoder_suite" if cudagraph_mm_encoder else "eager_encoder_suite"
     )
+    chunked = suite.chunked_by_budget[budget_name]
 
     label = (
         f"{CHUNK_ENV}={budget} ({budget_name}, {total_patches} patches, "
@@ -483,22 +718,14 @@ def test_video_chunking_is_bit_exact(
 
 
 @pytest.fixture(scope="module")
-def batched_videos_and_reference() -> tuple[
-    list[str], list[np.ndarray], list[GenerationResult]
-]:
-    """Runs unchunked batched video generation shared across batched tests."""
-    prompts = [
-        _build_qwen2_5_vl_video_prompt("Describe this video."),
-        _build_qwen2_5_vl_video_prompt("What is the baby doing in this video?"),
-    ]
-    videos = [_load_video(num_frames=16), _load_video(num_frames=8)]
-    reference = run_video_generation_in_isolated_process(
-        prompts=prompts,
-        videos=videos,
-        chunk_patch_size=0,
-        max_num_seqs=2,
-    )
-    return prompts, videos, reference
+def batched_videos_and_reference(
+    batched_video_inputs: tuple[list[str], list[tuple[np.ndarray, dict[str, Any]]]],
+    eager_encoder_suite: EncoderModeSuiteResult,
+) -> tuple[list[str], list[tuple[np.ndarray, dict[str, Any]]], list[GenerationResult]]:
+    """Returns unchunked batched video generation shared across batched tests."""
+    prompts, videos = batched_video_inputs
+    assert eager_encoder_suite.batched_reference is not None
+    return prompts, videos, eager_encoder_suite.batched_reference
 
 
 @pytest.mark.timeout(2400)
@@ -506,8 +733,9 @@ def batched_videos_and_reference() -> tuple[
 def test_batched_videos_chunking_is_bit_exact(
     cudagraph_mm_encoder: bool,
     batched_videos_and_reference: tuple[
-        list[str], list[np.ndarray], list[GenerationResult]
+        list[str], list[tuple[np.ndarray, dict[str, Any]]], list[GenerationResult]
     ],
+    request: pytest.FixtureRequest,
 ):
     """Tests that batched videos of different lengths stay bit-exact.
 
@@ -515,18 +743,15 @@ def test_batched_videos_chunking_is_bit_exact(
     encoder call and their combined patches exceed the budget, the group is
     split back into per-item forwards and each item is chunked on its own.
     """
-    prompts, videos, reference = batched_videos_and_reference
+    _, _, reference = batched_videos_and_reference
     # Half the shorter video: both videos exceed it, so both get chunked.
     budget = min(r.num_video_patches for r in reference) // 2
     assert budget > 0
 
-    chunked = run_video_generation_in_isolated_process(
-        prompts=prompts,
-        videos=videos,
-        chunk_patch_size=budget,
-        max_num_seqs=2,
-        cudagraph_mm_encoder=cudagraph_mm_encoder,
+    suite: EncoderModeSuiteResult = request.getfixturevalue(
+        "compiled_encoder_suite" if cudagraph_mm_encoder else "eager_encoder_suite"
     )
+    chunked = suite.batched_chunked
 
     assert len(chunked) == len(reference) == 2
     for i, (ref, out) in enumerate(zip(reference, chunked)):
