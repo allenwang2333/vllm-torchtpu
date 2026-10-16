@@ -88,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
+    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
@@ -1353,6 +1354,18 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
     return False
 
 
+def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
+    """TPU_FP8_SKINNY_HBM_PIN_SITES lists `prefix`'s site, "."-bounded: the layer's
+    fp8_skinny weight operand is constrained to HBM."""
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_SKINNY_HBM_PIN_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
 def _fp8_pallas_sched_group(prefix: str) -> int | None:
     """TPU_IDX_TOPK_SCHED_GROUPS: G2 for the q_b_proj of a DCP indexer layer (its
     indexer op, built at model init, registered the layer), else None."""
@@ -1687,8 +1700,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             if sched_group is not None:
                 setattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, sched_group)
+            hbm_pin = fp8_skinny_hbm_pin_selected(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if hbm_pin:
+                setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
             get_fp8_linear_pallas_op(
-                padded_copy, sched_group
+                padded_copy, sched_group, hbm_pin
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1758,6 +1776,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             sched_kwargs = (
                 {} if sched_group is None else {"scheduling_group_id": sched_group}
             )
+            if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False):
+                sched_kwargs["hbm_pin"] = True
             out = quantized_matmul_pallas(
                 x,
                 weight,

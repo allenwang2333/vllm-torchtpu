@@ -251,6 +251,8 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_MOE_ROUTER_HBM_PIN: bool = False
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
@@ -1722,6 +1724,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer at decode. Applies to the sites in fp8_skinny.SCALE_DMA_SITES (o_proj).
     # Outputs are bit-identical.
     "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA"),
+    # With TPU_FP8_LINEAR_PALLAS: comma-separated layer-prefix suffixes ("."-bounded,
+    # as TPU_FP8_LINEAR_PALLAS_SITES) whose skinny kernel takes its weight operand
+    # constrained to HBM (pltpu.with_memory_space_constraint). The kernel streams the
+    # weight from HBM itself; without the constraint XLA's memory-space assignment
+    # may stage it into VMEM with a copy the call then waits on (o_proj 6.29 MB, q_b
+    # 16.8 MB at TP16 x DCP8 decode), exposed whenever too little runs between the
+    # copy's start and the call. Per site, not global: a site whose staging copy is
+    # hidden (qkv_a under its prefetch override) keeps it. Bit-identical outputs.
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    # MoE router logits (the bf16 gate GEMM, [T, hidden] x [E, hidden]^T) of a layer
+    # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
+    # Pallas kernel that streams the router weight from HBM (operand constrained
+    # to HBM), instead of an XLA dot whose weight XLA stages into VMEM with a copy
+    # (exposed at decode once the window before it shrinks). Same f32-accumulated
+    # dot rounded once to bf16: bit-identical logits. Prefill sizes unchanged.
+    "TPU_MOE_ROUTER_HBM_PIN": env_bool("TPU_MOE_ROUTER_HBM_PIN"),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
