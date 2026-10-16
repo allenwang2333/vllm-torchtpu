@@ -25,7 +25,7 @@ from jax import lax
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .. import kernel, planner
+from .. import cache, kernel, planner
 from ..blocks.gdn import GDNBlock
 from ..blocks.gqa import GQABlock
 from ..blocks.moe import MoEBlock
@@ -198,7 +198,12 @@ def qwen35_spec(g: Qwen35Geometry, gdn_block: Block | None = None) -> ModelSpec:
             branch_counts=(g.att_every - 1, 1),
         )
     lt = LayerType(name="qwen35_layer", slots=(mixer, moe))
-    return ModelSpec(name="qwen3_5", config=g, layer_type=lt)
+    return ModelSpec(
+        name="qwen3_5",
+        config=g,
+        layer_type=lt,
+        pool_backend=qwen35_pool.qwen35_pool_backend(g),
+    )
 
 
 def build(
@@ -223,6 +228,19 @@ def make_step(
     """Build Qwen3.5 `jax.jit` + `shard_map` step `(step, info)`."""
     spec = qwen35_spec(g, gdn_block=gdn_block)
     return kernel.make_step(mesh, spec, ex, donate_states=donate_states)
+
+
+def make_pooled_step(
+    mesh,
+    g: Qwen35Geometry,
+    ex: ExecSpec,
+    *,
+    gdn_block: Block | None = None,
+    donate_pools: bool = False,
+):
+    """Build Qwen3.5 paged-pool `shard_map` step (`PallasWriter`)."""
+    spec = qwen35_spec(g, gdn_block=gdn_block)
+    return cache.make_pooled_step(mesh, spec, ex, donate_pools=donate_pools)
 
 
 def accept_states(

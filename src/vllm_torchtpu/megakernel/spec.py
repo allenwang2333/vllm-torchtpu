@@ -345,12 +345,26 @@ class LayerType:
 
 
 @dataclass(frozen=True)
+class PoolBackend:
+    """Model-injected unified pool layout and gather/scatter callbacks."""
+
+    num_pools: int
+    has_recurrent_pool: bool
+    recurrent_slots_per_pool: int = 1
+    pool_state_name: str = "raw"
+    page_table_state_name: str = "page_table"
+    gather_states: Any = None
+    scatter_states: Any = None
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     """Complete declarative model architecture specification."""
 
     name: str
     config: Any
     layer_type: LayerType
+    pool_backend: PoolBackend | None = None
 
     def all_blocks(self) -> list[Block]:
         """Return unique active blocks in deterministic declaration order."""

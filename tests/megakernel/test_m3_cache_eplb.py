@@ -24,7 +24,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel.models import qwen35
@@ -593,3 +594,485 @@ def test_long_context_128k_page_table_plan_and_interpret():
     assert jnp.allclose(
         out_b.astype(jnp.float32), ref_512.astype(jnp.float32), atol=3e-2, rtol=3e-2
     )
+
+
+@pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
+def test_pallas_writer_pooled_step_cpu_interpret(T: int, B: int):
+    """Verify `PallasWriter`, `make_flat_pooled_step`, and scattered states."""
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    ex = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=96)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(20 + T), g, ex)
+    st_l = dict(
+        st_l,
+        conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
+    )
+
+    ref_out, ref_st = qwen35.reference_step(
+        g, ex, pos, hid_l, w_l, st_l, paged_kv=True, pool_io=True
+    )
+
+    _, hid_mk, w_mk, st_mk_paged = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
+    assert ex.num_pages >= min_np
+    raw_pools = tuple(
+        jax.device_put(r, tp) for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+    )
+
+    mk_paged_step, _ = qwen35.make_step(mesh, g, ex, donate_states=False)
+    _, mk_st = mk_paged_step(pos, hid_mk, w_mk, st_mk_paged)
+
+    spec = qwen35.qwen35_spec(g)
+    pooled_step, info = mk.PallasWriter().make_step(mesh, spec, ex, donate=False)
+    out_hid, raw_out = pooled_step(pos, hid_mk, w_mk, raw_pools, pt, ckpt, roff)
+    out_b = mk.unfold(out_hid, ex.R)[0, :B]
+
+    ex_direct = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
+    st_quant = dict(
+        st_l,
+        kc=jnp.clip(st_l["kc"], -448.0, 448.0)
+        .astype(jnp.float8_e4m3fn)
+        .astype(jnp.bfloat16),
+        vc=jnp.clip(st_l["vc"], -448.0, 448.0)
+        .astype(jnp.float8_e4m3fn)
+        .astype(jnp.bfloat16),
+        conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
+    )
+    _, _, _, st_mk_q = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_quant, g, ex_direct, mesh=mesh
+    )
+    direct_step, _ = mk.DirectHBM().make_step(mesh, spec, ex_direct, donate=False)
+    dir_hid, _ = direct_step(pos, hid_mk, w_mk, st_mk_q)
+    assert jnp.allclose(
+        out_hid.astype(jnp.float32), dir_hid.astype(jnp.float32), atol=2e-2, rtol=2e-2
+    )
+    assert jnp.allclose(
+        out_b.astype(jnp.float32), ref_out.astype(jnp.float32), atol=3e-2, rtol=3e-2
+    )
+
+    st_after = mk.pool_to_states(g, ex, raw_out, pt, ckpt)
+    mk_knew = mk.unfold(mk_st["knew"], ex.R)
+    mk_vnew = mk.unfold(mk_st["vnew"], ex.R)
+    for b in range(B):
+        s_idx, _ = divmod(b, T)
+        p_b = int(pos[b])
+        np.testing.assert_array_equal(
+            np.asarray(st_after["kc"][:, :, s_idx, p_b, :]).view(np.uint8),
+            np.asarray(mk_knew[:, :, b, :]).view(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(st_after["vc"][:, :, s_idx, p_b, :]).view(np.uint8),
+            np.asarray(mk_vnew[:, :, b, :]).view(np.uint8),
+        )
+
+    # Verify BOTH rec AND conv states written by scatter_pool_states
+    QKV = g.QKV(ex.R)
+    if T == 1:
+        mk_rec = mk.unfold(mk_st["rec"], ex.R)
+        np.testing.assert_array_equal(np.asarray(st_after["rec"]), np.asarray(mk_rec))
+        assert jnp.allclose(
+            st_after["rec"].astype(jnp.float32),
+            ref_st["rec"].astype(jnp.float32),
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        mk_conv = (
+            mk.unfold(mk_st["conv"], ex.R)[:, :, : 3 * B, :]
+            .reshape(ex.R, g.NGDN, 3, B, QKV)
+            .swapaxes(2, 3)
+            .astype(jnp.bfloat16)
+            .astype(jnp.float32)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(st_after["conv"][:, :, :, 0]), np.asarray(mk_conv)
+        )
+        ref_conv = (
+            ref_st["conv"][:, :, : 3 * B, :]
+            .reshape(ex.R, g.NGDN, 3, B, QKV)
+            .swapaxes(2, 3)
+        )
+        assert jnp.allclose(
+            st_after["conv"][:, :, :, 0], ref_conv, atol=3e-2, rtol=3e-2
+        )
+    else:
+        mk_rec_ckpt = mk.unfold(mk_st["rec_ckpt"], ex.R)
+        np.testing.assert_array_equal(
+            np.asarray(st_after["rec"]), np.asarray(mk_rec_ckpt)
+        )
+        assert jnp.allclose(
+            st_after["rec"].astype(jnp.float32),
+            ref_st["rec_ckpt"].astype(jnp.float32),
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        mk_conv_ckpt = mk.unfold(mk_st["conv_ckpt"], ex.R)
+        for t_idx in range(T):
+            exp_taps = (
+                mk_conv_ckpt[:, :, :, 1 + t_idx : 4 + t_idx, :]
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(st_after["conv"][:, :, :, t_idx]), np.asarray(exp_taps)
+            )
+
+    # Verify PallasWriter (states_dict path) and make_flat_pooled_step match bit-exact
+    out_pw, st_dict_out = pooled_step(
+        pos,
+        hid_mk,
+        w_mk,
+        {
+            "raw": raw_pools,
+            "page_table": pt,
+            "ckpt_indices": ckpt,
+            "read_offsets": roff,
+        },
+    )
+    np.testing.assert_array_equal(np.asarray(out_pw), np.asarray(out_hid))
+    for r_a, r_b in zip(st_dict_out["raw"], raw_out):
+        np.testing.assert_array_equal(
+            np.asarray(r_a).view(np.uint8), np.asarray(r_b).view(np.uint8)
+        )
+
+    # Verify make_flat_pooled_step for both T=1 and T=2 (VER=True)
+    flat_step, _, _, _ = mk.make_flat_pooled_step(mesh, spec, ex, donate_pools=False)
+    w_flat = [w_mk[k] for k in info["plan"].w_names]
+    flat_res = flat_step(pos, hid_mk, *w_flat, *raw_pools, pt, ckpt, roff)
+    np.testing.assert_array_equal(np.asarray(flat_res[0]), np.asarray(out_hid))
+    for r_a, r_b in zip(flat_res[1:], raw_out):
+        np.testing.assert_array_equal(
+            np.asarray(r_a).view(np.uint8), np.asarray(r_b).view(np.uint8)
+        )
+
+
+@pytest.mark.parametrize("NS,att_every", [(1, 4), (2, 4), (3, 3), (4, 4), (5, 4)])
+def test_scatter_pool_states_multi_ns_and_from_ckpt(NS: int, att_every: int):
+    """Verify `scatter_pool_states` across `NS=1..5`, `att_every`, and `from_ckpt`."""
+    L = 4 if att_every == 4 else 6
+    g = _tiny_geom(L=L, att_every=att_every)
+    ex = _tiny_exec(R=2, B=NS, T=1, ctx=256, paged_kv=True, num_pages=128)
+    pos, _, _, st_l = qwen35.random_logical_inputs(
+        jax.random.key(30 + NS + att_every), g, ex
+    )
+    pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
+    assert ex.num_pages >= min_np
+    ckpt_use = ckpt[0] if att_every == 3 else ckpt
+    roff_use = roff[0] if att_every == 3 else roff
+    raw_pools = mk.states_to_pool(g, ex, st_l, pt, ckpt_use, roff_use)
+    raw_r0 = tuple(mk.unfold(r, ex.R)[0] for r in raw_pools)
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(90 + NS), 4)
+    knew = jax.random.normal(k1, (g.NATT, ex.MR, g.HD), dtype=jnp.float32).astype(
+        jnp.float8_e4m3fn
+    )
+    vnew = jax.random.normal(k2, (g.NATT, ex.MR, g.HD), dtype=jnp.float32).astype(
+        jnp.float8_e4m3fn
+    )
+    QKV = g.QKV(ex.R)
+    vh = g.vh(ex.R)
+    CR = mk.rup(3 * NS, 8)
+    conv_new = (
+        jax.random.normal(k3, (g.NGDN, CR, QKV), dtype=jnp.float32)
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+    )
+    rec_new = jax.random.normal(
+        k4, (g.NGDN, NS * vh, g.KD, g.VD), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+
+    raw_sc = mk.scatter_pool_states(
+        g, ex, raw_r0, pos, pt, knew, vnew, conv_new, rec_new, ckpt_use
+    )
+    raw_sc_full = tuple(jnp.tile(r, (ex.R, 1, 1, 1, 1)) for r in raw_sc)
+    st_after = mk.pool_to_states(g, ex, raw_sc_full, pt, ckpt_use)
+    np.testing.assert_array_equal(np.asarray(st_after["rec"][0]), np.asarray(rec_new))
+    exp_conv = conv_new[:, : 3 * NS, :].reshape(g.NGDN, 3, NS, QKV).swapaxes(1, 2)
+    np.testing.assert_array_equal(
+        np.asarray(st_after["conv"][0, :, :, 0]), np.asarray(exp_conv)
+    )
+
+    if NS >= 2:
+        # Test inactive sequence 1 via explicit mask AND via "from_ckpt" (default)
+        act_mask = jnp.asarray([1, 0] + [1] * (NS - 2), dtype=jnp.int32)
+        raw_act = mk.scatter_pool_states(
+            g,
+            ex,
+            raw_r0,
+            pos,
+            pt,
+            knew,
+            vnew,
+            conv_new,
+            rec_new,
+            ckpt_use,
+            act_mask,
+        )
+        ckpt_inact = (
+            ckpt_use.at[:, 1, :].set(0)
+            if ckpt_use.ndim == 3
+            else ckpt_use.at[1, :].set(0)
+        )
+        raw_fc = mk.scatter_pool_states(
+            g,
+            ex,
+            raw_r0,
+            pos,
+            pt,
+            knew,
+            vnew,
+            conv_new,
+            rec_new,
+            ckpt_inact,
+            "from_ckpt",
+        )
+        raw_default = mk.scatter_pool_states(
+            g,
+            ex,
+            raw_r0,
+            pos,
+            pt,
+            knew,
+            vnew,
+            conv_new,
+            rec_new,
+            ckpt_inact,
+            None,
+        )
+        for r_a, r_b, r_d in zip(raw_act, raw_fc, raw_default):
+            np.testing.assert_array_equal(
+                np.asarray(r_a).view(np.uint8), np.asarray(r_b).view(np.uint8)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(r_a).view(np.uint8), np.asarray(r_d).view(np.uint8)
+            )
+        if NS == 2 and att_every == 4:
+            from jax.experimental import pallas as pl
+
+            with (
+                pl.enable_debug_checks(True),
+                pytest.raises(
+                    jax.errors.JaxRuntimeError,
+                    match="GDN scatter checkpoint slot maps outside",
+                ),
+            ):
+                r_bad = jax.jit(
+                    lambda ck: mk.scatter_pool_states(
+                        g,
+                        ex,
+                        raw_r0,
+                        pos,
+                        pt,
+                        knew,
+                        vnew,
+                        conv_new,
+                        rec_new,
+                        ck,
+                    )
+                )(ckpt_use + ex.num_pages)
+                r_bad[0].block_until_ready()
+
+
+def test_scatter_pool_states_top_of_pool_t2_no_corruption():
+    """Verify T>1 per-token and contiguous scatter at top of pool."""
+    g = _tiny_geom(L=2, att_every=2)  # G_PER_ATT=1 -> 5 pages per slot
+    # With num_pages=64 and T=2: (num_pages - 5*T, num_pages - 5] is (54, 59].
+    # Slot 11 has page base 11*5 = 55 (pages 55..59), right in (54, 59]!
+    # Neighboring slot 10 has page base 10*5 = 50 (pages 50..54).
+    ex = _tiny_exec(R=2, B=4, T=2, ctx=256, paged_kv=True, num_pages=64)
+    pos, _, _, st_l = qwen35.random_logical_inputs(jax.random.key(77), g, ex)
+    pt, _, roff, _ = mk.default_pool_layout(g, ex)
+    # 2D ckpt_indices: seq 0 uses slots (8, 9), seq 1 uses slots (10, 11)
+    # where slot 11 -> pages 55..59 (in (num_pages - 5*T, num_pages - 5]).
+    ckpt_2d = jnp.asarray([[8, 9], [10, 11]], dtype=jnp.int32)
+    raw_pools = mk.states_to_pool(g, ex, st_l, pt, ckpt_2d, roff[0])
+    raw_r0 = tuple(mk.unfold(r, ex.R)[0] for r in raw_pools)
+
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(78), 4)
+    knew = jax.random.normal(k1, (g.NATT, ex.MR, g.HD), dtype=jnp.float32).astype(
+        jnp.float8_e4m3fn
+    )
+    vnew = jax.random.normal(k2, (g.NATT, ex.MR, g.HD), dtype=jnp.float32).astype(
+        jnp.float8_e4m3fn
+    )
+    QKV = g.QKV(ex.R)
+    vh = g.vh(ex.R)
+    conv_new = (
+        jax.random.normal(k3, (g.NGDN, 2, 3 + ex.T, QKV), dtype=jnp.float32)
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+    )
+    rec_new = jax.random.normal(
+        k4, (g.NGDN, ex.NS * ex.T * vh, g.KD, g.VD), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+
+    def _assert_rec_and_conv(st_after: dict):
+        np.testing.assert_array_equal(
+            np.asarray(st_after["rec"][0]), np.asarray(rec_new)
+        )
+        for t_idx in range(ex.T):
+            exp_taps = (
+                conv_new[:, :, 1 + t_idx : 4 + t_idx, :]
+                .astype(jnp.bfloat16)
+                .astype(jnp.float32)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(st_after["conv"][0, :, :, t_idx]), np.asarray(exp_taps)
+            )
+
+    # 1. Test 2D ckpt_indices (always takes per-token branch)
+    raw_sc_2d = mk.scatter_pool_states(
+        g, ex, raw_r0, pos, pt, knew, vnew, conv_new, rec_new, ckpt_2d
+    )
+    raw_sc_2d_full = tuple(jnp.tile(r, (ex.R, 1, 1, 1, 1)) for r in raw_sc_2d)
+    st_after_2d = mk.pool_to_states(g, ex, raw_sc_2d_full, pt, ckpt_2d)
+    _assert_rec_and_conv(st_after_2d)
+
+    # 2. Test 3D non-contiguous ckpt_indices with slot 11 at t=0 and slot 10 at t=1
+    ckpt_3d_noncontig = jnp.asarray([[[8, 9], [11, 10]]], dtype=jnp.int32)
+    raw_sc_3d = mk.scatter_pool_states(
+        g, ex, raw_r0, pos, pt, knew, vnew, conv_new, rec_new, ckpt_3d_noncontig
+    )
+    raw_sc_3d_full = tuple(jnp.tile(r, (ex.R, 1, 1, 1, 1)) for r in raw_sc_3d)
+    st_after_3d = mk.pool_to_states(g, ex, raw_sc_3d_full, pt, ckpt_3d_noncontig)
+    _assert_rec_and_conv(st_after_3d)
+
+    # 3. Test 3D contiguous ckpt_indices at top of pool (slots [10, 11] -> pages 50..59,
+    # exercising span = 5*T = 10 at num_pages - 5*T = 54 without corrupting [8, 9])
+    ckpt_3d_contig_top = jnp.asarray([[[8, 9], [10, 11]]], dtype=jnp.int32)
+    raw_sc_3d_contig = mk.scatter_pool_states(
+        g, ex, raw_r0, pos, pt, knew, vnew, conv_new, rec_new, ckpt_3d_contig_top
+    )
+    raw_sc_3d_contig_full = tuple(
+        jnp.tile(r, (ex.R, 1, 1, 1, 1)) for r in raw_sc_3d_contig
+    )
+    st_after_3d_contig = mk.pool_to_states(
+        g, ex, raw_sc_3d_contig_full, pt, ckpt_3d_contig_top
+    )
+    _assert_rec_and_conv(st_after_3d_contig)
+
+    # 4. Verify out-of-bounds ckpt slot (slot 12 -> pages 60..64) raises ValueError
+    with pytest.raises(ValueError, match="exceeds pool capacity"):
+        mk.scatter_pool_states(
+            g,
+            ex,
+            raw_r0,
+            pos,
+            pt,
+            knew,
+            vnew,
+            conv_new,
+            rec_new,
+            jnp.asarray([[8, 9], [10, 12]], dtype=jnp.int32),
+        )
+
+    # 5. Also trace non-interpret (TPU Ref.bitcast().reshape() path) via make_jaxpr
+    ex_tpu_trace = replace(ex, interpret=False)
+    jaxpr_sc = jax.make_jaxpr(
+        lambda r0, p, pt_i, kn, vn, cn, rn, ck: mk.scatter_pool_states(
+            g, ex_tpu_trace, r0, p, pt_i, kn, vn, cn, rn, ck
+        )
+    )(raw_r0, pos, pt, knew, vnew, conv_new, rec_new, ckpt_2d)
+    assert "qwen3_5_scatter_pool_states" in str(jaxpr_sc)
+
+
+def test_donate_pools_all_call_shapes_no_pool_copy():
+    """Verify `donate_pools=True` donates `raw_pools` across all 4 call shapes."""
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+
+    # 1-3: Mixed GDN+GQA model (states_dict, positional no-act, positional with act)
+    g = _tiny_geom(L=4, att_every=4)
+    ex = _tiny_exec(R=2, B=2, T=1, ctx=256, paged_kv=True, num_pages=96)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(61), g, ex)
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    spec = qwen35.qwen35_spec(g)
+    pw_step, _ = mk.PallasWriter().make_step(mesh, spec, ex, donate=True)
+
+    def _fresh_pools(target_g=g):
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(target_g, ex, st_l, pt, ckpt, roff)
+        )
+
+    # Shape 1: states_dict call (used by PallasWriter)
+    r1 = _fresh_pools()
+    st_d = {
+        "raw": r1,
+        "page_table": pt,
+        "ckpt_indices": ckpt,
+        "read_offsets": roff,
+    }
+    lowered_1 = pw_step.lower(pos, hid_mk, w_mk, st_d)
+    assert "jax.buffer_donor = true" in lowered_1.as_text()
+    compiled_hlo_1 = lowered_1.compile().as_text()
+    ok_real, msg_real = mk.check_pooled_step_hlo(
+        compiled_hlo_1, page_size=ex.page_size, kvh=1, hd=g.HD
+    )
+    assert ok_real, msg_real
+    out_1, _ = pw_step(pos, hid_mk, w_mk, st_d)
+    assert all(buf.is_deleted() for buf in r1)
+
+    # Verify 3D page_table (R, NS, W) at R=2 on PallasWriter
+    r_3d = _fresh_pools()
+    pt_3d = jax.device_put(
+        jnp.broadcast_to(pt[None, ...], (ex.R, *pt.shape)),
+        tp,
+    )
+    out_3d, _ = pw_step(pos, hid_mk, w_mk, r_3d, pt_3d, ckpt, roff)
+    np.testing.assert_array_equal(np.asarray(out_3d), np.asarray(out_1))
+    assert all(buf.is_deleted() for buf in r_3d)
+
+    # Also trace gather_gdn_states with interpret=False via make_jaxpr
+    ex_non_interp = replace(ex, interpret=False)
+    raw_r0 = tuple(mk.unfold(r, ex.R)[0] for r in _fresh_pools())
+    jaxpr_gather = jax.make_jaxpr(
+        lambda r0, ck, ro: mk.gather_gdn_states(g, ex_non_interp, r0, ck, ro)
+    )(raw_r0, ckpt, roff)
+    assert "qwen3_5_gather_gdn_states" in str(jaxpr_gather)
+
+    # Shape 2: GDN positional without active_seqs (reuses compiled _jitted_step)
+    r2 = _fresh_pools()
+    hlo_2 = pw_step.lower(pos, hid_mk, w_mk, r2, pt, ckpt, roff).as_text()
+    assert "jax.buffer_donor = true" in hlo_2
+    _, _ = pw_step(pos, hid_mk, w_mk, r2, pt, ckpt, roff)
+    assert all(buf.is_deleted() for buf in r2)
+
+    # Shape 3: GDN positional with active_seqs array
+    r3 = _fresh_pools()
+    act = jnp.asarray([1, 1], dtype=jnp.int32)
+    hlo_3 = pw_step.lower(pos, hid_mk, w_mk, r3, pt, ckpt, roff, act).as_text()
+    assert "jax.buffer_donor = true" in hlo_3
+    _, _ = pw_step(pos, hid_mk, w_mk, r3, pt, ckpt, roff, act)
+    assert all(buf.is_deleted() for buf in r3)
+
+    # Shape 4: Attention-only (NGDN=0) positional call
+    g_att = _tiny_geom(L=1, att_every=1)
+    _, hid_a, w_a, st_a = qwen35.random_logical_inputs(jax.random.key(62), g_att, ex)
+    _, hid_mk_a, w_mk_a, _ = qwen35.pack_inputs(
+        pos, hid_a, w_a, st_a, g_att, ex, mesh=mesh, build_default_pool=True
+    )
+    pt_a, ckpt_a, roff_a, _ = mk.default_pool_layout(g_att, ex)
+    r4 = tuple(
+        jax.device_put(np.asarray(r).copy(), tp)
+        for r in mk.states_to_pool(g_att, ex, st_a, pt_a, ckpt_a, roff_a)
+    )
+    att_step, _ = qwen35.make_pooled_step(mesh, g_att, ex, donate_pools=True)
+    hlo_4 = att_step.lower(pos, hid_mk_a, w_mk_a, r4, pt_a).as_text()
+    assert "jax.buffer_donor = true" in hlo_4
+    _, _ = att_step(pos, hid_mk_a, w_mk_a, r4, pt_a)
+    assert all(buf.is_deleted() for buf in r4)
+
+    # Also verify check_pooled_step_hlo negative cases
+    bad_single_cc, _ = mk.check_pooled_step_hlo("tpu_custom_call scatter_pool_states")
+    assert not bad_single_cc
+    bad_copy, _ = mk.check_pooled_step_hlo(
+        "tpu_custom_call tpu_custom_call scatter_pool_states "
+        "%c = f8e4m3fn[64,2,64,4,128] copy(%p)"
+    )
+    assert not bad_copy
