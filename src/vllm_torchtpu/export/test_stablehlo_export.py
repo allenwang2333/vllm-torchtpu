@@ -2749,3 +2749,70 @@ def test_duplicate_weight_name_within_first_exported_module_shares_global_index(
     global_idx = abs_in[0]["index"]
     assert fwd_in[1]["index"] == global_idx
     assert fwd_in[2]["index"] == global_idx
+
+
+def test_maybe_export_sampling_subgraphs_handles_list_eos_token_id(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify list-typed hf_config.eos_token_id (e.g. GLM-5) writes compile_options."""
+    export_dir = tmp_path / "export_list_eos"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    (export_dir / "metadata.json").write_text(
+        json.dumps({"format_version": 2, "functions": {}})
+    )
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+
+    class MockModel(torch.nn.Module):
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    class MockGlmRunner:
+        def __init__(self) -> None:
+            self.model = MockModel()
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [8]
+            self.model_config = MagicMock()
+            self.model_config.model = "zai-org/GLM-5.2-FP8"
+            self.model_config.get_hidden_size.return_value = 16
+            self.model_config.vocab_size = 32
+            self.model_config.max_model_len = 2048
+            self.model_config.eos_token_id = None
+            self.model_config.hf_config.eos_token_id = [154820, 154827, 154829]
+            self.parallel_config = MagicMock()
+            self.parallel_config.world_size = 4
+            self.parallel_config.tensor_parallel_size = 4
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.data_parallel_size = 1
+            self.cache_config = MagicMock()
+            self.cache_config.block_size = 16
+            self.cache_config.num_gpu_blocks = 64
+            self.speculative_config = None
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    mock_mlir_res = MagicMock()
+    mock_mlir_res.serialize_text.return_value = (
+        "module @subgraph { func.func @main(%arg0: tensor<8x16xbf16>) "
+        "-> tensor<8x32xbf16> { return %arg0 : tensor<8x32xbf16> } }"
+    )
+    mock_mlir_res.is_noop = False
+    mock_mlir_res.module = MagicMock()
+
+    with (
+        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
+        patch(
+            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
+            return_value=torch.zeros((8, 1), dtype=torch.int64),
+        ),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockGlmRunner())
+
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    assert meta["config"]["eos_token_id"] == 154820
+    assert meta["compile_options"] == {
+        "num_replicas": 1,
+        "num_partitions": 4,
+        "use_spmd_partitioning": True,
+    }
