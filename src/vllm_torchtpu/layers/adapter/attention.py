@@ -2554,7 +2554,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
         # W_UV runs before the DCP merge, so the merge carries v_head_dim.
-        uv_first = use_qrep and getattr(layer, "W_UV_dcp_qrep", None) is not None
+        # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
+        # projected partial stays f32, and the sized merge only takes a 2-byte
+        # partial, so it would silently fall back to the f32 reduce-scatter.
+        uv_first = (
+            use_qrep
+            and getattr(layer, "W_UV_dcp_qrep", None) is not None
+            and (
+                not envs.TPU_MTP_DCP_MERGE_SIZED
+                or vllm_compilation_backends.model_tag == "backbone"
+            )
+        )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
