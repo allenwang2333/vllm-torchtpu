@@ -18,7 +18,9 @@ from unittest.mock import MagicMock
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.request import RequestStatus
 
+from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 
@@ -726,3 +728,396 @@ def test_kv_producer_cold_cap_reserves_budget_for_ready_warm_and_multi_cold():
 
 
 
+
+
+# --- PAW aging, cold-cap release, retention guard, admission telemetry ---
+
+
+def _aged(request_id: str, prompt: int, computed: int, waited_s: float, now: float):
+    r = _running_request(request_id, prompt=prompt, computed=computed)
+    r.arrival_time = now - waited_s
+    return r
+
+
+def _producer(now: float, budget: int = 8192) -> PrefixAwareScheduler:
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s._is_disagg = True
+    s._is_kv_producer = True
+    s._is_kv_consumer = False
+    s.block_size = 640
+    s.max_num_scheduled_tokens = budget
+    s._cold_chunk_cap = 2560
+    s._cold_threshold = 4096
+    s._cold_min_decoders = 12
+    s._step_num_decoding = 0
+    s._step_decode_tokens = 0
+    s._step_prefill_tokens_by_req = {}
+    s._step_wall_time = now
+    s._step_cold_exempt_ids = set()
+    s.skipped_waiting = []
+    return s
+
+
+def test_paw_aging_lets_long_waiting_cold_prefill_overtake_srpf(monkeypatch):
+    now = time.time()
+    running = [
+        _aged("cold_old", 240_000, 0, waited_s=90, now=now),
+        _aged("cold_new", 150_000, 0, waited_s=1, now=now),
+        _aged("warm", 3_000, 0, waited_s=0.5, now=now),
+        _running_request("d1", prompt=500, computed=501),
+    ]
+    monkeypatch.setenv("TPU_SCHED_PAW_AGING_TOK_PER_S", "0")
+    s, seen = _make_step_scheduler(running, monkeypatch)
+    s.schedule()
+    assert seen["order"] == ["d1", "warm", "cold_new", "cold_old"]
+
+    # 240,000 - 3,000 x 90 s < 0 puts the 90 s old cold prefill first;
+    # 150,000 - 3,000 x 1 s keeps the fresh one behind the warm turn.
+    monkeypatch.setenv("TPU_SCHED_PAW_AGING_TOK_PER_S", "3000")
+    s, seen = _make_step_scheduler(running, monkeypatch)
+    s.schedule()
+    assert seen["order"] == ["d1", "cold_old", "warm", "cold_new"]
+
+
+def test_paw_aging_reorders_waiting_queue_within_a_tier(monkeypatch):
+    now = time.time()
+    small = _make_request("small_cold", num_tokens=30_000, arrival_time=now - 1)
+    big = _make_request("big_cold", num_tokens=150_000, arrival_time=now - 61)
+
+    monkeypatch.setenv("TPU_SCHED_PAW_AGING_TOK_PER_S", "0")
+    s = _make_scheduler([small, big], {"small_cold": 0, "big_cold": 0})
+    q = s._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q] == ["small_cold", "big_cold"]
+
+    # 150,000 - 3,000 x 61 s is below 30,000 - 3,000 x 1 s.
+    monkeypatch.setenv("TPU_SCHED_PAW_AGING_TOK_PER_S", "3000")
+    warm = _make_request("warm", num_tokens=50_000, arrival_time=now)
+    s = _make_scheduler(
+        [small, big, warm], {"small_cold": 0, "big_cold": 0, "warm": 47_000}
+    )
+    q = s._select_waiting_queue_for_scheduling()
+    # Aging works within a tier: the locally warm request still goes first.
+    assert q.pop_request().request_id == "warm"
+    q = s._select_waiting_queue_for_scheduling()
+    assert [r.request_id for r in q] == ["big_cold", "small_cold"]
+
+
+def test_cold_cap_exempts_running_cold_request_past_max_wait(monkeypatch):
+    monkeypatch.setenv("TPU_SCHED_PAW_MAX_WAIT_S", "10")
+    now = time.time()
+    s = _producer(now)
+    fresh = _aged("fresh", 200_000, 0, waited_s=2, now=now)
+    old = _aged("old", 200_000, 0, waited_s=30, now=now)
+    s._step_running_prefill_ids = {id(fresh), id(old)}
+    s.waiting = [object()]
+    # Two warm turns waiting need 7,552 tokens: the cold group gets one block.
+    s._step_warm_waiting_tokens = 7552
+
+    assert s._cap_cold_prefill_tokens(fresh, 0, 8192) == 640
+    assert s._step_warm_reserve_applied is True
+    s._step_prefill_tokens_by_req[id(fresh)] = 640
+    # The old request's group budget is 8,191 - min(7,552, 0.5 x 8,192) =
+    # 4,095, so the waiting warm turns keep 4,096 tokens of the step.
+    assert s._cap_cold_prefill_tokens(old, 0, 8192) == 4095 - 640
+    assert s._step_cold_exempt_ids == {id(old)}
+
+    # Alone on the step, the old request gets the same 4,095.
+    s = _producer(now)
+    s._step_running_prefill_ids = {id(old)}
+    s.waiting = [object()]
+    s._step_warm_waiting_tokens = 7552
+    assert s._cap_cold_prefill_tokens(old, 0, 8192) == 4095
+    # A small warm backlog leaves the exempt request the rest of the step.
+    s._step_prefill_tokens_by_req = {}
+    s._step_warm_waiting_tokens = 1280
+    assert s._cap_cold_prefill_tokens(old, 0, 8192) == 8191 - 1280
+
+    # Reserve 0: the exempt request keeps only the phase-1 one-token gap.
+    monkeypatch.setenv("TPU_SCHED_PAW_EXEMPT_WARM_RESERVE", "0")
+    s = _producer(now)
+    s._step_running_prefill_ids = {id(old)}
+    s.waiting = [object()]
+    s._step_warm_waiting_tokens = 7552
+    assert s._cap_cold_prefill_tokens(old, 0, 8192) == 8191
+
+    # MAX_WAIT_S = 0: no exemption, the old request is capped like the fresh one.
+    monkeypatch.setenv("TPU_SCHED_PAW_MAX_WAIT_S", "0")
+    s = _producer(now)
+    s._step_running_prefill_ids = {id(old)}
+    s.waiting = [object()]
+    s._step_warm_waiting_tokens = 7552
+    assert s._cap_cold_prefill_tokens(old, 0, 8192) == 640
+
+
+def test_cold_cap_released_after_a_step_that_admitted_no_warm_request(monkeypatch):
+    monkeypatch.setenv("TPU_SCHED_PAW_MAX_WAIT_S", "10")
+    now = time.time()
+    cold = _aged("cold", 200_000, 6400, waited_s=1, now=now)
+    warm = _make_request("warm", num_tokens=50_000, arrival_time=now)
+    admit_warm = {"on": False}
+    chunks = []
+
+    def fake_schedule(self, *args, **kwargs):
+        n = self._cap_cold_prefill_tokens(cold, cold.num_computed_tokens, 8192)
+        chunks.append(n)
+        scheduled = {"cold": n}
+        if admit_warm["on"]:
+            scheduled["warm"] = 4000
+        return SimpleNamespace(
+            num_scheduled_tokens=scheduled,
+            total_num_scheduled_tokens=sum(scheduled.values()),
+        )
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", fake_schedule, raising=False)
+    s = _producer(now)
+    s.running = [cold]
+    s.waiting = [warm]
+    s._prefix_warmth = lambda r: 46_000 if r is warm else 0
+    s._external_warmth = lambda r, local: 0
+
+    # (ceil(4000 / 640) + 1) x 640 = 5,120 warm tokens: cold cap 2,560.
+    s.schedule()
+    assert chunks[-1] == 2560 and s._warm_reserve_wasted
+    # The warm turn was not admitted: the next step does not cap the cold group.
+    s.schedule()
+    assert chunks[-1] == 8191 and not s._warm_reserve_wasted
+    # The release step reserved nothing, so the cap comes back.
+    admit_warm["on"] = True
+    s.schedule()
+    assert chunks[-1] == 2560 and not s._warm_reserve_wasted
+    s.schedule()
+    assert chunks[-1] == 2560
+
+    # With TPU_SCHED_PAW_MAX_WAIT_S=0 there is no release: the S0 cold cap.
+    monkeypatch.setenv("TPU_SCHED_PAW_MAX_WAIT_S", "0")
+    admit_warm["on"] = False
+    s = _producer(now)
+    s.running = [cold]
+    s.waiting = [warm]
+    s._prefix_warmth = lambda r: 46_000 if r is warm else 0
+    s._external_warmth = lambda r, local: 0
+    s.schedule()
+    s.schedule()
+    assert chunks[-2:] == [2560, 2560]
+
+
+class _MambaSpec:
+    pass
+
+
+_MambaSpec.__name__ = "MambaSpec"
+
+
+class _FullAttentionSpec:
+    pass
+
+
+_FullAttentionSpec.__name__ = "FullAttentionSpec"
+
+
+class _GuardPool:
+    num_gpu_blocks = 8000
+
+    def __init__(self, free: int):
+        self.free = free
+
+    def get_num_free_blocks(self) -> int:
+        return self.free
+
+    def free_blocks(self, blocks) -> None:
+        for b in blocks:
+            b.ref_cnt -= 1
+            if b.ref_cnt == 0:
+                self.free += 1
+
+
+class _GuardKVM:
+    """KVCacheManager stand-in with v0.29.0's two allocate_slots refusals."""
+
+    def __init__(self, free: int, need: int):
+        self.pool = _GuardPool(free)
+        self.need = need
+        self.mamba_mgr = SimpleNamespace(block_size=640, cached_blocks_this_step=set())
+        groups = [
+            SimpleNamespace(spec=_FullAttentionSpec(), group_ids=[0]),
+            SimpleNamespace(spec=_MambaSpec(), group_ids=[1]),
+        ]
+        self.coordinator = SimpleNamespace(
+            attention_groups=groups,
+            single_type_managers=[SimpleNamespace(block_size=640), self.mamba_mgr],
+            block_pool=self.pool,
+            get_num_blocks_to_allocate=self._need,
+        )
+        self.enable_caching = True
+        self.watermark_blocks = 0
+        self.calls = 0
+
+    def _need(self, **kwargs) -> int:
+        blocks = kwargs.get("new_computed_blocks") or ((), ())
+        mamba = blocks[1] if len(blocks) > 1 else ()
+        if mamba and mamba[-1].block_hash in self.mamba_mgr.cached_blocks_this_step:
+            return self.pool.num_gpu_blocks + 1
+        return self.need
+
+    def allocate_slots(
+        self,
+        request,
+        num_new_tokens,
+        new_computed_blocks=None,
+        delay_cache_blocks=False,
+        reserved_blocks=0,
+        has_scheduled_reqs=True,
+        **kwargs,
+    ):
+        self.calls += 1
+        need = self.coordinator.get_num_blocks_to_allocate(
+            new_computed_blocks=getattr(new_computed_blocks, "blocks", None)
+        )
+        if need > self.pool.get_num_free_blocks() - reserved_blocks:
+            return None
+        self.pool.free -= need
+        return "blocks"
+
+
+def _guarded(free: int, need: int, n_convs: int = 10, blocks_per_conv: int = 5):
+    kvm = _GuardKVM(free, need)
+    ret = HybridStateRetention(kvm, max_conversations=256)
+    assert ret.enabled
+    for i in range(n_convs):
+        blocks = [
+            SimpleNamespace(ref_cnt=1, is_null=False) for _ in range(blocks_per_conv)
+        ]
+        ret._conv_lru[("c", i)] = _ConvLRUEntry(
+            conv_key=("c", i),
+            req_id=f"r{i}",
+            first_hash=None,
+            boundary_idx=0,
+            boundary_hash=None,
+            blocks=blocks,
+            hit=640,
+        )
+    return kvm, ret
+
+
+def _waiting_req(request_id: str = "w") -> SimpleNamespace:
+    return SimpleNamespace(request_id=request_id, status=RequestStatus.WAITING)
+
+
+def test_retention_guard_keeps_lru_when_refused_by_inflight_reservation():
+    kvm, ret = _guarded(free=7000, need=350)
+    ret.begin_step()
+    res = kvm.allocate_slots(
+        _waiting_req(), 0, delay_cache_blocks=True, reserved_blocks=6900
+    )
+    assert res is None
+    assert len(ret._conv_lru) == 10
+    assert ret.alloc_none["inflight_reserve"] == 1
+    assert ret.alloc_none_evicted["no_blocks"] == 0
+    assert ret.step_waiting_none == ["inflight_reserve"]
+    assert kvm.calls == 1
+
+
+def test_retention_guard_evicts_only_the_shortfall():
+    # 112 needed, 100 free: three 5-block conversations cover the 12 missing.
+    kvm, ret = _guarded(free=100, need=112)
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 640) == "blocks"
+    assert len(ret._conv_lru) == 7
+    assert ret.alloc_none_evicted["no_blocks"] == 3
+    assert sum(ret.alloc_none.values()) == 0
+    assert ret.step_admits == 1 and ret.step_async_admits == 0
+
+
+def test_retention_guard_shortfall_then_reservation_stops_after_shortfall():
+    kvm, ret = _guarded(free=100, need=112)
+    ret.begin_step()
+    res = kvm.allocate_slots(
+        _waiting_req(), 0, delay_cache_blocks=True, reserved_blocks=50
+    )
+    assert res is None
+    assert len(ret._conv_lru) == 7
+    assert ret.alloc_none_evicted["no_blocks"] == 3
+    assert ret.alloc_none["inflight_reserve"] == 1
+
+
+def test_retention_guard_ignores_same_step_mamba_refusal():
+    kvm, ret = _guarded(free=7000, need=10)
+    mamba_block = SimpleNamespace(block_hash="h-mamba")
+    kvm.mamba_mgr.cached_blocks_this_step.add("h-mamba")
+    attn_block = SimpleNamespace(block_hash="h-attn")
+    hit = SimpleNamespace(blocks=((attn_block,), (mamba_block,)))
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 640, new_computed_blocks=hit) is None
+    assert len(ret._conv_lru) == 10
+    assert ret.alloc_none["same_step"] == 1
+    assert ret.step_waiting_none == ["same_step"]
+
+
+def test_retention_guard_counts_async_admission_and_running_refusals():
+    kvm, ret = _guarded(free=5, need=3, n_convs=0)
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 0, delay_cache_blocks=True) == "blocks"
+    assert ret.step_admits == 1 and ret.step_async_admits == 1
+    running = SimpleNamespace(request_id="r", status=RequestStatus.RUNNING)
+    assert kvm.allocate_slots(running, 640) is None
+    assert ret.alloc_none["no_blocks"] == 1
+    # A running request's refusal does not end the waiting loop.
+    assert ret.step_waiting_none == []
+
+
+def test_waiting_loop_stop_reason_and_admission_telemetry():
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = []
+    s.waiting = [object()]
+    s.skipped_waiting = []
+    s.max_num_scheduled_tokens = 8192
+    s.max_num_running_reqs = 32
+    s.block_size = 640
+    out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
+
+    s._step_wait_event = None
+    s._retention = SimpleNamespace(
+        step_waiting_none=["inflight_reserve"],
+        step_admits=0,
+        step_async_admits=0,
+        alloc_none={"inflight_reserve": 7, "no_blocks": 0},
+    )
+    assert s._waiting_loop_stop_reason(out, 1) == "alloc:inflight_reserve"
+
+    # The first stop of a waiting request wins; running requests are ignored.
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.RUNNING), "align0")
+    assert s._step_wait_event is None
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.WAITING), "cap0:cold_cap")
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.WAITING), "align0")
+    assert s._waiting_loop_stop_reason(out, 1) == "cap0:cold_cap"
+
+    s._step_wait_event = None
+    s._retention.step_waiting_none = []
+    assert s._waiting_loop_stop_reason(out, 1) == "other"
+    full = SimpleNamespace(total_num_scheduled_tokens=8192, num_scheduled_tokens={})
+    assert s._waiting_loop_stop_reason(full, 1) == "budget"
+    s.waiting = []
+    assert s._waiting_loop_stop_reason(out, 0) == "idle"
+
+    s.waiting = [object()]
+    s._step_cold_exempt_ids = {1}
+    s._record_step_telemetry(out, 3, "alloc:inflight_reserve")
+    s._step_cold_exempt_ids = set()
+    s._record_step_telemetry(out, 3, "alloc:inflight_reserve")
+    s._record_step_telemetry(full, 0, "idle")
+    # Every waiting request got in: a short step is not a small step then.
+    s.waiting = []
+    s._record_step_telemetry(out, 2, "drained")
+    s._step_warm_waiting_tokens = 7552
+    s._step_max_cold_budget = 640
+    s._step_cold_release = False
+    s._step_cold_exempt_ids = set()
+    text = s._admission_telemetry("alloc:inflight_reserve")
+    assert "warm_waiting_toks=7552 max_cold_budget=640 cold_release=0" in text
+    assert "stop=alloc:inflight_reserve" in text
+    assert "min_steps=4 min_small_steps_waiting=2 min_exempt_steps=1" in text
+    assert "min_alloc_none=inflight_reserve:7,no_blocks:0" in text
+    assert "min_stops=alloc:inflight_reserve:2,drained:1" in text
+    # The per-minute counters restart after each telemetry line.
+    text = s._admission_telemetry("idle")
+    assert "min_steps=0" in text and "min_alloc_none=inflight_reserve:0" in text

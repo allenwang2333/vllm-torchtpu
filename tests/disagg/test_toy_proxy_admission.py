@@ -159,3 +159,58 @@ def test_prompt_token_helpers() -> None:
     assert _m._prompt_tokens_from_prefill({"usage": {"prompt_tokens": 7}}, {}) == 7
     assert _m._prompt_tokens_from_prefill({}, {"num_tokens": 9}) == 10
     assert _m._prompt_tokens_from_prefill({}, {}) is None
+
+
+def test_decode_router_balances_on_running_requests() -> None:
+    r = _PrefixAffinityRouter(n=3, chunk=1024, slack=2, load_metric="running")
+    # A cold conversation goes to the leg decoding the fewest requests, not to
+    # the one with the fewest in flight (leg 1): requests in the prefill hop
+    # hold no decode slot yet.
+    r.inflight = [10, 4, 12]
+    r.running = [0, 4, 1]
+    rank, sticky = r.route(r.hashes("cold-" * 1000))
+    assert not sticky and rank == 0
+    r.done(rank)
+    r.running = [5, 4, 1]
+    rank, sticky = r.route(r.hashes("cold2-" * 1000))
+    assert not sticky and rank == 2
+    r.done(rank)
+    # The same conversation stays on its leg while it is within the slack of
+    # the least-running leg, and moves to the least-running leg beyond it.
+    text = "conv-" * 1000
+    owner, _ = r.route(r.hashes(text))
+    r.done(owner)
+    r.running = [3, 3, 3]
+    r.running[owner] = 5
+    rank, sticky = r.route(r.hashes(text + "x" * 4096))
+    assert sticky and rank == owner
+    r.done(rank)
+    r.running[owner] = 6
+    rank, sticky = r.route(r.hashes(text + "x" * 8192))
+    assert not sticky and rank != owner
+
+
+def test_decode_router_running_count_follows_start_and_done() -> None:
+    r = _PrefixAffinityRouter(n=2, chunk=1024, load_metric="running")
+    rank, _ = r.route(r.hashes("a" * 4096))
+    assert r.inflight[rank] == 1 and r.running[rank] == 0
+    r.start_running(rank)
+    assert r.running[rank] == 1
+    r.done(rank, was_running=True)
+    assert r.inflight[rank] == 0 and r.running[rank] == 0
+    # A request that never reached the decode hop leaves running untouched.
+    rank, _ = r.route(r.hashes("b" * 4096))
+    r.start_running(1 - rank)
+    r.done(rank)
+    assert r.running[1 - rank] == 1 and r.inflight == [0, 0]
+    assert r.stats()["running"] == r.running
+    assert r.stats()["load_metric"] == "running"
+
+
+def test_inflight_metric_keeps_prefill_router_behaviour() -> None:
+    r = _PrefixAffinityRouter(n=2, chunk=1024)
+    r.inflight = [3, 0]
+    r.running = [0, 5]
+    rank, _ = r.route(r.hashes("p" * 4096))
+    assert rank == 1
+    r.done(rank)

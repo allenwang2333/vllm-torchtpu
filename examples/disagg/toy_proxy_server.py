@@ -41,6 +41,13 @@ class _PrefixAffinityRouter:
     With ``saturated_inflight`` > 0 the slack check is skipped while every
     server has at least that many requests in flight: a cold placement there
     costs a full re-prefill, which is worse than queueing behind the owner.
+
+    ``load_metric`` picks the per-server load that the slack check and the
+    non-sticky placement compare: ``inflight`` counts requests from route()
+    to done(), ``running`` counts only those between start_running() and
+    done(). A decode leg uses ``running``: its batch is the requests it is
+    decoding, while a request still in the prefill hop holds no decode slot.
+    Ties fall back to the in-flight count, then to the number placed.
     """
 
     def __init__(
@@ -51,8 +58,14 @@ class _PrefixAffinityRouter:
         slack: int = 8,
         max_sessions: int = 0,
         saturated_inflight: int = 0,
+        load_metric: str = "inflight",
     ) -> None:
+        if load_metric not in ("inflight", "running"):
+            raise ValueError(
+                f"load_metric must be inflight or running, got {load_metric!r}"
+            )
         self.n = n
+        self.load_metric = load_metric
         self.chunk = max(64, chunk)
         self.min_frac = min_frac
         self.slack = slack
@@ -61,6 +74,7 @@ class _PrefixAffinityRouter:
         self._lock = threading.Lock()
         self.owners: dict[bytes, int] = {}
         self.inflight = [0] * n
+        self.running = [0] * n
         self.placed = [0] * n
         self.sticky = 0
         self.sticky_saturated = 0
@@ -127,15 +141,17 @@ class _PrefixAffinityRouter:
                 if sid is None or self.session_rank.get(sid) != best_rank:
                     known = False
                     self.rerouted += 1
-            lo = min(self.inflight)
+            load = self.running if self.load_metric == "running" else self.inflight
+            lo = min(load)
             saturated = (
-                self.saturated_inflight > 0 and lo >= self.saturated_inflight
+                self.saturated_inflight > 0
+                and min(self.inflight) >= self.saturated_inflight
             )
-            if known and (saturated or self.inflight[best_rank] <= lo + self.slack):
+            if known and (saturated or load[best_rank] <= lo + self.slack):
                 rank = best_rank
                 is_sticky = True
                 self.sticky += 1
-                if saturated and self.inflight[best_rank] > lo + self.slack:
+                if saturated and load[best_rank] > lo + self.slack:
                     self.sticky_saturated += 1
             else:
                 if self.max_sessions > 0:
@@ -143,6 +159,7 @@ class _PrefixAffinityRouter:
                         range(self.n),
                         key=lambda r: (
                             len(self.resident[r]),
+                            load[r],
                             self.inflight[r],
                             self.placed[r],
                             r,
@@ -151,7 +168,7 @@ class _PrefixAffinityRouter:
                 else:
                     rank = min(
                         range(self.n),
-                        key=lambda r: (self.inflight[r], self.placed[r], r),
+                        key=lambda r: (load[r], self.inflight[r], self.placed[r], r),
                     )
                 is_sticky = False
                 self.cold += 1
@@ -173,7 +190,8 @@ class _PrefixAffinityRouter:
                     f"cold={self.cold} rerouted={self.rerouted} placed={self.placed} "
                     f"inflight={self.inflight} unique_chunks={len(self.owners)} "
                     f"resident={[len(r) for r in self.resident]} "
-                    f"evicted={self.evicted} sessions={self._next_session}",
+                    f"evicted={self.evicted} sessions={self._next_session} "
+                    f"running={self.running} load_metric={self.load_metric}",
                     flush=True,
                 )
             return rank, is_sticky
@@ -193,15 +211,24 @@ class _PrefixAffinityRouter:
                 self.session_rank[old_sid] = None
                 self.evicted += 1
 
-    def done(self, rank: int) -> None:
+    def start_running(self, rank: int) -> None:
+        """Counts a request routed to ``rank`` as running there."""
+        with self._lock:
+            self.running[rank] += 1
+
+    def done(self, rank: int, was_running: bool = False) -> None:
         with self._lock:
             self.inflight[rank] = max(0, self.inflight[rank] - 1)
+            if was_running:
+                self.running[rank] = max(0, self.running[rank] - 1)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "placed": list(self.placed),
                 "inflight": list(self.inflight),
+                "running": list(self.running),
+                "load_metric": self.load_metric,
                 "sticky": self.sticky,
                 "sticky_saturated": self.sticky_saturated,
                 "cold": self.cold,
@@ -603,12 +630,27 @@ async def lifespan(app: FastAPI):
     else:
         app.state.prefill_router = None
     decode_routing = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    # Decode prefix routing keeps a conversation on its leg while that leg runs
+    # at most PROXY_DECODE_HASH_SLACK more requests than the least-loaded leg,
+    # and otherwise picks the leg with the fewest running requests.
+    # PROXY_DECODE_LOAD_METRIC=inflight counts requests from routing to stream
+    # end instead (prefill hop included), with the old default slack of 8.
+    decode_load_metric = (
+        os.getenv("PROXY_DECODE_LOAD_METRIC", "running").strip().lower()
+    )
+    if decode_load_metric not in ("running", "inflight"):
+        raise ValueError(
+            "PROXY_DECODE_LOAD_METRIC must be running or inflight, "
+            f"got {decode_load_metric!r}"
+        )
+    decode_slack_default = 2 if decode_load_metric == "running" else 8
     if len(app.state.decode_clients) > 1 and decode_routing == "prefix_hash":
         app.state.decode_router = _PrefixAffinityRouter(
             n=len(app.state.decode_clients),
             chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
             min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
-            slack=_env_int("PROXY_DECODE_HASH_SLACK", 8),
+            slack=_env_int("PROXY_DECODE_HASH_SLACK", decode_slack_default),
+            load_metric=decode_load_metric,
         )
     else:
         app.state.decode_router = None
@@ -651,7 +693,9 @@ async def lifespan(app: FastAPI):
         _AdmissionBudget(f"prefill[{i}]", pending_cap, pending_cap_tokens)
         for i in range(len(app.state.prefill_clients))
     ]
-    app.state.bytes_per_token = _env_float("PROXY_TOKEN_BYTES_EST", 4.0)
+    # Prompt bytes per token of the AgentX trace: bytes / 4.0 came out at 0.84x
+    # the real prompt_tokens (p10 to p90), bytes / 3.4 matches.
+    app.state.bytes_per_token = _env_float("PROXY_TOKEN_BYTES_EST", 3.4)
     app.state.output_tokens_est = _env_int("PROXY_DECODE_OUTPUT_TOKENS_EST", 1024)
 
     print(
@@ -664,9 +708,15 @@ async def lifespan(app: FastAPI):
         f"and {len(app.state.decode_clients)} decode clients.",
         flush=True,
     )
+    decode_router = app.state.decode_router
+    decode_route_desc = (
+        f"prefix_hash load_metric={decode_router.load_metric} "
+        f"slack={decode_router.slack}"
+        if decode_router
+        else "round_robin"
+    )
     print(
-        "Decode routing="
-        f"{'prefix_hash' if app.state.decode_router else 'round_robin'} "
+        f"Decode routing={decode_route_desc} "
         f"max_inflight_per_decode={decode_cap or 'unlimited'} "
         f"max_inflight_tokens_per_decode={decode_cap_tokens or 'unlimited'} "
         f"admit_point={admit_point}",
@@ -922,6 +972,7 @@ async def _handle_completions(api: str, request: Request):
         pending_held = False
         pending_budget: _AdmissionBudget | None = None
         decode_released = False
+        decode_running = False
         pending_released = False
         t_prefill_recv_perf: float | None = None
 
@@ -933,7 +984,7 @@ async def _handle_completions(api: str, request: Request):
             if decode_held:
                 await decode_budget.release(decode_tokens)
             if decode_router is not None:
-                decode_router.done(decode_idx)
+                decode_router.done(decode_idx, was_running=decode_running)
 
         async def release_pending(reason: str) -> None:
             nonlocal pending_released
@@ -1065,7 +1116,11 @@ async def _handle_completions(api: str, request: Request):
 
             # Stream response from decode service
             async def generate_stream():
+                nonlocal decode_running
                 try:
+                    if decode_router is not None:
+                        decode_router.start_running(decode_idx)
+                        decode_running = True
                     t_decode_send = time.time()
                     t_decode_send_perf = time.perf_counter()
                     print(
