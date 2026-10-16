@@ -65,6 +65,15 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
+
+@pytest.fixture(autouse=True)
+def _default_path(monkeypatch):
+    """This file tests `sparsecore_topk` itself (default and row-cap paths).
+    TPU_SC_TOPK_VALID_READS, on by default, reroutes every call to
+    `sparsecore_topk_valid` (its own tests), so it is off here."""
+    monkeypatch.setenv("TPU_SC_TOPK_VALID_READS", "0")
+
+
 # `n` for a given `--max-model-len`, mirroring `streamindex_topk.py:602-605`:
 # `align_to(pages_per_seq, bkv_p) * page_size // 128 * 128` with page_size=1024
 # and bkv_p=2 on the GLM path.

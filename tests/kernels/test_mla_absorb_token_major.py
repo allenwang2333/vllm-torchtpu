@@ -122,9 +122,11 @@ def test_pick_blocks():
 def test_mode_gate(monkeypatch):
     from vllm_torchtpu.layers.adapter import attention
 
-    monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR", raising=False)
+    monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "0")
     assert attention.mla_absorb_mode(4096) is None
-    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A", raising=False)
+    monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR", raising=False)
+    assert attention.mla_absorb_mode(4096) == "pallas"  # default "1"
+    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A", "0")  # on by default; see below
     monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "1")
     assert attention.mla_absorb_mode(4096) == "pallas"
     assert attention.mla_absorb_mode(64) == "pallas"

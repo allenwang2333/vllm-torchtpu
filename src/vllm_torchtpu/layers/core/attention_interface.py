@@ -1072,11 +1072,12 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     """TPU_DCP_MLA_TOPK_CAP as it applies at this DCP size (0 = off).
 
     Auto (-1, the default): a rank owns ~topk/dcp_size slots, so a cap of 512
-    rarely binds at DCP16 and overflows every row at DCP2.
+    rarely binds at DCP16, binds sometimes at DCP8 (served there, GLM-5.2
+    trial 4) and overflows every row at DCP2.
     """
     topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
     if topk_cap < 0:
-        return 512 if dcp_size >= 16 else 0
+        return 512 if dcp_size >= 8 else 0
     return topk_cap
 
 
@@ -1084,7 +1085,7 @@ def _row_widths(env_name: str, value: str, topk_cap: int) -> tuple[int, ...]:
     """A comma list of capped-path row widths (TPU_DCP_MLA_MIXED_LIVE_WIDTHS,
     TPU_MLA_DECODE_ROW_WIDTHS) for this cap (0 = none).
 
-    The defaults were set for the auto cap of 512 at DCP >= 16: without a cap
+    The defaults were set for the auto cap of 512 at DCP >= 8: without a cap
     they step aside, and under a smaller explicit cap the widths it cannot take
     are dropped. Widths set explicitly reach the kernel as given, which refuses
     any that is not below the cap.

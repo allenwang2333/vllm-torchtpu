@@ -670,7 +670,10 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MLA_MERGE_PIECES": 0,
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_WEIGHTED_HM": False,
+        "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_RS_LAG": 0,
+        "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
+        "TPU_DCP_MERGE_VSPACE": False,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -942,6 +945,7 @@ def test_merge_chunks_per_bucket(
     monkeypatch.setattr(
         cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", min_tokens, raising=False
     )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_SMALL", 0, raising=False)
     calls = []
     monkeypatch.setattr(
         cp_mla, "_merge_chunked", lambda o, lse, g, n: calls.append(n) or o[:, :2]

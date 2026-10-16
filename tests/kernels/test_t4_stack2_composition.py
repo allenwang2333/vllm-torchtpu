@@ -53,6 +53,31 @@ import test_t4_combined_composition as t4  # noqa: E402
 
 pytestmark = pytest.mark.tpu_test
 
+# Trial-4 flags that are on by default now but not what this file composes:
+# pinned off in both arms, as they were when it was written (the on arm's
+# T4S2_FLAGS_ON still turns its own on).
+_TRIAL4_DEFAULTS_OFF = {
+    "TPU_DCP_MLA_SEND_LAYOUT": "0",
+    "TPU_DCP_MLA_SEND_LAYOUT_UNPACK": "0",
+    "TPU_DCP_MLA_MERGE_PIECES": "0",
+    "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": "0",
+    "TPU_DCP_MLA_MIXED_KERNEL_V2": "0",
+    "TPU_DCP_MERGE_CHUNKED_SMALL": "0",
+    "TPU_DCP_MERGE_VSPACE": "0",
+    "TPU_DCP_MERGE_WEIGHTED_HM": "0",
+    "TPU_SC_TOPK_VALID_READS": "0",
+    "TPU_INDEXER_QPREP_FUSED": "0",
+    "TPU_INDEXER_K_WRITE_COMPACT": "0",
+    "TPU_MLA_ABSORB_TOKEN_MAJOR": "0",
+}
+
+
+@pytest.fixture(autouse=True)
+def _trial4_defaults_off(monkeypatch):
+    for k, v in _TRIAL4_DEFAULTS_OFF.items():
+        monkeypatch.setenv(k, v)
+
+
 T4S2_FLAGS_ON = dict(
     t3.T3_FLAGS_ON,
     TPU_DCP_LSE_MERGE_A2A="1",
@@ -105,6 +130,7 @@ def test_t4_stack2_attention_all_flags_on_vs_off():
 
     for k in T4S2_FLAGS_ON:
         os.environ.pop(k, None)
+    os.environ.update(_TRIAL4_DEFAULTS_OFF)  # MERGE_PIECES is on by default
     ref, ref_w = t4._attention_run(dcp, on=False)
     seen = []
     got, got_w = _on_run(dcp, sparse_kernel, seen)
@@ -192,6 +218,7 @@ def test_t4_stack2_merge_pieces_swap_fault_is_caught():
 
     for k in T4S2_FLAGS_ON:
         os.environ.pop(k, None)
+    os.environ.update(_TRIAL4_DEFAULTS_OFF)  # MERGE_PIECES is on by default
     ref, _ = t4._attention_run(dcp, on=False)
     real_k = sparse_kernel.sparse_ragged_paged_attention
 

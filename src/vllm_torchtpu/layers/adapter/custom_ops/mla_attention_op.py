@@ -279,8 +279,8 @@ def _dcp_indexer_a2a_for_bucket(
     `num_tokens` is the static padded bucket, so this picks one merge per
     compiled variant: decode-sized buckets keep the all-gather merge and
     prefill-sized ones (>= `min_tokens`) take the all-to-all. The all-to-all
-    splits the bucket over the DCP ranks; on by default, a bucket that does not
-    divide keeps the all-gather unless TPU_DCP_INDEXER_A2A_MERGE was set.
+    splits the bucket over the DCP ranks; a bucket that does not divide keeps
+    the all-gather unless TPU_DCP_INDEXER_A2A_MERGE was set.
     """
     if (
         enabled

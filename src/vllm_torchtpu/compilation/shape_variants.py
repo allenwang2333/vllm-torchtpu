@@ -246,7 +246,7 @@ def _scalar_adapter(
     if len(stored_t) != len(current_t):
         return None
     by_name = {current[i]: i for i in current_t}
-    source: list[int] | None = [by_name.get(stored[i], -1) for i in stored_t]
+    source: list[int] = [by_name.get(stored[i], -1) for i in stored_t]
     if -1 in source or len(set(source)) != len(source):
         # Renamed placeholders: match the tensors by position, dtype and shape.
         if any(stored[i][1] != current[j][1] for i, j in zip(stored_t, current_t)):
@@ -294,8 +294,12 @@ def _non_tensor_inputs(graph: fx.GraphModule) -> dict[str, str]:
     return out
 
 
-def _named_delta(stored: Sequence[tuple[str, Any]], current: Sequence[tuple[str, Any]],
-                 stored_scalars: dict[str, str], current_scalars: dict[str, str]) -> str:
+def _named_delta(
+    stored: Sequence[tuple[str, Any]],
+    current: Sequence[tuple[str, Any]],
+    stored_scalars: dict[str, str],
+    current_scalars: dict[str, str],
+) -> str:
     """The inputs, by name, only one of two traces takes (at most 8 each)."""
 
     def render(entries: list[tuple[str, Any]], scalars: dict[str, str]) -> str:

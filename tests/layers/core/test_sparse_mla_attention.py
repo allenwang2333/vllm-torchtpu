@@ -1886,16 +1886,17 @@ def _sc_specs():
 
 
 @pytest.mark.parametrize(
-    "cap,dcp,want", [(-1, 16, 512), (-1, 8, 0), (-1, 2, 0), (0, 16, 0), (256, 2, 256)]
+    "cap,dcp,want",
+    [(-1, 16, 512), (-1, 8, 512), (-1, 4, 0), (-1, 2, 0), (0, 16, 0), (256, 2, 256)],
 )
 def test_dcp_mla_topk_cap_resolves_auto(monkeypatch, cap, dcp, want):
     monkeypatch.setattr(envs, "TPU_DCP_MLA_TOPK_CAP", cap)
     assert attention_interface.dcp_mla_topk_cap(dcp) == want
 
 
-@pytest.mark.parametrize("dcp,want", [(16, True), (8, False), (2, False)])
+@pytest.mark.parametrize("dcp,want", [(16, True), (8, True), (4, False), (2, False)])
 def test_kv_write_in_gather_needs_the_resolved_cap(monkeypatch, dcp, want):
-    """The default auto cap (-1) is off below DCP16: no fused-prep gather runs
+    """The default auto cap (-1) is off below DCP8: no fused-prep gather runs
     there, so the KV write must stay with the cache writer (the kernel refuses
     a kv_write without that gather)."""
     monkeypatch.setattr(envs, "TPU_DCP_MLA_TOPK_CAP", -1)
