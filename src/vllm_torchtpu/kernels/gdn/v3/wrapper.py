@@ -933,29 +933,32 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
+    # The launches touch disjoint sequences, state slots and output rows, so
+    # their order does not change any value.
+    launch_modes = [
+        mode
+        for mode, skip in (
+            (config.GDNMode.BATCHED, prefill_only),
+            (config.GDNMode.PER_SEQ, batched_only),
+        )
+        if not skip
+    ]
+    if config.PER_SEQ_FIRST:
+        launch_modes.reverse()
+
     if pooled:
         out_act, out_source = None, state_source
-        if not prefill_only:
-            out_act, out_source, _ = call_kernel(
-                state_source, None, None, config.GDNMode.BATCHED
-            )
-        if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
+        for mode in launch_modes:
+            out_act, out_source, _ = call_kernel(out_source, None, out_act, mode)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = None, conv_state, recurrent_state
-    if not prefill_only:
+    for mode in launch_modes:
         out_act, out_conv_state, out_recurrent_state = call_kernel(
-            conv_state, recurrent_state, None, config.GDNMode.BATCHED
-        )
-    if not batched_only:
-        out_act, out_conv_state, out_recurrent_state = call_kernel(
-            out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+            out_conv_state, out_recurrent_state, out_act, mode
         )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]

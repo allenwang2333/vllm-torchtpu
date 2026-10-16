@@ -33,6 +33,12 @@ OUT_ZERO_ROWS = 16
 # Fraction of VMEM a launch without verify windows may scope.
 DEFAULT_VMEM_FRACTION = 0.7
 
+# Run the PER_SEQ launch before the BATCHED one. On 1024-token steps XLA
+# overlaps an HBM-bound SparseCore relayout of the qkvz projection with
+# whichever launch comes first; PER_SEQ is compute-bound, BATCHED streams
+# decode states and slows by the bandwidth it loses.
+PER_SEQ_FIRST = True
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
@@ -137,7 +143,7 @@ class GDNConfig:
     # qkv arrives in the activation dtype as its HBM row tiles (see
     # QKV_TILE_ROWS) and is widened to the compact f32 layout in VMEM.
     qkv_row_tiled: bool = False
-    # The BATCHED launch creates the output; this launch zeroes its rows from
+    # The first launch creates the output; this launch zeroes its rows from
     # `MetadataRef.out_zero_row` on (none when that is the buffer's end). The
     # rows before it are all computed by the BATCHED or the PER_SEQ launch.
     zero_out_tail: bool = False
