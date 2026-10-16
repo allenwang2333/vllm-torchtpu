@@ -11,18 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`ModelSpec`-driven weight collector and packer for vLLM TPU models.
+"""Qwen3.5 weight collector and packer for vLLM TPU models.
 
-Extracts sharded `torch.Tensor` weights from vLLM model layers and packs them
-into the layout declared by `planner.plan(spec, ex)`:
-- `_own(x)` and `_stack(xs)` allocate fresh base buffers (`storage_offset() == 0`,
-  `_is_view() is False`) so `torch_tpu` never emits `tt_jit_execute_as_strided`
-  copies on compiled steps.
+Extracts sharded `torch.Tensor` weights from vLLM Qwen3.5 layers and packs them
+into the layout declared by `planner.plan(qwen35.qwen35_spec(g), ex)`:
 - When `ex.stack_e` is `False` (default for serving), dynamic routed-expert
-  weights (`e13`, `e2`) are passed as their original 3D `torch.nn.Parameter`
-  base buffers (`e13[l].data_ptr() == w13.data_ptr()`), avoiding duplicate
-  expert HBM allocations; the 3D -> 4D reshape happens as a zero-copy XLA
-  bitcast inside `cache.make_flat_pooled_step`.
+  weights (`e13`, `e2` — ~18.9 GB per rank at `R=8` for 60 layers) are passed as
+  their original 3D `torch.nn.Parameter` base buffers (`e13[l].data_ptr() ==
+  w13.data_ptr()`), avoiding duplicate expert HBM allocations; the 3D -> 4D
+  reshape happens as a zero-copy XLA bitcast inside `cache.make_flat_pooled_step`.
+- Non-expert layer weights (`lin_in`, `lin_out`, `att_in`, `att_out`, `router`,
+  `sh13`, `sh2`, `es`, `smalls`, `final_norm` — ~1.5 GB per rank at `R=8` for 60
+  layers) are stacked across layers into contiguous base buffers
+  (`storage_offset() == 0`, `_is_view() is False`) required by the single-call
+  megakernel so `torch_tpu` never emits `tt_jit_execute_as_strided` copies on
+  compiled steps.
 """
 
 from __future__ import annotations
@@ -48,7 +51,9 @@ def _need(cond: bool, msg: str) -> None:
 
 
 def _own(x: torch.Tensor) -> torch.Tensor:
-    """Copy `x` into a freshly allocated base buffer (`storage_offset() == 0`)."""
+    """Return `x` as a contiguous base buffer (`storage_offset() == 0`, not a view)."""
+    if not x._is_view() and x.storage_offset() == 0 and x.is_contiguous():
+        return x
     return torch.empty(x.shape, dtype=x.dtype, device=x.device).copy_(x)
 
 
@@ -94,8 +99,12 @@ def extract_kn_fp8_weight(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return `(w_kn [hidden_dim, out_dim] fp8, s_n [out_dim] f32)` from `proj`."""
     w = proj.weight.data
-    flipped = getattr(proj, WEIGHT_FLIPPED_ATTR, False)
-    if flipped or tuple(w.shape) == (hidden_dim, out_dim):
+    flipped = getattr(proj, WEIGHT_FLIPPED_ATTR, None)
+    if flipped is True and tuple(w.shape) == (hidden_dim, out_dim):
+        w_kn = w
+    elif flipped is False and tuple(w.shape) == (out_dim, hidden_dim):
+        w_kn = w.transpose(0, 1)
+    elif tuple(w.shape) == (hidden_dim, out_dim) and hidden_dim != out_dim:
         w_kn = w
     elif tuple(w.shape) == (out_dim, hidden_dim):
         w_kn = w.transpose(0, 1)
@@ -139,11 +148,13 @@ def quantize_ba_weight(
     """Quantize BF16 `in_proj_ba` (`2*vh` channels) per-channel to FP8."""
     out_dim = 2 * vh
     w = in_proj_ba.weight.data
-    flipped = getattr(in_proj_ba, WEIGHT_FLIPPED_ATTR, False)
-    if flipped or tuple(w.shape) == (hidden_dim, out_dim):
+    flipped = getattr(in_proj_ba, WEIGHT_FLIPPED_ATTR, None)
+    if flipped is True and tuple(w.shape) == (hidden_dim, out_dim):
         w_nk = w.transpose(0, 1)
     elif tuple(w.shape) == (out_dim, hidden_dim):
         w_nk = w
+    elif tuple(w.shape) == (hidden_dim, out_dim):
+        w_nk = w.transpose(0, 1)
     else:
         raise ValueError(
             f"Unexpected in_proj_ba.weight shape {tuple(w.shape)}; "
@@ -396,7 +407,12 @@ def extract_ecopy_layer(
     ex: ExecSpec,
     dev: torch.device,
 ) -> torch.Tensor | None:
-    """Build the `[E]` `float32` `ecopy` descriptor vector for `smalls['ecopy']`."""
+    """Build the `[E]` `float32` `ecopy` descriptor vector for `smalls['ecopy']`.
+
+    Returns `None` when no explicit `_ecopy`, `_ecopy_cores`, or matching
+    `expert_placement` manifest is present on the module, so `smalls['ecopy']`
+    remains all zeros (primary-only routing).
+    """
     er = g.ER(ex.R)
     ew = g.EW(ex.R)
     if g.moe_tp or g.e_slots <= er:
@@ -438,13 +454,7 @@ def extract_ecopy_layer(
             )
     except ImportError:
         pass
-    idx = 0 if layer_idx is None else int(layer_idx)
-    default_cores = qwen35.default_eplb_cores(g, ex.R)[idx]
-    return torch.tensor(
-        planner.encode_ecopy(g.E, er, ew, g.moe_tp, default_cores),
-        dtype=torch.float32,
-        device=dev,
-    )
+    return None
 
 
 def pack_smalls_layer(
@@ -654,6 +664,21 @@ def apply_tp_moe_flags(experts: Any) -> None:
                 _try_set(qm, "_moe_lowtok_scores_op", None)
                 _try_set(qm, "_fused_moe_ep_op", None)
                 _try_set(qm, "_use_adaptive_fused_moe", False)
+        if (
+            moe_cfg is not None
+            and hasattr(moe_cfg, "experts_per_token")
+            and hasattr(tgt, "activation")
+        ):
+            from vllm_torchtpu.layers.adapter.fused_moe import (
+                prebuild_fused_moe_kernel,
+            )
+
+            act_val = getattr(tgt.activation, "value", tgt.activation)
+            prebuild_fused_moe_kernel(
+                topk=moe_cfg.experts_per_token,
+                activation=act_val,
+                use_ep=False,
+            )
 
 
 def reshard_layer_experts_ep_to_tp(
@@ -680,8 +705,8 @@ def reshard_layer_experts_ep_to_tp(
         if hasattr(experts, "w2_weight_scale_inv")
         else "w2_weight_scale"
     )
-    s13_ep = getattr(experts, s13_attr).data[:er].contiguous()
-    s2_ep = getattr(experts, s2_attr).data[:er].contiguous()
+    s13_ep = getattr(experts, s13_attr).data[:er].reshape(er, 2 * g.I).contiguous()
+    s2_ep = getattr(experts, s2_attr).data[:er].reshape(er, g.H).contiguous()
 
     if all_gather_fn is None:
         from vllm.distributed import tensor_model_parallel_all_gather
@@ -696,10 +721,23 @@ def reshard_layer_experts_ep_to_tp(
     w13_tp, w2_tp, s13_tp, s2_tp = reshard_experts_ep_to_tp_local(
         w13_all, w2_all, s13_all, s2_all, tp_rank=tp_rank, g=g, ex=ex
     )
+    del w13_all, w2_all, s13_all, s2_all
+    del w13_ep, w2_ep, s13_ep, s2_ep
+
     experts.w13_weight = torch.nn.Parameter(w13_tp, requires_grad=False)
     experts.w2_weight = torch.nn.Parameter(w2_tp, requires_grad=False)
-    setattr(experts, s13_attr, torch.nn.Parameter(s13_tp, requires_grad=False))
-    setattr(experts, s2_attr, torch.nn.Parameter(s2_tp, requires_grad=False))
+    s13_new_param = torch.nn.Parameter(s13_tp, requires_grad=False)
+    s2_new_param = torch.nn.Parameter(s2_tp, requires_grad=False)
+    setattr(experts, s13_attr, s13_new_param)
+    setattr(experts, s2_attr, s2_new_param)
+
+    if w13_tp.device.type == "tpu":
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        synchronize_tensors(
+            [experts.w13_weight, experts.w2_weight, s13_new_param, s2_new_param]
+        )
+
     apply_tp_moe_flags(mlp.experts)
 
 

@@ -42,6 +42,7 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
     execute_pooled_step_inplace,
     export_pooled_step,
     verify_pooled_step_hlo,
+    verify_torchtpu_compiled_step_ir,
 )
 
 
@@ -251,6 +252,18 @@ def test_verify_and_export_pooled_step_hlo() -> None:
     )
     assert ok, f"verify_pooled_step_hlo failed: {msg}"
 
+    ok_2col, msg_2col = verify_pooled_step_hlo(
+        mesh,
+        spec,
+        ex,
+        w_flat_local,
+        pools_local,
+        max_pages_per_seq=ex.max_pages_per_seq,
+        compile_hlo=True,
+        ckpt_cols=2,
+    )
+    assert ok_2col, f"verify_pooled_step_hlo (ckpt_cols=2) failed: {msg_2col}"
+
     exported = export_pooled_step(
         mesh,
         spec,
@@ -259,6 +272,77 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         pools_local,
         max_pages_per_seq=ex.max_pages_per_seq,
         platforms=("cpu",),
+        ckpt_cols=2,
     )
     assert len(exported.mlir_module_serialized) > 0
     assert exported.input_output_aliases == {2 + len(w_flat_local): 1}
+
+
+def test_verify_torchtpu_compiled_step_ir() -> None:
+    """Verify `verify_torchtpu_compiled_step_ir` on StableHLO MLIR and HLO text."""
+    pool_ty = "tensor<64x2x64x4x128xf8E4M3FN>"
+    pool_args = ", ".join(
+        f"%arg{i}: {pool_ty} {{tf.aliasing_output = {i}}}" for i in range(15)
+    )
+    valid_mlir = (
+        f"module @SyncTensorsGraph {{\n"
+        f"  func.func @main({pool_args}) -> ({', '.join([pool_ty] * 15)}) {{\n"
+        f"    %0 = stablehlo.custom_call @tpu_custom_call(%arg0) : "
+        f"({pool_ty}) -> {pool_ty}\n"
+        f"    return {', '.join(f'%arg{i}' for i in range(15))} : "
+        f"{', '.join([pool_ty] * 15)}\n"
+        f"  }}\n"
+        f"}}\n"
+    )
+    ok, msg = verify_torchtpu_compiled_step_ir(
+        valid_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert ok, f"Expected valid StableHLO MLIR to pass: {msg}"
+
+    # Missing one tf.aliasing_output attribute must fail
+    missing_alias_args = ", ".join(
+        f"%arg{i}: {pool_ty}" + (f" {{tf.aliasing_output = {i}}}" if i < 14 else "")
+        for i in range(15)
+    )
+    bad_alias_mlir = valid_mlir.replace(pool_args, missing_alias_args)
+    ok_bad, msg_bad = verify_torchtpu_compiled_step_ir(
+        bad_alias_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert not ok_bad
+    assert "expected >= 15 tf.aliasing_output attributes" in msg_bad
+
+    # Full-pool dynamic_update_slice / as_strided_copy_inverse must fail
+    bad_copy_mlir = valid_mlir.replace(
+        "return",
+        f"%c = stablehlo.dynamic_update_slice %arg0, %arg1, %c0 : "
+        f"({pool_ty}, {pool_ty}, tensor<i32>) -> {pool_ty}\n    return",
+    )
+    ok_copy, msg_copy = verify_torchtpu_compiled_step_ir(
+        bad_copy_mlir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert not ok_copy
+    assert "unexpected full-pool copy in torch_tpu IR" in msg_copy
+
+    # Valid HLO text vs HLO text with full-pool copy
+    alias_entries = ", ".join(f"{{{{{i}}}, {i + 2}, {{}}}}" for i in range(15))
+    valid_hlo = (
+        f"HloModule SyncTensorsGraph, input_output_alias={{ {alias_entries} }}\n"
+        f"ENTRY %main {{\n"
+        f'  %k = () custom-call(), custom_call_target="tpu_custom_call"\n'
+        f"  ROOT %t = () tuple()\n"
+        f"}}\n"
+    )
+    ok_hlo, msg_hlo = verify_torchtpu_compiled_step_ir(
+        valid_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert ok_hlo, f"Expected valid HLO to pass: {msg_hlo}"
+
+    bad_hlo = valid_hlo.replace(
+        "ROOT %t = () tuple()",
+        "  %cp = f8e4m3fn[64,2,64,4,128] copy(%p0)\n  ROOT %t = () tuple()",
+    )
+    ok_bad_hlo, msg_bad_hlo = verify_torchtpu_compiled_step_ir(
+        bad_hlo, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=15
+    )
+    assert not ok_bad_hlo
+    assert "unexpected full-pool copy in torch_tpu HLO" in msg_bad_hlo

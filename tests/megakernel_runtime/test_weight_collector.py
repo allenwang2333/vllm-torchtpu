@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
@@ -29,10 +33,21 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     _own,
     _stack,
+    extract_ecopy_layer,
+    extract_kn_fp8_weight,
     find_backbone,
     pack_weights,
     reshard_layer_experts_ep_to_tp,
 )
+
+
+def _jax_to_torch(a: jax.Array) -> torch.Tensor:
+    arr = np.asarray(a)
+    if a.dtype == jnp.float8_e4m3fn:
+        return torch.from_numpy(arr.view(np.uint8).copy()).view(torch.float8_e4m3fn)
+    if a.dtype == jnp.bfloat16:
+        return torch.from_numpy(arr.view(np.uint16).copy()).view(torch.bfloat16)
+    return torch.from_numpy(arr.copy())
 
 
 def _make_fp8_linear(
@@ -61,6 +76,7 @@ def make_synthetic_qwen35_backbone(
     *,
     fused_mlp: bool = True,
     fused_qkv: bool = False,
+    e_cores: list[list[list[int]]] | None = None,
 ) -> SimpleNamespace:
     """Construct a synthetic Qwen3.5 backbone matching `g` and `ex`."""
     gdn_lay = GDNBlock.lin_in_layout(g, ex)
@@ -165,6 +181,8 @@ def make_synthetic_qwen35_backbone(
             w13_weight_scale=torch.nn.Parameter(w13_s, requires_grad=False),
             w2_weight_scale=torch.nn.Parameter(w2_s, requires_grad=False),
         )
+        if e_cores is not None:
+            experts._ecopy_cores = e_cores[l_idx]
 
         if fused_mlp:
             fused_gu_cols = g.E + 2 * g.IS
@@ -237,8 +255,10 @@ def make_synthetic_qwen35_backbone(
 
 
 def test_own_and_stack_allocate_base_buffers() -> None:
-    """Verify `_own` and `_stack` return non-view base buffers (`offset == 0`)."""
-    base = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    """Verify `_own` and `_stack` return non-view base buffers without extra copy."""
+    base = torch.arange(32, dtype=torch.float32).reshape(4, 8).clone()
+    assert _own(base).data_ptr() == base.data_ptr()
+
     sliced = base[1:3, 2:6]
     assert sliced._is_view() or sliced.storage_offset() != 0
 
@@ -251,6 +271,38 @@ def test_own_and_stack_allocate_base_buffers() -> None:
     assert not stacked._is_view()
     assert stacked.storage_offset() == 0
     assert stacked.shape == (2, 2, 4)
+
+
+def test_extract_kn_fp8_weight_square_orientation() -> None:
+    """Verify square `[D, D]` weights respect `WEIGHT_FLIPPED_ATTR`."""
+    d = 64
+    w_raw = (
+        torch.arange(d * d, dtype=torch.int32)
+        .remainder(120)
+        .add(1)
+        .to(torch.uint8)
+        .reshape(d, d)
+        .view(torch.float8_e4m3fn)
+    )
+    s_raw = torch.ones((d, 1), dtype=torch.float32)
+
+    proj_flipped = SimpleNamespace(
+        weight=torch.nn.Parameter(w_raw.clone(), requires_grad=False),
+        weight_scale=torch.nn.Parameter(s_raw.clone(), requires_grad=False),
+    )
+    setattr(proj_flipped, WEIGHT_FLIPPED_ATTR, True)
+    w_fl, _ = extract_kn_fp8_weight(proj_flipped, d, d)
+    assert torch.equal(w_fl.view(torch.uint8), w_raw.view(torch.uint8))
+
+    proj_unflipped = SimpleNamespace(
+        weight=torch.nn.Parameter(w_raw.clone(), requires_grad=False),
+        weight_scale=torch.nn.Parameter(s_raw.clone(), requires_grad=False),
+    )
+    setattr(proj_unflipped, WEIGHT_FLIPPED_ATTR, False)
+    w_unfl, _ = extract_kn_fp8_weight(proj_unflipped, d, d)
+    assert torch.equal(
+        w_unfl.view(torch.uint8), w_raw.transpose(0, 1).contiguous().view(torch.uint8)
+    )
 
 
 def test_find_backbone_wrappers() -> None:
@@ -275,7 +327,7 @@ def test_find_backbone_wrappers() -> None:
 def test_pack_weights_shapes_base_buffers_and_expert_aliasing(
     stack_e: bool, fused_mlp: bool
 ) -> None:
-    """Verify `pack_weights` shapes, base buffers, EPLB `ecopy`, and expert aliasing."""
+    """Verify `pack_weights` shapes, base buffers, and `ecopy` extraction."""
     g = qwen35.Qwen35Geometry(
         L=4,
         att_every=4,
@@ -308,11 +360,27 @@ def test_pack_weights_shapes_base_buffers_and_expert_aliasing(
         tiles=tiles,
         interpret=True,
     )
+    # 1. Without `_ecopy` / `_ecopy_cores` / `expert_placement`, `extract_ecopy_layer`
+    # must return `None` (no fabricated fallback placement).
+    backbone_no_ecopy = make_synthetic_qwen35_backbone(
+        g, ex, fused_mlp=fused_mlp, fused_qkv=not fused_mlp, e_cores=None
+    )
+    assert (
+        extract_ecopy_layer(0, backbone_no_ecopy.layers[0], g, ex, torch.device("cpu"))
+        is None
+    )
+    packed_no_ecopy = pack_weights(backbone_no_ecopy, g, ex, tp_rank=1)
+    plan: planner.Plan = packed_no_ecopy["plan"]
+    ecopy_off, ecopy_w = plan.smalls_layout["ecopy"]
+    ecopy_zero = packed_no_ecopy["smalls"][:, 0, ecopy_off : ecopy_off + ecopy_w]
+    assert torch.count_nonzero(ecopy_zero).item() == 0
+
+    # 2. With explicit `_ecopy_cores`, `extract_ecopy_layer` encodes the placement.
+    e_cores = qwen35.default_eplb_cores(g, ex.R)
     backbone = make_synthetic_qwen35_backbone(
-        g, ex, fused_mlp=fused_mlp, fused_qkv=not fused_mlp
+        g, ex, fused_mlp=fused_mlp, fused_qkv=not fused_mlp, e_cores=e_cores
     )
     packed = pack_weights(backbone, g, ex, tp_rank=1)
-    plan: planner.Plan = packed["plan"]
     w_shapes = planner.weight_shapes(qwen35.qwen35_spec(g), ex, plan)
 
     for k in plan.w_names:
@@ -336,10 +404,255 @@ def test_pack_weights_shapes_base_buffers_and_expert_aliasing(
             assert val.storage_offset() == 0
             assert tuple(val.shape) == exp_shape
 
-    # Verify `ecopy` is populated in `smalls` when `e_slots > ER`
-    ecopy_off, ecopy_w = plan.smalls_layout["ecopy"]
     ecopy_slice = packed["smalls"][:, 0, ecopy_off : ecopy_off + ecopy_w]
     assert torch.any(ecopy_slice > 0.0)
+
+
+def test_pack_weights_value_parity_against_split_hf_weights() -> None:
+    """Verify `pack_weights` matches `split_hf_weights` + `pack_inputs`."""
+    g = qwen35.Qwen35Geometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=False,
+        e_slots=68,
+    )
+    tiles = replace(TINY_TILES, bank=512 << 10)
+    ex = ExecSpec(
+        R=2,
+        B=4,
+        T=1,
+        ctx=256,
+        paged_kv=True,
+        num_pages=96,
+        max_pages_per_seq=2,
+        stack_e=False,
+        tiles=tiles,
+        interpret=True,
+    )
+    hf = qwen35.random_hf_weights(jax.random.key(314), g)
+    e_cores = qwen35.default_eplb_cores(g, ex.R)
+    w_logical = qwen35.split_hf_weights(hf, g, ex, e_cores=e_cores)
+    pos_j, hid_l, _, st_l = qwen35.random_logical_inputs(jax.random.key(315), g, ex)
+    _, _, w_mk_ref, _ = qwen35.pack_inputs(
+        pos_j, hid_l, w_logical, st_l, g, ex, build_default_pool=True
+    )
+
+    tp_rank = 1
+    gdn_lay = GDNBlock.lin_in_layout(g, ex)
+    qkvz_dim = gdn_lay.QKV + gdn_lay.Z
+    layers: list[Any] = []
+    for l_idx in range(g.L):
+        is_att = (l_idx % g.att_every) == (g.att_every - 1)
+        if is_att:
+            a_idx = l_idx // g.att_every
+            w_att_in = _jax_to_torch(w_logical["att_in"][tp_rank, a_idx])
+            s_att_in = _jax_to_torch(w_logical["att_in_s"][tp_rank, a_idx])
+            w_att_out = _jax_to_torch(w_logical["att_out"][tp_rank, a_idx])
+            s_att_out = _jax_to_torch(w_logical["att_out_s"][tp_rank, a_idx])
+            qkv_proj = SimpleNamespace(
+                weight=torch.nn.Parameter(w_att_in, requires_grad=False),
+                weight_scale=torch.nn.Parameter(s_att_in, requires_grad=False),
+            )
+            setattr(qkv_proj, WEIGHT_FLIPPED_ATTR, True)
+            o_proj = SimpleNamespace(
+                weight=torch.nn.Parameter(w_att_out, requires_grad=False),
+                weight_scale=torch.nn.Parameter(s_att_out, requires_grad=False),
+            )
+            setattr(o_proj, WEIGHT_FLIPPED_ATTR, True)
+            self_attn = SimpleNamespace(
+                qkv_proj=qkv_proj,
+                o_proj=o_proj,
+                q_norm=SimpleNamespace(
+                    weight=torch.nn.Parameter(
+                        _jax_to_torch(w_logical["qn"][tp_rank, a_idx]),
+                        requires_grad=False,
+                    )
+                ),
+                k_norm=SimpleNamespace(
+                    weight=torch.nn.Parameter(
+                        _jax_to_torch(w_logical["kn"][tp_rank, a_idx]),
+                        requires_grad=False,
+                    )
+                ),
+            )
+            linear_attn = None
+        else:
+            o_gdn = l_idx - (l_idx + 1) // g.att_every
+            w_lin_full = _jax_to_torch(w_logical["lin_in"][tp_rank, o_gdn])
+            s_lin_full = _jax_to_torch(w_logical["lin_in_s"][tp_rank, o_gdn])
+            w_qkvz = w_lin_full[:, :qkvz_dim].contiguous()
+            s_qkvz = s_lin_full[:qkvz_dim].contiguous()
+            w_b = w_lin_full[:, gdn_lay.BA : gdn_lay.BA + gdn_lay.vh]
+            w_a = w_lin_full[:, gdn_lay.A_OFF : gdn_lay.A_OFF + gdn_lay.vh]
+            w_ba = torch.cat([w_b, w_a], dim=1).contiguous()
+            s_b = s_lin_full[gdn_lay.BA : gdn_lay.BA + gdn_lay.vh]
+            s_a = s_lin_full[gdn_lay.A_OFF : gdn_lay.A_OFF + gdn_lay.vh]
+            s_ba = torch.cat([s_b, s_a], dim=0).contiguous()
+
+            in_proj_qkvz = SimpleNamespace(
+                weight=torch.nn.Parameter(w_qkvz, requires_grad=False),
+                weight_scale=torch.nn.Parameter(s_qkvz, requires_grad=False),
+            )
+            setattr(in_proj_qkvz, WEIGHT_FLIPPED_ATTR, True)
+            in_proj_ba = SimpleNamespace(
+                weight=torch.nn.Parameter(w_ba, requires_grad=False),
+                weight_scale=torch.nn.Parameter(s_ba, requires_grad=False),
+            )
+            setattr(in_proj_ba, WEIGHT_FLIPPED_ATTR, True)
+            out_proj = SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["lin_out"][tp_rank, o_gdn]),
+                    requires_grad=False,
+                ),
+                weight_scale=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["lin_out_s"][tp_rank, o_gdn]),
+                    requires_grad=False,
+                ),
+            )
+            setattr(out_proj, WEIGHT_FLIPPED_ATTR, True)
+            conv_4_qkv = _jax_to_torch(w_logical["conv"][tp_rank, o_gdn]).reshape(
+                4, gdn_lay.QKV
+            )
+            conv_w = conv_4_qkv.transpose(0, 1).unsqueeze(1).contiguous()
+            linear_attn = SimpleNamespace(
+                in_proj_qkvz=in_proj_qkvz,
+                in_proj_ba=in_proj_ba,
+                out_proj=out_proj,
+                conv1d=SimpleNamespace(
+                    weight=torch.nn.Parameter(conv_w, requires_grad=False)
+                ),
+                A_log=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["alog"][tp_rank, o_gdn]),
+                    requires_grad=False,
+                ),
+                dt_bias=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["dtb"][tp_rank, o_gdn]),
+                    requires_grad=False,
+                ),
+                norm=SimpleNamespace(
+                    weight=torch.nn.Parameter(
+                        _jax_to_torch(w_logical["gnorm"][tp_rank, o_gdn]),
+                        requires_grad=False,
+                    )
+                ),
+            )
+            self_attn = None
+
+        experts = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                _jax_to_torch(w_logical["e13"][tp_rank, l_idx]), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                _jax_to_torch(w_logical["e2"][tp_rank, l_idx]), requires_grad=False
+            ),
+            w13_weight_scale=torch.nn.Parameter(
+                _jax_to_torch(w_logical["e13_s"][tp_rank, l_idx]), requires_grad=False
+            ),
+            w2_weight_scale=torch.nn.Parameter(
+                _jax_to_torch(w_logical["e2_s"][tp_rank, l_idx]), requires_grad=False
+            ),
+            _ecopy_cores=e_cores[l_idx],
+        )
+        gu_proj = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                _jax_to_torch(w_logical["sh13"][tp_rank, l_idx]), requires_grad=False
+            ),
+            weight_scale=torch.nn.Parameter(
+                _jax_to_torch(w_logical["sh13_s"][tp_rank, l_idx]), requires_grad=False
+            ),
+        )
+        setattr(gu_proj, WEIGHT_FLIPPED_ATTR, True)
+        down_proj = SimpleNamespace(
+            weight=torch.nn.Parameter(
+                _jax_to_torch(w_logical["sh2"][tp_rank, l_idx]), requires_grad=False
+            ),
+            weight_scale=torch.nn.Parameter(
+                _jax_to_torch(w_logical["sh2_s"][tp_rank, l_idx]), requires_grad=False
+            ),
+        )
+        setattr(down_proj, WEIGHT_FLIPPED_ATTR, True)
+        mlp = SimpleNamespace(
+            experts=experts,
+            gate=SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["router"][l_idx])
+                    .transpose(0, 1)
+                    .contiguous(),
+                    requires_grad=False,
+                )
+            ),
+            shared_expert=SimpleNamespace(gate_up_proj=gu_proj, down_proj=down_proj),
+            shared_expert_gate=SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    _jax_to_torch(w_logical["sh_gate"][tp_rank, l_idx]),
+                    requires_grad=False,
+                )
+            ),
+        )
+        layers.append(
+            SimpleNamespace(
+                layer_type="full_attention" if is_att else "linear_attention",
+                input_layernorm=SimpleNamespace(
+                    weight=torch.nn.Parameter(
+                        _jax_to_torch(w_logical["in_norm"][l_idx]), requires_grad=False
+                    )
+                ),
+                post_attention_layernorm=SimpleNamespace(
+                    weight=torch.nn.Parameter(
+                        _jax_to_torch(w_logical["post_norm"][l_idx]),
+                        requires_grad=False,
+                    )
+                ),
+                linear_attn=linear_attn,
+                self_attn=self_attn,
+                mlp=mlp,
+            )
+        )
+
+    backbone = SimpleNamespace(
+        layers=layers,
+        norm=SimpleNamespace(
+            weight=torch.nn.Parameter(
+                _jax_to_torch(w_logical["final_norm"]), requires_grad=False
+            )
+        ),
+    )
+    packed = pack_weights(backbone, g, ex, tp_rank=tp_rank)
+    plan: planner.Plan = packed["plan"]
+
+    for k in plan.w_names:
+        val_t = packed[k]
+        ref_j = w_mk_ref[k]
+        if k in plan.dynamic_kinds:
+            for l_idx in range(g.L):
+                ref_l = np.asarray(ref_j[l_idx])[tp_rank]
+                # `pack_inputs` tiles `[EW, NT, TK, N]`; unstacked keeps `[EW, K, N]`
+                ref_3d = ref_l.reshape(val_t[l_idx].shape)
+                np.testing.assert_array_equal(
+                    val_t[l_idx].view(torch.uint8).numpy(),
+                    ref_3d.view(np.uint8),
+                    err_msg=f"mismatch in {k}[{l_idx}]",
+                )
+        else:
+            ref_r = np.asarray(ref_j)[tp_rank]
+            np.testing.assert_array_equal(
+                val_t.view(torch.uint8).numpy(),
+                ref_r.view(np.uint8),
+                err_msg=f"mismatch in {k}",
+            )
 
 
 def test_reshard_layer_experts_ep_to_tp() -> None:

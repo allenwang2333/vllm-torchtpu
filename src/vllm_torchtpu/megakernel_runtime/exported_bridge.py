@@ -21,16 +21,23 @@ Provides:
   CPU `torch.Tensor` operands in unit tests.
 - `execute_pooled_step_inplace`: invokes the custom op and copies the donated
   pool outputs back into `pools` via `dst.copy_(src)`, preserving `dst.data_ptr()`
-  (Raiden pointer identity) and folding into an XLA `input_output_alias` under
-  `torch.compile(backend="tpu")`.
-- `verify_pooled_step_hlo`: lowers/compiles the pooled step and validates pool
-  buffer donation via `cache.check_pooled_step_hlo`.
-- `export_pooled_step`: serializes the StableHLO module and aliasing manifest
-  (`PooledStepExport`) via `jax.export`.
+  (Raiden pointer identity) and folding into an XLA `input_output_alias` /
+  `tf.aliasing_output` under `torch.compile(backend="tpu")`.
+- `verify_pooled_step_hlo`: lowers/compiles the JAX pooled step (defaulting to
+  compiled post-optimization HLO on TPU) and validates pool buffer donation via
+  `cache.check_pooled_step_hlo`.
+- `verify_torchtpu_compiled_step_ir`: inspects the compiled `torch_tpu` forward
+  graph's StableHLO MLIR / HLO (`TpuCompileDebug.stablehlo_forward_text`) to
+  verify that `dst.copy_(src)` on all pools folded into `tf.aliasing_output` /
+  `input_output_alias` with zero full-pool copies.
+- `export_pooled_step`: offline inspection/serialization helper that exports the
+  StableHLO module and aliasing manifest (`PooledStepExport`) via `jax.export`
+  (serving traces directly through `build_pooled_step_op` / `JaxCallable`).
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -49,7 +56,7 @@ from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
 
 @dataclass(frozen=True)
 class PooledStepExport:
-    """Serialized StableHLO export and aliasing manifest for a pooled step."""
+    """Offline serialized StableHLO export and aliasing manifest for a pooled step."""
 
     op_name: str
     exported: Any
@@ -135,12 +142,14 @@ def _build_global_avals(
     raw_pools: Sequence[torch.Tensor],
     *,
     max_pages_per_seq: int,
+    ckpt_cols: int | None = None,
 ) -> list[jax.ShapeDtypeStruct]:
     """Construct global `jax.ShapeDtypeStruct` descriptors for HLO lowering/export."""
     r_cnt = int(mesh.devices.size)
     g: Any = spec.config
     b_tok = ex.B
     t_tok = ex.T
+    k_ckpt = int(ckpt_cols) if ckpt_cols is not None else t_tok
     nseq = ex.NS
     m_rows = ex.M
     g_per_att = max(1, int(getattr(g, "att_every", 4)) - 1)
@@ -155,7 +164,7 @@ def _build_global_avals(
         *(_global_sds(w) for w in w_flat),
         *(_global_sds(p) for p in raw_pools),
         jax.ShapeDtypeStruct((nseq, int(max_pages_per_seq)), jnp.int32),
-        jax.ShapeDtypeStruct((g_per_att, nseq, t_tok), jnp.int32),
+        jax.ShapeDtypeStruct((g_per_att, nseq, k_ckpt), jnp.int32),
         jax.ShapeDtypeStruct((g_per_att, nseq), jnp.int32),
     ]
 
@@ -168,9 +177,17 @@ def verify_pooled_step_hlo(
     raw_pools: Sequence[torch.Tensor],
     *,
     max_pages_per_seq: int,
-    compile_hlo: bool = False,
+    ckpt_cols: int | None = None,
+    compile_hlo: bool | None = None,
 ) -> tuple[bool, str]:
-    """Lower (or compile) `make_flat_pooled_step` and verify pool donation in HLO."""
+    """Lower or compile `make_flat_pooled_step` and verify pool donation in HLO.
+
+    When `compile_hlo` is `None` (default), compiles post-optimization HLO on
+    TPU (`jax.default_backend() == "tpu" and not ex.interpret`) so XLA buffer
+    assignment and copy insertion have run.
+    """
+    if compile_hlo is None:
+        compile_hlo = bool(jax.default_backend() == "tpu" and not ex.interpret)
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=True
     )
@@ -183,6 +200,7 @@ def verify_pooled_step_hlo(
         w_flat,
         raw_pools,
         max_pages_per_seq=max_pages_per_seq,
+        ckpt_cols=ckpt_cols,
     )
     j_fn = jax.jit(
         step_fn,
@@ -193,6 +211,7 @@ def verify_pooled_step_hlo(
     )
     lowered = j_fn.lower(*avals)
     hlo_text = lowered.compile().as_text() if compile_hlo else lowered.as_text("hlo")
+    num_pages = int(raw_pools[0].shape[0])
     page_size = int(raw_pools[0].shape[-1])
     g: Any = spec.config
     kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
@@ -202,7 +221,84 @@ def verify_pooled_step_hlo(
         page_size=page_size,
         kvh=kvh,
         hd=hd,
+        min_pool_pages=max(16, num_pages),
     )
+
+
+def verify_torchtpu_compiled_step_ir(
+    ir_text: str,
+    *,
+    num_pages: int,
+    page_size: int = 128,
+    kvh: int = 1,
+    hd: int = 256,
+    num_pools: int = 15,
+) -> tuple[bool, str]:
+    """Verify that a compiled `torch_tpu` forward step aliases all pools in-place.
+
+    Inspects the StableHLO MLIR (`TpuCompileDebug.stablehlo_forward_text`) or
+    HLO text produced by `torch.compile(backend="tpu")` for the outer step graph
+    that invokes `execute_pooled_step_inplace` (`op(...)` + `dst.copy_(src)`):
+    1. Confirms the custom Pallas kernel call is present.
+    2. Confirms all `num_pools` pool inputs carry `tf.aliasing_output` (MLIR) or
+       `input_output_alias` (HLO) so `dst.copy_(src)` is folded into an in-place
+       buffer alias.
+    3. Confirms no `copy`, `copy-start`, `dynamic_update_slice`, or
+       `as_strided_copy_inverse` materializes a full-pool buffer.
+    """
+    if not ir_text or not ir_text.strip():
+        return False, "empty torch_tpu compiled IR"
+
+    has_custom_call = (
+        "custom_call" in ir_text
+        or "tpu_custom_call" in ir_text
+        or "megakernel_runtime" in ir_text
+    )
+    if not has_custom_call:
+        return False, "missing custom kernel call in torch_tpu compiled IR"
+
+    n_mlir_alias = ir_text.count("tf.aliasing_output")
+    n_hlo_alias = ir_text.count("input_output_alias")
+    if n_mlir_alias < num_pools and n_hlo_alias == 0:
+        return (
+            False,
+            f"expected >= {num_pools} tf.aliasing_output attributes on donated "
+            f"pool arguments in torch_tpu IR, found {n_mlir_alias}",
+        )
+
+    mlir_pool_pat = re.compile(rf"\b(\d+)x{2 * kvh}x{hd // 4}x4x{page_size}xf8E4M3FN\b")
+    hlo_pool_suffix = f",{2 * kvh},{hd // 4},4,{page_size}]"
+    copy_ops = (
+        "stablehlo.copy",
+        "mhlo.copy",
+        "copy-start(",
+        "dynamic_update_slice",
+        "dynamic-update-slice(",
+        "as_strided_copy_inverse",
+    )
+    for line in ir_text.splitlines():
+        if "func.func" in line or "ENTRY" in line or "custom_call" in line:
+            continue
+        is_copy_line = any(op in line for op in copy_ops) or (
+            "= f8e4m3fn[" in line and "copy(" in line
+        )
+        if not is_copy_line:
+            continue
+        for m in mlir_pool_pat.finditer(line):
+            if int(m.group(1)) >= num_pages:
+                return (
+                    False,
+                    f"unexpected full-pool copy in torch_tpu IR: {line.strip()}",
+                )
+        if hlo_pool_suffix in line:
+            prefix = line.split(hlo_pool_suffix, 1)[0]
+            dim_str = prefix.rsplit("[", 1)[-1].rsplit(",", 1)[-1].strip()
+            if not dim_str.isdigit() or int(dim_str) >= num_pages:
+                return (
+                    False,
+                    f"unexpected full-pool copy in torch_tpu HLO: {line.strip()}",
+                )
+    return True, "ok"
 
 
 def export_pooled_step(
@@ -213,10 +309,16 @@ def export_pooled_step(
     raw_pools: Sequence[torch.Tensor],
     *,
     max_pages_per_seq: int,
+    ckpt_cols: int | None = None,
     op_name: str = "megakernel_runtime::exported_pooled_step",
     platforms: Sequence[str] = ("tpu",),
 ) -> PooledStepExport:
-    """Export `make_flat_pooled_step` to a serialized StableHLO module + manifest."""
+    """Export `make_flat_pooled_step` to a serialized StableHLO module.
+
+    Note: At serving time, `build_pooled_step_op` traces through
+    `sharded_jax_callable` (`JaxCallable`). This helper is provided for offline
+    StableHLO inspection and serialization tests.
+    """
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=True
     )
@@ -229,6 +331,7 @@ def export_pooled_step(
         w_flat,
         raw_pools,
         max_pages_per_seq=max_pages_per_seq,
+        ckpt_cols=ckpt_cols,
     )
     j_fn = jax.jit(
         step_fn,

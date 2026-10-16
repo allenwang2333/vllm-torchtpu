@@ -22,6 +22,7 @@ from .exported_bridge import (
     export_pooled_step,
     make_typed_step_wrapper,
     verify_pooled_step_hlo,
+    verify_torchtpu_compiled_step_ir,
 )
 from .weight_collector import (
     apply_tp_moe_flags,
@@ -65,4 +66,5 @@ __all__ = [
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
     "verify_pooled_step_hlo",
+    "verify_torchtpu_compiled_step_ir",
 ]
