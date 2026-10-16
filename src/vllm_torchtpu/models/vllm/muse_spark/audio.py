@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Replicated waveform encoder producing one token per 1,920 audio samples."""
 
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -47,12 +49,13 @@ class Patchifier(nn.Module):
         return self.norm(x)
 
 
-class DepthwiseCausalConv(nn.Conv1d):
+class DepthwiseCausalConv(nn.Module):
     """Depthwise causal 1-D convolution with optional streaming cache."""
 
     def __init__(self, d_model: int, kernel_size: int) -> None:
+        super().__init__()
         self._kernel_size = kernel_size
-        super().__init__(
+        conv = nn.Conv1d(
             in_channels=d_model,
             out_channels=d_model,
             kernel_size=kernel_size,
@@ -61,6 +64,8 @@ class DepthwiseCausalConv(nn.Conv1d):
             bias=True,
             groups=d_model,
         )
+        self.weight = conv.weight
+        self.bias = conv.bias
 
     def forward(
         self,
@@ -72,16 +77,21 @@ class DepthwiseCausalConv(nn.Conv1d):
 
         if cache is None:
             x = F.pad(x, (self._kernel_size - 1, 0))
-            x = super().forward(x)
             new_cache = None
         else:
             x = torch.cat((cache, x), dim=-1)
             new_cache = x[:, :, -self._kernel_size + 1 :]
-            x = super().forward(x)
+
+        x = F.conv1d(x, self.weight, self.bias, groups=self.weight.shape[0])
 
         # RMSNorm requires contiguous output after the permutation.
         x = x.permute(0, 2, 1).contiguous()  # [B, T, D]
         return x, new_cache
+
+
+class _AudioMLP(nn.Module):
+    fc1: ColumnParallelLinear
+    fc2: RowParallelLinear
 
 
 class Block(nn.Module):
@@ -101,7 +111,7 @@ class Block(nn.Module):
         self._kernel_size = kernel_size
         self.conv = DepthwiseCausalConv(d_model, kernel_size)
         self.norm = RMSNorm(d_model, eps=norm_eps)
-        self.mlp = nn.Module()
+        self.mlp = _AudioMLP()
         self.mlp.fc1 = ColumnParallelLinear(
             input_size=d_model,
             output_size=d_hidden,
@@ -138,6 +148,11 @@ class Block(nn.Module):
         x = self.activation(x)
         x, _ = self.mlp.fc2(x)
         return x + inputs, cache
+
+
+class _AudioStage(nn.Module):
+    patch_embedder: Patchifier
+    conv_blocks: nn.ModuleList
 
 
 class AutoEncoder(nn.Module):
@@ -203,8 +218,8 @@ class AutoEncoder(nn.Module):
         disable_tp: bool = True,
         norm_eps: float = 1e-6,
         mlp_ratio: float = 4.0,
-    ) -> nn.Module:
-        stage = nn.Module()
+    ) -> _AudioStage:
+        stage = _AudioStage()
         stage.patch_embedder = Patchifier(
             patch_size,
             d_input,
@@ -231,6 +246,7 @@ class AutoEncoder(nn.Module):
     def _encode_prefill(self, x: torch.Tensor) -> torch.Tensor:
         """Encode waveforms without streaming context."""
         for stage in self.layers:
+            stage = cast(_AudioStage, stage)
             x = stage.patch_embedder(x)
             for block in stage.conv_blocks:
                 x, _ = block(x, None)

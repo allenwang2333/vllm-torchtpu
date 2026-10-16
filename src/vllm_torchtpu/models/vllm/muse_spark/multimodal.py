@@ -84,7 +84,7 @@ class MuseSparkForConditionalGeneration(
         adapter_output_dim = hf_config.projector_hidden_size
         llm_hidden_size = hf_config.text_config.hidden_size
         self.vllm_config = vllm_config
-        self._vision_output_dtype = vllm_config.model_config.dtype
+        self._vision_output_dtype = cast(torch.dtype, vllm_config.model_config.dtype)
         # FP32 vision avoids BF16 drift from bucket padding and graph fusion.
         vision_dtype = (
             torch.float32
@@ -158,7 +158,7 @@ class MuseSparkForConditionalGeneration(
         )
         self._vision_output_dim = hf_config.out_hidden_size
 
-    def get_language_model(self) -> torch.nn.Module:
+    def get_language_model(self) -> MuseSparkForCausalLM:
         return self
 
     def _process_image_input(

@@ -25,11 +25,14 @@ case. This module registers a tokenizer that sets the flag.
 
 import copy
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import huggingface_hub
 import jinja2
 from transformers import AutoTokenizer
+from transformers.tokenization_utils_base import AddedToken
 from vllm.tokenizers.hf import HfTokenizer, get_cached_tokenizer
 from vllm.tokenizers.protocol import TokenizerLike
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
@@ -92,15 +95,18 @@ class TPUHfTokenizer(TokenizerLike):
         revision: str | None = None,
         download_dir: str | None = None,
         **kwargs,
-    ) -> HfTokenizer:
+    ) -> TokenizerLike:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                path_or_repo_id,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                cache_dir=download_dir,
-                **kwargs,
+            tokenizer = cast(
+                HfTokenizer,
+                AutoTokenizer.from_pretrained(
+                    path_or_repo_id,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    cache_dir=download_dir,
+                    **kwargs,
+                ),
             )
         except ValueError as e:
             if not trust_remote_code and (
@@ -137,12 +143,12 @@ class TPUHfTokenizer(TokenizerLike):
         if isinstance(encoder_config, dict) and encoder_config.get(
             "do_lower_case", False
         ):
-            special_tokens_map = {
-                k: v.lower() for k, v in tokenizer.special_tokens_map.items()
-            }
+            special_tokens_map: dict[
+                str, str | AddedToken | Sequence[str | AddedToken]
+            ] = {k: v.lower() for k, v in tokenizer.special_tokens_map.items()}
             tokenizer.add_special_tokens(special_tokens_map)
 
-        return get_cached_tokenizer(tokenizer)
+        return cast(TokenizerLike, get_cached_tokenizer(tokenizer))
 
 
 def _is_var_access(node: jinja2.nodes.Node, varname: str) -> bool:

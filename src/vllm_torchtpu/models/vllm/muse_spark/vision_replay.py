@@ -2,7 +2,8 @@
 """Static image geometry and isolated padding for encoder output-token buckets."""
 
 import itertools
-from typing import Any
+from collections.abc import Hashable
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +21,11 @@ from .vision import (
     _get_sparse_attention_perm,
     _precompute_rope_freqs_cis,
 )
+
+if TYPE_CHECKING:
+    from .config import MuseSparkTextConfig
+    from .layers import MuseRMSNorm
+    from .model import _MuseModelComponents
 
 
 def _pad_boundaries(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -154,6 +160,25 @@ def image_encoder_forward(vision, values: dict[str, torch.Tensor]):
 class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
     """The existing TPU manager owns bucket compilation, packing and slicing."""
 
+    model: "_MuseModelComponents"
+    config: "MuseSparkTextConfig"
+    _use_vision_dp: bool
+    normalize_tok_embeddings: bool
+    perception_emb_norm: "MuseRMSNorm"
+    _vision_output_dtype: torch.dtype
+
+    if TYPE_CHECKING:
+
+        def _get_patch_count(self, item: torch.Tensor) -> int: ...
+
+        def _process_image_input(
+            self, images: torch.Tensor | list[torch.Tensor]
+        ) -> list[torch.Tensor]: ...
+
+        def _encode_vision(
+            self, vision_items: list[torch.Tensor]
+        ) -> list[torch.Tensor]: ...
+
     def get_encoder_cudagraph_config(self):
         vision = self.model.vision_tower
         if vision.use_cls_token or vision.downsample_strategy != "ps":
@@ -211,6 +236,7 @@ class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
         device,
         dtype,
         path="default",
+        axis_keys: tuple[Hashable, ...] | None = None,
     ):
         vision = self.model.vision_tower
         dtype = vision.patch_embedder.position_embedding_table.weight.dtype
@@ -250,8 +276,12 @@ class MuseVisionReplayMixin(SupportsEncoderCudaGraph):
         path="default",
     ):
         return EncoderCudaGraphReplayBuffers(
-            values=prepare_image_buffers(
-                self.model.vision_tower, self._process_image_input(mm_kwargs["images"])
+            values=cast(
+                dict[str, torch.Tensor | None],
+                prepare_image_buffers(
+                    self.model.vision_tower,
+                    self._process_image_input(mm_kwargs["images"]),
+                ),
             )
         )
 

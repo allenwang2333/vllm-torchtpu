@@ -470,7 +470,9 @@ def _preprocess_single_video(
     return video_tensor, _video_patch_count(video_tensor, config), factored_ts
 
 
-VIDEO_PROCESSOR_MAPPING_NAMES.setdefault("muse_spark", "MuseGlimmerVideoProcessor")
+cast(dict[str, str], VIDEO_PROCESSOR_MAPPING_NAMES).setdefault(
+    "muse_spark", "MuseGlimmerVideoProcessor"
+)
 
 
 @VIDEO_LOADER_REGISTRY.register(
@@ -563,9 +565,6 @@ class MuseSparkProcessingInfo(BaseProcessingInfo):
                 "frame_timestamp_format", "Time: {timestamp:.2f}s"
             ),
         )
-
-    def get_hf_processor(self, **kwargs: object) -> None:
-        return None
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         limits: dict[str, int | None] = {"image": None, "video": None}

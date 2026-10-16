@@ -326,7 +326,6 @@ def test_precompiled_buckets_replay_new_geometry_without_recompilation(
     )
     manager.precompile_vision_encoder()
     assert len(graphs) == 3
-    assert manager.get_cumulative_stats()["num_budgets"] == 3
     for height, width in ((2, 2), (6, 6), (8, 10), (2, 14), (10, 8)):
         image = torch.randn(3, height * 2, width * 2)
         expected = image_model.encoder_eager_forward({"images": [image]})

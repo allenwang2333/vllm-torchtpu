@@ -3,6 +3,7 @@
 """Muse Spark text inference with DP attention and TP or DP×TP EP experts."""
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.utils import make_empty_intermediate_tensors_factory
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.logger import init_logger
 
@@ -50,8 +52,22 @@ from .weights import (
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from .audio import AutoEncoder
+    from .config import MuseSparkTextConfig
+    from .vision import NaViT, NaViTAdapter
+
 
 class MuseExperts(nn.Module):
+    gate_up_proj: nn.Parameter
+    down_proj: nn.Parameter
+    gate_up_proj_weight_scale: nn.Parameter
+    down_proj_weight_scale: nn.Parameter
+    gate_up_proj_weight_scale_2: nn.Parameter
+    down_proj_weight_scale_2: nn.Parameter
+    experts_start: torch.Tensor | None
+    post_expert_norm: MuseRMSNorm
+
     def __init__(
         self,
         hidden_size: int,
@@ -143,6 +159,7 @@ class MuseExperts(nn.Module):
             )
         owned = None
         if self.use_ep:
+            assert self.experts_start is not None
             local_ids = ids - self.experts_start
             owned = (local_ids >= 0) & (local_ids < self.gate_up_proj.shape[0])
             ids = local_ids.clamp(0, self.gate_up_proj.shape[0] - 1)
@@ -222,7 +239,7 @@ class MuseMoE(nn.Module):
         logits, _ = self.gate(x.float())
         weights, ids = route_experts(
             logits,
-            self.gate.e_score_correction_bias,
+            cast(torch.Tensor, self.gate.e_score_correction_bias),
             top_k=self.top_k,
             multiplier=self.multiplier,
             scoring=self.scoring,
@@ -351,10 +368,12 @@ class MuseDecoderLayer(nn.Module):
         moe_prefix = f"{prefix}.mlp"
         packed = (
             vllm_config.model_config.quantization == "modelopt_fp4"
-            and vllm_config.additional_config.get(
+            and cast(dict[str, Any], vllm_config.additional_config).get(
                 "muse_packed_experts", get_tensor_model_parallel_world_size() <= 16
             )
-            and not vllm_config.quant_config.is_layer_excluded(moe_prefix + ".experts")
+            and not cast(VllmNvfp4Config, vllm_config.quant_config).is_layer_excluded(
+                moe_prefix + ".experts"
+            )
         )
         self.mlp = MuseMoE(
             config,
@@ -404,7 +423,7 @@ class MuseModel(nn.Module):
         self.prefix = prefix
         config = vllm_config.model_config.hf_text_config
         self.residual_dtype = torch.float32
-        self.dtype = vllm_config.model_config.dtype
+        self.dtype = cast(torch.dtype, vllm_config.model_config.dtype)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
@@ -431,11 +450,23 @@ class MuseModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
+        if inputs_embeds is None:
+            assert input_ids is not None
+            x = self.embed_input_ids(input_ids)
+        else:
+            x = inputs_embeds
         x = x.to(self.residual_dtype)
         for layer in self.layers:
             x = layer(positions, x)
         return self.norm(x, out_dtype=self.dtype)
+
+
+class _MuseModelComponents(nn.Module):
+    language_model: MuseModel
+    vision_tower: "NaViT"
+    vision_adapter: "NaViTAdapter"
+    vision_projection: RowParallelLinear
+    audio_tower: "AutoEncoder"
 
 
 class MuseSparkForCausalLM(nn.Module):
@@ -443,7 +474,9 @@ class MuseSparkForCausalLM(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.config = config = vllm_config.model_config.hf_text_config
+        self.config = config = cast(
+            "MuseSparkTextConfig", vllm_config.model_config.hf_text_config
+        )
         parallel = vllm_config.parallel_config
         if (
             parallel.pipeline_parallel_size != 1
@@ -472,7 +505,8 @@ class MuseSparkForCausalLM(nn.Module):
                 f"Muse TPU supports BF16 and NVFP4 checkpoints, got {quant}"
             )
         if quant == "modelopt_fp4":
-            vllm_config.quant_config.exclude_modules = list(
+            quant_config = cast(VllmNvfp4Config, vllm_config.quant_config)
+            quant_config.exclude_modules = list(
                 vllm_config.model_config.hf_config.quantization_config[
                     "modules_to_not_convert"
                 ]
@@ -490,7 +524,7 @@ class MuseSparkForCausalLM(nn.Module):
         model_prefix = (
             f"{prefix}.model.language_model" if prefix else "model.language_model"
         )
-        self.model = nn.Module()
+        self.model = _MuseModelComponents()
         self.model.language_model = MuseModel(
             vllm_config=vllm_config, prefix=model_prefix
         )
@@ -501,7 +535,7 @@ class MuseSparkForCausalLM(nn.Module):
             prefix=f"{prefix}.lm_head" if prefix else "lm_head",
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.logits_processor.head_dtype = self.lm_head.weight.dtype
+        self.logits_processor.head_dtype = cast(torch.Tensor, self.lm_head.weight).dtype
         self.multiplier = config.output_multiplier
         self.soft_cap = config.final_logit_softcapping
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -524,7 +558,8 @@ class MuseSparkForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(
-            self.lm_head, hidden_states.to(self.lm_head.weight.dtype)
+            self.lm_head,
+            hidden_states.to(cast(torch.Tensor, self.lm_head.weight).dtype),
         )
         if logits is None:
             return None

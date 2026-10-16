@@ -31,6 +31,7 @@ def _grouped_experts(
 ) -> jax.Array:
     tokens, top_k = ids.shape
     if num_experts is not None:
+        assert experts_start is not None
         ids = ids - experts_start
         ids = jnp.where((ids >= 0) & (ids < w13.shape[0]), ids, -1)
     inputs, sizes, inverse, _, valid, _ = prepare_routed_gmm_inputs(

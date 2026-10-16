@@ -527,6 +527,11 @@ class NaViTAdapter(nn.Module):
         return out
 
 
+class _NaViTPatchEmbedder(nn.Module):
+    patch_embedding: ColumnParallelLinear
+    position_embedding_table: nn.Embedding
+
+
 class NaViT(nn.Module):
     """NaViT patch embedding, transformer, downsampling, and adapter."""
 
@@ -609,7 +614,7 @@ class NaViT(nn.Module):
         )
 
         input_dim = 3 * self.patch_height * self.patch_width * self.patch_temporal
-        self.patch_embedder = nn.Module()
+        self.patch_embedder = _NaViTPatchEmbedder()
         self.patch_embedder.patch_embedding = ColumnParallelLinear(
             input_size=input_dim,
             output_size=latent_dim,
@@ -778,6 +783,7 @@ class NaViT(nn.Module):
             ds_perm_list.append(ds_perm)
 
             if self.sparse_attention_factor > 1:
+                assert sp_perm is not None and sp_slen is not None
                 sp_perm_list.append(sp_perm)
                 sp_slen_list.append(sp_slen)
 
@@ -834,6 +840,7 @@ class NaViT(nn.Module):
 
         batch_cls_tok_idx = None
         if self.use_cls_token and self.class_embedding is not None:
+            assert cls_pos_emb_wei is not None
             batch_cls_tok_idx = torch.tensor(cls_tok_idx, device=device)
             x[batch_cls_tok_idx, :] = self.class_embedding + cls_pos_emb_wei
 
