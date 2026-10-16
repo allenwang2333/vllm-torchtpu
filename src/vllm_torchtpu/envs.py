@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
     TPU_SRPT_HOLD_PROGRESS_GUARD: bool = False
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
+    TPU_SRPT_ATTN_WORK_CAP: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
@@ -681,6 +682,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SrptPrefillScheduler: with --prefill-schedule-interval, ignore vLLM's
     # capacity-bound escape so ranks with decodes prefill only on cadence steps.
     "TPU_SRPT_STRICT_PREFILL_CADENCE": env_bool("TPU_SRPT_STRICT_PREFILL_CADENCE"),
+    # SrptPrefillScheduler: cap on a step's attention work, the sum over its
+    # scheduled tokens of their context length, by clipping prefill chunks.
+    # A deep-context chunk on one DP rank otherwise sets every layer's period
+    # for all ranks. 0 disables it.
+    "TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int("TPU_SRPT_ATTN_WORK_CAP", 0),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),

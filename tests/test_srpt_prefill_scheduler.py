@@ -1,9 +1,11 @@
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core.srpt_prefill_scheduler import SrptPrefillScheduler
@@ -339,3 +341,79 @@ def test_capacity_bound_kept_without_strict_cadence():
     s = _livelock_scheduler(guard=False)
     _step_throttled(s, throttle=False)
     assert _step_throttled(s, throttle=True)["bound"] is True
+
+
+def _capped(cap):
+    s = _make_scheduler()
+    s._attn_work_cap = cap
+    s._attn_work = 0.0
+    s._attn_prefill_scheduled = False
+    s._attn_clipped_chunks = 0
+    s.num_prefill_lookahead = 0  # upstream's MTP lookahead reserve: a no-op here
+    return s
+
+
+def _req(prompt, status=RequestStatus.RUNNING, num_tokens=None):
+    return SimpleNamespace(
+        num_prompt_tokens=prompt, num_tokens=num_tokens or prompt, status=status
+    )
+
+
+def test_attn_cap_off_leaves_chunks_alone():
+    s = _capped(0)
+    assert s._reserve_prefill_lookahead(_req(400_000), 300_000, 128) == 128
+    assert s._attn_work == 0.0
+
+
+def test_attn_cap_clips_a_deep_chunk_to_the_remaining_work():
+    s = _capped(10_000_000)
+    n = s._reserve_prefill_lookahead(_req(400_000), 100_000, 128)
+    assert n == 99  # 99 * (100k + 49.5) <= 10M < 100 * (100k + 50)
+    assert n * (100_000 + n / 2) <= 10_000_000
+    assert s._attn_clipped_chunks == 1
+
+
+def test_attn_cap_counts_decodes_first_and_never_clips_them():
+    s = _capped(1_000_000)
+    decode = _req(200_000, num_tokens=200_010)
+    assert s._reserve_prefill_lookahead(decode, 200_010, 7) == 7  # over the cap alone
+    assert s._attn_work == pytest.approx(7 * (200_010 + 3.5))
+    # no room left: the step's first chunk still advances, a second one waits
+    assert s._reserve_prefill_lookahead(_req(400_000), 100_000, 128) == 16
+    assert s._reserve_prefill_lookahead(_req(400_000), 100_000, 128) == 0
+
+
+def test_attn_cap_still_advances_the_steps_first_chunk():
+    s = _capped(1_000_000)  # less than 16 tokens of a 300k-context chunk
+    assert s._reserve_prefill_lookahead(_req(400_000), 300_000, 128) == 16
+    # a second deep chunk in the same step waits
+    assert s._reserve_prefill_lookahead(_req(500_000), 300_000, 128) == 0
+
+
+def test_attn_cap_admits_a_waiting_request_with_one_token_rather_than_none():
+    s = _capped(1_000_000)
+    s._reserve_prefill_lookahead(_req(50_000), 9_000, 100)  # most of the cap
+    waiting = _req(400_000, status=RequestStatus.WAITING)
+    assert s._reserve_prefill_lookahead(waiting, 300_000, 128) == 1
+
+
+def test_attn_cap_lets_shallow_chunks_through_whole():
+    s = _capped(25_000_000)
+    assert s._reserve_prefill_lookahead(_req(60_000), 40_000, 121) == 121
+    assert s._attn_clipped_chunks == 0
+
+
+def test_schedule_resets_the_attention_work():
+    s = _capped(10_000_000)
+    s._reserve_prefill_lookahead(_req(400_000), 100_000, 128)
+    _step(s)
+    assert s._attn_work == 0.0
+
+
+def test_upstream_routes_both_queues_through_the_chunk_hook():
+    # The cap is inert unless upstream calls the hook for running chunks and for
+    # waiting requests alike; fail loudly if a vLLM update drops either call.
+    assert (
+        inspect.getsource(Scheduler.schedule).count("self._reserve_prefill_lookahead(")
+        == 2
+    )
