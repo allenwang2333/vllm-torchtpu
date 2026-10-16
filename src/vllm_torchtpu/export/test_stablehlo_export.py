@@ -1781,6 +1781,39 @@ def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
         engine_utils.wait_for_engine_startup(None, [], None, False, None, None)
     assert exc_info.value.code == 0
 
+    # DP>1 with TP=1 (world_size=1, data_parallel_size=8) must NOT exit inside a
+    # single worker before peers finish, and normal startup completion must
+    # close launch resources and exit 0.
+    class MockDPRunner(MockTPRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parallel_config.world_size = 1
+            self.parallel_config.data_parallel_size = 8
+
+    with (
+        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
+        patch(
+            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
+            return_value=torch.zeros((1, 1), dtype=torch.int64),
+        ),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockDPRunner())
+
+    mock_launch = MagicMock()
+    with (
+        patch.object(
+            engine_utils,
+            "_orig_wait_for_engine_startup",
+            lambda *_a, **_kw: None,
+            create=True,
+        ),
+        pytest.raises(SystemExit) as clean_exc_info,
+    ):
+        engine_utils.wait_for_engine_startup(None, [], None, False, None, mock_launch)
+    assert clean_exc_info.value.code == 0
+    mock_launch.engine_manager.close.assert_called_once()
+    mock_launch.coordinator.close.assert_called_once()
+
 
 def test_load_hlo_dir_pins_num_gpu_blocks_override_from_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
