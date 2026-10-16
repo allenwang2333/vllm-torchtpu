@@ -30,6 +30,12 @@ op's mesh (the whole EP x TP world), whose partials together cover every
 (fused_moe_func with use_ep and experts_start: SparseCore ragged gather, local
 grouped GEMMs, ragged gather-reduce) plus the shared expert and a psum, so
 prefill and mixed batches keep the EP x TP routed kernels.
+
+Prefill kernel: with FUSED_MOE_PREFILL_KERNEL=1, a TP-expert layer (no EP)
+runs the steps of more than FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens through
+kernels/experimental/fused_moe_prefill (routed and shared experts, combine and
+all-reduce) instead of the usual path and a psum: the same kernel and the same
+cut-over as under FUSED_MOE_DECODE_KERNEL, which this op stands down for.
 """
 
 import dataclasses
@@ -49,6 +55,7 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import fused_moe_prefill
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
@@ -79,6 +86,8 @@ _BUFFERS = (
 # exit instead.
 SELFTEST_TIMEOUT_S = 300
 _SUM_FLOOR = 1e-20
+# fused_moe_prefill quantizes x per 512 columns; the hidden size must divide.
+_PREFILL_Q_BLOCK = 512
 
 _OPS: dict[tuple, Any] = {}
 _SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
@@ -105,6 +114,9 @@ class _OpStatics:
     # TPU_MOE_ROUTER_TOPK_BIAS: the psum path picks experts as the layer does
     # (router_topk.select_bias; same ids and weights as select on scores+bias).
     router_bias: bool = False
+    # FUSED_MOE_PREFILL_KERNEL on a TP-expert layer: token counts above this
+    # run the fused MoE prefill kernel instead of the psum path. None = off.
+    prefill_above: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -313,6 +325,13 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         onehot_threshold=resolve_onehot_permute_threshold(),
         use_ep=bool(par.use_ep),
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
+        prefill_above=(
+            envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
+            if envs.FUSED_MOE_PREFILL_KERNEL
+            and not par.use_ep
+            and hidden % _PREFILL_Q_BLOCK == 0
+            else None
+        ),
     )
     return _Admitted(
         shared=shared,
@@ -320,6 +339,52 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         hidden=hidden,
         statics=statics,
         experts_start=int(experts_start),
+    )
+
+
+def _route(scores, bias, is_pad, st, dtype):
+    """select_experts as the unarmed path runs it: ids from the biased scores,
+    the picked unbiased scores renormalized and rounded to `dtype`, and
+    zero_routing_weights_for_padding."""
+    bias = bias.astype(jnp.float32)
+    if st.router_bias:
+        w, ids = router_select_bias(scores, bias[None, :], st.topk)
+    else:
+        _, ids = router_select(scores + bias[None, :], st.topk)
+        w = jnp.take_along_axis(scores, ids, axis=-1)
+    total = jnp.sum(w, axis=-1, keepdims=True)
+    # torch.clamp(min=1e-20) keeps NaN; a fused jnp.maximum may not (XLA CPU).
+    total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
+    w = (w / total).astype(dtype)
+    return jnp.where(is_pad[:, None], jnp.zeros_like(w), w), ids
+
+
+def _prefill_chain(
+    x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, axis
+):
+    """The layer's output, summed over `axis`, from the fused MoE prefill
+    kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing, as
+    fused_moe_decode's prefill path calls it. GLM-5.2's shared expert is
+    ungated; routed_scale is folded into the route weights by the kernel."""
+    # Trace-time, once per token bucket: the evidence that the kernel serves it.
+    logger.info("moe_tp_decode: fused MoE prefill kernel traced for %d tokens", x.shape[0])
+    w, ids = _route(scores, bias, is_pad, st, x.dtype)
+    return fused_moe_prefill(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        None,
+        w,
+        ids.astype(jnp.int32),
+        axis_name=axis,
+        expert_start=None,
+        routed_scale=st.routed_scale,
     )
 
 
@@ -332,17 +397,7 @@ def _tp_chain(
     experts_start e0, so the SparseCore EP dispatch and combine), the shared
     expert's two quantized linears around SiluAndMul, and shared + scale *
     routed in bf16."""
-    bias = bias.astype(jnp.float32)
-    if st.router_bias:
-        w, ids = router_select_bias(scores, bias[None, :], st.topk)
-    else:
-        _, ids = router_select(scores + bias[None, :], st.topk)
-        w = jnp.take_along_axis(scores, ids, axis=-1)
-    total = jnp.sum(w, axis=-1, keepdims=True)
-    # torch.clamp(min=1e-20) keeps NaN; a fused jnp.maximum may not (XLA CPU).
-    total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
-    w = (w / total).astype(x.dtype)
-    w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
+    w, ids = _route(scores, bias, is_pad, st, x.dtype)
     routed = fused_moe_func(
         x,
         w13,
@@ -421,6 +476,10 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 topk=statics.topk,
                 n_ranks=n_ranks,
             )
+        if statics.prefill_above is not None and n > statics.prefill_above:
+            return _prefill_chain(
+                x, scores, bias, is_pad, *weights, statics, axis
+            ).astype(x.dtype)
         partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
         return lax.psum(partial, axis)
 
