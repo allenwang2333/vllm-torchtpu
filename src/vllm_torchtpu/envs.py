@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_MIXED_KV_PAGES: int | None = None
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = False
+    TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -1342,6 +1343,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every P, per-wave double buffer, min P = cdiv(n, 64K), row lengths read
     # in-kernel). Takes precedence over TPU_SC_TOPK_ROW_CAP. Same index sets.
     "TPU_SC_TOPK_VALID_READS": env_bool("TPU_SC_TOPK_VALID_READS", default=False),
+    # DCP indexer top-k, all-gather merge, T <= 32 tokens: all-gather each
+    # rank's candidate scores flat ([T * k] -> [dcp * T * k], rank-major) and
+    # let the SparseCore merge read each row's dcp pieces in place, instead of
+    # gathering [T, dcp * k] and padding it to 32 rows (an XLA pad + relayout
+    # copy of 32 * dcp * k words, plus relayouts of the local slots and the
+    # output slice). T > 32 keeps the padded path. Bitwise identical output.
+    "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool(
+        "TPU_SC_TOPK_DCP_MERGE_FLAT", default=False
+    ),
     # The indexed layer's own attention reads its rows back from the updated
     # shared table, the same `table[:num_tokens]` expression the following
     # skip_topk layers read, instead of the fresh rows. One expression lets XLA

@@ -745,3 +745,41 @@ def test_merge_overlap_fn_is_exact():
     np.testing.assert_array_equal(
         np.asarray(topk), np.asarray(streamindex_topk_dcp(*args, **kwargs))
     )
+
+
+# ===================================================================== #
+# TPU_SC_TOPK_DCP_MERGE_FLAT: flat rank-major gather, unpadded merge.
+# ===================================================================== #
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [4, 16, 32, 64])
+def test_flat_merge_matches_padded(dcp_size, q_len):
+    """Flag on vs off, byte for byte; q_len 64 (> 32) takes the padded path
+    either way."""
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(dcp_size, 41, q_len=q_len)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=False))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=True))
+    np.testing.assert_array_equal(got, want)
+    assert (want >= 0).any()
+
+
+@pytest.mark.multichip
+def test_flat_merge_with_merge_overlap_is_exact():
+    """The pinned merge-overlap path slices the flat gather for its barrier."""
+    _need_devices(8)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(8, 37, q_len=4)
+    x = jax.random.normal(jax.random.key(5), (4, 512), jnp.float32)
+    ov = dict(
+        overlap_fn=lambda v: v * 2.0,
+        overlap_args=(x,),
+        merge_overlap_fn=lambda v: jnp.tanh(v) + 1.0,
+    )
+    want_t, want_o = streamindex_topk_dcp(*args, **kwargs, **ov, flat_merge=False)
+    got_t, got_o = streamindex_topk_dcp(*args, **kwargs, **ov, flat_merge=True)
+    np.testing.assert_array_equal(np.asarray(got_t), np.asarray(want_t))
+    np.testing.assert_array_equal(np.asarray(got_o), np.asarray(want_o))

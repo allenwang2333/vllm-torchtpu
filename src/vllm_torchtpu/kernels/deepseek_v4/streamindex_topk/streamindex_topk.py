@@ -29,6 +29,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
+    rank_major_merge_fits,
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
@@ -1713,6 +1714,7 @@ def streamindex_topk(
         "overlap_fn",
         "merge_overlap_fn",
         "overlap_pin_max_tokens",
+        "flat_merge",
     ),
 )
 def streamindex_topk_dcp(
@@ -1746,6 +1748,7 @@ def streamindex_topk_dcp(
     overlap_args: tuple = (),
     merge_overlap_fn=None,
     overlap_pin_max_tokens: int | None = None,
+    flat_merge: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1843,6 +1846,11 @@ def streamindex_topk_dcp(
       overlap_pin_max_tokens: pin only buckets of at most this many tokens
         (the decode buckets, whose TensorCore idles on the SparseCore calls);
         larger ones run the work unpinned. None pins every bucket.
+      flat_merge: all-gather merge only, `padded_num_tokens <= 32`: gather the
+        scores flat (`[T * k] -> [dcp_size * T * k]`, rank-major) and merge
+        them in place (`sparsecore_topk_dcp_merge(rank_major=True)`), with no
+        32-row pad or 2-D relayout around the merge. None reads
+        `TPU_SC_TOPK_DCP_MERGE_FLAT`. Same result.
 
     Returns:
       With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
@@ -1879,6 +1887,13 @@ def streamindex_topk_dcp(
 
     if overlap_fn is None and merge_overlap_fn is not None:
         raise ValueError("merge_overlap_fn needs overlap_fn")
+    if flat_merge is None:
+        from vllm_torchtpu import envs
+
+        flat_merge = envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+    flat_merge = (
+        bool(flat_merge) and not a2a_merge and rank_major_merge_fits(q.shape[0])
+    )
     # Pin only where each stage is one SparseCore call: an unchunked local
     # top-k (as `streamindex_topk` decides it) and the all-gather merge.
     pin = (
@@ -1983,11 +1998,13 @@ def streamindex_topk_dcp(
             slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
             return _ret(dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank))
 
-        # Stage 1. All-gather the scores; the indices stay home.
+        # Stage 1. All-gather the scores; the indices stay home. Flat, the
+        # gather is rank-major over whole [T * k] lists, which the merge reads
+        # in place.
         scores = lax.all_gather(
-            scores,
+            scores.reshape(-1) if flat_merge else scores,
             dcp_axis_name,
-            axis=1,
+            axis=0 if flat_merge else 1,
             tiled=True,
         )
 
@@ -1995,7 +2012,8 @@ def streamindex_topk_dcp(
         if merge_pinned:
             # The merge stage's work starts once the candidates have landed
             # (a slice, so the merge's operand keeps its layout).
-            _, ov = lax.optimization_barrier((scores[:1, :128], ov))
+            head = scores[:128] if flat_merge else scores[:1, :128]
+            _, ov = lax.optimization_barrier((head, ov))
 
         # Stage 2. Fused SparseCore global top-k threshold selection, owner
         # filtering, local index resolution, and prefix compaction.
@@ -2007,6 +2025,7 @@ def streamindex_topk_dcp(
                 dcp_rank=dcp_rank,
                 dcp_size=dcp_size,
                 scheduling_group_id=global_scheduling_group_id,
+                rank_major=flat_merge,
             ),
             merge_pinned,
         )
