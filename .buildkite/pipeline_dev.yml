@@ -89,7 +89,7 @@ steps:
   # -----------------------------------------------------------------
   - label: ":kubernetes: PP4 prefill + TPUMultiConnector (disagg + offload), Qwen3.5-35B"
     key: pp4_multi_connector_disagg_offload
-    if: 'build.env("K3_PD_CONFIG") == null'
+    if: 'build.env("K3_PD_CONFIG") == null && build.env("PP_ON_2X2X4") != "1"'
     depends_on: build_docker
     timeout_in_minutes: 1440
     agents:
@@ -107,6 +107,25 @@ steps:
       RUN_ROOT: "perf_eval_results/qwen35_pp4_multi_connector"
     commands:
       - .buildkite/kubernetes/run.sh env PREFILL_PCP=1 PREFILL_PP=4 bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
+
+  # The same run on host 0 of a 2x2x4 slice at post-merge priority: that
+  # queue reclaims lent quota from lower-priority work, the 8-core one does not.
+  # Build env PP_ON_2X2X4=1 selects it instead of the step above.
+  - label: ":kubernetes: PP4 prefill + TPUMultiConnector (disagg + offload), Qwen3.5-35B, on 2x2x4"
+    key: pp4_multi_connector_disagg_offload_2x2x4
+    if: 'build.env("K3_PD_CONFIG") == null && build.env("PP_ON_2X2X4") == "1"'
+    depends_on: build_docker
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      ARTIFACTS_DIR: "perf_eval_results"
+      WORKLOAD_PRIORITY: "post-merge"
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-pp4-multi-connector-on-2x2x4.yaml
 
   # -----------------------------------------------------------------
   # Kimi-K3 megakernel AgentX, on a build that sets K3_PD_CONFIG
