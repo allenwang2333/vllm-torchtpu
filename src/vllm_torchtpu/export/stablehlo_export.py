@@ -743,10 +743,8 @@ def _install_warmup_early_exit_hook(vllm_config: Any = None) -> None:
                     ).strip()
                     if export_dir_str:
                         export_dir = Path(export_dir_str)
-                        if (
-                            (export_dir / "metadata.json").is_file()
-                            or ": 0}" in str(exc)
-                            or "Failed core proc(s):" in str(exc)
+                        if (export_dir / "metadata.json").is_file() or ": 0}" in str(
+                            exc
                         ):
                             logger.info(
                                 "[TpuCompilerAdaptor] Exported all StableHLO modules to %s; exiting early.",
