@@ -188,14 +188,6 @@ class GDNConfig:
         num_lanes = tpu_info.num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
-    def get_kernel_name(self) -> str:
-        # Windows of different sizes compile to different kernels; keep them
-        # distinguishable in profiles.
-        suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
-        if self.is_kda and self.gate_lower_bound is not None:
-            suffix += "_bounded"
-        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
-
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
         ret = {}
@@ -211,22 +203,6 @@ class GDNConfig:
             (self.batch_size, self.num_v_heads, self.v_head_dim),
             self.dtypes.act_out,
         )
-
-    # Fraction of VMEM the kernel may use. A multi-token window holds one
-    # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
-    # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
-    WINDOWED_VMEM_FRACTION = 0.9
-
-    def get_vmem_limit_bytes(self) -> int:
-        tpu_info = pltpu.get_tpu_info()
-        fraction = (
-            self.WINDOWED_VMEM_FRACTION
-            if self.window_size > 1
-            else self.DEFAULT_VMEM_FRACTION
-        )
-        return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
