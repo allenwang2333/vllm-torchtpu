@@ -24,6 +24,7 @@ from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .attention_kernels import (
+    _fp8_query_shards,
     gathered_kv_cache_scope,
     paged_attention,
     paged_indexer,
@@ -595,6 +596,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
         # This rank's SP token shard of qr, before the gather.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
+        tp_size = (
+            get_tensor_model_parallel_world_size()
+            if self._sp_sharded_input and qr.device.type == "tpu"
+            else 1
+        )
         qr_local = (
             qr
             if self._sp_sharded_input
@@ -606,7 +612,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else None
         )
         if self._sp_sharded_input:
-            if indexer_weights is not None:
+            keep_local_indexer_inputs = (
+                qr.device.type == "tpu"
+                and not getattr(self, "_all_indices_fit", False)
+                and isinstance(swa_kv, PagedCacheRows)
+                and self.window_size % 64 == 0
+                and _fp8_query_shards(num_tokens, tp_size, True, qr.shape[0]) > 1
+                and _query_split(num_tokens, tp_size)[0] == qr.shape[0]
+            )
+            if indexer_weights is not None and not keep_local_indexer_inputs:
                 assert qr.dtype == kv.dtype == indexer_weights.dtype
                 packed = sp_all_gather(torch.cat((qr, kv, indexer_weights), dim=-1))[
                     :num_tokens
@@ -619,7 +633,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     )
                 )
             elif qr_local is not None:
-                # Non-source encoder layers with local_q do not consume
+                # Encoder layers with active local_q do not consume
                 # full-token qr on the host; gather only kv (512 cols vs 2048).
                 kv = sp_all_gather(kv)[:num_tokens]
             else:
@@ -1521,7 +1535,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     ):
         """Publish explicit index-cache and logical-selection outputs."""
         indexer = self.indexer
-        count = qr.shape[0]
+        count = positions.shape[0]
         has_candidates = indexer.indexer_op.candidate_blocks is not None
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
@@ -1619,10 +1633,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             else None
         )
         if split:
+            part = positions_part.shape[0]
             qr_part, weights_part = (
-                torch.cat((x, x.new_full((padding, *x.shape[1:]), fill))).index_select(
-                    0, mine
-                )
+                x
+                if x.shape[0] == part and part * ranks == count
+                else torch.cat(
+                    (x, x.new_full((padding, *x.shape[1:]), fill))
+                ).index_select(0, mine)
                 for x, fill in ((qr, 0), (weights, 0))
             )
             cached_cand_part = (

@@ -2751,11 +2751,13 @@ def paged_indexer_jax(
                 count = token_ids.size
             else:
                 count = rows + (-rows % tile)
-                inputs = jax.tree.map(
-                    lambda x: jnp.pad(
-                        x, ((0, count - rows),) + ((0, 0),) * (x.ndim - 1)
+                pad_len = count - rows
+                inputs = (
+                    *(
+                        jnp.pad(x, ((0, pad_len),) + ((0, 0),) * (x.ndim - 1))
+                        for x in inputs[:-1]
                     ),
-                    inputs,
+                    jnp.pad(requests, (0, pad_len), mode="edge"),
                 )
 
             def prepare(i):
@@ -2874,6 +2876,17 @@ def paged_indexer_jax(
             # The untiled score buffer is small here; keep one query tile.
             return score_context(records, rows)
         columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
+        default_query_tile = (
+            48
+            if (
+                jax.default_backend() == "tpu"
+                and rows >= 512
+                and page_records is not None
+                and q.dtype == jnp.bfloat16
+                and q.shape[-1] == index_word_scores.DIM
+            )
+            else indexer.QUERY_TILE
+        )
         if (
             not candidate_write
             and not candidate_filter
@@ -2886,10 +2899,10 @@ def paged_indexer_jax(
             return jax.lax.cond(
                 lengths.max() <= columns,
                 lambda _: score_context(records[:, :columns], query_tile),
-                lambda _: score_context(records, indexer.QUERY_TILE),
+                lambda _: score_context(records, default_query_tile),
                 None,
             )
-        return score_context(records, indexer.QUERY_TILE)
+        return score_context(records, default_query_tile)
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:

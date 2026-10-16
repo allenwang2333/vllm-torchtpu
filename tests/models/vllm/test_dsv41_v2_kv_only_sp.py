@@ -994,3 +994,75 @@ class TestAttentionKernelsKvOnlySp:
                 res_full = fn(qr_small, *args_sub[1:])
                 assert res_full.shape == (128, 1024)
                 assert len(all_gather_calls) == 0  # In-kernel all_gather was skipped!
+
+    def test_select_paged_indices_uses_local_qr_and_weights_directly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Verify _select_paged_indices uses local qr/weights directly."""
+        attn = _setup_mock_attn(monkeypatch, tp_size=8)
+        attn._tp_rank = torch.tensor(0, dtype=torch.int32)
+        attn._config = {"index_topk": 16}
+        attn.candidate_block_size = 16
+        attn.candidate_block_buffer = torch.zeros((1024, 4), dtype=torch.int32)
+        seen = {}
+
+        def fake_paged_indexer(
+            q_part,
+            index_cache,
+            records,
+            weights_part,
+            lengths_part,
+            candidates_part,
+            write_records,
+            write_keys,
+            requests_part,
+            **kwargs,
+        ):
+            seen["index_q_rows"] = q_part.shape[0]
+            seen["weights_rows"] = weights_part.shape[0]
+            return (
+                index_cache,
+                torch.zeros((q_part.shape[0], 16), dtype=torch.int32),
+                candidates_part,
+            )
+
+        attn.indexer = SimpleNamespace(
+            head_dim=128,
+            n_head=4,
+            indexer_op=SimpleNamespace(
+                candidate_blocks=True,
+                candidate_write=False,
+            ),
+        )
+        attn._project_index_q = lambda q_part, pos_part: torch.zeros(
+            (q_part.shape[0], 4, 128)
+        )
+        monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
+        monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: None)
+        monkeypatch.setattr(v2_attn, "_gather_query_rows", lambda t: t.repeat(8, 1))
+        monkeypatch.setattr(v2_attn, "_active_stage_attn_cache", None)
+        # count = 1024, ranks = 8 -> part = 128, padding = 128
+        positions = torch.arange(1024, dtype=torch.long)
+        qr_local = torch.randn(128, 16)
+        weights_local = torch.randn(128, 4)
+        index_cache = SimpleNamespace(raw=SimpleNamespace(copy_=lambda u: None))
+        records = torch.zeros((8, 64), dtype=torch.int32)
+        requests = torch.zeros((1024,), dtype=torch.int32)
+        lengths = torch.ones((1024, 1), dtype=torch.int32) * 32
+        swa_slots = torch.arange(1024, dtype=torch.long)
+
+        selected = v2_attn.DeepseekV41Attention._select_paged_indices(
+            attn,
+            qr_local,
+            positions,
+            index_cache,
+            records,
+            requests,
+            weights_local,
+            lengths,
+            swa_slots,
+            None,
+        )
+        assert seen["index_q_rows"] == 128
+        assert seen["weights_rows"] == 128
+        assert selected.shape == (1024, 16)
