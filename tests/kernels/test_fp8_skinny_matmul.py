@@ -193,6 +193,7 @@ SCALE_DMA_SITES = [
 ]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("k,n,config", SCALE_DMA_SITES)
 @pytest.mark.parametrize("m,real", [(16, 4), (16, 16), (8, 8)])
 def test_scale_dma_is_bit_identical(k, n, config, m, real):
@@ -221,6 +222,7 @@ def test_scale_dma_is_bit_identical(k, n, config, m, real):
     assert not np.array_equal(np.asarray(y2, np.float32), np.asarray(y1, np.float32))
 
 
+@pytest.mark.tpu_test
 def test_scale_dma_stacked_eager_bit_identical():
     """The constraint cannot run eagerly; the scale_dma path jits itself."""
     k, n = 1024, 3072
@@ -243,6 +245,7 @@ def _scale_copy_lines(hlo: str, n: int) -> list[str]:
     return [ln.strip()[:200] for ln in hlo.splitlines() if pat.search(ln)]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 16384), (6144, 1536)])
 def test_scale_dma_lowers_scale_to_hbm(k, n):
     """scale_dma: the custom call carries `input_memory_space_colors` and the compiled
