@@ -85,6 +85,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    LookupResult,
     OffloadKey,
     ReqContext,
     get_offload_group_idx,
@@ -323,6 +324,39 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             )
 
     def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        result = self._get_num_new_matched_tokens(request, num_computed_tokens)
+        if tpu_envs.TPU_OFFLOAD_LOG_LOOKUPS and result[0] is not None:
+            self._log_lookup(request, num_computed_tokens, result[0])
+        return result
+
+    def _log_lookup(self, request: Request, local: int, external: int) -> None:
+        """One line per admitted lookup: what HBM and host each had."""
+        req_status = self._req_status[request.request_id]
+        (full,) = (
+            g
+            for g in self.config.kv_group_configs
+            if g.sliding_window_size_in_chunks is None
+        )
+        keys = req_status.group_states[full.group_idx].offload_keys
+        prefix = local // full.tokens_per_chunk
+        while prefix < len(keys) and (
+            self._raiden_manager.lookup(keys[prefix], req_status.req_context)
+            is LookupResult.HIT
+        ):
+            prefix += 1
+        logger.info(
+            "raiden lookup: req=%s tokens=%d local=%d external=%d "
+            "host_fa_prefix_tokens=%d",
+            request.request_id,
+            request.num_tokens,
+            local,
+            external,
+            prefix * full.tokens_per_chunk,
+        )
+
+    def _get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         if not tpu_envs.TPU_FINE_PREFIX_HIT_TOKENS:
