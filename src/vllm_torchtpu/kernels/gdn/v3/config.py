@@ -177,6 +177,13 @@ class GDNConfig:
         return (self.dim_size // pltpu.get_tpu_info().num_lanes) | 1
 
     @property
+    def qkv_stage_tile_stride(self) -> int:
+        """Lane rows between consecutive widened row tiles in the PER_SEQ
+        stage. Odd, so one token row's lane groups, a tile apart, are a
+        single strided load, and no tile is transposed on the way in."""
+        return QKV_TILE_ROWS | 1
+
+    @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
 
@@ -300,9 +307,14 @@ class GDNConfig:
             num_lanes = pltpu.get_tpu_info().num_lanes
             stage_rows = self.qkv_tile_groups * QKV_TILE_ROWS
             if self.seq_tile_size == 1:
-                # Every staged row in compact layout; the tile's rows start
-                # at a dynamic offset into it.
-                stage_shape = (1, stage_rows, 1, self.dim_size)
+                # Each widened row tile `qkv_stage_tile_stride` lane rows
+                # apart; the tile's rows start at a dynamic offset into it.
+                stage_shape = (
+                    self.qkv_tile_groups
+                    * (self.dim_size // num_lanes)
+                    * self.qkv_stage_tile_stride,
+                    num_lanes,
+                )
             else:
                 stage_shape = (stage_rows * self.dim_size // num_lanes, num_lanes)
             qkv_stage_scratch = pltpu.VMEM(stage_shape, jnp.float32)

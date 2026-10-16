@@ -182,10 +182,32 @@ def inner_kernel(
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
     qkv_in_ref = qkv_slot_ref
-    if cfg.qkv_row_tiled and cfg.seq_tile_size == 1:
-        vmem_ldst.widen_row_tiles_as_compact(qkv_slot_ref, qkv_stage_scratch_ref)
+    # PER_SEQ row tiles keep each token row as [lane groups, lanes] through
+    # the conv: that is how a row comes out of the stage.
+    lane_group_rows = cfg.qkv_row_tiled and cfg.seq_tile_size == 1
+
+    def read_in_rows(idx: int, start: jax.Array | int, size: int) -> jax.Array:
+        return qkv_in_ref[idx, pl.ds(start, size)]
+
+    if lane_group_rows:
+        tile_stride = cfg.qkv_stage_tile_stride
+        vmem_ldst.widen_row_tiles_strided(
+            qkv_slot_ref, qkv_stage_scratch_ref, tile_stride
+        )
         row_in_tile = metadata_ref.p_id_to_r_base[p_id, 0] % config.QKV_TILE_ROWS
-        qkv_in_ref = qkv_stage_scratch_ref.at[:, pl.ds(row_in_tile, cfg.chunk_size)]
+        lane_groups = qkv_slot_ref.shape[1]
+
+        def read_in_rows(idx: int, start: jax.Array | int, size: int) -> jax.Array:
+            del idx
+            return vmem_ldst.load_staged_rows(
+                qkv_stage_scratch_ref,
+                row_in_tile + start,
+                size,
+                lane_groups,
+                config.QKV_TILE_ROWS,
+                tile_stride,
+            )
+
         qkv_slot_ref = qkv_scratch_ref
     elif cfg.qkv_row_tiled:
         vmem_ldst.widen_row_tiles_to_compact(
@@ -198,14 +220,26 @@ def inner_kernel(
             ],
         )
         qkv_in_ref = qkv_slot_ref = qkv_scratch_ref
-    qkv_in_compact = qkv_in_ref[...].astype(jnp.float32)
-    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
     conv_bias = None
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
+    if lane_group_rows:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        qkv_in_compact = read_in_rows(0, 0, cfg.chunk_size)[None]
+        # Reloaded rather than reshaped: a value reshape picks a row layout
+        # that the conv would inherit.
+        carry_conv_scratch_ref[...] = prev_conv
+        prev_conv = vmem_ldst.load_lane_grouped(carry_conv_scratch_ref)
+        conv_weight = vmem_ldst.load_lane_grouped(weights_ref.conv.weight)
+        conv_weight = conv_weight.astype(jnp.float32)
+        if conv_bias is not None:
+            conv_bias = conv_bias.reshape(-1, num_lanes)
+    else:
+        qkv_in_compact = qkv_in_ref[...].astype(jnp.float32)
+    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     def window_rows(last_row: int) -> jax.Array:
         # Read the checkpoint's rows at their dynamic offset instead of
@@ -216,7 +250,7 @@ def inner_kernel(
             r = metadata_ref.p_id_to_r_size[p_id, idx]
             start = jnp.where((r >= 1) & (r < last_row), r, last_row)
             # Windows starting at or past the input tile lie inside it.
-            picked = qkv_in_ref[idx, pl.ds(jnp.maximum(start - pk, 0), pk)]
+            picked = read_in_rows(idx, jnp.maximum(start - pk, 0), pk)
             picked = picked.astype(jnp.float32)
             for s in range(1, pk):
                 picked = jnp.where(start == s, qkv_in_compact[idx, s : s + pk], picked)
@@ -231,6 +265,8 @@ def inner_kernel(
         cfg=cfg,
         window_rows=window_rows,
     )
+    if lane_group_rows:
+        new_conv_state = new_conv_state.reshape(*new_conv_state.shape[:-2], 1, -1)
 
     if cfg.state_plan is None:
         conv_state_slot_ref[...] = new_conv_state
@@ -302,6 +338,10 @@ def inner_kernel(
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
     if cfg.use_recurrent:
+        if lane_group_rows:
+            qkv_out_compact = qkv_out_compact.reshape(
+                *qkv_out_compact.shape[:2], 1, -1
+            )
         recurrent_fn = (
             compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
         )

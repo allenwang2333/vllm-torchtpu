@@ -122,6 +122,18 @@ def store_lane_grouped_as_compact(compact_ref: jax.Ref, grouped: jax.Array) -> N
     compact_ref.reshape(-1, grouped.shape[-1])[...] = grouped
 
 
+def load_lane_grouped(compact_ref: jax.Ref) -> jax.Array:
+    """Loads a [..., 1, cols] ref as [..., cols / lanes, lanes] values.
+
+    Goes through a lane-preserving 2D view of the ref, so the values come out
+    in the native (sublane, lane) layout of that shape.
+    """
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    assert compact_ref.shape[-2] == 1
+    shape = (*compact_ref.shape[:-2], compact_ref.shape[-1] // num_lanes, num_lanes)
+    return compact_ref.reshape(-1, num_lanes)[...].reshape(shape)
+
+
 def widen_row_tiles_to_compact(
     tiles_ref: jax.Ref,
     stage_ref: jax.Ref,
@@ -155,22 +167,43 @@ def widen_row_tiles_to_compact(
     store_lane_grouped_as_compact(compact_ref, jnp.concatenate(rows, axis=0))
 
 
-def widen_row_tiles_as_compact(tiles_ref: jax.Ref, rows_ref: jax.Ref) -> None:
-    """Widens HBM row tiles into compact f32 rows, in row order.
+def widen_row_tiles_strided(
+    tiles_ref: jax.Ref, stage_ref: jax.Ref, tile_stride: int
+) -> None:
+    """Widens HBM row tiles into f32, tile by tile, `tile_stride` lane rows
+    apart.
 
     Args:
         tiles_ref: [groups, cols / lanes, tile_rows, lanes] row tiles.
-        rows_ref: [1, groups * tile_rows, 1, cols] f32; row `j` receives row
-            `j` of the tiles.
+        stage_ref: [groups * cols / lanes * tile_stride, lanes] f32; tile
+            (g, j) lands at row (g * cols / lanes + j) * tile_stride.
+        tile_stride: Lane rows from one staged tile to the next.
     """
-    groups, lane_groups, tile_rows, num_lanes = tiles_ref.shape
-    flat_ref = rows_ref.reshape(-1, num_lanes)
-    block = tile_rows * lane_groups
+    groups, lane_groups, tile_rows, _ = tiles_ref.shape
     for g in range(groups):
         tile = tiles_ref[g].astype(jnp.float32)
-        flat_ref[pl.ds(g * block, block), :] = jnp.swapaxes(tile, 0, 1).reshape(
-            block, num_lanes
-        )
+        for j in range(lane_groups):
+            row = (g * lane_groups + j) * tile_stride
+            stage_ref[pl.ds(row, tile_rows), :] = tile[j]
+
+
+def load_staged_rows(
+    stage_ref: jax.Ref,
+    first_row: jax.Array,
+    num_rows: int,
+    lane_groups: int,
+    tile_rows: int,
+    tile_stride: int,
+) -> jax.Array:
+    """Token rows [first_row, first_row + num_rows) of a stage written by
+    `widen_row_tiles_strided`, as [num_rows, cols / lanes, lanes] f32."""
+    group_stride = lane_groups * tile_stride
+    rows = []
+    for t in range(num_rows):
+        row = first_row + t
+        start = (row // tile_rows) * group_stride + row % tile_rows
+        rows.append(stage_ref[pl.ds(start, lane_groups, stride=tile_stride), :])
+    return jnp.stack(rows)
 
 
 def _region_rows_per_block(

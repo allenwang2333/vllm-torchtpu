@@ -44,8 +44,10 @@ def causal_conv1d(
 
     out_list = []
 
+    # One token row: [1, dim_size], or [dim_size / lanes, lanes].
+    row_shape = lhs.shape[2:]
     for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
+        out = jnp.zeros((cfg.seq_tile_size, *row_shape), jnp.float32)
 
         end_idx = c_idx + cfg.prev_kernel_size
         start_idx = 1 + end_idx - cfg.kernel_size
@@ -54,7 +56,7 @@ def causal_conv1d(
             out += lhs_curr * conv_weight[k : k + 1]
 
         if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
+            out += conv_bias.reshape(1, *row_shape)
 
         out_list.append(out)
 
