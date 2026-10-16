@@ -822,7 +822,7 @@ def test_the_all_to_all_takes_the_wire_dtype(rs_bf16, is_backbone, want, monkeyp
     monkeypatch.setattr(
         cp_mla,
         "merge_lse_partials_all_to_all",
-        lambda o, lse, g, send_dtype=None: seen.append(send_dtype) or o[:, :2],
+        lambda o, lse, g, send_dtype=None, **kw: seen.append(send_dtype) or o[:, :2],
     )
     outputs, lses = _partials(np.random.default_rng(21), 2, tokens=8, vdim=4)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _FakeGroup(outputs, lses, 0))
@@ -914,6 +914,9 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
         "TPU_DCP_MERGE_RS_BF16": 0,
+        # f32 reduce-scatter wire, the reference these checks compare against
+        # (#1808 narrows it to bf16 by default; test_rs_out_precision_* below).
+        "TPU_DCP_RS_OUT_PRECISION": False,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -946,7 +949,9 @@ def test_chunked_merge_is_bitwise_the_unchunked_merge(dcp_size, chunks, monkeypa
     calls = []
     real = cp_mla._merge_chunked
     monkeypatch.setattr(
-        cp_mla, "_merge_chunked", lambda *a: calls.append(a[-1]) or real(*a)
+        cp_mla,
+        "_merge_chunked",
+        lambda *a, **kw: calls.append(a[-1]) or real(*a, **kw),
     )
     today = _rs_merge_whole(outputs, lses, monkeypatch)
     assert calls == []
@@ -966,7 +971,7 @@ def test_positive_control_misaligned_chunk_weights_are_caught(monkeypatch):
     monkeypatch.setattr(
         cp_mla,
         "cp_lse_ag_out_rs",
-        lambda o, lse, g: real(o, torch.roll(lse, 1, dims=0), g),
+        lambda o, lse, g, **kw: real(o, torch.roll(lse, 1, dims=0), g, **kw),
     )
     outputs, lses = _hard_partials(np.random.default_rng(37), 4, tokens=32)
     got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=4)
@@ -1065,7 +1070,9 @@ def test_merge_chunks_per_bucket(
     )
     calls = []
     monkeypatch.setattr(
-        cp_mla, "_merge_chunked", lambda o, lse, g, n: calls.append(n) or o[:, :2]
+        cp_mla,
+        "_merge_chunked",
+        lambda o, lse, g, n, **kw: calls.append(n) or o[:, :2],
     )
     outputs, lses = _partials(np.random.default_rng(3), 2, tokens=tokens, vdim=4)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _FakeGroup(outputs, lses, 0))
@@ -1186,7 +1193,7 @@ def test_positive_control_wrong_weight_exceeds_the_bf16_bound(
     heavily (its own lse raised by log 1.25, the merged lse left alone)."""
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses, group):
+    def wrong(output, lse_f32, lses, group, rs_dtype=None):
         if group.rank_in_group == 1:
             lse_f32 = lse_f32 + math.log(1.25)
         return real(output, lse_f32, lses, group)
@@ -1540,3 +1547,30 @@ class SparseMlaLseTest(parameterized.TestCase):
             counts,
         )
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_rs_out_precision_chunked_merge_is_bitwise_the_unchunked_merge(
+    dcp_size, lse_ag, monkeypatch
+):
+    """With TPU_DCP_RS_OUT_PRECISION (#1808, bf16 reduce-scatter wire) the
+    chunked merge, with or without the collapsed lse gather, still matches the
+    unchunked merge bit for bit: every path narrows the same weighted terms."""
+    outputs, lses = _hard_partials(np.random.default_rng(53), dcp_size, tokens=32)
+    on = {"TPU_DCP_RS_OUT_PRECISION": True}
+    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag,
+        **on,
+    )
+    assert torch.equal(got.view(torch.int16), today.view(torch.int16))
+    if dcp_size > 2:
+        # Positive control: the bf16 wire is really on (differs from the f32
+        # wire). Two ranks' terms round to the same bits on this data.
+        f32 = _rs_merge_whole(outputs, lses, monkeypatch)
+        assert not torch.equal(today.view(torch.int16), f32.view(torch.int16))
