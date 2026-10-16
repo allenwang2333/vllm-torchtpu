@@ -1226,6 +1226,48 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
 
+@pytest.mark.parametrize(
+    "T_list, uniform_q_len",
+    [
+        ((1, 1, 1, 61, 64), None),
+        ((1, 1, 126), None),
+        ((40, 88), None),
+        ((7, 7, 7, 7, 100), 7),
+        ((7, 7, 114), 7),
+        ((7,) * 8 + (72,), 7),
+    ],
+    ids=[
+        "decodes+2mixed",
+        "decodes+1mixed",
+        "2mixed",
+        "4verify+100",
+        "2verify+114",
+        "8verify+72",
+    ],
+)
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_split_mixed_blocks_matches_unsplit(T_list, uniform_q_len, kv_layout):
+    """The mixed-block seam split selects exactly what one pass selects."""
+    page_size, H_I, D = 128, 4, 128
+    comp_ratio, bq_sz, bkv_p = 1, (1, 8, 8), (2, 2, 2)
+    S_list = tuple(256 + 128 * (i % 3) for i in range(len(T_list)))
+    k = 64
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, comp_ratio, bq_sz, bkv_p, kv_layout, None
+    )
+    if uniform_q_len is not None:
+        num_verify = sum(1 for t in T_list if t == uniform_q_len)
+        kwargs["distribution"] = (0, num_verify, len(T_list))
+        kwargs["uniform_q_len"] = uniform_q_len
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    expected = np.array(streamindex_topk(**kwargs))
+    hlo = streamindex_topk.lower(**kwargs, split_mixed_blocks=True).as_text()
+    assert "_scheduling_group_id" in hlo, "split_mixed_blocks did not split"
+    actual = np.array(streamindex_topk(**kwargs, split_mixed_blocks=True))
+    np.testing.assert_array_equal(actual, expected)
+
+
 class TestChunkedPipelining:
     """Chunking the token axis must not change which candidates are selected.
 

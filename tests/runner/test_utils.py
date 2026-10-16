@@ -213,6 +213,7 @@ def test_phased_profiler_handles_all_phases(profiler_fixture):
         InferencePhase.DECODE_ONLY,
         InferencePhase.DECODE_HEAVY,
         InferencePhase.BALANCED,
+        InferencePhase.AMBIGUOUS,
     ]
 
     for i, phase in enumerate(phases_to_profile):
