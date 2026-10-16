@@ -196,14 +196,36 @@ def load_staged_rows(
     tile_stride: int,
 ) -> jax.Array:
     """Token rows [first_row, first_row + num_rows) of a stage written by
-    `widen_row_tiles_strided`, as [num_rows, cols / lanes, lanes] f32."""
-    group_stride = lane_groups * tile_stride
-    rows = []
-    for t in range(num_rows):
-        row = first_row + t
-        start = (row // tile_rows) * group_stride + row % tile_rows
-        rows.append(stage_ref[pl.ds(start, lane_groups, stride=tile_stride), :])
-    return jnp.stack(rows)
+    `widen_row_tiles_strided`, as [num_rows, lane_groups, lanes] f32."""
+    return jnp.stack(
+        [
+            load_staged_row(
+                stage_ref,
+                first_row + t,
+                slice(0, lane_groups),
+                lane_groups,
+                tile_rows,
+                tile_stride,
+            )
+            for t in range(num_rows)
+        ]
+    )
+
+
+def load_staged_row(
+    stage_ref: jax.Ref,
+    row: jax.Array,
+    groups: slice,
+    lane_groups: int,
+    tile_rows: int,
+    tile_stride: int,
+) -> jax.Array:
+    """Lane groups `groups` of token row `row` of a stage written by
+    `widen_row_tiles_strided`, as [groups, lanes] f32: one strided load."""
+    start = (row // tile_rows) * (lane_groups * tile_stride) + row % tile_rows
+    start = start + groups.start * tile_stride
+    size = groups.stop - groups.start
+    return stage_ref[pl.ds(start, size, stride=tile_stride), :]
 
 
 def _region_rows_per_block(
@@ -472,7 +494,7 @@ def load_activation_as_compact(
 
 
 def load_activation_as_large(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
@@ -481,7 +503,8 @@ def load_activation_as_large(
     """Load activations from VMEM as a large layout.
 
     A 2D `qkv_vmem_ref` holds one sequence's token rows
-    `cfgs.qkv_row_stride` lane rows apart.
+    `cfgs.qkv_row_stride` lane rows apart; with `qkv_vreg` None they are
+    already there.
     """
 
     num_lanes = pltpu.get_tpu_info().num_lanes
@@ -491,7 +514,7 @@ def load_activation_as_large(
         assert cfgs.seq_tile_size == 1
         stride = cfgs.qkv_row_stride
         cols = cfgs.dim_size // num_lanes
-        for t in range(cfgs.chunk_size):
+        for t in range(0 if qkv_vreg is None else cfgs.chunk_size):
             qkv_vmem_ref[pl.ds(t * stride, cols), :] = qkv_vreg[0, t].reshape(
                 cols, num_lanes
             )

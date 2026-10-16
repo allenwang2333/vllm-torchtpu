@@ -245,9 +245,15 @@ def inner_kernel(
     conv_bias = None
     if weights_ref.conv.bias is not None:
         conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
+    # The conv's output rows go straight into the 2D qkv scratch the chunked
+    # step reads heads from (see GDNConfig.qkv_row_stride).
+    conv_to_scratch = lane_group_rows and not cfg.use_recurrent
     if lane_group_rows:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        qkv_in_compact = read_in_rows(0, 0, cfg.chunk_size)[None]
+        # Every row past the previous state comes from the stage; the conv
+        # to the scratch needs only the first ones as values (`window_rows`).
+        num_value_rows = cfg.prev_kernel_size if conv_to_scratch else cfg.chunk_size
+        qkv_in_compact = read_in_rows(0, 0, num_value_rows)[None]
         # Reloaded rather than reshaped: a value reshape picks a row layout
         # that the conv would inherit.
         carry_conv_scratch_ref[...] = prev_conv
@@ -276,14 +282,45 @@ def inner_kernel(
             rows.append(picked)
         return jnp.stack(rows)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
-        window_rows=window_rows,
-    )
+    if conv_to_scratch:
+        pk = cfg.prev_kernel_size
+
+        def load_block(r: int, blk: slice) -> jax.Array:
+            if r < pk:
+                return prev_conv[0, r, blk]
+            return vmem_ldst.load_staged_row(
+                qkv_stage_scratch_ref,
+                row_in_tile + (r - pk),
+                blk,
+                lane_groups,
+                config.QKV_TILE_ROWS,
+                tile_stride,
+            )
+
+        def store_block(t: int, blk: slice, out: jax.Array) -> None:
+            rows = pl.ds(t * cfg.qkv_row_stride + blk.start, blk.stop - blk.start)
+            qkv_scratch_ref[rows, :] = jax.nn.silu(out)
+
+        compute_conv1d.causal_conv1d_blocks(
+            load_block,
+            conv_weight,
+            conv_bias,
+            store_block,
+            cfg,
+            block_size=pltpu.get_tpu_info().num_sublanes,
+        )
+        qkv_out_compact = None
+        # The final checkpoint, as `causal_conv1d` builds it.
+        new_conv_state = window_rows(cfg.chunk_size)[:, None]
+    else:
+        qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=qkv_in_compact,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+            window_rows=window_rows,
+        )
     if lane_group_rows:
         new_conv_state = new_conv_state.reshape(*new_conv_state.shape[:-2], 1, -1)
 
@@ -313,7 +350,8 @@ def inner_kernel(
         carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
     # Apply activation function.
-    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+    if not conv_to_scratch:
+        qkv_out_compact = jax.nn.silu(qkv_out_compact)
     if cfg.is_kda and cfg.window_size > 1:
         # The one-token K3 decode kernel stores the post-SiLU activation in
         # the model activation dtype before promoting it for the recurrent

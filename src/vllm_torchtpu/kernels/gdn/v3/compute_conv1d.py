@@ -87,3 +87,37 @@ def causal_conv1d(
         state_list.append(new_conv_state)
 
     return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
+
+
+def causal_conv1d_blocks(
+    load_block: Callable[[int, slice], jax.Array],
+    conv_weight: jax.Array,  # [kernel_size, groups, lanes]
+    conv_bias: jax.Array | None,  # [groups, lanes]
+    store_block: Callable[[int, slice, jax.Array], None],
+    cfg: config.GDNConfig,
+    block_size: int,
+) -> None:
+    """`causal_conv1d`'s output rows for one sequence, one block of lane
+    groups at a time.
+
+    Rows are [groups, lanes]. `load_block(r, blk)` returns lane groups `blk`
+    of input row r, rows [0, prev_kernel_size) being the previous conv
+    state, and `store_block(t, blk, out)` takes output row t's. Every output
+    element goes through the same operations as in `causal_conv1d`; walking
+    the blocks outermost keeps a block's taps and its window of input rows
+    in registers.
+    """
+    groups = conv_weight.shape[1]
+    for b0 in range(0, groups, block_size):
+        blk = slice(b0, min(b0 + block_size, groups))
+        taps = [conv_weight[k, blk] for k in range(cfg.kernel_size)]
+        window = [load_block(r, blk) for r in range(cfg.prev_kernel_size)]
+        for c_idx in range(cfg.chunk_size):
+            window.append(load_block(c_idx + cfg.prev_kernel_size, blk))
+            out = jnp.zeros(window[0].shape, jnp.float32)
+            for k in range(cfg.kernel_size):
+                out += window[k] * taps[k]
+            if conv_bias is not None:
+                out += conv_bias[blk]
+            store_block(c_idx, blk, out)
+            window.pop(0)
