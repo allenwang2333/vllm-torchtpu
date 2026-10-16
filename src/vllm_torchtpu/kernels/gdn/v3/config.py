@@ -134,9 +134,9 @@ class GDNConfig:
     # qkv arrives in the activation dtype as its HBM row tiles (see
     # QKV_TILE_ROWS) and is widened to the compact f32 layout in VMEM.
     qkv_row_tiled: bool = False
-    # This launch creates the output and zeroes its rows from
-    # `MetadataRef.out_zero_row` on; the rows before it are all computed by
-    # this launch or the PER_SEQ one that follows.
+    # The BATCHED launch creates the output; this launch zeroes its rows from
+    # `MetadataRef.out_zero_row` on (none when that is the buffer's end). The
+    # rows before it are all computed by the BATCHED or the PER_SEQ launch.
     zero_out_tail: bool = False
 
     @property

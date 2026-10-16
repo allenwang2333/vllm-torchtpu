@@ -90,8 +90,8 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
-    # Scalar first output row that no launch computes; set only for a
-    # `GDNConfig.zero_out_tail` launch, which zeroes the rows from it on.
+    # Scalar first output row a `GDNConfig.zero_out_tail` launch zeroes; the
+    # buffer's row count when that launch leaves the tail to the other one.
     out_zero_row: Any = None
 
     @classmethod

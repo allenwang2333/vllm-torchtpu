@@ -785,6 +785,19 @@ def fused_conv1d_gdn(
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
 
+    def out_zero_row(zero_out_tail: bool, mode: config.GDNMode) -> jax.Array | None:
+        # The DMAs are hidden behind the launch with real work: BATCHED on
+        # decode-only steps, PER_SEQ once a prefill is present. The other
+        # launch gets the buffer's end, so it starts no copy.
+        if not zero_out_tail:
+            return None
+        has_prefill = distribution[-1] > distribution[0]
+        if mode == config.GDNMode.BATCHED:
+            has_prefill = ~has_prefill
+        return jnp.where(
+            has_prefill, query_start_loc[distribution[-1]], padded_batch_size
+        )
+
     def call_kernel(
         in_conv_state: jax.Array,
         in_recurrent_state: jax.Array | None,
@@ -802,14 +815,9 @@ def fused_conv1d_gdn(
             window_size = num_spec_tokens + 1
 
         # With both launches, every row up to the last real token is
-        # computed by one of them, so the creating launch zeroes only the
-        # rest instead of the whole buffer being zero-filled first.
-        zero_out_tail = (
-            mode == config.GDNMode.BATCHED
-            and in_act is None
-            and zero_initialize_out
-            and not batched_only
-        )
+        # computed by one of them, so the rest is zeroed by DMAs inside a
+        # launch instead of the whole buffer being zero-filled first.
+        zero_out_tail = zero_initialize_out and not (batched_only or prefill_only)
 
         cfg = config.GDNConfig(
             mode=mode,
@@ -849,9 +857,7 @@ def fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 ckpt_indices=ckpt_indices,
-                out_zero_row=(
-                    query_start_loc[distribution[-1]] if zero_out_tail else None
-                ),
+                out_zero_row=out_zero_row(zero_out_tail, mode),
             )
         else:
             metadata_obj = metadata.compute_per_seq_metadata(
@@ -863,6 +869,7 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                out_zero_row=out_zero_row(zero_out_tail, mode),
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)

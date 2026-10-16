@@ -74,6 +74,7 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    out_zero_row: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile.
 
@@ -160,4 +161,5 @@ def compute_per_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        out_zero_row=out_zero_row,
     )
