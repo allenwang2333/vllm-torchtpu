@@ -613,6 +613,18 @@ def prepare_step_metadata(
     return pos_b, pt_b, ckpt_b, roff_b
 
 
+def _pcp_or_dcp_enabled(runner: Any) -> bool:
+    if getattr(runner, "_pcp_enabled", False) or getattr(runner, "_dcp_enabled", False):
+        return True
+    p_cfg = getattr(runner, "parallel_config", None)
+    if p_cfg is not None:
+        if int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1:
+            return True
+        if int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1:
+            return True
+    return False
+
+
 class MegakernelDriver:
     """End-to-end Qwen3.5 megakernel driver for `TPUModelRunner`."""
 
@@ -628,6 +640,7 @@ class MegakernelDriver:
         buckets: Sequence[int] = _DEFAULT_BUCKETS,
         verify_buckets: Sequence[int] = _DEFAULT_VERIFY_BUCKETS,
         reshard_ep_to_tp: bool = False,
+        expert_placement: Any = None,
         ab: bool | None = None,
         stats_period_s: float | None = None,
         compile_hlo_check: bool | None = None,
@@ -698,9 +711,23 @@ class MegakernelDriver:
                     prebuild_moe_fn=prebuild_fused_moe_kernel,
                 )
 
+        if expert_placement is None:
+            try:
+                from vllm_torchtpu import (
+                    expert_placement as _ep_mod,  # type: ignore[attr-defined]
+                )
+
+                expert_placement = _ep_mod
+            except ImportError:
+                expert_placement = None
+
         t0 = time.perf_counter()
         self.weights = pack_weights(
-            self.backbone, g=self.geom, ex=self.base_exec, tp_rank=self.tp_rank
+            self.backbone,
+            g=self.geom,
+            ex=self.base_exec,
+            tp_rank=self.tp_rank,
+            expert_placement=expert_placement,
         )
         self.w_flat: list[torch.Tensor] = self.weights["w_flat"]
         logger.info(
@@ -726,6 +753,7 @@ class MegakernelDriver:
         self._bound = False
         self._hlo_checked_t: set[int] = set()
         self._torchtpu_ir_checked: bool = False
+        self._torchtpu_ir_error: str | None = None
         self._prepared_step: tuple[Any, ...] | None = None
         self._step_mix: dict[str, int] = {}
         self._step_mix_t0: float = time.monotonic()
@@ -760,6 +788,14 @@ class MegakernelDriver:
                 "(_unified_kv_layout=True); skipping."
             )
             return None
+        if getattr(runner, "supports_mm_inputs", False):
+            logger.warning(
+                "Qwen3.5 megakernel requires text-only input_ids "
+                "(runner.supports_mm_inputs=True passes inputs_embeds; "
+                'pass --limit-mm-per-prompt \'{"image":0,"video":0}\' for '
+                "text-only serving); skipping."
+            )
+            return None
         if getattr(runner, "lora_config", None) is not None:
             logger.warning(
                 "Qwen3.5 megakernel does not support LoRA adapters; skipping."
@@ -770,6 +806,12 @@ class MegakernelDriver:
         ):
             logger.warning(
                 "Qwen3.5 megakernel requires single-stage pipeline (PP=1); skipping."
+            )
+            return None
+        if _pcp_or_dcp_enabled(runner):
+            logger.warning(
+                "Qwen3.5 megakernel does not support prefill/decode context "
+                "parallelism (PCP/DCP); skipping."
             )
             return None
         dp_lockstep_fn = getattr(runner, "_dp_lockstep_enabled", None)
@@ -846,6 +888,9 @@ class MegakernelDriver:
 
         _need(len(pools) == natt, f"expected {natt} pools, got {len(pools)}")
         num_pages = int(pools[0].shape[0])
+        kvh_expected = max(1, self.geom.NKV // self.base_exec.R)
+        hd4_expected = self.geom.HD // 4
+        expected_shape = (num_pages, 2 * kvh_expected, hd4_expected, 4, 128)
         for r, pool in enumerate(pools):
             _need(
                 isinstance(pool, torch.Tensor) and pool.dtype == torch.float8_e4m3fn,
@@ -856,8 +901,8 @@ class MegakernelDriver:
                 f"pool[{r}] has non-zero storage_offset={pool.storage_offset()}",
             )
             _need(
-                tuple(pool.shape) == (num_pages, 2, 64, 4, 128),
-                f"pool[{r}] shape {tuple(pool.shape)} != ({num_pages}, 2, 64, 4, 128)",
+                tuple(pool.shape) == expected_shape,
+                f"pool[{r}] shape {tuple(pool.shape)} != {expected_shape}",
             )
             for g_idx in range(g_per_att):
                 la_layer = self.backbone.layers[self.geom.att_every * r + g_idx]
@@ -1061,32 +1106,13 @@ class MegakernelDriver:
             return hid_out
 
         if is_tpu:
-            num_pages = self.num_pages
-            page_size = self.page_size
-            kvh = max(1, int(self.raw_pools[0].shape[3]) // 4)
-            hd = self.geom.HD
-            natt = self.geom.NATT
 
             def _on_torchtpu_compile(debug: Any) -> None:
-                fwd_texts = getattr(debug, "stablehlo_forward_text", None) or ()
-                if not fwd_texts:
-                    return
-                ir_text = "\n".join(fwd_texts)
-                ok_ir, reason_ir = verify_torchtpu_compiled_step_ir(
-                    ir_text,
-                    num_pages=num_pages,
-                    page_size=page_size,
-                    kvh=kvh,
-                    hd=hd,
-                    num_pools=natt,
+                self._verify_torchtpu_compile_debug(
+                    debug,
+                    tokens_per_seq=tokens_per_seq,
+                    bucket_t=bucket_t,
                 )
-                if not ok_ir:
-                    raise RuntimeError(
-                        "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
-                        f"check failed for (T={tokens_per_seq}, B={bucket_t}): "
-                        f"{reason_ir}"
-                    )
-                self._torchtpu_ir_checked = True
 
             compile_opts: dict[str, Any] = {"debug_callback": _on_torchtpu_compile}
             if not self._torchtpu_ir_checked:
@@ -1099,6 +1125,84 @@ class MegakernelDriver:
                 options=compile_opts,
             )
         return _step_impl
+
+    def _verify_torchtpu_compile_debug(
+        self,
+        debug: Any,
+        *,
+        tokens_per_seq: int,
+        bucket_t: int,
+    ) -> None:
+        """Validate `TpuCompileDebug` pre-XLA StableHLO and post-XLA HLO."""
+        fwd_texts = getattr(debug, "stablehlo_forward_text", None) or ()
+        if not fwd_texts or not any(str(t).strip() for t in fwd_texts):
+            msg = (
+                "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
+                f"check failed for (T={tokens_per_seq}, B={bucket_t}): "
+                "empty stablehlo_forward_text"
+            )
+            self._torchtpu_ir_error = msg
+            raise RuntimeError(msg)
+
+        ir_text = "\n".join(str(t) for t in fwd_texts)
+        hlo_parts: list[str] = []
+        for attr in ("hlo_text", "optimized_hlo_text", "post_xla_hlo_text"):
+            val = getattr(debug, attr, None)
+            if isinstance(val, str) and val.strip():
+                hlo_parts.append(val)
+            elif isinstance(val, (list, tuple)):
+                hlo_parts.extend(str(x) for x in val if str(x).strip())
+        for exe in getattr(debug, "compiled_executables", None) or ():
+            if exe is None:
+                continue
+            for method_name in ("as_text", "hlo_text"):
+                fn = getattr(exe, method_name, None)
+                if callable(fn):
+                    try:
+                        txt = fn()
+                    except Exception:
+                        txt = None
+                    if isinstance(txt, str) and txt.strip():
+                        hlo_parts.append(txt)
+                elif isinstance(fn, str) and fn.strip():
+                    hlo_parts.append(fn)
+            for mod_fn_name in ("hlo_modules", "get_hlo_modules"):
+                mod_fn = getattr(exe, mod_fn_name, None)
+                if callable(mod_fn):
+                    try:
+                        mods = mod_fn() or ()
+                    except Exception:
+                        mods = ()
+                    for m in mods:
+                        to_str = getattr(m, "to_string", None)
+                        if callable(to_str):
+                            try:
+                                s = to_str()
+                            except Exception:
+                                s = None
+                            if isinstance(s, str) and s.strip():
+                                hlo_parts.append(s)
+
+        hlo_text = "\n".join(hlo_parts) if hlo_parts else None
+        kvh = max(1, int(self.raw_pools[0].shape[1]) // 2)
+        ok_ir, reason_ir = verify_torchtpu_compiled_step_ir(
+            ir_text,
+            num_pages=self.num_pages,
+            page_size=self.page_size,
+            kvh=kvh,
+            hd=self.geom.HD,
+            num_pools=self.geom.NATT,
+            hlo_text=hlo_text,
+        )
+        if not ok_ir:
+            msg = (
+                "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
+                f"check failed for (T={tokens_per_seq}, B={bucket_t}): "
+                f"{reason_ir}"
+            )
+            self._torchtpu_ir_error = msg
+            raise RuntimeError(msg)
+        self._torchtpu_ir_checked = True
 
     def reset_stats(self) -> None:
         """Reset step-mix counters and A/B latency accumulators."""
@@ -1194,6 +1298,11 @@ class MegakernelDriver:
                             c0_b, c1_b, c2_b = s0_b, s1_b, s2_b
                         r_call = r_raw
 
+                        # Note: on TPU, the warmup sentinel writes to page 0 (vLLM's
+                        # reserved null KV page) and GDN block 1 (pages 5..9, which are
+                        # unallocated at warmup time and overwritten when block 1 is
+                        # later allocated) without restoring them, avoiding slice-writes
+                        # (`as_strided_copy_inverse`) on the 2.30 GiB pools.
                         do_sentinel = not sentinel_checked and self.num_pages >= 5 * (
                             T + 1
                         )
@@ -1262,6 +1371,14 @@ class MegakernelDriver:
                                         f"failed on pool[{idx}] "
                                         f"(kv_ok={kv_ok}, gdn_ok={gdn_ok})"
                                     )
+            if dev.type == "tpu" and not is_eager:
+                if self._torchtpu_ir_error is not None:
+                    raise RuntimeError(self._torchtpu_ir_error)
+                if not self._torchtpu_ir_checked:
+                    raise RuntimeError(
+                        "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
+                        "check did not run during warmup"
+                    )
             self.reset_stats()
         finally:
             if saved_page0 is not None:
@@ -1272,13 +1389,22 @@ class MegakernelDriver:
         """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets."""
         precompile_timed = getattr(runner, "_precompile_timed", None)
         eager_only = bool(getattr(runner, "enforce_eager", False))
-        if callable(precompile_timed):
-            with precompile_timed("megakernel"):
+        try:
+            if callable(precompile_timed):
+                with precompile_timed("megakernel"):
+                    self.bind_caches(runner)
+                    self.warmup(runner, eager_only=eager_only)
+            else:
                 self.bind_caches(runner)
                 self.warmup(runner, eager_only=eager_only)
-        else:
-            self.bind_caches(runner)
-            self.warmup(runner, eager_only=eager_only)
+        except ValueError as exc:
+            logger.warning(
+                "Disabling Qwen3.5 megakernel due to incompatible KV cache layout: %s",
+                exc,
+            )
+            self._bound = False
+            if runner is not None and hasattr(runner, "_megakernel"):
+                runner._megakernel = None
 
     @staticmethod
     def _check_qsl_uniform(qsl_host: Any, num_reqs: int) -> tuple[bool, int, int, str]:
@@ -1318,7 +1444,6 @@ class MegakernelDriver:
             )
             comb_key = getattr(runner, "_cached_comb_key", None)
             comb_cpu: Any = getattr(runner, "_combined_request_distribution_cpu", None)
-            req_dist_cpu: Any = getattr(runner, "_request_distribution_cpu", None)
             if has_runner_roff and isinstance(comb_key, tuple) and len(comb_key) == 3:
                 _, num_windowed, dist_reqs = (
                     int(comb_key[0]),
@@ -1355,30 +1480,17 @@ class MegakernelDriver:
                         0,
                         "stock_prefill" if num_windowed == 0 else "stock_mixed",
                     )
-            elif (
-                not has_runner_roff
-                and req_dist_cpu is not None
-                and isinstance(req_dist_cpu, torch.Tensor)
-                and req_dist_cpu.numel() >= 3
-                and int(req_dist_cpu[2].item()) > 0
-            ):
-                num_decode = int(req_dist_cpu[0].item())
-                dist_reqs = int(req_dist_cpu[2].item())
-                if num_reqs is None:
-                    num_reqs = dist_reqs
-                if num_decode != dist_reqs:
-                    return (
-                        False,
-                        num_reqs,
-                        0,
-                        "stock_prefill" if num_decode == 0 else "stock_mixed",
-                    )
 
             qsl_host = getattr(runner, "query_start_loc_np", None)
             if qsl_host is None:
                 qsl_host = getattr(runner, "query_start_loc_cpu", None)
             if qsl_host is not None and num_reqs is not None:
-                return cls._check_qsl_uniform(qsl_host, num_reqs)
+                ok_qsl, n_qsl, t_qsl, reason_qsl = cls._check_qsl_uniform(
+                    qsl_host, num_reqs
+                )
+                if ok_qsl and not has_runner_roff and t_qsl != 1:
+                    return False, n_qsl, 0, "stock_prefill"
+                return ok_qsl, n_qsl, t_qsl, reason_qsl
 
         # Fallback for unit tests passing CPU metadata without a full runner instance.
         # Never read device tensors on TPU; fail closed if host/CPU qsl is absent.
@@ -1456,19 +1568,19 @@ class MegakernelDriver:
             return False
         if runner is not None:
             bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
-            if (
-                getattr(runner, "_in_dummy_run", False)
-                or getattr(runner, "_in_precompile_backbone", False)
-                or getattr(bctx, "position_ids_override", None) is not None
-            ):
+            if getattr(bctx, "position_ids_override", None) is not None:
                 return False
             if not getattr(runner, "_unified_kv_layout", True):
+                return False
+            if getattr(runner, "supports_mm_inputs", False):
                 return False
             if getattr(runner, "lora_config", None) is not None:
                 return False
             if not getattr(runner, "_pp_is_first", True) or not getattr(
                 runner, "_pp_is_last", True
             ):
+                return False
+            if _pcp_or_dcp_enabled(runner):
                 return False
             dp_lockstep_fn = getattr(runner, "_dp_lockstep_enabled", None)
             if callable(dp_lockstep_fn) and dp_lockstep_fn():

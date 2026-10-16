@@ -560,6 +560,100 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     driver.bind_caches(runner_ok)
     assert driver._bound
 
+    # `bind_and_warmup` falls back gracefully to stock if `bind_caches` fails
+    # (e.g. non-zero `storage_offset` from a sliced pool), disabling `_megakernel`
+    # instead of aborting startup.
+    sliced_pool = raw_pools_t[0][1:]
+    assert sliced_pool.storage_offset() > 0
+    backbone.layers[3].self_attn.attn.kv_cache = [sliced_pool]
+    runner_fallback = SimpleNamespace(
+        model=model, _unified_kv_layout=True, _megakernel=driver
+    )
+    driver.bind_and_warmup(runner_fallback)
+    assert not driver._bound
+    assert runner_fallback._megakernel is None
+
+    # Restore valid pool and verify `_verify_torchtpu_compile_debug` fails closed
+    backbone.layers[3].self_attn.attn.kv_cache = [raw_pools_t[0]]
+    driver.bind_caches(runner_ok)
+    with pytest.raises(RuntimeError, match="empty stablehlo_forward_text"):
+        driver._verify_torchtpu_compile_debug(
+            SimpleNamespace(stablehlo_forward_text=[]),
+            tokens_per_seq=1,
+            bucket_t=2,
+        )
+    assert driver._torchtpu_ir_error is not None
+    assert not driver._torchtpu_ir_checked
+
+    driver._torchtpu_ir_error = None
+    inlined_only_ir = (
+        "module @jit_step {\n"
+        "  func.func public @main(\n"
+        "    %arg0: tensor<96x2x64x4x128xf8E4M3FN>\n"
+        "  ) -> (tensor<16x256xbf16>, tensor<96x2x64x4x128xf8E4M3FN>) {\n"
+        "    %0:2 = stablehlo.custom_call @tpu_custom_call(%arg0) : "
+        "(tensor<96x2x64x4x128xf8E4M3FN>) -> "
+        "(tensor<16x256xbf16>, tensor<96x2x64x4x128xf8E4M3FN>)\n"
+        "    return %0#0, %0#1 : tensor<16x256xbf16>, "
+        "tensor<96x2x64x4x128xf8E4M3FN>\n"
+        "  }\n"
+        "  func.func private @sub("
+        "%p0: tensor<96x2x64x4x128xf8E4M3FN> {tf.aliasing_output = 1 : i32}"
+        ") -> tensor<96x2x64x4x128xf8E4M3FN> {\n"
+        "    return %p0 : tensor<96x2x64x4x128xf8E4M3FN>\n"
+        "  }\n"
+        "}\n"
+    )
+    with pytest.raises(RuntimeError, match="expected >= 1 donated pool arguments"):
+        driver._verify_torchtpu_compile_debug(
+            SimpleNamespace(stablehlo_forward_text=[inlined_only_ir]),
+            tokens_per_seq=1,
+            bucket_t=2,
+        )
+    assert not driver._torchtpu_ir_checked
+
+    valid_donor_ir = inlined_only_ir.replace(
+        "%arg0: tensor<96x2x64x4x128xf8E4M3FN>",
+        "%arg0: tensor<96x2x64x4x128xf8E4M3FN> {jax.buffer_donor = true}",
+    )
+    fake_exe_bad = SimpleNamespace(
+        hlo_text=lambda: (
+            "HloModule jit_step, input_output_alias={ {1}: (0, {}, may-alias) }\n"
+            "ENTRY %main {\n"
+            "  %copy.99 = f8e4m3fn[96,2,64,4,128] copy(f8e4m3fn[96,2,64,4,128] %p0)\n"
+            "}\n"
+        )
+    )
+    with pytest.raises(RuntimeError, match="full-pool copy"):
+        driver._verify_torchtpu_compile_debug(
+            SimpleNamespace(
+                stablehlo_forward_text=[valid_donor_ir],
+                compiled_executables=[fake_exe_bad],
+            ),
+            tokens_per_seq=1,
+            bucket_t=2,
+        )
+
+    driver._torchtpu_ir_error = None
+    fake_exe_ok = SimpleNamespace(
+        hlo_text=lambda: (
+            "HloModule jit_step, input_output_alias={ {1}: (0, {}, may-alias) }\n"
+            "ENTRY %main {\n"
+            "  %cc = (bf16[16,256], f8e4m3fn[96,2,64,4,128]) custom-call(%p0), "
+            'custom_call_target="tpu_custom_call"\n'
+            "}\n"
+        )
+    )
+    driver._verify_torchtpu_compile_debug(
+        SimpleNamespace(
+            stablehlo_forward_text=[valid_donor_ir],
+            compiled_executables=[fake_exe_ok],
+        ),
+        tokens_per_seq=1,
+        bucket_t=2,
+    )
+    assert driver._torchtpu_ir_checked
+
 
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify `can_run` against real `TPUModelRunner` and `AttentionMetadata` fields."""
@@ -590,11 +684,17 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
         max_num_blocks_per_req=2,
         num_tokens_paddings=[2, 4, 8],
         _unified_kv_layout=True,
+        supports_mm_inputs=False,
         lora_config=None,
         _pp_is_first=True,
         _pp_is_last=True,
+        _pcp_enabled=False,
+        _dcp_enabled=False,
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
         _dp_lockstep_enabled=lambda: False,
-        _in_dummy_run=False,
         _attn_metadata_builder_ctx=SimpleNamespace(num_reqs=2),
         _request_distribution_cpu=req_dist_cpu,
         _combined_request_distribution_cpu=comb_dist_cpu,
@@ -633,6 +733,8 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
 
     ids_2 = torch.zeros((2,), dtype=torch.int32)
     pos_2 = torch.zeros((2,), dtype=torch.int32)
+    ids_4 = torch.zeros((4,), dtype=torch.int32)
+    pos_4 = torch.zeros((4,), dtype=torch.int32)
     ids_8 = torch.zeros((8,), dtype=torch.int32)
     pos_8 = torch.zeros((8,), dtype=torch.int32)
 
@@ -644,21 +746,27 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert driver._prepared_step is not None
     assert driver._prepared_step[5:8] == (2, 1, 2)
 
-    # 2. Single-request prefill (1 req, 8 tokens) with mamba_state_indices -> False
+    # 2. Single-request prefill (1 req, 8 tokens or 4 tokens in non-spec mode) -> False
     runner._attn_metadata_builder_ctx.num_reqs = 1
     req_dist_cpu.copy_(torch.tensor([0, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 8]
     assert not driver.can_run(ids_8, pos_8, runner=runner)
-    req_dist_cpu.copy_(torch.tensor([1, 1, 1], dtype=torch.int32))
-    assert not driver.can_run(ids_8, pos_8, runner=runner)
+    qsl_np[:2] = [0, 4]
+    assert not driver.can_run(ids_4, pos_4, runner=runner)
 
-    # 3. Mixed decode + prefill (2 reqs, [1, 7] tokens) -> False
+    # 3. Mixed decode + prefill (2 reqs, [1, 7] tokens) -> False, followed by pure
+    #    decode at the same concurrency where `_request_distribution_cpu` remains
+    #    stale (`[1, 2, 2]`) on a decode-metadata cache hit -> must still run MK!
     runner._attn_metadata_builder_ctx.num_reqs = 2
     req_dist_cpu.copy_(torch.tensor([1, 2, 2], dtype=torch.int32))
     qsl_np[:3] = [0, 1, 8]
     assert not driver.can_run(ids_8, pos_8, runner=runner)
-    req_dist_cpu.copy_(torch.tensor([2, 2, 2], dtype=torch.int32))
-    assert not driver.can_run(ids_8, pos_8, runner=runner)
+    # Subsequent pure-decode step hits decode metadata cache: `req_dist_cpu` stays
+    # `[1, 2, 2]`, while `qsl_np[:3]` is updated to `[0, 1, 2]`.
+    qsl_np[:3] = [0, 1, 2]
+    assert driver.can_run(ids_2, pos_2, runner=runner)
+    assert driver._prepared_step is not None
+    assert driver._prepared_step[5:8] == (2, 1, 2)
 
     # 4. Spec decode enabled (`mamba_slot_read_offsets` present, 4-col ckpt):
     #    4a. Uniform T=4 verify (1 req, 4 tokens) -> True (mk_t4_b4)
@@ -669,8 +777,6 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     runner._attn_metadata_builder_ctx.num_reqs = 1
     comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 4]
-    ids_4 = torch.zeros((4,), dtype=torch.int32)
-    pos_4 = torch.zeros((4,), dtype=torch.int32)
     assert driver.can_run(ids_4, pos_4, runner=runner)
     assert driver._prepared_step is not None
     assert driver._prepared_step[5:8] == (1, 4, 4)
@@ -700,18 +806,13 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     qsl_np[:3] = [0, 1, 2]
     assert driver.can_run(ids_2, pos_2, runner=runner)
 
-    # 6. Dummy runs (`bctx.position_ids_override is not None` or `_in_dummy_run=True`)
-    #    gate off MK without needing runner-side flags in `_dummy_run`
+    # 6. Dummy runs (`bctx.position_ids_override is not None`) gate off MK
     runner._attn_metadata_builder_ctx.position_ids_override = pos_2
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     hit_dummy, out_dummy = driver.try_forward(runner, ids_2, pos_2)
     assert not hit_dummy and out_dummy is None
     runner._attn_metadata_builder_ctx.position_ids_override = None
     assert driver.can_run(ids_2, pos_2, runner=runner)
-
-    runner._in_dummy_run = True
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner._in_dummy_run = False
 
     # 7. mrope 2D positions `(3, tok_pad)`: rejected when rows differ, accepted when ==
     pos_mrope_diff = torch.tensor([[5, 9], [5, 10], [5, 9]], dtype=torch.int32)
@@ -724,6 +825,10 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     runner._unified_kv_layout = True
 
+    runner.supports_mm_inputs = True
+    assert not driver.can_run(ids_2, pos_2, runner=runner)
+    runner.supports_mm_inputs = False
+
     runner.lora_config = object()
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     runner.lora_config = None
@@ -731,6 +836,14 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     runner._pp_is_last = False
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     runner._pp_is_last = True
+
+    runner._pcp_enabled = True
+    assert not driver.can_run(ids_2, pos_2, runner=runner)
+    runner._pcp_enabled = False
+
+    runner.parallel_config.decode_context_parallel_size = 2
+    assert not driver.can_run(ids_2, pos_2, runner=runner)
+    runner.parallel_config.decode_context_parallel_size = 1
 
     runner._dp_lockstep_enabled = lambda: True
     assert not driver.can_run(ids_2, pos_2, runner=runner)
@@ -740,7 +853,9 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert not driver.can_run(ids_2, pos_2, runner=runner)
     backbone.aux_hidden_state_layers = ()
 
-    # 9. `megakernel_runtime.maybe_create` model-architecture registry check
+    # 9. `megakernel_runtime.maybe_create` registry and lazy fast-path
+    import vllm_torchtpu.megakernel_runtime as mk_rt
+
     non_qwen_runner = SimpleNamespace(
         model=SimpleNamespace(),
         model_config=SimpleNamespace(
@@ -750,6 +865,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
         ),
     )
     assert driver_mod.maybe_create(non_qwen_runner) is None
+    assert mk_rt.maybe_create(non_qwen_runner) is None
 
 
 def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
