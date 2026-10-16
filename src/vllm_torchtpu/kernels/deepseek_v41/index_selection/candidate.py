@@ -23,6 +23,8 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode, tuned_blo
 # NOMASK: drop the membership/causal mask (wrong results; VPU-cost probe only).
 _SKIP_EMPTY_TILES = os.environ.get("TPU_DSV41_CAND_SKIP", "0") == "1"
 _NO_MASK = os.environ.get("TPU_DSV41_CAND_NOMASK", "0") == "1"
+# TILE: key_tile override for candidate_indexer (default 4096).
+_KEY_TILE = int(os.environ.get("TPU_DSV41_CAND_TILE", "0"))
 
 
 class UnionMetadata(NamedTuple):
@@ -307,6 +309,8 @@ def candidate_indexer(
     """Pipeline whole-request score groups and SC selection over a reusable union."""
     requests, queries = q.shape[:2]
     width = ids.shape[1] * block_size
+    if _KEY_TILE:
+        key_tile = _KEY_TILE
     if request_tile is None:
         request_tile = tuned_block_sizes.get_candidate_request_tile(
             tuned_block_sizes.CandidateTuningKey(

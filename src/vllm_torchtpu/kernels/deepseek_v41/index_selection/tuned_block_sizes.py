@@ -77,6 +77,8 @@ CANDIDATE_REQUEST_TILES: dict[CandidateTuningKey, int] = {
     CandidateTuningKey("TPU7x", 48, 6, 32, 40960, 4096, 512): 48,
     # Captured C384 candidates, synthetic Q/weights/pages, seeds 825/826.
     CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 4096, 512): 48,
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512): 48,
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 16384, 512): 48,
 }
 # 40K overflowed in 12/48 profiled rank-steps. The 48K bucket covers the
 # captured maximum of 5138 blocks with headroom, at 576 MiB per 48 requests.
