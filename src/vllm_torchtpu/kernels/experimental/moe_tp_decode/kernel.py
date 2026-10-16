@@ -427,9 +427,7 @@ def _kernel(
                 w1_ref[slot, k : k + _Q_BLOCK, :],
                 preferred_element_type=jnp.float32,
             ).astype(jnp.bfloat16)
-            part *= jnp.concatenate(
-                [xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1
-            )
+            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1)
             part *= w_scale
             acc += part
         return acc

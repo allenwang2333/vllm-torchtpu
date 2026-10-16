@@ -93,7 +93,9 @@ class TpuRMSNorm(RMSNorm):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._min_rows = max(envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, kernel.DEFAULT_BLOCK_ROWS)
+        self._min_rows = max(
+            envs.TPU_FUSED_ADD_RMSNORM_MIN_TOKENS, kernel.DEFAULT_BLOCK_ROWS
+        )
         self._pallas_ok = (
             self.has_weight
             and self.variance_size_override is None

@@ -29,12 +29,12 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.flash_attention.kernel import flash_attention
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
     update_sparse_mla_kv_cache,
     update_sparse_mla_kv_cache_dcp,
 )
+from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger

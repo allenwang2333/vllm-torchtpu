@@ -41,10 +41,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
-    ragged_gather_reduce_v4,
+    pick_tile_tokens as ragged_gather_reduce_v4_tile_tokens,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
-    pick_tile_tokens as ragged_gather_reduce_v4_tile_tokens,
+    ragged_gather_reduce_v4,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v4 import (
     supported as ragged_gather_reduce_v4_supported,
@@ -695,7 +695,9 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(x.dtype)
         if _use_sc_combine_v5(gmm2_res, argsort_revert_indices, topk):
-            combine = ragged_gather_reduce_v6 if _SC_COMBINE_V6 else ragged_gather_reduce_v5
+            combine = (
+                ragged_gather_reduce_v6 if _SC_COMBINE_V6 else ragged_gather_reduce_v5
+            )
             return combine(
                 gmm2_res,
                 argsort_revert_indices,

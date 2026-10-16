@@ -207,7 +207,9 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
 
             @pl.when(jnp.int32(j) != me)
             def _(j=j):
-                push(slot(gathered, me), slot(gathered, me), send2, recv2, j, axis, True)
+                push(
+                    slot(gathered, me), slot(gathered, me), send2, recv2, j, axis, True
+                )
 
         wait_bytes_of(slots(gathered), recv2)
         write_out()
@@ -238,11 +240,16 @@ def _twoshot_valid_rows(x, n, axis, collective_id, tile_rows):
 
             def write_out():
                 summed = jnp.concatenate(
-                    [gathered[j, pl.ds(0, tile_rows), pl.ds(0, LANES)] for j in range(n)],
+                    [
+                        gathered[j, pl.ds(0, tile_rows), pl.ds(0, LANES)]
+                        for j in range(n)
+                    ],
                     axis=1,
                 ).astype(jnp.float32)
                 for j in range(k):
-                    blk = summed if j == 0 else pltpu.roll(summed, tile_rows - j * fr, 0)
+                    blk = (
+                        summed if j == 0 else pltpu.roll(summed, tile_rows - j * fr, 0)
+                    )
                     o_ref[pl.ds(0, tile_rows), pl.ds(j * hk, hk)] = jnp.where(
                         row < n_valid, blk, 0.0
                     ).astype(o_ref.dtype)
@@ -291,12 +298,17 @@ def small_all_reduce_valid_rows(
       tile_rows: the bf16 sublane tiling (16 on TPU v7).
     """
     rows, hidden = x.shape
-    if hidden % (num_cores * LANES) or fold_geometry(rows, hidden, num_cores, tile_rows) is None:
+    if (
+        hidden % (num_cores * LANES)
+        or fold_geometry(rows, hidden, num_cores, tile_rows) is None
+    ):
         raise ValueError(
             f"[{rows}, {hidden}] over {num_cores} cores has no fold path "
             f"(tile_rows={tile_rows})"
         )
-    scratch, kernel, name = _twoshot_valid_rows(x, num_cores, axis, collective_id, tile_rows)
+    scratch, kernel, name = _twoshot_valid_rows(
+        x, num_cores, axis, collective_id, tile_rows
+    )
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     return pl.pallas_call(
         kernel,

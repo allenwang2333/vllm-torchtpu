@@ -573,4 +573,3 @@ def test_streamidx_block_sizes_mixed_kv_pages():
         (2, 2, STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP),
         (1, 128, 4),
     )
-

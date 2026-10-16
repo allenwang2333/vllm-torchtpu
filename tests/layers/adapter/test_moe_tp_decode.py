@@ -498,7 +498,9 @@ def test_prefill_kernel_arms_on_tp_experts_only(
     assert harness.statics[0].prefill_above == want
 
 
-@pytest.mark.parametrize(("tokens", "prefill"), [(512, True), (256, False), (128, False)])
+@pytest.mark.parametrize(
+    ("tokens", "prefill"), [(512, True), (256, False), (128, False)]
+)
 def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, prefill):
     import jax
     import jax.numpy as jnp

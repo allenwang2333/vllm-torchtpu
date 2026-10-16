@@ -503,6 +503,7 @@ def _capped_window_live_kernel(
         live = tab_ref[g]
         off = tab_ref[num_groups + g]
         dead_before = tb * atoms_w - off
+
         @pl.when(live == atoms_w)
         def _whole_group():
             # Every atom live: the group's rows token-major (as the
@@ -545,7 +546,9 @@ def _capped_window_live_kernel(
     @pl.when(w > 0)
     def _token_major():
         for jj in range(lane_rows):
-            tok_ref[pl.ds(jj, bz, stride=lane_rows), :] = phys[:, jj * 128 : (jj + 1) * 128]
+            tok_ref[pl.ds(jj, bz, stride=lane_rows), :] = phys[
+                :, jj * 128 : (jj + 1) * 128
+            ]
         base = ((c * num_windows + w) * chunk_size + tb * bz) * lane_rows
         cp = pltpu.make_async_copy(
             tok_ref, out_hbm_ref.at[pl.ds(base, bz * lane_rows)], sems.at[2]
@@ -743,7 +746,9 @@ def _capped_window_live_fused_kernel(
         blk = jnp.broadcast_to(kv_col[h * 128 : (h + 1) * 128, :], (128, 128))
         kv_row = jnp.transpose(blk)[0:1, :].astype(jnp.int32)
         if fault == "kv":  # test-only positive control
-            kv_row = kv_row + (lax.broadcasted_iota(jnp.int32, kv_row.shape, 1) == 5).astype(jnp.int32)
+            kv_row = kv_row + (
+                lax.broadcasted_iota(jnp.int32, kv_row.shape, 1) == 5
+            ).astype(jnp.int32)
         kv_ref[pl.ds(c * (chunk_size // 128) + h, 1), :] = kv_row
     kv_i = kv_col.astype(jnp.int32)
 
@@ -953,11 +958,7 @@ def prepare_capped_window_live_fused(
         ),
         out_shape=[
             *(
-                [
-                    jax.ShapeDtypeStruct(
-                        (num_windows * region_rows, 128), jnp.int32
-                    )
-                ]
+                [jax.ShapeDtypeStruct((num_windows * region_rows, 128), jnp.int32)]
                 * num_chunks
             ),
             jax.ShapeDtypeStruct((num_tokens // 128, 128), jnp.int32),
@@ -1060,9 +1061,9 @@ def _capped_window_fused_kernel(
         )
         # Token t's 128-lane slice j -> row w * window_rows + t * k + j.
         for j in range(lane_rows):
-            rows_vmem_ref[pl.ds(w * window_rows + j, num_tokens, stride=lane_rows), :] = (
-                phys[:, j * 128 : (j + 1) * 128]
-            )
+            rows_vmem_ref[
+                pl.ds(w * window_rows + j, num_tokens, stride=lane_rows), :
+            ] = phys[:, j * 128 : (j + 1) * 128]
         copy(w * window_rows, window_rows, w).start()
 
     # Window 0 is always live: translate it before the bound is known.
@@ -1202,7 +1203,9 @@ def prepare_capped_window_fused(
     )
 
 
-def live_group_supported(chunk_size: int, kernel_batch_size: int, topk_cap: int) -> bool:
+def live_group_supported(
+    chunk_size: int, kernel_batch_size: int, topk_cap: int
+) -> bool:
     """Whether the live-group capped path (`prepare_capped_window_live`) serves
     a chunk: whole grid steps per chunk, a grid step's 64-slot atom block
     (`kernel_batch_size * 64` indices) is whole (8, 128) i32 tiles, and the
@@ -1865,8 +1868,12 @@ def _attention_kernel(
                     _async_copy(nope_slot, nope_slot, sem_nope, True)
                     _async_copy(rope_slot, rope_slot, sem_rope, True)
                 else:
-                    _async_copy(live_nope_hbm_ref.at[off + a], nope_slot, sem_nope, False)
-                    _async_copy(live_rope_hbm_ref.at[off + a], rope_slot, sem_rope, False)
+                    _async_copy(
+                        live_nope_hbm_ref.at[off + a], nope_slot, sem_nope, False
+                    )
+                    _async_copy(
+                        live_rope_hbm_ref.at[off + a], rope_slot, sem_rope, False
+                    )
 
     def _fetch_bq_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -2394,9 +2401,7 @@ def _attention_kernel(
             else:
                 lo = 0
                 for i, rung in enumerate(kv_rungs):
-                    hi_ok = (
-                        True if i == len(kv_rungs) - 1 else batch_max_kv_len <= rung
-                    )
+                    hi_ok = True if i == len(kv_rungs) - 1 else batch_max_kv_len <= rung
                     pl.when((batch_max_kv_len > lo) & hi_ok)(
                         functools.partial(run_steps, rung)
                     )
@@ -3305,9 +3310,7 @@ def sparse_attention_chunk(
     _, num_q_heads, head_dim = q.shape
     split_q = q_pe is not None
     if split_q:
-        head_dim = align_to(
-            head_dim + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128
-        )
+        head_dim = align_to(head_dim + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 

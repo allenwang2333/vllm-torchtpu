@@ -75,7 +75,10 @@ def _reference(o, lse):
 
 
 def _within_1ulp(got, ref):
-    return bool(np.isfinite(got).all() and (np.abs(got - ref) <= 2.0**-8 * np.abs(ref) + 1e-6).all())
+    return bool(
+        np.isfinite(got).all()
+        and (np.abs(got - ref) <= 2.0**-8 * np.abs(ref) + 1e-6).all()
+    )
 
 
 def _host_rank_order(o, lse):
@@ -161,9 +164,13 @@ def test_routing(flag, is_backbone, built, expect, monkeypatch):
     monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False, raising=False)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _Group())
     monkeypatch.setattr(
-        cp_mla, "_SIZED_MERGE_OPS", {4: lambda o, l: calls.append(1) or o[:, :1]} if built else {}
+        cp_mla,
+        "_SIZED_MERGE_OPS",
+        {4: lambda o, l: calls.append(1) or o[:, :1]} if built else {},
     )
     monkeypatch.setattr(cp_mla, "cp_lse_ag_out_rs", lambda o, l, g: o[:, :1])
     o = torch.zeros(16, 4, 8, dtype=torch.bfloat16)
-    cp_mla.merge_lse_partials_scatter_heads(o, torch.zeros(16, 4), is_backbone=is_backbone)
+    cp_mla.merge_lse_partials_scatter_heads(
+        o, torch.zeros(16, 4), is_backbone=is_backbone
+    )
     assert bool(calls) == expect

@@ -107,7 +107,11 @@ def _valid_rows(mesh, per_core, n_valid):
 
     def body(x, m):
         return ar.small_all_reduce_valid_rows(
-            x, m.reshape(2)[:1], m.reshape(2)[1:], num_cores=N, axis=AXIS,
+            x,
+            m.reshape(2)[:1],
+            m.reshape(2)[1:],
+            num_cores=N,
+            axis=AXIS,
             tile_rows=TILE_ROWS,
         )
 
@@ -150,7 +154,7 @@ def test_an_understated_valid_count_fails_the_oracle(mesh):
     per_core = blocks((N, rows, hidden), seed=5)
     want, tolerance = exact_sum(per_core), sum_tolerance(per_core)
     got = _valid_rows(mesh, per_core, fold_rows - 1)
-    assert not within(got[0][: fold_rows], want[:fold_rows], tolerance[:fold_rows]).all()
+    assert not within(got[0][:fold_rows], want[:fold_rows], tolerance[:fold_rows]).all()
 
 
 def test_fold_geometry():

@@ -234,7 +234,14 @@ def test_dcp_caches_partials_and_lse_bit_identical():
 
 @pytest.mark.parametrize(
     "fault",
-    ["wrong_owner", "wrong_row", "skip_write", "no_fence", "late_write", "ignore_owner"],
+    [
+        "wrong_owner",
+        "wrong_row",
+        "skip_write",
+        "no_fence",
+        "late_write",
+        "ignore_owner",
+    ],
 )
 def test_dcp_positive_control_fails(fault):
     _require_tpu()

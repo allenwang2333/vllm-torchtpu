@@ -50,9 +50,9 @@ def _kernel(*refs, eps: float, has_residual: bool):
         s = x_ref[...].astype(jnp.float32)
     var = jnp.mean(s * s, axis=-1, keepdims=True)
     normed = (s * jax.lax.rsqrt(var + eps)).astype(y_ref.dtype)
-    y_ref[...] = (
-        normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)
-    ).astype(y_ref.dtype)
+    y_ref[...] = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(
+        y_ref.dtype
+    )
 
 
 def supports(num_rows: int, hidden: int, block_rows: int = DEFAULT_BLOCK_ROWS) -> bool:

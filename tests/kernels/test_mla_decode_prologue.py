@@ -28,7 +28,6 @@ with positive controls the comparison must catch: skipped rope, swapped
 rope halves, a wrong lse sentinel.
 """
 
-import math
 import os
 from unittest import mock
 
@@ -110,7 +109,10 @@ def _problem(rng, query_tokens, seq_q, topk=2048):
     page_table = rng.permutation(pages).astype(np.int32)
     inv = np.argsort(page_table)
     physical = np.stack(
-        [rng.choice(cache_tokens, size=topk, replace=False) for _ in range(query_tokens)]
+        [
+            rng.choice(cache_tokens, size=topk, replace=False)
+            for _ in range(query_tokens)
+        ]
     )
     logical = (inv[physical // page_size] * page_size + physical % page_size).astype(
         np.int32
@@ -124,7 +126,9 @@ def _problem(rng, query_tokens, seq_q, topk=2048):
     live = np.arange(topk)[None, :] < counts[:, None]
     topk_idx = np.where(live, logical, -1).astype(np.int32)
     num_seqs = len(seq_q)
-    tables = [page_table] + [rng.permutation(pages) for _ in range(max(num_seqs - 1, 0))]
+    tables = [page_table] + [
+        rng.permutation(pages) for _ in range(max(num_seqs - 1, 0))
+    ]
     num_decode = sum(1 for n in seq_q if n == 4)
     q_raw = jnp.asarray(
         rng.normal(size=(query_tokens, HEADS, RAW_HEAD)).astype(np.float32),
@@ -289,7 +293,9 @@ def _local_topk(global_rows, dcp, interleave):
         row = global_rows[i][global_rows[i] >= 0]
         off = row % vps
         owner = (off % cycle) // interleave
-        local = (row // vps) * PAGE_SIZE + (off // cycle) * interleave + off % interleave
+        local = (
+            (row // vps) * PAGE_SIZE + (off // cycle) * interleave + off % interleave
+        )
         for r in range(dcp):
             sel = local[owner == r]
             out[r, i, : sel.size] = sel
@@ -356,8 +362,9 @@ def _dcp_run(dcp, *, candidate, fault=None, big_mixed=False, **dcp_kwargs):
         kv_c, k_pe = fp8(n, NOPE_DIM), fp8(n, ROPE_DIM)
         posj = jnp.asarray(pos)
         if candidate:
-            q_pe, extra = q_raw, dict(
-                q_rope_table=rope_table(posj, cache), prologue_fault=fault
+            q_pe, extra = (
+                q_raw,
+                dict(q_rope_table=rope_table(posj, cache), prologue_fault=fault),
             )
         else:
             q_pe, extra = rope_reference(q_raw, posj, cache), {}
@@ -560,9 +567,9 @@ def test_torch_wrapper_rope_matches_kernel_rope_semantics():
     k_a = k_rot.cpu().view(torch.int16).numpy()
     k_b = k_rot_fold.cpu().view(torch.int16).numpy()
     tab_np = tab.cpu().numpy()
-    cache = jnp.asarray(
-        rope.cos_sin_cache.cpu().float().numpy(), jnp.float32
-    ).astype(jnp.bfloat16)
+    cache = jnp.asarray(rope.cos_sin_cache.cpu().float().numpy(), jnp.float32).astype(
+        jnp.bfloat16
+    )
     q_j = jnp.asarray(q_np, jnp.bfloat16)
     pos_j = jnp.asarray(pos_np.astype(np.int32))
     want = _bits16(jax.jit(rope_reference)(q_j, pos_j, cache))

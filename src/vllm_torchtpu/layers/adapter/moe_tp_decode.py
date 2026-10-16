@@ -367,7 +367,9 @@ def _prefill_chain(
     fused_moe_decode's prefill path calls it. GLM-5.2's shared expert is
     ungated; routed_scale is folded into the route weights by the kernel."""
     # Trace-time, once per token bucket: the evidence that the kernel serves it.
-    logger.info("moe_tp_decode: fused MoE prefill kernel traced for %d tokens", x.shape[0])
+    logger.info(
+        "moe_tp_decode: fused MoE prefill kernel traced for %d tokens", x.shape[0]
+    )
     w, ids = _route(scores, bias, is_pad, st, x.dtype)
     return fused_moe_prefill(
         x,

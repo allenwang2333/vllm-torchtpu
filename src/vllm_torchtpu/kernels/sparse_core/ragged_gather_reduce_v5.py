@@ -207,11 +207,21 @@ def _kernel(
         @pl.when(tile < num_tiles)
         def _():
             copies = [
-                pltpu.make_async_copy(gidx_hbm.at[pl.ds(tile * e2, e2)], gidx_vmem, sem.at[0]),
-                pltpu.make_async_copy(aux_hbm.at[pl.ds(tile * e2, e2)], aux_vmem, sem.at[0]),
-                pltpu.make_async_copy(w_hbm.at[pl.ds(tile * e2, e2)], w_vmem, sem.at[0]),
-                pltpu.make_async_copy(grp_hbm.at[pl.ds(tile * gpad, gpad)], grp_vmem, sem.at[0]),
-                pltpu.make_async_copy(ng_hbm.at[pl.ds(tile * lanes, lanes)], ng_vmem, sem.at[0]),
+                pltpu.make_async_copy(
+                    gidx_hbm.at[pl.ds(tile * e2, e2)], gidx_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    aux_hbm.at[pl.ds(tile * e2, e2)], aux_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    w_hbm.at[pl.ds(tile * e2, e2)], w_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    grp_hbm.at[pl.ds(tile * gpad, gpad)], grp_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    ng_hbm.at[pl.ds(tile * lanes, lanes)], ng_vmem, sem.at[0]
+                ),
             ]
             for c in copies:
                 c.start()
@@ -239,7 +249,9 @@ def _kernel(
                     @plsc.parallel_loop(0, col_chunk, step=lanes, unroll=unroll)
                     def _(j):
                         for p in range(half):
-                            out_ref[p, pl.ds(j, lanes)] = jnp.zeros((lanes,), jnp.uint32)
+                            out_ref[p, pl.ds(j, lanes)] = jnp.zeros(
+                                (lanes,), jnp.uint32
+                            )
 
                 aux_vec = aux_vmem[pl.ds(start, lanes)]
                 w_vec = w_vmem[pl.ds(start, lanes)]
@@ -253,7 +265,9 @@ def _kernel(
 
                 def row(r, j):
                     v = gather_ref[r, pl.ds(j, lanes)]
-                    v = jnp.bitwise_and(jnp.left_shift(v, shifts[r]), jnp.uint32(0xFFFF0000))
+                    v = jnp.bitwise_and(
+                        jnp.left_shift(v, shifts[r]), jnp.uint32(0xFFFF0000)
+                    )
                     return plsc.bitcast(v, jnp.float32) * ws[r]
 
                 for cls in range(1, k + 1):
@@ -266,7 +280,9 @@ def _kernel(
                             d = dsts[t * cls]
                             pidx.append(jnp.right_shift(d, 1))
                             odd = jnp.bitwise_and(d, 1) == 1
-                            hm = jnp.where(odd, jnp.uint32(0xFFFF0000), jnp.uint32(0x0000FFFF))
+                            hm = jnp.where(
+                                odd, jnp.uint32(0xFFFF0000), jnp.uint32(0x0000FFFF)
+                            )
                             hm = jnp.where(t < cnt, hm, jnp.uint32(0))
                             hmask.append(jnp.broadcast_to(hm, (lanes,)))
 
@@ -277,9 +293,15 @@ def _kernel(
                                 run = row(r0, j)
                                 for q in range(1, cls):
                                     run = run + row(r0 + q, j)
-                                packed = plsc.pack(run, run, format=plsc.PackFormat.INTERLEAVED)
-                                bits = jnp.bitwise_and(plsc.bitcast(packed, jnp.uint32), hmask[t])
-                                plsc.addupdate(out_ref.at[pidx[t], pl.ds(j, lanes)], bits)
+                                packed = plsc.pack(
+                                    run, run, format=plsc.PackFormat.INTERLEAVED
+                                )
+                                bits = jnp.bitwise_and(
+                                    plsc.bitcast(packed, jnp.uint32), hmask[t]
+                                )
+                                plsc.addupdate(
+                                    out_ref.at[pidx[t], pl.ds(j, lanes)], bits
+                                )
 
             pltpu.emit_pipeline(
                 step,

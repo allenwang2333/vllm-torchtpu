@@ -31,6 +31,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+# pytest prepends this directory to sys.path (no __init__.py here).
+from test_mla_rope_neox_permute import _inputs, _run, _wrapper  # noqa: E402
+
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import VllmTPUIndexer
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -39,9 +42,6 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
-
-# pytest prepends this directory to sys.path (no __init__.py here).
-from test_mla_rope_neox_permute import _inputs, _run, _wrapper  # noqa: E402
 
 TOPK = 8
 
@@ -184,4 +184,3 @@ def test_indexer_hands_the_op_q_c_and_the_q_b_weights():
     )
     assert out == ("topk", None)
     assert "qb_overlap" not in op.call_args.kwargs
-

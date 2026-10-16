@@ -108,11 +108,21 @@ def _kernel(
         @pl.when(tile < num_tiles)
         def _():
             copies = [
-                pltpu.make_async_copy(gidx_hbm.at[pl.ds(tile * e2, e2)], gidx_vmem, sem.at[0]),
-                pltpu.make_async_copy(aux_hbm.at[pl.ds(tile * e2, e2)], aux_vmem, sem.at[0]),
-                pltpu.make_async_copy(w_hbm.at[pl.ds(tile * e2, e2)], w_vmem, sem.at[0]),
-                pltpu.make_async_copy(grp_hbm.at[pl.ds(tile * gpad, gpad)], grp_vmem, sem.at[0]),
-                pltpu.make_async_copy(ng_hbm.at[pl.ds(tile * lanes, lanes)], ng_vmem, sem.at[0]),
+                pltpu.make_async_copy(
+                    gidx_hbm.at[pl.ds(tile * e2, e2)], gidx_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    aux_hbm.at[pl.ds(tile * e2, e2)], aux_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    w_hbm.at[pl.ds(tile * e2, e2)], w_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    grp_hbm.at[pl.ds(tile * gpad, gpad)], grp_vmem, sem.at[0]
+                ),
+                pltpu.make_async_copy(
+                    ng_hbm.at[pl.ds(tile * lanes, lanes)], ng_vmem, sem.at[0]
+                ),
             ]
             for c in copies:
                 c.start()
@@ -132,7 +142,9 @@ def _kernel(
             def gather(c, word, slot):
                 start = jnp.bitwise_and(word, _START_MASK)
                 return pltpu.make_async_copy(
-                    x_u32.at[gidx_vmem[pl.ds(start, lanes)], pl.ds(c * col_chunk, col_chunk)],
+                    x_u32.at[
+                        gidx_vmem[pl.ds(start, lanes)], pl.ds(c * col_chunk, col_chunk)
+                    ],
                     gslot(slot),
                     gsem.at[slot],
                 )
@@ -140,13 +152,17 @@ def _kernel(
             def gather_wait(slot):
                 # Only the destination shape and the semaphore matter for a wait.
                 pltpu.make_async_copy(
-                    x_u32.at[pl.ds(0, lanes), pl.ds(0, col_chunk)], gslot(slot), gsem.at[slot]
+                    x_u32.at[pl.ds(0, lanes), pl.ds(0, col_chunk)],
+                    gslot(slot),
+                    gsem.at[slot],
                 ).wait()
 
             def out_copy(c, slot):
                 return pltpu.make_async_copy(
                     oslot(slot),
-                    out_u32.at[pl.ds(tile * half, half), pl.ds(c * col_chunk, col_chunk)],
+                    out_u32.at[
+                        pl.ds(tile * half, half), pl.ds(c * col_chunk, col_chunk)
+                    ],
                     osem.at[slot],
                 )
 
@@ -166,7 +182,9 @@ def _kernel(
 
                 def row(r, j):
                     v = gather_ref[r, pl.ds(j, lanes)]
-                    v = jnp.bitwise_and(jnp.left_shift(v, shifts[r]), jnp.uint32(0xFFFF0000))
+                    v = jnp.bitwise_and(
+                        jnp.left_shift(v, shifts[r]), jnp.uint32(0xFFFF0000)
+                    )
                     return plsc.bitcast(v, jnp.float32) * ws[r]
 
                 for cls in range(1, k + 1):
@@ -179,7 +197,9 @@ def _kernel(
                             d = dsts[t * cls]
                             pidx.append(jnp.right_shift(d, 1))
                             odd = jnp.bitwise_and(d, 1) == 1
-                            hm = jnp.where(odd, jnp.uint32(0xFFFF0000), jnp.uint32(0x0000FFFF))
+                            hm = jnp.where(
+                                odd, jnp.uint32(0xFFFF0000), jnp.uint32(0x0000FFFF)
+                            )
                             hm = jnp.where(t < cnt, hm, jnp.uint32(0))
                             hmask.append(jnp.broadcast_to(hm, (lanes,)))
 
@@ -190,9 +210,15 @@ def _kernel(
                                 run = row(r0, j)
                                 for q in range(1, cls):
                                     run = run + row(r0 + q, j)
-                                packed = plsc.pack(run, run, format=plsc.PackFormat.INTERLEAVED)
-                                bits = jnp.bitwise_and(plsc.bitcast(packed, jnp.uint32), hmask[t])
-                                plsc.addupdate(out_ref.at[pidx[t], pl.ds(j, lanes)], bits)
+                                packed = plsc.pack(
+                                    run, run, format=plsc.PackFormat.INTERLEAVED
+                                )
+                                bits = jnp.bitwise_and(
+                                    plsc.bitcast(packed, jnp.uint32), hmask[t]
+                                )
+                                plsc.addupdate(
+                                    out_ref.at[pidx[t], pl.ds(j, lanes)], bits
+                                )
 
             # Step s = c * num_groups + g gathers into slot s % nslots; the gather
             # of step s + nslots - 1 is issued before step s waits. A prefetch
@@ -204,7 +230,9 @@ def _kernel(
             def advance(pc, pg):
                 wrap = pg == last_g
                 done = jnp.logical_and(wrap, pc == last_c)
-                pc2 = jnp.where(jnp.logical_and(wrap, jnp.logical_not(done)), pc + 1, pc)
+                pc2 = jnp.where(
+                    jnp.logical_and(wrap, jnp.logical_not(done)), pc + 1, pc
+                )
                 pg2 = jnp.where(done, pg, jnp.where(wrap, 0, pg + 1))
                 return pc2, pg2
 
@@ -253,7 +281,13 @@ def _kernel(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("reduce_group_size", "tile_tokens", "col_chunk", "unroll", "nslots"),
+    static_argnames=(
+        "reduce_group_size",
+        "tile_tokens",
+        "col_chunk",
+        "unroll",
+        "nslots",
+    ),
 )
 def ragged_gather_reduce_v6(
     x: jax.Array,
@@ -282,7 +316,9 @@ def ragged_gather_reduce_v6(
     else:
         # A requested chunk that does not fit the deeper ring is narrowed
         # (column chunking never changes the arithmetic).
-        col_chunk = _col_chunk(hidden, min(col_chunk, pick_col_chunk(hidden, tile_tokens, nslots)))
+        col_chunk = _col_chunk(
+            hidden, min(col_chunk, pick_col_chunk(hidden, tile_tokens, nslots))
+        )
     num_tiles = num_tokens // tile_tokens
     e2 = tile_tokens * k + lanes
     gpad = _max_groups(tile_tokens, k) + lanes

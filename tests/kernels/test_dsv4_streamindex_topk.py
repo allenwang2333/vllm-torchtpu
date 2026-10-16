@@ -1505,7 +1505,6 @@ class TestChunkedPipelining:
             " fallback that the cases above rely on has changed")
 
 
-
 # fmt: off
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
