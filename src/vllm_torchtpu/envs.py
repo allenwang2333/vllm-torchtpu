@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
+    TPU_DCP_MLA_SEND_DENSE: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -538,6 +539,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS", 0
     ),
+    # With TPU_DCP_MLA_SEND_LAYOUT: exchange the kernel's send buffer with a
+    # dense all-to-all of whole destination blocks (one JAX op, with the
+    # unpack) instead of the ragged real-rows one, and zero the received
+    # partial rows past the real tokens' as the ragged exchange leaves them.
+    # XLA's ragged all-to-all runs on a row-contiguous [rows, 2, 256] copy of
+    # the kernel's tiled buffer and copies the result back; the dense one
+    # takes the tiled blocks as they are. Same bits on every row the merge
+    # reads, same merge.
+    "TPU_DCP_MLA_SEND_DENSE": env_bool("TPU_DCP_MLA_SEND_DENSE", default=False),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8

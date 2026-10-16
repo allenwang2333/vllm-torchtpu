@@ -690,6 +690,17 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
+    if envs.TPU_DCP_MLA_SEND_DENSE:
+        # Whole blocks through a dense all-to-all + the unpack, one JAX op;
+        # partial rows past the real ones zeroed as the ragged exchange leaves
+        # them. The merge below is the incumbent's, on the same bits.
+        prebuild_send_dense(world)
+        o_recv, l_recv = _SEND_DENSE_OPS[world](
+            send.reshape(world * block, vdim).contiguous(), 1 + real * local, _DCP_RANK
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
     if envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE:
         # The exchange, the unpack and the merge as one JAX op: plain slices
         # and bitcasts of the received buffer instead of torch view copies.
@@ -1018,6 +1029,89 @@ def _build_send_unpack(world: int):
 
     return sharded_jax_op(
         f"pallas::dcp_send_layout_unpack_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_unpack_fake,
+    )
+
+
+_SEND_DENSE_OPS: dict = {}
+
+
+def prebuild_send_dense(world: int) -> None:
+    """Build (register) the send-layout dense exchange + unpack op
+    (`TPU_DCP_MLA_SEND_DENSE`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_DENSE_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_DENSE_OPS[world] = _build_send_dense(world)
+
+
+def send_dense_unpack_local(x, rows, *, world: int, axis_name: str):
+    """One rank's `TPU_DCP_MLA_SEND_DENSE` exchange + unpack inside a
+    `shard_map` over the DCP axis.
+
+    `x` is this rank's int16 send buffer `[world * block, V]` (block `d` for
+    rank `d`; `sparse_mla_kernel.send_layout_shape`), `rows` int32 `[1]` the
+    ragged exchange's row count `1 + real * local`. Returns the received
+    partials `[world, T * local, V]` bf16 and lse `[world, T * local]` f32:
+    what `_build_send_unpack` returns from the ragged exchange, bit for bit.
+    The ragged exchange zero-fills a received block past its `rows` rows from
+    `SEND_PAD_ROWS - 1`; the dense one carries the sender's bytes there, so
+    those partial rows (padding tokens) are selected to zero. The lse word row
+    arrives whole either way; rows before it are never read."""
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    block = x.shape[0] // world
+    vdim = x.shape[1]
+    tl = block - SEND_PAD_ROWS
+    recv = jax.lax.all_to_all(x, axis_name, 0, 0, tiled=True).reshape(world, block, vdim)
+    live = jnp.clip(rows[0] - 1, 0, tl).astype(jnp.int32)
+    row = jax.lax.broadcasted_iota(jnp.int32, (world, tl, vdim), 1)
+    part = recv[:, SEND_PAD_ROWS:]
+    part = jnp.where(row < live, part, jnp.zeros_like(part))
+    o = jax.lax.bitcast_convert_type(part, jnp.bfloat16)
+    words = recv[:, SEND_PAD_ROWS - 1]
+    hi = words[:, :tl].astype(jnp.int32)
+    lo = words[:, tl : 2 * tl].astype(jnp.int32)
+    l = jax.lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+    return o, l
+
+
+def _build_send_dense(world: int):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+
+    def body(x, rows, rank):
+        # `rank` is lifted as the ragged op lifts it (one rank buffer for
+        # every consumer; warmup hands a bucket over between traces that lift
+        # the same buffers) and kept live by a zero added to `rows`.
+        rows = rows + (rank[0] - rank[0]).astype(rows.dtype)
+        return send_dense_unpack_local(x, rows, world=world, axis_name=DCP_AXIS_NAME)
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_dense_{world}",
         fn,
         mesh=mesh,
         input_partition_specs=(rank_spec, P(), rank_spec),
