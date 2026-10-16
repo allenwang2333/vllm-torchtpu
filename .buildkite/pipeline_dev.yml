@@ -99,6 +99,9 @@ steps:
           podTemplate: tpu-launcher
     env:
       ARTIFACTS_DIR: "perf_eval_results"
+      # Ahead of unclassed and nightly work in the 8-core queue; the fleet's
+      # queues never preempt within themselves, so this only orders the wait.
+      WORKLOAD_PRIORITY: "post-merge"
       SHAPE: "tpu7x-standard-4t/2x2x1"
       TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
       RUN_ROOT: "perf_eval_results/qwen35_pp4_multi_connector"
