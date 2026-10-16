@@ -782,7 +782,10 @@ def ep_layout(c, n_ranks):
 
 def _ep_worker():
     """Expert range on 16 CPU devices: EP 4 x TP 4 weights (SMALL_EP)."""
-    from jax._src import tpu_info as jax_tpu_info
+    try:  # newer jax keeps a second copy outside pallas
+        from jax._src import tpu_info as jax_tpu_info
+    except ImportError:
+        jax_tpu_info = None
     from jax._src.pallas.mosaic import tpu_info
     from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
@@ -792,7 +795,8 @@ def _ep_worker():
     pltpu.get_tpu_info = _tpu7x
     tpu_info.get_tpu_info = _tpu7x
     # The EP path's grouped matmul pipeline asks jax's own copy.
-    jax_tpu_info.get_tpu_info = _tpu7x
+    if jax_tpu_info is not None:
+        jax_tpu_info.get_tpu_info = _tpu7x
     c = SMALL_EP
     devices = sorted(jax.devices("cpu"), key=lambda d: d.id)
     mesh = Mesh(np.asarray(devices), ("d",))
