@@ -89,13 +89,22 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     """Select the default Qwen3.5-397B TP8/EP8 expert placement table for a
     given serving shape. Each replicated expert slot per rank trades 0.755 GB
     of device HBM (60 layers x one FP8 expert) for lower decode MoE imbalance
-    in the few-token kernel: 128 total copies for small batches (max_num_seqs <= 8),
-    64 copies for medium batches (max_num_seqs <= 16), and 32 copies for larger
-    batches or DCP > 1 to preserve HBM KV cache headroom."""
-    if dcp_size <= 1 and max_num_seqs <= 8:
+    in the few-token kernel: 128 total copies for small batches (max_num_seqs <= 8)
+    when the megakernel is off, 112 co-activation-solved 2-pass Po2C copies for
+    medium batches (max_num_seqs <= 24, or max_num_seqs <= 8 with the megakernel
+    where 112 is the max copy count keeping VEC route_dedup active), and 32
+    co-activation-solved copies for larger batches or DCP > 1 to preserve
+    HBM KV cache headroom."""
+    mk_on = os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if dcp_size <= 1 and max_num_seqs <= 8 and not mk_on:
         name = "expert_placement_dp8_ep8_opt_copies128.json"
-    elif dcp_size <= 1 and max_num_seqs <= 16:
-        name = "expert_placement_dp8_ep8_opt_copies64.json"
+    elif dcp_size <= 1 and max_num_seqs <= 24:
+        name = "expert_placement_dp8_ep8_opt_copies112.json"
     else:
         name = "expert_placement_dp8_ep8_opt_copies32.json"
     return os.path.join(_TABLE_DIR, name)
@@ -115,7 +124,7 @@ def data() -> dict:
     primary permutation and optional copies."""
     global _DATA, _DATA_PATH
     path = _path()
-    if _DATA is None or _DATA_PATH != path:
+    if _DATA is None or path != _DATA_PATH:
         with open(path) as f:
             table = json.load(f)
         experts = int(table["experts"])
@@ -293,6 +302,13 @@ def permute_router_rows(name: str, tensor):
     them)."""
     if not enabled() or not _ROUTER_RE.search(name):
         return tensor
+    try:
+        from vllm.config import get_current_vllm_config
+
+        if not get_current_vllm_config().parallel_config.enable_expert_parallel:
+            return tensor
+    except Exception:  # noqa: S110
+        pass
     layer = layer_index(name)
     if layer is None or str(layer) not in data()["layers"]:
         return tensor

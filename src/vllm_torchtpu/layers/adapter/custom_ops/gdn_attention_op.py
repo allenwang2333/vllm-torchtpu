@@ -1204,7 +1204,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv = _project(self.in_proj_qkv, hidden_states, prequant)
             ba = _project(self.in_proj_ba, hidden_states, prequant)
             z = _project(self.in_proj_z, hidden_states, prequant)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            if not self.fused_norm_quant:
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
         else:
             mixed_qkvz = _project(self.in_proj_qkvz, hidden_states, prequant)
@@ -1216,7 +1217,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            if not self.fused_norm_quant:
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
 
         # ============================================================

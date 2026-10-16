@@ -1096,3 +1096,74 @@ def test_patched_sparse_moe_forward_takes_prenorm_outputs(monkeypatch):
     out = patched_sparse_moe_forward(moe, x, prenorm_outputs=(logits, se_out))
     torch.testing.assert_close(out, x * 0.5 + se_out)
     assert seen["router_logits"] is logits
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "expected_bm", "expected_step"),
+    [
+        (16, 1024, 16, 16),  # < 32: full shape
+        (32, 1024, 32, 32),  # 32-aligned decode bucket (TP=8)
+        (64, 1024, 32, 32),  # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
+        (512, 1024, 512, 64),  # TP=8 prefill: 512-row block, 64-row in-kernel steps
+        # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each 512-row
+        # block runs as one step.
+        (4096, 4096, 512, 512),
+    ],
+)
+def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_step):
+    """The BlockSpec tile `bm` and the in-kernel row step that
+    `pallas_sigmoid_gate_quant` derives from it."""
+    bm = patch_mod._legal_tile(rows, patch_mod._select_gate_q_tile(rows, cols))
+    step = patch_mod._legal_tile(bm, patch_mod._select_gate_q_vreg_step(cols))
+    assert (bm, step) == (expected_bm, expected_step)
+    assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
+    assert step == bm or (bm % step == 0 and step % 32 == 0)
+
+
+def test_patched_sparse_moe_forward_v2_owns_combine_no_double_all_reduce(monkeypatch):
+    """When fused_moe_ep v2 is armed (_fused_moe_ep_op is not None) and
+    se_is_replicated=False (TP=8, SP=0), patched_sparse_moe_forward must only
+    all-reduce shared_output and NOT all-reduce final_hidden_states a second time.
+    """
+    tp = 8
+    all_reduced: list[torch.Tensor] = []
+    _fake_tp_collectives(monkeypatch, tp, all_reduced=all_reduced)
+    monkeypatch.setattr(patch_mod.sequence_parallel, "is_active", lambda: False)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
+
+    hidden_dim = 64
+    tokens = 4
+    x = torch.ones(tokens, hidden_dim, dtype=torch.bfloat16)
+    routed_out = torch.full((tokens, hidden_dim), 2.0, dtype=torch.bfloat16)
+    shared_partial = torch.full((tokens, hidden_dim), 0.25, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        patch_mod,
+        "compute_fused_gate_and_shared_expert",
+        lambda _moe, _h: (torch.zeros(tokens, 8), shared_partial),
+    )
+
+    qm = SimpleNamespace(_fused_moe_ep_op=object())
+    routed_experts = SimpleNamespace(quant_method=qm)
+    moe = SimpleNamespace(
+        _fused_gate_se_checked=True,
+        _fused_gate_se_weight=torch.ones(1),
+        _fused_se_is_replicated=False,
+        replicate_shared_expert=False,
+        is_sequence_parallel=False,
+        tp_size=tp,
+        experts=type(
+            "_E",
+            (),
+            {
+                "routed_experts": routed_experts,
+                "__call__": lambda self, hidden_states, router_logits: routed_out,
+            },
+        )(),
+    )
+
+    out = patched_sparse_moe_forward(moe, x)
+    assert len(all_reduced) == 1
+    torch.testing.assert_close(all_reduced[0], shared_partial)
+    # Expected: routed_out (2.0) + tp * shared_partial (8 * 0.25 = 2.0) = 4.0
+    torch.testing.assert_close(out, routed_out + shared_partial * tp)

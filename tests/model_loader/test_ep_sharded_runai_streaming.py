@@ -97,6 +97,46 @@ def test_local_expert_ids_use_loader_ownership_mapping():
     compute_ids.assert_called_once_with(896, 32, 11, placement="linear")
 
 
+@pytest.mark.parametrize(
+    ("flag", "knob", "filtered"),
+    [
+        (True, "0", True),
+        (False, None, True),
+        (False, "1", True),
+        (False, "0", False),
+    ],
+)
+def test_tpu_knob_turns_the_filter_on_without_the_flag(
+    monkeypatch, flag, knob, filtered
+):
+    """TPU_ENABLE_EP_WEIGHT_FILTER (default on) filters without
+    --enable-ep-weight-filter; "0" leaves the choice to the flag."""
+    from vllm.model_executor.model_loader import default_loader
+
+    if knob is None:
+        monkeypatch.delenv("TPU_ENABLE_EP_WEIGHT_FILTER", raising=False)
+    else:
+        monkeypatch.setenv("TPU_ENABLE_EP_WEIGHT_FILTER", knob)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(is_moe=True, get_num_experts=lambda: 8),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_ep_weight_filter=flag,
+            enable_eplb=False,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            expert_placement_strategy="linear",
+        ),
+    )
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        default_loader, "compute_local_expert_ids", lambda *a, **kw: {0, 1}
+    )
+
+    assert _compute_local_expert_ids() == ({0, 1} if filtered else None)
+
+
 def test_skips_nonlocal_expert_packed_and_scale():
     base = "language_model.model.layers.3.block_sparse_moe.experts.500"
     assert _should_skip(f"{base}.w1.weight_packed", _LOCAL)

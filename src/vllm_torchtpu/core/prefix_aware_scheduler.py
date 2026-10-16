@@ -22,8 +22,8 @@ import os
 import time
 from bisect import bisect_right
 from itertools import islice
-from typing import cast
 from operator import itemgetter
+from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -35,14 +35,21 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.core import prefix_change_log
-from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
+from vllm_torchtpu.core import prefix_change_log, single_step_prefill
+from vllm_torchtpu.core.hybrid_retention import (
+    ALLOC_NONE_REASONS,
+    HybridStateRetention,
+    format_counts,
+    is_waiting_status,
+)
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
-from vllm_torchtpu.core import single_step_prefill
 
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
+# Telemetry counts a step of at most this many Mamba blocks of tokens, taken
+# while requests wait, as a small step (a lone cold chunk under the cold cap).
+_SMALL_STEP_BLOCKS = 2
 
 # Priority tiers: lower values admit earlier.
 _TIER_FREE_BLOCK_FIT = 0
@@ -62,6 +69,31 @@ def _remaining_prefill_tokens(request: Request) -> int:
     )
 
 
+def _remaining_output_tokens(request: Request) -> int | None:
+    max_toks = getattr(request, "max_tokens", None)
+    if max_toks is None:
+        sp = getattr(request, "sampling_params", None)
+        max_toks = getattr(sp, "max_tokens", None) if sp is not None else None
+    if max_toks is None:
+        return None
+    try:
+        max_toks_i = int(max_toks)
+    except (TypeError, ValueError):
+        return None
+    if max_toks_i <= 0:
+        return None
+    out_toks = getattr(request, "num_output_tokens", None)
+    if out_toks is None:
+        all_ids = getattr(request, "all_token_ids", None)
+        prompt_toks = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        if all_ids is not None and prompt_toks > 0:
+            out_toks = max(len(all_ids) - prompt_toks, 0)
+        else:
+            comp_toks = int(getattr(request, "num_computed_tokens", 0) or 0)
+            out_toks = max(comp_toks - prompt_toks, 0)
+    return max_toks_i - int(out_toks)
+
+
 def _env_on(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in (
         "0",
@@ -72,13 +104,45 @@ def _env_on(name: str, default: str = "1") -> bool:
     )
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _read_paw_aging_knobs() -> tuple[float, float]:
+    """Returns (TPU_SCHED_PAW_AGING_TOK_PER_S, TPU_SCHED_PAW_MAX_WAIT_S); 0 = off."""
+    return (
+        max(_env_float("TPU_SCHED_PAW_AGING_TOK_PER_S", 0.0), 0.0),
+        max(_env_float("TPU_SCHED_PAW_MAX_WAIT_S", 0.0), 0.0),
+    )
+
+
+def _read_exempt_warm_reserve() -> float:
+    """Returns TPU_SCHED_PAW_EXEMPT_WARM_RESERVE, clamped to [0, 1]."""
+    return min(max(_env_float("TPU_SCHED_PAW_EXEMPT_WARM_RESERVE", 0.5), 0.0), 1.0)
+
+
+def _wait_seconds(request: Request, now: float) -> float:
+    """Seconds since ``request.arrival_time``.
+
+    ``arrival_time`` is the wall-clock time (``time.time()``) at which this
+    engine's API server received the request; on a disaggregated prefill leg
+    that is the proxy's prefill hop. It covers time in the waiting queue and
+    time in ``running``, and does not reset on preemption.
+    """
+    arrival = getattr(request, "arrival_time", None)
+    if arrival is None:
+        return 0.0
+    return max(now - float(arrival), 0.0)
+
+
 def _hit_signature(result) -> tuple:
     """Comparable form of a find_longest_cache_hit result (block ids)."""
     blocks = result[0]
     try:
-        ids = tuple(
-            tuple(getattr(b, "block_id", b) for b in group) for group in blocks
-        )
+        ids = tuple(tuple(getattr(b, "block_id", b) for b in group) for group in blocks)
     except TypeError:
         ids = None
     return (result[1], result[2] if len(result) > 2 else None, ids)
@@ -132,7 +196,21 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        self._srpf_running: bool = bool(envs.TPU_SCHED_SRPF_RUNNING)
+        kv_transfer_cfg = getattr(
+            getattr(self, "vllm_config", None), "kv_transfer_config", None
+        )
+        kv_role = getattr(kv_transfer_cfg, "kv_role", None)
+        self._is_disagg = (
+            kv_transfer_cfg is not None
+            or getattr(self, "connector", None) is not None
+        )
+        self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
+        self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
+        self._srpf_running: bool = (
+            bool(envs.TPU_SCHED_SRPF_RUNNING)
+            if "TPU_SCHED_SRPF_RUNNING" in os.environ
+            else not self._is_kv_consumer
+        )
         self._mk_max_running: int = self._resolve_mk_max_running()
         budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
         eff_seqs = (
@@ -148,20 +226,45 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._step_total_cap: int = (
             int(envs.TPU_SCHED_STEP_TOTAL_CAP)
             if "TPU_SCHED_STEP_TOTAL_CAP" in os.environ
-            else max(1024, budget // 2)
+            else (0 if self._is_disagg else max(1024, budget // 2))
         )
         self._cold_chunk_cap: int = (
             int(envs.TPU_SCHED_COLD_CHUNK_CAP)
             if "TPU_SCHED_COLD_CHUNK_CAP" in os.environ
-            else max(512, self._step_total_cap // 2)
+            else (
+                max(512, budget // 4)
+                if self._is_kv_producer
+                else (0 if self._is_disagg else max(512, self._step_total_cap // 2))
+            )
         )
         self._cold_min_decoders: int = (
             int(envs.TPU_SCHED_COLD_MIN_DECODERS)
             if "TPU_SCHED_COLD_MIN_DECODERS" in os.environ
             else max(1, (3 * eff_seqs) // 4)
         )
-        self._warm_streak: int = int(envs.TPU_SCHED_WARM_STREAK)
+        self._warm_streak: int = (
+            int(envs.TPU_SCHED_WARM_STREAK)
+            if "TPU_SCHED_WARM_STREAK" in os.environ
+            else (0 if self._is_disagg else int(envs.TPU_SCHED_WARM_STREAK))
+        )
         self._warm_min_decoders: int = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
+        self._finish_decode_steps: int = (
+            int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+            if "TPU_SCHED_FINISH_DECODE_STEPS" in os.environ
+            else (0 if self._is_disagg else int(envs.TPU_SCHED_FINISH_DECODE_STEPS))
+        )
+        self._finish_decode_max_deferral_steps: int = int(
+            envs.TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
+        )
+        self._finish_decode_prefill_min_tokens: int = int(
+            envs.TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS
+        )
+        self._paw_aging_tok_per_s, self._paw_max_wait_s = _read_paw_aging_knobs()
+        self._paw_exempt_warm_reserve = _read_exempt_warm_reserve()
+        self._warm_reserve_wasted = False
+        self._finish_decode_defer_streak: int = 0
+        self._step_has_near_finish_decoder: bool | None = None
+        self._step_finish_decode_deferred: bool = False
         self._skip_midblock_align_stop: bool = bool(
             envs.TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP
         )
@@ -175,7 +278,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         # place before HybridStateRetention binds its per-instance hooks.
         self._single_step = False
         self._n_single_step_reqs = 0
-        if single_step_prefill.enabled():
+        if not self._is_kv_consumer and single_step_prefill.enabled():
             ok, why = single_step_prefill.supported(self)
             if ok:
                 single_step_prefill.install_mamba_manager_patches()
@@ -186,7 +289,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                     "then run without it too.",
                     why,
                 )
-        if os.environ.get("TPU_HYBRID_STATE_RETENTION", "1") != "0":
+        default_retention = "0" if self._is_kv_consumer else "1"
+        if os.environ.get("TPU_HYBRID_STATE_RETENTION", default_retention) != "0":
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention
@@ -194,12 +298,18 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         logger.info(
             "PrefixAwareScheduler ACTIVE (window=%d, decoders first, "
-            "srpf_running=%s, cold_chunk_cap=%d, cold_threshold=%d, "
+            "srpf_running=%s, finish_decode_steps=%d@%d(min_toks=%d), "
+            "cold_chunk_cap=%d, cold_threshold=%d, "
             "cold_min_decoders=%d, step_total_cap=%d, mk_max_running=%d, "
             "warm_streak=%d@%d, hybrid_state_retention=%s, memo_xstep=%s, "
-            "skip_midblock_align_stop=%s, single_step_prefill=%s)",
+            "skip_midblock_align_stop=%s, single_step_prefill=%s, "
+            "paw_aging_tok_per_s=%g, paw_max_wait_s=%g, "
+            "paw_exempt_warm_reserve=%g)",
             self.WINDOW,
             self._srpf_running,
+            self._finish_decode_steps,
+            self._finish_decode_max_deferral_steps,
+            self._finish_decode_prefill_min_tokens,
             self._cold_chunk_cap,
             self._cold_threshold,
             self._cold_min_decoders,
@@ -211,6 +321,9 @@ class PrefixAwareScheduler(AsyncScheduler):
             getattr(self, "_memo_xstep", False),
             self._skip_midblock_align_stop,
             self._single_step,
+            self._paw_aging_tok_per_s,
+            self._paw_max_wait_s,
+            self._paw_exempt_warm_reserve,
         )
 
     # ------------------------------------------------------------------
@@ -366,6 +479,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             mk_max_verify_rows = 32
         elif not _env_on("VLLM_TPU_QWEN35_MK_VERIFY_64", "1"):
             mk_max_verify_rows = 48
+        elif _env_on("VLLM_TPU_QWEN35_MK_SPLIT_WIDE", "1"):
+            mk_max_verify_rows = 128
         else:
             mk_max_verify_rows = 64
         num_spec = max(int(getattr(self, "num_spec_tokens", 3) or 0), 0)
@@ -388,6 +503,47 @@ class PrefixAwareScheduler(AsyncScheduler):
             min_dec = int(envs.TPU_SCHED_COLD_MIN_DECODERS)
         return srpf, cap, thresh, min_dec
 
+    def _get_paw_aging_knobs(self) -> tuple[float, float]:
+        rate = getattr(self, "_paw_aging_tok_per_s", None)
+        max_wait = getattr(self, "_paw_max_wait_s", None)
+        if rate is None or max_wait is None:
+            rate, max_wait = _read_paw_aging_knobs()
+            self._paw_aging_tok_per_s, self._paw_max_wait_s = rate, max_wait
+        return rate, max_wait
+
+    def _get_exempt_warm_reserve(self) -> float:
+        reserve = getattr(self, "_paw_exempt_warm_reserve", None)
+        if reserve is None:
+            reserve = self._paw_exempt_warm_reserve = _read_exempt_warm_reserve()
+        return reserve
+
+    def _now(self) -> float:
+        """Wall-clock time of the current schedule() call."""
+        now = getattr(self, "_step_wall_time", None)
+        return time.time() if now is None else now
+
+    def _aged_prefill_key(self, request: Request, now: float) -> float:
+        """SRPF key of a running prefill: remaining prompt tokens minus
+        TPU_SCHED_PAW_AGING_TOK_PER_S x seconds since arrival."""
+        rate, _ = self._get_paw_aging_knobs()
+        rem = _remaining_prefill_tokens(request)
+        if rate <= 0:
+            return rem
+        return rem - rate * _wait_seconds(request, now)
+
+    def _cold_cap_exempt(self, request: Request) -> bool:
+        """Returns whether ``request`` arrived over TPU_SCHED_PAW_MAX_WAIT_S ago."""
+        _, max_wait = self._get_paw_aging_knobs()
+        return max_wait > 0 and _wait_seconds(request, self._now()) > max_wait
+
+    def _note_waiting_stop(self, request: Request, reason: str) -> None:
+        """Records why the waiting loop stopped at ``request`` (first stop of
+        the step wins; running requests are ignored)."""
+        if getattr(self, "_step_wait_event", None) is None and is_waiting_status(
+            request
+        ):
+            self._step_wait_event = reason
+
     def _get_step_cap_knobs(self) -> tuple[int, int, int]:
         step_cap = getattr(self, "_step_total_cap", None)
         if step_cap is None:
@@ -399,6 +555,34 @@ class PrefixAwareScheduler(AsyncScheduler):
         if warm_min_dec is None:
             warm_min_dec = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
         return step_cap, warm_streak, warm_min_dec
+
+    def _get_finish_decode_knobs(self) -> tuple[int, int, int]:
+        steps = getattr(self, "_finish_decode_steps", None)
+        if steps is None:
+            steps = int(envs.TPU_SCHED_FINISH_DECODE_STEPS)
+        max_defer = getattr(self, "_finish_decode_max_deferral_steps", None)
+        if max_defer is None:
+            max_defer = int(envs.TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS)
+        min_toks = getattr(self, "_finish_decode_prefill_min_tokens", None)
+        if min_toks is None:
+            min_toks = int(envs.TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS)
+        return steps, max_defer, min_toks
+
+    def _has_near_finish_decoder(self, finish_decode_steps: int) -> bool:
+        if finish_decode_steps <= 0:
+            return False
+        step_flag = getattr(self, "_step_has_near_finish_decoder", None)
+        if step_flag is not None:
+            return bool(step_flag)
+        tokens_per_dec = 1 + max(int(getattr(self, "num_spec_tokens", 3) or 0), 0)
+        threshold = finish_decode_steps * tokens_per_dec
+        for r in getattr(self, "running", ()):
+            if not _is_decoding(r):
+                continue
+            rem_out = _remaining_output_tokens(r)
+            if rem_out is not None and 1 <= rem_out <= threshold:
+                return True
+        return False
 
     def _retention_failed(self) -> None:
         logger.exception(
@@ -456,6 +640,17 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
         return cached
 
+    def _connector_finished(self, request: Request):
+        res = super()._connector_finished(request)
+        if res[0]:
+            retention = getattr(self, "_retention", None)
+            if retention is not None:
+                try:
+                    retention.pin_running((request,))
+                except Exception:
+                    self._retention_failed()
+        return res
+
     def _free_request_blocks(self, request: Request):
         retention = getattr(self, "_retention", None)
         if retention is None:
@@ -473,6 +668,28 @@ class PrefixAwareScheduler(AsyncScheduler):
         return result
 
     def schedule(self, *args, **kwargs):
+        from vllm_torchtpu.runner import lightweight_step_stats
+
+        _stats_on = lightweight_step_stats.is_enabled()
+        _sched_t0_ns = time.perf_counter_ns() if _stats_on else 0
+        _kv_wait_ns = 0
+        _early_reqs = 0
+        _waited_reqs = 0
+        _waited = False
+
+        connector = getattr(self, "connector", None)
+        if connector is not None:
+            poll_fn = getattr(connector, "poll_and_complete_transfers", None)
+            if callable(poll_fn):
+                try:
+                    _kv_wait_ns, _early_reqs, _waited_reqs, _waited = poll_fn(
+                        self
+                    )
+                except Exception:
+                    logger.exception(
+                        "PrefixAwareScheduler: poll_and_complete_transfers failed."
+                    )
+
         retention = getattr(self, "_retention", None)
         if retention is not None:
             try:
@@ -485,12 +702,15 @@ class PrefixAwareScheduler(AsyncScheduler):
         # ahead of every prefilling one. When TPU_SCHED_SRPF_RUNNING is enabled,
         # also stably order prefilling requests by fewest remaining prompt
         # tokens (Shortest-Remaining-Prefill-First) so warm turns finish ahead
-        # of multi-step cold prefills.
+        # of multi-step cold prefills, less TPU_SCHED_PAW_AGING_TOK_PER_S per
+        # second since arrival so a long cold prefill cannot starve.
+        now_wall = time.time()
+        self._step_wall_time = now_wall
         srpf_running, _, _, _ = self._get_sched_knobs()
         decoding = [r for r in self.running if _is_decoding(r)]
         prefilling = [r for r in self.running if not _is_decoding(r)]
         if srpf_running and len(prefilling) > 1:
-            prefilling.sort(key=_remaining_prefill_tokens)
+            prefilling.sort(key=lambda r: self._aged_prefill_key(r, now_wall))
         if prefilling and (decoding or (srpf_running and len(prefilling) > 1)):
             self.running[:] = decoding + prefilling
         self._step_num_decoding = len(decoding)
@@ -503,8 +723,56 @@ class PrefixAwareScheduler(AsyncScheduler):
             )
             for r in decoding
         )
+        finish_steps, finish_max_defer, _ = self._get_finish_decode_knobs()
+        if finish_steps > 0 and decoding:
+            tokens_per_dec = 1 + max(
+                int(getattr(self, "num_spec_tokens", 3) or 0), 0
+            )
+            finish_thresh = finish_steps * tokens_per_dec
+            near_finish_ids = {
+                id(r)
+                for r in decoding
+                if (rem_out := _remaining_output_tokens(r)) is not None
+                and 1 <= rem_out <= finish_thresh
+            }
+            self._step_has_near_finish_decoder = bool(near_finish_ids)
+            prev_nf_ids = getattr(self, "_prev_near_finish_ids", None)
+            if prev_nf_ids and (prev_nf_ids - near_finish_ids):
+                total_nf_defer = int(
+                    getattr(self, "_total_nf_defer_streak", 0) or 0
+                )
+                if total_nf_defer < 2 * finish_max_defer:
+                    self._finish_decode_defer_streak = 0
+            self._prev_near_finish_ids = near_finish_ids
+        else:
+            self._step_has_near_finish_decoder = False
+            self._prev_near_finish_ids = set()
+        if not self._step_has_near_finish_decoder:
+            self._finish_decode_defer_streak = 0
+            self._total_nf_defer_streak = 0
+        self._step_finish_decode_deferred = False
         self._step_running_prefill_ids = {id(r) for r in prefilling}
         self._step_prefill_tokens_by_req = {}
+        warm_req_ids: set[str] = set()
+        self._step_warm_waiting_tokens = (
+            self._compute_warm_waiting_tokens(self._cold_threshold, warm_req_ids)
+            if getattr(self, "_is_kv_producer", False)
+            else 0
+        )
+        # Warm budget release (only with TPU_SCHED_PAW_MAX_WAIT_S > 0): the cold
+        # group is not capped on this step when the previous step capped it for
+        # warm requests and none was admitted.
+        self._step_cold_release = bool(
+            getattr(self, "_warm_reserve_wasted", False)
+        ) and (self._get_paw_aging_knobs()[1] > 0)
+        self._step_warm_reserve_applied = False
+        self._step_max_cold_budget = None
+        self._step_cold_exempt_ids = set()
+        self._step_wait_event = None
+        waiting_at_start = len(getattr(self, "waiting", ()) or ())
+        retention = getattr(self, "_retention", None)
+        if retention is not None:
+            retention.begin_step()
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
         single_step = getattr(self, "_single_step", False)
@@ -513,21 +781,19 @@ class PrefixAwareScheduler(AsyncScheduler):
         mk_max_running = getattr(self, "_mk_max_running", None)
         if mk_max_running is None:
             mk_max_running = self._resolve_mk_max_running()
-        orig_max_running = getattr(self, "max_num_running_reqs", None)
+        # The scan admits into ``running`` against max_num_active_reqs;
+        # max_num_running_reqs is the runner's slot count and must stay.
+        orig_max_active = getattr(self, "max_num_active_reqs", None)
         if (
             mk_max_running > 0
-            and isinstance(orig_max_running, int)
-            and orig_max_running > mk_max_running
+            and isinstance(orig_max_active, int)
+            and orig_max_active > mk_max_running
         ):
-            self.max_num_running_reqs = mk_max_running
+            self.max_num_active_reqs = mk_max_running
         try:
-            # vLLM's Scheduler walks the waiting queue without a selection
+            # vLLM's Scheduler walks the waiting queues without a selection
             # hook, so the warmest-first promotion runs here, once per step.
-            queue = getattr(self, "kv_holding_waiting", None) or getattr(
-                self, "waiting", None
-            )
-            if queue is not None:
-                self._promote_warmest(queue)
+            self._select_waiting_queue_for_scheduling()
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
@@ -542,17 +808,36 @@ class PrefixAwareScheduler(AsyncScheduler):
                     self._n_single_step_reqs += len(cuts)
             if any(v > 0 for v in self._step_prefill_tokens_by_req.values()):
                 self._pure_decode_streak = 0
+                self._finish_decode_defer_streak = 0
+                self._total_nf_defer_streak = 0
             else:
                 self._pure_decode_streak = (
                     getattr(self, "_pure_decode_streak", 999999) + 1
                 )
+                if getattr(self, "_step_finish_decode_deferred", False):
+                    self._finish_decode_defer_streak = (
+                        int(getattr(self, "_finish_decode_defer_streak", 0) or 0)
+                        + 1
+                    )
+                    self._total_nf_defer_streak = (
+                        int(getattr(self, "_total_nf_defer_streak", 0) or 0)
+                        + 1
+                    )
+            scheduled = getattr(out, "num_scheduled_tokens", None) or {}
+            warm_admitted = any(rid in scheduled for rid in warm_req_ids)
+            self._warm_reserve_wasted = (
+                self._step_warm_reserve_applied and not warm_admitted
+            )
+            stop = self._waiting_loop_stop_reason(out, waiting_at_start)
+            self._record_step_telemetry(out, waiting_at_start, stop)
             now = time.monotonic()
             if now - getattr(self, "_last_sched_log_t", 0.0) >= 60.0:
                 self._last_sched_log_t = now
                 logger.info(
                     "prefix-scheduler telemetry: running=%d waiting=%d decoding=%d "
                     "prefilling=%d free_blocks=%s sched_tokens=%d pure_decode_streak=%d "
-                    "midblock_stops_skipped=%d single_step_reqs=%d",
+                    "finish_defer_streak=%d midblock_stops_skipped=%d "
+                    "single_step_reqs=%d %s",
                     len(self.running),
                     len(getattr(self, "waiting", ())),
                     len(decoding),
@@ -560,8 +845,10 @@ class PrefixAwareScheduler(AsyncScheduler):
                     self._get_num_free_blocks(),
                     getattr(out, "total_num_scheduled_tokens", 0),
                     self._pure_decode_streak,
+                    getattr(self, "_finish_decode_defer_streak", 0),
                     getattr(self, "_n_midblock_stops_skipped", 0),
                     getattr(self, "_n_single_step_reqs", 0),
+                    self._admission_telemetry(stop),
                 )
                 if getattr(self, "_memo_xstep", False) or getattr(
                     self, "_memo_computes", 0
@@ -576,10 +863,156 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
-            if orig_max_running is not None:
-                self.max_num_running_reqs = orig_max_running
+            if _stats_on:
+                _sched_elapsed_ns = time.perf_counter_ns() - _sched_t0_ns
+                lightweight_step_stats.get_step_stats_recorder().record_scheduler_step(
+                    schedule_ns=_sched_elapsed_ns,
+                    kv_wait_ns=_kv_wait_ns,
+                    early_completed_reqs=_early_reqs,
+                    waited_completed_reqs=_waited_reqs,
+                    waited=_waited,
+                )
+            if orig_max_active is not None:
+                self.max_num_active_reqs = orig_max_active
             self._step_running_prefill_ids = set()
             self._step_prefill_tokens_by_req = None
+            self._step_warm_waiting_tokens = 0
+            self._step_has_near_finish_decoder = None
+            self._step_finish_decode_deferred = False
+            self._step_wall_time = None
+            self._step_cold_release = False
+            self._step_warm_reserve_applied = False
+            self._step_max_cold_budget = None
+            self._step_cold_exempt_ids = set()
+            self._step_wait_event = None
+
+    def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
+        """Names what ended vLLM's waiting loop on this step.
+
+        ``cap0:<why>`` / ``align0`` / ``lookahead0``: the chunk of the request
+        at the head came out 0 tokens (our cold cap, the Mamba block-aligned
+        split, the MTP lookahead reserve). ``alloc:<reason>``: allocate_slots
+        refused it (``ALLOC_NONE_REASONS``). Otherwise ``idle`` (nothing was
+        waiting), ``preempted`` (the loop did not run), ``max_running``,
+        ``budget`` (no token budget left), ``drained`` (every waiting request
+        was admitted or skipped) or ``other``.
+        """
+        event = getattr(self, "_step_wait_event", None)
+        if event is not None:
+            return event
+        retention = getattr(self, "_retention", None)
+        nones = getattr(retention, "step_waiting_none", None)
+        if nones:
+            return "alloc:" + nones[0]
+        if waiting_at_start == 0 and not getattr(self, "kv_holding_waiting", None):
+            return "idle"
+        if getattr(out, "preempted_req_ids", None):
+            return "preempted"
+        # The admission check the scan stops at; schedule() restores the
+        # megakernel cap on max_num_active_reqs only after this runs.
+        max_active = getattr(self, "max_num_active_reqs", None)
+        num_active = len(self.running) + int(
+            getattr(self, "num_waiting_for_streaming_input", 0) or 0
+        )
+        if isinstance(max_active, int) and num_active >= max_active:
+            return "max_running"
+        budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
+        if getattr(out, "total_num_scheduled_tokens", 0) >= budget:
+            return "budget"
+        if not self._has_undeferred_waiting():
+            return "drained"
+        return "other"
+
+    def _has_undeferred_waiting(self) -> bool:
+        """Whether ``waiting`` holds a request vLLM has not deferred.
+
+        The scan puts a skipped request that holds no KV blocks back into
+        ``waiting`` and keeps it in ``deferred_waiting`` until it is scheduled.
+        """
+        deferred = getattr(self, "deferred_waiting", None) or ()
+        return any(r not in deferred for r in getattr(self, "waiting", None) or ())
+
+    def _record_step_telemetry(self, out, waiting_at_start: int, stop: str) -> None:
+        """Accumulates the per-minute step counters of the telemetry line.
+
+        A small step counts only when requests are still waiting after it, so
+        a step that admitted every waiting request with a short chunk is not
+        one.
+        """
+        tm = getattr(self, "_tm", None)
+        if tm is None:
+            tm = self._tm = {
+                "steps": 0,
+                "small_steps_waiting": 0,
+                "exempt_steps": 0,
+                "stops": {},
+                "alloc_none_base": None,
+            }
+        tm["steps"] += 1
+        if getattr(self, "_step_cold_exempt_ids", None):
+            tm["exempt_steps"] = tm.get("exempt_steps", 0) + 1
+        if waiting_at_start > 0:
+            tokens = getattr(out, "total_num_scheduled_tokens", 0)
+            if (
+                tokens <= _SMALL_STEP_BLOCKS * self._get_block_size()
+                and self._has_undeferred_waiting()
+            ):
+                tm["small_steps_waiting"] += 1
+            stops = tm["stops"]
+            stops[stop] = stops.get(stop, 0) + 1
+
+    def _admission_telemetry(self, stop: str) -> str:
+        """Formats the sampled step's admission state plus the per-minute step
+        counters, and resets the counters."""
+        retention = getattr(self, "_retention", None)
+        tm = getattr(self, "_tm", None) or {}
+        step_none = getattr(retention, "step_waiting_none", None)
+        alloc_total = getattr(retention, "alloc_none", None)
+        alloc_minute = "-"
+        if alloc_total is not None:
+            base = tm.get("alloc_none_base") or dict.fromkeys(ALLOC_NONE_REASONS, 0)
+            alloc_minute = format_counts(
+                {k: v - base.get(k, 0) for k, v in alloc_total.items()}
+            )
+            tm["alloc_none_base"] = dict(alloc_total)
+        reserved = "-"
+        fn = getattr(self, "_inflight_prefill_reserved_blocks", None)
+        if callable(fn) and hasattr(self, "_inflight_prefills"):
+            try:
+                reserved = str(fn())
+            except Exception:
+                reserved = "-"
+        pool_free = "-"
+        pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
+        get_free = getattr(pool, "get_num_free_blocks", None)
+        if callable(get_free):
+            try:
+                pool_free = str(int(get_free()))
+            except Exception:
+                pool_free = "-"
+        max_cold = getattr(self, "_step_max_cold_budget", None)
+        stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
+        text = (
+            f"warm_waiting_toks={getattr(self, '_step_warm_waiting_tokens', 0)} "
+            f"max_cold_budget={'-' if max_cold is None else max_cold} "
+            f"cold_release={int(bool(getattr(self, '_step_cold_release', False)))} "
+            f"cold_exempt={len(getattr(self, '_step_cold_exempt_ids', ()) or ())} "
+            f"admits={getattr(retention, 'step_admits', 0)} "
+            f"async_admits={getattr(retention, 'step_async_admits', 0)} "
+            f"stop={stop} "
+            f"step_alloc_none={','.join(step_none) if step_none else '-'} "
+            f"inflight_reserved={reserved} pool_free={pool_free} "
+            f"min_steps={tm.get('steps', 0)} "
+            f"min_small_steps_waiting={tm.get('small_steps_waiting', 0)} "
+            f"min_exempt_steps={tm.get('exempt_steps', 0)} "
+            f"min_alloc_none={alloc_minute} "
+            f"min_stops={format_counts(stops)}"
+        )
+        tm["steps"] = 0
+        tm["small_steps_waiting"] = 0
+        tm["exempt_steps"] = 0
+        tm["stops"] = {}
+        return text
 
     def _cap_cold_prefill_tokens(
         self,
@@ -599,13 +1032,20 @@ class PrefixAwareScheduler(AsyncScheduler):
            ``step_total_cap`` (default ``budget // 2``), returning ``0`` if fewer
            than one Mamba block remains so multi-prefill collisions never spill
            into the ``budget`` XLA compile bucket.
+        3. KV producer, cold request already running: while warm requests wait,
+           the cold group shares ``max(block, min(cold_chunk_cap, budget -
+           warm_waiting_toks))`` per step. For a request that arrived more than
+           TPU_SCHED_PAW_MAX_WAIT_S ago the group budget is ``max(cold_chunk_cap,
+           budget - 1 - min(warm_waiting_toks, reserve x budget))`` with reserve
+           = TPU_SCHED_PAW_EXEMPT_WARM_RESERVE, so the waiting warm requests keep
+           up to that share of the step. With TPU_SCHED_PAW_MAX_WAIT_S > 0, on
+           the step after a step whose warm reservation admitted no warm request
+           the cold group keeps only the phase-1 gap (``budget - 1``) that lets
+           the waiting loop start async loads. With both PAW aging knobs at 0
+           this branch is the S0 cold cap.
         """
-        _, cold_chunk_cap, cold_threshold, cold_min_decoders = (
-            self._get_sched_knobs()
-        )
-        step_total_cap, warm_streak, warm_min_decoders = (
-            self._get_step_cap_knobs()
-        )
+        _, cold_chunk_cap, cold_threshold, cold_min_decoders = self._get_sched_knobs()
+        step_total_cap, warm_streak, warm_min_decoders = self._get_step_cap_knobs()
         prefill_end = max(
             getattr(request, "num_prompt_tokens", 0),
             getattr(request, "num_tokens", 0) - 1,
@@ -626,21 +1066,40 @@ class PrefixAwareScheduler(AsyncScheduler):
             and 0 < warm_min_decoders <= num_decoding
             and getattr(self, "_pure_decode_streak", 999999) < warm_streak
         ):
+            self._last_cap_zero = "warm_streak"
             return 0
 
         sched_map = getattr(self, "_step_prefill_tokens_by_req", None)
         req_key = id(request)
         if sched_map is not None:
-            prior_prefill_tokens = sum(
-                v for k, v in sched_map.items() if k != req_key
-            )
-            has_prior_prefill = any(
-                v > 0 for k, v in sched_map.items() if k != req_key
-            )
+            prior_prefill_tokens = sum(v for k, v in sched_map.items() if k != req_key)
+            has_prior_prefill = any(v > 0 for k, v in sched_map.items() if k != req_key)
         else:
             prior_prefill_tokens = 0
             has_prior_prefill = False
         already_scheduled = decode_tokens + prior_prefill_tokens
+
+        finish_steps, finish_max_defer, finish_min_toks = (
+            self._get_finish_decode_knobs()
+        )
+        if finish_steps > 0:
+            if self._has_near_finish_decoder(finish_steps):
+                if max(prior_prefill_tokens + num_new_tokens, rem) >= finish_min_toks:
+                    defer_streak = int(
+                        getattr(self, "_finish_decode_defer_streak", 0) or 0
+                    )
+                    if defer_streak < finish_max_defer:
+                        self._step_finish_decode_deferred = True
+                        if sched_map is None:
+                            self._finish_decode_defer_streak = defer_streak + 1
+                        else:
+                            sched_map[req_key] = 0
+                        self._last_cap_zero = "finish_defer"
+                        return 0
+                    self._finish_decode_defer_streak = 0
+                    self._step_finish_decode_deferred = False
+            elif sched_map is None:
+                self._finish_decode_defer_streak = 0
 
         if (
             step_total_cap > 0
@@ -654,34 +1113,89 @@ class PrefixAwareScheduler(AsyncScheduler):
             ):
                 if sched_map is not None:
                     sched_map[req_key] = 0
+                self._last_cap_zero = "step_cap"
                 return 0
             num_new_tokens = min(num_new_tokens, rem_step_cap)
 
-        if (
-            cold_chunk_cap > 0
-            and cold_threshold > 0
-            and rem > cold_threshold
-        ):
-            in_running = req_key in getattr(
-                self, "_step_running_prefill_ids", ()
-            )
-            has_waiting = bool(getattr(self, "waiting", None)) or bool(
-                getattr(self, "skipped_waiting", None)
-            )
-            if (
-                0 < cold_min_decoders <= num_decoding
-                or (in_running and has_waiting)
-            ):
-                if has_prior_prefill:
-                    rem_cold_cap = cold_chunk_cap - already_scheduled
-                    if rem_cold_cap >= block_size:
-                        num_new_tokens = min(num_new_tokens, rem_cold_cap)
+        if cold_chunk_cap > 0 and cold_threshold > 0 and rem > cold_threshold:
+            in_running = req_key in getattr(self, "_step_running_prefill_ids", ())
+            if getattr(self, "_is_kv_producer", False):
+                if in_running:
+                    budget = int(
+                        getattr(self, "max_num_scheduled_tokens", 8192) or 8192
+                    )
+                    warm_waiting_toks = getattr(
+                        self, "_step_warm_waiting_tokens", None
+                    )
+                    if warm_waiting_toks is None:
+                        warm_waiting_toks = self._compute_warm_waiting_tokens(
+                            cold_threshold
+                        )
+                    any_waiting = bool(getattr(self, "waiting", None)) or bool(
+                        getattr(self, "kv_holding_waiting", None)
+                    )
+                    if warm_waiting_toks > 0 and not getattr(
+                        self, "_step_cold_release", False
+                    ):
+                        if self._cold_cap_exempt(request):
+                            warm_keep = min(
+                                warm_waiting_toks,
+                                int(self._get_exempt_warm_reserve() * budget),
+                            )
+                            max_cold_budget = max(
+                                cold_chunk_cap, budget - 1 - warm_keep
+                            )
+                            exempt_ids = getattr(self, "_step_cold_exempt_ids", None)
+                            if exempt_ids is not None:
+                                exempt_ids.add(req_key)
+                        else:
+                            max_cold_budget = max(
+                                block_size,
+                                min(cold_chunk_cap, budget - warm_waiting_toks),
+                            )
+                        self._step_warm_reserve_applied = True
+                        self._step_max_cold_budget = max_cold_budget
+                        if has_prior_prefill:
+                            rem_cold_cap = max_cold_budget - already_scheduled
+                            if rem_cold_cap < block_size:
+                                if sched_map is not None:
+                                    sched_map[req_key] = 0
+                                self._last_cap_zero = "cold_cap"
+                                return 0
+                            num_new_tokens = min(num_new_tokens, rem_cold_cap)
+                        else:
+                            num_new_tokens = min(
+                                num_new_tokens,
+                                max(block_size, max_cold_budget - decode_tokens),
+                            )
+                    elif any_waiting:
+                        max_phase1_budget = max(block_size, budget - 1)
+                        rem_phase1 = max_phase1_budget - already_scheduled
+                        if has_prior_prefill and rem_phase1 < block_size:
+                            if sched_map is not None:
+                                sched_map[req_key] = 0
+                            self._last_cap_zero = "phase1"
+                            return 0
+                        num_new_tokens = min(
+                            num_new_tokens, max(block_size, rem_phase1)
+                        )
+            else:
+                has_waiting = bool(getattr(self, "waiting", None)) or bool(
+                    getattr(self, "kv_holding_waiting", None)
+                )
+                if 0 < cold_min_decoders <= num_decoding or (
+                    in_running and has_waiting
+                ):
+                    if has_prior_prefill:
+                        rem_cold_cap = cold_chunk_cap - already_scheduled
+                        if rem_cold_cap >= block_size:
+                            num_new_tokens = min(num_new_tokens, rem_cold_cap)
+                        else:
+                            cap = max(block_size, cold_chunk_cap - decode_tokens)
+                            num_new_tokens = min(num_new_tokens, cap)
                     else:
                         cap = max(block_size, cold_chunk_cap - decode_tokens)
                         num_new_tokens = min(num_new_tokens, cap)
-                else:
-                    cap = max(block_size, cold_chunk_cap - decode_tokens)
-                    num_new_tokens = min(num_new_tokens, cap)
 
         if sched_map is not None:
             sched_map[req_key] = num_new_tokens
@@ -694,6 +1208,25 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        self._last_cap_zero = None
+        aligned = self._capped_aligned_split(
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if aligned <= 0:
+            why = getattr(self, "_last_cap_zero", None)
+            self._note_waiting_stop(request, f"cap0:{why}" if why else "align0")
+        return aligned
+
+    def _capped_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> int:
         start = (
             getattr(request, "num_computed_tokens", 0)
             + num_new_local_computed_tokens
@@ -702,6 +1235,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_new_tokens = self._cap_cold_prefill_tokens(
             request, start, num_new_tokens
         )
+        if num_new_tokens <= 0:
+            return 0
         retention = getattr(self, "_retention", None)
         if retention is not None:
             try:
@@ -746,9 +1281,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             )
         if retention is not None:
             try:
-                aligned = retention.adjust_prefill_split(
-                    request, start, aligned
-                )
+                aligned = retention.adjust_prefill_split(request, start, aligned)
             except Exception:
                 self._retention_failed()
         sched_map = getattr(self, "_step_prefill_tokens_by_req", None)
@@ -830,13 +1363,18 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
+        why = None
         if not getattr(self, "need_mamba_block_aligned_split", False):
+            self._last_cap_zero = None
             num_new_tokens = self._cap_cold_prefill_tokens(
                 request, num_computed_tokens, num_new_tokens
             )
+            why = getattr(self, "_last_cap_zero", None)
         reserved = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
+        if reserved <= 0:
+            self._note_waiting_stop(request, f"cap0:{why}" if why else "lookahead0")
         sched_map = getattr(self, "_step_prefill_tokens_by_req", None)
         if sched_map is not None and id(request) in sched_map:
             sched_map[id(request)] = reserved
@@ -845,7 +1383,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _get_block_size(self) -> int:
         """Return KV cache block size in tokens (defaults to 16 if unset)."""
         block_size = getattr(self, "block_size", None)
-        if isinstance(block_size, int) and not isinstance(block_size, bool) and block_size > 0:
+        if (
+            isinstance(block_size, int)
+            and not isinstance(block_size, bool)
+            and block_size > 0
+        ):
             return block_size
         cache_cfg = getattr(self, "cache_config", None)
         cfg_block_size = getattr(cache_cfg, "block_size", None)
@@ -940,10 +1482,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self, request: Request
     ) -> tuple[object, int, int, bool]:
         connector = getattr(self, "connector", None)
-        if (
-            connector is None
-            or not connector.supports_divergent_local_hybrid_hits
-        ):
+        if connector is None or not connector.supports_divergent_local_hybrid_hits:
             kvm = self.kv_cache_manager
             epoch = self._get_prefix_cache_epoch()
             if (
@@ -969,11 +1508,10 @@ class PrefixAwareScheduler(AsyncScheduler):
                         # memo itself must never be mutated downstream.
                         computed_blocks = tuple(list(b) for b in computed_blocks)
                     shared_prefix_boundary = (
-                        num_new_computed_tokens + num_uncached
-                        if num_uncached
-                        else 0
+                        num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
                     blocks = kvm.create_kv_cache_blocks(computed_blocks)
+                    request._tpu_local_hit_tokens = num_new_computed_tokens
                     return (
                         blocks,
                         num_new_computed_tokens,
@@ -983,9 +1521,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
             super()._get_local_prefix_cache_hit(request)
         )
-        if hit_diverged and hasattr(
-            connector, "resolve_divergent_local_hit_tokens"
-        ):
+        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
                 kvm.get_computed_blocks(request)
@@ -995,6 +1531,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 request, num_local, num_reconciled, block_size
             )
             if target_local is None:
+                request._tpu_local_hit_tokens = num_reconciled
                 return (
                     reconciled_blocks,
                     num_reconciled,
@@ -1002,6 +1539,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     False,
                 )
             if target_local <= 0:
+                request._tpu_local_hit_tokens = 0
                 return (
                     kvm.empty_kv_cache_blocks,
                     0,
@@ -1011,63 +1549,177 @@ class PrefixAwareScheduler(AsyncScheduler):
             if target_local < num_local:
                 blocks = kvm.truncate_computed_blocks(blocks, target_local)
                 num_local = target_local
+        request._tpu_local_hit_tokens = num_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
+
+    def _external_warmth(self, request: Request, local_warmth: int) -> int:
+        if getattr(self, "_is_kv_consumer", False):
+            return 0
+        connector = getattr(self, "connector", None)
+        if connector is None:
+            return 0
+        fn = getattr(connector, "estimate_external_hit_tokens", None)
+        if not callable(fn):
+            return 0
+        if request.num_tokens - local_warmth < self._get_block_size():
+            return 0
+        try:
+            return max(0, int(fn(request, local_warmth) or 0))
+        except Exception:
+            return 0
+
+    def _compute_warm_waiting_tokens(
+        self, cold_threshold: int, ids: set[str] | None = None
+    ) -> int:
+        """Return block-aligned TPU prefill tokens needed on this step by
+        ready warm requests in ``kv_holding_waiting`` (completed async CPU
+        loads) or ``waiting`` (pure HBM cache hits). ``ids`` collects their
+        request ids."""
+        block_size = self._get_block_size()
+        budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
+        total = 0
+        finished_recv = getattr(self, "finished_recving_kv_req_ids", None) or ()
+        kv_holding = getattr(self, "kv_holding_waiting", None)
+        if kv_holding:
+            for r in kv_holding:
+                # A finished load still reads WAITING_FOR_REMOTE_KVS until the
+                # scan promotes it; one promoted on an earlier step but not
+                # scheduled stays here unblocked.
+                if r.request_id not in finished_recv and (
+                    self._is_blocked_waiting_status(r.status)
+                ):
+                    continue
+                rem = max(
+                    getattr(r, "num_tokens", 0)
+                    - getattr(r, "num_computed_tokens", 0),
+                    1,
+                )
+                if rem <= cold_threshold:
+                    total += (math.ceil(rem / block_size) + 1) * block_size
+                    if ids is not None:
+                        ids.add(r.request_id)
+                    if total >= budget:
+                        return budget
+        waiting = getattr(self, "waiting", None)
+        if waiting:
+            for r in islice(waiting, self.WINDOW):
+                local_warmth = self._prefix_warmth(r)
+                if local_warmth <= 0:
+                    continue
+                rem = max(getattr(r, "num_tokens", 0) - local_warmth, 1)
+                if rem > cold_threshold:
+                    continue
+                if self._external_warmth(r, local_warmth) > 0:
+                    continue
+                total += (math.ceil(rem / block_size) + 1) * block_size
+                if ids is not None:
+                    ids.add(r.request_id)
+                if total >= budget:
+                    return budget
+        return total
 
     def _rank_and_warmth(
         self,
         request: Request,
         free_blocks_for_fit: int | None = None,
+        now: float | None = None,
     ) -> tuple[tuple[int, float, float], int]:
-        """Return (sort_key, warmth). Lower sort_key is admitted first."""
-        warmth = self._prefix_warmth(request)
-        cold_tokens = float(max(request.num_tokens - warmth, 0))
+        """Return (sort_key, warmth). Lower sort_key is admitted first.
+
+        The key is (tier, uncached tokens, arrival time); the uncached tokens
+        are reduced by TPU_SCHED_PAW_AGING_TOK_PER_S per second since arrival
+        (see ``_wait_seconds``), which reorders requests within a tier only.
+        """
+        local_warmth = self._prefix_warmth(request)
+        hbm_cold_tokens = max(request.num_tokens - local_warmth, 0)
+        rate, _ = self._get_paw_aging_knobs()
+        aging = 0.0
+        if rate > 0:
+            aging = rate * _wait_seconds(
+                request, time.time() if now is None else now
+            )
+        if getattr(self, "_is_kv_consumer", False):
+            tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+            return (tier, hbm_cold_tokens - aging, request.arrival_time), local_warmth
         if (
             free_blocks_for_fit is not None
-            and warmth > 0
-            and math.ceil(cold_tokens / self._get_block_size())
+            and local_warmth > 0
+            and math.ceil(hbm_cold_tokens / self._get_block_size())
             <= free_blocks_for_fit
         ):
-            tier = _TIER_FREE_BLOCK_FIT
-        elif request.num_preemptions > 0:
-            tier = _TIER_PREEMPTED
-        elif warmth > 0:
-            tier = _TIER_NORMAL
-        else:
-            tier = _TIER_NORMAL + 1
-        return (tier, cold_tokens, request.arrival_time), warmth
+            return (
+                (
+                    _TIER_FREE_BLOCK_FIT,
+                    hbm_cold_tokens - aging,
+                    request.arrival_time,
+                ),
+                local_warmth,
+            )
+        if request.num_preemptions > 0:
+            return (
+                (_TIER_PREEMPTED, hbm_cold_tokens - aging, request.arrival_time),
+                local_warmth,
+            )
+        if local_warmth > 0:
+            return (
+                (_TIER_NORMAL, hbm_cold_tokens - aging, request.arrival_time),
+                local_warmth,
+            )
+        ext_warmth = self._external_warmth(request, 0)
+        if ext_warmth > 0:
+            ext_cold_tokens = max(request.num_tokens - ext_warmth, 0)
+            return (
+                (_TIER_NORMAL + 1, ext_cold_tokens - aging, request.arrival_time),
+                ext_warmth,
+            )
+        return (
+            (_TIER_NORMAL + 2, hbm_cold_tokens - aging, request.arrival_time),
+            0,
+        )
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        queue = getattr(self, "kv_holding_waiting", None) or getattr(
-            self, "waiting", None
-        )
-        if queue is not None:
-            self._promote_warmest(queue)
-        return queue
+        """Promotes the warmest request of each waiting queue to its head.
+
+        vLLM's scan drains ``kv_holding_waiting`` (requests holding KV blocks,
+        such as async loads) before ``waiting`` on every step, so ``waiting``
+        is promoted even while ``kv_holding_waiting`` is not empty. Returns
+        the queue the scan reads first.
+        """
+        kv_holding = getattr(self, "kv_holding_waiting", None)
+        if kv_holding:
+            self._promote_warmest(kv_holding)
+        waiting = getattr(self, "waiting", None)
+        if waiting:
+            self._promote_warmest(waiting)
+        return kv_holding or waiting
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
-        if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
+        if len(queue) < 2 or self.policy != SchedulingPolicy.FCFS:
             return
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
-        head_scored = self._rank_and_warmth(head)
-        head_warmth = head_scored[1]
+        now = self._now()
+        head_scored = self._rank_and_warmth(head, now=now)
+        head_local_warmth = self._prefix_warmth(head)
 
-        free_blocks = self._get_num_free_blocks()
+        free_blocks = (
+            None
+            if getattr(self, "_is_kv_consumer", False)
+            else self._get_num_free_blocks()
+        )
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
-            head_cold_tokens = max(head.num_tokens - head_warmth, 0)
-            head_needed_blocks = math.ceil(
-                head_cold_tokens / self._get_block_size()
-            )
+            head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
+            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
             if free_blocks < head_needed_blocks:
                 free_blocks_for_fit = free_blocks
 
         scored = [(head_scored, head)] + [
             (
                 self._rank_and_warmth(
-                    r, free_blocks_for_fit=free_blocks_for_fit
+                    r, free_blocks_for_fit=free_blocks_for_fit, now=now
                 ),
                 r,
             )

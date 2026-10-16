@@ -121,6 +121,8 @@ def test_relayout_skips_the_shared_module(monkeypatch):
 @pytest.mark.parametrize(
     "flag", ["TPU_ROPE_CACHE_TRUNCATE", "TPU_ROPE_CACHE_ROW_MAJOR"]
 )
-def test_the_flags_default_off(monkeypatch, flag):
+def test_the_flags_default_on(monkeypatch, flag):
     monkeypatch.delenv(flag, raising=False)
+    assert envs.environment_variables[flag]() is True
+    monkeypatch.setenv(flag, "0")
     assert envs.environment_variables[flag]() is False

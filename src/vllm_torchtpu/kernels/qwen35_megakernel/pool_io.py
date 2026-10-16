@@ -127,6 +127,7 @@ def gather_gdn_states(
     ssm_u32_rows = (vh * KD) // 2
     REC_PAGES = c.rec_pages
     GDN_PAGES = c.gdn_pages
+    GDN_STRIDE = c.gdn_stride
     SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
@@ -189,13 +190,17 @@ def gather_gdn_states(
             roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, roff]
-                return slot * GDN_PAGES
+                return slot * GDN_STRIDE
             else:
                 slot = ckpt_ref[s, roff]
                 return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
+        def is_in_active(sub, s):
+            roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
+            return jnp.logical_and(is_active(s), roff >= 0)
+
         def start_page_read(raw_ref, sub, s, p_slot):
-            @pl.when(is_active(s))
+            @pl.when(is_in_active(sub, s))
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
@@ -205,10 +210,14 @@ def gather_gdn_states(
         def finish_page_read(raw_ref, sub, s, p_slot, g_slot, r_slot, r_sub):
             @pl.when(is_active(s))
             def _():
-                pb = page_base_for(sub, s)
-                pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
-                ).wait()
+                has_in = (roff_ref[sub, s] if roff_is_2d else roff_ref[s]) >= 0
+
+                @pl.when(has_in)
+                def _():
+                    pb = page_base_for(sub, s)
+                    pltpu.make_async_copy(
+                        raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    ).wait()
 
                 # Unpack SSM state: pages 0..REC_PAGES-1 -> (ssm_u32_rows, 128) u32 -> (vh, KD, VD) bf16
                 u32_val = (
@@ -216,6 +225,7 @@ def gather_gdn_states(
                     .bitcast(U32)
                     .reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
                 )
+                u32_val = jnp.where(has_in, u32_val, jnp.uint32(0))
                 s_km = pltpu.bitcast(u32_val, BF16).reshape(vh, KD, VD)
                 h0 = s * vh if isinstance(s, int) else pl.multiple_of(s * vh, vh)
                 rec_buf[r_slot, r_sub, pl.ds(h0, vh)] = s_km
@@ -228,7 +238,9 @@ def gather_gdn_states(
                         .reshape(c.HR, QKV)
                         .astype(conv_dt)
                     )
-                    conv_buf[g_slot, sub, s] = jnp.where(conv_row_iota < 3, raw_hr, 0.0)
+                    conv_buf[g_slot, sub, s] = jnp.where(
+                        jnp.logical_and(has_in, conv_row_iota < 3), raw_hr, 0.0
+                    )
                 else:
                     # Unpack Conv state: page REC_PAGES -> (conv_rows_pad, 128) bf16 (tile-aligned)
                     c0 = (
@@ -236,10 +248,13 @@ def gather_gdn_states(
                         if isinstance(s, int)
                         else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
                     )
-                    conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = (
+                    c_val = (
                         page_buf.at[p_slot, REC_PAGES]
                         .bitcast(BF16)
                         .reshape(256, 128)[:conv_rows_pad, :]
+                    )
+                    conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = jnp.where(
+                        has_in, c_val, jnp.bfloat16(0.0)
                     )
 
         total_gdn = c.NATT * G_PER_ATT
@@ -535,6 +550,7 @@ def scatter_pool_states(
     ssm_u32_rows = (vh * KD) // 2
     REC_PAGES = c.rec_pages
     GDN_PAGES = c.gdn_pages
+    GDN_STRIDE = c.gdn_stride
     SSM_U32_CAP = REC_PAGES * 128
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
@@ -656,7 +672,7 @@ def scatter_pool_states(
         def pb_for(sub, s, t):
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, t + ckpt_t_off]
-                return slot * GDN_PAGES
+                return slot * GDN_STRIDE
             else:
                 slot = ckpt_ref[s, t + ckpt_t_off]
                 return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
@@ -664,6 +680,8 @@ def scatter_pool_states(
         def is_contig_ckpt(sub, s):
             if not ckpt_is_3d or T <= 1:
                 return jnp.bool_(T == 1)
+            if GDN_STRIDE != GDN_PAGES:
+                return jnp.bool_(False)  # consecutive slots are not adjacent pages
             s0 = ckpt_ref[sub, s, ckpt_t_off]
             ok = jnp.bool_(True)
             for t in range(1, T):
@@ -773,7 +791,9 @@ def scatter_pool_states(
                             )
                             page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
                                 256, 128
-                            )[:conv_rows_pad, :] = w4.reshape(conv_rows_pad, 128)
+                            )[:conv_rows_pad, :] = w4.reshape(4 * qkv_128, 128)[
+                                :conv_rows_pad, :
+                            ]
                         else:
                             taps_128 = (
                                 conv_buf[slot, 0, 1 + t : 4 + t, :]
@@ -1333,6 +1353,7 @@ def make_flat_pooled_step(
     scopes=False,
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
+    out_rows: int = 0,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1426,8 +1447,12 @@ def make_flat_pooled_step(
             )
             if bool(interpret):
                 hid, raw_out = out
+                if out_rows > 0 and hid.shape[0] > out_rows:
+                    hid = hid[:out_rows]
                 return (hid, *raw_out)
             hid = out[0] if isinstance(out, (tuple, list)) else out
+            if out_rows > 0 and hid.shape[0] > out_rows:
+                hid = hid[:out_rows]
             return (hid, *raw_pools)
 
         if use_gpr:
@@ -1461,6 +1486,8 @@ def make_flat_pooled_step(
             interpret=interpret,
             conv_partial=use_gpr,
         )
+        if out_rows > 0 and hid.shape[0] > out_rows:
+            hid = hid[:out_rows]
         return (hid, *raw_out)
 
     smap = jax.shard_map(
@@ -1572,6 +1599,7 @@ def make_pooled_step(
     scopes=False,
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
+    out_rows: int = 0,
 ):
     """Build the `shard_map` decode/verify step over unified block pools `raw[0..14]`.
 
@@ -1869,12 +1897,12 @@ def default_pool_layout(c: MKConfig):
     `(G_PER_ATT, NS)`).
     """
     G_PER_ATT = max(1, c.att_every - 1)
-    gdn_pages = c.gdn_pages
+    gdn_stride = c.gdn_stride
     pages_per_seq = c.ctx // c.page_size
     kv_pages_total = c.NS * pages_per_seq
     n_ckpt_slots = G_PER_ATT * c.NS * c.T
-    base_slot = (kv_pages_total + gdn_pages - 1) // gdn_pages
-    min_num_pages = (base_slot + n_ckpt_slots) * gdn_pages
+    base_slot = (kv_pages_total + gdn_stride - 1) // gdn_stride
+    min_num_pages = (base_slot + n_ckpt_slots) * gdn_stride
 
     pt = np.zeros((c.NS, max(c.max_pages_per_seq, pages_per_seq)), dtype=np.int32)
     for s in range(c.NS):
@@ -1897,6 +1925,7 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
     G_PER_ATT = AE - 1
     rec_pages = c.rec_pages
     gdn_pages = c.gdn_pages
+    gdn_stride = c.gdn_stride
     pt = np.asarray(page_table)
     ckpt = np.asarray(ckpt_indices)
     ckpt_is_3d = ckpt.ndim == 3
@@ -1930,7 +1959,7 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
                     ro_val = int(roff[sub, s]) if roff_is_2d else int(roff[s])
                     if ckpt_is_3d:
                         slot = int(ckpt[sub, s, ro_val])
-                        page_base = slot * gdn_pages
+                        page_base = slot * gdn_stride
                     else:
                         slot = int(ckpt[s, ro_val])
                         page_base = slot * (gdn_pages * G_PER_ATT) + sub * gdn_pages

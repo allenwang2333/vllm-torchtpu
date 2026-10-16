@@ -3271,3 +3271,103 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_stage_timing_disabled_skips_thread_and_events():
+    from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+
+    timing = RunnerStageTiming(0, enabled=False)
+    assert timing._enabled is False
+    assert timing._thread is None
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("prep"):
+        pass
+    assert timing.take_samples() == ([], [])
+
+
+def test_dp_num_tokens_across_dp_caches_cpu_tensors():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner._dp_lockstep_enabled = lambda: False
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=True,
+    )
+    t1 = runner._dp_num_tokens_across_dp(64)
+    t2 = runner._dp_num_tokens_across_dp(64)
+    t3 = runner._dp_num_tokens_across_dp(16)
+    assert t1 is not None
+    assert t1 is t2
+    assert t1.tolist() == [64]
+    assert t3 is not None and t3.tolist() == [16]
+
+    runner.parallel_config.use_sequence_parallel_moe = False
+    assert runner._dp_num_tokens_across_dp(64) is None
+
+
+def test_kv_transfer_uses_stage_timing():
+    cfg_none = SimpleNamespace(kv_transfer_config=None)
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_none) is False
+
+    cfg_offload = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenOffloadingConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_offload) is False
+
+    cfg_raiden = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_raiden) is True
+
+    cfg_multi_with_tpu = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPUMultiConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "TPURaidenOffloadingConnector"},
+                    {"kv_connector": "TPUConnector"},
+                ]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True
+
+
+def test_update_states_clears_prev_draft_len_of_scheduled_cached_requests():
+    """The base runner's async draft correction reads prev_num_draft_len of
+    every scheduled cached request; one scheduled without drafts after
+    drafting in the previous step must be cleared too."""
+    from vllm.v1.core.sched.output import SchedulerOutput
+
+    runner = object.__new__(TPUModelRunner)
+    states = {
+        rid: SimpleNamespace(prev_num_draft_len=3)
+        for rid in ("drafting", "budget_cut", "unscheduled")
+    }
+    runner.requests = states
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner._pre_async_results = None
+    runner._install_spec_token_room_guard = lambda: None
+    runner._mamba_state_pos = {}
+    runner._mamba_offset_seeded = set()
+    runner._mamba_slot_by_req_id = {}
+    runner._free_mamba_slots = []
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = ["drafting", "budget_cut"]
+    output.scheduled_spec_decode_tokens = {"drafting": [-1, -1, -1]}
+    seen: dict[str, int] = {}
+
+    def base_update(_output):
+        seen.update({rid: s.prev_num_draft_len for rid, s in states.items()})
+
+    with patch.object(GPUModelRunner, "_update_states", side_effect=base_update):
+        runner._update_states(output)
+
+    assert seen == {"drafting": 0, "budget_cut": 0, "unscheduled": 3}

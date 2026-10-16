@@ -103,7 +103,9 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         )
         else 0
     )
-    return ((_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots) * 3 * hidden * inter, slots
+    return (
+        (_QWEN35_SAFE_KV_SLOTS - slots) * layers - mtp_extra_slots
+    ) * 3 * hidden * inter, slots
 
 
 def _log_effective_config(vllm_config: VllmConfig) -> None:
@@ -712,6 +714,8 @@ class TpuPlatform(Platform):
     def get_compile_backend(cls) -> str:
         return "vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor"
 
+    _dp_tokens_tpu_cache: dict[tuple[int, ...], torch.Tensor] = {}
+
     @classmethod
     def set_additional_forward_context(cls, *args, **kwargs) -> dict:
         """Move DP metadata onto the TPU for DP+EP.
@@ -723,7 +727,12 @@ class TpuPlatform(Platform):
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
-                tpu_t = t.to("tpu")
+                key = (int(t.item()),) if t.numel() == 1 else tuple(t.tolist())
+                tpu_t = cls._dp_tokens_tpu_cache.get(key)
+                if tpu_t is None or tpu_t.dtype != t.dtype:
+                    tpu_t = t.to("tpu")
+                    if len(cls._dp_tokens_tpu_cache) < 512:
+                        cls._dp_tokens_tpu_cache[key] = tpu_t
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
@@ -796,6 +805,47 @@ class TpuPlatform(Platform):
                 "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
             )
         kv_cache_layout = get_flashinfer_layout_string(layout)
+        if (
+            vllm_config.speculative_config is not None
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_producer"
+            and vllm_config.speculative_config.num_speculative_tokens != 1
+        ):
+            logger.info(
+                "Clamping prefill (kv_producer, pcp=%d) speculative_config.num_speculative_tokens "
+                "from %d to 1 and resetting synthetic rejection sampling.",
+                parallel_config.prefill_context_parallel_size,
+                vllm_config.speculative_config.num_speculative_tokens,
+            )
+            vllm_config.speculative_config.num_speculative_tokens = 1
+            vllm_config.speculative_config.rejection_sample_method = "standard"
+            vllm_config.speculative_config.synthetic_acceptance_rates = None
+            vllm_config.speculative_config.synthetic_acceptance_length = None
+        elif (
+            vllm_config.speculative_config is not None
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_role == "kv_consumer"
+            and vllm_config.speculative_config.num_speculative_tokens >= 3
+            and vllm_config.speculative_config.rejection_sample_method == "standard"
+        ):
+            synth_len_env = os.environ.get("SYNTHETIC_ACCEPTANCE_LENGTH", "").strip()
+            if synth_len_env and float(synth_len_env) > 0:
+                synth_len = float(synth_len_env)
+                vllm_config.speculative_config.rejection_sample_method = "synthetic"
+                vllm_config.speculative_config.synthetic_acceptance_rates = (
+                    vllm_config.speculative_config._resolve_synthetic_acceptance_rates(
+                        vllm_config.speculative_config.num_speculative_tokens,
+                        None,
+                        synth_len,
+                    )
+                )
+                vllm_config.speculative_config.synthetic_acceptance_length = None
+                logger.info(
+                    "Enabled synthetic rejection sampling on decode (kv_consumer): "
+                    "length=%.2f -> rates=%s",
+                    synth_len,
+                    vllm_config.speculative_config.synthetic_acceptance_rates,
+                )
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
             kv_cache_layout=kv_cache_layout,
@@ -924,7 +974,8 @@ class TpuPlatform(Platform):
 
         if (
             model_config is not None
-            and "Qwen3_5MoeForConditionalGeneration" in (model_config.architectures or [])
+            and "Qwen3_5MoeForConditionalGeneration"
+            in (model_config.architectures or [])
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):
@@ -935,12 +986,18 @@ class TpuPlatform(Platform):
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
-            if hasattr(cache_config, "prefix_cache_retention_interval"):
-                cache_config.prefix_cache_retention_interval = 0
-            if hasattr(cache_config, "prefix_match_unit") and getattr(
-                cache_config, "prefix_match_unit", None
-            ) in (None, 0, 1):
-                cache_config.prefix_match_unit = 128
+            if (
+                vllm_config.kv_transfer_config is None
+                or vllm_config.kv_transfer_config.kv_role == "kv_producer"
+                or os.environ.get("TPU_HYBRID_STATE_RETENTION", "0").strip().lower()
+                in ("1", "true", "yes", "on")
+            ):
+                if hasattr(cache_config, "prefix_cache_retention_interval"):
+                    cache_config.prefix_cache_retention_interval = 0
+                if hasattr(cache_config, "prefix_match_unit") and getattr(
+                    cache_config, "prefix_match_unit", None
+                ) in (None, 0, 1):
+                    cache_config.prefix_match_unit = 128
             dcp_size = int(
                 getattr(parallel_config, "decode_context_parallel_size", 1) or 1
             )
@@ -964,8 +1021,8 @@ class TpuPlatform(Platform):
                     dcp_size,
                 )
             # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
-                    # while reserving ~2.5 GiB of HBM headroom for runtime activations
-                    # and program-load scratch buffers under DCP=1 and DCP>1.
+            # while reserving ~2.5 GiB of HBM headroom for runtime activations
+            # and program-load scratch buffers under DCP=1 and DCP>1.
             if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
                 safe_kv = 32_500_000_000
                 max_ablat_kv = 41_559_696_640
@@ -982,12 +1039,32 @@ class TpuPlatform(Platform):
             ):
                 safe_kv = min(safe_kv, max_ablat_kv)
             # Apply the shape-calibrated HBM KV memory budget unless the caller
-                    # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
+            # explicitly opts out via TPU_KV_BYTES_EXPLICIT=1.
             requested = cache_config.kv_cache_memory_bytes
             keep = requested is not None and os.environ.get(
                 "TPU_KV_BYTES_EXPLICIT", "0"
             ).strip().lower() in ("1", "true", "yes", "on")
-            if keep or requested != safe_kv:
+            # The budget is calibrated for a TP8<=8192 engine. A disagg prefill
+            # leg with PCP>1 or >8192 batched tokens has larger activations, so
+            # leave that leg on gpu_memory_utilization.
+            kv_cfg = vllm_config.kv_transfer_config
+            if (
+                kv_cfg is not None
+                and kv_cfg.kv_role == "kv_producer"
+                and (
+                    pcp_size > 1
+                    or int(parallel_config.tensor_parallel_size) != 8
+                    or scheduler_config.max_num_batched_tokens > 8192
+                )
+            ):
+                logger.info(
+                    "Qwen3.5-397B kv_cache_memory_bytes left to the prefill "
+                    "leg (requested %s; mixed-engine auto would be %d).",
+                    requested,
+                    safe_kv,
+                )
+                keep = True
+            elif keep or requested != safe_kv:
                 logger.warning(
                     "Qwen3.5-397B kv_cache_memory_bytes %s: requested %s, "
                     "auto %d (slots=%s, dcp=%d, seqs=%d).",

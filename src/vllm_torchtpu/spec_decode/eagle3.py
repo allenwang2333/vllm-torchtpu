@@ -149,6 +149,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@contextlib.contextmanager
+def _mtp_megakernel_no_small_ar_context(mk: Any):
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        mtp_megakernel_context,
+    )
+
+    prev_ar = small_all_reduce_op._AR_OP
+    small_all_reduce_op._AR_OP = None
+    try:
+        with mtp_megakernel_context(mk):
+            yield
+    finally:
+        small_all_reduce_op._AR_OP = prev_ar
+
+
 def _collect_topk_indices_buffers(mtp_model) -> list[torch.Tensor]:
     """The distinct `topk_indices_buffer` tensors of a DSA MTP draft.
 
@@ -316,6 +331,9 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        self._mtp_fused_loop_max_p: int = 0
+        self._prep_step1_inputs: bool = False
+        self._last_prep_step1: tuple[torch.Tensor, torch.Tensor] | None = None
         # The megakernel running the MTP layer (VLLM_TPU_QWEN35_MTP_MK=1) and
         # the step-0 and fused-loop programs traced with it, each with its
         # warm flag. Set by attach_mtp_megakernel; None keeps the XLA layer.
@@ -347,15 +365,23 @@ class Eagle3Proposer:
         on a sequence-parallel layer: rows at or above
         `sequence_parallel.min_rows()` are sliced, except under the MTP step-0
         post-attention gather, whose rows shrink mid-layer and so always run
-        replicated. The caller records it with `sequence_parallel.set_active`
-        before the compiled forward, so the MoE dispatch / combine agree with
-        the model's own chunking.
+        replicated. Because compiled draft programs (`draft_model`,
+        `_mtp_fused_loop`, `_mtp_loop_model`) are traced once at the first
+        padded token bucket outside `shape_variants.warmup()`, a runner whose
+        smallest padded bucket is below `min_rows()` traces them replicated and
+        must keep `rows_sliced=False` across every bucket of that trace.
         """
-        return (
-            self._draft_sequence_parallel
-            and step0_gather_indices is None
-            and int(num_tokens) >= sequence_parallel.min_rows()
-        )
+        if not self._draft_sequence_parallel or step0_gather_indices is not None:
+            return False
+        min_rows = sequence_parallel.min_rows()
+        paddings = getattr(self.runner, "num_tokens_paddings", None)
+        if (
+            paddings
+            and not getattr(self.runner, "enforce_eager", False)
+            and int(paddings[0]) < min_rows
+        ):
+            return False
+        return int(num_tokens) >= min_rows
 
     def _rank_padding_counts(
         self, num_valid_tokens: int, num_tokens: int, rows_sliced: bool
@@ -849,8 +875,22 @@ class Eagle3Proposer:
         if K < 2:
             return
         try:
+            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+                is_step0_post_attn_gather_installed,
+            )
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
+            step0_gather = (
+                envs.TPU_MTP_STEP0_POST_ATTN_GATHER
+                and not self._draft_kv_shared
+                and not self.runner._dp_lockstep_enabled()
+                and is_step0_post_attn_gather_installed(draft_model)
+            )
+            loop_dims = (
+                {k: v for k, v in draft_dims.items() if k != "hidden_states"}
+                if step0_gather
+                else draft_dims
+            )
             loop_vllm_config = self._get_loop_vllm_config()
             with (
                 set_model_tag("eagle_head"),
@@ -864,7 +904,7 @@ class Eagle3Proposer:
                     prefix=f"mtp_fused_loop_k{K}",
                     mtp=draft_model,
                     num_steps=K - 1,
-                    dynamic_arg_dims=draft_dims,
+                    dynamic_arg_dims=loop_dims,
                     greedy_head_owner=self._draft_greedy_head_owner,
                     propose_step0=True,
                 )
@@ -875,8 +915,12 @@ class Eagle3Proposer:
                 exc_info=True,
             )
             self._mtp_fused_loop = None
+            self._mtp_fused_loop_max_p = 0
             return
         self._mtp_fused_loop_warm = False
+        self._mtp_fused_loop_max_p = (
+            self._loop_bucket(self.runner.max_num_reqs) if step0_gather else 0
+        )
         logger.info("MTP draft loop steps 1..%d run as one compiled program.", K - 1)
 
     def attach_mtp_megakernel(self, mk: Qwen35MtpMegakernel) -> bool:
@@ -897,9 +941,18 @@ class Eagle3Proposer:
         if draft_dims is None:
             return False
         K = self.speculative_config.num_speculative_tokens
+        loop_dims = (
+            {k: v for k, v in draft_dims.items() if k != "hidden_states"}
+            if getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+            else draft_dims
+        )
 
         def build(
-            buckets: tuple[int, ...], builder, **kwargs
+            buckets: tuple[int, ...],
+            builder,
+            *,
+            dims: dict[str, int] = draft_dims,
+            **kwargs,
         ) -> torch.nn.Module | None:
             config = self._mtp_mk_vllm_config(buckets)
             if config is None:
@@ -914,7 +967,7 @@ class Eagle3Proposer:
                 return builder(
                     vllm_config=config,
                     mtp=self.draft_model,
-                    dynamic_arg_dims=draft_dims,
+                    dynamic_arg_dims=dims,
                     megakernel=True,
                     **kwargs,
                 )
@@ -924,14 +977,29 @@ class Eagle3Proposer:
                 self._mtp_fused_loop_mk = build(
                     mk.loop_buckets,
                     build_mtp_fused_loop,
+                    dims=loop_dims,
                     prefix=f"mtp_fused_loop_k{K}_mk",
                     num_steps=K - 1,
                     greedy_head_owner=self._draft_greedy_head_owner,
                     propose_step0=True,
                 )
-            if envs.TPU_MTP_STEP0_POST_ATTN_GATHER:
+            if envs.TPU_MTP_STEP0_POST_ATTN_GATHER and mk.verify_buckets:
+                # Step 0 arrives padded to the runner's token bucket (28
+                # requests verify 112 rows, padded to 128), and use_for_step
+                # admits the padded count.
+                max_verify_rows = min(
+                    mk.verify_buckets[-1] * 2,
+                    mk.padded_rows(
+                        (1 + K) * int(getattr(self.runner, "max_num_reqs", 0) or 1024)
+                    ),
+                )
+                step0_buckets = tuple(
+                    b
+                    for b in (*mk.verify_buckets, max_verify_rows)
+                    if b <= max_verify_rows
+                )
                 self._mtp_mk_step0 = build(
-                    mk.verify_buckets,
+                    step0_buckets,
                     build_mtp_loop_step_model,
                     prefix="mtp_mk_step0",
                 )
@@ -1033,7 +1101,10 @@ class Eagle3Proposer:
         (seq_lens,) = seq_lens_set.values()
         self._draft_md_cache.pop(id(chunk), None)
 
-        num_tokens = hidden_states.shape[0]
+        num_tokens = int(positions.shape[-1])
+        max_p = getattr(self, "_mtp_fused_loop_max_p", 0)
+        if max_p > 0 and hidden_states.shape[0] < max_p:
+            hidden_states = _maybe_pad_dim0(hidden_states, max_p)
         # Every loop step runs at this one row count, so one decision covers
         # the program; it must match the draft forward's own row gating.
         rows_sliced = self._draft_rows_sliced(num_tokens)
@@ -1057,12 +1128,8 @@ class Eagle3Proposer:
             and chunk.attn_ctx.position_ids_override is None
             and mk.use_for_step(attn_metadata, num_tokens, step0=False)
         ):
-            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
-                mtp_megakernel_context,
-            )
-
             program, warm_attr = self._mtp_fused_loop_mk, "_mtp_fused_loop_mk_warm"
-            mk_ctx = mtp_megakernel_context(mk)
+            mk_ctx = _mtp_megakernel_no_small_ar_context(mk)
         with (
             set_model_tag("eagle_head"),
             token_padding.use_padding_state(loop_padding_state),
@@ -1634,6 +1701,7 @@ class Eagle3Proposer:
             hidden_carry = (
                 hidden
                 if hidden.shape[0] == indices.shape[0]
+                or getattr(self, "_mtp_fused_loop_max_p", 0) > 0
                 else hidden[: indices.shape[0]].clone()
             )
         else:
@@ -1695,6 +1763,8 @@ class Eagle3Proposer:
         pad_req_idx: torch.Tensor,
         ov_tokens: torch.Tensor | None = None,
         step0_pad_len: int = 0,
+        positions: torch.Tensor | None = None,
+        base_seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         # Fused on-device async first-pass input prep at bucketed shapes:
         #   input_ids: [T]
@@ -1746,6 +1816,33 @@ class Eagle3Proposer:
             if eff_b < knr
             else num_rejected_b
         )
+        if positions is not None and base_seq_lens is not None:
+            pos_carry = (
+                torch.index_select(positions, 1, gather_indices)
+                if positions.ndim == 2
+                else torch.index_select(positions, 0, gather_indices)
+            )
+            pos_step1 = pos_carry + 1 if self.advance_draft_positions else pos_carry
+            sl_delta = 1 if self.advance_draft_positions else 0
+            seq_lens_step1 = base_seq_lens + sl_delta - num_rejected_out
+            if step0_pad_len > 0:
+                step0_gather_indices = _pad_dim0_repeat_last(
+                    gather_indices, step0_pad_len
+                )
+                return (
+                    draft_input_ids,
+                    num_rejected_out,
+                    step0_gather_indices,
+                    pos_step1,
+                    seq_lens_step1,
+                )
+            return (
+                draft_input_ids,
+                gather_indices,
+                num_rejected_out,
+                pos_step1,
+                seq_lens_step1,
+            )
         if step0_pad_len > 0:
             step0_gather_indices = (
                 torch.nn.functional.pad(
@@ -1911,6 +2008,10 @@ class Eagle3Proposer:
             # step-0 gather indices padded to the loop bucket (inside the async
             # prep program, or with the host upload), so no separate pad
             # program runs between the prep and the step-0 forward.
+            is_all_layout = (
+                getattr(chunk.sequence_layout_plan, "kind", None)
+                is SequenceLayoutKind.ALL
+            )
             use_step0_gather = self._use_mtp_step0_post_attn_gather(
                 chunk, can_use_post_step0_fused=use_fused_loop
             )
@@ -1919,6 +2020,17 @@ class Eagle3Proposer:
             )
             self._step0_pad_len = max_loop_p
             self._last_step0_gather_indices = None
+            self._prep_step1_inputs = (
+                is_async
+                and can_use_post_step0_fused
+                and is_all_layout
+                and use_step0_gather
+                and getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+                and getattr(chunk.input_ids, "device", None) is not None
+                and chunk.input_ids.device.type == "tpu"
+                and getattr(chunk.attn_ctx, "seq_lens", None) is not None
+            )
+            self._last_prep_step1 = None
             (input_ids, positions, last_token_indices, num_rejected) = (
                 self._prepare_draft_inputs(
                     chunk,
@@ -1935,15 +2047,14 @@ class Eagle3Proposer:
                 )
             )
             self._step0_pad_len = 0
+            self._prep_step1_inputs = False
             cached_step0_gather = self._last_step0_gather_indices
             self._last_step0_gather_indices = None
+            cached_prep_step1 = self._last_prep_step1
+            self._last_prep_step1 = None
             rejected_per_chunk.append(num_rejected)
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
-            )
-            is_all_layout = (
-                getattr(chunk.sequence_layout_plan, "kind", None)
-                is SequenceLayoutKind.ALL
             )
             if is_all_layout:
                 owner_mask = None
@@ -1996,48 +2107,61 @@ class Eagle3Proposer:
                 and getattr(hidden, "device", None) is not None
                 and hidden.device.type == "tpu"
             ):
-                p = self._loop_bucket(chunk.num_reqs)
                 knr = (
                     runner.num_reqs_max_model_len
                     if chunk.attn_ctx.use_max_model_len
                     else runner.num_reqs_most_model_len
                 )
-                if is_async:
+                if (
+                    cached_prep_step1 is not None
+                    and step0_gather_indices is not None
+                    and getattr(self, "_mtp_fused_loop_max_p", 0) > 0
+                ):
+                    pos_step1, seq_lens_step1 = cached_prep_step1
+                    hidden_carry = hidden
                     rej_dev = (
                         _maybe_pad_dim0(num_rejected, knr)
                         if num_rejected is not None
                         else None
                     )
-                elif num_rejected is not None and np.any(num_rejected):
-                    padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: chunk.num_reqs] = num_rejected.astype(
-                        np.int32, copy=False
-                    )
-                    rej_dev = torch.from_numpy(padded_nr).to(runner.device)
                 else:
-                    rej_dev = None
-                if rej_dev is not None:
-                    rej_dev_for_fused = rej_dev
-                else:
-                    z_key = (knr, str(runner.device))
-                    rej_dev_for_fused = self._zero_rej_dev_cache.get(z_key)
-                    if rej_dev_for_fused is None:
-                        rej_dev_for_fused = torch.from_numpy(
-                            np.zeros(knr, dtype=np.int32)
-                        ).to(runner.device)
-                        self._zero_rej_dev_cache[z_key] = rej_dev_for_fused
-                safe_gather_indices_p = _maybe_pad_dim0(safe_gather_indices, p)
-                with set_model_tag("eagle_head"):
-                    hidden_carry, pos_step1, seq_lens_step1 = (
-                        self._draft_post_step0_fused(
-                            hidden,
-                            positions,
-                            safe_gather_indices_p,
-                            chunk.attn_ctx.seq_lens,
-                            rej_dev_for_fused,
-                            step0_gather_indices is not None,
+                    p = self._loop_bucket(chunk.num_reqs)
+                    if is_async:
+                        rej_dev = (
+                            _maybe_pad_dim0(num_rejected, knr)
+                            if num_rejected is not None
+                            else None
                         )
-                    )
+                    elif num_rejected is not None and np.any(num_rejected):
+                        padded_nr = np.zeros(knr, dtype=np.int32)
+                        padded_nr[: chunk.num_reqs] = num_rejected.astype(
+                            np.int32, copy=False
+                        )
+                        rej_dev = torch.from_numpy(padded_nr).to(runner.device)
+                    else:
+                        rej_dev = None
+                    if rej_dev is not None:
+                        rej_dev_for_fused = rej_dev
+                    else:
+                        z_key = (knr, str(runner.device))
+                        rej_dev_for_fused = self._zero_rej_dev_cache.get(z_key)
+                        if rej_dev_for_fused is None:
+                            rej_dev_for_fused = torch.from_numpy(
+                                np.zeros(knr, dtype=np.int32)
+                            ).to(runner.device)
+                            self._zero_rej_dev_cache[z_key] = rej_dev_for_fused
+                    safe_gather_indices_p = _maybe_pad_dim0(safe_gather_indices, p)
+                    with set_model_tag("eagle_head"):
+                        hidden_carry, pos_step1, seq_lens_step1 = (
+                            self._draft_post_step0_fused(
+                                hidden,
+                                positions,
+                                safe_gather_indices_p,
+                                chunk.attn_ctx.seq_lens,
+                                rej_dev_for_fused,
+                                step0_gather_indices is not None,
+                            )
+                        )
                 hidden_carry_per_chunk.append(hidden_carry)
                 positions_carry_per_chunk.append(pos_step1)
                 draft_tokens_per_chunk.append([])
@@ -2280,7 +2404,9 @@ class Eagle3Proposer:
         skip_cat = self._skip_next_multi_chunk_draft_cat
         self._skip_next_multi_chunk_draft_cat = False
         if return_device:
-            if len(per_chunk_stacked) == 1 or skip_cat:
+            if skip_cat:
+                out = per_chunk_stacked[0]
+            elif len(per_chunk_stacked) == 1:
                 out = per_chunk_stacked[0][: chunks[0].num_reqs]
             else:
                 out = torch.cat(
@@ -2402,7 +2528,50 @@ class Eagle3Proposer:
                     ov_np[i] = req_state.get_token_id(seq_len)
                 ov_tokens_dev = _h2d_temp(runner, torch.from_numpy(ov_np))
             step0_pad_len = int(getattr(self, "_step0_pad_len", 0) or 0)
-            if step0_pad_len > 0:
+            prep_step1 = (
+                bool(getattr(self, "_prep_step1_inputs", False))
+                and getattr(chunk.attn_ctx, "seq_lens", None) is not None
+            )
+            if prep_step1 and step0_pad_len > 0:
+                (
+                    draft_input_ids,
+                    num_rejected_out,
+                    self._last_step0_gather_indices,
+                    pos_step1,
+                    seq_lens_step1,
+                ) = self._draft_async_prepare_inputs(
+                    chunk.input_ids,
+                    next_tokens_device,
+                    draft_lengths_dev,
+                    chunk.attn_ctx.query_start_loc,
+                    pad_req_idx,
+                    ov_tokens_dev,
+                    step0_pad_len,
+                    chunk.position_ids,
+                    chunk.attn_ctx.seq_lens,
+                )
+                gather_indices = self._last_step0_gather_indices
+                self._last_prep_step1 = (pos_step1, seq_lens_step1)
+            elif prep_step1:
+                (
+                    draft_input_ids,
+                    gather_indices,
+                    num_rejected_out,
+                    pos_step1,
+                    seq_lens_step1,
+                ) = self._draft_async_prepare_inputs(
+                    chunk.input_ids,
+                    next_tokens_device,
+                    draft_lengths_dev,
+                    chunk.attn_ctx.query_start_loc,
+                    pad_req_idx,
+                    ov_tokens_dev,
+                    0,
+                    chunk.position_ids,
+                    chunk.attn_ctx.seq_lens,
+                )
+                self._last_prep_step1 = (pos_step1, seq_lens_step1)
+            elif step0_pad_len > 0:
                 (
                     draft_input_ids,
                     gather_indices,
@@ -3059,12 +3228,8 @@ class Eagle3Proposer:
             and model is self.draft_model
             and self._use_mtp_mk_step0(chunk, attn_metadata, num_tokens)
         ):
-            from vllm_torchtpu.models.vllm.qwen3_next_patch import (
-                mtp_megakernel_context,
-            )
-
             model = self._mtp_mk_step0
-            mk_ctx = mtp_megakernel_context(self._mtp_mk)
+            mk_ctx = _mtp_megakernel_no_small_ar_context(self._mtp_mk)
         if model is self._mtp_loop_model:
             loop_padding_state = self._get_loop_token_padding_state()
             if loop_padding_state is not None:
@@ -3362,12 +3527,26 @@ class Eagle3Proposer:
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()
+                # Runtime never takes this path under PCP (the layout plan is
+                # not ALL), so do not precompile it there either.
+                and not getattr(runner, "_pcp_enabled", False)
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             else 0
         )
+        seed_t_paddings = sorted(
+            set(runner.num_tokens_paddings)
+            | (
+                {
+                    t * runner.parallel_config.prefill_context_parallel_size
+                    for t in runner.num_tokens_paddings
+                }
+                if getattr(runner, "_pcp_enabled", False)
+                else set()
+            )
+        )
         with runner._precompile_timed("drafter seed_input_ids"):
-            for T in runner.num_tokens_paddings:
+            for T in seed_t_paddings:
                 for p in idx_sizes:
                     if p > T:
                         continue
@@ -3377,6 +3556,8 @@ class Eagle3Proposer:
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
                 ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                pos_shape = (3, T) if runner.uses_mrope else (T,)
+                pos_t = torch.zeros(pos_shape, dtype=torch.int32).to(runner.device)
                 for B, p in req_loop_pairs:
                     if B > T or p > T:
                         continue
@@ -3389,14 +3570,43 @@ class Eagle3Proposer:
                     for knr in sorted(knr_buckets):
                         qsl = torch.ones(knr + 1, dtype=torch.int32).to(runner.device)
                         if step0_pad_warm > 0:
-                            out_async = self._draft_async_prepare_inputs(
-                                ids, nt, dl, qsl, pad_idx, None, step0_pad_warm
-                            )
-                            synchronize_tensors(out_async)
-                            out_async_ov = self._draft_async_prepare_inputs(
-                                ids, nt, dl, qsl, pad_idx, ov_warm, step0_pad_warm
-                            )
-                            synchronize_tensors(out_async_ov)
+                            if getattr(self, "_mtp_fused_loop_max_p", 0) > 0:
+                                base_sl = torch.zeros(knr, dtype=torch.int32).to(
+                                    runner.device
+                                )
+                                out_async = self._draft_async_prepare_inputs(
+                                    ids,
+                                    nt,
+                                    dl,
+                                    qsl,
+                                    pad_idx,
+                                    None,
+                                    step0_pad_warm,
+                                    pos_t,
+                                    base_sl,
+                                )
+                                synchronize_tensors(out_async)
+                                out_async_ov = self._draft_async_prepare_inputs(
+                                    ids,
+                                    nt,
+                                    dl,
+                                    qsl,
+                                    pad_idx,
+                                    ov_warm,
+                                    step0_pad_warm,
+                                    pos_t,
+                                    base_sl,
+                                )
+                                synchronize_tensors(out_async_ov)
+                            else:
+                                out_async = self._draft_async_prepare_inputs(
+                                    ids, nt, dl, qsl, pad_idx, None, step0_pad_warm
+                                )
+                                synchronize_tensors(out_async)
+                                out_async_ov = self._draft_async_prepare_inputs(
+                                    ids, nt, dl, qsl, pad_idx, ov_warm, step0_pad_warm
+                                )
+                                synchronize_tensors(out_async_ov)
                         else:
                             out_async = self._draft_async_prepare_inputs(
                                 ids, nt, dl, qsl, pad_idx
@@ -3476,6 +3686,9 @@ class Eagle3Proposer:
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not self._dp_lockstep_sharded()
+                # Runtime never takes this path under PCP (the layout plan is
+                # not ALL), so do not precompile it there either.
+                and not getattr(runner, "_pcp_enabled", False)
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             if self._mtp_fused_loop is not None or step0_post_attn_gather:

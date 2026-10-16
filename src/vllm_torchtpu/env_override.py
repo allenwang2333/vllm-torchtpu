@@ -8,9 +8,11 @@ decoding, fused EP, batched RPA decode, single sort, the Qwen3.5 megakernel)
 are not forced here; pass them explicitly.
 """
 
+import contextlib
 import json
 import os
 import re
+import sys
 
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
@@ -33,6 +35,38 @@ if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
 
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+
+# A VLLM_CACHE_ROOT on the pods' /compile-cache volume also gets persistent
+# JAX and TorchTPU Tier-2 caches next to it: <parent>/jax_cache and
+# <parent>/torch_tpu_cache. JAX reads its two settings from the environment
+# when it is first imported, which happens below at
+# patch_registry.apply("import"); a process that imported JAX earlier gets
+# them through jax.config instead.
+_vllm_cache_root = os.environ["VLLM_CACHE_ROOT"]
+if _vllm_cache_root.startswith("/compile-cache"):
+    _cache_parent = os.path.dirname(_vllm_cache_root.rstrip("/"))
+    _jax_cache = os.path.join(_cache_parent, "jax_cache")
+    _torch_tpu_cache = os.path.join(_cache_parent, "torch_tpu_cache")
+    for _cache_dir in (_jax_cache, _torch_tpu_cache):
+        with contextlib.suppress(OSError):
+            os.makedirs(_cache_dir, exist_ok=True)
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _jax_cache)
+    os.environ.setdefault("JAX_COMPILER_CACHE_DIR", _jax_cache)
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    os.environ.setdefault("TORCH_TPU_CACHE_DIR", _torch_tpu_cache)
+    if os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE") in (
+        None,
+        "",
+        "disabled",
+    ):
+        os.environ["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = _torch_tpu_cache
+    _jax = sys.modules.get("jax")
+    if _jax is not None:
+        try:
+            _jax.config.update("jax_compilation_cache_dir", _jax_cache)
+            _jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+        except Exception:  # noqa: S110
+            pass
 
 # Disable CUDA-specific shared experts stream for TPU
 # This prevents errors when trying to create CUDA streams on TPU hardware
@@ -195,6 +229,15 @@ _LIBTPU_REWRITES = {
         "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"
     ),
 }
+if os.environ.get("TPU_SC_REDUCE_SCATTER_OFFLOAD", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    _LIBTPU_REWRITES[
+        "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"
+    ] = "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true"
 _SC_HAR_FLAG = "--xla_tpu_enable_sparse_core_hierarchical_all_reduce"
 _SC_AR_MIN_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 # Either flag as a whole token, with its value and the whitespace before it.
@@ -248,6 +291,18 @@ if os.environ.get("TPU_DISABLE_PR989_KERNELS", "0").strip().lower() in (
     _set_env("TPU_GDN_FUSED_NORM_QUANT", "0")
     _set_env("TPU_FUSED_QK_NORM_ROPE", "0")
     _set_env("TPU_EXPERT_PLACEMENT", "")
+    _set_env("TPU_GREEDY_TOP_TOKENS", "0")
+    _set_env("TPU_SAMPLER_TOPK_CANDIDATES", "0")
+    _set_env("VLLM_TPU_FUSED_DRAFT_LOOP", "0")
+    _set_env("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "0")
+elif os.environ.get("TPU_RAIDEN_JOB_NAME", "").strip().lower() == "decode":
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "0")
+else:
+    if "USE_MOE_FUSED_EP_KERNEL" not in os.environ:
+        _set_env("USE_MOE_FUSED_EP_KERNEL", "1")
+    if os.environ.get("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS") in (None, "", "33"):
+        _set_env("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", "64")
 
 
 def _user_has_flag(flag_name: str, args_string: str | None = None) -> bool:
@@ -308,6 +363,61 @@ if _libtpu_extra_args or _existing_libtpu_args:
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
 
 
+def _has_cli_opt(argv: list[str], opt: str) -> bool:
+    return any(a == opt or a.startswith(opt + "=") for a in argv)
+
+
+def _get_cli_opt(argv: list[str], opt: str) -> str | None:
+    for i, a in enumerate(argv):
+        if a == opt and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(opt + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _apply_qwen35_serve_cli_defaults() -> None:
+    """Applies the serving defaults of the Qwen3.5-397B checkpoint: MTP=3
+    speculative decoding and 4 tokenizer renderer workers unless the command
+    line sets them."""
+    if os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return
+    argv = sys.argv
+    if (
+        "serve" not in argv[:3]
+        or "bench" in argv[:3]
+        or "qwen3.5-397b" not in " ".join(argv).lower()
+    ):
+        return
+    for opt, val in (
+        ("--speculative-config", '{"method":"mtp","num_speculative_tokens":3}'),
+        ("--renderer-num-workers", "4"),
+    ):
+        if not _has_cli_opt(argv, opt):
+            argv.extend([opt, val])
+            CHANGES.append(["argv_add", opt, val])
+    if "TPU_RPA_DECODE_BATCHED" not in os.environ:
+        _set_env("TPU_RPA_DECODE_BATCHED", "1")
+    if "TPU_MOE_SINGLE_SORT" not in os.environ:
+        _set_env("TPU_MOE_SINGLE_SORT", "1")
+    dcp = _get_cli_opt(argv, "--decode-context-parallel-size") or ""
+    if dcp.isdigit() and int(dcp) > 1:
+        if "TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS" not in os.environ:
+            _set_env("TORCH_TPU_INTERNAL_ENABLE_REASSOCIATE_NORM_WEIGHTS", "0")
+        if (
+            "MOE_FUSED_EP_KERNEL_IMPL" not in os.environ
+            and os.environ.get("USE_MOE_FUSED_EP_KERNEL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            _set_env("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+
+
+_apply_qwen35_serve_cli_defaults()
 os.environ.setdefault(
     "VLLM_TORCHTPU_CONFIG_CHANGES", json.dumps(CHANGES, separators=(",", ":"))
 )

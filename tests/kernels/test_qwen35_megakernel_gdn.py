@@ -153,6 +153,69 @@ def test_standalone_gdn_block_interpret():
     )
 
 
+def test_scatter_pool_states_direct_conv_aligned_conv_rows():
+    """Regression test for `scatter_pool_states` when `qkv_128 = 16` (`QKV = 2048`):
+    `conv_rows = 48 == conv_rows_pad` while `(4 * qkv_128) % 16 == 0` (`64 != 48`)."""
+    c = K.MKConfig(
+        R=1,
+        B=2,
+        T=2,
+        L=2,
+        att_every=2,
+        H=512,
+        NH=2,
+        NKV=1,
+        HD=256,
+        KH=4,
+        VH=8,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        ctx=256,
+        paged_kv=True,
+        num_pages=32,
+        page_size=128,
+        max_pages_per_seq=2,
+        ckpt_k=2,
+    )
+    assert c.QKV == 2048  # qkv_128 = 16 -> conv_rows = 48 == conv_rows_pad
+    rng = np.random.default_rng(7)
+    raw = (jnp.zeros((c.num_pages, 2, 64, 4, c.page_size), dtype=K.FP8),)
+    pos = jnp.array([4, 5], dtype=jnp.int32)
+    pt = jnp.array([[1, 0]], dtype=jnp.int32)
+    ckpt = jnp.arange(4, 4 + c.NS * c.T, dtype=jnp.int32).reshape(1, c.NS, c.T)
+    knew = jnp.asarray(rng.standard_normal((1, c.MR, c.HD)), dtype=K.FP8)
+    vnew = jnp.asarray(rng.standard_normal((1, c.MR, c.HD)), dtype=K.FP8)
+    conv_out = jnp.asarray(
+        rng.standard_normal((1, c.NS, c.HR, c.QKV)), dtype=jnp.bfloat16
+    )
+    rec_out = jnp.asarray(
+        rng.standard_normal((1, c.B * c.vh, c.KD, c.VD)), dtype=jnp.bfloat16
+    )
+
+    raw_out = pool_io.scatter_pool_states(
+        c, raw, pos, pt, knew, vnew, conv_out, rec_out, ckpt, interpret=True
+    )
+    for t in range(c.T):
+        roff = jnp.full((1, c.NS), t, dtype=jnp.int32)
+        g_conv, g_rec = pool_io.gather_gdn_states(
+            c, raw_out, ckpt, roff, interpret=True
+        )
+        np.testing.assert_array_equal(
+            np.asarray(g_conv[:, :, :3, :], dtype=np.float32),
+            np.asarray(conv_out[:, :, 1 + t : 4 + t, :], dtype=np.float32),
+        )
+        for s in range(c.NS):
+            b = s * c.T + t
+            np.testing.assert_array_equal(
+                np.asarray(g_rec[:, s * c.vh : (s + 1) * c.vh], dtype=np.float32),
+                np.asarray(rec_out[:, b * c.vh : (b + 1) * c.vh], dtype=np.float32),
+            )
+
+
 def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
     """3-stage pool I/O of a > 16-row verify bucket (GatedDeltaNet inputs read straight from the
     checkpoint pages (pool_gather / GPR), partial conv-page scatter) against fused pool I/O at
@@ -241,3 +304,88 @@ def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
         )
         conv = p0 + c.rec_pages
         assert np.array_equal(p_3[conv, 0, :cp_rows], p_f[conv, 0, :cp_rows]), int(slot)
+
+
+def test_gdn_checkpoint_slot_stride_matches_packed_layout():
+    """GDN checkpoint slots `gdn_stride_pages` apart (vLLM / Raiden place manager block b at page
+    b * (block_size // page_size), e.g. 10 pages at block 1280 vs 5 GDN pages at TP8) must give
+    the same hidden rows and slot contents as the packed layout, for fused and 3-stage pool I/O,
+    and must leave the pages between slots untouched."""
+    base = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=20,
+        T=4,
+        L=2,
+        att_every=2,
+        H=2048,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=4,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    gp = base.gdn_pages
+    st_shapes = K.state_shapes(dataclasses.replace(base, paged_kv=False))
+    St = {
+        k: (
+            jax.random.normal(jax.random.PRNGKey(40 + i), (base.R, *s), jnp.float32)
+            * (0.1 if k in ("conv", "rec") else 0.5)
+        ).astype(dt)
+        for i, (k, (s, dt)) in enumerate(st_shapes.items())
+    }
+    pos = jnp.asarray(
+        [10 + 37 * s + t for s in range(base.NS) for t in range(base.T)], jnp.int32
+    )
+    hid = jax.random.normal(jax.random.PRNGKey(9), (base.M, base.H), jnp.float32)
+    hid = jnp.where(jnp.arange(base.M)[:, None] < base.B, hid, 0.0).astype(jnp.bfloat16)
+    mesh = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
+    kv_pages = base.NS * (base.ctx // base.page_size)
+
+    def run(stride):
+        c = dataclasses.replace(base, gdn_stride_pages=stride)
+        pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c)
+        c = dataclasses.replace(c, num_pages=min_pages)
+        tiles = dataclasses.replace(K.default_tiles(c), kv_blk=512, kv_sub=256)
+        torch.manual_seed(0)
+        w = jnp_leaves(pack_weights(make_tiny_backbone(c, e_slots=c.EW), c, 0, tiles))
+        raw = [np.array(r) for r in pool_io.states_to_pool(c, St, pt, ckpt, roff)]
+        gap = np.zeros(min_pages, dtype=bool)
+        if stride > gp:
+            for slot in np.unique(np.asarray(ckpt)):
+                gap[int(slot) * stride + gp : (int(slot) + 1) * stride] = True
+            for r in raw:
+                r.view(np.uint8)[gap] = 0x5A
+        res = {}
+        for fused in (True, False):
+            fn, _, _, _ = pool_io.make_flat_pooled_step(
+                mesh, c, tiles, fused_pool_io=fused, interpret=True, skip=frozenset({"experts"})
+            )
+            out = fn(pos, hid, *w, *[jnp.array(r, copy=True) for r in raw], pt, ckpt, roff)
+            pages = np.asarray(jax.lax.bitcast_convert_type(out[1], jnp.uint8))
+            slots = {
+                int(s): pages[int(s) * stride : int(s) * stride + gp]
+                for s in np.unique(np.asarray(ckpt))
+            }
+            res[fused] = (np.asarray(out[0][: c.B], np.float32), pages[:kv_pages], slots, pages[gap])
+        return res
+
+    packed, strided = run(gp), run(2 * gp + 1)
+    for fused in (True, False):
+        h_p, kv_p, slots_p, _ = packed[fused]
+        h_s, kv_s, slots_s, gap_s = strided[fused]
+        assert np.isfinite(h_s).all()
+        np.testing.assert_array_equal(h_s, h_p, err_msg=f"hidden rows differ (fused={fused})")
+        assert np.array_equal(kv_s, kv_p), f"KV pages differ (fused={fused})"
+        assert len(slots_s) == len(slots_p)
+        for (sp, a), (ss, b) in zip(sorted(slots_p.items()), sorted(slots_s.items())):
+            assert np.array_equal(a, b), f"GDN slot {sp}/{ss} differs (fused={fused})"
+        assert gap_s.size and np.all(gap_s == 0x5A), f"pages between slots written (fused={fused})"

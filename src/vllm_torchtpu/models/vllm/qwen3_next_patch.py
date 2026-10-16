@@ -90,11 +90,13 @@ from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import (
     linear_common,
     sequence_parallel,
     small_all_reduce_op,
 )
+from vllm_torchtpu.layers.adapter.attention import batched_rpa_schedule_scope
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -134,6 +136,25 @@ def step0_post_attn_gather_context(indices: torch.Tensor | None):
         yield
     finally:
         _step0_gather_indices = prev
+
+
+def _step0_effective_gather_indices(
+    positions: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Slice `_step0_gather_indices` to 4 or 8 rows on small token buckets (`T<=4`
+    and `T<=8`) during `shape_variants.warmup()` so post-attention `o_proj`,
+    `small_all_reduce`, `norm_fp8_gate_and_se`, `moe_lowtok`, and `self.norm`
+    execute on 4 or 8 rows instead of `max_loop_p` (16) rows."""
+    gather_idx = _step0_gather_indices
+    if gather_idx is None:
+        return None
+    if positions is not None and shape_variants.in_warmup():
+        s0 = positions.shape[-1]
+        if gather_idx.shape[0] > 4 and s0 <= 4:
+            return gather_idx[:4]
+        if gather_idx.shape[0] > 8 and s0 <= 8:
+            return gather_idx[:8]
+    return gather_idx
 
 
 @contextlib.contextmanager
@@ -176,31 +197,41 @@ def _legal_tile(rows: int, cap: int) -> int:
     return rows
 
 
-def _select_gate_q_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-8 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
-
-    Keeps live fp32 arrays within the 64-VREG hardware file (preventing multi-MiB
-    VMEM spills at N=2048) and ensures grid >= 6 at decode/verify batch sizes
-    (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
-    """
+def _select_gate_q_vreg_step(cols: int) -> int:
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
+    return max(16, (64 // vregs_per_row // 8) * 8)
+
+
+def _select_gate_q_tile(rows: int, cols: int) -> int:
+    """Select multiple-of-8 VMEM BlockSpec tile cap for [rows, cols] gate + quant.
+
+    For decode/verify batch sizes (rows <= 256), caps tile so grid >= 6 and
+    double-buffered VMEM DMAs overlap with compute. For large prefill shapes
+    (rows > 256), uses a larger VMEM block (up to 512 rows) while the kernel
+    processes VREG-sized sub-tiles internally, avoiding large Pallas grid
+    overhead at T=8192 without spilling VREGs.
+    """
+    vreg_cap = _select_gate_q_vreg_step(cols)
     if rows <= 256:
-        dma_cap = max(8, (rows // 6 // 8) * 8)
+        dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
-    return vreg_cap
+    return max(vreg_cap, 512)
 
 
-def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref):
-    a = attn_ref[...].astype(jnp.float32)
-    g = gate_ref[...].astype(jnp.float32)
-    y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16).astype(jnp.float32)
-    amax = jnp.max(jnp.abs(y), axis=1, keepdims=True)
-    scale = amax * jnp.float32(1.0 / 448.0)
-    scale = jnp.where(scale == 0.0, 1.0, scale)
-    scale_inv = jnp.float32(1.0) / scale
-    q_ref[...] = jnp.clip(y * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-    s_ref[...] = scale
+def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
+    bm = attn_ref.shape[0]
+    step = min(bm, step_m)
+    for r in range(bm // step):
+        sl = slice(r * step, (r + 1) * step)
+        a = attn_ref[sl, :].astype(jnp.float32)
+        g = gate_ref[sl, :].astype(jnp.float32)
+        y = (a * jax.nn.sigmoid(g)).astype(jnp.bfloat16).astype(jnp.float32)
+        amax = jnp.max(jnp.abs(y), axis=1, keepdims=True)
+        scale = amax * jnp.float32(1.0 / 448.0)
+        scale = jnp.where(scale == 0.0, 1.0, scale)
+        scale_inv = jnp.float32(1.0) / scale
+        q_ref[sl, :] = jnp.clip(y * scale_inv, -448.0, 448.0).astype(jnp.float8_e4m3fn)
+        s_ref[sl, :] = scale
 
 
 def pallas_sigmoid_gate_quant(
@@ -217,10 +248,11 @@ def pallas_sigmoid_gate_quant(
         gate = jnp.pad(gate, ((0, pad), (0, 0)))
     m = attn_out.shape[0]
     bm = _legal_tile(m, _select_gate_q_tile(m, k))
+    step_m = _legal_tile(bm, _select_gate_q_vreg_step(k))
     q_spec = pl.BlockSpec((bm, k), lambda i: (i, 0))
     s_spec = pl.BlockSpec((bm, 1), lambda i: (i, 0))
     q, s = pl.pallas_call(
-        _sigmoid_gate_quant_kernel,
+        functools.partial(_sigmoid_gate_quant_kernel, step_m=step_m),
         out_shape=[
             jax.ShapeDtypeStruct((m, k), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((m, 1), jnp.float32),
@@ -424,7 +456,7 @@ def _forward_qwen3_next_attn_from_qkv(
 ) -> torch.Tensor:
     q, k, v, gate = attn_layer._project_qkv_gate(qkv, positions)
     attn_output = attn_layer.attn(q, k, v)
-    gather_idx = _step0_gather_indices
+    gather_idx = _step0_effective_gather_indices(positions)
     if gather_idx is not None:
         attn_output = torch.index_select(attn_output, 0, gather_idx)
         if gate is not None:
@@ -1021,20 +1053,26 @@ def patched_sparse_moe_forward(
         hidden_states=hidden_states,
         router_logits=router_logits,
     )
-    # When Fused EP v3 owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
-    # `_apply_owning_dispatch_v3` already performs `ep.combine` (all-reduce for
-    # SP=0, or in-kernel combine for SP=1). When `USE_MOE_FUSED_EP_KERNEL=0` and
-    # `se_is_replicated=False`, `skip_final_all_reduce=True` leaves
-    # `final_hidden_states` unreduced across EP/TP so it can be all-reduced
-    # together with `shared_output`.
+    # When Fused EP (v3 or v2) owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
+    # `self.experts(...)` already returns `final_hidden_states` reduced across
+    # EP/TP (`_apply_owning_dispatch_v3` or `fused_moe_ep` v2). When
+    # `USE_MOE_FUSED_EP_KERNEL=0` and `se_is_replicated=False`,
+    # `skip_final_all_reduce=True` leaves `final_hidden_states` unreduced across
+    # EP/TP so it can be all-reduced together with `shared_output`.
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+        fused_moe_ep_supported as fused_moe_ep_v2_supported,
+    )
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
         fused_moe_ep_supported as fused_moe_ep_v3_supported,
     )
 
     routed_experts = getattr(self.experts, "routed_experts", self.experts)
-    v3_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
+    qm = getattr(routed_experts, "quant_method", None)
+    fused_ep_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
         fused_moe_ep_v3_supported(routed_experts)
-        or fused_moe_ep_v3_supported(getattr(routed_experts, "quant_method", None))
+        or fused_moe_ep_v3_supported(qm)
+        or fused_moe_ep_v2_supported(routed_experts)
+        or fused_moe_ep_v2_supported(qm)
     )
     se_is_replicated = bool(
         getattr(self, "_fused_se_is_replicated", False)
@@ -1044,7 +1082,7 @@ def patched_sparse_moe_forward(
     if se_is_replicated:
         final_hidden_states = final_hidden_states + shared_output
     else:
-        if tp_size > 1 and v3_owns_combine:
+        if tp_size > 1 and fused_ep_owns_combine:
             shared_output = tensor_model_parallel_all_reduce(shared_output)
             final_hidden_states = final_hidden_states + shared_output
         else:
@@ -1251,9 +1289,20 @@ def _rows_are_sequence_parallel(num_tokens: int) -> bool:
     A step below `sequence_parallel.min_rows()` keeps its rows replicated, and
     so does the MTP step-0 post-attention gather, whose rows shrink mid-layer.
     The runner records the same decision with `sequence_parallel.set_active`
-    for the MoE dispatch and combine.
+    for the MoE dispatch and combine. Non-backbone modules compiled outside
+    `shape_variants.warmup()` share a single FX trace across all their compile
+    buckets, so while tracing they read the caller's Python boolean from
+    `sequence_parallel.is_active()` instead of guarding on symbolic
+    `num_tokens`.
     """
-    return _step0_gather_indices is None and num_tokens >= sequence_parallel.min_rows()
+    if _step0_gather_indices is not None:
+        return False
+    if torch.compiler.is_compiling():
+        from vllm_torchtpu.compilation import shape_variants
+
+        if not shape_variants.in_warmup():
+            return sequence_parallel.is_active()
+    return num_tokens >= sequence_parallel.min_rows()
 
 
 def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:
@@ -1397,7 +1446,13 @@ def patched_decoder_layer_forward(
         positions = positions + (small_all_reduce_op._RANK * 0)[0]
 
     prequant = None
-    if _fuses_pre_attn_norm_quant(self, hidden_states, input_is_sliced):
+    # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
+    pcp_streaming_gdn = self.layer_type == "linear_attention" and getattr(
+        self.linear_attn, "_pcp_streaming_configured", False
+    )
+    if not pcp_streaming_gdn and _fuses_pre_attn_norm_quant(
+        self, hidden_states, input_is_sliced
+    ):
         x_q, x_s, residual = _norm_quantize_rows(
             self.input_layernorm, hidden_states, residual
         )
@@ -1413,7 +1468,11 @@ def patched_decoder_layer_forward(
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if input_is_sliced and sequence_parallel.fp8_gather():
+        if (
+            input_is_sliced
+            and sequence_parallel.fp8_gather()
+            and not pcp_streaming_gdn
+        ):
             x_q, x_s = linear_common.quantize_rows(hidden_states)
             x_q = tensor_model_parallel_all_gather(x_q, 0)
             x_s = tensor_model_parallel_all_gather(x_s, 0)
@@ -1431,7 +1490,7 @@ def patched_decoder_layer_forward(
             positions=positions,
             **attn_kwargs,
         )
-        gather_idx = _step0_gather_indices
+        gather_idx = _step0_effective_gather_indices(positions)
         if gather_idx is not None:
             residual = torch.index_select(residual, 0, gather_idx)
     else:
@@ -1514,18 +1573,19 @@ def patched_model_forward(
         aux_hidden_states = [
             _sp_chunk(self.layers[self.start_layer], aux_hidden_states[0])
         ]
-    for layer_idx, layer in enumerate(
-        islice(self.layers, self.start_layer, self.end_layer),
-        start=self.start_layer,
-    ):
-        hidden_states, residual = layer(
-            positions=positions,
-            hidden_states=hidden_states,
-            residual=residual,
-        )
-        self._maybe_add_hidden_state(
-            aux_hidden_states, layer_idx + 1, hidden_states, residual
-        )
+    with batched_rpa_schedule_scope():
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            )
 
     if not get_pp_group().is_last_rank:
         assert isinstance(residual, torch.Tensor)
@@ -1597,6 +1657,14 @@ def patched_mtp_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    if (
+        _step0_gather_indices is not None
+        and hidden_states.shape[0] < _step0_gather_indices.shape[0]
+    ):
+        hidden_states = F.pad(
+            hidden_states,
+            (0, 0, 0, _step0_gather_indices.shape[0] - hidden_states.shape[0]),
+        )
     return hidden_states
 
 

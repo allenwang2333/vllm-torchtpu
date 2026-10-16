@@ -64,8 +64,8 @@ logger = init_logger(__name__)
 
 # Rows per draft step: one per request in the loop, K + 1 = 4 per request at
 # step 0. Larger steps keep the XLA draft layer.
-_DEFAULT_LOOP_BUCKETS = (4, 8, 16)
-_DEFAULT_VERIFY_BUCKETS = (4, 8, 16, 32)
+_DEFAULT_LOOP_BUCKETS = (4, 8, 12, 16, 20, 24, 28, 32)
+_DEFAULT_VERIFY_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
 _NUM_SPEC_TOKENS = 3
 # `K.W_NAMES` leaves of a one-layer stack: lin_in .. sh2, e13, e2, es, smalls,
 # final_norm. The experts are the layer's own parameters.
@@ -84,6 +84,23 @@ def _parse_buckets(name: str, default: Sequence[int]) -> tuple[int, ...]:
         f"invalid {name}={raw!r}",
     )
     return tuple(buckets)
+
+
+def _padded(n: int, paddings: Sequence[int]) -> int:
+    """`n` rounded up to the runner's token padding (`n` itself past the largest)."""
+    return next((p for p in sorted(paddings) if p >= n), n)
+
+
+def _covering_buckets(
+    raw: Sequence[int], cap: int, paddings: Sequence[int]
+) -> tuple[int, ...]:
+    """The buckets of `raw` up to the first one that holds `cap` rows after the runner
+    pads them (a step of `cap` rows arrives padded, e.g. 28 requests as 32 rows)."""
+    need = _padded(cap, paddings)
+    keep = [b for b in raw if b <= need]
+    if not keep or keep[-1] < need:
+        keep += [b for b in raw if b > need][:1]
+    return tuple(keep) or (raw[0],)
 
 
 def _fit(x: jax.Array, rows: int) -> jax.Array:
@@ -120,8 +137,8 @@ def _step_operands(
     j = jnp.arange(T, dtype=jnp.int32)
     pos = jnp.where(live[:, None], lens[:, None] - T + j, j).reshape(B)
     live_rows = jnp.repeat(live, T)
-    rows = hidden.shape[0]
-    hid = jnp.zeros((M, hidden.shape[1]), hidden.dtype).at[:rows].set(hidden)
+    rows = min(hidden.shape[0], M)
+    hid = jnp.zeros((M, hidden.shape[1]), hidden.dtype).at[:rows].set(hidden[:rows])
     hid = jnp.where(_fit(live_rows, M)[:, None], hid, jnp.zeros_like(hid))
     if gather_indices is None:
         moe_rows = live_rows.astype(jnp.int32)
@@ -139,7 +156,7 @@ class Qwen35MtpMegakernel:
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen35MtpMegakernel | None:
         """The driver for `runner`'s MTP drafter; None if disabled or unsupported."""
-        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "0") != "1":
+        if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "1") != "1":
             return None
         try:
             return cls(runner)
@@ -253,12 +270,25 @@ class Qwen35MtpMegakernel:
         self.base_cfg = base_cfg
         self.tiles = K.default_tiles(base_cfg)
         self.tk = K.plan(base_cfg, self.tiles)["tk"]
-        self.loop_buckets = _parse_buckets(
+        max_reqs = int(getattr(runner, "max_num_reqs", 0) or 0)
+        self._paddings = tuple(
+            int(x) for x in getattr(runner, "num_tokens_paddings", ()) or ()
+        )
+        raw_loop = _parse_buckets(
             "VLLM_TPU_QWEN35_MTP_MK_BUCKETS", _DEFAULT_LOOP_BUCKETS
         )
-        self.verify_buckets = _parse_buckets(
-            "VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS", _DEFAULT_VERIFY_BUCKETS
+        raw_verify = _parse_buckets(
+            "VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS",
+            _DEFAULT_VERIFY_BUCKETS,
         )
+        if max_reqs > 0:
+            self.loop_buckets = _covering_buckets(raw_loop, max_reqs, self._paddings)
+            self.verify_buckets = _covering_buckets(
+                raw_verify, (_NUM_SPEC_TOKENS + 1) * max_reqs, self._paddings
+            )
+        else:
+            self.loop_buckets = raw_loop
+            self.verify_buckets = raw_verify
         _need(
             bool(self.loop_buckets or self.verify_buckets),
             "both bucket lists are empty",
@@ -277,6 +307,12 @@ class Qwen35MtpMegakernel:
         # compiled programs take the parameters themselves.
         self.w_head: list[torch.Tensor] = w_flat[:_NUM_HEAD_LEAVES]
         self.w_tail: list[torch.Tensor] = w_flat[_NUM_HEAD_LEAVES + 2 :]
+        self._w_leaves: tuple[torch.Tensor, ...] = (
+            *self.w_head,
+            w13,
+            w2,
+            *self.w_tail,
+        )
         packed = self.w_head + self.w_tail
         if packed[0].device.type == "tpu":
             from vllm_torchtpu.utils import synchronize_tensors
@@ -392,13 +428,89 @@ class Qwen35MtpMegakernel:
             knr = seq_lens.shape[0] // R
             width = block_tables.size // R // knr
             _need(width * knr * R == block_tables.size, "ragged block tables")
-            c, step = self._step(T, select_bucket(rows, buckets), width)
-            _need(rows <= c.M, f"{rows} rows exceed the {c.M}-row step")
+            n_in = len(meta)
+            b_max = buckets[-1]
+
+            if gather and rows > b_max and knr > (b_max // T):
+                b0 = b_max
+                ns0 = b0 // T
+                rows1 = rows - b0
+                b1 = select_bucket(rows1, buckets)
+                c0, step0 = self._step(T, b0, width)
+                c1, step1 = self._step(T, b1, width)
+                _need(rows1 <= c1.M, f"{rows1} rows exceed the {c1.M}-row step")
+
+                def prep_two(*xs: jax.Array) -> tuple[jax.Array, ...]:
+                    h_in, bt_in, sl_in, qsl_in, g_in = xs
+                    pages = bt_in.reshape(knr, width)
+                    ops0 = _step_operands(
+                        c0,
+                        h_in[:b0],
+                        pages[:ns0],
+                        sl_in[:ns0],
+                        qsl_in[: ns0 + 1],
+                        g_in,
+                    )
+                    ops1 = _step_operands(
+                        c1,
+                        h_in[b0:],
+                        pages[ns0:],
+                        sl_in[ns0:],
+                        qsl_in[ns0:] - qsl_in[ns0],
+                        g_in[ns0:] - b0,
+                    )
+                    return (*ops0, *ops1)
+
+                (
+                    pos0,
+                    hid0,
+                    pt0,
+                    live0,
+                    moe0,
+                    pos1,
+                    hid1,
+                    pt1,
+                    live1,
+                    moe1,
+                ) = jax.shard_map(
+                    prep_two,
+                    mesh=self.mesh,
+                    in_specs=(A,) * n_in,
+                    out_specs=(A,) * 10,
+                    check_vma=False,
+                )(*args[:n_in])
+                out0, pool1 = step0(
+                    pos0, hid0, *leaves, pool, pt0, live0, moe0
+                )
+                out1, new_pool = step1(
+                    pos1, hid1, *leaves, pool1, pt1, live1, moe1
+                )
+
+                def post_two(
+                    o0: jax.Array, o1: jax.Array, g: jax.Array
+                ) -> jax.Array:
+                    o_cat = jnp.concatenate([o0[:b0], o1], axis=0)
+                    return jnp.take(
+                        o_cat,
+                        jnp.clip(g.astype(jnp.int32), 0, o_cat.shape[0] - 1),
+                        axis=0,
+                    )
+
+                out = jax.shard_map(
+                    post_two,
+                    mesh=self.mesh,
+                    in_specs=(A, A, A),
+                    out_specs=A,
+                    check_vma=False,
+                )(out0, out1, gidx)
+                return out, new_pool
+
+            c, step = self._step(T, select_bucket(min(rows, b_max), buckets), width)
+            _need(min(rows, b_max) <= c.M, f"{rows} rows exceed the {c.M}-row step")
 
             def prep(*xs: jax.Array) -> tuple[jax.Array, ...]:
                 return _step_operands(c, *xs[:4], xs[4] if gather else None)
 
-            n_in = len(meta)
             pos, hid, page_table, live, moe_rows = jax.shard_map(
                 prep,
                 mesh=self.mesh,
@@ -449,6 +561,15 @@ class Qwen35MtpMegakernel:
             fake=fake,
         )
 
+    def padded_rows(self, rows: int) -> int:
+        """The rows a draft step of `rows` rows arrives at after the runner pads it.
+
+        `use_for_step` admits step-0 steps up to `padded_rows((K + 1) *
+        max_num_reqs)` rows, so the step-0 program must compile every token
+        bucket up to that count.
+        """
+        return _padded(rows, self._paddings)
+
     def use_for_step(self, attn_metadata: Any, num_rows: int, *, step0: bool) -> bool:
         """Whether a draft step of `num_rows` rows runs on the megakernel.
 
@@ -461,10 +582,20 @@ class Qwen35MtpMegakernel:
             if isinstance(attn_metadata, dict)
             else None
         )
+        # A step-0 step arrives padded to the runner's token bucket: its rows past the
+        # requests' K + 1 tokens each are inert (no live sequence, no gather index).
+        max_rows = (
+            min(
+                buckets[-1] * 2,
+                self.padded_rows(int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1)),
+            )
+            if (step0 and md is not None)
+            else (buckets[-1] * 2 if step0 else buckets[-1])
+        )
         ok = bool(
             self.bound
             and buckets
-            and num_rows <= buckets[-1]
+            and num_rows <= max_rows
             and md is not None
             and md.query_start_loc.shape[0] == md.seq_lens.shape[0] + 1
             and md.block_tables.numel() % md.seq_lens.shape[0] == 0
@@ -475,21 +606,25 @@ class Qwen35MtpMegakernel:
         """Count a draft-step decision; log the MK/XLA mix periodically."""
         key = f"{'mk' if run else 'xla'}_{key}"
         self._step_mix[key] = self._step_mix.get(key, 0) + 1
-        now = time.monotonic()
-        if now - self._step_mix_t0 >= self._step_mix_period_s:
-            if self.tp_rank == 0:
-                total = sum(self._step_mix.values())
-                mk = sum(v for k, v in self._step_mix.items() if k.startswith("mk_"))
-                logger.info(
-                    "Qwen3.5 MTP megakernel step mix over %.0fs: %d/%d MK (%.1f%%) %s",
-                    now - self._step_mix_t0,
-                    mk,
-                    total,
-                    100.0 * mk / max(total, 1),
-                    dict(sorted(self._step_mix.items())),
-                )
-            self._step_mix = {}
-            self._step_mix_t0 = now
+        self._step_mix_calls = getattr(self, "_step_mix_calls", 0) + 1
+        if (self._step_mix_calls & 63) == 0:
+            now = time.monotonic()
+            if now - self._step_mix_t0 >= self._step_mix_period_s:
+                if self.tp_rank == 0:
+                    total = sum(self._step_mix.values())
+                    mk = sum(
+                        v for k, v in self._step_mix.items() if k.startswith("mk_")
+                    )
+                    logger.info(
+                        "Qwen3.5 MTP megakernel step mix over %.0fs: %d/%d MK (%.1f%%) %s",
+                        now - self._step_mix_t0,
+                        mk,
+                        total,
+                        100.0 * mk / max(total, 1),
+                        dict(sorted(self._step_mix.items())),
+                    )
+                self._step_mix = {}
+                self._step_mix_t0 = now
         return run
 
     def forward_layer(

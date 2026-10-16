@@ -70,9 +70,17 @@ def _pooled_region_bytes(
     return region.nblocks * region.nrows * payload * itemsize
 
 
+def _bf16_qkv_mode() -> int:
+    raw = os.environ.get("TPU_GDN_BF16_QKV", "2").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 2
+
+
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] or bf16
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
     conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
@@ -86,6 +94,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    act_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -112,6 +121,8 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        act_scratch_ref: Optional VMEM scratch reference for post-conv1d f32
+            activations when qkv_slot_ref is bfloat16.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -138,7 +149,38 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    if qkv_slot_ref.ndim == 3:
+        assert act_scratch_ref is not None
+        aligned_chunk = pl.cdiv(cfg.chunk_size, 16) * 16
+        for idx in range(cfg.seq_tile_size):
+            r_base = metadata_ref.p_id_to_r_base[p_id, idx]
+            r_prefix = jax.lax.rem(r_base, 16)
+            for prefix in range(16):
+
+                @pl.when(r_prefix == prefix)
+                def _unpack(idx=idx, prefix=prefix):
+                    load_rows = pl.cdiv(prefix + aligned_chunk, 16) * 16
+                    dense_qkv = qkv_slot_ref[idx, :load_rows, :]
+                    act_scratch_ref[idx, :aligned_chunk, 0, :] = dense_qkv[
+                        prefix : prefix + aligned_chunk, :
+                    ].astype(jnp.float32)
+
+        qkv_work_ref = (
+            act_scratch_ref
+            if aligned_chunk == cfg.chunk_size
+            else act_scratch_ref.at[:, : cfg.chunk_size]
+        )
+        qkv_in_compact = qkv_work_ref[...]
+    elif qkv_slot_ref.shape[-2] == 2:
+        assert act_scratch_ref is not None
+        qkv_raw = qkv_slot_ref[...].astype(jnp.float32)
+        qkv_in_compact = jnp.concatenate(
+            [qkv_raw[:, :, 0:1, :], qkv_raw[:, :, 1:2, :]], axis=-1
+        )
+        qkv_work_ref = act_scratch_ref
+    else:
+        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+        qkv_work_ref = qkv_slot_ref
     qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
     # Prepare conv1d weights.
@@ -205,7 +247,7 @@ def inner_kernel(
         q_compact, k_compact, v_compact, b_compact, a_compact = (
             vmem_ldst.load_activation_as_compact(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -230,7 +272,7 @@ def inner_kernel(
         q_large, k_large, v_large, b_large, a_large = (
             vmem_ldst.load_activation_as_large(
                 qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+                qkv_vmem_ref=qkv_work_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
@@ -293,6 +335,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    act_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -373,6 +416,7 @@ def outer_kernel(
                 weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
+                act_scratch_ref,
             ),
             allocations=allocations,
         )
@@ -398,6 +442,7 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "bf16_qkv_mode",
     ),
 )
 def fused_conv1d_gdn(
@@ -436,6 +481,7 @@ def fused_conv1d_gdn(
     mixed_tile_size: int = 128,
     seg_bounds: jax.Array | None = None,  # [num_seqs, 2]
     seg_state_indices: jax.Array | None = None,  # [num_seqs, 2]
+    bf16_qkv_mode: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Execute depthwise causal Conv1d, SiLU activation, L2 normalization, and
     recurrent Gated DeltaNet state update in a single fused Pallas kernel.
@@ -525,6 +571,12 @@ def fused_conv1d_gdn(
         seg_state_indices: Optional [num_seqs, 2] state slots (dense) or source
             blocks (pooled) receiving those checkpoints. Required with
             `seg_bounds`.
+        bf16_qkv_mode: How a bf16 qkv reaches the kernel: 0 casts it to f32
+            rows, 1 streams [T, 2, dim / 2] bf16, 2 streams the 2D [T, dim]
+            bf16 rows in 16-row aligned DMAs. None reads TPU_GDN_BF16_QKV
+            (default 2). Modes 1 and 2 need dim a multiple of 2 * num_lanes,
+            at least 16 tokens and a multiple-of-8 mixed chunk, and fall back
+            to 0 otherwise.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -532,7 +584,6 @@ def fused_conv1d_gdn(
             source (aliased in place) instead of the state pair.
         out: Fused output tensor.
     """
-    # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
     pooled = state_plan is not None
     if pooled:
@@ -550,7 +601,6 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -611,18 +661,33 @@ def fused_conv1d_gdn(
         seg_ckpt_indices = ckpt_indices
         if pooled and seg_ckpt_indices is None:
             seg_ckpt_indices = state_indices.astype(jnp.int32)[:, None]
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    packing = 4 // act_in_dtype.itemsize
-    padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
     if is_kda:
         mixed_tile_size = min(mixed_tile_size, 64)
     mixed_tile_size = min(mixed_tile_size, batch_size)
     if mixed_tile_size > 16:
         mixed_tile_size = (mixed_tile_size // 16) * 16
+    if bf16_qkv_mode is None:
+        bf16_qkv_mode = _bf16_qkv_mode()
+    if (
+        bf16_qkv_mode in (1, 2)
+        and qkv.dtype == jnp.bfloat16
+        and dim % (2 * num_lanes) == 0
+        and batch_size >= 16
+        and mixed_tile_size % 8 == 0
+    ):
+        qkv_2d = bf16_qkv_mode == 2
+    else:
+        bf16_qkv_mode = 0
+        qkv_2d = False
+        qkv = qkv.astype(jnp.float32)
+    act_in_dtype = qkv.dtype
+    assert a.dtype == b.dtype == jnp.float32
+
+    packing = 16 if qkv_2d else (4 // act_in_dtype.itemsize)
+    padded_batch_size = pl.cdiv(batch_size, packing) * packing
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
@@ -669,6 +734,14 @@ def fused_conv1d_gdn(
         )
         if dynamic_tiling:
             dyn_decode_tile = fit_decode_tile
+        if bf16_qkv_mode and mixed_tile_size % 8:
+            # The bf16 qkv layouts run only on multiple-of-8 chunks, and the
+            # VMEM fit can cap the chunk below the one checked above.
+            # padded_batch_size stays a multiple of 16, which f32 rows accept.
+            bf16_qkv_mode = 0
+            qkv_2d = False
+            qkv = qkv.astype(jnp.float32)
+            act_in_dtype = qkv.dtype
 
     spec_tile_cap = tiling.spec_window_tile_cap(
         window=window_size,
@@ -710,7 +783,10 @@ def fused_conv1d_gdn(
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
     qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
+    if bf16_qkv_mode == 1:
+        qkv = qkv.reshape(padded_batch_size, 2, dim // 2)
+    elif bf16_qkv_mode == 0:
+        qkv = qkv.reshape(padded_batch_size, 1, -1)
     if not is_kda:
         # Fuse b and a [N, n_v] -> [2, N_pad, 128] into a single HBM pad where
         # both leading-index slices remain 100% contiguous [N_pad, 1, 128].
@@ -770,6 +846,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            qkv_2d=qkv_2d,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,

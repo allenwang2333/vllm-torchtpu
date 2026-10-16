@@ -76,10 +76,12 @@ See `raiden_connector.py` for connector wiring, device fencing, and echo channel
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import hashlib
 import math
 import os
+import secrets
 import socket
 import threading
 import time
@@ -115,6 +117,14 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
+from vllm_torchtpu.offload.tier_dedup import (
+    FA_CLASS,
+    STATE_CLASS,
+    ClassRoutedStore,
+    fa_segment_key,
+    remove_stale_fa_segments,
+    resolve_tier_dedup_layout,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -132,6 +142,17 @@ _DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
 _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
 _DEFAULT_CONTROLLER_PORT = 51515
+
+
+def controller_ready_marker(port: int) -> str:
+    """File the scheduler writes once its offload controller listens on port.
+
+    A worker on the same host dials the controller only after the marker
+    appears: a connect to a local port nobody listens on can succeed against
+    itself (TCP simultaneous open with source port == destination port) and
+    then holds the port the controller is about to bind.
+    """
+    return f"/tmp/raiden_controller_ready_{port}"
 
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
@@ -265,6 +286,100 @@ class FinishedJob:
     failed_device_block_ids: list[int] = field(default_factory=list)
 
 
+def construct_kv_cache_store(
+    store_types: Any,
+    *,
+    capacity: int,
+    raiden_controller_port: int,
+    raiden_job_name: str,
+    world_size: int,
+    global_registry_address: str = "",
+    store_server_ip: str = "",
+    kv_pool_group: str = "",
+    secondary_backend_configs: Sequence[object] = (),
+    marker_payload: str | None = None,
+) -> Any:
+    """Builds a KVCacheStore and its controller, blocking until every worker registers.
+
+    A background thread writes `controller_ready_marker(port)` once the
+    controller listens; workers wait for it before dialing. Its content is
+    `marker_payload` (default: this process's pid), which lets workers read a
+    value the scheduler chose for this run.
+    """
+    logger.info(
+        "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
+        "until %d worker(s) register",
+        world_size,
+    )
+    _default_worker_registration_timeout()
+    ready_marker = controller_ready_marker(raiden_controller_port)
+    payload = marker_payload if marker_payload is not None else str(os.getpid())
+    with contextlib.suppress(OSError):
+        os.unlink(ready_marker)
+
+    def _mark_ready_when_listening(port: int, marker: str) -> None:
+        port_hex = f":{port:04X}"
+        for _ in range(600):
+            time.sleep(0.25)
+            listening = False
+            for netf in ("/proc/net/tcp", "/proc/net/tcp6"):
+                try:
+                    with open(netf) as f:
+                        for line in f:
+                            parts = line.split()
+                            if (
+                                len(parts) > 3
+                                and parts[1].upper().endswith(port_hex)
+                                and parts[3] == "0A"
+                            ):
+                                listening = True
+                                break
+                except OSError:
+                    pass
+                if listening:
+                    break
+            if listening:
+                try:
+                    with open(marker + ".tmp", "w") as mf:
+                        mf.write(payload)
+                    os.replace(marker + ".tmp", marker)
+                except OSError:
+                    pass
+                return
+
+    threading.Thread(
+        target=_mark_ready_when_listening,
+        args=(raiden_controller_port, ready_marker),
+        daemon=True,
+    ).start()
+    return store_types.KVCacheStore(
+        capacity=capacity,
+        raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
+        # Transfer fanout is dynamically driven by registered workers.
+        num_shards=1,
+        shard_size_bytes=1,
+        raiden_controller_port=raiden_controller_port,
+        global_registry_address=global_registry_address,
+        # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
+        store_server_ip=store_server_ip or "127.0.0.1",
+        # Pool group this store's KV cache flows within (spec
+        # publication and eviction placement).
+        kv_pool_group=kv_pool_group,
+        # Construction blocks in RaidenController::Init() until every
+        # rank registers, and raises on timeout
+        # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S; raised from Raiden's 120 s
+        # by _default_worker_registration_timeout).
+        expected_worker_count=world_size,
+        # Passed only when set, so a DRAM-only store is constructed
+        # exactly as before the storage tier existed.
+        **(
+            {"secondary_backend_configs": list(secondary_backend_configs)}
+            if secondary_backend_configs
+            else {}
+        ),
+    )
+
+
 class RaidenOffloadingManager(OffloadingManager):
     """Scheduler-side OffloadingManager backed by raiden's KVCacheStore.
 
@@ -299,6 +414,38 @@ class RaidenOffloadingManager(OffloadingManager):
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
+        # Tier telemetry: cumulative job counters plus the launch time and
+        # block count of every in-flight job, reported once a minute from
+        # poll_finished_jobs. The connector scheduler adds its own keys
+        # (poll_ns, wait_ns, waited_polls, load_cap_deferrals) to the same
+        # dict so one log line carries both sides.
+        self.telemetry: dict[str, float] = {
+            "load_jobs": 0,
+            "load_failed": 0,
+            "load_blocks": 0,
+            "load_remote_blocks": 0,
+            "load_lat_ms_sum": 0.0,
+            "load_lat_ms_max": 0.0,
+            "store_jobs": 0,
+            "store_failed": 0,
+            "store_blocks": 0,
+            "store_lat_ms_sum": 0.0,
+            "poll_ns": 0,
+            "wait_ns": 0,
+            "waited_polls": 0,
+            "load_cap_deferrals": 0,
+            "evicted_sub_hashes": 0,
+            # Store-split keys, filled by the connector scheduler: launched
+            # store keys of the full-attention groups and of all others.
+            "split_fa_keys": 0,
+            "split_mamba_keys": 0,
+            "demote_keys": 0,
+            "demoted_sub_hashes": 0,
+        }
+        self._tel_launch: dict[int, tuple[float, int]] = {}
+        self._tel_last_log = time.monotonic()
+        self._tel_last_snapshot = dict(self.telemetry)
+        self._tel_last_class_counts: dict[tuple[str, str], int] = {}
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
         self._enable_global = bool(global_registry_address)
@@ -328,38 +475,17 @@ class RaidenOffloadingManager(OffloadingManager):
         if store is None:
             from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
-            _default_worker_registration_timeout()
             store_types = _torch_impl()
-            logger.info(
-                "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
-                "until %d worker(s) register",
-                world_size,
-            )
-            store = store_types.KVCacheStore(
+            store = construct_kv_cache_store(
+                store_types,
                 capacity=kernel_physical_blocks_capacity,
-                raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
-                # Transfer fanout is dynamically driven by registered workers.
-                num_shards=1,
-                shard_size_bytes=1,
                 raiden_controller_port=raiden_controller_port,
+                raiden_job_name=raiden_job_name,
+                world_size=world_size,
                 global_registry_address=global_registry_address,
-                # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
-                store_server_ip=store_server_ip or "127.0.0.1",
-                # Pool group this store's KV cache flows within (spec
-                # publication and eviction placement).
+                store_server_ip=store_server_ip,
                 kv_pool_group=kv_pool_group,
-                # Construction blocks in RaidenController::Init() until every
-                # rank registers, and raises on timeout
-                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S; raised from Raiden's 120 s
-                # by _default_worker_registration_timeout).
-                expected_worker_count=world_size,
-                # Passed only when set, so a DRAM-only store is constructed
-                # exactly as before the storage tier existed.
-                **(
-                    {"secondary_backend_configs": list(secondary_backend_configs)}
-                    if secondary_backend_configs
-                    else {}
-                ),
+                secondary_backend_configs=secondary_backend_configs,
             )
             logger.info(
                 "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d "
@@ -752,6 +878,46 @@ class RaidenOffloadingManager(OffloadingManager):
             evicted_keys=[],
         )
 
+    def _launch_save(self, sub_hashes: list[bytes]) -> tuple[list[bytes], list[bytes]]:
+        """Launches a save; returns the (launched, refused) sub-hashes.
+
+        A class-routed store (the deduplicated layout) can launch one class
+        and refuse the other; a single store launches all or nothing.
+        """
+        parts = getattr(self._store, "save_parts", None)
+        if parts is not None:
+            return parts(sub_hashes)
+        if self._store.save(sub_hashes):
+            return list(sub_hashes), []
+        return [], list(sub_hashes)
+
+    def _launch_load(
+        self, sub_hashes: list[bytes], device_ids: list[int]
+    ) -> tuple[list[bytes], list[bytes]]:
+        """Launches a local load; returns the (launched, refused) sub-hashes."""
+        parts = getattr(self._store, "load_parts", None)
+        if parts is not None:
+            return parts(sub_hashes, device_ids)
+        if self._store.load(sub_hashes, device_ids):
+            return list(sub_hashes), []
+        return [], list(sub_hashes)
+
+    def demote(self, keys: Sequence[OffloadKey]) -> int:
+        """Queues the keys' host entries for eviction ahead of all others.
+
+        For entries a newer one supersedes (an older Mamba/GDN boundary of the
+        same conversation): they still answer lookups until evicted, but they
+        leave before any entry that is still live. Returns how many sub-hash
+        entries were queued; 0 on a store without demote().
+        """
+        demote = getattr(self._store, "demote", None)
+        if demote is None or not keys:
+            return 0
+        demoted = demote(self._expand_keys(list(keys)))
+        self.telemetry["demote_keys"] += len(keys)
+        self.telemetry["demoted_sub_hashes"] += demoted
+        return demoted
+
     def _sub_hash_to_offload_key(
         self, sub_hash: bytes
     ) -> tuple[OffloadKey, int] | None:
@@ -773,6 +939,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
         """Callback invoked by Raiden C++ store upon host LRU cache eviction."""
+        self.telemetry["evicted_sub_hashes"] += len(evicted_hashes)
         with self._eviction_lock:
             for sub_hash in evicted_hashes:
                 parsed = self._sub_hash_to_offload_key(sub_hash)
@@ -899,26 +1066,36 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
             )
             return
-        if not self._store.save(to_save):
-            # Synchronous launch failure: finalize immediately to revert the
-            # admitted entries.
+        # Only a job that launches reaches _finalize, which retires this entry.
+        self._tel_launch[job_id] = (time.monotonic(), len(keys))
+        launched, refused = self._launch_save(to_save)
+        if refused:
             logger.error(
                 "TPURaidenOffloadingConnector: store job %d: save() launch failed "
-                "for %d sub-blocks",
+                "for %d of %d sub-blocks",
                 job_id,
+                len(refused),
                 len(to_save),
             )
-            self._finalize(
-                Admission(
-                    job_id=job_id,
-                    op=AdmissionOp.STORE,
-                    keys=keys,
-                    sub_hashes=sub_hashes,
-                    pending=set(),
-                    failed=True,
-                    failed_sub_hashes=list(to_save),
-                )
+            admission = Admission(
+                job_id=job_id,
+                op=AdmissionOp.STORE,
+                keys=keys,
+                sub_hashes=sub_hashes,
+                pending=set(launched),
+                failed=True,
+                saved_sub_hashes=to_save,
+                failed_sub_hashes=list(refused),
             )
+            if not launched:
+                # Nothing in flight: finalize now to revert the admitted entries.
+                self._finalize(admission)
+                return
+            # Part of the save is in flight: the job stays live until those
+            # transfers resolve, then finalizes as failed without a retry.
+            self._admissions[job_id] = admission
+            for sub_hash in launched:
+                self._hash_to_admission[sub_hash] = admission
             return
         admission = Admission(
             job_id=job_id,
@@ -943,7 +1120,11 @@ class RaidenOffloadingManager(OffloadingManager):
     ) -> None:
         """Launch a load job; entries were pinned in prepare_load."""
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        self._tel_launch[job_id] = (time.monotonic(), len(keys))
         if not pinned:
+            self._tel_launch.pop(job_id, None)
+            self.telemetry["load_jobs"] += 1
+            self.telemetry["load_failed"] += 1
             # prepare_load lost the pin race; nothing is held, so fail the
             # job without touching the store and let vLLM recompute.
             self._finished.append(
@@ -1022,11 +1203,13 @@ class RaidenOffloadingManager(OffloadingManager):
             # matching a polled failure.
             self._finalize(admission)
 
-        if local_hashes and not self._store.load(
-            local_hashes, dst_device_ids_for_local
-        ):
-            _fail_launch("load()", local_hashes, [])
-            return
+        if local_hashes:
+            launched, refused = self._launch_load(
+                local_hashes, dst_device_ids_for_local
+            )
+            if refused:
+                _fail_launch("load()", refused, launched)
+                return
         if remote_hashes and not self._store.read_remote(
             remote_hashes, remote_slices, dst_device_ids_for_remote
         ):
@@ -1064,6 +1247,7 @@ class RaidenOffloadingManager(OffloadingManager):
         for sub_hash in admission.sub_hashes:
             self._hash_to_admission.pop(sub_hash, None)
         success = not (admission.failed or admission.poisoned)
+        self._tel_account(admission, success)
         # Give back only what the job still holds. A transfer that landed
         # already spent its pin and a peer read never took one, so the release
         # covers the admitted entries no transfer accounted for: on a store,
@@ -1181,7 +1365,8 @@ class RaidenOffloadingManager(OffloadingManager):
             return False
         retry_hashes = admission.failed_sub_hashes
         admission.retries_left -= 1
-        if not self._store.save(retry_hashes):
+        launched, refused = self._launch_save(retry_hashes)
+        if not launched:
             logger.error(
                 "TPURaidenOffloadingConnector: store job %d: save() retry launch "
                 "failed for %d sub-blocks; job fails",
@@ -1193,19 +1378,131 @@ class RaidenOffloadingManager(OffloadingManager):
             "TPURaidenOffloadingConnector: store job %d: retrying save of %d failed "
             "sub-blocks (%d retries left)",
             admission.job_id,
-            len(retry_hashes),
+            len(launched),
             admission.retries_left,
         )
-        admission.pending = set(retry_hashes)
-        admission.failed_sub_hashes = []
-        admission.failed = False
+        admission.pending = set(launched)
+        for sub_hash in launched:
+            self._hash_to_admission[sub_hash] = admission
+        # A refused part fails the job once the launched part resolves.
+        admission.failed_sub_hashes = list(refused)
+        admission.failed = bool(refused)
+        if refused:
+            admission.retries_left = 0
         return True
+
+    def _tel_account(self, admission: Admission, success: bool) -> None:
+        launched = self._tel_launch.pop(admission.job_id, None)
+        lat_ms = (time.monotonic() - launched[0]) * 1000.0 if launched else 0.0
+        nblocks = launched[1] if launched else len(admission.keys)
+        tel = self.telemetry
+        if admission.op == AdmissionOp.LOAD:
+            tel["load_jobs"] += 1
+            tel["load_blocks"] += nblocks
+            tel["load_remote_blocks"] += len(admission.remote_sub_hashes) / max(
+                self._device_block_size_factor, 1
+            )
+            tel["load_lat_ms_sum"] += lat_ms
+            tel["load_lat_ms_max"] = max(tel["load_lat_ms_max"], lat_ms)
+            if not success:
+                tel["load_failed"] += 1
+        else:
+            tel["store_jobs"] += 1
+            tel["store_blocks"] += nblocks
+            tel["store_lat_ms_sum"] += lat_ms
+            if not success:
+                tel["store_failed"] += 1
+
+    def _maybe_log_telemetry(self) -> None:
+        now = time.monotonic()
+        if now - self._tel_last_log < 60.0:
+            return
+        tel, prev = self.telemetry, self._tel_last_snapshot
+        dt = now - self._tel_last_log
+        d = {k: tel[k] - prev.get(k, 0) for k in tel}
+        d_loads = max(d["load_jobs"] - d["load_failed"], 1)
+        d_stores = max(d["store_jobs"] - d["store_failed"], 1)
+        inflight_loads = sum(
+            1 for a in self._admissions.values() if a.op == AdmissionOp.LOAD
+        )
+        logger.info(
+            "offload-tier telemetry: window %.0fs loads=%d (failed %d, blocks %d,"
+            " remote %d, %.0f blocks/s, lat mean %.0f ms max %.0f ms) stores=%d"
+            " (failed %d, blocks %d, %.0f blocks/s, lat mean %.0f ms)"
+            " load_cap_deferrals=%d poll %.0f ms wait %.0f ms in %d polls"
+            " evicted_sub_hashes=%d inflight loads=%d stores=%d |"
+            " total loads=%d/%d blocks store=%d/%d blocks",
+            dt,
+            d["load_jobs"],
+            d["load_failed"],
+            d["load_blocks"],
+            d["load_remote_blocks"],
+            d["load_blocks"] / dt,
+            d["load_lat_ms_sum"] / d_loads,
+            tel["load_lat_ms_max"],
+            d["store_jobs"],
+            d["store_failed"],
+            d["store_blocks"],
+            d["store_blocks"] / dt,
+            d["store_lat_ms_sum"] / d_stores,
+            d["load_cap_deferrals"],
+            d["poll_ns"] / 1e6,
+            d["wait_ns"] / 1e6,
+            d["waited_polls"],
+            d["evicted_sub_hashes"],
+            inflight_loads,
+            len(self._admissions) - inflight_loads,
+            tel["load_jobs"],
+            tel["load_blocks"],
+            tel["store_jobs"],
+            tel["store_blocks"],
+        )
+        logger.info(
+            "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d",
+            dt,
+            d["split_fa_keys"],
+            d["split_mamba_keys"],
+        )
+        class_evicted = getattr(self._store, "evicted_sub_hashes", None)
+        if class_evicted is not None:
+            # Per-class sub-hash counts since the last line: evicted, and
+            # launched saves and loads.
+            counts = {
+                "evicted": class_evicted,
+                "stored": self._store.saved_sub_hashes,
+                "loaded": self._store.loaded_sub_hashes,
+            }
+            prev = self._tel_last_class_counts
+            logger.info(
+                "offload-tier classes: window %.0fs %s demote_keys=%d "
+                "demoted_sub_hashes=%d",
+                dt,
+                " ".join(
+                    f"{cls}_capacity={self._store.class_capacity(cls)}"
+                    + "".join(
+                        f" {cls}_{what}={by_cls[cls] - prev.get((what, cls), 0)}"
+                        for what, by_cls in counts.items()
+                    )
+                    for cls in class_evicted
+                ),
+                d["demote_keys"],
+                d["demoted_sub_hashes"],
+            )
+            self._tel_last_class_counts = {
+                (what, cls): value
+                for what, by_cls in counts.items()
+                for cls, value in by_cls.items()
+            }
+        tel["load_lat_ms_max"] = 0.0
+        self._tel_last_snapshot = dict(tel)
+        self._tel_last_log = now
 
     def poll_finished_jobs(self) -> list[FinishedJob]:
         """Poll raiden completion and return newly terminal jobs."""
         self._poll_once()
         finished = self._finished
         self._finished = []
+        self._maybe_log_telemetry()
         return finished
 
     def drain_jobs(self, job_ids: set[int]) -> list[FinishedJob]:
@@ -1508,6 +1805,16 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+@dataclass(frozen=True)
+class FaRegistration:
+    """A worker's registration with the full-attention store (tier_dedup.py)."""
+
+    controller_address: str
+    host_blocks: int
+    fa_port: int
+    head_group: int
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1543,12 +1850,16 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # backend, which is right only when the store has no storage tier:
         # with one, every save needs every worker to write its shard.
         backend_configs: Sequence[object] = (),
+        # The deduplicated layout's second registration, with the
+        # full-attention controller; None for the replicated layout.
+        fa_target: FaRegistration | None = None,
     ):
         import numpy as np
         import torch
 
         # Set before either branch below starts the registration thread.
         self._backend_configs = list(backend_configs)
+        self._fa_target = fa_target
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -1669,6 +1980,15 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._controller_address = controller_address
         self._rank = rank
         self._mgr = None
+        self._fa_mgr = None
+        # Clear markers an earlier engine left for these ports; the scheduler
+        # writes fresh ones once its controllers listen.
+        for address in [controller_address] + (
+            [self._fa_target.controller_address] if self._fa_target else []
+        ):
+            _, _, port_str = address.rpartition(":")
+            with contextlib.suppress(OSError, ValueError):
+                os.unlink(controller_ready_marker(int(port_str)))
         self._stop_registration = threading.Event()
         self._register_thread = threading.Thread(
             target=self._register_loop,
@@ -1677,14 +1997,19 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         )
         self._register_thread.start()
 
-    def _controller_reachable(self) -> bool:
+    def _controller_reachable(self, address: str | None = None) -> bool:
         """TCP-probe the controller endpoint (a listening server is a
         precondition for registering, not proof of registration)."""
-        host, _, port = self._controller_address.rpartition(":")
+        host, _, port = (address or self._controller_address).rpartition(":")
         host = host.strip("[]")
+        if host in ("127.0.0.1", "localhost", "::1") and not os.path.exists(
+            controller_ready_marker(int(port))
+        ):
+            return False
         try:
-            with socket.create_connection((host, int(port)), timeout=1.0):
-                return True
+            with socket.create_connection((host, int(port)), timeout=1.0) as s:
+                # A self-connect reaches no controller.
+                return s.getsockname() != s.getpeername()
         except OSError:
             return False
 
@@ -1696,50 +2021,30 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         verdict lives scheduler-side: KVCacheStore construction blocks until
         every rank has registered and fails engine startup on timeout, so
         this loop only has to keep trying, never to give up or escalate.
+        In the deduplicated layout it then registers with the full-attention
+        controller the same way.
         """
+        if not self._register_with(self._controller_address, self._register_main):
+            return
+        if self._fa_target is not None:
+            self._register_with(self._fa_target.controller_address, self._register_fa)
+
+    def _register_with(self, address: str, register: Any) -> bool:
         delay = 0.5
         next_note = time.monotonic() + 30.0
         while not self._stop_registration.is_set():
-            if self._controller_reachable():
+            if self._controller_reachable(address):
                 try:
-                    from tpu_sync.api.torch import kv_cache_manager as _kcm
-
-                    # Registers the storage backend this rank writes its
-                    # shards through; omitted when there is no storage tier.
-                    # Any, not the inferred list type: a type checker matches
-                    # an unpacked dict's value type against every keyword
-                    # parameter the call does not pass explicitly.
-                    storage_kwargs: dict[str, Any] = (
-                        {"backend_configs": self._backend_configs}
-                        if self._backend_configs
-                        else {}
-                    )
-                    self._mgr = _kcm.KVCacheManager(
-                        kv_caches=self._device_tensors,
-                        local_control_port=0,
-                        host_blocks_to_allocate=self._host_blocks_to_allocate,
-                        raiden_worker_port=0,
-                        raiden_controller_address=self._controller_address,
-                        worker_id=f"shard_{self._rank}",
-                        node_id=self._rank,
-                        **storage_kwargs,
-                    )
-                    logger.info(
-                        "TPURaidenOffloadingConnector: rank %d registered with offload "
-                        "controller at %s (%d host kernel blocks%s)",
-                        self._rank,
-                        self._controller_address,
-                        self._host_blocks_to_allocate,
-                        ", storage tier on" if self._backend_configs else "",
-                    )
-                    return
+                    register()
+                    return True
                 except Exception:
                     # A persistent failure escalates via the
                     # scheduler's construction barrier timeout.
                     logger.warning(
                         "TPURaidenOffloadingConnector: rank %d: background "
-                        "registration attempt failed; retrying in %.1fs",
+                        "registration attempt with %s failed; retrying in %.1fs",
                         self._rank,
+                        address,
                         delay,
                         exc_info=True,
                     )
@@ -1753,11 +2058,78 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                     "registration barrier will fail engine startup if "
                     "registration does not succeed in time)",
                     self._rank,
-                    self._controller_address,
+                    address,
                 )
                 next_note = time.monotonic() + 30.0
             self._stop_registration.wait(delay)
             delay = min(delay * 2, 5.0)
+        return False
+
+    def _register_main(self) -> None:
+        from tpu_sync.api.torch import kv_cache_manager as _kcm
+
+        # Registers the storage backend this rank writes its shards through;
+        # omitted when there is no storage tier. Any, not the inferred list
+        # type: a type checker matches an unpacked dict's value type against
+        # every keyword parameter the call does not pass explicitly.
+        storage_kwargs: dict[str, Any] = (
+            {"backend_configs": self._backend_configs} if self._backend_configs else {}
+        )
+        self._mgr = _kcm.KVCacheManager(
+            kv_caches=self._device_tensors,
+            local_control_port=0,
+            host_blocks_to_allocate=self._host_blocks_to_allocate,
+            raiden_worker_port=0,
+            raiden_controller_address=self._controller_address,
+            worker_id=f"shard_{self._rank}",
+            node_id=self._rank,
+            **storage_kwargs,
+        )
+        logger.info(
+            "TPURaidenOffloadingConnector: rank %d registered with offload "
+            "controller at %s (%d host kernel blocks%s)",
+            self._rank,
+            self._controller_address,
+            self._host_blocks_to_allocate,
+            ", storage tier on" if self._backend_configs else "",
+        )
+
+    def _register_fa(self) -> None:
+        from tpu_sync.api.torch import kv_cache_manager as _kcm
+
+        target = self._fa_target
+        assert target is not None
+        with open(controller_ready_marker(target.fa_port)) as marker:
+            run_token = marker.read().strip()
+        removed = remove_stale_fa_segments(target.fa_port, run_token)
+        if removed:
+            logger.info(
+                "TPURaidenOffloadingConnector: rank %d removed full-attention "
+                "segments of earlier runs: %s",
+                self._rank,
+                removed,
+            )
+        key = fa_segment_key(target.fa_port, run_token, target.head_group)
+        self._fa_mgr = _kcm.KVCacheManager(
+            kv_caches=self._device_tensors,
+            local_control_port=0,
+            host_blocks_to_allocate=target.host_blocks,
+            raiden_worker_port=0,
+            raiden_controller_address=target.controller_address,
+            worker_id=f"shard_{self._rank}",
+            node_id=self._rank,
+            shm_group_key=key,
+        )
+        logger.info(
+            "TPURaidenOffloadingConnector: rank %d registered with the "
+            "full-attention controller at %s (%d host kernel blocks in shared "
+            "segment %s, head group %d)",
+            self._rank,
+            target.controller_address,
+            target.host_blocks,
+            key,
+            target.head_group,
+        )
 
     def submit_store(self, job_id, src_spec, dst_spec) -> bool:
         raise AssertionError(
@@ -1782,6 +2154,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         self._stop_registration.set()
         self._register_thread.join(timeout=5.0)
         self._mgr = None
+        self._fa_mgr = None
 
 
 # -- storage tier ---------------------------------------------------------------
@@ -2222,6 +2595,18 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in "
                 "kv_connector_extra_config (--kv-offloading-size)"
             )
+        # Read by raiden's host memory allocator: prefer, rather than bind to,
+        # the TPU's NUMA node when placing host pages.
+        os.environ.setdefault("RAIDEN_NUMA_POLICY", "preferred")
+        max_cpu_bytes = int(os.environ.get("TPU_RAIDEN_MAX_CPU_BYTES", "560000000000"))
+        if int(cpu_bytes_to_use) > max_cpu_bytes:
+            logger.info(
+                "TPURaidenOffloadingConnector: capping cpu_bytes_to_use from %s "
+                "to %d (TPU_RAIDEN_MAX_CPU_BYTES) for host RAM headroom",
+                cpu_bytes_to_use,
+                max_cpu_bytes,
+            )
+            cpu_bytes_to_use = max_cpu_bytes
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)
@@ -2284,6 +2669,21 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             self.extra_config.get("global_registry_address", "")
         )
         self.store_server_ip = str(self.extra_config.get("store_server_ip", ""))
+        self._auto_global_registry = os.environ.get(
+            "TPU_ENABLE_GLOBAL_KV_REGISTRY", ""
+        ).strip().lower() in ("1", "true", "yes")
+        if self._auto_global_registry and not self.global_registry_address:
+            os.environ.setdefault("PYTHONHASHSEED", "0")
+            job_set_name = os.environ.get("JOB_SET_NAME", "").strip()
+            reg_port = int(os.environ.get("TPU_GLOBAL_KV_REGISTRY_PORT", "48500"))
+            reg_host = os.environ.get("TPU_GLOBAL_KV_REGISTRY_HOST", "").strip() or (
+                f"{job_set_name}-prefill-0-0.{job_set_name}"
+                if job_set_name
+                else "127.0.0.1"
+            )
+            self.global_registry_address = f"{reg_host}:{reg_port}"
+            if not self.store_server_ip:
+                self.store_server_ip = envs.TPU_RAIDEN_ADVERTISE_HOST or "127.0.0.1"
         # KV pool group this store's KVTransferSpec is published under; the
         # store nodes absorbing this pool's evictions name the same group.
         # Empty falls back to the raiden job name, which the DP suffix below
@@ -2332,22 +2732,200 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
-        self.raiden_controller_port = dp_rank_local + int(
+        base_ctrl_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
+        # Linux hands out 32768-60999 as ephemeral source ports, so a port in
+        # that range can be taken by a worker's own connect to it (see
+        # controller_ready_marker); move it below the range.
+        if base_ctrl_port >= 32768:
+            base_ctrl_port -= 20000
+        self.raiden_controller_port = dp_rank_local + base_ctrl_port
+        job_idx = os.environ.get("JOBSET_JOB_INDEX", "0").strip() or "0"
+        default_job_name = (
+            f"vllm-offload-prefill-{job_idx}"
+            if self._auto_global_registry
+            else f"vllm-offload-{config.engine_id}"
+        )
         self.raiden_job_name = str(
-            self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
+            self.extra_config.get("raiden_job_name", default_job_name)
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
         if dp_rank:
             self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
 
+        # The deduplicated host layout (tier_dedup.py), or None for the
+        # replicated one.
+        fa_group_ids = [
+            idx
+            for idx, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, AttentionSpec)
+        ]
+        self.dedup_layout = resolve_tier_dedup_layout(
+            fa_group_ids=fa_group_ids,
+            total_num_kv_heads=vllm_config.model_config.get_total_num_kv_heads(),
+            tp_size=parallel.tp_size,
+            world_size=self.world_size,
+            pcp_size=parallel.pcp_size,
+            dcp_size=parallel.dcp_size,
+            cpu_bytes=int(cpu_bytes_to_use),
+            worker_bytes_per_block=config.worker_kv_bytes_per_block,
+            state_port=self.raiden_controller_port,
+        )
+        if self.dedup_layout is not None:
+            if (
+                self.storage_config is not None
+                or self.global_registry_address
+                or self.block_major_contract is not None
+            ):
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: TPU_RAIDEN_TIER_DEDUP=1 runs "
+                    "without a storage tier, a global registry or the block-major "
+                    "layout"
+                )
+            # Keys of the deduplicated layout never match the replicated one's.
+            self.key_namespace = hashlib.sha256(
+                self.key_namespace
+                + repr(
+                    (
+                        "tpu-raiden-offload-tier-dedup",
+                        self.dedup_layout.replicas,
+                        tuple(sorted(self.dedup_layout.fa_group_ids)),
+                    )
+                ).encode()
+            ).digest()[:16]
+
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
 
+    def _build_dedup_manager(self) -> RaidenOffloadingManager:
+        """Builds the full-attention and state stores and the manager over both."""
+        from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+        layout = self.dedup_layout
+        assert layout is not None
+        store_types = _torch_impl()
+        factor = self.device_block_size_factor
+        state_store = construct_kv_cache_store(
+            store_types,
+            capacity=layout.state_capacity_keys * factor,
+            raiden_controller_port=layout.state_port,
+            raiden_job_name=self.raiden_job_name,
+            world_size=self.world_size,
+            store_server_ip=self.store_server_ip,
+            kv_pool_group=self.kv_pool_group,
+        )
+        # Workers name their head group's segment after this token (read from
+        # the full-attention controller's ready marker); it is new every run.
+        run_token = f"{os.getpid()}x{secrets.token_hex(4)}"
+        fa_store = construct_kv_cache_store(
+            store_types,
+            capacity=layout.fa_capacity_keys * factor,
+            raiden_controller_port=layout.fa_port,
+            raiden_job_name=f"{self.raiden_job_name}-fa",
+            world_size=self.world_size,
+            store_server_ip=self.store_server_ip,
+            kv_pool_group=self.kv_pool_group,
+            marker_payload=run_token,
+        )
+        # Workers register with node_id = rank; one writer per head group
+        # fills the bytes its group shares.
+        fa_store.set_d2h_writer_node_ids(layout.leader_ranks())
+        store = ClassRoutedStore(
+            {FA_CLASS: fa_store, STATE_CLASS: state_store},
+            layout,
+            store_types.RaidenBlockId,
+        )
+        logger.info(
+            "TPURaidenOffloadingConnector: deduplicated host tier up: full "
+            "attention %d blocks (groups %s, %d copies of %d replicated ranks, "
+            "controller %s, writers %s), state %d blocks (%d ranks, controller "
+            "%s), namespace=%s",
+            layout.fa_capacity_keys,
+            sorted(layout.fa_group_ids),
+            layout.num_head_groups,
+            layout.replicas,
+            fa_store.raiden_controller_address,
+            layout.leader_ranks(),
+            layout.state_capacity_keys,
+            layout.world_size,
+            state_store.raiden_controller_address,
+            self.key_namespace.hex(),
+        )
+        min_keys = min(layout.fa_capacity_keys, layout.state_capacity_keys)
+        return RaidenOffloadingManager(
+            kernel_physical_blocks_capacity=min_keys * factor,
+            offload_logical_blocks_capacity=min_keys,
+            device_block_size_factor=factor,
+            world_size=self.world_size,
+            raiden_controller_port=layout.state_port,
+            raiden_job_name=self.raiden_job_name,
+            key_namespace=self.key_namespace,
+            store=store,
+            store_types=store_types,
+        )
+
     def get_manager(self) -> OffloadingManager:
+        if self._manager is None and self.dedup_layout is not None:
+            self._manager = self._build_dedup_manager()
         if self._manager is None:
+            if self._auto_global_registry and self.global_registry_address:
+                import shutil
+                import subprocess
+
+                reg_host, _, reg_port_str = self.global_registry_address.rpartition(":")
+                reg_port = int(reg_port_str or "48500")
+                job_idx = os.environ.get("JOBSET_JOB_INDEX", "0").strip() or "0"
+                # The first job's DP rank 0 hosts the registry for the JobSet.
+                if (
+                    job_idx == "0"
+                    and not self.vllm_config.parallel_config.data_parallel_rank
+                ):
+                    bin_path = shutil.which("global_registry_server")
+                    if bin_path:
+                        try:
+                            with socket.create_connection(
+                                ("127.0.0.1", reg_port), timeout=0.5
+                            ):
+                                pass
+                        except OSError:
+                            logger.info(
+                                "TPURaidenOffloadingConnector: starting "
+                                "global_registry_server on :%d",
+                                reg_port,
+                            )
+                            subprocess.Popen(
+                                [bin_path, f"--port={reg_port}"],
+                                start_new_session=True,
+                            )
+                logger.info(
+                    "TPURaidenOffloadingConnector: waiting for "
+                    "global_registry_server at %s",
+                    self.global_registry_address,
+                )
+                deadline = time.monotonic() + 600.0
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(
+                            (reg_host, reg_port), timeout=2.0
+                        ):
+                            logger.info(
+                                "TPURaidenOffloadingConnector: "
+                                "global_registry_server at %s is reachable",
+                                self.global_registry_address,
+                            )
+                            break
+                    except OSError:
+                        time.sleep(1.0)
+                else:
+                    # The store swallows registry errors and serves local hits.
+                    logger.warning(
+                        "TPURaidenOffloadingConnector: global_registry_server at "
+                        "%s unreachable after 600 s; cross-instance lookups "
+                        "will miss",
+                        self.global_registry_address,
+                    )
             secondary_backend_configs: list[object] = []
             storage = self.storage_config
             if storage is not None:
@@ -2442,14 +3020,28 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     coords.pp_rank,
                     self.storage_config.root_dir,
                 )
+            host_blocks = self.kernel_physical_blocks_capacity
+            fa_target = None
+            layout = self.dedup_layout
+            if layout is not None:
+                host_blocks = layout.state_capacity_keys * self.device_block_size_factor
+                fa_target = FaRegistration(
+                    controller_address=(
+                        f"{self.store_server_ip or '127.0.0.1'}:{layout.fa_port}"
+                    ),
+                    host_blocks=layout.fa_capacity_keys * self.device_block_size_factor,
+                    fa_port=layout.fa_port,
+                    head_group=layout.head_group(rank),
+                )
             self._worker = RaidenStoreOffloadingWorker(
                 kv_caches,
                 vllm_config=self.vllm_config,
                 kv_cache_config=self.kv_cache_config,
-                host_blocks_to_allocate=self.kernel_physical_blocks_capacity,
+                host_blocks_to_allocate=host_blocks,
                 controller_address=controller_address,
                 rank=rank,
                 block_major_contract=self.block_major_contract,
                 backend_configs=backend_configs,
+                fa_target=fa_target,
             )
         return self._worker

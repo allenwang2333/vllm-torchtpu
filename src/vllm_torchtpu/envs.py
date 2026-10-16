@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
+    TPU_RUNNER_STAGE_TIMING: bool = False
     HOST_TRACER_LEVEL: int = 2
     DEVICE_TRACER_LEVEL: int = 1
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_ADVERTISE_HOST: str = ""
     TPU_RAIDEN_RESHARD_PORT_BASE: int = 27000
     TPU_RAIDEN_STORE_DISPATCH_PORT_BASE: int = 27100
+    TPU_RAIDEN_STORE_DISPATCH_WAIT_S: float = 600.0
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
@@ -83,6 +85,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_RPA_NATIVE_FP8_PREFILL: str = ""
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -146,6 +149,8 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
     TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
+    TPU_RAIDEN_ASYNC_COMPLETE: bool = False
+    TPU_RAIDEN_COMPLETE_SLOW_MS: float = 100.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
@@ -170,6 +175,7 @@ if TYPE_CHECKING:
     TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
+    TPU_DRAFT_LOAD_BARRIER: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     RAIDEN_STORAGE_PATH: str = ""
@@ -198,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_MTP_STEP0_POST_ATTN_GATHER: bool = True
+    TPU_PREFILL_SKIP_VERIFY_WARMUP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -219,6 +226,13 @@ if TYPE_CHECKING:
     TPU_SCHED_MK_MAX_RUNNING: int = 0
     TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
     TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
+    TPU_SCHED_FINISH_DECODE_STEPS: int = 64
+    TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS: int = 64
+    TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS: int = 1024
+    QX_TTFT_STAGE_LOG_PERIOD_S: float = 0.0
+    VLLM_TPU_LIGHTWEIGHT_STEP_STATS: bool = False
+    VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL: int = 500
+    VLLM_TPU_RAIDEN_LOAD_WAIT_MS: float = 1.5
 
 
 def env_with_choices(
@@ -507,7 +521,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION") or "0")
     ),
     # Python tracer level for profiling
-    "PYTHON_TRACER_LEVEL": lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
+    "PYTHON_TRACER_LEVEL": lambda: int(
+        os.getenv("PYTHON_TRACER_LEVEL") if os.getenv("PYTHON_TRACER_LEVEL") is not None else "1"
+    ),
+    "TPU_RUNNER_STAGE_TIMING": lambda: os.getenv(
+        "TPU_RUNNER_STAGE_TIMING", "0"
+    ).strip().lower() not in ("0", "false", "off", "no"),
     # Host tracer level for profiling
     "HOST_TRACER_LEVEL": lambda: int(os.getenv("HOST_TRACER_LEVEL") or "2"),
     # Device tracer level for profiling
@@ -619,6 +638,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STORE_DISPATCH_PORT_BASE": lambda: int(
         os.getenv("TPU_RAIDEN_STORE_DISPATCH_PORT_BASE") or "27100"
     ),
+    # How long a worker waits for rank 0's reshard store dispatch endpoint
+    # at register_runner. The ranks of one engine reach that step up to a
+    # minute apart on a loaded host, and only rank 0 hosts the store.
+    "TPU_RAIDEN_STORE_DISPATCH_WAIT_S": lambda: float(
+        os.getenv("TPU_RAIDEN_STORE_DISPATCH_WAIT_S") or "600"
+    ),
     # Decode-side prefix-cache-aware reshard loads: when true, the consumer
     # subtracts the local prefix-cache hit and transfers only the missing
     # FA suffix (page-aligned dst_skip_bytes clip planned by the source
@@ -693,7 +718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
-        "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
+        "RAGGED_GATHER_REDUCE_VERSION", "v3", ["v1", "v2", "v3"]
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
@@ -711,7 +736,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
-    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -746,7 +771,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
-    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS", default=True),
+    # Runs the batched RPA prefill / mixed kernel's QK and/or PV matmul with
+    # fp8 operands against the fp8 KV cache: "qk", "pv" or "qkpv", each
+    # operand optionally suffixed "s" for its static scale (e.g. "qkpvs").
+    # Empty: bf16 matmuls. See kernels/experimental/batched_rpa/configs.py.
+    "TPU_RPA_NATIVE_FP8_PREFILL": lambda: os.getenv("TPU_RPA_NATIVE_FP8_PREFILL", ""),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
@@ -810,10 +840,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
-    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
+    "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE", default=True),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
-    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -1042,6 +1072,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(
         "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0
     ),
+    # Issue the producer's post-transfer complete_request_blocks RPC on a
+    # background thread instead of the engine thread.
+    "TPU_RAIDEN_ASYNC_COMPLETE": env_bool("TPU_RAIDEN_ASYNC_COMPLETE", default=False),
+    # Milliseconds; complete_request_blocks calls at least this slow are logged.
+    "TPU_RAIDEN_COMPLETE_SLOW_MS": env_float("TPU_RAIDEN_COMPLETE_SLOW_MS", 100.0),
     # TEST-ONLY fault injection, in seconds; 0 disables it.
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
@@ -1094,6 +1129,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the real spec-decode dispatch once at startup so the first request
     # does not pay for those compiles. Off skips that warmup.
     "SPEC_WARMUP": env_bool("SPEC_WARMUP", default=True),
+    # Barrier on the world CPU group right before the draft model load, so the
+    # ranks enter the load's process-group creation together. torch_tpu's
+    # new_group waits a fixed 300 s for every rank's store key, and the ranks
+    # can finish streaming the target weights further apart than that.
+    "TPU_DRAFT_LOAD_BARRIER": env_bool("TPU_DRAFT_LOAD_BARRIER", default=True),
     # Raiden library switch, on by default. The TPU offloading connector
     # cannot run next to the raiden singleton worker, so it rejects an
     # explicit off and exports the variable as on for the raiden library.
@@ -1144,7 +1184,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
-        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=True
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
@@ -1181,7 +1221,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
-    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool(
+        "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", default=True
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1189,19 +1231,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
     # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
     # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
     # execute on p = pad(num_reqs) rows instead of all T verify rows.
     "TPU_MTP_STEP0_POST_ATTN_GATHER": env_bool(
         "TPU_MTP_STEP0_POST_ATTN_GATHER", default=True
     ),
+    "TPU_PREFILL_SKIP_VERIFY_WARMUP": env_bool(
+        "TPU_PREFILL_SKIP_VERIFY_WARMUP", default=False
+    ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
     # 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
-        "TPU_SAMPLER_TOPK_CANDIDATES", 0
+        "TPU_SAMPLER_TOPK_CANDIDATES", 64
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
@@ -1253,9 +1298,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_SCHED_WARM_MIN_DECODERS", 24
     ),
     # Cap active running sequences in PrefixAwareScheduler to the megakernel's
-    # verify capacity: 0 = disabled (default); -1 = auto, 64 //
-    # (1 + num_spec_tokens) when VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1
-    # (16 at MTP=3, so requests beyond 16 queue); >0 = explicit cap.
+    # verify capacity: 0 = disabled (default); -1 = auto,
+    # mk_max_verify_rows // (1 + num_spec_tokens) when
+    # VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1 (128 rows under
+    # VLLM_TPU_QWEN35_MK_SPLIT_WIDE, so 32 at MTP=3); >0 = explicit cap.
     "TPU_SCHED_MK_MAX_RUNNING": env_int("TPU_SCHED_MK_MAX_RUNNING", 0),
     # Mamba "align" prefill split: let a chunk that starts mid-block (a
     # 128-token partial-tail prefix hit) run past the next block boundary.
@@ -1272,6 +1318,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
         "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
     ),
+    # Near-finish decode protection: when >=1 decoding request has remaining
+    # output tokens <= TPU_SCHED_FINISH_DECODE_STEPS * (1 + num_spec_tokens) and
+    # scheduling a prefill would add >= TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS
+    # tokens, defer that prefill for up to TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS
+    # consecutive steps. 0 disables.
+    "TPU_SCHED_FINISH_DECODE_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_STEPS", 64
+    ),
+    "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_MAX_DEFERRAL_STEPS", 64
+    ),
+    "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS": env_nonnegative_int(
+        "TPU_SCHED_FINISH_DECODE_PREFILL_MIN_TOKENS", 1024
+    ),
+    # Host-side 5-point TTFT stage telemetry periodic summary interval in
+    # seconds; 0 disables (default, zero overhead).
+    "QX_TTFT_STAGE_LOG_PERIOD_S": env_float("QX_TTFT_STAGE_LOG_PERIOD_S", 0.0),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 96
     ),
@@ -1289,6 +1352,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
         "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2
+    ),
+    "VLLM_TPU_LIGHTWEIGHT_STEP_STATS": env_bool(
+        "VLLM_TPU_LIGHTWEIGHT_STEP_STATS", default=False
+    ),
+    "VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL": env_nonnegative_int(
+        "VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL", 500
+    ),
+    "VLLM_TPU_RAIDEN_LOAD_WAIT_MS": env_float(
+        "VLLM_TPU_RAIDEN_LOAD_WAIT_MS", 1.5
     ),
 }
 

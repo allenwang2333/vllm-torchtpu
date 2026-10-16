@@ -373,6 +373,7 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    precomputed_schedules: Any = None,
 ):
     """Shards along KV heads."""
 
@@ -386,7 +387,7 @@ def sharded_ragged_paged_attention(
         if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
             kv_cache_spec = P(None, "model", None, None, None)
             page_size_axis = 4
-    in_specs = (
+    in_specs: tuple[Any, ...] = (
         qkv_spec,  # q
         qkv_spec,  # k
         qkv_spec,  # v
@@ -398,7 +399,16 @@ def sharded_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
-    args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+    args: tuple[Any, ...] = (
+        q,
+        k,
+        v,
+        kv_cache,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+    )
 
     if use_hd64:
         # Batched RPA has no hd64 variant; head_dim==64 always uses default.
@@ -416,6 +426,11 @@ def sharded_ragged_paged_attention(
 
         in_specs += (P("model"),)
         args += (attention_sink,)
+
+    has_precomputed_schedules = precomputed_schedules is not None and not use_hd64
+    if has_precomputed_schedules:
+        in_specs += (P(None),)
+        args += (precomputed_schedules,)
 
     # Speculative decoding draft-only VMEM relief: cap the KV-fetch block on the
     # local path.
@@ -448,9 +463,13 @@ def sharded_ragged_paged_attention(
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
 
-    def _ragged_paged_attention(*args):
+    def _ragged_paged_attention(*inner_args):
+        sched_kwargs: dict[str, Any] = {}
+        if has_precomputed_schedules:
+            sched_kwargs["precomputed_schedules"] = inner_args[-1]
+            inner_args = inner_args[:-1]
         return func(
-            *args,
+            *inner_args,
             sm_scale=sm_scale,
             sliding_window=attention_chunk_size,
             q_scale=q_scale,
@@ -461,6 +480,7 @@ def sharded_ragged_paged_attention(
             use_causal_mask=use_causal_mask,
             **layout_kwargs,
             **block_kwargs,
+            **sched_kwargs,
         )
 
     if not shard:
@@ -625,6 +645,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    precomputed_schedules: Any = None,
 ) -> tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -670,6 +691,7 @@ def attention(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        precomputed_schedules=precomputed_schedules,
     )
 
     return kv_cache, output

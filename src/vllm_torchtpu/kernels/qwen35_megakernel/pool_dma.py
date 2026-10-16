@@ -45,9 +45,10 @@ class GprRecIn:
         scr = ctx.scr
         T, vh, KD, VD = ctx.T, ctx.vh, ctx.KD, ctx.VD
         SSM_U32_CAP, ssm_u32_rows = ctx.SSM_U32_CAP, ctx.ssm_u32_rows
+        sub = lax.rem(self.o, ctx.G_PER_ATT)
         s, n = self.s, self.n
         for sq, dst in zip(self.seqs, self.dsts):
-            self.dma.gpr_wait(sq, dst, scr["rec_sem"].at[0, s], ctx.REC_PAGES)
+            self.dma.gpr_wait(sub, sq, dst, scr["rec_sem"].at[0, s], ctx.REC_PAGES)
         for q, sq in enumerate(self.seqs):
             if ctx.typed:
                 u32 = pltpu.bitcast(scr["gpr_rec"][s, q], U32).reshape(
@@ -57,7 +58,7 @@ class GprRecIn:
                 u32 = scr["gpr_rec"].at[s, q].bitcast(U32).reshape(
                     SSM_U32_CAP, 128
                 )[:ssm_u32_rows, :]
-            u32 = jnp.where(self.dma.is_seq_active(sq), u32, jnp.uint32(0))
+            u32 = jnp.where(self.dma.is_gdn_in_active(sub, sq), u32, jnp.uint32(0))
             scr["recb"][s, pl.ds(n - n // T + q * vh, vh)] = pltpu.bitcast(
                 u32, BF16
             ).reshape(vh, KD, VD)
@@ -88,13 +89,16 @@ class GDNPoolDMA:
         ST = self.ctx.ST
         return ST["read_offsets"][sub, s] if self.ctx.roff_is_2d else ST["read_offsets"][s]
 
+    def is_gdn_in_active(self, sub, sq):
+        return jnp.logical_and(self.is_seq_active(sq), self.gdn_roff(sub, sq) >= 0)
+
     def gdn_pb_in(self, sub, s):
         ctx = self.ctx
         ST = ctx.ST
         GDN_PAGES, G_PER_ATT = ctx.GDN_PAGES, ctx.G_PER_ATT
         roff = self.gdn_roff(sub, s)
         if ctx.ckpt_is_3d:
-            return ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+            return ST["ckpt_indices"][sub, s, roff] * ctx.GDN_STRIDE
         return ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
     def gdn_pb_out(self, sub, s, t):
@@ -102,7 +106,7 @@ class GDNPoolDMA:
         ST = ctx.ST
         GDN_PAGES, G_PER_ATT, ckpt_t_off = ctx.GDN_PAGES, ctx.G_PER_ATT, ctx.ckpt_t_off
         if ctx.ckpt_is_3d:
-            return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * GDN_PAGES
+            return ST["ckpt_indices"][sub, s, t + ckpt_t_off] * ctx.GDN_STRIDE
         return (
             ST["ckpt_indices"][s, t + ckpt_t_off] * (GDN_PAGES * G_PER_ATT)
             + sub * GDN_PAGES
@@ -114,6 +118,8 @@ class GDNPoolDMA:
         T, ckpt_t_off = ctx.T, ctx.ckpt_t_off
         if not ctx.ckpt_is_3d or T <= 1:
             return jnp.bool_(T == 1)
+        if ctx.GDN_STRIDE != ctx.GDN_PAGES:
+            return jnp.bool_(False)  # consecutive slots are not adjacent pages
         s0 = ST["ckpt_indices"][sub, s, ckpt_t_off]
         ok = jnp.bool_(True)
         for t in range(1, T):
@@ -266,17 +272,17 @@ class GDNPoolDMA:
 
         def issue(r):
             for sq, dst in zip(seqs, dsts):
-                @pl.when(self.is_seq_active(sq))
+                @pl.when(self.is_gdn_in_active(sub, sq))
                 def _():
                     pb = self.gdn_pb_in(sub, sq) + first
                     pltpu.make_async_copy(r.at[pl.ds(pb, npages)], dst, sem).start()
 
         bswitch(g_pool, [lambda r=r: issue(r) for r in raw_refs])
 
-    def gpr_wait(self, sq, dst, sem, npages):
+    def gpr_wait(self, sub, sq, dst, sem, npages):
         raw_refs = self.ctx.raw_refs
 
-        @pl.when(self.is_seq_active(sq))
+        @pl.when(self.is_gdn_in_active(sub, sq))
         def _():
             pltpu.make_async_copy(raw_refs[0].at[pl.ds(0, npages)], dst, sem).wait()
 
@@ -296,7 +302,7 @@ class GDNPoolDMA:
 
         def issue(r):
             for sq in range(NS):
-                @pl.when(self.is_seq_active(sq))
+                @pl.when(self.is_gdn_in_active(sub, sq))
                 def _():
                     self.gpr_conv_copy(
                         r, sq, self.gdn_pb_in(sub, sq) + REC_PAGES, scr["st_sem"].at[0]

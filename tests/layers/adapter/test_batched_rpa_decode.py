@@ -161,3 +161,248 @@ def test_batched_entry_passes_the_settings_to_the_kernel(
         assert isinstance(rpa_func, functools.partial)
         assert rpa_func.func is attention.ragged_paged_attention_batched
         assert rpa_func.keywords == expected
+
+
+def test_q_tail_rungs_and_toggle(monkeypatch):
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs, kernel
+
+    monkeypatch.delenv("TPU_RPA_Q_TAIL_TRIM", raising=False)
+    assert kernel.q_tail_trim_enabled()
+    cfgs_1024 = SimpleNamespace(
+        mode=configs.RpaCase.MIXED, bq_sz=1024, bq_c_sz=512
+    )
+    assert kernel._q_tail_rungs(cfgs_1024) == (128, 256, 512, 1024)
+    cfgs_decode = SimpleNamespace(
+        mode=configs.RpaCase.DECODE, bq_sz=4, bq_c_sz=4
+    )
+    assert kernel._q_tail_rungs(cfgs_decode) == (4,)
+
+    monkeypatch.setenv("TPU_RPA_Q_TAIL_TRIM", "0")
+    assert not kernel.q_tail_trim_enabled()
+    assert kernel._q_tail_rungs(cfgs_1024) == (1024,)
+
+
+def test_batched_rpa_schedule_scope_hoists_across_layers(monkeypatch):
+    import jax.numpy as jnp
+    import torch
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    monkeypatch.delenv("TPU_RPA_HOIST_SCHEDULE", raising=False)
+    assert wrapper.hoist_schedule_enabled()
+    d_shapes, m_shapes = wrapper.get_rpa_schedule_shapes(
+        total_q_tokens=2048,
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        page_size=128,
+        max_num_seqs=16,
+        num_page_indices=16 * 72,
+        dtype_q=jnp.bfloat16,
+        dtype_kv=jnp.float8_e4m3fn,
+        decode_query_size=4,
+    )
+    assert len(d_shapes) == 14
+    assert len(m_shapes) == 14
+
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+    )
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+
+    schedule_calls = []
+    kernel_calls = []
+
+    def fake_schedule_op(*args):
+        schedule_calls.append(len(args))
+        return tuple(torch.zeros((1,), dtype=torch.int32) for _ in range(28))
+
+    def make_fake_scheduled_kernel(k_scale, v_scale):
+        def _kernel(kv_cache, query, *args):
+            kernel_calls.append((k_scale, v_scale, len(args)))
+            return query
+
+        return _kernel
+
+    with set_current_vllm_config(config):
+        layers = [
+            (
+                attention.PallasBatchedRPAAttentionBackendImpl(
+                    num_heads=4,
+                    head_size=256,
+                    scale=256**-0.5,
+                    num_kv_heads=1,
+                    alibi_slopes=None,
+                    sliding_window=None,
+                    kv_cache_dtype="bfloat16",
+                ),
+                SimpleNamespace(
+                    _k_scale_float=1.0 + 0.1 * i,
+                    _v_scale_float=2.0 + 0.1 * i,
+                ),
+            )
+            for i in range(3)
+        ]
+
+    for impl, layer_obj in layers:
+        assert not impl.runs_batched_rpa_schedule()
+        assert impl.supports_hoisted_rpa_schedule()
+        monkeypatch.setattr(
+            impl,
+            "_build_rpa_schedule_op",
+            lambda block_major=False: fake_schedule_op,
+        )
+        monkeypatch.setattr(
+            impl,
+            "_build_rpa_scheduled_kernel",
+            lambda q_s, k_s, v_s, skip_kv_update=False, block_major=False, _l=layer_obj: (  # noqa: E501
+                make_fake_scheduled_kernel(_l._k_scale_float, _l._v_scale_float)
+            ),
+        )
+        monkeypatch.setattr(
+            impl,
+            "_build_rpa_kernel",
+            lambda *a, **kw: (lambda kv_cache, query, *rest: query),
+        )
+
+    q = torch.zeros((32, 4, 256), dtype=torch.bfloat16)
+    k = torch.zeros((32, 1, 256), dtype=torch.bfloat16)
+    v = torch.zeros((32, 1, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((8, 128, 1, 2, 256), dtype=torch.bfloat16)
+    md = AttentionMetadata(
+        input_positions=torch.zeros((32,), dtype=torch.int32),
+        block_tables=torch.zeros((64,), dtype=torch.int32),
+        seq_lens=torch.ones((8,), dtype=torch.int32),
+        query_start_loc=torch.arange(9, dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+    )
+    mesh = SimpleNamespace(shape={"model": 1})
+    with (
+        set_vllm_model_wrapper_context(mesh=mesh, vllm_config=None),
+        attention.batched_rpa_schedule_scope(),
+    ):
+        for impl, layer_obj in layers:
+            impl.forward(layer_obj, q, k, v, kv_cache, md)
+
+    # Schedule op runs once on the first layer; all 3 layers receive the 28
+    # schedule tensors (7 metadata/kv/sinks + 28 schedule = 35 args after kv, q).
+    assert schedule_calls == [7]
+    assert len(kernel_calls) == 3
+    assert all(arg_count == 35 for _, _, arg_count in kernel_calls)
+
+
+def test_batched_rpa_schedule_scope_torch_compile_mark_dynamic(monkeypatch):
+    import torch
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    monkeypatch.delenv("TPU_RPA_HOIST_SCHEDULE", raising=False)
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+    )
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    mesh = SimpleNamespace(shape={"model": 1})
+    with (
+        set_current_vllm_config(config),
+        set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config),
+    ):
+        layers = [
+            (
+                attention.PallasBatchedRPAAttentionBackendImpl(
+                    num_heads=4,
+                    head_size=256,
+                    scale=256**-0.5,
+                    num_kv_heads=1,
+                    alibi_slopes=None,
+                    sliding_window=None,
+                    kv_cache_dtype="bfloat16",
+                ),
+                SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0),
+            )
+            for _ in range(3)
+        ]
+        for impl, layer_obj in layers:
+            impl.initialize_kernel(layer_obj)
+
+    captured_graphs = []
+
+    def capture_backend(gm, example_inputs):
+        captured_graphs.append(gm)
+        return lambda *args: (torch.zeros(4, 4, 256, dtype=torch.bfloat16),)
+
+    def step(
+        q,
+        k,
+        v,
+        kv_cache,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    ):
+        md = AttentionMetadata(
+            input_positions=torch.zeros((q.shape[0],), dtype=torch.int32),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            request_distribution=request_distribution,
+        )
+        with attention.batched_rpa_schedule_scope():
+            for impl, layer_obj in layers:
+                q = impl.forward(layer_obj, q, k, v, kv_cache, md)
+        return q
+
+    q = torch.zeros((4, 4, 256), dtype=torch.bfloat16)
+    k = torch.zeros((4, 1, 256), dtype=torch.bfloat16)
+    v = torch.zeros((4, 1, 256), dtype=torch.bfloat16)
+    kv_cache = torch.zeros((8, 128, 1, 2, 256), dtype=torch.bfloat16)
+    seq_lens = torch.ones((8,), dtype=torch.int32)
+    block_tables = torch.zeros((64,), dtype=torch.int32)
+    query_start_loc = torch.arange(9, dtype=torch.int32)
+    request_distribution = torch.tensor([0, 0, 1], dtype=torch.int32)
+
+    torch._dynamo.mark_dynamic(q, 0)
+    torch._dynamo.mark_dynamic(k, 0)
+    torch._dynamo.mark_dynamic(v, 0)
+
+    compiled = torch.compile(step, backend=capture_backend, fullgraph=True)
+    with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config):
+        compiled(
+            q,
+            k,
+            v,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+        )
+    assert len(captured_graphs) == 1
+    gm = captured_graphs[0]
+    sched_nodes = [n.name for n in gm.graph.nodes if "rpa_schedule" in str(n.target)]
+    kern_nodes = [
+        n.name
+        for n in gm.graph.nodes
+        if "rpa_kernel_batched_scheduled" in str(n.target)
+    ]
+    assert len(sched_nodes) == 1
+    assert len(kern_nodes) == 3
+
+

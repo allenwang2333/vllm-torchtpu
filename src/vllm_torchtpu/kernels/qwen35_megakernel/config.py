@@ -202,6 +202,10 @@ class MKConfig:
     num_pages: int = 37705
     page_size: int = 128
     max_pages_per_seq: int = 2050
+    # Kernel pages between consecutive GDN checkpoint slots in the pool (0 -> gdn_pages). vLLM and
+    # Raiden place manager block b's GDN state at page b * (block_size // page_size), so a vLLM
+    # block larger than gdn_pages * page_size tokens (e.g. 1280 at TP8) leaves a gap per slot.
+    gdn_stride_pages: int = 0
     fused_pool_io: bool = False  # P1+P2: gather/scatter GDN & KV states directly in raw[0..14]
     act_mode: str = "from_ckpt"  # "from_ckpt", "all", or "ref" when fused_pool_io=True
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
@@ -309,6 +313,12 @@ class MKConfig:
         return self.rec_pages + 1
 
     @property
+    def gdn_stride(self) -> int:  # kernel pages from one GDN checkpoint slot to the next
+        stride = self.gdn_stride_pages or self.gdn_pages
+        assert stride >= self.gdn_pages, (stride, self.gdn_pages)
+        return stride
+
+    @property
     def CR(self):  # conv state rows: three taps x B rows
         return rup(3 * self.B, 8)
 
@@ -324,7 +334,7 @@ class MKConfig:
         assert self.L % self.att_every == 0 and self.NH % self.R == 0 and self.R % self.NKV == 0
         assert self.KH % self.R == 0 and self.VH % self.R == 0 and self.E % self.R == 0
         assert self.IS % self.R == 0 and (not self.moe_tp or self.I % self.R == 0)
-        assert self.vh <= 64 and self.B * self.TOPK <= 640 and 1 <= self.B <= self.M <= 64
+        assert self.vh <= 64 and self.B * self.TOPK <= 1280 and 1 <= self.B <= self.M <= 128
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
@@ -404,15 +414,15 @@ class Tiles:
     # ECOPY dedup optimization: 1 = deduplicate unique experts in B*TOPK loop first, then classify
     # only the n_tot unique experts.
     ecopy_opt: int = 1
-    # Recurse-derived kernel changes. CPU-interpret bit-exact vs v15.3 and measured on v7x-8
+    # autotuned-derived kernel changes. CPU-interpret bit-exact vs v15.3 and measured on v7x-8
     # (L=60, T=4, seq_len=32768). On by default (the v21 values); each can be switched with
     # VLLM_TPU_QWEN35_MK_{R2_DIRECT,ROUTE_VEC,DENSE_ACC}=0 / 1 (vllm_adapter).
-    # Recurse R2: direct tile-0 store (= instead of zero-fill + +=) in experts_piped_ep (PIPE_EP).
+    # autotuned R2: direct tile-0 store (= instead of zero-fill + +=) in experts_piped_ep (PIPE_EP).
     r2_direct_store: bool = True
-    # Recurse cand-cc85bca1283c: VPU/MXU vectorized route_dedup (eliminates B*TOPK scalar SMEM loop).
+    # autotuned cand-cc85bca1283c: VPU/MXU vectorized route_dedup (eliminates B*TOPK scalar SMEM loop).
     # -12/-36/-90/-87/-115/-172/-209 us at B=4/8/12/16/20/24/32.
     route_vec: bool = True
-    # Recurse cand-aeab2123d449: 2-tile dmatmul register pairing + direct step-0 store + nt<=2 unroll.
+    # autotuned cand-aeab2123d449: 2-tile dmatmul register pairing + direct step-0 store + nt<=2 unroll.
     # -39/-47/-63/-29/-41/-46/-55 us at B=4/8/12/16/20/24/32.
     dense_acc_pair: bool = True
     # paged-KV ring stages aliased onto the (idle during attention) expert pool slots: NBE
@@ -451,6 +461,45 @@ CONV_STAGE_MIN_B = 8
 # barrier-free step (all ring waits, per-chunk register sums over all tiles, one acc store, then
 # all refills), so each chunk's MXU drain overlaps the next chunk's weight pushes.
 DMM_UNROLL = 8
+DMM_UNROLL_OFF_B = ()
+MXU_DR_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128)
+GDN_LCV = True
+GDN_ZDEFER = True
+ATT_GDEFER = True
+ATT_KVDEFER = True
+ATT_QSWAP = True
+FLUSH_IN_AR1 = True
+SH2_PRE_ROUTE = True
+ARPIPE_ON = True
+ARPIPE_OFF_B = (20, 24, 32)
+ARPIPE_H1_ON = True
+AR0S_ON = True
+FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9, 80: 8, 96: 5, 112: 2}
+
+# ROUTE_SHRINK (VEC route): shorter serial scalar chain from the EARLY_FILL issue to the first
+# expert compute. The copy-candidate scan packs each candidate's copy slot (its meta lane) above
+# the expert id in cplist, so the po2c passes decode both holders with shifts / masks instead of a
+# dependent ecopy SMEM load + f32 convert + two divisions per copy hit. Same decisions (exact).
+ROUTE_SHRINK = True
+CP_SH = 16
+
+# PRIM_NOW: the fixed-hit compaction (prim) stores no wlist entries (slot = e - me * ER is
+# derived in fetch_e / _unit_meta for list index < st[5]); halves prim's scalar stores before the first fill.
+PRIM_NOW = True
+
+# WGROUP (with GDEFER): att_in's ring tile waits through dtake_group (one bank rem, then the waits
+# back to back) instead of one rem + wait per tile (~23 scalar cycles each, all before the first q
+# MXU push). Same tiles, same views.
+ATT_WGROUP = True
+
+# Dense ring wait-group hoist: a group of consecutive dense tiles computes all its ring banks with ONE runtime
+# rem BEFORE its first DMA wait, and each wait uses a static bank-0 dst view (dma.done.wait reads only the semaphore).
+DWAIT_HOIST = True
+
+# GDN_ZDEFER_ROLL: deferred z-column chunks inside rolled GDN sequence loop
+GDN_ZDEFER_ROLL = True
+GDN_ZDEFER_ROLL_BUCKETS = (32,)
+GDN_SEQ_ROLL_MIN_B = 24
 
 
 def default_tiles(c: MKConfig) -> Tiles:
@@ -469,7 +518,7 @@ def default_tiles(c: MKConfig) -> Tiles:
     # the plain expert loop). v7x-8 (L=60, T=4, seq_len=32768): -46 us at B=4, -19 us at B=8 over
     # nbe=12 on v15.3; ~0 at B >= 12 (kept at 12 there). VLLM_TPU_QWEN35_MK_NBE_SMALL overrides.
     nbe_small = 20 if not c.moe_tp else nbe_ep
-    if c.B > 48:  # AgentX v20 B=56 / 64 buckets (adapter picks fused_pool_io for these)
+    if c.B > 48:  # serving v20 B=56 / 64 buckets (adapter picks fused_pool_io for these)
         t = dataclasses.replace(WIDE_TILES, nbd=8 if c.B <= 56 else 7, nbe=nbe_ep, hier=2)
     elif c.B > 32:
         # nbd 9 -> 8: room for the pool-gather (GPR) staging under the scoped VMEM limit with the
@@ -487,6 +536,10 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(DEFAULT_TILES, nbe=nbe_small, ecopy_opt=1)
     if c.R != 8 and t.hier in (1, 2):
         t = dataclasses.replace(t, hier=3 if c.B <= 32 else 0)
+    if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_NBD:
+        t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
+    if c.NGDN == 0:
+        t = dataclasses.replace(t, nbd=14)
     return t
 
 

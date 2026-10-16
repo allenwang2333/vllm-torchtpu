@@ -48,6 +48,8 @@ tensors (ModelOpt NVFP4, needed globally by FlashInfer backends) are not
 in the allowlist and stay unfiltered.
 """
 
+import contextlib
+import ctypes
 import functools
 import gc
 import json
@@ -137,10 +139,15 @@ def _compute_local_expert_ids() -> set[int] | None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
 
+    # TPU_ENABLE_EP_WEIGHT_FILTER (default on) filters without
+    # --enable-ep-weight-filter; "0" leaves the choice to the flag.
+    enable_ep_filter = parallel_config.enable_ep_weight_filter or (
+        os.environ.get("TPU_ENABLE_EP_WEIGHT_FILTER", "1") != "0"
+    )
     if not (
         model_config.is_moe
         and parallel_config.enable_expert_parallel
-        and parallel_config.enable_ep_weight_filter
+        and enable_ep_filter
     ):
         return None
     # EPLB redundant slots may need foreign logical experts; do not filter.
@@ -434,10 +441,10 @@ def _patch_runai_local_rank_discovery() -> None:
 def patch_runai_sharded_expert_streaming() -> None:
     """Make ``RunaiModelStreamerLoader`` fetch only this rank's tensors.
 
-    Inert unless ``--enable-expert-parallel`` AND
-    ``--enable-ep-weight-filter`` are both set (and EPLB is off); any
-    failure to set up the filter falls back to the stock full-checkpoint
-    streaming.
+    Inert unless ``--enable-expert-parallel`` is set and the EP weight filter
+    is on (``--enable-ep-weight-filter``, or TPU_ENABLE_EP_WEIGHT_FILTER,
+    default on), and EPLB is off; any failure to set up the filter falls
+    back to the stock full-checkpoint streaming.
     """
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
@@ -455,6 +462,9 @@ def patch_runai_sharded_expert_streaming() -> None:
             self._loading_model = None
 
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+        # Caps the streamer's CPU staging buffer at 5 GiB per process unless
+        # the operator set a limit.
+        os.environ.setdefault("RUNAI_STREAMER_MEMORY_LIMIT", "5368709120")
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -507,9 +517,10 @@ def patch_default_loader_ep_weight_filter() -> None:
     ``.weight``; a compressed-tensors MXFP4 checkpoint stores per-expert
     tensors as ``.weight_packed``/``.weight_scale``, so the stock filter
     reads all 896 experts on every rank. ``weight_utils`` imports the
-    predicate by value, so both module references are replaced. Inert when
-    the EP weight filter is off: ``safetensors_weights_iterator`` then
-    passes ``local_expert_ids=None`` and the predicate keeps everything.
+    predicate by value, so both module references are replaced. When the
+    loader passes ``local_expert_ids=None`` (upstream's flag is off), the
+    iterator derives them with ``_compute_local_expert_ids``, which also
+    honors TPU_ENABLE_EP_WEIGHT_FILTER; None from there keeps everything.
     """
     from vllm.model_executor.model_loader import (
         default_loader,
@@ -538,6 +549,13 @@ def patch_default_loader_ep_weight_filter() -> None:
         local_expert_ids=None,
         **kwargs,
     ):
+        if local_expert_ids is None:
+            try:
+                local_expert_ids = _compute_local_expert_ids()
+            except Exception:
+                # No current vLLM config (a load outside engine setup) or a
+                # vLLM without the filter fields: read every tensor.
+                local_expert_ids = None
         if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
             _start_ep_range_prefetch(
                 sorted(hf_weights_files, key=weight_utils._natural_sort_key),
@@ -707,34 +725,71 @@ def patch_default_model_loader_page_cache() -> None:
 
     from vllm.config import ModelConfig
     from vllm.model_executor.model_loader import default_loader as dl
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
-    if getattr(dl.DefaultModelLoader, "_tpu_cache_evict_patch", False):
-        return
+    if not getattr(dl.DefaultModelLoader, "_tpu_cache_evict_patch", False):
+        original_prepare_weights = dl.DefaultModelLoader._prepare_weights
+        original_load_weights = dl.DefaultModelLoader.load_weights
 
-    original_prepare_weights = dl.DefaultModelLoader._prepare_weights
-    original_load_weights = dl.DefaultModelLoader.load_weights
+        def _prepare_weights(self, *args, **kwargs):
+            res = original_prepare_weights(self, *args, **kwargs)
+            if isinstance(res, tuple) and len(res) >= 2:
+                self._loaded_weight_files = res[1]
+            return res
 
-    def _prepare_weights(self, *args, **kwargs):
-        res = original_prepare_weights(self, *args, **kwargs)
-        if isinstance(res, tuple) and len(res) >= 2:
-            self._loaded_weight_files = res[1]
-        return res
+        def load_weights(
+            self, model: torch.nn.Module, model_config: ModelConfig
+        ) -> None:
+            original_load_weights(self, model, model_config)
+            if hasattr(self, "_loaded_weight_files"):
+                _loaded_weight_files.update(dict.fromkeys(self._loaded_weight_files))
 
-    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
-        original_load_weights(self, model, model_config)
-        if hasattr(self, "_loaded_weight_files"):
-            _loaded_weight_files.update(dict.fromkeys(self._loaded_weight_files))
+        dl.DefaultModelLoader._prepare_weights = _prepare_weights
+        dl.DefaultModelLoader.load_weights = load_weights
+        dl.DefaultModelLoader._tpu_cache_evict_patch = True
 
-    dl.DefaultModelLoader._prepare_weights = _prepare_weights
-    dl.DefaultModelLoader.load_weights = load_weights
-    dl.DefaultModelLoader._tpu_cache_evict_patch = True
+    if not getattr(rsl.RunaiModelStreamerLoader, "_tpu_cache_evict_patch", False):
+        orig_runai_prepare = rsl.RunaiModelStreamerLoader._prepare_weights
+        orig_runai_load = rsl.RunaiModelStreamerLoader.load_weights
+
+        def _runai_prepare_weights(self, *args, **kwargs):
+            res = orig_runai_prepare(self, *args, **kwargs)
+            if isinstance(res, list):
+                self._loaded_weight_files = res
+                _loaded_weight_files.update(dict.fromkeys(res))
+            elif isinstance(res, tuple) and len(res) >= 2:
+                self._loaded_weight_files = res[1]
+                _loaded_weight_files.update(dict.fromkeys(res[1]))
+            return res
+
+        def _runai_load_weights(
+            self, model: torch.nn.Module, model_config: ModelConfig
+        ) -> None:
+            orig_runai_load(self, model, model_config)
+            if hasattr(self, "_loaded_weight_files"):
+                _loaded_weight_files.update(dict.fromkeys(self._loaded_weight_files))
+
+        rsl.RunaiModelStreamerLoader._prepare_weights = _runai_prepare_weights
+        rsl.RunaiModelStreamerLoader.load_weights = _runai_load_weights
+        rsl.RunaiModelStreamerLoader._tpu_cache_evict_patch = True
+
     logger.info(
-        "Applied TPU patch: DefaultModelLoader page cache eviction on load completion."
+        "Applied TPU patch: DefaultModelLoader/RunaiModelStreamerLoader page "
+        "cache eviction on load completion."
     )
 
 
-# Weight files loaded by DefaultModelLoader and not yet evicted, in load order.
+# Weight files loaded by DefaultModelLoader or RunaiModelStreamerLoader and not
+# yet evicted, in load order.
 _loaded_weight_files: dict[str, None] = {}
+
+
+def _release_host_memory_to_os() -> None:
+    """Returns freed host heap to the OS: a GC pass, then glibc malloc_trim(0)."""
+    gc.collect()
+    # A libc other than glibc has no libc.so.6 or no malloc_trim; nothing to trim.
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
 def evict_loaded_weights_page_cache() -> None:
@@ -742,6 +797,7 @@ def evict_loaded_weights_page_cache() -> None:
 
     Called by the runner after the target and any draft model are loaded.
     """
+    _release_host_memory_to_os()
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
         return
     files = list(_loaded_weight_files)
@@ -975,13 +1031,23 @@ def patch_moe_expert_write_staging() -> None:
     def process_weights_after_loading(model, model_config, target_device):
         during_load = stager.flushed
         stager.flush_all()
+        stager._pool.clear()
+        stager._tracker._seen.clear()
+        stager.written_early.clear()
         logger.info(
             "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.",
+            "expert landed, %d at the end of loading (rss=%.1f GiB before trim).",
             during_load,
             stager.flushed - during_load,
+            _rss_gib(),
         )
-        return orig_process(model, model_config, target_device)
+        res = orig_process(model, model_config, target_device)
+        _release_host_memory_to_os()
+        logger.info(
+            "Released staged host buffers after loading (rss=%.1f GiB after trim).",
+            _rss_gib(),
+        )
+        return res
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True

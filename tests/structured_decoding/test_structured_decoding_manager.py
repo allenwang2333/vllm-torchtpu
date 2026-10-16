@@ -38,6 +38,7 @@ def make_manager(
         _pcp_enabled=pcp_enabled,
         _mtp_enabled=mtp_enabled,
         _mtp_prefill_only=pcp_enabled and mtp_enabled,
+        _skip_verify_warmup=False,
     )
     return StructuredDecodingManager(runner)
 

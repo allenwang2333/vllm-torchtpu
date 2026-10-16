@@ -396,9 +396,14 @@ class TestTPUConnector:
             ("kv_consumer", "raiden", True, False, "direct", False),
             ("kv_consumer", "zmq", True, True, "direct", False),
             ("kv_consumer", "raiden", True, True, "multi", True),
-            # TPURaidenOffloadingConnector serves divergent hits too, so the
-            # Stage-3 consumer keeps them next to it.
+            # TPURaidenOffloadingConnector restores the lagging recurrent
+            # state from the host tier, and TPUMultiConnector claims the
+            # capability when any child has it, whatever the disagg child's
+            # role or transport.
             ("kv_consumer", "raiden", True, True, "offloading", True),
+            ("kv_producer", "raiden", True, True, "offloading", True),
+            ("kv_consumer", "raiden", False, True, "offloading", True),
+            ("kv_consumer", "zmq", True, True, "offloading", True),
         ],
     )
     def test_upstream_prefix_lookup_uses_connector_capability(

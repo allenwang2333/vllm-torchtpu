@@ -384,4 +384,12 @@ def test_spec_metadata_binds_h2d_temp_before_every_use():
         for n in ast.walk(fn)
         if isinstance(n, ast.Name) and n.id == "_h2d_temp"
     ]
-    assert len(imports) == 1 and uses and imports[0] < min(uses)
+    assert uses
+    # A module-level _h2d_temp is bound before any call, so no local import
+    # may shadow it.
+    if any(
+        isinstance(n, ast.FunctionDef) and n.name == "_h2d_temp" for n in tree.body
+    ):
+        assert not imports
+        return
+    assert len(imports) == 1 and imports[0] < min(uses)

@@ -7,15 +7,18 @@ Dispatches standard and hybrid attention layers to Batched RPA v3 or FlashAttent
 with per-head FP8 KV cache scaling.
 """
 
+import contextlib
 import dataclasses
 import functools
 import inspect
 import math
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
 import jax
 import torch
+from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.compilation import backends as vllm_compilation_backends
@@ -241,6 +244,7 @@ def _pallas_rpa_kernel_impl(
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
+    precomputed_schedules: Any = None,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -310,6 +314,7 @@ def _pallas_rpa_kernel_impl(
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
+        precomputed_schedules=precomputed_schedules,
     )
     if len(pool_shape) == 4:
         # A 4-D pool is never block-major, so the ndim == 4 branch set this.
@@ -551,6 +556,254 @@ def _pallas_rpa_kernel_batched(
     )
 
 
+_ACTIVE_RPA_SCHEDULE_CACHE: dict[tuple[Any, ...], tuple[torch.Tensor, ...]] | None = (
+    None
+)
+
+
+@contextlib.contextmanager
+def batched_rpa_schedule_scope():
+    """Scope within which `PallasBatchedRPAAttentionBackendImpl` layers sharing
+    identical geometry reuse a single precomputed RPA schedule per forward pass.
+    """
+    global _ACTIVE_RPA_SCHEDULE_CACHE
+    prev = _ACTIVE_RPA_SCHEDULE_CACHE
+    _ACTIVE_RPA_SCHEDULE_CACHE = {}
+    try:
+        yield
+    finally:
+        _ACTIVE_RPA_SCHEDULE_CACHE = prev
+
+
+_RpaSchedule28 = tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]
+
+
+def _pallas_rpa_schedule_batched(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    kv_layout: batched_rpa_configs.KVLayout,
+    decode_query_size: int = 1,
+    decode_tuning: batched_rpa_decode.DecodeTuning | None = None,
+    block_major: bool = False,
+) -> _RpaSchedule28:
+    """Precomputes the 28 `(decode_schedule, mixed_schedule)` leaf arrays once
+    for all batched-RPA layers sharing the same geometry in a forward pass."""
+    if block_major:
+        page_size = (
+            kv_cache.shape[5]
+            if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+            else kv_cache.shape[2]
+        )
+    else:
+        page_size = (
+            kv_cache.shape[4]
+            if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+            else kv_cache.shape[1]
+        )
+    tp_size = (
+        int(mesh.shape.get("model", 1))
+        if isinstance(mesh, jax.sharding.Mesh)
+        else 1
+    )
+    local_num_q_heads = max(1, query.shape[1] // tp_size)
+    local_num_kv_heads = max(1, key.shape[1] // tp_size)
+    head_dim = query.shape[2]
+    total_q_tokens = query.shape[0]
+    num_page_indices = block_tables.shape[0]
+    dtype_q = query.dtype
+    dtype_kv = kv_cache.dtype
+
+    tuning_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, total_q_tokens)
+
+    def _run_sched(kv_lens_s, cu_q_lens_s, dist_s):
+        decode_leaves, mixed_leaves = rpa_batched_wrapper.build_rpa_schedules(
+            kv_lens_s,
+            cu_q_lens_s,
+            dist_s,
+            total_q_tokens=total_q_tokens,
+            num_q_heads=local_num_q_heads,
+            num_kv_heads=local_num_kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_page_indices=num_page_indices,
+            dtype_q=dtype_q,
+            dtype_kv=dtype_kv,
+            sliding_window=sliding_window,
+            kv_layout=kv_layout,
+            decode_query_size=decode_query_size,
+            **tuning_kwargs,
+        )
+        return (*decode_leaves, *mixed_leaves)
+
+    if isinstance(mesh, jax.sharding.Mesh):
+        return shard_map.shard_map(
+            _run_sched,
+            mesh=mesh,
+            in_specs=(P(None), P(None), P(None)),
+            out_specs=P(None),
+            check_rep=False,
+        )(seq_lens, query_start_loc, request_distribution)
+    return _run_sched(seq_lens, query_start_loc, request_distribution)
+
+
+def _pallas_rpa_kernel_batched_scheduled(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    d_s0: jax.Array,
+    d_s1: jax.Array,
+    d_s2: jax.Array,
+    d_s3: jax.Array,
+    d_s4: jax.Array,
+    d_s5: jax.Array,
+    d_s6: jax.Array,
+    d_s7: jax.Array,
+    d_s8: jax.Array,
+    d_s9: jax.Array,
+    d_s10: jax.Array,
+    d_s11: jax.Array,
+    d_s12: jax.Array,
+    d_s13: jax.Array,
+    m_s0: jax.Array,
+    m_s1: jax.Array,
+    m_s2: jax.Array,
+    m_s3: jax.Array,
+    m_s4: jax.Array,
+    m_s5: jax.Array,
+    m_s6: jax.Array,
+    m_s7: jax.Array,
+    m_s8: jax.Array,
+    m_s9: jax.Array,
+    m_s10: jax.Array,
+    m_s11: jax.Array,
+    m_s12: jax.Array,
+    m_s13: jax.Array,
+    *,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    skip_kv_update: bool,
+    use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout,
+    decode_query_size: int = 1,
+    decode_tuning: batched_rpa_decode.DecodeTuning | None = None,
+    block_major: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Batched-RPA Pallas kernel entry consuming a precomputed 28-tensor schedule."""
+    kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_tuning, query.shape[0])
+    if decode_query_size > 1:
+        kernel_kwargs["decode_query_size"] = decode_query_size
+    precomputed_schedules = (
+        (
+            d_s0,
+            d_s1,
+            d_s2,
+            d_s3,
+            d_s4,
+            d_s5,
+            d_s6,
+            d_s7,
+            d_s8,
+            d_s9,
+            d_s10,
+            d_s11,
+            d_s12,
+            d_s13,
+        ),
+        (
+            m_s0,
+            m_s1,
+            m_s2,
+            m_s3,
+            m_s4,
+            m_s5,
+            m_s6,
+            m_s7,
+            m_s8,
+            m_s9,
+            m_s10,
+            m_s11,
+            m_s12,
+            m_s13,
+        ),
+    )
+    return _pallas_rpa_kernel_impl(
+        kv_cache,
+        query,
+        key,
+        value,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        sinks,
+        q_scale,
+        k_scale,
+        v_scale,
+        mesh=mesh,
+        sliding_window=sliding_window,
+        skip_kv_update=skip_kv_update,
+        rpa_func=(
+            functools.partial(ragged_paged_attention_batched, **kernel_kwargs)
+            if kernel_kwargs
+            else ragged_paged_attention_batched
+        ),
+        sm_scale=sm_scale,
+        soft_cap=soft_cap,
+        use_causal_mask=use_causal_mask,
+        kv_layout=kv_layout,
+        block_major=block_major,
+        precomputed_schedules=precomputed_schedules,
+    )
+
+
 # ======================================================================================
 # VLLM Attention Backend
 # ======================================================================================
@@ -788,6 +1041,13 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[int | MultipleOf]:
+        # TPU_KERNEL_PAGE_TOKENS pins the kernel page. vLLM takes the largest
+        # supported size dividing block_size, so block 1280 would get 256-token
+        # pages, while the Qwen3.5 megakernel binds only 128. A disagg pair must
+        # pin both legs: Raiden requires equal page_tokens on the two peers.
+        pinned = os.environ.get("TPU_KERNEL_PAGE_TOKENS", "").strip()
+        if pinned:
+            return [int(pinned)]
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
@@ -1406,8 +1666,232 @@ class PallasAttentionBackendImpl(AttentionImpl):
             skip_kv_update=skip_kv_update,
             block_major=self._bm_kernel,
         )
+        if (
+            self.supports_hoisted_rpa_schedule()
+            and not skip_kv_update
+            and self.sinks is None
+        ):
+            self._build_rpa_schedule_op(block_major=self._bm_kernel)
+            self._build_rpa_scheduled_kernel(
+                q_scale,
+                k_scale,
+                v_scale,
+                skip_kv_update=skip_kv_update,
+                block_major=self._bm_kernel,
+            )
+
+    def _build_rpa_schedule_op(self, block_major: bool = False):
+        config_key = (
+            "pallas::rpa_schedule_batched",
+            self.sliding_window,
+            self.kv_layout,
+            self.decode_query_size,
+            self.decode_tuning,
+            block_major,
+        )
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+
+        ctx = get_vllm_model_wrapper_context()
+        mesh, op_mesh, _ = self._select_kernel_mesh(ctx.mesh, False)
+        registry_key = (
+            "pallas::rpa_schedule_batched",
+            self.sliding_window,
+            id(mesh),
+            self.kv_layout,
+            self.decode_query_size,
+            self.decode_tuning,
+            block_major,
+        )
+        existing = self._kernel_registry.get(registry_key)
+        if existing is not None:
+            self._kernel_config_cache[config_key] = existing
+            return existing
+
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"pallas::rpa_schedule_batched_{kernel_instance_id}"
+        wrapped_fn = functools.partial(
+            _pallas_rpa_schedule_batched,
+            mesh=mesh,
+            sliding_window=self.sliding_window,
+            kv_layout=self.kv_layout,
+            decode_query_size=self.decode_query_size,
+            decode_tuning=self.decode_tuning,
+            block_major=block_major,
+        )
+        schedule_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=None,
+            mesh=op_mesh,
+        )
+
+        def _fake_rpa_schedule_op(
+            kv_cache: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+        ):
+            if block_major:
+                page_size = (
+                    int(kv_cache.shape[5])
+                    if self.kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                    else int(kv_cache.shape[2])
+                )
+            else:
+                page_size = (
+                    int(kv_cache.shape[4])
+                    if self.kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+                    else int(kv_cache.shape[1])
+                )
+            tp_size = (
+                int(mesh.shape.get("model", 1))
+                if hasattr(mesh, "shape") and isinstance(mesh.shape, dict)
+                else (
+                    int(mesh.shape["model"])
+                    if isinstance(mesh, jax.sharding.Mesh)
+                    else 1
+                )
+            )
+            local_num_q_heads = max(1, int(query.shape[1]) // tp_size)
+            local_num_kv_heads = max(1, int(key.shape[1]) // tp_size)
+            head_dim = int(query.shape[2])
+            total_q_tokens = (
+                int(query.shape[0]) if isinstance(query.shape[0], int) else 8192
+            )
+            max_num_seqs = int(seq_lens.shape[0])
+            num_page_indices = int(block_tables.shape[0])
+            dtype_q = pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[query.dtype]
+            dtype_kv = pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[kv_cache.dtype]
+            tuning_kwargs = batched_rpa_decode.kernel_kwargs(
+                self.decode_tuning, total_q_tokens
+            )
+            decode_shapes, mixed_shapes = rpa_batched_wrapper.get_rpa_schedule_shapes(
+                total_q_tokens=total_q_tokens,
+                num_q_heads=local_num_q_heads,
+                num_kv_heads=local_num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                max_num_seqs=max_num_seqs,
+                num_page_indices=num_page_indices,
+                dtype_q=dtype_q,
+                dtype_kv=dtype_kv,
+                sliding_window=self.sliding_window,
+                kv_layout=self.kv_layout,
+                decode_query_size=self.decode_query_size,
+                **tuning_kwargs,
+            )
+            return tuple(
+                seq_lens.new_empty(s, dtype=torch.int32)
+                for s in (*decode_shapes, *mixed_shapes)
+            )
+
+        schedule_op.register_fake(_fake_rpa_schedule_op)
+        self._kernel_registry[registry_key] = schedule_op
+        self._kernel_config_cache[config_key] = schedule_op
+        return schedule_op
+
+    def _build_rpa_scheduled_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool = False,
+        block_major: bool = False,
+    ):
+        config_key = (
+            "pallas::rpa_kernel_batched_scheduled",
+            self.sliding_window,
+            q_scale,
+            k_scale,
+            v_scale,
+            self.kv_layout,
+            self.decode_query_size,
+            self.decode_tuning,
+            block_major,
+        )
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+
+        ctx = get_vllm_model_wrapper_context()
+        mesh, op_mesh, input_partition_specs = self._select_kernel_mesh(ctx.mesh, False)
+        registry_key = (
+            "pallas::rpa_kernel_batched_scheduled",
+            self.sliding_window,
+            self.scale,
+            self.logits_soft_cap,
+            id(mesh),
+            q_scale,
+            k_scale,
+            v_scale,
+            skip_kv_update,
+            self.use_causal_mask,
+            self.kv_layout,
+            self.decode_query_size,
+            self.decode_tuning,
+            block_major,
+        )
+        existing = self._kernel_registry.get(registry_key)
+        if existing is not None:
+            self._kernel_config_cache[config_key] = existing
+            return existing
+
+        kernel_instance_id = self._allocate_kernel_instance_id()
+        op_name = f"pallas::rpa_kernel_batched_scheduled_{kernel_instance_id}"
+        wrapped_fn = functools.partial(
+            _pallas_rpa_kernel_batched_scheduled,
+            mesh=mesh,
+            sliding_window=self.sliding_window,
+            sm_scale=self.scale,
+            soft_cap=self.logits_soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            skip_kv_update=skip_kv_update,
+            use_causal_mask=self.use_causal_mask,
+            kv_layout=self.kv_layout,
+            decode_query_size=self.decode_query_size,
+            decode_tuning=self.decode_tuning,
+            block_major=block_major,
+        )
+        rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
+        rpa_kernel_op = pallas.jax_op(
+            op_name,
+            wrapped_fn,
+            donate_argnums=rpa_donate_argnums,
+            mesh=op_mesh,
+            input_partition_specs=input_partition_specs,
+        )
+
+        def _fake_rpa_op(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
+            return torch.empty_like(kv_cache), torch.empty_like(query)
+
+        rpa_kernel_op.register_fake(_fake_rpa_op)
+
+        def rpa_kernel_impl(kv_cache, *args, **kwargs):
+            new_kv_cache, output = rpa_kernel_op(kv_cache, *args, **kwargs)
+            if new_kv_cache.shape != kv_cache.shape:
+                raise RuntimeError(
+                    "RPA kernel returned an incompatible KV cache shape: "
+                    f"expected {tuple(kv_cache.shape)}, got "
+                    f"{tuple(new_kv_cache.shape)}."
+                )
+            kv_cache.copy_(new_kv_cache)
+            return output
+
+        self._kernel_registry[registry_key] = rpa_kernel_impl
+        self._kernel_config_cache[config_key] = rpa_kernel_impl
+        return rpa_kernel_impl
 
     def runs_batched_rpa_schedule(self) -> bool:
+        return False
+
+    def supports_hoisted_rpa_schedule(self) -> bool:
         return False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -1609,18 +2093,76 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 block_tables = flat_kernel_ids(
                     block_tables, pool_index, layout.num_pools, layout.split
                 )
-            # Call the operator
-            outputs = rpa_kernel(
-                kv_cache,
-                query,
-                key,
-                value,
-                attn_metadata.seq_lens,
-                block_tables,
-                attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
-                sink,
-            )
+            if (
+                _ACTIVE_RPA_SCHEDULE_CACHE is not None
+                and self.supports_hoisted_rpa_schedule()
+                and not use_pcp_streaming
+                and not skip_kv_update
+                and sink is None
+                and kv_cache.ndim in (5, 6)
+            ):
+                # The schedule takes its page size from the pool shape, so
+                # layers of a KV cache group with another page geometry must
+                # not share it.
+                schedule_key = (
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    kv_cache.dtype,
+                    tuple(kv_cache.shape[1:]),
+                    self.sliding_window,
+                    self.kv_layout,
+                    self.decode_query_size,
+                    self.decode_tuning,
+                    self._bm_kernel,
+                )
+                schedule_tensors = _ACTIVE_RPA_SCHEDULE_CACHE.get(schedule_key)
+                if schedule_tensors is None:
+                    schedule_op = self._build_rpa_schedule_op(
+                        block_major=self._bm_kernel
+                    )
+                    schedule_tensors = schedule_op(
+                        kv_cache,
+                        query,
+                        key,
+                        attn_metadata.seq_lens,
+                        block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                    _ACTIVE_RPA_SCHEDULE_CACHE[schedule_key] = schedule_tensors
+                scheduled_rpa_kernel = self._build_rpa_scheduled_kernel(
+                    None,
+                    layer._k_scale_float if self.kv_cache_quantized_dtype else None,
+                    layer._v_scale_float if self.kv_cache_quantized_dtype else None,
+                    skip_kv_update=skip_kv_update,
+                    block_major=self._bm_kernel,
+                )
+                outputs = scheduled_rpa_kernel(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    attn_metadata.seq_lens,
+                    block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                    sink,
+                    *schedule_tensors,
+                )
+            else:
+                # Call the operator
+                outputs = rpa_kernel(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    attn_metadata.seq_lens,
+                    block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                    sink,
+                )
 
         # Drop the padding added above so callers see the layer's own width.
         if outputs.shape[-1] > self.head_size:
@@ -1656,6 +2198,13 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
             self.decode_query_size = spec.num_speculative_tokens + 1
         if vllm_config is not None and self.head_size != 64:
             self.decode_tuning = batched_rpa_decode.decode_tuning(vllm_config)
+
+    def supports_hoisted_rpa_schedule(self) -> bool:
+        return (
+            self.head_size != 64
+            and self._kernel_entry is _pallas_rpa_kernel_batched
+            and rpa_batched_wrapper.hoist_schedule_enabled()
+        )
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

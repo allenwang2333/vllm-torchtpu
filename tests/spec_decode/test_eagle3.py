@@ -3075,6 +3075,63 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert stacked.shape == (4, 3)
     assert torch.equal(stacked[:, 0], tok0_ref)
 
+    # When step0 post-attn gather outputs [max_loop_p, H], _MtpFusedLoop slices
+    # hidden_states[:positions.shape[-1]] internally and produces identical tokens.
+    h_padded = torch.cat([h_f.clone(), torch.full((12, 4), 99.0)], dim=0)
+    stacked_from_padded = loop_mod(None, pos1_f.clone(), h_padded, seq1_f.clone())
+    assert torch.equal(stacked_from_padded, stacked)
+
+    # _draft_async_prepare_inputs with positions and base_seq_lens returns
+    # identical pos_step1 and seq_lens_step1 without needing _draft_post_step0_fused.
+    input_ids = torch.arange(8, dtype=torch.int32)
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, 203, 204]], dtype=torch.int32
+    )
+    draft_lengths = torch.tensor([3, 3], dtype=torch.int32)
+    qsl = torch.tensor([0, 4, 5, 5, 5], dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    _, rej_a, s0_gi_a, pos1_a, seq1_a = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            qsl,
+            pad_req_idx,
+            None,
+            16,
+            positions,
+            base_seq_lens,
+        )
+    )
+    _, pos1_gi, seq1_gi = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            s0_gi_a[:4],
+            base_seq_lens,
+            rej_a,
+        )
+    )
+    assert torch.equal(rej_a, rejected)
+    assert s0_gi_a.shape == (16,)
+    assert torch.equal(pos1_a, pos1_gi)
+    assert torch.equal(seq1_a, seq1_gi)
+
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        _step0_effective_gather_indices,
+        step0_post_attn_gather_context,
+    )
+
+    with step0_post_attn_gather_context(s0_gi_a):
+        assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (16,)
+        with shape_variants.warmup():
+            assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (4,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 8))).shape == (8,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 12))).shape == (16,)
+
     # Without propose_step0 (main's form) the program takes step 0's token
     # and returns steps 1..K-1 one tensor each: the same tokens.
     steps_mod = _MtpFusedLoop(
@@ -3157,16 +3214,19 @@ def test_prepare_draft_inputs_device_seed_pure_partial_prefill_uses_bucketed_fas
 
 
 @pytest.mark.parametrize(
-    ("draft_sp", "num_tokens", "gather", "expect_sliced"),
+    ("draft_sp", "num_tokens", "gather", "min_bucket", "expect_sliced"),
     [
-        (False, 8, False, False),  # draft not admitted to sequence-parallel MoE
-        (True, 8, False, True),  # at or above min_rows: rows sliced over TP
-        (True, 2, False, False),  # below min_rows: rows replicated
-        (True, 8, True, False),  # MTP step-0 post-attention gather: replicated
+        (False, 8, False, 4, False),  # draft not admitted to sequence-parallel MoE
+        (True, 8, False, 4, True),  # at or above min_rows: rows sliced over TP
+        (True, 2, False, 4, False),  # below min_rows: rows replicated
+        (True, 8, True, 4, False),  # MTP step-0 post-attention gather: replicated
+        # The smallest token bucket is below min_rows, so the one trace every
+        # bucket shares is replicated.
+        (True, 8, False, 2, False),
     ],
 )
 def test_forward_draft_records_sequence_parallel_row_form(
-    monkeypatch, draft_sp, num_tokens, gather, expect_sliced
+    monkeypatch, draft_sp, num_tokens, gather, min_bucket, expect_sliced
 ):
     """The MTP drafter runs under sequence-parallel MoE (main #1562), so every
     draft forward records its row form with sequence_parallel.set_active
@@ -3176,6 +3236,7 @@ def test_forward_draft_records_sequence_parallel_row_form(
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     proposer, _ = _forward_draft_harness(monkeypatch)
+    proposer.runner.num_tokens_paddings = [min_bucket, 8]
     proposer._draft_sequence_parallel = draft_sp
     monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 4)
     active = []
@@ -3219,6 +3280,7 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
     proposer, _ = _forward_draft_harness(monkeypatch)
     proposer._draft_sequence_parallel = draft_sp
     proposer.runner.max_num_reqs = 8
+    proposer.runner.num_tokens_paddings = [8]
     proposer._loop_bucket = lambda _num_reqs: 8
     monkeypatch.setattr(e3.sequence_parallel, "min_rows", lambda: 8)
     active = []
@@ -3539,3 +3601,36 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def test_mtp_loop_step_model_passes_spec_step_idx_by_keyword():
+    """Draft models like Qwen3_5MoeMTP accept 5 positional args + **kwargs
+    without a positional spec_step_idx parameter."""
+    from vllm_torchtpu.spec_decode.mtp_loop_model import MtpLoopStepModel
+
+    recorded = []
+
+    class _KwargsDraft(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            **kwargs,
+        ):
+            recorded.append((input_ids, positions, kwargs))
+            return hidden_states
+
+    loop_model = object.__new__(MtpLoopStepModel)
+    torch.nn.Module.__init__(loop_model)
+    loop_model.mtp = _KwargsDraft()
+
+    ids = torch.zeros(4, dtype=torch.int32)
+    pos = torch.zeros((4, 4), dtype=torch.int32)
+    hid = torch.zeros((4, 8))
+    out = MtpLoopStepModel.forward(loop_model, ids, pos, hid, spec_step_idx=2)
+    assert out is hid
+    assert len(recorded) == 1
+    assert recorded[0][2] == {"spec_step_idx": 2}
