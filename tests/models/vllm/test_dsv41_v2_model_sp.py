@@ -132,11 +132,10 @@ def test_decoder_layer_init_branching(monkeypatch: pytest.MonkeyPatch):
         model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=4)),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
     )
-    # Layer 0 (< ced_boundary 2): else branch
+    # Layer 0 (< ced_boundary 2) and Layer 2 (>= ced_boundary 2) both keep SP=True
     v2_model.DeepseekV41DecoderLayer(vllm_config, prefix="model.layers.0")
-    # Layer 2 (>= ced_boundary 2): if branch with _use_sequence_parallel forced False
     v2_model.DeepseekV41DecoderLayer(vllm_config, prefix="model.layers.2")
-    assert observed_sp == [True, False]
+    assert observed_sp == [True, True]
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +483,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model.upstream, "sp_all_gather", lambda t: t)
     synced: list[Any] = []
     monkeypatch.setattr(
-        v2_model, "synchronize_tensors", lambda pair: synced.append(pair)
+        v2_model, "synchronize_tensors", lambda pair, **kw: synced.append(pair)
     )
 
     meta_mock = _FakeMeta(

@@ -93,13 +93,7 @@ def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
 
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
     def __init__(self, vllm_config, prefix: str = "", **kwargs) -> None:
-        layer_idx = upstream.extract_layer_index(prefix)
-        ced_enabled, ced_boundary = _ced_config(vllm_config)
-        if ced_enabled and layer_idx >= ced_boundary:
-            with device_hooks(upstream, _use_sequence_parallel=lambda _: False):
-                super().__init__(vllm_config, prefix=prefix, **kwargs)
-        else:
-            super().__init__(vllm_config, prefix=prefix, **kwargs)
+        super().__init__(vllm_config, prefix=prefix, **kwargs)
         if hasattr(self, "attn"):
             self.attn._sp_sharded_input = bool(
                 getattr(self, "use_sequence_parallel", False)
@@ -532,11 +526,23 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # depend on whether prefix caching is on.
             requests = first.seq_lens.shape[0] if first is not None else 1
             hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
+            if not any(hits) and positions.device.type == "tpu":
+                zero_cache = getattr(self, "_zero_window_starts", None)
+                if zero_cache is None:
+                    zero_cache = self._zero_window_starts = {}
+                key = (requests, positions.dtype, positions.device)
+                window_starts = zero_cache.get(key)
+                if window_starts is None:
+                    window_starts = torch.zeros(
+                        requests, dtype=positions.dtype, device=positions.device
+                    )
+                    zero_cache[key] = window_starts
+            else:
+                window_starts = torch.tensor(
+                    hits + (0,) * (requests - len(hits)),
+                    dtype=positions.dtype,
+                    device=positions.device,
+                )
             encoder_context = replace(
                 context,
                 additional_kwargs={
@@ -650,10 +656,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 >= bounds[-1]
             )
             if encoder_sp and hidden.device.type == "tpu":
-                # Materialize the eager inter-stage SP all-gather before
-                # slicing and launching the compiled decoder stage so
-                # DEFER_AND_FUSE does not fuse both stages across the boundary.
-                synchronize_tensors((hidden, pre_mix))
+                # Flush the eager inter-stage SP all-gather before slicing and
+                # launching the compiled decoder stage so DEFER_AND_FUSE does
+                # not fuse both stages across the boundary, without blocking
+                # the Python host thread on the encoder execution.
+                synchronize_tensors((hidden, pre_mix), wait=False)
             decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
         dp_metadata = getattr(context, "dp_metadata", None)
         decoder_ctx_kwargs = {
@@ -717,9 +724,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         return _scatter_decoder_rows(output, indices, total_rows)
 
     def _stage_uses_sequence_parallel(self, stage: str) -> bool:
-        # Under CED=1, encoder_stage (L0..L19) runs SP while decoder_stage
-        # (L20..L39) runs TP on the bounded replay / decode rows.
-        return bool(self.use_sequence_parallel and stage != "decoder")
+        del stage
+        return bool(self.use_sequence_parallel)
 
     # Keep the upstream forward order; adapt its Engram metadata access here,
     # alongside attention/compressor adapters, so the runner stays model-neutral.

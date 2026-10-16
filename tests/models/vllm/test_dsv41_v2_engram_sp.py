@@ -82,7 +82,7 @@ def test_ced_decoder_layer_disables_sequence_parallel_past_boundary(monkeypatch)
     )
     for idx in range(4):
         v2_model.DeepseekV41DecoderLayer(vllm_config, prefix=f"model.layers.{idx}")
-    assert observed_sp == [(0, True), (1, True), (2, False), (3, False)]
+    assert observed_sp == [(0, True), (1, True), (2, True), (3, True)]
 
     observed_sp.clear()
     vllm_config.cache_config.enable_prefix_caching = True
@@ -145,7 +145,7 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
     )
     assert dummy._stage_uses_sequence_parallel("encoder") is True
     assert dummy._stage_uses_sequence_parallel("full") is True
-    assert dummy._stage_uses_sequence_parallel("decoder") is False
+    assert dummy._stage_uses_sequence_parallel("decoder") is True
 
     # Incomplete prefill chunk: empty plan.indices must skip sp_all_gather and decoder.
     monkeypatch.setattr(

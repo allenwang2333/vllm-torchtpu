@@ -810,24 +810,20 @@ class Engram(upstream.Engram):
             pair[2] ^= 1
         return pair[pair[2]]
 
-    def _upload_rows(
-        self, staged: torch.Tensor, num_tokens: int, row_start: int, row_end: int
-    ) -> None:
+    def _pack_scale_rows(
+        self, num_tokens: int, row_start: int, row_end: int
+    ) -> tuple[torch.Tensor, int, int]:
         raw_wpt, scale_wpt, raw_words = self._split_layout(num_tokens)
         host_words = self._host_packed_buf.view(torch.int32)
         scale_words = self._host_scale_buf.view(torch.int32)
         s0, s1 = row_start * scale_wpt, row_end * scale_wpt
         host_words[raw_words + s0 : raw_words + s1].copy_(scale_words[s0:s1])
-        r0, r1 = row_start * raw_wpt, row_end * raw_wpt
-        staged[r0:r1].copy_(host_words[r0:r1])
-        staged[raw_words + s0 : raw_words + s1].copy_(
-            host_words[raw_words + s0 : raw_words + s1]
-        )
+        return host_words, raw_wpt, scale_wpt
 
     def prepare_tail(
         self, hash_ids: torch.Tensor, head_rows: int, num_tokens: int
     ) -> None:
-        """Gather and upload rows ``[head_rows, num_tokens)`` ahead of time."""
+        """Gather and pack rows ``[head_rows, num_tokens)`` on host ahead of time."""
         assert self.supports_split_staging()
         assert head_rows + hash_ids.shape[0] == num_tokens, (
             head_rows,
@@ -841,12 +837,12 @@ class Engram(upstream.Engram):
             self._host_raw[head_rows:num_tokens],
             self._host_scale[head_rows:num_tokens],
         )
-        staged = self._split_staged(num_tokens, advance=True)
-        self._upload_rows(staged, num_tokens, head_rows, num_tokens)
+        self._split_staged(num_tokens, advance=True)
+        self._pack_scale_rows(num_tokens, head_rows, num_tokens)
         self._pending_split = (head_rows, num_tokens)
 
     def prepare_head(self, hash_ids: torch.Tensor) -> None:
-        """Gather and upload rows ``[0, head_rows)``; activate the bucket."""
+        """Gather rows ``[0, head_rows)`` and upload the whole packed bucket at once."""
         pending = getattr(self, "_pending_split", None)
         assert pending is not None and pending[0] == hash_ids.shape[0], (
             "prepare_tail must precede prepare_head with matching head rows"
@@ -857,8 +853,9 @@ class Engram(upstream.Engram):
             hash_ids, self._host_raw[:head_rows], self._host_scale[:head_rows]
         )
         staged = self._split_staged(num_tokens, advance=False)
-        self._upload_rows(staged, num_tokens, 0, head_rows)
-        raw_wpt, scale_wpt, _ = self._split_layout(num_tokens)
+        host_words, raw_wpt, scale_wpt = self._pack_scale_rows(num_tokens, 0, head_rows)
+        total_words = num_tokens * (raw_wpt + scale_wpt)
+        staged.copy_(host_words[:total_words])
         view = staged.view(num_tokens, raw_wpt + scale_wpt)
         if num_tokens >= 2:
             torch._dynamo.mark_dynamic(view, 0)
