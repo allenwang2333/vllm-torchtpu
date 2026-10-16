@@ -63,6 +63,9 @@ CASES = (
     (64, 33),
 )
 BODY_CASE = (16, 7)
+# fast=True (TPU_MOE_TP_DECODE_FAST) on the plain-TP path (one ring item per
+# expert): bitwise against fast=False.
+FAST_CASES = ((16, 0), (16, 16), (32, 12))
 # A token count the kernel does not admit: the op body's psum path.
 CHAIN_ROWS = 128
 # Kernel vs an f32 reference with dequantized weights and unquantized
@@ -205,7 +208,7 @@ def on_16_devices():
         env=env,
         capture_output=True,
         text=True,
-        timeout=540,
+        timeout=900,
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
@@ -226,6 +229,14 @@ def test_kernel_on_16_devices(on_16_devices, rows, n_valid):
         assert case["nan"] == 0, case
         assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
         assert case["cos"] >= TOLERANCE["cos"], case
+
+
+@pytest.mark.parametrize("rows, n_valid", FAST_CASES)
+def test_fast_schedule_is_bitwise(on_16_devices, rows, n_valid):
+    # fast=True reschedules the same arithmetic: the output bits equal
+    # fast=False on the plain-TP path too.
+    got = on_16_devices["fast"][f"{rows}:{n_valid}"]
+    assert got["bitwise"] and not got["races_found"], got
 
 
 def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(on_16_devices):
@@ -280,6 +291,16 @@ def test_expert_range_kernel_on_16_devices(ep_on_16_devices, rows, n_valid):
         assert case["nan"] == 0, case
         assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
         assert case["cos"] >= TOLERANCE["cos"], case
+
+
+@pytest.mark.parametrize("case", [f"{r}:{n}" for r, n in EP_CASES] + ["tie"])
+def test_expert_range_fast_schedule_is_bitwise(ep_on_16_devices, case):
+    # fast=True (TPU_MOE_TP_DECODE_FAST) reschedules the same arithmetic: the
+    # output bits equal fast=False, ties included (the exact fallback).
+    got = ep_on_16_devices["fast"][case]
+    assert got["bitwise"] and not got["races_found"], got
+    if case == "tie":
+        assert got["tie"], got
 
 
 def test_expert_range_wrong_offset_fails_the_oracle(ep_on_16_devices):
@@ -418,7 +439,7 @@ def _worker():
     rank_ids = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
     specs = (P("d"), P("d"), P(), P(), P("d")) + (P("d"),) * 8
 
-    def body(x, scores, b, n_valid, rank, *weights):
+    def body(x, scores, b, n_valid, rank, *weights, fast=False):
         return kernel.moe_tp_decode(
             x,
             scores,
@@ -429,11 +450,21 @@ def _worker():
             routed_scale=ROUTED_SCALE,
             topk=c["topk"],
             n_ranks=N_RANKS,
+            fast=fast,
         )
 
     run = jax.jit(
         jax.shard_map(
             body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+        )
+    )
+    run_fast = jax.jit(
+        jax.shard_map(
+            lambda *a: body(*a, fast=True),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=P("d"),
+            check_vma=False,
         )
     )
 
@@ -470,7 +501,7 @@ def _worker():
             for a, s in zip(operands, in_specs, strict=True)
         ]
 
-    result = {"race_control": _race_control(), "cases": {}}
+    result = {"race_control": _race_control(), "cases": {}, "fast": {}}
     for rows, n_valid in CASES:
         x, scores = inputs(rows)
         operands = (
@@ -486,6 +517,12 @@ def _worker():
         result["cases"][f"{rows}:{n_valid}"] = checks(
             out, x, scores, rows, n_valid, races, start
         )
+        if (rows, n_valid) in FAST_CASES:
+            fast, fast_races = _interpret(run_fast, *put(operands, specs))
+            result["fast"][f"{rows}:{n_valid}"] = dict(
+                bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+                races_found=fast_races,
+            )
 
     # The adapter's op body: the operands moe_tp_decode_forward passes, with a
     # padding mask longer than the token count, as the runner's is.
@@ -617,7 +654,7 @@ def _ep_worker():
     )
     specs = (P("d"), P("d"), P(), P(), P("d")) + (P("d"),) * 9
 
-    def body(x, scores, b, n_valid, rank, *weights_e0):
+    def body(x, scores, b, n_valid, rank, *weights_e0, fast=False):
         *weights, e0 = weights_e0
         return kernel.moe_tp_decode(
             x,
@@ -630,11 +667,21 @@ def _ep_worker():
             routed_scale=ROUTED_SCALE,
             topk=c["topk"],
             n_ranks=N_RANKS,
+            fast=fast,
         )
 
     run = jax.jit(
         jax.shard_map(
             body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+        )
+    )
+    run_fast = jax.jit(
+        jax.shard_map(
+            lambda *a: body(*a, fast=True),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=P("d"),
+            check_vma=False,
         )
     )
 
@@ -670,7 +717,7 @@ def _ep_worker():
             )
         return case, out
 
-    result = {"cases": {}}
+    result = {"cases": {}, "fast": {}}
     for rows, n_valid in EP_CASES:
         x, scores = inputs(rows)
         ops = (
@@ -686,9 +733,39 @@ def _ep_worker():
         result["cases"][f"{rows}:{n_valid}"] = summary(
             out, x, scores, rows, n_valid, races
         )[0]
+        fast, fast_races = _interpret(run_fast, *put(ops, specs))
+        result["fast"][f"{rows}:{n_valid}"] = dict(
+            bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+            races_found=fast_races,
+        )
         if (rows, n_valid) == (16, 16):
             bad, _ = _interpret(run, *put((*ops[:-1], wrong), specs))
             result["wrong_offset"] = summary(bad, x, scores, rows, n_valid)[0]
+
+    # The fast schedule's exact fallback: two columns of row 0 tie on their
+    # biased score inside the top-k, so the fast pick takes both at once and
+    # the kernel must rerun the exact routing.
+    x, scores = inputs(16)
+    tied = np.asarray(scores).copy()
+    b_np = np.asarray(bias)
+    tied[0, 1] = 0.99
+    tied[0, 9] = np.float32(np.float32(0.99) + b_np[1]) - b_np[9]
+    ops = (
+        jnp.tile(x, (N_RANKS, 1)),
+        jnp.tile(jnp.asarray(tied), (N_RANKS, 1)),
+        bias,
+        jnp.asarray([16], jnp.int32),
+        rank_ids,
+        *stacked,
+        e0s,
+    )
+    out, _ = _interpret(run, *put(ops, specs))
+    fast, fast_races = _interpret(run_fast, *put(ops, specs))
+    result["fast"]["tie"] = dict(
+        tie=bool(tied[0, 1] + b_np[1] == tied[0, 9] + b_np[9]),
+        bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+        races_found=fast_races,
+    )
 
     # The op body: kernel at 16 rows, the EP routed path elsewhere. The EP
     # path's grouped matmuls do not run in interpret mode (the TPU check runs
