@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
     TPU_DCP_MLA_SEND_DENSE: bool = False
+    TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -548,6 +549,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # takes the tiled blocks as they are. Same bits on every row the merge
     # reads, same merge.
     "TPU_DCP_MLA_SEND_DENSE": env_bool("TPU_DCP_MLA_SEND_DENSE", default=False),
+    # With TPU_DCP_MLA_SEND_LAYOUT (and not TPU_DCP_MLA_SEND_DENSE): run the
+    # ragged exchange over groups of this many rows (8 or 16: whole (8,128)
+    # tiles of the int16 buffer, so XLA keeps the kernel's tiled layout
+    # instead of copying it to and from [rows, 2, 256]), from the group
+    # holding the lse word row to the one holding the last real partial row;
+    # received partial rows past the real ones are zeroed as the row-ragged
+    # exchange leaves them. 0 = the row-ragged exchange. Same bits on every
+    # row the merge reads, same merge. Applies where the block splits into
+    # whole groups (fixed per bucket at trace time).
+    "TPU_DCP_MLA_SEND_GROUP_ROWS": env_int("TPU_DCP_MLA_SEND_GROUP_ROWS", 0),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8

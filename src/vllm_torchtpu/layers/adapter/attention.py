@@ -2145,6 +2145,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         _cp_mla_attention.prebuild_send_unpack(self.dcp_size)
                     if envs.TPU_DCP_MLA_SEND_DENSE:
                         _cp_mla_attention.prebuild_send_dense(self.dcp_size)
+                    if envs.TPU_DCP_MLA_SEND_GROUP_ROWS > 0:
+                        _cp_mla_attention.prebuild_send_group(
+                            self.dcp_size, envs.TPU_DCP_MLA_SEND_GROUP_ROWS
+                        )
 
     def _get_kv_scales(
         self, layer: Any

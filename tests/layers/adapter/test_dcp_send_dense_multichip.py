@@ -12,13 +12,14 @@ On 8 ranks, each rank builds a synthetic kernel send buffer
 of junk, the lse word row, then T * local partial rows, the padding tokens'
 rows junk too) and merges it through `merge_send_layout` three ways: the
 ragged exchange (TPU_DCP_MLA_SEND_LAYOUT_UNPACK, the served path), the ragged
-exchange with torch views (no flag), and the dense exchange
-(TPU_DCP_MLA_SEND_DENSE). Every output element must agree bit for bit, at
-decode buckets 4 / 8 / 16 with all, all-but-one and one real token(s).
+exchange with torch views (no flag), the dense exchange
+(TPU_DCP_MLA_SEND_DENSE) and the row-group ragged exchange
+(TPU_DCP_MLA_SEND_GROUP_ROWS=8 / 16). Every output element must agree bit for
+bit, at decode buckets 4 / 8 / 16 with all, all-but-one and one real token(s).
 
-Positive controls the comparison must catch: the dense op handed every row as
-live (padding tokens' junk merged instead of zero), and the send buffer with
-its lse word row's lo halves zeroed.
+Positive controls the comparison must catch: the dense and row-group ops
+handed every row as live (padding tokens' junk merged instead of zero), and
+the send buffer with its lse word row's lo halves zeroed.
 """
 
 import argparse
@@ -91,15 +92,17 @@ def _check(rank, world, cp_mla):
             try:
                 wrap = mm._compile if how == "compiled" else (lambda f: f)
 
-                def run(s, q, unpack, dense, tokens=tokens):
+                def run(s, q, unpack, dense, group=0, tokens=tokens):
                     cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = unpack
                     cp_mla.envs.TPU_DCP_MLA_SEND_DENSE = dense
+                    cp_mla.envs.TPU_DCP_MLA_SEND_GROUP_ROWS = group
                     try:
                         f = wrap(lambda s, q: cp_mla.merge_send_layout(s, q, tokens))
                         return f(s.contiguous().to("tpu"), q).cpu()
                     finally:
                         cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = False
                         cp_mla.envs.TPU_DCP_MLA_SEND_DENSE = False
+                        cp_mla.envs.TPU_DCP_MLA_SEND_GROUP_ROWS = 0
 
                 want = run(send, qsl, True, False)  # served: ragged + unpack op
                 plain = run(send, qsl, False, False)  # ragged, torch views
@@ -107,6 +110,10 @@ def _check(rank, world, cp_mla):
                 got_u = run(send, qsl, True, True)  # DENSE wins over UNPACK
                 ctl_rows = run(send, qsl_all, False, True)  # no padding mask
                 ctl_lse = run(bad, qsl, False, True)
+                got_g8 = run(send, qsl, True, False, 8)
+                got_g16 = run(send, qsl, True, False, 16)
+                ctl_g8_rows = run(send, qsl_all, True, False, 8)
+                ctl_g8_lse = run(bad, qsl, True, False, 8)
 
                 def nd(a):
                     return int((a.view(torch.int16) != want.view(torch.int16)).sum())
@@ -120,6 +127,10 @@ def _check(rank, world, cp_mla):
                     "pad_rows_zero": bool((want[real:] == 0).all()),
                     "ctl_rows_n_diff": nd(ctl_rows),
                     "ctl_lse_n_diff": nd(ctl_lse),
+                    "g8_n_diff": nd(got_g8),
+                    "g16_n_diff": nd(got_g16),
+                    "ctl_g8_rows_n_diff": nd(ctl_g8_rows),
+                    "ctl_g8_lse_n_diff": nd(ctl_g8_lse),
                 }
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
@@ -168,6 +179,8 @@ def _run_worker(result_dir: Path) -> None:
         cp_mla.prebuild_ragged_all_to_all(world, SEND_PAD_ROWS - 1)
         cp_mla.prebuild_send_unpack(world)
         cp_mla.prebuild_send_dense(world)
+        cp_mla.prebuild_send_group(world, 8)
+        cp_mla.prebuild_send_group(world, 16)
         result["check"] = _check(rank, world, cp_mla)
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -178,7 +191,7 @@ def _run_worker(result_dir: Path) -> None:
         raise SystemExit(1)
 
 
-def test_send_dense_matches_ragged_on_real_collectives(tmp_path):
+def test_send_dense_and_group_match_ragged_on_real_collectives(tmp_path):
     import subprocess
 
     cmd = [
@@ -213,7 +226,8 @@ def test_send_dense_matches_ragged_on_real_collectives(tmp_path):
             t = total.setdefault(
                 key,
                 dict(elements=0, plain=0, n_diff=0, unpack_too=0, nonzero=False,
-                     pad_zero=True, ctl_rows=0, ctl_lse=0),
+                     pad_zero=True, ctl_rows=0, ctl_lse=0, g8=0, g16=0, ctl_g8_rows=0,
+                     ctl_g8_lse=0),
             )
             t["elements"] += c["elements"]
             t["plain"] += c["plain_n_diff"]
@@ -223,15 +237,23 @@ def test_send_dense_matches_ragged_on_real_collectives(tmp_path):
             t["pad_zero"] &= c["pad_rows_zero"]
             t["ctl_rows"] += c["ctl_rows_n_diff"]
             t["ctl_lse"] += c["ctl_lse_n_diff"]
+            t["g8"] += c["g8_n_diff"]
+            t["g16"] += c["g16_n_diff"]
+            t["ctl_g8_rows"] += c["ctl_g8_rows_n_diff"]
+            t["ctl_g8_lse"] += c["ctl_g8_lse_n_diff"]
     for key, t in sorted(total.items()):
         print(f"SENDDENSE {key}: {t}")
         tokens, real = (int(x[1:]) for x in key.split("/")[0].split("_"))
         assert t["plain"] == 0, ("ragged torch-view path drifted", key, t)
         assert t["n_diff"] == 0, ("TPU_DCP_MLA_SEND_DENSE not bitwise", key, t)
         assert t["unpack_too"] == 0, (key, t)
+        assert t["g8"] == 0, ("TPU_DCP_MLA_SEND_GROUP_ROWS=8 not bitwise", key, t)
+        assert t["g16"] == 0, ("TPU_DCP_MLA_SEND_GROUP_ROWS=16 not bitwise", key, t)
+        assert t["ctl_g8_lse"] > 0, ("row-group lse control not caught", key, t)
         assert t["nonzero"] and t["pad_zero"], (key, t)
         if real < tokens:
             assert t["ctl_rows"] > 0, ("unmasked padding rows not caught", key, t)
+            assert t["ctl_g8_rows"] > 0, ("row-group padding rows not caught", key, t)
         assert t["ctl_lse"] > 0, ("dropped lse lo halves not caught", key, t)
 
 
