@@ -191,8 +191,7 @@ def _parse_subgraph_index(key: str | None) -> int:
 
 
 def _is_export_writer_rank(runner: Any = None) -> bool:
-    for env_key in ("RANK", "LOCAL_RANK", "TORCH_TPU_SLICE_RANK"):
-        raw = os.environ.get(env_key)
+    for raw in (os.environ.get("RANK"), os.environ.get("LOCAL_RANK")):
         if raw is not None and str(raw).strip() not in ("", "0"):
             try:
                 if int(str(raw).strip()) != 0:
@@ -392,9 +391,9 @@ def _build_generic_weight_sources(
     weight_name: str, shape: list[int | str], model: Any = None
 ) -> list[dict[str, Any]] | None:
     """Build declarative `sources` from `model` and `packed_modules_mapping`."""
-    int_shape = [int(d) for d in shape if isinstance(d, int)]
-    if not weight_name or not int_shape:
+    if not weight_name or any(not isinstance(d, int) for d in shape):
         return None
+    int_shape = [int(d) for d in shape if isinstance(d, int)]
 
     if model is not None and "." in weight_name:
         mod_path, attr = weight_name.rsplit(".", 1)
@@ -943,11 +942,9 @@ def _write_exported_module(
 
             raw_shape = inp.get("shape", [])
             int_shape = [int(d) for d in raw_shape if isinstance(d, int)]
-            sources = inp.get("sources") or (
-                [{"path": "", "source_tensor": w_name, "source_shape": int_shape}]
-                if int_shape
-                else None
-            )
+            sources = inp.get("sources") or [
+                {"path": "", "source_tensor": w_name, "source_shape": int_shape}
+            ]
             entry: dict[str, Any] = {
                 "index": inp["index"],
                 "shape": raw_shape,
@@ -1761,15 +1758,20 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 import importlib
 
                 hf_hub = importlib.import_module("huggingface_hub")
+                cache_kw = (
+                    {"cache_dir": str(Path(envs.HF_HOME) / "hub")}
+                    if envs.HF_HOME
+                    else {}
+                )
                 snap_dir = Path(
                     hf_hub.snapshot_download(
-                        repo_id=str(model_id), local_files_only=True
+                        repo_id=str(model_id), local_files_only=True, **cache_kw
                     )
                 )
             if snap_dir is None or not snap_dir.is_dir():
                 repo_slug = "models--" + str(model_id).replace("/", "--")
                 hf_homes: list[Path] = []
-                env_hf_home = os.environ.get("HF_HOME")
+                env_hf_home = envs.HF_HOME
                 if env_hf_home:
                     hf_homes.append(Path(env_hf_home))
                 hf_homes.extend(
@@ -1802,7 +1804,10 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         for fname in (
             "tokenizer.json",
             "tokenizer_config.json",
+            "tokenizer.model",
+            "tiktoken.model",
             "config.json",
+            "hf_quant_config.json",
             "generation_config.json",
             "model.safetensors.index.json",
             "merges.txt",
@@ -1813,6 +1818,11 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             if src.is_file() and not dst.is_file():
                 with contextlib.suppress(OSError):
                     shutil.copy2(src, dst)
+        for py_file in sorted(snap_dir.glob("*.py")):
+            dst = export_dir / py_file.name
+            if py_file.is_file() and not dst.is_file():
+                with contextlib.suppress(OSError):
+                    shutil.copy2(py_file, dst)
         for st in sorted(snap_dir.glob("*.safetensors")):
             dst = export_dir / st.name
             if not dst.exists():
@@ -1867,6 +1877,15 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     default_st_path = str((snap_dir / "model.safetensors").absolute())
                 elif (export_dir / "model.safetensors").exists():
                     default_st_path = str((export_dir / "model.safetensors").absolute())
+                elif not tensor_to_file:
+                    if snap_dir is not None and snap_dir.is_dir():
+                        default_st_path = str(
+                            (snap_dir / "model.safetensors").absolute()
+                        )
+                    else:
+                        default_st_path = str(
+                            (export_dir / "model.safetensors").absolute()
+                        )
 
                 # Resolve & save internal constants (e.g. rotary_emb_inv_freq)
                 internal_tensors: dict[str, torch.Tensor] = {}
@@ -1881,10 +1900,11 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             int(d)
                             for d in w_spec.get("shape", [])
                             if isinstance(d, int)
-                        ] or [40960, 128]
+                        ]
                         if w_name == "rotary_emb_inv_freq":
+                            rope_shape = shape_list or [40960, 128]
                             rope_t = _CAPTURED_CONSTANTS.get("rotary_emb_inv_freq")
-                            if rope_t is None or list(rope_t.shape) != shape_list:
+                            if rope_t is None or list(rope_t.shape) != rope_shape:
                                 for cand_mod in (
                                     getattr(runner, "model", None),
                                     _ACTIVE_MODEL,
@@ -1910,7 +1930,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                                                             buf, "is_meta", False
                                                         )
                                                         and list(buf.shape)
-                                                        == shape_list
+                                                        == rope_shape
                                                     ):
                                                         rope_t = (
                                                             buf.detach()
@@ -1921,12 +1941,12 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                                                         break
                                                 if rope_t is not None:
                                                     break
-                            if rope_t is None or list(rope_t.shape) != shape_list:
+                            if rope_t is None or list(rope_t.shape) != rope_shape:
                                 max_pos = (
-                                    shape_list[0] if len(shape_list) >= 1 else 40960
+                                    rope_shape[0] if len(rope_shape) >= 1 else 40960
                                 )
                                 head_dim = (
-                                    shape_list[1] if len(shape_list) >= 2 else 128
+                                    rope_shape[1] if len(rope_shape) >= 2 else 128
                                 )
                                 rope_theta = 1000000.0
                                 cfg_p = export_dir / "config.json"
@@ -1956,6 +1976,56 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             internal_tensors[w_name] = rope_t
                         elif w_name in _CAPTURED_CONSTANTS:
                             internal_tensors[w_name] = _CAPTURED_CONSTANTS[w_name]
+                        else:
+                            resolved_buf: torch.Tensor | None = None
+                            for cand_mod in (
+                                getattr(runner, "model", None),
+                                _ACTIVE_MODEL,
+                            ):
+                                if cand_mod is None:
+                                    continue
+                                if hasattr(cand_mod, "named_buffers"):
+                                    with contextlib.suppress(Exception):
+                                        buf_map = dict(cand_mod.named_buffers())
+                                        for cand_key in (
+                                            w_name,
+                                            w_name.removeprefix("model."),
+                                        ):
+                                            b = buf_map.get(cand_key)
+                                            if (
+                                                b is not None
+                                                and isinstance(b, torch.Tensor)
+                                                and b.__class__.__name__ != "FakeTensor"
+                                                and not getattr(b, "is_meta", False)
+                                            ):
+                                                resolved_buf = (
+                                                    b.detach().cpu().contiguous()
+                                                )
+                                                break
+                                if resolved_buf is None:
+                                    for cand_key in (
+                                        w_name,
+                                        w_name.removeprefix("model."),
+                                    ):
+                                        cur: Any = cand_mod
+                                        for part in cand_key.split("."):
+                                            cur = getattr(cur, part, None)
+                                            if cur is None:
+                                                break
+                                        if (
+                                            cur is not None
+                                            and isinstance(cur, torch.Tensor)
+                                            and cur.__class__.__name__ != "FakeTensor"
+                                            and not getattr(cur, "is_meta", False)
+                                        ):
+                                            resolved_buf = (
+                                                cur.detach().cpu().contiguous()
+                                            )
+                                            break
+                                if resolved_buf is not None:
+                                    break
+                            if resolved_buf is not None:
+                                internal_tensors[w_name] = resolved_buf
 
                 constants_st_path = serving_ckpt_dir / "constants.safetensors"
                 if internal_tensors:
