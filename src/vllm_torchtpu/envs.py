@@ -1127,7 +1127,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS", default=False
     ),
     "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS": env_int(
-        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS", 256
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS", 512
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS": env_int(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS", 2
     ),
     "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16": env_bool(
         "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16", default=True

@@ -1102,6 +1102,7 @@ def sparse_ragged_paged_attention(
     dcp_chunk_merge_axis: str | None = None,
     dcp_chunk_merge_bf16_rs: bool = True,
     dcp_chunk_merge_barrier: bool = True,
+    dcp_chunk_merge_max_groups: int = 2,
     owns_mask: jax.Array | None = None,
     out_head_dim: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1322,42 +1323,37 @@ def sparse_ragged_paged_attention(
         merged_chunks: list[jax.Array] = []
         pending_weighted: jax.Array | None = None
         eff_out_dim = out_head_dim if out_head_dim is not None else actual_head_dim
+        max_groups = max(1, dcp_chunk_merge_max_groups)
+        chunks_per_group = cdiv(num_chunks, min(num_chunks, max_groups))
+        num_groups = cdiv(num_chunks, chunks_per_group)
 
-        for i in range(num_chunks):
-            start_pos = i * gather_and_attention_chunk_size
-            end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
-            c_len = end_pos - start_pos
-            q_chunk = q[start_pos:end_pos]
-            q_pe_chunk = None if q_pe is None else q_pe[start_pos:end_pos]
-            kv_lens_chunk = kv_lens[start_pos:end_pos]
-            phys_chunk = (
-                None if physical_indices is None else physical_indices[start_pos:end_pos]
+        for g in range(num_groups):
+            c_start = g * chunks_per_group
+            c_end = min(c_start + chunks_per_group, num_chunks)
+            group_start_pos = c_start * gather_and_attention_chunk_size
+            group_end_pos = min(
+                c_end * gather_and_attention_chunk_size, q.shape[0]
             )
-            win_chunk = (
+            g_len = group_end_pos - group_start_pos
+            q_group = q[group_start_pos:group_end_pos]
+            q_pe_group = None if q_pe is None else q_pe[group_start_pos:group_end_pos]
+            kv_lens_group = kv_lens[group_start_pos:group_end_pos]
+            phys_group = (
                 None
-                if window_indices_all is None
-                else window_indices_all[
-                    i * chunk_window_rows : (i + 1) * chunk_window_rows
-                ]
+                if physical_indices is None
+                else physical_indices[group_start_pos:group_end_pos]
             )
-            lse_chunk_init = jnp.full(
-                (c_len, num_q_heads) if lse_lane_dense else (c_len, num_q_heads, 1),
+            lse_group = jnp.full(
+                (g_len, num_q_heads) if lse_lane_dense else (g_len, num_q_heads, 1),
                 jnp.finfo(jnp.float32).min,
                 dtype=jnp.float32,
             )
-            token_end_chunk = jnp.maximum(0, token_end_total - start_pos)
+            token_end_group = jnp.maximum(0, token_end_total - group_start_pos)
 
             if pending_weighted is not None and dcp_chunk_merge_barrier:
-                if win_chunk is not None:
-                    pending_weighted, q_chunk, win_chunk = (
-                        jax.lax.optimization_barrier(
-                            (pending_weighted, q_chunk, win_chunk)
-                        )
-                    )
-                else:
-                    pending_weighted, q_chunk = jax.lax.optimization_barrier(
-                        (pending_weighted, q_chunk)
-                    )
+                pending_weighted, q_group = jax.lax.optimization_barrier(
+                    (pending_weighted, q_group)
+                )
 
             merged_prev = (
                 jax.lax.psum_scatter(
@@ -1370,46 +1366,59 @@ def sparse_ragged_paged_attention(
                 else None
             )
 
-            out_chunk_raw, lse_chunk_raw = sparse_attention_chunk(
-                q_chunk,
-                cache_kv_nope,
-                cache_kv_rope,
-                kv_lens_chunk,
-                phys_chunk,
-                lse_chunk_init,
-                start_pos=0,
-                end_pos=c_len,
-                token_end=token_end_chunk,
-                sm_scale=sm_scale,
-                k_scale=k_scale,
-                attention_kernel_batch_size=attention_kernel_batch_size,
-                vmem_limit_bytes=vmem_limit_bytes,
-                cache_layout=cache_layout,
-                sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
-                sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
-                sparsecore_gather_pipelined=sparsecore_gather_pipelined,
-                small_chunk_tokens=small_chunk_tokens,
-                small_chunk_batch_size=small_chunk_batch_size,
-                small_chunk_live_gather=small_chunk_live_gather,
-                small_chunk_gather_atoms=small_chunk_gather_atoms,
-                live_gather_all_chunks=live_gather_all_chunks,
-                topk_cap=topk_cap,
-                topk_override=topk,
-                window_indices=win_chunk,
-                q_pe=q_pe_chunk,
-                lse_lane_dense=lse_lane_dense,
-            )
-            out_chunk = prepare_outputs(
-                out_chunk_raw, actual_num_q_heads, eff_out_dim
+            for i in range(c_start, c_end):
+                local_start = (i - c_start) * gather_and_attention_chunk_size
+                local_end = min(local_start + gather_and_attention_chunk_size, g_len)
+                win_chunk = (
+                    None
+                    if window_indices_all is None
+                    else window_indices_all[
+                        i * chunk_window_rows : (i + 1) * chunk_window_rows
+                    ]
+                )
+                q_group, lse_group = sparse_attention_chunk(
+                    q_group,
+                    cache_kv_nope,
+                    cache_kv_rope,
+                    kv_lens_group,
+                    phys_group,
+                    lse_group,
+                    start_pos=local_start,
+                    end_pos=local_end,
+                    token_end=token_end_group,
+                    sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    attention_kernel_batch_size=attention_kernel_batch_size,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    cache_layout=cache_layout,
+                    sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
+                    sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
+                    sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+                    small_chunk_tokens=small_chunk_tokens,
+                    small_chunk_batch_size=small_chunk_batch_size,
+                    small_chunk_live_gather=small_chunk_live_gather,
+                    small_chunk_gather_atoms=small_chunk_gather_atoms,
+                    live_gather_all_chunks=live_gather_all_chunks,
+                    topk_cap=topk_cap,
+                    topk_override=topk,
+                    window_indices=win_chunk,
+                    q_pe=q_pe_group,
+                    lse_lane_dense=lse_lane_dense,
+                )
+
+            out_group = prepare_outputs(
+                q_group, actual_num_q_heads, eff_out_dim
             )
             lse_chunk = (
-                cast(jax.Array, lse_chunk_raw)[:, :actual_num_q_heads]
+                cast(jax.Array, lse_group)[:, :actual_num_q_heads]
                 if lse_lane_dense
-                else cast(jax.Array, lse_chunk_raw)[:, :actual_num_q_heads, 0]
+                else cast(jax.Array, lse_group)[:, :actual_num_q_heads, 0]
             )
             if owns_mask is not None:
                 lse_chunk = jnp.where(
-                    owns_mask[start_pos:end_pos, None], lse_chunk, -jnp.inf
+                    owns_mask[group_start_pos:group_end_pos, None],
+                    lse_chunk,
+                    -jnp.inf,
                 )
 
             lses_i = jax.lax.all_gather(
@@ -1439,17 +1448,17 @@ def sparse_ragged_paged_attention(
                 0.0,
             )[..., None]
             weighted_i = jnp.where(
-                weight_i > 0, out_chunk.astype(jnp.float32) * weight_i, 0.0
+                weight_i > 0, out_group.astype(jnp.float32) * weight_i, 0.0
             )
             if dcp_chunk_merge_bf16_rs:
-                weighted_i = weighted_i.astype(out_chunk.dtype)
+                weighted_i = weighted_i.astype(out_group.dtype)
 
             if merged_prev is not None:
                 if dcp_chunk_merge_barrier:
                     merged_prev, weighted_i = jax.lax.optimization_barrier(
                         (merged_prev, weighted_i)
                     )
-                merged_chunks.append(merged_prev.astype(out_chunk.dtype))
+                merged_chunks.append(merged_prev.astype(out_group.dtype))
             pending_weighted = weighted_i
 
         assert pending_weighted is not None

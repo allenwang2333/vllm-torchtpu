@@ -1256,6 +1256,7 @@ def sparse_mla_attention_dcp(
                 dcp_chunk_merge_axis=dcp_axis_name,
                 dcp_chunk_merge_bf16_rs=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16,
                 dcp_chunk_merge_barrier=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER,
+                dcp_chunk_merge_max_groups=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS,
                 owns_mask=owns,
                 out_head_dim=ql_nope.shape[-1],
                 **chunk_kwargs,
