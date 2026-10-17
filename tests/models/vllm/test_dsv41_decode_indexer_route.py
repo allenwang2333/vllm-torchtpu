@@ -232,7 +232,7 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
     assert bool(usable[0]) == (mode not in ("overflow", "reordered", "ragged_rows"))
     if mode == "overflow":
         assert np.all(np.asarray(actual) * 8 > capacity)
-    select = jax.jit(select_candidate_cache_jax, static_argnums=(12, 13, 14))
+    select = jax.jit(select_candidate_cache_jax, static_argnums=(13, 14, 15))
     result = select(
         q,
         pool,
@@ -245,6 +245,7 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
         dense,
         ids,
         bits,
+        actual,
         usable,
         8,
         128,

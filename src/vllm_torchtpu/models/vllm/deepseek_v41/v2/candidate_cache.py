@@ -119,6 +119,7 @@ def select_candidate_cache_jax(
     keys: jax.Array,
     ids: jax.Array,
     membership: jax.Array,
+    actual_count: jax.Array,
     usable: jax.Array,
     block_size: int,
     page_records: int,
@@ -139,6 +140,7 @@ def select_candidate_cache_jax(
             lengths.reshape(groups, queries),
             block_size=block_size,
             request_tile=request_tile,
+            actual_count=actual_count,
         )
 
     def fallback():
@@ -181,6 +183,7 @@ def select_candidate_cache_2bank_jax(
     keys: jax.Array,
     ids: jax.Array,
     membership: jax.Array,
+    actual_count: jax.Array,
     usable: jax.Array,
     block_size: int,
     page_records: int,
@@ -198,6 +201,7 @@ def select_candidate_cache_2bank_jax(
         keys,
         ids,
         membership,
+        actual_count,
         usable,
         block_size,
         page_records,
@@ -274,13 +278,13 @@ def initialize_candidate_cache() -> None:
         "pallas::dsv41_candidate_select",
         select_candidate_cache_jax,
         mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 12 + (None,) * 3),
+        input_partition_specs=cast(Any, (P(),) * 13 + (None,) * 3),
     )
     _select_2bank_op = pallas.jax_op(
         "pallas::dsv41_candidate_select_2bank",
         select_candidate_cache_2bank_jax,
         mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 13 + (None,) * 3),
+        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 3),
     )
 
     def fake_select(
@@ -295,6 +299,7 @@ def initialize_candidate_cache() -> None:
         keys: torch.Tensor,
         ids: torch.Tensor,
         membership: torch.Tensor,
+        actual_count: torch.Tensor,
         usable: torch.Tensor,
         block_size: int,
         page_records: int,
@@ -315,6 +320,7 @@ def initialize_candidate_cache() -> None:
         keys: torch.Tensor,
         ids: torch.Tensor,
         membership: torch.Tensor,
+        actual_count: torch.Tensor,
         usable: torch.Tensor,
         block_size: int,
         page_records: int,
@@ -332,6 +338,7 @@ def initialize_candidate_cache() -> None:
             keys,
             ids,
             membership,
+            actual_count,
             usable,
             block_size,
             page_records,
@@ -398,6 +405,7 @@ def select_candidate_cache(
         prepared.keys,
         prepared.ids,
         prepared.membership,
+        prepared.actual_count,
         prepared.usable,
         block_size,
         page_records,

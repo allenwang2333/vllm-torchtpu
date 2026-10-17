@@ -12,6 +12,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
 )
 
 
+@pytest.mark.parametrize("exclude_neg_inf", [False, True])
 @pytest.mark.parametrize("block,threshold", [(8192, 8192), (16384, 32768)])
 @pytest.mark.parametrize("width", [65536, 65408])
 @pytest.mark.parametrize(
@@ -26,7 +27,9 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
         "masked",
     ],
 )
-def test_streaming_topk_contract(block, threshold, width, distribution):
+def test_streaming_topk_contract(
+    block, threshold, width, distribution, exclude_neg_inf
+):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore selection requires TPU")
     rng = np.random.default_rng(17)
@@ -57,6 +60,7 @@ def test_streaming_topk_contract(block, threshold, width, distribution):
             k=512,
             block_size=block,
             reconstruct_threshold=threshold,
+            exclude_neg_inf=exclude_neg_inf,
         )
     )
     for row, length in enumerate(lengths):

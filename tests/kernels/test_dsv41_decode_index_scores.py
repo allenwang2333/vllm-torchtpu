@@ -278,3 +278,41 @@ def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
         )
         assert int(result.actual_count[request]) == len(expected)
         assert bool(result.overflow[request]) == (len(expected) > capacity)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="SparseCore selection")
+@pytest.mark.parametrize("request_tile,overlap", [(4, True), (8, True), (4, False)])
+def test_candidate_indexer_union_lengths_preserve_ties_and_masks(request_tile, overlap):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        candidate_indexer,
+    )
+
+    requests, queries, capacity, block_size = 8, 6, 6144, 8
+    counts = np.array([0, 1, 63, 1024, 1025, 5120, 5138, capacity], np.int32)
+    slots = np.arange(capacity, dtype=np.int32)[None, :]
+    ids = np.where(slots < counts[:, None], slots * 2, -1).astype(np.int32)
+    bits = np.where(ids >= 0, np.array([63, 1, 2, 4, 8, 16, 32, 0])[slots % 8], 0)
+    lengths = np.broadcast_to(
+        np.array([0, 23, 512, 16385, 82000, 100000], np.int32), (requests, queries)
+    ).copy()
+    actual = candidate_indexer(
+        jnp.ones((requests, queries, 32, 128), jnp.bfloat16),
+        jnp.ones((requests, queries, 32), jnp.float32),
+        jnp.zeros((requests, capacity * block_size, 128), jnp.bfloat16),
+        jnp.asarray(ids),
+        jnp.asarray(bits, jnp.int32),
+        jnp.asarray(lengths),
+        block_size=block_size,
+        actual_count=jnp.asarray(counts),
+        key_tile=8192,
+        request_tile=request_tile,
+        overlap=overlap,
+    ).reshape(requests, queries, 512)
+    expected = np.full((requests, queries, 512), -1, np.int32)
+    for r in range(requests):
+        logical = (ids[r, :, None] * block_size + np.arange(block_size)).reshape(-1)
+        for q in range(queries):
+            valid = np.repeat((ids[r] >= 0) & ((bits[r] & (1 << q)) != 0), block_size)
+            eligible = logical[valid & (logical < lengths[r, q])][:512]
+            expected[r, q, : len(eligible)] = eligible
+    np.testing.assert_array_equal(actual, expected)

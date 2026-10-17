@@ -255,13 +255,24 @@ def candidate_indexer(
     lengths: jax.Array,
     *,
     block_size: int,
+    actual_count: jax.Array | None = None,
     key_tile: int | None = None,
     request_tile: int | None = None,
     k: int = 512,
     overlap: bool = True,
 ) -> jax.Array:
-    """Pipeline whole-request score groups and SC selection over a reusable union."""
+    """Pipeline whole-request scoring and SC selection over a reusable union.
+
+    actual_count counts union blocks per request, before physical-page masking.
+    The caller must fall back on overflow; absent counts scan the full capacity.
+    """
     requests, queries = q.shape[:2]
+    if actual_count is not None and (
+        actual_count.shape != (requests,) or actual_count.dtype != jnp.int32
+    ):
+        raise ValueError(
+            "actual_count must be an int32 vector with one entry per request"
+        )
     width = ids.shape[1] * block_size
     if key_tile is None:
         key_tile = tuned_block_sizes.get_candidate_key_tile(
@@ -300,9 +311,18 @@ def candidate_indexer(
 
     def select(i, values):
         group_ids = prepare(i)[3]
+        if actual_count is None:
+            valid_lengths = jnp.full((request_tile * queries,), width, jnp.int32)
+        else:
+            counts = jax.lax.dynamic_slice_in_dim(
+                actual_count, i * request_tile, request_tile
+            )
+            valid_lengths = jnp.repeat(
+                jnp.clip(counts, 0, ids.shape[1]) * block_size, queries
+            )
         selected = decode._select(
             values,
-            jnp.full((request_tile * queries,), width, jnp.int32),
+            valid_lengths,
             k,
             8192,
             8192,

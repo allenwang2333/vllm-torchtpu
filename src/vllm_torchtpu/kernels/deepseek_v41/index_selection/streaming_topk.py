@@ -301,7 +301,14 @@ def streaming_topk(
                 else:
                     load_full_block()
 
-                @plsc.parallel_loop(0, block_size, lanes, carry=count)
+                # The final DMA stays block-sized, but only lanes preceding the
+                # valid length can contribute candidates. Avoid scanning padding.
+                @plsc.parallel_loop(
+                    0,
+                    pl.cdiv(jnp.minimum(block_size, length - offset), lanes) * lanes,
+                    lanes,
+                    carry=count,
+                )
                 def append_candidates(i, count):
                     keys = block[pl.ds(i, lanes)]
                     ids = offset + i + lane_ids
