@@ -80,6 +80,11 @@ class NgramHashState(upstream.NgramHashState):
             return input_ids.new_empty(
                 (0, layers, (ngram - 1) * self.primes.shape[-1]), dtype=torch.int32
             )
+        if hash_rows is not None and hash_rows < count:
+            count = hash_rows
+            input_ids = input_ids[:hash_rows]
+            positions = positions[:hash_rows]
+            dead_mask = dead_mask[:hash_rows]
         if slot_mapping is not None:
             slot_mapping = slot_mapping[:count]
         if self.use_slot_cache:
@@ -89,10 +94,6 @@ class NgramHashState(upstream.NgramHashState):
             )
             valid = slot_mapping >= 0
             self.write_cache(self._cache, slot_mapping, mapped, valid)
-        if hash_rows is not None and hash_rows < count:
-            input_ids = input_ids[:hash_rows]
-            positions = positions[:hash_rows]
-            dead_mask = dead_mask[:hash_rows]
 
         def fallback(past, reqs, window):
             if not self.use_slot_cache:
@@ -637,6 +638,8 @@ class Engram(upstream.Engram):
             self._prefetch_done = None
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
+        self._active_head: torch.Tensor | None = None
+        self._split_head_rows: int = 0
         self._pending_split: tuple[int, int] | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
@@ -740,9 +743,11 @@ class Engram(upstream.Engram):
                 )
             _, cols, head_dim = self._host_raw.shape
             blocks = self._host_scale.shape[-1]
-            raw_words = num_tokens * ((cols * head_dim) // 4)
+            raw_wpt = (cols * head_dim) // 4
+            scale_wpt = -(-(cols * blocks) // 4)
+            raw_words = num_tokens * raw_wpt
             scale_bytes = num_tokens * cols * blocks
-            scale_words = num_tokens * (-(-(cols * blocks) // 4))
+            scale_words = num_tokens * scale_wpt
             if scale_words * 4 > scale_bytes:
                 self._host_scale_buf[scale_bytes : scale_words * 4].fill_(
                     _INVALID_SCALE
@@ -762,6 +767,20 @@ class Engram(upstream.Engram):
             staged = self._staged_tensors(num_tokens)
             staged.copy_(host_words[: raw_words + scale_words])
             self._active_raw = self._staged_views(num_tokens)
+            head_cap = getattr(self, "_split_head_rows", 0)
+            if head_cap <= 0:
+                self._active_head = None
+            elif num_tokens == head_cap:
+                self._active_head = staged.view(num_tokens, raw_wpt + scale_wpt)
+            else:
+                head_raw_words = head_cap * raw_wpt
+                head_scale_words = head_cap * scale_wpt
+                host_words[head_raw_words : head_raw_words + head_scale_words].copy_(
+                    self._host_scale_buf[: head_scale_words * 4].view(torch.int32)
+                )
+                head_staged = self._split_head_staged(head_cap, advance=True)
+                head_staged.copy_(host_words[: head_raw_words + head_scale_words])
+                self._active_head = head_staged.view(head_cap, raw_wpt + scale_wpt)
             return
         super().prepare_embeddings(hash_ids)
 
@@ -770,13 +789,11 @@ class Engram(upstream.Engram):
     # prompt rows' hashes on the host long before the decode rows' (which wait
     # on the previous step's accepted and drafted tokens). `prepare_tail` stages
     # rows [head_rows, num_tokens) while the previous step still runs, and
-    # `prepare_head` stages rows [0, head_rows) once the device hashes land, so
-    # only the small head crosses H2D on the inter-step critical path. Both
-    # parts are 1-D int32 slice uploads into one packed device tensor of the
-    # `num_tokens` bucket; the compiled stage keeps reading a single
-    # `[num_tokens, words_per_tok]` view. Each bucket alternates between two
-    # device tensors so the early tail upload never touches the buffer the
-    # running step reads, whatever TorchTPU's slice-copy aliasing does.
+    # `prepare_head` stages ONLY rows [0, head_rows) into a separate small
+    # whole-tensor head buffer once the device hashes land, so only the small
+    # head (`304 KB` vs `6.49 MB`) crosses H2D on the inter-step critical path.
+    # Both parts use whole-tensor 1-D int32 uploads to avoid TorchTPU's
+    # slice-copy buffer allocation and scatter_fusion overhead.
 
     def supports_split_staging(self) -> bool:
         if self._staged_raw is None or self.embed_tokens.dp_size != 1:
@@ -784,6 +801,16 @@ class Engram(upstream.Engram):
         cols = self._host_raw.shape[1]
         blocks = self._host_scale.shape[-1]
         return (cols * blocks) % 4 == 0
+
+    def set_split_head_rows(self, head_rows: int) -> None:
+        if not self.supports_split_staging() or head_rows <= 0:
+            self._split_head_rows = 0
+            self._active_head = None
+            return
+        self._split_head_rows = head_rows
+        raw_wpt, scale_wpt, _ = self._split_layout(head_rows)
+        head_staged = self._split_head_staged(head_rows, advance=False)
+        self._active_head = head_staged.view(head_rows, raw_wpt + scale_wpt)
 
     def _split_layout(self, num_tokens: int) -> tuple[int, int, int]:
         _, cols, head_dim = self._host_raw.shape
@@ -798,14 +825,32 @@ class Engram(upstream.Engram):
             slots = self._split_staged_by_tokens = {}
         pair = slots.get(num_tokens)
         if pair is None:
-            raw_wpt, scale_wpt, _ = self._split_layout(num_tokens)
+            raw_wpt, scale_wpt, raw_words = self._split_layout(num_tokens)
             words = num_tokens * (raw_wpt + scale_wpt)
             dev = self._staged_raw.device
-            pair = slots[num_tokens] = [
-                torch.zeros(words, dtype=torch.int32, device=dev),
-                torch.zeros(words, dtype=torch.int32, device=dev),
-                0,
-            ]
+            buf0 = torch.zeros(words, dtype=torch.int32, device=dev)
+            buf0[raw_words:].fill_(-1)
+            buf1 = torch.zeros(words, dtype=torch.int32, device=dev)
+            buf1[raw_words:].fill_(-1)
+            pair = slots[num_tokens] = [buf0, buf1, 0]
+        if advance:
+            pair[2] ^= 1
+        return pair[pair[2]]
+
+    def _split_head_staged(self, head_rows: int, advance: bool) -> torch.Tensor:
+        slots = getattr(self, "_split_head_staged_by_tokens", None)
+        if slots is None:
+            slots = self._split_head_staged_by_tokens = {}
+        pair = slots.get(head_rows)
+        if pair is None:
+            raw_wpt, scale_wpt, raw_words = self._split_layout(head_rows)
+            words = head_rows * (raw_wpt + scale_wpt)
+            dev = self._staged_raw.device
+            buf0 = torch.zeros(words, dtype=torch.int32, device=dev)
+            buf0[raw_words:].fill_(-1)
+            buf1 = torch.zeros(words, dtype=torch.int32, device=dev)
+            buf1[raw_words:].fill_(-1)
+            pair = slots[head_rows] = [buf0, buf1, 0]
         if advance:
             pair[2] ^= 1
         return pair[pair[2]]
@@ -823,7 +868,7 @@ class Engram(upstream.Engram):
     def prepare_tail(
         self, hash_ids: torch.Tensor, head_rows: int, num_tokens: int
     ) -> None:
-        """Gather and pack rows ``[head_rows, num_tokens)`` on host ahead of time."""
+        """Gather, pack, and upload tail rows ``[head_rows, num_tokens)`` early."""
         assert self.supports_split_staging()
         assert head_rows + hash_ids.shape[0] == num_tokens, (
             head_rows,
@@ -837,29 +882,39 @@ class Engram(upstream.Engram):
             self._host_raw[head_rows:num_tokens],
             self._host_scale[head_rows:num_tokens],
         )
-        self._split_staged(num_tokens, advance=True)
-        self._pack_scale_rows(num_tokens, head_rows, num_tokens)
-        self._pending_split = (head_rows, num_tokens)
-
-    def prepare_head(self, hash_ids: torch.Tensor) -> None:
-        """Gather rows ``[0, head_rows)`` and upload the whole packed bucket at once."""
-        pending = getattr(self, "_pending_split", None)
-        assert pending is not None and pending[0] == hash_ids.shape[0], (
-            "prepare_tail must precede prepare_head with matching head rows"
+        staged = self._split_staged(num_tokens, advance=True)
+        host_words, raw_wpt, scale_wpt = self._pack_scale_rows(
+            num_tokens, head_rows, num_tokens
         )
-        self._pending_split = None
-        head_rows, num_tokens = pending
-        self.embed_tokens.gather_raw(
-            hash_ids, self._host_raw[:head_rows], self._host_scale[:head_rows]
-        )
-        staged = self._split_staged(num_tokens, advance=False)
-        host_words, raw_wpt, scale_wpt = self._pack_scale_rows(num_tokens, 0, head_rows)
         total_words = num_tokens * (raw_wpt + scale_wpt)
         staged.copy_(host_words[:total_words])
         view = staged.view(num_tokens, raw_wpt + scale_wpt)
         if num_tokens >= 2:
             torch._dynamo.mark_dynamic(view, 0)
         self._active_raw = view
+        self._pending_split = (head_rows, num_tokens)
+
+    def prepare_head(self, hash_ids: torch.Tensor) -> None:
+        """Gather and upload only head rows ``[0, head_rows)`` on the critical path."""
+        pending = getattr(self, "_pending_split", None)
+        assert pending is not None and pending[0] == hash_ids.shape[0], (
+            "prepare_tail must precede prepare_head with matching head rows"
+        )
+        self._pending_split = None
+        head_rows, _ = pending
+        self.embed_tokens.gather_raw(
+            hash_ids, self._host_raw[:head_rows], self._host_scale[:head_rows]
+        )
+        raw_wpt, scale_wpt, head_raw_words = self._split_layout(head_rows)
+        head_scale_words = head_rows * scale_wpt
+        host_words = self._host_packed_buf.view(torch.int32)
+        scale_words = self._host_scale_buf.view(torch.int32)
+        host_words[head_raw_words : head_raw_words + head_scale_words].copy_(
+            scale_words[:head_scale_words]
+        )
+        head_staged = self._split_head_staged(head_rows, advance=True)
+        head_staged.copy_(host_words[: head_raw_words + head_scale_words])
+        self._active_head = head_staged.view(head_rows, raw_wpt + scale_wpt)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
@@ -877,8 +932,27 @@ class Engram(upstream.Engram):
         by_word = self._active_raw.view(
             raw_words_per_tok + scale_words_per_tok, num_tokens
         )
-        raw = _unpack_bytes(by_word[:raw_words_per_tok].view(-1), raw_bytes)
-        scale = _unpack_bytes(by_word[raw_words_per_tok:].view(-1), scale_bytes)
+        raw_words = by_word[:raw_words_per_tok].view(num_tokens, raw_words_per_tok)
+        scale_words = by_word[raw_words_per_tok:].view(num_tokens, scale_words_per_tok)
+        active_head = getattr(self, "_active_head", None)
+        if active_head is not None:
+            head_cap = active_head.shape[0]
+            head_by_word = active_head.view(
+                raw_words_per_tok + scale_words_per_tok, head_cap
+            )
+            head_raw = head_by_word[:raw_words_per_tok].view(
+                head_cap, raw_words_per_tok
+            )
+            head_scale = head_by_word[raw_words_per_tok:].view(
+                head_cap, scale_words_per_tok
+            )
+            idx = torch.arange(num_tokens, device=raw_words.device)
+            use_head = (idx < head_cap)[:, None]
+            clamped = idx.clamp(max=head_cap - 1)
+            raw_words = torch.where(use_head, head_raw[clamped], raw_words)
+            scale_words = torch.where(use_head, head_scale[clamped], scale_words)
+        raw = _unpack_bytes(raw_words.reshape(-1), raw_bytes)
+        scale = _unpack_bytes(scale_words.reshape(-1), scale_bytes)
         return dequant_fp8_rows(
             raw.reshape(num_tokens, cols, head_dim),
             scale.reshape(num_tokens, cols, blocks),

@@ -80,6 +80,20 @@ def test_split_staging_matches_whole_buffer_path():
     assert pair[0] is not pair[1]
     assert pair[0] is not engram._staged_by_tokens.get(12)
 
+    # Also verify pre-configured fixed head_rows (`set_split_head_rows`) across
+    # both exact-head (`num_tokens == head`) and non-head (`num_tokens != head`)
+    # `prepare_embeddings` calls.
+    engram.set_split_head_rows(4)
+    for n in (4, 12, 3):
+        h = torch.randint(0, 1000, (n, COLS), generator=g, dtype=torch.int32)
+        engram.prepare_embeddings(h)
+        got_n = engram._ready_rows(n).clone()
+        engram.set_split_head_rows(0)
+        engram.prepare_embeddings(h)
+        want_n = engram._ready_rows(n).clone()
+        assert torch.equal(got_n.view(torch.int16), want_n.view(torch.int16))
+        engram.set_split_head_rows(4)
+
 
 def test_split_staging_requires_word_aligned_scale_rows():
     engram = _engram()
