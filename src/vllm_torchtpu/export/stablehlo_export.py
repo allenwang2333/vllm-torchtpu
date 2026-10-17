@@ -21,7 +21,7 @@ import re
 import shutil
 import struct
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -175,13 +175,204 @@ def _shape_to_list(val: Any) -> list[int | str]:
     return out
 
 
-def _extract_sharding_spec(node: fx.Node | None, val: Any) -> str | None:
+def _extract_sharding_spec(node: fx.Node | None, val: Any) -> Any:
     if node is not None:
         for meta_key in ("sharding", "sharding_spec", "partition_spec"):
-            if node.meta.get(meta_key) is not None:
-                return str(node.meta[meta_key])
+            raw = node.meta.get(meta_key)
+            if raw is not None:
+                if isinstance(raw, (list, tuple)):
+                    return [str(x) if x is not None else None for x in raw]
+                return str(raw)
     sharding = getattr(val, "sharding", None)
-    return str(sharding) if sharding is not None else None
+    if sharding is not None:
+        if isinstance(sharding, (list, tuple)):
+            return [str(x) if x is not None else None for x in sharding]
+        return str(sharding)
+    return None
+
+
+def _resolve_submod_and_param(
+    weight_name: str, model: Any = None
+) -> tuple[Any, Any, str, str]:
+    """Resolves `(submod, param_or_buf, mod_path, attr)` from `model`."""
+    if model is None or not weight_name:
+        return None, None, "", weight_name
+    mod_path, attr = (
+        weight_name.rsplit(".", 1) if "." in weight_name else ("", weight_name)
+    )
+    submod = None
+    if mod_path:
+        for cand_mod_path in (mod_path, mod_path.removeprefix("model.")):
+            with contextlib.suppress(Exception):
+                submod = model.get_submodule(cand_mod_path)
+                if submod is not None:
+                    break
+    else:
+        submod = model
+    param_obj = getattr(submod, attr, None) if submod is not None else None
+    return submod, param_obj, mod_path, attr
+
+
+def _infer_weight_sharding(
+    weight_name: str,
+    shape: Sequence[int | str],
+    model: Any = None,
+    explicit_sharding: Any = None,
+    tp_size_hint: int = 1,
+    has_ep_hint: bool = False,
+) -> list[str | None] | str:
+    """Determines per-tensor mesh sharding from module/param attributes and name."""
+    if explicit_sharding is not None:
+        if isinstance(explicit_sharding, (list, tuple)):
+            return [str(x) if x is not None else None for x in explicit_sharding]
+        s_str = str(explicit_sharding).strip()
+        if s_str and s_str not in ("None", "{replicated}", "replicated"):
+            return s_str
+
+    rank = len(shape)
+    submod, param_obj, _, attr = _resolve_submod_and_param(weight_name, model)
+    submod_tp = int(getattr(submod, "tp_size", 0) or 0) if submod is not None else 0
+    tp_size = max(submod_tp, int(tp_size_hint or 1))
+
+    if rank == 0:
+        if any(
+            weight_name.endswith(s)
+            for s in (
+                "org_vocab_start_index",
+                "org_vocab_end_index",
+                "added_vocab_start_index",
+                "added_vocab_end_index",
+                "num_org_vocab_padding",
+            )
+        ):
+            return "tp" if tp_size > 1 else []
+        if weight_name.endswith("experts_start"):
+            return "ep" if (has_ep_hint or tp_size > 1) else []
+        return []
+
+    if param_obj is not None:
+        for shard_attr, axis_name in (
+            ("ep_dim", "ep"),
+            ("tp_dim", "tp"),
+            ("output_dim", "tp"),
+            ("input_dim", "tp"),
+        ):
+            dim_val = getattr(param_obj, shard_attr, None)
+            if isinstance(dim_val, int) and 0 <= dim_val < rank:
+                if axis_name == "tp" and tp_size <= 1:
+                    continue
+                sharding_dims: list[str | None] = [None] * rank
+                if shard_attr == "output_dim" and rank == 2 and attr == "weight":
+                    # Linear weights are transposed [in_dim, out_dim] on TPU
+                    is_emb = hasattr(submod, "num_embeddings") or (
+                        submod is not None
+                        and "embedding" in type(submod).__name__.lower()
+                    )
+                    target_dim = 0 if is_emb else (1 - dim_val)
+                    sharding_dims[target_dim] = "tp"
+                elif shard_attr == "input_dim" and rank == 2 and attr == "weight":
+                    target_dim = 1 - dim_val
+                    sharding_dims[target_dim] = "tp"
+                else:
+                    sharding_dims[dim_val] = axis_name
+                return sharding_dims
+
+    if ".routed_experts." in weight_name:
+        if rank >= 3:
+            ep_axis = "ep" if (has_ep_hint or tp_size > 1) else None
+            return [ep_axis] + [None] * (rank - 1)
+        return [None] * rank
+
+    if tp_size <= 1:
+        return [None] * rank
+
+    if rank == 1:
+        if any(
+            k in weight_name
+            for k in (
+                "qkv_proj",
+                "gate_up_proj",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "gate_proj",
+                "up_proj",
+                "wq_b",
+                "q_b_proj",
+                "wo_a",
+                "in_proj_qkvz",
+                "in_proj_ba",
+                "a_log",
+                "dt_bias",
+                "fused_qkvb_proj",
+                "fused_fa_ga_proj",
+                "f_b_proj",
+                "g_b_proj",
+                "attn_sink",
+            )
+        ) and not any(
+            weight_name.endswith(s)
+            for s in (
+                "o_proj.weight_scale",
+                "down_proj.weight_scale",
+                "out_proj.weight_scale",
+                "wo_b.weight_scale",
+            )
+        ):
+            return ["tp"]
+        return [None]
+
+    if rank == 2:
+        if (
+            weight_name.endswith("embed_tokens.weight")
+            or weight_name == "lm_head.weight"
+            or weight_name.endswith(".lm_head.weight")
+            or weight_name.endswith(".o_proj.weight")
+            or weight_name.endswith(".down_proj.weight")
+            or weight_name.endswith(".out_proj.weight")
+            or weight_name.endswith(".wo_b.weight")
+            or ".in_proj_qkvz." in weight_name
+        ):
+            return ["tp", None]
+        if any(
+            k in weight_name
+            for k in (
+                "qkv_proj",
+                "gate_up_proj",
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "gate_proj",
+                "up_proj",
+                "wq_b",
+                "q_b_proj",
+                "wo_a",
+                "in_proj_ba",
+                "fused_qkvb_proj",
+                "fused_fa_ga_proj",
+                "f_b_proj",
+                "g_b_proj",
+                "compressor.fused_wkv_wgate",
+            )
+        ):
+            return [None, "tp"]
+        return [None, None]
+
+    if rank == 3:
+        if (
+            ".conv1d.weight" in weight_name
+            or ".w_uk_t" in weight_name
+            or ".w_uv" in weight_name
+        ):
+            return ["tp", None, None]
+        return [None, None, None]
+
+    if rank == 4:
+        if ".conv_weight_fused" in weight_name:
+            return [None, None, "tp", None]
+        return [None, None, None, None]
+
+    return [None] * rank
 
 
 def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
@@ -315,23 +506,28 @@ def _parse_mlir_tensor_type(tensor_body: str) -> tuple[list[int | str], str]:
     return shape, _MLIR_DTYPE_TO_TORCH_NAME.get(elem, elem)
 
 
-def _parse_mlir_main_args(args_str: str) -> list[tuple[list[int | str], str, bool]]:
-    return [
-        (
-            *_parse_mlir_tensor_type(tensor_body),
-            bool(
-                attr_str
-                and re.search(
-                    r"(?:buffer_donor\s*=\s*true|tf\.aliasing_output)", attr_str
-                )
-            ),
+def _parse_mlir_main_args(
+    args_str: str,
+) -> list[tuple[list[int | str], str, bool, str | None]]:
+    out: list[tuple[list[int | str], str, bool, str | None]] = []
+    for tensor_body, attr_str in re.findall(
+        r"tensor<([^>]+)>(\s*\{(?:[^{}\"]|\"[^\"]*\"|\{[^}]*\})*\})?",
+        args_str,
+        re.DOTALL,
+    ):
+        shape, dtype = _parse_mlir_tensor_type(tensor_body)
+        is_donor = bool(
+            attr_str
+            and re.search(r"(?:buffer_donor\s*=\s*true|tf\.aliasing_output)", attr_str)
         )
-        for tensor_body, attr_str in re.findall(
-            r"tensor<([^>]+)>(\s*\{(?:[^{}\"]|\"[^\"]*\"|\{[^}]*\})*\})?",
-            args_str,
-            re.DOTALL,
+        m_sharding = (
+            re.search(r"mhlo\.sharding\s*=\s*\"([^\"]+)\"", attr_str)
+            if attr_str
+            else None
         )
-    ]
+        mlir_sharding = m_sharding.group(1) if m_sharding is not None else None
+        out.append((shape, dtype, is_donor, mlir_sharding))
+    return out
 
 
 def _resolve_dynamo_placeholder(
@@ -414,7 +610,7 @@ def _build_generic_weight_sources(
                 submod = model.get_submodule(cand_mod_path)
                 if submod is not None:
                     break
-        if submod is not None and attr == "weight":
+        if submod is not None:
             parent_path, leaf_mod_name = (
                 mod_path.rsplit(".", 1) if "." in mod_path else ("", mod_path)
             )
@@ -425,31 +621,52 @@ def _build_generic_weight_sources(
                 isinstance(sub_names, (list, tuple))
                 and isinstance(output_sizes, (list, tuple))
                 and len(sub_names) == len(output_sizes)
-                and len(int_shape) == 2
             ):
                 tp_size = int(getattr(submod, "tp_size", 1) or 1)
                 local_sizes = [int(s) // max(tp_size, 1) for s in output_sizes]
-                if sum(local_sizes) == int_shape[1]:
-                    in_dim = int_shape[0]
-                    sources: list[dict[str, Any]] = []
-                    offset = 0
-                    for sub_n, out_sz in zip(sub_names, local_sizes):
-                        src_prefix = f"{parent_path}.{sub_n}" if parent_path else sub_n
-                        sources.append(
-                            {
-                                "path": "",
-                                "source_tensor": f"{src_prefix}.{attr}",
-                                "source_shape": [out_sz, in_dim],
-                                "transpose": [1, 0],
-                                "dst_slices": [
-                                    {"dim": 1, "start": offset, "length": out_sz}
-                                ],
-                            }
-                        )
-                        offset += out_sz
-                    return sources
-                if sum(local_sizes) == int_shape[0]:
-                    in_dim = int_shape[1]
+                if attr == "weight" and len(int_shape) == 2:
+                    if sum(local_sizes) == int_shape[1]:
+                        in_dim = int_shape[0]
+                        sources: list[dict[str, Any]] = []
+                        offset = 0
+                        for sub_n, out_sz in zip(sub_names, local_sizes):
+                            src_prefix = (
+                                f"{parent_path}.{sub_n}" if parent_path else sub_n
+                            )
+                            sources.append(
+                                {
+                                    "path": "",
+                                    "source_tensor": f"{src_prefix}.{attr}",
+                                    "source_shape": [out_sz, in_dim],
+                                    "transpose": [1, 0],
+                                    "dst_slices": [
+                                        {"dim": 1, "start": offset, "length": out_sz}
+                                    ],
+                                }
+                            )
+                            offset += out_sz
+                        return sources
+                    if sum(local_sizes) == int_shape[0]:
+                        in_dim = int_shape[1]
+                        sources = []
+                        offset = 0
+                        for sub_n, out_sz in zip(sub_names, local_sizes):
+                            src_prefix = (
+                                f"{parent_path}.{sub_n}" if parent_path else sub_n
+                            )
+                            sources.append(
+                                {
+                                    "path": "",
+                                    "source_tensor": f"{src_prefix}.{attr}",
+                                    "source_shape": [out_sz, in_dim],
+                                    "dst_slices": [
+                                        {"dim": 0, "start": offset, "length": out_sz}
+                                    ],
+                                }
+                            )
+                            offset += out_sz
+                        return sources
+                elif len(int_shape) == 1 and sum(local_sizes) == int_shape[0]:
                     sources = []
                     offset = 0
                     for sub_n, out_sz in zip(sub_names, local_sizes):
@@ -458,7 +675,7 @@ def _build_generic_weight_sources(
                             {
                                 "path": "",
                                 "source_tensor": f"{src_prefix}.{attr}",
-                                "source_shape": [out_sz, in_dim],
+                                "source_shape": [out_sz],
                                 "dst_slices": [
                                     {"dim": 0, "start": offset, "length": out_sz}
                                 ],
@@ -468,7 +685,8 @@ def _build_generic_weight_sources(
                     return sources
 
             if (
-                len(int_shape) == 2
+                attr == "weight"
+                and len(int_shape) == 2
                 and not hasattr(submod, "num_embeddings")
                 and "embedding" not in type(submod).__name__.lower()
                 and (
@@ -686,13 +904,23 @@ def _extract_input_specs(
             resolved_node_name = weight_name
 
         shape_list = _shape_to_list(val)
+        raw_sharding = _extract_sharding_spec(node or outer_node, val)
+        if is_weight and weight_name:
+            resolved_sharding: Any = _infer_weight_sharding(
+                weight_name,
+                shape_list,
+                model=_ACTIVE_MODEL,
+                explicit_sharding=raw_sharding,
+            )
+        else:
+            resolved_sharding = raw_sharding
         spec_entry: dict[str, Any] = {
             "arg_index": idx,
             "index": idx,
             "name": weight_name if is_weight and weight_name else resolved_node_name,
             "shape": shape_list,
             "dtype": _dtype_name(val),
-            "sharding": _extract_sharding_spec(node or outer_node, val),
+            "sharding": resolved_sharding,
             "argument_type": "weight" if is_weight else arg_type,
             "is_weight": is_weight,
             "weight_name": weight_name,
@@ -787,7 +1015,11 @@ def _write_abstract_params(
 ) -> None:
     """Emit `abstract_params.mlir` and register `functions.abstract_params.default`."""
     sorted_weights = sorted(
-        (item for item in weights_dict.items() if isinstance(item[1], dict)),
+        (
+            item
+            for item in weights_dict.items()
+            if item[0] != "mesh" and isinstance(item[1], dict) and "shape" in item[1]
+        ),
         key=lambda item: (int(item[1].get("index", 0)), item[0]),
     )
     arg_decls: list[str] = []
@@ -902,6 +1134,7 @@ def _write_exported_module(
                 existing_weights = raw_wj.get("weights", raw_wj)
                 existing_weights.pop("hf_checkpoint_path", None)
                 existing_weights.pop("checkpoint_path", None)
+                existing_weights.pop("mesh", None)
     used_weight_indices: set[int] = {
         int(v["index"])
         for v in existing_weights.values()
@@ -923,11 +1156,15 @@ def _write_exported_module(
     if match is not None:
         mlir_args = _parse_mlir_main_args(match.group(1))
         if len(mlir_args) == len(annotated_inputs):
-            for spec, (m_shape, m_dtype, is_donor) in zip(annotated_inputs, mlir_args):
+            for spec, (m_shape, m_dtype, is_donor, m_sharding) in zip(
+                annotated_inputs, mlir_args
+            ):
                 if "?" not in m_shape and "?" not in (spec.get("shape") or []):
                     spec["shape"] = m_shape
                 if m_dtype in _TORCH_TENSOR_DTYPES:
                     spec["dtype"] = m_dtype
+                if spec.get("sharding") is None and m_sharding is not None:
+                    spec["sharding"] = m_sharding
                 spec["buffer_donor"] = is_donor
                 if (
                     is_donor
@@ -960,6 +1197,10 @@ def _write_exported_module(
                     out_spec["name"] = "hidden_states"
                 out_spec["argument_type"] = "intermediate"
 
+    has_ep_any = any(
+        ".routed_experts." in str(inp.get("weight_name") or inp.get("name") or "")
+        for inp in annotated_inputs
+    ) or any(".routed_experts." in k for k in existing_weights)
     weight_map: dict[str, Any] = {}
     for inp in annotated_inputs:
         if inp.get("is_weight") and inp.get("weight_name"):
@@ -978,6 +1219,13 @@ def _write_exported_module(
 
             raw_shape = inp.get("shape", [])
             int_shape = [int(d) for d in raw_shape if isinstance(d, int)]
+            if inp.get("sharding") is None:
+                inp["sharding"] = _infer_weight_sharding(
+                    w_name,
+                    raw_shape,
+                    model=_ACTIVE_MODEL,
+                    has_ep_hint=has_ep_any,
+                )
             sources = inp.get("sources") or [
                 {"path": "", "source_tensor": w_name, "source_shape": int_shape}
             ]
@@ -1388,7 +1636,9 @@ def maybe_export_or_load_stablehlo(
                     f"MLIR @main input count mismatch for '{fn_key}': "
                     f"expected {len(saved_inputs)}, got {len(mlir_inputs)}"
                 )
-            for i, ((s, dt, donor), exp) in enumerate(zip(mlir_inputs, saved_inputs)):
+            for i, ((s, dt, donor, _), exp) in enumerate(
+                zip(mlir_inputs, saved_inputs)
+            ):
                 if s != exp.get("shape") or dt != exp.get("dtype"):
                     raise ValueError(
                         f"MLIR @main input signature mismatch at index {i} "
@@ -1631,7 +1881,7 @@ def _check_main_signature(fn_key: str, lowered: LoweredModule) -> None:
     if match is None:
         raise ValueError(f"'{fn_key}': lowered module has no @main function")
     declared_inputs = [
-        (shape, dtype) for shape, dtype, _ in _parse_mlir_main_args(match.group(1))
+        (shape, dtype) for shape, dtype, _, _ in _parse_mlir_main_args(match.group(1))
     ]
     declared_outputs = [
         _parse_mlir_tensor_type(t)
@@ -1707,6 +1957,12 @@ def _sampling_module_specs(
                     "name": "lm_head.weight",
                     "shape": shape,
                     "dtype": dtype,
+                    "sharding": _infer_weight_sharding(
+                        "lm_head.weight",
+                        shape,
+                        model=_ACTIVE_MODEL,
+                        explicit_sharding=_extract_sharding_spec(None, lm_head_weight),
+                    ),
                     "argument_type": "weight",
                     "is_weight": True,
                     "weight_name": "lm_head.weight",
@@ -1809,7 +2065,11 @@ def _unused_weight_index(export_dir: Path) -> int:
     if wj_path.is_file():
         raw_wj = json.loads(wj_path.read_text())
         for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
-            if w_name != "lm_head.weight" and isinstance(w_spec, dict):
+            if (
+                w_name not in ("lm_head.weight", "mesh")
+                and isinstance(w_spec, dict)
+                and isinstance(w_spec.get("index"), int)
+            ):
                 used.add(int(w_spec["index"]))
     return max(used, default=0) + 1
 
@@ -1939,6 +2199,15 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 with contextlib.suppress(OSError):
                     dst.symlink_to(st.resolve())
 
+    parallel_cfg_early = getattr(runner, "parallel_config", None)
+    tp_size_cfg = int(getattr(parallel_cfg_early, "tensor_parallel_size", 1) or 1)
+    dp_size_cfg = int(getattr(parallel_cfg_early, "data_parallel_size", 1) or 1)
+    mesh_doc = (
+        {"mesh_shape": [dp_size_cfg, tp_size_cfg], "axis_names": ["dp", "tp"]}
+        if dp_size_cfg > 1
+        else {"mesh_shape": [tp_size_cfg], "axis_names": ["tp"]}
+    )
+
     serving_ckpt_dir = export_dir / "serving_checkpoint"
     serving_ckpt_dir.mkdir(parents=True, exist_ok=True)
     serving_weight_json_path = serving_ckpt_dir / "weight.json"
@@ -1950,6 +2219,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 weights_dict = raw_wj.get("weights", raw_wj)
                 weights_dict.pop("hf_checkpoint_path", None)
                 weights_dict.pop("checkpoint_path", None)
+                weights_dict.pop("mesh", None)
 
                 # Index safetensors headers in snap_dir / export_dir
                 tensor_to_file: dict[str, str] = {}
@@ -2097,12 +2367,21 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     for k in internal_tensors:
                         tensor_to_file[k] = str(constants_st_path.absolute())
 
+                has_ep_any = any(".routed_experts." in k for k in weights_dict)
                 for w_name, w_spec in weights_dict.items():
                     if not isinstance(w_spec, dict):
                         continue
                     w_shape = [
                         int(d) for d in w_spec.get("shape", []) if isinstance(d, int)
                     ]
+                    if w_spec.get("sharding") is None:
+                        w_spec["sharding"] = _infer_weight_sharding(
+                            w_name,
+                            w_shape,
+                            model=getattr(runner, "model", None) or _ACTIVE_MODEL,
+                            tp_size_hint=tp_size_cfg,
+                            has_ep_hint=has_ep_any,
+                        )
                     sources = w_spec.get("sources")
                     if not isinstance(sources, list) or not sources:
                         sources = [
@@ -2131,10 +2410,11 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             src_entry["source_shape"] = w_shape
                     w_spec.pop("is_internal_constant", None)
 
+                out_wj: dict[str, Any] = {"mesh": mesh_doc, **weights_dict}
                 tmp_wj = (
                     serving_weight_json_path.parent / f"weight.json.{os.getpid()}.tmp"
                 )
-                tmp_wj.write_text(json.dumps(weights_dict, indent=2))
+                tmp_wj.write_text(json.dumps(out_wj, indent=2))
                 os.replace(tmp_wj, serving_weight_json_path)
 
     # If speculative decoding / MTP is configured and mtp_draft was not yet exported,
@@ -2261,6 +2541,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         meta_dict["target_tpu"] = _get_target_hardware_fingerprint().get(
             "chip_type", "v5p"
         )
+        meta_dict["mesh"] = mesh_doc
 
         block_size = int(getattr(cache_cfg, "block_size", 16) or 16)
         num_blocks = int(getattr(cache_cfg, "num_gpu_blocks", 512) or 512)

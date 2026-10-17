@@ -2964,3 +2964,89 @@ def test_internal_constant_takes_the_dtype_the_module_declares() -> None:
         stablehlo_export._constant_for_spec(
             "rotary_emb_inv_freq", cache, {"shape": [4, 8], "dtype": "bfloat16"}
         )
+
+
+def test_infer_weight_sharding_and_packed_1d_sources() -> None:
+    """Per-tensor mesh sharding and 1D packed weight_scale sources are generated."""
+
+    class _FakeQKV(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tp_size = 4
+            self.output_sizes = [4096, 1024, 1024]
+            self.input_size = 5120
+            self.weight = torch.nn.Parameter(
+                torch.zeros((5120, 1536), dtype=torch.bfloat16)
+            )
+            self.weight_scale = torch.nn.Parameter(
+                torch.zeros((1536,), dtype=torch.float32)
+            )
+
+    class _FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.packed_modules_mapping = {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            }
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].self_attn = torch.nn.Module()
+            self.model.layers[0].self_attn.qkv_proj = _FakeQKV()
+
+    fake_model = _FakeModel()
+    assert stablehlo_export._infer_weight_sharding(
+        "model.embed_tokens.weight", [37984, 5120], tp_size_hint=4
+    ) == ["tp", None]
+    assert (
+        stablehlo_export._infer_weight_sharding(
+            "model.embed_tokens.org_vocab_start_index", [], tp_size_hint=4
+        )
+        == "tp"
+    )
+    assert stablehlo_export._infer_weight_sharding(
+        "model.layers.0.self_attn.qkv_proj.weight",
+        [5120, 1536],
+        model=fake_model,
+    ) == [None, "tp"]
+    assert stablehlo_export._infer_weight_sharding(
+        "model.layers.0.self_attn.qkv_proj.weight_scale",
+        [1536],
+        model=fake_model,
+    ) == ["tp"]
+    assert stablehlo_export._infer_weight_sharding(
+        "model.layers.0.self_attn.o_proj.weight",
+        [2048, 5120],
+        tp_size_hint=4,
+    ) == ["tp", None]
+    assert stablehlo_export._infer_weight_sharding(
+        "model.layers.0.mlp.experts.routed_experts.w13_weight",
+        [64, 2048, 1024],
+        tp_size_hint=4,
+        has_ep_hint=True,
+    ) == ["ep", None, None]
+
+    sources_1d = stablehlo_export._build_generic_weight_sources(
+        "model.layers.0.self_attn.qkv_proj.weight_scale",
+        [1536],
+        fake_model,
+    )
+    assert sources_1d == [
+        {
+            "path": "",
+            "source_tensor": "model.layers.0.self_attn.q_proj.weight_scale",
+            "source_shape": [1024],
+            "dst_slices": [{"dim": 0, "start": 0, "length": 1024}],
+        },
+        {
+            "path": "",
+            "source_tensor": "model.layers.0.self_attn.k_proj.weight_scale",
+            "source_shape": [256],
+            "dst_slices": [{"dim": 0, "start": 1024, "length": 256}],
+        },
+        {
+            "path": "",
+            "source_tensor": "model.layers.0.self_attn.v_proj.weight_scale",
+            "source_shape": [256],
+            "dst_slices": [{"dim": 0, "start": 1280, "length": 256}],
+        },
+    ]
