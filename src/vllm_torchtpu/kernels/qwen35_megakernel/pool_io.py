@@ -1399,9 +1399,10 @@ def make_flat_pooled_step(
         scopes=scopes,
         pool_gather=use_gpr,
     )
-    tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
-    e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, c_paged.IR // tk["e2"], tk["e2"], c_paged.H)
+    p_plan = plan(c_paged, tiles or default_tiles(c_paged))
+    tk, nt = p_plan["tk"], p_plan["nt"]
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
     n_w_leaves = sum(
         c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
     )
@@ -1528,9 +1529,10 @@ def make_flat_attn_step(
         row_mask=True,
         pool_gather=False,
     )
-    tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
-    e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, c_paged.IR // tk["e2"], tk["e2"], c_paged.H)
+    p_plan = plan(c_paged, tiles or default_tiles(c_paged))
+    tk, nt = p_plan["tk"], p_plan["nt"]
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
     n_w_leaves = sum(
         c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
     )
@@ -1625,9 +1627,10 @@ def make_pooled_step(
         scopes=scopes,
         pool_gather=False,
     )
-    tk = plan(c_paged, tiles or default_tiles(c_paged))["tk"]
-    e13_shape_4d = (c_paged.EW, c_paged.H // tk["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, c_paged.IR // tk["e2"], tk["e2"], c_paged.H)
+    p_plan = plan(c_paged, tiles or default_tiles(c_paged))
+    tk, nt = p_plan["tk"], p_plan["nt"]
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
     _fused_cache = {
         (c_paged.act_mode, c_paged.ckpt_2d, c_paged.roff_1d, c_paged.ckpt_k or c_paged.T): call
     }

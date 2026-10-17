@@ -115,6 +115,16 @@ def _expert_slot_kv_credit(model_config, parallel_config) -> tuple[int, object]:
         # (s13_tp, s2_tp, es_mk) for all 512 experts instead of 64 experts
         # (~0.94 GB across 60 layers); reserve 1.07 GB of the freed slot credit.
         credit -= 1_070_230_528
+        if os.environ.get("VLLM_TPU_QWEN35_MK_FUSE_ES", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            # FUSE_ES pads one 8-sublane F32 tile (32 FP8 rows) onto w13 and w2
+            # across 512 experts x 60 layers (+4.28 GB) while dropping es_mk
+            # (-0.57 GB), plus +0.57 GB fallback-graph slice buffer.
+            credit -= 4_278_190_080
     return credit, slots
 
 

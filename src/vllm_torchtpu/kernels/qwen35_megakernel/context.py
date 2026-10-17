@@ -390,8 +390,14 @@ class MKBuildContext:
             "elist": pltpu.SMEM((rup(B * c.TOPK),), I32),  # deduplicated hit experts, pick order
             "seen": pltpu.SMEM((8, 128), I32),  # [e // 128, e % 128]: layer + 1 of e's last list
             "misc_sem": pltpu.SemaphoreType.DMA(()),
-            "es": pltpu.VMEM((NSS, 1, 2 * IR + H), F32),
-            "es_sem": pltpu.SemaphoreType.DMA((NSS,)),
+            **(
+                {}
+                if c.fuse_es
+                else {
+                    "es": pltpu.VMEM((NSS, 1, 2 * IR + H), F32),
+                    "es_sem": pltpu.SemaphoreType.DMA((NSS,)),
+                }
+            ),
             "st": pltpu.SMEM((8,), I32),
             "fn": pltpu.VMEM((1, H), F32),
         }

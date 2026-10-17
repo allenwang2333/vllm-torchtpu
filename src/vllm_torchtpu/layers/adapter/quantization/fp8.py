@@ -1222,10 +1222,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
         # elementwise subtract from `experts_start` (scalar).
+        w1, w2 = _unpadded_expert_weights(layer)
         kwargs = {
             "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
+            "w1": w1,
+            "w2": w2,
             "w1_scale": layer.w13_weight_scale_inv,
             "w2_scale": layer.w2_weight_scale_inv,
             "w1_bias": getattr(layer, "w13_bias", None),
@@ -1330,10 +1331,11 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids, topk_weights
             )
+        w1, w2 = _unpadded_expert_weights(layer)
         kwargs = {
             "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
+            "w1": w1,
+            "w2": w2,
             "w1_scale": layer.w13_weight_scale_inv,
             "w2_scale": layer.w2_weight_scale_inv,
             "w1_bias": getattr(layer, "w13_bias", None),
@@ -1348,6 +1350,19 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         out = fused_moe_gmm(**kwargs)
         return retain_fused_ep_graph_inputs(out)
 
+
+
+def _unpadded_expert_weights(
+    layer: RoutedExperts,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice off trailing fused expert-scale rows (`_fused_es_rows`) for stock `fused_moe_gmm`."""
+    fused_es_rows = int(getattr(layer, "_fused_es_rows", 0) or 0)
+    if fused_es_rows > 0:
+        return (
+            layer.w13_weight[:, :-fused_es_rows, :],
+            layer.w2_weight[:, :-fused_es_rows, :],
+        )
+    return layer.w13_weight, layer.w2_weight
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):

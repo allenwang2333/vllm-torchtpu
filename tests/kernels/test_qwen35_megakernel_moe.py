@@ -282,3 +282,133 @@ def test_tp16_shared_and_routed_expert_packing():
     )
     assert packed_tp16["e13"][0].shape == (c_tiny16_tp.E, c_tiny16_tp.H, 256)
     assert packed_tp16["e2"][0].shape == (c_tiny16_tp.E, 128, c_tiny16_tp.H)
+
+
+def test_fuse_es_moe_block_and_packing():
+    """Verify fuse_es=True packs scales into trailing 32 FP8 rows of e13/e2 and matches fuse_es=False bit-exactly."""
+    c_base, tiles_base, ctx_base, w_sh_b, st_sh_b, _, w_vals_b, st_vals_b, pos, hid = (
+        make_test_ctx_and_inputs()
+    )
+    assert c_base.moe_tp and not c_base.fuse_es
+
+    c_fuse = dataclasses.replace(c_base, fuse_es=True)
+    tiles_fuse = dataclasses.replace(tiles_base, ebank=264 << 10)
+    ctx_fuse = K.MKBuildContext(c_fuse, tiles_fuse, interpret=True)
+    assert "es" not in ctx_fuse.scratch
+    assert "es_sem" not in ctx_fuse.scratch
+    assert ctx_fuse.tk["e13"] == c_fuse.H + 32
+    assert ctx_fuse.tk["e2"] == c_fuse.IR + 32
+    assert ctx_fuse.nt["e13"] == 1 and ctx_fuse.nt["e2"] == 1
+
+    from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
+        _pack_f32_scale_to_fp8_rows,
+    )
+
+    # Convert w_vals_b["es"] ([L, EW, 1, 2*IR + H] f32) into trailing 32 FP8 rows on e13 and e2
+    e13_b = np.array(w_vals_b["e13"])  # [L, EW, 1, H, 2*IR] fp8
+    e2_b = np.array(w_vals_b["e2"])    # [L, EW, 1, IR, H] fp8
+    es_b = np.array(w_vals_b["es"])    # [L, EW, 1, 2*IR + H] f32
+    e13_fuse_list = []
+    e2_fuse_list = []
+    for l_idx in range(c_fuse.L):
+        s13_t = torch.from_numpy(es_b[l_idx, :, 0, : 2 * c_fuse.IR])
+        s2_t = torch.from_numpy(es_b[l_idx, :, 0, 2 * c_fuse.IR :])
+        s13_fp8 = _pack_f32_scale_to_fp8_rows(s13_t).view(torch.uint8).numpy()
+        s2_fp8 = _pack_f32_scale_to_fp8_rows(s2_t).view(torch.uint8).numpy()
+        w13_u8 = e13_b[l_idx, :, 0].view(np.uint8)
+        w2_u8 = e2_b[l_idx, :, 0].view(np.uint8)
+        e13_fuse_list.append(
+            np.concatenate([w13_u8, s13_fp8], axis=1)[:, None, :, :]
+        )
+        e2_fuse_list.append(
+            np.concatenate([w2_u8, s2_fp8], axis=1)[:, None, :, :]
+        )
+    w_vals_f = dict(w_vals_b)
+    w_vals_f["e13"] = jnp.array(np.stack(e13_fuse_list, axis=0)).view(jnp.float8_e4m3fn)
+    w_vals_f["e2"] = jnp.array(np.stack(e2_fuse_list, axis=0)).view(jnp.float8_e4m3fn)
+    w_vals_f["es"] = jnp.zeros((1, 1, 1, 128), dtype=F32)
+
+    mesh1 = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
+
+    def run_moe(ctx_in, w_vals_in, pipe_flag: bool):
+        if ctx_in.tiles.pipe != pipe_flag:
+            t_in = dataclasses.replace(ctx_in.tiles, pipe=pipe_flag)
+            ctx_in = K.MKBuildContext(ctx_in.c, t_in, interpret=pltpu.InterpretParams())
+        seg_r = ctx_in.nt["lin_in"] + ctx_in.nt["lin_out"]
+
+        def moe_kernel(*refs):
+            ctx_in.bind_refs(refs)
+            rings = WeightRings(ctx_in)
+            moe_blk = MoEBlock(ctx_in, rings)
+            scr = ctx_in.scr
+            scr["hitv"][...] = jnp.zeros((ctx_in.MR, 128), I32)
+            zero_seen = pltpu.make_async_copy(
+                scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+            )
+            zero_seen.start()
+            zero_seen.wait()
+            for i in range(ctx_in.N_MOE):
+                rings.fetch(jnp.int32(seg_r + i))
+            cp_sm = pltpu.make_async_copy(
+                ctx_in.W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+            )
+            cp_sm.start()
+            cp_sm.wait()
+            scr["res"][...] = jnp.where(
+                ctx_in.live, ctx_in.hid_ref[: ctx_in.MB].astype(F32), 0.0
+            )
+            part = moe_blk(jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+            ctx_in.out_ref[: ctx_in.MB] = part.astype(BF16)
+
+        call = pl.pallas_call(
+            moe_kernel,
+            out_shape=ctx_in.out_shape,
+            in_specs=ctx_in.in_specs,
+            out_specs=ctx_in.out_specs,
+            scratch_shapes=[ctx_in.scratch[k] for k in ctx_in.s_names],
+            interpret=pltpu.InterpretParams(),
+        )
+        args = (pos, hid, *[w_vals_in[k] for k in w_sh_b], *[st_vals_b[k] for k in st_sh_b])
+        hid_out, _, _, _, _ = jax.shard_map(
+            lambda *a: call(*a),
+            mesh=mesh1,
+            in_specs=tuple(P() for _ in args),
+            out_specs=tuple(P() for _ in ctx_in.out_shape),
+            check_vma=False,
+        )(*args)
+        return hid_out[: ctx_in.B]
+
+    for pipe_flag in (True, False):
+        out_base = run_moe(ctx_base, w_vals_b, pipe_flag=pipe_flag)
+        out_fuse = run_moe(ctx_fuse, w_vals_f, pipe_flag=pipe_flag)
+        assert float(jnp.max(jnp.abs(out_base.astype(F32) - out_fuse.astype(F32)))) == 0.0
+
+    # Also test reshard_layer_experts_ep_to_tp + pack_weights with fuse_es=True
+    c_tp_pack = dataclasses.replace(
+        K.TINY, moe_tp=True, stack_e=False, e_slots=0, paged_kv=True, fuse_es=True
+    )
+    backbone = make_tiny_backbone(
+        dataclasses.replace(K.TINY_EP, stack_e=False, e_slots=16, paged_kv=True),
+        e_slots=16,
+    )
+    for l_idx in range(c_tp_pack.L):
+        reshard_layer_experts_ep_to_tp(
+            backbone.layers[l_idx].mlp,
+            tp_rank=0,
+            c=c_tp_pack,
+            all_gather_fn=lambda x: x.repeat(c_tp_pack.R, *([1] * (x.ndim - 1))),
+        )
+    assert getattr(backbone.layers[0].mlp.experts, "_fused_es_rows", 0) == 32
+    packed_fuse = pack_weights(backbone, c_tp_pack, tp_rank=0, tiles=tiles_fuse)
+    assert packed_fuse["e13"][0].shape == (c_tp_pack.E, c_tp_pack.H + 32, 2 * c_tp_pack.IR)
+    assert packed_fuse["e2"][0].shape == (c_tp_pack.E, c_tp_pack.IR + 32, c_tp_pack.H)
+    assert packed_fuse["es"].shape == (1, 1, 1, 128)
+
+    # Verify default_tiles(c) with fuse_es=True on FULL config
+    c_full_fuse = dataclasses.replace(
+        K.FULL, R=8, moe_tp=True, stack_e=False, paged_kv=True, fused_pool_io=True, fuse_es=True
+    )
+    tiles_full_fuse = K.default_tiles(c_full_fuse)
+    assert tiles_full_fuse.ebank == 1032 << 10
+    p_full_fuse = K.plan(c_full_fuse, tiles_full_fuse)
+    assert p_full_fuse["nt"]["e13"] == 1 and p_full_fuse["nt"]["e2"] == 1

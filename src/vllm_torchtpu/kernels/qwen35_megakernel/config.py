@@ -211,6 +211,7 @@ class MKConfig:
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
     ckpt_k: int = 0              # K dimension of ckpt_indices (0 -> T)
     roff_1d: bool = False        # True when read_offsets is 1D [NS] instead of 2D [G_PER_ATT, NS]
+    fuse_es: bool = False        # True when expert FP32 scales are packed as 32 trailing FP8 rows on e13/e2
 
     @property
     def NS(self):  # sequences (KV caches, GDN input states)
@@ -339,6 +340,11 @@ class MKConfig:
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
         assert self.e_slots == 0 or self.e_slots >= (self.E if self.moe_tp else self.ER)
+        assert not self.fuse_es or (self.moe_tp and self.IR <= 128), (
+            self.fuse_es,
+            self.moe_tp,
+            self.IR,
+        )
         if self.paged_kv:
             assert self.page_size == 128 and self.num_pages >= 1 and self.max_pages_per_seq >= 1
         for n in (self.H, self.QKV, self.Z, self.KD, self.VD, self.HD, self.IR, self.ISR):
@@ -540,6 +546,13 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
     if c.NGDN == 0:
         t = dataclasses.replace(t, nbd=14)
+    if c.fuse_es:
+        need_ebank = max(
+            pool_alias.storage_size((c.H + 32, 2 * c.IR), jnp.dtype(FP8)),
+            pool_alias.storage_size((c.IR + 32, c.H), jnp.dtype(FP8)),
+        )
+        if t.ebank < need_ebank:
+            t = dataclasses.replace(t, ebank=need_ebank)
     return t
 
 
@@ -553,8 +566,8 @@ def stream_kinds(c: MKConfig):
         "router": (c.H, c.E, BF16),
         "sh13": (c.H, 2 * c.ISR, FP8),
         "sh2": (c.ISR, c.H, FP8),
-        "e13": (c.H, 2 * c.IR, FP8),
-        "e2": (c.IR, c.H, FP8),
+        "e13": (c.H + 32 if c.fuse_es else c.H, 2 * c.IR, FP8),
+        "e2": (c.IR + 32 if c.fuse_es else c.IR, c.H, FP8),
     }
 
 
@@ -611,8 +624,19 @@ def encode_ecopy(c: MKConfig, cores) -> list[float]:
 
 def plan(c: MKConfig, tiles: Tiles):
     kinds = stream_kinds(c)
-    tk = {k: tiles.tk(K, N, dt, tiles.ebank if k in EXPERT else tiles.bank)
-          for k, (K, N, dt) in kinds.items()}
+    tk = {}
+    for k, (K, N, dt) in kinds.items():
+        bank = tiles.ebank if k in EXPERT else tiles.bank
+        if c.fuse_es and k in EXPERT:
+            assert pool_alias.storage_size((K, N), jnp.dtype(dt)) <= bank, (
+                k,
+                K,
+                N,
+                bank,
+            )
+            tk[k] = K
+        else:
+            tk[k] = tiles.tk(K, N, dt, bank)
     nt = {k: kinds[k][0] // tk[k] for k in kinds}
     t_gdn = nt["lin_in"] + nt["lin_out"] + nt["router"] + nt["sh13"] + nt["sh2"]
     t_att = nt["att_in"] + nt["att_out"] + nt["router"] + nt["sh13"] + nt["sh2"]
@@ -649,7 +673,9 @@ def weight_shapes(c: MKConfig, tiles: Tiles):
         "e2": e2,
         # per-channel scales, gate|up then down. One [1, N] row per expert: a one-row slice of a
         # 3-D [L, EW, N] array DMAs wrong data on TPU (interpret mode cannot catch it).
-        "es": ((c.L, c.EW, 1, 2 * c.IR + c.H), F32),
+        "es": ((1, 1, 1, 128), F32)
+        if c.fuse_es
+        else ((c.L, c.EW, 1, 2 * c.IR + c.H), F32),
         "smalls": ((c.L, 1, S), F32),
         "final_norm": ((1, c.H), F32),
     }

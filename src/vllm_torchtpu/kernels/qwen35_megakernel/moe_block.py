@@ -29,12 +29,23 @@ class MoEBlock:
 
     def es_wait(self, i):
         ctx = self.ctx
+        if ctx.c.fuse_es:
+            return
         W, scr, sc, NSS = ctx.W, ctx.scr, ctx.sc, ctx.NSS
         s = i % NSS
         with sc("swait", 2):
             pltpu.make_async_copy(
                 W["es"].at[0, 0], scr["es"].at[s], scr["es_sem"].at[s]
             ).wait()
+
+    def _e_split(self, kind: str, w_ref):
+        ctx = self.ctx
+        if not ctx.c.fuse_es:
+            return w_ref[...], None
+        k_main = ctx.H if kind == "e13" else ctx.IR
+        w_main = w_ref[:k_main, :]
+        s_f32 = pltpu.bitcast(w_ref[k_main : k_main + 32, :], F32)[0:1, :]
+        return w_main, s_f32
 
     def moe(self, l, slot, g0, is_att, defer_flush: bool = False):
         ctx = self.ctx
@@ -622,8 +633,10 @@ class MoEBlock:
         s = i % NSS
         base = i * TE
         acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
+        s13 = None
         if T13 == 1:
-            h = mm(xb[...], etake("e13", base)[...])
+            w13_val, s13 = self._e_split("e13", etake("e13", base))
+            h = mm(xb[...], w13_val)
             egive(base, l)
         else:
             # Hypothesis expert-mrb: static unroll (like the PIPE_EP prologue) so the MXU
@@ -647,7 +660,9 @@ class MoEBlock:
                     egive(u, l, t)
             h = acc[:, :2 * IR]
         self.es_wait(i)
-        h = h * scr["es"][s, :, :2 * IR]
+        if s13 is None:
+            s13 = scr["es"][s, :, :2 * IR]
+        h = h * s13
         mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
         xb2[:, :IR] = mid_.astype(BF16)
         wcol = jnp.sum(
@@ -656,12 +671,13 @@ class MoEBlock:
         u2 = base + T13
         if T2 == 1:
             # one [IR, H] tile: CH-lane chunks keep each result in a few vregs
-            w2 = etake("e2", u2)[...]
+            w2, s2 = self._e_split("e2", etake("e2", u2))
+            if s2 is None:
+                s2 = scr["es"][s, :, 2 * IR:]
             xm = xb2[:, :IR]
             for j in range(H // CH):
-                lo = 2 * IR + j * CH
                 y = mm(xm, w2[:, j * CH:(j + 1) * CH])[0:MR]
-                y = rnd(y * scr["es"][s, :, lo:lo + CH])
+                y = rnd(y * s2[:, j * CH:(j + 1) * CH])
                 part[0:MR, j * CH:(j + 1) * CH] += wcol * y
             egive(u2, l)
         else:
@@ -689,7 +705,10 @@ class MoEBlock:
         """Single-tile expert i's activated gate|up rows [MB, IR] (bf16)."""
         ctx = self.ctx
         scr, mm, NSS, IR = ctx.scr, ctx.mm, ctx.NSS, ctx.IR
-        h = mm(scr["xb"][...], w13[...]) * scr["es"][i % NSS, :, :2 * IR]
+        w13_val, s13 = self._e_split("e13", w13)
+        if s13 is None:
+            s13 = scr["es"][i % NSS, :, :2 * IR]
+        h = mm(scr["xb"][...], w13_val) * s13
         return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
 
     def down(self, i, mid, w2):
@@ -706,13 +725,15 @@ class MoEBlock:
             ctx.lane_e8,
         )
         e, s, part = scr["elist"][i], i % NSS, scr["part"]
+        w2_val, s2 = self._e_split("e2", w2)
+        if s2 is None:
+            s2 = scr["es"][s, :, 2 * IR:]
         wcol = jnp.sum(
             jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
         )
         for j in range(H // CH):
-            lo = 2 * IR + j * CH
-            y = mm(mid, w2[:, j * CH:(j + 1) * CH])[0:MR]
-            y = rnd(y * scr["es"][s, :, lo:lo + CH])
+            y = mm(mid, w2_val[:, j * CH:(j + 1) * CH])[0:MR]
+            y = rnd(y * s2[:, j * CH:(j + 1) * CH])
             part[0:MR, j * CH:(j + 1) * CH] += wcol * y
 
     def experts_piped(self, l, n_hit):
@@ -735,7 +756,7 @@ class MoEBlock:
                 u13, u2 = (i + 1) * TE, i * TE + T13
                 w13 = etake("e13", u13)
                 self.es_wait(i + 1)
-                w2 = etake("e2", u2)[...]
+                w2 = etake("e2", u2)
                 mid = xb2[:, :IR]
                 nxt = self.gate_up(i + 1, w13)
                 self.down(i, mid, w2)
@@ -747,7 +768,7 @@ class MoEBlock:
             lax.fori_loop(0, n_hit - 1, body, 0)
             last = n_hit - 1
             u2 = last * TE + T13
-            self.down(last, xb2[:, :IR], etake("e2", u2)[...])
+            self.down(last, xb2[:, :IR], etake("e2", u2))
             egive(u2, l, T13)
 
     def experts_piped_ep(self, l, n_hit, pre_drain=None):

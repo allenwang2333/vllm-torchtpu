@@ -491,7 +491,7 @@ class ExpertWeightRing:
                 e13_start(t)
             else:
                 e2_start(t - T13)
-            if t == 0:
+            if t == 0 and not c.fuse_es:
                 es_copy()
             return
         t = u - i * TE
@@ -504,7 +504,8 @@ class ExpertWeightRing:
         def _():
             e2_start(t - T13)
 
-        pl.when(t == 0)(es_copy)
+        if not c.fuse_es:
+            pl.when(t == 0)(es_copy)
 
     def etake(self, kind: str, u):
         ctx = self.ctx
@@ -555,6 +556,8 @@ class ExpertWeightRing:
 
     def _es_start(self, i, w, l):
         ctx = self.ctx
+        if ctx.c.fuse_es:
+            return
         NSS, W, scr = ctx.NSS, ctx.W, ctx.scr
         s = lax.rem(i, jnp.int32(NSS)) if not isinstance(i, int) else i % NSS
         pltpu.make_async_copy(W["es"].at[l, w], scr["es"].at[s], scr["es_sem"].at[s]).start()
@@ -606,24 +609,27 @@ class ExpertWeightRing:
                 self._arm_issue(r13, r2, w, bank, t, td, gate)
 
         bswitch(l, [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])])
-        for (i, w, bank, t, td, gate) in metas:
-            if t is not None:
-                if t == 0:
-                    pl.when(gate)(lambda i=i, w=w: self._es_start(i, w, l))
-            else:
-                pl.when(jnp.logical_and(gate, td == 0))(
-                    lambda i=i, w=w: self._es_start(i, w, l)
-                )
+        if not ctx.c.fuse_es:
+            for (i, w, bank, t, td, gate) in metas:
+                if t is not None:
+                    if t == 0:
+                        pl.when(gate)(lambda i=i, w=w: self._es_start(i, w, l))
+                else:
+                    pl.when(jnp.logical_and(gate, td == 0))(
+                        lambda i=i, w=w: self._es_start(i, w, l)
+                    )
 
     def fetch_loop(self, nf, l):
         """Initial ring fill: units 0..nf-1 (nf <= NBE) in ONE bswitch walk (loop in the arm)."""
         W = self.ctx.W
+        fuse_es = self.ctx.c.fuse_es
 
         def arm(r13, r2):
             def body(k, carry):
                 i, w, _, t, td = self._unit_meta(k, None)
                 self._arm_issue(r13, r2, w, k, t, td, None)  # k < nf <= NBE: bank == k
-                pl.when(td == 0)(lambda: self._es_start(i, w, l))
+                if not fuse_es:
+                    pl.when(td == 0)(lambda: self._es_start(i, w, l))
                 return carry
 
             lax.fori_loop(0, nf, body, 0)
@@ -648,6 +654,8 @@ class ExpertWeightRing:
 
     def es_wait(self, i):
         ctx = self.ctx
+        if ctx.c.fuse_es:
+            return
         s = i % ctx.NSS
         with ctx.sc("swait", 2):
             pltpu.make_async_copy(

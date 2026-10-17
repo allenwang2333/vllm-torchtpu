@@ -300,6 +300,13 @@ def parse_mk_zero_copy(env_val: str | None = None) -> bool:
     return _env_flag("VLLM_TPU_QWEN35_MK_ZERO_COPY", "0", env_val)
 
 
+def parse_mk_fuse_es(env_val: str | None = None) -> bool:
+    """`VLLM_TPU_QWEN35_MK_FUSE_ES` (default off): pack per-expert FP32 scales `es`
+    as 32 trailing FP8 rows on each expert's `e13` and `e2` weight tiles in TP mode,
+    cutting per-expert HBM->VMEM DMAs from 3 to 2."""
+    return _env_flag("VLLM_TPU_QWEN35_MK_FUSE_ES", "0", env_val)
+
+
 # Per-flag kernel switches for bisecting the v16 megakernel defaults without a
 # code change. Unset = keep `megakernel.default_tiles(c)`.
 _MK_TILE_ENV_BOOL = {
@@ -1011,7 +1018,7 @@ def pack_expert_views_layer(
     )
 
     if not getattr(c, "stack_e", True):
-        # Pass the base 3D Parameter tensors [EW, H, 2*IR] and [EW, IR, H]
+        # Pass the base 3D Parameter tensors [EW, H(+32), 2*IR] and [EW, IR(+32), H]
         # directly without calling .view(...) in PyTorch. In torch_tpu, calling
         # .view(...) on a materialized PJRT tensor creates a deferred as_strided
         # node that triggers tt_jit_execute_as_strided (allocating duplicate 4D
@@ -1020,14 +1027,21 @@ def pack_expert_views_layer(
         e13_view = w13
         e2_view = w2
     else:
-        t13 = c.H // tk_e13
-        t2 = c.IR // tk_e2
+        k13 = c.H + 32 if getattr(c, "fuse_es", False) else c.H
+        k2 = c.IR + 32 if getattr(c, "fuse_es", False) else c.IR
+        t13 = k13 // tk_e13
+        t2 = k2 // tk_e2
         e13_view = w13.view(ew, t13, tk_e13, 2 * c.IR)
         e2_view = w2.view(ew, t2, tk_e2, c.H)
     _need(
         e13_view.data_ptr() == w13.data_ptr() and e2_view.data_ptr() == w2.data_ptr(),
         "expert views must share storage with w13_weight / w2_weight",
     )
+
+    if getattr(c, "fuse_es", False):
+        es_mk = torch.zeros((1, 1, 128), dtype=torch.float32, device=w13.device)
+        es_8x8192 = torch.empty((0,), dtype=torch.float32, device=w13.device)
+        return e13_view, e2_view, es_mk, es_8x8192
 
     s13_raw = getattr(experts, "w13_weight_scale_inv", None)
     if s13_raw is None:
@@ -1050,6 +1064,22 @@ def pack_expert_views_layer(
     return e13_view, e2_view, es_mk, es_8x8192
 
 
+def _pack_f32_scale_to_fp8_rows(s_2d: torch.Tensor) -> torch.Tensor:
+    """Pack `[E, N] float32` scale rows into `[E, 32, N] float8_e4m3fn` matching
+    TPU `#tpu.tiled<(32,128)(4,1)>` <-> `#tpu.tiled<(8,128)>` bitcast layout."""
+    e_cnt, n_cols = int(s_2d.shape[0]), int(s_2d.shape[1])
+    s_cpu = s_2d.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    s_8 = s_cpu.unsqueeze(1).expand(e_cnt, 8, n_cols).contiguous()
+    s_fp8 = (
+        s_8.unsqueeze(-1)
+        .view(torch.float8_e4m3fn)
+        .permute(0, 1, 3, 2)
+        .reshape(e_cnt, 32, n_cols)
+        .contiguous()
+    )
+    return s_fp8.to(device=s_2d.device)
+
+
 def reshard_experts_ep_to_tp_local(
     w13_all: torch.Tensor,
     w2_all: torch.Tensor,
@@ -1069,8 +1099,8 @@ def reshard_experts_ep_to_tp_local(
       c: `MKConfig` with `moe_tp=True`
 
     Returns:
-      - `w13_tp`: `[E, H, 2*IR]` (`[512, 4096, 256]`) `float8_e4m3fn`
-      - `w2_tp`: `[E, IR, H]` (`[512, 128, 4096]`) `float8_e4m3fn`
+      - `w13_tp`: `[E, H(+32), 2*IR]` (`[512, 4096(+32), 256]`) `float8_e4m3fn`
+      - `w2_tp`: `[E, IR(+32), H]` (`[512, 128(+32), 4096]`) `float8_e4m3fn`
       - `s13_tp`: `[E, 1, 1, 2*IR]` (`[512, 1, 1, 256]`) `float32`
       - `s2_tp`: `[E, 1, 1, H]` (`[512, 1, 1, H]`) `float32`
     """
@@ -1102,10 +1132,17 @@ def reshard_experts_ep_to_tp_local(
         g_s = torch.cat([g_s, z_s13], dim=-1)
         u_s = torch.cat([u_s, z_s13], dim=-1)
 
+    s13_2d = torch.cat([g_s, u_s], dim=-1).contiguous()
+    s2_2d = s2_flat.contiguous()
     w13_tp = torch.cat([g_w, u_w], dim=-1).contiguous()
     w2_tp = w2_tp.contiguous()
-    s13_tp = _fresh(torch.cat([g_s, u_s], dim=-1).reshape(c.E, 1, 1, 2 * c.IR))
-    s2_tp = _fresh(s2_flat.reshape(c.E, 1, 1, c.H))
+    if getattr(c, "fuse_es", False):
+        s13_fp8 = _pack_f32_scale_to_fp8_rows(s13_2d)
+        s2_fp8 = _pack_f32_scale_to_fp8_rows(s2_2d)
+        w13_tp = _fresh(torch.cat([w13_tp, s13_fp8], dim=1))
+        w2_tp = _fresh(torch.cat([w2_tp, s2_fp8], dim=1))
+    s13_tp = _fresh(s13_2d.reshape(c.E, 1, 1, 2 * c.IR))
+    s2_tp = _fresh(s2_2d.reshape(c.E, 1, 1, c.H))
     return w13_tp, w2_tp, s13_tp, s2_tp
 
 
@@ -1229,6 +1266,9 @@ def reshard_layer_experts_ep_to_tp(
         )
 
     apply_tp_moe_flags(mlp.experts)
+    fused_es_rows = 32 if getattr(c, "fuse_es", False) else 0
+    for tgt in (mlp.experts, experts):
+        setattr(tgt, "_fused_es_rows", fused_es_rows)
 
 
 def pack_weights(
@@ -1355,7 +1395,11 @@ def pack_weights(
         "sh2": _stack(sh2_list),
         "e13": e13_out,
         "e2": e2_out,
-        "es": _stack(es_mk_list),
+        "es": (
+            torch.zeros((1, 1, 1, 128), dtype=torch.float32, device=final_norm_w.device)
+            if getattr(c, "fuse_es", False)
+            else _stack(es_mk_list)
+        ),
         "smalls": _stack(smalls_mk_list),
         "final_norm": _fresh(final_norm_w),
     }
@@ -1734,6 +1778,7 @@ class Qwen35Megakernel:
         self.fused_pool_io_min_b_hi = parse_mk_fused_pool_io_min_b_hi()
         self._hlo_checked = False
         self.zero_copy = parse_mk_zero_copy() if zero_copy is None else bool(zero_copy)
+        self.fuse_es = bool(mode == "tp" and parse_mk_fuse_es())
         self._runner_ref: Any = runner
         self._raiden_sync_views: list[tuple[int, torch.Tensor, tuple[int, ...]]] = []
         self.backbone = _find_backbone(runner.model)
@@ -1758,9 +1803,12 @@ class Qwen35Megakernel:
         with torch.no_grad():
             if self.mode == "tp":
                 logger.info(
-                    "Qwen3.5 megakernel: resharding 60 MoE layers from EP to TP in-place"
+                    "Qwen3.5 megakernel: resharding 60 MoE layers from EP to TP in-place (fuse_es=%s)",
+                    self.fuse_es,
                 )
-                tp_full = dataclasses.replace(K.FULL, R=self.tp_size)
+                tp_full = dataclasses.replace(
+                    K.FULL, R=self.tp_size, fuse_es=self.fuse_es
+                )
                 for l in range(tp_full.L):
                     layer_l = self.backbone.layers[l]
                     reshard_layer_experts_ep_to_tp(
@@ -1796,6 +1844,7 @@ class Qwen35Megakernel:
                     e_slots=0,
                     paged_kv=True,
                     fused_pool_io=self.fused_pool_io,
+                    fuse_es=self.fuse_es,
                 )
             else:
                 e_slots = int(
@@ -2308,7 +2357,10 @@ class Qwen35Megakernel:
         # Distinct op / trace names per pool-I/O mode so the two kernels never
         # share a compilation-cache key.
         io_tag = "" if bucket_fused else "_3stage"
-        fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
+        es_tag = "_fes" if c.fuse_es else ""
+        fn_name = (
+            f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{es_tag}{io_tag}"
+        )
         src = (
             f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
             f"    return _step_fn({', '.join(args)})\n"
@@ -2317,7 +2369,7 @@ class Qwen35Megakernel:
         exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
 
         op_name = (
-            f"qwen35_megakernel::step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
+            f"qwen35_megakernel::step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{es_tag}{io_tag}"
         )
         flat_callable = sharded_jax_callable(
             op_name,
@@ -2902,7 +2954,8 @@ class Qwen35Megakernel:
             args = [f"x{i}" for i in range(n_in)]
             ret = "tuple[" + ", ".join(["jax.Array"] * len(out_specs)) + "]"
             io_tag = "" if bucket_fused else "_3stage"
-            fn_name = f"qwen35_mk_selftest_t{T}_b{B}_{self.mode}{io_tag}"
+            es_tag = "_fes" if c.fuse_es else ""
+            fn_name = f"qwen35_mk_selftest_t{T}_b{B}_{self.mode}{es_tag}{io_tag}"
             src = (
                 f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
                 f"    return _step_fn({', '.join(args)})\n"
@@ -2910,7 +2963,7 @@ class Qwen35Megakernel:
             ns: dict[str, Any] = {"jax": jax, "_step_fn": step_fn}
             exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
             flat_callable = sharded_jax_callable(
-                f"qwen35_megakernel::selftest_t{T}_b{B}_{self.mode}{io_tag}",
+                f"qwen35_megakernel::selftest_t{T}_b{B}_{self.mode}{es_tag}{io_tag}",
                 ns[fn_name],
                 mesh=self.mesh,
                 input_partition_specs=in_specs,
