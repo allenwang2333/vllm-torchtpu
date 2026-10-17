@@ -137,6 +137,10 @@ def register_active_model(model: Any) -> None:
     for iter_fn in ("named_parameters", "named_buffers"):
         if hasattr(model, iter_fn):
             for name, t in getattr(model, iter_fn)():
+                if iter_fn == "named_buffers" and any(
+                    s in name.lower() for s in ("cos_sin_cache", "cos_sin_cache_bf16")
+                ):
+                    continue
                 if isinstance(t, torch.Tensor):
                     with contextlib.suppress(Exception):
                         _ACTIVE_PARAM_MAP[t.data_ptr()] = name
@@ -357,7 +361,7 @@ def _resolve_dynamo_placeholder(
                     break
         is_const = kind == "buffers"
         if is_const and attr.lower() in ("cos_sin_cache", "cos_sin_cache_bf16"):
-            canonical = "rotary_emb_inv_freq"
+            return "rotary_emb_inv_freq", False, "constant", True
         return canonical, True, "weight", is_const
 
     lower_name = raw_name.lower()
@@ -548,6 +552,7 @@ def _extract_input_specs(
                 )
             elif cand_name:
                 arg_type = cand_type
+                is_const = cand_const
 
         if not is_weight and node is not None:
             cand_name, cand_w, cand_type, cand_const = _resolve_dynamo_placeholder(
@@ -562,6 +567,7 @@ def _extract_input_specs(
                 )
             elif cand_type != "user_io":
                 arg_type = cand_type
+                is_const = cand_const
 
         if not is_weight and node is not None:
             desc = node.meta.get("desc")
@@ -1888,94 +1894,13 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             (export_dir / "model.safetensors").absolute()
                         )
 
-                # Resolve & save internal constants (e.g. rotary_emb_inv_freq)
+                # Resolve & save internal constants
                 internal_tensors: dict[str, torch.Tensor] = {}
                 for w_name, w_spec in weights_dict.items():
                     if not isinstance(w_spec, dict):
                         continue
-                    if (
-                        bool(w_spec.get("is_internal_constant"))
-                        or w_name == "rotary_emb_inv_freq"
-                    ):
-                        shape_list = [
-                            int(d)
-                            for d in w_spec.get("shape", [])
-                            if isinstance(d, int)
-                        ]
-                        if w_name == "rotary_emb_inv_freq":
-                            rope_shape = shape_list or [40960, 128]
-                            rope_t = _CAPTURED_CONSTANTS.get("rotary_emb_inv_freq")
-                            if rope_t is None or list(rope_t.shape) != rope_shape:
-                                for cand_mod in (
-                                    getattr(runner, "model", None),
-                                    _ACTIVE_MODEL,
-                                ):
-                                    if cand_mod is not None and hasattr(
-                                        cand_mod, "named_modules"
-                                    ):
-                                        with contextlib.suppress(Exception):
-                                            for _, mod in cand_mod.named_modules():
-                                                for attr in (
-                                                    "cos_sin_cache_bf16",
-                                                    "cos_sin_cache",
-                                                ):
-                                                    buf = getattr(mod, attr, None)
-                                                    if (
-                                                        buf is not None
-                                                        and isinstance(
-                                                            buf, torch.Tensor
-                                                        )
-                                                        and buf.__class__.__name__
-                                                        != "FakeTensor"
-                                                        and not getattr(
-                                                            buf, "is_meta", False
-                                                        )
-                                                        and list(buf.shape)
-                                                        == rope_shape
-                                                    ):
-                                                        rope_t = (
-                                                            buf.detach()
-                                                            .cpu()
-                                                            .to(torch.bfloat16)
-                                                            .contiguous()
-                                                        )
-                                                        break
-                                                if rope_t is not None:
-                                                    break
-                            if rope_t is None or list(rope_t.shape) != rope_shape:
-                                max_pos = (
-                                    rope_shape[0] if len(rope_shape) >= 1 else 40960
-                                )
-                                head_dim = (
-                                    rope_shape[1] if len(rope_shape) >= 2 else 128
-                                )
-                                rope_theta = 1000000.0
-                                cfg_p = export_dir / "config.json"
-                                if cfg_p.is_file():
-                                    with contextlib.suppress(Exception):
-                                        rope_theta = float(
-                                            json.loads(cfg_p.read_text()).get(
-                                                "rope_theta", rope_theta
-                                            )
-                                        )
-                                half_dim = head_dim // 2
-                                inv_freq = 1.0 / (
-                                    rope_theta
-                                    ** (
-                                        torch.arange(0, half_dim, dtype=torch.float32)
-                                        / float(half_dim)
-                                    )
-                                )
-                                freqs = torch.outer(
-                                    torch.arange(max_pos, dtype=torch.float32), inv_freq
-                                )
-                                rope_t = (
-                                    torch.cat([freqs.cos(), freqs.sin()], dim=-1)
-                                    .to(torch.bfloat16)
-                                    .contiguous()
-                                )
-                            internal_tensors[w_name] = rope_t
-                        elif w_name in _CAPTURED_CONSTANTS:
+                    if bool(w_spec.get("is_internal_constant")):
+                        if w_name in _CAPTURED_CONSTANTS:
                             internal_tensors[w_name] = _CAPTURED_CONSTANTS[w_name]
                         else:
                             resolved_buf: torch.Tensor | None = None

@@ -1449,20 +1449,6 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
                 }
             ],
         },
-        "rotary_emb_inv_freq": {
-            "index": 7,
-            "shape": [64, 16],
-            "dtype": "bfloat16",
-            "sharding": None,
-            "is_internal_constant": True,
-            "sources": [
-                {
-                    "path": "",
-                    "source_tensor": "rotary_emb_inv_freq",
-                    "source_shape": [64, 16],
-                }
-            ],
-        },
     }
     (export_dir / "serving_checkpoint" / "weight.json").write_text(
         json.dumps(seed_weights)
@@ -1511,13 +1497,10 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
         stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
     assert exc_info.value.code == 0
 
-    constants_st = export_dir / "serving_checkpoint" / "constants.safetensors"
-    assert constants_st.is_file()
+    assert not (export_dir / "serving_checkpoint" / "constants.safetensors").exists()
     assert not (export_dir / "weight.json").exists()
     wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
-    assert wj["rotary_emb_inv_freq"]["sources"][0]["path"] == str(
-        constants_st.resolve()
-    )
+    assert "rotary_emb_inv_freq" not in wj
     assert wj["model.embed_tokens.weight"]["sources"][0]["path"] == str(
         (ckpt_dir / "model.safetensors").resolve()
     )
@@ -1531,7 +1514,6 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
     assert abs_spec["file_path"] == "abstract_params.mlir"
     assert [inp["name"] for inp in abs_spec["inputs"]] == [
         "model.embed_tokens.weight",
-        "rotary_emb_inv_freq",
         "lm_head.weight",
     ]
 
@@ -1977,7 +1959,9 @@ def test_generic_dynamo_placeholder_and_packed_module_reflection() -> None:
         {"dim": 1, "start": 0, "length": 2048}
     ]
 
-    assert specs[4]["weight_name"] == "rotary_emb_inv_freq"
+    assert specs[4]["name"] == "rotary_emb_inv_freq"
+    assert specs[4]["is_weight"] is False
+    assert specs[4]["argument_type"] == "constant"
     assert specs[4].get("is_internal_constant") is True
 
     assert specs[5]["name"] == "kv_cache_layer_0"
@@ -2274,7 +2258,8 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
     assert specs[2]["name"] == "model.layers.0.input_layernorm.weight"
     assert specs[2]["argument_type"] == "weight"
     assert specs[3]["name"] == "rotary_emb_inv_freq"
-    assert specs[3]["argument_type"] == "weight"
+    assert specs[3]["argument_type"] == "constant"
+    assert specs[3]["is_weight"] is False
     assert specs[3]["is_internal_constant"] is True
     assert specs[4]["name"] == "positions"
     assert specs[4]["argument_type"] == "user_io"
@@ -2401,12 +2386,12 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
 
     assert (export_dir / "config.json").is_file()
     assert (export_dir / "tokenizer.json").is_file()
-    assert (export_dir / "serving_checkpoint" / "constants.safetensors").is_file()
+    assert not (export_dir / "serving_checkpoint" / "constants.safetensors").exists()
     wj_final = json.loads(
         (export_dir / "serving_checkpoint" / "weight.json").read_text()
     )
     assert "model.embed_tokens.weight" in wj_final
-    assert "rotary_emb_inv_freq" in wj_final
+    assert "rotary_emb_inv_freq" not in wj_final
     assert "lm_head.weight" in wj_final
     assert wj_final["model.embed_tokens.weight"]["sources"][0]["path"] == str(
         (snap / "model.safetensors").absolute()
