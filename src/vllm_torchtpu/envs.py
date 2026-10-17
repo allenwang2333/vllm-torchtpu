@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_SRPT_ATTN_WORK_CAP: int = 0
     TPU_SRPT_OFFCADENCE_TOKENS: int = 0
+    TPU_SRPT_OFFCADENCE_MAX_CONTEXT: int | None = None
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
@@ -710,6 +711,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of deferring prefill or, on a decode-free rank, taking the whole
     # budget. 0 disables it.
     "TPU_SRPT_OFFCADENCE_TOKENS": env_nonnegative_int("TPU_SRPT_OFFCADENCE_TOKENS", 0),
+    # SrptPrefillScheduler, with TPU_SRPT_OFFCADENCE_TOKENS: off-cadence prefill
+    # chunks only cover prompt positions below this; 0 makes off-cadence steps
+    # decode-only. Unset: no limit.
+    "TPU_SRPT_OFFCADENCE_MAX_CONTEXT": env_nonnegative_int_or_auto(
+        "TPU_SRPT_OFFCADENCE_MAX_CONTEXT"
+    ),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),

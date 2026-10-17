@@ -54,6 +54,8 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._srpt_strict_cadence = False
     s._offcadence_tokens = 0
     s._offcadence_steps = 0
+    s._offcadence_max_context = None
+    s._offcadence_active = False
     s.max_num_scheduled_tokens = 128
     s.prefill_capacity_bound = False
     s._srpt_hold_paused = False
@@ -429,6 +431,43 @@ def _req(prompt, status=RequestStatus.RUNNING, num_tokens=None):
     return SimpleNamespace(
         num_prompt_tokens=prompt, num_tokens=num_tokens or prompt, status=status
     )
+
+
+def _offcadence_context(limit, active=True):
+    s = _capped(0)
+    s._offcadence_max_context = limit
+    s._offcadence_active = active
+    return s
+
+
+def test_offcadence_context_limit_clips_and_defers_chunks():
+    s = _offcadence_context(8192)
+    assert s._reserve_prefill_lookahead(_req(20_000), 0, 32) == 32  # shallow: whole
+    assert s._reserve_prefill_lookahead(_req(20_000), 8180, 32) == 12  # stops at 8192
+    assert s._reserve_prefill_lookahead(_req(200_000), 150_000, 18) == 0  # deep: waits
+
+
+def test_offcadence_context_zero_leaves_only_decodes():
+    s = _offcadence_context(0)
+    assert s._reserve_prefill_lookahead(_req(20_000), 0, 32) == 0
+    decode = _req(200_000, num_tokens=200_010)
+    assert s._reserve_prefill_lookahead(decode, 200_010, 7) == 7
+
+
+def test_offcadence_context_limit_ignored_on_cadence_steps():
+    s = _offcadence_context(0, active=False)
+    assert s._reserve_prefill_lookahead(_req(200_000), 150_000, 128) == 128
+
+
+def test_offcadence_step_flag_set_only_during_capped_schedule():
+    s = _offcadence_scheduler([_decoding("d")])
+    seen = []
+    with patch.object(
+        AsyncScheduler, "schedule", side_effect=lambda t: seen.append(s._offcadence_active)
+    ):
+        s.schedule(True)
+        s.schedule(False)
+    assert seen == [True, False] and not s._offcadence_active
 
 
 def test_attn_cap_off_leaves_chunks_alone():

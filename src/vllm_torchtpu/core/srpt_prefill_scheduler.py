@@ -69,6 +69,11 @@ cadence and ``TPU_SRPT_OFFCADENCE_TOKENS=F``, an off-cadence step instead
 schedules prefill on every rank, decode-free or not, but caps the rank's step
 at ``max(F, its decode tokens)``: off-cadence steps stay in the small bucket
 that decodes need anyway, and the prefill fills that bucket's padding.
+A prefill chunk's attention cost grows with its context, so one rank's short
+chunk deep in a long prompt still sets every rank's off-cadence step. With
+``TPU_SRPT_OFFCADENCE_MAX_CONTEXT=C`` off-cadence chunks only cover prompt
+positions below ``C``; ``C=0`` leaves off-cadence steps decode-only on every
+rank, decode-free ranks included.
 
 With ``TPU_SRPT_ATTN_WORK_CAP=W`` a step's attention work -- the sum over its
 scheduled tokens of the context each attends to, decodes included -- is kept
@@ -124,6 +129,12 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_external_end: dict[str, int] = {}
         self._attn_work_cap = envs.TPU_SRPT_ATTN_WORK_CAP
         self._offcadence_tokens = envs.TPU_SRPT_OFFCADENCE_TOKENS
+        self._offcadence_max_context = envs.TPU_SRPT_OFFCADENCE_MAX_CONTEXT
+        self._offcadence_active = False
+        if self._offcadence_max_context is not None and not self._offcadence_tokens:
+            raise ValueError(
+                "TPU_SRPT_OFFCADENCE_MAX_CONTEXT needs TPU_SRPT_OFFCADENCE_TOKENS"
+            )
         if self._offcadence_tokens and not self._srpt_strict_cadence:
             raise ValueError(
                 "TPU_SRPT_OFFCADENCE_TOKENS needs TPU_SRPT_STRICT_PREFILL_CADENCE=1"
@@ -140,8 +151,10 @@ class SrptPrefillScheduler(AsyncScheduler):
             )
         if self._offcadence_tokens:
             logger.info(
-                "SrptPrefillScheduler: off-cadence steps capped at %d tokens",
+                "SrptPrefillScheduler: off-cadence steps capped at %d tokens, "
+                "prefill below context %s",
                 self._offcadence_tokens,
+                self._offcadence_max_context,
             )
         logger.info("SrptPrefillScheduler active")
 
@@ -250,6 +263,15 @@ class SrptPrefillScheduler(AsyncScheduler):
         once a request's tokens are budgeted); with an attention-work cap,
         clip prefill chunks to the work left in this step."""
         prefill = num_computed_tokens < request.num_prompt_tokens
+        if (
+            self._offcadence_active
+            and self._offcadence_max_context is not None
+            and prefill
+        ):
+            # Zero skips a running chunk this step and stops admission at a
+            # waiting request; both wait for the next cadence step.
+            room = max(self._offcadence_max_context - num_computed_tokens, 0)
+            num_new_tokens = min(num_new_tokens, room)
         if self._attn_work_cap and prefill and num_new_tokens > 0:
             fit = self._attn_fit(num_computed_tokens)
             if fit < num_new_tokens:
@@ -331,9 +353,11 @@ class SrptPrefillScheduler(AsyncScheduler):
         if step_cap is not None:
             self.max_num_scheduled_tokens = min(step_cap, full_cap)
             self._offcadence_steps += 1
+        self._offcadence_active = step_cap is not None
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self._offcadence_active = False
             self.max_num_scheduled_tokens = full_cap
             self.max_num_running_reqs += len(held)
             self.running.extend(held)
