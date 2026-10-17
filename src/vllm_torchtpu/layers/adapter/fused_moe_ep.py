@@ -51,6 +51,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import expert_placement
 from vllm_torchtpu.distributed.ep_mesh import (
     EP_AXIS_NAME,
     build_ep_mesh,
@@ -178,6 +179,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     scales_expert_second_minor=False,
+    has_expert_slot=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -196,6 +198,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         scales_expert_second_minor,
+        has_expert_slot,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -295,6 +298,68 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    # The placed variants: the same three plus the layer's [experts] slot
+    # table as their last operand (expert_placement.py).
+    def placed_moe(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x, w1, w2, w1_scale, w2_scale, gating, rank, expert_slot=expert_slot
+        )
+
+    def placed_moe_with_score_bias(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_slot=expert_slot,
+        )
+
+    def placed_moe_with_hash_ids(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        expert_slot: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            expert_slot=expert_slot,
+        )
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -309,6 +374,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((PartitionSpec(),) if has_expert_slot else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -317,16 +383,17 @@ def _build_op(
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
     if has_score_bias:
-        fn = moe_with_score_bias
+        fn = placed_moe_with_score_bias if has_expert_slot else moe_with_score_bias
     elif has_hash_ids:
-        fn = moe_with_hash_ids
+        fn = placed_moe_with_hash_ids if has_expert_slot else moe_with_hash_ids
     else:
-        fn = moe
+        fn = placed_moe if has_expert_slot else moe
     op = jax_op(
         name,
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+        # [, expert_slot]
         # -- and the single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
@@ -353,6 +420,7 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    expert_slot: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -364,8 +432,10 @@ def fused_moe_ep(
 
     `score_bias` is the layer's `e_score_correction_bias`, [global experts]
     f32, and `hash_ids` is `hash_topk_ids_operand`'s [tokens, topk] i32 table
-    lookup. Each must be passed exactly when prebuild saw the corresponding
-    thing on the layer -- prebuild built the op's signature around that.
+    lookup; `expert_slot` is a placed layer's slot table
+    (`expert_placement.expert_slot_table`). Each must be passed exactly when
+    prebuild saw the corresponding thing on the layer -- prebuild built the
+    op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
     """
@@ -381,7 +451,7 @@ def fused_moe_ep(
         )
     if envs.TPU_MOE_SKIP_PADDED_TOKENS:
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
-    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    extra = tuple(t for t in (score_bias, hash_ids, expert_slot) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -674,6 +744,7 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
+    has_expert_slot = expert_placement.expert_slot_table(layer) is not None
     op = _build_op(
         mesh,
         topk,
@@ -689,6 +760,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         scales_expert_second_minor=scales_expert_second_minor,
+        has_expert_slot=has_expert_slot,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

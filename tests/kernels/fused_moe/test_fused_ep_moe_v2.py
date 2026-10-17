@@ -687,6 +687,68 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+def test_expert_slot_placement_is_bit_exact(routing):
+    """A static placement moves experts between shards and nothing else.
+
+    The weights go in slot order, `expert_slot` maps each global expert to
+    its slot after selection, and every token must come out with the same
+    bits as the unplaced layer -- on the served fp4 block-512 form, for the
+    plain top-k, the bias-corrected top-k and the hash-table selections.
+    The control checks the placement really moved experts across shards.
+    """
+    mesh = _mesh()
+    e_total = 32
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 52, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 53, tokens=256, hidden=1024, e_total=e_total)
+    rng = np.random.default_rng(54)
+    slot_of_expert = rng.permutation(e_total).astype(np.int32)
+    g_local = e_total // EP
+    assert (slot_of_expert // g_local != np.arange(e_total) // g_local).any()
+    expert_of_slot = np.argsort(slot_of_expert)
+    expert_sharding = NamedSharding(mesh, P(AXIS))
+
+    def to_slot_order(a):
+        return jax.device_put(np.asarray(a)[expert_of_slot], expert_sharding)
+
+    extra = {}
+    if routing == "score_bias":
+        extra["score_bias"] = jnp.asarray(
+            rng.normal(size=(e_total,)).astype(np.float32)
+        )
+    elif routing == "hash":
+        extra["hash_topk_ids"] = _make_hash_ids(
+            mesh, 55, tokens=256, topk=4, e_total=e_total
+        )
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        **extra,
+    )
+    identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed = fused_ep_moe_v2(
+        x,
+        *(to_slot_order(a) for a in (*weights, *scales)),
+        gating,
+        expert_slot=jnp.asarray(slot_of_expert),
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
+    unmapped = fused_ep_moe_v2(
+        x, *(to_slot_order(a) for a in (*weights, *scales)), gating, **common
+    )
+    assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

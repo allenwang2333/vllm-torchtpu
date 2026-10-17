@@ -272,6 +272,7 @@ def fused_ep_moe_v2(
     routed_scaling_factor=1.0,
     token_replica_groups=None,
     scales_expert_second_minor=False,
+    expert_slot=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -336,6 +337,14 @@ def fused_ep_moe_v2(
     which is what the reference hash router does. Everything downstream of
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
+
+    expert_slot [e_total] i32, replicated, places the experts: the weights'
+    expert axis is in SLOT order and expert_slot[e] is the slot holding global
+    expert e. Selection -- top-k or the hash table, its ties, its weights and
+    the order of the k slots -- runs on global ids exactly as without it; only
+    the selected ids are mapped to slots before dispatch. Each token therefore
+    gets the same experts and the same arithmetic, on whichever shard holds
+    them. None is the identity: slot e holds expert e.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -437,6 +446,7 @@ def fused_ep_moe_v2(
     has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
+    has_expert_slot = expert_slot is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -455,6 +465,13 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    if has_expert_slot and (
+        expert_slot.shape != (e_total,) or expert_slot.dtype != jnp.int32
+    ):
+        raise ValueError(
+            f"expert_slot must be one i32 slot per global expert, [{e_total}]; "
+            f"got {jnp.dtype(expert_slot.dtype).name}{tuple(expert_slot.shape)}"
+        )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -486,6 +503,7 @@ def fused_ep_moe_v2(
         gate_l = next(operands)
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
+        expert_slot_l = next(operands) if has_expert_slot else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
@@ -523,9 +541,11 @@ def fused_ep_moe_v2(
             # contributed here.
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+            if expert_slot_l is not None:
+                topk_idx = jnp.take(expert_slot_l, topk_idx, axis=0, mode="clip")
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows
+                scores, topk=topk, block_rows=select_rows, labels=expert_slot_l
             )
         else:
             # Selection is based on (scores + score_bias_l); the weights come
@@ -535,6 +555,7 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
+                labels=expert_slot_l,
             )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
@@ -756,9 +777,11 @@ def fused_ep_moe_v2(
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
+    # Replicated for the same reason: it is indexed by global expert id.
+    expert_slot_args = (expert_slot,) if has_expert_slot else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
-        + (P(),) * len(score_bias_args)
+        + (P(),) * (len(score_bias_args) + len(expert_slot_args))
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -767,6 +790,7 @@ def fused_ep_moe_v2(
         + (gating,)
         + hash_args
         + score_bias_args
+        + expert_slot_args
         + bias_args
     )
     NS = jax.sharding.NamedSharding
@@ -800,6 +824,7 @@ def fused_ep_moe_v2(
         scoring_fn,
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
+        has_expert_slot,
         float(routed_scaling_factor),
         bool(scales_expert_second_minor),
     )
