@@ -599,7 +599,7 @@ def _use_raiden_stage3_transport() -> bool:
 
 
 def _use_per_layer_pool_tags() -> bool:
-    return bool(tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER)
+    return True
 
 
 def _pipeline_parallel_size(vllm_config: VllmConfig) -> int:
