@@ -3635,9 +3635,11 @@ def sparse_attention_chunk(
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
         row_live_atoms = None
-        if capped_live_rows and group_tab is None:
-            # (Live groups already bound the gather per grid step, on a
-            # layout that is not window-major rows.)
+        if capped_live_rows and group_tab is None and kv_write is None:
+            # Not with live groups: they already bound the gather per grid
+            # step, on a layout that is not window-major rows. Not with
+            # kv_write (TPU_MLA_KV_WRITE_IN_GATHER): the gather's write phase
+            # plus the row-atoms operand hangs the SparseCore kernel.
             # Window w of a gridded token holds prefix-packed slots [w*cap, (w+1)*cap).
             window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
             live_slots = jnp.clip(
