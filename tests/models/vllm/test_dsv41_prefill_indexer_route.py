@@ -14,7 +14,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("with_mesh", [False, True])
-def test_prefill_bridge_preserves_full_record_mask(monkeypatch, with_mesh):
+@pytest.mark.parametrize("halfplane", [False, True])
+def test_prefill_bridge_preserves_full_record_mask(monkeypatch, with_mesh, halfplane):
     from jax.sharding import Mesh
 
     from vllm_torchtpu.models.vllm import vllm_model_wrapper_context as context
@@ -25,6 +26,7 @@ def test_prefill_bridge_preserves_full_record_mask(monkeypatch, with_mesh):
 
     def score(q, weights, pool, pages, limit, *, records, **kwargs):
         # Observe both inputs through the bridge, including a partial-page hole.
+        assert kwargs["halfplane"] == halfplane
         return jnp.where(records >= 0, records, -1) + jnp.repeat(
             pages, kwargs["page_records"], axis=1
         )
@@ -39,12 +41,14 @@ def test_prefill_bridge_preserves_full_record_mask(monkeypatch, with_mesh):
         records,
         jnp.array([2048], jnp.int32),
         page_records=128,
+        halfplane=halfplane,
     )
     expected = records + jnp.repeat(records[:, ::128], 128, axis=1)
     np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("halfplane", [False, True])
 @pytest.mark.parametrize(
     "rows,live,mixed,mode,marker,width,length",
     [
@@ -71,7 +75,7 @@ def test_prefill_bridge_preserves_full_record_mask(monkeypatch, with_mesh):
     ],
 )
 def test_prefill_route_excludes_decode_and_mixed(
-    monkeypatch, rows, live, mixed, mode, marker, width, length
+    monkeypatch, rows, live, mixed, mode, marker, width, length, halfplane
 ):
     # Run graph plumbing on CPU with distinct scorer markers. This is not
     # SparseCore emulation or a numerical/performance qualification.
@@ -85,10 +89,16 @@ def test_prefill_route_excludes_decode_and_mixed(
     candidates = jnp.zeros((rows, 0), jnp.int32)
     pool = jnp.zeros((128, 128), jnp.int32)
 
-    def old_score(q, pool, records, weights, lengths, requests, page_records):
+    expected_halfplane = halfplane
+
+    def old_score(
+        q, pool, records, weights, lengths, requests, page_records, *, halfplane
+    ):
+        assert halfplane == expected_halfplane
         return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
 
-    def new_score(q, weights, pool, shared_records, limit, *, page_records):
+    def new_score(q, weights, pool, shared_records, limit, *, page_records, halfplane):
+        assert halfplane == expected_halfplane
         assert page_records == 128
         # The active request need not be row zero. Pass all records to preserve
         # per-record validity, rather than just the first address of each page.
@@ -126,6 +136,7 @@ def test_prefill_route_excludes_decode_and_mixed(
             False,
             True,
             page_records=128,
+            halfplane=halfplane,
             **({} if mode is None else {"prefill_mode": mode}),
         )
     np.testing.assert_array_equal(np.asarray(selected[:live]), marker)

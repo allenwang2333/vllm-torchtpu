@@ -64,15 +64,14 @@ def _request_kernel(
     pool,
     out,
     words,
-    unpacked,
-    sem,
-    *,
+    *scratch,
     page_records,
     tile,
     coalesce,
     prefetch,
     profile_stages,
     fuse_mask,
+    halfplane=False,
 ):
     request = pl.program_id(0)
     # Keep the scalar-prefetch address space flat: a 2D SMEM row subview
@@ -87,8 +86,7 @@ def _request_kernel(
         None,
         out.at[:, 0, :],
         words,
-        unpacked,
-        sem,
+        *scratch,
         page_records=page_records,
         tile=tile,
         coalesce=coalesce,
@@ -96,6 +94,7 @@ def _request_kernel(
         profile_stages=profile_stages,
         row_lengths=query_limits if fuse_mask else None,
         row_offset=request * q.shape[0],
+        halfplane=halfplane,
     )
 
 
@@ -109,6 +108,7 @@ def _request_kernel(
         "interpret",
         "score_window",
         "fuse_mask",
+        "halfplane",
     ),
 )
 def grouped_decode_scores(
@@ -125,6 +125,7 @@ def grouped_decode_scores(
     interpret: bool = False,
     score_window: int = 32768,
     fuse_mask: bool = False,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Score split-order Q [requests, queries, heads, 128] against paged keys.
 
@@ -166,6 +167,7 @@ def grouped_decode_scores(
             prefetch=prefetch,
             profile_stages=profile_stages,
             fuse_mask=fuse_mask,
+            halfplane=halfplane,
         ),
         out_shape=jax.ShapeDtypeStruct((requests * queries, 1, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -179,7 +181,11 @@ def grouped_decode_scores(
             out_specs=pl.BlockSpec((queries, 1, window), lambda i, j, *_: (i, 0, j)),
             scratch_shapes=(
                 pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),
+                *(
+                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
+                    if not halfplane
+                    else ()
+                ),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
@@ -232,6 +238,7 @@ def _select(scores, lengths, k, block_size, threshold, fuse_validity):
         "profile_stages",
         "score_window",
         "fuse_mask",
+        "halfplane",
         "fuse_validity",
         "topk_block",
         "topk_threshold",
@@ -255,6 +262,7 @@ def decode_indexer(
     profile_stages: bool = False,
     score_window: int = 131072,
     fuse_mask: bool = True,
+    halfplane: bool = False,
     fuse_validity: bool = True,
     topk_block: int = 8192,
     topk_threshold: int = 8192,
@@ -313,6 +321,7 @@ def decode_indexer(
             profile_stages=profile_stages,
             score_window=score_window,
             fuse_mask=fuse_mask,
+            halfplane=halfplane,
         )
 
     def select(i, values):

@@ -122,14 +122,19 @@ def test_candidate_exact_tuning_precedes_default(monkeypatch):
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("key_tile,expected", [(None, 8192), (4096, 4096)])
 @pytest.mark.parametrize("requests,request_tile", [(48, 48), (24, 24), (64, 32)])
+@pytest.mark.parametrize("halfplane", [False, True])
 def test_candidate_indexer_default_dispatch_uses_measured_tiles(
-    monkeypatch, key_tile, expected, requests, request_tile
+    monkeypatch, key_tile, expected, requests, request_tile, halfplane
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
     calls = []
+    expected_halfplane = halfplane
 
-    def score(q, weights, keys, ids, membership, lengths, *, block_size, key_tile):
+    def score(
+        q, weights, keys, ids, membership, lengths, *, block_size, key_tile, halfplane
+    ):
+        assert halfplane is expected_halfplane
         calls.append((q.shape[0], key_tile))
         return jnp.zeros((*q.shape[:2], ids.shape[1] * block_size), jnp.float32)
 
@@ -150,7 +155,7 @@ def test_candidate_indexer_default_dispatch_uses_measured_tiles(
     )
     result = jax.eval_shape(
         lambda *args: candidate.candidate_indexer(
-            *args, block_size=8, key_tile=key_tile
+            *args, block_size=8, key_tile=key_tile, halfplane=halfplane
         ),
         *inputs,
     )
