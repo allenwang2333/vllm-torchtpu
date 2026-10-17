@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -591,6 +592,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
     ),
+    # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
+    # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
+    # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
+    # right before the call, exposed (~0.9-1.1 us per call at decode); the
+    # kernels only DMA the operand, so the bytes and the results are the same.
+    "TPU_SMALL_COLL_HBM_OPERAND": env_bool("TPU_SMALL_COLL_HBM_OPERAND", default=False),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8

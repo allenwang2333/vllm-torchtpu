@@ -27,7 +27,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.experimental.small_collectives import all_to_all as a2a
 
-from .oracle import AXIS, N
+from .oracle import AXIS, N, custom_call_operands_in_vmem
 
 pytestmark = pytest.mark.multichip
 
@@ -206,3 +206,38 @@ def test_rejects_unaligned_rows():
         )
     with pytest.raises(ValueError):
         a2a.small_all_to_all(jnp.zeros((8 * 36, V), jnp.int16), num_cores=8, axis=AXIS)
+
+
+@pytest.mark.parametrize("block", [32, 48])
+def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, block):
+    """`hbm_operand=True` (TPU_SMALL_COLL_HBM_OPERAND): same rows as the
+    reference when the send blocks come out of a preceding op (as the MLA
+    kernel's send buffer does), and the compiled call reads them from HBM --
+    no copy-start/-done into VMEM in front of it."""
+    row0 = 8
+    blocks = _blocks(N, block, seed=11 + block)
+
+    def body(x, r, _):
+        return a2a.small_all_to_all(
+            x + jnp.int16(1), num_cores=N, axis=AXIS, row0=row0, rank=r, hbm_operand=True
+        )
+
+    got = _run(mesh, body, blocks.reshape(N, N * block, V), range(N))
+    want = a2a.reference((blocks + np.int16(1)).astype(np.int16), row0)
+    np.testing.assert_array_equal(
+        _rows_from(got, block, row0), _rows_from(want, block, row0)
+    )
+
+    spec = P(mesh.axis_names)
+    fn = jax.jit(
+        jax.shard_map(body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False)
+    )
+    args = (
+        jax.ShapeDtypeStruct((N * N * block, V), jnp.int16),
+        jax.ShapeDtypeStruct((N,), jnp.int32),
+        jax.ShapeDtypeStruct((N,), jnp.int32),
+    )
+    lowered = fn.lower(*args)
+    assert "input_memory_space_colors" in lowered.as_text()
+    staged = custom_call_operands_in_vmem(lowered.compile().as_text(), "small_all_to_all")
+    assert staged and not any(staged.values()), staged

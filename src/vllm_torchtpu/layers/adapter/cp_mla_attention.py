@@ -1155,6 +1155,7 @@ def send_small_unpack_local(x, rows, rank, lane, *, world: int, axis_name: str,
         rank=jnp.reshape(rank, (1,)),
         lane_axis=lane_axis,
         lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
+        hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
     ).reshape(world, block, vdim)
     return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
 

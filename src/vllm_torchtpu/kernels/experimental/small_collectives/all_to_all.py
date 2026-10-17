@@ -73,6 +73,7 @@ def small_all_to_all(
     lane_axis=None,
     lane=None,
     collective_id=COLLECTIVE_ID,
+    hbm_operand=False,
 ):
     """``lax.all_to_all(x, axis, 0, 0, tiled=True)`` of ``[n * block, V]``
     for rows ``[row0, block)`` of every block, inside a shard_map over a mesh
@@ -87,6 +88,12 @@ def small_all_to_all(
       lane_axis: the mesh's other axis, if it has one (at most one).
       lane: int32 [1], this core's index on ``lane_axis`` as data, or None to
         read it from the axis. Ignored without ``lane_axis``.
+      hbm_operand: constrain ``x`` to HBM (``pltpu.with_memory_space_constraint``).
+        With the operand in ``pl.ANY``, XLA's memory-space assignment stages the
+        send blocks into VMEM with a copy-start/-done right before the call,
+        exposed because the producer runs just before; the kernel only DMAs
+        them, so HBM costs nothing. The in_spec's memory space alone does not
+        stop the staging (it only types the kernel ref).
     """
     if x.ndim != 2:
         raise ValueError(f"small_all_to_all takes [n * block, V], got {x.shape}")
@@ -153,10 +160,12 @@ def small_all_to_all(
         scalars.append(jnp.reshape(rank, (-1,))[:1].astype(jnp.int32))
     if data_lane:
         scalars.append(jnp.reshape(lane, (-1,))[:1].astype(jnp.int32))
+    if hbm_operand:
+        x = pltpu.with_memory_space_constraint(x, pltpu.HBM)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        in_specs=[smem] * len(scalars) + [any_],
+        in_specs=[smem] * len(scalars) + [hbm if hbm_operand else any_],
         out_specs=hbm,
         scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),

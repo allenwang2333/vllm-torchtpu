@@ -2187,6 +2187,9 @@ def streamindex_topk_dcp(
     small_all_gather = (
         bool(small_all_gather) and flat_merge and q.shape[0] <= SMALL_AG_MAX_TOKENS
     )
+    from vllm_torchtpu import envs as _envs
+
+    small_ag_hbm = _envs.TPU_SMALL_COLL_HBM_OPERAND
     lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
     if small_all_gather and len(lane_axes) > 1:
         raise ValueError(
@@ -2331,6 +2334,7 @@ def streamindex_topk_dcp(
                 rank=jnp.reshape(dcp_rank, (1,)),
                 lane_axis=lane_axis,
                 lane=lane,
+                hbm_operand=small_ag_hbm,
             )
         else:
             scores = lax.all_gather(
