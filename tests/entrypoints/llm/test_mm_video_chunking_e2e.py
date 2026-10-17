@@ -44,6 +44,7 @@ import multiprocessing
 import os
 import queue as queue_lib
 import traceback
+import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -171,13 +172,15 @@ MAX_NUM_BATCHED_TOKENS = 2048
 
 def _set_video_chunk_patch_size(self, chunk_patch_size: int) -> None:
     os.environ[CHUNK_ENV] = str(chunk_patch_size)
-    self.model_runner.encoder_cache.clear()
 
 
 def _format_video_inputs(
     prompts: list[str],
     videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
+    # Assign a fresh UUID per request so Scheduler.encoder_cache_manager and
+    # TPUModelRunner.encoder_cache compute a distinct mm_hash on every call and
+    # re-run the vision encoder under the current MM_ENCODER_FRAME_CHUNK_PATCH_SIZE.
     return [
         {
             "prompt": prompt,
@@ -199,6 +202,7 @@ def _format_video_inputs(
                     )
                 )
             },
+            "multi_modal_uuids": {"video": uuid.uuid4().hex},
         }
         for prompt, video in zip(prompts, videos)
     ]

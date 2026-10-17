@@ -71,10 +71,6 @@ def _build_qwen2_5_vl_prompt(question: str) -> str:
     )
 
 
-def _clear_encoder_cache(self) -> None:
-    self.model_runner.encoder_cache.clear()
-
-
 def _run_mm_generation_worker(
     batches: list[tuple[list[str], list, int]],
     cudagraph_mm_encoder: bool,
@@ -131,22 +127,27 @@ def _run_mm_generation_worker(
 
         all_results: list[list[str]] = []
         for idx, (prompts, images, max_tokens) in enumerate(batches):
-            if idx > 0:
-                llm.llm_engine.collective_rpc(_clear_encoder_cache)
             sampling_params = SamplingParams(
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
+            # Tag each batch with a distinct multi_modal_uuids key so subsequent
+            # batches execute the vision encoder instead of reusing cached
+            # embeddings from an earlier batch while keeping Scheduler's
+            # EncoderCacheManager in sync with TPUModelRunner.encoder_cache.
+            mm_uuids = {"image": f"batch-{idx}"}
             if len(prompts) == 1:
                 inputs: dict | list[dict] = {
                     "prompt": prompts[0],
                     "multi_modal_data": {"image": images[0]},
+                    "multi_modal_uuids": mm_uuids,
                 }
             else:
                 inputs = [
                     {
                         "prompt": p,
                         "multi_modal_data": {"image": img},
+                        "multi_modal_uuids": mm_uuids,
                     }
                     for p, img in zip(prompts, images)
                 ]

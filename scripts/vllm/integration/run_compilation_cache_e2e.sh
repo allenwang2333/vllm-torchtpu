@@ -90,7 +90,7 @@ mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 TEST_PROMPT="The capital of France is"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 64 --max-num-seqs 8 --max-tokens 8 \
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
   --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
 
 sync && sleep 10
@@ -162,7 +162,7 @@ echo "================================================================="
 clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
-  --max-model-len 256 --max-num-batched-tokens 64 --max-num-seqs 8 --max-tokens 8 \
+  --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
   --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
 
 sync && sleep 10
