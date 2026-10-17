@@ -1114,6 +1114,48 @@ def send_small_a2a_applies(num_tokens: int) -> bool:
     )
 
 
+def fused_small_a2a_applies(num_tokens: int) -> bool:
+    """Whether the decode MLA kernel runs this bucket's small all-to-all
+    itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket `send_small_a2a_applies`
+    takes whose attention grid is one step -- the decode body lever "step8"
+    on the capped fused-prep row-widths body, the bucket a divisor of its step.
+    Fixed at trace time on the static bucket size."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+        return False
+    value = envs.TPU_MLA_DECODE_BODY_LEVERS
+    levers = (
+        sparse_kernel.DECODE_BODY_DEFAULT
+        if value == "1"
+        else tuple(v.strip() for v in (value or "").split(",") if v.strip() and v != "0")
+    )
+    return bool(
+        "step8" in levers
+        and envs.TPU_DCP_MLA_TOPK_CAP
+        and envs.TPU_DCP_MLA_FUSED_PREP
+        and envs.TPU_MLA_DECODE_ROW_WIDTHS
+        and 0 < num_tokens <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and sparse_kernel._largest_divisor(num_tokens, sparse_kernel.DECODE_STEP8_TOKENS)
+        == num_tokens
+    )
+
+
+def merge_fused_recv(
+    o_recv: torch.Tensor, l_recv: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    """`merge_send_layout`'s small all-to-all merge from the partials and lse
+    the fused-exchange attention op unpacked (`TPU_MLA_FUSED_SMALL_A2A`):
+    `o_recv` bf16 `[world, T * local, V]`, `l_recv` f32 `[world, T * local]`,
+    real rows only (the rest zeroed as the small all-to-all's unpack leaves
+    them). Returns `[T, local, V]` bf16."""
+    world, rows, vdim = o_recv.shape
+    local = rows // num_tokens
+    o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+    l_recv = l_recv.reshape(world, num_tokens, local)
+    return _merge_received(o_recv, l_recv).to(torch.bfloat16)
+
+
 def prebuild_send_small(world: int) -> None:
     """Build (register) the send-layout small all-to-all + unpack op
     (`TPU_DCP_MLA_SEND_SMALL_A2A`) for a DCP group of `world` ranks."""

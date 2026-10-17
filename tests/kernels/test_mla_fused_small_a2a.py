@@ -1,0 +1,103 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TPU_MLA_FUSED_SMALL_A2A: the decode MLA kernel runs the DCP small
+all-to-all itself.
+
+CPU: the bucket gate (`fused_small_a2a_applies`) and the kernel's static
+geometry.
+
+The bit-identity claim -- the fused kernel's receive buffer equals
+`small_all_to_all(send, row0=SEND_SLAB_ROW0)` of the unfused kernel's send
+buffer in every row it writes, so the unpack and merge see the same bits --
+needs 8 TensorCores with remote DMA and a barrier. It was checked on 2x2x2
+(16 ranks = two DCP8 groups) at the served per-rank shapes (T = 4 / 8 and the
+T = 16 guard, edge cells with padding tokens and whole ranks at lse -inf),
+with NaN-poisoned receive buffers and positive controls (misrouted peer
+block, dropped peer block, misrouted destination slab, dropped lse low
+halves) that must fail, by the write-tpu-kernels harness of close-gaps trial 6
+(kernel_work/t6-mla-fuse, probe 02-m1).
+"""
+
+import os
+from unittest import mock
+
+import pytest
+
+from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
+from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
+
+GATE_ENV = {
+    "TPU_MLA_FUSED_SMALL_A2A": "1",
+    "TPU_DCP_MLA_SEND_SMALL_A2A": "1",
+    "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": "8",
+    "TPU_DCP_INDEXER_SMALL_AG": "1",
+    "TPU_SC_TOPK_DCP_MERGE_FLAT": "1",
+    "TPU_DCP_RANK_OPERAND": "1",
+    "TPU_MLA_DECODE_BODY_LEVERS": "1",
+    "TPU_DCP_MLA_TOPK_CAP": "512",
+    "TPU_DCP_MLA_FUSED_PREP": "1",
+    "TPU_MLA_DECODE_ROW_WIDTHS": "128,256,384",
+    "TPU_DCP_MLA_SMALL_CHUNK_TOKENS": "32",
+}
+
+
+def _applies(tokens, **over):
+    env = {k: v for k, v in dict(GATE_ENV, **over).items() if v is not None}
+    with mock.patch.dict(os.environ, env):
+        for k, v in over.items():
+            if v is None:
+                os.environ.pop(k, None)
+        return cp_mla.fused_small_a2a_applies(tokens)
+
+
+def test_gate_buckets():
+    # T <= cap (8) with a one-step grid; never the T = 16 bucket.
+    assert [t for t in (1, 2, 4, 8, 16, 32) if _applies(t)] == [1, 2, 4, 8]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "TPU_MLA_FUSED_SMALL_A2A",
+        "TPU_DCP_MLA_SEND_SMALL_A2A",
+        "TPU_DCP_RANK_OPERAND",
+        "TPU_DCP_MLA_FUSED_PREP",
+        "TPU_MLA_DECODE_ROW_WIDTHS",
+        "TPU_DCP_MLA_TOPK_CAP",
+    ],
+)
+def test_gate_off_without(key):
+    assert not _applies(4, **{key: None})
+
+
+def test_gate_needs_step8():
+    # Without "step8" the decode grid walks the small-chunk batch: not one step.
+    assert not _applies(8, TPU_MLA_DECODE_BODY_LEVERS="tr,zu,pv512,quad")
+    assert _applies(8, TPU_MLA_DECODE_BODY_LEVERS="tr,step8")
+
+
+def test_gate_cap():
+    assert not _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
+    assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
+
+
+def test_slab_geometry():
+    # The slab starts on a 16-row int16 tile and its last head row is the lse
+    # word row, which lands on row SEND_PAD_ROWS - 1 of the receiving block.
+    assert sparse_mla.SEND_SLAB_ROW0 % 8 == 0
+    assert sparse_mla.SEND_SLAB_ROW0 + (sparse_mla.SEND_SLAB_ROW0 - 1) == (
+        sparse_mla.SEND_PAD_ROWS - 1
+    )
+    assert sparse_mla.SEND_EXCHANGE_COLLECTIVE_ID == 13
+

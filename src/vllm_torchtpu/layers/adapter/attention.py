@@ -43,7 +43,11 @@ from vllm_torchtpu.block_major_pool import (
     unified_block_major_enabled,
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import dcp_rank_operand, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (
+    dcp_lane_operand,
+    dcp_rank_operand,
+    get_or_create_dcp_mesh,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -2437,6 +2441,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         interleave_size: int,
         q_rope: bool = False,
         send_layout: bool = False,
+        fused_exchange: bool = False,
     ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2454,6 +2459,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         returns `(nope, rope, send)`, the kernel-written int16 send buffer of
         the packed real-rows merge (`cp_mla_attention.merge_send_layout`),
         instead of the partial and its lse. Decode buckets only.
+
+        `fused_exchange` (TPU_MLA_FUSED_SMALL_A2A; needs `send_layout` and
+        TPU_DCP_RANK_OPERAND): the kernel also runs the small all-to-all, and
+        the op takes this rank's lane operand and returns `(o_recv, l_recv)`,
+        the received partials and lse (`cp_mla_attention.merge_fused_recv`).
+        Buckets `cp_mla_attention.fused_small_a2a_applies` takes only.
         """
         from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
         from vllm_torchtpu.layers.core.attention_interface import (
@@ -2461,6 +2472,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         assert q_rope or not send_layout, "send_layout rides the prologue op"
+        assert send_layout or not fused_exchange, "fused_exchange rides send_layout"
 
         mesh = self._dcp_mesh
         # Set in __init__ when dcp_size > 1, the only case that builds this op.
@@ -2472,6 +2484,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # TPU_DCP_RANK_OPERAND: this rank's DCP index as a sharded i32 operand
         # (built here, outside Dynamo) instead of the iota all_to_all.
         rank_tensor = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
+        # TPU_MLA_FUSED_SMALL_A2A: peers are (my lane, j), both as data.
+        lane_tensor = dcp_lane_operand() if fused_exchange else None
+        assert lane_tensor is None or rank_tensor is not None, (
+            "fused_exchange needs TPU_DCP_RANK_OPERAND"
+        )
         # TPU_MTP_DCP_MERGE_SIZED: the drafter's merge op, registered here
         # (model build, outside any trace).
         _cp_mla_attention.prebuild_sized_merge(dcp_size)
@@ -2490,6 +2507,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             request_distribution: jax.Array,
             rope_table: jax.Array | None,
             rank_ids: jax.Array | None,
+            lane_ids: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
@@ -2514,6 +2532,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 q_rope_table=rope_table,
                 dcp_rank_ids=rank_ids,
                 send_layout=send_layout,
+                fused_exchange=fused_exchange,
+                dcp_lane_ids=lane_ids,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2640,12 +2660,47 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 rank_ids,
             )
 
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank_lane(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+                lane_ids,
+            )
+
         core_fn = {
             (False, False): sparse_mla_attention_core_tpu_dcp,
             (True, False): sparse_mla_attention_core_tpu_dcp_qrope,
             (False, True): sparse_mla_attention_core_tpu_dcp_rank,
             (True, True): sparse_mla_attention_core_tpu_dcp_qrope_rank,
         }[(bool(q_rope), rank_tensor is not None)]
+        if fused_exchange:
+            core_fn = sparse_mla_attention_core_tpu_dcp_qrope_rank_lane
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
@@ -2656,13 +2711,24 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             op_name += "_rank"
         if send_layout:
             op_name += "_send"
+        if fused_exchange:
+            op_name += "_xa2a"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
         if rank_tensor is not None:
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # rank ids, sharded
+        if lane_tensor is not None:
+            input_specs = input_specs + (P(DCP_AXIS_NAME),)  # lane ids, sharded
         output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
-        if send_layout:
+        if fused_exchange:
+            # Caches, then this rank's received [dcp, rows, V] partials and
+            # [dcp, rows] lse: four outputs, as the partial + lse op's.
+            output_specs = output_specs[:2] + (
+                P(DCP_AXIS_NAME, None, None),
+                P(DCP_AXIS_NAME, None),
+            )
+        elif send_layout:
             # Caches, then this rank's [dcp, rows, V] send blocks. The torch
             # op's schema is inferred from the return annotation too: three
             # outputs, not the partial + lse pair's four.
@@ -2686,6 +2752,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
         ):
             del rest, kwargs
+            if fused_exchange:
+                tokens, heads, vdim = ql_nope.shape
+                rows = tokens * (heads // dcp_size)
+                return (
+                    torch.empty_like(kv_cache_nope),
+                    torch.empty_like(kv_cache_rope),
+                    ql_nope.new_empty((dcp_size, rows, vdim), dtype=torch.bfloat16),
+                    ql_nope.new_empty((dcp_size, rows), dtype=torch.float32),
+                )
             if send_layout:
                 tokens, heads, vdim = ql_nope.shape
                 return (
@@ -2740,10 +2815,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 request_distribution,
                 *rope_table,
                 *(() if rank_tensor is None else (rank_tensor,)),
+                *(() if lane_tensor is None else (lane_tensor,)),
             )
             new_nope, new_rope = results[:2]
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
+            if fused_exchange:
+                return results[2], results[3]  # received partials, lse
             if send_layout:
                 return results[2]  # the send buffer
             outputs, lse = results[2:]
@@ -2900,24 +2978,47 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         is_backbone,
                     )
                 ):
-                    # TPU_DCP_MLA_SEND_LAYOUT: the kernel writes the packed
-                    # real-rows exchange's send buffer; one ragged a2a + merge.
-                    send = send_op(
-                        kv_cache,
-                        ql_nope_dcp,
-                        q_pe_dcp,
-                        kv_c_normed_flat,
-                        k_pe_flat,
-                        topk_indices,
-                        attn_metadata.seq_lens,
-                        attn_metadata.block_tables,
-                        attn_metadata.query_start_loc,
-                        attn_metadata.request_distribution,
-                        *q_rope_table,
-                    )
-                    outputs = _cp_mla_attention.merge_send_layout(
-                        send, attn_metadata.query_start_loc, ql_nope_dcp.shape[0]
-                    )
+                    fused_op = getattr(layer, "sparse_mla_dcp_fused_op", None)
+                    if fused_op is not None and _cp_mla_attention.fused_small_a2a_applies(
+                        ql_nope_dcp.shape[0]
+                    ):
+                        # TPU_MLA_FUSED_SMALL_A2A: the kernel also runs the
+                        # small all-to-all and the op unpacks; only the merge.
+                        o_recv, l_recv = fused_op(
+                            kv_cache,
+                            ql_nope_dcp,
+                            q_pe_dcp,
+                            kv_c_normed_flat,
+                            k_pe_flat,
+                            topk_indices,
+                            attn_metadata.seq_lens,
+                            attn_metadata.block_tables,
+                            attn_metadata.query_start_loc,
+                            attn_metadata.request_distribution,
+                            *q_rope_table,
+                        )
+                        outputs = _cp_mla_attention.merge_fused_recv(
+                            o_recv, l_recv, ql_nope_dcp.shape[0]
+                        )
+                    else:
+                        # TPU_DCP_MLA_SEND_LAYOUT: the kernel writes the packed
+                        # real-rows exchange's send buffer; one a2a + merge.
+                        send = send_op(
+                            kv_cache,
+                            ql_nope_dcp,
+                            q_pe_dcp,
+                            kv_c_normed_flat,
+                            k_pe_flat,
+                            topk_indices,
+                            attn_metadata.seq_lens,
+                            attn_metadata.block_tables,
+                            attn_metadata.query_start_loc,
+                            attn_metadata.request_distribution,
+                            *q_rope_table,
+                        )
+                        outputs = _cp_mla_attention.merge_send_layout(
+                            send, attn_metadata.query_start_loc, ql_nope_dcp.shape[0]
+                        )
                 else:
                     dcp_op = layer.sparse_mla_dcp_op
                     if q_rope_table:

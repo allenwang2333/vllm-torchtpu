@@ -1153,6 +1153,8 @@ def sparse_mla_attention_dcp(
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
     send_layout: bool = False,
+    fused_exchange: bool = False,
+    dcp_lane_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1189,6 +1191,17 @@ def sparse_mla_attention_dcp(
         over `dcp_axis_name` (each rank's `[dcp_size, ...]` block, destination
         major). Its sent rows are bit for bit the rows
         `cp_mla_attention._all_to_all_packed` builds from `(output, lse)`.
+      fused_exchange: TPU_MLA_FUSED_SMALL_A2A, with `send_layout`, the rank
+        operand and `dcp_lane_ids` (i32[dcp_size] sharded over
+        `dcp_axis_name`, this rank's lane on the mesh's other axis), on a
+        bucket `cp_mla_attention.fused_small_a2a_applies` takes: the kernel
+        also runs the small all-to-all on its send blocks, and the op returns
+        `(kv_cache_nope, kv_cache_rope, o_recv, l_recv)` -- what
+        `cp_mla_attention.send_small_unpack_local` returns from the send
+        buffer, bit for bit: bf16 `[dcp_size * dcp_size, num_tokens *
+        num_heads // dcp_size, lkv_dim]` and f32 `[dcp_size * dcp_size,
+        num_tokens * num_heads // dcp_size]`, each rank's `[dcp_size, ...]`
+        block sender-major, partial rows past the real ones zero.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1271,6 +1284,20 @@ def sparse_mla_attention_dcp(
         if num_tokens > sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
             raise ValueError(f"send_layout is decode-only, got {num_tokens} tokens")
         out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # send
+    lane_axis = None
+    if fused_exchange:
+        if not (send_layout and dcp_rank_ids is not None and dcp_lane_ids is not None):
+            raise ValueError(
+                "fused_exchange needs send_layout, dcp_rank_ids and dcp_lane_ids"
+            )
+        lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
+        if len(lane_axes) > 1:
+            raise ValueError(f"fused_exchange: at most one lane axis, got {mesh.axis_names}")
+        lane_axis = lane_axes[0] if lane_axes else None
+        out_specs = out_specs[:2] + (
+            P(dcp_axis_name, None, None),  # received partials
+            P(dcp_axis_name, None),  # received lse
+        )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1295,10 +1322,12 @@ def sparse_mla_attention_dcp(
         *extra_,
     ):
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
-        # then this shard's DCP rank (TPU_DCP_RANK_OPERAND).
+        # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
+        # (TPU_MLA_FUSED_SMALL_A2A).
         rope_table_ = extra_[0] if q_rope else None
+        dcp_lane = extra_[-1][0] if fused_exchange else None
         if dcp_rank_ids is not None:
-            dcp_rank = extra_[-1][0]
+            dcp_rank = extra_[int(q_rope)][0]
         else:
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
@@ -1386,6 +1415,11 @@ def sparse_mla_attention_dcp(
                 )
                 if send_layout:
                     split_kwargs["send_world"] = dcp_size
+                if fused_exchange:
+                    split_kwargs["send_exchange"] = (dcp_axis_name, lane_axis)
+                    split_kwargs["send_peer"] = jnp.stack(
+                        [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
+                    )
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1483,6 +1517,20 @@ def sparse_mla_attention_dcp(
         output, lse = attn[:2]
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
+        if fused_exchange:
+            # `lse` is the receive buffer [W * block, V]: the small all-to-all
+            # path's unpack (cp_mla_attention.send_small_unpack_local's).
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _mask_unpack
+
+            per = ql_nope.shape[1] // dcp_size
+            block = sparse_mla_kernel.SEND_PAD_ROWS + num_tokens * per
+            rows = 1 + query_start_loc_[-1:].astype(jnp.int32) * per
+            o_recv, l_recv = _mask_unpack(
+                lse.reshape(dcp_size, block, lse.shape[-1]),
+                rows,
+                block - sparse_mla_kernel.SEND_PAD_ROWS,
+            )
+            return (kv_cache_nope, kv_cache_rope, o_recv, l_recv)
         if send_layout:
             return (kv_cache_nope, kv_cache_rope, lse)  # `lse` is the send buffer
         if not mask_in_kernel:
@@ -1492,6 +1540,9 @@ def sparse_mla_attention_dcp(
 
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:
+        in_specs = in_specs + (P(dcp_axis_name),)
+    if fused_exchange:
+        rank_args = rank_args + (dcp_lane_ids,)
         in_specs = in_specs + (P(dcp_axis_name),)
     return jax.jit(
         shard_map.shard_map(

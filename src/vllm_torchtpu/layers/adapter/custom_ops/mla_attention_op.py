@@ -1835,6 +1835,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_op = None
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
+        self.sparse_mla_dcp_fused_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1855,6 +1856,17 @@ class VllmTPUMLAAttention(MLAAttention):
                         q_rope=True,
                         send_layout=True,
                     )
+                    # TPU_MLA_FUSED_SMALL_A2A: its variant that also runs the
+                    # small all-to-all (buckets fused_small_a2a_applies takes).
+                    if envs.TPU_MLA_FUSED_SMALL_A2A and envs.TPU_DCP_RANK_OPERAND:
+                        self.sparse_mla_dcp_fused_op = impl._build_sparse_mla_dcp_op(
+                            self,
+                            dcp_size,
+                            impl.dcp_interleave_size,
+                            q_rope=True,
+                            send_layout=True,
+                            fused_exchange=True,
+                        )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention

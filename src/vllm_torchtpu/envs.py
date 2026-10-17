@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_MLA_FUSED_SMALL_A2A: bool = False
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -627,6 +628,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
     ),
+    # On the buckets TPU_DCP_MLA_SEND_SMALL_A2A takes (T <= its cap, a power of
+    # 2) whose attention grid is one step (decode body lever "step8"): the
+    # decode MLA kernel runs that exchange itself -- barrier signalled at
+    # kernel entry, each destination's block built in a VMEM slab and pushed
+    # once to the peer -- and returns the receive buffer, so the send buffer
+    # and the separate small all-to-all call are gone. Same received bits,
+    # same unpack and merge. Other buckets keep their exchange.
+    "TPU_MLA_FUSED_SMALL_A2A": env_bool("TPU_MLA_FUSED_SMALL_A2A", default=False),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
