@@ -98,6 +98,12 @@ for _fp8_attr, _st_code in (
     if hasattr(torch, _fp8_attr):
         _TORCH_TO_SAFETENSORS_DTYPE[getattr(torch, _fp8_attr)] = _st_code
 
+# `@main(<args>) -> <results>` of a StableHLO module.
+_MAIN_SIGNATURE_RE = re.compile(
+    r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)(?:\s*->\s*([^\{\n]+))?",
+    re.DOTALL,
+)
+
 _ACTIVE_PARAM_MAP: dict[int, str] = {}
 _ACTIVE_MODEL: Any = None
 _CAPTURED_CONSTANTS: dict[str, torch.Tensor] = {}
@@ -1462,11 +1468,7 @@ def maybe_export_or_load_stablehlo(
 
         # MLIR @main signature check
         saved_outputs = entry.get("outputs", [])
-        match = re.search(
-            r"func\.func\s+(?:public\s+)?@main\s*\((.*?)\)(?:\s*->\s*([^\{\n]+))?",
-            mlir_text,
-            re.DOTALL,
-        )
+        match = _MAIN_SIGNATURE_RE.search(mlir_text)
         if match is None:
             if saved_inputs or saved_outputs:
                 raise ValueError(
@@ -1622,239 +1624,186 @@ def _compile_options_for(
     }
 
 
-def maybe_export_sampling_subgraphs(runner: Any) -> None:
-    """Export sampling subgraphs, write `serving_checkpoint/weight.json`, and exit."""
-    export_dir_str = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
-    if not export_dir_str:
-        return
-    if not _is_export_writer_rank(runner):
-        return
-    export_dir = Path(export_dir_str)
-    export_dir.mkdir(parents=True, exist_ok=True)
+@dataclasses.dataclass(frozen=True)
+class LoweredModule:
+    """A StableHLO module as lowered by the TorchTPU backend.
 
+    `inputs` and `outputs` are the tensors behind the `@main` arguments and
+    results, in signature order.
+    """
+
+    mlir_text: str
+    inputs: tuple[torch.Tensor, ...]
+    outputs: tuple[torch.Tensor, ...]
+
+
+def _lower_with_tpu_backend(
+    fn: Callable[[torch.Tensor], torch.Tensor], example: torch.Tensor
+) -> LoweredModule:
+    """Compiles `fn` with `torch.compile(backend="tpu")` and returns its module.
+
+    The module is the one the backend hands to PJRT, captured at its
+    `fx_to_mlir` lowering step. The compiled program then runs once on
+    `example`, as the runner's sampling precompile does, so collectives inside
+    `fn` need every tensor-parallel rank to make the same call.
+    """
     from torch_tpu._internal import export as torch_tpu_export
 
-    from vllm_torchtpu.runner import greedy_top_tokens
+    lowered: list[LoweredModule] = []
+    orig_fx_to_mlir = torch_tpu_export.fx_to_mlir
 
-    hsize = runner.model_config.get_hidden_size()
-    dtype = getattr(runner, "_hidden_states_dtype", torch.bfloat16)
-    device = getattr(runner, "device", torch.device("cpu"))
-    raw_reqs_paddings = getattr(runner, "num_reqs_paddings", None) or [1]
-    raw_tokens_paddings = getattr(runner, "num_tokens_paddings", None) or []
-    fwd_bucket_sizes: list[int] = []
-    meta_path_pre = export_dir / "metadata.json"
-    if meta_path_pre.is_file():
-        with contextlib.suppress(Exception):
-            pre_meta = json.loads(meta_path_pre.read_text())
-            fwd_map = (pre_meta.get("functions") or {}).get("forward") or {}
-            if isinstance(fwd_map, dict):
-                for k in fwd_map:
-                    if str(k).isdigit():
-                        fwd_bucket_sizes.append(int(k))
-    num_reqs_paddings = sorted(
-        {
-            int(x)
-            for x in (*raw_reqs_paddings, *raw_tokens_paddings, *fwd_bucket_sizes)
-            if isinstance(x, int) and int(x) > 0
-        }
-    ) or [1]
-
-    lm_head_weight = None
-    if hasattr(runner, "model"):
-        lm_head = getattr(runner.model, "lm_head", None)
-        if lm_head is not None:
-            lm_head_weight = getattr(lm_head, "weight", None)
-        if lm_head_weight is None and hasattr(runner.model, "named_parameters"):
-            for p_name, p in runner.model.named_parameters():
-                if "lm_head" in p_name and p_name.endswith(".weight"):
-                    lm_head_weight = p
-                    break
-
-    class _LogitsExplicitGraph(torch.nn.Module):
-        def forward(self, h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-            return torch.matmul(h, w.t())
-
-    class _TopTokensExplicitGraph(torch.nn.Module):
-        def forward(self, h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-            return torch.argmax(torch.matmul(h, w.t()), dim=-1, keepdim=True)
-
-    class _LogitsWrapper(torch.nn.Module):
-        def __init__(self, model: Any) -> None:
-            super().__init__()
-            self.model = model
-
-        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return self.model.compute_logits(hidden_states)
-
-    tp_size = 1
-    if meta_path_pre.is_file():
-        with contextlib.suppress(Exception):
-            pre_meta = json.loads(meta_path_pre.read_text())
-            co = pre_meta.get("compile_options") or {}
-            tp_size = int(
-                co.get("num_partitions")
-                or (pre_meta.get("config") or {}).get("tensor_parallel_size")
-                or 1
+    def _capture(
+        module: fx.GraphModule,
+        args: list[Any],
+        build_mlir_module: bool = True,
+        **kw: Any,
+    ) -> Any:
+        exported = orig_fx_to_mlir(module, args, build_mlir_module=True, **kw)
+        if exported.updates_default_generator_state:
+            raise ValueError(
+                "The lowered sampling module consumes RNG state, which its "
+                "export contract has no input for."
             )
-    if tp_size <= 1:
-        tp_size = int(
-            getattr(
-                getattr(runner, "parallel_config", None),
-                "tensor_parallel_size",
-                1,
+        if not exported.is_noop:
+            lowered.append(
+                LoweredModule(
+                    mlir_text=exported.serialize_text(),
+                    inputs=tuple(a for a in args if isinstance(a, torch.Tensor)),
+                    outputs=tuple(exported.mlir_result_tensors),
+                )
             )
-            or 1
-        )
+        return exported
 
-    v_raw = getattr(getattr(runner, "model_config", None), "vocab_size", 151936)
+    compiled = torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
+    torch_tpu_export.fx_to_mlir = _capture
     try:
-        local_vocab_size = (
-            int(lm_head_weight.shape[0]) if lm_head_weight is not None else int(v_raw)
+        with torch.no_grad():
+            compiled(example)
+    finally:
+        torch_tpu_export.fx_to_mlir = orig_fx_to_mlir
+    if len(lowered) != 1:
+        raise RuntimeError(
+            f"The TPU backend lowered {len(lowered)} modules for one sampling "
+            "call; expected exactly one. A compile cache hit skips lowering."
         )
-    except Exception:
-        local_vocab_size = 151936
-    vocab_size = (
-        local_vocab_size * tp_size
-        if (tp_size > 1 and lm_head_weight is not None)
-        else local_vocab_size
+    return lowered[0]
+
+
+def _find_lm_head_weight(model: torch.nn.Module) -> torch.Tensor:
+    """Returns the `lm_head` weight, including one tied to the embedding."""
+    heads = {
+        id(p): p
+        for name, p in model.named_parameters(remove_duplicate=False)
+        if name == "lm_head.weight" or name.endswith(".lm_head.weight")
+    }
+    if len(heads) != 1:
+        raise ValueError(
+            f"Expected exactly one lm_head weight in {type(model).__name__}, "
+            f"found {len(heads)}."
+        )
+    return next(iter(heads.values()))
+
+
+def _sampling_bucket_sizes(runner: Any) -> list[int]:
+    """The row counts to export: every request padding and every token padding.
+
+    Derived from runner state only, so every rank lowers the same buckets in
+    the same order.
+    """
+    sizes = sorted(
+        {int(n) for n in (*runner.num_reqs_paddings, *runner.num_tokens_paddings)}
     )
+    if not sizes or sizes[0] < 1:
+        raise ValueError(f"Invalid sampling bucket sizes: {sizes}")
+    return sizes
 
-    # weight.json `index` is the global HBM weight slot. `lm_head.weight` is arg 1
-    # of the sampling subgraphs, which is also the slot of forward's
-    # `model.embed_tokens.weight`, so give it the first slot no forward weight uses.
-    used_weight_indices: set[int] = set()
-    wj_path = export_dir / "serving_checkpoint" / "weight.json"
-    if wj_path.is_file():
-        with contextlib.suppress(Exception):
-            raw_wj = json.loads(wj_path.read_text())
-            for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
-                if w_name != "lm_head.weight" and isinstance(w_spec, dict):
-                    used_weight_indices.add(int(w_spec["index"]))
-    lm_head_index = max(used_weight_indices, default=0) + 1
 
-    def _inject_tp_all_gather(
-        mlir_text: str,
-        fn_key: str,
-        num_reqs: int,
-        local_vocab: int,
-        full_vocab: int,
-        tp: int,
-        dt_name: str,
-    ) -> str:
-        if tp <= 1 or local_vocab == full_vocab:
-            return mlir_text
-        dt_mlir = (
-            "bf16"
-            if dt_name == "bfloat16"
-            else ("f16" if dt_name == "float16" else "f32")
+def _tensor_signature(t: Any) -> tuple[list[int | str], str]:
+    return _shape_to_list(t), _dtype_name(t)
+
+
+def _check_main_signature(fn_key: str, lowered: LoweredModule) -> None:
+    """Fails unless `@main` declares exactly the lowered argument tensors."""
+    match = _MAIN_SIGNATURE_RE.search(lowered.mlir_text)
+    if match is None:
+        raise ValueError(f"'{fn_key}': lowered module has no @main function")
+    declared_inputs = [
+        (shape, dtype) for shape, dtype, _ in _parse_mlir_main_args(match.group(1))
+    ]
+    declared_outputs = [
+        _parse_mlir_tensor_type(t)
+        for t in re.findall(r"tensor<([^>]+)>", match.group(2) or "")
+    ]
+    expected_inputs = [_tensor_signature(t) for t in lowered.inputs]
+    expected_outputs = [_tensor_signature(t) for t in lowered.outputs]
+    if declared_inputs != expected_inputs or declared_outputs != expected_outputs:
+        raise ValueError(
+            f"'{fn_key}': @main signature {declared_inputs} -> {declared_outputs} "
+            f"does not match the lowered tensors {expected_inputs} -> "
+            f"{expected_outputs}"
         )
-        groups_str = ", ".join(str(i) for i in range(tp))
-        local_tensor = f"tensor<{num_reqs}x{local_vocab}x{dt_mlir}>"
-        full_tensor = f"tensor<{num_reqs}x{full_vocab}x{dt_mlir}>"
-        ag_stmt = (
-            f'    %ag = "stablehlo.all_gather"(%1) '
-            f"<{{all_gather_dim = 1 : i64, "
-            f"channel_handle = #stablehlo.channel_handle<handle = 1, type = 0>, "
-            f"replica_groups = dense<[[{groups_str}]]> : tensor<1x{tp}xi64>, "
-            f"use_global_device_ids}}> : ({local_tensor}) -> {full_tensor}"
-        )
-        lines = mlir_text.splitlines()
-        new_lines: list[str] = []
-        for line in lines:
-            if fn_key.startswith("compute_logits"):
-                if "func.func @main" in line and f"-> {local_tensor}" in line:
-                    line = line.replace(f"-> {local_tensor}", f"-> {full_tensor}")
-                elif "stablehlo.dot_general" in line and f"-> {local_tensor}" in line:
-                    new_lines.append(line)
-                    new_lines.append(ag_stmt)
-                    continue
-                elif "return %1 :" in line and local_tensor in line:
-                    line = line.replace(
-                        f"return %1 : {local_tensor}", f"return %ag : {full_tensor}"
-                    )
-            elif fn_key.startswith("sample_top_tokens"):
-                if "stablehlo.dot_general" in line and f"-> {local_tensor}" in line:
-                    new_lines.append(line)
-                    new_lines.append(ag_stmt)
-                    continue
-                elif (
-                    "stablehlo.iota" in line
-                    and f"tensor<{num_reqs}x{local_vocab}xi64>" in line
-                ):
-                    line = line.replace(
-                        f"tensor<{num_reqs}x{local_vocab}xi64>",
-                        f"tensor<{num_reqs}x{full_vocab}xi64>",
-                    )
-                elif "stablehlo.reduce(%1 init:" in line:
-                    line = (
-                        line.replace(
-                            "stablehlo.reduce(%1 init:", "stablehlo.reduce(%ag init:"
-                        )
-                        .replace(local_tensor, full_tensor)
-                        .replace(
-                            f"tensor<{num_reqs}x{local_vocab}xi64>",
-                            f"tensor<{num_reqs}x{full_vocab}xi64>",
-                        )
-                    )
-            new_lines.append(line)
-        return "\n".join(new_lines) + ("\n" if mlir_text.endswith("\n") else "")
 
-    def _export_bucket(
-        fn_key: str,
-        num_reqs: int,
-        dummy_hidden: torch.Tensor,
-        explicit_mod: torch.nn.Module,
-        fallback_mod: torch.nn.Module,
-        out_name: str,
-        out_shape: list[int],
-        out_dtype: str,
-    ) -> None:
-        if lm_head_weight is not None:
-            if str(dummy_hidden.device).startswith("tpu"):
-                _ = dummy_hidden.cpu()
-                _ = lm_head_weight.cpu()
-            traced_gm = fx.symbolic_trace(explicit_mod)
-            example_args = [dummy_hidden, lm_head_weight]
+
+def _sampling_module_specs(
+    fn_key: str,
+    lowered: LoweredModule,
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_index: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Builds `metadata.json` specs for a `compute_logits` or `sample_top_tokens`
+    module.
+
+    Each `@main` argument is classified by matching it against the two tensors
+    the export contract allows, never by its position: by identity when the
+    backend passed the tensor itself, otherwise by shape and dtype.
+    """
+    hidden_sig = _tensor_signature(hidden_states)
+    head_sig = _tensor_signature(lm_head_weight)
+    input_specs: list[dict[str, Any]] = []
+    for arg_index, tensor in enumerate(lowered.inputs):
+        shape, dtype = _tensor_signature(tensor)
+        if tensor is hidden_states:
+            is_hidden = True
+        elif tensor is lm_head_weight:
+            is_hidden = False
+        elif hidden_sig == head_sig:
+            raise ValueError(
+                f"'{fn_key}': hidden_states and lm_head.weight share the "
+                f"signature {hidden_sig}, so lowered argument {arg_index} "
+                "cannot be classified"
+            )
+        elif (shape, dtype) == hidden_sig:
+            is_hidden = True
+        elif (shape, dtype) == head_sig:
+            is_hidden = False
         else:
-            traced_gm = None
-            if hasattr(fx, "symbolic_trace"):
-                with contextlib.suppress(Exception):
-                    traced_gm = fx.symbolic_trace(fallback_mod)
-            if traced_gm is None:
-                g = fx.Graph()
-                g.output(g.placeholder("hidden_states"))
-                traced_gm = fx.GraphModule(torch.nn.Module(), g)
-            example_args = [dummy_hidden]
-
-        exported_mlir = torch_tpu_export.fx_to_mlir(
-            traced_gm, example_args, build_mlir_module=True
-        )
-        if (
-            getattr(exported_mlir, "is_noop", False)
-            or getattr(exported_mlir, "module", None) is None
-        ):
-            return
-
-        if lm_head_weight is not None:
-            lm_shape = [int(d) for d in lm_head_weight.shape]
-            input_specs = [
+            raise ValueError(
+                f"'{fn_key}': lowered argument {arg_index} {shape} {dtype} is "
+                "neither hidden_states nor lm_head.weight"
+            )
+        if is_hidden:
+            input_specs.append(
                 {
-                    "arg_index": 0,
+                    "arg_index": arg_index,
                     "index": 0,
                     "name": "hidden_states",
-                    "shape": list(dummy_hidden.shape),
-                    "dtype": _dtype_name(dummy_hidden),
+                    "shape": shape,
+                    "dtype": dtype,
                     "argument_type": "intermediate",
                     "is_weight": False,
                     "weight_name": "",
                     "buffer_donor": False,
-                },
+                }
+            )
+        elif (shape, dtype) == head_sig:
+            input_specs.append(
                 {
-                    "arg_index": 1,
+                    "arg_index": arg_index,
                     "index": lm_head_index,
                     "name": "lm_head.weight",
-                    "shape": lm_shape,
-                    "dtype": _dtype_name(lm_head_weight),
+                    "shape": shape,
+                    "dtype": dtype,
                     "argument_type": "weight",
                     "is_weight": True,
                     "weight_name": "lm_head.weight",
@@ -1863,115 +1812,146 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                         {
                             "path": "",
                             "source_tensor": "lm_head.weight",
-                            "source_shape": lm_shape,
+                            "source_shape": shape,
                         }
                     ],
-                },
-            ]
-            output_specs = [
-                {
-                    "arg_index": 0,
-                    "index": 0,
-                    "name": out_name,
-                    "shape": out_shape,
-                    "dtype": out_dtype,
-                    "argument_type": "user_io",
-                    "buffer_donor": False,
                 }
-            ]
-        else:
-            input_specs = _extract_input_specs(traced_gm, [dummy_hidden]) or [
-                {
-                    "arg_index": 0,
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": list(dummy_hidden.shape),
-                    "dtype": _dtype_name(dummy_hidden),
-                    "argument_type": "intermediate",
-                    "is_weight": False,
-                    "weight_name": "",
-                    "buffer_donor": False,
-                }
-            ]
-            for inp in input_specs:
-                if inp.get("name") == "hidden_states" and not inp.get("is_weight"):
-                    inp["argument_type"] = "intermediate"
-            output_specs = _extract_output_specs(traced_gm, exported_mlir) or [
-                {
-                    "arg_index": 0,
-                    "index": 0,
-                    "name": out_name,
-                    "shape": out_shape,
-                    "dtype": out_dtype,
-                    "argument_type": "user_io",
-                    "buffer_donor": False,
-                }
-            ]
-
-        mlir_text = exported_mlir.serialize_text()
-        if tp_size > 1 and lm_head_weight is not None:
-            mlir_text = _inject_tp_all_gather(
-                mlir_text=mlir_text,
-                fn_key=fn_key,
-                num_reqs=num_reqs,
-                local_vocab=local_vocab_size,
-                full_vocab=vocab_size,
-                tp=tp_size,
-                dt_name=_dtype_name(dummy_hidden),
             )
+        else:
+            raise ValueError(
+                f"'{fn_key}': lowered argument {arg_index} {shape} {dtype} is "
+                "neither hidden_states nor lm_head.weight"
+            )
+    names = sorted(spec["name"] for spec in input_specs)
+    if names != ["hidden_states", "lm_head.weight"]:
+        raise ValueError(
+            f"'{fn_key}': expected inputs (hidden_states, lm_head.weight), got {names}"
+        )
 
+    if len(lowered.outputs) != 1:
+        raise ValueError(f"'{fn_key}': expected one output, got {len(lowered.outputs)}")
+    out_shape, out_dtype = _tensor_signature(lowered.outputs[0])
+    num_reqs = int(hidden_states.shape[0])
+    if fn_key.startswith("sample_top_tokens"):
+        out_name = "tokens"
+        valid = out_shape == [num_reqs, 1] and out_dtype == "int64"
+    else:
+        out_name = "logits"
+        valid = len(out_shape) == 2 and out_shape[0] == num_reqs
+    if not valid:
+        raise ValueError(
+            f"'{fn_key}': unexpected {out_name} output {out_shape} {out_dtype}"
+        )
+    output_specs = [
+        {
+            "arg_index": 0,
+            "index": 0,
+            "name": out_name,
+            "shape": out_shape,
+            "dtype": out_dtype,
+            "argument_type": "user_io",
+            "buffer_donor": False,
+        }
+    ]
+    return input_specs, output_specs
+
+
+def _lower_sampling_functions(
+    runner: Any,
+) -> dict[tuple[str, int], tuple[LoweredModule, torch.Tensor]]:
+    """Lowers `compute_logits` and `sample_top_tokens` for every bucket.
+
+    Both are the model's own `compute_logits`, compiled by the same TPU backend
+    that serves it. `sample_top_tokens` is the argmax over those full logits,
+    so ties resolve to the lowest token id as in `torch.argmax`.
+    `LogitsProcessor.get_top_tokens` is not used: it adds this rank's
+    vocabulary offset as a Python constant and masks this rank's vocabulary
+    padding, so its lowering is only valid on the rank that traced it.
+    """
+    model = runner.model
+
+    def compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+        return model.compute_logits(hidden_states)
+
+    def sample_top_tokens(hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = model.compute_logits(hidden_states)
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    hidden_size = runner.model_config.get_hidden_size()
+    lowered: dict[tuple[str, int], tuple[LoweredModule, torch.Tensor]] = {}
+    for num_reqs in _sampling_bucket_sizes(runner):
+        hidden_states = torch.zeros(
+            (num_reqs, hidden_size),
+            dtype=runner._hidden_states_dtype,
+            device=runner.device,
+        )
+        for fn_name, fn in (
+            ("compute_logits", compute_logits),
+            ("sample_top_tokens", sample_top_tokens),
+        ):
+            module = _lower_with_tpu_backend(fn, hidden_states)
+            lowered[(fn_name, num_reqs)] = (module, hidden_states)
+    return lowered
+
+
+def _unused_weight_index(export_dir: Path) -> int:
+    """The first global weight slot no exported weight other than `lm_head` uses.
+
+    `lm_head.weight` is argument 1 of the sampling modules, which is also the
+    slot of the forward modules' `model.embed_tokens.weight`, so it needs a
+    global slot of its own.
+    """
+    used: set[int] = set()
+    wj_path = export_dir / "serving_checkpoint" / "weight.json"
+    if wj_path.is_file():
+        raw_wj = json.loads(wj_path.read_text())
+        for w_name, w_spec in raw_wj.get("weights", raw_wj).items():
+            if w_name != "lm_head.weight" and isinstance(w_spec, dict):
+                used.add(int(w_spec["index"]))
+    return max(used, default=0) + 1
+
+
+def maybe_export_sampling_subgraphs(runner: Any) -> None:
+    """Exports `compute_logits` and `sample_top_tokens`, finalizes the artifact,
+    and exits when this process is the only worker.
+
+    Every rank lowers the modules; only the writer rank writes them.
+    """
+    export_dir_str = str(envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or "").strip()
+    if not export_dir_str:
+        return
+    lm_head_weight = _find_lm_head_weight(runner.model)
+    lowered_modules = _lower_sampling_functions(runner)
+    if not _is_export_writer_rank(runner):
+        return
+    export_dir = Path(export_dir_str)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    lm_head_index = _unused_weight_index(export_dir)
+    for (fn_name, num_reqs), (lowered, hidden_states) in lowered_modules.items():
+        fn_key = f"{fn_name}_req{num_reqs}"
+        _check_main_signature(fn_key, lowered)
+        input_specs, output_specs = _sampling_module_specs(
+            fn_key, lowered, hidden_states, lm_head_weight, lm_head_index
+        )
         _write_exported_module(
             export_dir=export_dir,
             fn_key=fn_key,
             subgraph_idx=0,
             compile_size=num_reqs,
-            mlir_text=mlir_text,
+            mlir_text=lowered.mlir_text,
             input_specs=input_specs,
             output_specs=output_specs,
         )
 
-    logits_mod = _LogitsWrapper(runner.model)
-    for num_reqs in num_reqs_paddings:
-        fn_key = f"compute_logits_req{num_reqs}"
-        dummy_hidden = torch.zeros((num_reqs, hsize), dtype=dtype, device=device)
-        with contextlib.suppress(Exception):
-            _export_bucket(
-                fn_key=fn_key,
-                num_reqs=num_reqs,
-                dummy_hidden=dummy_hidden,
-                explicit_mod=_LogitsExplicitGraph(),
-                fallback_mod=logits_mod,
-                out_name="logits",
-                out_shape=[num_reqs, vocab_size],
-                out_dtype=_dtype_name(dummy_hidden),
-            )
-
-    head_owner = getattr(runner, "_greedy_head_owner", None)
-    if head_owner is not None or lm_head_weight is not None:
-
-        class _TopTokensWrapper(torch.nn.Module):
-            def __init__(self, owner: Any) -> None:
-                super().__init__()
-                self.head_owner = owner
-
-            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-                return greedy_top_tokens.top_tokens(self.head_owner, hidden_states)
-
-        top_tokens_mod = _TopTokensWrapper(head_owner)
-        for num_reqs in num_reqs_paddings:
-            fn_key = f"sample_top_tokens_req{num_reqs}"
-            dummy_hidden = torch.zeros((num_reqs, hsize), dtype=dtype, device=device)
-            with contextlib.suppress(Exception):
-                _export_bucket(
-                    fn_key=fn_key,
-                    num_reqs=num_reqs,
-                    dummy_hidden=dummy_hidden,
-                    explicit_mod=_TopTokensExplicitGraph(),
-                    fallback_mod=top_tokens_mod,
-                    out_name="tokens",
-                    out_shape=[num_reqs, 1],
-                    out_dtype="int64",
-                )
+    hsize = runner.model_config.get_hidden_size()
+    hidden_dtype_name = _dtype_name(runner._hidden_states_dtype)
+    fwd_bucket_sizes: list[int] = []
+    meta_path_pre = export_dir / "metadata.json"
+    if meta_path_pre.is_file():
+        pre_meta = json.loads(meta_path_pre.read_text())
+        fwd_map = (pre_meta.get("functions") or {}).get("forward") or {}
+        fwd_bucket_sizes = [int(k) for k in fwd_map if str(k).isdigit()]
 
     # Bundle checkpoint assets, constants.safetensors, and per-source paths
     model_id = getattr(getattr(runner, "model_config", None), "model", None)
@@ -2262,7 +2242,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         draft_buckets = sorted(
             {
                 int(x)
-                for x in (*raw_tokens_paddings, *fwd_bucket_sizes)
+                for x in (*runner.num_tokens_paddings, *fwd_bucket_sizes)
                 if isinstance(x, int) and int(x) > 0
             }
         )
@@ -2275,16 +2255,16 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             )
             embed_shape = list(
                 (weights_dict.get("model.embed_tokens.weight") or {}).get(
-                    "shape", [vocab_size, hsize]
+                    "shape", [int(lm_head_weight.shape[0]), hsize]
                 )
             )
             embed_dtype = str(
                 (weights_dict.get("model.embed_tokens.weight") or {}).get(
-                    "dtype", _dtype_name(dummy_hidden)
+                    "dtype", hidden_dtype_name
                 )
             )
             e_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(embed_dtype, "bf16")
-            h_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(_dtype_name(dummy_hidden), "bf16")
+            h_mlir = _TORCH_NAME_TO_MLIR_DTYPE.get(hidden_dtype_name, "bf16")
             e_dims = "x".join(str(d) for d in embed_shape)
             draft_out_ty = f"tensor<{b_sz}x{num_spec_tokens}xi32>"
             draft_mlir = (
@@ -2334,7 +2314,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                         "index": 0,
                         "name": "target_hidden_states",
                         "shape": [b_sz, hsize],
-                        "dtype": _dtype_name(dummy_hidden),
+                        "dtype": hidden_dtype_name,
                         "argument_type": "intermediate",
                         "is_weight": False,
                         "weight_name": "",
