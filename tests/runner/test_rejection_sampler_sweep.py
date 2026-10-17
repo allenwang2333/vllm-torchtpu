@@ -215,6 +215,7 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         _sampler_radix_bits=tpu_runner._SAMPLER_LIGHT_DEFAULT_RADIX_BITS,
         _sampler_fused_chain=optional_paths,
         _sampler_verify_trim=optional_paths,
+        _sampler_graph_rng=False,  # TPU_SAMPLER_GRAPH_RNG off: host-drawn uniforms
     )
     runner._sampler_light_variants = functools.partial(
         TPUModelRunner._sampler_light_variants, runner
