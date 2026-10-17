@@ -57,7 +57,7 @@ import os
 import struct
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -194,6 +194,47 @@ def _compute_local_expert_ids() -> set[int] | None:
     return local_ids
 
 
+def _unused_checkpoint_tensor_predicate(
+    model: torch.nn.Module | None,
+) -> Callable[[str], bool] | None:
+    """Builds a predicate for checkpoint tensors ``model.load_weights`` discards.
+
+    A model that defines ``is_checkpoint_tensor_used`` answers for itself (an
+    MTP draft reads only its ``mtp.`` tensors). Otherwise a tensor is unused
+    when ``hf_to_vllm_mapper`` drops its name or the mapped name falls under a
+    pipeline-missing layer, the two cases ``AutoWeightsLoader`` discards.
+    Returns None when nothing can be dropped.
+    """
+    if model is None:
+        return None
+    is_used = getattr(model, "is_checkpoint_tensor_used", None)
+    if callable(is_used):
+        return lambda name: not is_used(name)
+
+    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
+
+    # Built here rather than through get_pp_missing_layer_names, whose cache
+    # is keyed by id(model) and can outlive an earlier model at that address.
+    missing = tuple(
+        name + "."
+        for name, module in model.named_modules()
+        if isinstance(module, (StageMissingLayer, PPMissingLayer))
+    )
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if not missing and mapper is None:
+        return None
+
+    def unused(name: str) -> bool:
+        if mapper is not None:
+            mapped = mapper.apply_list([name])
+            if not mapped:
+                return True
+            name = mapped[0]
+        return name.startswith(missing)
+
+    return unused
+
+
 class _OnlineFp8LayerFinisher:
     """Quantizes each decoder layer after all its checkpoint tensors are consumed."""
 
@@ -262,8 +303,10 @@ def _sharded_runai_weights_iterator(
     ``gs://`` and local paths both work), drops non-local expert tensors
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. The skipped bytes are never requested from storage.
-    With ``model``, each decoder layer's online-FP8 linears are quantized
-    as soon as the layer's tensors have been delivered.
+    With ``model``, tensors its ``load_weights`` would discard (layers of
+    other pipeline stages, a draft's target weights) are dropped as well,
+    and each decoder layer's online-FP8 linears are quantized as soon as
+    the layer's tensors have been delivered.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -287,8 +330,9 @@ def _sharded_runai_weights_iterator(
         # (and a zero-byte group at the head of its queue aborts the whole
         # remaining stream). They are yielded directly as empty tensors.
         zero_size_tensors: list = []
-        kept = skipped = 0
-        kept_bytes = skipped_bytes = 0
+        kept = skipped = unused = 0
+        kept_bytes = skipped_bytes = unused_bytes = 0
+        is_unused = _unused_checkpoint_tensor_predicate(model)
 
         run_start: int | None = None
         run_sizes: list[int] = []
@@ -308,9 +352,14 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
-                    skipped += 1
-                    skipped_bytes += size
+                drop_unused = is_unused is not None and is_unused(tensor_meta.name)
+                if drop_unused or _should_skip(tensor_meta.name, local_expert_ids):
+                    if drop_unused:
+                        unused += 1
+                        unused_bytes += size
+                    else:
+                        skipped += 1
+                        skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
                     # the current run may continue through it.
                     if size:
@@ -330,12 +379,15 @@ def _sharded_runai_weights_iterator(
 
         logger.info(
             "[sharded-ep-load] fetching %d tensors (%.1f GB) in %d ranges; "
-            "skipping %d non-local expert tensors (%.1f GB) before fetch",
+            "skipping %d non-local expert tensors (%.1f GB) and %d tensors "
+            "the model does not load (%.1f GB) before fetch",
             kept,
             kept_bytes / 1e9,
             len(requests),
             skipped,
             skipped_bytes / 1e9,
+            unused,
+            unused_bytes / 1e9,
         )
 
         finisher = None

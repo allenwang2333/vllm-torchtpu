@@ -70,6 +70,16 @@ def _predictor_forward(
 cast(Any, upstream.Qwen3_5MultiTokenPredictor).forward = _predictor_forward
 
 
+def _is_checkpoint_tensor_used(self: torch.nn.Module, name: str) -> bool:
+    """Reports whether the draft's `load_weights` reads checkpoint tensor `name`.
+
+    Mirrors upstream `Qwen3_5MTP.load_weights`, which keeps the `mtp.` tensors,
+    the embedding and the head, so the sharded Run:AI loader skips fetching
+    the target's layers for the draft.
+    """
+    return name.startswith("mtp.") or "embed_tokens" in name or "lm_head" in name
+
+
 class Qwen3_5MTP(upstream.Qwen3_5MTP):
     """Upstream's draft, admitted under pipeline parallelism.
 
@@ -83,9 +93,11 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
     """
 
     supports_pp: ClassVar[Literal[True]] = True
+    is_checkpoint_tensor_used = _is_checkpoint_tensor_used
 
 
 class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
     """The MoE draft, admitted under pipeline parallelism; see `Qwen3_5MTP`."""
 
     supports_pp: ClassVar[Literal[True]] = True
+    is_checkpoint_tensor_used = _is_checkpoint_tensor_used

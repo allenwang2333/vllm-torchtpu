@@ -1457,10 +1457,21 @@ class Eagle3Proposer:
                 )
 
             cast(Any, model).load_weights = load_weights
+            # The sharded Run:AI loader asks this predicate what to fetch, so
+            # the borrowed modules' tensors are not streamed either.
+            is_used = getattr(model, "is_checkpoint_tensor_used", None)
+            if is_used is not None:
+
+                def is_checkpoint_tensor_used(name: str) -> bool:
+                    return is_used(name) and not any(key in name for key in shared_keys)
+
+                cast(Any, model).is_checkpoint_tensor_used = is_checkpoint_tensor_used
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:
                 del cast(Any, model).load_weights
+                if is_used is not None:
+                    del cast(Any, model).is_checkpoint_tensor_used
             if base_loader._has_online_quant(model):
                 base_loader.finalize_layerwise_processing(model, draft_model_config)
             base_loader.process_weights_after_loading(
