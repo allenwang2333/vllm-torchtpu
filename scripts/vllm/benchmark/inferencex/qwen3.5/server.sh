@@ -95,6 +95,9 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-32768}"
 
 # Default to v3 which is a bit faster than v2.
 export RAGGED_GATHER_REDUCE_VERSION="${RAGGED_GATHER_REDUCE_VERSION:-v3}"
+# No EAGLE/MTP block drop: the prefix hit reaches the last full block and the
+# Mamba state is checkpointed there (about one block more hit per turn).
+export VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP="${VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP:-1}"
 
 # Add extra padding
 # 4, 8 for low concurrency 4 and 8

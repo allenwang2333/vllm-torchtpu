@@ -718,7 +718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
     "RAGGED_GATHER_REDUCE_VERSION": env_with_choices(
-        "RAGGED_GATHER_REDUCE_VERSION", "v3", ["v1", "v2", "v3"]
+        "RAGGED_GATHER_REDUCE_VERSION", "v2", ["v1", "v2", "v3"]
     ),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
@@ -1184,7 +1184,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
-        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=True
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
