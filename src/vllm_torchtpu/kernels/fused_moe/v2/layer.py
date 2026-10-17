@@ -273,6 +273,7 @@ def fused_ep_moe_v2(
     token_replica_groups=None,
     scales_expert_second_minor=False,
     expert_slot=None,
+    order_after=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -345,6 +346,11 @@ def fused_ep_moe_v2(
     the selected ids are mapped to slots before dispatch. Each token therefore
     gets the same experts and the same arithmetic, on whichever shard holds
     them. None is the identity: slot e holds expert e.
+
+    order_after, any array sharded on the mesh axis, is a scheduling operand:
+    the kernel does not start until it exists. It changes no value. A caller
+    passes a result it wants computed while the token all-gather is in flight
+    rather than after the kernel.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -447,6 +453,7 @@ def fused_ep_moe_v2(
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
     has_expert_slot = expert_slot is not None
+    has_order_after = order_after is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
     if has_score_bias and score_bias.shape != (e_total,):
@@ -504,6 +511,7 @@ def fused_ep_moe_v2(
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
         expert_slot_l = next(operands) if has_expert_slot else None
+        order_after_l = next(operands) if has_order_after else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
         # torch_tpu recompiles this module through its jax.export bridge.
@@ -529,6 +537,8 @@ def fused_ep_moe_v2(
             axis=0,
             tiled=True,
         )
+        if order_after_l is not None:
+            q_g, _ = lax.optimization_barrier((q_g, order_after_l))
 
         scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
@@ -779,10 +789,11 @@ def fused_ep_moe_v2(
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
     # Replicated for the same reason: it is indexed by global expert id.
     expert_slot_args = (expert_slot,) if has_expert_slot else ()
+    order_after_args = (order_after,) if has_order_after else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),) * (len(score_bias_args) + len(expert_slot_args))
-        + (P(ax),) * len(bias_args)
+        + (P(ax),) * (len(order_after_args) + len(bias_args))
     )
     args = (
         (x, rank, w1, w2)
@@ -791,6 +802,7 @@ def fused_ep_moe_v2(
         + hash_args
         + score_bias_args
         + expert_slot_args
+        + order_after_args
         + bias_args
     )
     NS = jax.sharding.NamedSharding
@@ -825,6 +837,7 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
         has_expert_slot,
+        has_order_after and order_after.shape[1:],
         float(routed_scaling_factor),
         bool(scales_expert_second_minor),
     )
