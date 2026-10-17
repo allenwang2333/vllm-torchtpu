@@ -45,11 +45,38 @@ def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
     # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
     # elements), i.e. q's split element order.
     key = jnp.where(first, lo, pltpu.roll(hi, half, 1))
-    for t in range(q_ref.shape[0]):
-        logits = jax.lax.dot_general(
-            q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-        )
-        out_ref[t, 0] = (jnp.maximum(logits, 0) * w_ref[t]).sum(0)
+    num_q, heads, dim = q_ref.shape
+    keys = key.shape[0]
+    if heads % 8 == 0 and 1 < num_q <= 8:
+        logits_all = jax.lax.dot_general(
+            q_ref[...].reshape(num_q * heads, dim),
+            key,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).reshape(num_q, heads, keys)
+        for t in range(num_q):
+            out_ref[t, 0] = (jnp.maximum(logits_all[t], 0) * w_ref[t]).sum(0)
+    elif heads % 8 == 0 and num_q > 8 and num_q % 8 == 0:
+        for g in range(0, num_q, 8):
+            logits_chunk = jax.lax.dot_general(
+                q_ref[pl.ds(g, 8), :, :].reshape(8 * heads, dim),
+                key,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            ).reshape(8, heads, keys)
+            for t in range(8):
+                out_ref[g + t, 0] = (
+                    jnp.maximum(logits_chunk[t], 0) * w_ref[g + t]
+                ).sum(0)
+    else:
+        for t in range(num_q):
+            logits = jax.lax.dot_general(
+                q_ref[t],
+                key,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            out_ref[t, 0] = (jnp.maximum(logits, 0) * w_ref[t]).sum(0)
 
 
 # Jitted: the memory-space constraint below cannot run eagerly.

@@ -2155,6 +2155,7 @@ def paged_index_scores_jax(
     requests: jax.Array | None = None,
     page_records: int | None = None,
     records_are_pages: bool = False,
+    mask_invalid: bool = False,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
@@ -2276,6 +2277,15 @@ def paged_index_scores_jax(
         def shared_rows(_):
             return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
 
+        def _finish_shared(out):
+            if mask_invalid and not records_are_pages:
+                return jnp.where(
+                    jnp.take(records[:, :width] >= 0, requests, axis=0),
+                    out,
+                    -jnp.inf,
+                )
+            return out
+
         if (
             pages
             and dim == index_word_scores.DIM
@@ -2329,8 +2339,8 @@ def paged_index_scores_jax(
                 )
                 return jax.lax.fori_loop(0, trips, grouped_step, scores)[:, :width]
 
-            return jax.lax.cond(fits, grouped_rows, shared_rows, None)
-        return shared_rows(None)
+            return _finish_shared(jax.lax.cond(fits, grouped_rows, shared_rows, None))
+        return _finish_shared(shared_rows(None))
 
     trips = jnp.minimum(
         (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, padded_width // tile
@@ -2346,15 +2356,17 @@ def paged_index_scores_jax(
         rows = tile // index_word_scores.SLOTS
         page_tile = tile // page
 
-        def _run_word_loop(rec):
+        def _run_word_loop(rec_unpadded):
             if records_are_pages:
                 rec = jnp.pad(
-                    rec,
-                    ((0, 0), (0, padded_width // page - rec.shape[1])),
+                    rec_unpadded,
+                    ((0, 0), (0, padded_width // page - rec_unpadded.shape[1])),
                     constant_values=-1,
                 )
             else:
-                rec = jnp.pad(rec, ((0, 0), (0, -width % tile)), constant_values=-1)
+                rec = jnp.pad(
+                    rec_unpadded, ((0, 0), (0, -width % tile)), constant_values=-1
+                )
             n_rows = rec.shape[0]
 
             def word_step(index, result):
@@ -2377,7 +2389,18 @@ def paged_index_scores_jax(
                     result, values, index * tile, axis=1
                 )
 
-            return jax.lax.fori_loop(0, trips, word_step, scores)[:, :width]
+            out = jax.lax.fori_loop(0, trips, word_step, scores)[:, :width]
+            if mask_invalid and not records_are_pages:
+                valid = rec_unpadded[:, :width] >= 0
+                if 1 < n_rows < tokens:
+                    out = jnp.where(
+                        valid[:, None, :],
+                        out.reshape(n_rows, tokens // n_rows, width),
+                        -jnp.inf,
+                    ).reshape(tokens, width)
+                else:
+                    out = jnp.where(valid, out, -jnp.inf)
+            return out
 
         if requests is not None and tokens >= 6 and tokens % 6 == 0:
             group_tokens = 6
@@ -2385,20 +2408,33 @@ def paged_index_scores_jax(
             can_group = jnp.all(
                 requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
             )
-            return jax.lax.cond(
-                can_group,
-                lambda _: _run_word_loop(
-                    jnp.take(records, requests[::group_tokens], axis=0)
-                ),
-                lambda _: _run_word_loop(jnp.take(records, requests, axis=0)),
-                None,
-            )
+
+            def _grouped_or_raw(_):
+                return jax.lax.cond(
+                    can_group,
+                    lambda _: _run_word_loop(
+                        jnp.take(records, requests[::group_tokens], axis=0)
+                    ),
+                    lambda _: _run_word_loop(jnp.take(records, requests, axis=0)),
+                    None,
+                )
+
+            if groups > 1:
+                same_request = jnp.all(requests == requests[0])
+                return jax.lax.cond(
+                    same_request,
+                    lambda _: _run_word_loop(jnp.take(records, requests[:1], axis=0)),
+                    _grouped_or_raw,
+                    None,
+                )
+            return _grouped_or_raw(None)
         if requests is not None:
             records = jnp.take(records, requests, axis=0)
         return _run_word_loop(records)
 
     if requests is not None:
         records = jnp.take(records, requests, axis=0)
+    unpadded_records = records
     records = jnp.pad(records, ((0, 0), (0, -width % tile)), constant_values=-1)
 
     def step(index, result):
@@ -2420,7 +2456,10 @@ def paged_index_scores_jax(
             result, head_sum(logits), index * tile, axis=1
         )
 
-    return jax.lax.fori_loop(0, trips, step, scores)[:, :width]
+    out = jax.lax.fori_loop(0, trips, step, scores)[:, :width]
+    if mask_invalid and not records_are_pages:
+        out = jnp.where(unpadded_records[:, :width] >= 0, out, -jnp.inf)
+    return out
 
 
 _indexer_op = None
@@ -2706,10 +2745,14 @@ def paged_indexer_jax(
             tile = min(rows, query_tile)
             if not grouped and rows <= tile:
                 scores = paged_index_scores_jax(
-                    q, pool, records, weights, lengths, requests, page_records
-                )
-                scores = jnp.where(
-                    jnp.take(records >= 0, requests, axis=0), scores, -jnp.inf
+                    q,
+                    pool,
+                    records,
+                    weights,
+                    lengths,
+                    requests,
+                    page_records,
+                    mask_invalid=True,
                 )
                 return select_indices_jax(
                     scores,
@@ -2773,7 +2816,7 @@ def paged_indexer_jax(
 
             def score(args):
                 queries, row_weights, row_lengths, _, row_requests, row_records = args
-                scores = paged_index_scores_jax(
+                return paged_index_scores_jax(
                     queries,
                     pool,
                     row_records,
@@ -2781,9 +2824,7 @@ def paged_indexer_jax(
                     row_lengths,
                     row_requests,
                     page_records,
-                )
-                return jnp.where(
-                    jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
+                    mask_invalid=True,
                 )
 
             def select(i, scores):

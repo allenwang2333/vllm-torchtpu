@@ -40,21 +40,23 @@ def _reference(q, weights, words):
     return np.asarray(scores)  # record order: key 2r + s is slot s of row r
 
 
+@pytest.mark.parametrize("heads", [3, 8])
 @pytest.mark.parametrize(
     "tokens,groups,rows",
     [
         (2, 2, 16),
         (6, 1, 16),
+        (16, 1, 16),
         (4, 2, 16),
         (12, 2, 16),
         (1, 1, 2 * index_word_scores.MAX_BLOCK_ROWS),
     ],
 )
-def test_score_word_rows_matches_xla(tokens, groups, rows):
-    rng = np.random.default_rng(rows + tokens * 10 + groups)
+def test_score_word_rows_matches_xla(tokens, groups, rows, heads):
+    rng = np.random.default_rng(rows + tokens * 10 + groups + heads * 100)
     words = _words(rng, (groups, rows, ROW_WORDS))
-    q = jnp.asarray(rng.standard_normal((tokens, 3, 128)), jnp.bfloat16)
-    weights = jnp.asarray(rng.standard_normal((tokens, 3, 1)), jnp.float32)
+    q = jnp.asarray(rng.standard_normal((tokens, heads, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, heads, 1)), jnp.float32)
     out = index_word_scores.score_word_rows(q, weights, words, interpret=True)
     assert out.shape == (tokens, index_word_scores.SLOTS * rows)
     # Interpret mode sums on CPU; TPU is bitwise identical.
@@ -133,12 +135,20 @@ def test_paged_index_scores_word_path_matches_record_path(tokens, width, lengths
     np.testing.assert_array_equal(np.isfinite(paged), scored)
     valid = scored & (records >= 0)
     np.testing.assert_allclose(paged[valid], per_record[valid], rtol=1e-6, atol=1e-5)
+    masked = np.asarray(
+        ak.paged_index_scores_jax(
+            q, pool, jnp.asarray(records), weights, n, None, PAGE, mask_invalid=True
+        )
+    )
+    np.testing.assert_array_equal(np.isfinite(masked), valid)
+    np.testing.assert_allclose(masked[valid], per_record[valid], rtol=1e-6, atol=1e-5)
 
 
 @pytest.mark.parametrize(
     "tokens,requests,expected_groups",
     [
         (6, [1, 1, 1, 1, 1, 1], 1),
+        (12, [1] * 12, 1),
         (12, [0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2], 2),
         # tokens=6 with heterogeneous requests: can_group is False
         (6, [0, 0, 0, 1, 1, 1], 6),
@@ -169,17 +179,25 @@ def test_paged_index_scores_grouped_decode_requests(tokens, requests, expected_g
     with mock.patch.object(ak, "_score_word_rows", side_effect=_spy):
         grouped = np.asarray(
             ak.paged_index_scores_jax(
-                q, pool, records_arr, weights, lengths, req_arr, PAGE
+                q,
+                pool,
+                records_arr,
+                weights,
+                lengths,
+                req_arr,
+                PAGE,
+                mask_invalid=True,
             )
         )
     assert expected_groups in observed_groups
     expanded_records = np.asarray(records)[np.asarray(requests)]
     per_record = np.asarray(
         ak.paged_index_scores_jax(
-            q, pool, jnp.asarray(expanded_records), weights, lengths
+            q, pool, jnp.asarray(expanded_records), weights, lengths, mask_invalid=True
         )
     )
     valid = np.isfinite(per_record) & (expanded_records >= 0)
+    np.testing.assert_array_equal(np.isfinite(grouped), valid)
     np.testing.assert_allclose(grouped[valid], per_record[valid], rtol=1e-6, atol=1e-5)
 
 
