@@ -475,6 +475,10 @@ def _pair_kernel(
             out_ref[r0:r1, pl.ds(j * cols, cols)] = (partial * scale).astype(out_dtype)
 
 
+# The pair kernel covers one token tile of the fused op: 2T <= 1024 tokens.
+PAIR_MAX_TOKENS = 1024
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -509,13 +513,14 @@ def fused_reverse_rope_wo_a_projection_pair(
     [2T, G*H, head_dim] input whose tokens [0, T) are
     ``first[first_row0 + t, first_head0 + h]`` and tokens [T, 2T) are
     ``second[second_row0 + t, second_head0 + h]``, both read in place.
-    Bit-identical to the fused op on the assembled input, for 2T <= 1024.
+    Bit-identical to the fused op on the assembled input, for 2T <=
+    PAIR_MAX_TOKENS.
     """
     num_tokens = positions.shape[0] // 2
     reduction, out_features = wo_a.shape
     assert reduction % head_dim == 0 and reduction // head_dim == SUBLANE
     total = 2 * num_tokens
-    assert total <= 1024, "the pair kernel assumes a single token tile"
+    assert total <= PAIR_MAX_TOKENS, "the pair kernel assumes a single token tile"
     assert num_heads % SUBLANE == 0
     num_groups = num_heads // SUBLANE
     assert out_features % num_groups == 0

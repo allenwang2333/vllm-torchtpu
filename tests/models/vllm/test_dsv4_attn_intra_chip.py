@@ -12,6 +12,7 @@ import sys
 import threading
 import types
 
+import pytest
 import torch
 
 _MODULE = (
@@ -49,15 +50,26 @@ def _load_module(monkeypatch):
             "vllm_torchtpu.models.vllm",
             "vllm_torchtpu.models.vllm.deepseek_v4",
             "vllm_torchtpu.models.vllm.deepseek_v4.attention",
+            "vllm_torchtpu.kernels",
+            "vllm_torchtpu.kernels.deepseek_v4",
+            "vllm_torchtpu.kernels.deepseek_v4.o_projection",
+            "vllm_torchtpu.models.vllm.vllm_model_wrapper_context",
         )
     }
+    o_projection = stubs["vllm_torchtpu.kernels.deepseek_v4.o_projection"]
+    o_projection.PAIR_MAX_TOKENS = 1024
+    o_projection.fused_reverse_rope_wo_a_projection_pair = None
+    wrapper_context = stubs["vllm_torchtpu.models.vllm.vllm_model_wrapper_context"]
+    wrapper_context.get_pallas_op_mesh = None
     attention = stubs["vllm_torchtpu.models.vllm.deepseek_v4.attention"]
     attention.VllmDeepseekV4MLAAttention = _FakeBaseAttention
+    attention._pallas_op_cache = {}
     stubs["vllm.distributed"].parallel_state = types.SimpleNamespace()
     stubs["vllm.model_executor.layers.linear"].ColumnParallelLinear = object
     stubs["vllm.model_executor.layers.linear"].RowParallelLinear = object
     stubs["vllm_torchtpu"].envs = types.SimpleNamespace(
-        TPU_DSV4_ATTN_INTRA_CHIP_SWAP="allgather"
+        TPU_DSV4_ATTN_INTRA_CHIP_SWAP="allgather",
+
     )
     logger = types.SimpleNamespace(info=lambda *a: None, info_once=lambda *a: None,
                                    warning=lambda *a: None)
@@ -93,7 +105,8 @@ class _PairGroup:
         return sum(self.exchange(x)).chunk(2, dim)[self.rank_in_group]
 
 
-def test_matches_unsharded_reference(monkeypatch):
+@pytest.mark.parametrize("split", [False, True])
+def test_matches_unsharded_reference(monkeypatch, split):
     aic = _load_module(monkeypatch)
     torch.manual_seed(0)
     wq = torch.randn(R, H * D)
@@ -128,11 +141,25 @@ def test_matches_unsharded_reference(monkeypatch):
         layer.kv_rope = lambda kv, p: kv
         layer.forward_mqa = lambda q, kv, p, _, topk_indices=None: attn(q, p)
         layer.rotary_emb = types.SimpleNamespace(cos_sin_cache=None)
-        layer.o_proj_op = lambda o, p, c, w, s: torch.einsum(
-            "tgk,gko->tgo",
-            o.reshape(-1, G // 2, (H // G) * D) * pos_scale[p][:, None, None],
-            wa[groups],
-        ).reshape(-1, G // 2 * O)
+        def o_proj(o, p, c, w, s):
+            return torch.einsum(
+                "tgk,gko->tgo",
+                o.reshape(-1, G // 2, (H // G) * D) * pos_scale[p][:, None, None],
+                wa[groups],
+            ).reshape(-1, G // 2 * O)
+
+        def o_proj_pair(first, second, p, c, w, s):
+            # Core 0's tokens are first[:T] or my heads of first; see the op.
+            mine = first if rank == 0 else second
+            mine = mine[:, rank * H // 2 : (rank + 1) * H // 2]
+            gathered = second if rank == 0 else first
+            peer = gathered.view(2, T, H // 2, D)[1 - rank]
+            rows = [mine, peer] if rank == 0 else [peer, mine]
+            return o_proj(torch.cat(rows, dim=0), p, c, w, s)
+
+        layer.o_proj_op = o_proj
+        layer._split_wo_a = split
+        layer.__dict__["_o_proj_pair_op_instance"] = o_proj_pair
         layer.wo_b = lambda z: z @ wb[rows]
         layer.wo_a = types.SimpleNamespace(weight=None, weight_scale=None)
         return layer

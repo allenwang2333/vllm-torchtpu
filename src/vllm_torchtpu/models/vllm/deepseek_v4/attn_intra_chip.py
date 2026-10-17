@@ -32,6 +32,7 @@ from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
+    PAIR_MAX_TOKENS,
     fused_reverse_rope_wo_a_projection_pair,
 )
 from vllm_torchtpu.logger import init_logger
@@ -212,6 +213,11 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         for layer in (self.wq_b, self.wo_a, self.wo_b):
             _use_my_slice(layer, rank, size)
         object.__setattr__(self, "_chip_pair", group)
+        # The pair kernel covers one token tile; servers whose buckets can pass
+        # it run the split path at every size, so the traced graph is the same
+        # for all buckets.
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._split_wo_a = 2 * max_tokens > PAIR_MAX_TOKENS
         logger.info_once(
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
         )
@@ -299,19 +305,36 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         # place, core 0's tokens first (see `o_proj_pair_op`).
         theirs = o[:, (1 - rank) * half : (2 - rank) * half]
         gathered = group.all_gather(theirs.contiguous(), dim=0)
-        first, second = (o, gathered) if rank == 0 else (gathered, o)
         positions_all = group.all_gather(
             positions.to(torch.int32).contiguous(), dim=0
         ).to(positions.dtype)
-        z = self.o_proj_pair_op(
-            first,
-            second,
-            positions_all,
-            self.rotary_emb.cos_sin_cache,
-            self.wo_a.weight,
-            self.wo_a.weight_scale,
-        )
+        if self._split_wo_a:
+            z = self._o_proj_split(o, gathered, positions_all)
+        else:
+            first, second = (o, gathered) if rank == 0 else (gathered, o)
+            z = self.o_proj_pair_op(
+                first,
+                second,
+                positions_all,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a.weight,
+                self.wo_a.weight_scale,
+            )
         partial = self.wo_b(z)
         if isinstance(partial, tuple):
             partial = partial[0]
         return group.reduce_scatter(partial.contiguous(), dim=0)
+
+    def _o_proj_split(self, o, gathered, positions_all):
+        """wo_a on my tokens and on the peer's gathered rows separately."""
+        rank = self._chip_pair.rank_in_group
+        half = self.n_local_heads // 2
+        num_tokens = o.shape[0]
+        positions_by_core = positions_all.view(2, num_tokens)
+        mine = o[:, rank * half : (rank + 1) * half].contiguous()
+        peer = gathered.view(2, num_tokens, half, -1)[1 - rank]
+        args = (self.rotary_emb.cos_sin_cache, self.wo_a.weight, self.wo_a.weight_scale)
+        z_mine = self.o_proj_op(mine, positions_by_core[rank], *args)
+        z_peer = self.o_proj_op(peer, positions_by_core[1 - rank], *args)
+        pieces = [z_mine, z_peer] if rank == 0 else [z_peer, z_mine]
+        return torch.cat(pieces, dim=0)
