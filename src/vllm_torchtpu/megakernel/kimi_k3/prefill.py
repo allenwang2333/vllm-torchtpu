@@ -65,6 +65,7 @@ from vllm_torchtpu.megakernel.kimi_k3.program import (
     DCP_SIZE,
     HIDDEN_SIZE,
     TP_SIZE,
+    VOCAB,
     kernel_modules,
 )
 from vllm_torchtpu.megakernel.program import (
@@ -79,7 +80,6 @@ logger = init_logger(__name__)
 AXIS = "k3_sp"
 WINDOWS = (512, 1024, 2048, 4096, 8192)
 PAGE_TOKENS = 256
-VOCAB = 163840
 SLOTS = 16  # sequences per window, at most (and at most one per page)
 GROUP_PAIRS = 11  # regular 8-layer groups: layers 4..91
 COPY_PAIRS = 8  # copy-on-write block copies per PoolWriter.copy_blocks call

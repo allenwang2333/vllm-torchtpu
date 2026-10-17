@@ -20,6 +20,7 @@ TP_SIZE = 32
 DCP_SIZE = 32
 BLOCK_SIZE = 256
 HIDDEN_SIZE = 7168
+VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
 # Attention DP2's compiled request counts: half of each are one group's.
@@ -241,6 +242,10 @@ def capabilities(config: MegakernelEngineConfig) -> Capabilities:
         else config.max_num_batched_tokens,
         page_aligned_chunks=config.role == "prefill",
         block_copies=config.role == "prefill",
+        # The decoder's plain op masks its logits (the prefill discards its
+        # first tokens, so it only accepts the requests). DSpark's verify ops
+        # do not mask: a step with a structured request runs plain instead.
+        structured_outputs=True,
     )
 
 
