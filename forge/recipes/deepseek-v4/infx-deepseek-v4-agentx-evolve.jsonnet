@@ -144,7 +144,9 @@ local kvCacheDtype = cdk.var('KV_CACHE_DTYPE', 'fp8_e4m3');
 // it is allocated; vLLM's profile run under-counts that compile. See MAX_NUM_BATCHED_TOKENS above for 0.93.
 // 0.98 at MNBT128 (c=160): +15% KV (1.875M -> 2.156M tokens/rank) and booted cleanly in j-7d2883be and,
 // with intra-chip attention TP, j-9ce4b7ed (3.35M tokens/rank). Re-check if MNBT grows.
-local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.98');
+// 0.97 at c=192 (forge run 362mfwyj): at 0.98 a run logs ~4-9k ExecutePrepareWithOomRetries defragments (each
+// stalls all 16 ranks) and MNBT192 ~190k; at 0.97 none, T128 period mean ~82 vs ~85-86 ms (j-f0a950e7, j-78dccec8).
+local gpuMemoryUtilization = cdk.var('GPU_MEMORY_UTILIZATION', '0.97');
 local enablePrefixCaching = cdk.boolVar('ENABLE_PREFIX_CACHING', true);
 // Token interval between retained sliding-window prefix-cache checkpoints (vLLM CacheConfig
 // prefix_cache_retention_interval). 32768 and the env-var spelling are the InferenceX B200 setup
@@ -316,7 +318,14 @@ local srptHoldProgressGuard = cdk.var('TPU_SRPT_HOLD_PROGRESS_GUARD', '1');
 local offloadWindowCheckpointInterval = cdk.var('TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL', '32768');
 // Hash the windowed blocks Raiden stores (each checkpoint's EAGLE peek block): unhashed, a freed one is reused
 // at once and cancels its not-yet-launched store job, full-attention chunks included. Empty = off.
-local offloadHashCheckpointBlocks = cdk.var('TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS', '');
+// c=192: uncached prompt tokens 4,647 -> 4,367/4,374 per request (j-f3325d62 -> j-470176e6, j-ab94aec0).
+local offloadHashCheckpointBlocks = cdk.var('TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS', '1');
+// Static EP16 expert placement built from production per-expert counts (vllm-torchtpu expert_placement.py,
+// TPU_EXPERT_PLACEMENT; needs the fused EP kernel) and the shared-expert down GEMM issued before the fused
+// MoE kernel so it runs inside the token all-gather wait (MOE_FUSED_EP_SHARED_BEFORE_KERNEL). Together:
+// T128 period 85 -> 82 ms in j-070d0c07. Empty = off.
+local expertPlacement = cdk.var('TPU_EXPERT_PLACEMENT', 'dsv4_pro_agentx_ep16');
+local moeSharedBeforeKernel = cdk.var('MOE_FUSED_EP_SHARED_BEFORE_KERNEL', '1');
 // The DP routing hook sends a new session that shares >= 12 x 512 prompt tokens with a routed prompt
 // (a subagent and its parent) to that prompt's engine.
 local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFINITY', '1');
@@ -778,6 +787,8 @@ local serverJob = cdk.job(
           'TPU_BLOCK_TABLE_STAGE_RING',
           'TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO',
           'TPU_STREAMIDX_SPLIT_MIXED',
+          'TPU_EXPERT_PLACEMENT',
+          'MOE_FUSED_EP_SHARED_BEFORE_KERNEL',
           'TPU_PJRT_EVENT_TRACE_ENABLE',
           'USE_PHASED_PROFILER',
           'VLLM_TPU_MOST_MODEL_LEN',
@@ -811,6 +822,8 @@ local serverJob = cdk.job(
         [if srptHoldProgressGuard != '' then 'TPU_SRPT_HOLD_PROGRESS_GUARD']: srptHoldProgressGuard,
         [if offloadWindowCheckpointInterval != '' then 'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL']: offloadWindowCheckpointInterval,
         [if offloadHashCheckpointBlocks != '' then 'TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS']: offloadHashCheckpointBlocks,
+        [if expertPlacement != '' then 'TPU_EXPERT_PLACEMENT']: expertPlacement,
+        [if moeSharedBeforeKernel != '' then 'MOE_FUSED_EP_SHARED_BEFORE_KERNEL']: moeSharedBeforeKernel,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
