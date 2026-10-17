@@ -182,17 +182,15 @@ def compute_batched_seq_metadata(
     max_bkv = max(1, pl.cdiv(pages_per_seq, max_kv_pages_per_block))
 
     if chunked:
-        # A chunk can cut across a sequence tile, in which case we compute the
-        # block holding the seam twice: once for the tail of the first sequence,
-        # once for the head of the next. That is one extra block per tile the
-        # chunk touches, and it touches at most max_seq_tiles tiles, or at most
-        # chunk_tokens of them since a touched tile owns at least one token.
-        per_chunk_bq = min(
-            total_max_bq,
-            pl.cdiv(chunk_tokens, seq_batch_size * bq_sz)
-            + min(max_seq_tiles, chunk_tokens),
-        )
-        req_max_steps = num_chunks * per_chunk_bq * max_bkv
+        # The chunks partition the token axis, so across all of them a tile's
+        # blocks are its unchunked ones plus one for each cut through it (the
+        # block holding a cut is computed once per side). There are
+        # num_chunks - 1 cuts, so the schedule needs at most num_chunks - 1
+        # more blocks than the unchunked bound -- not num_chunks times it: a
+        # bound that grows with the chunk count pushes the scalar-prefetched
+        # schedule past what SMEM holds well (measured on tpu7x at 8 chunks of
+        # a 2048-token call: every pipeline step ~5x slower).
+        req_max_steps = (total_max_bq + num_chunks - 1) * max_bkv
     else:
         req_max_steps = total_max_bq * max_bkv
     req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024
