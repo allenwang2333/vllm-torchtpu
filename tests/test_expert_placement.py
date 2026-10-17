@@ -14,6 +14,7 @@
 """Host-side checks for TPU_EXPERT_PLACEMENT (vllm_torchtpu/expert_placement.py)."""
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -140,3 +141,16 @@ def test_a_drafter_layer_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
     with pytest.raises(ValueError, match="drafter layer"):
         expert_placement.apply_to_layer(_fake_layer("model.layers.7.ffn.experts", 0))
+
+
+def test_shipped_placements_resolve_by_name_and_parse():
+    shipped = sorted(os.listdir(expert_placement.PLACEMENT_DIR))
+    assert shipped
+    for f in shipped:
+        path = expert_placement.resolve(f[:-5])
+        assert path == os.path.join(expert_placement.PLACEMENT_DIR, f)
+        with open(path) as fh:
+            expert_placement.parse(json.load(fh), path)
+    with pytest.raises(FileNotFoundError, match="shipped placement"):
+        expert_placement.resolve("no_such_placement")
+    assert expert_placement.resolve("/tmp/x.json") == "/tmp/x.json"

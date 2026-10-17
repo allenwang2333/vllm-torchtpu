@@ -38,6 +38,7 @@ it; `check_layer_served` refuses anything else.
 
 import functools
 import json
+import os
 import re
 from dataclasses import dataclass
 
@@ -116,10 +117,28 @@ def _load(path: str) -> Placement:
         return parse(json.load(f), path)
 
 
+# Placements shipped with the package, by name (a file stem in this directory).
+PLACEMENT_DIR = os.path.join(os.path.dirname(__file__), "expert_placements")
+
+
+def resolve(value: str) -> str:
+    """A path as given, or a shipped placement's name -> its file."""
+    if os.sep in value or value.endswith(".json"):
+        return value
+    path = os.path.join(PLACEMENT_DIR, f"{value}.json")
+    if not os.path.exists(path):
+        shipped = sorted(f[:-5] for f in os.listdir(PLACEMENT_DIR))
+        raise FileNotFoundError(
+            f"TPU_EXPERT_PLACEMENT={value!r} is neither a path nor a shipped "
+            f"placement {shipped}"
+        )
+    return path
+
+
 def current() -> Placement | None:
     """The process's placement, or None when TPU_EXPERT_PLACEMENT is unset."""
-    path = envs.TPU_EXPERT_PLACEMENT
-    return _load(path) if path else None
+    value = envs.TPU_EXPERT_PLACEMENT
+    return _load(resolve(value)) if value else None
 
 
 def layer_index(name: str) -> int | None:
