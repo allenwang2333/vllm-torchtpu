@@ -152,7 +152,15 @@ _prequantized_matmul_ops: dict[torch.dtype, Callable] = {}
 _prequantized_matmul_ops_lock = Lock()
 
 
-def _get_prequantized_matmul_op(out_dtype: torch.dtype) -> Callable:
+def prequantized_matmul_op(out_dtype: torch.dtype) -> Callable:
+    """`quantized_matmul` (per-channel path) as an op on a 2-D activation its
+    producer already quantized per token: `op(x_q, x_scale, w_q, w_s)` with
+    `x_scale` [num_tokens, 1] f32, as `quantize_tensor` returns it, and an
+    `out_dtype` output.
+
+    Call it at model construction and keep the op: Dynamo cannot trace the
+    lock that guards creating it inside a compiled forward.
+    """
     with _prequantized_matmul_ops_lock:
         if out_dtype in _prequantized_matmul_ops:
             return _prequantized_matmul_ops[out_dtype]
@@ -181,19 +189,6 @@ def _get_prequantized_matmul_op(out_dtype: torch.dtype) -> Callable:
         op.register_fake(_fake_prequantized_matmul)
         _prequantized_matmul_ops[out_dtype] = op
         return op
-
-
-def prequantized_matmul(
-    x_q: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_q: torch.Tensor,
-    w_s: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    """`quantized_matmul` (per-channel path) on a 2-D activation its producer
-    already quantized per token, `x_scale` [num_tokens, 1] f32, as
-    `quantize_tensor` does; the output is `out_dtype`."""
-    return _get_prequantized_matmul_op(out_dtype)(x_q, x_scale, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(

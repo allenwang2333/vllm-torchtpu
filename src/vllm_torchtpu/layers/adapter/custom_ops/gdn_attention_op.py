@@ -50,7 +50,7 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
-    prequantized_matmul,
+    prequantized_matmul_op,
 )
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
@@ -649,6 +649,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         quant_out = self._pooled_op_quantizes_out = (
             gate_out and self._out_proj_takes_quantized_activation()
         )
+        # Built here, not on first use: forward runs under torch.compile.
+        self._out_proj_dtype = vllm_config.model_config.dtype
+        self._out_proj_prequantized_op = (
+            prequantized_matmul_op(self._out_proj_dtype) if quant_out else None
+        )
         pooled_outputs = (
             tuple[jax.Array, jax.Array, jax.Array]
             if quant_out
@@ -782,7 +787,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _out_proj_takes_quantized_activation(self) -> bool:
         """Whether out_proj runs `quantized_matmul`'s per-channel FP8 path on
         this device's whole activation, so it can take the activation already
-        quantized (`prequantized_matmul`) with the same result."""
+        quantized (`prequantized_matmul_op`) with the same result."""
         from vllm_torchtpu.layers.adapter.quantization.fp8 import (
             VllmFp8LinearMethodTPU,
         )
@@ -1171,13 +1176,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         raise RuntimeError(
                             "GDN op returned an incompatible output shape."
                         )
+                    if mixed_qkv.dtype != self._out_proj_dtype:
+                        raise RuntimeError(
+                            f"out_proj op built for {self._out_proj_dtype}, "
+                            f"activations are {mixed_qkv.dtype}."
+                        )
                     # out_proj on the activation the op already quantized.
-                    return prequantized_matmul(
+                    return self._out_proj_prequantized_op(
                         out_q,
                         out_scale,
                         self.out_proj.weight,
                         self.out_proj.weight_scale,
-                        mixed_qkv.dtype,
                     )
                 core_attn_out = pooled_out
                 gated = self._pooled_op_gates_out
