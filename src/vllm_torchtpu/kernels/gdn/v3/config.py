@@ -34,10 +34,10 @@ OUT_ZERO_ROWS = 16
 DEFAULT_VMEM_FRACTION = 0.7
 
 # Fewest tokens a launch pair applies the gated output norm for (`gate_out`).
-# Below it the norm runs in XLA on the projection's z slice: reading z widens
-# the DMA-bound decode body, and a decode bucket's norm is a few
-# microseconds in XLA. 0 gates in the kernel at every bucket.
-GATE_OUT_MIN_TOKENS = 512
+# Below it the norm runs after the launches, in XLA or in the output
+# epilogue. 0 gates in the kernel at every bucket: the z lane groups add
+# little to the decode body's DMA, which the per-sequence states dominate.
+GATE_OUT_MIN_TOKENS = 0
 
 # Run the PER_SEQ launch before the BATCHED one. On 1024-token steps XLA
 # overlaps an HBM-bound SparseCore relayout of the qkvz projection with
