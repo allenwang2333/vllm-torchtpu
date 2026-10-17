@@ -852,7 +852,8 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    emit_z: bool = False,
+) -> tuple[jnp.ndarray, ...]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
@@ -862,7 +863,8 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
 
     ``mixed_qkv`` may be the whole qkvz projection output: the kernel reads
-    only its leading ``conv_dim`` columns.
+    only its leading ``conv_dim`` columns, and with ``emit_z`` also returns
+    the trailing z gate token-major, the layout of the output it gates.
     """
 
     conv_dim = conv_weight.shape[0]
@@ -883,7 +885,7 @@ def run_jax_gdn_attention_pooled_local(
         qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
         recurrent_state_dtype=recurrent_state_dtype,
     )
-    recurrent_state, output = gdn_v3_wrapper.fused_conv1d_gdn(
+    return gdn_v3_wrapper.fused_conv1d_gdn(
         mixed_qkv,
         b,
         a,
@@ -908,8 +910,8 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         qkv_columns=conv_dim,
+        emit_z=emit_z,
     )
-    return recurrent_state, output
 
 
 def run_jax_gdn_attention_pooled(
@@ -937,7 +939,8 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    emit_z: bool = False,
+) -> tuple[jnp.ndarray, ...]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -970,11 +973,14 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        emit_z: `j_mixed_qkv` is the whole qkvz projection output; also
+          return its z gate in the output's layout.
 
     Returns:
         A tuple containing:
         - The updated pool (the in-place written state regions).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
+        - With `emit_z`, the z gate of shape `(num_tokens, n_v * d_v)`.
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
@@ -1008,6 +1014,8 @@ def run_jax_gdn_attention_pooled(
         pool_spec,  # new_recurrent_state (attention-shaped pool)
         P(None, "model"),  # output
     )
+    if emit_z:
+        out_specs = out_specs + (P(None, "model"),)  # z
 
     tp_size = get_mesh_shape_product(mesh, "model")
 
@@ -1021,6 +1029,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        emit_z=emit_z,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

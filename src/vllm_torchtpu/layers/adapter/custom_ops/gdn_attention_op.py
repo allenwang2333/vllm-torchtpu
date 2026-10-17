@@ -170,7 +170,8 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
-) -> tuple[jax.Array, jax.Array]:
+    emit_z: bool = False,
+) -> tuple[jax.Array, ...]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
         b,
@@ -195,6 +196,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        emit_z=emit_z,
     )
 
 
@@ -627,6 +629,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # the request's state block; rejected drafts are rolled back by
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
+        # With a combined qkvz projection the op is handed all of it and
+        # also returns z, laid out like the output it gates (see forward).
+        emit_z = self._pooled_op_emits_z = not hasattr(self, "in_proj_qkv")
+        returns = (
+            tuple[jax.Array, jax.Array, jax.Array]
+            if emit_z
+            else tuple[jax.Array, jax.Array]
+        )
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -646,7 +656,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
-        ) -> tuple[jax.Array, jax.Array]:
+        ) -> returns:
             return gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
@@ -677,6 +687,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                emit_z=emit_z,
             )
 
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
@@ -691,6 +702,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
             out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+            if emit_z:
+                return torch.empty_like(recurrent_state), out, torch.empty_like(out)
             return torch.empty_like(recurrent_state), out
 
         gdn_jax_op.register_fake(_fake_gdn)
@@ -710,8 +723,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            new_rec, outputs = gdn_jax_op(
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            new_rec, *outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
                 a,
@@ -731,7 +744,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
 
-            return outputs
+            # (output, z) with emit_z, else the output alone.
+            return tuple(outputs) if emit_z else outputs[0]
 
         return gdn_impl
 
@@ -1077,7 +1091,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
-                core_attn_out = self.gdn_pooled_op(
+                pooled_outputs = self.gdn_pooled_op(
                     pooled_qkv,
                     b,
                     a,
@@ -1093,6 +1107,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     slot_read_offsets,
                     ckpt_indices,
                 )
+                if self._pooled_op_emits_z:
+                    # z as the op lays it out, so the gate does not relayout
+                    # the projection.
+                    core_attn_out, z = pooled_outputs
+                    z = z.reshape(z.size(0), -1, self.head_v_dim)
+                else:
+                    core_attn_out = pooled_outputs
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
             else:
