@@ -30,6 +30,31 @@ sys.modules["select_pr_tests"] = select_pr_tests
 spec.loader.exec_module(select_pr_tests)
 
 
+_SAMPLE_TESTS_KUBE_YAML = """\
+steps:
+  - group: ":kubernetes: Unit Tests on TPU"
+    steps:
+      - label: ":kubernetes: Unit Tests - General (PR)"
+        key: "unit_tests_general_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 3
+        env:
+          SHAPE: *shape_single
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-cmd: "pytest -sv"
+
+      - label: ":kubernetes: Unit Tests - Speculative Decoding (PR)"
+        key: "unit_tests_spec_decode_pr"
+        <<: *tpu_step
+        if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 3
+"""
+
+
 class SelectPrTestsTest(unittest.TestCase):
     """Tests diff-aware PR test selection and YAML step filtering."""
 
@@ -164,26 +189,29 @@ class SelectPrTestsTest(unittest.TestCase):
         self.assertEqual(plan.omni_image_skip, "")
 
     def test_filter_yaml_injects_skip_and_test_pattern(self) -> None:
-        tests_kube = (REPO_ROOT / ".buildkite" / "pipeline_tests_kube.yml").read_text(
-            encoding="utf-8"
-        )
+        yaml_inputs = [_SAMPLE_TESTS_KUBE_YAML]
+        tests_kube_path = REPO_ROOT / ".buildkite" / "pipeline_tests_kube.yml"
+        if tests_kube_path.exists():
+            yaml_inputs.append(tests_kube_path.read_text(encoding="utf-8"))
+
         plan = select_pr_tests.select_for_files(["tests/lora/test_lora.py"])
-        filtered = select_pr_tests.filter_yaml_content(
-            yaml_text=tests_kube,
-            skip_steps=plan.skip_steps,
-            general_test_pattern=plan.general_test_pattern,
-            general_test_parallelism=plan.general_test_parallelism,
-            multichip_test_pattern=plan.multichip_test_pattern,
-        )
-        self.assertIn(
-            '              test-file-pattern: "tests/lora/test_lora.py"\n',
-            filtered,
-        )
-        self.assertIn("        parallelism: 1\n", filtered)
-        self.assertIn(
-            '        key: "unit_tests_spec_decode_pr"\n        skip: "',
-            filtered,
-        )
+        for tests_kube in yaml_inputs:
+            filtered = select_pr_tests.filter_yaml_content(
+                yaml_text=tests_kube,
+                skip_steps=plan.skip_steps,
+                general_test_pattern=plan.general_test_pattern,
+                general_test_parallelism=plan.general_test_parallelism,
+                multichip_test_pattern=plan.multichip_test_pattern,
+            )
+            self.assertIn(
+                '              test-file-pattern: "tests/lora/test_lora.py"\n',
+                filtered,
+            )
+            self.assertIn("        parallelism: 1\n", filtered)
+            self.assertIn(
+                '        key: "unit_tests_spec_decode_pr"\n        skip: "',
+                filtered,
+            )
         for reason in plan.skip_steps.values():
             self.assertLessEqual(len(reason), 70)
 
