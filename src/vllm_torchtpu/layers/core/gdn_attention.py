@@ -852,8 +852,9 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-    emit_z: bool = False,
-) -> tuple[jnp.ndarray, ...]:
+    out_norm_weight: jnp.ndarray | None = None,
+    out_norm_eps: float = 0.0,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
@@ -863,8 +864,9 @@ def run_jax_gdn_attention_pooled_local(
     kernel's state operands, so the kernel itself never sees the pool layout.
 
     ``mixed_qkv`` may be the whole qkvz projection output: the kernel reads
-    only its leading ``conv_dim`` columns, and with ``emit_z`` also returns
-    the trailing z gate token-major, the layout of the output it gates.
+    only its leading ``conv_dim`` columns. With ``out_norm_weight`` its
+    trailing columns are the z gate, and the output is the gated RMSNorm of
+    the GDN output (``fused_conv1d_gdn``'s ``out_norm_weight``).
     """
 
     conv_dim = conv_weight.shape[0]
@@ -910,7 +912,8 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         qkv_columns=conv_dim,
-        emit_z=emit_z,
+        out_norm_weight=out_norm_weight,
+        out_norm_eps=out_norm_eps,
     )
 
 
@@ -939,8 +942,9 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
-    emit_z: bool = False,
-) -> tuple[jnp.ndarray, ...]:
+    out_norm_weight: jnp.ndarray | None = None,
+    out_norm_eps: float = 0.0,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -973,14 +977,15 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
-        emit_z: `j_mixed_qkv` is the whole qkvz projection output; also
-          return its z gate in the output's layout.
+        out_norm_weight: `(d_v,)` RMSNormGated weight. When set,
+          `j_mixed_qkv` is the whole qkvz projection output and the output is
+          gated and normed with its z (see the local function).
+        out_norm_eps: That norm's epsilon.
 
     Returns:
         A tuple containing:
         - The updated pool (the in-place written state regions).
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
-        - With `emit_z`, the z gate of shape `(num_tokens, n_v * d_v)`.
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
@@ -1010,12 +1015,13 @@ def run_jax_gdn_attention_pooled(
         )
         in_specs = in_specs + (P(None, None),)
 
+    if out_norm_weight is not None:
+        in_specs = in_specs + (P(None),)  # out_norm_weight, last
+
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
         P(None, "model"),  # output
     )
-    if emit_z:
-        out_specs = out_specs + (P(None, "model"),)  # z
 
     tp_size = get_mesh_shape_product(mesh, "model")
 
@@ -1029,10 +1035,19 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
-        emit_z=emit_z,
+        out_norm_eps=out_norm_eps,
     )
+
+    def local_fn(*args):
+        if out_norm_weight is None:
+            return p_run_jax_gdn_attention_pooled_local(*args)
+        *args, norm_weight = args
+        return p_run_jax_gdn_attention_pooled_local(
+            *args, out_norm_weight=norm_weight
+        )
+
     mapped_fn = jax.shard_map(
-        p_run_jax_gdn_attention_pooled_local,
+        local_fn,
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -1055,6 +1070,8 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if out_norm_weight is not None:
+        extra_args = extra_args + (out_norm_weight,)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

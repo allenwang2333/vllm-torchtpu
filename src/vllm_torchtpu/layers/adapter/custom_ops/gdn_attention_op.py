@@ -160,6 +160,7 @@ def gdn_attention_pooled_core_tpu(
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
+    out_norm_weight: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -170,8 +171,8 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
-    emit_z: bool = False,
-) -> tuple[jax.Array, ...]:
+    out_norm_eps: float = 0.0,
+) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
         b,
@@ -196,7 +197,8 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
-        emit_z=emit_z,
+        out_norm_weight=out_norm_weight,
+        out_norm_eps=out_norm_eps,
     )
 
 
@@ -630,13 +632,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
         # With a combined qkvz projection the op is handed all of it and
-        # also returns z, laid out like the output it gates (see forward).
-        emit_z = self._pooled_op_emits_z = not hasattr(self, "in_proj_qkv")
-        returns = (
-            tuple[jax.Array, jax.Array, jax.Array]
-            if emit_z
-            else tuple[jax.Array, jax.Array]
+        # returns the output already through the gated norm (see forward).
+        gate_out = self._pooled_op_gates_out = (
+            not hasattr(self, "in_proj_qkv")
+            and self.norm.norm_before_gate
+            and self.norm.group_size is None
+            and getattr(self.norm, "activation", "swish") in ("silu", "swish")
         )
+        out_norm_eps = float(self.norm.eps)
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -654,9 +657,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             query_start_loc: jax.Array,
             distribution: jax.Array,
             seq_lens: jax.Array,
+            out_norm_weight: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
-        ) -> returns:
+        ) -> tuple[jax.Array, jax.Array]:
             return gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
@@ -672,6 +676,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                out_norm_weight if gate_out else None,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -687,7 +692,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
-                emit_z=emit_z,
+                out_norm_eps=out_norm_eps,
             )
 
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
@@ -702,8 +707,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             num_tokens = mixed_qkv.size(0)
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
             out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
-            if emit_z:
-                return torch.empty_like(recurrent_state), out, torch.empty_like(out)
             return torch.empty_like(recurrent_state), out
 
         gdn_jax_op.register_fake(_fake_gdn)
@@ -723,8 +726,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            new_rec, *outputs = gdn_jax_op(
+        ) -> torch.Tensor:
+            new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
                 a,
@@ -737,6 +740,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 query_start_loc,
                 request_distribution,
                 seq_lens,
+                self.norm.weight,
                 slot_read_offsets,
                 ckpt_indices,
             )
@@ -744,8 +748,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
 
-            # (output, z) with emit_z, else the output alone.
-            return tuple(outputs) if emit_z else outputs[0]
+            return outputs
 
         return gdn_impl
 
@@ -952,13 +955,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         )
 
     def _apply_output_projection(
-        self, core_attn_out: torch.Tensor, z: torch.Tensor, num_tokens: int
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        num_tokens: int,
+        gated: bool = False,
     ) -> torch.Tensor:
         local_num_v_heads = self.num_v_heads // self.tp_size
         core_attn_out = core_attn_out.view(
             num_tokens, local_num_v_heads, self.head_v_dim
         )
-        core_attn_out = self.norm(core_attn_out, z)
+        if not gated:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -1052,6 +1060,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Part 2: Core Attention (Custom Op)
         # ============================================================
         local_num_v_heads = self.num_v_heads // self.tp_size
+        # Whether the GDN op already applied the gated output norm.
+        gated = False
 
         # During warmup or memory profiling, the kv_cache might not be allocated yet
         if kv_cache is None or kv_cache[0].numel() == 0:
@@ -1091,7 +1101,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
-                pooled_outputs = self.gdn_pooled_op(
+                core_attn_out = self.gdn_pooled_op(
                     pooled_qkv,
                     b,
                     a,
@@ -1107,13 +1117,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     slot_read_offsets,
                     ckpt_indices,
                 )
-                if self._pooled_op_emits_z:
-                    # z as the op lays it out, so the gate does not relayout
-                    # the projection.
-                    core_attn_out, z = pooled_outputs
-                    z = z.reshape(z.size(0), -1, self.head_v_dim)
-                else:
-                    core_attn_out = pooled_outputs
+                gated = self._pooled_op_gates_out
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
             else:
@@ -1208,4 +1212,4 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._apply_output_projection(core_attn_out, z, num_tokens)
+        return self._apply_output_projection(core_attn_out, z, num_tokens, gated)
