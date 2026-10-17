@@ -72,14 +72,25 @@ def test_init_local_q_weights_keep_vllm_layout_disables(monkeypatch):
     assert attn._local_q_attn is False
 
 
+@pytest.mark.parametrize("compress_ratio", [0, 4])
+def test_init_local_q_weights_enables_compressed_and_pure_swa(
+    monkeypatch, compress_ratio
+):
+    attn = _stub(monkeypatch, compress_ratio=compress_ratio)
+    attn._fp8_kv = bool(compress_ratio)
+    attn._init_local_q_weights()
+    assert attn._local_q_attn is True
+    assert hasattr(attn, "_wq_b_full")
+
+
 @pytest.mark.parametrize(
     "kwargs,extra",
     [
         ({"enabled": False}, {}),
         ({"tp": 1}, {}),
-        ({"compress_ratio": 0}, {}),
         ({"compress_ratio": 4}, {"_fp8_kv": False}),
         ({"compress_ratio": 4}, {"_ced_decoder": True}),
+        ({"compress_ratio": 0}, {"_ced_decoder": True}),
         ({"groups": 2}, {}),
     ],
 )

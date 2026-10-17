@@ -1163,8 +1163,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             qr_local is not None
             and self._local_q_attn
             and tiled
-            and self._fp8_kv
-            and bool(self.compress_ratio)
+            and (self._fp8_kv or not self.compress_ratio)
         )
         q = None
         if not fused_qo:
@@ -1514,7 +1513,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             not envs.TPU_DEEPSEEK_V41_LOCAL_Q
             or tp_size <= 1
             or getattr(self, "_ced_decoder", False)
-            or not (self._fp8_kv and self.compress_ratio)
+            or (bool(self.compress_ratio) and not self._fp8_kv)
             or self.n_local_groups != 1
         ):
             return

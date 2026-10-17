@@ -1014,6 +1014,10 @@ def sparse_fp8_attention_jax(
         scale,
         max_requests=max_requests,
     )
+    if not main_records.shape[1]:
+        maximum, denominator, numerator = state
+        denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
+        return (numerator / denominator[..., None]).astype(q.dtype)
     # The SWA conditional holds SparseCore gathers, and XLA completes every
     # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
     # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA
@@ -1080,11 +1084,14 @@ def slice_token_parallel_attention_inputs(
     rank_idx = tp_rank.reshape(())
     start = rank_idx * tokens_local
     swa_local = jax.lax.dynamic_slice_in_dim(swa_records, start, tokens_local, axis=0)
-    main_local = (
-        main_records
-        if main_records.shape[0] == tokens_local
-        else jax.lax.dynamic_slice_in_dim(main_records, start, tokens_local, axis=0)
-    )
+    if not main_records.shape[1]:
+        main_local = jnp.empty((tokens_local, 0), dtype=main_records.dtype)
+    elif main_records.shape[0] == tokens_local:
+        main_local = main_records
+    else:
+        main_local = jax.lax.dynamic_slice_in_dim(
+            main_records, start, tokens_local, axis=0
+        )
     q_loc_local = jnp.clip(query_start_loc - start, 0, tokens_local)
     return swa_local, main_local, q_loc_local
 
@@ -1730,29 +1737,46 @@ def initialize_paged_attention():
                 ]
             q = _quantized_matmul_jax(q_in, wq, wqs)
             q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
-            q_tok = jax.lax.all_to_all(
-                q, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
-            )
-            s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
-                s_r, m_r, q_loc, r_id, tp_size, tokens
-            )
-            out_tok = sparse_fp8_attention_jax(
-                q_tok,
-                s_p,
-                m_p,
-                r_p,
-                s_r_tok,
-                m_r_tok,
-                pgs,
-                q_loc_tok,
-                f_snk,
-                **attn_kwargs,
-                gathered_nope=g_n,
-                gathered_rope=g_r,
-            )
-            out = jax.lax.all_to_all(
-                out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
-            )
+            if not m_r.shape[1]:
+                snk = jax.lax.dynamic_slice_in_dim(
+                    f_snk, r_id.reshape(()) * q.shape[1], q.shape[1], axis=0
+                )
+                out = sparse_fp8_attention_jax(
+                    q,
+                    s_p,
+                    m_p,
+                    r_p,
+                    s_r,
+                    m_r,
+                    pgs,
+                    q_loc,
+                    snk,
+                    **attn_kwargs,
+                )
+            else:
+                q_tok = jax.lax.all_to_all(
+                    q, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
+                )
+                s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
+                    s_r, m_r, q_loc, r_id, tp_size, tokens
+                )
+                out_tok = sparse_fp8_attention_jax(
+                    q_tok,
+                    s_p,
+                    m_p,
+                    r_p,
+                    s_r_tok,
+                    m_r_tok,
+                    pgs,
+                    q_loc_tok,
+                    f_snk,
+                    **attn_kwargs,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
+                )
+                out = jax.lax.all_to_all(
+                    out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
+                )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
             projected = _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
             if wb is not None:
@@ -2036,20 +2060,24 @@ def sparse_fp8_attention_qo(
     ``[T/tp, hidden]`` SP shard on the token-parallel path, the TP-partial
     ``[T, hidden]`` otherwise (see `fp8_attention_qo`).
     """
-    assert _fp8_attention_qo_op is not None and main.rope is not None
+    has_main = bool(main_records.shape[1])
+    assert _fp8_attention_qo_op is not None and (not has_main or main.rope is not None)
     local_wo_b = wo_b_full is not None
     page_size = main.shape[1]
-    if pages is None:
-        page_size, pages, starts = _resolve_fp8_pages(
-            main, main_records, positions.shape[0]
-        )
     tokens = positions.shape[0]
-    shards = _fp8_query_shards(tokens, _attention_tp_size, True)
-    if shards > 1 and main_records.shape[0] * shards == tokens:
-        shards = -shards
-    gathered = _gather_fp8_for_stage(
-        main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
-    )
+    if not has_main:
+        pages = swa_records[:, :1]
+        starts = swa_records[:, 0]
+        gathered: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
+    else:
+        if pages is None:
+            page_size, pages, starts = _resolve_fp8_pages(main, main_records, tokens)
+        shards = _fp8_query_shards(tokens, _attention_tp_size, True)
+        if shards > 1 and main_records.shape[0] * shards == tokens:
+            shards = -shards
+        gathered = _gather_fp8_for_stage(
+            main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
+        )
     tail_args = (
         swa_records.int(),
         main_records.int(),
@@ -2080,11 +2108,13 @@ def sparse_fp8_attention_qo(
             wo_b_full,
             wo_b_full_scale,
         )
+    rope_raw = main.rope if has_main else swa.raw
+    rope_hi = main.rope_hi if has_main else swa.raw_hi
     if _has_hi_bank(main):
         assert (
             _fp8_attention_qo_2bank_op is not None
             and swa.raw_hi is not None
-            and main.rope_hi is not None
+            and rope_hi is not None
         )
         op_2bank = (
             _fp8_attention_qo_2bank_wob_op if local_wo_b else _fp8_attention_qo_2bank_op
@@ -2103,12 +2133,12 @@ def sparse_fp8_attention_qo(
             swa.raw_hi,
             main.raw,
             main.raw_hi,
-            main.rope,
-            main.rope_hi,
+            rope_raw,
+            rope_hi,
             *tail_args,
         )
     op = _fp8_attention_qo_wob_op if local_wo_b else _fp8_attention_qo_op
-    assert op is not None
+    assert op is not None and rope_raw is not None
     return op(
         qr,
         qr_local,
@@ -2120,7 +2150,7 @@ def sparse_fp8_attention_qo(
         cos_sin_cache,
         swa.raw,
         main.raw,
-        main.rope,
+        rope_raw,
         *tail_args,
     )
 

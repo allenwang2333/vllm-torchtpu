@@ -2457,3 +2457,43 @@ def test_shard_quantized_matmul_matches_per_rank_wo_b_partials(shards):
     if shards > 1:
         single = xla_quantized_matmul(x, w_q, w_s)
         assert not np.array_equal(np.asarray(single), np.asarray(expected))
+
+
+def test_sparse_fp8_attention_jax_pure_swa_matches_paged_attention():
+    """When ``main_records`` has width 0 (pure SWA), ``sparse_fp8_attention_jax``
+    produces the exact same output as ``paged_attention_jax`` without reading
+    ``main_pool`` or ``rope_pool``."""
+    rng = np.random.default_rng(7)
+    tokens, heads, dim, window = 128, 4, 256, 64
+    rows = jnp.asarray(rng.standard_normal((256, dim)), jnp.bfloat16)
+    pool = jax.lax.bitcast_convert_type(rows.reshape(-1, 128, 2), jnp.int32)
+    q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    swa_records = (
+        jnp.arange(tokens, dtype=jnp.int32)[:, None]
+        - window
+        + 1
+        + jnp.arange(window, dtype=jnp.int32)[None, :]
+    )
+    swa_records = jnp.where(swa_records >= 0, swa_records, -1)
+    main_records = jnp.empty((tokens, 0), dtype=jnp.int32)
+    sink = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
+    pages = jnp.zeros((1, 1), dtype=jnp.int32)
+    starts = jnp.array([0, tokens], dtype=jnp.int32)
+
+    expected = attention_kernels.paged_attention_jax(
+        q, pool, pool, swa_records, main_records, sink, 0.125
+    )
+    actual = attention_kernels.sparse_fp8_attention_jax(
+        q,
+        pool,
+        pool,
+        pool,
+        swa_records,
+        main_records,
+        pages,
+        starts,
+        sink,
+        0.125,
+        page_size=64,
+    )
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
