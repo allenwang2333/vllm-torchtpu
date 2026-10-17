@@ -916,63 +916,72 @@ def scatter_pool_states(
                 v_cols_buf[g] = batch_to_i32_cols(vnew_buf[g])
 
         # 1. Double-buffered scatter of B new KV tokens across all c.NATT attention layers
+        me = lax.axis_index("tp").astype(I32) if c.dcp_size > 1 else jnp.int32(0)
+        dcp_size = c.dcp_size
+        dcp_rank = lax.rem(me, dcp_size) if dcp_size > 1 else jnp.int32(0)
+
         def scatter_single_token_across_att(s_idx, b_idx):
             p = pos_ref[b_idx]
-            lp = lax.div(p, c.page_size)
-            ln = lax.rem(p, c.page_size)
-            kp = pt_ref[s_idx, lp]
-            mask_ln = lane_iota == ln
-            # lane rotate (jnp.roll semantics) column b_idx onto lane ln
-            sh_b = lax.rem(ln + (c.page_size - lax.rem(b_idx, c.page_size)), c.page_size)
+            gp = lax.div(p, c.page_size)
+            owns = (lax.rem(gp, dcp_size) == dcp_rank) if dcp_size > 1 else jnp.bool_(True)
 
-            pltpu.make_async_copy(
-                raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
-            ).start()
-            if c.NATT >= 2:
+            @pl.when(owns)
+            def _():
+                lp = lax.div(gp, dcp_size) if dcp_size > 1 else gp
+                ln = lax.rem(p, c.page_size)
+                kp = pt_ref[s_idx, lp]
+                mask_ln = lane_iota == ln
+                # lane rotate (jnp.roll semantics) column b_idx onto lane ln
+                sh_b = lax.rem(ln + (c.page_size - lax.rem(b_idx, c.page_size)), c.page_size)
+
                 pltpu.make_async_copy(
-                    raw_out_refs[1].at[kp], kv_page.at[1], sem_kv_rd.at[1]
+                    raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
                 ).start()
-
-            for g in range(c.NATT):
-                k_slot = g & 1
-                if g >= 2:
+                if c.NATT >= 2:
                     pltpu.make_async_copy(
-                        kv_page.at[k_slot],
-                        raw_out_refs[g - 2].at[kp],
-                        sem_kv_wr.at[k_slot],
-                    ).wait()
-                pltpu.make_async_copy(
-                    raw_out_refs[g].at[kp], kv_page.at[k_slot], sem_kv_rd.at[k_slot]
-                ).wait()
-
-                k_cols = k_cols_buf[g] if NS > 1 else batch_to_i32_cols(knew_buf[g])
-                v_cols = v_cols_buf[g] if NS > 1 else batch_to_i32_cols(vnew_buf[g])
-                k_col = pltpu.roll(k_cols, sh_b, 1)
-                v_col = pltpu.roll(v_cols, sh_b, 1)
-                k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(64, c.page_size)
-                v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(64, c.page_size)
-                k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
-                v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
-
-                pltpu.make_async_copy(
-                    kv_page.at[k_slot],
-                    raw_out_refs[g].at[kp],
-                    sem_kv_wr.at[k_slot],
-                ).start()
-                if g + 2 < c.NATT:
-                    pltpu.make_async_copy(
-                        raw_out_refs[g + 2].at[kp],
-                        kv_page.at[k_slot],
-                        sem_kv_rd.at[k_slot],
+                        raw_out_refs[1].at[kp], kv_page.at[1], sem_kv_rd.at[1]
                     ).start()
 
-            for g_tail in range(max(0, c.NATT - 2), c.NATT):
-                tail_slot = g_tail & 1
-                pltpu.make_async_copy(
-                    kv_page.at[tail_slot],
-                    raw_out_refs[g_tail].at[kp],
-                    sem_kv_wr.at[tail_slot],
-                ).wait()
+                for g in range(c.NATT):
+                    k_slot = g & 1
+                    if g >= 2:
+                        pltpu.make_async_copy(
+                            kv_page.at[k_slot],
+                            raw_out_refs[g - 2].at[kp],
+                            sem_kv_wr.at[k_slot],
+                        ).wait()
+                    pltpu.make_async_copy(
+                        raw_out_refs[g].at[kp], kv_page.at[k_slot], sem_kv_rd.at[k_slot]
+                    ).wait()
+
+                    k_cols = k_cols_buf[g] if NS > 1 else batch_to_i32_cols(knew_buf[g])
+                    v_cols = v_cols_buf[g] if NS > 1 else batch_to_i32_cols(vnew_buf[g])
+                    k_col = pltpu.roll(k_cols, sh_b, 1)
+                    v_col = pltpu.roll(v_cols, sh_b, 1)
+                    k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(64, c.page_size)
+                    v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(64, c.page_size)
+                    k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
+                    v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
+
+                    pltpu.make_async_copy(
+                        kv_page.at[k_slot],
+                        raw_out_refs[g].at[kp],
+                        sem_kv_wr.at[k_slot],
+                    ).start()
+                    if g + 2 < c.NATT:
+                        pltpu.make_async_copy(
+                            raw_out_refs[g + 2].at[kp],
+                            kv_page.at[k_slot],
+                            sem_kv_rd.at[k_slot],
+                        ).start()
+
+                for g_tail in range(max(0, c.NATT - 2), c.NATT):
+                    tail_slot = g_tail & 1
+                    pltpu.make_async_copy(
+                        kv_page.at[tail_slot],
+                        raw_out_refs[g_tail].at[kp],
+                        sem_kv_wr.at[tail_slot],
+                    ).wait()
 
         if T == 1:
             def scatter_kv_row(b, _):
@@ -991,14 +1000,16 @@ def scatter_pool_states(
                 @pl.when(is_active(s))
                 def _():
                     b0 = s * T
-                    lp0 = lax.div(pos_ref[b0], c.page_size)
+                    gp0 = lax.div(pos_ref[b0], c.page_size)
+                    owns0 = (lax.rem(gp0, dcp_size) == dcp_rank) if dcp_size > 1 else jnp.bool_(True)
+                    lp0 = lax.div(gp0, dcp_size) if dcp_size > 1 else gp0
                     same_page = jnp.bool_(True)
                     for t in range(1, T):
                         same_page = jnp.logical_and(
-                            same_page, lax.div(pos_ref[b0 + t], c.page_size) == lp0
+                            same_page, lax.div(pos_ref[b0 + t], c.page_size) == gp0
                         )
 
-                    @pl.when(same_page)
+                    @pl.when(jnp.logical_and(same_page, owns0))
                     def _():
                         kp = pt_ref[s, lp0]
                         ln_list = [lax.rem(pos_ref[b0 + t], c.page_size) for t in range(T)]

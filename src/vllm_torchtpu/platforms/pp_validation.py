@@ -90,7 +90,7 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif (
         parallel_config.prefill_context_parallel_size > 1
         and vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+        and vllm_config.kv_transfer_config.kv_connector not in ("TPURaidenConnector", "TPUMultiConnector")
     ):
         # These connectors pair a stage with its peer through one pool per
         # device; a context-parallel stage spreads a request over several.
@@ -122,7 +122,7 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         )
     elif (
         vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+        and vllm_config.kv_transfer_config.kv_connector not in ("TPURaidenConnector", "TPUMultiConnector")
     ):
         # The raiden connector transfers each stage's own layers; the
         # other connectors assume every worker holds every layer.

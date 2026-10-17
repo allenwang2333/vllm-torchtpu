@@ -249,6 +249,13 @@ def maybe_share_embeddings(
             raise RuntimeError(
                 "Draft embedding sharing requires target_lm.model.embed_tokens"
             )
+        if not hasattr(target_embed, "weight"):
+            logger.info(
+                "Target embed_tokens (%s) has no weight on this pipeline stage; "
+                "keeping draft's own loaded embed_tokens.",
+                type(target_embed).__name__,
+            )
+            return
         if tp_layout_matches:
             logger.info(
                 "Sharing the target's embed_tokens with the draft using the "
@@ -370,6 +377,13 @@ def maybe_share_lm_head(
         share_lm_head = True
 
     if share_lm_head:
+        if not hasattr(target_lm_head, "weight"):
+            logger.info(
+                "Target lm_head (%s) has no weight on this pipeline stage; "
+                "keeping draft's own loaded lm_head.",
+                type(target_lm_head).__name__,
+            )
+            return
         if tp_layout_matches:
             logger.info(
                 "Sharing the target's lm_head with the draft using the same TP layout."

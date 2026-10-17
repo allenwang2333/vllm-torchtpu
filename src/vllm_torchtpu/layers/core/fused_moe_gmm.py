@@ -371,7 +371,9 @@ def prepare_routed_gmm_inputs(
         group_sizes_local = group_sizes_local.sum(axis=0)
 
     if token_indices_sorted is None:
-        if packable:
+        if sorted_indices is not None:
+            token_indices_sorted = sorted_indices // topk
+        elif packable:
             # Packing (key, token) into one int32 keeps the payload out of the sort
             # and drops the follow-up gather. Equal packed values carry the same
             # token id, so their order cannot matter.

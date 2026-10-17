@@ -3555,7 +3555,7 @@ class TPUModelRunner(GPUModelRunner):
             # optimistically; roll back the over-count (= num_rejected) so it
             # reflects the real committed length (start_idx + len(sampled_ids)).
             end_idx = int(num_tokens_no_spec[req_idx])
-            start_idx = end_idx - n_placeholder
+            start_idx = max(0, end_idx - n_placeholder)
             end_tok_idx = start_idx + n_sampled
             num_tokens_no_spec[req_idx] = end_tok_idx
 
@@ -6675,6 +6675,7 @@ class TPUModelRunner(GPUModelRunner):
                     and (
                         self.speculative_config is None
                         or self.speculative_config.draft_tensor_parallel_size != 1
+                        or self.parallel_config.tensor_parallel_size == 1
                     )
                 ):
                     drafter._skip_next_multi_chunk_draft_cat = True
@@ -7252,6 +7253,7 @@ class TPUModelRunner(GPUModelRunner):
                         assert self.speculative_config is not None
                         replicated_draft = (
                             self.speculative_config.draft_tensor_parallel_size == 1
+                            and self.parallel_config.tensor_parallel_size > 1
                         )
                     if replicated_draft:
                         impl.decode_query_size = 1
@@ -7733,8 +7735,16 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
+        has_mamba = (
+            self._has_mamba_state
+            or (
+                self.kv_cache_config is not None
+                and self.kv_cache_config.has_mamba_layers
+            )
+            or getattr(self.model_config, "is_hybrid", False)
+        )
         block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+            has_mamba and self.cache_config.mamba_cache_mode == "align"
         )
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
@@ -9687,7 +9697,12 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=[
+                        max(t + 1, len(self.requests[r].output_token_ids))
+                        if r in self.requests
+                        else t + 1
+                        for r in rids
+                    ],
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -9752,7 +9767,15 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=[
+                            max(
+                                n_decode + 1 + vi,
+                                len(self.requests[r].output_token_ids),
+                            )
+                            if r in self.requests
+                            else n_decode + 1 + vi
+                            for r in rids
+                        ],
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -9857,7 +9880,11 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=[
+                        max(t + 1, len(self.requests[rid].output_token_ids))
+                        if rid in self.requests
+                        else t + 1
+                    ],
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq

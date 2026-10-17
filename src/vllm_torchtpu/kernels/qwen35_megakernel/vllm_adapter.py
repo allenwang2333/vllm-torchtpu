@@ -41,9 +41,7 @@ from typing import Any
 
 import jax
 try:
-    import vllm.envs as _vllm_envs
-
-    _vcr = _vllm_envs.VLLM_CACHE_ROOT
+    _vcr = os.environ.get("VLLM_CACHE_ROOT", "")
     if _vcr and _vcr.startswith("/compile-cache"):
         _jcd = os.path.join(os.path.dirname(_vcr.rstrip("/")), "jax_cache")
         os.makedirs(_jcd, exist_ok=True)
@@ -90,8 +88,28 @@ _DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 # `(4, 64)` and `(4, b1)` Pallas kernels without exceeding the 62 MiB VMEM limit
 # or falling back to slow stock_t4_b96 / stock_t4_b128 (256-padded XLA).
 _DEFAULT_WIDE_VERIFY_BUCKETS_128 = (80, 84, 88, 96, 104, 112, 120, 128)
+_DEFAULT_WIDE_VERIFY_BUCKETS_160 = (80, 84, 88, 96, 104, 112, 120, 128, 136, 144, 160)
 _MAX_SINGLE_KERNEL_B = 80
 _SPLIT_BASE_B = 80
+_OPTIMAL_WIDE_SPLIT_PAIRS: dict[int, tuple[int, int]] = {
+    84: (64, 20),
+    88: (48, 40),
+    96: (56, 40),
+    104: (56, 48),
+    112: (56, 56),
+    120: (64, 56),
+    128: (80, 48),
+    136: (80, 56),
+    144: (80, 64),
+    160: (80, 80),
+}
+
+
+def _optimal_split_pair(b: int) -> tuple[int, int]:
+    pair = _OPTIMAL_WIDE_SPLIT_PAIRS.get(int(b))
+    if pair is not None:
+        return pair
+    return (_SPLIT_BASE_B, int(b) - _SPLIT_BASE_B)
 
 
 def _env_off(name: str, default: str = "1") -> bool:
@@ -231,7 +249,7 @@ def parse_mk_verify_buckets(env_val: str | None = None) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
     _need(
-        len(buckets) > 0 and all(4 <= b <= 128 and b % 4 == 0 for b in buckets),
+        len(buckets) > 0 and all(4 <= b <= 160 and b % 4 == 0 for b in buckets),
         f"invalid VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS={raw!r}",
     )
     return tuple(buckets)
@@ -308,10 +326,12 @@ _MK_TILE_ENV_BOOL = {
     "VLLM_TPU_QWEN35_MK_ROUTE_VEC": "route_vec",
     "VLLM_TPU_QWEN35_MK_DENSE_ACC": "dense_acc_pair",
     "VLLM_TPU_QWEN35_MK_R2_DIRECT": "r2_direct_store",
+    "VLLM_TPU_QWEN35_MK_DCP_FAST_RMW": "dcp_fast_rmw",
 }
 _MK_TILE_ENV_INT = {
     "VLLM_TPU_QWEN35_MK_AMASK": "amask",
     "VLLM_TPU_QWEN35_MK_ECOPY_OPT": "ecopy_opt",
+    "VLLM_TPU_QWEN35_MK_FUSE_ATT_NEW": "fuse_att_new",
 }
 
 
@@ -1748,6 +1768,7 @@ class Qwen35Megakernel:
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.dcp_size = int(getattr(getattr(runner, "parallel_config", None), "decode_context_parallel_size", 1) or 1)
         _need(
             self.tp_size in (8, 16),
             f"tp_size={self.tp_size} must be 8 or 16",
@@ -1798,6 +1819,7 @@ class Qwen35Megakernel:
                     e_slots=0,
                     paged_kv=True,
                     fused_pool_io=self.fused_pool_io,
+                    dcp_size=self.dcp_size,
                 )
             else:
                 e_slots = int(
@@ -1812,6 +1834,7 @@ class Qwen35Megakernel:
                     e_slots=e_slots,
                     paged_kv=True,
                     fused_pool_io=self.fused_pool_io,
+                    dcp_size=self.dcp_size,
                 )
 
             packed = pack_weights(
@@ -1938,12 +1961,11 @@ class Qwen35Megakernel:
         ]
         self.attn_layer_name = self.backbone.layers[3].self_attn.attn.layer_name
 
-        # The stock GDN op and the KV connectors place manager block b's GDN
-        # state at kernel page b * (block_size // page_size), so checkpoint
-        # slots sit that many pages apart. They read the finalized
-        # cache_config.block_size; runner.block_size is a snapshot taken
-        # before the platform adjusts the block size after the model load.
-        block_size = int(runner.vllm_config.cache_config.block_size)
+        # The stock GDN op and the KV connectors place manager block b's GDN state at kernel page
+        # b * (block_size // page_size), so checkpoint slots sit that many pages apart.
+        block_size = int(
+            getattr(runner, "block_size", 0) or runner.vllm_config.cache_config.block_size
+        )
         _need(
             block_size % self.page_size == 0,
             f"vLLM block_size {block_size} is not a multiple of the kernel page size {self.page_size}",
@@ -1957,7 +1979,7 @@ class Qwen35Megakernel:
 
         self.base_cfg = dataclasses.replace(
             self.base_cfg,
-            ctx=max(self.base_cfg.ctx, self.max_pages_per_seq * self.page_size),
+            ctx=max(self.base_cfg.ctx, self.max_pages_per_seq * self.page_size * self.dcp_size),
             num_pages=self.num_pages,
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
@@ -2022,13 +2044,22 @@ class Qwen35Megakernel:
         )
         if runner_max_reqs <= 16:
             return
-        target_rows = min(128, 4 * runner_max_reqs)
-        max_wide = select_bucket(target_rows, _DEFAULT_WIDE_VERIFY_BUCKETS_128)
+        wide_160 = not _env_off(
+            "VLLM_TPU_QWEN35_MK_WIDE_160",
+            "1" if (runner_max_reqs > 32 or self.dcp_size > 1) else "0",
+        )
+        wide_list = _DEFAULT_WIDE_VERIFY_BUCKETS_160 if wide_160 else _DEFAULT_WIDE_VERIFY_BUCKETS_128
+        target_rows = min(160 if wide_160 else 128, 4 * runner_max_reqs)
+        max_wide = select_bucket(target_rows, wide_list)
         wide_extra = [
             b
-            for b in _DEFAULT_WIDE_VERIFY_BUCKETS_128
+            for b in wide_list
             if b <= max_wide
-            and (b <= _MAX_SINGLE_KERNEL_B or (b - _SPLIT_BASE_B) in self.verify_buckets)
+            and (
+                b <= _MAX_SINGLE_KERNEL_B
+                or (b - _SPLIT_BASE_B) in self.verify_buckets
+                or (b - _SPLIT_BASE_B) <= _MAX_SINGLE_KERNEL_B
+            )
             and b not in self.verify_buckets
         ]
         if wide_extra:
@@ -2082,8 +2113,8 @@ class Qwen35Megakernel:
                 self._bucket_steps[b] = step
             self._bucket_out_rows[(T, b)] = out_rows
         for T, b in split_keys:
-            b1 = b - _SPLIT_BASE_B
-            m_rows = _SPLIT_BASE_B + max(16, K.rup(b1, 16))
+            b0, b1 = _optimal_split_pair(b)
+            m_rows = max(16, K.rup(b0, 16)) + max(16, K.rup(b1, 16))
             out_rows = self._runner_out_rows(b, m_rows)
             step = self._build_split_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
             self._bucket_steps[(T, b)] = step
@@ -2584,12 +2615,10 @@ class Qwen35Megakernel:
         B = int(bucket_t)
         if B % T != 0:
             raise ValueError(f"bucket_t={B} must be a multiple of tokens_per_seq={T}")
-        b0 = _SPLIT_BASE_B
-        b1 = B - b0
-        if b1 <= 0 or b1 > _SPLIT_BASE_B or b1 % T != 0:
+        b0, b1 = _optimal_split_pair(B)
+        if b0 <= 0 or b1 <= 0 or b0 + b1 != B or b0 % T != 0 or b1 % T != 0:
             raise ValueError(
-                f"Split bucket requires {_SPLIT_BASE_B} < B <= {2 * _SPLIT_BASE_B} "
-                f"and B % {T} == 0, got B={B}"
+                f"Split bucket requires b0+b1==B and multiples of T={T}, got B={B} -> ({b0}, {b1})"
             )
         s0_len = b0 // T
         s1_len = b1 // T
@@ -2617,7 +2646,7 @@ class Qwen35Megakernel:
 
         m_rows_0 = dataclasses.replace(self.base_cfg, B=b0, T=T).M
         m_rows_1 = dataclasses.replace(self.base_cfg, B=b1, T=T).M
-        m_rows_total = b0 + max(16, K.rup(b1, 16))
+        m_rows_total = max(16, K.rup(b0, 16)) + max(16, K.rup(b1, 16))
         target_out_rows = int(out_pad_rows or m_rows_total)
 
         logger.info(
@@ -2997,7 +3026,7 @@ class Qwen35Megakernel:
             or getattr(runner, "max_num_reqs", 64)
             or 64
         )
-        max_warm_b = min(128, max(16, max_cfg_seqs * 4))
+        max_warm_b = min(160, max(16, max_cfg_seqs * 4))
         all_keys = [
             (1, b) for b in self.buckets if b <= max_warm_b
         ] + [
@@ -3159,11 +3188,15 @@ class Qwen35Megakernel:
                                 if do_sentinel:
                                     do_sentinel = False
                                     sentinel_checked = True
-                                    kv_ok = not torch.equal(
-                                        self.raw_pools[0][0]
-                                        .view(torch.uint8)
-                                        .cpu(),
-                                        sent_kv,
+                                    kv_ok = (
+                                        True
+                                        if (self.tp_rank % self.dcp_size) != 0
+                                        else not torch.equal(
+                                            self.raw_pools[0][0]
+                                            .view(torch.uint8)
+                                            .cpu(),
+                                            sent_kv,
+                                        )
                                     )
                                     gdn_ok = not torch.equal(
                                         self.raw_pools[0][gdn_sent]
@@ -3266,9 +3299,13 @@ class Qwen35Megakernel:
                                 synchronize_tensors([out_b, *self.raw_pools])
                             if do_sentinel:
                                 sentinel_checked = True
-                                kv_ok = not torch.equal(
-                                    self.raw_pools[0][0].view(torch.uint8).cpu(),
-                                    sent_kv,
+                                kv_ok = (
+                                    True
+                                    if (self.tp_rank % self.dcp_size) != 0
+                                    else not torch.equal(
+                                        self.raw_pools[0][0].view(torch.uint8).cpu(),
+                                        sent_kv,
+                                    )
                                 )
                                 gdn_ok = not torch.equal(
                                     self.raw_pools[0][gdn_sent].view(torch.uint8).cpu(),

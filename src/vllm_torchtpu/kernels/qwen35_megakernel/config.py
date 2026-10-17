@@ -206,6 +206,7 @@ class MKConfig:
     # Raiden place manager block b's GDN state at page b * (block_size // page_size), so a vLLM
     # block larger than gdn_pages * page_size tokens (e.g. 1280 at TP8) leaves a gap per slot.
     gdn_stride_pages: int = 0
+    dcp_size: int = 1
     fused_pool_io: bool = False  # P1+P2: gather/scatter GDN & KV states directly in raw[0..14]
     act_mode: str = "from_ckpt"  # "from_ckpt", "all", or "ref" when fused_pool_io=True
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
@@ -333,6 +334,7 @@ class MKConfig:
     def check(self):
         assert self.L % self.att_every == 0 and self.NH % self.R == 0 and self.R % self.NKV == 0
         assert self.KH % self.R == 0 and self.VH % self.R == 0 and self.E % self.R == 0
+        assert self.dcp_size in (1, 2, 4) and self.G % self.dcp_size == 0
         assert self.IS % self.R == 0 and (not self.moe_tp or self.I % self.R == 0)
         assert self.vh <= 64 and self.B * self.TOPK <= 1280 and 1 <= self.B <= self.M <= 128
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
@@ -433,6 +435,19 @@ class Tiles:
     # two ring stages at once, so the ring is raised to >= 4 stages (double-buffered pairs; with
     # kv_ering the ring already has NBE >= 12 stages).
     pair_kv: bool = True
+    # DCP >= 2 single-page RMW prefetch across 128-token page boundaries: because T <= page_size
+    # consecutive tokens touch at most 2 consecutive global pages (gp0, gp0+1) and gp0 % dcp_size
+    # != (gp0+1) % dcp_size for dcp_size >= 2, each DCP rank owns at most ONE page per sequence
+    # per step. Prefetching that rank-owned page in kvrd_issue and masking per-token lanes by
+    # owns_t in kv_rmw handles both same_page and page-crossing steps in 1 prefetched read + 1 write
+    # and eliminates the synchronous per-token RMW fallback loop.
+    dcp_fast_rmw: bool = True
+    # Fuse att_merge -> att_new state handoff and overlap local verify Q*Knew dot products with
+    # the att_merge 3-peer ICI exchange:
+    # 0 = baseline (write am/al/aacc to VMEM in att_merge, reload in att_new, compute s_new after wait)
+    # 1 = register-direct (m_old, l_old, a_old) handoff from att_merge to att_new (no am/al/aacc VMEM RMW)
+    # 2 = register-direct handoff + precompute qf/qblk and s_new during att_merge ICI wait window
+    fuse_att_new: int = 2
 
     def tk(self, K, N, dtype, bank):
         """Largest 128-multiple divisor of K whose [tk, N] tile fits a `bank`-byte slot."""
@@ -539,7 +554,8 @@ def default_tiles(c: MKConfig) -> Tiles:
     if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_NBD:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
     if c.NGDN == 0:
-        t = dataclasses.replace(t, nbd=14)
+        t = dataclasses.replace(t, nbd=14 if c.B <= 64 else 10)
+    t = dataclasses.replace(t, dcp_fast_rmw=bool(c.dcp_size > 1 and c.B != 64), fuse_att_new=2)
     return t
 
 

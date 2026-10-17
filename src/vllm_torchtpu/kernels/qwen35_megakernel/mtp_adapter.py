@@ -64,8 +64,20 @@ logger = init_logger(__name__)
 
 # Rows per draft step: one per request in the loop, K + 1 = 4 per request at
 # step 0. Larger steps keep the XLA draft layer.
-_DEFAULT_LOOP_BUCKETS = (4, 8, 12, 16, 20, 24, 28, 32)
-_DEFAULT_VERIFY_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
+_WIDE_160_ON = (
+    os.environ.get("VLLM_TPU_QWEN35_MK_WIDE_160", "0") == "1"
+    or int(os.environ.get("TPU_SCHED_MK_MAX_RUNNING", "32") or 32) > 32
+)
+_DEFAULT_LOOP_BUCKETS = (
+    (4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48)
+    if _WIDE_160_ON
+    else (4, 8, 12, 16, 20, 24, 28, 32)
+)
+_DEFAULT_VERIFY_BUCKETS = (
+    (4, 8, 16, 24, 32, 48, 64, 80)
+    if _WIDE_160_ON
+    else (4, 8, 16, 24, 32, 48, 64)
+)
 _NUM_SPEC_TOKENS = 3
 # `K.W_NAMES` leaves of a one-layer stack: lin_in .. sh2, e13, e2, es, smalls,
 # final_norm. The experts are the layer's own parameters.
@@ -80,27 +92,10 @@ def _parse_buckets(name: str, default: Sequence[int]) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x) for x in raw.split(",") if x.strip()})
     _need(
-        all(4 <= b <= 64 and b % 4 == 0 for b in buckets),
+        all(4 <= b <= 80 and b % 4 == 0 for b in buckets),
         f"invalid {name}={raw!r}",
     )
     return tuple(buckets)
-
-
-def _padded(n: int, paddings: Sequence[int]) -> int:
-    """`n` rounded up to the runner's token padding (`n` itself past the largest)."""
-    return next((p for p in sorted(paddings) if p >= n), n)
-
-
-def _covering_buckets(
-    raw: Sequence[int], cap: int, paddings: Sequence[int]
-) -> tuple[int, ...]:
-    """The buckets of `raw` up to the first one that holds `cap` rows after the runner
-    pads them (a step of `cap` rows arrives padded, e.g. 28 requests as 32 rows)."""
-    need = _padded(cap, paddings)
-    keep = [b for b in raw if b <= need]
-    if not keep or keep[-1] < need:
-        keep += [b for b in raw if b > need][:1]
-    return tuple(keep) or (raw[0],)
 
 
 def _fit(x: jax.Array, rows: int) -> jax.Array:
@@ -215,6 +210,7 @@ class Qwen35MtpMegakernel:
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.dcp_size = int(getattr(getattr(runner, "parallel_config", None), "decode_context_parallel_size", 1) or 1)
         _need(self.tp_size in (8, 16), f"tp_size={self.tp_size} must be 8 or 16")
         _need(get_pp_group().world_size == 1, "pipeline parallelism")
 
@@ -222,6 +218,7 @@ class Qwen35MtpMegakernel:
             K.FULL_EP,
             R=self.tp_size,
             L=1,
+            dcp_size=self.dcp_size,
             att_every=1,
             moe_tp=False,
             stack_e=False,
@@ -271,21 +268,26 @@ class Qwen35MtpMegakernel:
         self.tiles = K.default_tiles(base_cfg)
         self.tk = K.plan(base_cfg, self.tiles)["tk"]
         max_reqs = int(getattr(runner, "max_num_reqs", 0) or 0)
-        self._paddings = tuple(
-            int(x) for x in getattr(runner, "num_tokens_paddings", ()) or ()
-        )
+        wide_160 = _WIDE_160_ON or max_reqs > 32 or getattr(self, "dcp_size", 1) > 1
+        def_loop = (4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48) if wide_160 else _DEFAULT_LOOP_BUCKETS
+        def_verify = (4, 8, 16, 24, 32, 48, 64, 80) if wide_160 else _DEFAULT_VERIFY_BUCKETS
         raw_loop = _parse_buckets(
-            "VLLM_TPU_QWEN35_MTP_MK_BUCKETS", _DEFAULT_LOOP_BUCKETS
+            "VLLM_TPU_QWEN35_MTP_MK_BUCKETS", def_loop
         )
         raw_verify = _parse_buckets(
             "VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS",
-            _DEFAULT_VERIFY_BUCKETS,
+            def_verify,
         )
         if max_reqs > 0:
-            self.loop_buckets = _covering_buckets(raw_loop, max_reqs, self._paddings)
-            self.verify_buckets = _covering_buckets(
-                raw_verify, (_NUM_SPEC_TOKENS + 1) * max_reqs, self._paddings
+            # Runner compile_sizes pads 33..40 requests up to 48 rows in the T=1 draft loop
+            max_loop = 48 if (max_reqs > 32 and max_reqs <= 48) else max_reqs
+            self.loop_buckets = tuple(b for b in raw_loop if b <= max_loop) or (
+                raw_loop[0],
             )
+            max_verify = (_NUM_SPEC_TOKENS + 1) * max_reqs
+            self.verify_buckets = tuple(
+                b for b in raw_verify if b <= max_verify
+            ) or (raw_verify[0],)
         else:
             self.loop_buckets = raw_loop
             self.verify_buckets = raw_verify
@@ -390,7 +392,7 @@ class Qwen35MtpMegakernel:
                 self.base_cfg,
                 T=T,
                 B=B,
-                ctx=width * self.page_size,
+                ctx=width * self.page_size * self.dcp_size,
                 num_pages=self.num_pages,
                 page_size=self.page_size,
                 max_pages_per_seq=width,
@@ -561,15 +563,6 @@ class Qwen35MtpMegakernel:
             fake=fake,
         )
 
-    def padded_rows(self, rows: int) -> int:
-        """The rows a draft step of `rows` rows arrives at after the runner pads it.
-
-        `use_for_step` admits step-0 steps up to `padded_rows((K + 1) *
-        max_num_reqs)` rows, so the step-0 program must compile every token
-        bucket up to that count.
-        """
-        return _padded(rows, self._paddings)
-
     def use_for_step(self, attn_metadata: Any, num_rows: int, *, step0: bool) -> bool:
         """Whether a draft step of `num_rows` rows runs on the megakernel.
 
@@ -582,13 +575,8 @@ class Qwen35MtpMegakernel:
             if isinstance(attn_metadata, dict)
             else None
         )
-        # A step-0 step arrives padded to the runner's token bucket: its rows past the
-        # requests' K + 1 tokens each are inert (no live sequence, no gather index).
         max_rows = (
-            min(
-                buckets[-1] * 2,
-                self.padded_rows(int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1)),
-            )
+            min(buckets[-1] * 2, int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1))
             if (step0 and md is not None)
             else (buckets[-1] * 2 if step0 else buckets[-1])
         )

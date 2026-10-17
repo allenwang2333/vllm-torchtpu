@@ -61,19 +61,30 @@ class PagedAttentionBlock:
         c, scr, ST, pos_ref = ctx.c, ctx.scr, ctx.ST, ctx.pos_ref
         NS, T, BLK, max_nb = ctx.NS, ctx.T, ctx.BLK, ctx.max_nb
         SPLIT, TS, gi = ctx.SPLIT, ctx.TS, ctx.gi
+        dcp_size = c.dcp_size
+        BLK_G = BLK * dcp_size
+        TS_LOCAL = (TS // dcp_size) if SPLIT else 1
+        gi_rep = lax.div(gi, dcp_size) if SPLIT else jnp.int32(0)
+        max_nb_local = (max_nb + dcp_size - 1) // dcp_size
         n = jnp.int32(0)
         for b in range(NS):
-            nb = jnp.minimum(jnp.maximum((pos_ref[b * T] + BLK - 1) // BLK, 0), max_nb)
-            t0 = lax.rem(gi + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
-            cnt = jnp.maximum(nb - t0 + TS - 1, 0) // TS
+            nb = jnp.minimum(
+                jnp.maximum((pos_ref[b * T] + BLK_G - 1) // BLK_G, 0), max_nb_local
+            )
+            t0 = (
+                lax.rem(gi_rep + (TS_LOCAL - b % TS_LOCAL), TS_LOCAL)
+                if (SPLIT and TS_LOCAL > 1)
+                else jnp.int32(0)
+            )
+            cnt = jnp.maximum(nb - t0 + TS_LOCAL - 1, 0) // TS_LOCAL
 
             def put(j, carry, b=b, t0=t0, n=n):
                 scr["wl_b"][n + j] = jnp.int32(b)
-                scr["wl_t"][n + j] = t0 + j * TS
+                scr["wl_t"][n + j] = t0 + j * TS_LOCAL
                 if c.paged_kv:
                     pt_ref_ = ST["page_table"]
                     pb = BLK // c.page_size
-                    p0 = (t0 + j * TS) * pb
+                    p0 = (t0 + j * TS_LOCAL) * pb
                     k0 = (n + j) * pb
                     for p in range(pb):
                         col = jnp.minimum(p0 + p, c.max_pages_per_seq - 1)
@@ -558,6 +569,11 @@ class PagedAttentionBlock:
                 if (c.paged_kv and AMASK == 0)
                 else None
             )
+            if c.dcp_size > 1 and c.paged_kv:
+                dcp_rank = lax.rem(ctx.me, c.dcp_size)
+                col = (lax.div(col, c.page_size) * c.dcp_size + dcp_rank) * c.page_size + lax.rem(col, c.page_size)
+                if col_v is not None:
+                    col_v = (lax.div(col_v, c.page_size) * c.dcp_size + dcp_rank) * c.page_size + lax.rem(col_v, c.page_size)
             am[...] = jnp.full(am.shape, -1e30, F32)
             al[...] = jnp.zeros(al.shape, F32)
             aacc[...] = jnp.zeros(aacc.shape, F32)
@@ -588,9 +604,9 @@ class PagedAttentionBlock:
                             v_full = pltpu.bitcast(v_u32, FP8)
                 outs = []
                 for j in range(BLK // SUB):
-                    off = t * BLK + j * SUB
+                    off = (t * BLK + j * SUB) * c.dcp_size
                     rem = plen - off
-                    full_blk = off + SUB <= plen
+                    full_blk = off + SUB * c.dcp_size <= plen
                     if c.paged_kv:
                         kj = k_full if SUB == BLK else k_full[:, j * SUB:(j + 1) * SUB]
                         if AMASK == 0:
@@ -739,6 +755,97 @@ class PagedAttentionBlock:
                     d.start()
             return mx
 
+        FUSE_NEW = int(getattr(tiles, "fuse_att_new", 0))
+        VEC_SEQ_NEW = bool(SPLIT and not GQ and VER and PACK and QV and PB == T and QG == 8)
+        NR = nh if PACK else 8
+        row_q_pb = lax.broadcasted_iota(I32, (QG, 1), 0) if VEC_SEQ_NEW else None
+        tile0_snews = None
+
+        def _att_new_row(b, m_old, l_old, a_old):
+            sq, tb = divmod(b, T)
+            if QV:
+                qf = jnp.concatenate(
+                    [scr["qg"][gi, j, b * SR:b * SR + NR, :] for j in range(NHH)],
+                    axis=-1,
+                )
+            elif PACK:
+                t_, o_ = qrow(b)
+                qf = scr["qg"][gi, t_, o_:o_ + nh]
+            else:
+                qf = (
+                    scr["qg"][gi, b]
+                    if SPLIT or VER
+                    else scr["qb"][b].astype(F32)
+                )
+            if VER:
+                for j in range(tb + 1):
+                    bj = sq * T + j
+                    s_new = jnp.sum(
+                        qf * scr["knew"][bj:bj + 1, :], axis=-1, keepdims=True
+                    )
+                    m_new = jnp.maximum(m_old, s_new)
+                    alpha = jnp.exp(m_old - m_new)
+                    p_new = jnp.exp(s_new - m_new)
+                    l_old = l_old * alpha + p_new
+                    a_old = a_old * alpha + p_new * scr["vnew"][bj:bj + 1, :]
+                    m_old = m_new
+                outb = a_old / l_old
+            else:
+                s_new = jnp.sum(
+                    qf * scr["knew"][b:b + 1, :], axis=-1, keepdims=True
+                )
+                m_new = jnp.maximum(m_old, s_new)
+                alpha = jnp.exp(m_old - m_new)
+                p_new = jnp.exp(s_new - m_new)
+                l_tot = l_old * alpha + p_new
+                outb = (
+                    a_old * alpha + p_new * scr["vnew"][b:b + 1, :]
+                ) / l_tot
+            if QV:
+                ob = rnd(outb[:nh])
+                for j in range(NHH):
+                    scr["ost"][j, b * SR:b * SR + nh, :] = ob[
+                        :, j * 128:(j + 1) * 128
+                    ]
+                return
+            for h in range(nh):
+                oh = rnd(outb[h:h + 1, :])
+                gh = scr["gate"][b:b + 1, h * HD:(h + 1) * HD]
+                if not SPLIT:
+                    gh = rnd(jax.nn.sigmoid(gh))
+                scr["mix"][b:b + 1, h * HD:(h + 1) * HD] = rnd(oh * gh)
+
+        def _att_new_seq_tile(sq, m_old, l_old, a_old, s_news_pre=None):
+            r0 = sq * QG
+            if s_news_pre is None:
+                qblk = jnp.concatenate(
+                    [scr["qg"][gi, j, r0:r0 + QG, :] for j in range(NHH)], axis=-1
+                )
+            for j in range(T):
+                bj = sq * T + j
+                s_new = (
+                    s_news_pre[j]
+                    if s_news_pre is not None
+                    else jnp.sum(
+                        qblk * scr["knew"][bj:bj + 1, :], axis=-1, keepdims=True
+                    )
+                )
+                m_new = jnp.maximum(m_old, s_new)
+                alpha = jnp.exp(m_old - m_new)
+                p_new = jnp.exp(s_new - m_new)
+                l_new = l_old * alpha + p_new
+                a_new = a_old * alpha + p_new * scr["vnew"][bj:bj + 1, :]
+                if j == 0:
+                    m_old, l_old, a_old = m_new, l_new, a_new
+                else:
+                    upd = row_q_pb >= j * nh
+                    m_old = jnp.where(upd, m_new, m_old)
+                    l_old = jnp.where(upd, l_new, l_old)
+                    a_old = jnp.where(upd, a_new, a_old)
+            ob = rnd(a_old / l_old)
+            for j in range(NHH):
+                scr["ost"][j, r0:r0 + QG, :] = ob[:, j * 128:(j + 1) * 128]
+
         if SPLIT:
             mx = gq_merge_start() if GQ else slab_merge_start()
             pri = scr["pri"]
@@ -748,6 +855,16 @@ class PagedAttentionBlock:
                     kv_dma.kv_rmw(a)
             with sc("att_gate"):  # output gates of all rows (att_new reads them)
                 scr["gate"][0:B, :] = rnd(jax.nn.sigmoid(scr["gate"][0:B, :]))
+                if FUSE_NEW >= 2 and VEC_SEQ_NEW and NBP > 0:
+                    qblk0 = jnp.concatenate(
+                        [scr["qg"][gi, j, 0:QG, :] for j in range(NHH)], axis=-1
+                    )
+                    tile0_snews = [
+                        jnp.sum(
+                            qblk0 * scr["knew"][j:j + 1, :], axis=-1, keepdims=True
+                        )
+                        for j in range(T)
+                    ]
             with sc("att_merge"):
                 for d in mx:
                     d.wait_recv()
@@ -762,22 +879,38 @@ class PagedAttentionBlock:
                     wg = [jnp.exp(x - m) for x in mg]
                     lsum = sum(w * x[:, HD + 64:HD + 65] for w, x in zip(wg, parts))
                     asum = sum(w * x[:, :HD] for w, x in zip(wg, parts))
+                    if FUSE_NEW >= 2 and VEC_SEQ_NEW:
+                        _att_new_seq_tile(
+                            t, m, lsum, asum, tile0_snews if t == 0 else None
+                        )
+                        continue
                     if not PACK:  # tile t is row t
-                        sq, q0 = t // T, (t % T) * QR
-                        am[sq, q0:q0 + 8] = jnp.broadcast_to(m, (8, 128))
-                        al[sq, q0:q0 + 8] = jnp.broadcast_to(lsum, (8, 128))
-                        aacc[sq, q0:q0 + 8] = asum
+                        if FUSE_NEW >= 1:
+                            _att_new_row(t, m[:8], lsum[:8], asum[:8])
+                        else:
+                            sq, q0 = t // T, (t % T) * QR
+                            am[sq, q0:q0 + 8] = jnp.broadcast_to(m, (8, 128))
+                            al[sq, q0:q0 + 8] = jnp.broadcast_to(lsum, (8, 128))
+                            aacc[sq, q0:q0 + 8] = asum
                         continue
                     for b in range(t * PB, min(B, (t + 1) * PB)):
                         o_ = qrow(b)[1]
-                        sq, q0 = b // T, (b % T) * QR
-                        am[sq, q0:q0 + nh] = jnp.broadcast_to(
-                            m[o_:o_ + nh], (nh, 128)
-                        )
-                        al[sq, q0:q0 + nh] = jnp.broadcast_to(
-                            lsum[o_:o_ + nh], (nh, 128)
-                        )
-                        aacc[sq, q0:q0 + nh] = asum[o_:o_ + nh]
+                        if FUSE_NEW >= 1:
+                            _att_new_row(
+                                b,
+                                m[o_:o_ + nh],
+                                lsum[o_:o_ + nh],
+                                asum[o_:o_ + nh],
+                            )
+                        else:
+                            sq, q0 = b // T, (b % T) * QR
+                            am[sq, q0:q0 + nh] = jnp.broadcast_to(
+                                m[o_:o_ + nh], (nh, 128)
+                            )
+                            al[sq, q0:q0 + nh] = jnp.broadcast_to(
+                                lsum[o_:o_ + nh], (nh, 128)
+                            )
+                            aacc[sq, q0:q0 + nh] = asum[o_:o_ + nh]
 
         with sc("att_new"):
             if GQ:
@@ -800,9 +933,6 @@ class PagedAttentionBlock:
                     qblk = jnp.concatenate(
                         [scr["qg"][0, j, r0:r0 + QG, :] for j in range(NHH)], axis=-1
                     )
-                    # new tokens, all T tokens' rows at once: row r (token r // nh) takes new
-                    # token j's update iff j <= r // nh, so each row sees exactly the same update
-                    # sequence as the per-token chain (j = 0 .. t)
                     m_old, l_old, a_old = m, lsum, asum
                     for j in range(T):
                         bj = sq * T + j
@@ -824,67 +954,14 @@ class PagedAttentionBlock:
                     ob = rnd(a_old / l_old)  # park rnd(out): flattened rows b * nh + h
                     for j in range(NHH):
                         scr["ost"][j, r0:r0 + QG, :] = ob[:, j * 128:(j + 1) * 128]
-            else:
-                NR = nh if PACK else 8  # softmax-state rows: rows 0..nh-1 are own heads
+            elif not (SPLIT and FUSE_NEW >= 1):
                 for b in range(B):
-                    # the new tokens' columns; rows q0 .. q0+NR-1 of KV row sq's softmax state are
-                    # row b's (own heads in rows q0 .. q0+nh-1)
                     sq, tb = divmod(b, T)
                     q0 = tb * QR
                     m_old = am[sq, q0:q0 + NR][:, 0:1]
                     l_old = al[sq, q0:q0 + NR][:, 0:1]
                     a_old = aacc[sq, q0:q0 + NR]
-                    if QV:  # PACK: rows b * SR .. + nh; else the row's 8-row tile (rows nh.. zero)
-                        qf = jnp.concatenate(
-                            [scr["qg"][gi, j, b * SR:b * SR + NR, :] for j in range(NHH)],
-                            axis=-1,
-                        )
-                    elif PACK:
-                        t_, o_ = qrow(b)
-                        qf = scr["qg"][gi, t_, o_:o_ + nh]
-                    else:
-                        qf = (
-                            scr["qg"][gi, b]
-                            if SPLIT or VER
-                            else scr["qb"][b].astype(F32)
-                        )
-                    if VER:  # token tb sees new tokens 0..tb of its sequence
-                        for j in range(tb + 1):
-                            bj = sq * T + j
-                            s_new = jnp.sum(
-                                qf * scr["knew"][bj:bj + 1, :], axis=-1, keepdims=True
-                            )
-                            m_new = jnp.maximum(m_old, s_new)
-                            alpha = jnp.exp(m_old - m_new)
-                            p_new = jnp.exp(s_new - m_new)
-                            l_old = l_old * alpha + p_new
-                            a_old = a_old * alpha + p_new * scr["vnew"][bj:bj + 1, :]
-                            m_old = m_new
-                        outb = a_old / l_old
-                    else:
-                        s_new = jnp.sum(
-                            qf * scr["knew"][b:b + 1, :], axis=-1, keepdims=True
-                        )
-                        m_new = jnp.maximum(m_old, s_new)
-                        alpha = jnp.exp(m_old - m_new)
-                        p_new = jnp.exp(s_new - m_new)
-                        l_tot = l_old * alpha + p_new
-                        outb = (
-                            a_old * alpha + p_new * scr["vnew"][b:b + 1, :]
-                        ) / l_tot
-                    if QV:  # park rnd(out) of the own heads as flattened rows b * SR + h
-                        ob = rnd(outb[:nh])
-                        for j in range(NHH):
-                            scr["ost"][j, b * SR:b * SR + nh, :] = ob[
-                                :, j * 128:(j + 1) * 128
-                            ]
-                        continue
-                    for h in range(nh):
-                        oh = rnd(outb[h:h + 1, :])
-                        gh = scr["gate"][b:b + 1, h * HD:(h + 1) * HD]
-                        if not SPLIT:
-                            gh = rnd(jax.nn.sigmoid(gh))
-                        scr["mix"][b:b + 1, h * HD:(h + 1) * HD] = rnd(oh * gh)
+                    _att_new_row(b, m_old, l_old, a_old)
             if QV:  # gate, product and rounding on [B, HD] blocks: head h of all rows at once
                 for h in range(nh):
                     oh = jnp.concatenate(

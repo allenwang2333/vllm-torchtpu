@@ -22,7 +22,7 @@ then chunks are cut by token count alone.
 import math
 from typing import Any, cast
 
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core.pp_chunks import StepCostModel
@@ -47,7 +47,20 @@ def _prefill_end(request: Any) -> int:
     return max(request.num_prompt_tokens, request.num_tokens - 1)
 
 
-class TpuPipelineChunkScheduler(Scheduler):
+class TpuPipelineChunkScheduler(PrefixAwareScheduler):
+    def _cap_cold_prefill_tokens(
+        self,
+        request: Any,
+        start_computed_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        # Pipeline chunk sizing uses StepCostModel in _mamba_block_aligned_split.
+        return num_new_tokens
+
+    def _midblock_stop_skip_tokens(
+        self, request: Any, start: int, num_new_tokens: int
+    ) -> int:
+        return 0
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._cost: StepCostModel | None = None
@@ -160,6 +173,7 @@ class TpuPipelineChunkScheduler(Scheduler):
             if request.request_id not in self._seeded:
                 self._account(num_new_tokens, start)
             return num_new_tokens
+        orig_new_tokens = num_new_tokens
         if self._cost is not None and num_new_tokens > 0:
             cap = self._cost.chunk(
                 start,
@@ -172,7 +186,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             )
             if cap == 0 and self._step_prefill_tokens == 0:
                 # The first prefill chunk of a step always advances.
-                cap = min(num_new_tokens, self._cost.granularity)
+                min_step = (
+                    max(self._cost.granularity, self.block_size)
+                    if self._mamba_split
+                    else self._cost.granularity
+                )
+                cap = min(num_new_tokens, min_step)
             if cap == 0:
                 self._waits += 1
             elif cap < num_new_tokens:
@@ -188,12 +207,29 @@ class TpuPipelineChunkScheduler(Scheduler):
                 )
             num_new_tokens = cap
         if self._mamba_split and num_new_tokens > 0:
-            num_new_tokens = super()._mamba_block_aligned_split(
+            aligned = super()._mamba_block_aligned_split(
                 request,
                 num_new_tokens,
                 num_new_local_computed_tokens,
                 num_external_computed_tokens,
             )
+            if (
+                aligned == 0
+                and self._step_prefill_tokens == 0
+                and orig_new_tokens >= self.block_size
+            ):
+                min_step = (
+                    max(self.block_size, self._cost.granularity)
+                    if self._cost is not None
+                    else self.block_size
+                )
+                aligned = super()._mamba_block_aligned_split(
+                    request,
+                    min(orig_new_tokens, min_step),
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
+            num_new_tokens = aligned
         self._account(num_new_tokens, start)
         self._step_prefill_tokens += num_new_tokens
         if self._cost is not None:

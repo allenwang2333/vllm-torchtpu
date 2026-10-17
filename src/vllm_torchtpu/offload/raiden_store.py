@@ -2598,15 +2598,30 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Read by raiden's host memory allocator: prefer, rather than bind to,
         # the TPU's NUMA node when placing host pages.
         os.environ.setdefault("RAIDEN_NUMA_POLICY", "preferred")
-        max_cpu_bytes = int(os.environ.get("TPU_RAIDEN_MAX_CPU_BYTES", "560000000000"))
-        if int(cpu_bytes_to_use) > max_cpu_bytes:
-            logger.info(
-                "TPURaidenOffloadingConnector: capping cpu_bytes_to_use from %s "
-                "to %d (TPU_RAIDEN_MAX_CPU_BYTES) for host RAM headroom",
-                cpu_bytes_to_use,
-                max_cpu_bytes,
+        if parallel.pp_size > 1:
+            pp_target_bytes = int(
+                os.environ.get("TPU_RAIDEN_PP_MAX_CPU_BYTES", "550000000000")
             )
-            cpu_bytes_to_use = max_cpu_bytes
+            if int(cpu_bytes_to_use) != pp_target_bytes:
+                logger.info(
+                    "TPURaidenOffloadingConnector: setting PP cpu_bytes_to_use "
+                    "from %s to %d (TPU_RAIDEN_PP_MAX_CPU_BYTES) for host RAM headroom",
+                    cpu_bytes_to_use,
+                    pp_target_bytes,
+                )
+                cpu_bytes_to_use = pp_target_bytes
+        else:
+            max_cpu_bytes = int(
+                os.environ.get("TPU_RAIDEN_MAX_CPU_BYTES", "560000000000")
+            )
+            if int(cpu_bytes_to_use) > max_cpu_bytes:
+                logger.info(
+                    "TPURaidenOffloadingConnector: capping cpu_bytes_to_use from %s "
+                    "to %d (TPU_RAIDEN_MAX_CPU_BYTES) for host RAM headroom",
+                    cpu_bytes_to_use,
+                    max_cpu_bytes,
+                )
+                cpu_bytes_to_use = max_cpu_bytes
 
         (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
             resolve_kernel_geometry(vllm_config, kv_cache_config)

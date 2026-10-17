@@ -100,7 +100,7 @@ def legal_tile(rows: int, cap: int) -> int:
 def default_vreg_step(cols: int) -> int:
     """Select an inner VREG sub-tile row step keeping live fp32 arrays in 64 VREGs."""
     vregs_per_row = max(1, (cols + VREG_F32_LANES - 1) // VREG_F32_LANES)
-    return max(16, (TARGET_VREG_BUDGET // vregs_per_row // 8) * 8)
+    return max(32, (TARGET_VREG_BUDGET // vregs_per_row // 32) * 32)
 
 
 def default_tile_cap(tokens: int, cols: int) -> int:
@@ -117,7 +117,8 @@ def default_tile_cap(tokens: int, cols: int) -> int:
     if tokens <= 256:
         dma_cap = max(8, (tokens // 6 // 8) * 8)
         return min(vreg_cap, dma_cap)
-    return max(vreg_cap, 512)
+    budget_cap = max(32, ((12 << 20) // (10 * max(cols, 1))) // 32 * 32)
+    return min(max(vreg_cap, 512), budget_cap)
 
 
 def gated_norm_quant(

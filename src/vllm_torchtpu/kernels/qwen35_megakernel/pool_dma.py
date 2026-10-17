@@ -440,16 +440,32 @@ class KVPoolDMA:
         kv_scat = scr["kv_scat_page"]
         rd_sem = scr["kv_rd_sem"]
         rd_pend = scr["kv_rd_pend"]
+        dcp_size = c.dcp_size
+        dcp_rank = lax.rem(ctx.me, dcp_size) if dcp_size > 1 else jnp.int32(0)
+        dcp_fast = bool(ctx.tiles.dcp_fast_rmw and dcp_size > 1 and T <= c.page_size)
         for s in range(NS):
             self.wait_kv_wr(s)
             act_s = self.is_seq_active(s)
-            same_s = self.seq_same_page(s)
-            do_rd = jnp.logical_and(act_s, same_s)
+            b0 = s * T
+            if dcp_fast:
+                gp_my = lax.div(pos_ref[b0], c.page_size)
+                owns_any = lax.rem(gp_my, dcp_size) == dcp_rank
+                for t in range(1, T):
+                    gp_t = lax.div(pos_ref[b0 + t], c.page_size)
+                    owns_t = lax.rem(gp_t, dcp_size) == dcp_rank
+                    gp_my = jnp.where(owns_t, gp_t, gp_my)
+                    owns_any = jnp.logical_or(owns_any, owns_t)
+                do_rd = jnp.logical_and(act_s, owns_any)
+            else:
+                same_s = self.seq_same_page(s)
+                gp_my = lax.div(pos_ref[b0], c.page_size)
+                owns0 = (lax.rem(gp_my, dcp_size) == dcp_rank) if dcp_size > 1 else jnp.bool_(True)
+                do_rd = jnp.logical_and(jnp.logical_and(act_s, same_s), owns0)
             rd_pend[s] = jnp.where(do_rd, 1, 0).astype(I32)
 
             @pl.when(do_rd)
-            def _(s=s):
-                lp0 = lax.div(pos_ref[s * T], c.page_size)
+            def _(s=s, gp_my=gp_my):
+                lp0 = lax.div(gp_my, dcp_size) if dcp_size > 1 else gp_my
                 kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
 
                 def issue_rd(r):
@@ -481,9 +497,12 @@ class KVPoolDMA:
         lane_iota_kv = lax.broadcasted_iota(I32, (64, c.page_size), 1)
         k_cols = self.batch_to_i32_cols(scr["knew_o"][...])
         v_cols = self.batch_to_i32_cols(scr["vnew_o"][...])
+        dcp_size = c.dcp_size
+        dcp_rank = lax.rem(ctx.me, dcp_size) if dcp_size > 1 else jnp.int32(0)
+        dcp_fast = bool(ctx.tiles.dcp_fast_rmw and dcp_size > 1 and T <= c.page_size)
         for s in range(NS):
             act_s = self.is_seq_active(s)
-            same_s = self.seq_same_page(s)
+            same_s = jnp.bool_(True) if dcp_fast else self.seq_same_page(s)
             do_fast = rd_pend[s] != 0
             rd_pend[s] = jnp.int32(0)
 
@@ -499,14 +518,20 @@ class KVPoolDMA:
                     v_view = kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
                     k_cur = k_view[...]
                     v_cur = v_view[...]
+                gp_my = lax.div(pos_ref[b0], c.page_size)
                 for t in range(T):
                     # lane rotate (jnp.roll semantics) column b0+t onto lane
                     # pos % page_size instead of a masked 128-lane reduction
                     p_t = pos_ref[b0 + t]
+                    gp_t = lax.div(p_t, c.page_size)
                     ln_t = lax.rem(p_t, c.page_size)
                     sh_t = lax.rem(
                         ln_t + (c.page_size - (b0 + t) % c.page_size), c.page_size
                     )
+                    if dcp_fast:
+                        owns_t = lax.rem(gp_t, dcp_size) == dcp_rank
+                        gp_my = jnp.where(owns_t, gp_t, gp_my)
+                        ln_t = jnp.where(owns_t, ln_t, jnp.int32(-1))
                     mask_ln = lane_iota_kv == ln_t
                     k_cur = jnp.where(mask_ln, pltpu.roll(k_cols, sh_t, 1), k_cur)
                     v_cur = jnp.where(mask_ln, pltpu.roll(v_cols, sh_t, 1), v_cur)
@@ -520,7 +545,7 @@ class KVPoolDMA:
                 else:
                     k_view[...] = k_cur
                     v_view[...] = v_cur
-                lp0 = lax.div(pos_ref[b0], c.page_size)
+                lp0 = lax.div(gp_my, dcp_size) if dcp_size > 1 else gp_my
                 kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
 
                 def issue_wr(r):
@@ -531,62 +556,69 @@ class KVPoolDMA:
                 bswitch(a, [lambda r=r: issue_wr(r) for r in raw_refs])
 
             wr_pend[s] = jnp.where(do_fast, 1, 0).astype(I32)
-            if T > 1:
+            if T > 1 and not dcp_fast:
                 @pl.when(jnp.logical_and(act_s, jnp.logical_not(same_s)))
                 def _(s=s):
                     b0 = s * T
+                    dcp_size = c.dcp_size
+                    dcp_rank = lax.rem(ctx.me, dcp_size) if dcp_size > 1 else jnp.int32(0)
                     for t in range(T):
                         p_t = pos_ref[b0 + t]
-                        lp_t = lax.div(p_t, c.page_size)
-                        ln_t = lax.rem(p_t, c.page_size)
-                        kp_t = jnp.clip(pt_ref[s, lp_t], 0, c.num_pages - 1)
+                        gp_t = lax.div(p_t, c.page_size)
+                        owns_t = (lax.rem(gp_t, dcp_size) == dcp_rank) if dcp_size > 1 else jnp.bool_(True)
 
-                        def rd_one(r, kp_t=kp_t):
+                        @pl.when(owns_t)
+                        def _(t=t, p_t=p_t, gp_t=gp_t):
+                            lp_t = lax.div(gp_t, dcp_size) if dcp_size > 1 else gp_t
+                            ln_t = lax.rem(p_t, c.page_size)
+                            kp_t = jnp.clip(pt_ref[s, lp_t], 0, c.num_pages - 1)
+
+                            def rd_one(r, kp_t=kp_t):
+                                pltpu.make_async_copy(
+                                    r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
+                                ).start()
+
+                            bswitch(a, [lambda r=r: rd_one(r) for r in raw_refs])
+                            # lane rotate (jnp.roll semantics) column b0+t onto lane
+                            # ln_t while the page read is in flight
+                            sh_t = lax.rem(
+                                ln_t + (c.page_size - (b0 + t) % c.page_size), c.page_size
+                            )
+                            mask_ln = lane_iota_kv == ln_t
+                            k_col = pltpu.roll(k_cols, sh_t, 1)
+                            v_col = pltpu.roll(v_cols, sh_t, 1)
+                            self.wait_kv_rd(s)
+                            if typed:
+                                k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(
+                                    64, c.page_size
+                                )
+                                v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(
+                                    64, c.page_size
+                                )
+                                k_cur = jnp.where(mask_ln, k_col, k_cur)
+                                v_cur = jnp.where(mask_ln, v_col, v_cur)
+                                kv_scat[s, 0] = pltpu.bitcast(
+                                    k_cur.reshape(64, 1, c.page_size), FP8
+                                )
+                                kv_scat[s, 1] = pltpu.bitcast(
+                                    v_cur.reshape(64, 1, c.page_size), FP8
+                                )
+                            else:
+                                k_view = (
+                                    kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
+                                )
+                                v_view = (
+                                    kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
+                                )
+                                k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
+                                v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
+
+                            def wr_one(r, kp_t=kp_t):
+                                pltpu.make_async_copy(
+                                    kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
+                                ).start()
+
+                            bswitch(a, [lambda r=r: wr_one(r) for r in raw_refs])
                             pltpu.make_async_copy(
-                                r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
-                            ).start()
-
-                        bswitch(a, [lambda r=r: rd_one(r) for r in raw_refs])
-                        # lane rotate (jnp.roll semantics) column b0+t onto lane
-                        # ln_t while the page read is in flight
-                        sh_t = lax.rem(
-                            ln_t + (c.page_size - (b0 + t) % c.page_size), c.page_size
-                        )
-                        mask_ln = lane_iota_kv == ln_t
-                        k_col = pltpu.roll(k_cols, sh_t, 1)
-                        v_col = pltpu.roll(v_cols, sh_t, 1)
-                        self.wait_kv_rd(s)
-                        if typed:
-                            k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(
-                                64, c.page_size
-                            )
-                            v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(
-                                64, c.page_size
-                            )
-                            k_cur = jnp.where(mask_ln, k_col, k_cur)
-                            v_cur = jnp.where(mask_ln, v_col, v_cur)
-                            kv_scat[s, 0] = pltpu.bitcast(
-                                k_cur.reshape(64, 1, c.page_size), FP8
-                            )
-                            kv_scat[s, 1] = pltpu.bitcast(
-                                v_cur.reshape(64, 1, c.page_size), FP8
-                            )
-                        else:
-                            k_view = (
-                                kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
-                            )
-                            v_view = (
-                                kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
-                            )
-                            k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
-                            v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
-
-                        def wr_one(r, kp_t=kp_t):
-                            pltpu.make_async_copy(
-                                kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
-                            ).start()
-
-                        bswitch(a, [lambda r=r: wr_one(r) for r in raw_refs])
-                        pltpu.make_async_copy(
-                            kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
-                        ).wait()
+                                kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
+                            ).wait()

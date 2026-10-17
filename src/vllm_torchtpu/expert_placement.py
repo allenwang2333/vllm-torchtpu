@@ -103,7 +103,7 @@ def auto_table(dcp_size: int, max_num_seqs: int) -> str:
     )
     if dcp_size <= 1 and max_num_seqs <= 8 and not mk_on:
         name = "expert_placement_dp8_ep8_opt_copies128.json"
-    elif dcp_size <= 1 and max_num_seqs <= 24:
+    elif (dcp_size <= 1 or mk_on) and max_num_seqs <= 24:
         name = "expert_placement_dp8_ep8_opt_copies112.json"
     else:
         name = "expert_placement_dp8_ep8_opt_copies32.json"

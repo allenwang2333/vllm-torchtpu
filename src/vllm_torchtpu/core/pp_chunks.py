@@ -173,9 +173,17 @@ class StepCostModel:
                     p1, ms1 = prefixed[0]
                     stage_slopes.append(max((ms1 - base[t]) / (t * p1), 0.0))
             attn = median(stage_slopes) if stage_slopes else 0.0
-            ladders.append(
-                {t: max(ms - attn * t * t / 2, 0.0) for t, ms in base.items()}
-            )
+            ladder: dict[int, float] = {}
+            for t, ms in base.items():
+                lin_t = max(ms - attn * t * t / 2, 0.0)
+                prefixed_t = sorted(
+                    (p, p_ms) for (tt, p), p_ms in timed.items() if tt == t and p > 0
+                )
+                if prefixed_t:
+                    p1, ms1 = prefixed_t[0]
+                    lin_t = min(lin_t, max(ms1 - attn * (t * p1 + t * t / 2), 0.0))
+                ladder[t] = lin_t
+            ladders.append(ladder)
             slopes.append(attn)
         buckets = sorted(ladders[0])
         if any(sorted(ladder) != buckets for ladder in ladders):
@@ -186,7 +194,14 @@ class StepCostModel:
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
         attn = max(slopes)
         top = buckets[-1]
-        full_step = linear[top] + attn * top * top / 2
+        top_p0 = max(
+            min(
+                (ms for t, p, ms in samples if int(t) == top and int(p) == 0),
+                default=0.0,
+            )
+            for samples in stage_samples
+        )
+        full_step = max(top_p0, linear[top] + attn * top * top / 2)
         return cls(
             buckets, linear, attn, full_step * (1.0 + slack), int(granularity), schedule
         )

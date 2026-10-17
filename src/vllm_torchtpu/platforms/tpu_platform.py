@@ -980,9 +980,12 @@ class TpuPlatform(Platform):
             in ("1", "true", "yes", "on")
         ):
             paw_cls = "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
-            if scheduler_config.scheduler_cls in (
-                None,
-                "vllm.v1.core.sched.scheduler.Scheduler",
+            if (
+                scheduler_config.scheduler_cls in (
+                    None,
+                    "vllm.v1.core.sched.scheduler.Scheduler",
+                )
+                and parallel_config.pipeline_parallel_size == 1
             ):
                 scheduler_config.scheduler_cls = paw_cls
                 logger.info("Auto-enabled PrefixAwareScheduler for Qwen3.5-397B.")
@@ -1023,7 +1026,7 @@ class TpuPlatform(Platform):
             # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
             # while reserving ~2.5 GiB of HBM headroom for runtime activations
             # and program-load scratch buffers under DCP=1 and DCP>1.
-            if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+            if (dcp_size == 1 or os.environ.get("VLLM_TPU_QWEN35_MEGAKERNEL", "0").strip().lower() in ("1", "true", "yes", "on")) and scheduler_config.max_num_seqs > 16:
                 safe_kv = 32_500_000_000
                 max_ablat_kv = 41_559_696_640
             else:
@@ -1533,7 +1536,12 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+    if scheduler_config.scheduler_cls not in (
+        None,
+        "vllm.v1.core.sched.scheduler.Scheduler",
+        "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler",
+        SCHEDULER_CLS,
+    ):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,

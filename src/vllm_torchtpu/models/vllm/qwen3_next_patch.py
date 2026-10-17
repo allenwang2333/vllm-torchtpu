@@ -199,7 +199,7 @@ def _legal_tile(rows: int, cap: int) -> int:
 
 def _select_gate_q_vreg_step(cols: int) -> int:
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    return max(16, (64 // vregs_per_row // 8) * 8)
+    return max(32, (64 // vregs_per_row // 32) * 32)
 
 
 def _select_gate_q_tile(rows: int, cols: int) -> int:
@@ -215,7 +215,8 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     if rows <= 256:
         dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
-    return max(vreg_cap, 512)
+    budget_cap = max(32, ((12 << 20) // (10 * max(cols, 1))) // 32 * 32)
+    return min(max(vreg_cap, 512), budget_cap)
 
 
 def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
@@ -1355,7 +1356,7 @@ def _fuses_pre_attn_norm_quant(
     return (
         hidden_states.device.type == "tpu"
         and hidden_states.dtype == torch.bfloat16
-        and sequence_parallel.fp8_gather()
+        and (not input_is_sliced or sequence_parallel.fp8_gather())
         and getattr(layer, "_pre_norm_quant_eligible", False)
         and (input_is_sliced or getattr(layer, "_pre_norm_quant_exact", False))
         and envs.TPU_FUSE_PRE_ATTN_NORM_QUANT

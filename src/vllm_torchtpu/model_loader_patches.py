@@ -74,9 +74,51 @@ logger = init_logger(__name__)
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
 
-def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
+def _compute_model_layer_filter(
+    model: torch.nn.Module | None,
+) -> tuple[tuple[int, int] | None, bool]:
+    """Return (layer_range, is_mtp_model) for PP stage / MTP drafter filtering."""
+    if model is None:
+        return None, False
+    cls_name = type(model).__name__
+    if "MTP" in cls_name or "Eagle" in cls_name:
+        return None, True
+    try:
+        from vllm.config import get_current_vllm_config
+
+        pp_size = get_current_vllm_config().parallel_config.pipeline_parallel_size
+    except Exception:
+        pp_size = 1
+    if pp_size <= 1:
+        return None, False
+    for mod in model.modules():
+        s = getattr(mod, "start_layer", None)
+        e = getattr(mod, "end_layer", None)
+        if isinstance(s, int) and isinstance(e, int) and e > s:
+            return (s, e), False
+    return None, False
+
+
+def _should_skip(
+    name: str,
+    local_expert_ids: set[int] | None,
+    layer_range: tuple[int, int] | None = None,
+    is_mtp_model: bool = False,
+) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
+    if is_mtp_model:
+        if expert_placement.layer_index(name) is not None:
+            return True
+    elif layer_range is not None:
+        if name.startswith("mtp.") or ".mtp." in name:
+            return True
+        layer = expert_placement.layer_index(name)
+        if layer is not None and not (layer_range[0] <= layer < layer_range[1]):
+            return True
+
+    if local_expert_ids is None:
+        return False
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
@@ -252,9 +294,11 @@ class _OnlineFp8LayerFinisher:
 
 def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
-    local_expert_ids: set[int],
+    local_expert_ids: set[int] | None,
     use_tqdm_on_load: bool,
     model: torch.nn.Module | None = None,
+    layer_range: tuple[int, int] | None = None,
+    is_mtp_model: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -308,7 +352,12 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if _should_skip(
+                    tensor_meta.name,
+                    local_expert_ids,
+                    layer_range=layer_range,
+                    is_mtp_model=is_mtp_model,
+                ):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -464,7 +513,8 @@ def patch_runai_sharded_expert_streaming() -> None:
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
         # Caps the streamer's CPU staging buffer at 5 GiB per process unless
         # the operator set a limit.
-        os.environ.setdefault("RUNAI_STREAMER_MEMORY_LIMIT", "5368709120")
+        if os.environ.get("RUNAI_STREAMER_MEMORY_LIMIT", "").strip() in ("", "0"):
+            os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = "5368709120"
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -481,7 +531,8 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "full-checkpoint streaming"
             )
             local_expert_ids = None
-        if local_expert_ids is None:
+        layer_range, is_mtp_model = _compute_model_layer_filter(self._loading_model)
+        if local_expert_ids is None and layer_range is None and not is_mtp_model:
             return original_get_iterator(self, model_or_path, revision)
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
@@ -498,6 +549,8 @@ def patch_runai_sharded_expert_streaming() -> None:
             local_expert_ids,
             self.load_config.use_tqdm_on_load,
             self._loading_model,
+            layer_range=layer_range,
+            is_mtp_model=is_mtp_model,
         )
 
     rsl.RunaiModelStreamerLoader._loading_model = None

@@ -198,7 +198,7 @@ class MKBuildContext:
         SUB = tiles.kv_sub or BLK  # KV tokens per online-softmax update
         assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
         PW = HD + 128  # partial-softmax slab lanes: acc | m (64 lanes) | l (64 lanes)
-        eff_ctx = max(c.ctx, c.max_pages_per_seq * c.page_size) if c.paged_kv else c.ctx
+        eff_ctx = max(c.ctx, c.max_pages_per_seq * c.page_size * c.dcp_size) if c.paged_kv else c.ctx
         max_nb = -(-eff_ctx // BLK)
         NWL = rup(NS * -(-max_nb // TS), 8)  # KV work items per rank, at most
         # above 16 rows ("wide"; up to 16 rows the kernel is unchanged):
