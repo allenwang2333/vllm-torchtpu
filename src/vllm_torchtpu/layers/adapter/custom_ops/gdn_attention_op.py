@@ -1009,6 +1009,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            pooled_qkv = mixed_qkv
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -1025,6 +1026,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            # The pooled kernel reads q/k/v straight out of the projection
+            # output, so no sliced copy of it is made per layer.
+            pooled_qkv = mixed_qkvz
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
@@ -1074,7 +1078,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
                 core_attn_out = self.gdn_pooled_op(
-                    mixed_qkv,
+                    pooled_qkv,
                     b,
                     a,
                     recurrent_state,

@@ -860,6 +860,9 @@ def run_jax_gdn_attention_pooled_local(
     region in the following tokens. All pool knowledge lives here: this
     function builds the copy-plan that maps those two regions onto the V3
     kernel's state operands, so the kernel itself never sees the pool layout.
+
+    ``mixed_qkv`` may be the whole qkvz projection output: the kernel reads
+    only its leading ``conv_dim`` columns.
     """
 
     conv_dim = conv_weight.shape[0]
@@ -904,6 +907,7 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        qkv_columns=conv_dim,
     )
     return recurrent_state, output
 
@@ -937,7 +941,8 @@ def run_jax_gdn_attention_pooled(
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
-        j_mixed_qkv: Input tensor of shape `(num_tokens, dim)`.
+        j_mixed_qkv: Input tensor of shape `(num_tokens, dim)`, or the whole
+          qkvz projection output, whose columns past `dim` are not read.
         j_b: Input tensor of shape `(num_tokens, n_v)`.
         j_a: Input tensor of shape `(num_tokens, n_v)`.
         recurrent_state: The attention-shaped pool
