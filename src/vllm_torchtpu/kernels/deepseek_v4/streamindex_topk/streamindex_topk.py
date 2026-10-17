@@ -55,6 +55,12 @@ KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
+# Packed decode body options (TPU_STREAMIDX_DECODE_PACK). interior_skip: blocks
+# every row sees whole skip the valid/causal mask (it would select everything).
+# buffer_count: KV ring depth of a packed pass (at least); the packed body is
+# short enough that a deeper lookahead still pays (−3…−4.5 % at 47k–67k keys
+# per rank, bkvp 32, v7x).
+_DECODE_PACK_OPTS = {"interior_skip": True, "buffer_count": 6}
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -213,6 +219,8 @@ def kernel(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    decode_pack: bool = False,
+    decode_page_major: bool = False,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -273,6 +281,42 @@ def kernel(
         seq_batch_size=seq_batch_size,
     )
 
+    # Decode under MTP (TPU_STREAMIDX_DECODE_PACK): a q block of
+    # `q_packing` tokens (4 for FP8) scores [num_q_heads * 4, bkv] rows, so each
+    # head owns half a (8, 128) f32 tile and the head reduction runs on
+    # half-empty registers plus a sublane shift for every odd head. Packing
+    # stacks the block's two KV halves on the sublanes instead: the MXU
+    # contracts a block-diagonal [8H, 2D] query (row 8h + 2t + s holds head h
+    # of token t against key half s, zeros against the other) with the two key
+    # halves stacked along the contraction, so head h's scores for both halves
+    # fill one aligned tile and the per-element arithmetic -- relu, weight, the
+    # head sum in head order, scale, mask -- is unchanged: the scores are
+    # bit-identical, on half the vector ops.
+    q_packing = get_dtype_packing(q_hbm_ref.dtype)
+    decode_pack = (
+        decode_pack
+        and seq_along_lane
+        and not prefill_cfg.enabled
+        and seq_batch_size == 1
+        and bq_sz == q_packing
+        and 2 * bq_sz == 8
+        and num_sublanes_bkv % 2 == 0
+    )
+    # Page-major KV block (with the packed decode body): the SEQ_ALONG_LANE
+    # block is gathered as `bkv_p` whole pages stacked on the sublane-group
+    # axis, [bkv_p * groups, packing, page_size], instead of side by side on
+    # the lane axis, [groups, packing, bkv_p * page_size]. A page is
+    # contiguous in HBM, so each page copy lands in one contiguous VMEM range
+    # instead of being cut into a strided lane window of every group row.
+    # Only the addressing of the key and scale tiles changes.
+    page_major = (
+        decode_page_major
+        and seq_along_lane
+        and not prefill_cfg.enabled
+        and seq_batch_size == 1
+        and page_size % 128 == 0
+    )
+
     q_spec = pl.BlockSpec(
         (pl.BoundedSlice(seq_batch_size * bq_sz), num_q_heads, head_dim),
         lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
@@ -283,7 +327,18 @@ def kernel(
         lambda p_id: (seq_tile(p_id), bq_block(p_id), 0),
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
-    if seq_along_lane:
+    if seq_along_lane and page_major:
+        kv_spec = pl.BlockSpec(
+            (
+                pl.BoundedSlice(seq_batch_size),
+                bkv_p * kv_sublane_groups,
+                kv_packing,
+                page_size,
+            ),
+            lambda p_id: (seq_tile(p_id), bkv_block(p_id), 0, 0),
+            pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
+        )
+    elif seq_along_lane:
         kv_spec = pl.BlockSpec(
             (
                 pl.BoundedSlice(seq_batch_size),
@@ -342,6 +397,7 @@ def kernel(
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            page_major_groups=kv_sublane_groups if page_major else 0,
         )
     else:
         kv_alloc = bref_override.StreamIndexKVBufferedRef.input(
@@ -386,18 +442,31 @@ def kernel(
             seq_batch_size, kv_sublane_groups * num_lane_tiles_bkv, 128
         )
 
+    # Page-major block viewed as u32 rows: row (p * groups + g) * tpp + j is
+    # group g of lane tile j of page p (tpp lane tiles per page).
+    tiles_per_page = page_size // 128
+
+    def _tile_row0(lane_tile_idx):
+        """(first u32 row of the tile's group 0, row stride between groups)."""
+        if page_major:
+            p, j = divmod(lane_tile_idx, tiles_per_page)
+            return p * kv_sublane_groups * tiles_per_page + j, tiles_per_page
+        return lane_tile_idx, num_lane_tiles_bkv
+
     def seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx):
         """[head_dim, 128] FP8 keys of lane tile `lane_tile_idx`."""
+        row0, stride = _tile_row0(lane_tile_idx)
         words = rows[
             batch_idx,
-            pl.ds(lane_tile_idx, kv_head_dim_groups, stride=num_lane_tiles_bkv),
+            pl.ds(row0, kv_head_dim_groups, stride=stride),
             :,
         ]
         return pltpu.bitcast(words, jnp.float8_e4m3fn)
 
     def seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx):
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
-        row = kv_head_dim_groups * num_lane_tiles_bkv + lane_tile_idx
+        row0, stride = _tile_row0(lane_tile_idx)
+        row = row0 + kv_head_dim_groups * stride
         words = rows[batch_idx, pl.ds(row, 1), :]
         # UE8M0 holds a bare biased exponent, which is where f32 keeps its own:
         # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly
@@ -577,6 +646,141 @@ def kernel(
         )
         scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
 
+    def packed_decode_step(
+        q_vmem,
+        weights_vmem,
+        bkv_vmem,
+        scores_vmem,
+        q_hm_ref,
+        q2w_ref,
+        q2_ref,
+        w2_ref,
+    ):
+        """One (q block, kv block) step of the packed decode path.
+
+        Row r = 8h + 2t + s of the block-diagonal query holds head h of token t
+        in contraction block s (zeros in the other), and block s of the keys is
+        KV half s, so each head's scores for both halves fill one (8, 128) f32
+        tile with row 2t + s. That order makes every output tile one strided
+        store (row 2t + s goes to score row t * nsub + s * nsub / 2 + j).
+
+        Args:
+          q_vmem: [bq, H, D] query block (bq = q_packing tokens).
+          weights_vmem: [bq, H] indexer weights.
+          bkv_vmem: the SEQ_ALONG_LANE key block of this step.
+          scores_vmem: [bq, nsub, 128] i32 output block.
+          q_hm_ref: [H * bq, D] head-major q block (head h, token t at h*bq+t).
+          q2w_ref: [2, 2 * H, D] u32 staging for the block-diagonal query.
+          q2_ref: [8 * H, 2 * D] block-diagonal query, rebuilt once per q block.
+          w2_ref: [8, H] f32 weights in query row order, once per q block.
+        """
+        p_id = pl.program_id(0)
+        batch_start_seq_idx = seq_tile(p_id)
+        bq_idx = bq_block(p_id)
+        bkv_idx = bkv_block(p_id)
+        cp_rank = cp_rank_ref[0]
+        half = bkv_sz // 2
+        tiles_half = num_lane_tiles_bkv // 2
+        rows8 = 2 * bq_sz
+
+        @pl.when(bkv_idx == 0)
+        def _():
+            # One u32 word row packs 4 query rows (byte i = row 4r + i). Word
+            # row h of the head-major block holds tokens 0..3 of head h; rows
+            # 8h..8h+7 = (t, s) pairs (0,0)(0,1)(1,0)(1,1) | (2,0)(2,1)(3,0)(3,1),
+            # so block s gets token bytes at positions s and s + 2 of each word.
+            q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
+            words = pltpu.bitcast(q_hm_ref[...], jnp.uint32)  # [H, D]
+            lo = (words & 0xFF) | ((words & 0xFF00) << 8)  # [t0, 0, t1, 0]
+            hi = ((words >> 16) & 0xFF) | ((words >> 8) & 0xFF0000)  # [t2, 0, t3, 0]
+            q2w_ref[0, pl.ds(0, num_q_heads, stride=2), :] = lo
+            q2w_ref[0, pl.ds(1, num_q_heads, stride=2), :] = hi
+            q2w_ref[1, pl.ds(0, num_q_heads, stride=2), :] = lo << 8
+            q2w_ref[1, pl.ds(1, num_q_heads, stride=2), :] = hi << 8
+            q2_ref[...] = pltpu.bitcast(
+                jnp.concatenate([q2w_ref[0], q2w_ref[1]], axis=1), q_hbm_ref.dtype
+            )
+            w = weights_vmem[...].reshape(bq_sz, num_q_heads).astype(jnp.float32)
+            for r in range(rows8):
+                w2_ref[pl.ds(r, 1), :] = w[r // 2 : r // 2 + 1, :]
+
+        rows = seq_along_lane_block_rows(bkv_vmem)
+        keys = [seq_along_lane_key_tile(rows, 0, j) for j in range(num_lane_tiles_bkv)]
+        scls = [
+            seq_along_lane_scale_tile(rows, 0, j) for j in range(num_lane_tiles_bkv)
+        ]
+        # [2D, bkv/2]: key dims of the first half on top of the second half's.
+        k2 = jnp.concatenate(
+            [
+                jnp.concatenate(keys[:tiles_half], axis=1),
+                jnp.concatenate(keys[tiles_half:], axis=1),
+            ],
+            axis=0,
+        )
+        st = jnp.einsum(
+            "nd,dm->nm", q2_ref[...], k2, preferred_element_type=jnp.float32
+        ).reshape(num_q_heads, rows8, half)
+        w2 = w2_ref[...]
+        acc = jnp.maximum(st[0], 0.0) * w2[:, 0:1]
+        for h in range(1, num_q_heads):
+            acc = acc + jnp.maximum(st[h], 0.0) * w2[:, h : h + 1]
+
+        row = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+        sel_hi = (row & 1) == 1
+        scale2 = jnp.where(
+            sel_hi,
+            jnp.concatenate(scls[tiles_half:], axis=1),
+            jnp.concatenate(scls[:tiles_half], axis=1),
+        )
+        acc = acc * scale2
+
+        seq_len = seq_lens_ref[batch_start_seq_idx]
+        kv_len = seq_len >> shift_comp
+        q_s = cu_q_lens_ref[batch_start_seq_idx]
+        q_l = cu_q_lens_ref[batch_start_seq_idx + 1] - q_s
+        block_start = bq_idx * bq_sz + jnp.maximum(0, start_end_seq_idx_ref[2] - q_s)
+        pos0 = seq_len - q_l + block_start
+        scores_rows = scores_vmem.reshape(bq_sz * num_sublanes_bkv, 128)
+
+        def store(vals):
+            # Row 2t + s of lane tile j -> score row (2t + s) * tiles_half + j.
+            for jj in range(tiles_half):
+                scores_rows[pl.ds(jj, rows8, stride=tiles_half)] = pltpu.bitcast(
+                    vals[:, jj * 128 : (jj + 1) * 128], jnp.int32
+                )
+
+        def masked():
+            k_local = (
+                bkv_idx * bkv_sz
+                + lax.broadcasted_iota(jnp.int32, acc.shape, 1)
+                + jnp.where(sel_hi, half, 0)
+            )
+            k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
+            q_pos = pos0 + (row >> 1)
+            mask = jnp.logical_and(k_span < kv_len, k_span <= (q_pos >> shift_comp))
+            return jnp.where(mask, acc, -jnp.inf)
+
+        if _DECODE_PACK_OPTS["interior_skip"]:
+            # Every key of a block before the last one a row can see is
+            # visible to all rows: the mask would select `acc` everywhere.
+            last_key = cp_local_to_global(
+                (bkv_idx + 1) * bkv_sz - 1, cp_rank, cp_size, interleave_c
+            )
+            interior = jnp.logical_and(
+                last_key < kv_len, last_key <= (pos0 >> shift_comp)
+            )
+
+            @pl.when(interior)
+            def _():
+                store(acc)
+
+            @pl.when(jnp.logical_not(interior))
+            def _():
+                store(masked())
+
+        else:
+            store(masked())
+
     def blocked_prefill_step(
         q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
     ):
@@ -747,10 +951,18 @@ def kernel(
                 s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
             )
 
-    def _run_all(q_hm_ref=None, wb_ref=None):
+    def _run_all(q_hm_ref=None, wb_ref=None, q2_ref=None, w2_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
                 blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
+            )
+        elif decode_pack:
+            body = functools.partial(
+                packed_decode_step,
+                q_hm_ref=q_hm_ref,
+                q2w_ref=wb_ref,
+                q2_ref=q2_ref,
+                w2_ref=w2_ref,
             )
         else:
             body = functools.partial(step_body, q_hm_ref=q_hm_ref)
@@ -790,6 +1002,14 @@ def kernel(
                 ),
                 prefill_cfg.wb_dtype,
             ),
+        )
+    elif decode_pack:
+        pl.run_scoped(
+            _run_all,
+            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((2, 2 * num_q_heads, head_dim), jnp.uint32),
+            pltpu.VMEM((8 * num_q_heads, 2 * head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((2 * bq_sz, num_q_heads), jnp.float32),
         )
     elif seq_batch_size == 1 and bq_sz > 1:
         pl.run_scoped(
@@ -1069,6 +1289,8 @@ def _effective_row_lengths(
         "return_scores",
         "skip_empty_decode",
         "skip_empty_decode_chunked",
+        "decode_pack",
+        "decode_page_major",
     ),
 )
 def streamindex_topk(
@@ -1100,6 +1322,8 @@ def streamindex_topk(
     skip_empty_decode: bool = False,
     skip_empty_decode_chunked: bool = False,
     final_sc_tie: tuple = (),
+    decode_pack: bool = False,
+    decode_page_major: bool | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """StreamIndex Top-K retrieval.
 
@@ -1178,6 +1402,14 @@ def streamindex_topk(
         the SparseCore operand keeps its layout (a barrier on the whole
         buffer costs two relayout copies of it). Values are untouched. Needs
         `enable_early_exit=False`.
+      decode_pack: score `num_queries_per_block == 4` MIXED blocks (decode
+        under MTP) with the block-diagonal packed body (see `kernel` and
+        `packed_decode_step`), a KV ring at least `_DECODE_PACK_OPTS
+        ["buffer_count"]` deep, and -- unless `decode_page_major` says
+        otherwise -- the page-major KV block. Same indices and scores bit for
+        bit; SEQ_ALONG_LANE and FP8 queries only, other passes ignore it.
+      decode_page_major: gather those blocks page-major (one contiguous copy
+        per page). None follows `decode_pack`. Same scores.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1294,6 +1526,24 @@ def streamindex_topk(
         bkv_sz = page_size * bkv_p
         return bq_sz, bkv_sz
 
+    def _pack_flags(case, seq_batch_size, bq_sz):
+        pack = (
+            decode_pack
+            and case == MlaCase.MIXED
+            and kv_layout == KVLayout.SEQ_ALONG_LANE
+            and seq_batch_size == 1
+            and bq_sz == get_dtype_packing(q.dtype)
+            and 2 * bq_sz == 8
+        )
+        page_major = (
+            (decode_pack if decode_page_major is None else decode_page_major)
+            and case == MlaCase.MIXED
+            and kv_layout == KVLayout.SEQ_ALONG_LANE
+            and seq_batch_size == 1
+            and bq_sz == get_dtype_packing(q.dtype)
+        )
+        return pack, page_major
+
     def run_scores_kernel(
         q,
         prepared_indexer_weights,
@@ -1363,6 +1613,13 @@ def streamindex_topk(
         input_output_aliases = {num_flat_prefetches + 3: 0} if aliased else {}
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
+        pack, pack_page_major = _pack_flags(case, seq_batch_size, bq_sz)
+        if pack:
+            buffer_count = max(buffer_count, _DECODE_PACK_OPTS["buffer_count"])
+        if pack:
+            layout_tag += "-pk"
+        if pack_page_major:
+            layout_tag += "-pm"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
         if chunked:
             # The chunk count is part of the kernel's identity, so a sweep over chunk
@@ -1383,6 +1640,8 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    decode_pack=pack,
+                    decode_page_major=pack_page_major,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -1726,6 +1985,7 @@ SMALL_AG_MAX_TOKENS = 8
         "overlap_pin_max_tokens",
         "flat_merge",
         "small_all_gather",
+        "decode_pack",
     ),
 )
 def streamindex_topk_dcp(
@@ -1762,6 +2022,7 @@ def streamindex_topk_dcp(
     overlap_pin_max_tokens: int | None = None,
     flat_merge: bool | None = None,
     small_all_gather: bool | None = None,
+    decode_pack: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1832,6 +2093,7 @@ def streamindex_topk_dcp(
         the candidate axis with an `all_gather`; see above. Same result.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
+      decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2006,6 +2268,7 @@ def streamindex_topk_dcp(
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
+            decode_pack=decode_pack,
         )
         if pin:
             idxs, scores, tied = local

@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = False
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
     TPU_STREAMIDX_MIXED_KV_PAGES: int | None = None
+    TPU_STREAMIDX_DECODE_PACK: bool = False
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
@@ -1383,6 +1384,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED": env_bool(
         "TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED", default=False
     ),
+    # Score the small-bucket (q block 4) MIXED pass -- every decode step under
+    # MTP -- with the packed body: the query block goes to the MXU as a
+    # block-diagonal [8H, 2D] matrix against the KV block's two halves stacked
+    # on the contraction, so each head's scores fill whole f32 tiles (half the
+    # head-reduction vector ops, no odd-head relayout), interior KV blocks skip
+    # the mask, scores leave by strided stores, and the KV block is gathered
+    # page-major (one contiguous copy per page) with a 6-deep ring.
+    # Bit-identical indices and scores. SEQ_ALONG_LANE index cache only; other
+    # passes are unchanged. Pairs with TPU_STREAMIDX_SMALL_BUCKET_BKVP=32
+    # (GLM-5.2 DCP8, 9k-67k keys per rank: -10...-48 % per call).
+    "TPU_STREAMIDX_DECODE_PACK": env_bool("TPU_STREAMIDX_DECODE_PACK", default=False),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above

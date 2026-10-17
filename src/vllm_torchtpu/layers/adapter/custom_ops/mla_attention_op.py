@@ -534,6 +534,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -612,6 +613,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                decode_pack=decode_pack,
             )
             return cache_kv, topk_indices
 
@@ -670,6 +672,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
@@ -777,6 +780,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 dcp_rank_ids=rank_ids_arg,
                 dcp_lane_ids=lane_ids_arg,
                 small_all_gather=small_ag,
+                decode_pack=decode_pack,
                 **overlap,
             )
             if qb_overlap:
