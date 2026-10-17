@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dev only: the single-host Qwen3.5 block-major disagg+offload rig with a PP4
-# prefill engine, run on host 0 of a 2x2x4 slice. GKE places a multi-host
-# slice as the pods of one Job, so the Job takes all four hosts; hosts 1-3
-# exit at once and host 0 runs as a lone 2x2x1 host (single_host_engine.sh).
+# Dev only: the single-host Qwen3.5 disagg+offload rig, one variant per host
+# of a 2x2x4 slice, each host running as a lone 2x2x1 host
+# (single_host_engine.sh). Every host exits 0 so one failing variant does not
+# stop the others; each prints "VARIANT <name> rc=<rc>".
+#   0: PP4 prefill, Raiden disagg + offload (TPUMultiConnector)
+#   1: TP4 prefill, Raiden disagg + offload (TPUMultiConnector)
+#   2: PP4 prefill, Raiden disagg only
+#   3: idle
 #
 # ${WORKLOAD_NAME} and ${IMAGE} are substituted; a literal dollar is $$.
 
@@ -36,9 +40,6 @@ spec:
           completions: 4
           completionMode: Indexed
           backoffLimit: 0
-          successPolicy:
-            rules:
-              - succeededIndexes: "0"
           activeDeadlineSeconds: 10800
           template:
             spec:
@@ -52,25 +53,29 @@ spec:
                   args:
                     - |
                       set -o pipefail
-                      [ "$${JOB_COMPLETION_INDEX}" = 0 ] || exit 0
-                      mkdir -p "$${ARTIFACTS_DIR}"
+                      case "$${JOB_COMPLETION_INDEX}" in
+                        0) variant=pp4_multi; export PREFILL_PP=4 OFFLOAD=1 ;;
+                        1) variant=tp4_multi; export PREFILL_PP=1 PREFILL_TP=4 OFFLOAD=1 ;;
+                        2) variant=pp4_disagg_only; export PREFILL_PP=4 OFFLOAD=0 ;;
+                        *) exit 0 ;;
+                      esac
+                      export RUN_ROOT="$${ARTIFACTS_DIR}/qwen35_$${variant}"
+                      mkdir -p "$${RUN_ROOT}"
                       bash .buildkite/kubernetes/single_host_engine.sh \
                         bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
                       rc=$$?
+                      echo "VARIANT $${variant} rc=$${rc}"
+                      echo "VARIANT $${variant} rc=$${rc}" > "$${RUN_ROOT}/variant_result.txt"
                       find "$${ARTIFACTS_DIR}" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
                       buildkite-agent artifact upload "$${ARTIFACTS_DIR}/**/*" || true
-                      exit $$rc
+                      exit 0
                   env:
                     - name: ARTIFACTS_DIR
                       value: perf_eval_results
-                    - name: RUN_ROOT
-                      value: perf_eval_results/qwen35_pp4_multi_connector
                     - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
                       value: "1"
                     - name: PREFILL_PCP
                       value: "1"
-                    - name: PREFILL_PP
-                      value: "4"
                     # The block-major pool refuses pipeline parallelism.
                     - name: VLLM_TPU_BLOCK_MAJOR_KV
                       value: "0"

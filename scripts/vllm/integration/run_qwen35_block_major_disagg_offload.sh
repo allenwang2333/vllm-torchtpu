@@ -73,6 +73,7 @@ export PREFILL_TP="${PREFILL_TP:-1}"
 export PREFILL_PCP="${PREFILL_PCP:-4}"
 # PREFILL_PCP=1 PREFILL_PP=4 serves the prefill engine pipeline-parallel instead.
 export PREFILL_PP="${PREFILL_PP:-1}"
+export OFFLOAD="${OFFLOAD:-1}"
 export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
 export DECODE_TP="${DECODE_TP:-1}"
 export DECODE_DP="${DECODE_DP:-4}"
@@ -133,8 +134,10 @@ for role in prefill decode; do
     grep -m1 "Block-major unified pool contract:" "${log}" \
       || fail "the ${role} engine did not register the block-major offload contract"
   fi
-  grep -m1 "KVCacheStore up" "${log}" \
-    || fail "no Raiden store came up on the ${role} engine"
+  if [[ "${OFFLOAD}" == "1" ]]; then
+    grep -m1 "KVCacheStore up" "${log}" \
+      || fail "no Raiden store came up on the ${role} engine"
+  fi
 done
 
 expected_prefill_block=$((PREFILL_BLOCK_SIZE * PREFILL_PCP))
@@ -174,6 +177,11 @@ smoke_lengths() {
 # until decode has pulled them, so a prompt sent to the prefill engine alone
 # can never be reset out of HBM. The counters and the reset address the
 # prefill engine.
+if [[ "${OFFLOAD}" != "1" ]]; then
+  echo "BLOCK_MAJOR_DISAGG_OK (offload off)"
+  exit 0
+fi
+
 echo "===== offload: seed and restore on the prefill engine (PCP${PREFILL_PCP} PP${PREFILL_PP}) ====="
 python3 "${script_dir}/smoke_block_major_offload.py" \
   --base "http://${P4D2_BIND_HOST}:${PROXY_PORT}" \
