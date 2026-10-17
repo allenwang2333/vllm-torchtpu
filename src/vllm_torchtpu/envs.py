@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION: bool = False
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
@@ -354,6 +355,10 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Experimental draft-only fusion: evaluates proposal quality via acceptance.
+    "TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION": env_bool(
+        "TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION"
+    ),
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),

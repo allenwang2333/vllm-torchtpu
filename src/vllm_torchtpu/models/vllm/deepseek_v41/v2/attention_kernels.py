@@ -393,6 +393,33 @@ def _attend_shared_swa(q, pool, records, scale, query_block_size):
     return tuple(result)
 
 
+def _fused_shared_swa(q, pool, records, sink, scale, query_block_size):
+    """Draft-only fixed-window fusion; target attention retains its own path."""
+    from vllm_torchtpu.kernels.deepseek_v41.dspark_attention import fused_attention
+
+    tokens, _, dim = q.shape
+    width = records.shape[1]
+    if not width:
+        return jnp.zeros_like(q)
+    groups = tokens // query_block_size
+    grouped_records = records.reshape(groups, query_block_size, width)
+    shared = grouped_records.max(axis=1)
+    valid_query = (grouped_records >= 0).any(axis=-1)
+    compatible = ((grouped_records == shared[:, None]) | ~valid_query[..., None]).all(
+        axis=(1, 2)
+    )
+    shared = jnp.pad(shared, ((0, 0), (0, -width % 64)), constant_values=-1)
+    pieces = gather_cache_pieces(pool, shared.reshape(-1), dim)
+    kv = merge_pieces(pieces).reshape(groups, shared.shape[1], dim)
+    output = fused_attention(q, kv, shared >= 0, sink, scale, block=query_block_size)
+    output = jnp.where(valid_query.reshape(tokens, 1, 1), output, 0)
+    return jnp.where(
+        jnp.repeat(compatible, query_block_size).reshape(tokens, 1, 1),
+        output,
+        jnp.nan,
+    )
+
+
 def paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
@@ -408,6 +435,10 @@ def paged_attention_jax(
 
     assert query_block_size >= 1 and q.shape[0] % query_block_size == 0
     assert query_block_size == 1 or main_records.shape[1] == 0
+    if query_block_size > 1 and envs.TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION:
+        return _fused_shared_swa(
+            q, swa_pool, swa_records, sink, scale, query_block_size
+        )
     if query_block_size == 1 and main_records.shape[1] == 0 and supports_swa(q, swa_records):
         return _swa_attention(q, swa_pool, swa_records, sink, scale)
     # SWA widths in the released model are multiples of 64, preserving the

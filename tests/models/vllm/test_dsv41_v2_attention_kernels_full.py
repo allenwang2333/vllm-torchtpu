@@ -148,6 +148,55 @@ class TestWindowAttentionAndAttend:
         )
         assert jnp.isnan(result).all()
 
+    @pytest.mark.parametrize("width", [0, 64, 133, 192])
+    def test_fused_draft_swa_masks_and_sink(self, width, monkeypatch):
+        """Exercise real fused attention with uniform scores and masked queries."""
+        import functools
+
+        from vllm_torchtpu.kernels.deepseek_v41 import dspark_attention
+
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION", "1")
+        kernel = functools.partial(dspark_attention.fused_attention, interpret=True)
+        q = jnp.zeros((10, 64, 512), jnp.bfloat16)
+        # Two BF16 1.0 values packed into each word.
+        pool = jnp.full((512, 128), 0x3F803F80, jnp.int32)
+        records = jnp.zeros((10, width), jnp.int32).at[0].set(-1)
+        records = records.at[5:].set(-1)
+        with mock.patch.object(
+            dspark_attention, "fused_attention", wraps=kernel
+        ) as call:
+            actual = paged_attention_jax(
+                q,
+                pool,
+                pool,
+                records,
+                jnp.empty((10, 0), jnp.int32),
+                jnp.zeros(64),
+                512**-0.5,
+                query_block_size=5,
+            )
+            assert call.call_count == bool(width)
+        assert jnp.isfinite(actual).all()
+        assert (actual[0] == 0).all() and (actual[5:] == 0).all()
+        expected = jnp.asarray(width / (width + 1), jnp.bfloat16)
+        np.testing.assert_array_equal(
+            np.asarray(actual[1:5]), np.full((4, 64, 512), expected)
+        )
+        if width:
+            records = records.at[2, 0].set(1)
+            with mock.patch.object(dspark_attention, "fused_attention", wraps=kernel):
+                bad = paged_attention_jax(
+                    q,
+                    pool,
+                    pool,
+                    records,
+                    jnp.empty((10, 0), jnp.int32),
+                    jnp.zeros(64),
+                    512**-0.5,
+                    query_block_size=5,
+                )
+            assert jnp.isnan(bad[:5]).all()
+
     def test_attention_state(self):
         q = jnp.zeros((8, 4, 128), dtype=jnp.float32)
         maximum, denominator, numerator = _attention_state(q)
