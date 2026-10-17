@@ -24,10 +24,12 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     compute_gdn,
     compute_kda,
     config,
+    epilogue,
     memory_ref,
     metadata,
     vmem_ldst,
 )
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
 
 
 def _chunked_gdn_in_place(
@@ -667,6 +669,7 @@ def outer_kernel(
         "gate_lower_bound",
         "qkv_columns",
         "out_norm_eps",
+        "out_quant_dtype",
     ),
 )
 def fused_conv1d_gdn(
@@ -706,7 +709,12 @@ def fused_conv1d_gdn(
     qkv_columns: int | None = None,
     out_norm_weight: jax.Array | None = None,  # [d_v]
     out_norm_eps: float = 0.0,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
+    out_quant_dtype: jnp.dtype | None = None,
+) -> (
+    tuple[tuple[jax.Array, jax.Array], jax.Array]
+    | tuple[jax.Array, jax.Array]
+    | tuple[jax.Array, jax.Array, jax.Array]
+):
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
@@ -789,12 +797,19 @@ def fused_conv1d_gdn(
             kernel, to z read from the same row tiles as q/k/v, so z never
             leaves VMEM; smaller ones in XLA, on the projection's slice.
             Pooled path with both launches only.
+        out_quant_dtype: With `out_norm_weight`, return the gated output
+            the way the output projection consumes it instead:
+            `quantize_tensor(out, out_quant_dtype)`, the per-token quantized
+            [batch_size, n_v * d_v] activation and its [batch_size, 1] f32
+            scale. `epilogue.gate_and_quantize` writes them token-major,
+            gating first where the launches did not.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
             recurrent state cache tensors. With a state source: the updated
             source (aliased in place) instead of the state pair.
-        out: Fused output tensor.
+        out: Fused output tensor; with `out_quant_dtype`, the quantized
+            output and its scale.
     """
     # TODO(kyuyeunk): Support bf16
     act_out_dtype = qkv.dtype
@@ -840,6 +855,8 @@ def fused_conv1d_gdn(
         )
         if not gate_out:
             sliced_z = qkv[:, dim:]
+    if out_quant_dtype is not None:
+        assert out_norm_weight is not None, "out_quant_dtype needs out_norm_weight"
     if not qkv_row_tiled:
         qkv = qkv[:, :dim].astype(jnp.float32)
     b = b.astype(jnp.float32)
@@ -1128,6 +1145,28 @@ def fused_conv1d_gdn(
             weights,
         )
 
+    def quantize_out(
+        out_act: jax.Array, qkv: jax.Array, sliced_z: jax.Array | None
+    ) -> tuple[jax.Array, jax.Array]:
+        if epilogue.supports(padded_batch_size, n_v, d_v) and qkv_row_tiled:
+            # Where the launches did not gate, the epilogue reads z out of the
+            # same row tiles they read q/k/v from.
+            out_q, out_scale = epilogue.gate_and_quantize(
+                out_act,
+                None if gate_out else qkv,
+                None if gate_out else out_norm_weight,
+                z_group=dim // num_lanes,
+                eps=out_norm_eps,
+                quant_dtype=out_quant_dtype,
+            )
+            return out_q[:batch_size], out_scale[:batch_size]
+        out_act = out_act[:batch_size]
+        if sliced_z is not None:
+            out_act = compute_gdn.gated_rms_norm(
+                out_act, sliced_z.reshape(out_act.shape), out_norm_weight, out_norm_eps
+            )
+        return quantize_tensor(out_act.reshape(batch_size, -1), out_quant_dtype)
+
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
@@ -1148,6 +1187,8 @@ def fused_conv1d_gdn(
         out_act, out_source = None, state_source
         for mode in launch_modes:
             out_act, out_source, _ = call_kernel(out_source, None, out_act, mode)
+        if out_quant_dtype is not None:
+            return out_source, *quantize_out(out_act, qkv, sliced_z)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         if sliced_z is not None:
             # Below GATE_OUT_MIN_TOKENS the gate runs here, in XLA.
