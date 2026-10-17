@@ -37,14 +37,24 @@ def placement_file(tmp_path, monkeypatch):
     yield path
 
 
-def test_slot_ids_invert_the_rank_lists():
+def test_slot_table_inverts_the_rank_lists():
     p = expert_placement.parse(_table())
-    slots = p.slot_ids(3)
-    assert slots == [1, 4, 3, 6, 7, 2, 5, 0]
-    for r, held in enumerate(p.ranks(3)):
-        for j, e in enumerate(held):
-            assert slots[e] == r * p.slots + j
+    assert p.slots(3) == 4
+    assert p.slot_table(3) == [[1], [4], [3], [6], [7], [2], [5], [0]]
     assert p.ranks(4) is None
+
+
+def test_spare_slots_hold_replicas():
+    table = _table(
+        layers={"3": [[7, 0, 5, 2, 3], [1, 6, 3, 4, 7]], "4": [[0, 1, 2, 3]] * 2}
+    )
+    table["layers"]["4"] = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    p = expert_placement.parse(table)
+    assert p.slots(4) == 4
+    assert p.slots(3) == 5
+    rows = p.slot_table(3)
+    assert rows[3] == [4, 7] and rows[7] == [0, 9]
+    assert rows[0] == [1, -1]
 
 
 @pytest.mark.parametrize(
@@ -53,6 +63,7 @@ def test_slot_ids_invert_the_rank_lists():
         {"3": [[7, 0, 5, 2], [1, 6, 3, 3]]},  # 4 missing, 3 twice
         {"3": [[7, 0, 5], [1, 6, 3, 4, 2]]},  # uneven ranks
         {"3": [[7, 0, 5, 2]]},  # one rank short
+        {"3": [[7, 7, 5, 2], [1, 6, 3, 4]]},  # 0 missing, 7 twice on rank 0
     ],
 )
 def test_a_table_that_is_not_a_permutation_is_refused(layers):
@@ -105,7 +116,7 @@ def test_apply_maps_slots_and_gates_the_fetch_filter(placement_file):
     assert layer._expert_map.tolist() == [-1, 0, -1, 2, 3, -1, 1, -1]
     slots = expert_placement.expert_slot_table(layer)
     assert slots.dtype == torch.int32
-    assert slots.tolist() == [1, 4, 3, 6, 7, 2, 5, 0]
+    assert slots.tolist() == [[1], [4], [3], [6], [7], [2], [5], [0]]
     assert expert_placement.fetch_filter_ids(
         "layers.3.ffn.experts.0.w1.weight", 1
     ) == frozenset({1, 6, 3, 4})
@@ -135,12 +146,18 @@ def test_a_table_for_another_mesh_is_refused(placement_file):
         expert_placement.apply_to_layer(layer)
 
 
-def test_a_drafter_layer_is_refused(tmp_path, monkeypatch):
+def test_drafter_layers_take_their_mtp_tensors(tmp_path, monkeypatch):
+    monkeypatch.setattr(expert_placement, "_APPLIED_LAYERS", set())
+    expert_placement._target_layers.cache_clear()
     path = tmp_path / "drafter.json"
     path.write_text(json.dumps(_table(layers={"7": [[7, 0, 5, 2], [1, 6, 3, 4]]})))
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
-    with pytest.raises(ValueError, match="drafter layer"):
-        expert_placement.apply_to_layer(_fake_layer("model.layers.7.ffn.experts", 0))
+    assert expert_placement.apply_to_layer(_fake_layer("model.layers.7.ffn.experts", 1))
+    # A 6-layer target: mtp.1 is module layers.7.
+    name = "mtp.1.ffn.experts.0.w1.weight"
+    assert expert_placement.fetch_filter_ids(name, 1) == frozenset({1, 6, 3, 4})
+    assert expert_placement.fetch_filter_ids("mtp.0.ffn.experts.0.w1", 1) is None
+    expert_placement._target_layers.cache_clear()
 
 
 def test_shipped_placements_resolve_by_name_and_parse():

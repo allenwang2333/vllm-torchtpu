@@ -17,20 +17,26 @@ The file names, per MoE layer, which global experts each EP rank holds and in
 what slot order:
 
     {"experts": 384, "shards": 16,
-     "layers": {"3": [[17, 250, ...24 ids...], ...16 ranks...], ...}}
+     "layers": {"3": [[17, 250, ...24 ids...], ...16 ranks...],
+                "7": [[94, 13, ...25 ids...], ...16 ranks...], ...}}
 
-Every expert of a listed layer is held exactly once (a permutation, no
-copies). Layers that are not listed keep the checkpoint's contiguous blocks.
+Every rank of a layer lists the same number of slots, at least experts /
+shards; every expert of a listed layer is held at least once and at most once
+per rank. Slots beyond experts / shards hold REPLICAS of hot experts: each copy
+computes the share of that expert's tokens the kernel routes to it, at the
+cost of one more expert's weights in HBM per rank. Layers that are not listed
+keep the checkpoint's contiguous blocks.
 
 What follows from it, all decided at load:
   * the layer's expert map puts expert `ranks[r][j]` in slot j of rank r, so
-    vLLM's weight loader and the fetch-time expert filter load exactly those;
-  * `expert_slot_table` maps each global expert to its SLOT id,
-    `r * slots + j`, which is the contiguous-block numbering the fused EP
-    kernel addresses. The kernel applies it to the selected ids after top-k,
-    so selection, tie-breaking, the router weights and the order of the k
-    combine terms are those of the unplaced model: per token the output is
-    the same bits, only where each expert's matmuls run moves.
+    vLLM's weight loader and the fetch-time expert filter load exactly those
+    (and the layer holds that many slots, not experts / shards);
+  * `expert_slot_table` lists, per global expert, the SLOT ids holding it,
+    `r * slots + j`, the contiguous-block numbering the fused EP kernel
+    addresses. The kernel maps the selected ids after top-k, so selection,
+    tie-breaking, the router weights and the order of the k combine terms are
+    those of the unplaced model: every copy holds the same weights, so per
+    token the output is the same bits; only where the matmuls run moves.
 
 Only the fused EP kernel reads slot ids, so a placed layer must be armed for
 it; `check_layer_served` refuses anything else.
@@ -48,8 +54,11 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # `model.layers.7.ffn.experts` (a module prefix) and `layers.7.ffn.experts.3.w1`
-# (a checkpoint tensor) both name layer 7. A drafter's `mtp.0.` does not match.
+# (a checkpoint tensor) both name layer 7.
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# A DSpark drafter's MoE layers are modules `layers.{n + i}` of an n-layer
+# target, built from the checkpoint's `mtp.{i}.*` tensors.
+_DRAFTER_TENSOR_RE = re.compile(r"^mtp\.(\d+)\.")
 
 # The layer attribute the slot table is registered under.
 EXPERT_SLOT_ATTR = "_tpu_expert_slot"
@@ -66,26 +75,28 @@ class Placement:
     shards: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
 
-    @property
-    def slots(self) -> int:
-        return self.experts // self.shards
+    def slots(self, layer: int) -> int:
+        """Slots per rank of a listed layer."""
+        return len(self.layers[layer][0])
 
     def ranks(self, layer: int) -> tuple[tuple[int, ...], ...] | None:
         """Per rank, the global experts it holds in slot order; None if unlisted."""
         return self.layers.get(layer)
 
-    def slot_ids(self, layer: int) -> list[int]:
-        """slot_ids[e] = r * slots + j for the rank r and slot j holding e."""
-        ranks = self.layers[layer]
-        table = [0] * self.experts
-        for r, held in enumerate(ranks):
+    def slot_table(self, layer: int) -> list[list[int]]:
+        """Row e: the slots r * slots + j holding expert e, padded with -1 to
+        the most replicas any expert of the layer has."""
+        held_at = [[] for _ in range(self.experts)]
+        slots = self.slots(layer)
+        for r, held in enumerate(self.layers[layer]):
             for j, e in enumerate(held):
-                table[e] = r * self.slots + j
-        return table
+                held_at[e].append(r * slots + j)
+        width = max(len(h) for h in held_at)
+        return [h + [-1] * (width - len(h)) for h in held_at]
 
 
 def parse(table: dict, source: str = "<dict>") -> Placement:
-    """Validate a placement table: every listed layer is a permutation."""
+    """Validate a placement table: every expert held, no rank holds one twice."""
     experts = int(table["experts"])
     shards = int(table["shards"])
     if experts % shards:
@@ -93,21 +104,30 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
             f"expert placement {source}: {experts} experts do not divide over "
             f"{shards} ranks"
         )
-    slots = experts // shards
     layers = {}
     for key, ranks in table["layers"].items():
-        if len(ranks) != shards or any(len(held) != slots for held in ranks):
+        slots = len(ranks[0]) if ranks else 0
+        if (
+            len(ranks) != shards
+            or slots < experts // shards
+            or any(len(held) != slots for held in ranks)
+        ):
             raise ValueError(
                 f"expert placement {source}: layer {key} must list {shards} "
-                f"ranks of {slots} experts"
+                f"ranks of one slot count, at least {experts // shards}"
             )
-        flat = sorted(int(e) for held in ranks for e in held)
-        if flat != list(range(experts)):
+        ranks = tuple(tuple(int(e) for e in held) for held in ranks)
+        if any(len(set(held)) != len(held) for held in ranks):
+            raise ValueError(
+                f"expert placement {source}: layer {key} holds an expert twice "
+                "on one rank"
+            )
+        if sorted({e for held in ranks for e in held}) != list(range(experts)):
             raise ValueError(
                 f"expert placement {source}: layer {key} must hold every one "
-                f"of the {experts} experts exactly once"
+                f"of the {experts} experts"
             )
-        layers[int(key)] = tuple(tuple(int(e) for e in held) for held in ranks)
+        layers[int(key)] = ranks
     return Placement(experts=experts, shards=shards, layers=layers)
 
 
@@ -167,6 +187,9 @@ def fetch_filter_ids(name: str, ep_rank: int) -> frozenset[int] | None:
     placement for the layer, or no MoE method applied one to it.
     """
     layer = layer_index(name)
+    drafter = _DRAFTER_TENSOR_RE.match(name)
+    if drafter is not None:
+        layer = _target_layers() + int(drafter.group(1))
     if layer is None or layer not in _APPLIED_LAYERS:
         return None
     ranks = current().ranks(layer)
@@ -201,16 +224,18 @@ def apply_to_layer(layer) -> bool:
             f"expert placement: {layer.layer_name} fuses shared experts into "
             "its expert map, which a placement does not describe"
         )
-    _refuse_drafter_layer(layer.layer_name)
+    _target_layers()  # cached under the model config, for the loader's threads
     rank = manager.ep_rank
     expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
-    expert_map[list(ranks[rank])] = torch.arange(placement.slots, dtype=torch.int32)
+    slots = len(ranks[rank])
+    expert_map[list(ranks[rank])] = torch.arange(slots, dtype=torch.int32)
     manager._expert_map = expert_map.to(manager.expert_map.device)
+    manager._local_num_experts = slots
     layer.update_expert_map_info()
     layer.register_buffer(
         EXPERT_SLOT_ATTR,
         torch.tensor(
-            placement.slot_ids(layer_index(layer.layer_name)),
+            placement.slot_table(layer_index(layer.layer_name)),
             dtype=torch.int32,
             device=manager.expert_map.device,
         ),
@@ -229,22 +254,15 @@ def apply_to_layer(layer) -> bool:
     return True
 
 
-def _refuse_drafter_layer(name: str) -> None:
-    """A drafter's MoE layers are numbered after the target's (`layers.61.` on
-    a 61-layer model) but load from `mtp.*` tensors, which the fetch filter
-    cannot place, so the placed slots would hold nothing."""
+@functools.cache
+def _target_layers() -> int:
     from vllm.config import get_current_vllm_config
 
-    target_layers = get_current_vllm_config().model_config.hf_config.num_hidden_layers
-    if layer_index(name) >= target_layers:
-        raise ValueError(
-            f"expert placement lists {name}, a drafter layer (the target has "
-            f"{target_layers} decoder layers); only target layers can be placed"
-        )
+    return get_current_vllm_config().model_config.hf_config.num_hidden_layers
 
 
 def expert_slot_table(layer):
-    """The [experts] i32 slot table of a placed layer, or None."""
+    """The [experts, replicas] i32 slot table of a placed layer, or None."""
     return getattr(layer, EXPERT_SLOT_ATTR, None)
 
 

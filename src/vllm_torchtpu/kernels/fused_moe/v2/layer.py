@@ -202,6 +202,19 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     return pairs, scale_bits, counts
 
 
+def _to_slots(topk_idx, expert_slot, row_base):
+    """Selected global ids [rows, K] -> slots under an [experts, R] table.
+
+    Row r's selection of e takes replica (row_base + r) mod (replicas of e).
+    """
+    n_rep = jnp.sum(expert_slot >= 0, axis=1, dtype=jnp.int32)
+    e = jnp.clip(topk_idx, 0, expert_slot.shape[0] - 1)
+    token = row_base + lax.broadcasted_iota(jnp.int32, topk_idx.shape, 0)
+    replica = lax.rem(token, jnp.take(n_rep, e, axis=0))
+    flat = e * expert_slot.shape[1] + replica
+    return jnp.take(expert_slot.reshape(-1), flat, axis=0)
+
+
 def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     """Map selected experts from EP-rank order to device-mesh order.
 
@@ -339,11 +352,15 @@ def fused_ep_moe_v2(
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
 
-    expert_slot [e_total] i32, replicated, places the experts: the weights'
-    expert axis is in SLOT order and expert_slot[e] is the slot holding global
-    expert e. Selection -- top-k or the hash table, its ties, its weights and
-    the order of the k slots -- runs on global ids exactly as without it; only
-    the selected ids are mapped to slots before dispatch. Each token therefore
+    expert_slot [experts, R] i32, replicated, places the experts: the
+    weights' expert axis is in SLOT order, and row e lists the slots holding
+    global expert e, padded with -1 past its last replica. A token's
+    selection of e goes to replica (global token row) mod (replicas of e), so
+    a replicated expert's rows split evenly over its copies. The gating and
+    score_bias stay [.., experts] while the weights have ep * slots-per-shard
+    rows. Selection -- top-k or the hash table, its ties, its weights and the
+    order of the k slots -- runs on global ids exactly as without it; only the
+    selected ids are mapped to slots before dispatch. Each token therefore
     gets the same experts and the same arithmetic, on whichever shard holds
     them. None is the identity: slot e holds expert e.
 
@@ -419,7 +436,9 @@ def fused_ep_moe_v2(
                 f"range({ep}); got {mesh_ep_ranks}"
             )
     g_local = e_total // ep
-    if T % ep or gating.shape != (T, e_total):
+    # Global experts the router scores; without a placement, one slot each.
+    e_router = gating.shape[1] if expert_slot is not None else e_total
+    if T % ep or gating.shape != (T, e_router):
         raise ValueError(
             "input and gating rows must agree and partition evenly over EP"
         )
@@ -456,9 +475,9 @@ def fused_ep_moe_v2(
     has_order_after = order_after is not None
     if scoring_fn not in SCORING_FNS:
         raise ValueError(f"scoring_fn must be one of {SCORING_FNS}; got {scoring_fn!r}")
-    if has_score_bias and score_bias.shape != (e_total,):
+    if has_score_bias and score_bias.shape != (e_router,):
         raise ValueError(
-            f"score_bias must be one value per global expert, [{e_total}]; "
+            f"score_bias must be one value per global expert, [{e_router}]; "
             f"got {tuple(score_bias.shape)}"
         )
     if has_hash_ids:
@@ -473,12 +492,17 @@ def fused_ep_moe_v2(
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
     if has_expert_slot and (
-        expert_slot.shape != (e_total,) or expert_slot.dtype != jnp.int32
+        expert_slot.ndim != 2
+        or expert_slot.shape[0] != e_router
+        or expert_slot.dtype != jnp.int32
+        or e_total < e_router
     ):
         raise ValueError(
-            f"expert_slot must be one i32 slot per global expert, [{e_total}]; "
-            f"got {jnp.dtype(expert_slot.dtype).name}{tuple(expert_slot.shape)}"
+            f"expert_slot must be i32 [{e_router}, replicas] over {e_total} "
+            f"slots; got {jnp.dtype(expert_slot.dtype).name}"
+            f"{tuple(expert_slot.shape)}"
         )
+    replicated = has_expert_slot and expert_slot.shape[1] > 1
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -511,6 +535,10 @@ def fused_ep_moe_v2(
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
         expert_slot_l = next(operands) if has_expert_slot else None
+        # One replica each: the selector emits slots directly.
+        select_labels = (
+            expert_slot_l[:, 0] if has_expert_slot and not replicated else None
+        )
         order_after_l = next(operands) if has_order_after else None
         # This shard's index arrives as data, not from `lax.axis_index`: that
         # lowers to `partition-id`, which the SPMD partitioner rejects when
@@ -552,10 +580,10 @@ def fused_ep_moe_v2(
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
             if expert_slot_l is not None:
-                topk_idx = jnp.take(expert_slot_l, topk_idx, axis=0, mode="clip")
+                topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows, labels=expert_slot_l
+                scores, topk=topk, block_rows=select_rows, labels=select_labels
             )
         else:
             # Selection is based on (scores + score_bias_l); the weights come
@@ -565,8 +593,10 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
-                labels=expert_slot_l,
+                labels=select_labels,
             )
+        if replicated and hash_l is None:
+            topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )
@@ -836,7 +866,7 @@ def fused_ep_moe_v2(
         scoring_fn,
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
-        has_expert_slot,
+        has_expert_slot and expert_slot.shape,
         has_order_after and order_after.shape[1:],
         float(routed_scaling_factor),
         bool(scales_expert_second_minor),

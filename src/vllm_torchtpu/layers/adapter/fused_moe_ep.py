@@ -711,7 +711,8 @@ def prebuild_fused_moe_ep(
     # silently. `local_experts * ep` is exactly the `e_total` the kernel will
     # derive from the global weight, so requiring the gate width to match it is
     # the same check the kernel would make if it made one.
-    if layer.global_num_experts != local_experts * ep:
+    placed = expert_placement.expert_slot_table(layer)
+    if placed is None and layer.global_num_experts != local_experts * ep:
         logger.warning_once(
             "Fused EP MoE not engaged: the kernel needs one equal contiguous "
             "expert block per shard, but %d global experts over ep=%d does "
@@ -740,7 +741,7 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    has_expert_slot = expert_placement.expert_slot_table(layer) is not None
+    has_expert_slot = placed is not None
     op = _build_op(
         mesh,
         topk,

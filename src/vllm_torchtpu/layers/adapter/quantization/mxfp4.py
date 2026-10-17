@@ -485,6 +485,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if expert_placement.apply_to_layer(layer):
+            # A placement with replicas gives this rank more slots.
+            num_experts = layer.local_num_experts
         Mxfp4MoEMethod.create_weights(
             self,
             layer,
@@ -494,7 +497,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             params_dtype,
             **extra_weight_attrs,
         )
-        expert_placement.apply_to_layer(layer)
 
     def _dequantize_and_pad(
         self,

@@ -687,15 +687,37 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+def _placement_slots(rng, e_total, spare):
+    """(expert of each slot, [experts, replicas] slot table) for a random
+    placement with `spare` extra slots per shard holding replicas."""
+    g_local = e_total // EP
+    ranks = [list(r) for r in rng.permutation(e_total).reshape(EP, g_local)]
+    hot = rng.choice(e_total, size=EP * spare, replace=False)
+    for i, e in enumerate(hot):
+        r = next(r for r in (np.arange(EP) + i) % EP if e not in ranks[r])
+        while len(ranks[r]) >= g_local + spare:
+            r = (r + 1) % EP
+        ranks[r].append(int(e))
+    width = g_local + spare
+    expert_of_slot = np.array([e for held in ranks for e in held])
+    held_at = [list(np.flatnonzero(expert_of_slot == e)) for e in range(e_total)]
+    reps = max(len(h) for h in held_at)
+    table = np.array([h + [-1] * (reps - len(h)) for h in held_at], np.int32)
+    assert expert_of_slot.size == EP * width
+    return expert_of_slot, table
+
+
+@pytest.mark.parametrize("spare", [0, 1])
 @pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
-def test_expert_slot_placement_is_bit_exact(routing):
+def test_expert_slot_placement_is_bit_exact(routing, spare):
     """A static placement moves experts between shards and nothing else.
 
     The weights go in slot order, `expert_slot` maps each global expert to
-    its slot after selection, and every token must come out with the same
+    its slots after selection, and every token must come out with the same
     bits as the unplaced layer -- on the served fp4 block-512 form, for the
-    plain top-k, the bias-corrected top-k and the hash-table selections.
-    The control checks the placement really moved experts across shards.
+    plain top-k, the bias-corrected top-k and the hash-table selections, with
+    and without spare slots holding replicas. The control checks the
+    placement really moved experts across shards.
     """
     mesh = _mesh()
     e_total = 32
@@ -703,11 +725,8 @@ def test_expert_slot_placement_is_bit_exact(routing):
         mesh, 52, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
     )
     x, gating = _make_inputs(mesh, 53, tokens=256, hidden=1024, e_total=e_total)
-    rng = np.random.default_rng(54)
-    slot_of_expert = rng.permutation(e_total).astype(np.int32)
-    g_local = e_total // EP
-    assert (slot_of_expert // g_local != np.arange(e_total) // g_local).any()
-    expert_of_slot = np.argsort(slot_of_expert)
+    rng = np.random.default_rng(54 + spare)
+    expert_of_slot, slot_table = _placement_slots(rng, e_total, spare)
     expert_sharding = NamedSharding(mesh, P(AXIS))
 
     def to_slot_order(a):
@@ -735,17 +754,14 @@ def test_expert_slot_placement_is_bit_exact(routing):
         **extra,
     )
     identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed_weights = tuple(to_slot_order(a) for a in (*weights, *scales))
     placed = fused_ep_moe_v2(
-        x,
-        *(to_slot_order(a) for a in (*weights, *scales)),
-        gating,
-        expert_slot=jnp.asarray(slot_of_expert),
-        **common,
+        x, *placed_weights, gating, expert_slot=jnp.asarray(slot_table), **common
     )
     np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
-    unmapped = fused_ep_moe_v2(
-        x, *(to_slot_order(a) for a in (*weights, *scales)), gating, **common
-    )
+    if spare:
+        return
+    unmapped = fused_ep_moe_v2(x, *placed_weights, gating, **common)
     assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
 
 

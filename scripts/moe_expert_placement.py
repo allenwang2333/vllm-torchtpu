@@ -14,28 +14,27 @@
 # limitations under the License.
 """Build a TPU_EXPERT_PLACEMENT table from MOE_EXPERT_COUNT_TAP_DIR snapshots.
 
-    moe_expert_placement.py --shards 16 --layers 3:60 [--spare 1] \\
+    moe_expert_placement.py --shards 16 --layers 3:60 [--replica-slots 20] \\
         --out placement.json TAP_DIR [TAP_DIR ...]
 
 Each rank's load is its last snapshot minus its `--skip`-th (1-based; 0 keeps
 everything), which drops warmup and compile traffic; ranks are then summed.
 
-The fused EP kernel streams every visited expert's weights once and computes
-its rows a tile at a time, so a slot's cost is modelled as
-`base + tile_us * (ceil(rows / tile_rows) - 1)` on its expected rows per step,
-and a layer is as slow as its most expensive rank. Per layer, `--spare` extra
-slots per rank go to replicas of the costliest experts (a replica takes an
-even share of its expert's rows), slots are assigned costliest-first to the
-cheapest rank that does not already hold that expert, and pairwise swaps off
-the costliest rank follow. Prints the modelled straggler of the checkpoint's
-contiguous placement and of the built one.
+A layer is as slow as its costliest rank, and a rank's cost is the sum of its
+slots' costs (VisitModel: weight stream floor, full and short tiles). Each
+layer is placed to minimise the EXPECTED straggler over steps sampled from the
+measured per-expert means and variances: costliest-first onto the cheapest
+rank, then pairwise swaps off the rank that is most often the straggler. A
+layer whose expected straggler does not drop by --min-gain-us stays
+contiguous. `--replica-slots` extra slots per rank in total (each one more
+expert's weights per rank in HBM) go one at a time to the layer whose expected
+straggler drops most; a replica takes an even share of its expert's rows.
 """
 
 import argparse
 import collections
 import glob
 import json
-import math
 import os
 import re
 
@@ -75,58 +74,107 @@ def load_counts(dirs, skip):
     return {n: (mean[i], var[i]) for i, n in enumerate(names)}
 
 
-class CostModel:
-    def __init__(self, base, tile_us, tile_rows):
-        self.base, self.tile_us, self.tile_rows = base, tile_us, tile_rows
+class VisitModel:
+    """Device time of one expert slot holding `rows` rows in one step (us).
 
-    def slot(self, rows):
-        return self.base + self.tile_us * max(0, math.ceil(rows / self.tile_rows) - 1)
+    A visited slot costs max(floor, its tiles) plus a fixed visit cost: full
+    tiles of tile_rows rows, a tail tile at the short rung's cost when it fits
+    in it, and a small per-row term. Not visited (no rows): nothing. Defaults
+    are a least-squares fit to 36 measured EP8 cells of the fused EP kernel
+    (synthetic Zipf and replayed production routing, three placements each;
+    RMSE 9 us of 440-820 us layers).
+    """
+
+    def __init__(self, floor, visit, full_tile, short_tile, per_row, rung, tile_rows):
+        self.floor, self.visit = floor, visit
+        self.full, self.short, self.per_row = full_tile, short_tile, per_row
+        self.rung, self.tile_rows = rung, tile_rows
+
+    def cost(self, rows):
+        rows = np.asarray(rows, np.float64)
+        full = np.floor(rows / self.tile_rows)
+        tail = rows - full * self.tile_rows
+        tail_cost = np.where(tail <= self.rung, self.short, self.full)
+        comp = full * self.full + (tail > 0) * tail_cost + self.per_row * rows
+        return np.where(rows > 0, np.maximum(self.floor, comp) + self.visit, 0.0)
 
 
-def place(mu, shards, spare, model):
-    """Per rank, the experts it holds (len experts / shards + spare each)."""
+def sample_rows(mu, var, steps, rng):
+    """[experts, steps] per-step rows: normal at the measured mean and variance
+    (at least Poisson), rounded and clipped at zero."""
+    sd = np.sqrt(np.maximum(var, mu))
+    noise = rng.standard_normal((mu.size, steps))
+    return np.maximum(0, np.rint(mu[:, None] + sd[:, None] * noise))
+
+
+def place(mu, var, shards, spare, model, steps=64, sweeps=200, seed=0):
+    """(per rank the experts it holds, expected straggler us).
+
+    The objective is the mean over sampled steps of the costliest rank, so a
+    placement is judged on the steps it will actually see rather than on the
+    expected rows alone. Greedy costliest-first, then pairwise swaps off the
+    rank that is most often the straggler while the objective improves.
+    """
+    rng = np.random.default_rng(seed)
     experts = mu.size
     width = experts // shards + spare
     reps = np.ones(experts, int)
     for _ in range(shards * spare):
         e = max(
-            range(experts), key=lambda e: (model.slot(mu[e] / reps[e]), mu[e] / reps[e])
+            (e for e in range(experts) if reps[e] < shards),
+            key=lambda e: (float(model.cost(mu[e] / reps[e])), mu[e] / reps[e]),
         )
-        if reps[e] == shards:
-            raise SystemExit("an expert would need more replicas than ranks")
         reps[e] += 1
-    cost = {e: model.slot(mu[e] / reps[e]) for e in range(experts)}
+    rows = sample_rows(mu, var, steps, rng)
+    cost = {e: model.cost(rows[e] / reps[e]) for e in range(experts)}
+    # Replicated experts first: their copies need distinct ranks, which only
+    # stays possible while every rank still has free slots.
     order = sorted(
-        (e for e in range(experts) for _ in range(reps[e])), key=lambda e: -cost[e]
+        (e for e in range(experts) for _ in range(reps[e])),
+        key=lambda e: (reps[e] == 1, -cost[e].mean()),
     )
     held = [[] for _ in range(shards)]
-    total = np.zeros(shards)
+    total = np.zeros((shards, steps))
     for e in order:
         free = [r for r in range(shards) if len(held[r]) < width and e not in held[r]]
-        r = min(free, key=lambda r: total[r])
+        r = min(free, key=lambda r: total[r].mean())
         held[r].append(e)
         total[r] += cost[e]
-    for _ in range(experts * 4):
-        hi = int(np.argmax(total))
+    objective = total.max(0).mean()
+    for _ in range(sweeps):
+        hi = int(np.argmax(np.bincount(total.argmax(0), minlength=shards)))
         best = None
-        for lo in range(shards):
-            if lo == hi:
-                continue
-            for i, a in enumerate(held[hi]):
-                for j, b in enumerate(held[lo]):
-                    d = cost[a] - cost[b]
-                    if d <= 0 or a in held[lo] or b in held[hi]:
-                        continue
-                    new_max = max(total[hi] - d, total[lo] + d)
-                    if new_max < total[hi] and (best is None or new_max < best[0]):
-                        best = (new_max, lo, i, j, d)
+        for i, a in enumerate(held[hi]):
+            for lo in range(shards):
+                if lo == hi or a in held[lo]:
+                    continue
+                cand = [j for j, b in enumerate(held[lo]) if b not in held[hi]]
+                if not cand:
+                    continue
+                cb = np.stack([cost[held[lo][j]] for j in cand])
+                new_hi = total[hi] - cost[a] + cb
+                new_lo = total[lo] + cost[a] - cb
+                rest = np.delete(total, [hi, lo], axis=0).max(0)
+                o = np.maximum(np.maximum(new_hi, new_lo), rest).mean(1)
+                k = int(np.argmin(o))
+                if o[k] < objective - 1e-9 and (best is None or o[k] < best[0]):
+                    best = (o[k], i, lo, cand[k])
         if best is None:
             break
-        _, lo, i, j, d = best
-        held[hi][i], held[lo][j] = held[lo][j], held[hi][i]
-        total[hi] -= d
-        total[lo] += d
-    return held, cost
+        objective, i, lo, j = best
+        a, b = held[hi][i], held[lo][j]
+        held[hi][i], held[lo][j] = b, a
+        total[hi] += cost[b] - cost[a]
+        total[lo] += cost[a] - cost[b]
+    return held, objective
+
+
+def expected_straggler(held, mu, var, model, steps=256, seed=1):
+    """Mean over sampled steps of the costliest rank of a given placement."""
+    rows = sample_rows(mu, var, steps, np.random.default_rng(seed))
+    reps = np.bincount([e for h in held for e in h], minlength=mu.size)
+    total = np.stack([sum(model.cost(rows[e] / reps[e]) for e in h) for h in held])
+    return total.max(0).mean()
 
 
 def main():
@@ -141,45 +189,80 @@ def main():
         help="first:last decoder layers to place (a drafter's MoE layers are "
         "numbered after the target's)",
     )
-    ap.add_argument("--spare", type=int, default=0, help="replica slots per rank")
-    ap.add_argument("--base-us", type=float, default=10.7)
-    ap.add_argument("--tile-us", type=float, default=12.0)
+    ap.add_argument(
+        "--replica-slots",
+        type=int,
+        default=0,
+        help="extra slots per rank, summed over layers, for replicas",
+    )
+    ap.add_argument("--min-gain-us", type=float, default=5.0)
+    ap.add_argument("--floor-us", type=float, default=4.86)
+    ap.add_argument("--visit-us", type=float, default=1.725)
+    ap.add_argument("--tile-us", type=float, default=11.1)
+    ap.add_argument("--short-tile-us", type=float, default=7.16)
+    ap.add_argument("--row-us", type=float, default=0.01)
+    ap.add_argument(
+        "--rung",
+        type=int,
+        default=48,
+        help="the kernel's short tile height at the served shape "
+        "(kernel.tile_height_rungs; 48 at DSv4-Pro EP16 T128)",
+    )
     ap.add_argument("--tile-rows", type=int, default=128)
     a = ap.parse_args()
-    model = CostModel(a.base_us, a.tile_us, a.tile_rows)
+    model = VisitModel(
+        a.floor_us,
+        a.visit_us,
+        a.tile_us,
+        a.short_tile_us,
+        a.row_us,
+        a.rung,
+        a.tile_rows,
+    )
     counts = load_counts(a.dirs, a.skip)
     lo, hi = (int(x) for x in a.layers.split(":"))
-    table, experts, before, after = {}, None, [], []
-    for name, (mu, _) in counts.items():
+    layers = {}
+    for name, (mu, var) in counts.items():
         m = _LAYER_RE.search(name)
-        if not m or not lo <= int(m.group(1)) <= hi:
-            continue
-        layer = int(m.group(1))
-        experts = mu.size
-        slots = experts // a.shards
-        linear = [
-            sum(model.slot(x) for x in mu[r * slots : (r + 1) * slots])
-            for r in range(a.shards)
-        ]
-        held, cost = place(mu, a.shards, a.spare, model)
-        placed = [sum(cost[e] for e in h) for h in held]
-        before.append(max(linear))
-        after.append(max(placed))
+        if m and lo <= int(m.group(1)) <= hi:
+            layers[int(m.group(1))] = (mu, var)
+    spare = dict.fromkeys(layers, 0)
+    built = {n: place(mu, var, a.shards, 0, model) for n, (mu, var) in layers.items()}
+    for _ in range(a.replica_slots):
+        trial = {
+            n: place(mu, var, a.shards, spare[n] + 1, model)
+            for n, (mu, var) in layers.items()
+        }
+        n = max(layers, key=lambda n: built[n][1] - trial[n][1])
+        if trial[n][1] >= built[n][1]:
+            break
+        spare[n] += 1
+        built[n] = trial[n]
+    table, before, after = {}, [], []
+    for n, (mu, var) in sorted(layers.items()):
+        slots = mu.size // a.shards
+        contiguous = [list(range(r * slots, (r + 1) * slots)) for r in range(a.shards)]
+        before.append(expected_straggler(contiguous, mu, var, model))
+        after.append(expected_straggler(built[n][0], mu, var, model))
+        keep = after[-1] < before[-1] - a.min_gain_us
         print(
-            f"layer {layer:3d} rows/step {mu.sum():8.1f} hottest expert "
-            f"{mu.max() / mu.mean():5.1f}x mean | modelled straggler FFN us: "
-            f"contiguous {max(linear):6.1f} placed {max(placed):6.1f} "
-            f"(rank mean {np.mean(placed):6.1f})"
+            f"layer {n:3d} rows/step {mu.sum():8.1f} hottest expert "
+            f"{mu.max() / mu.mean():5.1f}x mean | expected straggler us: "
+            f"contiguous {before[-1]:6.1f} placed {after[-1]:6.1f} "
+            f"replica slots {spare[n]}{'' if keep else ' -> not placed'}"
         )
-        table[str(layer)] = held
+        if keep:
+            table[str(n)] = built[n][0]
+        else:
+            after[-1] = before[-1]
+    experts = next(iter(layers.values()))[0].size
     out = {"experts": experts, "shards": a.shards, "layers": table}
-    if a.spare:
-        out["slots_per_shard"] = experts // a.shards + a.spare
     with open(a.out, "w") as f:
         json.dump(out, f)
     print(
-        f"wrote {a.out}: {len(table)} layers, modelled straggler FFN summed over "
-        f"layers {sum(before) / 1e3:.2f} -> {sum(after) / 1e3:.2f} ms/step"
+        f"wrote {a.out}: {len(table)} layers, {sum(spare.values())} replica slots "
+        f"per rank, expected straggler summed over layers "
+        f"{sum(before) / 1e3:.2f} -> {sum(after) / 1e3:.2f} ms/step"
     )
 
 
