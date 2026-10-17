@@ -909,9 +909,14 @@ async def lifespan(app: FastAPI):
     block_tokens = prefill_block_tokens
 
     kv_offload_bytes = _env_int("KV_OFFLOAD_BYTES_PREFILL", 770000000000)
+    if prefill_pp_size >= 8 and kv_offload_bytes == 420000000000:
+        kv_offload_bytes = 550000000000
     bytes_per_prefill_block = 35651584 if prefill_pp_size >= 8 else 41944704
-    default_prefill_hbm_blocks = 7247 if prefill_pp_size >= 8 else 7739
+    default_prefill_hbm_blocks = 1616 if prefill_pp_size >= 8 else 7739
     default_prefill_dram_blocks = max(0, int(kv_offload_bytes // bytes_per_prefill_block)) if kv_offload_bytes > 0 else 18358
+    prefill_dram_blocks = _env_int("PROXY_PREFILL_DRAM_MAX_BLOCKS", default_prefill_dram_blocks)
+    if prefill_pp_size >= 8 and prefill_dram_blocks == 11780:
+        prefill_dram_blocks = 15427
     default_peak_prefill_tok_s = 62000.0 if prefill_pp_size >= 8 else 42000.0
 
     routing_mode = os.getenv("PROXY_PREFILL_ROUTING", "prefix_hash").strip().lower()
@@ -926,7 +931,7 @@ async def lifespan(app: FastAPI):
             role="prefill",
             block_tokens=prefill_block_tokens,
             hbm_max_blocks=_env_int("PROXY_PREFILL_HBM_MAX_BLOCKS", default_prefill_hbm_blocks),
-            dram_max_blocks=_env_int("PROXY_PREFILL_DRAM_MAX_BLOCKS", default_prefill_dram_blocks),
+            dram_max_blocks=prefill_dram_blocks,
             peak_prefill_tok_s=_env_float("PROXY_PEAK_PREFILL_TOK_S", default_peak_prefill_tok_s),
             dram_load_tok_s=_env_float("PROXY_DRAM_LOAD_TOK_S", 280000.0),
         )
