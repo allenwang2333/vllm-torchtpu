@@ -39,7 +39,6 @@ import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
@@ -60,7 +59,7 @@ from vllm_torchtpu.megakernel_runtime.weight_collector import (
 logger = init_logger(__name__)
 
 _DEFAULT_BUCKETS = (8, 16, 32)
-_DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32)
+_DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -72,6 +71,52 @@ def _unwrap(x: Any) -> Any:
     while isinstance(x, (list, tuple)) and len(x) == 1:
         x = x[0]
     return x
+
+
+def _resolve_tp_size(runner: Any) -> int:
+    """Resolve the tensor-parallel device count for `runner`."""
+    p_cfg = getattr(runner, "parallel_config", None)
+    tp_size = int(getattr(p_cfg, "tensor_parallel_size", 0) or 0)
+    if tp_size > 0:
+        return tp_size
+    mesh = getattr(runner, "mesh", None)
+    if mesh is not None and getattr(mesh, "devices", None) is not None:
+        return int(mesh.devices.size)
+    return 0
+
+
+def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
+    """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
+
+    When `fallback_mesh` already contains `r_cnt` devices (e.g. CPU unit-test
+    runner), reuses its devices with axis `'tp'`. Otherwise queries
+    `torch_tpu._internal.pallas.get_pallas_mesh(axis_names=('tp',))` so device
+    ordering matches `TPUWorker` TP ranks on `tpu7x` (`2x2x1`) hosts rather than
+    sorting by physical `device_id`.
+    """
+    import jax
+
+    if (
+        fallback_mesh is not None
+        and getattr(fallback_mesh, "devices", None) is not None
+        and int(fallback_mesh.devices.size) == r_cnt
+    ):
+        if tuple(fallback_mesh.axis_names) == ("tp",):
+            return fallback_mesh
+        return jax.sharding.Mesh(np.asarray(fallback_mesh.devices).reshape(-1), ("tp",))
+    try:
+        from torch_tpu._internal.pallas import get_pallas_mesh
+
+        pallas_mesh = get_pallas_mesh(axis_names=("tp",))
+        if int(pallas_mesh.devices.size) == r_cnt:
+            return pallas_mesh
+    except Exception as exc:
+        logger.debug(
+            "get_pallas_mesh unavailable (%s); falling back to jax.devices()",
+            exc,
+        )
+    devs = jax.devices()[:r_cnt]
+    return jax.sharding.Mesh(np.asarray(devs), ("tp",))
 
 
 def _parse_bool(val: Any) -> bool:
@@ -154,6 +199,8 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
         "mode": "",
         "buckets": _DEFAULT_BUCKETS,
         "verify_buckets": _DEFAULT_VERIFY_BUCKETS,
+        "buckets_explicit": False,
+        "verify_buckets_explicit": False,
         "ab": False,
         "stats_period_s": 60.0,
         "compile_hlo_check": False,
@@ -167,8 +214,10 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
             cfg["mode"] = "" if m == "auto" else m
         if "buckets" in d and d["buckets"] is not None:
             cfg["buckets"] = parse_mk_buckets(d["buckets"])
+            cfg["buckets_explicit"] = True
         if "verify_buckets" in d and d["verify_buckets"] is not None:
             cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
+            cfg["verify_buckets_explicit"] = True
         if "ab" in d and d["ab"] is not None:
             cfg["ab"] = _parse_bool(d["ab"])
         if "stats_period_s" in d and d["stats_period_s"] is not None:
@@ -712,6 +761,7 @@ class MegakernelDriver:
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bound = False
         self._hlo_checked_t: set[int] = set()
+        self._torchtpu_ir_probe_attached: bool = False
         self._torchtpu_ir_checked: bool = False
         self._torchtpu_ir_error: str | None = None
         self._prepared_step: tuple[Any, ...] | None = None
@@ -853,7 +903,7 @@ class MegakernelDriver:
             )
             return None
 
-        r_cnt = int(runner.mesh.devices.size)
+        r_cnt = _resolve_tp_size(runner)
         if r_cnt != 8:
             logger.warning(
                 "Megakernel requires 8 TPU devices in mesh, got %d; skipping.",
@@ -875,9 +925,23 @@ class MegakernelDriver:
             )
         mode = req_mode if req_mode else ("ep" if loaded_ep else "tp")
         reshard = mode == "tp" and loaded_ep
-        mesh = build_ep_mesh() if mode == "ep" else runner.mesh
+        mesh = _build_tp_rank_mesh(r_cnt, fallback_mesh=getattr(runner, "mesh", None))
+        if int(mesh.devices.size) != r_cnt:
+            logger.warning(
+                "Megakernel TP-rank mesh has %d devices, expected %d; skipping.",
+                int(mesh.devices.size),
+                r_cnt,
+            )
+            return None
         buckets = tuple(cfg["buckets"])
         verify_buckets = tuple(cfg["verify_buckets"])
+        if hasattr(runner, "speculative_config"):
+            spec_cfg = getattr(runner, "speculative_config", None)
+            num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+            if num_spec == 3 and not cfg.get("buckets_explicit", False):
+                buckets = ()
+            elif num_spec == 0 and not cfg.get("verify_buckets_explicit", False):
+                verify_buckets = ()
         if not buckets and not verify_buckets:
             logger.info("Megakernel disabled (both bucket lists empty).")
             return None
@@ -972,9 +1036,11 @@ class MegakernelDriver:
         ]
         self.attn_layer_name = self.backbone.layers[g_per_att].self_attn.attn.layer_name
 
+        kv_blk = int(self.base_exec.resolved_tiles.kv_blk)
+        aligned_ctx = ((self.max_pages_per_seq * self.page_size) // kv_blk) * kv_blk
         self.base_exec = dataclasses.replace(
             self.base_exec,
-            ctx=max(self.base_exec.ctx, self.max_pages_per_seq * self.page_size),
+            ctx=max(self.base_exec.ctx, aligned_ctx),
             num_pages=self.num_pages,
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
@@ -1007,6 +1073,7 @@ class MegakernelDriver:
         self._bucket_ops.clear()
         self._bucket_out_rows.clear()
         self._hlo_checked_t.clear()
+        self._torchtpu_ir_probe_attached = False
         for b in self.buckets:
             m_rows = max(16, rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
@@ -1137,24 +1204,36 @@ class MegakernelDriver:
                 hid_out = F.pad(hid_out, (0, 0, 0, out_rows - hid_out.shape[0]))
             return hid_out
 
+        _step_impl.__code__ = _step_impl.__code__.replace(
+            co_name=f"step_t{tokens_per_seq}_b{bucket_t}"
+        )
         if is_tpu:
+            if not self._torchtpu_ir_probe_attached and not self._torchtpu_ir_checked:
+                self._torchtpu_ir_probe_attached = True
 
-            def _on_torchtpu_compile(debug: Any) -> None:
-                self._verify_torchtpu_compile_debug(
-                    debug,
-                    tokens_per_seq=tokens_per_seq,
-                    bucket_t=bucket_t,
+                def _on_torchtpu_compile(debug: Any) -> None:
+                    self._verify_torchtpu_compile_debug(
+                        debug,
+                        tokens_per_seq=tokens_per_seq,
+                        bucket_t=bucket_t,
+                    )
+
+                compile_opts: dict[str, Any] = {
+                    "debug_callback": _on_torchtpu_compile,
+                    "serializable": False,
+                }
+                return torch.compile(
+                    _step_impl,
+                    backend="tpu",
+                    fullgraph=True,
+                    dynamic=False,
+                    options=compile_opts,
                 )
-
-            compile_opts: dict[str, Any] = {"debug_callback": _on_torchtpu_compile}
-            if not self._torchtpu_ir_checked:
-                compile_opts["serializable"] = False
             return torch.compile(
                 _step_impl,
                 backend="tpu",
                 fullgraph=True,
                 dynamic=False,
-                options=compile_opts,
             )
         return _step_impl
 
@@ -1202,6 +1281,31 @@ class MegakernelDriver:
         self._step_mix_t0 = time.monotonic()
         self.ab_calibrator.reset()
 
+    def promote_fast_callables(self) -> int:
+        """Promote `_qx_fastcall` wrappers to direct AOT callables."""
+        self.reset_stats()
+        promoted = 0
+        for key, fn in list(self._bucket_steps.items()):
+            st = getattr(fn, "_qx_fast_state", None)
+            if isinstance(st, dict):
+                entries = st.get("entries")
+                entry = st.get("entry")
+                if (
+                    isinstance(entry, tuple)
+                    and len(entry) == 3
+                    and callable(entry[1])
+                    and (not isinstance(entries, list) or len(entries) <= 1)
+                ):
+                    self._bucket_steps[key] = entry[1]
+                    promoted += 1
+        if promoted > 0:
+            logger.info(
+                "MegakernelDriver: promoted %d bucket step callables "
+                "to direct dispatch",
+                promoted,
+            )
+        return promoted
+
     @torch.no_grad()
     def warmup(self, runner: Any = None, *, eager_only: bool = False) -> None:
         """Warm compiled bucket steps and run the sentinel pool-write check."""
@@ -1221,17 +1325,27 @@ class MegakernelDriver:
         )
         req_block_pairs: list[tuple[int, int]] = []
         if runner is not None:
-            r_max = getattr(runner, "num_reqs_max_model_len", None)
-            b_max = getattr(runner, "max_num_blocks_per_req", None)
-            if r_max is not None and b_max is not None:
+            attn_shapes_fn = getattr(runner, "_attention_kernel_shapes", None)
+            if callable(attn_shapes_fn):
+                r_max, b_max, _ = attn_shapes_fn(True)
                 req_block_pairs.append((int(r_max), int(b_max)))
-            if getattr(runner, "most_model_len", None) is not None:
-                r_most = getattr(runner, "num_reqs_most_model_len", None)
-                b_most = getattr(runner, "num_blocks_per_most_len_req", None)
-                if r_most is not None and b_most is not None:
+                if getattr(runner, "most_model_len", None) is not None:
+                    r_most, b_most, _ = attn_shapes_fn(False)
                     pair = (int(r_most), int(b_most))
                     if pair not in req_block_pairs:
                         req_block_pairs.append(pair)
+            else:
+                r_max = getattr(runner, "num_reqs_max_model_len", None)
+                b_max = getattr(runner, "max_num_blocks_per_req", None)
+                if r_max is not None and b_max is not None:
+                    req_block_pairs.append((int(r_max), int(b_max)))
+                if getattr(runner, "most_model_len", None) is not None:
+                    r_most = getattr(runner, "num_reqs_most_model_len", None)
+                    b_most = getattr(runner, "num_blocks_per_most_len_req", None)
+                    if r_most is not None and b_most is not None:
+                        pair = (int(r_most), int(b_most))
+                        if pair not in req_block_pairs:
+                            req_block_pairs.append(pair)
         roff_buf = (
             getattr(runner, "mamba_slot_read_offsets", None)
             if runner is not None
@@ -1371,7 +1485,7 @@ class MegakernelDriver:
                         "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
                         "check did not run during warmup"
                     )
-            self.reset_stats()
+            self.promote_fast_callables()
         finally:
             if saved_page0 is not None:
                 for p, saved in zip(self.raw_pools, saved_page0, strict=True):
