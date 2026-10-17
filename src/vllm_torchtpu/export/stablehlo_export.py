@@ -2432,6 +2432,21 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
             meta_dict["config"]["tensor_parallel_size"],
             meta_dict["config"]["data_parallel_size"],
         )
+        # The tokenizer is referenced relative to the artifact directory, so
+        # the artifact stays relocatable. Models without a `tokenizer.json`
+        # (e.g. tiktoken-only checkpoints) carry no `tokenizer_config`.
+        serving_cfg = meta_dict.setdefault("serving_config", {})
+        if (export_dir / "tokenizer.json").is_file():
+            serving_cfg["tokenizer_config"] = {
+                "source": {"TokenizerPath": {"path": "tokenizer.json"}}
+            }
+        else:
+            serving_cfg.pop("tokenizer_config", None)
+            logger.warning(
+                "[TpuCompilerAdaptor] No tokenizer.json bundled in %s; "
+                "metadata.json carries no tokenizer_config.",
+                export_dir,
+            )
         _write_abstract_params(export_dir, meta_dict, weights_dict)
         tmp_path = export_dir / f"metadata.json.{os.getpid()}.tmp"
         tmp_path.write_text(json.dumps(meta_dict, indent=2))
