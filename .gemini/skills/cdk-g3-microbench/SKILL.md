@@ -43,17 +43,20 @@ The GKE `cdk` cluster has only 2 `2x2x2` nodes and 5 `2x2x1` nodes (36 chips tot
 
 ---
 
-## 2. Mandatory Step 0: Pre-Flight Scope Verification (`cdk-g3 verify-scope`)
+## 2. Mandatory Step 0: Automatic Router & Pre-Flight Scope Verification (`cdk-g3 verify-scope` / `cdk-g3 route`)
 
-Before dispatching any candidate to `cdk-g3`, always run `cdk-g3 verify-scope` (supported in both flag orders). It enforces:
-1. **`[TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE]`**: Rejects (`rc=2`) any modification to `models/`, `worker/`, `attention/`, `communicator/`, or `vllm/` and instructs routing to GKE `cdk`.
-2. **`[TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE]`**: Walks the transitive Python AST import closure across `--source-root` and rejects any kernel module that imports `torch`, `torch_xla`, `vllm`, or `triton`.
-3. **Auto-Staging (`--stage-bundle-dir`)**: Copies the verified transitive `.py` closure byte-for-byte into `--stage-bundle-dir`, writes empty 0-byte `__init__.py` stubs for parent package directories (preventing `vllm_torchtpu/__init__.py` from importing `torch`), and writes `MANIFEST.sha256`.
+Before dispatching any candidate, run `cdk-g3 verify-scope` (or its alias `cdk-g3 route`, supported in both flag orders). The human user never needs to specify which tool or backend to use—the router inspects the git worktree (`git diff` / `git status` when `--changed-files` is omitted) and AST import closure automatically:
+1. **Automatic Git Diff Discovery & Routing Verdict (`routing_target`)**: Outputs `"routing_target": "CDK_G3"` (`rc=0`) vs. `"routing_target": "GKE_CDK"` (`rc=2`), along with `"recommended_cli"` (`"cdk-g3"` vs. `"cdk"`), `"recommended_backend"` (`"forge"`, `"minibench"`, `"xmanager"`, or `"gke_cdk"`), and `"recommended_recipe"` (`"forge-microbench"`, `"minibench-ab"`, `"xm-sweep"`, or `"run-vllm-torchtpu-bench"`).
+2. **`[TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE]` & `--allow-dependency-closure`**: Rejects (`rc=2`) modifications to `vllm/`, `Dockerfile`, or `csrc/` and routes them to GKE `cdk`. When `--allow-dependency-closure` is passed, pure-Python sublayer/module paths outside `vllm_torchtpu/kernels/**` are also admitted if their transitive AST import closure only imports pre-linked Google3 TPU runner packages (`jax`, `jax.experimental.pallas`, `tokamax`, `flax`, `optax`, `einops`, `numpy`, `scipy`, `absl`, Python stdlib).
+3. **`[TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE]`**: Walks the transitive Python AST import closure across `--source-root` and routes any module that imports `torch`, `torch_xla`, `vllm`, or `triton` to GKE `cdk`.
+4. **Auto-Staging (`--stage-bundle-dir`)**: Copies the verified transitive `.py` closure byte-for-byte into `--stage-bundle-dir`, writes empty 0-byte `__init__.py` stubs for parent package directories (preventing `vllm_torchtpu/__init__.py` from importing `torch`), and writes `MANIFEST.sha256`.
 
 ```bash
-cdk-g3 verify-scope \
+# Auto-detect modified files from git worktree and stage transitive closure:
+cdk-g3 route \
   --source-root /path/to/vllm-torchtpu \
-  --changed-files "vllm_torchtpu/kernels/quantized_matmul/fp8_skinny.py,vllm_torchtpu/envs.py" \
+  --allow-dependency-closure \
+  --topology 1x1x1 \
   --stage-bundle-dir /tmp/cdk_g3_staged_bundle \
   --output-receipt /tmp/cdk_g3_scope_receipt.json
 ```
