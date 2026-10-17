@@ -82,3 +82,59 @@ def test_tail_request_view_keeps_other_fields():
         frontend_patches._TailPromptRequest(_request(None, True), 8).prompt_token_ids
         is None
     )
+
+
+def _dsv4_renderer(backend, workers):
+    from transformers import TokenizersBackend
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+    from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+    from vllm.tokenizers.hf import get_cached_tokenizer
+
+    hf = TokenizersBackend(tokenizer_object=backend._tokenizer)
+    tok = get_cached_tokenizer(get_deepseek_v4_tokenizer(hf))
+    model_config = SimpleNamespace(
+        renderer_num_workers=workers,
+        multimodal_config=None,
+        is_multimodal_model=False,
+        hf_config=SimpleNamespace(),
+        skip_tokenizer_init=False,
+    )
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(_api_process_rank=0),
+    )
+    return DeepseekV4Renderer(config, tok), tok
+
+
+def _concurrent_tokenize(renderer, n=48):
+    from concurrent.futures import ThreadPoolExecutor
+
+    tokenizer = renderer.get_tokenizer()
+
+    def one(i):
+        # vLLM's _tokenize_prompt passes truncation for some requests, which
+        # reconfigures the shared HF tokenizer mid-encode.
+        kw = {"truncation": True, "max_length": 10**7 - i} if i % 2 else {}
+        return tokenizer(_TEXT * 40, add_special_tokens=False, **kw)["input_ids"]
+
+    with ThreadPoolExecutor(8) as ex:
+        futures = [ex.submit(one, i) for i in range(n)]
+    errors = [f.exception() for f in futures if f.exception() is not None]
+    return [f.result() for f in futures if f.exception() is None], errors
+
+
+def test_dsv4_renderer_thread_pool(backend, monkeypatch):
+    pytest.importorskip("transformers")
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+
+    reference = backend._tokenizer.encode(_TEXT * 40, add_special_tokens=False).ids
+    monkeypatch.setattr(DeepseekV4Renderer, "__init__", DeepseekV4Renderer.__init__)
+    monkeypatch.delattr(DeepseekV4Renderer, "_tpu_thread_pool_patched", raising=False)
+    frontend_patches.patch_dsv4_renderer_thread_pool()
+
+    renderer, shared = _dsv4_renderer(backend, workers=16)
+    ids, errors = _concurrent_tokenize(renderer)
+    assert not errors
+    assert all(x == reference for x in ids)
+    # The caller's tokenizer (shared with the detokenizer) keeps its class.
+    assert type(shared) is not type(renderer.get_tokenizer())

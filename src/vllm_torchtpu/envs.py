@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     TPU_SRPT_ATTN_WORK_CAP: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_DETOK_PRIME_TAIL_TOKENS: int = 0
+    TPU_DSV4_RENDERER_THREAD_POOL: bool = False
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
     TPU_BLOCK_TABLE_STAGE_RING: int = 1
@@ -713,6 +714,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full-prompt priming.
     "TPU_DETOK_PRIME_TAIL_TOKENS": env_nonnegative_int(
         "TPU_DETOK_PRIME_TAIL_TOKENS", 0
+    ),
+    # Give each DeepSeek-V4 renderer thread its own tokenizer copy, as vLLM's
+    # HF renderer does, so --renderer-num-workers > 1 works
+    # (frontend_patches.py).
+    "TPU_DSV4_RENDERER_THREAD_POOL": env_bool(
+        "TPU_DSV4_RENDERER_THREAD_POOL", default=False
     ),
     # Directory for per-step host timestamps of the EngineCore, the runner and
     # the worker output thread (runner/host_loop_trace.py). Empty disables it.
