@@ -1064,6 +1064,7 @@ def prepare_outputs(
         "dcp_chunk_merge_axis",
         "dcp_chunk_merge_bf16_rs",
         "dcp_chunk_merge_barrier",
+        "dcp_chunk_merge_max_groups",
         "out_head_dim",
     ),
 )
