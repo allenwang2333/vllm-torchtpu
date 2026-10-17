@@ -33,11 +33,11 @@ OUT_ZERO_ROWS = 16
 # Fraction of VMEM a launch without verify windows may scope.
 DEFAULT_VMEM_FRACTION = 0.7
 
-# Fewest tokens a launch pair writes the z gate out for (`emit_z`). Below it
-# z stays the projection's slice: decode buckets relayout it on the
-# TensorCore in well under a microsecond, while emitting it widens the
-# DMA-bound decode body. 0 emits it at every bucket.
-EMIT_Z_MIN_TOKENS = 512
+# Fewest tokens a launch pair applies the gated output norm for (`gate_out`).
+# Below it the norm runs in XLA on the projection's z slice: reading z widens
+# the DMA-bound decode body, and a decode bucket's norm is a few
+# microseconds in XLA. 0 gates in the kernel at every bucket.
+GATE_OUT_MIN_TOKENS = 512
 
 # Run the PER_SEQ launch before the BATCHED one. On 1024-token steps XLA
 # overlaps an HBM-bound SparseCore relayout of the qkvz projection with
@@ -154,9 +154,10 @@ class GDNConfig:
     # rows before it are all computed by the BATCHED or the PER_SEQ launch.
     zero_out_tail: bool = False
     # The qkv row tiles carry the z gate (`v_dim_size` columns) right after
-    # q, k and v; the launch also writes it out token-major, the layout of
-    # the output its gate multiplies (see `fused_conv1d_gdn`'s `emit_z`).
-    emit_z: bool = False
+    # q, k and v; the launch writes RMSNormGated(out, z) instead of out (see
+    # `fused_conv1d_gdn`'s `out_norm_weight`), with this epsilon.
+    gate_out: bool = False
+    out_norm_eps: float = 0.0
 
     @property
     def chunk_size(self) -> int:
@@ -187,16 +188,7 @@ class GDNConfig:
     def qkv_src_lane_groups(self) -> int:
         """Lane groups of a token row a grid step copies in."""
         z_groups = self.v_dim_size // pltpu.get_tpu_info().num_lanes
-        return self.qkv_lane_groups + (z_groups if self.emit_z else 0)
-
-    @property
-    def z_needs_buffer(self) -> bool:
-        """Whether an `emit_z` launch stages z in its own VMEM buffer, copied
-        out at the end of the step, rather than in the output tile ahead of
-        the GDN step. The decode step loads its states before the conv, and
-        a copy started or waited on while they are live keeps them in VMEM
-        (+11.8 MB scoped at decode tile 4)."""
-        return self.emit_z and self.seq_tile_size > 1
+        return self.qkv_lane_groups + (z_groups if self.gate_out else 0)
 
     @property
     def z_stage_groups(self) -> int:
@@ -395,22 +387,7 @@ class GDNConfig:
             )
             out_zero_sem = pltpu.SemaphoreType.DMA
 
-        z_scratch = {}
-        if self.emit_z:
-            z_scratch = dict(z_sem_ref=pltpu.SemaphoreType.DMA)
-            if self.z_needs_buffer:
-                z_scratch["z_buffer_ref"] = pltpu.VMEM(
-                    (
-                        self.seq_tile_size,
-                        self.chunk_size,
-                        self.num_v_heads,
-                        self.v_head_dim,
-                    ),
-                    self.dtypes.act_out,
-                )
-
         return dict(
-            **z_scratch,
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             qkv_stage_scratch_ref=qkv_stage_scratch,

@@ -34,6 +34,19 @@ def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     return x / norm
 
 
+def gated_rms_norm(
+    x: jax.Array, z: jax.Array, weight: jax.Array, eps: float
+) -> jax.Array:
+    """vLLM's RMSNormGated with `norm_before_gate`, over the last axis:
+    rms_norm(x) * weight * silu(z) in f32 on the 16-bit `x` and `z`, rounded
+    back to `x`'s dtype. Shared by the kernel and the XLA path so both
+    evaluate the same expression."""
+    x32 = x.astype(jnp.float32)
+    variance = jnp.mean(x32 * x32, axis=-1, keepdims=True)
+    out = x32 * jax.lax.rsqrt(variance + eps) * weight.astype(jnp.float32)
+    return (out * jax.nn.silu(z.astype(jnp.float32))).astype(x.dtype)
+
+
 def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
     match jnp.dtype(dtype).itemsize:
         case 4:

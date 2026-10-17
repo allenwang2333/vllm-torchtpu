@@ -46,9 +46,12 @@ def _chunked_gdn_in_place(
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
     p_id: jax.Array,
+    out_norm_weight: jax.Array | None = None,
 ) -> None:
     """Chunked GDN that updates the carried recurrent state where it lives
-    and writes the output and the sequence's final state itself."""
+    and writes the output and the sequence's final state itself. With
+    `cfg.gate_out`, `out_slot_ref` holds the tile's z on entry, and each
+    output row is gated with the z it overwrites."""
     q_large, k_large, v_large, b_large, a_large = (
         vmem_ldst.load_activation_as_large(
             qkv_vreg=qkv_out_compact,
@@ -70,13 +73,22 @@ def _chunked_gdn_in_place(
                 recurrent_slot_ref.dtype
             )
 
+    def gate(out: jax.Array, z_ref: jax.Ref) -> jax.Array:
+        out = out.astype(out_slot_ref.dtype)
+        if not cfg.gate_out:
+            return out
+        return compute_gdn.gated_rms_norm(
+            out, z_ref[...], out_norm_weight, cfg.out_norm_eps
+        )
+
     def store_out(idx: int, h0: int, values: jax.Array) -> None:
         # [heads, chunk, v_head_dim] -> [chunk, heads, v_head_dim]
         num_heads, chunk, _ = values.shape
+        heads = pl.ds(h0, num_heads)
         if out_stage_scratch_ref is None:
-            out_slot_ref[idx, :, pl.ds(h0, num_heads)] = values.swapaxes(
-                0, 1
-            ).astype(out_slot_ref.dtype)
+            out_slot_ref[idx, :, heads] = gate(
+                values.swapaxes(0, 1), out_slot_ref.at[idx, :, heads]
+            )
             return
         # Through the stage: each head's rows go in whole, each token's come
         # out by one strided load.
@@ -87,9 +99,12 @@ def _chunked_gdn_in_place(
             out_stage_scratch_ref[pl.ds(t, num_heads, stride=stride)]
             for t in range(chunk)
         ]
-        out_slot_ref[idx, :, pl.ds(h0, num_heads)] = jnp.stack(rows).astype(
-            out_slot_ref.dtype
-        )
+        if cfg.gate_out:
+            # A token at a time: its z is read just before its row replaces it.
+            for t, row in enumerate(rows):
+                out_slot_ref[idx, t, heads] = gate(row, out_slot_ref.at[idx, t, heads])
+            return
+        out_slot_ref[idx, :, heads] = jnp.stack(rows).astype(out_slot_ref.dtype)
 
     compute_gdn.chunked_gdn(
         real_sizes=real_sizes,
@@ -140,9 +155,6 @@ def inner_kernel(
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
-    z_ref: jax.Array | None = None,
-    z_sem_ref: jax.Array | None = None,
-    z_buffer_ref: jax.Array | None = None,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -177,29 +189,14 @@ def inner_kernel(
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
             pipeline owns the Pallas program id.
-        z_ref: HBM output a `cfg.emit_z` launch copies the tile's z gate rows
-            to, token-major. They pass through `z_buffer_ref`, or else
-            through `out_slot_ref` before the GDN step writes it.
-        z_sem_ref: DMA semaphore of those copies.
-        z_buffer_ref: VMEM ref shaped like `out_slot_ref`, when
-            `cfg.z_needs_buffer`.
     """
 
     if p_id is None:
         p_id = pl.program_id(0)
 
-    z_stage_out_ref = None
-    if cfg.emit_z:
-        z_stage_out_ref = out_slot_ref
-        if cfg.z_needs_buffer:
-            z_stage_out_ref = z_buffer_ref
-
-            # The previous step's z copy still reads the buffer.
-            @pl.when(p_id > 0)
-            def _():
-                memory_ref.wait_copy_out_rows(
-                    z_buffer_ref, z_sem_ref, metadata_ref, p_id - 1, cfg
-                )
+    # A `gate_out` launch stages the tile's z, token-major, in the output
+    # tile; the GDN step's rows replace it as they are gated with it.
+    z_stage_out_ref = out_slot_ref if cfg.gate_out else None
 
     # The chunked GDN step updates the carried recurrent state in place.
     chunked_in_place = (
@@ -244,7 +241,7 @@ def inner_kernel(
         )
         row_in_tile = metadata_ref.p_id_to_r_base[p_id, 0] % config.QKV_TILE_ROWS
         # The qkv scratch is free until the conv writes it: it stages z.
-        z_part = cfg.z_stage_groups if cfg.emit_z else 0
+        z_part = cfg.z_stage_groups if cfg.gate_out else 0
         for g0 in range(0, cfg.qkv_src_lane_groups - lane_groups, max(z_part, 1)):
             vmem_ldst.widen_row_tiles_strided(
                 qkv_slot_ref.at[:, pl.ds(lane_groups + g0, z_part)],
@@ -285,11 +282,6 @@ def inner_kernel(
             z_stage_out_ref,
         )
         qkv_in_ref = qkv_slot_ref = qkv_scratch_ref
-
-    if cfg.emit_z and not cfg.z_needs_buffer:
-        memory_ref.start_copy_out_rows(
-            out_slot_ref, z_ref, z_sem_ref, metadata_ref, p_id, cfg
-        )
 
     # Prepare conv1d weights.
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -411,13 +403,11 @@ def inner_kernel(
         # keeps this intermediate in fp32.
         qkv_out_compact = qkv_out_compact.astype(cfg.dtypes.act_out).astype(jnp.float32)
 
-    if cfg.emit_z and not cfg.z_needs_buffer:
-        # The GDN step writes the output tile the z rows are copied from.
-        memory_ref.wait_copy_out_rows(
-            out_slot_ref, z_sem_ref, metadata_ref, p_id, cfg
-        )
-
     # Step 2: GDN.
+
+    out_norm_weight = None
+    if cfg.gate_out:
+        out_norm_weight = weights_ref.out_norm[...]
 
     # Prepare gdn weights.
     if cfg.is_kda:
@@ -447,6 +437,7 @@ def inner_kernel(
             dt_bias=dt_bias,
             cfg=cfg,
             p_id=p_id,
+            out_norm_weight=out_norm_weight,
         )
         return
 
@@ -511,7 +502,12 @@ def inner_kernel(
         )
 
     # Store output and recurrent to vmem.
-    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+    out = out.astype(out_slot_ref.dtype)
+    if cfg.gate_out:
+        out = compute_gdn.gated_rms_norm(
+            out, out_slot_ref[...], out_norm_weight, cfg.out_norm_eps
+        )
+    out_slot_ref[...] = out
     if cfg.state_plan is None:
         recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
     else:
@@ -532,12 +528,6 @@ def inner_kernel(
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
-    if cfg.z_needs_buffer:
-        # Last, so no value is held across the copy's start.
-        memory_ref.start_copy_out_rows(
-            z_buffer_ref, z_ref, z_sem_ref, metadata_ref, p_id, cfg
-        )
-
 
 def outer_kernel(
     # Inputs.
@@ -548,13 +538,11 @@ def outer_kernel(
     conv_state_ref: jax.Array,
     recurrent_state_ref: jax.Array,
     _: jax.Array,
-    _z: jax.Array | None,
     weights_ref: memory_ref.WeightRefs,
     # Outputs.
     out_ref: jax.Array,
     conv_state_out_ref: jax.Array,
     recurrent_state_out_ref: jax.Array,
-    z_ref: jax.Array | None,
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
@@ -564,8 +552,6 @@ def outer_kernel(
     solve_scratch_ref: jax.Array | None,
     out_zero_scratch_ref: jax.Array | None,
     out_zero_sem_ref: jax.Array | None,
-    z_sem_ref: jax.Array | None = None,
-    z_buffer_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -584,22 +570,9 @@ def outer_kernel(
             metadata_ref.out_zero_row[...],
         )
 
-        zero_copies = [zero_copy]
-        if cfg.emit_z:
-            # z rows past the last token pair with zero output rows.
-            zero_copies.append(
-                memory_ref.zero_rows_from(
-                    z_ref,
-                    out_zero_scratch_ref,
-                    out_zero_sem_ref,
-                    metadata_ref.out_zero_row[...],
-                )[1]
-            )
-
         @pl.loop(0, num_zero_copies)
         def _(i):
-            for copy in zero_copies:
-                copy(i).start()
+            zero_copy(i).start()
 
     if cfg.state_plan is not None:
         # Both state regions stream from the single external source ref,
@@ -622,15 +595,7 @@ def outer_kernel(
     num_tiles = metadata_ref.num_tiles[...]
 
     pipeline_func = pltpu.emit_pipeline(
-        body=functools.partial(
-            inner_kernel,
-            cfg=cfg,
-            **(
-                dict(z_ref=z_ref, z_sem_ref=z_sem_ref, z_buffer_ref=z_buffer_ref)
-                if cfg.emit_z
-                else {}
-            ),
-        ),
+        body=functools.partial(inner_kernel, cfg=cfg),
         grid=(num_tiles,),
         in_specs=(
             qkv_alloc.spec,
@@ -675,20 +640,11 @@ def outer_kernel(
 
     _run()
 
-    if cfg.z_needs_buffer:
-
-        @pl.when(num_tiles > 0)
-        def _():
-            memory_ref.wait_copy_out_rows(
-                z_buffer_ref, z_sem_ref, metadata_ref, num_tiles - 1, cfg
-            )
-
     if cfg.zero_out_tail:
 
         @pl.loop(0, num_zero_copies)
         def _(i):
-            for copy in zero_copies:
-                copy(i).wait()
+            zero_copy(i).wait()
 
 
 @jax.jit(
@@ -710,7 +666,7 @@ def outer_kernel(
         "attention_mode",
         "gate_lower_bound",
         "qkv_columns",
-        "emit_z",
+        "out_norm_eps",
     ),
 )
 def fused_conv1d_gdn(
@@ -748,12 +704,9 @@ def fused_conv1d_gdn(
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
     qkv_columns: int | None = None,
-    emit_z: bool = False,
-) -> (
-    tuple[tuple[jax.Array, jax.Array], jax.Array]
-    | tuple[jax.Array, jax.Array]
-    | tuple[jax.Array, jax.Array, jax.Array]
-):
+    out_norm_weight: jax.Array | None = None,  # [d_v]
+    out_norm_eps: float = 0.0,
+) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
     Args:
@@ -828,12 +781,14 @@ def fused_conv1d_gdn(
             `None` means all of them. Lets `qkv` be a whole projection output
             whose trailing columns (e.g. the z gate) the kernel never reads, so
             no sliced copy of it is made per layer.
-        emit_z: `qkv`'s `n_v * d_v` columns after `qkv_columns` are the z gate;
-            the launches also return it as a third output, [batch_size,
-            n_v * d_v] in the output's token-major layout, so its consumer
-            reads it without relayouting the projection. Rows past the last
-            token are zero, like the output's. Pooled path with both launches
-            only; off the row-tiled path it is the projection's slice.
+        out_norm_weight: When set, `qkv`'s `n_v * d_v` columns after
+            `qkv_columns` are the z gate, and `out` is RMSNormGated(out, z)
+            per value head (`compute_gdn.gated_rms_norm`, epsilon
+            `out_norm_eps`) rather than the bare GDN output. Launch pairs of
+            `config.GATE_OUT_MIN_TOKENS` tokens or more apply it in the
+            kernel, to z read from the same row tiles as q/k/v, so z never
+            leaves VMEM; smaller ones in XLA, on the projection's slice.
+            Pooled path with both launches only.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -869,20 +824,22 @@ def fused_conv1d_gdn(
         and dim % pltpu.get_tpu_info().num_lanes == 0
         and num_spec_tokens == 0
     )
-    sliced_z = None
-    if emit_z:
-        assert pooled and zero_initialize_out, "emit_z needs the pooled path"
-        assert not (batched_only or prefill_only), "emit_z needs both launches"
+    gate_out, sliced_z = False, None
+    if out_norm_weight is not None:
+        assert pooled and zero_initialize_out, "out_norm_weight needs the pooled path"
+        assert not (batched_only or prefill_only), "out_norm_weight needs both launches"
+        assert attention_mode == config.AttentionMode.GDN, attention_mode
         assert qkv.shape[-1] == dim + n_v * d_v, (qkv.shape, dim, n_v, d_v)
+        assert out_norm_weight.shape == (d_v,), out_norm_weight.shape
+        out_norm_weight = out_norm_weight.astype(jnp.float32)
         # The PER_SEQ step stages z in its chunked qkv scratch.
-        if (
-            not qkv_row_tiled
-            or min(mixed_tile_size, qkv.shape[0]) == 1
-            or qkv.shape[0] < config.EMIT_Z_MIN_TOKENS
-        ):
-            # z is the projection's slice, as unfused.
+        gate_out = (
+            qkv_row_tiled
+            and min(mixed_tile_size, qkv.shape[0]) > 1
+            and qkv.shape[0] >= config.GATE_OUT_MIN_TOKENS
+        )
+        if not gate_out:
             sliced_z = qkv[:, dim:]
-            emit_z = False
     if not qkv_row_tiled:
         qkv = qkv[:, :dim].astype(jnp.float32)
     b = b.astype(jnp.float32)
@@ -1015,7 +972,11 @@ def fused_conv1d_gdn(
     # Step 4: Wrap inputs for the kernel.
     conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
     gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
-    weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
+    weights = memory_ref.WeightRefs(
+        conv=conv_weights,
+        gdn=gdn_weights,
+        out_norm=out_norm_weight.reshape(1, d_v) if gate_out else None,
+    )
 
     # Step 5: Create specs.
     smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -1041,8 +1002,7 @@ def fused_conv1d_gdn(
         in_recurrent_state: jax.Array | None,
         in_act: jax.Array | None,
         mode: config.GDNMode,
-        in_z: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
         # With a state source, it rides the conv-state slot and the dense
         # recurrent-state input is absent.
         if mode == config.GDNMode.PER_SEQ:
@@ -1066,7 +1026,8 @@ def fused_conv1d_gdn(
             window_size=window_size,
             qkv_row_tiled=qkv_row_tiled,
             zero_out_tail=zero_out_tail,
-            emit_z=emit_z,
+            gate_out=gate_out,
+            out_norm_eps=out_norm_eps,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -1131,19 +1092,9 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        # The z gate output follows the same row ownership as the output.
-        z_shape = z_spec = in_z_spec = None
-        if emit_z:
-            z_shape, z_spec = cfg.get_out_shape(), hbm_spec
-            if in_z is not None:
-                z_shape, in_z_spec = in_z, hbm_spec
-                in_z_index = len(metadata_obj) + 3 + num_state_inputs
-                in_z_index += in_act is not None
-                input_output_aliases[in_z_index] = 2 + (not pooled)
-
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
-            out_shape=(out_shape, in_conv_state, in_recurrent_state, z_shape),
+            out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
                 metadata_spec,
                 hbm_spec,
@@ -1152,10 +1103,9 @@ def fused_conv1d_gdn(
                 hbm_spec,
                 None if pooled else hbm_spec,
                 in_out_spec,
-                in_z_spec,
                 weights_spec,
             ),
-            out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec, z_spec),
+            out_specs=(hbm_spec, hbm_spec, None if pooled else hbm_spec),
             scratch_shapes=dict(
                 cfg.get_scratch_shape_dict(),
                 solve_scratch_ref=compute_gdn.solve_scratch(cfg),
@@ -1175,7 +1125,6 @@ def fused_conv1d_gdn(
             in_conv_state,
             in_recurrent_state,
             in_act,
-            in_z,
             weights,
         )
 
@@ -1196,23 +1145,26 @@ def fused_conv1d_gdn(
         launch_modes.reverse()
 
     if pooled:
-        out_act, out_source, out_z = None, state_source, None
+        out_act, out_source = None, state_source
         for mode in launch_modes:
-            out_act, out_source, _, out_z = call_kernel(
-                out_source, None, out_act, mode, out_z
-            )
+            out_act, out_source, _ = call_kernel(out_source, None, out_act, mode)
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
-        if emit_z:
-            sliced_z = out_z.reshape(padded_batch_size, -1)[:batch_size]
         if sliced_z is not None:
-            return out_source, out_act, sliced_z
+            # Below GATE_OUT_MIN_TOKENS the gate runs here, in XLA.
+            heads = (batch_size, n_v, d_v)
+            out_act = compute_gdn.gated_rms_norm(
+                out_act.reshape(heads),
+                sliced_z.reshape(heads),
+                out_norm_weight,
+                out_norm_eps,
+            ).reshape(batch_size, -1)
         return out_source, out_act
 
     # The first segment holds verify windows of up to `num_spec_tokens + 1`
     # tokens, or plain 1-token decodes without speculative decoding.
     out_act, out_conv_state, out_recurrent_state = None, conv_state, recurrent_state
     for mode in launch_modes:
-        out_act, out_conv_state, out_recurrent_state, _ = call_kernel(
+        out_act, out_conv_state, out_recurrent_state = call_kernel(
             out_conv_state, out_recurrent_state, out_act, mode
         )
 
