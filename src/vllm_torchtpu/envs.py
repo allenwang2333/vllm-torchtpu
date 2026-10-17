@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_SRPT_ATTN_WORK_CAP: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
+    TPU_DETOK_PRIME_TAIL_TOKENS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
     TPU_BLOCK_TABLE_STAGE_RING: int = 1
@@ -707,6 +708,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
+    # Prime each request's streaming detokenizer with only the last N prompt
+    # tokens instead of the whole prompt (frontend_patches.py). 0 keeps vLLM's
+    # full-prompt priming.
+    "TPU_DETOK_PRIME_TAIL_TOKENS": env_nonnegative_int(
+        "TPU_DETOK_PRIME_TAIL_TOKENS", 0
+    ),
     # Directory for per-step host timestamps of the EngineCore, the runner and
     # the worker output thread (runner/host_loop_trace.py). Empty disables it.
     "TPU_HOST_LOOP_TRACE_DIR": env_str("TPU_HOST_LOOP_TRACE_DIR", ""),
