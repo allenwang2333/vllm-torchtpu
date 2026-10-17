@@ -24,7 +24,12 @@ shared). Positive control: a different seed changes some output.
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+
+from types import SimpleNamespace
+
 from test_sampler_verify_trim import (  # noqa: F401
+    K,
     PADDED_NUM_REQS,
     VARIANTS,
     _fused,
@@ -36,6 +41,16 @@ from test_sampler_verify_trim import (  # noqa: F401
 )
 
 CASES = [[3], [3, 3], [2, 1], [1, 1, 3], [3, 3, 2]]
+
+
+def _run_graph(fn, dev, logits, md, temps, top_k, top_p, **kw):
+    self_ = SimpleNamespace(rejection_sampler=RejectionSampler())
+    return fn(
+        self_, logits.to(dev), md.bonus_logits_indices, md.target_logits_indices,
+        temps.to(dev), top_k.to(dev), top_p.to(dev), md.draft_token_ids,
+        md.draft_lengths, md.segment_ids, md.group_indices, None, None, None, K,
+        graph_rng=True, **kw,
+    ).cpu()
 
 
 def _default_gen(dev):
@@ -63,8 +78,7 @@ def _steps(dev, seed, graph, interleave):
         if sum(case) <= 8 and padded > 8:
             kw["verify_rows"] = 8
         if graph:
-            out = _run(fn, dev, logits, md, temps, top_k, top_p, (None, None, None), 0,
-                       graph_rng=True, **kw)
+            out = _run_graph(fn, dev, logits, md, temps, top_k, top_p, **kw)
         else:
             draws = _eager_draws(gen, padded, vocab, dev)
             out = _run(fn, dev, logits, md, temps, top_k, top_p, draws, 0, **kw)
