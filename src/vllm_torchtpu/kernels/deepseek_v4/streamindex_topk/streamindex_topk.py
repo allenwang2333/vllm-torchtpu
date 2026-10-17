@@ -1438,7 +1438,7 @@ def streamindex_topk(
             ),
         )
 
-    def _pass_metadata(spec, chunk_starts, chunk_tokens):
+    def _pass_metadata(spec, chunk_starts, chunk_tokens, skip_kv_len_at_most):
         """One schedule per pass, holding every chunk's steps back to back."""
         bq_sz, bkv_sz = _block_sizes(
             spec["num_queries_per_block"],
@@ -1463,6 +1463,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            skip_kv_len_at_most=skip_kv_len_at_most,
         )
 
     def _scores_for_chunk(
@@ -1552,8 +1553,11 @@ def streamindex_topk(
             if num_chunks == 1
             else tuple(m * chunk_len for m in range(num_chunks))
         )
+        # Every row of a sequence with at most k compressed positions is short,
+        # so a tile of such sequences writes scores nothing reads.
+        skip_kv_len_at_most = k if skip_short_rows else None
         passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
+            (spec, _pass_metadata(spec, chunk_starts, chunk_len, skip_kv_len_at_most))
             for spec in _pass_specs(decode_batch_end)
         )
         topk_idxs = []

@@ -155,6 +155,7 @@ def compute_batched_seq_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    skip_kv_len_at_most: int | None = None,
 ) -> MetadataRef:
     max_num_seqs = seq_lens.shape[0]
     max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
@@ -244,6 +245,8 @@ def compute_batched_seq_metadata(
         else:
             local_kv_lens_all = kv_lens_all
         max_kv_lens = jnp.max(local_kv_lens_all, axis=-1)
+        if skip_kv_len_at_most is not None:
+            is_valid_seq_tile &= max_kv_lens > skip_kv_len_at_most
         # 1D array of shape (max_seq_tiles,)
         s_num_bkv = jnp.where(
             is_valid_seq_tile,
@@ -349,11 +352,14 @@ def compute_metadata(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    skip_kv_len_at_most: int | None = None,
 ) -> MetadataRef:
     """Unified metadata calculation for batch_tile_idx, bq_idx, and bkv_idx.
 
     Passing a tuple of `chunk_token_start` values builds one schedule holding
     every chunk back to back, with `num_steps[m]` steps for chunk `m`.
+    A sequence tile whose compressed KV lengths are all at most
+    `skip_kv_len_at_most` gets no steps.
     """
     return compute_batched_seq_metadata(
         seq_lens=seq_lens,
@@ -373,4 +379,5 @@ def compute_metadata(
         cp_rank=cp_rank,
         cp_size=cp_size,
         interleave_c=interleave_c,
+        skip_kv_len_at_most=skip_kv_len_at_most,
     )
