@@ -90,6 +90,37 @@ def test_gate_needs_step8():
 def test_gate_cap():
     assert not _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
     assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
+    # A cap above the step8 step would leave a two-step grid: off everywhere.
+    assert not _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="16")
+    assert not _applies(4, TPU_DCP_MLA_SMALL_CHUNK_TOKENS="4")
+
+
+def test_gate_compares_tokens_once():
+    # The bucket size is symbolic under torch.compile: one `T <= cap`
+    # comparison and nothing else (no modulo, no lower bound), or the
+    # backbone trace specializes on the first bucket.
+    seen = []
+
+    class T(int):
+        def __le__(self, other):
+            seen.append(("<=", other))
+            return int(self) <= other
+
+        def __gt__(self, other):
+            seen.append((">", other))
+            return int(self) > other
+
+        def __mod__(self, other):
+            raise AssertionError("modulo on the token count")
+
+        def __lt__(self, other):
+            raise AssertionError("< on the token count")
+
+        def __ge__(self, other):
+            raise AssertionError(">= on the token count")
+
+    assert _applies(T(4))
+    assert seen == [("<=", 8)], seen
 
 
 def test_slab_geometry():

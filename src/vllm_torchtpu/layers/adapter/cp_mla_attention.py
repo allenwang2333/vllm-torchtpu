@@ -1118,8 +1118,11 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     """Whether the decode MLA kernel runs this bucket's small all-to-all
     itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket `send_small_a2a_applies`
     takes whose attention grid is one step -- the decode body lever "step8"
-    on the capped fused-prep row-widths body, the bucket a divisor of its step.
-    Fixed at trace time on the static bucket size."""
+    on the capped fused-prep row-widths body. The only token-count gate is
+    `send_small_a2a_applies`' `T <= cap` (a power of 2): the rest is static --
+    the cap itself at most DECODE_STEP8_TOKENS (a power-of-2 bucket at or
+    below it is its own step) and within the small-chunk path. Fixed at trace
+    time on the static bucket size."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
 
     if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
@@ -1135,9 +1138,8 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
         and envs.TPU_DCP_MLA_TOPK_CAP
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
-        and 0 < num_tokens <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
-        and sparse_kernel._largest_divisor(num_tokens, sparse_kernel.DECODE_STEP8_TOKENS)
-        == num_tokens
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS <= sparse_kernel.DECODE_STEP8_TOKENS
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
     )
 
 
