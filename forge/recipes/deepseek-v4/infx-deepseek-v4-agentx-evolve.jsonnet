@@ -530,6 +530,11 @@ local serverScript = agentx.fill(
       export MODEL_PATH="/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
       export HF_HUB_OFFLINE=1
+    elif [ -d "/vllm-cache/DeepSeek-V4-Pro-0813" ]; then
+      echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/DeepSeek-V4-Pro-0813"
+      export MODEL_PATH="/vllm-cache/DeepSeek-V4-Pro-0813"
+      export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
+      export HF_HUB_OFFLINE=1
     elif [ -d "/vllm-cache/hub/models--deepseek-ai--DeepSeek-V4-Pro-0813" ]; then
       echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/hub/models--deepseek-ai--DeepSeek-V4-Pro-0813"
       export MODEL_PATH="deepseek-ai/DeepSeek-V4-Pro-0813"
