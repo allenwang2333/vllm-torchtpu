@@ -1509,6 +1509,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     main_records,
                     self.attn_sink,
                     self.scale,
+                    query_block_size=(
+                        int(getattr(self, "swa_query_block_size", 1))
+                        if non_causal and not self.compress_ratio
+                        else 1
+                    ),
                 )
             output.copy_(result.masked_fill(swa_invalid_3d, 0))
             return None

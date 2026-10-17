@@ -89,6 +89,65 @@ class _FakeKVBuffer:
 
 
 class TestWindowAttentionAndAttend:
+    @pytest.mark.parametrize("block", [1, 5, 6])
+    @pytest.mark.parametrize("width", [0, 64, 133, 192])
+    @pytest.mark.parametrize("two_banks", [False, True])
+    def test_request_shared_swa(self, block, width, two_banks):
+        rng = np.random.default_rng(31)
+        requests, heads, dim = 3, 4, 512
+        tokens = requests * block
+        q = jnp.asarray(rng.normal(0, 0.2, (tokens, heads, dim)), jnp.bfloat16)
+        rows = jnp.asarray(rng.normal(0, 0.2, (257, dim)), jnp.bfloat16)
+        bits = np.asarray(rows).view(np.uint16).astype(np.uint32)
+        words = bits[:, 0::2] | (bits[:, 1::2] << 16)
+        raw = jnp.asarray(words.view(np.int32).reshape(-1, 128))
+        pool = (raw[:258], raw[258:]) if two_banks else raw
+        records = rng.integers(0, 257, (requests, width), dtype=np.int32)
+        records[:, :3] = -1
+        records[-1] = -1
+        records = np.repeat(records, block, axis=0)
+        if block > 1:
+            records[0] = -1  # Padding may precede a live query in its block.
+        records = jnp.asarray(records)
+        empty = jnp.empty((tokens, 0), jnp.int32)
+        sink = jnp.asarray(rng.normal(size=heads), jnp.float32)
+        args = (q, pool, pool, records, empty, sink, dim**-0.5)
+        expected = paged_attention_jax(*args)
+        with mock.patch.object(
+            attention_kernels,
+            "gather_cache_pieces",
+            wraps=attention_kernels.gather_cache_pieces,
+        ) as gather:
+            actual = paged_attention_jax(*args, query_block_size=block)
+            if width:
+                assert gather.call_args.args[1].size == requests * (
+                    (width + 63) // 64 * 64
+                )
+            else:
+                gather.assert_not_called()
+        np.testing.assert_allclose(
+            np.asarray(actual, np.float32),
+            np.asarray(expected, np.float32),
+            rtol=0,
+            atol=1e-6,
+        )
+
+    def test_request_shared_swa_rejects_different_windows(self):
+        q = jnp.ones((5, 2, 512), jnp.bfloat16)
+        pool = jnp.zeros((32, 128), jnp.int32)
+        records = jnp.zeros((5, 64), jnp.int32).at[1, 0].set(1)
+        result = paged_attention_jax(
+            q,
+            pool,
+            pool,
+            records,
+            jnp.empty((5, 0), jnp.int32),
+            jnp.zeros(2),
+            0.125,
+            query_block_size=5,
+        )
+        assert jnp.isnan(result).all()
+
     def test_attention_state(self):
         q = jnp.zeros((8, 4, 128), dtype=jnp.float32)
         maximum, denominator, numerator = _attention_state(q)
@@ -2229,18 +2288,35 @@ def test_gather_reuse_in_compiled_twenty_layer_stage(monkeypatch):
     lib.define("gather(Tensor pool, Tensor? hi, Tensor records, int dim) -> Tensor")
     lib.define(
         "attend(Tensor q, Tensor swa, Tensor main, Tensor sr, Tensor mr, "
-        "Tensor sink, float scale, Tensor? gathered=None) -> Tensor"
+        "Tensor sink, float scale, Tensor? gathered=None, "
+        "int query_block_size=1) -> Tensor"
     )
     lib.impl("gather", lambda pool, hi, records, dim: pool.clone(), "CPU")
     lib.impl("gather", lambda pool, hi, records, dim: torch.empty_like(pool), "Meta")
     lib.impl(
         "attend",
-        lambda q, swa, main, sr, mr, sink, scale, gathered=None: q.clone(),
+        lambda q,
+        swa,
+        main,
+        sr,
+        mr,
+        sink,
+        scale,
+        gathered=None,
+        query_block_size=1: q.clone(),
         "CPU",
     )
     lib.impl(
         "attend",
-        lambda q, swa, main, sr, mr, sink, scale, gathered=None: torch.empty_like(q),
+        lambda q,
+        swa,
+        main,
+        sr,
+        mr,
+        sink,
+        scale,
+        gathered=None,
+        query_block_size=1: torch.empty_like(q),
         "Meta",
     )
     gather_op = torch.ops.dsv41_gather_test.gather.default
@@ -2279,7 +2355,7 @@ def test_gather_reuse_in_compiled_twenty_layer_stage(monkeypatch):
     assert len(attends) == 20
     for group, gathered in enumerate(gathers):
         assert all(
-            node.args[-1] is gathered for node in attends[2 + 6 * group : 8 + 6 * group]
+            node.args[7] is gathered for node in attends[2 + 6 * group : 8 + 6 * group]
         )
     assert ak._active_gathered_kv is None
 

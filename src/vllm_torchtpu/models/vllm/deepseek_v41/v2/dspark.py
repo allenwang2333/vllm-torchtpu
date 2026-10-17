@@ -201,6 +201,10 @@ class DSparkDeepseekV41Model(nn.Module):
                 raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
+            layer.attn.swa_query_block_size = (
+                vllm_config.speculative_config.num_speculative_tokens
+                + int(not getattr(config, "sample_from_anchor", True))
+            )
 
         compact_rope_caches(
             (layer.attn for layer in self.layers),

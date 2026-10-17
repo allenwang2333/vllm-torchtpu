@@ -366,6 +366,33 @@ def _swa_attention(q, pool, records, sink, scale):
     )
 
 
+def _attend_shared_swa(q, pool, records, scale, query_block_size):
+    """Share fixed noncausal query blocks' KV without sharing their softmax."""
+    tokens, heads, dim = q.shape
+    if not records.shape[1]:
+        return _attention_state(q)
+    groups = tokens // query_block_size
+    grouped_records = records.reshape(groups, query_block_size, records.shape[1])
+    shared_records = grouped_records.max(axis=1)
+    valid_query = (grouped_records >= 0).any(axis=-1)
+    compatible = (
+        (grouped_records == shared_records[:, None]) | ~valid_query[..., None]
+    ).all(axis=(1, 2))
+    grouped_q = q.reshape(groups, query_block_size * heads, dim)
+    state = _attend(grouped_q, pool, shared_records, _attention_state(grouped_q), scale)
+    result = []
+    for value, empty in zip(state, (-1e30, 0, 0)):
+        value = value.reshape(tokens, heads, *value.shape[2:])
+        valid = valid_query.reshape(tokens, *([1] * (value.ndim - 1)))
+        value = jnp.where(valid, value, empty)
+        # A caller violating the fixed-block contract must not silently reuse KV.
+        supported = jnp.repeat(compatible, query_block_size).reshape(
+            tokens, *([1] * (value.ndim - 1))
+        )
+        result.append(jnp.where(supported, value, jnp.nan))
+    return tuple(result)
+
+
 def paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
@@ -375,10 +402,13 @@ def paged_attention_jax(
     sink: jax.Array,
     scale: float,
     gathered: jax.Array | None = None,
+    query_block_size: int = 1,
 ) -> jax.Array:
     from vllm_torchtpu.kernels.mla.swa_attention import supports_swa
 
-    if main_records.shape[1] == 0 and supports_swa(q, swa_records):
+    assert query_block_size >= 1 and q.shape[0] % query_block_size == 0
+    assert query_block_size == 1 or main_records.shape[1] == 0
+    if query_block_size == 1 and main_records.shape[1] == 0 and supports_swa(q, swa_records):
         return _swa_attention(q, swa_pool, swa_records, sink, scale)
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
@@ -386,7 +416,11 @@ def paged_attention_jax(
         q,
         main_pool,
         main_records,
-        _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
+        (
+            _attend_shared_swa(q, swa_pool, swa_records, scale, query_block_size)
+            if query_block_size > 1
+            else _attend_window(q, swa_pool, swa_records, _attention_state(q), scale)
+        ),
         scale,
         gathered=gathered,
     )
@@ -1289,7 +1323,7 @@ def initialize_paged_attention():
         paged_attention_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P()))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P(), None))
         ),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -1305,6 +1339,7 @@ def initialize_paged_attention():
         sink: jax.Array,
         scale: float,
         gathered: jax.Array | None = None,
+        query_block_size: int = 1,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -1315,6 +1350,7 @@ def initialize_paged_attention():
             sink,
             scale,
             gathered,
+            query_block_size,
         )
 
     _attention_2bank_op = pallas.jax_op(
@@ -1322,7 +1358,7 @@ def initialize_paged_attention():
         paged_attention_2bank,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P()))
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P(), None))
         ),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
@@ -2096,7 +2132,11 @@ def sparse_fp8_attention_qo(
     )
 
 
-def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
+def paged_attention(
+    q, swa, main, swa_records, main_records, sink, scale, query_block_size=1
+):
+    assert query_block_size >= 1 and q.shape[0] % query_block_size == 0
+    assert query_block_size == 1 or main_records.shape[1] == 0
     gathered = None
     cache = _active_gathered_kv
     if cache is not None and main_records.shape[1]:
@@ -2129,6 +2169,7 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
             sink,
             scale,
             gathered,
+            query_block_size,
         )
     assert _attention_op is not None
     return _attention_op(
@@ -2140,6 +2181,7 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
         sink,
         scale,
         gathered,
+        query_block_size,
     )
 
 

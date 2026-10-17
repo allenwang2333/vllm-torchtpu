@@ -190,17 +190,21 @@ def test_attend_window_width_over_512(monkeypatch: pytest.MonkeyPatch):
     assert out is state
 
 
-def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("compress_ratio", [0, 2])
+def test_prepare_tpu_non_causal_dspark_swa(
+    monkeypatch: pytest.MonkeyPatch, compress_ratio: int
+):
     attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
     torch.nn.Module.__init__(attn)
     attn.prefix = "swa_pfx"
     attn.window_size = 512
     attn._ced_decoder = False
+    attn._csa2 = False
     attn._ced_global_from_encoder = False
     attn._local_q_attn = False
     attn.compressor = None
     attn.indexer = None
-    attn.compress_ratio = 2
+    attn.compress_ratio = compress_ratio
     attn._config = {"index_topk": 4}
     attn._max_model_len = 256
     attn._fp8_kv = True
@@ -218,6 +222,7 @@ def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
     attn.wq_b = lambda qr: qr
     attn.non_causal_multi_token_decode = True
     attn.dspark_block_size = 16
+    attn.swa_query_block_size = 4
 
     cache_mock = MagicMock(spec=PagedCacheRows)
     cache_mock.numel.return_value = 1024
@@ -248,9 +253,13 @@ def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
 
     def fake_sparse_fp8_attn(q, swa_c, main_c, records, main_rec, *args, **kwargs):
         captured_records.append(records.clone())
+        if not compress_ratio:
+            assert kwargs["query_block_size"] == 4
+            assert main_rec.shape[1] == 0
         return torch.zeros_like(q)
 
     monkeypatch.setattr(v2_attn, "sparse_fp8_attention", fake_sparse_fp8_attn)
+    monkeypatch.setattr(v2_attn, "paged_attention", fake_sparse_fp8_attn)
 
     hidden = torch.zeros((4, 16))
     qr = torch.zeros((4, 16))
@@ -265,6 +274,7 @@ def test_prepare_tpu_non_causal_dspark_swa(monkeypatch: pytest.MonkeyPatch):
     # Token 0 (pos=20) attends up to pos=23 (end_pos=24) in non-causal mode!
     assert int(rec_uncached[0, 23].item()) >= 0
     assert int(rec_uncached[0, 24].item()) == -1
+    assert torch.equal(rec_uncached, rec_uncached[:1].expand_as(rec_uncached))
 
     # Path B: with stage_attention_cache_scope
     captured_records.clear()
@@ -475,6 +485,7 @@ class _FakeDraftAttn(nn.Module):
     def __init__(self, hidden_size: int, window_size: int = 512, prefix: str = ""):
         super().__init__()
         self.window_size = window_size
+        self._csa2 = False
         self.non_causal_multi_token_decode = False
         self.dspark_block_size = 0
         self.swa_cache_layer = SimpleNamespace(
@@ -675,11 +686,15 @@ def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_dspark, "get_tensor_model_parallel_rank", lambda: 0)
 
 
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
 def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, sample_from_anchor: bool
 ):
     _patch_dspark_env(monkeypatch)
     vllm_cfg = _make_dspark_vllm_config()
+    vllm_cfg.speculative_config.draft_model_config.hf_config.sample_from_anchor = (
+        sample_from_anchor
+    )
     draft_lm = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg)
 
     # Share embeddings & lm_head and initialize uninitialized linear weights
@@ -695,6 +710,7 @@ def test_dspark_deepseek_v41_for_causal_lm_forward_and_hooks(
     for layer in draft_lm.model.layers:
         assert layer.attn.non_causal_multi_token_decode is True
         assert layer.attn.dspark_block_size == 16
+        assert layer.attn.swa_query_block_size == 15 + int(not sample_from_anchor)
 
     input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
     positions = torch.tensor([0, 1, 2, 3], dtype=torch.long)
