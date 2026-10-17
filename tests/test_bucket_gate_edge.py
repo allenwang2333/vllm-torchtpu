@@ -90,3 +90,16 @@ def test_merge_chunk_gate_unchanged_on_the_ladder(cap, monkeypatch):
     want = {4: 1, 8: 1, 16: 1, 32: 1, 64: 1, 128: 1, 256: 1, 512: 1,
             1024: 2, 2048: 2, 4096: 8}
     assert {t: cp_mla._merge_chunks(t) for t in want} == want
+
+
+def test_small_all_reduce_fold_gate_picks_the_same_buckets():
+    """fold_geometry's rows test is `rows > tile_rows // 2` (cap rule): on the
+    bucket ladder it is the old `rows >= tile_rows` (tile 16, bf16 on v7)."""
+    from vllm_torchtpu.kernels.experimental.small_collectives import all_reduce as ar
+
+    hidden, cores, tile = 6144, 8, 16
+    for rows in (4, 8, 16, 32, 64):
+        got = ar.fold_geometry(rows, hidden, cores, tile) is not None
+        own = hidden // cores
+        old = not (own % ar.LANES or rows < tile) and (own // ar.LANES) >= 2
+        assert got == old, rows
