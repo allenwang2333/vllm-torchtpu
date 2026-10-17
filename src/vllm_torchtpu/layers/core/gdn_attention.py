@@ -854,7 +854,8 @@ def run_jax_gdn_attention_pooled_local(
     num_spec_tokens: int = 0,
     out_norm_weight: jnp.ndarray | None = None,
     out_norm_eps: float = 0.0,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    out_quant_dtype: jnp.dtype | None = None,
+) -> tuple[jnp.ndarray, ...]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
@@ -866,7 +867,8 @@ def run_jax_gdn_attention_pooled_local(
     ``mixed_qkv`` may be the whole qkvz projection output: the kernel reads
     only its leading ``conv_dim`` columns. With ``out_norm_weight`` its
     trailing columns are the z gate, and the output is the gated RMSNorm of
-    the GDN output (``fused_conv1d_gdn``'s ``out_norm_weight``).
+    the GDN output (``fused_conv1d_gdn``'s ``out_norm_weight``), returned
+    quantized for the output projection with ``out_quant_dtype``.
     """
 
     conv_dim = conv_weight.shape[0]
@@ -914,6 +916,7 @@ def run_jax_gdn_attention_pooled_local(
         qkv_columns=conv_dim,
         out_norm_weight=out_norm_weight,
         out_norm_eps=out_norm_eps,
+        out_quant_dtype=out_quant_dtype,
     )
 
 
@@ -944,7 +947,8 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     out_norm_weight: jnp.ndarray | None = None,
     out_norm_eps: float = 0.0,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+    out_quant_dtype: jnp.dtype | None = None,
+) -> tuple[jnp.ndarray, ...]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
     Args:
@@ -981,11 +985,15 @@ def run_jax_gdn_attention_pooled(
           `j_mixed_qkv` is the whole qkvz projection output and the output is
           gated and normed with its z (see the local function).
         out_norm_eps: That norm's epsilon.
+        out_quant_dtype: With `out_norm_weight`, return the output quantized
+          per token for the output projection, as `quantize_tensor` does.
 
     Returns:
         A tuple containing:
         - The updated pool (the in-place written state regions).
-        - The output tensor of shape `(num_tokens, n_v * d_v)`.
+        - The output tensor of shape `(num_tokens, n_v * d_v)`; with
+          `out_quant_dtype`, quantized, followed by its `(num_tokens, 1)`
+          f32 scale.
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
@@ -1024,6 +1032,10 @@ def run_jax_gdn_attention_pooled(
     )
 
     tp_size = get_mesh_shape_product(mesh, "model")
+    if out_quant_dtype is not None:
+        # A token's scale spans all of its heads.
+        assert tp_size == 1, "out_quant_dtype needs the heads on one device"
+        out_specs = out_specs + (P(None, None),)  # output scale
 
     p_run_jax_gdn_attention_pooled_local = functools.partial(
         run_jax_gdn_attention_pooled_local,
@@ -1036,6 +1048,7 @@ def run_jax_gdn_attention_pooled(
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         out_norm_eps=out_norm_eps,
+        out_quant_dtype=out_quant_dtype,
     )
 
     def local_fn(*args):

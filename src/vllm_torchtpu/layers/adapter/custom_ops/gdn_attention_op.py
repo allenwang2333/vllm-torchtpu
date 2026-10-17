@@ -48,7 +48,10 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
 )
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    prequantized_matmul,
+)
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -172,7 +175,8 @@ def gdn_attention_pooled_core_tpu(
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
     out_norm_eps: float = 0.0,
-) -> tuple[jax.Array, jax.Array]:
+    out_quant_dtype: jnp.dtype | None = None,
+) -> tuple[jax.Array, ...]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
         b,
@@ -199,6 +203,7 @@ def gdn_attention_pooled_core_tpu(
         num_spec_tokens=num_spec_tokens,
         out_norm_weight=out_norm_weight,
         out_norm_eps=out_norm_eps,
+        out_quant_dtype=out_quant_dtype,
     )
 
 
@@ -640,6 +645,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             and getattr(self.norm, "activation", "swish") in ("silu", "swish")
         )
         out_norm_eps = float(self.norm.eps)
+        # And quantized for out_proj, which then skips its own quantization.
+        quant_out = self._pooled_op_quantizes_out = (
+            gate_out and self._out_proj_takes_quantized_activation()
+        )
+        pooled_outputs = (
+            tuple[jax.Array, jax.Array, jax.Array]
+            if quant_out
+            else tuple[jax.Array, jax.Array]
+        )
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -660,7 +674,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             out_norm_weight: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
-        ) -> tuple[jax.Array, jax.Array]:
+        ) -> pooled_outputs:
             return gdn_attention_pooled_core_tpu(
                 mixed_qkv,
                 b,
@@ -693,6 +707,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
                 out_norm_eps=out_norm_eps,
+                out_quant_dtype=jnp.float8_e4m3fn if quant_out else None,
             )
 
         op_name = f"pallas::gdn_attention_pooled_{self.prefix.replace('.', '_')}"
@@ -705,8 +720,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
+            device = mixed_qkv.device
+            if quant_out:
+                out_q = torch.empty(
+                    (num_tokens, local_num_v_heads * self.head_v_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=device,
+                )
+                out_scale = torch.empty(
+                    (num_tokens, 1), dtype=torch.float32, device=device
+                )
+                return torch.empty_like(recurrent_state), out_q, out_scale
             out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
-            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=device)
             return torch.empty_like(recurrent_state), out
 
         gdn_jax_op.register_fake(_fake_gdn)
@@ -726,8 +752,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            new_rec, outputs = gdn_jax_op(
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            new_rec, *outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
                 a,
@@ -748,9 +774,31 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Plain donation + copy_ writeback (aliased in-place by XLA).
             recurrent_state.copy_(new_rec)
 
-            return outputs
+            # (quantized output, scale) with quant_out, else the output.
+            return tuple(outputs) if quant_out else outputs[0]
 
         return gdn_impl
+
+    def _out_proj_takes_quantized_activation(self) -> bool:
+        """Whether out_proj runs `quantized_matmul`'s per-channel FP8 path on
+        this device's whole activation, so it can take the activation already
+        quantized (`prequantized_matmul`) with the same result."""
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            VllmFp8LinearMethodTPU,
+        )
+
+        method = getattr(self.out_proj, "quant_method", None)
+        if type(method) is not VllmFp8LinearMethodTPU:
+            return False
+        _, weight_dtype, block_size, matmul_kernel = method._linear_quant_config
+        return (
+            weight_dtype == torch.float8_e4m3fn
+            and block_size is None
+            and not matmul_kernel
+            and self.tp_size == 1
+            and self.out_proj.bias is None
+            and not getattr(self.out_proj, KEEP_VLLM_LAYOUT_ATTR, False)
+        )
 
     def _build_pooled_pcp_gdn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
@@ -1101,7 +1149,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
-                core_attn_out = self.gdn_pooled_op(
+                pooled_out = self.gdn_pooled_op(
                     pooled_qkv,
                     b,
                     a,
@@ -1117,6 +1165,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     slot_read_offsets,
                     ckpt_indices,
                 )
+                if self._pooled_op_quantizes_out:
+                    out_q, out_scale = pooled_out
+                    if out_q.shape[0] != num_tokens:
+                        raise RuntimeError(
+                            "GDN op returned an incompatible output shape."
+                        )
+                    # out_proj on the activation the op already quantized.
+                    return prequantized_matmul(
+                        out_q,
+                        out_scale,
+                        self.out_proj.weight,
+                        self.out_proj.weight_scale,
+                        mixed_qkv.dtype,
+                    )
+                core_attn_out = pooled_out
                 gated = self._pooled_op_gates_out
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")

@@ -10,7 +10,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -143,6 +146,54 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+_prequantized_matmul_ops: dict[torch.dtype, Callable] = {}
+_prequantized_matmul_ops_lock = Lock()
+
+
+def _get_prequantized_matmul_op(out_dtype: torch.dtype) -> Callable:
+    with _prequantized_matmul_ops_lock:
+        if out_dtype in _prequantized_matmul_ops:
+            return _prequantized_matmul_ops[out_dtype]
+        jax_out_dtype = jnp.dtype(str(out_dtype).removeprefix("torch."))
+
+        def prequantized_matmul_jax(
+            x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+        ) -> jax.Array:
+            if w_s.ndim != 1:
+                raise ValueError(
+                    f"Expected a per-channel weight scale, got {w_s.shape=}"
+                )
+            return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jax_out_dtype)
+
+        op = pallas.jax_op(
+            f"pallas::prequantized_matmul_{jax_out_dtype.name}",
+            prequantized_matmul_jax,
+        )
+
+        def _fake_prequantized_matmul(x_q, x_scale, w_q, w_s):
+            del x_scale, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[-1], dtype=out_dtype, device=x_q.device
+            )
+
+        op.register_fake(_fake_prequantized_matmul)
+        _prequantized_matmul_ops[out_dtype] = op
+        return op
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """`quantized_matmul` (per-channel path) on a 2-D activation its producer
+    already quantized per token, `x_scale` [num_tokens, 1] f32, as
+    `quantize_tensor` does; the output is `out_dtype`."""
+    return _get_prequantized_matmul_op(out_dtype)(x_q, x_scale, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(
