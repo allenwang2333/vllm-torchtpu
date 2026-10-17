@@ -656,6 +656,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode,
                 skip_empty_decode_chunked,
                 mixed_bkvp,
+                decode_pack,
                 kv_cache_mode,
             ),
             build_op,
