@@ -9631,7 +9631,7 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        max_pos = min(self.max_model_len, P + (n_decode + 3) * (1 + K))
         # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -9712,7 +9712,17 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
-                nct = [x + 1 for x in nct]
+                nct = [
+                    int(
+                        self.input_batch.num_tokens_no_spec[
+                            self.input_batch.req_id_to_index[r]
+                        ]
+                    )
+                    - 1
+                    if r in self.input_batch.req_id_to_index
+                    else x + 1
+                    for r, x in zip(rids, nct)
+                ]
             if (
                 mixed
                 and self.max_num_reqs >= R + 1
@@ -9791,7 +9801,17 @@ class TPUModelRunner(GPUModelRunner):
                     assert self.execute_model(so) is None
                     self.sample_tokens(None)
                     self.take_draft_token_ids()
-                    nct = [x + 1 for x in nct]
+                    nct = [
+                        int(
+                            self.input_batch.num_tokens_no_spec[
+                                self.input_batch.req_id_to_index[r]
+                            ]
+                        )
+                        - 1
+                        if r in self.input_batch.req_id_to_index
+                        else x + 1
+                        for r, x in zip(rids, nct)
+                    ]
                     prev_ids = [e.req_id for e in extras]
         except Exception:
             logger.exception("spec-decode warmup R=%d failed; continuing", R)
@@ -9824,7 +9844,6 @@ class TPUModelRunner(GPUModelRunner):
         # near the prefill.
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        decode_ncts = [P + t for t in range(n_dec)]
         # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
         # BlockPool workaround, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
@@ -9835,7 +9854,7 @@ class TPUModelRunner(GPUModelRunner):
         # attention), an attention block spans block_size x DCP tokens of
         # context, and the runner-level self.block_size predates the
         # executor's post-load block-size finalization.
-        max_pos = min(self.max_model_len, max([P] + decode_ncts) + (1 + K))
+        max_pos = min(self.max_model_len, P + (n_dec + 1) * (1 + K))
         top = int(self.kv_cache_config.num_blocks)
         block_ids_per_group = []
         max_nblk = 0
@@ -9871,7 +9890,17 @@ class TPUModelRunner(GPUModelRunner):
             d = self.take_draft_token_ids()
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
-            for t, nct in enumerate(decode_ncts):
+            for t in range(n_dec):
+                nct = (
+                    int(
+                        self.input_batch.num_tokens_no_spec[
+                            self.input_batch.req_id_to_index[rid]
+                        ]
+                    )
+                    - 1
+                    if rid in self.input_batch.req_id_to_index
+                    else P + t
+                )
                 all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(
                     req_ids=[rid],
