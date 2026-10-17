@@ -42,6 +42,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    KVConnectorTransferResults,
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -1031,6 +1032,24 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
+
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        """Completed sends and receives, with the failed receives named.
+
+        A failed receive is also in ``finished_recving``. The scheduler fails
+        or recomputes it by request id, which stays unambiguous when the KV
+        cache groups share block ids.
+        """
+        finished_sending, finished_recving = self.get_finished(finished_req_ids)
+        worker = self.connector_worker
+        take_failed = getattr(worker, "take_failed_recving", None)
+        return KVConnectorTransferResults(
+            finished_sending=set(finished_sending or ()),
+            finished_recving=set(finished_recving or ()),
+            failed_recving=take_failed() if take_failed is not None else set(),
+        )
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         # Surface KV-load failures so the scheduler recomputes the affected
@@ -2704,6 +2723,9 @@ class TPURaidenConnectorWorker:
         self._done_sending: set[str] = set()
         self._done_recving: set[str] = set()
         self._failed_recving: set[str] = set()
+        # Failed receives get_finished has reported as finished, kept for
+        # get_transfer_results to name until take_failed_recving drains them.
+        self._failed_recving_reported: set[str] = set()
         self._suppress_done_recving: set[str] = set()
         # Report each req's recv-completion to the scheduler at most once. vLLM's
         # _update_from_kv_xfer_finished asserts a finished_recving req is still
@@ -6387,6 +6409,7 @@ class TPURaidenConnectorWorker:
         )
         self._suppress_done_recving.difference_update(recv_finished)
         self._reported_recving.update(done_recving)
+        self._failed_recving_reported.update(done_recving & self._failed_recving)
         if done_recving:
             logger.debug(
                 "TPURaidenConnectorWorker rank%d --> reporting done_recving=%s",
@@ -6406,6 +6429,8 @@ class TPURaidenConnectorWorker:
                 and req_id not in self._reported_recving
             ):
                 done_recving.add(req_id)
+                if req_id in self._failed_recving:
+                    self._failed_recving_reported.add(req_id)
                 if req_meta is not None:
                     self._stage3_release_producer_registration(req_id, req_meta)
             elif (
@@ -6806,6 +6831,12 @@ class TPURaidenConnectorWorker:
         # with reporting the req as finished in get_finished() in the same pass.
         failed = self._failed_block_ids
         self._failed_block_ids = set()
+        return failed
+
+    def take_failed_recving(self) -> set[str]:
+        """Drains the failed receives get_finished reported as finished."""
+        failed = self._failed_recving_reported
+        self._failed_recving_reported = set()
         return failed
 
     def _wait_for_recving(self, req_ids: set[str]) -> None:

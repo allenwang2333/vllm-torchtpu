@@ -141,6 +141,7 @@ class TestIntermediateStageSampleTokens:
             None,
             None,
             set(),
+            set(),
             None,
             None,
         )
@@ -159,6 +160,7 @@ class TestIntermediateStageSampleTokens:
             None,
             None,
             None,
+            set(),
             set(),
             None,
             None,

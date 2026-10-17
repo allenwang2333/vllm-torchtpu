@@ -31,6 +31,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
@@ -839,12 +842,19 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
     device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
-    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_sending={"sent"},
+        finished_recving={"loaded", "failed"},
+        failed_recving={"failed"},
+    )
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
     connector.get_kv_connector_stats.return_value = stats
-    runner = SimpleNamespace(_stage_timing=MagicMock())
+    runner = SimpleNamespace(
+        _stage_timing=MagicMock(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object()]),
+    )
     runner._stage_timing.take_samples.return_value = (cpu_samples, device_samples)
     scheduler_output = SimpleNamespace(finished_req_ids={"finished"})
 
@@ -859,7 +869,15 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
+    assert result == (
+        {"sent"},
+        {"loaded", "failed"},
+        {"jobs": []},
+        {41, 43},
+        {"failed"},
+        2,
+        stats,
+    )
     assert result[-1] is stats
     if isinstance(leaf_stats, TpuKVConnectorStats):
         assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
@@ -868,17 +886,64 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
         assert stats == original_stats
     assert unrelated_stats.data == original_unrelated_data
     runner._stage_timing.take_samples.assert_called_once_with()
-    connector.get_finished.assert_called_once_with({"finished"})
+    connector.get_transfer_results.assert_called_once_with({"finished"})
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
     connector.clear_connector_metadata.assert_called_once_with()
+
+
+def test_get_finished_kv_transfers_reports_hybrid_load_failures_by_request():
+    connector = MagicMock()
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_recving={"aborted", "loaded"},
+        failed_recving={"aborted"},
+    )
+    connector.get_block_ids_with_load_errors.return_value = {41, 43}
+    connector.get_kv_connector_stats.return_value = None
+    runner = SimpleNamespace(
+        _stage_timing=MagicMock(),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
+    )
+    runner._stage_timing.take_samples.return_value = ([], [])
+    scheduler_output = SimpleNamespace(finished_req_ids={"aborted"})
+
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch.object(
+            tpu_runner, "_KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP", False
+        ),
+    ):
+        result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
+
+    sending, recving, _meta, invalid_block_ids, failed_recving, group, _ = result
+    # The scheduler refuses flat block ids when KV cache groups share them;
+    # the failed request goes by id instead.
+    assert invalid_block_ids == set()
+    assert group is None
+    assert failed_recving == {"aborted"}
+    assert recving == {"aborted", "loaded"}
+    assert sending is None
 
 
 def test_no_forward_output_preserves_invalid_block_ids():
     runner = SimpleNamespace(
         maybe_setup_kv_connector=MagicMock(),
         get_finished_kv_transfers=MagicMock(
-            return_value=(set(), {"failed-load"}, None, {41, 43}, 2, None)
+            return_value=(
+                set(),
+                {"failed-load"},
+                None,
+                {41, 43},
+                {"failed-load"},
+                2,
+                None,
+            )
         ),
     )
     scheduler_output = SimpleNamespace()
@@ -894,6 +959,7 @@ def test_no_forward_output_preserves_invalid_block_ids():
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
+    assert output.kv_connector_output.failed_recving == {"failed-load"}
     if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         assert output.kv_connector_output.invalid_block_group_index == 2
 
@@ -912,6 +978,7 @@ def test_build_kv_connector_output_supports_vllm_023():
             finished_recving=None,
             kv_connector_worker_meta=None,
             invalid_block_ids=set(),
+            failed_recving=set(),
             invalid_block_group_index=None,
         )
 
@@ -920,6 +987,7 @@ def test_build_kv_connector_output_supports_vllm_023():
         finished_recving=None,
         kv_connector_worker_meta=None,
         invalid_block_ids=set(),
+        failed_recving=set(),
         kv_connector_stats=None,
     )
 
@@ -935,10 +1003,12 @@ def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recover
             finished_recving={"failed-load"},
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
+            failed_recving={"failed-load"},
             invalid_block_group_index=2,
         )
         assert out.finished_recving == {"failed-load"}
         assert out.invalid_block_ids == {41, 43}
+        assert out.failed_recving == {"failed-load"}
 
 
 def _fake_phased_runner(

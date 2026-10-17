@@ -149,6 +149,20 @@ def _mamba_only_groups():
     ]
 
 
+def test_get_transfer_results_names_failed_receives():
+    worker = SimpleNamespace(take_failed_recving=lambda: {"dst-fail"})
+    connector = SimpleNamespace(
+        connector_worker=worker,
+        get_finished=lambda finished: ({"sent"}, {"dst-fail", "dst-ok"}),
+    )
+
+    results = TPUConnector.get_transfer_results(connector, {"done"})
+
+    assert results.finished_sending == {"sent"}
+    assert results.finished_recving == {"dst-fail", "dst-ok"}
+    assert results.failed_recving == {"dst-fail"}
+
+
 @pytest.mark.parametrize(
     "groups,multi_group,expected",
     [
@@ -3804,6 +3818,9 @@ class TestTPURaidenConnectorWorker:
             assert worker.get_finished() == (set(), {"dst-fail"})
 
         assert worker.get_block_ids_with_load_errors() == {7, 8}
+        # Named once, for the scheduler's per-request failure path.
+        assert worker.take_failed_recving() == {"dst-fail"}
+        assert worker.take_failed_recving() == set()
         facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
             req_id="src-fail", uuid=999
         )
