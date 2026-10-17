@@ -231,8 +231,11 @@ class RowTileInBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         first, count = self._tile_range(grid_indices[0])
+        # Only the leading lane groups are qkv; the source row may carry
+        # more (see `fused_conv1d_gdn`'s `qkv_columns`).
+        lane_groups = self.window_ref.shape[2]
         pltpu.make_async_copy(
-            src_ref.at[pl.ds(first, count)],
+            src_ref.at[pl.ds(first, count), pl.ds(0, lane_groups)],
             self.window_ref.at[slot, pl.ds(0, count)],
             self.sem_recvs.at[slot],
         ).start()
@@ -687,7 +690,12 @@ def create_allocs(
     )
 
     if cfg.qkv_row_tiled:
-        qkv_shape = (cfg.qkv_tile_groups, *qkv_ref.shape[1:])
+        num_lanes = qkv_ref.shape[-1]
+        qkv_shape = (
+            cfg.qkv_tile_groups,
+            cfg.dim_size // num_lanes,
+            *qkv_ref.shape[2:],
+        )
     qkv_spec = block_spec_partial(block_shape=qkv_shape)
     b_spec = block_spec_partial(block_shape=b_shape)
     a_spec = block_spec_partial(block_shape=a_shape)

@@ -619,6 +619,7 @@ def outer_kernel(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "qkv_columns",
     ),
 )
 def fused_conv1d_gdn(
@@ -655,6 +656,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    qkv_columns: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -726,6 +728,10 @@ def fused_conv1d_gdn(
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences.
+        qkv_columns: Leading columns of `qkv` that hold q, k and v (`dim_size`);
+            `None` means all of them. Lets `qkv` be a whole projection output
+            whose trailing columns (e.g. the z gate) the kernel never reads, so
+            no sliced copy of it is made per layer.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -750,16 +756,19 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
+    dim = qkv.shape[-1] if qkv_columns is None else qkv_columns
+    assert dim <= qkv.shape[-1], (dim, qkv.shape)
     # A 16-bit qkv is read by the kernel straight out of its HBM row tiles
     # and widened in VMEM; casting here would write and then re-read an f32
     # copy in HBM. Verify windows keep the f32 path their VMEM sizing assumes.
     qkv_row_tiled = (
         qkv.dtype.itemsize == 2
         and qkv.shape[-1] % pltpu.get_tpu_info().num_lanes == 0
+        and dim % pltpu.get_tpu_info().num_lanes == 0
         and num_spec_tokens == 0
     )
     if not qkv_row_tiled:
-        qkv = qkv.astype(jnp.float32)
+        qkv = qkv[:, :dim].astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
@@ -783,7 +792,7 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape
+    batch_size, qkv_width = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -870,7 +879,7 @@ def fused_conv1d_gdn(
         qkv = qkv.reshape(
             padded_batch_size // config.QKV_TILE_ROWS,
             config.QKV_TILE_ROWS,
-            dim // num_lanes,
+            qkv_width // num_lanes,
             num_lanes,
         ).transpose(0, 2, 1, 3)
     else:
