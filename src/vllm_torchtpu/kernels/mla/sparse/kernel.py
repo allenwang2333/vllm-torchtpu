@@ -1423,7 +1423,7 @@ def sparse_ragged_paged_attention(
                 )
 
             lses_i = jax.lax.all_gather(
-                lse_chunk[None, ...],
+                lse_chunk,
                 axis_name=dcp_chunk_merge_axis,
                 axis=0,
                 tiled=False,
