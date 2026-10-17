@@ -135,6 +135,13 @@ def patch_in_graph_rotary_embedding(model: Any = None) -> None:
     and sin/cos ops.
     """
     try:
+        import types
+
+        from vllm.model_executor.layers.rotary_embedding import (
+            MRotaryEmbedding,
+            MRotaryEmbeddingInterleaved,
+            RotaryEmbedding,
+        )
         from vllm.model_executor.layers.rotary_embedding.base import (
             ApplyRotaryEmb,
             RotaryEmbeddingBase,
@@ -147,6 +154,8 @@ def patch_in_graph_rotary_embedding(model: Any = None) -> None:
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         positions_flat = positions.flatten()
         num_tokens = positions_flat.shape[0]
@@ -201,10 +210,29 @@ def patch_in_graph_rotary_embedding(model: Any = None) -> None:
         return query, key
 
     RotaryEmbeddingBase.forward_native = _dynamic_forward_native
+    RotaryEmbedding.forward_native = _dynamic_forward_native
+    RotaryEmbedding.forward = _dynamic_forward_native
+    MRotaryEmbedding.forward_native = _dynamic_forward_native
+    MRotaryEmbedding.forward = _dynamic_forward_native
+    if hasattr(MRotaryEmbeddingInterleaved, "forward_native"):
+        MRotaryEmbeddingInterleaved.forward_native = _dynamic_forward_native
+    if hasattr(MRotaryEmbeddingInterleaved, "forward"):
+        MRotaryEmbeddingInterleaved.forward = _dynamic_forward_native
 
     if model is not None and hasattr(model, "named_modules"):
         for _, module in model.named_modules():
-            if isinstance(module, RotaryEmbeddingBase):
+            if isinstance(module, RotaryEmbeddingBase) or type(module).__name__ in (
+                "RotaryEmbedding",
+                "MRotaryEmbedding",
+                "MRotaryEmbeddingInterleaved",
+            ):
+                module.forward_native = types.MethodType(
+                    _dynamic_forward_native, module
+                )
+                module._forward_method = types.MethodType(
+                    _dynamic_forward_native, module
+                )
+                module.forward = types.MethodType(_dynamic_forward_native, module)
                 if hasattr(module, "_buffers"):
                     module._buffers.pop("cos_sin_cache", None)
                     module._buffers.pop("cos_sin_cache_bf16", None)
