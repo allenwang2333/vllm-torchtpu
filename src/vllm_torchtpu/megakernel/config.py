@@ -50,6 +50,7 @@ class MegakernelEngineConfig:
         tuple[tuple[int, tuple[float, ...]], ...] | None
     ) = None
     kv_cache_dtype: str = "auto"
+    mamba_ssm_cache_dtype: str = "auto"
     cp_kv_cache_interleave_size: int | None = None
     # Decoder attention data parallelism: groups of TP / attention_dp ranks,
     # each decoding its own requests with DCP over the group.
@@ -75,6 +76,7 @@ class MegakernelEngineConfig:
             decode_context_parallel_size=int(parallel.decode_context_parallel_size),
             block_size=int(vllm_config.cache_config.block_size),
             kv_cache_dtype=str(vllm_config.cache_config.cache_dtype),
+            mamba_ssm_cache_dtype=str(vllm_config.cache_config.mamba_ssm_cache_dtype),
             cp_kv_cache_interleave_size=int(parallel.cp_kv_cache_interleave_size),
             max_num_seqs=int(scheduler.max_num_seqs),
             max_model_len=int(vllm_config.model_config.max_model_len),

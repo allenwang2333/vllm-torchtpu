@@ -151,7 +151,13 @@ class DecodeOps:
         presharded: Path,
         num_slots: int,
         batch_sizes: tuple[int, ...] = (1,),
+        mamba_ssm_cache_dtype: str = "auto",
     ) -> None:
+        from vllm_torchtpu.megakernel.kimi_k3.program import recurrent_state_dtype
+
+        self.recurrent_dtype = getattr(
+            torch, recurrent_state_dtype(mamba_ssm_cache_dtype)
+        )
         self.presharded = Path(presharded)
         (self.paged, self.rank_loader) = kernel_modules("paged", "rank_loader")
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
@@ -213,7 +219,7 @@ class DecodeOps:
             dtype=torch.bfloat16,
         ).to("tpu")
         recurrent = torch.zeros(
-            (1, state_slots, KDA_LAYERS, 3, 128, 128), dtype=torch.float32
+            (1, state_slots, KDA_LAYERS, 3, 128, 128), dtype=self.recurrent_dtype
         ).to("tpu")
         self.slots = [conv, recurrent]
         if self.rank == 0:

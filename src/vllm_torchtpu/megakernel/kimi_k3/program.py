@@ -133,9 +133,30 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
     return tuple(dense)
 
 
+def recurrent_state_dtype(cache_dtype: str) -> str:
+    """Decode bank storage; auto preserves FP32 independently of model dtype.
+
+    Prefill and the connector retain their FP32 state format. The importer
+    casts that state once to the decoder bank's dtype.
+    """
+    if cache_dtype not in ("auto", "float32", "bfloat16"):
+        raise ValueError(
+            "K3 megakernel --mamba-ssm-cache-dtype supports auto, float32, "
+            f"or bfloat16, not {cache_dtype!r}"
+        )
+    return "float32" if cache_dtype == "auto" else cache_dtype
+
+
 def check(config: MegakernelEngineConfig) -> None:
     """Raise ``NotImplementedError`` for a configuration the K3 programs
     do not implement."""
+    recurrent_state_dtype(config.mamba_ssm_cache_dtype)
+    if config.role == "prefill" and config.mamba_ssm_cache_dtype == "bfloat16":
+        raise NotImplementedError(
+            "K3 megakernel --mamba-ssm-cache-dtype bfloat16 is decode-only; "
+            "the prefill worker requires auto or float32 for its FP32 state "
+            "and transfer format"
+        )
     if config.role not in ("prefill", "decode"):
         raise NotImplementedError(
             f"the K3 megakernel serves one role of a P/D pair, not {config.role!r}"
@@ -267,5 +288,6 @@ def build(
         presharded,
         num_slots=Control.total_slots(sub_base) if draft else sub_base,
         batch_sizes=decode_batch_sizes(config.max_num_seqs),
+        mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
     )
     return KimiDecoder(config, ops, draft, tp_rank=tp_rank)
