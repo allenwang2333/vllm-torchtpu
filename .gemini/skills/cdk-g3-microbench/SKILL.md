@@ -18,7 +18,9 @@ description: >-
 
 > [!IMPORTANT]
 > **Single Source of Truth Repository**: `https://jfy-32478767326.us-central1.sourcemanager.dev/cloud-tpu-inference-test/cdk-g3` (`git@jfy-32478767326-ssh.us-central1.sourcemanager.dev:cloud-tpu-inference-test/cdk-g3.git`).
-> Install on any GCE Cloud VM or Google3 Cloudtop with:
+> **Repo-Local Binary**: `./bin/cdk-g3` is committed directly in this repository. You can execute `./bin/cdk-g3` immediately without additional setup!
+>
+> To install system-wide on any GCE Cloud VM or Google3 Cloudtop:
 > ```bash
 > git clone git@jfy-32478767326-ssh.us-central1.sourcemanager.dev:cloud-tpu-inference-test/cdk-g3.git ~/cdk-g3
 > ~/cdk-g3/install.sh
