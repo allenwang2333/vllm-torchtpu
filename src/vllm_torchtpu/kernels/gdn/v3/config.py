@@ -33,6 +33,12 @@ OUT_ZERO_ROWS = 16
 # Fraction of VMEM a launch without verify windows may scope.
 DEFAULT_VMEM_FRACTION = 0.7
 
+# Fewest tokens a launch pair writes the z gate out for (`emit_z`). Below it
+# z stays the projection's slice: decode buckets relayout it on the
+# TensorCore in well under a microsecond, while emitting it widens the
+# DMA-bound decode body. 0 emits it at every bucket.
+EMIT_Z_MIN_TOKENS = 512
+
 # Run the PER_SEQ launch before the BATCHED one. On 1024-token steps XLA
 # overlaps an HBM-bound SparseCore relayout of the qkvz projection with
 # whichever launch comes first; PER_SEQ is compute-bound, BATCHED streams
@@ -147,6 +153,10 @@ class GDNConfig:
     # `MetadataRef.out_zero_row` on (none when that is the buffer's end). The
     # rows before it are all computed by the BATCHED or the PER_SEQ launch.
     zero_out_tail: bool = False
+    # The qkv row tiles carry the z gate (`v_dim_size` columns) right after
+    # q, k and v; the launch also writes it out token-major, the layout of
+    # the output its gate multiplies (see `fused_conv1d_gdn`'s `emit_z`).
+    emit_z: bool = False
 
     @property
     def chunk_size(self) -> int:
@@ -167,6 +177,38 @@ class GDNConfig:
         """Row tiles a grid step's qkv rows can span, the first one partial."""
         rows = self.seq_tile_size * self.chunk_size
         return pl.cdiv(QKV_TILE_ROWS - 1 + rows, QKV_TILE_ROWS)
+
+    @property
+    def qkv_lane_groups(self) -> int:
+        """Lane groups of a token row the conv reads: q, k and v."""
+        return self.dim_size // pltpu.get_tpu_info().num_lanes
+
+    @property
+    def qkv_src_lane_groups(self) -> int:
+        """Lane groups of a token row a grid step copies in."""
+        z_groups = self.v_dim_size // pltpu.get_tpu_info().num_lanes
+        return self.qkv_lane_groups + (z_groups if self.emit_z else 0)
+
+    @property
+    def z_needs_buffer(self) -> bool:
+        """Whether an `emit_z` launch stages z in its own VMEM buffer, copied
+        out at the end of the step, rather than in the output tile ahead of
+        the GDN step. The decode step loads its states before the conv, and
+        a copy started or waited on while they are live keeps them in VMEM
+        (+11.8 MB scoped at decode tile 4)."""
+        return self.emit_z and self.seq_tile_size > 1
+
+    @property
+    def z_stage_groups(self) -> int:
+        """z lane groups a PER_SEQ step widens at a time: as many as the qkv
+        scratch, free until the conv writes it, can stage at
+        `qkv_stage_tile_stride` (halving from all of them)."""
+        groups = self.qkv_src_lane_groups - self.qkv_lane_groups
+        free_rows = self.chunk_size * self.qkv_row_stride
+        while self.qkv_tile_groups * groups * self.qkv_stage_tile_stride > free_rows:
+            assert groups % 2 == 0, self
+            groups //= 2
+        return groups
 
     @property
     def qkv_row_stride(self) -> int:
@@ -319,12 +361,12 @@ class GDNConfig:
                 # apart; the tile's rows start at a dynamic offset into it.
                 stage_shape = (
                     self.qkv_tile_groups
-                    * (self.dim_size // num_lanes)
+                    * self.qkv_lane_groups
                     * self.qkv_stage_tile_stride,
                     num_lanes,
                 )
             else:
-                stage_shape = (stage_rows * self.dim_size // num_lanes, num_lanes)
+                stage_shape = (stage_rows * self.qkv_src_lane_groups, num_lanes)
             qkv_stage_scratch = pltpu.VMEM(stage_shape, jnp.float32)
             if self.seq_tile_size == 1 and not self.use_recurrent:
                 # Token rows `qkv_row_stride` lane rows apart; see there.
@@ -353,7 +395,22 @@ class GDNConfig:
             )
             out_zero_sem = pltpu.SemaphoreType.DMA
 
+        z_scratch = {}
+        if self.emit_z:
+            z_scratch = dict(z_sem_ref=pltpu.SemaphoreType.DMA)
+            if self.z_needs_buffer:
+                z_scratch["z_buffer_ref"] = pltpu.VMEM(
+                    (
+                        self.seq_tile_size,
+                        self.chunk_size,
+                        self.num_v_heads,
+                        self.v_head_dim,
+                    ),
+                    self.dtypes.act_out,
+                )
+
         return dict(
+            **z_scratch,
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
             qkv_stage_scratch_ref=qkv_stage_scratch,

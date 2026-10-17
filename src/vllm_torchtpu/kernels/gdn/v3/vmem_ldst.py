@@ -139,32 +139,58 @@ def widen_row_tiles_to_compact(
     stage_ref: jax.Ref,
     compact_ref: jax.Ref,
     row_starts: list[jax.Array],
+    z_ref: jax.Ref | None = None,
 ) -> None:
     """Gathers token rows out of HBM row tiles into the compact f32 layout.
 
     Args:
-        tiles_ref: [groups, cols / lanes, tile_rows, lanes] row tiles, the
+        tiles_ref: [groups, src_cols / lanes, tile_rows, lanes] row tiles, the
             first being the one that holds absolute row `row_starts[0]`.
-        stage_ref: f32 scratch of [groups * cols / lanes * tile_rows, lanes].
-        compact_ref: [seq, chunk, 1, cols] f32; sequence `idx`'s chunk
-            starts at absolute row `row_starts[idx]`.
+        stage_ref: f32 scratch of [groups * src_cols / lanes * tile_rows, lanes].
+        compact_ref: [seq, chunk, 1, cols] f32 for a row's leading `cols`;
+            sequence `idx`'s chunk starts at absolute row `row_starts[idx]`.
         row_starts: Absolute first row of each sequence, ascending.
+        z_ref: Optional [seq, chunk, z_groups, lanes] ref the lane groups
+            after the leading `cols` are stored into, token-major.
     """
     groups, lane_groups, tile_rows, num_lanes = tiles_ref.shape
+    qkv_groups = compact_ref.shape[-1] // num_lanes
+    z_groups = lane_groups - qkv_groups
+    qkv_stage_rows = groups * qkv_groups * tile_rows
+
+    def widen(lane_group0: int, num_groups: int, stage_row0: int) -> None:
+        tiles = tiles_ref[:, pl.ds(lane_group0, num_groups)]
+        stage_ref[pl.ds(stage_row0, groups * num_groups * tile_rows)] = tiles.astype(
+            jnp.float32
+        ).reshape(-1, num_lanes)
+
     # One token row is every `tile_rows`-th row of its tile's lane groups.
-    stage_ref[...] = tiles_ref[...].astype(jnp.float32).reshape(-1, num_lanes)
+    if z_ref is None:
+        stage_ref[...] = tiles_ref[...].astype(jnp.float32).reshape(-1, num_lanes)
+    else:
+        # q/k/v and z widen as two stages, each no larger than q/k/v alone.
+        widen(0, qkv_groups, 0)
+        widen(qkv_groups, z_groups, qkv_stage_rows)
     first_row = (row_starts[0] // tile_rows) * tile_rows
     seq_size, chunk_size = compact_ref.shape[:2]
-    rows = []
+    rows, z_rows = [], []
     for idx in range(seq_size):
         for t in range(chunk_size):
             # Rows past a sequence's end only feed outputs that are never
             # copied out; the clamp keeps their read inside the stage.
             row = row_starts[idx] - first_row + t
             row = jnp.clip(row, 0, groups * tile_rows - 1)
-            start = (row // tile_rows) * (lane_groups * tile_rows) + row % tile_rows
-            rows.append(stage_ref[pl.ds(start, lane_groups, stride=tile_rows), :])
+            tile, row_in_tile = row // tile_rows, row % tile_rows
+            start = tile * (qkv_groups * tile_rows) + row_in_tile
+            rows.append(stage_ref[pl.ds(start, qkv_groups, stride=tile_rows), :])
+            if z_ref is not None:
+                z_start = qkv_stage_rows + tile * (z_groups * tile_rows) + row_in_tile
+                z_rows.append(
+                    stage_ref[pl.ds(z_start, z_groups, stride=tile_rows), :]
+                )
     store_lane_grouped_as_compact(compact_ref, jnp.concatenate(rows, axis=0))
+    if z_ref is not None:
+        z_ref[...] = jnp.stack(z_rows).reshape(z_ref.shape).astype(z_ref.dtype)
 
 
 def widen_row_tiles_strided(
@@ -194,15 +220,17 @@ def load_staged_rows(
     lane_groups: int,
     tile_rows: int,
     tile_stride: int,
+    groups: slice | None = None,
 ) -> jax.Array:
     """Token rows [first_row, first_row + num_rows) of a stage written by
-    `widen_row_tiles_strided`, as [num_rows, lane_groups, lanes] f32."""
+    `widen_row_tiles_strided`, as [num_rows, groups, lanes] f32 (all
+    `lane_groups` of each row by default)."""
     return jnp.stack(
         [
             load_staged_row(
                 stage_ref,
                 first_row + t,
-                slice(0, lane_groups),
+                slice(0, lane_groups) if groups is None else groups,
                 lane_groups,
                 tile_rows,
                 tile_stride,
@@ -210,6 +238,29 @@ def load_staged_rows(
             for t in range(num_rows)
         ]
     )
+
+
+def store_staged_rows(
+    stage_ref: jax.Ref,
+    first_row: jax.Array,
+    out_ref: jax.Ref,
+    groups: slice,
+    lane_groups: int,
+    tile_rows: int,
+    tile_stride: int,
+) -> None:
+    """Stores lane groups `groups` of the token rows a stage written by
+    `widen_row_tiles_strided` holds from `first_row` on into a
+    [rows, groups, lanes] ref, token-major, a sublane tile of rows at a
+    time."""
+    num_rows = out_ref.shape[0]
+    block = pltpu.get_tpu_info().num_sublanes
+    for t0 in range(0, num_rows, block):
+        size = min(block, num_rows - t0)
+        rows = load_staged_rows(
+            stage_ref, first_row + t0, size, lane_groups, tile_rows, tile_stride, groups
+        )
+        out_ref[pl.ds(t0, size)] = rows.astype(out_ref.dtype)
 
 
 def load_staged_row(

@@ -635,6 +635,42 @@ def zero_rows_from(
     return pl.cdiv(num_rows - first_row, chunk), copy
 
 
+def _step_rows(metadata_ref: MetadataRef, p_id: jax.Array, cfg: config.GDNConfig):
+    return [
+        (metadata_ref.p_id_to_r_base[p_id, idx], metadata_ref.p_id_to_r_size[p_id, idx])
+        for idx in range(cfg.seq_tile_size)
+    ]
+
+
+def start_copy_out_rows(
+    vmem_ref: jax.Ref,
+    dst_ref: jax.Ref,
+    sem: jax.Ref,
+    metadata_ref: MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Starts copying grid step `p_id`'s token rows of a [seq, chunk, ...]
+    VMEM tile to `dst_ref`, as `OutBufferedRef.copy_out` does."""
+    for idx, (r_base, size) in enumerate(_step_rows(metadata_ref, p_id, cfg)):
+        pltpu.make_async_copy(
+            vmem_ref.at[idx, pl.ds(0, size)], dst_ref.at[pl.ds(r_base, size)], sem
+        ).start()
+
+
+def wait_copy_out_rows(
+    vmem_ref: jax.Ref,
+    sem: jax.Ref,
+    metadata_ref: MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Waits for the copies `start_copy_out_rows` started for step `p_id`."""
+    num_rows = sum(size for _, size in _step_rows(metadata_ref, p_id, cfg))
+    wait_ref = vmem_ref.at[0, pl.ds(0, num_rows)]
+    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
 def create_allocs(
     metadata_ref: MetadataRef,
     qkv_ref: jax.Array,
@@ -690,10 +726,9 @@ def create_allocs(
     )
 
     if cfg.qkv_row_tiled:
-        num_lanes = qkv_ref.shape[-1]
         qkv_shape = (
             cfg.qkv_tile_groups,
-            cfg.dim_size // num_lanes,
+            cfg.qkv_src_lane_groups,
             *qkv_ref.shape[2:],
         )
     qkv_spec = block_spec_partial(block_shape=qkv_shape)
