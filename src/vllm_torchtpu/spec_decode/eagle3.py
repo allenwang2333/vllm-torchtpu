@@ -742,14 +742,13 @@ class Eagle3Proposer:
                     mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
                 ),
             ):
-                input_ids_in = input_ids.clone()
-                positions_in = positions.clone()
-                hidden_states_in = hidden_states.clone()
-                shared_topk_in = (
-                    shared_topk_indices.clone()
-                    if shared_topk_indices is not None
-                    else None
-                )
+                # The caller hands in fresh clones (propose) or its own
+                # scratch (run_dp_dummy_draft); a second copy here would only
+                # add one eager copy program per input per propose.
+                input_ids_in = input_ids
+                positions_in = positions
+                hidden_states_in = hidden_states
+                shared_topk_in = shared_topk_indices
                 if not self._mtp_fused_loop_warm:
                     # The first call traces and compiles; like the loop-step
                     # program's, its outputs can carry symbolic sizes, so run it
@@ -2444,6 +2443,36 @@ class Eagle3Proposer:
             # programs, and the same collectives, as its peers. They read the
             # top-k table without having written it this step; load_model
             # seeds it with -1 so that read stays in range.
+            #
+            # propose() runs steps 1..K-1 as one fused program when one is
+            # built and the step is not DP-lockstepped; mirror that branch
+            # (same condition, same call-site copies) so a replay times the
+            # program the real propose runs. A real lockstep step never takes
+            # it (propose() checks the same condition), so lockstep peers are
+            # unaffected.
+            if (
+                self._mtp_fused_loop is not None
+                and self._mtp_fused_indexshare == self._share_mtp_indices
+                and not runner._dp_lockstep_enabled()
+            ):
+                fused = self._run_mtp_fused_loop(
+                    chunk=chunk,
+                    input_ids=loop_input_ids.clone(),
+                    positions=(loop_positions + 1).clone(),
+                    hidden_states=loop_hidden.clone(),
+                    num_rejected_np=None,
+                    num_rejected_dev=None,
+                    loop_query_start_loc=loop_qsl,
+                    loop_request_distribution=loop_reqdist,
+                    shared_topk_indices=(
+                        self._mtp_topk_buffers[0][:p].clone()
+                        if self._mtp_fused_indexshare
+                        else None
+                    ),
+                )
+                if fused is not None:
+                    synchronize_tensors(fused[-1])
+                    continue
             for step in range(1, K):
                 last_hidden, _ = self._forward_draft(
                     chunk=chunk,
