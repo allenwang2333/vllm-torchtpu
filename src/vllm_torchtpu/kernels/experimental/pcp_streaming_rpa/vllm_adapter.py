@@ -220,7 +220,8 @@ def make_pcp_streaming_rpa_kernel(
             # Bound the FP32 output accumulator to 16 MiB, preserving the
             # established 512-row tile for 32 heads x 256 channels. Q and
             # output DMA buffers each use half that storage in BF16.
-            local_heads = query.shape[-2] // mesh.shape.get(TP_AXIS_NAME, 1)
+            tp_size = 1 if mesh is None else mesh.shape.get(TP_AXIS_NAME, 1)
+            local_heads = query.shape[-2] // tp_size
             bytes_per_row = local_heads * query.shape[-1] * 4
             local_q_block_size = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
             while (
