@@ -494,6 +494,32 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             )
             self._gather_heads_cache = heads_cache
         heads_clamped, heads_valid = heads_cache
+        if work_device.type == "cpu":
+            # clip mode writes directly into the reusable output; NumPy's
+            # default raise mode allocates an additional full-sized buffer.
+            selected = indices.numpy()[:, heads_clamped.numpy()]
+            valid = (
+                heads_valid.numpy()
+                & (selected >= self.vocab_start_idx)
+                & (selected < self.vocab_end_idx)
+            )
+            rows = (selected.astype(np.int64) - self.vocab_start_idx).reshape(-1)
+            np.take(
+                weight.view(torch.uint8).numpy(),
+                rows,
+                axis=0,
+                out=raw_out.numpy().reshape(-1, self.dim),
+                mode="clip",
+            )
+            np.take(
+                scales.numpy(),
+                rows,
+                axis=0,
+                out=scale_out.numpy().reshape(-1, self.dim // self.block_size),
+                mode="clip",
+            )
+            scale_out.numpy()[~valid] = _INVALID_SCALE
+            return
         selected = indices[:, heads_clamped].long()
         valid = (
             heads_valid

@@ -931,3 +931,41 @@ class TestV2Engram:
         assert set(v2_engram.__all__) == expected_exports
         for name in expected_exports:
             assert hasattr(v2_engram, name)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("tokens", [0, 1, 9])
+@pytest.mark.parametrize("head_start", [0, 2])
+def test_host_raw_gather_matches_sharded_reference(dtype, tokens, head_start):
+    emb = object.__new__(common_engram.ParallelEngramEmbedding)
+    nn.Module.__init__(emb)
+    emb.part_n_hash_cols = 3
+    emb.n_hash_cols = 4
+    emb.head_start = head_start
+    emb.dim = 16
+    emb.block_size = 8
+    emb.vocab_start_idx = 11
+    emb.vocab_end_idx = 18
+    emb.part_num_embeddings = 7
+    raw = torch.arange(7 * 16, dtype=torch.uint8).reshape(7, 16)
+    scales = torch.arange(14, dtype=torch.uint8).reshape(7, 2)
+    emb._storage = lambda: (raw.view(torch.float8_e4m3fn), scales)
+    storage = torch.arange(tokens * 8, dtype=dtype).reshape(tokens, 8) % 23
+    output = torch.empty((tokens, 3, 16), dtype=torch.uint8)
+    scale_output = torch.empty((tokens, 3, 2), dtype=torch.uint8)
+    for shift in [0, 10, -20]:
+        current = (storage + shift)[:, ::2]
+        emb.gather_raw(current, output, scale_output)
+        for token in range(tokens):
+            for head in range(3):
+                source_head = min(head_start + head, 3)
+                index = int(current[token, source_head])
+                row = min(max(index - 11, 0), 6)
+                torch.testing.assert_close(output[token, head], raw[row])
+                expected = (
+                    scales[row]
+                    if head_start + head < 4 and 11 <= index < 18
+                    else torch.full((2,), 255, dtype=torch.uint8)
+                )
+                torch.testing.assert_close(scale_output[token, head], expected)
