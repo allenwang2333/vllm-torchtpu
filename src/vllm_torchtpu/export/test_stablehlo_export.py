@@ -2945,3 +2945,22 @@ def test_lower_with_tpu_backend_fails_without_a_lowering(monkeypatch: Any) -> No
             lambda h: h, torch.zeros((1, 1), dtype=torch.bfloat16)
         )
     assert torch_tpu_export.fx_to_mlir is orig
+
+
+def test_internal_constant_takes_the_dtype_the_module_declares() -> None:
+    """A constant is stored in the dtype of its `@main` argument.
+
+    vLLM keeps `cos_sin_cache` in float32 while the forward graph takes it in the
+    model dtype; storing the float32 buffer would hand the runtime twice the bytes
+    the argument holds.
+    """
+    cache = torch.randn((8, 4), dtype=torch.float32)
+    spec = {"shape": [8, 4], "dtype": "bfloat16"}
+    stored = stablehlo_export._constant_for_spec("rotary_emb_inv_freq", cache, spec)
+    assert stored.dtype == torch.bfloat16
+    assert torch.equal(stored, cache.to(torch.bfloat16))
+
+    with pytest.raises(ValueError, match="rotary_emb_inv_freq"):
+        stablehlo_export._constant_for_spec(
+            "rotary_emb_inv_freq", cache, {"shape": [4, 8], "dtype": "bfloat16"}
+        )
