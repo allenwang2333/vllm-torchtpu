@@ -2423,3 +2423,37 @@ def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
         np.testing.assert_array_equal(result, reference)
     assert rows > attention_kernels.indexer.QUERY_TILE
     assert score_rows == [rows]
+
+
+@pytest.mark.parametrize("shards", [1, 4])
+def test_shard_quantized_matmul_matches_per_rank_wo_b_partials(shards):
+    """Local full ``wo_b`` == the sum of each rank's sharded ``wo_b`` output.
+
+    Each rank quantizes its own ``K/tp`` activation block with a per-token
+    scale, so the local path has to scale per block too; a single full-K scale
+    differs by more than bf16 rounding when the blocks' magnitudes differ.
+    """
+    from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+
+    tokens, k, n = 8, 32, 16
+    key = jax.random.PRNGKey(0)
+    kx, kw, ks = jax.random.split(key, 3)
+    x = jax.random.normal(kx, (tokens, k * shards), jnp.float32)
+    # Make the K blocks differ in magnitude so one full-K scale is coarser.
+    block_scale = jnp.repeat(2.0 ** jnp.arange(shards, dtype=jnp.float32), k)
+    x = (x * block_scale).astype(jnp.bfloat16)
+    w_q = jax.random.normal(kw, (k * shards, n), jnp.float32).astype(jnp.float8_e4m3fn)
+    w_s = jax.random.uniform(ks, (n,), jnp.float32, 0.5, 1.5)
+
+    local = attention_kernels.shard_quantized_matmul(x, w_q, w_s, shards)
+    expected = sum(
+        xla_quantized_matmul(
+            x[:, r * k : (r + 1) * k], w_q[r * k : (r + 1) * k], w_s
+        ).astype(jnp.float32)
+        for r in range(shards)
+    ).astype(jnp.bfloat16)
+    assert local.dtype == jnp.bfloat16 and local.shape == (tokens, n)
+    np.testing.assert_array_equal(np.asarray(local), np.asarray(expected))
+    if shards > 1:
+        single = xla_quantized_matmul(x, w_q, w_s)
+        assert not np.array_equal(np.asarray(single), np.asarray(expected))

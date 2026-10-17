@@ -14,7 +14,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
-from vllm.models.common.ops.sequence_parallel import sp_all_gather
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_reduce_scatter
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
@@ -371,6 +371,13 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
         return AttentionBackend
 
 
+class _LocalWoB:
+    """`gemm_rs` sentinel: the attention returns its finished SP shard."""
+
+
+_LOCAL_WO_B = _LocalWoB()
+
+
 def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
@@ -661,12 +668,36 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if qr_local is not None:
             projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
             if projected is not None:
+                if getattr(self, "_local_wo_b", False):
+                    # The fused op applied wo_b: on the token-parallel path it
+                    # finished this rank's sequence-parallel shard [T/tp, H];
+                    # otherwise it is the TP-partial [T, H] to reduce-scatter.
+                    if projected.shape[0] != positions.shape[0]:
+                        return projected
+                    return self._finish_sp(projected)
                 # The fused q/attention/wo_a op already produced wo_b's input.
-                return _value(self.wo_b(projected))
+                return self._finish_sp(_value(self.wo_b(projected)))
         else:
             self._prepare_and_attn_fn(*args)
         o = o_padded[:, : self.n_local_heads, :]
-        return self._o_proj(o, positions)
+        return self._finish_sp(self._o_proj(o, positions))
+
+    def _local_wo_b_kwargs(self):
+        """``wo_b`` operands for the fused op when it applies ``wo_b`` itself."""
+        if not getattr(self, "_local_wo_b", False):
+            return {}
+        return dict(
+            wo_b=self.wo_b.weight,
+            wo_b_scale=self.wo_b.weight_scale,
+            wo_b_full=self._wo_b_full,
+            wo_b_full_scale=self._wo_b_full_scale,
+        )
+
+    def _finish_sp(self, output):
+        """Reduce-scatter the TP-partial output when this attention owns it."""
+        if self._sp_sharded_input and getattr(self, "gemm_rs", None) is _LOCAL_WO_B:
+            return sp_reduce_scatter(output)
+        return output
 
     def _run_parallel_input_projections(self, hidden_states):
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
@@ -1421,6 +1452,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self._swa_max_requests,
                     self._precompact_records,
                     int(self.head_dim),
+                    **self._local_wo_b_kwargs(),
                 )
             assert q is not None
             if self._fp8_kv and self.compress_ratio:
@@ -1516,10 +1548,36 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             ),
         }
+        wo_b = getattr(self, "wo_b", None)
+        wo_b_scale = getattr(wo_b, "weight_scale", None)
+        local_wo_b = False
+        if (
+            wo_b is not None
+            and wo_b_scale is not None
+            and wo_b_scale.ndim == 1
+            and not getattr(wo_b, KEEP_VLLM_LAYOUT_ATTR, False)
+        ):
+            # ``wo_b`` is (k, n) with k = this rank's o_lora_rank block: row
+            # block r of the gathered weight is rank r's shard, the order the
+            # token-parallel attention emits its all-head ``wo_a`` output in.
+            # Applying the full ``wo_b`` to this rank's own tokens finishes the
+            # sequence-parallel shard in place of the ``all_to_all`` +
+            # reduce-scatter pair, for the same FLOPs. The per-channel scale is
+            # replicated already.
+            local_wo_b = True
+            weight = wo_b.weight.contiguous()
+            gathered = tensor_model_parallel_all_gather(weight.view(torch.uint8), dim=0)
+            buffers["_wo_b_full"] = _fresh(gathered.view(weight.dtype))
+            buffers["_wo_b_full_scale"] = _fresh(wo_b_scale.reshape(-1).contiguous())
         synchronize_tensors(tuple(buffers.values()))
         for name, value in buffers.items():
             self.register_buffer(name, value, persistent=False)
         self._local_q_attn = True
+        self._local_wo_b = local_wo_b
+        if local_wo_b:
+            # Upstream's layer forward reduce-scatters the attention output
+            # unless the attention owns it (``gemm_rs``): this one does.
+            self.gemm_rs = _LOCAL_WO_B
 
     def _select_paged_indices(
         self,

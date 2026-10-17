@@ -37,6 +37,8 @@ _fp8_attention_op = None
 _fp8_attention_2bank_op = None
 _fp8_attention_qo_op = None
 _fp8_attention_qo_2bank_op = None
+_fp8_attention_qo_wob_op = None
+_fp8_attention_qo_2bank_wob_op = None
 _gather_bf16_op = None
 _gather_fp8_op = None
 _attention_tp_size = 1
@@ -1563,8 +1565,21 @@ def initialize_paged_attention():
         head_dim: int,
         gathered_nope: jax.Array | None = None,
         gathered_rope: jax.Array | None = None,
+        wo_b: jax.Array | None = None,
+        wo_b_scale: jax.Array | None = None,
+        wo_b_full: jax.Array | None = None,
+        wo_b_full_scale: jax.Array | None = None,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
+
+        With ``wo_b`` (this rank's shard) and ``wo_b_full`` (the all-gathered
+        ``wo_b``), ``wo_b`` is applied inside the op: on the token-parallel path
+        with ``wo_b_full`` to this rank's own token shard, returning the
+        finished ``[T/tp, hidden]`` sequence-parallel shard (no return
+        ``all_to_all`` and no reduce-scatter, the same FLOPs); on the
+        head-sharded path with ``wo_b`` as the TP-partial ``[T, hidden]`` the
+        caller reduce-scatters. Both traces then read the same weights, which
+        vLLM's split-graph bucket hand-over requires. Otherwise:
 
         Returns this rank's ``wo_b`` input ``[T, o_lora_rank]``. With the
         token-parallel shape condition of `fp8_attention`, each rank projects q
@@ -1613,6 +1628,8 @@ def initialize_paged_attention():
                 ok,
                 g_n,
                 g_r,
+                wb=None,
+                wbs=None,
             ):
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
@@ -1642,19 +1659,18 @@ def initialize_paged_attention():
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
                 )
                 projected = _o_proj_jax(out_tok, pos_tok, cs, w, ws, head_dim=head_dim)
+                if wb is not None:
+                    # ``projected`` columns are rank-major ``wo_a`` groups, the
+                    # order ``wo_b_full`` rows were gathered in; one activation
+                    # scale per rank block, as the sharded ``wo_b`` applies.
+                    return shard_quantized_matmul(projected, wb, wbs, tp_size)
                 projected = projected.reshape(tokens_local, tp_size, -1)
                 gathered = jax.lax.all_to_all(
                     projected, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
                 )
                 return gathered.reshape(tokens, -1)
 
-            return jax.shard_map(
-                _local_body,
-                mesh=tp_mesh,
-                in_specs=(P(),) * 19,
-                out_specs=out_spec,
-                check_vma=False,
-            )(
+            local_args = (
                 qr_local,
                 wq_b_full,
                 wq_b_full_scale,
@@ -1675,6 +1691,15 @@ def initialize_paged_attention():
                 gathered_nope,
                 gathered_rope,
             )
+            if wo_b_full is not None:
+                local_args = (*local_args, wo_b_full, wo_b_full_scale)
+            return jax.shard_map(
+                _local_body,
+                mesh=tp_mesh,
+                in_specs=(P(),) * len(local_args),
+                out_specs=out_spec,
+                check_vma=False,
+            )(*local_args)
 
         def _sharded_body(
             q_in,
@@ -1696,6 +1721,8 @@ def initialize_paged_attention():
             ok,
             g_n,
             g_r,
+            wb=None,
+            wbs=None,
         ):
             if tp_size > 1 and q_in.shape[0] < tokens:
                 q_in = jax.lax.all_gather(q_in, axis_name="tp", axis=0, tiled=True)[
@@ -1727,15 +1754,13 @@ def initialize_paged_attention():
                 out_tok, axis_name="tp", split_axis=1, concat_axis=0, tiled=True
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
-            return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
+            projected = _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
+            if wb is not None:
+                # This rank's ``wo_b`` shard: the TP-partial [T, hidden].
+                return _quantized_matmul_jax(projected, wb, wbs)
+            return projected
 
-        return jax.shard_map(
-            _sharded_body,
-            mesh=tp_mesh,
-            in_specs=(P(),) * 19,
-            out_specs=out_spec,
-            check_vma=False,
-        )(
+        sharded_args = (
             qr,
             wq_b,
             wq_b_scale,
@@ -1756,6 +1781,15 @@ def initialize_paged_attention():
             gathered_nope,
             gathered_rope,
         )
+        if wo_b is not None:
+            sharded_args = (*sharded_args, wo_b, wo_b_scale)
+        return jax.shard_map(
+            _sharded_body,
+            mesh=tp_mesh,
+            in_specs=(P(),) * len(sharded_args),
+            out_specs=out_spec,
+            check_vma=False,
+        )(*sharded_args)
 
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
@@ -1766,6 +1800,30 @@ def initialize_paged_attention():
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
         lambda qr, *args: qr.new_empty((args[5].shape[0], args[17].shape[-1]))
+    )
+
+    def _qo_local_wo_b_fake(qr, qr_local, positions, wo_b_full):
+        # Mirrors the token-parallel shape condition of `fp8_attention_qo`:
+        # the finished SP shard [T/tp, hidden], else the TP-partial [T, hidden].
+        if (
+            _fp8_query_shards(
+                positions.shape[0], _attention_tp_size, True, qr_local.shape[0]
+            )
+            > 1
+        ):
+            return qr.new_empty((qr_local.shape[0], wo_b_full.shape[-1]))
+        return qr.new_empty((positions.shape[0], wo_b_full.shape[-1]))
+
+    global _fp8_attention_qo_wob_op
+    _fp8_attention_qo_wob_op = pallas.jax_op(
+        "pallas::dsv41v2_sparse_fp8_attention_qo_wob",
+        fp8_attention_qo,
+        mesh=tp_mesh,
+        input_partition_specs=cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 6),
+    )
+    # qr_local is args[0], positions args[5], wo_b_full args[-2].
+    _fp8_attention_qo_wob_op.register_fake(
+        lambda qr, *args: _qo_local_wo_b_fake(qr, args[0], args[5], args[-2])
     )
 
     def fp8_attention_qo_2bank(
@@ -1802,6 +1860,10 @@ def initialize_paged_attention():
         head_dim: int,
         gathered_nope: jax.Array | None = None,
         gathered_rope: jax.Array | None = None,
+        wo_b: jax.Array | None = None,
+        wo_b_scale: jax.Array | None = None,
+        wo_b_full: jax.Array | None = None,
+        wo_b_full_scale: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -1834,6 +1896,10 @@ def initialize_paged_attention():
             head_dim,
             gathered_nope,
             gathered_rope,
+            wo_b,
+            wo_b_scale,
+            wo_b_full,
+            wo_b_full_scale,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
@@ -1846,6 +1912,44 @@ def initialize_paged_attention():
     _fp8_attention_qo_2bank_op.register_fake(
         lambda qr, *args: qr.new_empty((args[5].shape[0], args[20].shape[-1]))
     )
+    global _fp8_attention_qo_2bank_wob_op
+    _fp8_attention_qo_2bank_wob_op = pallas.jax_op(
+        "pallas::dsv41v2_sparse_fp8_attention_qo_2bank_wob",
+        fp8_attention_qo_2bank,
+        mesh=tp_mesh,
+        input_partition_specs=cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 6),
+    )
+    _fp8_attention_qo_2bank_wob_op.register_fake(
+        lambda qr, *args: _qo_local_wo_b_fake(qr, args[0], args[5], args[-2])
+    )
+
+
+def shard_quantized_matmul(
+    x: jax.Array, w_q: jax.Array, w_s: jax.Array, shards: int
+) -> jax.Array:
+    """``x @ w_q`` quantizing ``x`` per token *and* per K shard.
+
+    The TP-sharded ``wo_b`` quantizes each rank's ``[T, K/tp]`` activation
+    block with its own per-token scale, emits a bf16 partial and the
+    reduce-scatter adds the partials. Applying the all-gathered ``wo_b`` to a
+    local token shard reproduces that -- one scale per ``K/tp`` block and an
+    f32 sum of bf16 partials -- rather than one coarser scale over all of
+    ``K``, so the local path tracks the sharded one's numerics (DSpark
+    acceptance moved 99.9% -> 99.7% with a single full-K scale).
+    """
+    from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+
+    tokens, k_full = x.shape
+    if shards <= 1 or k_full % shards:
+        return xla_quantized_matmul(x, w_q, w_s)
+    k = k_full // shards
+    acc = None
+    for shard in range(shards):
+        rows = slice(shard * k, (shard + 1) * k)
+        partial = xla_quantized_matmul(x[:, rows], w_q[rows], w_s).astype(jnp.float32)
+        acc = partial if acc is None else acc + partial
+    assert acc is not None
+    return acc.astype(x.dtype)
 
 
 def _has_hi_bank(cache) -> bool:
@@ -1921,9 +2025,19 @@ def sparse_fp8_attention_qo(
     max_requests,
     precompacted,
     head_dim,
+    wo_b=None,
+    wo_b_scale=None,
+    wo_b_full=None,
+    wo_b_full_scale=None,
 ):
-    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``."""
+    """`fp8_attention_qo` entry: ``qr`` -> this rank's ``wo_b`` input ``[T, R]``.
+
+    With ``wo_b``/``wo_b_full`` the op applies ``wo_b`` itself: the finished
+    ``[T/tp, hidden]`` SP shard on the token-parallel path, the TP-partial
+    ``[T, hidden]`` otherwise (see `fp8_attention_qo`).
+    """
     assert _fp8_attention_qo_op is not None and main.rope is not None
+    local_wo_b = wo_b_full is not None
     page_size = main.shape[1]
     if pages is None:
         page_size, pages, starts = _resolve_fp8_pages(
@@ -1956,13 +2070,27 @@ def sparse_fp8_attention_qo(
         head_dim,
         *gathered,
     )
+    if local_wo_b:
+        assert wo_b is not None and wo_b_scale is not None
+        assert wo_b_full_scale is not None
+        tail_args = (
+            *tail_args,
+            wo_b,
+            wo_b_scale.reshape(-1),
+            wo_b_full,
+            wo_b_full_scale,
+        )
     if _has_hi_bank(main):
         assert (
             _fp8_attention_qo_2bank_op is not None
             and swa.raw_hi is not None
             and main.rope_hi is not None
         )
-        return _fp8_attention_qo_2bank_op(
+        op_2bank = (
+            _fp8_attention_qo_2bank_wob_op if local_wo_b else _fp8_attention_qo_2bank_op
+        )
+        assert op_2bank is not None
+        return op_2bank(
             qr,
             qr_local,
             wq_b,
@@ -1979,7 +2107,9 @@ def sparse_fp8_attention_qo(
             main.rope_hi,
             *tail_args,
         )
-    return _fp8_attention_qo_op(
+    op = _fp8_attention_qo_wob_op if local_wo_b else _fp8_attention_qo_op
+    assert op is not None
+    return op(
         qr,
         qr_local,
         wq_b,

@@ -150,3 +150,90 @@ def test_forward_routes_projected_output_to_wo_b(monkeypatch, local):
         assert seen["qr"].shape == (tokens, attn.q_lora_rank)
         assert gathered_widths == [attn.q_lora_rank + attn.head_dim]
         assert out == "o_proj"
+
+
+def _stub_with_wo_b(monkeypatch, scale_ndim=1):
+    attn = _stub(monkeypatch)
+    gen = torch.Generator().manual_seed(1)
+    wo_b = torch.randn(4, 6, generator=gen).to(torch.float8_e4m3fn)  # (R_local, H)
+    scale = torch.rand(6, generator=gen) if scale_ndim == 1 else torch.rand(1, 6)
+    attn.wo_b = SimpleNamespace(weight=wo_b, weight_scale=scale)
+    return attn
+
+
+def test_init_local_q_weights_gathers_wo_b_rows_and_owns_reduce_scatter(monkeypatch):
+    attn = _stub_with_wo_b(monkeypatch)
+    attn._init_local_q_weights()
+    assert attn._local_q_attn is True
+    assert attn._local_wo_b is True
+    wo_b = attn.wo_b.weight
+    # Row block r of the gathered weight is rank r's (k, n) shard.
+    assert torch.equal(
+        attn._wo_b_full.view(torch.uint8),
+        torch.cat((wo_b, _flip(wo_b)), 0).view(torch.uint8),
+    )
+    assert torch.equal(attn._wo_b_full_scale, attn.wo_b.weight_scale)
+    assert attn.gemm_rs is v2_attn._LOCAL_WO_B
+    assert "_wo_b_full" not in attn.state_dict()
+
+
+def test_init_local_q_weights_without_per_channel_wo_b_keeps_upstream_rs(monkeypatch):
+    attn = _stub_with_wo_b(monkeypatch, scale_ndim=2)
+    attn._init_local_q_weights()
+    assert attn._local_q_attn is True
+    assert attn._local_wo_b is False
+    assert not hasattr(attn, "_wo_b_full")
+    assert getattr(attn, "gemm_rs", None) is not v2_attn._LOCAL_WO_B
+
+
+@pytest.mark.parametrize("finished", [True, False])
+def test_forward_local_wo_b_returns_shard_or_reduce_scatters(monkeypatch, finished):
+    attn = _stub_with_wo_b(monkeypatch)
+    attn._init_local_q_weights()
+    attn._sp_sharded_input = True
+    attn.padded_heads = attn.n_local_heads = 2
+    attn.head_dim = 4
+    attn.q_lora_rank = 3
+    attn.indexer = None
+    tokens, local = 4, 2
+    qr = torch.ones(local, 3)
+    kv = torch.zeros(local, 4)
+    monkeypatch.setattr(
+        attn, "_run_parallel_input_projections", lambda h: (None, None, None)
+    )
+    monkeypatch.setattr(attn, "_split_qkv_and_norm", lambda x: (qr, None, kv))
+    monkeypatch.setattr(v2_attn, "sp_all_gather", lambda t: torch.cat((t, t)))
+    hidden = attn._wo_b_full.shape[-1]
+    # The op applied wo_b itself: the finished [T/tp, hidden] shard on the
+    # token-parallel path, else the TP-partial [T, hidden] to reduce-scatter.
+    # Either way the torch side must not call ``wo_b`` (that would make the two
+    # traces read different weights).
+    projected = torch.full((local if finished else tokens, hidden), 3.0)
+    monkeypatch.setattr(
+        attn, "_prepare_and_attn_fn", lambda *a, qr_local=None: projected, raising=False
+    )
+    attn.wo_b = lambda x: pytest.fail("wo_b must be applied inside the fused op")
+    scattered = []
+
+    def fake_rs(t):
+        scattered.append(t.shape)
+        return t[:local]
+
+    monkeypatch.setattr(v2_attn, "sp_reduce_scatter", fake_rs)
+    out = attn.forward(torch.zeros(tokens, dtype=torch.long), torch.zeros(local, 8))
+    if finished:
+        assert out is projected
+        assert scattered == []
+    else:
+        assert scattered == [(tokens, hidden)]
+        assert torch.equal(out, projected[:local])
+
+
+def test_local_wo_b_kwargs_hand_both_shard_and_full_to_the_op(monkeypatch):
+    attn = _stub_with_wo_b(monkeypatch)
+    assert attn._local_wo_b_kwargs() == {}
+    attn._init_local_q_weights()
+    kwargs = attn._local_wo_b_kwargs()
+    assert set(kwargs) == {"wo_b", "wo_b_scale", "wo_b_full", "wo_b_full_scale"}
+    assert kwargs["wo_b"] is attn.wo_b.weight
+    assert kwargs["wo_b_full"] is attn._wo_b_full
