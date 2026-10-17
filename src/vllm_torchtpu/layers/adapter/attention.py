@@ -2442,42 +2442,82 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
 
-        def sparse_mla_attention_core_tpu_dcp_chunk_merge(
-            kv_cache_nope: jax.Array,
-            kv_cache_rope: jax.Array,
-            ql_nope: jax.Array,
-            q_pe: jax.Array,
-            kv_c_normed: jax.Array,
-            k_pe: jax.Array,
-            local_topk_indices: jax.Array,
-            seq_lens: jax.Array,
-            block_tables: jax.Array,
-            query_start_loc: jax.Array,
-            request_distribution: jax.Array,
-        ):
-            nope_spec, rope_spec = layer.mla_kv_spec
-            return sparse_mla_attention_dcp(
-                ql_nope,
-                q_pe,
-                kv_c_normed,
-                k_pe,
-                kv_cache_nope,
-                kv_cache_rope,
-                local_topk_indices,
-                seq_lens,
-                block_tables,
-                query_start_loc,
-                request_distribution,
-                mesh,
-                nope_spec,
-                rope_spec,
-                sm_scale=layer.scale,
-                k_scale=k_scale,
-                dcp_size=dcp_size,
-                interleave_size=interleave_size,
-                fuse_dcp_chunk_merge=True,
-                defer_dcp_last_rs=defer_last_rs,
-            )
+        if defer_last_rs:
+
+            def sparse_mla_attention_core_tpu_dcp_chunk_merge(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                ql_nope: jax.Array,
+                q_pe: jax.Array,
+                kv_c_normed: jax.Array,
+                k_pe: jax.Array,
+                local_topk_indices: jax.Array,
+                seq_lens: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+                request_distribution: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+                nope_spec, rope_spec = layer.mla_kv_spec
+                return sparse_mla_attention_dcp(
+                    ql_nope,
+                    q_pe,
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    local_topk_indices,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                    fuse_dcp_chunk_merge=True,
+                    defer_dcp_last_rs=True,
+                )
+        else:
+
+            def sparse_mla_attention_core_tpu_dcp_chunk_merge(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                ql_nope: jax.Array,
+                q_pe: jax.Array,
+                kv_c_normed: jax.Array,
+                k_pe: jax.Array,
+                local_topk_indices: jax.Array,
+                seq_lens: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+                request_distribution: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                nope_spec, rope_spec = layer.mla_kv_spec
+                return sparse_mla_attention_dcp(
+                    ql_nope,
+                    q_pe,
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    local_topk_indices,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                    fuse_dcp_chunk_merge=True,
+                    defer_dcp_last_rs=False,
+                )
 
         suffix = "_defer_rs" if defer_last_rs else ""
         op_name = f"pallas::sparse_mla_attention_dcp_chunk_merge{suffix}_{layer.layer_name.replace('.', '_')}"
