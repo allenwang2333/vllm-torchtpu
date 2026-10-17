@@ -701,6 +701,22 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
+    if send_small_a2a_applies(num_tokens):
+        # One Pallas round of remote DMAs + the unpack, one JAX op; partial
+        # rows past the real ones zeroed as the ragged exchange leaves them.
+        # The merge below is the incumbent's, on the same bits.
+        from vllm_torchtpu.distributed.dcp import dcp_lane_operand
+
+        prebuild_send_small(world)
+        o_recv, l_recv = _SEND_SMALL_OPS[world](
+            send.reshape(world * block, vdim).contiguous(),
+            1 + real * local,
+            _DCP_RANK,
+            dcp_lane_operand(),
+        )
+        o_recv = o_recv.reshape(world, num_tokens, local, vdim)
+        l_recv = l_recv.reshape(world, num_tokens, local)
+        return _merge_received(o_recv, l_recv).to(torch.bfloat16)
     if envs.TPU_DCP_MLA_SEND_DENSE:
         # Whole blocks through a dense all-to-all + the unpack, one JAX op;
         # partial rows past the real ones zeroed as the ragged exchange leaves
@@ -1080,6 +1096,107 @@ def send_group_rows_fit(block: int, group_rows: int) -> bool:
 
 
 _SEND_GROUP_OPS: dict = {}
+_SEND_SMALL_OPS: dict = {}
+
+
+def send_small_a2a_applies(num_tokens: int) -> bool:
+    """Whether `merge_send_layout` exchanges this bucket with the Pallas
+    small all-to-all (`TPU_DCP_MLA_SEND_SMALL_A2A`): `T <= cap` on the static
+    bucket size, and only where the indexer's small all-gather already lifts
+    the lane operand on every bucket (so no bucket lifts a buffer another
+    does not)."""
+    return bool(
+        envs.TPU_DCP_MLA_SEND_SMALL_A2A
+        and envs.TPU_DCP_INDEXER_SMALL_AG
+        and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+        and envs.TPU_DCP_RANK_OPERAND
+        and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+    )
+
+
+def prebuild_send_small(world: int) -> None:
+    """Build (register) the send-layout small all-to-all + unpack op
+    (`TPU_DCP_MLA_SEND_SMALL_A2A`) for a DCP group of `world` ranks."""
+    global _DCP_RANK
+    if world not in _SEND_SMALL_OPS:
+        from vllm_torchtpu.distributed.dcp import dcp_rank_operand
+
+        _DCP_RANK = dcp_rank_operand(torch.device("tpu"))
+        _SEND_SMALL_OPS[world] = _build_send_small(world)
+
+
+def _send_small_fake(x, rows, rank, lane):
+    return _send_unpack_fake(x, rows, rank)
+
+
+def send_small_unpack_local(x, rows, rank, lane, *, world: int, axis_name: str,
+                            lane_axis: str | None):
+    """One rank's `TPU_DCP_MLA_SEND_SMALL_A2A` exchange + unpack inside a
+    `shard_map` over the (lane, DCP) mesh: `_build_send_unpack`'s result, bit
+    for bit.
+
+    The kernel moves every destination block from the (8,128) tile row that
+    holds the lse word row (`SEND_PAD_ROWS - 1`) to the block's end; rows
+    before it stay unwritten and are never read. Partial rows past the real
+    ones (padding tokens) arrive as the sender left them and are zeroed by
+    the unpack, as `TPU_DCP_MLA_SEND_DENSE` does."""
+    from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
+        small_all_to_all,
+    )
+    from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
+
+    block = x.shape[0] // world
+    vdim = x.shape[1]
+    recv = small_all_to_all(
+        x,
+        num_cores=world,
+        axis=axis_name,
+        row0=(SEND_PAD_ROWS - 1) // 8 * 8,
+        rank=jnp.reshape(rank, (1,)),
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
+    ).reshape(world, block, vdim)
+    return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
+
+
+def _build_send_small(world: int):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+
+    mesh = get_or_create_dcp_mesh()
+    assert mesh.shape[DCP_AXIS_NAME] == world, (mesh.shape, world)
+    rank_spec = P(DCP_AXIS_NAME)
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+
+    def body(x, rows, rank, lane):
+        return send_small_unpack_local(
+            x, rows, rank, lane, world=world, axis_name=DCP_AXIS_NAME,
+            lane_axis=lane_axis,
+        )
+
+    def fn(
+        x: jax.Array, rows: jax.Array, rank: jax.Array, lane: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(rank_spec, P(), rank_spec, rank_spec),
+            out_specs=(rank_spec, rank_spec),
+            check_vma=False,
+        )(x, rows, rank, lane)
+
+    return sharded_jax_op(
+        f"pallas::dcp_send_layout_small_a2a_{world}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(rank_spec, P(), rank_spec, rank_spec),
+        output_partition_specs=(rank_spec, rank_spec),
+        fake=_send_small_fake,
+    )
 
 
 def prebuild_send_group(world: int, group_rows: int) -> None:

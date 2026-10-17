@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
     TPU_DCP_MLA_SEND_DENSE: bool = False
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
+    TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
+    TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
@@ -573,6 +575,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row the merge reads, same merge. Applies where the block splits into
     # whole groups (fixed per bucket at trace time).
     "TPU_DCP_MLA_SEND_GROUP_ROWS": env_int("TPU_DCP_MLA_SEND_GROUP_ROWS", 0),
+    # With TPU_DCP_MLA_SEND_LAYOUT, on backbone buckets of
+    # T <= TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS tokens (a power of 2): run the
+    # exchange as one Pallas round of remote DMAs
+    # (small_collectives.all_to_all) instead of XLA's ragged all-to-all --
+    # every destination block from the (8,128) tile row holding the lse word
+    # row to the block's end, received partial rows past the real ones zeroed
+    # as the ragged exchange leaves them. Same bits on every row the merge
+    # reads, same merge. Takes precedence over TPU_DCP_MLA_SEND_DENSE /
+    # TPU_DCP_MLA_SEND_GROUP_ROWS on those buckets. Peers are addressed by
+    # (lane, rank) as data, so it needs the lane operand the indexer's
+    # TPU_DCP_INDEXER_SMALL_AG already lifts on every bucket (with
+    # TPU_SC_TOPK_DCP_MERGE_FLAT and TPU_DCP_RANK_OPERAND); otherwise off.
+    "TPU_DCP_MLA_SEND_SMALL_A2A": env_bool("TPU_DCP_MLA_SEND_SMALL_A2A", default=False),
+    "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
+        "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
+    ),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
