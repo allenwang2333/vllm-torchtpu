@@ -9645,7 +9645,11 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        stride = self._spec_warmup_nct_stride()
+        # The mixed verify+prefill steps after the decode run advance the
+        # batch's requests up to two more steps.
+        n_steps = n_decode + (2 if mixed else 0)
+        max_pos = min(self.max_model_len, P + max(n_decode * (1 + K), n_steps * stride))
         # Per-group block counts in the group's own block-table units (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -9711,7 +9715,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=[x - P + 1 for x in nct],
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -9721,7 +9725,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.execute_model(so) is None
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
-                nct = [x + 1 for x in nct]
+                nct = [x + stride for x in nct]
             if (
                 mixed
                 and self.max_num_reqs >= R + 1
@@ -9776,7 +9780,7 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=[x - P + 1 for x in nct],
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -9792,12 +9796,33 @@ class TPUModelRunner(GPUModelRunner):
                     assert self.execute_model(so) is None
                     self.sample_tokens(None)
                     self.take_draft_token_ids()
-                    nct = [x + 1 for x in nct]
+                    nct = [x + stride for x in nct]
                     prev_ids = [e.req_id for e in extras]
         except Exception:
             logger.exception("spec-decode warmup R=%d failed; continuing", R)
         finally:
             self._warmup_spec_decode_cleanup(rids + mix_ids)
+
+    def _spec_warmup_nct_stride(self) -> int:
+        """How far a synthetic spec-decode step advances num_computed_tokens.
+
+        Under async scheduling the scheduler counts every scheduled token
+        (1 + K) and the next step subtracts the rejected drafts on device
+        (``spec_decode_num_rejected_tokens``), so the synthetic steps advance
+        by 1 + K as well. A stride of 1 would put the correction before the
+        context: a 1-token prompt with all K drafts rejected reaches position
+        -1, and the forward that writes it never completes. Synchronous
+        scheduling applies no correction; one token per step stays valid.
+
+        The steps pass num_output_tokens = num_computed_tokens - prompt + 1,
+        as the scheduler does (its count includes the async placeholders). A
+        smaller count makes vLLM's _update_states trim output_token_ids and
+        num_tokens_no_spec under the runner's optimistic placeholders.
+        """
+        if not self.scheduler_config.async_scheduling:
+            return 1
+        assert self.speculative_config is not None
+        return 1 + self.speculative_config.num_speculative_tokens
 
     def _warmup_one_spec_request(
         self, P: int, idx: int, quiet: bool = False, greedy: bool = True
@@ -9825,7 +9850,8 @@ class TPUModelRunner(GPUModelRunner):
         # near the prefill.
         room = self.max_model_len - P
         n_dec = min(max(5, K + 2), max(0, room // (1 + K) - 1))
-        decode_ncts = [P + t for t in range(n_dec)]
+        stride = self._spec_warmup_nct_stride()
+        decode_ncts = [P + t * stride for t in range(n_dec)]
         # Reuse low physical block ids, as in _warmup_spec_batch and the LIFO
         # BlockPool workaround, rather than exercising the SC2-sensitive end
         # of the pool. Warmup runs before serving and tears down each request;
@@ -9881,7 +9907,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=[nct - P + 1],
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
