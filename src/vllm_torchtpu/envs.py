@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_SAMPLER_VOCAB_PARALLEL: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
+    TPU_MTP_ONEHOT_AR: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = False
     TPU_SAMPLER_FUSED_CHAIN: bool = False
@@ -1776,6 +1777,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # result, so each draft pass reads H*2H/tp weight bytes instead of H*2H
     # (spec_decode/utils.ColumnParallelEhProj). Same per-element dot product.
     "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP"),
+    # MTP draft: the two tiny TP all-gathers per draft pass -- the column-
+    # parallel eh_proj output (TPU_MTP_EH_PROJ_TP) and the vocab-parallel
+    # argmax (max, id) pairs (TPU_SAMPLER_VOCAB_PARALLEL) -- become a TP
+    # all-reduce of a zero buffer holding this rank's block in its own slot,
+    # which TPU_SMALL_ALL_REDUCE_DRAFT routes to the small Pallas all-reduce
+    # (~8 us) instead of XLA's all-gather (~14 us at 16 cores). Bitwise the
+    # gather up to the sign of a zero: each element sums one block and 15 +0.
+    "TPU_MTP_ONEHOT_AR": env_bool("TPU_MTP_ONEHOT_AR"),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
