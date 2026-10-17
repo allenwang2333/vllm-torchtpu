@@ -18,8 +18,11 @@ This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
+from contextlib import contextmanager
+
 import torch
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
@@ -92,16 +95,118 @@ def _get_moe_collective_group():
         )
     if pcp_size > 1:
         return pcp_group, "PCP"
+    if dp_size == 1 and _sequence_parallel_moe.active:
+        # TP sequence parallel at DP1: the runner's naive dispatch/combine
+        # all-gathers and reduce-scatters over the EP group (== TP group).
+        ep_group = get_ep_group()
+        if ep_group is not None and int(ep_group.world_size) > 1:
+            return ep_group, "EP"
     return dp_group, "DP"
 
 
-@torch.compiler.assume_constant_result
-def _log_active_chunk_pipeline() -> None:
-    """Emit trace-time evidence without passing symbolic values to logging."""
-    collective_group, collective_kind = _get_moe_collective_group()
-    parallel_size = (
-        int(collective_group.world_size) if collective_group is not None else 1
+class _SequenceParallelMoE:
+    """Whether the MoE layer being applied is token-sharded (sequence parallel).
+
+    Set per call by the quant method (`set_sequence_parallel_moe`) from the
+    layer's own ``moe_config``: a model can mix SP layers (DeepSeek-V4.1's
+    main stack) with replicated ones (its DSpark drafter, whose MoE output
+    the runner all-reduces), and only the former may be gathered and
+    reduce-scattered over the EP group. A plain Python attribute, constant
+    while a graph is captured.
+    """
+
+    active = False
+
+
+_sequence_parallel_moe = _SequenceParallelMoE()
+
+
+def set_sequence_parallel_moe(active: bool) -> bool:
+    """Set the flag for the enclosing MoE call; returns the previous value."""
+    previous = _sequence_parallel_moe.active
+    _sequence_parallel_moe.active = bool(active)
+    return previous
+
+
+def layer_is_sequence_parallel(layer) -> bool:
+    config = getattr(layer, "moe_config", None)
+    return bool(getattr(config, "is_sequence_parallel", False))
+
+
+@contextmanager
+def local_padding_mask(num_local_tokens: int):
+    """Route this rank's SP shard against its own slice of the padding mask.
+
+    The routers zero padded tokens through ``forward_context.is_padding[:n]``.
+    The model publishes that mask for the whole batch, which is what the
+    runner's naive dispatch routes (all tokens, after the all-gather). With
+    the chunk pipeline the quant method routes its local shard before the
+    gather, so the mask must be the matching shard; the untouched prefix would
+    be rank 0's slice on every rank and would drop real tokens elsewhere.
+    """
+    context = get_forward_context() if is_forward_context_available() else None
+    original = getattr(context, "is_padding", None) if context is not None else None
+    if (
+        original is None
+        or original.shape[0] == num_local_tokens
+        or not _sequence_parallel_moe.active
+    ):
+        yield
+        return
+    group = _get_moe_collective_group()[0]
+    if group is None or int(group.world_size) <= 1:
+        yield
+        return
+    world = int(group.world_size)
+    rank = int(group.rank_in_group)
+    mask = original
+    pad = (-mask.shape[0]) % world
+    if pad:
+        mask = torch.nn.functional.pad(mask, (0, pad), value=True)
+    chunk = mask.shape[0] // world
+    if chunk != num_local_tokens:
+        # Not the SP token layout this pipeline shards; leave the mask alone.
+        yield
+        return
+    assert context is not None
+    context.is_padding = mask[rank * chunk : (rank + 1) * chunk]
+    try:
+        yield
+    finally:
+        context.is_padding = original
+
+
+def _gather_routing(collective_group, topk_weights, topk_ids):
+    """All-gather the routing pair with one collective.
+
+    Weights and ids are packed as f32 (exact for bf16/f32 weights and for
+    expert ids below 2**24): on a decode-sized shard every extra ICI
+    collective costs more than the bytes it moves.
+    """
+    if topk_weights is None or topk_ids is None:
+        ag_topk_weights = (
+            collective_group.all_gather(topk_weights, dim=0)
+            if topk_weights is not None
+            else None
+        )
+        ag_topk_ids = (
+            collective_group.all_gather(topk_ids, dim=0)
+            if topk_ids is not None
+            else None
+        )
+        return ag_topk_weights, ag_topk_ids
+    topk = topk_weights.shape[-1]
+    packed = torch.cat((topk_weights.float(), topk_ids.float()), dim=-1)
+    packed = collective_group.all_gather(packed, dim=0)
+    return (
+        packed[:, :topk].to(topk_weights.dtype),
+        packed[:, topk:].to(topk_ids.dtype),
     )
+
+
+@torch.compiler.assume_constant_result
+def _log_active_chunk_pipeline(collective_kind: str, parallel_size: int) -> None:
+    """Emit trace-time evidence without passing symbolic values to logging."""
     logger.info_once(
         "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
         collective_kind,
@@ -163,7 +268,7 @@ def pipelined_fused_moe_gmm(
         torch.Tensor: Reduced local output activations [S, H].
     """
     chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
-    collective_group, _ = _get_moe_collective_group()
+    collective_group, collective_kind = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
     parallel_size = (
@@ -178,15 +283,8 @@ def pipelined_fused_moe_gmm(
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
             ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
+            ag_topk_weights, ag_topk_ids = _gather_routing(
+                collective_group, topk_weights, topk_ids
             )
         else:
             ag_hidden_states = hidden_states
@@ -215,7 +313,7 @@ def pipelined_fused_moe_gmm(
             return collective_group.reduce_scatter(out, dim=0)
         return out
 
-    _log_active_chunk_pipeline()
+    _log_active_chunk_pipeline(collective_kind, parallel_size)
     assert collective_group is not None
 
     # Slice local inputs into num_chunks chunks along dim 0
@@ -242,15 +340,8 @@ def pipelined_fused_moe_gmm(
 
     # Prime pipeline with initial all-gather for chunk 0
     ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
+    ag_tw_curr, ag_ti_curr = _gather_routing(
+        collective_group, weights_slices[0], ids_slices[0]
     )
 
     rs_outputs = []
@@ -260,18 +351,8 @@ def pipelined_fused_moe_gmm(
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
             ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
-            ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
-                else None
-            )
-            ids_next = ids_slices[i + 1]
-            ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
-                else None
+            ag_tw_next, ag_ti_next = _gather_routing(
+                collective_group, weights_slices[i + 1], ids_slices[i + 1]
             )
 
         # Compute MoE kernel for current gathered chunk

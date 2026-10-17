@@ -15,6 +15,9 @@ export TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD="${TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOA
 # mixed step 320 -> 308 ms, E2E +1.4%, pure-decode step +0.8 ms.
 export TPU_DEEPSEEK_V41_SP="${TPU_DEEPSEEK_V41_SP:-1}"
 export TPU_DEEPSEEK_V41_LOCAL_Q="${TPU_DEEPSEEK_V41_LOCAL_Q:-1}"
+# Chunk the sequence-parallel MoE all-gather/gmm/reduce-scatter (4 chunks per
+# 8192-token step) so each chunk's reduce-scatter overlaps the next gmm.
+export TPU_MOE_COLLECTION_CHUNK_SIZE="${TPU_MOE_COLLECTION_CHUNK_SIZE:-2048}"
 export USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE:-1}"
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-0}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-0}"

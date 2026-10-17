@@ -245,12 +245,12 @@ def test_pipelined_moe_execution_flow_and_numerical_parity():
     # Numerical parity check: each token should be exactly hs * 2.0
     torch.testing.assert_close(out, hidden_states * 2.0)
 
-    # Call log should record 2 all-gathers (for hidden_states, topk_weights, topk_ids)
-    # and 2 reduce-scatters
+    # hidden_states and the packed (topk_weights, topk_ids) pair are gathered
+    # per chunk; one reduce-scatter per chunk.
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors gathered per chunk * 2 chunks = 6 all_gather calls
-    assert len(ag_calls) == 6
+    # 2 tensors gathered per chunk * 2 chunks = 4 all_gather calls
+    assert len(ag_calls) == 4
     # 1 tensor reduce-scattered per chunk * 2 chunks = 2 reduce_scatter calls
     assert len(rs_calls) == 2
 
@@ -300,7 +300,7 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
         )
 
     torch.testing.assert_close(out, hidden_states * 2.0)
-    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
+    assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 4
     assert len([c for c in pcp_group.call_log if c[0] == "reduce_scatter"]) == 2
     assert dp_group.call_log == []
 
@@ -705,11 +705,11 @@ def test_pipelined_moe_single_chunk_dp_greater_than_one():
     assert out.shape == (seq_len, hidden_dim)
     torch.testing.assert_close(out, hidden_states * 3.0)
 
-    # In single-chunk mode (num_chunks=1): 3 all_gathers (hs, weights, ids)
+    # In single-chunk mode (num_chunks=1): 2 all_gathers (hs, packed routing)
     # and 1 reduce_scatter
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    assert len(ag_calls) == 3
+    assert len(ag_calls) == 2
     assert len(rs_calls) == 1
 
 
@@ -892,7 +892,110 @@ def test_pipelined_moe_four_stage_pipeline():
     torch.testing.assert_close(out, hidden_states * 4.0)
     ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
     rs_calls = [c for c in dp_group.call_log if c[0] == "reduce_scatter"]
-    # 3 tensors * 4 chunks = 12 all_gather calls
-    assert len(ag_calls) == 12
+    # 2 tensors (hidden, packed routing) * 4 chunks = 8 all_gather calls
+    assert len(ag_calls) == 8
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
+
+
+def test_sequence_parallel_moe_pipelines_over_ep_group():
+    """TP sequence parallel at DP1 chunks the EP-group all-gather/reduce-scatter."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    ep_group = _MockCollectiveGroup(world_size=8, rank=0)
+    dp_group = _MockCollectiveGroup(world_size=1, rank=0)
+    seq_len = 1024  # this rank's SP shard of an 8192-token step
+    hidden_dim = 16
+    topk = 2
+    hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+    topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+
+    layer = MagicMock()
+    layer.moe_config.is_sequence_parallel = True
+    assert pfm.layer_is_sequence_parallel(layer)
+    previous = pfm.set_sequence_parallel_moe(True)
+    try:
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 2048),
+            patch.object(pfm, "get_pcp_group", return_value=None),
+            patch.object(pfm, "get_dp_group", return_value=dp_group),
+            patch.object(pfm, "get_ep_group", return_value=ep_group),
+            patch.object(
+                pfm,
+                "fused_moe_gmm",
+                side_effect=lambda hidden_states, **kw: hidden_states * 2.0,
+            ),
+        ):
+            assert pfm._get_moe_collective_group()[1] == "EP"
+            out = pipelined_fused_moe_gmm(
+                hidden_states=hidden_states,
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                experts_start=None,
+                topk=topk,
+                activation="silu",
+            )
+    finally:
+        pfm.set_sequence_parallel_moe(previous)
+
+    torch.testing.assert_close(out, hidden_states * 2.0)
+    # 8192 / 2048 = 4 chunks: hidden + packed routing gathered, 1 RS each.
+    assert len([c for c in ep_group.call_log if c[0] == "all_gather"]) == 8
+    assert len([c for c in ep_group.call_log if c[0] == "reduce_scatter"]) == 4
+    assert dp_group.call_log == []
+
+
+def test_replicated_layer_keeps_dp_group_under_sp_model():
+    """A non-SP layer (DSpark drafter) in an SP model must not use the EP group."""
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    layer = MagicMock()
+    layer.moe_config.is_sequence_parallel = False
+    assert not pfm.layer_is_sequence_parallel(layer)
+    assert not pfm.layer_is_sequence_parallel(object())
+    previous = pfm.set_sequence_parallel_moe(pfm.layer_is_sequence_parallel(layer))
+    try:
+        with (
+            patch.object(pfm, "get_pcp_group", return_value=None),
+            patch.object(pfm, "get_dp_group", return_value=_MockCollectiveGroup(1, 0)),
+            patch.object(pfm, "get_ep_group", return_value=_MockCollectiveGroup(8, 0)),
+        ):
+            assert pfm._get_moe_collective_group()[1] == "DP"
+    finally:
+        pfm.set_sequence_parallel_moe(previous)
+
+
+def test_local_padding_mask_slices_rank_shard():
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    ep_group = _MockCollectiveGroup(world_size=4, rank=2)
+    context = MagicMock()
+    # 10 tokens, 4 ranks -> padded to 12, 3 per rank; rank 2 owns rows 6..8.
+    full = torch.tensor([False] * 9 + [True], dtype=torch.bool)
+    context.is_padding = full
+    previous = pfm.set_sequence_parallel_moe(True)
+    try:
+        with (
+            patch.object(pfm, "get_pcp_group", return_value=None),
+            patch.object(pfm, "get_dp_group", return_value=_MockCollectiveGroup(1, 0)),
+            patch.object(pfm, "get_ep_group", return_value=ep_group),
+            patch.object(pfm, "is_forward_context_available", return_value=True),
+            patch.object(pfm, "get_forward_context", return_value=context),
+        ):
+            with pfm.local_padding_mask(3):
+                assert context.is_padding.tolist() == [False, False, False]
+            assert context.is_padding is full
+            # A mask already at local size, or an unknown layout, is untouched.
+            with pfm.local_padding_mask(10):
+                assert context.is_padding is full
+            with pfm.local_padding_mask(5):
+                assert context.is_padding is full
+    finally:
+        pfm.set_sequence_parallel_moe(previous)

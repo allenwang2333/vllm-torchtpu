@@ -75,7 +75,10 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
+    layer_is_sequence_parallel,
+    local_padding_mask,
     pipelined_fused_moe_gmm,
+    set_sequence_parallel_moe,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
@@ -340,29 +343,50 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         # methods so the routing-simulation hook lives in exactly one place.
         # input_ids is forwarded for DeepSeek-V4 hash routing; mxfp4 is the only
         # method that supplies it, matching the pre-consolidation behavior.
+        if enable_pipelined_collective_and_compute():
+            # The chunk pipeline gathers/reduce-scatters SP layers over the EP
+            # group; replicated layers (DSpark drafter) keep the runner's
+            # all-reduce. Routing runs on this rank's own rows, so the
+            # padding mask is sliced to match (`local_padding_mask`).
+            previous = set_sequence_parallel_moe(layer_is_sequence_parallel(layer))
+            try:
+                with local_padding_mask(x.shape[0]):
+                    topk_weights, topk_ids = moe_routing.route(
+                        layer, x, router_logits, input_ids=input_ids
+                    )
+                return pipelined_fused_moe_gmm(
+                    **_fused_moe_kwargs(
+                        self, layer, x, topk_weights, topk_ids, activation_str
+                    )
+                )
+            finally:
+                set_sequence_parallel_moe(previous)
+
         topk_weights, topk_ids = moe_routing.route(
             layer, x, router_logits, input_ids=input_ids
         )
+        return fused_moe_gmm(
+            **_fused_moe_kwargs(self, layer, x, topk_weights, topk_ids, activation_str)
+        )
 
-        kwargs = {
-            "hidden_states": x,
-            "w1": layer.w13_weight,
-            "w2": layer.w2_weight,
-            "w1_scale": layer.w13_weight_scale,
-            "w2_scale": layer.w2_weight_scale,
-            "w1_bias": getattr(layer, "w13_bias", None),
-            "w2_bias": getattr(layer, "w2_bias", None),
-            "topk_weights": topk_weights,
-            "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
-            "topk": layer.moe_config.experts_per_token,
-            "activation": activation_str,
-            "rhs_quant_dtype": self.rhs_quant_dtype,
-        }
-        if enable_pipelined_collective_and_compute():
-            return pipelined_fused_moe_gmm(**kwargs)
 
-        return fused_moe_gmm(**kwargs)
+def _fused_moe_kwargs(method, layer, x, topk_weights, topk_ids, activation_str):
+    """The `fused_moe_gmm` / `pipelined_fused_moe_gmm` call (identical signatures)."""
+    return {
+        "hidden_states": x,
+        "w1": layer.w13_weight,
+        "w2": layer.w2_weight,
+        "w1_scale": layer.w13_weight_scale,
+        "w2_scale": layer.w2_weight_scale,
+        "w1_bias": getattr(layer, "w13_bias", None),
+        "w2_bias": getattr(layer, "w2_bias", None),
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "experts_start": layer._experts_start,
+        "topk": layer.moe_config.experts_per_token,
+        "activation": activation_str,
+        "rhs_quant_dtype": method.rhs_quant_dtype,
+    }
 
 
 REQUANTIZED_BLOCK_SIZE = (
