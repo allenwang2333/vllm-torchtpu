@@ -255,8 +255,15 @@ def verify_pooled_step_hlo(
     TPU (`jax.default_backend() == "tpu" and not ex.interpret`) so XLA buffer
     assignment and copy insertion have run.
     """
+    has_real_jax_devices = bool(
+        mesh.devices.size > 0 and isinstance(mesh.devices.flat[0], jax.Device)
+    )
     if compile_hlo is None:
-        compile_hlo = bool(jax.default_backend() == "tpu" and not ex.interpret)
+        compile_hlo = bool(
+            has_real_jax_devices and jax.default_backend() == "tpu" and not ex.interpret
+        )
+    else:
+        compile_hlo = bool(compile_hlo and has_real_jax_devices)
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=True
     )
