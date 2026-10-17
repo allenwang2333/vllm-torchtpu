@@ -72,6 +72,8 @@ if TYPE_CHECKING:
     TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
     TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
+    TPU_OFFLOAD_LOG_LOOKUPS: bool = False
+    TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS: bool = False
     TPU_SRPT_HOLD_PROGRESS_GUARD: bool = False
     TPU_SRPT_STRICT_PREFILL_CADENCE: bool = False
     TPU_SRPT_ATTN_WORK_CAP: int = 0
@@ -676,6 +678,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint (never cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
     "TPU_KV_DROP_HCA_STATE_CHECKPOINT": env_bool("TPU_KV_DROP_HCA_STATE_CHECKPOINT"),
+    # TPURaidenOffloadingConnector: log each admitted lookup (request id,
+    # HBM hit, host hit, host full-attention prefix) at INFO. Diagnostic.
+    "TPU_OFFLOAD_LOG_LOOKUPS": env_bool("TPU_OFFLOAD_LOG_LOOKUPS"),
+    # Engine core: hash the windowed blocks the Raiden offload stores (the
+    # EAGLE peek block of each checkpoint), so a freed one is not reused before
+    # its store launches; a cancelled store also drops the full-attention chunks
+    # of its job (core/checkpoint_free_order.py).
+    "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS": env_bool(
+        "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS"
+    ),
     # SrptPrefillScheduler: after a held step that admits no waiting request,
     # stop holding prefill chunks until a step admits one (breaks the livelock
     # where the held chunks' own KV blocks keep the waiting request out).

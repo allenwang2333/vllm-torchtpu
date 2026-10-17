@@ -305,6 +305,20 @@ class TestWindowCheckpointPolicy(unittest.TestCase):
             self.assertEqual(job.dst_spec.group_sizes[HCA_STATE_GROUP], 0)
             self.assertEqual(loaded[FULL_GROUP], 9)
 
+    def test_lookup_log_reports_host_prefix(self):
+        sched, _, _ = self._prefill(0)
+        with (
+            patch.dict("os.environ", {"TPU_OFFLOAD_LOG_LOOKUPS": "1"}),
+            self.assertLogs(
+                "vllm.vllm_torchtpu.offload.raiden_connector", "INFO"
+            ) as logs,
+        ):
+            self.assertEqual(self._hit(sched, HASHES, self.PROMPT + 3000), 9216)
+        (line,) = [
+            r.getMessage() for r in logs.records if "raiden lookup" in r.getMessage()
+        ]
+        self.assertIn("local=0 external=9216 host_fa_prefix_tokens=9216", line)
+
     def test_rejects_unaligned_interval(self):
         with self.assertRaisesRegex(ValueError, "multiple of the full-attention chunk"):
             make_scheduler(1000)
