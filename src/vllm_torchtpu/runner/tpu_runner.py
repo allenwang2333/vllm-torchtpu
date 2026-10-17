@@ -950,6 +950,12 @@ class TPUModelRunner(GPUModelRunner):
         # TPU_SAMPLER_VERIFY_TRIM: the fused chain's target work on 8 rows
         # when the chunk's drafts fit (see _verify_trim_rows).
         self._sampler_verify_trim = bool(envs.TPU_SAMPLER_VERIFY_TRIM)
+        # TPU_SAMPLER_GRAPH_RNG: the fused chain draws its uniforms in-graph
+        # from the default generator (= the sampling generator, see
+        # _get_sampling_generator).
+        self._sampler_graph_rng = bool(envs.TPU_SAMPLER_GRAPH_RNG) and bool(
+            envs.TPU_SAMPLER_FUSED_CHAIN
+        )
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -4096,7 +4102,14 @@ class TPUModelRunner(GPUModelRunner):
         independent request streams, so they decorrelate, which is fine.)
         """
         if self._sampling_generator is None:
-            gen = torch.Generator(device=self.device)
+            if self._sampler_graph_rng:
+                # TPU_SAMPLER_GRAPH_RNG: the device's default generator, which
+                # compiled torch.rand draws from; seeded here once, as below.
+                gen = getattr(torch, self.device.type).default_generators[
+                    self.device.index or 0
+                ]
+            else:
+                gen = torch.Generator(device=self.device)
             gen.manual_seed(int(self.model_config.seed or 0))
             self._sampling_generator = gen
         return self._sampling_generator
@@ -4334,6 +4347,36 @@ class TPUModelRunner(GPUModelRunner):
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
             assert self.speculative_config is not None
+            trim_kwargs = {}
+            if rows := self._verify_trim_rows(
+                md.target_logits_indices.shape[0], md.draft_lengths_cpu
+            ):
+                trim_kwargs["verify_rows"] = rows
+            if self._sampler_graph_rng:
+                # Same three draws, in-graph from the default generator, which
+                # is sampling_generator here (_get_sampling_generator).
+                assert sampling_generator is None or (
+                    sampling_generator is self._get_sampling_generator()
+                )
+                return self.spec_sample_verify_fused(
+                    logits,
+                    md.bonus_logits_indices,
+                    md.target_logits_indices,
+                    req_temperatures,
+                    req_top_k,
+                    req_top_p,
+                    md.draft_token_ids,
+                    md.draft_lengths,
+                    md.segment_ids,
+                    md.group_indices,
+                    None,
+                    None,
+                    None,
+                    self.speculative_config.num_speculative_tokens,
+                    **self._sampler_kwargs(),
+                    **trim_kwargs,
+                    graph_rng=True,
+                )
             # The unfused path's draws: rand_like(bonus_logits, f32), then
             # accept_u, then rand_like(target_logits, f32) -- same shapes,
             # dtypes, order.
@@ -4355,11 +4398,6 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
-            trim_kwargs = {}
-            if rows := self._verify_trim_rows(
-                md.target_logits_indices.shape[0], md.draft_lengths_cpu
-            ):
-                trim_kwargs["verify_rows"] = rows
             return self.spec_sample_verify_fused(
                 logits,
                 md.bonus_logits_indices,
@@ -6172,6 +6210,18 @@ class TPUModelRunner(GPUModelRunner):
             _VERIFY_TRIM_ROWS < num_tokens <= _VERIFY_TRIM_MAX_LEN
         ):
             trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
+        rng_kwargs: dict[str, Any] = {}
+        default_gen_state = None
+        if self._sampler_graph_rng:
+            # The served calls draw in-graph; warm that program. Its draws
+            # advance the default generator: restore it after, so warmup never
+            # moves the sampling stream.
+            default_gen = getattr(torch, self.device.type).default_generators[
+                self.device.index or 0
+            ]
+            default_gen_state = default_gen.get_state()
+            bonus_u = accept_u = recover_u = None
+            rng_kwargs = {"graph_rng": True}
         for trim_kwargs in trim_variants:
             for light_kwargs in self._sampler_light_variants() or [{}]:
                 out = self.spec_sample_verify_fused(
@@ -6191,8 +6241,11 @@ class TPUModelRunner(GPUModelRunner):
                     k,
                     **light_kwargs,
                     **trim_kwargs,
+                    **rng_kwargs,
                 )
                 synchronize_tensors(out)
+        if default_gen_state is not None:
+            default_gen.set_state(default_gen_state)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7775,15 +7828,16 @@ class TPUModelRunner(GPUModelRunner):
         draft_lengths: torch.Tensor,
         segment_ids: torch.Tensor,
         group_indices: torch.Tensor,
-        bonus_u: torch.Tensor,
-        accept_u: torch.Tensor,
-        recover_u: torch.Tensor,
+        bonus_u: torch.Tensor | None,
+        accept_u: torch.Tensor | None,
+        recover_u: torch.Tensor | None,
         max_draft_tokens: int,
         need_top_k: bool = True,
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
         verify_rows: int = 0,
+        graph_rng: bool = False,
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
         _sample_spec_verify_chunk as one program -- the logits gathers, bonus
@@ -7794,8 +7848,29 @@ class TPUModelRunner(GPUModelRunner):
         ``verify_rows`` (static, TPU_SAMPLER_VERIFY_TRIM): keep only the first
         that many draft slots -- the caller guarantees every real slot is
         among them (_verify_trim_rows). The uniforms are drawn at the full
-        shape and sliced here, so the generator stream is unchanged."""
+        shape and sliced here, so the generator stream is unchanged.
+
+        ``graph_rng`` (static, TPU_SAMPLER_GRAPH_RNG): draw the three
+        uniforms here from the default generator -- the caller's shapes,
+        dtype and order, before any trim -- instead of taking them as inputs."""
         assert self.rejection_sampler is not None
+        if graph_rng:
+            vocab = logits.shape[-1]
+            bonus_u = torch.rand(
+                (bonus_logits_indices.shape[0], vocab),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            accept_u = torch.rand(
+                draft_token_ids.shape, dtype=torch.float32, device=logits.device
+            )
+            recover_u = torch.rand(
+                (target_logits_indices.shape[0], vocab),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+        assert bonus_u is not None and accept_u is not None
+        assert recover_u is not None
         if verify_rows:
             target_logits_indices = target_logits_indices[:verify_rows]
             draft_token_ids = draft_token_ids[:verify_rows]

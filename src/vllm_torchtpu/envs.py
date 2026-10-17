@@ -278,6 +278,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_FAST_TOP_P: bool = False
     TPU_SAMPLER_FUSED_CHAIN: bool = False
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_SAMPLER_GRAPH_RNG: bool = False
     TPU_FP8_LINEAR_PALLAS_SITES: str = (
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     )
@@ -1834,6 +1835,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # padding slots; the uniforms are drawn at the full shape and sliced, so
     # tokens and accept decisions are unchanged.
     "TPU_SAMPLER_VERIFY_TRIM": env_bool("TPU_SAMPLER_VERIFY_TRIM"),
+    # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
+    # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
+    # instead of as six eager programs before it. Dynamo cannot take a
+    # torch.Generator, so the sampling generator becomes the device's default
+    # generator, seeded once from model_config.seed exactly like the dedicated
+    # one; a compiled torch.rand on it yields the same bits as the eager draw
+    # with the same state, so the stream (and every token) is unchanged as long
+    # as nothing else draws from the default generator while serving.
+    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
     "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
     # With TPU_FP8_LINEAR_PALLAS: the skinny kernel takes its per-channel weight
     # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
