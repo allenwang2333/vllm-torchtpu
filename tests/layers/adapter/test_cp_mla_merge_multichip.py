@@ -71,7 +71,9 @@ HEADS = 64
 VDIM = 512
 DV = 256  # GLM-5.2 v_head_dim
 CHECK_TOKENS = 64
-LAUNCH_TIMEOUT_SECONDS = 900
+# Under CI's 600 s pytest timeout, so a hung worker group is killed (and its
+# log printed) by the test rather than by pytest. A passing run takes ~150 s.
+LAUNCH_TIMEOUT_SECONDS = 540
 
 _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A": False,
@@ -1082,6 +1084,9 @@ def test_all_to_all_merge_on_real_collectives(tmp_path):
         if line.startswith("BENCH "):
             print(line)
     print(json.dumps(results[0], indent=1))
+    if completed.returncode != 0:
+        # A rank that hung or died writes no result; its log is the only clue.
+        print(completed.stdout[-12000:])
     assert completed.returncode == 0 or any("error" in r for r in results), (
         completed.stdout[-12000:]
     )
