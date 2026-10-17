@@ -109,6 +109,13 @@ STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 # results"), as (decode, prefill, MIXED).
 STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+# Small-bucket MIXED kv pages per block under TPU_STREAMIDX_DECODE_PACK when
+# TPU_STREAMIDX_SMALL_BUCKET_BKVP is unset: `T <= cap` buckets (1-2 MTP
+# requests) take the long block, larger small buckets the short one. GLM-5.2
+# DCP8 (9k-67k keys per rank): 32 pages wins from 47k keys up at 4-8 tokens,
+# 16 pages wins at 16 tokens and short contexts (32 regresses b3 at 9.4k keys).
+STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
+STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
 
 
 def _streamidx_block_sizes(
@@ -117,6 +124,7 @@ def _streamidx_block_sizes(
     small_bucket_bkvp: int | None,
     small_bucket_tokens: int,
     mixed_bkvp: int | None = None,
+    decode_pack: bool = False,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a token bucket.
 
@@ -135,7 +143,12 @@ def _streamidx_block_sizes(
             STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,),
             STREAMIDX_QUERIES_PER_BLOCK,
         )
-    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    if small_bucket_bkvp:
+        bkvp = small_bucket_bkvp
+    elif decode_pack:
+        bkvp = STREAMIDX_PACK_BKVP[num_tokens > STREAMIDX_PACK_BKVP_CAP_TOKENS]
+    else:
+        bkvp = STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
         STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
@@ -595,6 +608,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_bucket_bkvp,
                 small_bucket_tokens,
                 mixed_bkvp,
+                decode_pack,
             )
             topk_indices = streamindex_topk(
                 q,
@@ -745,6 +759,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_bucket_bkvp,
                 small_bucket_tokens,
                 mixed_bkvp,
+                decode_pack,
             )
             overlap = {}
             if qb_overlap:
