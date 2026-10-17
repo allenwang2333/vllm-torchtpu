@@ -1125,13 +1125,6 @@ class TPUModelRunner(GPUModelRunner):
 
         self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
-        mm_cfg = getattr(self.model_config, "multimodal_config", None)
-        if (
-            mm_cfg is not None
-            and getattr(mm_cfg, "language_model_only", False)
-            and self.parallel_config.pipeline_parallel_size == 1
-        ):
-            self.supports_mm_inputs = False
 
         # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
@@ -5203,7 +5196,11 @@ class TPUModelRunner(GPUModelRunner):
         is_mm_embed_full = None
         mm_tok_cumsum = None
         mm_cumsum_np = None
-        if self.supports_mm_inputs and self._pp_is_first:
+        mm_cfg = getattr(self.model_config, "multimodal_config", None)
+        is_lm_only = bool(
+            mm_cfg is not None and getattr(mm_cfg, "language_model_only", False)
+        )
+        if self.supports_mm_inputs and self._pp_is_first and not is_lm_only:
             mm_embeds_list, is_mm_embed_full = self._gather_mm_embeddings(
                 scheduler_output
             )
@@ -5395,7 +5392,10 @@ class TPUModelRunner(GPUModelRunner):
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
             self._record_input_staging_fence()
-            if self._pp_is_first:
+            if self._pp_is_first and not (
+                getattr(self, "_qwen35_mk", None) is not None
+                and chunk_mm_inputs is None
+            ):
                 input_ids, inputs_embeds = self._get_model_inputs(
                     input_ids, chunk_mm_inputs
                 )
@@ -10346,6 +10346,13 @@ class TPUModelRunner(GPUModelRunner):
             kwargs["intermediate_tensors"] = intermediate_tensors
         if not in_precompile:
             self._step_last_dispatch = (False, int(positions.shape[-1]))
+        if (
+            inputs_embeds is None
+            and input_ids is not None
+            and self.supports_mm_inputs
+            and self._pp_is_first
+        ):
+            input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
         out = self.model(
             input_ids=input_ids,
             positions=positions,
