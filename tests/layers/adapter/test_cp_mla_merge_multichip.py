@@ -300,15 +300,16 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
                 except Exception as exc:  # noqa: BLE001 - reported to the parent
                     traceback.print_exc()
                     report[key] = {"error": repr(exc)[:400]}
-    # Positive control: rank 1 weighs its partial 25 % too heavily.
+    # Positive control: rank 1 weighs its partial 25 % too heavily. The bump
+    # is data (0 on every other rank), not a branch on the rank: a compiled
+    # merge must be the same program on every rank around its collectives.
     import math
 
     real = cp_mla._weighted_reduce_scatter
+    bump = torch.tensor(math.log(1.25) if rank == 1 else 0.0, device="tpu")
 
     def wrong(output, lse_f32, lses_g, group, *args, **kwargs):  # + rs_dtype
-        if int(group.rank_in_group) == 1:
-            lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses_g, group, *args, **kwargs)
+        return real(output, lse_f32 + bump, lses_g, group, *args, **kwargs)
 
     cp_mla._weighted_reduce_scatter = wrong
     try:
