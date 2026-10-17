@@ -143,11 +143,13 @@ if [[ "${PREFILL_PCP}" -gt 1 ]]; then
     "${RUN_DIR}/logs/prefill.log" \
     || fail "prefill did not resolve a ${expected_prefill_block}-token scheduler block"
 else
-  # The PCP block-size resolution only logs for PCP > 1.
-  grep -Fq "Using KV cache block size: ${expected_prefill_block}" "${RUN_DIR}/logs/prefill.log" \
-    || fail "prefill did not resolve a ${expected_prefill_block}-token block"
+  # Without PCP, take the block vLLM resolved. PP stages hold fewer layers, so
+  # the Mamba page alignment can pick a block other than PREFILL_BLOCK_SIZE.
+  expected_prefill_block="$(grep -m1 -oP 'kv lcm block sizes \K[0-9]+' "${RUN_DIR}/logs/prefill.log")" \
+    || fail "prefill did not log its resolved block size"
+  echo "prefill resolved a ${expected_prefill_block}-token block"
 fi
-grep -Fq "Using KV cache block size: ${DECODE_BLOCK_SIZE}" "${RUN_DIR}/logs/decode.log" \
+grep -Fq "kv lcm block sizes ${DECODE_BLOCK_SIZE}" "${RUN_DIR}/logs/decode.log" \
   || fail "decode did not resolve a ${DECODE_BLOCK_SIZE}-token block"
 
 echo "===== disagg: known-answer prefix-cache smokes through the proxy ====="
