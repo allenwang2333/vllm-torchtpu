@@ -66,6 +66,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 def test_idle_dp_rank_encodes_before_decoder_pairing():
     order = []
     runner = SimpleNamespace(
+        _is_dspark_pd_producer=False,
         _execute_dp_mm_encoder=lambda: order.append("encoder"),
         _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
         speculative_config=SimpleNamespace(use_eagle=lambda: True),
@@ -437,6 +438,81 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
+def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        max_num_reqs=max_reqs,
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+
+
+@pytest.mark.parametrize(
+    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
     attempts = MagicMock(side_effect=[False, True, True])
     runner = SimpleNamespace(
@@ -498,6 +574,7 @@ def test_only_the_last_pipeline_stage_hosts_a_drafter():
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
     def runner(is_drafter):
         return SimpleNamespace(
+            _is_dspark_pd_producer=False,
             _execute_dp_mm_encoder=MagicMock(),
             _run_dp_dummy_chunk=MagicMock(),
             _is_async_drafter=is_drafter,
@@ -2846,3 +2923,227 @@ def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
     TPUModelRunner._flush_disjoint_async_results(runner)
     runner._modify_prev_results.assert_called_once()
     assert runner._pre_async_results is None
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
+    """Covers bf16 and fp32 inputs, large-offset logits, a sampled token outside
+    the top-k, and a row with a single finite logit."""
+    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    logits = torch.tensor(
+        [
+            [20, 16, 15, 13, 12],
+            [84, 80, 79, 77, 76],
+            [20, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=dtype,
+    )
+    original_logits = logits.clone()
+    sampled_tokens = torch.tensor([[0], [4], [0]])
+
+    with torch.compiler.set_stance("force_eager"):
+        result = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
+
+    # log(1 + exp(-4) + exp(-5) + exp(-7) + exp(-8)), independently in FP64.
+    log_normalizer = 0.02596100830585109
+    expected = torch.tensor(
+        [
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=torch.float64,
+    )
+    assert result.logprobs.dtype == torch.float32
+    assert result.logprobs.shape == (3, max_logprobs + 1)
+    assert result.logprob_token_ids[:, 0].tolist() == [0, 4, 0]
+    assert result.selected_token_ranks.tolist() == [1, 5, 1]
+    if max_logprobs:
+        assert result.logprob_token_ids[:2, 1:].tolist() == [[0, 1, 2], [0, 1, 2]]
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+
+
+def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
+    """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
+    bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+
+    logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
+    temperatures = torch.tensor([[1.0]], dtype=torch.bfloat16)
+    top_k = torch.tensor([[0]], dtype=torch.int32)
+    top_p = torch.tensor([[1.0]], dtype=torch.float32)
+
+    # With float32 u = 0.9995, -log(-log(0.9995)) ~= 7.60 > 6.0 + 0.37, so
+    # token 1 is sampled. In bfloat16, 1 - eps = 0.9921875 clamps Gumbel noise
+    # to <= 4.85, making token 1 impossible to sample.
+    u_fp32 = torch.tensor([[0.5, 0.9995]], dtype=torch.float32)
+    out_fp32 = sample_fn(runner, logits, temperatures, u_fp32, top_k, top_p)
+    assert int(out_fp32.item()) == 1
+
+    u_bf16 = u_fp32.to(torch.bfloat16)
+    out_bf16 = sample_fn(runner, logits, temperatures, u_bf16, top_k, top_p)
+    assert int(out_bf16.item()) == 0
+
+
+def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
+    """All TPUModelRunner call sites into sample_from_logits_func must draw
+    uniform random noise `u` in float32 even when logits are bfloat16."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+
+    seen_u_dtypes: list[torch.dtype] = []
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+    ):
+        seen_u_dtypes.append(u.dtype)
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
+    sampling_params = (
+        torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+    )
+
+    # 1. _precompile_sample_from_logits
+    precompile_runner = SimpleNamespace(
+        num_reqs_paddings=[2],
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: 0,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=fake_sample_from_logits,
+    )
+    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+    assert seen_u_dtypes == [torch.float32, torch.float32]
+    seen_u_dtypes.clear()
+
+    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    seen_recover_dtypes: list[torch.dtype] = []
+
+    def fake_rejection_sampler(**kwargs):
+        seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner = SimpleNamespace(
+        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
+            bf16_logits,
+            bf16_logits,
+        ),
+        _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+        _sampler_topk_candidates=lambda start, end, grammar: 0,
+        sample_from_logits_func=fake_sample_from_logits,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+    )
+    spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
+    spec_runner.rejection_sampler.synthetic_mode = False
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths=torch.ones((2,), dtype=torch.int32),
+        segment_ids=torch.tensor([0, 1], dtype=torch.int32),
+        group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_u_dtypes == [torch.float32]
+    assert seen_recover_dtypes == [torch.float32]
+    seen_u_dtypes.clear()
+
+    # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
+    for spec_method in (None, "ngram"):
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"r0": 1, "r1": 1},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        runner = SimpleNamespace(
+            _pp_wave=None,
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=[bf16_logits],
+                num_reqs_list=[2],
+                spec_decode_metadata_list=[None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=None,
+                num_reqs=2,
+                req_ids=["r0", "r1"],
+                req_id_to_index={"r0": 0, "r1": 1},
+                all_greedy=False,
+                num_tokens_no_spec=[1, 1],
+                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
+            ),
+            requests={
+                "r0": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+                "r1": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+            },
+            speculative_config=(
+                None
+                if spec_method is None
+                else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _get_sampling_generator=lambda: None,
+            _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            sample_from_logits_func=fake_sample_from_logits,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+        TPUModelRunner.sample_tokens(runner, None)
+
+    assert seen_u_dtypes == [torch.float32, torch.float32]

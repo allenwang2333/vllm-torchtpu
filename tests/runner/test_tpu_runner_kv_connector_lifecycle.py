@@ -64,6 +64,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
+        _pp_wave=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],
@@ -97,6 +98,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _is_async_drafter=method == "mtp",
         _mtp_prefill_only=False,
         _fence_spec_kv_under_token_copy=fence,
+        _is_dspark_pd_producer=False,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),
