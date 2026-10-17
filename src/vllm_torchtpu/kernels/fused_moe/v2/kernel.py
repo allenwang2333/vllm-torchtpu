@@ -368,6 +368,7 @@ def expert_ffn_blockscale(
     qb=QB4,
     act_fn="silu",
     w1b=None,
+    contract_fn=None,
 ):
     """One expert's FFN on block-scaled weights: the same body as
     expert_ffn_fp8 with each matmul summed over contraction blocks carrying
@@ -382,6 +383,11 @@ def expert_ffn_blockscale(
     Nothing below depends on what the block was stored as; every other line
     here runs on either, and a block-scaled integer-four form would reuse
     this body verbatim with a different bitcast in the reader.
+
+    `contract_fn(lhs, which)` (which = 1 for gate/up, 2 for down), where
+    given, may replace a contraction by returning its accumulator, or
+    decline with None; a replacement must compute the same sums in the same
+    order, as the kernel's looped gate/up does in less program text.
     """
     n_blocks1, n_blocks2 = w1s_blocks.shape[0], w2s_blocks.shape[0]
     inter = w1s_blocks.shape[-1] // 2
@@ -405,13 +411,17 @@ def expert_ffn_blockscale(
             chunks.append(acc)
         return jnp.concatenate(chunks, axis=-1)
 
-    acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
+    acc1 = None if contract_fn is None else contract_fn(act_q, 1)
+    if acc1 is None:
+        acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
     # The block scales are already inside acc1, so the halves this builds
     # are the true activation values and owe no further weight scale.
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
     )
-    acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden)
+    acc2 = None if contract_fn is None else contract_fn(mid_q, 2)
+    if acc2 is None:
+        acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden)
     return acc2, mid_scale
 
 
@@ -803,6 +813,18 @@ def _build_fused_ep_moe_kernel(
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    # Whether the full-height tile's gate/up contraction runs as a loop over
+    # its stream chunks instead of fully unrolled. The kernel's program is
+    # almost entirely the two unrolled FFN bodies, and at DSv4-Pro's EP16
+    # shape a 48-row short rung takes it to 43k bundles, which reloads on
+    # entry to most calls (~16 us before the first post-barrier marker in 74%
+    # of production calls); with a 32-row short rung (42k) it stays resident.
+    # Looping the full-height gate/up takes it to 35k, measured per MoE layer
+    # at t_local 96: 400 -> 392 us (uniform), 410/398 -> 393 us (replayed
+    # production counts); at t_local 64 (32-row rung) it would cost 4 us.
+    loops_full_gate_up = (
+        chunked_stream and len(height_rungs) > 1 and height_rungs[0] > LOW_RUNG_MIN
+    )
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -957,6 +979,8 @@ def _build_fused_ep_moe_kernel(
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
         w1c_sems, w2c_sems = (next(it), next(it)) if chunked_stream else (None, None)
+        # The looped gate/up contraction's accumulator.
+        acc1_vm = next(it) if loops_full_gate_up else None
 
         me = rank_sm[0, 0]
 
@@ -1116,6 +1140,64 @@ def _build_fused_ep_moe_kernel(
                     )
 
             return before, after
+
+        def _looped_gate_up(expert, visit_i, slot, sslot, first_tile, last_tile):
+            """`contract_fn` for expert_ffn_blockscale: the full-height tile's
+            gate/up contraction as a loop over its stream chunks.
+
+            The sums are the unrolled contraction's own, block for block and
+            in the same order; only the program text shrinks. The full-height
+            body is the one hot (multi-tile) experts run, where a loop edge per
+            chunk is noise beside a compute-bound tile, while the short rung
+            that most visits take stays unrolled. Iteration c owns stream chunk
+            c: it waits that chunk on the expert's first tile and refills it
+            with the next visit's on the last tile, once every block of it has
+            been read. Everything else declines (None) to the unrolled form.
+            """
+            packed_rows = rhs_qb // PACK4
+            n_blocks = hidden // rhs_qb
+            sub_chunks = W1_STREAM_CHUNK // FP4_OUTPUT_CHUNK
+
+            def contract(lhs, which):
+                if which != 1 or lhs.shape[0] != tile_m:
+                    return None
+
+                def body(c, carry):
+                    @pl.when(first_tile)
+                    def _():
+                        w1_chunk_copy(expert, slot, c).wait()
+
+                    base = pl.multiple_of(c * W1_STREAM_CHUNK, W1_STREAM_CHUNK)
+                    for j in range(sub_chunks):
+                        cols = pl.ds(base + j * FP4_OUTPUT_CHUNK, FP4_OUTPUT_CHUNK)
+                        acc = None
+                        for b in range(n_blocks):
+                            block = pltpu.bitcast(
+                                w1_vm[slot, pl.ds(b * packed_rows, packed_rows), cols],
+                                FP4,
+                            ).astype(FP8)
+                            part = lax.dot_general(
+                                lhs[:, b * rhs_qb : (b + 1) * rhs_qb],
+                                block,
+                                DN,
+                                preferred_element_type=jnp.float32,
+                            )
+                            part = part * w1s_vm[sslot, pl.ds(b, 1), cols]
+                            acc = part if acc is None else acc + part
+                        acc1_vm[:, cols] = acc
+
+                    @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
+                    def _():
+                        w1_chunk_copy(visit_sm[visit_i + 1], slot, c).start(
+                            priority=WEIGHT_DMA_PRIORITY
+                        )
+
+                    return carry
+
+                lax.fori_loop(0, n_w1_chunks, body, jnp.int32(0))
+                return acc1_vm[...]
+
+            return contract
 
         def _slab_waiter(expert, slot, first_tile):
             """`(copy, block) -> ()`: land the slab that block `block` opens,
@@ -1771,6 +1853,13 @@ def _build_fused_ep_moe_kernel(
                             qb=rhs_qb,
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            contract_fn=(
+                                _looped_gate_up(
+                                    e, visit_i, slot, sslot, first_tile, last_tile
+                                )
+                                if loops_full_gate_up
+                                else None
+                            ),
                         )
                     elif weight_format == host.WeightFormat.INT8:
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
@@ -2135,6 +2224,13 @@ def _build_fused_ep_moe_kernel(
                 pltpu.SemaphoreType.DMA((n_w2_chunks,)),  # w2c_sems
             ]
             if chunked_stream
+            else []
+        )
+        # The looped gate/up accumulator: the acc1 host.vmem_tile_body_arrays
+        # already counts, declared because the loop writes it a chunk at a time.
+        + (
+            [pltpu.VMEM((tile_m, 2 * inter), jnp.float32)]
+            if loops_full_gate_up
             else []
         )
     )
