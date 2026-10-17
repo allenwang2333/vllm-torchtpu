@@ -1047,6 +1047,13 @@ def _effective_row_lengths(
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
 
+def _every_visible_position(row_lengths: jax.Array, k: int) -> jax.Array:
+    """`[0, row_length)` ascending, -1 suffix-padded to k: what the SparseCore
+    top-k emits for a row whose positions all win."""
+    s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
+    return jnp.where(s_idx < row_lengths[:, None], s_idx, -1)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1519,6 +1526,15 @@ def streamindex_topk(
             cp_size=cp_size,
             interleave_c=interleave_c,
         )
+        # A row that sees at most k positions selects all of them, so it needs no
+        # selection. Rank-local rows and returned scores still need the scores.
+        skip_short_rows = cp_size == 1 and not return_scores
+        short_rows = eff_row_lengths <= k
+        sc_row_lengths = (
+            jnp.where(short_rows, 0, eff_row_lengths)
+            if skip_short_rows
+            else eff_row_lengths
+        )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
@@ -1570,7 +1586,7 @@ def streamindex_topk(
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=sc_row_lengths[start : start + chunk_len],
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
@@ -1580,7 +1596,7 @@ def streamindex_topk(
                 chunk_topk_idxs = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=sc_row_lengths[start : start + chunk_len],
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
@@ -1589,6 +1605,10 @@ def streamindex_topk(
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
+        if skip_short_rows:
+            out = jnp.where(
+                short_rows[:, None], _every_visible_position(eff_row_lengths, k), out
+            )
 
         if cp_size == 1 and not return_scores:
             return out
