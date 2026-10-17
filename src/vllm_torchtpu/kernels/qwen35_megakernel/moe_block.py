@@ -14,6 +14,8 @@ from .config import (
     I32,
     NT,
     TOPK_LANES,
+    es_geom,
+    es_right_slot,
     rnd,
     topk_rows_on_lanes,
 )
@@ -38,14 +40,57 @@ class MoEBlock:
                 W["es"].at[0, 0], scr["es"].at[s], scr["es_sem"].at[s]
             ).wait()
 
-    def _e_split(self, kind: str, w_ref):
+    def _w_main(self, kind: str, w_ref):
+        """Main [K, N] weight value of a single-tile expert ring slot, without the fused / padded
+        scale rows and columns (MKConfig.fuse_es / es_pad)."""
+        ctx = self.ctx
+        x13, x2r, x2c = es_geom(ctx.c)
+        if kind == "e13":
+            return w_ref[:ctx.H, :] if x13 else w_ref[...]
+        if x2r or x2c:
+            return w_ref[:ctx.IR, :ctx.H]
+        return w_ref[...]
+
+    def _s13(self, i, w13_ref):
+        """[1, 2 * IR] f32 gate|up scales of single-tile expert i: its es row (after es_wait), or
+        the 32 trailing FP8 rows of its e13 slot (fuse_es, read before the slot is refilled)."""
         ctx = self.ctx
         if not ctx.c.fuse_es:
-            return w_ref[...], None
-        k_main = ctx.H if kind == "e13" else ctx.IR
-        w_main = w_ref[:k_main, :]
-        s_f32 = pltpu.bitcast(w_ref[k_main : k_main + 32, :], F32)[0:1, :]
-        return w_main, s_f32
+            return ctx.scr["es"][i % ctx.NSS, :, :2 * ctx.IR]
+        H = ctx.H
+        return pltpu.bitcast(w13_ref[H:H + 32, :], F32)[0:1, :]
+
+    def _s2_prep(self, w2_ref):
+        """Per-expert down-scale value for _scale2: the [IR // 4, cols] f32 view of the right block
+        ("right"), the whole [1, H] row ("bottom" + "reg"), or None (es row / per-chunk reads)."""
+        ctx = self.ctx
+        c, IR, H = ctx.c, ctx.IR, ctx.H
+        if not c.fuse_es:
+            return None
+        if c.es_layout == "right":
+            return pltpu.bitcast(w2_ref[:, H:], F32)
+        if c.es_read == "reg":
+            return pltpu.bitcast(w2_ref[IR:IR + 32, :], F32)[0:1, :]
+        return None
+
+    def _scale2(self, i, w2_ref, prep, j, y):
+        """y [MR, CH], the down projection of output chunk j, times its per-channel scales."""
+        ctx = self.ctx
+        c, IR, CH = ctx.c, ctx.IR, ctx.CH
+        lo = j * CH
+        if not c.fuse_es:
+            return y * ctx.scr["es"][i % ctx.NSS, :, 2 * IR + lo:2 * IR + lo + CH]
+        if c.es_layout == "right":
+            pieces = []
+            for q in range(CH // 128):
+                k, t = es_right_slot(c, lo // 128 + q)
+                pieces.append(
+                    y[:, q * 128:(q + 1) * 128] * prep[k:k + 1, t * 128:(t + 1) * 128]
+                )
+            return jnp.concatenate(pieces, axis=1)
+        if c.es_read == "reg":
+            return y * prep[:, lo:lo + CH]
+        return y * pltpu.bitcast(w2_ref[IR:IR + 32, lo:lo + CH], F32)[0:1, :]
 
     def moe(self, l, slot, g0, is_att, defer_flush: bool = False):
         ctx = self.ctx
@@ -635,8 +680,10 @@ class MoEBlock:
         acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
         s13 = None
         if T13 == 1:
-            w13_val, s13 = self._e_split("e13", etake("e13", base))
-            h = mm(xb[...], w13_val)
+            w13 = etake("e13", base)
+            h = mm(xb[...], self._w_main("e13", w13))
+            if c.fuse_es:
+                s13 = self._s13(i, w13)
             egive(base, l)
         else:
             # Hypothesis expert-mrb: static unroll (like the PIPE_EP prologue) so the MXU
@@ -661,7 +708,7 @@ class MoEBlock:
             h = acc[:, :2 * IR]
         self.es_wait(i)
         if s13 is None:
-            s13 = scr["es"][s, :, :2 * IR]
+            s13 = self._s13(i, None)
         h = h * s13
         mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
         xb2[:, :IR] = mid_.astype(BF16)
@@ -671,13 +718,13 @@ class MoEBlock:
         u2 = base + T13
         if T2 == 1:
             # one [IR, H] tile: CH-lane chunks keep each result in a few vregs
-            w2, s2 = self._e_split("e2", etake("e2", u2))
-            if s2 is None:
-                s2 = scr["es"][s, :, 2 * IR:]
+            w2r = etake("e2", u2)
+            w2 = self._w_main("e2", w2r)
+            prep = self._s2_prep(w2r)
             xm = xb2[:, :IR]
             for j in range(H // CH):
                 y = mm(xm, w2[:, j * CH:(j + 1) * CH])[0:MR]
-                y = rnd(y * s2[:, j * CH:(j + 1) * CH])
+                y = rnd(self._scale2(i, w2r, prep, j, y))
                 part[0:MR, j * CH:(j + 1) * CH] += wcol * y
             egive(u2, l)
         else:
@@ -704,36 +751,32 @@ class MoEBlock:
     def gate_up(self, i, w13):
         """Single-tile expert i's activated gate|up rows [MB, IR] (bf16)."""
         ctx = self.ctx
-        scr, mm, NSS, IR = ctx.scr, ctx.mm, ctx.NSS, ctx.IR
-        w13_val, s13 = self._e_split("e13", w13)
-        if s13 is None:
-            s13 = scr["es"][i % NSS, :, :2 * IR]
-        h = mm(scr["xb"][...], w13_val) * s13
+        scr, mm, IR = ctx.scr, ctx.mm, ctx.IR
+        h = mm(scr["xb"][...], self._w_main("e13", w13)) * self._s13(i, w13)
         return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
 
-    def down(self, i, mid, w2):
-        """part[0:MR] += wn[:, e] * (mid @ e2) for single-tile expert i, in CH-lane chunks."""
+    def down(self, i, mid, w2r, w2=None):
+        """part[0:MR] += wn[:, e] * (mid @ e2) for single-tile expert i, in CH-lane chunks.
+        w2r: the expert's e2 ring slot; w2: its main weight value when already loaded."""
         ctx = self.ctx
-        scr, mm, NSS, IR, H, CH, MR, lane_e8 = (
+        scr, mm, H, CH, MR, lane_e8 = (
             ctx.scr,
             ctx.mm,
-            ctx.NSS,
-            ctx.IR,
             ctx.H,
             ctx.CH,
             ctx.MR,
             ctx.lane_e8,
         )
-        e, s, part = scr["elist"][i], i % NSS, scr["part"]
-        w2_val, s2 = self._e_split("e2", w2)
-        if s2 is None:
-            s2 = scr["es"][s, :, 2 * IR:]
+        e, part = scr["elist"][i], scr["part"]
+        if w2 is None:
+            w2 = self._w_main("e2", w2r)
+        prep = self._s2_prep(w2r)
         wcol = jnp.sum(
             jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
         )
         for j in range(H // CH):
-            y = mm(mid, w2_val[:, j * CH:(j + 1) * CH])[0:MR]
-            y = rnd(y * s2[:, j * CH:(j + 1) * CH])
+            y = mm(mid, w2[:, j * CH:(j + 1) * CH])[0:MR]
+            y = rnd(self._scale2(i, w2r, prep, j, y))
             part[0:MR, j * CH:(j + 1) * CH] += wcol * y
 
     def experts_piped(self, l, n_hit):
@@ -756,10 +799,11 @@ class MoEBlock:
                 u13, u2 = (i + 1) * TE, i * TE + T13
                 w13 = etake("e13", u13)
                 self.es_wait(i + 1)
-                w2 = etake("e2", u2)
+                w2r = etake("e2", u2)
+                w2 = self._w_main("e2", w2r)
                 mid = xb2[:, :IR]
                 nxt = self.gate_up(i + 1, w13)
-                self.down(i, mid, w2)
+                self.down(i, mid, w2r, w2)
                 xb2[:, :IR] = nxt
                 egive(u13, l, 0)
                 egive(u2, l, T13)

@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 import numpy as np
+import pytest
 import torch
 
 from vllm_torchtpu import expert_placement
@@ -31,6 +32,20 @@ from vllm_torchtpu.kernels.qwen35_megakernel import (
     MoEBlock,
     WeightRings,
     megakernel as K,
+)
+from vllm_torchtpu.kernels.qwen35_megakernel.config import (
+    es_right_cols,
+    es_right_slot,
+    pool_alias,
+    stream_kinds,
+    weight_shapes,
+)
+from vllm_torchtpu.kernels.qwen35_megakernel.es_pack import (
+    expert_dma_bytes,
+    fuse_e2,
+    fuse_e13,
+    pack_right,
+    pack_rows,
 )
 from vllm_torchtpu.kernels.qwen35_megakernel.megakernel import BF16, F32, I32, rnd
 from vllm_torchtpu.kernels.qwen35_megakernel.vllm_adapter import (
@@ -284,6 +299,56 @@ def test_tp16_shared_and_routed_expert_packing():
     assert packed_tp16["e2"][0].shape == (c_tiny16_tp.E, 128, c_tiny16_tp.H)
 
 
+def _run_moe_block(mesh1, ctx_in, w_sh, st_sh, w_vals_in, st_vals, pos, hid, pipe_flag: bool):
+    """Run MoEBlock layer 0 alone in interpret mode; returns its [B, H] bf16 output."""
+    if ctx_in.tiles.pipe != pipe_flag:
+        t_in = dataclasses.replace(ctx_in.tiles, pipe=pipe_flag)
+        ctx_in = K.MKBuildContext(ctx_in.c, t_in, interpret=pltpu.InterpretParams())
+    seg_r = ctx_in.nt["lin_in"] + ctx_in.nt["lin_out"]
+
+    def moe_kernel(*refs):
+        ctx_in.bind_refs(refs)
+        rings = WeightRings(ctx_in)
+        moe_blk = MoEBlock(ctx_in, rings)
+        scr = ctx_in.scr
+        scr["hitv"][...] = jnp.zeros((ctx_in.MR, 128), I32)
+        zero_seen = pltpu.make_async_copy(
+            scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+        )
+        zero_seen.start()
+        zero_seen.wait()
+        for i in range(ctx_in.N_MOE):
+            rings.fetch(jnp.int32(seg_r + i))
+        cp_sm = pltpu.make_async_copy(
+            ctx_in.W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        )
+        cp_sm.start()
+        cp_sm.wait()
+        scr["res"][...] = jnp.where(
+            ctx_in.live, ctx_in.hid_ref[: ctx_in.MB].astype(F32), 0.0
+        )
+        part = moe_blk(jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+        ctx_in.out_ref[: ctx_in.MB] = part.astype(BF16)
+
+    call = pl.pallas_call(
+        moe_kernel,
+        out_shape=ctx_in.out_shape,
+        in_specs=ctx_in.in_specs,
+        out_specs=ctx_in.out_specs,
+        scratch_shapes=[ctx_in.scratch[k] for k in ctx_in.s_names],
+        interpret=pltpu.InterpretParams(),
+    )
+    args = (pos, hid, *[w_vals_in[k] for k in w_sh], *[st_vals[k] for k in st_sh])
+    hid_out, _, _, _, _ = jax.shard_map(
+        lambda *a: call(*a),
+        mesh=mesh1,
+        in_specs=tuple(P() for _ in args),
+        out_specs=tuple(P() for _ in ctx_in.out_shape),
+        check_vma=False,
+    )(*args)
+    return hid_out[: ctx_in.B]
+
+
 def test_fuse_es_moe_block_and_packing():
     """Verify fuse_es=True packs scales into trailing 32 FP8 rows of e13/e2 and matches fuse_es=False bit-exactly."""
     c_base, tiles_base, ctx_base, w_sh_b, st_sh_b, _, w_vals_b, st_vals_b, pos, hid = (
@@ -331,52 +396,9 @@ def test_fuse_es_moe_block_and_packing():
     mesh1 = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
 
     def run_moe(ctx_in, w_vals_in, pipe_flag: bool):
-        if ctx_in.tiles.pipe != pipe_flag:
-            t_in = dataclasses.replace(ctx_in.tiles, pipe=pipe_flag)
-            ctx_in = K.MKBuildContext(ctx_in.c, t_in, interpret=pltpu.InterpretParams())
-        seg_r = ctx_in.nt["lin_in"] + ctx_in.nt["lin_out"]
-
-        def moe_kernel(*refs):
-            ctx_in.bind_refs(refs)
-            rings = WeightRings(ctx_in)
-            moe_blk = MoEBlock(ctx_in, rings)
-            scr = ctx_in.scr
-            scr["hitv"][...] = jnp.zeros((ctx_in.MR, 128), I32)
-            zero_seen = pltpu.make_async_copy(
-                scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
-            )
-            zero_seen.start()
-            zero_seen.wait()
-            for i in range(ctx_in.N_MOE):
-                rings.fetch(jnp.int32(seg_r + i))
-            cp_sm = pltpu.make_async_copy(
-                ctx_in.W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
-            )
-            cp_sm.start()
-            cp_sm.wait()
-            scr["res"][...] = jnp.where(
-                ctx_in.live, ctx_in.hid_ref[: ctx_in.MB].astype(F32), 0.0
-            )
-            part = moe_blk(jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.bool_(False))
-            ctx_in.out_ref[: ctx_in.MB] = part.astype(BF16)
-
-        call = pl.pallas_call(
-            moe_kernel,
-            out_shape=ctx_in.out_shape,
-            in_specs=ctx_in.in_specs,
-            out_specs=ctx_in.out_specs,
-            scratch_shapes=[ctx_in.scratch[k] for k in ctx_in.s_names],
-            interpret=pltpu.InterpretParams(),
+        return _run_moe_block(
+            mesh1, ctx_in, w_sh_b, st_sh_b, w_vals_in, st_vals_b, pos, hid, pipe_flag
         )
-        args = (pos, hid, *[w_vals_in[k] for k in w_sh_b], *[st_vals_b[k] for k in st_sh_b])
-        hid_out, _, _, _, _ = jax.shard_map(
-            lambda *a: call(*a),
-            mesh=mesh1,
-            in_specs=tuple(P() for _ in args),
-            out_specs=tuple(P() for _ in ctx_in.out_shape),
-            check_vma=False,
-        )(*args)
-        return hid_out[: ctx_in.B]
 
     for pipe_flag in (True, False):
         out_base = run_moe(ctx_base, w_vals_b, pipe_flag=pipe_flag)
@@ -412,3 +434,79 @@ def test_fuse_es_moe_block_and_packing():
     assert tiles_full_fuse.ebank == 1032 << 10
     p_full_fuse = K.plan(c_full_fuse, tiles_full_fuse)
     assert p_full_fuse["nt"]["e13"] == 1 and p_full_fuse["nt"]["e2"] == 1
+
+
+ES_LAYOUT_MODES = {
+    "pad": dict(es_pad=True),
+    "bottom_reg": dict(fuse_es=True),
+    "bottom_chunk": dict(fuse_es=True, es_read="chunk"),
+    "right": dict(fuse_es=True, es_layout="right"),
+    "pad_right": dict(es_pad=True, es_layout="right"),
+}
+
+
+@pytest.mark.parametrize("H", [1024, 2048])
+def test_es_layout_modes_bit_exact(H):
+    """Every expert-scale layout (es_pad / fuse_es x bottom / right x reg / chunk reads) gives the
+    separate-es MoE block output bit-exactly, piped and unpiped. H=2048 spans 2 CH chunks and
+    2 f32 vregs of the right block."""
+    tiles_overrides = {"ebank": max(K.TINY_TILES.ebank, 2 * H * 128)}
+    c_b, tiles_b, ctx_b, w_sh_b, st_sh_b, _, w_b, st_b, pos, hid = make_test_ctx_and_inputs(
+        tiles_overrides=tiles_overrides, H=H
+    )
+    assert c_b.moe_tp and ctx_b.nt["e13"] == 1 and ctx_b.nt["e2"] == 1
+    mesh1 = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
+    IR = c_b.IR
+    es = w_b["es"]  # [L, EW, 1, 2 * IR + H] f32
+    s13, s2 = es[:, :, 0, : 2 * IR], es[:, :, 0, 2 * IR :]
+    ref = {
+        p: _run_moe_block(mesh1, ctx_b, w_sh_b, st_sh_b, w_b, st_b, pos, hid, p)
+        for p in (True, False)
+    }
+    for name, kw in ES_LAYOUT_MODES.items():
+        c_m = dataclasses.replace(c_b, **kw)
+        c_m.check()
+        kinds = stream_kinds(c_m)
+        need = max(pool_alias.storage_size(kinds[k][:2], jnp.dtype(K.FP8)) for k in K.EXPERT)
+        tiles_m = dataclasses.replace(tiles_b, ebank=max(tiles_b.ebank, need))
+        ctx_m = K.MKBuildContext(c_m, tiles_m, interpret=True)
+        assert ctx_m.nt["e13"] == 1 and ctx_m.nt["e2"] == 1, name
+        assert ("es" in ctx_m.scratch) == (not c_m.fuse_es), name
+        w_m = dict(w_b)
+        w_m["e13"] = fuse_e13(c_m, w_b["e13"][:, :, 0], s13)[:, :, None]
+        w_m["e2"] = fuse_e2(c_m, w_b["e2"][:, :, 0], s2)[:, :, None]
+        if c_m.fuse_es:
+            w_m["es"] = jnp.zeros((1, 1, 1, 128), F32)
+        shapes_m = weight_shapes(c_m, tiles_m)
+        for k in ("e13", "e2", "es"):
+            assert tuple(w_m[k].shape) == tuple(shapes_m[k][0]), (name, k)
+        for p in (True, False):
+            out = _run_moe_block(mesh1, ctx_m, w_sh_b, st_sh_b, w_m, st_b, pos, hid, p)
+            assert bool(jnp.array_equal(out, ref[p])), (name, H, p)
+
+
+def test_es_pack_layouts_roundtrip():
+    """pack_rows / pack_right put each f32 scale where pltpu.bitcast(., F32) reads it."""
+    c = dataclasses.replace(K.FULL, R=8, moe_tp=True, fuse_es=True, es_layout="right")
+    assert es_right_cols(c) == 128 and expert_dma_bytes(c) == (4128 * 256 + 128 * 4224)
+    s = jax.random.uniform(jax.random.PRNGKey(0), (3, c.H), F32, 0.01, 2.0)
+
+    def f32_view(x):  # [..., 4n, N] FP8 -> [..., n, N] f32 as TPU bitcasts it
+        u = lax.bitcast_convert_type(x, jnp.uint8).astype(jnp.uint32)
+        u = u.reshape(*x.shape[:-2], x.shape[-2] // 4, 4, x.shape[-1])
+        w = u[..., 0, :] | (u[..., 1, :] << 8) | (u[..., 2, :] << 16) | (u[..., 3, :] << 24)
+        return lax.bitcast_convert_type(w, F32)
+
+    rows = f32_view(pack_rows(s))  # [3, 8, H]
+    assert bool(jnp.array_equal(rows, jnp.broadcast_to(s[:, None], rows.shape)))
+    blk = f32_view(pack_right(c, s))  # [3, IR // 4, 128]
+    for g in range(c.H // 128):
+        k, t = es_right_slot(c, g)
+        assert bool(
+            jnp.array_equal(blk[:, k, t * 128 : (t + 1) * 128], s[:, g * 128 : (g + 1) * 128])
+        )
+    c_b = dataclasses.replace(c, es_layout="bottom")
+    assert expert_dma_bytes(c_b) == 4128 * 256 + 160 * 4096
+    assert expert_dma_bytes(dataclasses.replace(c, fuse_es=False)) == (
+        4096 * 256 + 128 * 4096 + 4 * (256 + 4096)
+    )

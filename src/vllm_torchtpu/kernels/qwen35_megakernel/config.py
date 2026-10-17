@@ -211,7 +211,16 @@ class MKConfig:
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
     ckpt_k: int = 0              # K dimension of ckpt_indices (0 -> T)
     roff_1d: bool = False        # True when read_offsets is 1D [NS] instead of 2D [G_PER_ATT, NS]
-    fuse_es: bool = False        # True when expert FP32 scales are packed as 32 trailing FP8 rows on e13/e2
+    fuse_es: bool = False        # True when expert FP32 scales are packed into the e13/e2 tiles (no es DMA)
+    # Expert-scale layout ablations (moe_tp only). es_pad: the e13/e2 tiles carry the fused layout's
+    # extra rows / columns unused, and the scales still come from the es DMA. es_layout "bottom": 32
+    # trailing FP8 rows on e13 and e2 (each scale row replicated over 8 f32 sublanes); "right": 32
+    # trailing rows on e13 and es_right_cols(c) trailing FP8 columns on e2 holding the [1, H] down
+    # scales densely (4 FP8 rows per f32, see es_right_slot). es_read ("bottom" layout): "reg" reads
+    # the whole down-scale row as one value, "chunk" bitcasts one CH-lane chunk at a time from VMEM.
+    es_pad: bool = False
+    es_layout: str = "bottom"
+    es_read: str = "reg"
 
     @property
     def NS(self):  # sequences (KV caches, GDN input states)
@@ -340,11 +349,14 @@ class MKConfig:
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
         assert self.e_slots == 0 or self.e_slots >= (self.E if self.moe_tp else self.ER)
-        assert not self.fuse_es or (self.moe_tp and self.IR <= 128), (
+        assert not (self.fuse_es or self.es_pad) or (self.moe_tp and self.IR <= 128), (
             self.fuse_es,
+            self.es_pad,
             self.moe_tp,
             self.IR,
         )
+        assert not (self.fuse_es and self.es_pad)
+        assert self.es_layout in ("bottom", "right") and self.es_read in ("reg", "chunk")
         if self.paged_kv:
             assert self.page_size == 128 and self.num_pages >= 1 and self.max_pages_per_seq >= 1
         for n in (self.H, self.QKV, self.Z, self.KD, self.VD, self.HD, self.IR, self.ISR):
@@ -546,18 +558,40 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
     if c.NGDN == 0:
         t = dataclasses.replace(t, nbd=14)
-    if c.fuse_es:
+    if c.fuse_es or c.es_pad:
+        kinds = stream_kinds(c)
         need_ebank = max(
-            pool_alias.storage_size((c.H + 32, 2 * c.IR), jnp.dtype(FP8)),
-            pool_alias.storage_size((c.IR + 32, c.H), jnp.dtype(FP8)),
+            pool_alias.storage_size(kinds[k][:2], jnp.dtype(FP8)) for k in EXPERT
         )
         if t.ebank < need_ebank:
             t = dataclasses.replace(t, ebank=need_ebank)
     return t
 
 
+def es_right_cols(c: MKConfig) -> int:
+    """FP8 columns of the right-packed [IR, cols] down-scale block on e2 ("right" layout)."""
+    nrow = c.IR // 4  # f32 rows of the block's bitcast view
+    return 128 * -(-(c.H // 128) // nrow)
+
+
+def es_right_slot(c: MKConfig, g: int) -> tuple[int, int]:
+    """(f32 row, 128-lane tile) of the right block's f32 view holding down scales g*128 .. +127."""
+    nrow = c.IR // 4
+    return g % nrow, g // nrow
+
+
+def es_geom(c: MKConfig) -> tuple[int, int, int]:
+    """(extra e13 rows, extra e2 rows, extra e2 columns) of the fused / padded scale layout."""
+    if not (c.fuse_es or c.es_pad):
+        return 0, 0, 0
+    if c.es_layout == "right":
+        return 32, 0, es_right_cols(c)
+    return 32, 32, 0
+
+
 def stream_kinds(c: MKConfig):
     """Streamed weight kinds: (K, N, dtype) of the per-rank matrix."""
+    x13, x2r, x2c = es_geom(c)
     return {
         "lin_in": (c.H, c.NLI, FP8),
         "lin_out": (c.Z, c.H, FP8),
@@ -566,8 +600,8 @@ def stream_kinds(c: MKConfig):
         "router": (c.H, c.E, BF16),
         "sh13": (c.H, 2 * c.ISR, FP8),
         "sh2": (c.ISR, c.H, FP8),
-        "e13": (c.H + 32 if c.fuse_es else c.H, 2 * c.IR, FP8),
-        "e2": (c.IR + 32 if c.fuse_es else c.IR, c.H, FP8),
+        "e13": (c.H + x13, 2 * c.IR, FP8),
+        "e2": (c.IR + x2r, c.H + x2c, FP8),
     }
 
 
@@ -627,7 +661,7 @@ def plan(c: MKConfig, tiles: Tiles):
     tk = {}
     for k, (K, N, dt) in kinds.items():
         bank = tiles.ebank if k in EXPERT else tiles.bank
-        if c.fuse_es and k in EXPERT:
+        if (c.fuse_es or c.es_pad) and k in EXPERT:
             assert pool_alias.storage_size((K, N), jnp.dtype(dt)) <= bank, (
                 k,
                 K,

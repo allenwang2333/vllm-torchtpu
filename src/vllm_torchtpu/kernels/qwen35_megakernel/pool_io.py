@@ -1354,13 +1354,15 @@ def make_flat_pooled_step(
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
     out_rows: int = 0,
+    forced_routing: bool = False,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
     Every operand and output uses `PartitionSpec("tp")`, so `sharded_jax_callable` passes each
     rank's local PyTorch tensor (`pos [B]`, `hidden [M, H]`, `*w_flat`, `*raw_pools`,
     `page_table [NS, max_pages_per_seq]`, `ckpt_indices [3, NS, T]`, `read_offsets [3, NS]`)
-    directly into `shard_map` with its unmodified per-rank shape.
+    directly into `shard_map` with its unmodified per-rank shape. forced_routing appends a
+    per-rank `[L, M, E]` f32 routing-choice operand (top-k picks its largest lanes per row).
 
     Returns:
       `(flat_step_fn, in_specs, out_specs, donate_argnums)`
@@ -1394,23 +1396,24 @@ def make_flat_pooled_step(
         c_paged,
         tiles,
         interpret=interpret,
-        forced_routing=False,
+        forced_routing=forced_routing,
         skip=skip,
         scopes=scopes,
         pool_gather=use_gpr,
     )
     p_plan = plan(c_paged, tiles or default_tiles(c_paged))
     tk, nt = p_plan["tk"], p_plan["nt"]
-    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], p_plan["kinds"]["e13"][1])
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], p_plan["kinds"]["e2"][1])
     n_w_leaves = sum(
         c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
     )
     n_p = c_paged.NATT
+    n_rb = 1 if forced_routing else 0
     A = P(mesh.axis_names[0])
     # All inputs and outputs are sharded along axis 0 over the mesh so each rank's
     # local PyTorch tensor has the exact per-rank shape expected inside `shard_map`.
-    in_specs = (A,) * (2 + n_w_leaves + n_p + 3)
+    in_specs = (A,) * (2 + n_w_leaves + n_p + 3 + n_rb)
     out_specs = (A,) * (1 + n_p)
     donate_argnums = tuple(range(2 + n_w_leaves, 2 + n_w_leaves + n_p))
 
@@ -1418,7 +1421,8 @@ def make_flat_pooled_step(
         pos, hidden = args[0], args[1]
         w_leaves = args[2:2 + n_w_leaves]
         raw_pools = args[2 + n_w_leaves:2 + n_w_leaves + n_p]
-        page_table, ckpt_indices, read_offsets = args[2 + n_w_leaves + n_p:]
+        page_table, ckpt_indices, read_offsets = args[2 + n_w_leaves + n_p:][:3]
+        rb = args[2 + n_w_leaves + n_p + 3:]
 
         w_grouped = []
         idx = 0
@@ -1445,6 +1449,7 @@ def make_flat_pooled_step(
                 page_table,
                 ckpt_indices,
                 read_offsets,
+                *rb,
             )
             if bool(interpret):
                 hid, raw_out = out
@@ -1458,7 +1463,7 @@ def make_flat_pooled_step(
 
         if use_gpr:
             hid, conv_out, rec_out, knew, vnew = call(
-                pos, hidden, *w_grouped, raw_pools, page_table, ckpt_indices, read_offsets
+                pos, hidden, *w_grouped, raw_pools, page_table, ckpt_indices, read_offsets, *rb
             )
         else:
             conv, rec = gather_gdn_states(
@@ -1471,7 +1476,7 @@ def make_flat_pooled_step(
                 coal_rec_override=coal_rec_override,
             )
             hid, conv_out, rec_out, knew, vnew = call(
-                pos, hidden, *w_grouped, conv, rec, raw_pools, page_table
+                pos, hidden, *w_grouped, conv, rec, raw_pools, page_table, *rb
             )
         raw_out = scatter_pool_states(
             c_paged,
@@ -1531,8 +1536,8 @@ def make_flat_attn_step(
     )
     p_plan = plan(c_paged, tiles or default_tiles(c_paged))
     tk, nt = p_plan["tk"], p_plan["nt"]
-    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], p_plan["kinds"]["e13"][1])
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], p_plan["kinds"]["e2"][1])
     n_w_leaves = sum(
         c_paged.L if (not c_paged.stack_e and k in ("e13", "e2")) else 1 for k in W_NAMES
     )
@@ -1629,8 +1634,8 @@ def make_pooled_step(
     )
     p_plan = plan(c_paged, tiles or default_tiles(c_paged))
     tk, nt = p_plan["tk"], p_plan["nt"]
-    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], 2 * c_paged.IR)
-    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], c_paged.H)
+    e13_shape_4d = (c_paged.EW, nt["e13"], tk["e13"], p_plan["kinds"]["e13"][1])
+    e2_shape_4d = (c_paged.EW, nt["e2"], tk["e2"], p_plan["kinds"]["e2"][1])
     _fused_cache = {
         (c_paged.act_mode, c_paged.ckpt_2d, c_paged.roff_1d, c_paged.ckpt_k or c_paged.T): call
     }

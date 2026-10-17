@@ -74,8 +74,10 @@ def bare_mk(monkeypatch, **attrs) -> VA.Qwen35Megakernel:
     return mk
 
 
-def make_test_ctx_and_inputs(seed: int = 42):
-    """Construct a fast single-rank TINY config, MKBuildContext, and synthetic weights/states."""
+def make_test_ctx_and_inputs(seed: int = 42, tiles_overrides=None, **overrides):
+    """Construct a fast single-rank TINY config, MKBuildContext, and synthetic weights/states.
+
+    overrides / tiles_overrides replace MKConfig / Tiles fields of the defaults below."""
     c = dataclasses.replace(
         TINY,
         R=1,
@@ -95,6 +97,7 @@ def make_test_ctx_and_inputs(seed: int = 42):
         paged_kv=False,
         fused_pool_io=False,
     )
+    c = dataclasses.replace(c, **overrides)
     tiles = dataclasses.replace(
         TINY_TILES,
         bank=256 << 10,
@@ -106,6 +109,7 @@ def make_test_ctx_and_inputs(seed: int = 42):
         pair_kv=False,
         pipe=False,
     )
+    tiles = dataclasses.replace(tiles, **(tiles_overrides or {}))
     ctx = MKBuildContext(c, tiles, interpret=True)
     w_sh = weight_shapes(c, tiles)
     st_sh = state_shapes(c)
