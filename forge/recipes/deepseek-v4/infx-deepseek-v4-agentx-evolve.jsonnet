@@ -314,6 +314,9 @@ local srptHoldProgressGuard = cdk.var('TPU_SRPT_HOLD_PROGRESS_GUARD', '1');
 // Raiden stores window/state KV chunks only at replay boundaries and every N tokens, so the host pool holds
 // full-attention prefix instead of per-step window copies.
 local offloadWindowCheckpointInterval = cdk.var('TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL', '32768');
+// Hash the windowed blocks Raiden stores (each checkpoint's EAGLE peek block): unhashed, a freed one is reused
+// at once and cancels its not-yet-launched store job, full-attention chunks included. Empty = off.
+local offloadHashCheckpointBlocks = cdk.var('TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS', '');
 // The DP routing hook sends a new session that shares >= 12 x 512 prompt tokens with a routed prompt
 // (a subagent and its parent) to that prompt's engine.
 local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFINITY', '1');
@@ -807,6 +810,7 @@ local serverJob = cdk.job(
         [if schedUnchargedDraftSlots != '' then 'TPU_SCHED_UNCHARGED_DRAFT_SLOTS']: schedUnchargedDraftSlots,
         [if srptHoldProgressGuard != '' then 'TPU_SRPT_HOLD_PROGRESS_GUARD']: srptHoldProgressGuard,
         [if offloadWindowCheckpointInterval != '' then 'TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL']: offloadWindowCheckpointInterval,
+        [if offloadHashCheckpointBlocks != '' then 'TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS']: offloadHashCheckpointBlocks,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,

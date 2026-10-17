@@ -126,6 +126,76 @@ def _pop_blocks_for_free(self, request) -> list[KVCacheBlock]:
     return chain_ordered_blocks(self, request)[::-1]
 
 
+def _offload_marks(coordinator) -> list[tuple[object, tuple[int, int, bool]]]:
+    """``(manager, (alignment, lookahead, eagle))`` per windowed manager: where
+    the host-offload policy puts its checkpoints (raiden_connector's
+    WindowCheckpointPolicy) and whether the group also stores the peek block."""
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    groups = coordinator.kv_cache_config.kv_cache_groups
+    eagle = [
+        manager.block_size
+        for group, manager in zip(groups, coordinator.single_type_managers)
+        if group.is_eagle_group and isinstance(manager, SlidingWindowManager)
+    ]
+    lookahead = max([1, *eagle])
+    return [
+        (manager, (coordinator.scheduler_block_size, lookahead, group.is_eagle_group))
+        for group, manager in zip(groups, coordinator.single_type_managers)
+        if isinstance(manager, SlidingWindowManager)
+    ]
+
+
+def _hash_offload_checkpoint_blocks(coordinator) -> None:
+    for manager, mark in _offload_marks(coordinator):
+        _cache_offload_checkpoint_blocks(
+            manager, mark, envs.TPU_OFFLOAD_WINDOW_CHECKPOINT_INTERVAL or 0
+        )
+
+
+def _cache_offload_checkpoint_blocks(
+    manager, mark: tuple[int, int, bool], interval: int
+) -> None:
+    """Hash every windowed block the host offload stores.
+
+    A freed block without a hash goes to the front of the free queue and is
+    reused at once. The offload connector cancels a store job when one of its
+    windowed source blocks is reallocated before the job launches, and with
+    it every full-attention chunk in the same job, which is then never
+    offered again. The EAGLE peek block of each offload checkpoint, and the
+    window block of an offload replay boundary that differs from the KV
+    cache's own, were not hashed. Hashed, a freed block waits its turn at the
+    back of the queue.
+    """
+    alignment, lookahead, peek = mark
+    block_mask = manager.reachable_block_mask
+
+    def reachable_block_mask(
+        start_block, end_block, *args, reachable_boundaries=(), **kwargs
+    ):
+        # cache_blocks passes the replay boundary (num_prompt - 1) first.
+        replay = (reachable_boundaries[0] + 1 - lookahead) // alignment * alignment
+        boundaries = [replay] if replay > 0 else []
+        if interval:
+            end_tokens = end_block * manager.block_size
+            boundaries += range(interval, end_tokens + 1, interval)
+        mask = block_mask(
+            start_block,
+            end_block,
+            *args,
+            reachable_boundaries=[*reachable_boundaries, *boundaries],
+            **kwargs,
+        )
+        if mask is not None and peek:
+            for boundary in boundaries:
+                peek_block = boundary // manager.block_size
+                if start_block <= peek_block < end_block:
+                    mask[peek_block - start_block] = True
+        return mask
+
+    manager.reachable_block_mask = reachable_block_mask
+
+
 def patch_hold_replay_checkpoint() -> None:
     if not envs.TPU_KV_HOLD_REPLAY_CHECKPOINT:
         return
@@ -142,4 +212,34 @@ def patch_hold_replay_checkpoint() -> None:
     logger.info(
         "TPU_KV_HOLD_REPLAY_CHECKPOINT: windowed groups hold each request's "
         "replay-boundary checkpoint until the request is freed"
+    )
+
+
+def install_offload_checkpoint_hashing(set_attr) -> None:
+    """Hash the host offload's windowed checkpoint blocks at coordinator
+    construction (``setattr`` or a test's monkeypatch)."""
+    import functools
+
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
+    original_init = HybridKVCacheCoordinator.__init__
+    if getattr(original_init, "_tpu_offload_checkpoint_hashing", False):
+        return
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _hash_offload_checkpoint_blocks(self)
+
+    __init__._tpu_offload_checkpoint_hashing = True  # type: ignore[attr-defined]
+    set_attr(HybridKVCacheCoordinator, "__init__", __init__)
+
+
+def patch_hash_offload_checkpoint_blocks() -> None:
+    if not envs.TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS:
+        return
+    install_offload_checkpoint_hashing(setattr)
+    logger.info(
+        "TPU_OFFLOAD_HASH_CHECKPOINT_BLOCKS: windowed blocks of host-offload "
+        "checkpoints are hashed"
     )
