@@ -69,6 +69,13 @@ _KV_PAGES_PER_BLOCK = {
 # under the 32-token block: equal at 100k, -2% to -6% at 300-600k.
 _SMALL_MIXED_BLOCK_MAX_TOKENS = 128
 
+# Token buckets from which the call is cut into 4 pieces, so each piece's
+# SparseCore top-k overlaps the next piece's scoring and only the last quarter
+# is left exposed. Measured on tpu7x (one core, the 4-piece call against the
+# 2-piece split, bitexact): T1024 -5%, T2048 -9..-10% at 16-300k context.
+# 8 pieces at T2048 were 4x slower.
+_FOUR_PIECE_MIN_TOKENS = 1024
+
 BATCH_AXIS = None
 
 
@@ -144,7 +151,8 @@ def _indexer_jax(
             decode_req_batch_size=1,
             uniform_q_len=uniform_q_len,
             kv_layout=kv_layout,
-            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS
+            or (q.shape[0] // 4 if q.shape[0] >= _FOUR_PIECE_MIN_TOKENS else None),
             split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED,
         )
 
