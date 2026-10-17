@@ -326,5 +326,8 @@ def patch_scheduler_prefill_srpt() -> None:
             )
         return schedule_with_srpt(self, policy, orig, throttle_prefills)
 
+    # The decode-interleave wrapper calls the unwrapped schedule on a
+    # decode-only step, so a deferred step never counts as a hold.
+    schedule._tpu_orig = orig
     Scheduler.schedule = schedule
     Scheduler._tpu_prefill_srpt = True
