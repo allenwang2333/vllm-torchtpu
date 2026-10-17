@@ -300,20 +300,6 @@ class Eagle3Proposer:
                 tp_group.world_size,
                 n_eh,
             )
-        # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
-        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
-        # The fused draft loop also argmaxes compute_logits; it keeps the
-        # full-logit path.
-        self._vocab_parallel_argmax = None
-        if (
-            envs.TPU_SAMPLER_VOCAB_PARALLEL
-            and not envs.VLLM_TPU_FUSED_DRAFT_LOOP
-            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
-        ):
-            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
-                self.draft_model
-            )
-            logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -337,6 +323,24 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+
+        # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
+        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
+        # The fused draft loop also argmaxes compute_logits and keeps the
+        # full-logit path, so this is gated on the loop actually being built,
+        # not on VLLM_TPU_FUSED_DRAFT_LOOP: under IndexShare the flag is on
+        # but _build_mtp_fused_loop returns early, and every draft step runs
+        # _draft_propose_token.
+        self._vocab_parallel_argmax = None
+        if (
+            envs.TPU_SAMPLER_VOCAB_PARALLEL
+            and self._mtp_fused_loop is None
+            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
+        ):
+            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
+                self.draft_model
+            )
+            logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
