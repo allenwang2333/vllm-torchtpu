@@ -60,10 +60,22 @@ def enabled() -> bool:
     return bool(envs.MOE_EXPERT_COUNT_TAP_DIR)
 
 
+def _directory() -> str:
+    # Pod specs pass env values verbatim, e.g. "$CDK_OUTPUT_DIR/moe_counts".
+    directory = os.path.expandvars(envs.MOE_EXPERT_COUNT_TAP_DIR)
+    if "$" in directory:
+        raise ValueError(
+            f"MOE_EXPERT_COUNT_TAP_DIR={envs.MOE_EXPERT_COUNT_TAP_DIR!r} references "
+            "an unset variable"
+        )
+    return directory
+
+
 def register(layer) -> None:
     """Give a RoutedExperts layer its count buffer. Call after weight load."""
     if not enabled():
         return
+    _directory()  # an unresolvable directory fails at load, not hours later
     experts = layer.global_num_experts
     layer.register_buffer(
         COUNTS_ATTR,
@@ -118,7 +130,7 @@ def maybe_dump(ep_rank: int) -> None:
     import numpy as np
 
     host = torch.stack([getattr(layer, COUNTS_ATTR) for _, layer in _TAPPED]).cpu()
-    directory = envs.MOE_EXPERT_COUNT_TAP_DIR
+    directory = _directory()
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"counts_ep{ep_rank}_{_STATE['seq']:04d}.npz")
     np.savez(

@@ -182,6 +182,7 @@ def apply_to_layer(layer) -> bool:
             f"expert placement: {layer.layer_name} fuses shared experts into "
             "its expert map, which a placement does not describe"
         )
+    _refuse_drafter_layer(layer.layer_name)
     rank = manager.ep_rank
     expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
     expert_map[list(ranks[rank])] = torch.arange(placement.slots, dtype=torch.int32)
@@ -207,6 +208,20 @@ def apply_to_layer(layer) -> bool:
         ranks[rank][:6],
     )
     return True
+
+
+def _refuse_drafter_layer(name: str) -> None:
+    """A drafter's MoE layers are numbered after the target's (`layers.61.` on
+    a 61-layer model) but load from `mtp.*` tensors, which the fetch filter
+    cannot place, so the placed slots would hold nothing."""
+    from vllm.config import get_current_vllm_config
+
+    target_layers = get_current_vllm_config().model_config.hf_config.num_hidden_layers
+    if layer_index(name) >= target_layers:
+        raise ValueError(
+            f"expert placement lists {name}, a drafter layer (the target has "
+            f"{target_layers} decoder layers); only target layers can be placed"
+        )
 
 
 def expert_slot_table(layer):

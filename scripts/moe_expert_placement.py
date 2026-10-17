@@ -103,10 +103,15 @@ def main():
     ap.add_argument("--shards", type=int, required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip", type=int, default=1, help="snapshots to drop")
-    ap.add_argument("--layers", default="", help="first:last decoder layers to place")
+    ap.add_argument(
+        "--layers",
+        required=True,
+        help="first:last target decoder layers to place; the tap also records "
+        "the drafter's, which are numbered after them and cannot be placed",
+    )
     a = ap.parse_args()
     counts = load_counts(a.dirs, a.skip)
-    lo, hi = (int(x) for x in a.layers.split(":")) if a.layers else (0, 1 << 30)
+    lo, hi = (int(x) for x in a.layers.split(":"))
     table = {}
     for name, (mu, var) in counts.items():
         m = _LAYER_RE.search(name)

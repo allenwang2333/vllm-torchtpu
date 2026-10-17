@@ -93,3 +93,13 @@ def test_dump_writes_cumulative_snapshots_every_n_steps(monkeypatch, tmp_path):
     assert snap["counts"][0, 0, 2] == 7
     assert snap["layer_names"].tolist() == [layer.layer_name]
     assert int(snap["step"]) == 4
+
+
+def test_the_directory_expands_environment_variables(monkeypatch, tmp_path):
+    monkeypatch.setenv("QH_TAP_ROOT", str(tmp_path))
+    layer = _Layer()
+    _tapped(monkeypatch, tmp_path, layer)
+    monkeypatch.setenv("MOE_EXPERT_COUNT_TAP_DIR", "$QH_TAP_ROOT/sub")
+    for _ in range(2):
+        expert_count_tap.maybe_dump(ep_rank=0)
+    assert (tmp_path / "sub" / "counts_ep0_0000.npz").exists()

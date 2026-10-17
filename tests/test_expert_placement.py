@@ -66,6 +66,16 @@ def test_layer_index_reads_module_prefixes_and_checkpoint_names():
     assert expert_placement.layer_index("model.sublayers.3.x") is None
 
 
+@pytest.fixture(autouse=True)
+def _target_has_six_layers(monkeypatch):
+    import vllm.config
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=6))
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+
+
 def _fake_layer(name, rank, experts=8, shards=2):
     manager = SimpleNamespace(
         global_num_experts=experts,
@@ -122,3 +132,11 @@ def test_a_table_for_another_mesh_is_refused(placement_file):
     layer = _fake_layer("model.layers.3.ffn.experts", rank=0, experts=16, shards=4)
     with pytest.raises(ValueError, match="is for 2 ranks x 8 experts"):
         expert_placement.apply_to_layer(layer)
+
+
+def test_a_drafter_layer_is_refused(tmp_path, monkeypatch):
+    path = tmp_path / "drafter.json"
+    path.write_text(json.dumps(_table(layers={"7": [[7, 0, 5, 2], [1, 6, 3, 4]]})))
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+    with pytest.raises(ValueError, match="drafter layer"):
+        expert_placement.apply_to_layer(_fake_layer("model.layers.7.ffn.experts", 0))
