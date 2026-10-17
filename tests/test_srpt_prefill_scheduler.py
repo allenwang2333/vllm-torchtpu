@@ -52,6 +52,9 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._srpt_held_chunks = 0
     s._srpt_progress_guard = False
     s._srpt_strict_cadence = False
+    s._offcadence_tokens = 0
+    s._offcadence_steps = 0
+    s.max_num_scheduled_tokens = 128
     s.prefill_capacity_bound = False
     s._srpt_hold_paused = False
     s._srpt_paused_steps = 0
@@ -335,6 +338,75 @@ def test_strict_cadence_clears_capacity_bound_and_skips_holds_off_cadence():
     assert (seen["running"], seen["bound"], seen["throttle"]) == ([], False, False)
     seen = _step_throttled(s, throttle=True)  # off-cadence: upstream defers prefill
     assert (seen["running"], seen["bound"], seen["throttle"]) == (["long"], False, True)
+
+
+def _decoding(name, spec=6):
+    """A decoding request upstream schedules 1 + spec tokens for."""
+    return SimpleNamespace(
+        name=name,
+        is_prefill_chunk=False,
+        num_tokens=1000,
+        num_tokens_with_spec=1001 + spec,
+        num_output_placeholders=0,
+        num_computed_tokens=1000,
+    )
+
+
+def _step_capped(s, throttle):
+    seen = {}
+
+    def fake(throttle_prefills):
+        seen["running"] = [r.name for r in s.running]
+        seen["throttle"] = throttle_prefills
+        seen["cap"] = s.max_num_scheduled_tokens
+        return "output"
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=fake):
+        assert s.schedule(throttle) == "output"
+    assert s.max_num_scheduled_tokens == 128
+    return seen
+
+
+def _offcadence_scheduler(running, tokens=32):
+    s = _make_scheduler(running=running)
+    s._srpt_strict_cadence = True
+    s._offcadence_tokens = tokens
+    return s
+
+
+def test_offcadence_step_prefills_within_the_cap():
+    s = _offcadence_scheduler([_decoding("d"), _running("p", 5000, 1000)])
+    seen = _step_capped(s, throttle=True)
+    assert seen == {"running": ["d", "p"], "throttle": False, "cap": 32}
+    assert s._offcadence_steps == 1
+
+
+def test_offcadence_cap_never_starves_decodes():
+    decodes = [_decoding(f"d{i}") for i in range(6)]  # 6 x 7 = 42 tokens
+    s = _offcadence_scheduler(decodes + [_running("p", 5000, 1000)])
+    assert _step_capped(s, throttle=True)["cap"] == 42
+
+
+def test_offcadence_cap_counts_placeholders_and_short_drafts():
+    d = _decoding("d", spec=2)
+    d.num_output_placeholders = 3
+    s = _offcadence_scheduler([d], tokens=1)
+    assert _step_capped(s, throttle=True)["cap"] == 6
+
+
+def test_cadence_step_keeps_the_full_budget():
+    s = _offcadence_scheduler([_decoding("d"), _running("p", 5000, 1000)])
+    seen = _step_capped(s, throttle=False)
+    assert (seen["throttle"], seen["cap"]) == (False, 128)
+    assert s._offcadence_steps == 0
+
+
+def test_offcadence_cap_restored_when_upstream_raises():
+    s = _offcadence_scheduler([_decoding("d")])
+    with patch.object(AsyncScheduler, "schedule", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            s.schedule(True)
+    assert s.max_num_scheduled_tokens == 128
 
 
 def test_capacity_bound_kept_without_strict_cadence():

@@ -62,6 +62,14 @@ so the deferral rarely holds. ``TPU_SRPT_STRICT_PREFILL_CADENCE=1`` clears that
 flag every step, so a rank with a decoding request prefills only on cadence
 steps.
 
+The DP group pads every rank's step to the bucket of the largest one, so an
+off-cadence step on which any rank prefills -- a rank without decodes always
+may -- costs every rank the full ``max_num_batched_tokens`` bucket. With strict
+cadence and ``TPU_SRPT_OFFCADENCE_TOKENS=F``, an off-cadence step instead
+schedules prefill on every rank, decode-free or not, but caps the rank's step
+at ``max(F, its decode tokens)``: off-cadence steps stay in the small bucket
+that decodes need anyway, and the prefill fills that bucket's padding.
+
 With ``TPU_SRPT_ATTN_WORK_CAP=W`` a step's attention work -- the sum over its
 scheduled tokens of the context each attends to, decodes included -- is kept
 under ``W`` by clipping prefill chunks: a chunk of ``n`` tokens starting at
@@ -111,9 +119,15 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._srpt_strict_cadence = envs.TPU_SRPT_STRICT_PREFILL_CADENCE
         self._srpt_hold_paused = False
         self._srpt_paused_steps = 0
+        self._offcadence_steps = 0
         self._srpt_count_external = envs.TPU_SRPT_COUNT_EXTERNAL_HIT
         self._srpt_external_end: dict[str, int] = {}
         self._attn_work_cap = envs.TPU_SRPT_ATTN_WORK_CAP
+        self._offcadence_tokens = envs.TPU_SRPT_OFFCADENCE_TOKENS
+        if self._offcadence_tokens and not self._srpt_strict_cadence:
+            raise ValueError(
+                "TPU_SRPT_OFFCADENCE_TOKENS needs TPU_SRPT_STRICT_PREFILL_CADENCE=1"
+            )
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         self._attn_clipped_chunks = 0
@@ -123,6 +137,11 @@ class SrptPrefillScheduler(AsyncScheduler):
             logger.info(
                 "SrptPrefillScheduler: attention work cap %d token-context/step",
                 self._attn_work_cap,
+            )
+        if self._offcadence_tokens:
+            logger.info(
+                "SrptPrefillScheduler: off-cadence steps capped at %d tokens",
+                self._offcadence_tokens,
             )
         logger.info("SrptPrefillScheduler active")
 
@@ -266,12 +285,27 @@ class SrptPrefillScheduler(AsyncScheduler):
             return 0
         return int(math.sqrt(context * context + 2 * room) - context)
 
+    def _decode_tokens(self) -> int:
+        """Tokens this step's decoding requests take, as upstream counts them."""
+        return sum(
+            max(
+                r.num_tokens_with_spec + r.num_output_placeholders - r.num_computed_tokens,
+                0,
+            )
+            for r in self.running
+            if not r.is_prefill_chunk
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         waiting = self._order_queues()
         if self._srpt_strict_cadence:
             self.prefill_capacity_bound = False
+        step_cap = None
+        if self._offcadence_tokens and throttle_prefills:
+            step_cap = max(self._offcadence_tokens, self._decode_tokens())
+            throttle_prefills = False  # prefill fills the capped step instead
         if self._srpt_strict_cadence and throttle_prefills:
             held = []  # upstream defers every prefill this step anyway
         elif self._srpt_hold_paused:
@@ -293,9 +327,14 @@ class SrptPrefillScheduler(AsyncScheduler):
             self._srpt_held_steps += 1
             self._srpt_held_chunks += len(held)
         self.max_num_running_reqs -= len(held)
+        full_cap = self.max_num_scheduled_tokens
+        if step_cap is not None:
+            self.max_num_scheduled_tokens = min(step_cap, full_cap)
+            self._offcadence_steps += 1
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_scheduled_tokens = full_cap
             self.max_num_running_reqs += len(held)
             self.running.extend(held)
         admitted = any(r.status not in _ADMITTABLE for r in candidates)
@@ -304,11 +343,12 @@ class SrptPrefillScheduler(AsyncScheduler):
         if self._srpt_steps % _LOG_EVERY_STEPS == 0:
             logger.info(
                 "SRPT prefill: steps=%d held_steps=%d held_chunks=%d paused_steps=%d "
-                "attn_clipped_chunks=%d",
+                "attn_clipped_chunks=%d offcadence_steps=%d",
                 self._srpt_steps,
                 self._srpt_held_steps,
                 self._srpt_held_chunks,
                 self._srpt_paused_steps,
                 self._attn_clipped_chunks,
+                self._offcadence_steps,
             )
         return output
