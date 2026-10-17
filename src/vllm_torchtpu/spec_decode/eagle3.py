@@ -301,20 +301,6 @@ class Eagle3Proposer:
                 tp_group.world_size,
                 n_eh,
             )
-        # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
-        # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
-        # The fused draft loop also argmaxes compute_logits; it keeps the
-        # full-logit path.
-        self._vocab_parallel_argmax = None
-        if (
-            envs.TPU_SAMPLER_VOCAB_PARALLEL
-            and not envs.VLLM_TPU_FUSED_DRAFT_LOOP
-            and getattr(self.draft_model, "draft_id_to_target_id", None) is None
-        ):
-            self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
-                self.draft_model
-            )
-            logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
         if self.speculative_config.method == "eagle3":
             # Lazy + guarded: only eagle3 needs this vLLM internal, so a wrong vLLM
             # checkout shouldn't break unrelated TPU runs at import time.
@@ -338,6 +324,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._maybe_install_vocab_parallel_argmax()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -353,6 +340,31 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    def _maybe_install_vocab_parallel_argmax(self) -> None:
+        """TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per
+        logit shard and all-gathers (max, id) per row, not [rows, vocab]
+        logits.
+
+        Runs after `_build_mtp_fused_loop`, and only when that left no fused
+        program: the install makes the draft's `compute_logits` return this
+        rank's shard, and the fused program argmaxes `compute_logits` itself,
+        so it needs the full-logit path. Gating on the flag alone would miss
+        drafts the fused program refuses (IndexShare, a draft->target id map,
+        K < 2), which then argmax full logits at every step.
+        """
+        self._vocab_parallel_argmax = None
+        if (
+            not envs.TPU_SAMPLER_VOCAB_PARALLEL
+            or self._mtp_fused_loop is not None
+            or getattr(self.draft_model, "draft_id_to_target_id", None) is not None
+        ):
+            return
+        assert self.draft_model is not None
+        self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
+            self.draft_model
+        )
+        logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.

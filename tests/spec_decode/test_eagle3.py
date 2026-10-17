@@ -2251,6 +2251,120 @@ def test_index_share_turns_off_when_its_loop_step_program_cannot_be_built():
     assert proposer.draft_model.model.skip_topk is None
 
 
+# --- TPU_SAMPLER_VOCAB_PARALLEL draft argmax vs the fused draft loop ---
+
+
+@pytest.mark.parametrize(
+    "fused_flag,index_share,expect_fused,expect_vocab_parallel",
+    [
+        # IndexShare: the fused program refuses to build, so every draft step
+        # argmaxes through _draft_propose_token and takes vocab-parallel.
+        (True, True, False, True),
+        # The fused program is built and argmaxes compute_logits itself; it
+        # needs the full-logit path, so nothing is installed.
+        (True, False, True, False),
+        # No fused program requested.
+        (False, True, False, True),
+        (False, False, False, True),
+    ],
+)
+def test_vocab_parallel_draft_argmax_follows_whether_fused_loop_was_built(
+    monkeypatch, fused_flag, index_share, expect_fused, expect_vocab_parallel
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    import vllm_torchtpu.spec_decode.mtp_fused_loop as mfl
+
+    proposer = _make_proposer(draft_tp=8, target_tp=8, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.draft_vllm_config = object()
+    draft, target = _make_vocab_models()
+    draft._dynamic_arg_dims = {"input_ids": 0, "positions": 0}
+
+    def load_draft_model():
+        proposer.draft_model = draft
+
+    def init_index_sharing():
+        proposer._share_mtp_indices = index_share
+
+    proposer._load_draft_model = load_draft_model
+    proposer._init_mtp_index_sharing = init_index_sharing
+    proposer._build_mtp_loop_model = lambda: None
+
+    def null(*_args, **_kwargs):
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(e3, "set_model_tag", null)
+    monkeypatch.setattr(e3, "set_vllm_model_wrapper_context", null)
+    monkeypatch.setattr(e3, "set_current_vllm_config", null)
+    fused_program = torch.nn.Identity()
+    monkeypatch.setattr(mfl, "build_mtp_fused_loop", lambda **_kw: fused_program)
+    monkeypatch.setattr(e3.envs, "TPU_SAMPLER_VOCAB_PARALLEL", True)
+    monkeypatch.setattr(e3.envs, "VLLM_TPU_FUSED_DRAFT_LOOP", fused_flag)
+    info = spec_decode_utils.VocabParallelArgmax(0, 3, 8)
+    installed = []
+
+    def install(model):
+        installed.append(model)
+        return info
+
+    monkeypatch.setattr(e3, "install_vocab_parallel_draft_argmax", install)
+
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config", return_value={}
+    ):
+        proposer.load_model(target)
+
+    assert (proposer._mtp_fused_loop is fused_program) == expect_fused
+    if expect_vocab_parallel:
+        assert installed == [draft]
+        assert proposer._vocab_parallel_argmax == info
+    else:
+        assert installed == []
+        assert proposer._vocab_parallel_argmax is None
+
+
+def test_vocab_parallel_draft_argmax_installed_when_fused_loop_build_fails(
+    monkeypatch,
+):
+    """A fused program that fails to build leaves the per-step loop, whose
+    argmax goes through _draft_propose_token and can take vocab-parallel."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+    import vllm_torchtpu.spec_decode.mtp_fused_loop as mfl
+
+    proposer = _make_proposer(draft_tp=8, target_tp=8, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.draft_vllm_config = object()
+    draft, target = _make_vocab_models()
+    draft._dynamic_arg_dims = {"input_ids": 0, "positions": 0}
+
+    def load_draft_model():
+        proposer.draft_model = draft
+
+    def fail(**_kw):
+        raise RuntimeError("boom")
+
+    def null(*_args, **_kwargs):
+        return contextlib.nullcontext()
+
+    proposer._load_draft_model = load_draft_model
+    monkeypatch.setattr(e3, "set_model_tag", null)
+    monkeypatch.setattr(e3, "set_vllm_model_wrapper_context", null)
+    monkeypatch.setattr(e3, "set_current_vllm_config", null)
+    monkeypatch.setattr(mfl, "build_mtp_fused_loop", fail)
+    monkeypatch.setattr(e3.envs, "TPU_SAMPLER_VOCAB_PARALLEL", True)
+    monkeypatch.setattr(e3.envs, "VLLM_TPU_FUSED_DRAFT_LOOP", True)
+    info = spec_decode_utils.VocabParallelArgmax(0, 3, 8)
+    monkeypatch.setattr(e3, "install_vocab_parallel_draft_argmax", lambda _m: info)
+
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config", return_value={}
+    ):
+        proposer.load_model(target)
+
+    assert proposer._mtp_fused_loop is None
+    assert proposer._vocab_parallel_argmax == info
+
+
 def _fake_attn(with_impl: bool = True):
     return SimpleNamespace(
         kv_sharing_target_layer_name=None,
