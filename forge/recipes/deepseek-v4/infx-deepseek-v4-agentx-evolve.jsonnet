@@ -291,6 +291,9 @@ local torchLogs = cdk.var('TORCH_LOGS', '');
 // sampler off. Added after j-191aa11f-389d-43cb-bc1d was OOM-killed at the 900Gi host limit at the
 // end of startup with nothing in the log saying what held the memory.
 local hostMemSampleSeconds = cdk.numVar('HOST_MEM_SAMPLE_SECONDS', 30);
+// CPU cores requested (= limit) per server pod. The head pod runs the API server, all 16 EngineCore processes and
+// its 8 TPU workers; a tpu7x host has ~223 allocatable cores. The "hostcpu:" log lines report throttling.
+local serverCpu = cdk.var('SERVER_CPU', '32');
 // libtpu's premapped host buffer, sized and thresholded as in infx-glm52-agentx and
 // infx-qwen35-agentx (one var sets both, as there). Without it every transfer maps its own DMA
 // buffer: in j-f74e6597-85ac-4f79-869a MapDmaBuffer took ~850 ms during program reloads and
@@ -478,6 +481,15 @@ local serverScript = agentx.fill(
             split=$(awk '$1 == "rss" || $1 == "cache" || $1 == "shmem" { printf " %s=%.1fGiB", $1, $2 / 2^30 }' /sys/fs/cgroup/memory/memory.stat)
           fi
           echo "hostmem: $(date +%T) pod=$JOBSET_JOB_INDEX used=$(gib "$used") limit=$(gib "$limit")$split"
+          # CPU over the last interval from the cgroup: cores busy and the share of CFS periods throttled.
+          if [ -f /sys/fs/cgroup/cpu.stat ]; then
+            read -r cu cp ct ctu < <(awk '$1 == "usage_usec" { u = $2 } $1 == "nr_periods" { p = $2 } $1 == "nr_throttled" { t = $2 } $1 == "throttled_usec" { tu = $2 } END { print u, p, t, tu }' /sys/fs/cgroup/cpu.stat)
+            if [ -n "${pcu:-}" ]; then
+              awk -v du=$((cu - pcu)) -v dp=$((cp - pcp)) -v dt=$((ct - pct)) -v dtu=$((ctu - pctu)) -v s="$HOST_MEM_SAMPLE_SECONDS" -v q="$(cat /sys/fs/cgroup/cpu.max)" -v ts="$(date +%T)" -v pod="$JOBSET_JOB_INDEX" \
+                'BEGIN { printf "hostcpu: %s pod=%s cores=%.1f max=%s throttled_periods=%.1f%% throttled_s=%.1f\n", ts, pod, du / s / 1e6, q, dp ? 100 * dt / dp : 0, dtu / 1e6 }'
+            fi
+            pcu=$cu; pcp=$cp; pct=$ct; pctu=$ctu
+          fi
           sleep "$HOST_MEM_SAMPLE_SECONDS"
         done
       ) &
@@ -852,7 +864,7 @@ local serverJob = cdk.job(
         RAY_memory_usage_threshold: '0.99',
         RAY_memory_monitor_refresh_ms: '0',
       } + serverExtraEnv + cdk.jobSetNameEnv + agentx.megascaleOff,
-      resources=cdk.tpuResources(chipsPerHost, cpu='32', memory='900Gi'),
+      resources=cdk.tpuResources(chipsPerHost, cpu=serverCpu, memory='900Gi'),
       volumeMounts=serverVolumeMounts,
     ),
   ],
