@@ -5754,9 +5754,17 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
-        block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+        # The unified block pool keeps Mamba state in the KV groups without the
+        # compact slot pool that sets `_has_mamba_state`.
+        kv_cache_config = self.kv_cache_config
+        has_mamba = self._has_mamba_state or (
+            kv_cache_config is not None
+            and any(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                for group in kv_cache_config.kv_cache_groups
+            )
         )
+        block_aligned = has_mamba and self.cache_config.mamba_cache_mode == "align"
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
         )

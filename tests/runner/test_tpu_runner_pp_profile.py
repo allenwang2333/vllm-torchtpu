@@ -136,7 +136,9 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     assert seen["input_ids"].abs().sum() == 0
 
 
-def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1):
+def _bucket_runner(
+    paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1, kv_groups=None
+):
     from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 
     runner = MagicMock(spec=TPUModelRunner)
@@ -149,6 +151,9 @@ def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=
     runner._pp_chunk_granularity = None
     runner.drafter = None
     runner._has_mamba_state = mamba_state
+    runner.kv_cache_config = (
+        None if kv_groups is None else SimpleNamespace(kv_cache_groups=kv_groups)
+    )
     runner.cache_config = SimpleNamespace(block_size=block_size, mamba_cache_mode=mode)
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
@@ -174,6 +179,21 @@ def test_chunk_buckets_follow_the_final_block_when_aligned():
     # Idempotent.
     runner._add_pipeline_chunk_buckets()
     assert runner.num_tokens_paddings.count(4352) == 1
+
+
+def test_chunk_buckets_align_to_mamba_groups_of_the_unified_pool():
+    # The unified pool never builds the compact slot pool, so only the KV
+    # groups show that the model keeps Mamba state.
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    groups = [
+        SimpleNamespace(kv_cache_spec=MagicMock(spec=MambaSpec)),
+        SimpleNamespace(kv_cache_spec=MagicMock(spec=FullAttentionSpec)),
+    ]
+    runner = _bucket_runner([16, 4096], 2176, False, "align", kv_groups=groups)
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 2176
+    assert runner.num_tokens_paddings == [16, 2176, 4096]
 
 
 def test_chunk_buckets_use_an_eighth_step_without_alignment():

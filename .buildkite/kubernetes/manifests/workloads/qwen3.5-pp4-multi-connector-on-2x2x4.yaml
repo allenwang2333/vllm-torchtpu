@@ -17,7 +17,7 @@
 # (single_host_engine.sh). Every host exits 0 so one failing variant does not
 # stop the others; each prints "VARIANT <name> rc=<rc>".
 #   0: one PP4 engine, no KV connector, no Raiden env
-#   1: PP4 prefill, Raiden disagg only, prefix caching off
+#   1: PP4 prefill, Raiden disagg only
 #   2: PP2 prefill, Raiden disagg only
 #   3: PP4 prefill, Raiden disagg + offload (TPUMultiConnector)
 #
@@ -56,8 +56,7 @@ spec:
                       case "$${JOB_COMPLETION_INDEX}" in
                         0) variant=pp4_standalone; export PREFILL_PP=4
                            rig=run_qwen35_pp_standalone.sh ;;
-                        1) variant=pp4_disagg_no_prefix_cache
-                           export PREFILL_PP=4 OFFLOAD=0 ENABLE_PREFIX_CACHING=0 MAMBA_CACHE_MODE=none ;;
+                        1) variant=pp4_disagg_only; export PREFILL_PP=4 OFFLOAD=0 ;;
                         2) variant=pp2_disagg_only; export PREFILL_PP=2 OFFLOAD=0 ;;
                         3) variant=pp4_multi; export PREFILL_PP=4 OFFLOAD=1 ;;
                       esac
