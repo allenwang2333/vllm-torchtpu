@@ -8,6 +8,8 @@ Manages persistent device buffers, asynchronous H2D metadata uploads, hybrid
 KV/GDN state updates, and multi-step speculative decoding on TPU.
 """
 
+import functools
+
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -22,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -799,6 +801,23 @@ def _h2d_temp(runner, host: torch.Tensor) -> torch.Tensor:
     return host.to(runner.device, non_blocking=True)
 
 
+def _pp_step[**P, R](
+    method: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
+    """Brackets a runner call that traces device ops with the pipeline wave's
+    step."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
+        wave = self._pp_wave
+        if wave is None:
+            return method(self, *args, **kwargs)
+        with wave.step():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -978,6 +997,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # Default for a runner built without __init__.
+    _pp_wave: PPWave | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1454,7 +1475,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
-        self._pp_wave: PPWave | None = None
+        self._pp_wave = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -5100,6 +5121,7 @@ class TPUModelRunner(GPUModelRunner):
         return t
 
     @torch.no_grad()
+    @_pp_step
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -6218,6 +6240,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
         )
 
+    @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -7345,6 +7368,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    @_pp_step
     def _dummy_run(
         self,
         num_tokens: int,
