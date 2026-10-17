@@ -1125,6 +1125,13 @@ class TPUModelRunner(GPUModelRunner):
 
         self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
+        mm_cfg = getattr(self.model_config, "multimodal_config", None)
+        if (
+            mm_cfg is not None
+            and getattr(mm_cfg, "language_model_only", False)
+            and self.parallel_config.pipeline_parallel_size == 1
+        ):
+            self.supports_mm_inputs = False
 
         # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
