@@ -40,8 +40,10 @@ from vllm_torchtpu.block_major_pool import (
     kernel_view,
     unified_block_major_enabled,
 )
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp_comm import dcp_reduce_scatter
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -130,6 +132,78 @@ _SPARSE_MLA_DCP_CHUNK_MERGE_OUTPUT_PARTITION_SPECS = (
     P(DCP_AXIS_NAME),  # updated rope cache
     P(DCP_AXIS_NAME),  # merged & head-scattered attention output
 )
+_SPARSE_MLA_DCP_CHUNK_MERGE_DEFER_RS_OUTPUT_PARTITION_SPECS = (
+    P(DCP_AXIS_NAME),  # updated nope cache
+    P(DCP_AXIS_NAME),  # updated rope cache
+    P(DCP_AXIS_NAME),  # merged & head-scattered early super-chunks
+    P(DCP_AXIS_NAME),  # weighted last super-chunk (pre-reduce-scatter)
+)
+
+
+def _dcp_epi_opt_barrier_2_jax(
+    a: jax.Array, b: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    return jax.lax.optimization_barrier((a, b))
+
+
+def _fake_dcp_epi_opt_barrier_2(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(a), torch.empty_like(b)
+
+
+_DCP_EPI_OPT_BARRIER_2_OP = pallas.jax_op(
+    "pallas::dcp_epi_opt_barrier_2", _dcp_epi_opt_barrier_2_jax
+)
+_DCP_EPI_OPT_BARRIER_2_OP.register_fake(_fake_dcp_epi_opt_barrier_2)
+
+
+def _dcp_epi_opt_barrier_2(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if a.device.type != "tpu":
+        return a, b
+    return _DCP_EPI_OPT_BARRIER_2_OP(a, b)
+
+
+def _project_w_uv_and_o_proj_local(
+    layer: Any,
+    o_proj: Any,
+    merged_chunk: torch.Tensor,
+    input_dtype: torch.dtype,
+    gate_chunk: torch.Tensor | None,
+) -> torch.Tensor:
+    outputs_t = merged_chunk.reshape(
+        -1, layer.num_heads, layer.kv_lora_rank
+    ).transpose(0, 1)
+    w_uv = (
+        layer.W_UV.to(outputs_t.dtype)
+        if layer.W_UV.dtype != outputs_t.dtype
+        else layer.W_UV
+    )
+    out_proj = torch.bmm(outputs_t, w_uv)
+    if hasattr(layer, "W_UV_scale"):
+        out_proj = out_proj * layer.W_UV_scale
+    attn_out_c = (
+        out_proj.transpose(0, 1)
+        .to(input_dtype)
+        .reshape(-1, layer.num_heads * layer.v_head_dim)
+    )
+    if gate_chunk is not None:
+        attn_out_c = attn_out_c * gate_chunk.sigmoid()
+    return o_proj.quant_method.apply(o_proj, attn_out_c, None)
+
+
+def _finish_o_proj_all_reduce(
+    o_proj: Any, output_parallel: torch.Tensor
+) -> torch.Tensor:
+    if o_proj.reduce_results and o_proj.tp_size > 1:
+        output = tensor_model_parallel_all_reduce(output_parallel)
+    else:
+        output = output_parallel
+    if o_proj.bias is not None and not o_proj.skip_bias_add:
+        output = output + o_proj.bias
+    return output
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
@@ -2349,7 +2423,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         return sparse_mla_dcp_impl
 
     def _build_sparse_mla_dcp_chunk_merge_op(
-        self, layer: Any, dcp_size: int, interleave_size: int
+        self,
+        layer: Any,
+        dcp_size: int,
+        interleave_size: int,
+        *,
+        defer_last_rs: bool = False,
     ):
         """DCP sparse MLA op with in-kernel per-chunk LSE all-gather + BF16 reduce-scatter."""
         from vllm_torchtpu.layers.core.attention_interface import (
@@ -2375,7 +2454,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        ):
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
                 ql_nope,
@@ -2397,22 +2476,48 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
                 fuse_dcp_chunk_merge=True,
+                defer_dcp_last_rs=defer_last_rs,
             )
 
-        op_name = f"pallas::sparse_mla_attention_dcp_chunk_merge_{layer.layer_name.replace('.', '_')}"
+        suffix = "_defer_rs" if defer_last_rs else ""
+        op_name = f"pallas::sparse_mla_attention_dcp_chunk_merge{suffix}_{layer.layer_name.replace('.', '_')}"
+        out_specs = (
+            _SPARSE_MLA_DCP_CHUNK_MERGE_DEFER_RS_OUTPUT_PARTITION_SPECS
+            if defer_last_rs
+            else _SPARSE_MLA_DCP_CHUNK_MERGE_OUTPUT_PARTITION_SPECS
+        )
         sparse_mla_chunk_merge_jax_op = pcp_streaming_jax_op(
             op_name,
             sparse_mla_attention_core_tpu_dcp_chunk_merge,
             donate_argnums=(0, 1),
             mesh=mesh,
             input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
-            output_partition_specs=_SPARSE_MLA_DCP_CHUNK_MERGE_OUTPUT_PARTITION_SPECS,
+            output_partition_specs=out_specs,
         )
 
         def _fake_sparse_mla_dcp_chunk_merge(
             kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
         ):
             del rest, kwargs
+            if defer_last_rs:
+                n_early = ql_nope.shape[0] // 2
+                n_last = ql_nope.shape[0] - n_early
+                early_shape = (
+                    n_early,
+                    ql_nope.shape[1] // dcp_size,
+                    ql_nope.shape[2],
+                )
+                last_shape = (
+                    n_last,
+                    ql_nope.shape[1],
+                    ql_nope.shape[2],
+                )
+                return (
+                    torch.empty_like(kv_cache_nope),
+                    torch.empty_like(kv_cache_rope),
+                    ql_nope.new_empty(early_shape),
+                    ql_nope.new_empty(last_shape),
+                )
             out_shape = (
                 ql_nope.shape[0],
                 ql_nope.shape[1] // dcp_size,
@@ -2437,8 +2542,27 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: torch.Tensor,
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
-        ) -> torch.Tensor:
+        ):
             nope_cache, rope_cache = kv_cache
+            if defer_last_rs:
+                new_nope, new_rope, merged_early, pending_weighted_last = (
+                    sparse_mla_chunk_merge_jax_op(
+                        nope_cache,
+                        rope_cache,
+                        ql_nope,
+                        q_pe,
+                        kv_c_normed,
+                        k_pe,
+                        local_topk_indices,
+                        seq_lens,
+                        block_tables,
+                        query_start_loc,
+                        request_distribution,
+                    )
+                )
+                nope_cache.copy_(new_nope)
+                rope_cache.copy_(new_rope)
+                return merged_early, pending_weighted_last
             new_nope, new_rope, outputs = sparse_mla_chunk_merge_jax_op(
                 nope_cache,
                 rope_cache,
@@ -2478,6 +2602,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_nope, q_pe = q
         input_dtype = q_nope.dtype
 
+        topk_indices = kwargs.get("topk_indices")
+        q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        output_gate = kwargs.get("output_gate")
+        o_proj_layer = kwargs.get("o_proj")
+
         # For determine_available_memory when cache memory buffer is empty right during
         # probe (before binding, `layer.kv_cache` is the layer's default empty tensor;
         # after binding, sparse layers hold a (nope, rope) pair).
@@ -2487,12 +2616,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 template = q_nope.flatten(1)[:, :1].expand(
                     -1, layer.num_heads * layer.v_head_dim
                 )
-                return torch.ones_like(template)
+                probe_out = torch.ones_like(template)
+                if o_proj_layer is not None:
+                    if output_gate is not None:
+                        probe_out = probe_out * output_gate.sigmoid()
+                    return o_proj_layer(probe_out)[0]
+                return probe_out
             output.fill_(1)
             return output
-
-        topk_indices = kwargs.get("topk_indices")
-        q_dcp_replicated = kwargs.get("q_dcp_replicated")
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2583,6 +2714,81 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     and ql_nope_dcp.shape[0]
                     >= envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS
                 ):
+                    if (
+                        o_proj_layer is not None
+                        and envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_EPI_OVERLAP
+                        and ql_nope_dcp.shape[0] >= 1024
+                    ):
+                        if (
+                            not hasattr(layer, "sparse_mla_dcp_chunk_merge_epi_op")
+                            or layer.sparse_mla_dcp_chunk_merge_epi_op is None
+                        ):
+                            layer.sparse_mla_dcp_chunk_merge_epi_op = (
+                                self._build_sparse_mla_dcp_chunk_merge_op(
+                                    layer,
+                                    self.dcp_size,
+                                    self.dcp_interleave_size,
+                                    defer_last_rs=True,
+                                )
+                            )
+                        merged_0, weighted_1 = (
+                            layer.sparse_mla_dcp_chunk_merge_epi_op(
+                                kv_cache,
+                                ql_nope_dcp,
+                                q_pe_dcp,
+                                kv_c_normed_flat,
+                                k_pe_flat,
+                                topk_indices,
+                                attn_metadata.seq_lens,
+                                attn_metadata.block_tables,
+                                attn_metadata.query_start_loc,
+                                attn_metadata.request_distribution,
+                            )
+                        )
+                        n0 = merged_0.shape[0]
+                        gate_0 = (
+                            output_gate[:n0] if output_gate is not None else None
+                        )
+                        gate_1 = (
+                            output_gate[n0:] if output_gate is not None else None
+                        )
+                        dcp_group = _get_dcp_group()
+                        assert dcp_group is not None
+
+                        # Stage 1: Super-Chunk 1 DCP Reduce-Scatter (SC/ICI)
+                        # overlapped with Super-Chunk 0 W_UV BMM + gate + o_proj
+                        # local GEMM (TC MXU).
+                        merged_1 = dcp_reduce_scatter(
+                            weighted_1, input_dtype, dcp_group
+                        )
+                        o_0_partial = _project_w_uv_and_o_proj_local(
+                            layer, o_proj_layer, merged_0, input_dtype, gate_0
+                        )
+                        if envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER:
+                            merged_1, o_0_partial = _dcp_epi_opt_barrier_2(
+                                merged_1, o_0_partial
+                            )
+
+                        # Stage 2: Super-Chunk 0 TP All-Reduce (ICI) overlapped
+                        # with Super-Chunk 1 W_UV BMM + gate + o_proj local GEMM
+                        # (TC MXU).
+                        h_0 = _finish_o_proj_all_reduce(
+                            o_proj_layer, o_0_partial
+                        )
+                        o_1_partial = _project_w_uv_and_o_proj_local(
+                            layer, o_proj_layer, merged_1, input_dtype, gate_1
+                        )
+                        if envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER:
+                            h_0, o_1_partial = _dcp_epi_opt_barrier_2(
+                                h_0, o_1_partial
+                            )
+
+                        # Stage 3: Super-Chunk 1 TP All-Reduce (ICI) + concat.
+                        h_1 = _finish_o_proj_all_reduce(
+                            o_proj_layer, o_1_partial
+                        )
+                        return torch.cat([h_0, h_1], dim=0)
+
                     if (
                         not hasattr(layer, "sparse_mla_dcp_chunk_merge_op")
                         or layer.sparse_mla_dcp_chunk_merge_op is None
@@ -2685,6 +2891,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             .to(input_dtype)
             .reshape(-1, layer.num_heads * layer.v_head_dim)
         )
+
+        if o_proj_layer is not None:
+            if output_gate is not None:
+                outputs = outputs * output_gate.sigmoid()
+            outputs = o_proj_layer(outputs)[0]
 
         if output is not None and outputs is not output:
             output.copy_(outputs)

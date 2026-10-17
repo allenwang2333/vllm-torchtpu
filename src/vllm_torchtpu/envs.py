@@ -1138,6 +1138,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER": env_bool(
         "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER", default=True
     ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_EPI_OVERLAP": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_EPI_OVERLAP", default=True
+    ),
 }
 
 

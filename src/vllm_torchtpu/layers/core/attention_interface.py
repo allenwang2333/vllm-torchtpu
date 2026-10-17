@@ -1079,6 +1079,7 @@ def sparse_mla_attention_dcp(
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
     fuse_dcp_chunk_merge: bool = False,
+    defer_dcp_last_rs: bool = False,
 ) -> (
     tuple[jax.Array, jax.Array, jax.Array, jax.Array]
     | tuple[jax.Array, jax.Array, jax.Array]
@@ -1155,20 +1156,26 @@ def sparse_mla_attention_dcp(
         P(None),  # query_start_loc
         P(None),  # request_distribution
     )
-    out_specs = (
-        (
+    if fuse_dcp_chunk_merge and defer_dcp_last_rs:
+        out_specs = (
+            P(dcp_axis_name),  # nope cache shard
+            P(dcp_axis_name),  # rope cache shard
+            P(dcp_axis_name, None, None),  # merged early super-chunks
+            P(dcp_axis_name, None, None),  # weighted last super-chunk (pre-RS)
+        )
+    elif fuse_dcp_chunk_merge:
+        out_specs = (
             P(dcp_axis_name),  # nope cache shard
             P(dcp_axis_name),  # rope cache shard
             P(dcp_axis_name, None, None),  # merged head-scattered output
         )
-        if fuse_dcp_chunk_merge
-        else (
+    else:
+        out_specs = (
             P(dcp_axis_name),  # nope cache shard
             P(dcp_axis_name),  # rope cache shard
             P(dcp_axis_name, None, None),  # partial output
             P(dcp_axis_name, None),  # partial lse
         )
-    )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1257,12 +1264,23 @@ def sparse_mla_attention_dcp(
                 dcp_chunk_merge_bf16_rs=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16,
                 dcp_chunk_merge_barrier=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER,
                 dcp_chunk_merge_max_groups=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS,
+                dcp_chunk_merge_defer_last_rs=defer_dcp_last_rs,
                 owns_mask=owns,
                 out_head_dim=ql_nope.shape[-1],
                 **chunk_kwargs,
                 **split_kwargs,
             )
-            return (kv_cache_nope, kv_cache_rope, merged_output)
+            if defer_dcp_last_rs:
+                merged_early, pending_weighted_last = cast(
+                    tuple[jax.Array, jax.Array], merged_output
+                )
+                return (
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    merged_early,
+                    pending_weighted_last,
+                )
+            return (kv_cache_nope, kv_cache_rope, cast(jax.Array, merged_output))
 
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,

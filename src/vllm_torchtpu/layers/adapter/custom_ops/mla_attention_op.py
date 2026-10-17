@@ -1066,6 +1066,7 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         self.sparse_mla_dcp_chunk_merge_op = None
+        self.sparse_mla_dcp_chunk_merge_epi_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1076,6 +1077,15 @@ class VllmTPUMLAAttention(MLAAttention):
                         self, dcp_size, impl.dcp_interleave_size
                     )
                 )
+                if envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_EPI_OVERLAP:
+                    self.sparse_mla_dcp_chunk_merge_epi_op = (
+                        impl._build_sparse_mla_dcp_chunk_merge_op(
+                            self,
+                            dcp_size,
+                            impl.dcp_interleave_size,
+                            defer_last_rs=True,
+                        )
+                    )
 
     def forward(
         self,
@@ -1097,6 +1107,8 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            output_gate=kwargs.get("output_gate"),
+            o_proj=kwargs.get("o_proj"),
         )
 
 
@@ -1328,6 +1340,25 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 DCPGroupColumnParallelLinear, self._q_proj_layer()
             )._local_view
             q_nope, q_pe = local_view(q_nope), local_view(q_pe)
+
+        if (
+            envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS
+            and envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_EPI_OVERLAP
+            and self.is_sparse
+            and prefill_group is None
+            and self.g_proj is None
+            and getattr(self.mla_attn.impl, "dcp_size", 1) > 1
+        ):
+            return self.mla_attn(
+                (q_nope, q_pe),
+                kv_c_normed,
+                k_pe,
+                output_shape=(q.shape[0], self.hidden_size),
+                topk_indices=topk_indices,
+                q_dcp_replicated=q_dcp_replicated,
+                output_gate=output_gate,
+                o_proj=self.o_proj,
+            )
 
         attn_out = self.mla_attn(
             (q_nope, q_pe),

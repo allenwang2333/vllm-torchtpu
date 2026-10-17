@@ -1065,6 +1065,7 @@ def prepare_outputs(
         "dcp_chunk_merge_bf16_rs",
         "dcp_chunk_merge_barrier",
         "dcp_chunk_merge_max_groups",
+        "dcp_chunk_merge_defer_last_rs",
         "out_head_dim",
     ),
 )
@@ -1104,6 +1105,7 @@ def sparse_ragged_paged_attention(
     dcp_chunk_merge_bf16_rs: bool = True,
     dcp_chunk_merge_barrier: bool = True,
     dcp_chunk_merge_max_groups: int = 2,
+    dcp_chunk_merge_defer_last_rs: bool = False,
     owns_mask: jax.Array | None = None,
     out_head_dim: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1463,6 +1465,17 @@ def sparse_ragged_paged_attention(
             pending_weighted = weighted_i
 
         assert pending_weighted is not None
+        if dcp_chunk_merge_defer_last_rs and len(merged_chunks) >= 1:
+            merged_early = (
+                merged_chunks[0]
+                if len(merged_chunks) == 1
+                else jnp.concatenate(merged_chunks, axis=0)
+            )
+            if dcp_chunk_merge_barrier:
+                merged_early, pending_weighted = jax.lax.optimization_barrier(
+                    (merged_early, pending_weighted)
+                )
+            return merged_early, pending_weighted
         merged_last = jax.lax.psum_scatter(
             pending_weighted,
             axis_name=dcp_chunk_merge_axis,
