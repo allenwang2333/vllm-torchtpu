@@ -2542,10 +2542,9 @@ def _prefill_top_k(scores, lengths):
     )
 
     def select(s, n):
-        ids = streaming_topk.streaming_topk(s, valid_lengths=n, k=512)
-        values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
-        ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
-        return _compact_selected(ids)
+        return streaming_topk.streaming_topk(
+            s, valid_lengths=n, k=512, exclude_neg_inf=True
+        )
 
     try:
         mesh = get_vllm_model_wrapper_context().mesh

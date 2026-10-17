@@ -209,21 +209,15 @@ def grouped_decode_scores(
     return jnp.where(valid, result, -jnp.inf).reshape(requests * queries, width)
 
 
-def _select(scores, lengths, k, block_size, threshold, fuse_validity):
-    selected = streaming_topk.streaming_topk(
+def _select(scores, lengths, k, block_size, threshold):
+    return streaming_topk.streaming_topk(
         scores,
         valid_lengths=lengths,
         k=k,
         block_size=block_size,
         reconstruct_threshold=threshold,
-        exclude_neg_inf=fuse_validity,
+        exclude_neg_inf=True,
     )
-    valid = selected >= 0
-    if not fuse_validity:
-        values = jnp.take_along_axis(scores, jnp.maximum(selected, 0), axis=1)
-        valid &= values > -jnp.inf
-    ordered = jnp.sort(jnp.where(valid, selected, scores.shape[1]), axis=1)
-    return jnp.where(ordered < scores.shape[1], ordered, -1)
 
 
 @functools.partial(
@@ -239,7 +233,6 @@ def _select(scores, lengths, k, block_size, threshold, fuse_validity):
         "score_window",
         "fuse_mask",
         "halfplane",
-        "fuse_validity",
         "topk_block",
         "topk_threshold",
         "candidate_count",
@@ -263,7 +256,6 @@ def decode_indexer(
     score_window: int = 131072,
     fuse_mask: bool = True,
     halfplane: bool = False,
-    fuse_validity: bool = True,
     topk_block: int = 8192,
     topk_threshold: int = 8192,
     candidate_count: int = 0,
@@ -332,7 +324,6 @@ def decode_indexer(
             k,
             topk_block,
             topk_threshold,
-            fuse_validity,
         )
         if not candidate_count:
             return selected
@@ -348,7 +339,6 @@ def decode_indexer(
             candidate_count,
             topk_block,
             topk_threshold,
-            fuse_validity,
         )
         return selected, published
 

@@ -67,24 +67,55 @@ class CandidateTuningKey:
     queries: int
     heads: int
     capacity: int
-    key_tile: int
+    key_tile: int | None
     k: int
     packed: bool = False
 
 
-# Native two-bank preparation, BF16 reusable union, seeds 824/825, JAX 0.10.2
-# and libtpu 0.0.47. At 40K capacity, smaller groups lose to SC launch overhead.
-CANDIDATE_REQUEST_TILES: dict[CandidateTuningKey, int] = {
-    CandidateTuningKey("TPU7x", 48, 6, 32, 40960, 4096, 512): 48,
-    # Captured C384 candidates, synthetic Q/weights/pages, seeds 825/826.
-    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 4096, 512): 48,
-    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512): 48,
-}
-# JAX 0.10.2 / libtpu 0.0.47, seeds 825/826 plus tied scores: preparation
-# and four serial reindexes improve 5.8-7.1% with key/request tiles 8192/48.
-# Key: device, request-major Q shape, union capacity, top-k, packed keys.
-CANDIDATE_KEY_TILES: dict[tuple[str, tuple[int, ...], int, int, bool], int] = {
-    ("TPU7x", (48, 6, 32, 128), 49152, 512, False): 8192,
+@dataclass(frozen=True)
+class CandidateBlockSizes:
+    key_tile: int
+    request_tile: int
+    topk_block_size: int = 8192
+    reconstruct_threshold: int = 8192
+    compute_tile: int | None = None
+    head_stripe: int | None = None
+    fused_pipeline: bool = False
+
+
+_TPU7X_CACHED_DECODE = CandidateBlockSizes(
+    key_tile=49152,
+    request_tile=16,
+    topk_block_size=16384,
+    reconstruct_threshold=1024,
+    compute_tile=12288,
+    head_stripe=8,
+    fused_pipeline=True,
+)
+
+
+# Exact configurations take precedence over the bounded upstream fallback.
+CANDIDATE_BLOCK_SIZES: dict[CandidateTuningKey, CandidateBlockSizes] = {
+    CandidateTuningKey("TPU7x", 48, 6, 32, 40960, None, 512): CandidateBlockSizes(
+        4096, 48
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 40960, 4096, 512): CandidateBlockSizes(
+        4096, 48
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 4096, 512): CandidateBlockSizes(
+        4096, 48
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512): CandidateBlockSizes(
+        8192, 48
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 16384, 512): CandidateBlockSizes(
+        16384, 24, 16384, 1024
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 24576, 512): CandidateBlockSizes(
+        24576, 24, 16384, 1024, compute_tile=4096
+    ),
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 49152, 512): _TPU7X_CACHED_DECODE,
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, None, 512): _TPU7X_CACHED_DECODE,
 }
 # 40K overflowed in 12/48 profiled rank-steps. The 48K bucket covers the
 # captured maximum of 5138 blocks with headroom, at 576 MiB per 48 requests.
@@ -97,66 +128,43 @@ DEFAULT_CANDIDATE_REQUEST_TILE = 48
 CANDIDATE_SCORE_ELEMENTS = DEFAULT_CANDIDATE_REQUEST_TILE * 6 * CANDIDATE_KEY_CAPACITY
 
 
-def get_candidate_key_tile(
-    device_kind: str,
-    query_shape: tuple[int, ...],
-    capacity: int,
-    k: int,
-    packed: bool,
-) -> int:
-    """Prefer measured tiles, then use an aligned default for related workloads."""
-    if capacity < 1:
-        raise ValueError("candidate capacity must be positive")
-    key = (device_kind, query_shape, capacity, k, packed)
-    tile = CANDIDATE_KEY_TILES.get(key)
-    if tile is None:
-        related = (
-            device_kind == "TPU7x"
-            and not packed
-            and k == 512
-            and len(query_shape) == 4
-            and 1 <= query_shape[1] <= 6
-            and query_shape[2:] == (32, 128)
-        )
-        tile = math.gcd(DEFAULT_CANDIDATE_KEY_TILE if related else 4096, capacity)
-        logger.warning_once(
-            "[candidate_indexer] No tuned key_tile for %s; using %d", key, tile
-        )
-    if type(tile) is not int or tile < 1 or capacity % tile:
-        raise ValueError(f"Invalid candidate key_tile={tile} for {key}")
-    return tile
-
-
-def get_candidate_request_tile(key: CandidateTuningKey) -> int:
-    """Use whole requests and bound untuned groups by the measured score volume."""
+def get_candidate_block_sizes(key: CandidateTuningKey) -> CandidateBlockSizes:
+    """Resolve scorer and selector tiles together for the complete pipeline."""
     if key.requests < 1:
         raise ValueError("candidate requests must be positive")
     if key.queries < 1 or key.capacity < 1:
         raise ValueError("candidate queries and capacity must be positive")
-    tile = CANDIDATE_REQUEST_TILES.get(key)
-    if tile is None:
+    config = CANDIDATE_BLOCK_SIZES.get(key)
+    if config is None:
         related = (
             key.device_kind == "TPU7x"
             and not key.packed
             and 1 <= key.queries <= 6
             and key.heads == 32
-            and key.key_tile <= DEFAULT_CANDIDATE_KEY_TILE
             and key.k == 512
         )
+        key_tile = key.key_tile
+        if key_tile is None:
+            key_tile = math.gcd(
+                DEFAULT_CANDIDATE_KEY_TILE if related else 4096, key.capacity
+            )
         limit = (
             min(
                 DEFAULT_CANDIDATE_REQUEST_TILE,
                 max(1, CANDIDATE_SCORE_ELEMENTS // (key.queries * key.capacity)),
             )
-            if related
-            else 16
+            if related and key_tile <= DEFAULT_CANDIDATE_KEY_TILE
+            else DEFAULT_DECODE_REQUEST_TILE
         )
-        tile = next(
+        request_tile = next(
             n for n in range(min(limit, key.requests), 0, -1) if key.requests % n == 0
         )
+        config = CandidateBlockSizes(key_tile, request_tile)
         logger.warning_once(
-            "[candidate_indexer] No tuned request_tile for %s; using %d", key, tile
+            "[candidate_indexer] No tuned block sizes for %s; using %s", key, config
         )
-    if type(tile) is not int or tile < 1 or key.requests % tile:
-        raise ValueError(f"Invalid candidate request_tile={tile} for {key}")
-    return tile
+    if config.request_tile < 1 or key.requests % config.request_tile:
+        raise ValueError(
+            f"Invalid candidate request_tile={config.request_tile} for {key}"
+        )
+    return config

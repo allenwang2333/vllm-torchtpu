@@ -200,11 +200,11 @@ def test_halfplane_decode_native_bitcast_on_eight_devices():
     if len(jax.devices()) < 8:
         pytest.skip("Eight TPU devices required for model-mesh lowering")
     rng = np.random.default_rng(73)
-    ordinary, native = pools(jnp.asarray(rng.integers(-8, 9, (64, 128)), jnp.bfloat16))
+    ordinary, native = pools(jnp.asarray(rng.integers(-8, 9, (256, 128)), jnp.bfloat16))
     q = jnp.asarray(rng.integers(-2, 3, (8, 6, 32, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.integers(-2, 3, (8, 6, 32, 1)), jnp.float32)
-    pages = jnp.broadcast_to(jnp.array([48, 0, 32, 16], jnp.int32), (8, 4))
-    lengths = jnp.broadcast_to(jnp.array([64, 63, 32, 17, 1, 0], jnp.int32), (8, 6))
+    pages = jnp.broadcast_to(jnp.array([192, 0, 128, 64], jnp.int32), (8, 4))
+    lengths = jnp.broadcast_to(jnp.array([256, 255, 128, 65, 1, 0], jnp.int32), (8, 6))
     mesh = Mesh(np.asarray(jax.devices()[:8]), ("d",))
     results = []
     for halfplane, pool in ((False, ordinary), (True, native)):
@@ -216,8 +216,8 @@ def test_halfplane_decode_native_bitcast_on_eight_devices():
                 pool,
                 pages,
                 lengths,
-                page_records=16,
-                key_tile=32,
+                page_records=64,
+                key_tile=128,
                 prefetch=True,
                 fuse_mask=True,
                 halfplane=halfplane,
