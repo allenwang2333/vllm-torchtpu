@@ -257,6 +257,8 @@ if TYPE_CHECKING:
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
     TPU_SMALL_ALL_REDUCE_DRAFT: bool = False
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
+    TPU_FUSED_OPROJ_AR: bool = False
+    TPU_FUSED_OPROJ_AR_WAVES: bool = True
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
@@ -1743,6 +1745,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows to 16. Valid rows are bitwise TPU_SMALL_ALL_REDUCE's (same f32 sum
     # in core order).
     "TPU_SMALL_ALL_REDUCE_VALID_ROWS": env_bool("TPU_SMALL_ALL_REDUCE_VALID_ROWS"),
+    # With TPU_SMALL_ALL_REDUCE and TPU_FP8_LINEAR_PALLAS: attention's o_proj at
+    # decode (<= 16 rows, a measured fp8_skinny shape, TP group = the mesh) runs its
+    # matmul and its TP all-reduce as one Pallas kernel
+    # (kernels/quantized_matmul/fp8_oproj_all_reduce.py): the all-reduce's barrier
+    # round hides under the weight stream. Bitwise the two-call path.
+    "TPU_FUSED_OPROJ_AR": env_bool("TPU_FUSED_OPROJ_AR"),
+    # With TPU_FUSED_OPROJ_AR: push each owner's reduce-scatter chunk as soon as the
+    # weight tile holding its last column is done (waits the barrier after tile 0),
+    # instead of all after the last tile. 0.3-0.7 us/call faster on 2x2x2 tpu7x
+    # (t5-oproj-ar probe 02b); 0 keeps every push after the last tile.
+    "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
