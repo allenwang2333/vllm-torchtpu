@@ -763,6 +763,25 @@ def _extract_output_specs(
     return specs
 
 
+def _constant_for_spec(
+    name: str, tensor: torch.Tensor, spec: dict[str, Any]
+) -> torch.Tensor:
+    """Returns `tensor` on the host in the dtype its `@main` argument declares.
+
+    A buffer can live in a wider dtype than the graph consumes (vLLM keeps
+    `cos_sin_cache` in float32 and the forward graph takes it in the model
+    dtype), so the stored constant follows the argument, not the buffer.
+    """
+    shape = [int(d) for d in spec.get("shape", [])]
+    if [int(d) for d in tensor.shape] != shape:
+        raise ValueError(
+            f"Constant '{name}' has shape {list(tensor.shape)}, but its @main "
+            f"argument is {shape}"
+        )
+    dtype = getattr(torch, str(spec["dtype"]))
+    return tensor.detach().to(device="cpu", dtype=dtype).contiguous()
+
+
 def _write_abstract_params(
     export_dir: Path, metadata: dict[str, Any], weights_dict: dict[str, Any]
 ) -> None:
@@ -2043,7 +2062,7 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     payloads: list[bytes] = []
                     offset = 0
                     for name, tensor in internal_tensors.items():
-                        cpu_t = tensor.detach().cpu().contiguous()
+                        cpu_t = _constant_for_spec(name, tensor, weights_dict[name])
                         st_dtype = _TORCH_TO_SAFETENSORS_DTYPE.get(cpu_t.dtype, "BF16")
                         nbytes = cpu_t.numel() * cpu_t.element_size()
                         raw = (
