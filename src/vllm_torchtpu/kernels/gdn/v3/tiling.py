@@ -36,6 +36,14 @@ _DECODE_US_PER_SEQ_PER_HEAD = 0.0168
 
 _F32_BYTES = 4
 
+# Extra VMEM per qkv column of a PER_SEQ tile when qkv streams as 2D bf16 rows
+# (GDNConfig.qkv_2d) rather than f32 rows. Measured for TPU7x (AOT compile) as
+# the smallest vmem_limit_bytes that compiles, dense and pooled states, dim
+# 1536 to 12288, chunks 32 to 128: 68 to 136 bytes per column, the maximum at
+# dim 12288. 64 of them are the two 16-row DMA tails of the double-buffered
+# bf16 tile.
+_QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN = 136
+
 
 def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
@@ -87,6 +95,7 @@ def get_vmem_estimate_bytes(
     window_size: int = 1,
     rec_region_bytes: int | None = None,
     conv_region_bytes: int | None = None,
+    qkv_2d: bool = False,
 ) -> int:
     """Estimates the on-chip VMEM footprint in bytes of one GDN grid step.
 
@@ -110,6 +119,7 @@ def get_vmem_estimate_bytes(
         states stream from a pool (the raw block layout, padding included).
         None means a dense state.
       conv_region_bytes: The same for one conv state tile.
+      qkv_2d: qkv streams as 2D bf16 rows (wrapper bf16_qkv_mode=2).
     """
     aligned_num_v_heads = align_to(n_v, num_lanes)
     aligned_d_k = align_to(d_k, num_lanes)
@@ -118,9 +128,14 @@ def get_vmem_estimate_bytes(
     aligned_out_dim = align_to(n_v * d_v, num_lanes)
     state_elems = n_v * d_v * d_k
 
-    # 1. Double-buffered input activations: wrapper.py casts qkv, b and a
-    # to f32 before the pipeline.
+    # 1. Double-buffered input activations: wrapper.py casts b and a to f32
+    # before the pipeline, and qkv too unless it streams as bf16.
     qkv_bytes = 2 * tile_b * chunk_sz * dim_size * carry_scratch_bytes
+    # BATCHED tiles take no 2D term: at the measured decode shapes the estimate
+    # already exceeds the need with 2D bf16 qkv (n_v=8, T=16: 50.3 MiB
+    # estimated, 39.3 MiB needed; n_v=64, T=2: 50.1 and 43.8 MiB).
+    if qkv_2d and not is_decode:
+        qkv_bytes += tile_b * dim_size * _QKV_2D_PER_SEQ_EXTRA_BYTES_PER_COLUMN
     b_bytes = 2 * tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes
     a_bytes = 2 * tile_b * chunk_sz * aligned_num_v_heads * carry_scratch_bytes
 
@@ -272,6 +287,7 @@ def calculate_mixed_tile_size(
     kernel_size: int = 4,
     rec_region_bytes: int | None = None,
     conv_region_bytes: int | None = None,
+    qkv_2d: bool = False,
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
@@ -295,6 +311,7 @@ def calculate_mixed_tile_size(
         get_vmem_estimate_bytes.
       conv_region_bytes: Pooled conv state tile bytes, see
         get_vmem_estimate_bytes.
+      qkv_2d: qkv streams as 2D bf16 rows, see get_vmem_estimate_bytes.
 
     Returns:
       The largest MIXED_TILE_SIZES entry <= seq_len that fits, 1 for an empty
@@ -321,6 +338,7 @@ def calculate_mixed_tile_size(
             window_size=1,
             rec_region_bytes=rec_region_bytes,
             conv_region_bytes=conv_region_bytes,
+            qkv_2d=qkv_2d,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return cand
@@ -347,6 +365,7 @@ def get_tile_sizes(
     mixed_tile_size: int | None = None,
     rec_region_bytes: int | None = None,
     conv_region_bytes: int | None = None,
+    qkv_2d: bool = False,
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -382,6 +401,8 @@ def get_tile_sizes(
             get_vmem_estimate_bytes.
         conv_region_bytes: Pooled conv state tile bytes, see
             get_vmem_estimate_bytes.
+        qkv_2d: qkv streams as 2D bf16 rows; sizes the prefill/mixed chunk
+            only, see get_vmem_estimate_bytes.
 
     Returns:
         Tuple of (decode_tile_size, mixed_tile_size).
@@ -420,6 +441,7 @@ def get_tile_sizes(
         mixed_tile_size = calculate_mixed_tile_size(
             seq_len=batch_size,
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
+            qkv_2d=qkv_2d,
             **shape,
         )
     else:
@@ -428,6 +450,7 @@ def get_tile_sizes(
             calculate_mixed_tile_size(
                 seq_len=MIXED_TILE_SIZES[0],
                 vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
+                qkv_2d=qkv_2d,
                 **shape,
             ),
         )

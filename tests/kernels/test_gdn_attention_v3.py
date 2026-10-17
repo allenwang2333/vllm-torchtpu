@@ -384,6 +384,63 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     )
                     self.assertEqual(got, expected, msg=label)
 
+    def test_tile_sizes_with_2d_bf16_qkv(self):
+        """2D bf16 qkv widens only the prefill/mixed estimate; picks hold."""
+        d_k, d_v, kernel_size = 128, 128, 4
+        bf16 = jnp.dtype(jnp.bfloat16)
+        f32 = jnp.dtype(jnp.float32)
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            limit_w1 = config.GDNConfig.get_vmem_limit_bytes(1)
+            cases = [
+                ("tp8_b8192", 2, 8, 8192, 16, (4, 128)),
+                ("tp8_b64", 2, 8, 64, 64, (8, 64)),
+                ("dp4tp2_b2048", 8, 32, 2048, 32, (4, 128)),
+                ("dp8_b256", 16, 64, 256, 256, (2, 64)),
+                ("dp8_b4096", 16, 64, 4096, 1, (1, 64)),
+            ]
+            for label, n_kq, n_v, b, n, expected in cases:
+                dim = 2 * n_kq * d_k + n_v * d_v
+                shape = dict(
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    num_lanes=128,
+                    conv_state_dim_size=dim,
+                )
+                with self.subTest(label=label):
+                    got = tiling.get_tile_sizes(
+                        batch_size=b,
+                        num_seqs=n,
+                        padded_batch_size=b,
+                        act_out_dtype=bf16,
+                        recurrent_state_dtype=f32,
+                        decode_vmem_limit_bytes=limit_w1,
+                        mixed_vmem_limit_bytes=limit_w1,
+                        mixed_tile_size=128,
+                        qkv_2d=True,
+                        **shape,
+                    )
+                    self.assertEqual(got, expected, msg=label)
+                    for is_decode, extra in ((False, dim * 136), (True, 0)):
+                        est = [
+                            tiling.get_vmem_estimate_bytes(
+                                tile_b=1,
+                                chunk_sz=1 if is_decode else 64,
+                                act_out_bytes=2,
+                                rec_state_bytes=4,
+                                is_decode=is_decode,
+                                qkv_2d=qkv_2d,
+                                **shape,
+                            )
+                            for qkv_2d in (False, True)
+                        ]
+                        self.assertEqual(est[1] - est[0], extra)
+
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
