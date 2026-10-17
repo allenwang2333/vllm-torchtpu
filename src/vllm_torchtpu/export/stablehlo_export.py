@@ -127,6 +127,93 @@ def update_hash_with_loaded_hlo(hash_obj: Any) -> None:
                 hash_obj.update(hlo_path.read_bytes())
 
 
+def patch_in_graph_rotary_embedding(model: Any = None) -> None:
+    """Patches RotaryEmbedding to compute RoPE dynamically in-graph on TPU.
+
+    Eliminates the 10MB `cos_sin_cache` buffer and associated parameter slot,
+    computing trigonometric frequencies directly on device via vector outer-product
+    and sin/cos ops.
+    """
+    try:
+        from vllm.model_executor.layers.rotary_embedding.base import (
+            ApplyRotaryEmb,
+            RotaryEmbeddingBase,
+        )
+    except ImportError:
+        return
+
+    def _dynamic_forward_native(
+        self: Any,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        positions_flat = positions.flatten()
+        num_tokens = positions_flat.shape[0]
+
+        inv_freq = getattr(self, "inv_freq", None)
+        if inv_freq is None:
+            inv_freq = 1.0 / (
+                self.base
+                ** (
+                    torch.arange(
+                        0,
+                        self.rotary_dim,
+                        2,
+                        dtype=torch.float32,
+                        device=query.device,
+                    )
+                    / self.rotary_dim
+                )
+            )
+        else:
+            inv_freq = inv_freq.to(device=query.device, dtype=torch.float32)
+
+        freqs = torch.einsum("i,j->ij", positions_flat.float(), inv_freq)
+        cos = freqs.cos().to(query.dtype)
+        sin = freqs.sin().to(query.dtype)
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = ApplyRotaryEmb.forward_static(
+            query_rot,
+            cos,
+            sin,
+            self.is_neox_style,
+        )
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        if key is not None:
+            key_shape = key.shape
+            key = key.view(num_tokens, -1, self.head_size)
+            key_rot = key[..., : self.rotary_dim]
+            key_pass = key[..., self.rotary_dim :]
+            key_rot = ApplyRotaryEmb.forward_static(
+                key_rot,
+                cos,
+                sin,
+                self.is_neox_style,
+            )
+            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+        return query, key
+
+    RotaryEmbeddingBase.forward_native = _dynamic_forward_native
+
+    if model is not None and hasattr(model, "named_modules"):
+        for _, module in model.named_modules():
+            if isinstance(module, RotaryEmbeddingBase):
+                if hasattr(module, "_buffers"):
+                    module._buffers.pop("cos_sin_cache", None)
+                    module._buffers.pop("cos_sin_cache_bf16", None)
+                if "cos_sin_cache" in module.__dict__:
+                    del module.__dict__["cos_sin_cache"]
+                if "cos_sin_cache_bf16" in module.__dict__:
+                    del module.__dict__["cos_sin_cache_bf16"]
+
+
 def register_active_model(model: Any) -> None:
     """Register an active `torch.nn.Module` for parameter name resolution."""
     global _ACTIVE_PARAM_MAP, _ACTIVE_MODEL
@@ -134,6 +221,7 @@ def register_active_model(model: Any) -> None:
     _ACTIVE_MODEL = model
     if model is None:
         return
+    patch_in_graph_rotary_embedding(model)
     for iter_fn in ("named_parameters", "named_buffers"):
         if hasattr(model, iter_fn):
             for name, t in getattr(model, iter_fn)():
