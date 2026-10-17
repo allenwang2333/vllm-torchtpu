@@ -2950,15 +2950,10 @@ def sparse_ragged_paged_attention(
         # chunk gathers and each grid step fetches only its live atom blocks.
         assert topk_cap is not None and page_indices is not None
         chunk_window_rows = topk * uniform_chunk // 128
+        # No is_dcp_mode padding zeroing here: live-group steps never take the
+        # kv rungs it feeds, and MIXED_FUSED_PREP returns its own kv_lens, so
+        # zeroing only this branch would split the two bit for bit.
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
-        if is_dcp_mode:
-            # Same padding-token zeroing as the window prep below.
-            kv_lens = jnp.where(
-                jnp.arange(kv_lens.shape[0], dtype=jnp.int32)
-                < cu_q_lens[distribution[2]],
-                kv_lens,
-                0,
-            )
         physical_indices = None
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
