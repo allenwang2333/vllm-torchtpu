@@ -305,10 +305,10 @@ def _rs_bf16_checks(rank, world, cp_mla, merge):
 
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses_g, group):
+    def wrong(output, lse_f32, lses_g, group, *args, **kwargs):  # + rs_dtype
         if int(group.rank_in_group) == 1:
             lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses_g, group)
+        return real(output, lse_f32, lses_g, group, *args, **kwargs)
 
     cp_mla._weighted_reduce_scatter = wrong
     try:
@@ -655,7 +655,11 @@ def _check(rank, world, group, cp_mla):
     # Positive control for the chunked merge: every chunk weighted with its
     # neighbour row's lse. The same check must now fail.
     real_rs = cp_mla.cp_lse_ag_out_rs
-    cp_mla.cp_lse_ag_out_rs = lambda o, lse, g: real_rs(o, torch.roll(lse, 1, 0), g)
+
+    def misaligned_rs(o, lse, g, **kwargs):  # kwargs: rs_dtype (#1808)
+        return real_rs(o, torch.roll(lse, 1, 0), g, **kwargs)
+
+    cp_mla.cp_lse_ag_out_rs = misaligned_rs
     try:
         _set_arm(cp_mla, "chunk4")
         for how in ("eager", "compiled"):
@@ -933,6 +937,13 @@ def assert_merge_results(results: list[dict]) -> None:
                 assert "error" not in first, (r["rank"], arm, how, first)
                 assert "error" not in after, (r["rank"], arm, how, after)
                 assert first["shape"] == after["shape"], (r["rank"], arm, how)
+                if arm in RS_BF16_ARMS:
+                    # A bf16 wire by design (not bitwise): the projected f32
+                    # partial is narrowed before the reduce, so neither
+                    # invariant below holds. Its own bound is RS_BF16_MAX_ULP,
+                    # checked on the merge itself (`rsbf16/...`).
+                    assert first["finite"], (r["rank"], arm, how, first)
+                    continue
                 # One rounding at the end: exact to one bf16 ulp, and never
                 # less exact than projecting the rounded merge.
                 assert first["within_1ulp"], (r["rank"], arm, how, first)
