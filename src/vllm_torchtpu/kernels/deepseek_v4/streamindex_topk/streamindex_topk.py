@@ -348,9 +348,9 @@ def score_pipeline(
         kv_spec = pl.BlockSpec(
             (
                 pl.BoundedSlice(seq_batch_size),
-                kv_sublane_groups,
+                bkv_p * kv_sublane_groups,
                 kv_packing,
-                bkv_sz,
+                page_size,
             ),
             lambda p_id: (seq_tile(p_id), 0, 0, bkv_block(p_id)),
             pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
@@ -431,34 +431,50 @@ def score_pipeline(
     # ------------------------------------------------------------------------
     # SEQ_ALONG_LANE block access.
     #
-    # The VMEM block is u8[seq_batch, kv_sublane_groups, kv_packing, bkv_sz]:
-    # packed group g holds key dims [4g, 4g + 4) of every token, one byte per
-    # dim, and group `kv_head_dim_groups` holds the UE8M0 scale in byte 0.
-    # Viewed as u32, row `g * nt + j` (nt = bkv_sz // 128) is group g of lane
-    # tile j, so a sublane-strided load of rows `j, j + nt, ...` yields the
-    # [head_dim // 4, 128] words of lane tile j. Bitcasting those words to FP8
+    # The VMEM block is u8[seq_batch, bkv_p * kv_sublane_groups, kv_packing,
+    # page_size]: the block's pages back to back, each exactly as it is laid out
+    # in HBM, so every page arrives in one contiguous copy. In a page, packed
+    # group g holds key dims [4g, 4g + 4) of every token, one byte per dim, and
+    # group `kv_head_dim_groups` holds the UE8M0 scale in byte 0. Viewed as u32
+    # with tp = page_size // 128 lane tiles a page, row
+    # `(page * kv_sublane_groups + g) * tp + j` is group g of the page's lane
+    # tile j, so a sublane-strided load with stride tp yields the
+    # [head_dim // 4, 128] words of one lane tile. Bitcasting those words to FP8
     # gives [head_dim, 128] with key dim 4g + i taken from byte i -- exactly the
     # MXU-native packed layout -- so no relayout is needed on the key path.
+    # (Pages used to land in lane windows of a [groups, kv_packing, bkv_sz]
+    # block, which made that stride a whole block row, bkv_sz // 128 tiles. On
+    # tpu7x the verify pass ran 20-23% longer that way.)
     # ------------------------------------------------------------------------
     num_lane_tiles_bkv = bkv_sz // 128
+    tiles_per_page = page_size // 128
 
     def seq_along_lane_block_rows(bkv_vmem):
         return bkv_vmem.bitcast(jnp.uint32).reshape(
-            seq_batch_size, kv_sublane_groups * num_lane_tiles_bkv, 128
+            seq_batch_size, bkv_p * kv_sublane_groups * tiles_per_page, 128
         )
+
+    def seq_along_lane_row(group, lane_tile_idx):
+        """u32 row of `group` of block lane tile `lane_tile_idx`."""
+        page, tile = divmod(lane_tile_idx, tiles_per_page)
+        return (page * kv_sublane_groups + group) * tiles_per_page + tile
 
     def seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx):
         """[head_dim, 128] FP8 keys of lane tile `lane_tile_idx`."""
         words = rows[
             batch_idx,
-            pl.ds(lane_tile_idx, kv_head_dim_groups, stride=num_lane_tiles_bkv),
+            pl.ds(
+                seq_along_lane_row(0, lane_tile_idx),
+                kv_head_dim_groups,
+                stride=tiles_per_page,
+            ),
             :,
         ]
         return pltpu.bitcast(words, jnp.float8_e4m3fn)
 
     def seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx):
         """[1, 128] f32 dequantization scales of lane tile `lane_tile_idx`."""
-        row = kv_head_dim_groups * num_lane_tiles_bkv + lane_tile_idx
+        row = seq_along_lane_row(kv_head_dim_groups, lane_tile_idx)
         words = rows[batch_idx, pl.ds(row, 1), :]
         # UE8M0 holds a bare biased exponent, which is where f32 keeps its own:
         # moving byte 0 into the f32 exponent field yields 2^(e - 127) exactly
@@ -537,17 +553,13 @@ def score_pipeline(
         bkv_vec,
         scale_val_vec,
         bq_weights_vec,
-        bq_pos_compressed_vec,
-        bkv_idx,
-        batch_start_seq_idx,
-        cp_rank=0,
         q_is_head_major=False,
+        num_sublanes=num_sublanes_bkv,
     ):
         assert len(bq_vec) == seq_batch_size
         assert len(bkv_vec) == seq_batch_size
         assert len(scale_val_vec) == seq_batch_size
         assert len(bq_weights_vec) == seq_batch_size
-        assert len(bq_pos_compressed_vec) == seq_batch_size
         ret = []
 
         for batch_idx in range(seq_batch_size):
@@ -555,30 +567,17 @@ def score_pipeline(
             bkv = bkv_vec[batch_idx]
             scale_val = scale_val_vec[batch_idx]
             bq_weights = bq_weights_vec[batch_idx]
-            bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
 
             s_summed = reduce_heads(bq, bkv, bq_weights, head_major=q_is_head_major)
+            # Positions a token cannot see are left unmasked, as in
+            # `blocked_prefill_step`: the top-k reads each row only up to its
+            # `row_lengths` entry, the causal and end-of-sequence limit.
             s_summed = s_summed * scale_val
-            k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(
-                jnp.int32, s_summed.shape, 1
-            )
-            k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
-            seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
-            kv_len = seq_len >> shift_comp
-
-            valid_mask = k_span < kv_len
-            causal_mask = k_span <= bq_pos_compressed[:, None]
-            mask = jnp.logical_and(valid_mask, causal_mask)
-            s_summed = jnp.where(mask, s_summed, -jnp.inf)
-            ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+            ret.append(s_summed.reshape(-1, num_sublanes, 128))
         return jnp.concatenate(ret, axis=0)
 
     def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
-        p_id = pl.program_id(0)
-        batch_start_seq_idx = seq_tile(p_id)
-        bq_idx = bq_block(p_id)
-        bkv_idx = bkv_block(p_id)
-        cp_rank = cp_rank_ref[0]
+        bkv_idx = bkv_block(pl.program_id(0))
 
         if q_hm_ref is not None:
             # The head-major reordering depends only on the q block, but the grid
@@ -599,68 +598,73 @@ def score_pipeline(
         w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
         bq_weights_vec = [w_data[batch_idx] for batch_idx in range(seq_batch_size)]
 
-        # Blocks are laid out from the chunk's first token, 0 when unchunked.
-        chunk_start = start_end_seq_idx_ref[2]
-        bq_pos_compressed_vec = []
-        for batch_idx in range(seq_batch_size):
-            s_l = seq_lens_ref[batch_start_seq_idx + batch_idx]
-            q_s = cu_q_lens_ref[batch_start_seq_idx + batch_idx]
-            q_e = cu_q_lens_ref[batch_start_seq_idx + batch_idx + 1]
-            q_l = q_e - q_s
-            # Offset of this block's first token within the sequence.
-            block_start = bq_idx * bq_sz + jnp.maximum(0, chunk_start - q_s)
-            q_pos = s_l - q_l + block_start + jnp.arange(bq_sz, dtype=jnp.int32)
-            bq_pos_compressed_vec.append(q_pos >> shift_comp)
+        def score(num_tiles):
+            """Scores the block's first `num_tiles` lane tiles."""
+            bkvs = []
+            bkv_scales = []
+            for batch_idx in range(seq_batch_size):
+                if seq_along_lane:
+                    # Keys and scales come straight out of the packed block in their
+                    # MXU and lane layouts respectively; see
+                    # `seq_along_lane_block_rows`.
+                    rows = seq_along_lane_block_rows(bkv_vmem)
+                    lane_tiles = range(num_tiles)
+                    fp8_val = jnp.concatenate(
+                        [
+                            seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx)
+                            for lane_tile_idx in lane_tiles
+                        ],
+                        axis=1,
+                    )
+                    scale_val = jnp.concatenate(
+                        [
+                            seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx)
+                            for lane_tile_idx in lane_tiles
+                        ],
+                        axis=1,
+                    )
+                    bkvs.append(fp8_val)
+                    bkv_scales.append(scale_val)
+                else:
+                    bkv = bkv_vmem[batch_idx, :bkv_sz_per_kv_packing][...]
+                    flat_bkv = bkv.reshape(-1, bkv.shape[-1])
+                    fp8_val = pltpu.bitcast(flat_bkv[:, :head_dim], jnp.float8_e4m3fn)
+                    scale_val = pltpu.bitcast(
+                        flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
+                    ).astype(jnp.float32)
+                    bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
+                    bkv_scales.append(scale_val)
 
-        bkvs = []
-        bkv_scales = []
-        for batch_idx in range(seq_batch_size):
-            if seq_along_lane:
-                # Keys and scales come straight out of the packed block in their MXU
-                # and lane layouts respectively; see `seq_along_lane_block_rows`.
-                rows = seq_along_lane_block_rows(bkv_vmem)
-                lane_tiles = range(num_lane_tiles_bkv)
-                fp8_val = jnp.concatenate(
-                    [
-                        seq_along_lane_key_tile(rows, batch_idx, lane_tile_idx)
-                        for lane_tile_idx in lane_tiles
-                    ],
-                    axis=1,
-                )
-                scale_val = jnp.concatenate(
-                    [
-                        seq_along_lane_scale_tile(rows, batch_idx, lane_tile_idx)
-                        for lane_tile_idx in lane_tiles
-                    ],
-                    axis=1,
-                )
-                bkvs.append(fp8_val)
-                bkv_scales.append(scale_val)
-            else:
-                bkv = bkv_vmem[batch_idx, :bkv_sz_per_kv_packing][...]
-                flat_bkv = bkv.reshape(-1, bkv.shape[-1])
-                fp8_val = pltpu.bitcast(flat_bkv[:, :head_dim], jnp.float8_e4m3fn)
-                scale_val = pltpu.bitcast(
-                    flat_bkv[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
-                ).astype(jnp.float32)
-                bkvs.append(fp8_val.reshape(bkv_sz, head_dim))
-                bkv_scales.append(scale_val)
+            scores = compute_scores(
+                bq_vec,
+                bkvs,
+                bkv_scales,
+                bq_weights_vec,
+                q_is_head_major=q_hm_ref is not None,
+                num_sublanes=num_tiles,
+            )
+            scores_vmem[:, :num_tiles] = pltpu.bitcast(scores, jnp.int32)
 
-        scores = compute_scores(
-            bq_vec,
-            bkvs,
-            bkv_scales,
-            bq_weights_vec,
-            bq_pos_compressed_vec,
-            bkv_idx,
-            batch_start_seq_idx,
-            q_is_head_major=q_hm_ref is not None,
-            cp_rank=cp_rank,
-        )
-        scores_vmem[...] = pltpu.bitcast(scores, jnp.int32)
+        # A sequence's last KV block is usually part empty, and positions past
+        # its compressed length are never read (the top-k stops at
+        # `row_lengths`). When they fill at least half the block, only the
+        # first half is scored. The scored positions' arithmetic is unchanged.
+        half_tiles = num_lane_tiles_bkv // 2
+        if (
+            seq_along_lane
+            and seq_batch_size == 1
+            and cp_size == 1
+            and half_tiles % 8 == 0
+        ):
+            kv_len = seq_lens_ref[seq_tile(pl.program_id(0))] >> shift_comp
+            past_half = kv_len - bkv_idx * bkv_sz > half_tiles * 128
+            pl.when(past_half)(functools.partial(score, num_lane_tiles_bkv))
+            pl.when(jnp.logical_not(past_half))(functools.partial(score, half_tiles))
+        else:
+            score(num_lane_tiles_bkv)
 
     def blocked_prefill_step(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref, q_half_ref=None
     ):
         """Scores one (q block, kv block) step of the multi-token path.
 
@@ -674,6 +678,8 @@ def score_pipeline(
             head, token) row order.
           wb_ref: [num_tok_blks, H, tok_blk, 128] cache of the indexer weights,
             broadcast along lanes; bf16 for FP8 queries, f32 otherwise.
+          q_half_ref: [H * tok_blk // 2, D] cache of the block's first half of
+            tokens in (head group, head, token) row order, or None.
         """
         bkv_idx = bkv_block(pl.program_id(0))
         tok_blk = prefill_cfg.tok_blk
@@ -702,6 +708,14 @@ def score_pipeline(
                     q_hm_ref[pl.ds(prefill_cfg.cache_row(h, tb), tok_blk)] = q_rows[
                         h * tok_blk : (h + 1) * tok_blk
                     ]
+                    if q_half_ref is not None:
+                        g, hg = h % num_head_groups, h // num_head_groups
+                        q_half_ref[
+                            pl.ds(
+                                (g * heads_per_group + hg) * (tok_blk // 2),
+                                tok_blk // 2,
+                            )
+                        ] = q_rows[h * tok_blk : h * tok_blk + tok_blk // 2]
                     wb_ref[tb, h] = jnp.broadcast_to(
                         w[t0 : t0 + tok_blk, h : h + 1], (tok_blk, 128)
                     ).astype(wb_ref.dtype)
@@ -757,12 +771,13 @@ def score_pipeline(
                     "nd,md->nm", q_rows, keys, preferred_element_type=jnp.float32
                 )
 
-        def reduce_token_block(sts, tb):
-            """sum_h relu(st_h) * w_h over the rows of token block `tb`.
+        def reduce_token_block(sts, tb, rows):
+            """sum_h relu(st_h) * w_h over the first `rows` rows of token block `tb`.
 
             Args:
               sts: per head group, the [rows_per_group, lane_chunk] q @ k block.
               tb: token block index.
+              rows: leading rows (tokens) of the block to reduce.
             """
             acc = None
             for i in range(heads_per_group):
@@ -770,9 +785,14 @@ def score_pipeline(
                 # MXUs, so the accumulation drains every MXU at the rate it produces
                 # results.
                 for g, st in enumerate(sts):
-                    r0 = tb * rows_per_group_tok_blk + i * tok_blk
-                    st_h = st[r0 : r0 + tok_blk]
-                    w_h = wb_ref[tb, i * num_head_groups + g]
+                    # The half-block cache holds `rows` rows per head.
+                    r0 = (
+                        i * rows
+                        if rows < tok_blk
+                        else tb * rows_per_group_tok_blk + i * tok_blk
+                    )
+                    st_h = st[r0 : r0 + rows]
+                    w_h = wb_ref[tb, i * num_head_groups + g][:rows]
                     if tiles_per_chunk > 1:
                         w_h = jnp.concatenate([w_h] * tiles_per_chunk, axis=1)
                     if prefill_cfg.bf16_reduce:
@@ -795,44 +815,77 @@ def score_pipeline(
             if prefill_cfg.strided_score_store
             else None
         )
-        chunk_scores = []
-        for c in range(num_lane_chunks):
-            keys, scales = load_chunk(c)
-            # Reload the cached rows for every chunk instead of keeping the whole q
-            # block live in registers across chunks. Each head group is its own
-            # matmul so that the groups can run on different MXUs.
-            sts = [
-                qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
-                for g in range(num_head_groups)
-            ]
-            tb_scores = []
-            for tb in range(num_tok_blks):
-                acc = reduce_token_block(sts, tb) * scales
+
+        def score_block(rows):
+            """Scores every token block, reducing only its first `rows` rows."""
+            chunk_scores = []
+            for c in range(num_lane_chunks):
+                keys, scales = load_chunk(c)
+                # Reload the cached rows for every chunk instead of keeping the whole
+                # q block live in registers across chunks. Each head group is its
+                # own matmul so that the groups can run on different MXUs.
+                if rows < tok_blk:
+                    group_rows = heads_per_group * rows
+                    sts = [
+                        qk(q_half_ref[pl.ds(g * group_rows, group_rows)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                else:
+                    sts = [
+                        qk(q_hm_ref[pl.ds(g * rows_per_group, rows_per_group)], keys)
+                        for g in range(num_head_groups)
+                    ]
+                tb_scores = []
+                for tb in range(num_tok_blks):
+                    acc = reduce_token_block(sts, tb, rows) * scales
+                    if scores_rows is None:
+                        tb_scores.append(acc)
+                        continue
+                    for jj in range(tiles_per_chunk):
+                        lane_tile = c * tiles_per_chunk + jj
+                        scores_rows[
+                            pl.ds(
+                                tb * tok_blk * score_pitch + lane_tile,
+                                rows,
+                                stride=score_pitch,
+                            )
+                        ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
                 if scores_rows is None:
-                    tb_scores.append(acc)
-                    continue
-                for jj in range(tiles_per_chunk):
-                    lane_tile = c * tiles_per_chunk + jj
-                    scores_rows[
-                        pl.ds(
-                            tb * tok_blk * score_pitch + lane_tile,
-                            tok_blk,
-                            stride=score_pitch,
-                        )
-                    ] = pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
+                    chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+
             if scores_rows is None:
-                chunk_scores.append(jnp.concatenate(tb_scores, axis=0))
+                s_summed = jnp.concatenate(chunk_scores, axis=1)
+                scores_vmem[...] = pltpu.bitcast(
+                    s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
+                )
 
-        if scores_rows is None:
-            s_summed = jnp.concatenate(chunk_scores, axis=1)
-            scores_vmem[...] = pltpu.bitcast(
-                s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
+        # A q block's rows past its sequence (or chunk) are padding: they are
+        # never copied out. When at most half the block is real, as in the last
+        # block of a 100-token chunk, only the first packed 16-row half is
+        # reduced. The real rows' arithmetic is unchanged.
+        half = tok_blk // 2
+        if q_half_ref is not None:
+            assert scores_rows is not None
+            _, valid_rows = bref_override.token_window(
+                (None, cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref),
+                pl.program_id(0),
+                scores_hbm_ref.shape[0],
+                bq_sz=bq_sz,
+                seq_batch_size=seq_batch_size,
+                chunk_idx=chunk_idx,
             )
+            pl.when(valid_rows <= half)(functools.partial(score_block, half))
+            pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
+        else:
+            score_block(tok_blk)
 
-    def _run_all(q_hm_ref=None, wb_ref=None):
+    def _run_all(q_hm_ref=None, wb_ref=None, q_half_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
-                blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
+                blocked_prefill_step,
+                q_hm_ref=q_hm_ref,
+                wb_ref=wb_ref,
+                q_half_ref=q_half_ref,
             )
         else:
             body = functools.partial(step_body, q_hm_ref=q_hm_ref)
@@ -858,7 +911,15 @@ def score_pipeline(
         _run_pipeline()
 
     # Only the multi-token path reorders q, and only a single sequence per tile
-    # keeps the cached block unambiguous.
+    # keeps the cached block unambiguous. A single 32-token block also keeps a
+    # cache of its first 16 tokens, for blocks with at most 16 real rows.
+    half_block_cache = (
+        prefill_cfg.enabled
+        and prefill_cfg.num_tok_blks == 1
+        and prefill_cfg.bf16_reduce
+        and prefill_cfg.strided_score_store
+        and prefill_cfg.tok_blk == 32
+    )
     if prefill_cfg.enabled:
         pl.run_scoped(
             _run_all,
@@ -871,6 +932,11 @@ def score_pipeline(
                     128,
                 ),
                 prefill_cfg.wb_dtype,
+            ),
+            *(
+                (pltpu.VMEM((num_q_heads * bq_sz // 2, head_dim), q_hbm_ref.dtype),)
+                if half_block_cache
+                else ()
             ),
         )
     elif seq_batch_size == 1 and bq_sz > 1:

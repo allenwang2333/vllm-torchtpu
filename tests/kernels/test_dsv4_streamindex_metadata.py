@@ -489,6 +489,63 @@ class ChunkedMetadataTest(parameterized.TestCase):
         self.assertGreaterEqual(int(num_steps.sum()), 1)
         self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
 
+    @parameterized.named_parameters(
+        ("chunks_of_16", 16, False),
+        ("chunks_of_32", 32, False),
+        ("chunks_of_64", 64, False),
+        ("split_at_a_seam", 128, True),
+    )
+    def test_ragged_many_sequences_fit_the_schedule(self, chunk_tokens, split):
+        """Many short ragged sequences, every cut inside one: the schedule the
+        chunks need must fit the arrays, step for step, with the bound that
+        grows by one block per cut rather than by a factor per chunk."""
+        rng = np.random.default_rng(7)
+        num_seqs, max_tokens, bq_sz, bkv_sz, page_size, pps = 40, 128, 32, 128, 64, 16
+        q_lens = rng.multinomial(max_tokens - 8, np.ones(num_seqs) / num_seqs)
+        cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+        seq_lens = rng.integers(1, pps * page_size, num_seqs).astype(np.int32)
+        if split:
+            seam = int(cu_q_lens[num_seqs // 2]) + 5
+            starts = (seam - max_tokens, seam)
+        else:
+            starts = tuple(range(0, max_tokens, chunk_tokens))
+        meta_ = metadata.compute_metadata(
+            seq_lens=jnp.asarray(seq_lens),
+            cu_q_lens=jnp.asarray(cu_q_lens),
+            start_seq_idx=0,
+            end_seq_idx=num_seqs,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            pages_per_seq=pps,
+            page_size=page_size,
+            max_num_tokens=max_tokens,
+            static_q_len=None,
+            seq_batch_size=1,
+            chunk_token_start=starts,
+            chunk_tokens=chunk_tokens,
+        )
+        num_bkv = np.maximum(1, -(-seq_lens // bkv_sz))
+        expected = []
+        for start in starts:
+            lo = np.clip(start, cu_q_lens[:-1], cu_q_lens[1:])
+            hi = np.clip(start + chunk_tokens, cu_q_lens[:-1], cu_q_lens[1:])
+            expected.append(int(np.sum(-(-(hi - lo) // bq_sz) * num_bkv)))
+        np.testing.assert_array_equal(np.array(meta_.num_steps), expected)
+        self.assertLessEqual(sum(expected), meta_.bq_idx.shape[0])
+        # The block bound `max_steps` is sized from, checked directly (the
+        # array itself is rounded up to a multiple of 1024).
+        blocks = 0
+        for start in starts:
+            lo = np.clip(start, cu_q_lens[:-1], cu_q_lens[1:])
+            hi = np.clip(start + chunk_tokens, cu_q_lens[:-1], cu_q_lens[1:])
+            blocks += int(np.sum(-(-(hi - lo) // bq_sz)))
+        unchunked_bound = -(-max_tokens // bq_sz) + num_seqs
+        self.assertLessEqual(blocks, unchunked_bound + len(starts) - 1)
+        # Every step of every chunk is in the arrays and names a real block.
+        total = sum(expected)
+        tiles = np.array(meta_.batch_tile_idx)[:total]
+        self.assertTrue(np.all(np.array(meta_.bkv_idx)[:total] < num_bkv[tiles]))
+
     def test_empty_pass_returns_a_zero_per_chunk(self):
         """The empty branch has to agree with the schedule branch on shape."""
         meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
