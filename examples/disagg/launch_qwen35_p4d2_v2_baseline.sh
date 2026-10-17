@@ -120,8 +120,10 @@ prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP * PREFILL_PP))
 # A pipeline-parallel producer pairs KV pools with its peer by layer; both
 # engines must set this the same way.
 raiden_pool_tags_per_layer=0
+raiden_transfer_parallelism=4
 if [[ "${PREFILL_PP}" -gt 1 ]]; then
   raiden_pool_tags_per_layer=1
+  raiden_transfer_parallelism=$((PREFILL_PP * PREFILL_PCP))
 fi
 decode_sb_workers=$((DECODE_TP * DECODE_DP))
 prefill_sb_addresses=""
@@ -420,7 +422,7 @@ export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
 export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1;
 export TPU_RAIDEN_QWEN35_ADMISSION=1;
 export TPU_KV_RESHARD_TRANSPORT=raiden;
-export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
+export TPU_RAIDEN_TRANSFER_PARALLELISM=${raiden_transfer_parallelism};
 export TPU_RAIDEN_POOL_TAGS_PER_LAYER=${raiden_pool_tags_per_layer};
 EOF
 )

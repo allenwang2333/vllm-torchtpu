@@ -16,10 +16,10 @@
 # of a 2x2x4 slice, each host running as a lone 2x2x1 host
 # (single_host_engine.sh). Every host exits 0 so one failing variant does not
 # stop the others; each prints "VARIANT <name> rc=<rc>".
-#   0: PP4 prefill, Raiden disagg + offload (TPUMultiConnector)
-#   1: TP4 prefill, Raiden disagg + offload (TPUMultiConnector)
-#   2: PP4 prefill, Raiden disagg only
-#   3: idle
+#   0: one PP4 engine, no KV connector, no Raiden env
+#   1: PP4 prefill, Raiden disagg only, prefix caching off
+#   2: PP2 prefill, Raiden disagg only
+#   3: PP4 prefill, Raiden disagg + offload (TPUMultiConnector)
 #
 # ${WORKLOAD_NAME} and ${IMAGE} are substituted; a literal dollar is $$.
 
@@ -54,15 +54,17 @@ spec:
                     - |
                       set -o pipefail
                       case "$${JOB_COMPLETION_INDEX}" in
-                        0) variant=pp4_multi; export PREFILL_PP=4 OFFLOAD=1 ;;
-                        1) variant=tp4_multi; export PREFILL_PP=1 PREFILL_TP=4 OFFLOAD=1 ;;
-                        2) variant=pp4_disagg_only; export PREFILL_PP=4 OFFLOAD=0 ;;
-                        *) exit 0 ;;
+                        0) variant=pp4_standalone; export PREFILL_PP=4
+                           rig=run_qwen35_pp_standalone.sh ;;
+                        1) variant=pp4_disagg_no_prefix_cache
+                           export PREFILL_PP=4 OFFLOAD=0 ENABLE_PREFIX_CACHING=0 MAMBA_CACHE_MODE=none ;;
+                        2) variant=pp2_disagg_only; export PREFILL_PP=2 OFFLOAD=0 ;;
+                        3) variant=pp4_multi; export PREFILL_PP=4 OFFLOAD=1 ;;
                       esac
                       export RUN_ROOT="$${ARTIFACTS_DIR}/qwen35_$${variant}"
                       mkdir -p "$${RUN_ROOT}"
                       bash .buildkite/kubernetes/single_host_engine.sh \
-                        bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
+                        bash "./scripts/vllm/integration/$${rig:-run_qwen35_block_major_disagg_offload.sh}"
                       rc=$$?
                       echo "VARIANT $${variant} rc=$${rc}"
                       echo "VARIANT $${variant} rc=$${rc}" > "$${RUN_ROOT}/variant_result.txt"
@@ -74,6 +76,8 @@ spec:
                       value: perf_eval_results
                     - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
                       value: "1"
+                    - name: P4D2_CORRECTNESS_TIMEOUT
+                      value: "180"
                     - name: PREFILL_PCP
                       value: "1"
                     # The block-major pool refuses pipeline parallelism.
