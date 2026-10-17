@@ -226,8 +226,9 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     Speculative verify: the rows are one sequence's anchor and drafts;
     ``state_row`` (traced) picks the row whose input KDA state the sequence
     continues from. Every row's post-state and latent are committed; rejected
-    drafts lie past the next step's pool limit. ``defer_kda_commit`` (DP1
-    verifier): return per-row post-states; the caller commits accepted rows.
+    drafts lie past the next step's pool limit. ``defer_kda_commit``
+    (verifiers): return per-row post-states (under attention DP this group's
+    rows, shard-major); the caller commits accepted rows.
     """
     if tokens.shape != (batch_size,) or positions.shape != (batch_size,) or slots.shape != (batch_size,):
         raise ValueError("tokens, positions and slots must have one entry per row")
@@ -271,8 +272,6 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     # DP2 returns shard-major rows; commit each to its shard-bank index,
     # preserving untouched slots and ordered null-slot writes.
     if defer_kda_commit:
-        if dp != 1:
-            raise ValueError("deferred KDA commits currently require attention_dp=1")
         # Keep the input banks alive until acceptance. Return the native
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent

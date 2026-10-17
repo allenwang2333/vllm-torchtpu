@@ -138,6 +138,7 @@ def _route_hidden_states(
     on_local_selection,
     after_selection,
     after_scores=None,
+    after_score_send=None,
     live_rows=None,
 ):
     """Project and select local expert routes through one shared B1/B2 path.
@@ -179,6 +180,8 @@ def _route_hidden_states(
         device_id_type=pl.DeviceIdType.MESH,
     )
     copy.start()
+    if after_score_send is not None:
+        after_score_send()
     copy.wait()
 
     raw_scores = routing_scores_vmem[:, :expert_count]
@@ -847,6 +850,7 @@ def _run_routed_expert_stream(
     expert_width,
     expert_output_size,
     group_pending_routes,
+    progress=None,
 ):
     """Execute the next route shared by any ready batch rows.
 
@@ -1495,6 +1499,8 @@ def _run_routed_expert_stream(
             initial_second = next_expert(initial_processed | initial_first[3])
 
         def run_next_expert_pair(iteration, carry=None):
+          if progress is not None:
+            progress(iteration)
           with _phase("e_iteration"):
             select_scope = _phase_start("e_select")
             processed = processed_routes_vmem[:, :selected_expert_count] != 0
@@ -2198,6 +2204,8 @@ def moe(
     token_pipeline: bool = False,
     after_experts=None,
     after_routing_scores=None,
+    overlap_router_latent: bool = False,
+    overlap_shared_reduction: bool = False,
     prepare_weights_vmem=None,
     shared_gate_up_stream=None,
     token_scatter_owners: int = 4,
@@ -2466,6 +2474,10 @@ def moe(
         weights.start_routing_projection_copy()
     latent_output_copy = weights.make_latent_output_copy()
     overlap_latent_gather = selected_expert_count >= 12
+    overlap_router_latent = (
+        overlap_router_latent and overlap_latent_gather and owned_hidden_ref is None
+    )
+    overlap_shared_routing = overlap_router_latent and shared_sharded
     latent_slot = reduction_phase[0] % 2
 
     def latent_copy(offset):
@@ -2571,8 +2583,40 @@ def moe(
 
             prefetched_expert_count += should_prefetch
 
+        def overlap_router_score_exchange():
+            # Latent projection reads hidden states, not router scores. Its
+            # MXU work can run while the score halves move between chip cores.
+            start_latent_gather(latent_input_projection_vmem, latent_input_copy)
+
+        def prepare_shared_compute():
+            if shared_gate_up_stream is not None:
+                shared_gate_up = shared_gate_up_stream.dot(
+                    hidden, communication_workspace.reduction_phase[0] >= 0
+                ).astype(jnp.bfloat16).astype(jnp.float32)
+            else:
+                dense_copies.gate_up.wait()
+                shared_gate_up = _dot(
+                    hidden, shared_gate_up_projection_vmem[...]
+                ).astype(jnp.bfloat16).astype(jnp.float32)
+            middle = _gated_activation(
+                shared_gate_up[:, :shared_width],
+                shared_gate_up[:, shared_width:],
+            )
+            if not overlap_shared_routing:
+                dense_copies.down.wait()
+            if shared_sharded:
+                # The routed outputs are zeroed by the expert stream; until then
+                # they hold the BF16 activation (exact in FP32).
+                routed_outputs_vmem[:, :shared_width] = middle.astype(jnp.float32)
+            else:
+                shared_outputs_vmem[...] = _dot(
+                    middle, shared_down_projection_vmem[...]
+                )
+
         def overlap_routing_with_latent_gather(selection):
-            if selection == 3 and overlap_latent_gather:
+            if overlap_shared_routing and selection == 7:
+                prepare_shared_compute()
+            if selection == 3 and overlap_latent_gather and not overlap_router_latent:
                 start_latent_gather(
                     latent_input_projection_vmem,
                     latent_input_copy,
@@ -2617,6 +2661,9 @@ def moe(
                 on_local_selection=prefetch_shared_route_prefix,
                 after_selection=overlap_routing_with_latent_gather,
                 after_scores=after_routing_scores,
+                after_score_send=(
+                    overlap_router_score_exchange if overlap_router_latent else None
+                ),
                 live_rows=live_rows,
             )
         )
@@ -2651,28 +2698,10 @@ def moe(
             )
             wait_for_latent_gather()
 
-        if shared_gate_up_stream is not None:
-            shared_gate_up = shared_gate_up_stream.dot(
-                hidden, communication_workspace.reduction_phase[0] >= 0
-            ).astype(jnp.bfloat16).astype(jnp.float32)
+        if overlap_shared_routing:
+            dense_copies.down.wait()
         else:
-            dense_copies.gate_up.wait()
-            shared_gate_up = _dot(
-                hidden, shared_gate_up_projection_vmem[...]
-            ).astype(jnp.bfloat16).astype(jnp.float32)
-        middle = _gated_activation(
-            shared_gate_up[:, :shared_width],
-            shared_gate_up[:, shared_width:],
-        )
-        dense_copies.down.wait()
-        if shared_sharded:
-            # The routed outputs are zeroed by the expert stream; until then
-            # they hold the BF16 activation (exact in FP32).
-            routed_outputs_vmem[:, :shared_width] = middle.astype(jnp.float32)
-        else:
-            shared_outputs_vmem[...] = _dot(
-                middle, shared_down_projection_vmem[...]
-            )
+            prepare_shared_compute()
 
     if prepare_weights_vmem is not None:
         latent_down_vmem, shared_gate_up_vmem, shared_down_vmem = prepare_weights_vmem
@@ -3003,8 +3032,10 @@ def moe(
         if after_experts is not None:
             after_experts()
 
+        # The polled path completes this during or immediately after experts.
         t2 = _phase_start("t2_shared_local")
-        finish_shared_reduction(shared_transport_payload)
+        if not overlap_shared_reduction:
+            finish_shared_reduction(shared_transport_payload)
         _phase_end(t2)
 
         if reduce_scatter_routed_output:
@@ -3038,6 +3069,13 @@ def moe(
             )
             for offset in range(7, 0, -1):
                 expert_copy(lane_payload, offset).start()
+            if overlap_shared_reduction and not token_pipeline:
+                # Shared-output conversion/reduction is independent of the
+                # routed gather and uses a separate transport buffer.
+                with _phase("t6_shared_during_routed_gather"):
+                    finish_shared_host_reduction(
+                        shared_transport_payload, reduced_shared_outputs
+                    )
             if token_pipeline:
                 # The shared contribution must be ready before a completed
                 # routed tile can finish its latent-up/add. Its local sends
@@ -3083,11 +3121,12 @@ def moe(
                     )
                 )
                 _phase_end(t5)
-                t6 = _phase_start("t6_shared_host")
-                finish_shared_host_reduction(
-                    shared_transport_payload, reduced_shared_outputs
-                )
-                _phase_end(t6)
+                if not overlap_shared_reduction:
+                    t6 = _phase_start("t6_shared_host")
+                    finish_shared_host_reduction(
+                        shared_transport_payload, reduced_shared_outputs
+                    )
+                    _phase_end(t6)
             reduction_phase[0] += 2
             return
         for offset in range(7, 0, -1):
@@ -3126,29 +3165,83 @@ def moe(
         begin_shared_reduction(shared_outputs_vmem[...])
     if overlap_latent_gather:
         wait_for_latent_gather()
-    with _phase("p4_experts"):
-      _run_routed_expert_stream(
-        latent_vmem,
-        selected_experts_vmem[:, :selected_expert_count],
-        selected_probabilities_vmem[:, :selected_expert_count],
-        local_route_counts_vmem[:, 0],
-        probability_totals_vmem[:, 0],
-        expert_gate_up_vmem,
-        expert_gate_up_scale_vmem,
-        expert_down_vmem,
-        expert_down_scale_vmem,
-        routed_outputs_vmem,
-        gate_up_accumulator_vmem,
-        down_accumulator_vmem,
-        processed_routes_vmem,
-        first_compact_source_vmem,
-        second_compact_source_vmem,
-        copy_expert,
-        expert_input_size=expert_input_size,
-        expert_width=expert_width,
-        expert_output_size=expert_output_size,
-        group_pending_routes=group_pending_expert_routes,
-    )
+    def run_with_shared_progress(progress_state):
+        progress_state[0] = 0
+        payload = batch_size * (shared_shard_payload if reduce_scatter_shared_output else shared_payload)
+        # Seven copies, each with its own send/receive semaphore. DMA counters
+        # count 32-byte units; both ends must be complete before reusing sources.
+        expected = payload * 128 * 4 // 32
+
+        def poll_shared(iteration):
+            @pl.when((progress_state[0] == 0) & (iteration % 4 == 0))
+            def try_progress():
+                ready = jnp.bool_(True)
+                for peer in range(7):
+                    ready = ready & (pl.semaphore_read(shared_send_semaphores.at[peer]) >= expected)
+                    ready = ready & (pl.semaphore_read(shared_receive_semaphores.at[peer]) >= expected)
+                @pl.when(ready)
+                def advance():
+                    with _phase("t2_shared_local_polled"):
+                        finish_shared_reduction(payload)
+                    progress_state[0] = 1
+
+        with _phase("p4_experts"):
+            _run_routed_expert_stream(
+            latent_vmem,
+            selected_experts_vmem[:, :selected_expert_count],
+            selected_probabilities_vmem[:, :selected_expert_count],
+            local_route_counts_vmem[:, 0],
+            probability_totals_vmem[:, 0],
+            expert_gate_up_vmem,
+            expert_gate_up_scale_vmem,
+            expert_down_vmem,
+            expert_down_scale_vmem,
+            routed_outputs_vmem,
+            gate_up_accumulator_vmem,
+            down_accumulator_vmem,
+            processed_routes_vmem,
+            first_compact_source_vmem,
+            second_compact_source_vmem,
+            copy_expert,
+            expert_input_size=expert_input_size,
+            expert_width=expert_width,
+            expert_output_size=expert_output_size,
+            group_pending_routes=group_pending_expert_routes,
+            progress=poll_shared,
+            )
+        @pl.when(progress_state[0] == 0)
+        def drain_shared():
+            with _phase("t2_shared_local_drain"):
+                finish_shared_reduction(payload)
+            progress_state[0] = 1
+
+    if overlap_shared_reduction:
+        pl.run_scoped(run_with_shared_progress, progress_state=tpu.SMEM((1,), jnp.int32))
+    else:
+        with _phase("p4_experts"):
+            _run_routed_expert_stream(
+            latent_vmem,
+            selected_experts_vmem[:, :selected_expert_count],
+            selected_probabilities_vmem[:, :selected_expert_count],
+            local_route_counts_vmem[:, 0],
+            probability_totals_vmem[:, 0],
+            expert_gate_up_vmem,
+            expert_gate_up_scale_vmem,
+            expert_down_vmem,
+            expert_down_scale_vmem,
+            routed_outputs_vmem,
+            gate_up_accumulator_vmem,
+            down_accumulator_vmem,
+            processed_routes_vmem,
+            first_compact_source_vmem,
+            second_compact_source_vmem,
+            copy_expert,
+            expert_input_size=expert_input_size,
+            expert_width=expert_width,
+            expert_output_size=expert_output_size,
+            group_pending_routes=group_pending_expert_routes,
+            progress=None,
+            )
 
     def consume_routed_chunk(first, rows):
         with _phase("t7_pipeline_latent_up"):
@@ -4095,7 +4188,7 @@ def kda(
                 )
                 recurrent_state = (
                     recurrent_state_ref[rows] if state_ref is None else state_ref[...]
-                )
+                ).astype(jnp.float32)
                 convolution_window = jnp.concatenate(
                     (convolution_history, queries_keys_values[rows][:, None]), axis=1
                 )
@@ -4123,10 +4216,10 @@ def kda(
                 attended_rows = jnp.sum(query[..., None] * next_recurrent_state, axis=2)
                 if history_ref is None:
                     updated_convolution_history_ref[rows, :, :, :head_count] = convolution_window[:, 1:]
-                    updated_recurrent_state_ref[rows] = next_recurrent_state
+                    updated_recurrent_state_ref[rows] = next_recurrent_state.astype(updated_recurrent_state_ref.dtype)
                 else:
                     history_ref[:, :, :, :head_count] = convolution_window[:, 1:]
-                    state_ref[...] = next_recurrent_state
+                    state_ref[...] = next_recurrent_state.astype(state_ref.dtype)
                 return attended_rows
 
             _phase_end(kda_scope.pop())
@@ -4185,6 +4278,7 @@ def kda(
                 window = jnp.concatenate(
                     (history, queries_keys_values[first : first + sequence_rows]), axis=0
                 )
+                state = state.astype(jnp.float32)
                 rows = []
                 for offset in range(sequence_rows):
                     row = first + offset
@@ -4214,7 +4308,11 @@ def kda(
                     )
                     state = state + key[..., None] * state_update[:, None, :]
                     rows.append(jnp.sum(query[..., None] * state, axis=1)[None])
-                    store(offset, window[offset + 1 : offset + 4], state)
+                    # Match separate decode steps: the current output uses
+                    # FP32 updated state, but the next token sees stored state.
+                    saved_state = state.astype(recurrent_state_ref.dtype)
+                    store(offset, window[offset + 1 : offset + 4], saved_state)
+                    state = saved_state.astype(jnp.float32)
                 return rows
 
             if state_stream is None:
@@ -4539,7 +4637,8 @@ def mla(
     # invalid; timing only.
     dcp_skip = _config().dcp_skip
     dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, batch_size, sequence_rows=sequence_rows,
-                                         skip=dcp_skip)
+                                         skip=dcp_skip,
+                                         cache_verify_rows=sequence_rows > 1 and dcp[0].dtype == jnp.float8_e4m3fn)
     dcp_attention.prime()
 
     if "query_down" in streams:
@@ -4719,10 +4818,12 @@ def mla_dcp_shards(
     communication_workspace: AttentionCommunicationWorkspace,
     dcp,
     epsilon: float = 1e-5,
+    sequence_rows: int = 1,
 ) -> None:
     """One MLA layer of attention DP under DCP: the rank's held TP32 shards
     (3 heads each) attend in one ``mla_dcp.DcpAttention`` call over the DP
     group's latent pages, so a page is read once for every held head.
+    ``sequence_rows`` as in :func:`mla`, over the group's rows.
 
     The q/kv latents are computed once; each shard's queries come from its
     chunk of the query-up stream and are absorbed with its W_UK columns (the
@@ -4747,7 +4848,8 @@ def mla_dcp_shards(
 
     for name in ("query_up", "key_value_up", "output_gate"):
         start_copy(name)
-    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards)
+    dcp_attention = mla_dcp.DcpAttention(*dcp, position_ref, rows, skip=_config().dcp_skip, heads=3 * shards,
+                                         sequence_rows=sequence_rows)
     dcp_attention.prime()
     scope = _phase_start("q6_mla_projections")
     if "query_down" in streams:
@@ -5338,6 +5440,79 @@ def _router_copy(weight, buffer, sems, wait, *, initialize_padding=True):
         copy.wait() if wait else copy.start()
 
 
+def _dense_scatter_rows(partial, output, local, hosts, sends, recvs, owners):
+    """Reduce the dense layer directly to its token owners.
+
+    Preserve the original BF16 wire format, local eight-rank sum and four-host
+    sum, including their rounding points. Each owner consumes eight rows per
+    round instead of every rank reducing the entire batch and discarding most
+    rows. Pack each owner's source once; the two ranks in each owner pair send
+    and receive identical logical row ranges.
+    """
+    rank = jax.lax.axis_index("tp")
+    lane, host = rank % 8, rank // 8
+    owned_rows = partial.shape[0] // owners
+    hidden = partial.shape[1]
+    wire_rows = 8 * hidden // 128
+    payload = wire_rows // 2
+    assert owned_rows % 8 == 0 and 8 % owners == 0
+    assert payload <= local.shape[1] and payload <= hosts.shape[1]
+
+    def reduce_owned(wires):
+        def encode(value):
+            packed = tpu.bitcast(
+                value.reshape(wire_rows, 128).astype(jnp.bfloat16), jnp.uint32
+            )
+            return jax.lax.bitcast_convert_type(packed, jnp.float32)
+
+        def decode(value):
+            unpacked = tpu.bitcast(
+                jax.lax.bitcast_convert_type(value, jnp.uint32), jnp.bfloat16
+            ).astype(jnp.float32)
+            return jnp.sum(unpacked, axis=0).reshape(8, hidden)
+
+        for first in range(0, owned_rows, 8):
+            if first:
+                collectives32.barrier()
+            for owner in range(owners):
+                start = owner * owned_rows + first
+                wires[owner] = encode(partial[start : start + 8])
+            local[lane, :payload] = wires[lane // (8 // owners)]
+            copies = []
+            for offset in range(7, 0, -1):
+                copy = tpu.make_async_remote_copy(
+                    wires.at[(lane ^ offset) // (8 // owners)],
+                    local.at[lane, :payload],
+                    sends.at[offset - 1],
+                    recvs.at[offset - 1],
+                    device_id=(rank ^ offset,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                copy.start()
+                copies.append(copy)
+            for copy in copies:
+                copy.wait()
+            hosts[host, :payload] = encode(decode(local[:, :payload]))
+            copies = []
+            for offset in range(3, 0, -1):
+                view = hosts.at[host, :payload]
+                copy = tpu.make_async_remote_copy(
+                    view,
+                    view,
+                    sends.at[6 + offset],
+                    recvs.at[6 + offset],
+                    device_id=(rank ^ (8 * offset),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                copy.start()
+                copies.append(copy)
+            for copy in copies:
+                copy.wait()
+            output[first : first + 8] = decode(hosts[:, :payload]).astype(jnp.bfloat16)
+
+    pl.run_scoped(reduce_owned, tpu.VMEM((owners, payload, 128), jnp.float32))
+
+
 def _all_reduce_rows(partial, local, hosts, sends, recvs):
     """TP32 sum of an FP32 ``[batch, hidden]`` partial on every rank.
 
@@ -5388,6 +5563,83 @@ def _all_reduce_rows(partial, local, hosts, sends, recvs):
     encode(decode(local[:, :payload, :]), hosts.at[host])
     exchange(hosts, host, range(3, 0, -1), 8, 6)
     return decode(hosts[:, :payload, :])
+
+
+def _gather_sp8_local_rows(row, out, local, sends, recvs):
+    """Eight owners directly feed the existing pre-attention all-gather."""
+    rank = jax.lax.axis_index("tp")
+    owner = rank % 8
+    rows, hidden = row.shape
+    payload = rows * hidden // 128
+    assert rows == 8 and payload % 16 == 0
+    slots = 2 * local.shape[0] * local.shape[1] // payload
+    assert slots >= 32
+    wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
+    source = wires.at[owner]
+    source[...] = row.reshape(payload, 128)
+    copies = []
+    for offset in range(7, 0, -1):
+        copy = tpu.make_async_remote_copy(
+            source, source, sends.at[offset - 1], recvs.at[offset - 1],
+            device_id=(rank ^ offset,), device_id_type=pl.DeviceIdType.MESH,
+        )
+        copy.start()
+        copies.append(copy)
+    for copy in copies:
+        copy.wait()
+    for pair in range(4):
+        out[pair * 16:(pair + 1) * 16] = jnp.concatenate(
+            (wires[2 * pair].reshape(rows, hidden),
+             wires[2 * pair + 1].reshape(rows, hidden)), axis=0)
+
+
+def _gather_sp8_dp_moe_rows(row, owned_out, out, local, sends, recvs):
+    """DP2 MoE-input all-gather, eight owners, existing pair-major ABI out.
+
+    Payload slots are relative (DP group XOR, local core XOR). The upper
+    half of the existing transport allocation is disjoint from pre gather.
+    No separate pair reconstruction collective is needed.
+    """
+    rank = jax.lax.axis_index("tp")
+    group, owner = rank // 16, rank % 8
+    rows, hidden = row.shape
+    payload = rows * hidden // 128
+    assert rows == 8 and payload % 16 == 0
+    slots = 2 * local.shape[0] * local.shape[1] // payload
+    base = slots // 2
+    assert base >= 16
+    wires = pool_alias.view(local, (slots, payload, 128), jnp.bfloat16)
+
+    def wire(o, k):
+        return wires.at[base + 8 * o + k]
+
+    def send(source, o, k, semaphore, *, local_only=False):
+        copy = tpu.make_async_remote_copy(
+            source, wire(o, k), sends.at[semaphore], recvs.at[semaphore],
+            device_id=(rank ^ (0 if local_only else 16 * o) ^ k,), device_id_type=pl.DeviceIdType.MESH,
+        )
+        copy.start()
+        return copy
+
+    wire(0, 0)[...] = row.reshape(payload, 128)
+    local_copies = [send(wire(0, 0), 0, k, 7) for k in range(1, 8)]
+    group_copy = send(wire(0, 0), 1, 0, 8)
+    group_copy.wait_recv()
+    forwarded = [send(wire(1, 0), 1, k, 9, local_only=True) for k in range(1, 8)]
+    group_copy.wait_send()
+    for copy in (*local_copies, *forwarded):
+        copy.wait()
+    for d in range(2):
+        for p in range(4):
+            even = wire(group ^ d, owner ^ (2 * p))[...].reshape(rows, hidden)
+            odd = wire(group ^ d, owner ^ (2 * p + 1))[...].reshape(rows, hidden)
+            first = (2 * p + d) * 16
+            out[first:first + 16] = jnp.concatenate((even, odd), axis=0)
+        own = wire(group ^ d, 0)[...].reshape(rows, hidden)
+        peer = wire(group ^ d, 1)[...].reshape(rows, hidden)
+        owned_out[d * 16:(d + 1) * 16] = jnp.where(
+            owner % 2 == 0, jnp.concatenate((own, peer), axis=0),
+            jnp.concatenate((peer, own), axis=0))
 
 
 def _gather_local_pair_rows(source, destination, sends, recvs, scratch=None, owners=4,
@@ -6159,14 +6411,14 @@ def stack(
         batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
         and batch_size % (sp_owners * attention_dp) == 0
         and sequence_parallel_pre_attention
-        and sequence_rows == 1
+        and (batch_size // attention_dp) % sequence_rows == 0
         and not select_state_row
         and POOLED_WEIGHTS
     ):
         raise ValueError(
             "Attention DP needs a supported batch divisible by 4*DP, the "
-            "sequence-parallel token-scatter layout, one row per sequence "
-            "and pooled weights"
+            "sequence-parallel token-scatter layout, whole sequences in each "
+            "group's rows and pooled weights"
         )
     if attention_dp_ownership and (
         attention_dp == 1
@@ -6608,11 +6860,17 @@ def stack(
             copy.wait()
             initialize_blocks(embedding_vmem)
 
-        pl.run_scoped(
-            staged_blocks,
-            tpu.VMEM(embedding_ref.shape, embedding_ref.dtype),
-            tpu.SemaphoreType.DMA,
-        )
+        # With layer zero included, its pre-mixture has no active snapshots.
+        # That layer seeds snapshot zero from prefix before any later read.
+        # Keep all snapshot slots zero-initialized so masked arithmetic stays
+        # finite; only omit the redundant embedding DMA and row insertion.
+        if not (include_layer_zero and attention_dp == 2
+                and batch_size in (64, 128) and sequence_rows == 1):
+            pl.run_scoped(
+                staged_blocks,
+                tpu.VMEM(embedding_ref.shape, embedding_ref.dtype),
+                tpu.SemaphoreType.DMA,
+            )
 
         def owner_indices(pair):
             return (pair,) if owner_generic else range(sp_owners)
@@ -6689,6 +6947,17 @@ def stack(
             hidden_size,
         ) if attention_dp_ownership else None
 
+        sp8_residual = (attention_dp_ownership and attention_dp == 2
+                        and batch_size == 128 and sequence_rows == 1)
+        # Expert/projection ABIs retain their existing pair ownership. Only
+        # mixture rows and the following gathers use eight independent owners.
+        sp8_rows_vmem = dp_owned_vmem if sp8_residual else None
+
+        def sp8_owned_value():
+            value = sp8_rows_vmem[...]
+            return jnp.where(jax.lax.axis_index("tp") % 2 == 0,
+                             value[:8], value[8:16])
+
         def mix_dp_rows(folded, active_blocks, *, layer_index,
                         attention_output=False, start_block=False):
             rows = slice(0, dp_held_rows)
@@ -6709,7 +6978,22 @@ def stack(
                     relaxed_reduction_order=residual_reduction_order == "relaxed",
                 )
 
-            store_mixed_rows(mix_row, normalized_vmem if start_block and kda_shard_swap else dp_owned_vmem)
+            if sp8_residual:
+                # RMS keeps a native 16-row geometry; initialize unused rows
+                # rather than reading undefined scratch on the first layer.
+                sp8_rows_vmem[...] = jnp.zeros((16, hidden_size), jnp.bfloat16)
+                for lane in range(2):
+                    @pl.when(jax.lax.axis_index("tp") % 2 == lane)
+                    def mix_half(lane=lane):
+                        for local_row in range(8):
+                            @pl.when(communication_workspace.reduction_phase[0] >= 0)
+                            def store_row(local_row=local_row):
+                                row = lane * 8 + local_row
+                                # Index the full transformed view directly,
+                                # avoiding an unsupported nested half-row view.
+                                sp8_rows_vmem[pl.ds(row, 1)] = mix_row(row)
+            else:
+                store_mixed_rows(mix_row, normalized_vmem if start_block and kda_shard_swap else dp_owned_vmem)
             if start_block:
                 @pl.when(layer_index % 12 == 0)
                 def snapshot():
@@ -6720,7 +7004,12 @@ def stack(
                             mask == layer_index // 12, prefix_vmem[row : row + 1], half[...],
                         )
 
-        def normalize_dp_rows(scale):
+        def normalize_dp_rows(scale, *, split=False):
+            if split:
+                # Preserve the 16-row normalization geometry. Unowned rows
+                # are not communicated or consumed by any later computation.
+                normalize(sp8_rows_vmem, scale)
+                return
             if batch_size != 64:
                 normalize(dp_owned_vmem, scale)
                 return
@@ -6787,7 +7076,14 @@ def stack(
 
             return rows
 
-        def gather_dp_rows(destination):
+        def gather_dp_rows(destination, *, split=False):
+            if split:
+                _gather_sp8_dp_moe_rows(
+                    sp8_owned_value(), owned_rows_vmem, destination,
+                    communication_workspace.shared_local_reduction_vmem,
+                    communication_workspace.send_semaphores,
+                    communication_workspace.receive_semaphores)
+                return
             # Restore the router's owned input as well as the complete MoE
             # input. No arithmetic occurs after normalization. Scratch lanes
             # 4..7 for DP transport are disjoint from local-gather lanes 0..3.
@@ -7215,15 +7511,21 @@ def stack(
                     data_group == 0, rows[:group_rows], rows[group_rows:]
                 )
             elif attention_dp_ownership:
-                normalize_dp_rows(attention_norm_vmem)
+                normalize_dp_rows(attention_norm_vmem, split=sp8_residual)
                 with _phase("t0_dp_group_gather"):
-                    _gather_local_pair_rows(
-                        dp_owned_vmem, group_input_vmem,
-                        communication_workspace.send_semaphores,
-                        communication_workspace.receive_semaphores,
-                        communication_workspace.shared_local_reduction_vmem,
-                        packed=True,
-                    )
+                    if sp8_residual:
+                        _gather_sp8_local_rows(
+                            sp8_owned_value(), group_input_vmem,
+                            communication_workspace.shared_local_reduction_vmem,
+                            communication_workspace.send_semaphores,
+                            communication_workspace.receive_semaphores)
+                    else:
+                        _gather_local_pair_rows(
+                            dp_owned_vmem, group_input_vmem,
+                            communication_workspace.send_semaphores,
+                            communication_workspace.receive_semaphores,
+                            communication_workspace.shared_local_reduction_vmem,
+                            packed=True)
             elif sequence_parallel_pre_attention and attention_dp > 1:
                 # The group's attention input: each local pair contributes its
                 # owned row 2p + d.
@@ -7374,6 +7676,7 @@ def stack(
                                     if overlap_kda_state_writes and order == attention_dp - 1
                                     else None
                                 ),
+                                sequence_rows=sequence_rows,
                                 streams=streams,
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
@@ -7475,6 +7778,7 @@ def stack(
                                 chunk=kda_row_chunk,
                                 chunks=attention_dp * chunks_per_shard,
                                 slots=slots_ref if slot_reads else None,
+                                sequence_rows=sequence_rows,
                             )
                             shared_state_stream.prime()
                         for shard in range(attention_dp):
@@ -7497,6 +7801,7 @@ def stack(
                                     chunk=kda_row_chunk,
                                     chunks=chunks_per_shard,
                                     slots=slots_ref.at[rows] if slot_reads else None,
+                                    sequence_rows=sequence_rows,
                                 )
                                 state_stream.prime()
                             else:
@@ -7535,6 +7840,7 @@ def stack(
                                 epsilon=eps,
                                 synchronize_devices=False,
                                 weights_are_prefetched=True,
+                                sequence_rows=sequence_rows,
                                 streams=streams,
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
@@ -7756,6 +8062,7 @@ def stack(
                                 mla_dcp.DcpWorkspace(*dcp_persistent, *dcp_scoped),
                             ),
                             epsilon=eps,
+                            sequence_rows=sequence_rows,
                         )
                     else:
                         mla(
@@ -7848,10 +8155,10 @@ def stack(
                         mlp_residual_vmem, layer_index // 12 + 1,
                         layer_index=layer_index, attention_output=True,
                     )
-                normalize_dp_rows(ffn_norm_vmem)
+                normalize_dp_rows(ffn_norm_vmem, split=sp8_residual)
                 _phase_end(post_scope)
                 with _phase("t10_moe_input_gather"):
-                    gather_dp_rows(normalized_vmem)
+                    gather_dp_rows(normalized_vmem, split=sp8_residual)
             elif attention_token_scatter:
                 rank = jax.lax.axis_index("tp")
                 pair = (rank % 8) // (8 // sp_owners)
@@ -8083,6 +8390,8 @@ def stack(
                     ),
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
+                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and sequence_rows == 1),
+                    overlap_shared_reduction=(attention_dp == 2 and batch_size in (64, 128) and sequence_rows == 1),
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
                     token_pipeline=moe_token_pipeline,
@@ -8243,27 +8552,35 @@ def stack(
                         communication_workspace.receive_semaphores,
                     )
 
-                reduced = jnp.concatenate(
-                    [reduce_half(first) for first in range(0, batch_size, 8)],
-                    axis=0,
-                ) if batch_size > 8 else _all_reduce_rows(
-                    accumulator,
-                    communication_workspace.shared_local_reduction_vmem,
-                    communication_workspace.shared_host_reduction_vmem,
-                    communication_workspace.send_semaphores,
-                    communication_workspace.receive_semaphores,
-                )
-                if moe_token_scatter_output:
-                    rank = jax.lax.axis_index("tp")
-                    pair = (rank % 8) // (8 // sp_owners)
-                    for owner_pair in range(sp_owners):
-                        @pl.when(pair == owner_pair)
-                        def store_owned_dense_rows():
-                            owned_rows_vmem[...] = reduced[
-                                owner_pair * owned_rows : (owner_pair + 1) * owned_rows
-                            ].astype(jnp.bfloat16)
+                if (moe_token_scatter_output and attention_dp == 2
+                        and sp_owners == 4 and batch_size in (64, 128) and sequence_rows == 1):
+                    _dense_scatter_rows(accumulator,owned_rows_vmem,
+                        communication_workspace.shared_local_reduction_vmem,
+                        communication_workspace.shared_host_reduction_vmem,
+                        communication_workspace.send_semaphores,
+                        communication_workspace.receive_semaphores,sp_owners)
                 else:
-                    mixture_vmem[...] = reduced.astype(jnp.bfloat16)
+                    reduced = jnp.concatenate(
+                        [reduce_half(first) for first in range(0, batch_size, 8)],
+                        axis=0,
+                    ) if batch_size > 8 else _all_reduce_rows(
+                        accumulator,
+                        communication_workspace.shared_local_reduction_vmem,
+                        communication_workspace.shared_host_reduction_vmem,
+                        communication_workspace.send_semaphores,
+                        communication_workspace.receive_semaphores,
+                    )
+                    if moe_token_scatter_output:
+                        rank = jax.lax.axis_index("tp")
+                        pair = (rank % 8) // (8 // sp_owners)
+                        for owner_pair in range(sp_owners):
+                            @pl.when(pair == owner_pair)
+                            def store_owned_dense_rows():
+                                owned_rows_vmem[...] = reduced[
+                                    owner_pair * owned_rows : (owner_pair + 1) * owned_rows
+                                ].astype(jnp.bfloat16)
+                    else:
+                        mixture_vmem[...] = reduced.astype(jnp.bfloat16)
 
             if aux_capture == "mixture_input":
                 capture_aux_hidden(normalized_vmem)

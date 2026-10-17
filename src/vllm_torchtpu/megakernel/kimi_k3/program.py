@@ -23,6 +23,8 @@ HIDDEN_SIZE = 7168
 VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts
 SPEC_BATCHES = (1, 2, 4, 8, 16)  # the batched speculation's compiled request counts
+# Attention DP2's compiled request counts: half of each are one group's.
+DP_SPEC_BATCHES = (2, 4, 8, 16, 32)
 MAX_STEP_TOKENS = 8192  # the prefill's largest window
 # Sampling parameters the ops implement (beyond greedy): temperature, top-p,
 # top-k and a per-request seed, on both roles.
@@ -30,8 +32,9 @@ SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})
 
 _SPEC_SUPPORT = (
     f"3 or {DRAFT_TOKENS} drafts at batches 1-8, and 3 at batches "
-    f"9-{max(SPEC_BATCHES)} through the compiled "
-    f"speculation batches {SPEC_BATCHES} (up to --max-num-seqs), 0 anywhere"
+    f"9-{max(SPEC_BATCHES)} (attention DP2: 9-{max(DP_SPEC_BATCHES)}) through "
+    f"the compiled speculation batches {SPEC_BATCHES} (attention DP2: "
+    f"{DP_SPEC_BATCHES}; up to --max-num-seqs), 0 anywhere"
 )
 
 
@@ -43,10 +46,14 @@ def kernel_modules(*names: str) -> list[Any]:
     ]
 
 
-def supports_spec_tokens(batch: int, drafts: int) -> bool:
-    """Widths supported by the single and batched verifier/drafter."""
+def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool:
+    """Widths supported by the single and batched verifier/drafter (under
+    attention DP2 three drafts up to 32 requests: a 128-row verify, drafted
+    in parts)."""
+    largest = max(DP_SPEC_BATCHES if attention_dp > 1 else SPEC_BATCHES)
     return drafts == 0 or (
-        1 <= batch <= 16 and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
+        1 <= batch <= largest
+        and (drafts == 3 or (batch <= 8 and drafts == DRAFT_TOKENS))
     )
 
 
@@ -105,10 +112,12 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
         k = dense[b]
         if k == 0:
             continue
-        supported = supports_spec_tokens(b, k)
-        if b > 1 and supported:
+        supported = supports_spec_tokens(b, k, config.attention_dp)
+        if b > 1 and supported and config.attention_dp == 1:
             # A batched verify holds b requests only through a compiled
-            # speculation batch, itself no wider than --max-num-seqs.
+            # speculation batch, itself no wider than --max-num-seqs. (Attention
+            # DP's plan rows, a DP batch size, hold every DP_SPEC_BATCHES entry
+            # up to --max-num-seqs.)
             supported = any(b <= s <= max_seqs for s in SPEC_BATCHES)
         if not supported:
             given = (
@@ -125,9 +134,30 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
     return tuple(dense)
 
 
+def recurrent_state_dtype(cache_dtype: str) -> str:
+    """Decode bank storage; auto preserves FP32 independently of model dtype.
+
+    Prefill and the connector retain their FP32 state format. The importer
+    casts that state once to the decoder bank's dtype.
+    """
+    if cache_dtype not in ("auto", "float32", "bfloat16"):
+        raise ValueError(
+            "K3 megakernel --mamba-ssm-cache-dtype supports auto, float32, "
+            f"or bfloat16, not {cache_dtype!r}"
+        )
+    return "float32" if cache_dtype == "auto" else cache_dtype
+
+
 def check(config: MegakernelEngineConfig) -> None:
     """Raise ``NotImplementedError`` for a configuration the K3 programs
     do not implement."""
+    recurrent_state_dtype(config.mamba_ssm_cache_dtype)
+    if config.role == "prefill" and config.mamba_ssm_cache_dtype == "bfloat16":
+        raise NotImplementedError(
+            "K3 megakernel --mamba-ssm-cache-dtype bfloat16 is decode-only; "
+            "the prefill worker requires auto or float32 for its FP32 state "
+            "and transfer format"
+        )
     if config.role not in ("prefill", "decode"):
         raise NotImplementedError(
             f"the K3 megakernel serves one role of a P/D pair, not {config.role!r}"
@@ -147,10 +177,6 @@ def check(config: MegakernelEngineConfig) -> None:
         raise NotImplementedError(
             f"the K3 megakernel needs --decode-context-parallel-size {dcp}"
             + (f" under attention_dp {config.attention_dp}" if dcp != DCP_SIZE else "")
-        )
-    if config.attention_dp > 1 and config.num_speculative_tokens:
-        raise NotImplementedError(
-            "the K3 decoder under attention DP does not speculate"
         )
     from vllm_torchtpu.megakernel.kimi_k3.layout import cache_layout
 
@@ -249,9 +275,9 @@ def build(
     dense = spec_tokens_per_batch(config)
     draft = None
     if draft_checkpoint is not None and dense is not None and any(dense):
-        from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
+        from vllm_torchtpu.megakernel.kimi_k3.draft import draft_class
 
-        draft = DsparkDraft(
+        draft = draft_class(draft_checkpoint)(
             max_position=config.max_model_len + 16,
             checkpoint=str(draft_checkpoint),
             presharded=Path(presharded),
@@ -267,5 +293,6 @@ def build(
         presharded,
         num_slots=Control.total_slots(sub_base) if draft else sub_base,
         batch_sizes=decode_batch_sizes(config.max_num_seqs),
+        mamba_ssm_cache_dtype=config.mamba_ssm_cache_dtype,
     )
     return KimiDecoder(config, ops, draft, tp_rank=tp_rank)

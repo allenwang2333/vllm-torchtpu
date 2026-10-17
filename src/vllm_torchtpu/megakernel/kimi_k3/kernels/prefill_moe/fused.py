@@ -170,21 +170,33 @@ def _metadata_steps(
     compact-capacity decision uniform before any conditional collective runs.
     """
     bits = (tokens * 16 - 1).bit_length()
-    shape = (128, 16)
+    shape = (128, 16) if tokens < 4096 else (16, 128)
     expert_index = jnp.arange(56, dtype=jnp.int32)
     group_index = jnp.arange(16, dtype=jnp.int32)
-    slots = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
+    lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
     rows = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
     total_counts = jnp.zeros((56,), jnp.int32)
     total_groups = jnp.zeros((16,), jnp.int32)
     for chunk in range(tokens // 128):
-        records = wire[pl.ds(chunk * 32, 32), :].reshape(128, 32)
-        ids = records[:, :16]
-        probs = jax.lax.bitcast_convert_type(records[:, 16:], jnp.float32)
+        if tokens < 4096:
+            records = wire[pl.ds(chunk * 32, 32), :].reshape(128, 32)
+            ids = records[:, :16]
+            probs = jax.lax.bitcast_convert_type(records[:, 16:], jnp.float32)
+        else:
+            # Keep IDs and probabilities in separate planes so 128-token
+            # chunks need no interleaved-record reshape during metadata prep.
+            chunks_per_rank = tokens // 4096
+            rank_base = (chunk // chunks_per_rank) * (tokens // 128)
+            chunk_base = (chunk % chunks_per_rank) * 16
+            ids = wire[pl.ds(rank_base + chunk_base, 16), :]
+            probs = jax.lax.bitcast_convert_type(
+                wire[pl.ds(rank_base + tokens // 256 + chunk_base, 16), :],
+                jnp.float32,
+            )
         local = ids - (rank // 2 * 56)
         valid = (probs != 0) & (local >= 0) & (local < 56)
         local = jnp.where(valid, local, 56)
-        original_position = chunk * 2048 + rows * 16 + slots
+        original_position = chunk * 2048 + rows * shape[1] + lanes
         packed = (local << bits) | original_position
         keys[pl.ds(chunk * 16, 16), :] = packed.reshape(16, 128)
         probabilities[pl.ds(chunk * 16, 16), :] = probs.reshape(16, 128)
@@ -240,6 +252,37 @@ def _dense_panels(lhs, weights, buffers, semaphores, *, columns):
             panel * 256,
             jnp.matmul(lhs, buffers[bank][...], preferred_element_type=jnp.float32),
         )
+
+
+def _latent_half_pair_panels(lhs, weights, buffers, semaphores):
+    """Pair matching 256-column fragments of the two 1792-wide halves."""
+
+    def source_column(panel):
+        return (panel // 2) * 256 + (panel % 2) * 1792
+
+    def copy(panel):
+        return pltpu.make_async_copy(
+            weights.at[:, pl.ds(source_column(panel), 256)],
+            buffers[panel % 4],
+            semaphores[panel % 4],
+        )
+
+    for panel in range(2):
+        copy(panel).start()
+    for panel in range(0, 14, 2):
+        for j in range(2):
+            copy(panel + j).wait()
+        for j in range(2):
+            if panel + 2 + j < 14:
+                copy(panel + 2 + j).start()
+        products = [
+            jnp.matmul(
+                lhs, buffers[(panel + j) % 4][...], preferred_element_type=jnp.float32
+            )
+            for j in range(2)
+        ]
+        for j, product in enumerate(products):
+            yield source_column(panel + j), product
 
 
 def _route_gather_steps(payload, output, send, recv, *, rank):
@@ -409,6 +452,138 @@ def _latent_gather_steps(
     seed.wait()
 
 
+def _latent_ready_init(tables, payload, output, send, recv, stores, state, meta, *, rank):
+    """Seed twelve independently progressing streams of the 8K latent gather.
+
+    Cache neighbor IDs and owner row offsets in SMEM once. Each stream tracks
+    its hop and receive/forward/complete phase; state[0] counts active streams.
+    """
+    rows = payload.shape[0]
+    assert rows == 256
+    for directed in range(6):
+        family, direction = directed // 2, -1 if directed % 2 == 0 else 1
+        position = tables[family, 0, rank]
+        meta[directed * 34] = tables[family, 1, (position + direction) & 31]
+        meta[directed * 34 + 1] = tables[family, 1, (position - direction) & 31]
+
+        @pl.loop(0, 32)
+        def owners(step, *, family=family, position=position, direction=direction, directed=directed):
+            owner = tables[family, 1, (position - direction * step) & 31]
+            meta[directed * 34 + 2 + step] = owner * rows
+
+    pltpu.make_async_copy(payload, output.at[pl.ds(rank * rows, rows), :, :], stores).start()
+    state[0] = 12
+    begin = 0
+    for stream in range(12):
+        size = rows // 12 + (stream < rows % 12)
+        part = pl.ds(begin, size)
+        pltpu.make_async_remote_copy(
+            payload.at[part, :, :],
+            output.at[pl.ds(rank * rows + begin, size), :, :],
+            send.at[stream],
+            recv.at[0, stream],
+            device_id=meta[(stream % 6) * 34],
+            device_id_type=pl.DeviceIdType.LOGICAL,
+        ).start()
+        state[1 + stream] = 1
+        state[13 + stream] = 0
+        begin += size
+
+
+def _latent_ready_progress(
+    payload, output, send, recv, credits, stores, state, meta, *, rank, drain=False
+):
+    """Advance ready streams without blocking unrelated compute or streams.
+
+    A receive consumes both DMA completion counts. Credits protect the two
+    alternating receive semaphores from reuse before the peer consumes them.
+    The final drain completes every stream before routed experts read HBM.
+    """
+    rows = payload.shape[0]
+
+    def sweep():
+        begin = 0
+        for stream in range(12):
+            size = rows // 12 + (stream < rows % 12)
+            start = begin
+            begin += size
+            base = (stream % 6) * 34
+            # TPUv7 DMA semaphore accounting: one unit per 32 logical bytes.
+            units = size * 2 * 1792 * 2 // 32
+            step = state[1 + stream]
+
+            @pl.when(state[13 + stream] == 0)
+            def receive(*, step=step, stream=stream, units=units, base=base, start=start, size=size):
+                bank = (step - 1) & 1
+                ready = (pl.semaphore_read(send.at[stream]) >= units) & (
+                    pl.semaphore_read(recv.at[bank, stream]) >= units
+                )
+
+                @pl.when(ready)
+                def consume():
+                    incoming = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
+                    # wait_send only consumes its completion count; the HBM view
+                    # has the same logical transfer size as the initial VMEM source.
+                    transfer = pltpu.make_async_remote_copy(
+                        incoming,
+                        incoming,
+                        send.at[stream],
+                        recv.at[bank, stream],
+                        device_id=meta[base],
+                        device_id_type=pl.DeviceIdType.LOGICAL,
+                    )
+                    transfer.wait_send()
+                    transfer.wait_recv()
+
+                    @pl.when(step < 30)
+                    def credit():
+                        pl.semaphore_signal(
+                            credits.at[stream], 1, device_id=meta[base + 1], device_id_type=pl.DeviceIdType.LOGICAL
+                        )
+
+                    state[13 + stream] = jnp.where(step == 31, 2, 1)
+
+                    @pl.when(step == 31)
+                    def complete():
+                        state[0] = state[0] - 1
+
+            @pl.when(state[13 + stream] == 1)
+            def forward(*, step=step, stream=stream, base=base, start=start, size=size):
+                available = (step < 2) | (pl.semaphore_read(credits.at[stream]) >= 1)
+
+                @pl.when(available)
+                def issue():
+                    @pl.when(step >= 2)
+                    def acquire():
+                        pl.semaphore_wait(credits.at[stream], 1)
+
+                    source = output.at[pl.ds(meta[base + 2 + step] + start, size), :, :]
+                    pltpu.make_async_remote_copy(
+                        source,
+                        source,
+                        send.at[stream],
+                        recv.at[step & 1, stream],
+                        device_id=meta[base],
+                        device_id_type=pl.DeviceIdType.LOGICAL,
+                    ).start()
+                    state[1 + stream] = step + 1
+                    state[13 + stream] = 0
+
+    if drain:
+
+        def body(i):
+            sweep()
+            return i + 1
+
+        jax.lax.while_loop(lambda i: state[0] != 0, body, jnp.int32(0))
+        pltpu.make_async_copy(payload, output.at[pl.ds(rank * rows, rows), :, :], stores).wait()
+    else:
+
+        @pl.when(state[0] != 0)
+        def progress():
+            sweep()
+
+
 def _stripe_validity(rows, length, rank):
     row = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
     stripe = min(rows, 64)
@@ -432,6 +607,7 @@ def _prologue(
     maximum,
     *,
     counts_ready,
+    metadata_ready,
 ):
     """Router, latent projection and shared experts, with incremental collectives.
 
@@ -511,26 +687,59 @@ def _prologue(
                 )
 
         def metadata_progress():
-            for _ in range(2 if rows <= 128 else 4):
+            for _ in range(2 if rows <= 128 else 6):
                 next(metadata_steps, None)
 
-        for col, product in _dense_panels(
-            hx, latent_weight, gate_buffers, gate_sems, columns=4096
-        ):
+        if rows == 256:
+            latent_buffers = tuple(
+                s["router_gu"].at[:, pl.ds(i * 256, 256)] for i in range(4)
+            )
+            latent_products = _latent_half_pair_panels(
+                hx, latent_weight, latent_buffers, s["gu_sems"]
+            )
+        else:
+            latent_products = _dense_panels(
+                hx, latent_weight, gate_buffers, gate_sems, columns=4096
+            )
+        first_half = None
+        for col, product in latent_products:
             if route_started:
                 stage = next(route_steps, None)
                 if rows <= 128 and stage is None:
                     start_metadata()
             if rows <= 128 and metadata_started:
                 metadata_progress()
-            s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
+            if rows == 256:
+                fragment = product.astype(jnp.bfloat16)
+                if col < 1792:
+                    first_half = fragment
+                else:
+                    # Assemble both halves before writing their packed words.
+                    assert first_half is not None
+                    paired = jnp.concatenate((first_half, fragment), axis=1)
+                    s["latent_payload"][:, :, pl.ds(col - 1792, 256)] = paired.reshape(
+                        rows, 2, 256
+                    )
+            else:
+                s["latent"][:, pl.ds(col, 256)] = product.astype(jnp.bfloat16)
             for _ in range(min(2, 16 - top.index)):
                 top.step()
             if top.index == 16 and not route_started:
                 ids, probs = top.finish(valid)
-                wire = jnp.concatenate(
-                    (ids, jax.lax.bitcast_convert_type(probs, jnp.int32)), axis=1
-                )
+                if rows < 128:
+                    wire = jnp.concatenate(
+                        (ids, jax.lax.bitcast_convert_type(probs, jnp.int32)), axis=1
+                    )
+                else:
+                    wire = jnp.concatenate(
+                        (
+                            ids.reshape(rows // 8, 128),
+                            jax.lax.bitcast_convert_type(probs, jnp.int32).reshape(
+                                rows // 8, 128
+                            ),
+                        ),
+                        axis=0,
+                    )
                 s["route_payload"][...] = wire.reshape(rows // 4, 128)
                 route_steps = _route_gather_steps(
                     s["route_payload"],
@@ -544,7 +753,8 @@ def _prologue(
         for _ in route_steps:
             pass
         start_metadata()
-        s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
+        if rows <= 128:
+            s["latent_payload"][...] = s["latent"][:, :3584].reshape(rows, 2, 1792)
         latent_steps = _latent_gather_steps(
             tables,
             s["latent_payload"],
@@ -556,6 +766,27 @@ def _prologue(
             s["latent_stores"],
             rank=rank,
         )
+        if rows == 256:
+            latent_tick = 0
+            def latent_progress(*, drain=False):
+                nonlocal latent_tick
+                if latent_tick == 0:
+                    _latent_ready_init(tables, s["latent_payload"], latent_hbm,
+                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_stores"],
+                        s["latent_state"], s["latent_meta"], rank=rank)
+                else:
+                    _latent_ready_progress(s["latent_payload"], latent_hbm,
+                        s["latent_send_sems"], s["latent_recv_sems"], s["latent_credits"],
+                        s["latent_stores"], s["latent_state"], s["latent_meta"], rank=rank,
+                        drain=drain)
+                latent_tick += 1
+        else:
+            def latent_progress(*, drain=False):
+                if drain:
+                    for _ in latent_steps:
+                        pass
+                else:
+                    next(latent_steps, None)
         peer_input.wait_send()
         peer_input.wait_recv()
 
@@ -570,10 +801,10 @@ def _prologue(
         gu_copy(0, 0, gate_buffers, gate_sems).start()
         gu_copy(0, 3072, up_buffers, up_sems).start()
         if rows == 256:
-            next(latent_steps, None)
+            latent_progress()
         for panel in range(12):
             if rows <= 128:
-                next(latent_steps, None)
+                latent_progress()
             bank = panel % 2
             gu_copy(panel, 0, gate_buffers, gate_sems).wait()
             gu_copy(panel, 3072, up_buffers, up_sems).wait()
@@ -597,7 +828,7 @@ def _prologue(
                     activated.astype(jnp.bfloat16)
                 )
                 if rows == 256:
-                    next(latent_steps, None)
+                    latent_progress()
 
         def down_copy(panel):
             return pltpu.make_async_copy(
@@ -644,12 +875,18 @@ def _prologue(
                     transfer.start()
                     pending = transfer, bank, panel
                 if rows == 256 or row == rows:
-                    next(latent_steps, None)
+                    latent_progress()
         finish_reduction(pending)
-        for _ in latent_steps:
-            pass
-        for _ in metadata_steps:
-            pass
+        if rows == 256:
+            for _ in metadata_steps:
+                latent_progress()
+            # Start compact VMEM-to-SMEM transfers while the latent ring finishes.
+            metadata_ready()
+            latent_progress(drain=True)
+        else:
+            latent_progress(drain=True)
+            for _ in metadata_steps:
+                pass
 
     scratch = dict(
         pair=vmem((2 * rows, hidden_size), jnp.bfloat16),
@@ -664,7 +901,7 @@ def _prologue(
         peer_send=dma,
         peer_recv=dma,
         peer_credit=pltpu.SemaphoreType.REGULAR,
-        latent=vmem((rows, 4096), jnp.bfloat16),
+        latent=vmem((rows, 4096), jnp.bfloat16) if rows <= 128 else None,
         route_payload=vmem((rows // 4, 128), jnp.int32),
         route_wire=vmem((rows * 8, 128), jnp.int32),
         route_send=dma((5,)),
@@ -672,6 +909,8 @@ def _prologue(
         keys=vmem((rows * 4, 128), jnp.int32),
         latent_payload=vmem((rows, 2, 1792), jnp.bfloat16),
         latent_recv=vmem((2, rows, 2, 1792), jnp.bfloat16) if rows <= 128 else None,
+        latent_state=pltpu.SMEM((25,), jnp.int32) if rows == 256 else None,
+        latent_meta=pltpu.SMEM((6 * 34,), jnp.int32) if rows == 256 else None,
         latent_send_sems=dma((12,)),
         latent_recv_sems=dma((2, 12)),
         latent_credits=pltpu.SemaphoreType.REGULAR((12,)),
@@ -718,6 +957,7 @@ def _routed_experts(
     rows, width = (metadata_row_capacity or x.shape[0], rhs.shape[-1])
     assert rows <= x.shape[0]
     tm, tn, localrows = (tile, columns, tokens // 32)
+    packed_half = 512 if tokens == 8192 else tn // 2
     assert width % tn == 0
     limit = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.98)
     cfg = k.make_gmm_configs(
@@ -793,6 +1033,7 @@ def _routed_experts(
         payload,
         rx,
         state,
+        ring_meta,
     ):
         w = dataclasses.replace(
             w, weight=w.weight.at[layer[0]], scale=w.scale.at[layer[0]]
@@ -804,6 +1045,20 @@ def _routed_experts(
             scale=gu.scale.at[layer[0]],
         )
         gu = k.FusedWeightsRef(gate=gu, up=jax.tree.map(lambda r: r.at[..., 1536:], gu))
+        # Six directed rings: [target, source, 32 local-contribution row bases].
+        # One initialization per layer call, reused across all four columns.
+        rank = lax.axis_index("k3_sp")
+        for directed in range(6):
+            family, direction = directed // 2, -1 if directed % 2 == 0 else 1
+            position = tables[family, 0, rank]
+            ring_meta[directed * 34] = tables[family, 1, (position + direction) & 31]
+            ring_meta[directed * 34 + 1] = tables[family, 1, (position - direction) & 31]
+            @pl.loop(0, 32)
+            def hop(step, *, family=family, position=position, direction=direction, directed=directed):
+                owner_mesh = tables[family, 1, (position - direction * (step + 1)) & 31]
+                owner = tables[family, 2, owner_mesh]
+                ring_meta[directed * 34 + 2 + step] = owner * localrows
+
         active_ng = k.fill_metadata(counts, offset, metadata, cfgs=cfg)
 
         @pl.when(active_ng == 0)
@@ -816,40 +1071,30 @@ def _routed_experts(
         (xs, ws), _ = k.generate_block_specs(metadata, cfg)
         state[0] = 0
 
-        def advance(stop, block, subtotal_vmem):
-            @pl.loop(state[0], stop)
-            def hop(step):
-                _reduce_step(
-                    tables,
-                    subtotal_vmem,
-                    out.at[:, pl.ds(block * tn, tn)],
-                    sends,
-                    receives,
-                    credits,
-                    stores,
-                    payload,
-                    rx,
-                    streams=regions,
-                    buffers=2,
-                    step=step,
-                )
-
-            state[0] = stop
+        # Real-prompt tuning: short expert loops need all twelve streams per
+        # poll; longer loops alternate six-stream groups to bound polling cost.
+        def advance(stop, block, subtotal_vmem, *, drain=False, poll_round=0):
+            _ready_reduce(
+                tables, subtotal_vmem, out.at[:, pl.ds(block * tn, tn)],
+                sends, receives, credits, stores, payload, rx,
+                streams=regions, buffers=2, state=state, ring_meta=ring_meta, drain=drain, poll_round=poll_round, sparse_poll=(ng >= 72),
+            )
 
         def emit_subtotals(subtotal_vmem):
             @pl.loop(0, tokens // store_tile)
             def block(b):
-                cast[...] = (
-                    sums[pl.ds(b * store_tile, store_tile)]
-                    .reshape(store_tile, tn)
-                    .astype(jnp.bfloat16)
+                # Trim the aligned-layout padding before the existing ring.
+                # The cut at tn=896 is lane aligned, unlike a 448-wide half.
+                values = sums[pl.ds(b * store_tile, store_tile)].reshape(
+                    store_tile, 2 * packed_half
                 )
+                cast[...] = values[:, :tn].astype(jnp.bfloat16)
                 subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
 
         def route(i):
             return (destinations[i], probabilities[i])
 
-        def consume(tile_g, source, first=0):
+        def consume(tile_g, source, first=0, *, loop_unroll=unroll):
             start = metadata.gm_id_to_m_offset[tile_g]
             end = metadata.gm_id_to_m_offset[tile_g + 1]
             begin = start // sub * sub
@@ -861,14 +1106,14 @@ def _routed_experts(
                 target = sums.at[pl.ds(dest, 1)]
                 target[...] = target[...] + value * weight
 
-            full = (end - start) // unroll
+            full = (end - start) // loop_unroll
 
             @pl.loop(0, full)
             def chunk(b):
-                for u in range(unroll):
-                    update(start + b * unroll + u)
+                for u in range(loop_unroll):
+                    update(start + b * loop_unroll + u)
 
-            @pl.loop(start + full * unroll, end)
+            @pl.loop(start + full * loop_unroll, end)
             def tail(i):
                 update(i)
 
@@ -899,7 +1144,7 @@ def _routed_experts(
                     sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
             if not first:
-                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem)
+                advance(jnp.minimum(32, (g + 1) * 32 // ng), n - 1, subtotal_vmem, poll_round=g)
             current = packed.at[g % 2]
             previous = packed.at[(g + 1) % 2]
             previous_g = jnp.maximum(g - 1, 0)
@@ -950,19 +1195,20 @@ def _routed_experts(
                     previous_g,
                     previous,
                     (moved_rows if first else 0) + panel_count * down_unroll,
+                    loop_unroll=8 if first else unroll,
                 )
 
             @pl.when(g == ng - 1)
             def finish():
-                consume(g, current)
+                consume(g, current, loop_unroll=8 if first else unroll)
                 if not first:
-                    advance(jnp.int32(32), n - 1, subtotal_vmem)
+                    advance(jnp.int32(32), n - 1, subtotal_vmem, drain=True)
                     emit_subtotals(subtotal_vmem)
                     state[0] = 0
 
                     @pl.when(n == width // tn - 1)
                     def last():
-                        advance(jnp.int32(32), n, subtotal_vmem)
+                        advance(jnp.int32(32), n, subtotal_vmem, drain=True)
 
         (_, gu_ws), gu_ys = k.generate_block_specs(metadata, gu_cfg)
         gu_ws = k.FusedWeightsRef(gate=gu_ws, up=gu_ws)
@@ -1145,8 +1391,8 @@ def _routed_experts(
             gm_id_to_group_id=pltpu.SMEM((max_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
         ),
-        packed=pltpu.VMEM((2, tm, 2, tn // 2), x.dtype),
-        sums=pltpu.VMEM((tokens, 2, tn // 2), jnp.float32),
+        packed=pltpu.VMEM((2, tm, 2, packed_half), x.dtype),
+        sums=pltpu.VMEM((tokens, 2, packed_half), jnp.float32),
         cast=pltpu.VMEM((store_tile, tn), x.dtype),
         sends=pltpu.SemaphoreType.DMA((streams,)),
         receives=pltpu.SemaphoreType.DMA((2, streams)),
@@ -1154,7 +1400,8 @@ def _routed_experts(
         stores=pltpu.SemaphoreType.DMA,
         payload=pltpu.VMEM((localrows, tn), ring_dtype),
         rx=pltpu.VMEM((2, localrows, tn), ring_dtype),
-        state=pltpu.SMEM((1,), jnp.int32),
+        state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
+        ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
     )
 
 
@@ -1172,8 +1419,31 @@ class _PackedRows:
         return self.ref[rows].reshape(-1, 2 * self.ref.shape[-1])
 
 
+def _column_rhs(rhs, first, size):
+    """Slice references before dequantization to bound panel temporaries."""
+
+    def slice_ref(ref, first, size):
+        assert ref.scale is not None
+        return dataclasses.replace(
+            ref,
+            weight=ref.weight.at[:, pl.ds(first, size)],
+            scale=ref.scale.at[..., pl.ds(first, size)],
+        )
+
+    if isinstance(rhs, k.FusedWeightsRef):
+        # Gate/up columns alternate in lane-sized chunks. A complete pair
+        # maps to half as many columns in each underlying reference.
+        pair = 2 * pltpu.get_tpu_info().num_lanes
+        assert first % pair == 0 and size % pair == 0
+        return k.FusedWeightsRef(
+            slice_ref(rhs.gate, first // 2, size // 2),
+            slice_ref(rhs.up, first // 2, size // 2),
+        )
+    return slice_ref(rhs, first, size)
+
+
 def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
-    """Dequantize one MXFP4 K tile and issue its MXU column panels.
+    """Dequantize MXFP4 weights, panel-locally for the 8K row tile.
 
     Both routed projections cover their complete reduction dimension in one
     tile. The callback consumes rows of the previous expert tile between MXU
@@ -1183,22 +1453,41 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     assert not cfgs.rhs_cfgs.has_bias
     columns = pltpu.get_tpu_info().mxu_column_size
     activations = lhs.reshape(-1, cfgs.tiles.tile_k)[:bucket_rows]
-    weights = rhs.get_weight()
-    width = weights.shape[1]
-    block = cfgs.rhs_cfgs.quant_block_size
-    scales = rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
-    weights = weights.astype(cfgs.lhs_cfgs.dtype).reshape(
-        cfgs.num_quant_blocks_per_tile_k, block, width
+    width = (
+        2 * rhs.gate.weight.shape[-1]
+        if isinstance(rhs, k.FusedWeightsRef)
+        else rhs.weight.shape[-1]
     )
-    weights = (weights * scales).reshape(cfgs.tiles.tile_k, width)
+    block = cfgs.rhs_cfgs.quant_block_size
+    # The 8K window uses a 256-row tile. Smaller windows use 128 rows;
+    # their whole-tile conversion schedules better than panel-local loads.
+    panel_local = cfgs.tiles.tile_m == 256
+    weights = None
+    if not panel_local:
+        weights = rhs.get_weight()
+        scales = rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
+        weights = weights.astype(cfgs.lhs_cfgs.dtype).reshape(
+            cfgs.num_quant_blocks_per_tile_k, block, width
+        )
+        weights = (weights * scales).reshape(cfgs.tiles.tile_k, width)
     panels = []
     for first in range(0, width, columns):
-        last = min(width, first + columns)
-        accumulator = jnp.zeros((bucket_rows, last - first), cfgs.acc_dtype)
+        panel_width = min(columns, width - first)
+        if panel_local:
+            panel_rhs = _column_rhs(rhs, first, panel_width)
+            panel_weights = panel_rhs.get_weight().astype(cfgs.lhs_cfgs.dtype).reshape(
+                cfgs.num_quant_blocks_per_tile_k, block, panel_width
+            )
+            scales = panel_rhs.get_scale(replicate_size=block).astype(cfgs.lhs_cfgs.dtype)
+            panel_weights = (panel_weights * scales).reshape(
+                cfgs.tiles.tile_k, panel_width
+            )
+        else:
+            assert weights is not None
+            panel_weights = weights[:, first:first + panel_width]
+        accumulator = jnp.zeros((bucket_rows, panel_width), cfgs.acc_dtype)
         product = jnp.matmul(
-            activations,
-            weights[:, first:last],
-            preferred_element_type=jnp.float32,
+            activations, panel_weights, preferred_element_type=jnp.float32
         ).astype(cfgs.acc_dtype)
         overlap_work(first // columns)
         accumulator += product
@@ -1234,11 +1523,14 @@ def _gu_inner(lhs, rhs, output, partial, metadata, *, cfgs, overlap_work):
             last % cfgs.dims.size_lhs_sublane == 0, zeros, output[last_row]
         )
 
+    # At 8K, share the 128-row product for both small buckets.
+    # Keep route order, trading padded work for fewer instruction overlays.
+    first_bucket = 1 if cfgs.tiles.tile_m == 256 else 0
     branches = [
         functools.partial(product, bucket_index=i)
-        for i in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
+        for i in range(first_bucket, cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
     ]
-    lax.switch(last // cfgs.tiles.bucket_base, branches)
+    lax.switch(jnp.maximum(last // cfgs.tiles.bucket_base - first_bucket, 0), branches)
 
 
 def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
@@ -1252,19 +1544,28 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
     start = metadata.gm_id_to_m_offset[group]
     end = metadata.gm_id_to_m_offset[group + 1]
     aligned = start - start % cfgs.dims.size_lhs_sublane
-    first, last = start - aligned, end - aligned
+    last = end - aligned
 
+    # GU already masks inactive rows; consume() visits only live routes.
     def product(bucket_index):
         rows = cfgs.tiles.bucket_base * (bucket_index + 1)
         with jax.named_scope(f"bm{rows}_fragment"):
             value = _expert_product(
                 lhs, rhs, cfgs=cfgs, bucket_rows=rows, overlap_work=overlap_work
             )
-            row = lax.broadcasted_iota(jnp.int32, value.shape, 0)
-            value = jnp.where((first <= row) & (row < last), value, 0)
-            output[:rows] = value.astype(output.dtype).reshape(
-                rows, 2, cfgs.tiles.tile_n // 2
-            )
+            if cfgs.tiles.tile_n == 896:
+                # Keep the half boundary on a complete 128-lane block.
+                # Only the final 128 elements are padding; the consumer trims
+                # them once per subtotal before communicating the 896 columns.
+                value = value.astype(output.dtype)
+                padded = jnp.concatenate(
+                    (value, jnp.zeros((rows, 128), output.dtype)), axis=1
+                )
+                output[:rows] = padded.reshape(rows, 2, 512)
+            else:
+                output[:rows] = value.astype(output.dtype).reshape(
+                    rows, 2, cfgs.tiles.tile_n // 2
+                )
 
     branches = [
         functools.partial(product, bucket_index=i)
@@ -1394,6 +1695,149 @@ def _reduce_step(
         output.wait()
 
 
+def _ready_reduce(
+    tables_ref,
+    x_ref,
+    o_ref,
+    send_sems,
+    recv_sems,
+    credits,
+    store_sem,
+    payload,
+    received,
+    *,
+    streams,
+    buffers,
+    state,
+    ring_meta,
+    drain=False,
+    poll_round=0,
+    sparse_poll=True,
+):
+    """Same 12-stream protocol with cached descriptors and cheap failed polls.
+
+    ring_meta has six directed rings, each with neighbor mesh IDs followed by
+    32 source-row bases. SMEM offsets, not physical VMEM pointers, are cached.
+    Neither a failed receive nor a failed credit poll needs a payload address.
+    """
+    assert buffers == 2
+    count = len(streams)
+
+    def remote(stream, rows, cols, target, bank):
+        return pltpu.make_async_remote_copy(
+            payload.at[rows, cols],
+            received.at[bank, rows, cols],
+            send_sems.at[stream],
+            recv_sems.at[bank, stream],
+            device_id=target,
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    @pl.when(state[0] == 0)
+    def initialize():
+        peers = [(ring_meta[d * 34],) for d in range(6)]
+        sem = pltpu.get_barrier_semaphore()
+        for peer in peers:
+            pl.semaphore_signal(sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
+        pl.semaphore_wait(sem, len(peers))
+
+        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
+        def initialized(ready):
+            for peer in peers:
+                pl.semaphore_signal(ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH)
+            pl.semaphore_wait(ready, len(peers))
+
+        for stream, region in enumerate(streams):
+            begin, size, col_begin, width = region
+            base = (stream % 6) * 34
+            rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
+            source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2], o_ref.shape[0]) + begin, size)
+            target = (ring_meta[base],)
+            payload.at[rows, cols][...] = x_ref.at[source_rows, cols][...].astype(payload.dtype)
+            remote(stream, rows, cols, target, jnp.int32(0)).start()
+            state[1 + stream] = 1
+            state[1 + count + stream] = 0
+        state[0] = count + 1
+
+    def sweep(selected=None):
+        for stream, region in enumerate(streams):
+            if selected is not None and (stream // 6) != selected:
+                continue
+            begin, size, col_begin, width = region
+            base = (stream % 6) * 34
+            rows, cols = pl.ds(begin, size), pl.ds(col_begin, width)
+            units = size * width * 4 // 32
+            step = state[1 + stream]
+
+            @pl.when(state[1 + count + stream] == 0)
+            def receive(
+                *, step=step, stream=stream, units=units, base=base, rows=rows, cols=cols, begin=begin, size=size
+            ):
+                bank = (step - 1) & 1
+                ready = (pl.semaphore_read(send_sems.at[stream]) >= units) & (
+                    pl.semaphore_read(recv_sems.at[bank, stream]) >= units
+                )
+
+                @pl.when(ready)
+                def reduce():
+                    target = (ring_meta[base],)
+                    remote(stream, rows, cols, target, bank).wait()
+                    source_rows = pl.ds(pl.multiple_of(ring_meta[base + 2 + step], o_ref.shape[0]) + begin, size)
+                    payload.at[rows, cols][...] = (
+                        x_ref.at[source_rows, cols][...].astype(payload.dtype) + received.at[bank, rows, cols][...]
+                    )
+                    pl.semaphore_signal(
+                        credits.at[stream], 1, device_id=(ring_meta[base + 1],), device_id_type=pl.DeviceIdType.MESH
+                    )
+                    state[1 + count + stream] = jnp.where(step == 31, 2, 1)
+
+            @pl.when(state[1 + count + stream] == 1)
+            def forward(*, step=step, stream=stream, rows=rows, cols=cols, base=base):
+                available = (step < buffers) | (pl.semaphore_read(credits.at[stream]) >= 1)
+
+                @pl.when(available)
+                def send():
+                    @pl.when(step >= buffers)
+                    def acquire():
+                        pl.semaphore_wait(credits.at[stream], 1)
+
+                    remote(stream, rows, cols, (ring_meta[base],), step & 1).start()
+                    state[1 + stream] = step + 1
+                    state[1 + count + stream] = 0
+
+            @pl.when(state[1 + count + stream] == 2)
+            def finish(*, stream=stream):
+                @pl.when(pl.semaphore_read(credits.at[stream]) >= buffers)
+                def release():
+                    pl.semaphore_wait(credits.at[stream], buffers)
+                    state[1 + count + stream] = 3
+                    state[0] = state[0] - 1
+
+    if drain:
+
+        def pending(i):
+            return state[0] != 1
+
+        def iterate(i):
+            sweep()
+            return i + 1
+
+        jax.lax.while_loop(pending, iterate, jnp.int32(0))
+        output = pltpu.make_async_copy(payload, o_ref, store_sem)
+        output.start()
+        output.wait()
+    else:
+
+        @pl.when(state[0] != 1)
+        def progress():
+            # Alternate two six-stream groups only for long expert loops.
+            for group in range(2):
+
+                @pl.when(((poll_round & 1) == group) | ~sparse_poll)
+                def selected(*, group=group):
+                    sweep(group)
+
+
 def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
     """Normalize routed output and project up with three weight/prefix banks.
 
@@ -1411,12 +1855,6 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
         copy = pltpu.make_async_copy(norm_weight, s["norm"], s["norm_sem"])
         copy.start()
         copy.wait()
-        routed = reduced[...]
-        mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
-        inverse = jax.lax.rsqrt(mean + 1e-5)
-        s["normalized"][...] = ((routed * inverse) * s["norm"][...]).astype(
-            jnp.bfloat16
-        )
         panels = 7168 // 512
 
         def weight_copy(panel):
@@ -1440,9 +1878,16 @@ def _epilogue(control, reduced, shared, norm_weight, up_weight, prefix, output):
                 s["output_sems"][panel % 3],
             )
 
+        # Hide the first weight/residual loads behind the RMS reduction.
         for panel in (0, 1):
             weight_copy(panel).start()
             prefix_copy(panel).start()
+        routed = reduced[...]
+        mean = jnp.sum(routed * routed, axis=1, keepdims=True) / width
+        inverse = jax.lax.rsqrt(mean + 1e-5)
+        s["normalized"][...] = ((routed * inverse) * s["norm"][...]).astype(
+            jnp.bfloat16
+        )
         for panel in range(panels):
             bank = panel % 3
             weight_copy(panel).wait()
@@ -1557,6 +2002,11 @@ def _layer_kernel(
             )
 
         def prepare(ids_v, probs_v):
+            indices = pltpu.make_async_copy(
+                ids_v.at[: capacity // 128, :], s["ids"], s["index_sem"])
+            def metadata_ready():
+                indices.start()
+                probability_copy(probs_v).start()
             _prologue(
                 tables,
                 control,
@@ -1573,17 +2023,13 @@ def _layer_kernel(
                 s["counts_v"],
                 maximum,
                 counts_ready=counts_ready,
+                metadata_ready=metadata_ready,
             )
             count_copy().wait()
             if tokens == 8192:
                 maximum_copy().wait()
-            indices = pltpu.make_async_copy(
-                ids_v.at[: capacity // 128, :],
-                s["ids"],
-                s["index_sem"],
-            )
-            indices.start()
-            probability_copy(probs_v).start()
+            if tokens != 8192:
+                metadata_ready()
             if tokens == 8192:
 
                 @pl.when(s["maximum"][0] > capacity)

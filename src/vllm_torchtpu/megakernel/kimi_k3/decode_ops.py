@@ -19,6 +19,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
@@ -74,6 +75,21 @@ def dp_row_owners(batch_size: int) -> int:
     """Attention DP's local row owners: the four rank pairs, or at B2 and B4
     (one or two rows per DP group) one: every rank holds every row."""
     return 1 if batch_size <= 4 else 4
+
+
+def dp_group_rows(batch_size: int, attention_dp: int) -> np.ndarray:
+    """The batch row of each DP group row, group-major: group ``g``'s row
+    ``q`` (``g G + q``) is batch row ``p B / O + g r + j`` for ``q = p r + j``
+    (``O`` local row owners, ``dp_row_owners``; ``r = B / (O dp)``)."""
+    owners = dp_row_owners(batch_size)
+    per = batch_size // attention_dp // owners
+    q = np.arange(batch_size // attention_dp)
+    return np.concatenate(
+        [
+            q // per * (batch_size // owners) + group * per + q % per
+            for group in range(attention_dp)
+        ]
+    ).astype(np.int32)
 
 
 def decode_options(batch_size: int) -> dict:
@@ -135,7 +151,13 @@ class DecodeOps:
         presharded: Path,
         num_slots: int,
         batch_sizes: tuple[int, ...] = (1,),
+        mamba_ssm_cache_dtype: str = "auto",
     ) -> None:
+        from vllm_torchtpu.megakernel.kimi_k3.program import recurrent_state_dtype
+
+        self.recurrent_dtype = getattr(
+            torch, recurrent_state_dtype(mamba_ssm_cache_dtype)
+        )
         self.presharded = Path(presharded)
         (self.paged, self.rank_loader) = kernel_modules("paged", "rank_loader")
         self.mesh, self.rank = kernel_mesh(AXIS, TP_SIZE)
@@ -197,7 +219,7 @@ class DecodeOps:
             dtype=torch.bfloat16,
         ).to("tpu")
         recurrent = torch.zeros(
-            (1, state_slots, KDA_LAYERS, 3, 128, 128), dtype=torch.float32
+            (1, state_slots, KDA_LAYERS, 3, 128, 128), dtype=self.recurrent_dtype
         ).to("tpu")
         self.slots = [conv, recurrent]
         if self.rank == 0:
@@ -655,14 +677,18 @@ class DecodeOps:
         request's persistent state and emits temporary post-states. The packed
         operand is ``[tokens | positions | slots | indices | tables]`` (per
         row, except one block-table row per request; ``indices`` are for the
-        draft op). Returns what :meth:`_build_verify` does."""
+        draft op). Returns what :meth:`_build_verify` does.
+
+        Under attention DP the first ``requests / dp`` requests are group 0's,
+        and so on: the op moves each group's rows onto the batch rows the
+        group attends (``dp_group_rows``) and the logits and aux rows back."""
         key = ("verify", aux_layers, requests, rows_per, control.key(), synthetic_rates)
         if key in self._ops:
             return self._ops[key]
         rows, paged, names = requests * rows_per, self.paged, self.names
         count = len(names)
         options = decode_options(rows)
-        options["defer_kda_commit"] = self.attention_dp == 1
+        options["defer_kda_commit"] = True
         # The batch recipe: one request with four verify rows (1x4) uses the
         # plain B4 layout; token-scattered attention/MoE requires at least B8.
         options.update(
@@ -671,6 +697,10 @@ class DecodeOps:
         )
         pool_map, owner_table = self.pool_map, self.owner_table
         pools = len(self.unified_pools)
+        placed = order = None
+        if self.attention_dp > 1:
+            placed = dp_group_rows(rows, self.attention_dp)
+            order = np.argsort(placed)
 
         def body(*args):
             weights = {name: args[i][0] for i, name in enumerate(names)}
@@ -684,22 +714,24 @@ class DecodeOps:
                 ids[rows : 2 * rows],
                 ids[2 * rows : 3 * rows],
             )
-            tables = ids[4 * rows :].reshape(requests, -1)
+            tables = jnp.repeat(ids[4 * rows :].reshape(requests, -1), rows_per, axis=0)
+            operands = (tokens, positions, tables, slots)
+            if order is not None:
+                operands = tuple(operand[order] for operand in operands)
             logits, aux, conv, recurrent, pool = paged.decode_paged(
                 weights,
                 conv,
                 recurrent,
                 pool,
-                tokens,
-                positions,
-                jnp.repeat(tables, rows_per, axis=0),
-                slots,
+                *operands,
                 batch_size=rows,
                 layers=NUM_LAYERS,
                 dcp_pool_map=pool_map,
                 dcp_owner_table=owner_table,
                 **options,
             )
+            if placed is not None:
+                logits, aux = logits[placed], aux[:, placed]
             decisions, conv, recurrent = self._finish_verify(
                 control,
                 old_conv,
@@ -827,9 +859,28 @@ class DecodeOps:
         # The native custom call finishes before this consumer can write the
         # donated banks. It never aliases its temporary outputs to the banks.
         # Padding (null-slot) requests commit the last verifier row.
-        sources = jnp.arange(requests) * rows_per + jnp.where(
-            targets == 0, rows_per - 1, decisions[:, 0]
-        )
+        dp = self.attention_dp
+        if dp == 1:
+            sources = jnp.arange(requests) * rows_per + jnp.where(
+                targets == 0, rows_per - 1, decisions[:, 0]
+            )
+        else:
+            # This rank's group's requests; post-state row ``k G + q`` holds
+            # held shard k of group row q, committed to bank entry ``s + k n``
+            # of its group-local slot s (pools.group_slots).
+            share, bank = requests // dp, conv.shape[0] // dp
+            group = jax.lax.axis_index(AXIS) // (TP_SIZE // dp)
+            own = jax.lax.dynamic_slice_in_dim(targets, group * share, share)
+            accepted = jax.lax.dynamic_slice_in_dim(
+                decisions[:, 0], group * share, share
+            )
+            rows = jnp.arange(share) * rows_per + jnp.where(
+                own == 0, rows_per - 1, accepted
+            )
+            local = jnp.where(own == 0, 0, own - group * (bank - 1))
+            group_rows = share * rows_per
+            sources = jnp.concatenate([rows + k * group_rows for k in range(dp)])
+            targets = jnp.concatenate([local + k * bank for k in range(dp)])
         conv, recurrent = self.paged._commit_kda_states(
             conv, recurrent, new_conv, new_recurrent, targets, source_rows=sources
         )

@@ -74,18 +74,24 @@ def _batched_fn(
     names: tuple[str, ...],
     requests: int,
     rows_per: int,
+    first: int = 0,
+    verified: int | None = None,
 ) -> Any:
     """The batched draft op's global-view function: one ``fused`` call over
     the request dimension (the draft weights stream once for all requests),
     then each request's emitted tokens and control entry. The final operand
     holds the verifier's decisions ``[R, 2]`` (accepted count, bonus token).
+    A verify of ``verified`` requests wider than one fused call drafts in
+    parts: this one takes its requests ``first .. first + requests - 1``
+    (their verify rows, decisions and plan rows).
 
     The states arrive stacked on a request axis (``caches`` ``[1, R, layers,
     window, 128]`` per rank, ``cache_positions`` ``[1, R, window]``,
     ``vectors`` ``[1, R, 128]``) and leave the same way. Module-level so tests
     can drive it with a stub ``fused``."""
     width, R, k = dspark.ROWS, requests, rows_per
-    total = R * k
+    total = (requests if verified is None else verified) * k
+    rows = slice(first * k, (first + R) * k)
     count = len(names)
 
     def fn(*args):
@@ -94,9 +100,12 @@ def _batched_fn(
         weights = {name: args[i] for i, name in enumerate(names)}
         caches, cache_positions, vectors = args[count], args[count + 1], args[count + 2]
         aux, logits, ids, state, decisions = args[count + 3 :]
-        tokens, positions = ids[:total], ids[total : 2 * total]
-        indices = ids[3 * total : 4 * total]
-        plan, _ = control.fields(state, R)
+        tokens, positions = ids[:total][rows], ids[total : 2 * total][rows]
+        indices = ids[3 * total : 4 * total][rows]
+        aux, logits = aux[:, rows], logits[:, rows]
+        decisions = decisions[first : first + R]
+        plan, _ = control.fields(state, first + R)
+        plan = plan[first:]
         bases = positions.reshape(R, k)[:, 0]
         forced_count, forced_anchor = decisions[:, 0], decisions[:, 1]
         # Each request's group padded to the kernel's full block width.
@@ -170,13 +179,26 @@ def _batched_fn(
         state = jnp.concatenate(
             (
                 banks.reshape(-1),
+                state[control.plan_start : control.plan_start + first * control.FIELDS],
                 plan.reshape(-1),
-                state[control.plan_start + R * control.FIELDS :],
+                state[control.plan_start + (first + R) * control.FIELDS :],
             )
         )
         return vectors_out[None], caches_out, positions_out, emitted, state
 
     return fn
+
+
+def draft_class(checkpoint) -> type:
+    """The draft implementation for the speculator checkpoint: the MLA draft
+    (``Inferact/Kimi-K3-DSpark``, :mod:`draft_mla`) or :class:`DsparkDraft`
+    (``RedHatAI/Kimi-K3-speculator.dspark``)."""
+    (mla,) = kernel_modules("dspark_mla")
+    if mla.is_mla_draft(Path(checkpoint)):
+        from vllm_torchtpu.megakernel.kimi_k3.draft_mla import MlaDsparkDraft
+
+        return MlaDsparkDraft
+    return DsparkDraft
 
 
 class DsparkDraft:
@@ -424,12 +446,31 @@ class DsparkDraft:
             )
         return self._ops[key]
 
-    def _build_batched(self, control: Any, requests: int, rows_per: int) -> Any:
+    @staticmethod
+    def parts(requests: int, rows_per: int) -> list[tuple[int, int]]:
+        """``(first, count)`` of each fused draft call after a verify of
+        ``requests`` requests: the fused kernel drafts at most 16 requests of
+        up to four rows, or 8 of more."""
+        size = 16 if rows_per <= 4 else 8
+        return [
+            (first, min(size, requests - first)) for first in range(0, requests, size)
+        ]
+
+    def _build_batched(
+        self,
+        control: Any,
+        requests: int,
+        rows_per: int,
+        first: int = 0,
+        verified: int | None = None,
+    ) -> Any:
         """The draft step after a batched verify (``DecodeOps.
         verify_batched``): one fused kernel call over the request dimension
         (the weights stream once for all requests; ``_batched_fn``), then each
-        request's control entry advanced."""
-        key = ("batched", control.key(), requests, rows_per)
+        request's control entry advanced. ``first`` / ``verified``: this
+        call's part of a wider verify (``parts``)."""
+        verified = requests if verified is None else verified
+        key = ("batched", control.key(), requests, rows_per, first, verified)
         if key in self._ops:
             return self._ops[key]
         fused = self.dspark.make_fused_draft(
@@ -442,6 +483,8 @@ class DsparkDraft:
             self.names,
             requests,
             rows_per,
+            first,
+            verified,
         )
         count = len(self.names)
 
@@ -471,8 +514,9 @@ class DsparkDraft:
                 state,
             )
 
+        part = "" if verified == requests else f"_part{first}of{verified}"
         self._ops[key] = register_global_op(
-            f"pallas::k3_dspark_draft_rbatch{requests}x{rows_per}",
+            f"pallas::k3_dspark_draft_rbatch{requests}x{rows_per}{part}",
             self.mesh,
             fn,
             (P(AXIS),) * count
@@ -487,6 +531,8 @@ class DsparkDraft:
                     control.key(),
                     requests,
                     rows_per,
+                    first,
+                    verified,
                     self.names,
                     self.max_position,
                     dataclasses.astuple(self.config),
@@ -518,7 +564,10 @@ class DsparkDraft:
         vector = torch.empty((1, 128), dtype=torch.int32)
         state = torch.empty(control.size, dtype=torch.int32)
         calls = []
-        for requests in sorted({r for r, _ in spec_shapes if r > 8}):
+        drafted = {
+            count for r, k in spec_shapes for _, count in self.parts(r, k) if count > 8
+        }
+        for requests in sorted(drafted):
             calls.append(
                 CompileCall(
                     self._build_metadata(requests),
@@ -562,28 +611,33 @@ class DsparkDraft:
                     priority=2 * rows,
                 )
             )
-        for requests, spec_rows in spec_shapes:
-            rows = requests * spec_rows
-            calls.append(
-                CompileCall(
-                    self._build_batched(control, requests, spec_rows),
-                    (
-                        *weights,
-                        *((cache,) * requests),
-                        *(
-                            (
-                                torch.empty((1, requests, c.window), dtype=torch.int32),
-                                torch.empty((1, requests, 128), dtype=torch.int32),
-                            )
-                            if requests > 8
-                            else (positions,) * requests + (vector,) * requests
+        for verified, spec_rows in spec_shapes:
+            rows = verified * spec_rows
+            for first, requests in self.parts(verified, spec_rows):
+                calls.append(
+                    CompileCall(
+                        self._build_batched(
+                            control, requests, spec_rows, first, verified
                         ),
-                        *tail(rows, 4 * rows + requests * control.pages, requests),
-                    ),
-                    {},
-                    priority=2 * rows,
+                        (
+                            *weights,
+                            *((cache,) * requests),
+                            *(
+                                (
+                                    torch.empty(
+                                        (1, requests, c.window), dtype=torch.int32
+                                    ),
+                                    torch.empty((1, requests, 128), dtype=torch.int32),
+                                )
+                                if requests > 8
+                                else (positions,) * requests + (vector,) * requests
+                            ),
+                            *tail(rows, 4 * rows + verified * control.pages, verified),
+                        ),
+                        {},
+                        priority=2 * rows,
+                    )
                 )
-            )
         return calls
 
     def step_batched(
@@ -604,25 +658,31 @@ class DsparkDraft:
         requests join or leave. Returns ``(states, tokens
         [R, 8] -- each request's accepted drafts then its bonus, -1 padded --
         the control state)``."""
-        R = len(states)
-        op = self._build_batched(control, R, rows_per)
-        metadata = tuple(s.positions for s in states) + tuple(s.vector for s in states)
-        if R > 8:
-            metadata = self._build_metadata(R)(*metadata)
-        out = op(
-            *(self.weights[n] for n in self.names),
-            *(s.cache for s in states),
-            *metadata,
-            aux,
-            logits,
-            ids,
-            control_state,
-            decisions,
-        )
-        new = [
-            _settled(DraftState(out[R + j], out[2 * R + j], out[j])) for j in range(R)
-        ]
-        emitted, control_state = out[-2:]
+        verified = len(states)
+        new, emitted = [], []
+        for first, R in self.parts(verified, rows_per):
+            part = states[first : first + R]
+            op = self._build_batched(control, R, rows_per, first, verified)
+            metadata = tuple(s.positions for s in part) + tuple(s.vector for s in part)
+            if R > 8:
+                metadata = self._build_metadata(R)(*metadata)
+            out = op(
+                *(self.weights[n] for n in self.names),
+                *(s.cache for s in part),
+                *metadata,
+                aux,
+                logits,
+                ids,
+                control_state,
+                decisions,
+            )
+            new += [
+                _settled(DraftState(out[R + j], out[2 * R + j], out[j]))
+                for j in range(R)
+            ]
+            emitted.append(out[-2])
+            control_state = out[-1]
+        emitted = emitted[0] if len(emitted) == 1 else torch.cat(emitted)
         return new, emitted, control_state
 
     def step_single(
