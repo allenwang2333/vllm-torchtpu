@@ -18,7 +18,11 @@
 # process is killed by a signal, each of the directory's files is run again in
 # a process of its own, so a crash loses only the crashing file's coverage.
 #
-# Usage: run_coverage_split.sh <name> <pytest -m expression> <timeout_s>
+# Usage: run_coverage_split.sh <name> <pytest -m expression> <timeout_s> \
+#          [include regex] [exclude regex]
+#
+# The optional regexes (grep -E) pick which collected test files this run
+# covers, so one marker selection can be split across several jobs.
 #
 # Writes /perf_eval_results/coverage_<name>.dat.<index>[.<suffix>] data files
 # and /perf_eval_results/coverage_<name>_runs.txt, which lists every pytest
@@ -30,6 +34,8 @@ set -uo pipefail
 NAME="$1"
 MARKERS="$2"
 TIMEOUT="$3"
+INCLUDE="${4:-.}"
+EXCLUDE="${5:-}"
 OUT=/perf_eval_results
 RUNS="${OUT}/coverage_${NAME}_runs.txt"
 run_index=0
@@ -44,7 +50,7 @@ run_pytest() {
   local start
   start=$(date +%s)
   COVERAGE_FILE="${OUT}/coverage_${NAME}.dat.$(printf '%04d' "${run_index}")" \
-    python3 -m pytest -v -rfE --timeout="${TIMEOUT}" -m "${MARKERS}" \
+    python3 -m pytest -sv -rfE --timeout="${TIMEOUT}" -m "${MARKERS}" \
       --cov=vllm_torchtpu --cov-report= "$@" < /dev/null
   rc=$?
   echo "${rc} $(( $(date +%s) - start ))s ${label}" >> "${RUNS}"
@@ -63,7 +69,9 @@ fi
 echo "--- [coverage:${NAME}] Collecting test files for -m '${MARKERS}'"
 python3 -m pytest --collect-only -q --continue-on-collection-errors \
   -m "${MARKERS}" tests/ > /tmp/collect.txt 2>&1
-grep -oE '^tests/[^:]+\.py' /tmp/collect.txt | sort -u > /tmp/files.txt
+grep -oE '^tests/[^:]+\.py::' /tmp/collect.txt | sed 's/::$//' | sort -u \
+  | grep -E "${INCLUDE}" | { if [[ -n "${EXCLUDE}" ]]; then grep -vE "${EXCLUDE}"; else cat; fi; } \
+  > /tmp/files.txt
 grep -E '^ERROR ' /tmp/collect.txt || true
 total=$(wc -l < /tmp/files.txt)
 xargs -n1 dirname < /tmp/files.txt | sort -u > /tmp/dirs.txt
