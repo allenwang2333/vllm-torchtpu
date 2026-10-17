@@ -1686,13 +1686,38 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             return self.model.compute_logits(hidden_states)
 
+    tp_size = 1
+    if meta_path_pre.is_file():
+        with contextlib.suppress(Exception):
+            pre_meta = json.loads(meta_path_pre.read_text())
+            co = pre_meta.get("compile_options") or {}
+            tp_size = int(
+                co.get("num_partitions")
+                or (pre_meta.get("config") or {}).get("tensor_parallel_size")
+                or 1
+            )
+    if tp_size <= 1:
+        tp_size = int(
+            getattr(
+                getattr(runner, "parallel_config", None),
+                "tensor_parallel_size",
+                1,
+            )
+            or 1
+        )
+
     v_raw = getattr(getattr(runner, "model_config", None), "vocab_size", 151936)
     try:
-        vocab_size = (
+        local_vocab_size = (
             int(lm_head_weight.shape[0]) if lm_head_weight is not None else int(v_raw)
         )
     except Exception:
-        vocab_size = 151936
+        local_vocab_size = 151936
+    vocab_size = (
+        local_vocab_size * tp_size
+        if (tp_size > 1 and lm_head_weight is not None)
+        else local_vocab_size
+    )
 
     # weight.json `index` is the global HBM weight slot. `lm_head.weight` is arg 1
     # of the sampling subgraphs, which is also the slot of forward's
@@ -1706,6 +1731,73 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 if w_name != "lm_head.weight" and isinstance(w_spec, dict):
                     used_weight_indices.add(int(w_spec["index"]))
     lm_head_index = max(used_weight_indices, default=0) + 1
+
+    def _inject_tp_all_gather(
+        mlir_text: str,
+        fn_key: str,
+        num_reqs: int,
+        local_vocab: int,
+        full_vocab: int,
+        tp: int,
+        dt_name: str,
+    ) -> str:
+        if tp <= 1 or local_vocab == full_vocab:
+            return mlir_text
+        dt_mlir = (
+            "bf16"
+            if dt_name == "bfloat16"
+            else ("f16" if dt_name == "float16" else "f32")
+        )
+        groups_str = ", ".join(str(i) for i in range(tp))
+        local_tensor = f"tensor<{num_reqs}x{local_vocab}x{dt_mlir}>"
+        full_tensor = f"tensor<{num_reqs}x{full_vocab}x{dt_mlir}>"
+        ag_stmt = (
+            f'    %ag = "stablehlo.all_gather"(%1) '
+            f"<{{all_gather_dim = 1 : i64, "
+            f"channel_handle = #stablehlo.channel_handle<handle = 1, type = 0>, "
+            f"replica_groups = dense<[[{groups_str}]]> : tensor<1x{tp}xi64>, "
+            f"use_global_device_ids}}> : ({local_tensor}) -> {full_tensor}"
+        )
+        lines = mlir_text.splitlines()
+        new_lines: list[str] = []
+        for line in lines:
+            if fn_key.startswith("compute_logits"):
+                if "func.func @main" in line and f"-> {local_tensor}" in line:
+                    line = line.replace(f"-> {local_tensor}", f"-> {full_tensor}")
+                elif "stablehlo.dot_general" in line and f"-> {local_tensor}" in line:
+                    new_lines.append(line)
+                    new_lines.append(ag_stmt)
+                    continue
+                elif "return %1 :" in line and local_tensor in line:
+                    line = line.replace(
+                        f"return %1 : {local_tensor}", f"return %ag : {full_tensor}"
+                    )
+            elif fn_key.startswith("sample_top_tokens"):
+                if "stablehlo.dot_general" in line and f"-> {local_tensor}" in line:
+                    new_lines.append(line)
+                    new_lines.append(ag_stmt)
+                    continue
+                elif (
+                    "stablehlo.iota" in line
+                    and f"tensor<{num_reqs}x{local_vocab}xi64>" in line
+                ):
+                    line = line.replace(
+                        f"tensor<{num_reqs}x{local_vocab}xi64>",
+                        f"tensor<{num_reqs}x{full_vocab}xi64>",
+                    )
+                elif "stablehlo.reduce(%1 init:" in line:
+                    line = (
+                        line.replace(
+                            "stablehlo.reduce(%1 init:", "stablehlo.reduce(%ag init:"
+                        )
+                        .replace(local_tensor, full_tensor)
+                        .replace(
+                            f"tensor<{num_reqs}x{local_vocab}xi64>",
+                            f"tensor<{num_reqs}x{full_vocab}xi64>",
+                        )
+                    )
+            new_lines.append(line)
+        return "\n".join(new_lines) + ("\n" if mlir_text.endswith("\n") else "")
 
     def _export_bucket(
         fn_key: str,
@@ -1816,12 +1908,24 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                 }
             ]
 
+        mlir_text = exported_mlir.serialize_text()
+        if tp_size > 1 and lm_head_weight is not None:
+            mlir_text = _inject_tp_all_gather(
+                mlir_text=mlir_text,
+                fn_key=fn_key,
+                num_reqs=num_reqs,
+                local_vocab=local_vocab_size,
+                full_vocab=vocab_size,
+                tp=tp_size,
+                dt_name=_dtype_name(dummy_hidden),
+            )
+
         _write_exported_module(
             export_dir=export_dir,
             fn_key=fn_key,
             subgraph_idx=0,
             compile_size=num_reqs,
-            mlir_text=exported_mlir.serialize_text(),
+            mlir_text=mlir_text,
             input_specs=input_specs,
             output_specs=output_specs,
         )

@@ -2807,3 +2807,126 @@ def test_maybe_export_sampling_subgraphs_handles_list_eos_token_id(
         "num_partitions": 4,
         "use_spmd_partitioning": True,
     }
+
+
+def test_maybe_export_sampling_subgraphs_injects_tp_all_gather(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Verify TP>1 sampling subgraphs inject stablehlo.all_gather across TP ranks."""
+    export_dir = tmp_path / "export_tp2_sampling"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    (export_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "format_version": 2,
+                "compile_options": {
+                    "num_replicas": 1,
+                    "num_partitions": 2,
+                    "use_spmd_partitioning": True,
+                },
+                "functions": {},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+
+    class MockLmHead(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.zeros((16, 8), dtype=torch.bfloat16), requires_grad=False
+            )
+
+    class MockModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lm_head = MockLmHead()
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+    class MockTp2Runner:
+        def __init__(self) -> None:
+            self.model = MockModel()
+            self._greedy_head_owner = MagicMock()
+            self.num_reqs_paddings = [4]
+            self.model_config = MagicMock()
+            self.model_config.model = "Qwen/Qwen3-0.6B"
+            self.model_config.get_hidden_size.return_value = 8
+            self.model_config.vocab_size = 32
+            self.model_config.max_model_len = 2048
+            self.model_config.eos_token_id = 1
+            self.parallel_config = MagicMock()
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.data_parallel_size = 1
+            self.cache_config = MagicMock()
+            self.cache_config.block_size = 16
+            self.cache_config.num_gpu_blocks = 64
+            self.speculative_config = None
+            self._hidden_states_dtype = torch.bfloat16
+            self.device = torch.device("cpu")
+
+    logits_mlir = (
+        "module @logits {\n"
+        "  func.func @main(%arg0: tensor<4x8xbf16>, "
+        "%arg1: tensor<16x8xbf16>) -> tensor<4x16xbf16> {\n"
+        "    %0 = stablehlo.transpose %arg1, dims = [1, 0] : "
+        "(tensor<16x8xbf16>) -> tensor<8x16xbf16>\n"
+        "    %1 = stablehlo.dot_general %arg0, %0, "
+        "contracting_dims = [1] x [0] : "
+        "(tensor<4x8xbf16>, tensor<8x16xbf16>) -> tensor<4x16xbf16>\n"
+        "    return %1 : tensor<4x16xbf16>\n"
+        "  }\n"
+        "}\n"
+    )
+    sample_mlir = (
+        "module @sample {\n"
+        "  func.func @main(%arg0: tensor<4x8xbf16>, "
+        "%arg1: tensor<16x8xbf16>) -> tensor<4x1xi64> {\n"
+        "    %0 = stablehlo.transpose %arg1, dims = [1, 0] : "
+        "(tensor<16x8xbf16>) -> tensor<8x16xbf16>\n"
+        "    %1 = stablehlo.dot_general %arg0, %0, "
+        "contracting_dims = [1] x [0] : "
+        "(tensor<4x8xbf16>, tensor<8x16xbf16>) -> tensor<4x16xbf16>\n"
+        "    %2 = stablehlo.iota dim = 1 : tensor<4x16xi64>\n"
+        "    %cst_0 = stablehlo.constant dense<0xFF80> : tensor<bf16>\n"
+        "    %c = stablehlo.constant dense<0> : tensor<i64>\n"
+        "    %4:2 = stablehlo.reduce(%1 init: %cst_0), (%2 init: %c) "
+        "across dimensions = [1] : "
+        "(tensor<4x16xbf16>, tensor<4x16xi64>, tensor<bf16>, tensor<i64>) "
+        "-> (tensor<4xbf16>, tensor<4xi64>)\n"
+        "    %5 = stablehlo.reshape %4#1 : (tensor<4xi64>) -> tensor<4x1xi64>\n"
+        "    return %5 : tensor<4x1xi64>\n"
+        "  }\n"
+        "}\n"
+    )
+
+    call_idx = 0
+
+    def _fake_fx_to_mlir(*args: Any, **kwargs: Any) -> Any:
+        nonlocal call_idx
+        res = MagicMock()
+        res.is_noop = False
+        res.module = MagicMock()
+        res.serialize_text.return_value = logits_mlir if call_idx == 0 else sample_mlir
+        call_idx += 1
+        return res
+
+    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir):
+        stablehlo_export.maybe_export_sampling_subgraphs(MockTp2Runner())
+
+    written_logits = (export_dir / "compute_logits_req4.mlir").read_text()
+    assert '"stablehlo.all_gather"(%1)' in written_logits
+    assert "replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>" in written_logits
+    assert "-> tensor<4x32xbf16>" in written_logits
+    assert "return %ag : tensor<4x32xbf16>" in written_logits
+
+    written_sample = (export_dir / "sample_top_tokens_req4.mlir").read_text()
+    assert '"stablehlo.all_gather"(%1)' in written_sample
+    assert "stablehlo.iota dim = 1 : tensor<4x32xi64>" in written_sample
+    assert "stablehlo.reduce(%ag init: %cst_0), (%2 init: %c)" in written_sample
+    assert "(tensor<4x32xbf16>, tensor<4x32xi64>," in written_sample
