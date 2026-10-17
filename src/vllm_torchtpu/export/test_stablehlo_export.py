@@ -1545,6 +1545,11 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
         "model.embed_tokens.weight",
         "lm_head.weight",
     ]
+    # The bundled tokenizer is referenced relative to the artifact directory.
+    assert (export_dir / "tokenizer.json").is_file()
+    assert meta["serving_config"]["tokenizer_config"] == {
+        "source": {"TokenizerPath": {"path": "tokenizer.json"}}
+    }
 
 
 def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
@@ -1599,6 +1604,9 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
         assert entry_in["arg_index"] == 1
         assert entry_in["index"] == lm_head_index
         assert entry_in["argument_type"] == "weight"
+    # No checkpoint snapshot, so no tokenizer.json is bundled or referenced.
+    assert not (export_dir / "tokenizer.json").exists()
+    assert "tokenizer_config" not in metadata.get("serving_config", {})
 
 
 @pytest.mark.parametrize(
