@@ -225,16 +225,27 @@ def _merge_every_rank(outputs, lses, on, real=None):
             outputs[rank], lses[rank], _Group(rank), query_start_loc=qsl
         )
 
-    with (
-        mock.patch.object(cp_mla, "_all_to_all", exchange),
-        mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
-        mock.patch.object(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", on, create=True),
-        mock.patch.object(
-            cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", on, create=True
-        ),
-        concurrent.futures.ThreadPoolExecutor(world) as pool,
-    ):
-        return torch.cat(list(pool.map(run, range(world))), dim=1)
+    # One intra-op thread: eight lockstep threads each running torch ops can
+    # get differently sized OpenMP teams on a loaded host, which moves
+    # elements between vectorized and scalar exp/log and flips the odd bf16
+    # rounding. The exchanges under test are bitwise; the stand-in must be too.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        with (
+            mock.patch.object(cp_mla, "_all_to_all", exchange),
+            mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
+            mock.patch.object(
+                cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", on, create=True
+            ),
+            mock.patch.object(
+                cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", on, create=True
+            ),
+            concurrent.futures.ThreadPoolExecutor(world) as pool,
+        ):
+            return torch.cat(list(pool.map(run, range(world))), dim=1)
+    finally:
+        torch.set_num_threads(threads)
 
 
 def test_attention_all_flags_on_rank_control_fails():
