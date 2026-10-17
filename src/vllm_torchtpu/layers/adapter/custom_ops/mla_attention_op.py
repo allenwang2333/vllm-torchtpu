@@ -89,7 +89,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -631,15 +631,35 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
             return cache_kv, topk_indices
 
-        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        jax_op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
-
         def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
             return torch.empty_like(cache_kv), torch.empty(
                 (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
             )
 
-        jax_op.register_fake(_fake)
+        def build_op(op_name: str):
+            op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
+            op.register_fake(_fake)
+            return op
+
+        # The kernel and fake capture only the values keyed here (this tree's
+        # streamidx knobs: small-bucket block sizes, skip-empty decode, mixed
+        # KV pages); the cache geometry and token counts come from the
+        # argument shapes.
+        jax_op = get_shared_jax_op(
+            "streamidx_topk",
+            (
+                topk,
+                chunk_tokens,
+                small_bucket_bq,
+                small_bucket_bkvp,
+                small_bucket_tokens,
+                skip_empty_decode,
+                skip_empty_decode_chunked,
+                mixed_bkvp,
+                kv_cache_mode,
+            ),
+            build_op,
+        )
 
         def op(*args):
             new_cache, topk_indices = jax_op(*args)
