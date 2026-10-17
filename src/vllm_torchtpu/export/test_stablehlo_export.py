@@ -77,6 +77,76 @@ def _write_test_safetensors(tensors: dict[str, torch.Tensor], out_path: Path) ->
             f.write(chunk)
 
 
+class _LmHeadModel(torch.nn.Module):
+    """A model whose logits are `lm_head(hidden_states)`."""
+
+    def __init__(self, hidden_size: int = 16, vocab_size: int = 32) -> None:
+        super().__init__()
+        self.lm_head = torch.nn.Linear(
+            hidden_size, vocab_size, bias=False, dtype=torch.bfloat16
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states)
+
+
+def _mlir_tensor_type(t: torch.Tensor) -> str:
+    dims = "x".join(str(d) for d in t.shape)
+    elem = stablehlo_export._TORCH_NAME_TO_MLIR_DTYPE[
+        str(t.dtype).removeprefix("torch.")
+    ]
+    return f"tensor<{dims}x{elem}>" if dims else f"tensor<{elem}>"
+
+
+def _render_main(inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> str:
+    args = ", ".join(f"%arg{i}: {_mlir_tensor_type(t)}" for i, t in enumerate(inputs))
+    ret = _mlir_tensor_type(output)
+    return (
+        "module @lowered {\n"
+        f"  func.func public @main({args}) -> ({ret}) {{\n"
+        f"    %0 = stablehlo.constant dense<0> : {ret}\n"
+        f"    return %0 : {ret}\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+class _FakeTpuLowering:
+    """CPU stand-in for `stablehlo_export._lower_with_tpu_backend`.
+
+    Runs the function eagerly and reports the module the TPU backend lowers for
+    it: `@main(hidden_states, lm_head.weight, *extra_inputs) -> result`.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        extra_inputs: tuple[torch.Tensor, ...] = (),
+        mlir_text: str | None = None,
+    ) -> None:
+        self.lm_head_weight = model.lm_head.weight
+        self.extra_inputs = extra_inputs
+        self.mlir_text = mlir_text
+        self.calls: list[tuple[Any, torch.Tensor, torch.Tensor]] = []
+
+    def __call__(
+        self, fn: Any, example: torch.Tensor
+    ) -> stablehlo_export.LoweredModule:
+        with torch.no_grad():
+            out = fn(example)
+        self.calls.append((fn, example, out))
+        inputs = (example, self.lm_head_weight, *self.extra_inputs)
+        return stablehlo_export.LoweredModule(
+            mlir_text=self.mlir_text or _render_main(inputs, out),
+            inputs=inputs,
+            outputs=(out,),
+        )
+
+
+def _patch_tpu_lowering(lowering: _FakeTpuLowering) -> Any:
+    return patch.object(stablehlo_export, "_lower_with_tpu_backend", lowering)
+
+
 def test_env_mutually_exclusive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", "/tmp/mock_export_hlo")
     monkeypatch.setenv("VLLM_TORCHTPU_LOAD_HLO_DIR", "/tmp/mock_hlo_export")
@@ -1370,41 +1440,23 @@ def test_export_sampling_subgraphs_e2e(
     monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
     monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
 
-    class MockModel(torch.nn.Module):
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return torch.matmul(
-                hidden_states,
-                torch.ones((hidden_states.shape[-1], 32), dtype=hidden_states.dtype),
-            )
-
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1, 2]
+            self.num_tokens_paddings = [2]
             self.model_config = MagicMock()
             self.model_config.get_hidden_size.return_value = 16
             self.model_config.vocab_size = 32
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>) "
-        "-> tensor<1x32xbf16> { return %arg0 : tensor<1x32xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
+    runner = MockRunner()
     with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
+        _patch_tpu_lowering(_FakeTpuLowering(runner.model)),
         pytest.raises(SystemExit) as exc_info,
     ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
     assert exc_info.value.code == 0
 
     assert (export_dir / "compute_logits_req1.mlir").exists()
@@ -1454,19 +1506,11 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
         json.dumps(seed_weights)
     )
 
-    class MockModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = torch.nn.Linear(16, 32, bias=False, dtype=torch.bfloat16)
-
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return self.lm_head(hidden_states)
-
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1]
+            self.num_tokens_paddings = [1]
             self.model_config = MagicMock()
             self.model_config.model = str(ckpt_dir)
             self.model_config.get_hidden_size.return_value = 16
@@ -1474,27 +1518,12 @@ def test_export_sampling_subgraphs_bundles_checkpoint_assets(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph {\n"
-        "  func.func public @main(%arg0: tensor<1x16xbf16>, "
-        "%arg1: tensor<32x16xbf16>) -> tensor<1x32xbf16> {\n"
-        "    return %arg0 : tensor<1x32xbf16>\n"
-        "  }\n"
-        "}\n"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
+    runner = MockRunner()
     with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
+        _patch_tpu_lowering(_FakeTpuLowering(runner.model)),
         pytest.raises(SystemExit) as exc_info,
     ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
     assert exc_info.value.code == 0
 
     assert not (export_dir / "serving_checkpoint" / "constants.safetensors").exists()
@@ -1542,19 +1571,11 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
         json.dumps(seed_weights)
     )
 
-    class MockModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = torch.nn.Linear(16, 32, bias=False, dtype=torch.bfloat16)
-
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return self.lm_head(hidden_states)
-
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1]
+            self.num_tokens_paddings = [1]
             self.model_config = MagicMock()
             self.model_config.model = str(tmp_path / "no_such_ckpt")
             self.model_config.get_hidden_size.return_value = 16
@@ -1562,24 +1583,12 @@ def test_export_sampling_subgraphs_gives_lm_head_its_own_weight_index(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>, "
-        "%arg1: tensor<32x16xbf16>) -> tensor<1x32xbf16> "
-        "{ return %arg0 : tensor<1x32xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
+    runner = MockRunner()
     with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
+        _patch_tpu_lowering(_FakeTpuLowering(runner.model)),
         pytest.raises(SystemExit),
     ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
 
     wj = json.loads((export_dir / "serving_checkpoint" / "weight.json").read_text())
     lm_head_index = wj["lm_head.weight"]["index"]
@@ -1610,15 +1619,11 @@ def test_export_sampling_subgraphs_writes_compile_options(
     monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
     monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
 
-    class MockModel(torch.nn.Module):
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1]
+            self.num_tokens_paddings = [1]
             self.model_config = MagicMock()
             self.model_config.model = str(tmp_path / "no_such_ckpt")
             self.model_config.get_hidden_size.return_value = 16
@@ -1631,24 +1636,10 @@ def test_export_sampling_subgraphs_writes_compile_options(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>) "
-        "-> tensor<1x16xbf16> { return %arg0 : tensor<1x16xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
+    runner = MockRunner()
     cm = pytest.raises(SystemExit) if (tp * dp <= 1) else contextlib.nullcontext()
-    with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
-        cm,
-    ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+    with _patch_tpu_lowering(_FakeTpuLowering(runner.model)), cm:
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
 
     metadata = json.loads((export_dir / "metadata.json").read_text())
     assert metadata["compile_options"] == expected
@@ -1665,15 +1656,11 @@ def test_export_sampling_subgraphs_fails_when_metadata_cannot_be_finalized(
     monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
     monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
 
-    class MockModel(torch.nn.Module):
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1]
+            self.num_tokens_paddings = [1]
             self.model_config = MagicMock()
             self.model_config.model = str(tmp_path / "no_such_ckpt")
             self.model_config.get_hidden_size.return_value = 16
@@ -1684,23 +1671,12 @@ def test_export_sampling_subgraphs_fails_when_metadata_cannot_be_finalized(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>) "
-        "-> tensor<1x16xbf16> { return %arg0 : tensor<1x16xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
+    runner = MockRunner()
     with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
+        _patch_tpu_lowering(_FakeTpuLowering(runner.model)),
         pytest.raises(ValueError),
     ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
 
 
 def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
@@ -1713,15 +1689,11 @@ def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
     monkeypatch.setenv("VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir))
     monkeypatch.delenv("VLLM_TORCHTPU_LOAD_HLO_DIR", raising=False)
 
-    class MockModel(torch.nn.Module):
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
     class MockTPRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [1]
+            self.num_tokens_paddings = [1]
             self.model_config = MagicMock()
             self.model_config.get_hidden_size.return_value = 16
             self.model_config.vocab_size = 32
@@ -1730,22 +1702,9 @@ def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<1x16xbf16>) "
-        "-> tensor<1x32xbf16> { return %arg0 : tensor<1x32xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
-    with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
-    ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockTPRunner())
+    tp_runner = MockTPRunner()
+    with _patch_tpu_lowering(_FakeTpuLowering(tp_runner.model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(tp_runner)
 
     import vllm.v1.engine.utils as engine_utils
 
@@ -1778,14 +1737,9 @@ def test_export_early_exit_cleanly_handles_engine_startup_and_multiproc(
             self.parallel_config.world_size = 1
             self.parallel_config.data_parallel_size = 8
 
-    with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((1, 1), dtype=torch.int64),
-        ),
-    ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockDPRunner())
+    dp_runner = MockDPRunner()
+    with _patch_tpu_lowering(_FakeTpuLowering(dp_runner.model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(dp_runner)
 
     mock_launch = MagicMock()
     with (
@@ -2121,19 +2075,11 @@ def test_multi_rank_writer_guard_and_mtp_draft_collision_free_indices(
     assert draft_inputs[2]["arg_index"] == 2
     assert draft_inputs[2]["index"] == 3
 
-    # 3. Non-writer rank (RANK=1) must not overwrite or exit in sampling export
-    class MockModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lm_head = torch.nn.Linear(8, 32, bias=False, dtype=torch.bfloat16)
-
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
+    # 3. Non-writer rank (RANK=1) lowers the same modules (tensor-parallel
+    # collectives need every rank) but must not write or exit.
     class MockRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel(hidden_size=8, vocab_size=32)
             # num_reqs_paddings only has [1, 8], while forward_bucket16 has bucket 16
             self.num_reqs_paddings = [1, 8]
             self.num_tokens_paddings = [16]
@@ -2154,29 +2100,27 @@ def test_multi_rank_writer_guard_and_mtp_draft_collision_free_indices(
             self.device = torch.device("cpu")
 
     monkeypatch.setenv("RANK", "1")
-    stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+    rank1_runner = MockRunner()
+    rank1_lowering = _FakeTpuLowering(rank1_runner.model)
+    with _patch_tpu_lowering(rank1_lowering):
+        stablehlo_export.maybe_export_sampling_subgraphs(rank1_runner)
+    assert [int(example.shape[0]) for _, example, _ in rank1_lowering.calls] == [
+        1,
+        1,
+        8,
+        8,
+        16,
+        16,
+    ]
     meta_after_rank1 = json.loads((export_dir / "metadata.json").read_text())
     assert "sample_top_tokens" not in meta_after_rank1["functions"]
 
     # 4. Writer rank (RANK=0) exports sampling subgraphs for union of num_reqs_paddings
-    # and forward buckets ([1, 8, 16]) and records data_parallel_size=4
+    # and num_tokens_paddings ([1, 8, 16]) and records data_parallel_size=4
     monkeypatch.setenv("RANK", "0")
-
-    def _fake_fx_to_mlir(gm: Any, args: list[Any], **_kw: Any) -> Any:
-        n = int(args[0].shape[0])
-        m = MagicMock()
-        m.is_noop = False
-        m.module = MagicMock()
-        m.serialize_text.return_value = (
-            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
-            f"%arg1: tensor<32x8xbf16>) -> tensor<{n}x1xi64> {{ "
-            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
-            f"return %0 : tensor<{n}x1xi64> }} }}"
-        )
-        return m
-
-    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockRunner())
+    rank0_runner = MockRunner()
+    with _patch_tpu_lowering(_FakeTpuLowering(rank0_runner.model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(rank0_runner)
 
     meta_final = json.loads((export_dir / "metadata.json").read_text())
     assert set(meta_final["functions"]["sample_top_tokens"].keys()) == {"1", "8", "16"}
@@ -2344,11 +2288,7 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
 
     class DummyRunner:
         def __init__(self) -> None:
-            self.model = torch.nn.Module()
-            self.model.lm_head = torch.nn.Linear(
-                8, 32, bias=False, dtype=torch.bfloat16
-            )
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel(hidden_size=8, vocab_size=32)
             self.num_reqs_paddings = [8]
             self.num_tokens_paddings = [16]
             self.model_config = MagicMock()
@@ -2368,21 +2308,9 @@ def test_aot_reordered_arg_mapping_uppercase_dynamo_names_and_dummy_snapshot_ass
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    def _fake_fx_to_mlir_2(gm: Any, args: list[Any], **_kw: Any) -> Any:
-        n = int(args[0].shape[0])
-        m = MagicMock()
-        m.is_noop = False
-        m.module = MagicMock()
-        m.serialize_text.return_value = (
-            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
-            f"%arg1: tensor<32x8xbf16>) -> tensor<{n}x1xi64> {{ "
-            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
-            f"return %0 : tensor<{n}x1xi64> }} }}"
-        )
-        return m
-
-    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir_2):
-        stablehlo_export.maybe_export_sampling_subgraphs(DummyRunner())
+    dummy_runner = DummyRunner()
+    with _patch_tpu_lowering(_FakeTpuLowering(dummy_runner.model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(dummy_runner)
 
     assert (export_dir / "config.json").is_file()
     assert (export_dir / "tokenizer.json").is_file()
@@ -2423,6 +2351,9 @@ def test_scalar_buffer_constants_and_extra_snapshot_assets(
                 torch.zeros((16, 8), dtype=torch.bfloat16)
             )
             self.lm_head = torch.nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+
+        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return self.lm_head(hidden_states)
 
     active_model = VocabParallelDummyModel()
     stablehlo_export.register_active_model(active_model)
@@ -2519,7 +2450,6 @@ def test_scalar_buffer_constants_and_extra_snapshot_assets(
     class DummyRunner2:
         def __init__(self) -> None:
             self.model = active_model
-            self._greedy_head_owner = MagicMock()
             self.num_reqs_paddings = [8]
             self.num_tokens_paddings = [16]
             self.model_config = MagicMock()
@@ -2539,20 +2469,7 @@ def test_scalar_buffer_constants_and_extra_snapshot_assets(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    def _fake_fx_to_mlir_3(gm: Any, args: list[Any], **_kw: Any) -> Any:
-        n = int(args[0].shape[0])
-        m = MagicMock()
-        m.is_noop = False
-        m.module = MagicMock()
-        m.serialize_text.return_value = (
-            f"module @s {{ func.func public @main(%arg0: tensor<{n}x8xbf16>, "
-            f"%arg1: tensor<16x8xbf16>) -> tensor<{n}x1xi64> {{ "
-            f"%0 = stablehlo.constant dense<0> : tensor<{n}x1xi64> "
-            f"return %0 : tensor<{n}x1xi64> }} }}"
-        )
-        return m
-
-    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir_3):
+    with _patch_tpu_lowering(_FakeTpuLowering(active_model)):
         stablehlo_export.maybe_export_sampling_subgraphs(DummyRunner2())
 
     assert (export_dir / "tiktoken.model").is_file()
@@ -2755,15 +2672,11 @@ def test_maybe_export_sampling_subgraphs_handles_list_eos_token_id(
         stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
     )
 
-    class MockModel(torch.nn.Module):
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
-
     class MockGlmRunner:
         def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
+            self.model = _LmHeadModel()
             self.num_reqs_paddings = [8]
+            self.num_tokens_paddings = [8]
             self.model_config = MagicMock()
             self.model_config.model = "zai-org/GLM-5.2-FP8"
             self.model_config.get_hidden_size.return_value = 16
@@ -2783,22 +2696,9 @@ def test_maybe_export_sampling_subgraphs_handles_list_eos_token_id(
             self._hidden_states_dtype = torch.bfloat16
             self.device = torch.device("cpu")
 
-    mock_mlir_res = MagicMock()
-    mock_mlir_res.serialize_text.return_value = (
-        "module @subgraph { func.func @main(%arg0: tensor<8x16xbf16>) "
-        "-> tensor<8x32xbf16> { return %arg0 : tensor<8x32xbf16> } }"
-    )
-    mock_mlir_res.is_noop = False
-    mock_mlir_res.module = MagicMock()
-
-    with (
-        patch("torch_tpu._internal.export.fx_to_mlir", return_value=mock_mlir_res),
-        patch(
-            "vllm_torchtpu.runner.greedy_top_tokens.top_tokens",
-            return_value=torch.zeros((8, 1), dtype=torch.int64),
-        ),
-    ):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockGlmRunner())
+    runner = MockGlmRunner()
+    with _patch_tpu_lowering(_FakeTpuLowering(runner.model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
 
     meta = json.loads((export_dir / "metadata.json").read_text())
     assert meta["config"]["eos_token_id"] == 154820
@@ -2809,124 +2709,231 @@ def test_maybe_export_sampling_subgraphs_handles_list_eos_token_id(
     }
 
 
-def test_maybe_export_sampling_subgraphs_injects_tp_all_gather(
+class _SamplingRunner:
+    """The runner attributes the sampling export reads."""
+
+    def __init__(
+        self, model: torch.nn.Module, num_reqs_paddings: list[int], hidden_size: int
+    ) -> None:
+        self.model = model
+        self.num_reqs_paddings = num_reqs_paddings
+        self.num_tokens_paddings = num_reqs_paddings
+        self.model_config = MagicMock()
+        self.model_config.model = "Qwen/Qwen3-0.6B"
+        self.model_config.get_hidden_size.return_value = hidden_size
+        self.model_config.vocab_size = 32
+        self.model_config.max_model_len = 2048
+        self.model_config.eos_token_id = 1
+        self.parallel_config = MagicMock()
+        self.parallel_config.world_size = 2
+        self.parallel_config.tensor_parallel_size = 2
+        self.parallel_config.pipeline_parallel_size = 1
+        self.parallel_config.data_parallel_size = 1
+        self.cache_config = MagicMock()
+        self.cache_config.block_size = 16
+        self.cache_config.num_gpu_blocks = 64
+        self.speculative_config = None
+        self._hidden_states_dtype = torch.bfloat16
+        self.device = torch.device("cpu")
+
+
+def test_sample_top_tokens_is_argmax_of_compute_logits(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """Verify TP>1 sampling subgraphs inject stablehlo.all_gather across TP ranks."""
-    export_dir = tmp_path / "export_tp2_sampling"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    (export_dir / "metadata.json").write_text(
-        json.dumps(
-            {
-                "format_version": 2,
-                "compile_options": {
-                    "num_replicas": 1,
-                    "num_partitions": 2,
-                    "use_spmd_partitioning": True,
-                },
-                "functions": {},
-            }
-        )
-    )
+    """`sample_top_tokens` lowers the argmax of the model's own `compute_logits`."""
+    export_dir = tmp_path / "export_argmax"
     monkeypatch.setattr(
         stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
     )
+    model = _LmHeadModel(hidden_size=8, vocab_size=32)
+    torch.nn.init.normal_(model.lm_head.weight)
+    runner = _SamplingRunner(model, [4], hidden_size=8)
+    lowering = _FakeTpuLowering(model)
 
-    class MockLmHead(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = torch.nn.Parameter(
-                torch.zeros((16, 8), dtype=torch.bfloat16), requires_grad=False
+    with _patch_tpu_lowering(lowering):
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
+
+    (logits_fn, _, _), (tokens_fn, _, tokens_out) = lowering.calls
+    hidden = torch.randn((4, 8), dtype=torch.bfloat16)
+    with torch.no_grad():
+        logits = model.compute_logits(hidden)
+        assert torch.equal(logits_fn(hidden), logits)
+        assert torch.equal(
+            tokens_fn(hidden), torch.argmax(logits, dim=-1, keepdim=True)
+        )
+    assert tokens_out.dtype == torch.int64
+
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    tokens_entry = meta["functions"]["sample_top_tokens"]["4"]
+    assert [o["name"] for o in tokens_entry["outputs"]] == ["tokens"]
+    assert tokens_entry["outputs"][0]["shape"] == [4, 1]
+    assert tokens_entry["outputs"][0]["dtype"] == "int64"
+    logits_entry = meta["functions"]["compute_logits"]["4"]
+    assert [o["name"] for o in logits_entry["outputs"]] == ["logits"]
+    assert logits_entry["outputs"][0]["shape"] == [4, 32]
+
+
+def _with_all_gather(mlir_text: str) -> str:
+    return mlir_text.replace(
+        "    %0 =",
+        '    %ag = "stablehlo.all_gather"(%arg1) {all_gather_dim = 1 : i64}\n    %0 =',
+    )
+
+
+def test_sampling_export_writes_backend_module_verbatim(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The exported `.mlir` is the backend's module byte for byte, collectives
+    included, and input roles come from the lowered arguments, not positions."""
+    export_dir = tmp_path / "export_verbatim"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    model = _LmHeadModel(hidden_size=8, vocab_size=16)
+    runner = _SamplingRunner(model, [4], hidden_size=8)
+
+    class _Tp2Lowering(_FakeTpuLowering):
+        """Weight first, logits gathered across two vocabulary shards."""
+
+        def __call__(
+            self, fn: Any, example: torch.Tensor
+        ) -> stablehlo_export.LoweredModule:
+            with torch.no_grad():
+                out = fn(example)
+            if out.dtype != torch.int64:
+                out = torch.cat([out, out], dim=-1)
+            inputs = (self.lm_head_weight, example)
+            return stablehlo_export.LoweredModule(
+                mlir_text=_with_all_gather(_render_main(inputs, out)),
+                inputs=inputs,
+                outputs=(out,),
             )
 
-    class MockModel(torch.nn.Module):
+    with _patch_tpu_lowering(_Tp2Lowering(model)):
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
+
+    written = (export_dir / "compute_logits_req4.mlir").read_text()
+    assert written == _with_all_gather(
+        _render_main(
+            (model.lm_head.weight, torch.zeros((4, 8), dtype=torch.bfloat16)),
+            torch.zeros((4, 32), dtype=torch.bfloat16),
+        )
+    )
+
+    meta = json.loads((export_dir / "metadata.json").read_text())
+    inputs = meta["functions"]["compute_logits"]["4"]["inputs"]
+    assert [(i["arg_index"], i["name"], i["argument_type"]) for i in inputs] == [
+        (0, "lm_head.weight", "weight"),
+        (1, "hidden_states", "intermediate"),
+    ]
+    assert meta["functions"]["compute_logits"]["4"]["outputs"][0]["shape"] == [4, 32]
+
+
+def test_sampling_export_rejects_inputs_outside_the_contract(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A lowered sampling module with an extra input fails the export."""
+    export_dir = tmp_path / "export_extra_input"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    model = _LmHeadModel(hidden_size=8, vocab_size=16)
+    runner = _SamplingRunner(model, [4], hidden_size=8)
+    bias = torch.zeros((16,), dtype=torch.bfloat16)
+
+    with (
+        _patch_tpu_lowering(_FakeTpuLowering(model, extra_inputs=(bias,))),
+        pytest.raises(ValueError, match="compute_logits_req4"),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
+    assert not (export_dir / "compute_logits_req4.mlir").exists()
+
+
+def test_sampling_export_rejects_mlir_signature_mismatch(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The `@main` signature must match the lowered argument tensors."""
+    export_dir = tmp_path / "export_bad_signature"
+    monkeypatch.setattr(
+        stablehlo_export.envs, "VLLM_TORCHTPU_EXPORT_HLO_DIR", str(export_dir)
+    )
+    model = _LmHeadModel(hidden_size=8, vocab_size=16)
+    runner = _SamplingRunner(model, [4], hidden_size=8)
+    stale_text = _render_main(
+        (torch.zeros((2, 8), dtype=torch.bfloat16), model.lm_head.weight),
+        torch.zeros((2, 16), dtype=torch.bfloat16),
+    )
+
+    with (
+        _patch_tpu_lowering(_FakeTpuLowering(model, mlir_text=stale_text)),
+        pytest.raises(ValueError, match="@main"),
+    ):
+        stablehlo_export.maybe_export_sampling_subgraphs(runner)
+
+
+def test_find_lm_head_weight_handles_tied_embeddings() -> None:
+    """A tied `lm_head` shares the embedding parameter and is still found."""
+
+    class _Tied(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.lm_head = MockLmHead()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(16, 8)
+            self.lm_head = self.model.embed_tokens
 
-        def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            return hidden_states
+    tied = _Tied()
+    assert stablehlo_export._find_lm_head_weight(tied) is tied.model.embed_tokens.weight
 
-    class MockTp2Runner:
-        def __init__(self) -> None:
-            self.model = MockModel()
-            self._greedy_head_owner = MagicMock()
-            self.num_reqs_paddings = [4]
-            self.model_config = MagicMock()
-            self.model_config.model = "Qwen/Qwen3-0.6B"
-            self.model_config.get_hidden_size.return_value = 8
-            self.model_config.vocab_size = 32
-            self.model_config.max_model_len = 2048
-            self.model_config.eos_token_id = 1
-            self.parallel_config = MagicMock()
-            self.parallel_config.world_size = 2
-            self.parallel_config.tensor_parallel_size = 2
-            self.parallel_config.pipeline_parallel_size = 1
-            self.parallel_config.data_parallel_size = 1
-            self.cache_config = MagicMock()
-            self.cache_config.block_size = 16
-            self.cache_config.num_gpu_blocks = 64
-            self.speculative_config = None
-            self._hidden_states_dtype = torch.bfloat16
-            self.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="lm_head"):
+        stablehlo_export._find_lm_head_weight(torch.nn.Linear(2, 2))
 
-    logits_mlir = (
-        "module @logits {\n"
-        "  func.func @main(%arg0: tensor<4x8xbf16>, "
-        "%arg1: tensor<16x8xbf16>) -> tensor<4x16xbf16> {\n"
-        "    %0 = stablehlo.transpose %arg1, dims = [1, 0] : "
-        "(tensor<16x8xbf16>) -> tensor<8x16xbf16>\n"
-        "    %1 = stablehlo.dot_general %arg0, %0, "
-        "contracting_dims = [1] x [0] : "
-        "(tensor<4x8xbf16>, tensor<8x16xbf16>) -> tensor<4x16xbf16>\n"
-        "    return %1 : tensor<4x16xbf16>\n"
-        "  }\n"
-        "}\n"
-    )
-    sample_mlir = (
-        "module @sample {\n"
-        "  func.func @main(%arg0: tensor<4x8xbf16>, "
-        "%arg1: tensor<16x8xbf16>) -> tensor<4x1xi64> {\n"
-        "    %0 = stablehlo.transpose %arg1, dims = [1, 0] : "
-        "(tensor<16x8xbf16>) -> tensor<8x16xbf16>\n"
-        "    %1 = stablehlo.dot_general %arg0, %0, "
-        "contracting_dims = [1] x [0] : "
-        "(tensor<4x8xbf16>, tensor<8x16xbf16>) -> tensor<4x16xbf16>\n"
-        "    %2 = stablehlo.iota dim = 1 : tensor<4x16xi64>\n"
-        "    %cst_0 = stablehlo.constant dense<0xFF80> : tensor<bf16>\n"
-        "    %c = stablehlo.constant dense<0> : tensor<i64>\n"
-        "    %4:2 = stablehlo.reduce(%1 init: %cst_0), (%2 init: %c) "
-        "across dimensions = [1] : "
-        "(tensor<4x16xbf16>, tensor<4x16xi64>, tensor<bf16>, tensor<i64>) "
-        "-> (tensor<4xbf16>, tensor<4xi64>)\n"
-        "    %5 = stablehlo.reshape %4#1 : (tensor<4xi64>) -> tensor<4x1xi64>\n"
-        "    return %5 : tensor<4x1xi64>\n"
-        "  }\n"
-        "}\n"
-    )
 
-    call_idx = 0
+def test_lower_with_tpu_backend_captures_the_backend_module(
+    monkeypatch: Any,
+) -> None:
+    """The compiled function's lowering is captured, then `fx_to_mlir` restored."""
+    from torch_tpu._internal import export as torch_tpu_export
 
-    def _fake_fx_to_mlir(*args: Any, **kwargs: Any) -> Any:
-        nonlocal call_idx
+    hidden = torch.zeros((4, 8), dtype=torch.bfloat16)
+    weight = torch.zeros((16, 8), dtype=torch.bfloat16)
+    logits = torch.zeros((4, 16), dtype=torch.bfloat16)
+    lowered_text = _render_main((hidden, weight), logits)
+
+    def _fake_fx_to_mlir(module: Any, args: list[Any], **_kw: Any) -> Any:
         res = MagicMock()
         res.is_noop = False
-        res.module = MagicMock()
-        res.serialize_text.return_value = logits_mlir if call_idx == 0 else sample_mlir
-        call_idx += 1
+        res.updates_default_generator_state = False
+        res.mlir_result_tensors = [logits]
+        res.serialize_text.return_value = lowered_text
         return res
 
-    with patch("torch_tpu._internal.export.fx_to_mlir", side_effect=_fake_fx_to_mlir):
-        stablehlo_export.maybe_export_sampling_subgraphs(MockTp2Runner())
+    def _fake_compile(fn: Any, **kw: Any) -> Any:
+        assert kw == {"backend": "tpu", "fullgraph": True, "dynamic": False}
 
-    written_logits = (export_dir / "compute_logits_req4.mlir").read_text()
-    assert '"stablehlo.all_gather"(%1)' in written_logits
-    assert "replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>" in written_logits
-    assert "-> tensor<4x32xbf16>" in written_logits
-    assert "return %ag : tensor<4x32xbf16>" in written_logits
+        def _run(example: torch.Tensor) -> torch.Tensor:
+            torch_tpu_export.fx_to_mlir(MagicMock(), [example, weight, 3])
+            return fn(example)
 
-    written_sample = (export_dir / "sample_top_tokens_req4.mlir").read_text()
-    assert '"stablehlo.all_gather"(%1)' in written_sample
-    assert "stablehlo.iota dim = 1 : tensor<4x32xi64>" in written_sample
-    assert "stablehlo.reduce(%ag init: %cst_0), (%2 init: %c)" in written_sample
-    assert "(tensor<4x32xbf16>, tensor<4x32xi64>," in written_sample
+        return _run
+
+    monkeypatch.setattr(torch_tpu_export, "fx_to_mlir", _fake_fx_to_mlir)
+    monkeypatch.setattr(stablehlo_export.torch, "compile", _fake_compile)
+
+    lowered = stablehlo_export._lower_with_tpu_backend(lambda h: h, hidden)
+    assert lowered.mlir_text == lowered_text
+    assert lowered.inputs == (hidden, weight)
+    assert lowered.outputs == (logits,)
+    assert torch_tpu_export.fx_to_mlir is _fake_fx_to_mlir
+
+
+def test_lower_with_tpu_backend_fails_without_a_lowering(monkeypatch: Any) -> None:
+    """A call that lowers nothing (e.g. a compile cache hit) fails the export."""
+    from torch_tpu._internal import export as torch_tpu_export
+
+    orig = torch_tpu_export.fx_to_mlir
+    monkeypatch.setattr(stablehlo_export.torch, "compile", lambda fn, **_kw: fn)
+    with pytest.raises(RuntimeError, match="lowered 0"):
+        stablehlo_export._lower_with_tpu_backend(
+            lambda h: h, torch.zeros((1, 1), dtype=torch.bfloat16)
+        )
+    assert torch_tpu_export.fx_to_mlir is orig
