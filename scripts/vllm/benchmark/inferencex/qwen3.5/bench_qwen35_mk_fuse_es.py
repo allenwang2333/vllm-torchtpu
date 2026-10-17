@@ -68,6 +68,25 @@ MODE_KW: dict[str, dict[str, Any]] = {
     "bottom_chunk": {"fuse_es": True, "es_read": "chunk"},
     "right": {"fuse_es": True, "es_layout": "right"},
     "pad_right": {"es_pad": True, "es_layout": "right"},
+    # Routed-expert wcol / down-epilogue ablations:
+    "wcol_q": {"wcol_q": True},
+    "wcol_q_nornd": {"wcol_q": True, "down_fma": True},
+    "wcol_pre": {"wcol_q": True, "wcol_pre": True},
+    "wcol_pre_fma": {"wcol_q": True, "wcol_pre": True, "down_fma": True},
+    "pre_fma": {"wcol_pre": True, "down_fma": True},
+    "right_wcol_fma": {
+        "fuse_es": True,
+        "es_layout": "right",
+        "wcol_q": True,
+        "wcol_pre": True,
+        "down_fma": True,
+    },
+    "right_pre_fma": {
+        "fuse_es": True,
+        "es_layout": "right",
+        "wcol_pre": True,
+        "down_fma": True,
+    },
     # Diagnostics reproducing the first FUSE_ES microbenchmark (j-b0b077f8): "late" loads each
     # expert's e2 weights after the next expert's gate|up in experts_piped (that build's order);
     # "rand" fills the scale rows with random FP8 bytes as that run did (outputs then differ).
@@ -386,14 +405,28 @@ def _bench_mode(mesh, gen, mode, buckets, routings, warmup, iters, ref_out, tag)
                         out0 = np.asarray(outs[0]).astype(np.float32)
                         if key not in ref_out:
                             ref_out[key] = (mode, out0)
-                            check = {"vs": mode, "equal": True, "max_abs_diff": 0.0}
+                            check = {
+                                "vs": mode,
+                                "equal": True,
+                                "max_abs_diff": 0.0,
+                                "cos_sim": 1.0,
+                            }
                         else:
                             ref_mode, ref = ref_out[key]
                             diff = np.abs(out0 - ref)
+                            denom = float(
+                                np.linalg.norm(out0.ravel()) * np.linalg.norm(ref.ravel())
+                            )
+                            cos = (
+                                float(np.dot(out0.ravel(), ref.ravel()) / denom)
+                                if denom > 0
+                                else 1.0
+                            )
                             check = {
                                 "vs": ref_mode,
                                 "equal": bool(np.array_equal(out0, ref, equal_nan=True)),
                                 "max_abs_diff": float(np.nanmax(diff)) if diff.size else 0.0,
+                                "cos_sim": cos,
                                 "nan": int(np.isnan(out0).sum()),
                             }
                 times = []
@@ -413,10 +446,10 @@ def _bench_mode(mesh, gen, mode, buckets, routings, warmup, iters, ref_out, tag)
                     "check": check,
                 }
                 print(
-                    f"[bench] {tag} mode={mode:12s} {routing:7s} T={T} B={B:2d}: "
+                    f"[bench] {tag} mode={mode:14s} {routing:7s} T={T} B={B:2d}: "
                     f"median={med:8.1f} us min={np.min(times):8.1f} us first={first_s:5.1f} s "
                     f"hits/layer={hits:6.1f} equal={check['equal']} "
-                    f"maxdiff={check['max_abs_diff']:.3g}",
+                    f"maxdiff={check['max_abs_diff']:.3g} cos={check.get('cos_sim', 1.0):.6f}",
                     flush=True,
                 )
             except Exception as e:  # keep the remaining buckets / modes going

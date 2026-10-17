@@ -510,3 +510,40 @@ def test_es_pack_layouts_roundtrip():
     assert expert_dma_bytes(dataclasses.replace(c, fuse_es=False)) == (
         4096 * 256 + 128 * 4096 + 4 * (256 + 4096)
     )
+
+
+def test_wcol_and_down_epilogue_ablations():
+    """wcol_q is bit-exact across multiple 128-expert quadrants; wcol_pre and down_fma match within bf16 rounding."""
+    c_b, tiles_b, ctx_b, w_sh_b, st_sh_b, _, w_b, st_b, pos, hid = make_test_ctx_and_inputs(
+        E=256
+    )
+    mesh1 = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
+    ref = {
+        p: _run_moe_block(mesh1, ctx_b, w_sh_b, st_sh_b, w_b, st_b, pos, hid, p)
+        for p in (True, False)
+    }
+
+    c_q = dataclasses.replace(c_b, wcol_q=True)
+    ctx_q = K.MKBuildContext(c_q, tiles_b, interpret=True)
+    assert ctx_q.scratch["wn"].shape == (2, c_q.MR, 128)
+    for p in (True, False):
+        out_q = _run_moe_block(mesh1, ctx_q, w_sh_b, st_sh_b, w_b, st_b, pos, hid, p)
+        assert bool(jnp.array_equal(out_q, ref[p])), p
+
+    for kw in (
+        dict(wcol_q=True, down_fma=True),
+        dict(wcol_q=True, wcol_pre=True),
+        dict(wcol_q=True, wcol_pre=True, down_fma=True),
+    ):
+        c_m = dataclasses.replace(c_b, **kw)
+        ctx_m = K.MKBuildContext(c_m, tiles_b, interpret=True)
+        for p in (True, False):
+            out_m = _run_moe_block(
+                mesh1, ctx_m, w_sh_b, st_sh_b, w_b, st_b, pos, hid, p
+            )
+            np.testing.assert_allclose(
+                np.asarray(out_m, dtype=np.float32),
+                np.asarray(ref[p], dtype=np.float32),
+                rtol=2e-2,
+                atol=2e-2,
+            )

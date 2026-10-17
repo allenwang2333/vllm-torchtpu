@@ -221,6 +221,13 @@ class MKConfig:
     es_pad: bool = False
     es_layout: str = "bottom"
     es_read: str = "reg"
+    # Routed-expert wcol / down-epilogue ablations:
+    # - wcol_q: store scr["wn"] as [E // 128, MR, 128] and reduce only quadrant e >> 7 (bit-exact).
+    # - wcol_pre: multiply wcol [MR, 1] into gate_up output mid [MR, IR] before the e2 matmul.
+    # - down_fma: skip intermediate bf16 rnd() on y * s2 in down() so part += y * s2 fuses into FMA.
+    wcol_q: bool = False
+    wcol_pre: bool = False
+    down_fma: bool = False
 
     @property
     def NS(self):  # sequences (KV caches, GDN input states)

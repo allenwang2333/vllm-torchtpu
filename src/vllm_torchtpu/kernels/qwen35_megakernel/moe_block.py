@@ -92,6 +92,24 @@ class MoEBlock:
             return y * prep[:, lo:lo + CH]
         return y * pltpu.bitcast(w2_ref[IR:IR + 32, lo:lo + CH], F32)[0:1, :]
 
+    def _wcol(self, e):
+        """Row routing weights [MR, 1] of expert e."""
+        ctx = self.ctx
+        scr = ctx.scr
+        if ctx.c.wcol_q:
+            hi = lax.shift_right_logical(e, 7)
+            lo = lax.bitwise_and(e, 127)
+            return jnp.sum(
+                jnp.where(ctx.lane128 == lo, scr["wn"][hi], 0.0),
+                axis=1,
+                keepdims=True,
+            )
+        return jnp.sum(
+            jnp.where(ctx.lane_e8 == e, scr["wn"][...], 0.0),
+            axis=1,
+            keepdims=True,
+        )
+
     def moe(self, l, slot, g0, is_att, defer_flush: bool = False):
         ctx = self.ctx
         c, scr, sc, sm, mm, rms_zc = (
@@ -356,9 +374,14 @@ class MoEBlock:
             cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
             cp.start()
             wsel = jnp.where(sel, p8, 0.0)
-            scr["wn"][...] = jnp.where(
+            wn = jnp.where(
                 row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
             )
+            if c.wcol_q:
+                for q in range(E // 128):
+                    scr["wn"][q] = wn[:, q * 128 : (q + 1) * 128]
+            else:
+                scr["wn"][...] = wn
             cp.wait()
         stamp = l + 1
         n_fill0 = jnp.int32(0)
@@ -711,10 +734,15 @@ class MoEBlock:
             s13 = self._s13(i, None)
         h = h * s13
         mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+        wcol = self._wcol(e)
+        if c.wcol_pre and T2 == 1:
+            wcol_mb = (
+                jnp.concatenate([wcol, jnp.zeros((ctx.MB - MR, 1), F32)], axis=0)
+                if ctx.MB > MR
+                else wcol
+            )
+            mid_ = rnd(wcol_mb * mid_)
         xb2[:, :IR] = mid_.astype(BF16)
-        wcol = jnp.sum(
-            jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
-        )
         u2 = base + T13
         if T2 == 1:
             # one [IR, H] tile: CH-lane chunks keep each result in a few vregs
@@ -724,8 +752,12 @@ class MoEBlock:
             xm = xb2[:, :IR]
             for j in range(H // CH):
                 y = mm(xm, w2[:, j * CH:(j + 1) * CH])[0:MR]
-                y = rnd(self._scale2(i, w2r, prep, j, y))
-                part[0:MR, j * CH:(j + 1) * CH] += wcol * y
+                y = self._scale2(i, w2r, prep, j, y)
+                if not c.down_fma:
+                    y = rnd(y)
+                if not c.wcol_pre:
+                    y = wcol * y
+                part[0:MR, j * CH:(j + 1) * CH] += y
             egive(u2, l)
         else:
             TK2 = tk["e2"]
@@ -744,40 +776,50 @@ class MoEBlock:
                         egive(u, l, T13 + t)
                 else:
                     egive(u, l, T13 + t)
-            y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR:])
+            y = acc[0:MR, :H] * scr["es"][s, :, 2 * IR:]
+            if not c.down_fma:
+                y = rnd(y)
             part[0:MR, :] += wcol * y
         return carry
 
     def gate_up(self, i, w13):
         """Single-tile expert i's activated gate|up rows [MB, IR] (bf16)."""
         ctx = self.ctx
-        scr, mm, IR = ctx.scr, ctx.mm, ctx.IR
+        c, scr, mm, IR, MB, MR = ctx.c, ctx.scr, ctx.mm, ctx.IR, ctx.MB, ctx.MR
         h = mm(scr["xb"][...], self._w_main("e13", w13)) * self._s13(i, w13)
-        return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
+        mid = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+        if c.wcol_pre:
+            wcol = self._wcol(scr["elist"][i])
+            if MB > MR:
+                wcol = jnp.concatenate([wcol, jnp.zeros((MB - MR, 1), F32)], axis=0)
+            mid = rnd(wcol * mid)
+        return mid.astype(BF16)
 
     def down(self, i, mid, w2r, w2=None):
         """part[0:MR] += wn[:, e] * (mid @ e2) for single-tile expert i, in CH-lane chunks.
         w2r: the expert's e2 ring slot; w2: its main weight value when already loaded."""
         ctx = self.ctx
-        scr, mm, H, CH, MR, lane_e8 = (
+        c, scr, mm, H, CH, MR = (
+            ctx.c,
             ctx.scr,
             ctx.mm,
             ctx.H,
             ctx.CH,
             ctx.MR,
-            ctx.lane_e8,
         )
-        e, part = scr["elist"][i], scr["part"]
+        part = scr["part"]
         if w2 is None:
             w2 = self._w_main("e2", w2r)
         prep = self._s2_prep(w2r)
-        wcol = jnp.sum(
-            jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
-        )
+        wcol = None if c.wcol_pre else self._wcol(scr["elist"][i])
         for j in range(H // CH):
             y = mm(mid, w2[:, j * CH:(j + 1) * CH])[0:MR]
-            y = rnd(self._scale2(i, w2r, prep, j, y))
-            part[0:MR, j * CH:(j + 1) * CH] += wcol * y
+            y = self._scale2(i, w2r, prep, j, y)
+            if not c.down_fma:
+                y = rnd(y)
+            if wcol is not None:
+                y = wcol * y
+            part[0:MR, j * CH:(j + 1) * CH] += y
 
     def experts_piped(self, l, n_hit):
         """Single-tile experts, software-pipelined: iteration i runs expert i+1's gate|up
@@ -906,10 +948,10 @@ class MoEBlock:
                     acc13[:, :BN] += mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
                     egive(u13_1, l, t1)
 
-                wcol = jnp.sum(
-                    jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
-                )
-                y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                wcol = self._wcol(e)
+                y = acc[0:MR, :H] * scr["es"][s_cur, :, BN:]
+                if not c.down_fma:
+                    y = rnd(y)
                 part[0:MR, :] += wcol * y
 
                 self.es_wait(i + 1)
@@ -945,8 +987,8 @@ class MoEBlock:
                         egive(u2, l, T13 + s_step)
                 else:
                     egive(u2, l, T13 + s_step)
-            wcol_last = jnp.sum(
-                jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0), axis=1, keepdims=True
-            )
-            y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+            wcol_last = self._wcol(e_last)
+            y_last = acc[0:MR, :H] * scr["es"][s_last, :, BN:]
+            if not c.down_fma:
+                y_last = rnd(y_last)
             part[0:MR, :] += wcol_last * y_last

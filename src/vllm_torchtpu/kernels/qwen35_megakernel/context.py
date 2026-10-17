@@ -383,7 +383,11 @@ class MKBuildContext:
             "rcs": pltpu.VMEM((2, MR, c.ROT // 2), F32),  # per-row rope cos / sin (non-QV)
             "kv_out_sem": pltpu.SemaphoreType.DMA((2,)),
             # MoE
-            "wn": pltpu.VMEM((MR, E), F32),  # renormalized routing weights of rows 0..MR-1
+            "wn": (
+                pltpu.VMEM((E // 128, MR, 128), F32)
+                if c.wcol_q
+                else pltpu.VMEM((MR, E), F32)
+            ),  # renormalized routing weights of rows 0..MR-1
             "sg": pltpu.VMEM((MB, 128), F32),
             "hitv": pltpu.VMEM((MR, 128), I32),  # row b lanes 0..TOPK-1: row b's picks
             "hits": pltpu.SMEM((MR, 128), I32),
