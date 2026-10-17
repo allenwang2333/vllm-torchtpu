@@ -701,6 +701,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], *small_bucket, mixed_bkvp
             )
+            # The kernel's step schedule lives in SMEM and grows with the KV
+            # blocks each rank scans per sequence. A narrower DCP leaves every
+            # rank 16 / dcp_size times the pages of dcp=16, so widen the KV
+            # block by the same factor and keep the step count of dcp=16.
+            kv_scale = max(1, 16 // dcp_size)
+            kv_pages_per_block = tuple(b * kv_scale for b in kv_pages_per_block)
             overlap = {}
             if qb_overlap:
                 overlap = dict(
