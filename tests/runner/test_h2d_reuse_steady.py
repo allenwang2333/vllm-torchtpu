@@ -80,3 +80,10 @@ def test_key_bytes_match_numpy_for_numpy_dtypes():
     for t in (torch.arange(9, dtype=torch.int32), torch.arange(6, dtype=torch.int64)[::2],
               torch.tensor([True, False]), torch.rand(3, 2).t()):
         assert t.contiguous().view(torch.uint8).numpy().tobytes() == t.numpy().tobytes()
+
+
+def test_zero_dim_host_key():
+    r = _runner([0.7], [1], [0.9])
+    a = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
+    b = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
+    assert a is b and int(a) == 5

@@ -13,8 +13,11 @@ With the flag on, the first execute_model call of each worker:
   * finds the NUMA node of the TPU chip the process opened (its /dev/vfio/<group>
     descriptors -> /sys/kernel/iommu_groups/<group>/devices/*/numa_node);
   * gives the serving thread one whole physical core on that node (both SMT
-    siblings, so no other thread of any worker on this host is placed there);
-    the core is picked by LOCAL_RANK, so the workers of one host never share one;
+    siblings); the core is picked by LOCAL_RANK, so the workers of one host
+    never share one, and the block reserved per node covers every TPU device
+    of the host (max(LOCAL_WORLD_SIZE, /dev/vfio groups)), so no pinned thread
+    of any worker lands on another worker's core. Processes that are not TPU
+    workers (API server, EngineCore, Ray) are not moved;
   * moves every other thread of the process onto the rest of that node's CPUs
     (the node minus every worker's reserved core), and keeps doing so for
     threads created later (a daemon sweeper, every few seconds).
@@ -89,6 +92,14 @@ def tpu_numa_nodes(proc_fd: str = "/proc/self/fd", sys_root: str = "/sys") -> se
     return nodes
 
 
+def vfio_group_count(dev_vfio: str = "/dev/vfio") -> int:
+    """Number of TPU vfio groups on this host (one per device a worker opens)."""
+    try:
+        return sum(1 for n in os.listdir(dev_vfio) if n.isdigit())
+    except OSError:
+        return 0
+
+
 def node_physical_cores(
     node: int, allowed: set[int], sys_root: str = "/sys"
 ) -> list[tuple[int, ...]]:
@@ -151,6 +162,7 @@ class WorkerCpuPinner:
         self.active = True  # False: unpinned (TPU_HOST_LEVER_ALTERNATE)
         self._orig_affinity: set[int] | None = None
         self._seen: set[int] = set()
+        self._orig_masks: dict[int, set[int]] = {}
         self._lock = threading.Lock()
         self._sweeper: threading.Thread | None = None
 
@@ -188,7 +200,7 @@ class WorkerCpuPinner:
                 tids = []
             for t in tids:
                 try:
-                    os.sched_setaffinity(t, self._orig_affinity)
+                    os.sched_setaffinity(t, self._orig_masks.get(t, self._orig_affinity))
                 except OSError:
                     pass
             self._seen.clear()
@@ -203,7 +215,11 @@ class WorkerCpuPinner:
             node = next(iter(nodes))
             allowed = os.sched_getaffinity(0)
             cores = node_physical_cores(node, allowed)
-            p = plan(cores, self.local_rank, self.local_world_size, self.skip)
+            # TPU_LOCAL_RANK_OFFSET servers sharing a host each see only their
+            # own LOCAL_WORLD_SIZE; reserving per host device keeps their
+            # reserved blocks out of each other's "other" CPUs.
+            width = max(self.local_world_size, vfio_group_count())
+            p = plan(cores, self.local_rank, width, self.skip)
             if p is None:
                 raise RuntimeError(
                     f"node {node} has {len(cores)} usable cores for local rank "
@@ -217,7 +233,10 @@ class WorkerCpuPinner:
                 self.serving_tid,
                 tid,
             )
-            os.sched_setaffinity(self.serving_tid, self.other_cpus)
+            try:
+                os.sched_setaffinity(self.serving_tid, self.other_cpus)
+            except OSError:
+                pass  # the old serving thread exited
         # Other threads first, so nothing new inherits the serving core after
         # the serving thread is pinned (threads spawned later by the serving
         # thread itself are caught by the sweeper).
@@ -246,6 +265,8 @@ class WorkerCpuPinner:
         Returns how many threads were moved."""
         moved = 0
         with self._lock:
+            if not self.active:
+                return 0  # unpinned meanwhile (TPU_HOST_LEVER_ALTERNATE)
             try:
                 tids = [int(t) for t in os.listdir("/proc/self/task")]
             except OSError:
@@ -254,12 +275,16 @@ class WorkerCpuPinner:
                 if t == self.serving_tid or t in self._seen:
                     continue
                 try:
+                    if t not in self._orig_masks:
+                        self._orig_masks[t] = set(os.sched_getaffinity(t))
                     os.sched_setaffinity(t, self.other_cpus)
                     moved += 1
                 except OSError:
                     pass  # exited
                 self._seen.add(t)
             self._seen &= set(tids)
+            for t in [t for t in self._orig_masks if t not in self._seen and t != self.serving_tid]:
+                del self._orig_masks[t]
         return moved
 
     def _sweep_loop(self) -> None:

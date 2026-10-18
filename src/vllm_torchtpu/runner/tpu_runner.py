@@ -3429,7 +3429,7 @@ class TPUModelRunner(GPUModelRunner):
         key = (
             host.dtype,
             tuple(host.shape),
-            host.contiguous().view(torch.uint8).numpy().tobytes(),
+            host.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
         )
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:

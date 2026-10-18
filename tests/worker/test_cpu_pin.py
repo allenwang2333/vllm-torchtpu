@@ -107,21 +107,29 @@ def _patched_pinner(monkeypatch, tmp_path, nodes={1}, tids=(100, 101, 102)):
     allowed = _fake_host(sysr, nodes=2, cores_per_node=16)
     calls = []
     monkeypatch.setattr(cpu_pin, "tpu_numa_nodes", lambda: set(nodes))
+    monkeypatch.setattr(cpu_pin, "vfio_group_count", lambda: 0)
     real_cores = cpu_pin.node_physical_cores
     monkeypatch.setattr(cpu_pin, "node_physical_cores", lambda n, a: real_cores(n, a, sysr))
-    monkeypatch.setattr(cpu_pin.os, "sched_getaffinity", lambda pid: set(allowed))
-    monkeypatch.setattr(cpu_pin.os, "sched_setaffinity", lambda pid, cpus: calls.append((pid, set(cpus))))
+    def setaff(pid, cpus):
+        if pid in dead:
+            raise ProcessLookupError(pid)
+        calls.append((pid, set(cpus)))
+
+    dead = set()
+    monkeypatch.setattr(cpu_pin.os, "sched_setaffinity", setaff)
+    monkeypatch.setattr(cpu_pin.os, "sched_getaffinity", lambda pid: set(masks.get(pid, allowed)))
+    masks = {}
     me = threading.get_native_id()
     task = list(tids) + [me]
     real_listdir = os.listdir
     monkeypatch.setattr(
         cpu_pin.os, "listdir", lambda p: [str(t) for t in task] if p == "/proc/self/task" else real_listdir(p)
     )
-    return calls, me, task
+    return calls, me, task, masks, dead
 
 
 def test_pinner_pins_serving_thread_once_and_moves_others(monkeypatch, tmp_path):
-    calls, me, task = _patched_pinner(monkeypatch, tmp_path)
+    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
     p = cpu_pin.WorkerCpuPinner(True, 3, 8, skip=2, sweep_s=0)
     p.maybe_pin()
     serving = {16 + 2 + 3, 16 + 2 + 3 + 32}  # node 1 core index 5 and its sibling
@@ -143,7 +151,7 @@ def test_pinner_pins_serving_thread_once_and_moves_others(monkeypatch, tmp_path)
 
 
 def test_pinner_failure_is_quiet_and_sticky(monkeypatch, tmp_path):
-    calls, me, task = _patched_pinner(monkeypatch, tmp_path, nodes={0, 1})
+    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path, nodes={0, 1})
     p = cpu_pin.WorkerCpuPinner(True, 0, 8, sweep_s=0)
     p.maybe_pin()  # two NUMA nodes: refuse, never raise
     assert p.serving_tid is None and calls == []
@@ -152,7 +160,7 @@ def test_pinner_failure_is_quiet_and_sticky(monkeypatch, tmp_path):
 
 
 def test_pinner_unpin_and_repin(monkeypatch, tmp_path):
-    calls, me, task = _patched_pinner(monkeypatch, tmp_path)
+    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
     p = cpu_pin.WorkerCpuPinner(True, 1, 8, skip=2, sweep_s=0)
     p.maybe_pin()
     n = len(calls)
@@ -166,3 +174,34 @@ def test_pinner_unpin_and_repin(monkeypatch, tmp_path):
     p.set_active(True)  # re-places every thread, serving thread last
     assert calls[-1] == (0, p.serving_cpus)
     assert {pid for pid, _ in calls[m:-1]} == {100, 101, 102}
+
+
+def test_reserved_block_covers_every_host_device(tmp_path, monkeypatch):
+    """TPU_LOCAL_RANK_OFFSET: two servers on one host see LOCAL_WORLD_SIZE 2 and
+    4; the reserved block follows the host's vfio group count instead, so one
+    server's other threads never land on the other server's serving cores."""
+    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
+    monkeypatch.setattr(cpu_pin, "vfio_group_count", lambda: 4)
+    a = cpu_pin.WorkerCpuPinner(True, 0, 2, skip=2, sweep_s=0)  # server A, ranks 0-1
+    a.maybe_pin()
+    b = cpu_pin.WorkerCpuPinner(True, 3, 4, skip=2, sweep_s=0)  # server B (offset 2), rank 3
+    b._pin(999)
+    assert not (a.other_cpus & b.serving_cpus) and not (b.other_cpus & a.serving_cpus)
+
+
+def test_unpin_restores_each_threads_own_mask_and_survives_dead_threads(monkeypatch, tmp_path):
+    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
+    masks[101] = {7, 8}  # a thread that had its own affinity before
+    p = cpu_pin.WorkerCpuPinner(True, 1, 8, skip=2, sweep_s=0)
+    p.maybe_pin()
+    n = len(calls)
+    p.set_active(False)
+    restored = dict(calls[n:])
+    assert restored[101] == {7, 8} and restored[100] == set(range(64))
+    p.set_active(True)
+    dead.add(me)  # the old serving thread exits; a new one takes over
+    import threading as th
+
+    monkeypatch.setattr(cpu_pin.threading, "get_native_id", lambda: 4242)
+    p.maybe_pin()
+    assert p.serving_tid == 4242 and not p._failed

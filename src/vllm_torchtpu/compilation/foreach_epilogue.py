@@ -11,8 +11,8 @@ each a separate Python -> dispatcher -> torch_tpu call on the serving thread.
 With the flag on, an epilogue made only of such plain write-backs is
 regenerated as one ``torch._foreach_copy_(dsts, srcs)`` over the same pairs in
 the same order (torch_tpu registers a native PrivateUse1 kernel for it). The
-original epilogue is kept and used whenever any destination requires grad, so
-the autograd branch of the original stays exact. Epilogues with any other
+original epilogue is kept and used whenever any destination or source requires
+grad, so the autograd branch of the original stays exact. Epilogues with any other
 kind of line (metadata mutations, ``set_``, stream errors) are left untouched.
 """
 
@@ -84,10 +84,14 @@ def rewrite(source: str) -> str | None:
             "    if not _h5b_on[0]:",
             "        return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
             f"    _d = [{dsts}]",
+            f"    _s = [{srcs}]",
             "    for _t in _d:",
             "        if _t.requires_grad:",
             "            return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
-            f"    torch._foreach_copy_(_d, [{srcs}])",
+            "    for _t in _s:",
+            "        if _t.requires_grad:",
+            "            return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
+            "    torch._foreach_copy_(_d, _s)",
         ]
     )
 

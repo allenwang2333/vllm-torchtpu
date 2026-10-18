@@ -53,6 +53,11 @@ def test_rewrite_semantics_and_fallback():
     fn(orig, upd)
     assert orig_calls == [1]  # the original epilogue handles autograd
     orig[3] = torch.zeros(3)
+    upd_rg = list(upd)
+    upd_rg[1] = torch.ones(3, requires_grad=True)  # a source that requires grad
+    fn(orig, upd_rg)
+    assert orig_calls == [1, 1]
+    orig_calls.pop()
     g["_h5b_on"][0] = False  # runtime switch off: the original epilogue
     fn(orig, upd)
     assert orig_calls == [1, 1] and torch.equal(orig[3], torch.zeros(3))
