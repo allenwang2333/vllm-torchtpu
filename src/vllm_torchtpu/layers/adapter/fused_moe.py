@@ -18,17 +18,23 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import torch
+from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
+    fused_moe_func_ep_combine,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
@@ -290,4 +296,169 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+    )
+
+
+# Serve DP-attention + EP layers with gmm_v2_ffn_ep, which sends each routed
+# row to its token's owner, in place of the combine + reduce-scatter.
+GMM_EP_COMBINE = True
+GMM_EP_COMBINE_OP_ATTR = "_gmm_ep_combine_op"
+
+
+def gmm_ep_combine_supported(owner: Any) -> bool:
+    """Whether `prebuild_gmm_ep_combine` armed this layer's quant method."""
+    return getattr(owner, GMM_EP_COMBINE_OP_ATTR, None) is not None
+
+
+def _gmm_ep_combine_refusal(layer) -> str | None:
+    from vllm.distributed.parallel_state import get_dp_group
+
+    from vllm_torchtpu.distributed.dcp import get_dcp_world_size
+    from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+    from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+        enable_pipelined_collective_and_compute,
+    )
+
+    parallel = layer.moe_config.moe_parallel_config
+    if not GMM_EP_COMBINE:
+        return "disabled"
+    if not parallel.use_ep or parallel.dp_size <= 1:
+        return "not DP attention with expert parallelism"
+    if parallel.tp_size != 1 or parallel.pcp_size != 1 or get_dcp_world_size() != 1:
+        return "TP, PCP or DCP is on"
+    if parallel.is_sequence_parallel:
+        return "MoE sequence parallelism is on"
+    if enable_pipelined_collective_and_compute():
+        return "the chunked collective pipeline owns the dispatch"
+    if getattr(layer, "w13_bias", None) is not None:
+        return "expert biases are not wired through"
+    ep_group = get_ep_group()
+    if ep_group is None or tuple(ep_group.ranks) != tuple(get_dp_group().ranks):
+        # The op reads the DP-gathered token block of rank r as EP rank r's.
+        return "the EP group is not the DP group in the same order"
+    if layer.global_num_experts != layer.w13_weight.shape[0] * ep_group.world_size:
+        return "experts do not split into equal contiguous blocks"
+    return None
+
+
+def prebuild_gmm_ep_combine(
+    layer, *, topk: int, activation: str, rhs_quant_dtype=None
+) -> Any | None:
+    """The EP-combine op for this layer, or None to keep the combine in vLLM.
+
+    Called from process_weights_after_loading on every rank; refusals depend
+    only on the parallel config, so every rank arms the same layers (the
+    kernel's barrier would otherwise wait forever).
+    """
+    from vllm_torchtpu.distributed.ep_mesh import (
+        EP_AXIS_NAME,
+        build_ep_mesh,
+        ep_rank_order,
+    )
+
+    reason = _gmm_ep_combine_refusal(layer)
+    mesh = build_ep_mesh() if reason is None else None
+    if reason is None and mesh is None:
+        reason = "there is no EP mesh"
+    if reason is not None:
+        logger.info_once("gmm_v2_ffn_ep combine not engaged: %s", reason)
+        return None
+    order = ep_rank_order()
+    assert order is not None
+    mesh_index_of_rank = tuple(order.index(r) for r in range(len(order)))
+    key = ("ep_combine", id(mesh), topk, activation, rhs_quant_dtype)
+    op = _fused_moe_kernel_cache.get(key)
+    if op is not None:
+        return op
+
+    local = functools.partial(
+        fused_moe_func_ep_combine,
+        topk=topk,
+        activation=activation,
+        mesh_index_of_rank=mesh_index_of_rank,
+        axis_name=EP_AXIS_NAME,
+        use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+    )
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    # torch_tpu infers static arguments from annotations: every operand is a
+    # jax.Array, sharded on axis 0 per rank.
+    def fn(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=(spec,) * 8,
+            out_specs=spec,
+            check_vma=False,
+        )(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            experts_start,
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        f"pallas::fused_moe_ep_combine_{_allocate_kernel_instance_id()}",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec,) * 8,
+        output_partition_specs=spec,
+    )
+    ep = len(mesh_index_of_rank)
+
+    def _fake(hidden_states, *_args, **_kwargs):
+        return hidden_states.new_empty(
+            (hidden_states.shape[0] // ep, hidden_states.shape[1])
+        )
+
+    op.register_fake(_fake)
+    _fused_moe_kernel_cache[key] = op
+    logger.info_once(
+        "gmm_v2_ffn_ep combine armed | ep=%d mesh_index_of_rank=%s",
+        ep,
+        mesh_index_of_rank,
+    )
+    return op
+
+
+def gmm_ep_combine(
+    owner: Any,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    experts_start: torch.Tensor,
+) -> torch.Tensor:
+    """This rank's tokens of the DP-gathered `hidden_states`, summed over all
+    ranks' experts: the caller must not reduce-scatter the result."""
+    op = getattr(owner, GMM_EP_COMBINE_OP_ATTR)
+    return op(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        experts_start.reshape(1),
     )

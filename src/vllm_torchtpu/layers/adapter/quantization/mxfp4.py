@@ -67,9 +67,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
+    GMM_EP_COMBINE_OP_ATTR,
     TpuMoEActivationMixin,
     fused_moe_gmm,
+    gmm_ep_combine,
+    gmm_ep_combine_supported,
     prebuild_fused_moe_kernel,
+    prebuild_gmm_ep_combine,
     quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -358,6 +362,20 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
+        if gmm_ep_combine_supported(self):
+            # Returns this rank's tokens already summed over the DP group, so
+            # VllmMoERunner._maybe_combine skips the reduce-scatter.
+            return gmm_ep_combine(
+                self,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                topk_weights,
+                topk_ids,
+                layer._experts_start,
+            )
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
@@ -702,6 +720,18 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        setattr(
+            self,
+            GMM_EP_COMBINE_OP_ATTR,
+            None
+            if op is not None
+            else prebuild_gmm_ep_combine(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            ),
+        )
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(
                 layer,
