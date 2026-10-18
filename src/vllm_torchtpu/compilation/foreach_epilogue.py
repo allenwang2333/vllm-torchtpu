@@ -33,6 +33,9 @@ _PAT_ELSE = re.compile(r"^    else: orig_inputs\[(\d+)\]\.copy_\(updated_inputs\
 _PAT_PLAIN = re.compile(r"^    orig_inputs\[(\d+)\]\.copy_\(updated_inputs\[(\d+)\]\)$")
 
 STATS = {"rewritten": 0, "kept": 0, "pairs": 0}
+# Runtime switch read by every rewritten epilogue (diagnostic A/B within one
+# run, TPU_HOST_LEVER_ALTERNATE); True = the foreach form.
+ON = [True]
 
 
 def parse_pairs(source: str) -> list[tuple[int, int]] | None:
@@ -78,6 +81,8 @@ def rewrite(source: str) -> str | None:
     return "\n".join(
         [
             _HEADER,
+            "    if not _h5b_on[0]:",
+            "        return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
             f"    _d = [{dsts}]",
             "    for _t in _d:",
             "        if _t.requires_grad:",
@@ -109,6 +114,7 @@ def install() -> bool:
         orig_fn = original(source, dict(globals_dict), fn_name, artifact_name, *a, **k)
         g = dict(globals_dict)
         g["_h5b_original_apply_mutations"] = orig_fn
+        g["_h5b_on"] = ON
         STATS["rewritten"] += 1
         STATS["pairs"] += len(parse_pairs(source) or ())
         return original(new_source, g, fn_name, artifact_name + "_foreach", *a, **k)

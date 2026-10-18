@@ -149,3 +149,20 @@ def test_pinner_failure_is_quiet_and_sticky(monkeypatch, tmp_path):
     assert p.serving_tid is None and calls == []
     p.maybe_pin()
     assert calls == []
+
+
+def test_pinner_unpin_and_repin(monkeypatch, tmp_path):
+    calls, me, task = _patched_pinner(monkeypatch, tmp_path)
+    p = cpu_pin.WorkerCpuPinner(True, 1, 8, skip=2, sweep_s=0)
+    p.maybe_pin()
+    n = len(calls)
+    p.set_active(False)
+    full = set(range(64))
+    # every thread, the serving one included, back to the original affinity
+    assert {pid for pid, _ in calls[n:]} == set(task) and all(c == full for _, c in calls[n:])
+    m = len(calls)
+    p.maybe_pin()  # inactive: nothing
+    assert len(calls) == m
+    p.set_active(True)  # re-places every thread, serving thread last
+    assert calls[-1] == (0, p.serving_cpus)
+    assert {pid for pid, _ in calls[m:-1]} == {100, 101, 102}

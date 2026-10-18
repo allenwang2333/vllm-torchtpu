@@ -11,11 +11,18 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 class _Fn:
+    """Mirrors AOTCompiledFunction's switch: disable_guard_check() clears
+    _guard_check_enabled."""
+
     def __init__(self):
-        self.enabled = True
+        self._guard_check_enabled = True
+
+    @property
+    def enabled(self):
+        return self._guard_check_enabled
 
     def disable_guard_check(self):
-        self.enabled = False
+        self._guard_check_enabled = False
 
 
 class _Compiled(torch.nn.Module):
@@ -73,3 +80,30 @@ def test_real_aot_compiled_function_skips_check():
     assert fn("x") == "out" and called == [1]
     fn.disable_guard_check()
     assert fn("x") == "out" and called == [1]
+
+
+def test_set_host_levers_toggles_each_listed_lever(monkeypatch):
+    from vllm_torchtpu.compilation import foreach_epilogue
+
+    monkeypatch.setenv("TPU_AOT_SKIP_GUARD_CHECK", "1")
+    monkeypatch.setenv("TPU_FOREACH_MUTATION_EPILOGUE", "1")
+    monkeypatch.setattr(foreach_epilogue, "ON", [True])
+    r = _runner()
+    TPUModelRunner._skip_aot_guard_checks(r)
+    calls = []
+    r._cpu_pinner = SimpleNamespace(
+        set_active=lambda on: calls.append(("active", on)), maybe_pin=lambda: calls.append(("pin",))
+    )
+    r._lever_alt = {"levers": {"pin", "guard", "foreach", "h2d"}, "state": True}
+    TPUModelRunner._set_host_levers(r, False)
+    assert all(f.enabled for f in _fns(r))  # guard checks back on
+    assert foreach_epilogue.ON == [False] and r._h2d_reuse_on is False
+    assert calls == [("active", False)] and r._lever_alt["state"] is False
+    TPUModelRunner._set_host_levers(r, True)
+    assert not any(f.enabled for f in _fns(r))
+    assert foreach_epilogue.ON == [True] and r._h2d_reuse_on is True
+    assert calls[1:] == [("active", True), ("pin",)]
+    # a lever not listed is left alone
+    r._lever_alt["levers"] = {"h2d"}
+    TPUModelRunner._set_host_levers(r, False)
+    assert foreach_epilogue.ON == [True] and not any(f.enabled for f in _fns(r))

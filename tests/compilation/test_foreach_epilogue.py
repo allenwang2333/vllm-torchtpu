@@ -40,7 +40,7 @@ def test_rewrite_semantics_and_fallback():
     src = fe.rewrite(LEAF)
     assert src is not None and "torch._foreach_copy_" in src
     orig_calls = []
-    g = {"torch": torch, "_h5b_original_apply_mutations": lambda o, u: orig_calls.append(1)}
+    g = {"torch": torch, "_h5b_original_apply_mutations": lambda o, u: orig_calls.append(1), "_h5b_on": [True]}
     exec(compile(src, "<t>", "exec"), g)
     fn = g["_apply_mutations"]
     orig = [torch.zeros(3) for _ in range(6)]
@@ -52,6 +52,10 @@ def test_rewrite_semantics_and_fallback():
     orig[3] = torch.zeros(3, requires_grad=True)
     fn(orig, upd)
     assert orig_calls == [1]  # the original epilogue handles autograd
+    orig[3] = torch.zeros(3)
+    g["_h5b_on"][0] = False  # runtime switch off: the original epilogue
+    fn(orig, upd)
+    assert orig_calls == [1, 1] and torch.equal(orig[3], torch.zeros(3))
 
 
 def _backend():

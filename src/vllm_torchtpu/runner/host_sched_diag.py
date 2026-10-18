@@ -142,7 +142,7 @@ class HostSchedDiag:
     def _take(self):
         return (time.monotonic_ns(), _schedstat("/proc/thread-self/schedstat"), _threads(), _cgroup())
 
-    def tick(self) -> str | None:
+    def tick(self, suffix: str = "") -> str | None:
         """Count one runner step; every `every` steps log and return the line."""
         if self._snap is None:
             return None
@@ -192,5 +192,6 @@ class HostSchedDiag:
             f" nvcsw/step={(nvcsw - self._nvcsw0) / n:.2f}"
         )
         self._nvcsw0 = nvcsw
+        line += suffix
         logger.warning(line)
         return line

@@ -148,12 +148,14 @@ class WorkerCpuPinner:
         self.serving_cpus: set[int] | None = None
         self.other_cpus: set[int] | None = None
         self._failed = False
+        self.active = True  # False: unpinned (TPU_HOST_LEVER_ALTERNATE)
+        self._orig_affinity: set[int] | None = None
         self._seen: set[int] = set()
         self._lock = threading.Lock()
         self._sweeper: threading.Thread | None = None
 
     def maybe_pin(self) -> None:
-        if not self.enabled or self._failed:
+        if not self.enabled or self._failed or not self.active:
             return
         tid = threading.get_native_id()
         if tid == self.serving_tid:
@@ -164,7 +166,36 @@ class WorkerCpuPinner:
             self._failed = True
             logger.warning("TPU_WORKER_CPU_PIN: not pinned (%s)", e)
 
+    def set_active(self, active: bool) -> None:
+        """Diagnostic A/B within one run: unpin every thread of the process
+        (back to the affinity it started with) or pin again."""
+        if not self.enabled or self._failed or active == self.active:
+            return
+        self.active = active
+        if active:
+            with self._lock:
+                self._seen.clear()  # the next pin re-places every thread
+            tid, self.serving_tid = self.serving_tid, None
+            if tid is not None:
+                self.maybe_pin()
+            return
+        if self._orig_affinity is None:
+            return
+        with self._lock:
+            try:
+                tids = [int(t) for t in os.listdir("/proc/self/task")]
+            except OSError:
+                tids = []
+            for t in tids:
+                try:
+                    os.sched_setaffinity(t, self._orig_affinity)
+                except OSError:
+                    pass
+            self._seen.clear()
+
     def _pin(self, tid: int) -> None:
+        if self._orig_affinity is None:
+            self._orig_affinity = set(os.sched_getaffinity(0))
         if self.serving_cpus is None:
             nodes = tpu_numa_nodes()
             if len(nodes) != 1:
@@ -193,7 +224,8 @@ class WorkerCpuPinner:
         self.serving_tid = tid
         moved = self._sweep()
         os.sched_setaffinity(0, self.serving_cpus)
-        logger.warning(
+        self.pins = getattr(self, "pins", 0) + 1
+        (logger.warning if self.pins == 1 else logger.debug)(
             "TPU_WORKER_CPU_PIN local_rank=%d node=%d serving_tid=%d serving_cpus=%s "
             "other_cpus=%d threads_moved=%d",
             self.local_rank,
@@ -236,4 +268,5 @@ class WorkerCpuPinner:
         os.sched_setaffinity(0, self.other_cpus)
         while True:
             time.sleep(self.sweep_s)
-            self._sweep()
+            if self.active:
+                self._sweep()

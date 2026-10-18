@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     TPU_AOT_SKIP_GUARD_CHECK: bool = False
     TPU_FOREACH_MUTATION_EPILOGUE: bool = False
     TPU_H2D_REUSE_STEADY: bool = False
+    TPU_HOST_LEVER_ALTERNATE: str = ""
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
@@ -1320,6 +1321,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # distribution -- instead of a fresh H2D each step (value-keyed, like
     # _upload_unless_unchanged).
     "TPU_H2D_REUSE_STEADY": env_bool("TPU_H2D_REUSE_STEADY"),
+    # Diagnostic A/B inside one served run: with TPU_HOST_SCHED_DIAG_STEPS=N,
+    # switch the listed host levers (pin, guard, foreach, h2d -- each must
+    # also have its own flag on) off and on every N steps; each HOSTDIAG line
+    # carries alt=<0|1>, the state of the window it closes.
+    "TPU_HOST_LEVER_ALTERNATE": lambda: os.getenv("TPU_HOST_LEVER_ALTERNATE", ""),
     # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
     # at most 1024), derive the stable-sort positions, permuted token ids and
     # group sizes by int32 compare-and-count instead of three comparison
