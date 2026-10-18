@@ -23,13 +23,17 @@ Provides:
   pool outputs back into `pools` via `dst.copy_(src)`, preserving `dst.data_ptr()`
   (Raiden pointer identity) and folding into an XLA `input_output_alias` /
   `tf.aliasing_output` under `torch.compile(backend="tpu")`.
-- `verify_pooled_step_hlo`: lowers/compiles the JAX pooled step (defaulting to
-  compiled post-optimization HLO on TPU) and validates pool buffer donation via
-  `cache.check_pooled_step_hlo`.
+- `verify_pooled_step_hlo`: lowers (or compiles when `mesh` holds real
+  `jax.Device` instances on TPU) the JAX pooled step and validates pool buffer
+  donation (`input_output_alias`) and absence of full-pool copies via
+  `cache.check_pooled_step_hlo`. Under `torch_tpu`'s `_PallasDevice` mesh,
+  `StaticCompiler` owns XLA compilation, so `verify_pooled_step_hlo` checks the
+  lowered HLO while `verify_torchtpu_compiled_step_ir` checks the outer
+  `torch.compile(backend="tpu")` graph.
 - `verify_torchtpu_compiled_step_ir`: inspects the compiled `torch_tpu` forward
   graph's StableHLO MLIR / HLO (`TpuCompileDebug.stablehlo_forward_text`) to
-  verify that `dst.copy_(src)` on all pools folded into `tf.aliasing_output` /
-  `input_output_alias` with zero full-pool copies.
+  verify that `dst.copy_(src)` on all pools folded into `jax.buffer_donor = true` /
+  `tf.aliasing_output` / `input_output_alias` with zero full-pool copies.
 - `export_pooled_step`: offline inspection/serialization helper that exports the
   StableHLO module and aliasing manifest (`PooledStepExport`) via `jax.export`
   (serving traces directly through `build_pooled_step_op` / `JaxCallable`).
@@ -251,19 +255,33 @@ def verify_pooled_step_hlo(
 ) -> tuple[bool, str]:
     """Lower or compile `make_flat_pooled_step` and verify pool donation in HLO.
 
-    When `compile_hlo` is `None` (default), compiles post-optimization HLO on
-    TPU (`jax.default_backend() == "tpu" and not ex.interpret`) so XLA buffer
-    assignment and copy insertion have run.
+    When `compile_hlo` is `None` (default), compiles post-optimization HLO via
+    JAX when `mesh` contains real `jax.Device` instances on TPU
+    (`jax.default_backend() == "tpu" and not ex.interpret`), and lowers pre-XLA
+    HLO when `mesh` uses `torch_tpu`'s `_PallasDevice` mock devices (where XLA
+    compilation is owned by `torch_tpu` `StaticCompiler` and verified via
+    `verify_torchtpu_compiled_step_ir`). Passing `compile_hlo=True` with a
+    non-`jax.Device` mesh raises `ValueError`.
     """
     has_real_jax_devices = bool(
         mesh.devices.size > 0 and isinstance(mesh.devices.flat[0], jax.Device)
     )
+    if compile_hlo is True and not has_real_jax_devices:
+        dev_type = (
+            type(mesh.devices.flat[0]).__name__ if mesh.devices.size > 0 else "empty"
+        )
+        raise ValueError(
+            f"compile_hlo=True requires a Mesh of real jax.Device instances "
+            f"(got {dev_type}); under torch_tpu's _PallasDevice mesh, XLA "
+            f"compilation is performed by StaticCompiler and verified via "
+            f"verify_torchtpu_compiled_step_ir."
+        )
     if compile_hlo is None:
         compile_hlo = bool(
             has_real_jax_devices and jax.default_backend() == "tpu" and not ex.interpret
         )
     else:
-        compile_hlo = bool(compile_hlo and has_real_jax_devices)
+        compile_hlo = bool(compile_hlo)
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
         mesh, spec, ex, donate_pools=True
     )
