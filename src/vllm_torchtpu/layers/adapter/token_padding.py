@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -24,20 +24,31 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # TPU_SKIP_UNCHANGED_PADDING_UPLOAD: skip the upload when the mask would
+    # be rewritten with the bounds it already holds. Exact because every write
+    # goes through `update`, which records the bounds it wrote.
+    skip_unchanged: bool = False
+    _written_bounds: tuple[int, int] | None = field(default=None, repr=False)
 
     @classmethod
-    def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
+    def create(
+        cls, max_local_tokens: int, device, skip_unchanged: bool = False
+    ) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        return cls(local_padding_mask=local_padding_mask)
+        return cls(local_padding_mask=local_padding_mask, skip_unchanged=skip_unchanged)
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
+        bounds = (local_valid_tokens, local_padded_tokens)
+        if self.skip_unchanged and bounds == self._written_bounds:
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self._written_bounds = bounds
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]

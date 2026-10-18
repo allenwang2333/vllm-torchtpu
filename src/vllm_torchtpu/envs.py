@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_FUSED_DRAFT_LOOP_SHARE_MTP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -236,6 +237,10 @@ if TYPE_CHECKING:
     TPU_SAMPLER_FUSED_CHAIN: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_DISABLE_RUNNER_STAGE_TIMING: bool = False
+    TPU_SKIP_UNCHANGED_PADDING_UPLOAD: bool = False
+    TPU_DRAFT_LOOP_CACHE_UPLOADS: bool = False
+    TPU_GC_STEP_ALIGNED_COLLECT: int = 0
 
 
 def env_with_choices(
@@ -1416,11 +1421,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
-    #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
-    #     KV-sharing draft's fixed positions and seq_lens.
+    #   - Gemma-4 MTP: a KV-sharing draft's fixed positions and seq_lens.
+    #     (GLM-5.2's IndexShare: TPU_FUSED_DRAFT_LOOP_SHARE_MTP.)
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # With VLLM_TPU_FUSED_DRAFT_LOOP: an IndexShare MTP draft (GLM-5.2) runs
+    # its top-k compaction, step-0 lm-head and loop steps 1..K-1 as one
+    # compiled program per chunk, its async input prep as one more, and the
+    # fused programs keep TPU_SAMPLER_VOCAB_PARALLEL's draft argmax.
+    "TPU_FUSED_DRAFT_LOOP_SHARE_MTP": env_bool("TPU_FUSED_DRAFT_LOOP_SHARE_MTP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
@@ -1534,6 +1544,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
+    # Skip the runner's per-stage device/CPU timings (runner/stage_timing.py):
+    # no TpuEvent records on the serving thread and no collector thread. The
+    # timings feed only TpuKVConnectorStats; with this set they are empty.
+    "TPU_DISABLE_RUNNER_STAGE_TIMING": env_bool("TPU_DISABLE_RUNNER_STAGE_TIMING"),
+    # The token padding mask (TPU_MOE_SKIP_PADDED_TOKENS) is uploaded with a
+    # synchronous H2D every forward. Skip it when the step's (valid, padded)
+    # rows equal the ones last written, as in steady decode. Values unchanged.
+    "TPU_SKIP_UNCHANGED_PADDING_UPLOAD": env_bool("TPU_SKIP_UNCHANGED_PADDING_UPLOAD"),
+    # The drafter's loop steps upload query_start_loc and request_distribution
+    # (two H2Ds per chunk) on every propose. Keep them per (kernel_num_reqs,
+    # num_reqs) instead, at most 2 * max_num_reqs small tensors. Values unchanged.
+    "TPU_DRAFT_LOOP_CACHE_UPLOADS": env_bool("TPU_DRAFT_LOOP_CACHE_UPLOADS"),
+    # Worker: after warmup (and vLLM's gc.freeze of the warmed heap) turn
+    # automatic GC off and run gc.collect() every this many execute_model
+    # calls, at the same step on every rank. 0 keeps Python's automatic GC.
+    "TPU_GC_STEP_ALIGNED_COLLECT": env_nonnegative_int(
+        "TPU_GC_STEP_ALIGNED_COLLECT", 0
     ),
 }
 

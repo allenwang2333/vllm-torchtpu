@@ -1873,6 +1873,282 @@ def test_propose_index_share_order_across_two_chunks():
         )
 
 
+def test_propose_index_share_fused_tail_runs_chunk_major():
+    """TPU_FUSED_DRAFT_LOOP_SHARE_MTP: each chunk's fused tail runs right after
+    its own step-0 forward, before the next chunk's step 0 can overwrite the
+    top-k rows it compacts. No loop-step forward, lm-head or snapshot runs on
+    the host, and the [p, K] tail outputs are the drafts."""
+    device = torch.device("cpu")
+    K = 3
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=3, req_ids=["r0", "r1", "r2"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[2, 4, 8],
+        max_num_reqs=2,
+        uses_mrope=False,
+        num_reqs_max_model_len=2,
+        num_reqs_most_model_len=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer.vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=8)
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer.draft_model = SimpleNamespace(model=_FakeMtpModel(buf))
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_share_for_mtp_iteration=True)
+    )
+    proposer._init_mtp_index_sharing()
+    proposer._mtp_fused_tail = object()  # only its presence is read
+    proposer._target_draft_attn_metadata = lambda c: {"draft.attn": object()}
+    assert proposer._use_mtp_fused_tail([]) is True
+
+    chunks = [
+        _make_chunk(
+            input_ids=torch.zeros(2, dtype=torch.int32, device=device),
+            position_ids=torch.zeros(2, dtype=torch.int32, device=device),
+            query_start_loc_np=np.array([0, 1, n], dtype=np.int32)[: n + 1],
+            start_index=start,
+            num_reqs=n,
+            hidden=1,
+            device=device,
+            hidden_states=torch.zeros((2, 1), device=device),
+            attn_ctx=SimpleNamespace(use_max_model_len=True),
+        )
+        for start, n in ((0, 2), (2, 1))
+    ]
+    proposer.draft_chunks = chunks
+    proposer._prepare_draft_inputs = lambda *_a, **_k: (
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.tensor([1, -1], dtype=torch.int64, device=device),
+        np.zeros(2, dtype=np.int32),
+    )
+    proposer._loop_bucket = lambda n: 2
+    chunk_ids = {id(c): i for i, c in enumerate(chunks)}
+    events = []
+
+    def fake_forward(*, chunk, step_idx, **_k):
+        assert step_idx == 0, "a loop step ran outside the fused program"
+        events.append(("step0", chunk_ids[id(chunk)]))
+        return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
+
+    def fake_tail(*, chunk, gather_indices, num_rejected_dev, **_k):
+        ci = chunk_ids[id(chunk)]
+        events.append(("tail", ci))
+        # Clamped before the program sees it, as for the per-step compaction.
+        assert gather_indices.tolist() == [1, 0]
+        return torch.full((2, K), 10 * (ci + 1), dtype=torch.int32)
+
+    proposer._forward_draft = fake_forward
+    proposer._run_mtp_fused_tail = fake_tail
+    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+
+    def never(*_a, **_k):
+        raise AssertionError("ran outside the fused program")
+
+    proposer._draft_propose_token = never
+    proposer._mtp_compact_and_save = never
+    proposer._mtp_restore_topk = never
+
+    out = proposer.propose(
+        sampled_token_ids=[[1], [2], [3]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    assert events == [("step0", 0), ("tail", 0), ("step0", 1), ("tail", 1)]
+    assert out == [[10] * K, [10] * K, [20] * K]
+
+
+def test_use_mtp_fused_tail_needs_default_layout_and_target_metadata():
+    proposer = _make_proposer(method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    chunk = _make_chunk(
+        input_ids=torch.zeros(2, dtype=torch.int32),
+        position_ids=torch.zeros(2, dtype=torch.int32),
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=torch.device("cpu"),
+    )
+    proposer._target_draft_attn_metadata = lambda c: {"draft.attn": object()}
+    assert proposer._use_mtp_fused_tail([chunk]) is False  # not built
+    proposer._mtp_fused_tail = object()
+    assert proposer._use_mtp_fused_tail([chunk]) is True
+    proposer._target_draft_attn_metadata = lambda c: None
+    assert proposer._use_mtp_fused_tail([chunk]) is False
+    proposer._target_draft_attn_metadata = lambda c: {"draft.attn": object()}
+    chunk.sequence_layout_plan = _rank0_pcp_plan()
+    assert proposer._use_mtp_fused_tail([chunk]) is False
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_reqs", [1, 2, 4])
+def test_index_share_fused_tail_program_matches_the_per_step_loop(num_reqs):
+    """The fused tail, run as plain Python, against the per-step IndexShare
+    loop it replaces: compaction, step-0 lm-head, then per step positions +1,
+    seq_lens = base + step, the previous step's token in. The fake draft reads
+    every one of those (and the compacted top-k rows), so an off-by-one in any
+    of them changes the tokens."""
+    from vllm.config import CompilationMode
+
+    from vllm_torchtpu.spec_decode.mtp_fused_loop import (
+        build_mtp_index_share_fused_tail,
+    )
+
+    K, H, V, p, knr = 3, 4, 13, 4, 4
+    gen = torch.Generator().manual_seed(0)
+    w = torch.randn(H, V, generator=gen)
+
+    class _Mtp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.buf = torch.zeros(8, 2, dtype=torch.int32)
+            self.seq_lens = torch.zeros(knr, dtype=torch.int32)
+            self.steps = []
+
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            spec_step_idx=0,
+        ):
+            self.steps.append(spec_step_idx)
+            n = input_ids.shape[0]
+            mix = (
+                input_ids
+                + 3 * positions
+                + 5 * self.buf[:n, 0]
+                + 7 * self.seq_lens[:n]
+                + 11 * spec_step_idx
+            )
+            return hidden_states * 0.5 + torch.sin(mix.float()).unsqueeze(-1)
+
+        def compute_logits(self, h):
+            return h @ w
+
+        def compact_topk_indices(self, slot_ids):
+            n = slot_ids.numel()
+            self.buf[:n] = self.buf[slot_ids]
+
+    buf0 = torch.randint(0, 100, (8, 2), dtype=torch.int32, generator=gen)
+    last_hidden = torch.randn(p, H, generator=gen)
+    hidden = torch.randn(p, H, generator=gen)
+    positions = torch.randint(0, 50, (p,), dtype=torch.int32, generator=gen)
+    gather = torch.tensor([3, 5, 6, 7][:num_reqs] + [0] * (p - num_reqs))
+    base = torch.randint(10, 40, (knr,), dtype=torch.int32, generator=gen)
+    rej = torch.tensor([1, 0, 2, 0], dtype=torch.int32)
+
+    # Reference: the per-step loop.
+    ref = _Mtp()
+    ref.buf.copy_(buf0)
+    ref.compact_topk_indices(gather)
+    tok = ref.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+    ref_tokens, pos, hid = [tok], positions, hidden
+    for step in range(1, K):
+        pos = pos + 1
+        ref.seq_lens = base + step - rej
+        hid = ref(tok, pos, hid, spec_step_idx=step)
+        tok = ref.compute_logits(hid).argmax(dim=-1).to(torch.int32)
+        ref_tokens.append(tok)
+
+    # The program: step 1's seq_lens, bumped in place, read by the draft.
+    mtp = _Mtp()
+    mtp.buf.copy_(buf0)
+    mtp.seq_lens = base + 1 - rej
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE)
+    )
+    program = build_mtp_index_share_fused_tail(
+        vllm_config=config,
+        prefix="t",
+        mtp=mtp,
+        num_steps=K - 1,
+        compact_topk_indices=mtp.compact_topk_indices,
+    )
+    out = program(last_hidden, hidden, positions, gather, mtp.seq_lens)
+
+    assert out.shape == (p, K) and out.dtype == torch.int32
+    assert torch.equal(out, torch.stack(ref_tokens, dim=1))
+    assert mtp.steps == ref.steps == list(range(1, K))
+    assert torch.equal(mtp.buf, ref.buf)
+    assert torch.equal(mtp.seq_lens, base + (K - 1) - rej)
+
+
+@pytest.mark.tpu_test
+def test_draft_async_prep_matches_prepare_draft_inputs(device):
+    """The compiled async prep against the eager async `_prepare_draft_inputs`
+    plus the two pads propose() applies (gather index to p, clamped; rejected
+    count to kernel_num_reqs)."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1", "r2"]),
+        device=device,
+        requests={},
+        num_tokens_paddings=[16, 32, 64, 128],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    def make_chunk(draft_lengths):
+        return _make_chunk(
+            input_ids=torch.arange(100, 116, dtype=torch.int32, device=device),
+            position_ids=torch.arange(16, dtype=torch.int32, device=device),
+            query_start_loc_np=np.array([0, 4, 8, 12], dtype=np.int32),
+            start_index=0,
+            num_reqs=3,
+            device=device,
+            draft_lengths=draft_lengths,
+            attn_ctx=SimpleNamespace(
+                use_max_model_len=True,
+                query_start_loc=torch.tensor(
+                    [0, 4, 8, 12, 12], dtype=torch.int32, device=device
+                ),
+            ),
+        )
+
+    lengths = torch.tensor([3, 3, 3, 0], dtype=torch.int32, device=device)
+    next_tokens = torch.tensor(
+        [[91, 92, 201, -1], [202, -1, -1, -1], [5, 6, 7, 203], [-1] * 4],
+        dtype=torch.int32,
+        device=device,
+    )
+    ref_ids, ref_pos, ref_gather, ref_rej = proposer._prepare_draft_inputs(
+        make_chunk(lengths),
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+        next_tokens_device=next_tokens,
+    )
+    ids, pos, gather, rej = proposer._prepare_draft_inputs_fused(
+        make_chunk(lengths), [], next_tokens
+    )
+
+    assert torch.equal(ids.cpu(), ref_ids.cpu())
+    assert torch.equal(pos.cpu(), ref_pos.cpu())
+    assert torch.equal(gather.cpu(), ref_gather.clamp_min(0).cpu())
+    assert rej.cpu().tolist() == ref_rej.cpu().tolist() + [0] * 5
+    assert rej.cpu().tolist()[:3] == [1, 3, 0]
+    # The general path keeps what the compiled region does not cover.
+    assert (
+        proposer._prepare_draft_inputs_fused(make_chunk(lengths), [1], next_tokens)
+        is None
+    )
+    assert (
+        proposer._prepare_draft_inputs_fused(make_chunk(None), [], next_tokens) is None
+    )
+    assert proposer._prepare_draft_inputs_fused(make_chunk(lengths), [], None) is None
+
+
 # --------------------------------------------------------------------------
 # DSA (sparse-MLA) draft KV-cache validation
 # --------------------------------------------------------------------------
@@ -2487,3 +2763,106 @@ def test_static_shape_args_passes_non_tensors_through():
 
     t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
     assert step_idx == 3 and flag is None and t.shape == (2,)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("cache_uploads", [False, True])
+def test_propose_loop_upload_cache(cache_uploads, device):
+    """TPU_DRAFT_LOOP_CACHE_UPLOADS: the loop steps see the same
+    query_start_loc / request_distribution values, the drafts are unchanged,
+    and with the flag on a repeated propose reuses the first one's tensors."""
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    hidden_size, vocab_size, K, num_reqs = 8, 128, 3, 2
+    proposer = _make_proposer(draft_tp=1)
+    proposer._cache_loop_uploads = cache_uploads
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=num_reqs),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16, 32, 64, 128],
+        device=device,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    class _StubDraftModel:
+        model = SimpleNamespace(use_aux_hidden_state=True)
+
+        def combine_hidden_states(self, x):
+            return x
+
+        def compute_logits(self, hidden):
+            tokens = hidden[:, 0].round().clamp(min=0).to(torch.int64)
+            return torch.nn.functional.one_hot(tokens, vocab_size).to(torch.float32)
+
+    proposer.draft_model = _StubDraftModel()
+
+    def _prepare(chunk, *_args, **_kwargs):
+        return (
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.arange(chunk.num_reqs, device=device),
+            torch.ones(chunk.num_reqs, dtype=torch.int32, device=device),
+        )
+
+    proposer._prepare_draft_inputs = _prepare
+    seen = []
+
+    def _forward_draft(*, chunk, input_ids, step_idx, **kwargs):
+        n = input_ids.shape[0]
+        last_hidden = torch.zeros((n, hidden_size), device=device)
+        if step_idx == 0:
+            last_hidden[torch.arange(chunk.num_reqs, device=device), 0] = 40.0
+        else:
+            seen.append(
+                (kwargs["loop_query_start_loc"], kwargs["loop_request_distribution"])
+            )
+            last_hidden[:, 0] = (input_ids + 1).to(torch.float32)
+        return last_hidden, last_hidden
+
+    proposer._forward_draft = _forward_draft
+
+    results = []
+    for _ in range(2):
+        proposer.draft_chunks = [
+            _make_chunk(
+                input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+                position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+                query_start_loc_np=np.arange(num_reqs + 1, dtype=np.int32),
+                start_index=0,
+                num_reqs=num_reqs,
+                hidden=hidden_size,
+                device=device,
+                attn_ctx=SimpleNamespace(use_max_model_len=True),
+            )
+        ]
+        results.append(
+            proposer.propose(
+                sampled_token_ids=[[0]] * num_reqs,
+                discard_sampled_tokens_req_indices=[],
+                num_rejected_tokens_np=None,
+                scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+                # The async path GLM-5.2 serves with: device drafts and a
+                # device num_rejected.
+                return_device=True,
+                next_tokens_per_chunk=[
+                    torch.zeros((num_reqs, K + 1), dtype=torch.int32, device=device)
+                ],
+            )
+            .cpu()
+            .tolist()
+        )
+
+    assert results[0] == results[1] == [[40, 41, 42]] * num_reqs
+    assert len(seen) == 2 * (K - 1)
+    expected_qsl = np.minimum(np.arange(17), num_reqs).tolist()
+    for qsl, reqdist in seen:
+        assert qsl.cpu().tolist() == expected_qsl
+        assert reqdist.cpu().tolist() == [num_reqs] * 3
+    # The two proposes' loop steps share tensors exactly when caching.
+    assert (seen[0][0] is seen[-1][0]) == cache_uploads
+    assert (seen[0][1] is seen[-1][1]) == cache_uploads
