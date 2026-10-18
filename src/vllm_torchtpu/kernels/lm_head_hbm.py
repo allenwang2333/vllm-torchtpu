@@ -41,7 +41,8 @@ NBUF = 3
 MAX_K = 8192  # ring = NBUF x TILE x k x 2 B <= 24 MiB
 SUBLANE_BF16 = 16
 LANE = 128
-VMEM_LIMIT = 32 * 1024 * 1024
+VMEM_LIMIT = 32 * 1024 * 1024  # default config: ring 18.9 MB + x / out blocks <= 4.1 MB
+VMEM_LIMIT_MAX = 56 * 1024 * 1024
 
 # Timing-only and fault-injection variants for the kernel's own tests and benchmark.
 _VARIANTS = (None, "dma_only", "compute_only", "drop_tail", "off", "stale", "xrow", "kdrop")
@@ -129,6 +130,13 @@ def _build(m: int, k: int, n: int, dtype, t: int, nbuf: int, variant=None):
         raise ValueError(f"tile {t} / rows {n} must be multiples of {SUBLANE_BF16}")
     tiles = tiles_of(n, t)
     nbuf = max(1, min(nbuf, len(tiles)))
+    item = jnp.dtype(dtype).itemsize
+    # ring + the double-buffered x and out blocks; a non-default config may need more
+    # than the default scoped limit (t=1024 x 3 slots: 37.7 MB), never more than 56 MiB
+    need = nbuf * t * k * item + 2 * m * k * item + 2 * m * n * item
+    vmem_limit = max(VMEM_LIMIT, need + (4 << 20))
+    if vmem_limit > VMEM_LIMIT_MAX:
+        raise ValueError(f"config t={t} nbuf={nbuf} needs {need} B of VMEM")
     kern = functools.partial(_kernel, tiles=tiles, nbuf=nbuf, variant=variant)
     return pl.pallas_call(
         kern,
@@ -144,7 +152,7 @@ def _build(m: int, k: int, n: int, dtype, t: int, nbuf: int, variant=None):
             pltpu.SemaphoreType.DMA((nbuf,)),
         ],
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",), vmem_limit_bytes=VMEM_LIMIT
+            dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_limit
         ),
         name=f"lm_head_hbm_t{t}_b{nbuf}{'_' + variant if variant else ''}_m{m}_k{k}_n{n}",
     )
