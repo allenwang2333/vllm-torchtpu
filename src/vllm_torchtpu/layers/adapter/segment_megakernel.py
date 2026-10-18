@@ -138,6 +138,7 @@ SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 # too large for XLA to place in VMEM ahead of the call; per-layer operands of
 # these sizes each got a serial copy there (j-7694e3a5).
 _STACKS: dict[str, torch.Tensor] = {}
+STACK_MIN_ROWS = 32
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +657,9 @@ def lift_segment_buffers(model: Any, positions: torch.Tensor) -> torch.Tensor:
             tensors += _one_side_tensors(model, i)
     zero = None
     for t in tensors:
-        v = t.reshape(-1)[:1].to(torch.float32)
+        # One element by index: a reshape first would relayout the whole
+        # tensor (j-2f95e1a1: +167 us/step on fp8 weights).
+        v = t[(0,) * t.dim()].to(torch.float32)
         z = (v - v).to(positions.dtype)
         zero = z if zero is None else zero + z
     return positions if zero is None else positions + zero
@@ -713,13 +716,21 @@ def _build_stacks(layers: list, plan: list) -> None:
         )
         sw13s.append(getattr(moe, moe_tp_decode._BUFFERS[0]).detach().contiguous())
         sw2s.append(getattr(moe, moe_tp_decode._BUFFERS[2]).detach().contiguous())
-    stack8 = lambda xs: torch.stack([x.view(torch.uint8) for x in xs]).view(  # noqa: E731
-        xs[0].dtype
-    )
-    _STACKS["fstack"] = fresh_buffer(torch.stack(rows)[:, None, :])
-    _STACKS["s13s"] = fresh_buffer(torch.stack(s13s).to(torch.float32))
-    _STACKS["sw13s"] = fresh_buffer(stack8(sw13s))
-    _STACKS["sw2s"] = fresh_buffer(stack8(sw2s))
+    # At least STACK_MIN_ROWS rows (zero padding): with few armed boundaries
+    # (a twin has one) the stacks are small enough for XLA to place in VMEM
+    # with a copy each, as it does the per-layer tensors; GLM-5.2 serves 56.
+    pad = max(0, STACK_MIN_ROWS - len(rows))
+
+    def stack(xs, view8=False):
+        xs = [x.view(torch.uint8) if view8 else x for x in xs]
+        xs = xs + [torch.zeros_like(xs[0])] * pad
+        out = torch.stack(xs)
+        return out.view(sw13s[0].dtype) if view8 else out
+
+    _STACKS["fstack"] = fresh_buffer(stack(rows)[:, None, :])
+    _STACKS["s13s"] = fresh_buffer(stack(s13s).to(torch.float32))
+    _STACKS["sw13s"] = fresh_buffer(stack(sw13s, view8=True))
+    _STACKS["sw2s"] = fresh_buffer(stack(sw2s, view8=True))
     synchronize_tensors(list(_STACKS.values()))
 
 
