@@ -112,7 +112,9 @@ SMALL = Dims(hidden=4096, experts=128, q_lora=512, o_tile=1024)
 TINY = Dims(hidden=2048, experts=128, q_lora=512, o_tile=512)
 # (T, n_valid): decode b1 / b2 / b4 / b8 and a padded b3 (12 real rows in 16).
 TPU_CASES = ((4, 4), (8, 8), (16, 16), (32, 32), (16, 12))
-CPU_CASES = ((4, 4), (16, 12), (32, 32))
+# Interpret mode is slow (~minutes per call at SMALL): the fold path with the
+# positive controls, and a padded bucket on the full path.
+CPU_CASES = ((4, 4), (16, 12))
 # Harness tolerance rule (instruments spec.TOL_POLICY): factor x the
 # incumbent's error vs the f32 reference, floored per metric.
 TOL_FACTOR = 1.5
@@ -197,6 +199,12 @@ def _per_rank_inputs(d: Dims, T: int, n_valid: int, seed: int, rank):
     )
 
 
+def _host(x, dtype):
+    """A host (numpy) array in a JAX dtype: identical on every process, so it can
+    be placed on a multi-host mesh replicated."""
+    return np.asarray(x, np.float32).astype(jnp.dtype(dtype))
+
+
 def _shared_inputs(d: Dims, T: int, n_valid: int, seed: int):
     """Replicated operands and per-step metadata (host-side numpy)."""
     rng = np.random.default_rng(seed + 1000)
@@ -221,17 +229,17 @@ def _shared_inputs(d: Dims, T: int, n_valid: int, seed: int):
     row_of = rng.choice(d.num_pages * d.page_size, T, replace=False)
     dst = np.where(owner[None, :] == np.arange(DCP)[:, None], row_of[None, :], -1)
     return dict(
-        res=jnp.asarray(res, BF16),
-        gate=jnp.asarray(gate, BF16),
-        bias=jnp.asarray(rng.standard_normal(E) * 0.01, F32),
-        g_post=jnp.asarray(1 + 0.3 * rng.standard_normal(H), BF16),
-        g_in=jnp.asarray(1 + 0.3 * rng.standard_normal(H), BF16),
-        g_qa=jnp.asarray(1 + 0.1 * rng.standard_normal(d.q_lora), BF16),
-        g_kva=jnp.asarray(1 + 0.1 * rng.standard_normal(d.kv_lora), BF16),
-        qkv_w=jnp.asarray(qkv_w).astype(F8),
-        qkv_s=jnp.asarray(qkv_s),
-        cos=jnp.asarray(np.cos(ang), BF16),
-        sin=jnp.asarray(np.sin(ang), BF16),
+        res=_host(res, BF16),
+        gate=_host(gate, BF16),
+        bias=_host(rng.standard_normal(E) * 0.01, F32),
+        g_post=_host(1 + 0.3 * rng.standard_normal(H), BF16),
+        g_in=_host(1 + 0.3 * rng.standard_normal(H), BF16),
+        g_qa=_host(1 + 0.1 * rng.standard_normal(d.q_lora), BF16),
+        g_kva=_host(1 + 0.1 * rng.standard_normal(d.kv_lora), BF16),
+        qkv_w=_host(qkv_w, F8),
+        qkv_s=_host(qkv_s, F32),
+        cos=_host(np.cos(ang), BF16),
+        sin=_host(np.sin(ang), BF16),
         dst=dst.astype(np.int32),  # [DCP, T]
         planted=planted,
     )
@@ -489,7 +497,7 @@ def _metrics(d, T, n_valid, sh, out, ref, dst):
         np.asarray(x, np.float32) if i < 2 else np.asarray(x) for i, x in enumerate(out)
     )
     s2, q_ref, kv_ref, pe_ref, delta_ref = (np.asarray(x, np.float64) for x in ref)
-    res_in = np.asarray(sh["res"].astype(F32), np.float64)
+    res_in = np.asarray(sh["res"], np.float64)
     tp = -(-T // 16) * 16
     nope, rope, enc = _decode_pack(kvp, T, tp)
     kv_ref8 = np.asarray(
@@ -528,12 +536,13 @@ def _run_case(mesh, d, T, n_valid, seed, *, interpret=None, faults=(), incumbent
     """-> {build: per-device [(metrics, flags)]} for "kernel", each fault, and
     "incumbent" when asked. Inputs are built on device, per rank."""
     rank_ids = jax.device_put(
-        jnp.arange(N_RANKS, dtype=I32).reshape(N_RANKS, 1), NamedSharding(mesh, P(AXIS))
+        np.arange(N_RANKS, dtype=np.int32).reshape(N_RANKS, 1), NamedSharding(mesh, P(AXIS))
     )
     shared = _shared_inputs(d, T, n_valid, seed)
     sh = {k: v for k, v in shared.items() if k not in ("dst", "planted")}
+    sh_dev = {k: jax.device_put(v, NamedSharding(mesh, P())) for k, v in sh.items()}
     # [16, T]: device r is DCP rank r % DCP (vLLM's DCP groups inside TP).
-    dst_all = jnp.asarray(shared["dst"][np.arange(N_RANKS) % DCP])
+    dst_all = shared["dst"][np.arange(N_RANKS) % DCP]
     dst_sh = jax.device_put(dst_all, NamedSharding(mesh, P(AXIS)))
     sh_specs = {k: P() for k in sh}
 
@@ -570,7 +579,7 @@ def _run_case(mesh, d, T, n_valid, seed, *, interpret=None, faults=(), incumbent
                 check_vma=False,
             )
         )
-        return fn(rank_ids, dst_sh, sh)
+        return fn(rank_ids, dst_sh, sh_dev)
 
     ref = run("reference")
     builds = ["kernel", *faults] + (["incumbent"] if incumbent else [])
@@ -615,10 +624,10 @@ def _cpu_worker():
     tiny = os.environ.get("SEGMK_TEST_TINY") == "1"
     dims = TINY if tiny else SMALL
     cases = CPU_CASES[:1] if tiny else CPU_CASES
-    faults = () if tiny else FAULTS
-    for T, nv in cases:
+    for i, (T, nv) in enumerate(cases):
         t0 = time.time()
         pltpu.reset_tpu_interpret_mode_state()
+        faults = FAULTS if i == 0 and not tiny else ()
         res = _run_case(mesh, dims, T, nv, seed=T * 100 + nv, faults=faults)
         races = bool(interpret_pallas_call.races.races_found)
         out[f"T{T}_nv{nv}"] = {
@@ -668,12 +677,14 @@ def test_kernel_matches_the_oracle_on_16_devices(cpu_results):
 
 @pytest.mark.parametrize("fault", FAULTS)
 def test_positive_controls_fail_the_oracle(cpu_results, fault):
-    caught = 0
-    for r in cpu_results.values():
-        m, flags = r[fault]
-        if any(v > CPU_TOL[k] for k, v in m.items()) or not all(flags.values()):
-            caught += 1
-    assert caught == len(cpu_results), fault
+    runs = [r[fault] for r in cpu_results.values() if fault in r]
+    assert runs, fault
+    for m, flags in runs:
+        assert any(v > CPU_TOL[k] for k, v in m.items()) or not all(flags.values()), (
+            fault,
+            m,
+            flags,
+        )
 
 
 def _tpu_main():
