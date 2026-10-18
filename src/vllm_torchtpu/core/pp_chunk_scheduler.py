@@ -11,8 +11,12 @@ whatever their position in the running queue. When the pending prefill
 work cannot fill every stage with a full step, the step shrinks to that
 work spread over the pipeline, so a lone prompt runs as one small step per
 stage instead of trailing itself through the pipeline one full step at a
-time; a busy server keeps full steps and first-come order. A step also holds
-at most as many (query block, KV block) attention pairs as the batched
+time; a busy server keeps full steps and first-come order. The stages advance
+in lockstep, so while a larger step is still in the pipeline every step lasts
+at least as long as it does: the spreads are costed against the steps in
+flight, which the scheduler tracks from its own steps and from the pushes and
+settles the engine sends between them (``pipeline_advanced``). A step also
+holds at most as many (query block, KV block) attention pairs as the batched
 attention kernel can schedule, which bounds a chunk deep in a very long
 prompt so the kernel never overruns its SMEM. The cost model
 arrives after the engine core has built its executor and scheduler; until
@@ -61,8 +65,10 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_prefill_tokens = 0
         self._step_schedule = 0
         self._seeded: set[str] = set()
-        # Modelled time of the steps still in the pipeline, newest first:
-        # a step launched k steps ago runs for pp_size - k more steps.
+        # Modelled time of the steps still in the pipeline, newest first: a
+        # step launched k steps ago runs for pp_size - k more steps. A push
+        # enters as a step of no cost and ages the steps before it; a settle
+        # leaves the pipeline empty (pipeline_advanced).
         self._inflight_ms: list[float] = []
         self._clips = 0
         self._waits = 0
@@ -72,6 +78,23 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._cost = model
         self._pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
         logger.info("Pipeline chunk scheduler: %s", model.describe())
+
+    def _enter(self, step_ms: float) -> None:
+        """Records a step entering the pipeline; the oldest one leaves."""
+        self._inflight_ms = [step_ms, *self._inflight_ms][: max(self._pp_size - 1, 0)]
+
+    def pipeline_advanced(self, pushes: int = 0, settled: bool = False) -> None:
+        """Keeps the in-flight history in step with the pipeline outside
+        scheduler steps: each push is a step that carries nothing, so it
+        enters at no cost and ages the steps before it; a settle, sent once
+        nothing is in flight, leaves the pipeline empty. Without this a
+        burst that follows a wait would be costed against steps that have
+        long left the pipeline."""
+        if settled:
+            self._inflight_ms = []
+            return
+        for _ in range(max(int(pushes), 0)):
+            self._enter(0.0)
 
     def _account(self, tokens: int, prefix: int) -> None:
         self._step_tokens += tokens
@@ -99,7 +122,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         if self._cost is not None and output.total_num_scheduled_tokens > 0:
             estimate = self.step_estimate_ms(output)
             assert estimate is not None
-            self._inflight_ms = [estimate, *self._inflight_ms][: self._pp_size - 1]
+            self._enter(estimate)
         return output
 
     def step_estimate_ms(self, scheduler_output: Any) -> float | None:
@@ -153,7 +176,11 @@ class TpuPipelineChunkScheduler(Scheduler):
             step_ms = self._cost.step_ms(bucket, 0.0, float(share) * share)
             done_ms = 0.0
             for step in range(steps):
-                live = self._inflight_ms[: self._pp_size - 1 - step]
+                # The step launched k steps ago is still in the pipeline
+                # during candidate step s while k + s < pp_size - 1; past
+                # that no step in flight overlaps, and the bound must not
+                # go negative, which would read the oldest entries back in.
+                live = self._inflight_ms[: max(self._pp_size - 1 - step, 0)]
                 done_ms += max(step_ms, *live) if live else step_ms
             if done_ms < soonest:
                 limit, soonest = share, done_ms
@@ -237,6 +264,19 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
     scheduler.install_cost_model(model)
 
 
+def attach_pipeline_listener(scheduler: Any, executor: Any) -> None:
+    """Have the executor's push and settle accounting (``pp_push``) age the
+    scheduler's in-flight step costs; a no-op for other schedulers and for
+    executors without a pipeline."""
+    if not isinstance(scheduler, TpuPipelineChunkScheduler):
+        return
+    if getattr(executor, "vllm_config", None) is None:
+        return
+    from vllm_torchtpu.distributed.pp_push import wave_state
+
+    wave_state(executor).listener = scheduler.pipeline_advanced
+
+
 def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
     """Have the engine core time the stages once its executor and scheduler
     exist. Installed from the platform's config check (in-process engines)
@@ -252,6 +292,7 @@ def patch_engine_core_for_pp_chunks(vllm_config: Any) -> None:
     def __init__(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
         profile_and_install_cost_model(self.scheduler, self.model_executor)
+        attach_pipeline_listener(self.scheduler, self.model_executor)
 
     EngineCore.__init__ = __init__
     EngineCore._tpu_pp_chunks_patch = True

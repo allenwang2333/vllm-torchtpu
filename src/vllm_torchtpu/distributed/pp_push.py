@@ -45,6 +45,7 @@ widest any pipeline in the process asked for.
 """
 
 import contextlib
+from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any, cast
 
@@ -70,6 +71,14 @@ class _WaveState:
         self.settles = 0
         # The engine core times the pushes itself (core/pp_lazy_step.py).
         self.lazy = False
+        # Told of every advance the pipeline makes outside scheduler steps,
+        # as (pushes, settled); the chunk scheduler keeps its in-flight step
+        # costs in step with it (core/pp_chunk_scheduler.py).
+        self.listener: Callable[[int, bool], None] | None = None
+
+    def _advanced(self, pushes: int = 0, settled: bool = False) -> None:
+        if self.listener is not None:
+            self.listener(pushes, settled)
 
     def dispatched(self) -> int:
         """Records a scheduler step and returns its number."""
@@ -87,6 +96,7 @@ class _WaveState:
         self.pushes += 1
         if self.pushes <= 5 or self.pushes % 100 == 0:
             logger.debug("PP wave push %d as step %d", self.pushes, self.steps)
+        self._advanced(pushes=1)
         return self.steps, executor.collective_rpc(
             "pp_push", non_block=True, unique_reply_rank=executor.output_rank
         )
@@ -103,6 +113,7 @@ class _WaveState:
             logger.debug(
                 "PP wave settle %d after step %d", self.settles, self.last_step
             )
+        self._advanced(settled=True)
         return executor.collective_rpc(
             "pp_settle", non_block=True, unique_reply_rank=executor.output_rank
         )
@@ -139,6 +150,7 @@ class _WaveState:
                 "pp_push", non_block=True, unique_reply_rank=executor.output_rank
             )
         self.steps += need
+        self._advanced(pushes=need)
 
 
 class _PushFuture(Future):

@@ -304,3 +304,23 @@ def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, 
     executor = _install_on_fake_executor(monkeypatch, stages=4)
     assert executor.take_draft_token_ids() is None
     assert executor.calls == []
+
+
+def test_the_listener_hears_every_push_and_settle():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=8)
+    heard = []
+    wave.listener = lambda pushes, settled: heard.append((pushes, settled))
+    futures = _futures(executor, wave, 9)
+    # Waiting on step 5 with 4 later steps in flight sends two pushes.
+    assert futures[4].result() == 5
+    assert heard == [(2, False)]
+    # A push the engine core sends itself (lazy pushes) is heard too.
+    wave.push(executor)
+    assert heard == [(2, False), (1, False)]
+    # The settle that closes the burst is heard as such.
+    assert futures[8].result() == 9
+    assert heard == [(2, False), (1, False), (0, True)]
+    # A settle with nothing open is not sent and not heard.
+    assert wave.settle(executor) is None
+    assert len(heard) == 3
