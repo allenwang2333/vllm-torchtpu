@@ -114,7 +114,8 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
           "lg": ((t, c.E), BF16), "sgu": ((t, 2 * c.IS), BF16), "hq": ((t, c.IS), FP8),
           "hs": ((t, 1), F32), "sd": ((t, c.H), BF16), "sg": ((t, 1), F32),
           "topi": ((t, c.TOPK), I32), "topw": ((t, c.TOPK), F32), "rank": ((t, c.TOPK), I32),
-          "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), F32), "xf": ((t, c.H), F32), "pos": ((t, c.TOPK), I32)}
+          "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), F32), "xf": ((t, c.H), F32),
+          "pos": ((t, c.TOPK), I32)}
     if has_gdn:
         kdim = c.KH * c.KD
         ws.update({"qkvz": ((t, c.QKV + c.Z), BF16), "ba": ((t, 2 * c.VH), BF16),
