@@ -23,11 +23,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKOUT = os.environ.get("MK_CHECKOUT", os.path.abspath(os.path.join(HERE, "..", "..")))
 
 
-def serving_env():
+def serving_env(trace_regions=False):
     os.environ.pop("LIBTPU_INIT_ARGS", None)
     os.environ.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x-8")
     sys.path.insert(0, os.path.join(CHECKOUT, "src"))
     runpy.run_path(os.path.join(CHECKOUT, "src", "vllm_torchtpu", "env_override.py"))
+    if trace_regions:
+        # The kernel's named scopes reach the XLA TraceMe line only with these on.
+        os.environ["LIBTPU_INIT_ARGS"] = (os.environ.get("LIBTPU_INIT_ARGS", "")
+                                          + " --xla_enable_custom_call_region_trace=true"
+                                          " --xla_xprof_register_llo_debug_info=true")
 
 
 def tiles_from(args, MK):
@@ -39,7 +44,7 @@ def tiles_from(args, MK):
 
 
 def setup(args):
-    serving_env()
+    serving_env(trace_regions=getattr(args, "xprof", False))
     import jax
     import jax.numpy as jnp
 
