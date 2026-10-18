@@ -3,7 +3,7 @@
 The production call (RPAm-snh): one sequence of Q new tokens behind a CTX-token cached context,
 32 q heads / 2 kv heads / head_dim 256, fp8 KV cache in SEQ_ALONG_LANE pages of 128 tokens,
 bf16 q, causal. `sweep` runs every arm in its own process on one clock and writes
-attn_bench.json; an arm is `name:key=value,...` (keys: bq, bqc, bkv, batch, nbuf, vmem_mb, out=f32).
+attn_bench.json; an arm is `name:key=value,...` (keys: bq, bqc, bkv, batch, nbuf, vmem_mb, out=f32; impl=splash with sbq, sbkv, sbkvc).
 
     python3 attn_bench.py sweep --ctx 87040 --q 8192 --arms "default:" "b512:bq=512,bqc=512,bkv=512"
 """
@@ -86,6 +86,41 @@ def reference_rows(inp, ctx, rows):
     return out
 
 
+def make_splash_call(args, opts):
+    """Contiguous-KV prefill attention: gather this sequence's context K/V out of the paged fp8
+    cache into bf16, append the new tokens' K/V, then one MQA splash attention per kv head (its
+    16 q heads) with f32 softmax state. The gather is inside the timed call."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as splash
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as mask_lib
+
+    ctx, q_len = args.ctx, args.q
+    kv_len = ctx + q_len
+    n_ctx_pages = -(-ctx // PAGE)
+    group = NQ // NKV
+    bs = splash.BlockSizes(block_q=int(opts.get("sbq", 512)), block_kv=int(opts.get("sbkv", 1024)),
+                           block_kv_compute=int(opts.get("sbkvc", opts.get("sbkv", 1024))))
+    mask = mask_lib.MultiHeadMask(tuple(mask_lib.CausalMask((q_len, kv_len), offset=ctx)
+                                        for _ in range(group)))
+    attn = jax.vmap(splash.make_splash_mqa_single_device(mask, block_sizes=bs))
+
+    def call(q, k, v, cache, kv_lens, pi, cu, dist):
+        # kv_lens[0] - kv_len is 0 but loop-variant in the timed loop, so nothing is hoisted.
+        idx = pi[:n_ctx_pages] + (kv_lens[0] - kv_len)
+        pages = jnp.take(cache, idx, axis=0)                      # (n, 2H, HD/4, 4, PAGE)
+        kvc = pages.transpose(0, 4, 1, 2, 3).reshape(n_ctx_pages * PAGE, 2 * NKV, HD)[:ctx]
+        kvc = kvc.reshape(ctx, NKV, 2, HD)
+        k_all = jnp.concatenate([kvc[:, :, 0], k], axis=0).astype(jnp.bfloat16)  # (kv, H, D)
+        v_all = jnp.concatenate([kvc[:, :, 1], v], axis=0).astype(jnp.bfloat16)
+        qg = (q * jnp.asarray(HD ** -0.5, q.dtype)).reshape(q_len, NKV, group, HD)
+        qg = qg.transpose(1, 2, 0, 3)                              # (H, group, q, D)
+        out = attn(qg, k_all.transpose(1, 0, 2), v_all.transpose(1, 0, 2))
+        return out.transpose(2, 0, 1, 3).reshape(q_len, NQ, HD).astype(q.dtype), cache
+
+    return call
+
+
 def run_arm(args):
     serving_env()
     import jax
@@ -109,9 +144,13 @@ def run_arm(args):
         kw["vmem_limit_bytes"] = int(opts["vmem_mb"]) << 20
     layout = configs.KVLayout.SEQ_ALONG_LANE
 
-    def call(q, k, v, cache, kv_lens, pi, cu, dist):
+    def call_rpa(q, k, v, cache, kv_lens, pi, cu, dist):
         return wrapper.ragged_paged_attention(
             q, k, v, cache, kv_lens, pi, cu, dist, sm_scale=HD ** -0.5, kv_layout=layout, **kw)
+
+    call = call_rpa
+    if opts.get("impl") == "splash":
+        call = make_splash_call(args, opts)
 
     dev = jax.devices()[0]
     put = lambda x: jax.device_put(x, dev)
