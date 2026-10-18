@@ -153,6 +153,7 @@ _PER_RANK = (
     "w2",
     "s2",
     "fstack",
+    "s13s",
     "sw13s",
     "sw2s",
 )
@@ -175,6 +176,7 @@ _ARGS = (
     "s2",
     "qkv_w",  # fp8 [H, qkv_pad] (the lane-padded copy)
     "fstack",  # f32 [boundaries, row_width] (this rank's)
+    "s13s",  # f32 [boundaries, E, 2I]
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
 )
@@ -215,6 +217,7 @@ def _op_body(st: _Statics):
         s2,
         qkv_w,
         fstack,
+        s13s,
         sw13s,
         sw2s,
     ):
@@ -248,6 +251,7 @@ def _op_body(st: _Statics):
             s2=s2,
             qkv_w=qkv_w,
             fstack=fstack,
+            s13s=s13s,
             sw13s=sw13s,
             sw2s=sw2s,
         )
@@ -303,6 +307,7 @@ def _get_op(mesh, st: _Statics):
         s2: jax.Array,
         qkv_w: jax.Array,
         fstack: jax.Array,
+        s13s: jax.Array,
         sw13s: jax.Array,
         sw2s: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -325,6 +330,7 @@ def _get_op(mesh, st: _Statics):
             s2,
             qkv_w,
             fstack,
+            s13s,
             sw13s,
             sw2s,
         )
@@ -684,7 +690,6 @@ def _consts_row(st: _Statics, layer: Any, nxt: Any) -> torch.Tensor:
         ss13=ss13,
         ss2=ss2,
         qkv_s=nwrap.fused_qkv_a_proj.weight_scale,
-        s13=moe.w13_weight_scale_inv,
     )
     parts = []
     for name, _, w in st.cfg(kernel.TOKEN_BUCKETS[0]).fields():
@@ -698,17 +703,21 @@ def _build_stacks(layers: list, plan: list) -> None:
     buffers (a view would be re-materialized every forward)."""
     from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-    rows, sw13s, sw2s = [], [], []
+    rows, s13s, sw13s, sw2s = [], [], [], []
     for i, st in plan:
         layer, nxt = layers[i], layers[i + 1]
         moe = _moe_runner(layer).routed_experts
         rows.append(_consts_row(st, layer, nxt))
+        s13s.append(
+            moe.w13_weight_scale_inv.detach().reshape(moe.w13_weight.shape[0], -1)
+        )
         sw13s.append(getattr(moe, moe_tp_decode._BUFFERS[0]).detach().contiguous())
         sw2s.append(getattr(moe, moe_tp_decode._BUFFERS[2]).detach().contiguous())
     stack8 = lambda xs: torch.stack([x.view(torch.uint8) for x in xs]).view(  # noqa: E731
         xs[0].dtype
     )
     _STACKS["fstack"] = fresh_buffer(torch.stack(rows))
+    _STACKS["s13s"] = fresh_buffer(torch.stack(s13s).to(torch.float32))
     _STACKS["sw13s"] = fresh_buffer(stack8(sw13s))
     _STACKS["sw2s"] = fresh_buffer(stack8(sw2s))
     synchronize_tensors(list(_STACKS.values()))
@@ -871,6 +880,7 @@ def segment_forward(
         moe.w2_weight_scale_inv,
         getattr(nwrap.fused_qkv_a_proj, QKV_W_BUF),
         _STACKS["fstack"],
+        _STACKS["s13s"],
         _STACKS["sw13s"],
         _STACKS["sw2s"],
     )

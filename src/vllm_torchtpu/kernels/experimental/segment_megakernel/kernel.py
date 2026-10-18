@@ -133,7 +133,6 @@ class SegCfg:
             ("ss13", 2 * self.shared_i),
             ("ss2", self.hidden),
             ("qkv_s", self.qkv_pad),
-            ("s13", self.experts * 2 * self.moe_i),
         )
         out, off = [], 0
         for name, w in widths:
@@ -418,10 +417,11 @@ HBM_IN = (
     "s2",
     "qkv_w",
     "fstack",  # f32 [boundaries, row_width]: SegCfg.fields() per boundary
+    "s13s",  # f32 [boundaries, E, 2I]: routed gate/up scales
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
 )
-# fstack fields copied whole to VMEM (s13 rows go straight to the expert ring)
+# fstack fields, each copied to VMEM
 VEC_FIELDS = (
     "oproj_s",
     "g_post",
@@ -534,9 +534,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     slot_k = meta[2]  # this boundary's row of the constant stacks
     eps = jnp.float32(cfg.rms_eps)
 
-    def frow(name, extra=0, width=None):
+    def frow(name):
         off, w = cfg.field(name)
-        return r["fstack"].at[pl.ds(slot_k, 1), pl.ds(off + extra, width or w)]
+        return r["fstack"].at[pl.ds(slot_k, 1), pl.ds(off, w)]
 
     # ---- 1. barrier signals for BOTH in-kernel all-reduces (one prologue;
     #         AR2 skips its wait)
@@ -656,7 +656,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
                 r["w2"].at[e], r["w2_r"].at[slot], ring_sem.at[slot, 1]
             ),
             pltpu.make_async_copy(
-                frow("s13", e * (2 * cfg.moe_i), 2 * cfg.moe_i),
+                r["s13s"].at[slot_k, pl.ds(e, 1)],
                 r["s1_r"].at[slot],
                 ring_sem.at[slot, 2],
             ),
@@ -946,6 +946,7 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
         "s2": ((cfg.experts, 1, 1, H), F32),
         "qkv_w": ((H, cfg.qkv_pad), F8),
         "fstack": ((boundaries, cfg.row_width), F32),
+        "s13s": ((boundaries, cfg.experts, 2 * cfg.moe_i), F32),
         "sw13s": ((boundaries, H, 2 * cfg.shared_i), F8),
         "sw2s": ((boundaries, cfg.shared_i, H), F8),
     }
@@ -970,7 +971,7 @@ def pack_meta(n_valid, rank, slot, dst_rows):
 def fstack_row(cfg: SegCfg, consts: dict):
     """One boundary's `fstack` row (f32 [row_width]) from its constants:
     oproj_s, g_post, g_in, g_qa, g_kva, bias, ss13, ss2, qkv_s (padded to
-    qkv_pad), s13 ([E, 1, 1, 2I])."""
+    qkv_pad)."""
     parts = []
     for name, _, w in cfg.fields():
         v = consts[name].astype(F32).reshape(-1)

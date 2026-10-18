@@ -272,7 +272,6 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
         ss13=pr["ss13"],
         ss2=pr["ss2"],
         qkv_s=qkv_s,
-        s13=pr["s13"],
     )
     # Two boundaries in the stacks, this one in row 1 (row 0 a decoy: wrong
     # row indexing shows up as garbage constants).
@@ -289,6 +288,7 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
         s2=pr["s2"],
         qkv_w=qkv_w,
         fstack=jnp.stack([decoy, row]),
+        s13s=jnp.stack([jnp.flip(pr["s13"][:, 0, 0], 0), pr["s13"][:, 0, 0]]),
         sw13s=jnp.stack([jnp.flip(pr["sw13"], 0), pr["sw13"]]),
         sw2s=jnp.stack([jnp.flip(pr["sw2"], 0), pr["sw2"]]),
     )
