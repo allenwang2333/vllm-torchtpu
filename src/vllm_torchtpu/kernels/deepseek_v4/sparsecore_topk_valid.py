@@ -1076,6 +1076,20 @@ def _topk_body(
     lax.fori_loop(0, num_waves, wave_body, jnp.int32(0))
 
 
+# (b, n, p) shapes on which TPU_SC_TOPK_COOP_V2 is proven bitwise on hardware:
+# the DCP8 decode buckets T = 4 / 8 / 16 of the local top-k (n = 1M / 8), and
+# the a2a merge's stage 2 at T = 64 / 128 (b = T / 8 rows of n = 8 * 2048).
+COOP_V2_TESTED_SHAPES = frozenset(
+    {
+        (4, 131072, 8),
+        (8, 131072, 4),
+        (16, 131072, 2),
+        (8, 16384, 4),
+        (16, 16384, 2),
+    }
+)
+
+
 def _slice_buffer(num_waves: int, slice_len: int) -> tuple[int, int]:
     """(words, half) of a subcore's slice buffer on the wave loop.
 
@@ -1162,7 +1176,16 @@ def _sc_topk_direct(
     # P = 16 (b <= 2 rows at this width) is excluded: that configuration hung the
     # device on hardware (tests/kernels/test_sc_topk_coop_v2.py, b = 1) and no
     # decode bucket reaches it at DCP8 (T >= 4 -> P <= 8).
-    coop_v2 = coop_v2 and 1 < p <= 8 and wave_loop and num_waves == 1
+    # Safety net: engage only on (b, n, p) shapes this path has run bitwise on
+    # hardware (tests/kernels/test_sc_topk_coop_v2.py); every other shape keeps
+    # the default path.
+    coop_v2 = (
+        coop_v2
+        and 1 < p <= 8
+        and wave_loop
+        and num_waves == 1
+        and (b, n, p) in COOP_V2_TESTED_SHAPES
+    )
     shared_gather = coop_v2 and p >= 4
     async_gather = coop_v2 and p < 4
     peer_n = p if async_gather else 1

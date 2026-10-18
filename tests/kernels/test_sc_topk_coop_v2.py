@@ -112,6 +112,70 @@ def test_coop_v2_engages_on_single_wave_only():
         assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged, b
 
 
+N_A2A = 16384  # the a2a merge's stage 2 (TPU_DCP_INDEXER_A2A_MERGE): rows of dcp * k = 8 * 2048
+
+
+def _a2a_case(b, kind, seed):
+    """Stage-2 rows as `streamindex_topk_dcp(a2a_merge=True)` builds them: full width
+    (row_lengths = n), every rank's k candidates, -inf for unfilled slots; plus one
+    padding-token row that is -inf end to end and one whole-row tie, both spanning
+    every subcore's part, and a short negative row (rows < k select everything)."""
+    rng = np.random.default_rng(seed)
+    if kind == "ties":
+        s = (np.round(rng.standard_normal((b, N_A2A)) * 16) / 8).astype(np.float32)
+    else:
+        s = np.abs(rng.standard_normal((b, N_A2A))).astype(np.float32)
+    fill = rng.integers(K // 4, K + 1, size=(b, 8))
+    for r in range(b):
+        for q in range(8):
+            s[r, q * K + fill[r, q] : (q + 1) * K] = -np.inf
+    s[0, :] = -np.inf  # padding token: no candidate anywhere
+    s[1, :] = 0.75  # whole-row tie across all p parts
+    s[2, :] = -np.inf
+    s[2, : K - 300] = -np.abs(rng.standard_normal(K - 300)).astype(np.float32) * 3
+    return jnp.asarray(s), jnp.full((b,), N_A2A, jnp.int32)
+
+
+@pytest.mark.parametrize("b", [8, 16])
+@pytest.mark.parametrize("kind", ["relu", "ties"])
+def test_coop_v2_a2a_stage2_is_bitwise(b, kind):
+    _require_sparsecore()
+    scores, lens = _a2a_case(b, kind, seed=b + len(kind))
+    want = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
+    got = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
+    assert _same(got, want) is None, _same(got, want)
+    assert (np.asarray(got[0])[0] == -1).all()  # the padding row selects nothing
+    # The comparison sees a fault INSIDE the kernel: an in-kernel "-inf" key moved up
+    # to the key of +0.0 drops the all-negative row's candidates in the kernel only.
+    key_neg_inf = sc_valid.KEY_NEG_INF
+    try:
+        jax.clear_caches()
+        sc_valid.KEY_NEG_INF = 0
+        bad = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
+    finally:
+        sc_valid.KEY_NEG_INF = key_neg_inf
+        jax.clear_caches()
+    assert _same(bad, want) is not None, "in-kernel fault not detected"
+
+
+def test_coop_v2_engages_through_the_a2a_dispatcher(monkeypatch):
+    """The a2a merge's stage 2 reaches this kernel through
+    sparsecore_topk.sparsecore_topk (TPU_SC_TOPK_VALID_READS) with coop_v2 read
+    from the env: engaged exactly on the allow-listed shapes."""
+    _require_sparsecore()
+    monkeypatch.setattr(envs, "TPU_SC_TOPK_VALID_READS", True)
+    monkeypatch.setattr(envs, "TPU_SC_TOPK_COOP_V2", True)
+    for b, engaged in ((8, True), (16, True), (32, False), (4, False)):
+        scores = jnp.zeros((b, N_A2A), jnp.float32)
+        lens = jnp.full((b,), N_A2A, jnp.int32)
+        txt = (
+            jax.jit(lambda s, l: sc_topk.sparsecore_topk.__wrapped__(s, K, l, write_empty_rows=True))
+            .lower(scores, lens)
+            .as_text()
+        )
+        assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged, b
+
+
 def _merge_case(b, dcp, k, seed, kind):
     rng = np.random.default_rng(seed)
     if kind == "ties":
