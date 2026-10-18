@@ -1458,10 +1458,13 @@ class RaidenOffloadingManager(OffloadingManager):
             tel["store_blocks"],
         )
         logger.info(
-            "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d",
+            "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d"
+            " demote_keys=%d demoted_sub_hashes=%d",
             dt,
             d["split_fa_keys"],
             d["split_mamba_keys"],
+            d.get("demote_keys", 0),
+            d.get("demoted_sub_hashes", 0),
         )
         class_evicted = getattr(self._store, "evicted_sub_hashes", None)
         if class_evicted is not None:

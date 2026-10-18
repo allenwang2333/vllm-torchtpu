@@ -214,10 +214,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         lookups, but the tier evicts them before any live entry.
         """
         env = os.environ.get("TPU_RAIDEN_TIER_DEMOTE_STATE")
-        self._demote_stale_state = (env == "1") if env is not None else default_on
         self._state_group_ids = frozenset(
             g.group_idx for g in self.config.kv_group_configs if g.requires_cow_source
         )
+        # Superseded GDN boundary states otherwise compete with live KV in the host
+        # LRU: on PP=8 AgentX prefill they were >50% of all tier stores. Demote them
+        # by default whenever the model has state groups, not only under TIER_DEDUP
+        # (which PP>1 / TP=1 cannot use). TPU_RAIDEN_TIER_DEMOTE_STATE=0 opts out.
+        if env is not None:
+            self._demote_stale_state = env == "1"
+        else:
+            self._demote_stale_state = default_on or bool(self._state_group_ids)
         # req_id -> boundary tokens -> the state keys stored for that boundary.
         self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
         # req_id -> (boundary tokens, state keys) of the admission's hit.
