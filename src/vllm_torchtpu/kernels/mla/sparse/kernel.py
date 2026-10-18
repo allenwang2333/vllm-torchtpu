@@ -1501,7 +1501,16 @@ SEND_EXCHANGE_FAULTS = (
     "send_peer_drop",
     "send_xchg_rm_round",
     "send_xchg_entry_wait",
+    # Merge mode only: the merge's w_lo sum dropped (a ~2^-9 relative error).
+    "send_merge_lo_skip",
 )
+# TPU_MLA_FUSED_SMALL_A2A_MERGE (`send_exchange[4]`): peers push their slabs
+# into a VMEM receive scratch [W, SEND_SLAB_ROW0 + T * L, V] int16 of this
+# rank (remote VMEM destination, not HBM) and the kernel merges the W
+# partials itself -- the unpack and torch's `_merge_received`, term by term --
+# into the second output, int16 [T * L, V] (the bf16 merge's words). The
+# real-token count rides the bounds prefetch after (rank, lane).
+
 
 
 def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
@@ -1643,6 +1652,14 @@ def _attention_kernel(
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
     # Body lever "pair" (see below): its unpacked-KV ring is the last scratch
     # ref, after every other one.
+    xchg_merge = bool(
+        send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
+    )
+    recv_v_ref = None
+    if xchg_merge:
+        # [W, SEND_SLAB_ROW0 + T * L, o_dim] int16: the last scratch ref.
+        recv_v_ref = refs[-1]
+        refs = refs[:-1]
     kv_stage_ref = None
     if "pair" in body_levers or "quad" in body_levers:
         assert "xqk" not in body_levers
@@ -1835,7 +1852,12 @@ def _attention_kernel(
         xchg_rows = SEND_SLAB_ROW0 + send_rows
         xchg_block = SEND_PAD_ROWS + send_rows
         assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
-        assert lse_hbm_ref.shape == (send_world * xchg_block, o_dim), lse_hbm_ref.shape
+        if xchg_merge:
+            assert recv_v_ref.shape == (send_world, xchg_rows, o_dim), recv_v_ref.shape
+            assert lse_hbm_ref.shape == (send_rows, o_dim), lse_hbm_ref.shape
+            assert lse_hbm_ref.dtype == jnp.int16 and send_rows % 16 == 0
+        else:
+            assert lse_hbm_ref.shape == (send_world * xchg_block, o_dim), lse_hbm_ref.shape
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -2347,6 +2369,9 @@ def _attention_kernel(
         slot = lax.rem(me + 1, n) if fault == "send_peer_misorder" else me
 
         def rows_of(k):
+            if xchg_merge:
+                # Merge mode: slot k of the receive scratch (VMEM).
+                return recv_v_ref.at[k]
             start = k * xchg_block + SEND_SLAB_ROW0
             if not isinstance(k, int):
                 start = pl.multiple_of(start, 8)
@@ -2378,11 +2403,80 @@ def _attention_kernel(
 
         local = pltpu.make_async_copy(bo_x2_ref.at[0, me], rows_of(me), local_sem)
         local.start()
-        others = lse_hbm_ref.at[pl.ds(0, expect * xchg_rows)]
+        others = (
+            recv_v_ref.at[pl.ds(0, expect)]
+            if xchg_merge
+            else lse_hbm_ref.at[pl.ds(0, expect * xchg_rows)]
+        )
         pltpu.make_async_copy(others, others, recv_sem).wait()
         local.wait()
         if fault != "send_xchg_rm_round":
             pltpu.make_async_copy(others, others, send_sem).wait()
+
+    def xchg_merge_store():
+        """Merge mode: the unpack + torch `_merge_received` on the W received
+        slabs in `recv_v_ref`, term by term, senders in order 0..W-1; the bf16
+        result's words go to bo slot 1 and one DMA to the second output."""
+        n = send_world
+        tl = send_rows
+        live = start_end_seq_idx_ref[4] * send_per  # real tokens x L
+        rows_i = lax.broadcasted_iota(jnp.int32, (tl, o_dim), 0)
+        r128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 0)
+        c128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 1)
+        l_cols, o_rows = [], []
+        for w in range(n):
+            # int16 words to int32 lanes (sign-extended): row SEND_SLAB_ROW0 - 1
+            # is the lse word row, rows from SEND_SLAB_ROW0 the bf16 partials.
+            xi = recv_v_ref[w].astype(jnp.int32)  # [SEND_SLAB_ROW0 + tl, o_dim]
+            words = xi[SEND_SLAB_ROW0 - 1 : SEND_SLAB_ROW0]  # [1, o_dim]
+            lo_src = pltpu.roll(words, o_dim - tl, 1)  # lane r <- lane tl + r
+            bits = lax.shift_left(words, jnp.int32(16)) | (lo_src & 0xFFFF)
+            l_row = lax.bitcast_convert_type(bits, jnp.float32)[:, :128]
+            # Lanes to sublanes exactly: row r keeps only lane r (a masked max).
+            l_cols.append(
+                jnp.max(
+                    jnp.where(r128 == c128, jnp.broadcast_to(l_row, (tl, 128)), -jnp.inf),
+                    axis=1,
+                    keepdims=True,
+                )
+            )  # f32 [tl, 1]
+            # bf16 -> f32 is the bits shifted up 16 (exact, NaNs kept).
+            part = lax.bitcast_convert_type(
+                lax.shift_left(xi[SEND_SLAB_ROW0 : SEND_SLAB_ROW0 + tl], jnp.int32(16)),
+                jnp.float32,
+            )
+            # The unpack: partial rows past the real ones are zero.
+            o_rows.append(jnp.where(rows_i < live, part, 0.0))
+        finite = [jnp.isfinite(c) for c in l_cols]
+        shift = jnp.where(finite[0], l_cols[0], -jnp.inf)
+        for w in range(1, n):
+            shift = jnp.maximum(shift, jnp.where(finite[w], l_cols[w], -jnp.inf))
+        shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+        weights = [
+            jnp.where(finite[w], jnp.exp(l_cols[w] - shift), 0.0) for w in range(n)
+        ]
+        denom = weights[0]
+        for w in range(1, n):
+            denom = denom + weights[w]
+        denom = jnp.where(denom > 0, denom, 1.0)
+        acc_hi = jnp.zeros((tl, o_dim), jnp.float32)
+        acc_lo = jnp.zeros((tl, o_dim), jnp.float32)
+        for w in range(n):
+            wt = weights[w] / denom
+            w_hi = wt.astype(jnp.bfloat16).astype(jnp.float32)
+            w_lo = wt - w_hi
+            if fault == "send_merge_lo_skip":
+                w_lo = jnp.zeros_like(w_lo)
+            of = jnp.where(jnp.isnan(o_rows[w]), 0.0, o_rows[w])
+            acc_hi = acc_hi + of * w_hi
+            acc_lo = acc_lo + of * w_lo
+        out = (acc_hi + acc_lo).astype(jnp.bfloat16)
+        bo_x2_ref[1, 0, pl.ds(0, tl), :] = pltpu.bitcast(out, jnp.int16)
+        copy = pltpu.make_async_copy(
+            bo_x2_ref.at[1, 0, pl.ds(0, tl)], lse_hbm_ref, fill_sem
+        )
+        copy.start()
+        copy.wait()
 
     def store_blse(bo_sem_idx, batch_idx, lse_col):
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
@@ -2980,6 +3074,10 @@ def _attention_kernel(
         )
 
     if xchg:
+        if xchg_merge and fault in ("send_peer_misorder", "send_peer_drop"):
+            # Test only: a slot nobody writes reads NaN (before any peer can
+            # push: they wait for this rank's barrier signal).
+            recv_v_ref[...] = jnp.full(recv_v_ref.shape, 0x7FC0, jnp.int16)
         # One grid step: the collective section is unconditional (every rank
         # signals, pushes and counts every block, with or without work).
         xchg_signal()
@@ -2995,6 +3093,8 @@ def _attention_kernel(
     if xchg:
         build_send_lse_words()
         xchg_round()
+        if xchg_merge:
+            xchg_merge_store()
     elif send:
         # Every token's lse is in `fill_ref` now; the words overlap the last
         # partial DMA.
@@ -3417,7 +3517,7 @@ def sparse_ragged_paged_attention(
     ):
         raise ValueError(f"unknown prologue_fault {prologue_fault}")
     if send_exchange is not None and (
-        not send_world or send_peer is None or len(send_exchange) not in (2, 3, 4)
+        not send_world or send_peer is None or len(send_exchange) not in (2, 3, 4, 5)
     ):
         raise ValueError(
             "send_exchange = (axis, lane_axis) needs send_world and send_peer "
@@ -4248,6 +4348,24 @@ def sparse_attention_chunk(
                 )
             )
 
+        xchg_merge = bool(
+            send_exchange is not None
+            and len(send_exchange) > 4
+            and send_exchange[4]
+        )
+        if xchg_merge:
+            # Merge mode: the receive scratch, the last scratch ref.
+            assert send_recv_in is None, "merge mode has no receive buffer"
+            scratch_shapes.append(
+                pltpu.VMEM(
+                    (
+                        send_world,
+                        SEND_SLAB_ROW0 + batch_size * num_q_heads // send_world,
+                        q.shape[-1],
+                    ),
+                    jnp.int16,
+                )
+            )
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
             bounds.append(token_end)
@@ -4255,6 +4373,8 @@ def sparse_attention_chunk(
             # (rank, lane) ride the bounds prefetch: no extra operand.
             assert not preserve_suffix and send_peer is not None
             bounds += [send_peer[0], send_peer[1]]
+            if xchg_merge:
+                bounds.append(send_peer[2])  # real tokens
         scalar_prefetches = (
             kv_lens,
             jnp.array(bounds, jnp.int32),
@@ -4356,6 +4476,12 @@ def sparse_attention_chunk(
                             shape=(out_rows, *q.shape[1:]), dtype=q.dtype
                         ),
                         jax.ShapeDtypeStruct(
+                            # Merge mode: the merged rows' words [T * L, V].
+                            shape=(q.shape[0] * num_q_heads // send_world, q.shape[-1]),
+                            dtype=jnp.int16,
+                        )
+                        if xchg_merge
+                        else jax.ShapeDtypeStruct(
                             # Fused exchange: the receive buffer, flat.
                             shape=(
                                 int(np.prod(send_layout_shape(

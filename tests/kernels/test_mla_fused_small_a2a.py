@@ -169,3 +169,14 @@ def test_min_tokens_default_fuses_every_gated_bucket():
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS == 1
     with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": "8"}):
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS == 8
+
+
+def test_merge_mode_constants():
+    from vllm_torchtpu import envs
+
+    assert "send_merge_lo_skip" in sparse_mla.SEND_EXCHANGE_FAULTS
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE", None)
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is False
+    with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MERGE": "1"}):
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is True

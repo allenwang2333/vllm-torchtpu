@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB: int = 32
     TPU_MLA_FUSED_SMALL_A2A_BUCKETS: str = ""
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
+    TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = False
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -671,6 +672,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate in the traced graph. 1 = every bucket the flag takes.
     "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS", 1
+    ),
+    # With TPU_MLA_FUSED_SMALL_A2A: peers push into a VMEM receive scratch and
+    # the kernel also runs the DCP merge (the unpack + `_merge_received`, term
+    # by term), so the op returns the merged [T, L, V] -- no receive buffer, no
+    # unpack or merge ops after the call. Not bit-identical to torch's merge
+    # (exp / summation order). Needs MIN_TOKENS = 1.
+    "TPU_MLA_FUSED_SMALL_A2A_MERGE": env_bool(
+        "TPU_MLA_FUSED_SMALL_A2A_MERGE", default=False
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.

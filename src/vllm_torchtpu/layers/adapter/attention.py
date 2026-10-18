@@ -2486,6 +2486,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         rank_tensor = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
         # TPU_MLA_FUSED_SMALL_A2A: peers are (my lane, j), both as data.
         lane_tensor = dcp_lane_operand() if fused_exchange else None
+        # TPU_MLA_FUSED_SMALL_A2A_MERGE: the kernel also merges; the op returns
+        # the merged [T, L, V] bf16 instead of the unpacked partials + lse.
+        fused_merge = bool(fused_exchange and envs.TPU_MLA_FUSED_SMALL_A2A_MERGE)
         assert lane_tensor is None or rank_tensor is not None, (
             "fused_exchange needs TPU_DCP_RANK_OPERAND"
         )
@@ -2533,6 +2536,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 dcp_rank_ids=rank_ids,
                 send_layout=send_layout,
                 fused_exchange=fused_exchange,
+                fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
             )
 
@@ -2713,6 +2717,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             op_name += "_send"
         if fused_exchange:
             op_name += "_xa2a"
+        if fused_merge:
+            op_name += "m"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
@@ -2721,8 +2727,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if lane_tensor is not None:
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # lane ids, sharded
         output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
-        if fused_exchange:
-            # Caches, then this rank's received [dcp, rows, V] partials and
+        if fused_merge:
+            # Caches, then this rank's merged [T, L, V]: three outputs.
+            output_specs = output_specs[:2] + (P(DCP_AXIS_NAME, None, None),)
+        elif fused_exchange:
+            # Caches, then this rank's received [dcp, rows] partials and
             # [dcp, rows] lse: four outputs, as the partial + lse op's.
             output_specs = output_specs[:2] + (
                 P(DCP_AXIS_NAME, None, None),
@@ -2752,6 +2761,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
         ):
             del rest, kwargs
+            if fused_merge:
+                tokens, heads, vdim = ql_nope.shape
+                return (
+                    torch.empty_like(kv_cache_nope),
+                    torch.empty_like(kv_cache_rope),
+                    ql_nope.new_empty((tokens, heads // dcp_size, vdim), dtype=torch.bfloat16),
+                )
             if fused_exchange:
                 tokens, heads, vdim = ql_nope.shape
                 rows = tokens * (heads // dcp_size)
@@ -2820,6 +2836,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             new_nope, new_rope = results[:2]
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
+            if fused_merge:
+                return results[2]  # merged [T, L, V]
             if fused_exchange:
                 return results[2], results[3]  # received partials, lse
             if send_layout:
@@ -2984,7 +3002,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     ):
                         # TPU_MLA_FUSED_SMALL_A2A: the kernel also runs the
                         # small all-to-all and the op unpacks; only the merge.
-                        o_recv, l_recv = fused_op(
+                        fused_out = fused_op(
                             kv_cache,
                             ql_nope_dcp,
                             q_pe_dcp,
@@ -2997,9 +3015,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             attn_metadata.request_distribution,
                             *q_rope_table,
                         )
-                        outputs = _cp_mla_attention.merge_fused_recv(
-                            o_recv, l_recv, ql_nope_dcp.shape[0]
-                        )
+                        if envs.TPU_MLA_FUSED_SMALL_A2A_MERGE:
+                            outputs = fused_out  # merged in the kernel
+                        else:
+                            o_recv, l_recv = fused_out
+                            outputs = _cp_mla_attention.merge_fused_recv(
+                                o_recv, l_recv, ql_nope_dcp.shape[0]
+                            )
                     else:
                         # TPU_DCP_MLA_SEND_LAYOUT: the kernel writes the packed
                         # real-rows exchange's send buffer; one a2a + merge.

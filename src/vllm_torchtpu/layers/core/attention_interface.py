@@ -1188,6 +1188,7 @@ def sparse_mla_attention_dcp(
     send_layout: bool = False,
     fused_exchange: bool = False,
     dcp_lane_ids: jax.Array | None = None,
+    fused_merge: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1327,10 +1328,13 @@ def sparse_mla_attention_dcp(
         if len(lane_axes) > 1:
             raise ValueError(f"fused_exchange: at most one lane axis, got {mesh.axis_names}")
         lane_axis = lane_axes[0] if lane_axes else None
-        out_specs = out_specs[:2] + (
-            P(dcp_axis_name, None, None),  # received partials
-            P(dcp_axis_name, None),  # received lse
-        )
+        if fused_merge:
+            out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # merged
+        else:
+            out_specs = out_specs[:2] + (
+                P(dcp_axis_name, None, None),  # received partials
+                P(dcp_axis_name, None),  # received lse
+            )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1365,6 +1369,11 @@ def sparse_mla_attention_dcp(
             fused_exchange
             and topk_idx.shape[0] >= envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS
         )
+        if fused_merge and not fuse_here:
+            raise ValueError(
+                "TPU_MLA_FUSED_SMALL_A2A_MERGE needs every fused bucket in the "
+                "kernel (TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS <= the bucket)"
+            )
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
         else:
@@ -1462,10 +1471,13 @@ def sparse_mla_attention_dcp(
                         lane_axis,
                         int(vmem_mib) * 1024 * 1024,
                         pin,
+                        bool(fused_merge),
                     )
-                    split_kwargs["send_peer"] = jnp.stack(
-                        [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
-                    )
+                    peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
+                    if fused_merge:
+                        # The real-token count: the kernel's unpack mask.
+                        peer.append(query_start_loc_[-1].astype(jnp.int32))
+                    split_kwargs["send_peer"] = jnp.stack(peer)
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1569,6 +1581,10 @@ def sparse_mla_attention_dcp(
             per = ql_nope.shape[1] // dcp_size
             block = sparse_mla_kernel.SEND_PAD_ROWS + num_tokens * per
             rows = 1 + query_start_loc_[-1:].astype(jnp.int32) * per
+            if fused_merge:
+                # The kernel merged: its second output is the merged rows' words.
+                merged = jax.lax.bitcast_convert_type(lse, jnp.bfloat16)
+                return (kv_cache_nope, kv_cache_rope, merged.reshape(num_tokens, per, -1))
             if not fuse_here:
                 # Below TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: `lse` is the send
                 # buffer, exchanged by the separate small all-to-all + unpack
