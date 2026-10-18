@@ -504,6 +504,9 @@ FUSED_WIDE_NBD = {
 # deepest fitting ring): 80: 17.63 vs 18.25, 84: 19.59 vs 19.53, 88: 19.97 vs 20.24,
 # 96: 21.07 vs 21.51, 104: 23.86 vs 24.01, 112: 24.35 vs 25.22.
 FUSED_WIDE_RSAG_NBD = {80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
+# EP expert ring refills with static banks and one layer-dispatch walk per macro-step
+# (moe_block.experts_piped_ep). Bit-exact; microbench -1.5% at 64 / 80 rows, -6% at 96 / 112.
+EP_FAST_REFILL = True
 
 # ROUTE_SHRINK (VEC route): shorter serial scalar chain from the EARLY_FILL issue to the first
 # expert compute. The copy-candidate scan packs each candidate's copy slot (its meta lane) above

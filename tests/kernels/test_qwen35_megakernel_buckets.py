@@ -208,6 +208,46 @@ def test_fused_pool_io_fallback_rebuilds_only_fused_buckets(monkeypatch):
     assert not any(mk._bucket_fused.values())
 
 
+# Fused verify buckets of 80..112 rows run as ONE kernel each, with the flat reduce-scatter +
+# all-gather all-reduce and the dense ring depth that fits the scoped VMEM limit.
+WIDE_SINGLE_RSAG_NBD = {80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
+
+
+@pytest.mark.parametrize("b", sorted(WIDE_SINGLE_RSAG_NBD))
+def test_fused_wide_verify_bucket_single_kernel_tiles(b):
+    c = dataclasses.replace(
+        K.FULL_EP, R=8, B=b, T=4, paged_kv=True, fused_pool_io=True, dcp_size=4, e_slots=68
+    )
+    t = K.default_tiles(c)
+    assert (t.hier, t.rsag, t.nbd, t.nbe) == (0, True, WIDE_SINGLE_RSAG_NBD[b], 12), b
+    _, info = K.build(c, t)
+    assert info["vmem_scratch_bytes"] <= t.vmem_mib * 2**20, (b, info["vmem_scratch_bytes"])
+
+
+def test_wide_verify_buckets_up_to_112_build_as_one_call(monkeypatch):
+    """84..112-row verify buckets are single Pallas calls; wider ones stay 2-microbatch splits
+    whose halves are single-call buckets."""
+    mk = bare_mk(monkeypatch, buckets=(), verify_buckets=(64, 80, 84, 96, 104, 112, 120, 128))
+    single, split = [], []
+
+    def fake_single(b, tokens_per_seq=1, out_pad_rows=None):
+        single.append(b)
+        return object()
+
+    def fake_split(b, tokens_per_seq=1, out_pad_rows=None):
+        split.append(b)
+        return object()
+
+    mk._build_bucket_op = fake_single
+    mk._build_split_bucket_op = fake_split
+    mk._build_all_buckets()
+    assert single == [64, 80, 84, 96, 104, 112]
+    assert split == [120, 128]
+    for b in split:
+        b0, b1 = VA._optimal_split_pair(b)
+        assert b0 + b1 == b and max(b0, b1) <= VA._MAX_SINGLE_KERNEL_B
+
+
 def test_build_bucket_op_names_and_hlo_fallback(monkeypatch):
     """Op names carry `_3stage` exactly for 3-stage buckets, including a bucket that falls
     back from fused pool I/O when the HLO guard fails."""
