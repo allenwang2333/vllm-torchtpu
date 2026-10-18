@@ -25,6 +25,8 @@ def main():
     ap.add_argument("--w", type=int, default=1024, help="row width in u32 words (1024 = 4 KiB)")
     ap.add_argument("--inflight", type=int, nargs="*", default=[8, 16, 32, 64])
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--unroll", type=int, nargs="*", default=[1])
+    ap.add_argument("--vmem-only", action="store_true")
     args = ap.parse_args()
     os.environ.pop("LIBTPU_INIT_ARGS", None)
     os.environ.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x-8")
@@ -42,8 +44,9 @@ def main():
     idx = jnp.asarray(rng.integers(0, T, (N,), dtype=np.int64).astype(np.int32))
     results = []
 
-    for to_vmem in (False, True):
-        for k in args.inflight:
+    for to_vmem, k, un in [(tv, k, u) for tv in ((True,) if args.vmem_only else (False, True))
+                           for k in args.inflight for u in args.unroll]:
+        if True:
             if to_vmem:
                 # Gather into a VMEM tile of R rows, flushed to HBM per tile (what a grouped matmul
                 # would consume): R rows per tile, k DMAs in flight.
@@ -65,7 +68,7 @@ def main():
                                 wait(r - k)
                             issue(r)
                             return c
-                        jax.lax.fori_loop(0, R, body, 0)
+                        jax.lax.fori_loop(0, R, body, 0, unroll=un)
                         jax.lax.fori_loop(R - k, R, lambda r, c: (wait(r), c)[1], 0)
                         cp = pltpu.make_async_copy(buf, o_hbm.at[pl.ds(ti * R, R)], osem.at[0])
                         cp.start()
@@ -106,7 +109,7 @@ def main():
                 out_shape=jax.ShapeDtypeStruct((N, W), jnp.uint32),
             )
             f = jax.jit(call)
-            res = {"to_vmem": to_vmem, "inflight": k, "rows": N, "row_bytes": W * 4}
+            res = {"to_vmem": to_vmem, "inflight": k, "unroll": un, "rows": N, "row_bytes": W * 4}
             try:
                 out = jax.block_until_ready(f(idx, x))
                 ok = bool(jnp.array_equal(out[:64], x[idx[:64]])) and bool(jnp.array_equal(out[-64:], x[idx[-64:]]))
