@@ -69,6 +69,11 @@ class _MtpFusedLoop(nn.Module):
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        # TPU_SAMPLER_VOCAB_PARALLEL: set (before the first call traces) when
+        # the draft's compute_logits returns this rank's logit shard; the
+        # step's token is then `vocab_parallel_argmax` of it, as in
+        # Eagle3Proposer._draft_propose_token. None: plain argmax.
+        self.vocab_parallel_argmax = None
         # IndexShare only: the draft's top-k table -- the very tensor its MLA
         # layer reads while skip_topk is set. A plain attribute, not a
         # registered buffer: the draft owns it, and this module must not
@@ -124,12 +129,15 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = (
-                self.mtp.compute_logits(last_hidden)
-                .argmax(dim=-1)
-                .to(torch.int32)
-                .clone()
-            )
+            logits = self.mtp.compute_logits(last_hidden)
+            if self.vocab_parallel_argmax is not None:
+                from vllm_torchtpu.spec_decode.utils import vocab_parallel_argmax
+
+                input_ids = vocab_parallel_argmax(
+                    logits, self.vocab_parallel_argmax
+                ).clone()
+            else:
+                input_ids = logits.argmax(dim=-1).to(torch.int32).clone()
             tokens.append(input_ids)
         return tuple(tokens)
 

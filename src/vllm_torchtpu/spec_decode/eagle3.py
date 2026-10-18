@@ -329,21 +329,28 @@ class Eagle3Proposer:
 
         # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
         # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
-        # The fused draft loop also argmaxes compute_logits and keeps the
-        # full-logit path, so this is gated on the loop actually being built,
-        # not on VLLM_TPU_FUSED_DRAFT_LOOP: under IndexShare the flag is on
-        # but _build_mtp_fused_loop returns early, and every draft step runs
-        # _draft_propose_token.
+        # The plain fused draft loop argmaxes full logits, so it keeps the
+        # full-logit path: this is gated on that loop not being built (not on
+        # VLLM_TPU_FUSED_DRAFT_LOOP: under IndexShare the flag is on but
+        # without VLLM_TPU_MTP_FUSED_INDEXSHARE _build_mtp_fused_loop returns
+        # early, and every draft step runs _draft_propose_token). The
+        # IndexShare fused loop takes the shard argmax too, so both of its
+        # draft paths (step 0 here, steps 1.. in the program) agree.
         self._vocab_parallel_argmax = None
         if (
             envs.TPU_SAMPLER_VOCAB_PARALLEL
-            and self._mtp_fused_loop is None
+            and (self._mtp_fused_loop is None or self._mtp_fused_indexshare)
             and getattr(self.draft_model, "draft_id_to_target_id", None) is None
         ):
             self._vocab_parallel_argmax = install_vocab_parallel_draft_argmax(
                 self.draft_model
             )
             logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
+            if self._mtp_fused_loop is not None:
+                # Before its first call: the program traces lazily.
+                self._mtp_fused_loop.vocab_parallel_argmax = (
+                    self._vocab_parallel_argmax
+                )
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
