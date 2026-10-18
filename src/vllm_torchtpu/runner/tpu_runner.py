@@ -1047,7 +1047,22 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank, enabled=self._stage_timing_has_consumer()
+        )
+
+    def _stage_timing_has_consumer(self) -> bool:
+        """Whether runner stage timings can reach a sink.
+
+        The samples are only handed to a TPU KV connector's stats
+        (get_finished_kv_transfers); without a KV transfer config they are
+        taken and dropped every step. TPU_STAGE_TIMING_ONLY_WITH_CONSUMER then
+        skips them: each device-timed stage otherwise records two TpuEvents on
+        the serving thread and wakes a collector thread that synchronizes them.
+        """
+        if not envs.TPU_STAGE_TIMING_ONLY_WITH_CONSUMER:
+            return True
+        return self.vllm_config.kv_transfer_config is not None
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.

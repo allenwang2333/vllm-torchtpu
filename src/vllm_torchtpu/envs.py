@@ -136,6 +136,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = False
+    TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
@@ -1275,6 +1277,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # Skip the per-forward synchronous upload of the token padding mask when
+    # its padding rows are unchanged since the last write (steady decode at a
+    # fixed bucket). The device mask is then already what the upload would
+    # write.
+    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool("TPU_TOKEN_PADDING_SKIP_UNCHANGED"),
+    # Record runner stage timings (TpuEvent pairs + a collector thread) only
+    # when a KV connector can consume them; without a KV transfer config the
+    # samples are dropped every step, so the stages become no-ops.
+    "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER": env_bool(
+        "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER"
+    ),
     # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
     # at most 1024), derive the stable-sort positions, permuted token ids and
     # group sizes by int32 compare-and-count instead of three comparison
