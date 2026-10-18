@@ -115,12 +115,13 @@ def time_step(args):
            "finite": bool(jnp.isfinite(out[0].astype(jnp.float32)).all())}
     print("MK_RESULT " + json.dumps(res), flush=True)
     if args.xprof:
-        cmd = [sys.executable, os.path.abspath(__file__), "profile"] + [
-            a for a in sys.argv[2:] if a != "--xprof"]
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        done = [l for l in p.stdout.splitlines() if l.startswith("PROFILE_DONE ")]
-        print("XPROF " + (done[-1][13:] if done else f"failed rc={p.returncode}: {p.stderr[-500:]}"),
-              flush=True)
+        # In this process (a second one cannot open the TPU while this one holds it); the
+        # timing is already printed if the tracer misbehaves.
+        d = os.path.join(args.xprof_dir, "stage")
+        os.makedirs(d, exist_ok=True)
+        with jax.profiler.trace(d):
+            jax.block_until_ready(step(args.ctx, h, r, kw, ks_cur, rope))
+        print("XPROF " + d, flush=True)
 
 
 def main():
