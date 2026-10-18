@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LIGHTWEIGHT_STEP_STATS_INTERVAL: int = 500
     VLLM_TPU_RAIDEN_LOAD_WAIT_MS: float = 1.5
     VLLM_TPU_QWEN35_MEGAKERNEL: bool = False
+    VLLM_TPU_QWEN35_MK_WIDE_MB: int = 0
 
 
 def env_with_choices(
@@ -1368,6 +1369,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_RAIDEN_LOAD_WAIT_MS", 1.5
     ),
     "VLLM_TPU_QWEN35_MEGAKERNEL": env_bool("VLLM_TPU_QWEN35_MEGAKERNEL", default=False),
+    # Rows per microbatch of the Qwen3.5 megakernel's wide verify step, 0 for
+    # off; parse_mk_wide_mb checks the value.
+    "VLLM_TPU_QWEN35_MK_WIDE_MB": env_nonnegative_int("VLLM_TPU_QWEN35_MK_WIDE_MB", 0),
 }
 
 
