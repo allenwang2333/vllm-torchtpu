@@ -55,8 +55,8 @@ class MKTiles:
     tm_norm: int = 256      # norms, swiglu
     tm_prep: int = 64       # GDN conv/gates prep (wide f32 temporaries)
     tm_gate: int = 128      # GDN gated norm, attention q/k norm + rope, attention gate
-    tm: int = 512
-    tn: int = 512
+    tm: int = 1024           # matmul row tile (j-d714d214-80e9-4d1f-9ec4: 153 vs 157 ms at 512)
+    tn: int = 1024
     chunk: int = 64          # GDN chunk
     bq: int = 256            # attention q tile (tokens)
     bkv: int = 2048          # attention kv tile (j-692719db-95ef-4ea4-8b2f: best of 512..4096)
