@@ -42,9 +42,9 @@ compaction runs on the vector units (_compact_vector) and travels to the scalar
 core with the hit table, and one loop after it starts the first ring items: the
 incumbent's scalar compaction costs ~20 bundles per local expert, and its DMA
 starts inside a pl.when compile to predicated straight-line code on every hit
-expert that does not overlap the work after it. The ring loop runs in two parts with unconditional waits and
-refills, and the last item is peeled, so no ring DMA sits under a pl.when and
-no matmul reads a stale slot.
+expert that does not overlap the work after it. The ring loop runs in two parts
+with unconditional waits and refills, and the last item is peeled, so no ring
+DMA sits under a pl.when and no matmul reads a stale slot.
 
 Expert range (EP x TP weights, e.g. TPU_MOE_EP_TP_SIZE): a rank may hold only
 the experts [experts_start, experts_start + local) of the E the router scores,
@@ -279,7 +279,6 @@ def _route_fast(scores, bias, n_valid, *, topk):
     rows, n = scores.shape
     lb = max(1, (n - 1).bit_length())
     window = (1 << (30 - lb)) - 1  # ranks 1 .. window - 1 in the window, 0 beyond
-    masked = float(jnp.finfo(jnp.float32).min)
     x = scores + bias
     x = jnp.where(x > ROUTER_NEG, x, ROUTER_NEG)
     x = jnp.where(x == 0.0, 0.0, x)  # -0.0 == +0.0 in _route: one ordinal
@@ -473,9 +472,9 @@ def _kernel(
         # and their count (the vector compaction replaces the scalar one).
         ids, n_active = _compact_vector(wtab_ref[...], e0, local_experts)
         hits_v_ref[2:3, 0 : ids.shape[1]] = ids.astype(jnp.int32)
-        hits_v_ref[3:4, :] = jnp.broadcast_to(n_active, (1, hits_v_ref.shape[1])).astype(
-            jnp.int32
-        )
+        hits_v_ref[3:4, :] = jnp.broadcast_to(
+            n_active, (1, hits_v_ref.shape[1])
+        ).astype(jnp.int32)
 
     if fast:
         # Row 1 of the hit table carries _route_fast's flag to the scalar core.
@@ -720,9 +719,7 @@ def _kernel(
     )
 
 
-@functools.partial(
-    jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "fast")
-)
+@functools.partial(jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "fast"))
 def moe_tp_decode(
     x,
     scores,

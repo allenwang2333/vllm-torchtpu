@@ -92,7 +92,7 @@ def _check(rank, world, cp_mla):
             try:
                 wrap = mm._compile if how == "compiled" else (lambda f: f)
 
-                def run(s, q, unpack, dense, group=0, tokens=tokens):
+                def run(s, q, unpack, dense, group=0, tokens=tokens, wrap=wrap):
                     cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = unpack
                     cp_mla.envs.TPU_DCP_MLA_SEND_DENSE = dense
                     cp_mla.envs.TPU_DCP_MLA_SEND_GROUP_ROWS = group
@@ -115,7 +115,7 @@ def _check(rank, world, cp_mla):
                 ctl_g8_rows = run(send, qsl_all, True, False, 8)
                 ctl_g8_lse = run(bad, qsl, True, False, 8)
 
-                def nd(a):
+                def nd(a, want=want):
                     return int((a.view(torch.int16) != want.view(torch.int16)).sum())
 
                 report[key] = {
@@ -225,9 +225,20 @@ def test_send_dense_and_group_match_ragged_on_real_collectives(tmp_path):
             assert "error" not in c, (r["rank"], key, c)
             t = total.setdefault(
                 key,
-                dict(elements=0, plain=0, n_diff=0, unpack_too=0, nonzero=False,
-                     pad_zero=True, ctl_rows=0, ctl_lse=0, g8=0, g16=0, ctl_g8_rows=0,
-                     ctl_g8_lse=0),
+                dict(
+                    elements=0,
+                    plain=0,
+                    n_diff=0,
+                    unpack_too=0,
+                    nonzero=False,
+                    pad_zero=True,
+                    ctl_rows=0,
+                    ctl_lse=0,
+                    g8=0,
+                    g16=0,
+                    ctl_g8_rows=0,
+                    ctl_g8_lse=0,
+                ),
             )
             t["elements"] += c["elements"]
             t["plain"] += c["plain_n_diff"]

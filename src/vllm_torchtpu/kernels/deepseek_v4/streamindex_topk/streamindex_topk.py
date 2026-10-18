@@ -328,6 +328,7 @@ def kernel(
         pipeline_mode=pl.Buffered(buffer_count=buffer_cnt, use_lookahead=True),
     )
     if seq_along_lane and page_major:
+        assert kv_sublane_groups is not None
         kv_spec = pl.BlockSpec(
             (
                 pl.BoundedSlice(seq_batch_size),
@@ -397,7 +398,7 @@ def kernel(
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
-            page_major_groups=kv_sublane_groups if page_major else 0,
+            page_major_groups=(kv_sublane_groups or 0) if page_major else 0,
         )
     else:
         kv_alloc = bref_override.StreamIndexKVBufferedRef.input(

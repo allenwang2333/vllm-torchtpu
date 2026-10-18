@@ -192,9 +192,7 @@ def _build_matmul_all_reduce(mesh, waves: bool):
             x, w, w_s, rank, num_cores=n, axis=EP_AXIS_NAME, waves=waves
         )
 
-    def fn(
-        x: jax.Array, w: jax.Array, w_s: jax.Array, rank: jax.Array
-    ) -> jax.Array:
+    def fn(x: jax.Array, w: jax.Array, w_s: jax.Array, rank: jax.Array) -> jax.Array:
         return jax.shard_map(
             body, mesh=mesh, in_specs=(spec,) * 4, out_specs=spec, check_vma=False
         )(x, w, w_s, rank)

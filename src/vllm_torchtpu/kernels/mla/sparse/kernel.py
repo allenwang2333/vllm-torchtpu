@@ -1700,9 +1700,12 @@ def _attention_kernel(
     #            arrives lane-dense (not bit-exact: reduction order).
     # Every stage-A lever except "xqk" is bitwise-identical.
     assert not body_levers or group_tab_ref is not None or row_widths
-    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {"nofill", "quad", "lrows", "step8"}, (
-        body_levers
-    )
+    assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
+        "nofill",
+        "quad",
+        "lrows",
+        "step8",
+    }, body_levers
     assert not ("quad" in body_levers and "pair" in body_levers)
     q128 = "q128" in body_levers
     assert not q128 or q_rope
@@ -1748,10 +1751,7 @@ def _attention_kernel(
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     # "nofill" (decode levers): the one grid step stores every row's lse.
     nofill = (
-        "nofill" in body_levers
-        and lse_fill
-        and not send
-        and num_tokens <= batch_size
+        "nofill" in body_levers and lse_fill and not send and num_tokens <= batch_size
     )
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
@@ -4455,9 +4455,7 @@ def sparse_attention_chunk(
     attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
     if "step8" in row_levers and small_chunk:
         attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
-        attn_batch_end = (
-            start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
-        )
+        attn_batch_end = start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
     # For prefilling of short sequences (or early in the sequence), there are

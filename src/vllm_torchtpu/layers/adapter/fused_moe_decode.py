@@ -40,7 +40,6 @@ compares a signature across the EP group and raises on any mismatch.
 """
 
 import functools
-import os
 from typing import Any, cast
 
 import jax
@@ -570,9 +569,6 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
-_SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
-
-
 def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
     """With the prefill kernel on by default (env_override.py lowers the
     SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL is set),
@@ -581,11 +577,10 @@ def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
     collapsed with GLM-5.2."""
     if envs.is_set("FUSED_MOE_PREFILL_KERNEL"):
         return  # env_override.py lowered the floor or warned at import
+    from vllm_torchtpu.env_override import SC_ALL_REDUCE_FLAG, sc_all_reduce_floor
+
     smallest = min_tokens * hidden * 2
-    floor = None
-    for token in os.environ.get("LIBTPU_INIT_ARGS", "").split():
-        if token.startswith(_SC_ALL_REDUCE_FLAG + "="):
-            floor = token.split("=", 1)[1]  # the last one wins, as in libtpu
+    floor = sc_all_reduce_floor()
     if floor is not None and floor.isdigit() and int(floor) <= smallest:
         return
     logger.warning(
@@ -596,7 +591,7 @@ def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
         "See env_override.py.",
         floor or "libtpu's default",
         smallest,
-        _SC_ALL_REDUCE_FLAG,
+        SC_ALL_REDUCE_FLAG,
     )
 
 

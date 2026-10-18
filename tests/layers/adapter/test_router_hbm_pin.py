@@ -44,7 +44,10 @@ class _Runner:
 def test_pinned_router_bit_identical(compiled, e):
     torch.manual_seed(e)
     gate = _Gate(e)
-    xs = {t: (torch.randn(t, H) * 2).to(torch.bfloat16).to("tpu") for t in (1, 4, 8, 16, 32, 64)}
+    xs = {
+        t: (torch.randn(t, H) * 2).to(torch.bfloat16).to("tpu")
+        for t in (1, 4, 8, 16, 32, 64)
+    }
     torch._dynamo.reset()
     run = torch.compile(gate, fullgraph=True, dynamic=False) if compiled else gate
     ref = {t: run(x).cpu() for t, x in xs.items()}
@@ -58,7 +61,10 @@ def test_pinned_router_bit_identical(compiled, e):
         got = run(x).cpu()
         n = int((got.view(torch.int32) != ref[t].view(torch.int32)).sum())
         rel = float(((got - ref[t]).abs() / ref[t].abs().clamp_min(1e-3)).max())
-        print(f"ROUTERPIN e={e} t={t} compiled={compiled} mismatches={n} max_rel={rel:.2e}")
+        print(
+            f"ROUTERPIN e={e} t={t} compiled={compiled} mismatches={n} "
+            f"max_rel={rel:.2e}"
+        )
         if t > 16:
             assert n == 0
         else:

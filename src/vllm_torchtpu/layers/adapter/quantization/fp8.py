@@ -86,9 +86,9 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
-    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,

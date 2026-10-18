@@ -59,9 +59,9 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     get_ep_group,
 )
+from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
-from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
@@ -112,9 +112,13 @@ def get_router_logits_op() -> Any:
     router (`router_gemm_hbm.router_logits`). Build at load: jax_op takes a Lock."""
     global _ROUTER_OP
     if _ROUTER_OP is None:
-        op = pallas.jax_op("pallas::moe_router_logits_hbm", router_gemm_hbm.router_logits)
+        op = pallas.jax_op(
+            "pallas::moe_router_logits_hbm", router_gemm_hbm.router_logits
+        )
         op.register_fake(
-            lambda x, w: torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+            lambda x, w: torch.empty(
+                x.shape[0], w.shape[0], dtype=x.dtype, device=x.device
+            )
         )
         _ROUTER_OP = op
     return _ROUTER_OP

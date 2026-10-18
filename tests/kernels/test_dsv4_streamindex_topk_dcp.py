@@ -934,7 +934,8 @@ def test_lane_operand_is_kept_on_every_bucket(q_len):
     _, args, kwargs = _dcp_case(8, 59, q_len=q_len)
     mesh = kwargs["mesh"]
     ids = jax.device_put(
-        jnp.arange(8, dtype=jnp.int32), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))
+        jnp.arange(8, dtype=jnp.int32),
+        jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)),
     )
     lanes = jax.device_put(
         jnp.zeros(8, jnp.int32), jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME))

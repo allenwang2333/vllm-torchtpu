@@ -1574,8 +1574,12 @@ def test_skip_empty_decode_chunked_is_exact(T_list, chunk_tokens, drops_statical
     [
         # MTP decode buckets: every request q_len 4 (the MIXED pass at bq 4).
         pytest.param((4,), (9001,), 1, 0, 8, id="b1"),
-        pytest.param((4, 4, 4), (9001, 2052, 260), 1, 0, 8, id="b3_block_and_page_edges"),
-        pytest.param((4, 4), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 32, id="dcp8_rank3_bkvp32"),
+        pytest.param(
+            (4, 4, 4), (9001, 2052, 260), 1, 0, 8, id="b3_block_and_page_edges"
+        ),
+        pytest.param(
+            (4, 4), (8 * 9000 + 3, 8 * 2047 + 1), 8, 3, 32, id="dcp8_rank3_bkvp32"
+        ),
         # Prefill-like rows in a small bucket: q_len not a multiple of 4,
         # causal limits that vary inside a block.
         pytest.param((4, 21), (5003, 3021), 1, 0, 16, id="partial_q_blocks"),

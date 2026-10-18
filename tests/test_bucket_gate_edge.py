@@ -48,9 +48,7 @@ def test_non_power_of_two_keeps_its_exact_meaning(min_tokens):
         assert (t > edge) == (t >= min_tokens)
 
 
-@pytest.mark.parametrize(
-    "cap,first_absorb", [(64, 128), (32, 64), (16, 64)]
-)
+@pytest.mark.parametrize("cap,first_absorb", [(64, 128), (32, 64), (16, 64)])
 def test_absorb_starts_above_the_a2a_cap(cap, first_absorb, monkeypatch):
     """Absorb is `T > max(cap, MIN_TOKENS // 2)`: never true on a bucket the
     a2a merge (`T <= cap`) also takes, and with MIN_TOKENS=64 it starts at
@@ -87,8 +85,19 @@ def test_merge_chunk_gate_unchanged_on_the_ladder(cap, monkeypatch):
         TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS=2048,
     ).items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
-    want = {4: 1, 8: 1, 16: 1, 32: 1, 64: 1, 128: 1, 256: 1, 512: 1,
-            1024: 2, 2048: 2, 4096: 8}
+    want = {
+        4: 1,
+        8: 1,
+        16: 1,
+        32: 1,
+        64: 1,
+        128: 1,
+        256: 1,
+        512: 1,
+        1024: 2,
+        2048: 2,
+        4096: 8,
+    }
     assert {t: cp_mla._merge_chunks(t) for t in want} == want
 
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoE router logits at decode, router weight streamed from HBM (TPU_MOE_ROUTER_HBM_PIN).
+"""MoE router logits at decode, router weight streamed from HBM
+(TPU_MOE_ROUTER_HBM_PIN).
 
 The router GEMM is `x [m, k] bf16 @ w [e, k]^T bf16 -> [m, e] bf16` (vLLM's GateLinear
 on its F.linear tier; GLM-5.2: k = 6144, e = 256, 3 MB per rank, replicated). As an
@@ -82,15 +83,20 @@ def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, t, n_tiles, nbuf, kc, nt):
             if nt:
                 # [t, kc] . [m, kc]^T -> [t, m], transposed back after the sum
                 p = jax.lax.dot_general(
-                    wbuf[j % nbuf, :, ks], x_ref[:, ks], dn,
+                    wbuf[j % nbuf, :, ks],
+                    x_ref[:, ks],
+                    dn,
                     preferred_element_type=jnp.float32,
                 )
             else:
                 p = jax.lax.dot_general(
-                    x_ref[:, ks], wbuf[j % nbuf, :, ks], dn,
+                    x_ref[:, ks],
+                    wbuf[j % nbuf, :, ks],
+                    dn,
                     preferred_element_type=jnp.float32,
                 )
             y = p if y is None else y + p
+        assert y is not None
         if nt:
             y = y.T
         o_ref[:, j * t : (j + 1) * t] = y.astype(o_ref.dtype)
@@ -119,8 +125,8 @@ def _build(m, k, e, dtype, t, nbuf, kc=None, nt=False):
             pltpu.SemaphoreType.DMA((nbuf,)),
         ],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        name=f"router_gemm_hbm_t{t}_b{nbuf}{f'_kc{kc}' if kc else ''}{'_nt' if nt else ''}"
-        f"_m{m}_k{k}_e{e}",
+        name=f"router_gemm_hbm_t{t}_b{nbuf}{f'_kc{kc}' if kc else ''}"
+        f"{'_nt' if nt else ''}_m{m}_k{k}_e{e}",
     )
 
 
