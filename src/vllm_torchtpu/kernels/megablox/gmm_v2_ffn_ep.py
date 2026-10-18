@@ -198,6 +198,27 @@ def _prepare_tile(
     _tile_row_copies(gm_id, refs.lhs, lhs_staging, sem, metadata_ref, sublane, True)
 
 
+def _gather_tile_rows(
+    gm_id, refs: DispatchRefs, lhs_staging, sem, metadata_ref, sublane
+):
+    """Starts one row DMA per row of gm tile `gm_id`, from its token's row of
+    the gathered batch `x` (`send_src[r]` for grouped row r) to its in-tile
+    position."""
+    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+    m_offset = m_start - m_start % sublane
+
+    def gather_row(r, carry):
+        pltpu.make_async_copy(
+            refs.x.at[pl.ds(refs.send_src[r], 1)],
+            lhs_staging.at[pl.ds(r - m_offset, 1)],
+            sem,
+        ).start()
+        return carry
+
+    lax.fori_loop(m_start, m_end, gather_row, 0)
+
+
 def _fetch_chunk_rows(tile_m: int) -> int:
     return FETCH_CHUNK_ROWS if tile_m % FETCH_CHUNK_ROWS == 0 else tile_m
 
@@ -273,6 +294,7 @@ def ep_inner_kernel(
     up,
     down,
     axis_name: str,
+    gathered: bool,
 ):
     """One gm tile through the FFN, then each of its group's rows to its slot."""
     gm_id = pl.program_id(1)
@@ -285,14 +307,22 @@ def ep_inner_kernel(
     staging = staging_ref.at[slot]
     lhs_staging = lhs_staging_ref.at[slot]
     me = lax.axis_index(axis_name)
-    prepare = functools.partial(
-        _prepare_tile,
-        refs=dispatch,
-        metadata_ref=metadata_ref,
-        pending_ref=pending_ref,
-        me=me,
-        sublane=up.dims.size_lhs_sublane,
-    )
+    if gathered:
+        prepare = functools.partial(
+            _gather_tile_rows,
+            refs=dispatch,
+            metadata_ref=metadata_ref,
+            sublane=up.dims.size_lhs_sublane,
+        )
+    else:
+        prepare = functools.partial(
+            _prepare_tile,
+            refs=dispatch,
+            metadata_ref=metadata_ref,
+            pending_ref=pending_ref,
+            me=me,
+            sublane=up.dims.size_lhs_sublane,
+        )
 
     @pl.when(gm_id == 0)
     def _():
@@ -308,15 +338,18 @@ def ep_inner_kernel(
             sem=fetch_sems.at[1 - slot],
         )
 
-    _tile_row_copies(
-        gm_id,
-        dispatch.lhs,
-        lhs_staging,
-        fetch_sems.at[slot],
-        metadata_ref,
-        up.dims.size_lhs_sublane,
-        False,
-    )
+    if gathered:
+        _wait_rows(fetch_sems.at[slot], lhs_staging, m_end - m_start)
+    else:
+        _tile_row_copies(
+            gm_id,
+            dispatch.lhs,
+            lhs_staging,
+            fetch_sems.at[slot],
+            metadata_ref,
+            up.dims.size_lhs_sublane,
+            False,
+        )
 
     # The sends of two tiles ago read this staging slot; let them finish.
     _wait_rows(send_sems.at[slot], staging, pending_ref[_PENDING_REMOTE + slot])
@@ -397,6 +430,7 @@ def ep_kernel_main(
     down,
     num_devices: int,
     axis_name: str,
+    gathered: bool,
 ):
     """Opens the barrier, pushes, pipelines both legs over the gm tiles, then drains."""
     _barrier_signal(num_devices)
@@ -421,8 +455,9 @@ def ep_kernel_main(
 
     # Peers' buffers are only theirs to write once they have entered.
     _barrier_wait(num_devices, barrier_sem)
-    first_group = jnp.where(num_gm > 0, metadata_ref.gm_id_to_group_id[0], 0)
-    _push_groups(first_group + 1 + DISPATCH_LOOKAHEAD, dispatch, pending_ref, me)
+    if not gathered:
+        first_group = jnp.where(num_gm > 0, metadata_ref.gm_id_to_group_id[0], 0)
+        _push_groups(first_group + 1 + DISPATCH_LOOKAHEAD, dispatch, pending_ref, me)
 
     (_, w13_spec), _ = generate_block_specs(metadata_ref, up)
     (_, w2_spec), _ = generate_block_specs(metadata_ref, down)
@@ -431,7 +466,9 @@ def ep_kernel_main(
     w13_spec = FusedWeightsRef(gate=w13_spec, up=w13_spec)
 
     pipeline_fn = pltpu.emit_pipeline(
-        functools.partial(ep_inner_kernel, up=up, down=down, axis_name=axis_name),
+        functools.partial(
+            ep_inner_kernel, up=up, down=down, axis_name=axis_name, gathered=gathered
+        ),
         grid=(1, num_gm, 1),
         in_specs=(w13_spec, w2_spec),
         out_specs=(),
@@ -454,8 +491,9 @@ def ep_kernel_main(
         ],
     )
 
-    # Peers may still wait on rows for experts this device has no tiles past.
-    _push_groups(up.dims.size_group, dispatch, pending_ref, me)
+    if not gathered:
+        # Peers may still wait on rows for experts this device has no tiles past.
+        _push_groups(up.dims.size_group, dispatch, pending_ref, me)
     for slot in range(2):
         staging = staging_ref.at[slot]
         _wait_rows(send_sems.at[slot], staging, pending_ref[_PENDING_REMOTE + slot])
@@ -467,6 +505,7 @@ def ep_kernel_main(
 @jax.jit(
     static_argnames=[
         "recv_rows",
+        "gathered",
         "num_devices",
         "axis_name",
         "fuse_act",
@@ -490,6 +529,7 @@ def gmm_v2_ffn_ep(
     w2_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, n]
     *,
     recv_rows: int,
+    gathered: bool = False,
     num_devices: int,
     axis_name: str,
     fuse_act: str,
@@ -506,6 +546,10 @@ def gmm_v2_ffn_ep(
     `i` in `[send_bounds[g], send_bounds[g + 1])` to that device's local
     expert g; the pushes to all devices must fill each device's grouped rows
     `[0, sum(group_sizes))` exactly once.
+
+    With `gathered`, `x` is instead the whole batch every device holds, each
+    gm tile copies grouped row r from row `send_src[r]` of it, and nothing is
+    pushed (`send_dest` is unused).
 
     Returns this device's u32[recv_rows, n / 2] receive buffer. Row r holds the
     `pack_rows` of the output row some device's `dest` addressed to (this
@@ -557,7 +601,11 @@ def gmm_v2_ffn_ep(
         raise ValueError(f"{padded_size_m=} does not fit the destination table")
     if padded_size_m != size_m:
         dest = jnp.pad(dest, (0, padded_size_m - size_m))
+        if gathered:
+            send_src = jnp.pad(send_src, (0, padded_size_m - size_m))
     group_offset = jnp.zeros((1,), jnp.int32)
+    # Nothing lands here when the tiles gather from the whole batch.
+    lhs_rows = 8 if gathered else padded_size_m + _fetch_chunk_rows(up.tiles.tile_m)
 
     w1_scale, w1_scale_spec = _hbm_f32(w1_scale)
     w2_scale, w2_scale_spec = _hbm_f32(w2_scale)
@@ -597,11 +645,12 @@ def gmm_v2_ffn_ep(
             down=down,
             num_devices=num_devices,
             axis_name=axis_name,
+            gathered=gathered,
         ),
         out_shape=(
             jax.ShapeDtypeStruct((recv_rows, half_n), jnp.uint32),
             jax.ShapeDtypeStruct(
-                (padded_size_m + _fetch_chunk_rows(up.tiles.tile_m), x.shape[1]),
+                (lhs_rows, x.shape[1]),
                 jnp.uint32,
             ),
         ),

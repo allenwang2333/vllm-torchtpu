@@ -235,8 +235,8 @@ _COUNTING_SORT_BLOCK = 512
 
 # fused_moe_func_ep_combine pushes each routed token row to its expert's rank
 # from inside the kernel up to this many tokens per rank; past it, an XLA
-# all-gather moves the batch faster than per-row remote DMAs, and each rank
-# copies the rows it computes from the gathered block instead.
+# all-gather moves the batch faster than per-row remote DMAs, and each gm tile
+# gathers its rows from the gathered block instead.
 EP_DISPATCH_MAX_TOKENS = 256
 
 
@@ -884,18 +884,17 @@ def fused_moe_func_ep_combine(
     x = pack_rows(
         jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
     )
-    if tokens_per_rank > EP_DISPATCH_MAX_TOKENS:
-        # Every push is a local copy of a grouped row's token from the
-        # gathered block, whose rows are in mesh order.
+    gathered = tokens_per_rank > EP_DISPATCH_MAX_TOKENS
+    if gathered:
+        # Grouped row r reads its token's row of the gathered block, whose
+        # rows are in mesh order.
         x = jax.lax.all_gather(x, axis_name, tiled=True)
         row_mask = (1 << DEST_DEVICE_SHIFT) - 1
         send_src = (dest >> DEST_DEVICE_SHIFT) * tokens_per_rank + (
             dest & row_mask
         ) % tokens_per_rank
-        send_dest = jnp.left_shift(me, DEST_DEVICE_SHIFT) | route
-        send_bounds = jnp.concatenate(
-            [jnp.zeros((1,), jnp.int32), jnp.cumsum(group_sizes, dtype=jnp.int32)]
-        )
+        send_dest = jnp.zeros((1,), jnp.int32)
+        send_bounds = jnp.zeros((local_experts + 1,), jnp.int32)
     else:
         # Pushes: where each of this device's routes sits among its computing
         # rank's grouped rows -- the routes of earlier experts there, then
@@ -959,6 +958,7 @@ def fused_moe_func_ep_combine(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         recv_rows=-(-rows_per_rank // 8) * 8,
+        gathered=gathered,
         num_devices=num_devices,
         axis_name=axis_name,
         fuse_act=activation,
