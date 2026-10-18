@@ -1479,6 +1479,12 @@ SEND_SLAB_ROW0 = SEND_PAD_ROWS // 2
 # Barrier semaphore group, distinct from the fused MoE kernels (0), the
 # small all-reduces (5), reduce-scatter (7), all-gather (9), all-to-all (11).
 SEND_EXCHANGE_COLLECTIVE_ID = 13
+# Scoped VMEM of the fused-exchange call (one decode grid step: a few MiB of
+# KV / q / slab buffers). The default limit reserves all of VMEM for the call,
+# so XLA can neither keep the receive buffer in VMEM for the unpack nor run
+# its prefetch copies under the call -- the cover the separate all-to-all
+# call used to give them (served mirror: +4.8 us per layer of exposed glue).
+SEND_EXCHANGE_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 # Test-only: positive controls (misrouted / dropped peer block) and timing-
 # only removal arms (the round replaced by local copies; the barrier waited
 # at entry instead of after the body) of the fused exchange.
@@ -4316,7 +4322,11 @@ def sparse_attention_chunk(
                 ),
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
+                    vmem_limit_bytes=(
+                        min(vmem_limit_bytes, SEND_EXCHANGE_VMEM_LIMIT_BYTES)
+                        if send_exchange is not None
+                        else vmem_limit_bytes
+                    ),
                     disable_bounds_checks=True,
                     **(
                         {"collective_id": SEND_EXCHANGE_COLLECTIVE_ID}
