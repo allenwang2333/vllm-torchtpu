@@ -660,8 +660,36 @@ def _expert_tile(x, w13, w13s, w2, w2s, inter):
     return (y * hs * w2s[...]).astype(BF16).astype(F32)
 
 
+def _expert_tile_interleaved(x, w13, w13s, w2, w2s, inter, issue_chunks):
+    """_expert_tile with the next tile's row-DMA starts (issue_chunks: S callables) interleaved
+    between the column chunks of the two matmuls, in one basic block, so the scalar unit issues
+    DMAs while the MXU works."""
+    n_chunks = len(issue_chunks)
+    xq, xs = quantize_rows(x)
+    two_i = w13.shape[-1]
+    h = w2.shape[-1]
+    half = n_chunks // 2
+    c1, c2 = two_i // half, h // (n_chunks - half)
+    gu = []
+    for s in range(half):
+        gu.append(jax.lax.dot_general(xq, w13[:, s * c1:(s + 1) * c1], (((1,), (0,)), ((), ())),
+                                      preferred_element_type=F32))
+        issue_chunks[s]()
+    gu = jnp.concatenate(gu, -1)
+    gu = (gu * xs * w13s[...]).astype(BF16).astype(F32)
+    hq, hs = quantize_rows(jax.nn.silu(gu[:, :inter]) * gu[:, inter:])
+    ys = []
+    for s in range(n_chunks - half):
+        ys.append(jax.lax.dot_general(hq, w2[:, s * c2:(s + 1) * c2], (((1,), (0,)), ((), ())),
+                                      preferred_element_type=F32))
+        issue_chunks[half + s]()
+    y = jnp.concatenate(ys, -1)
+    return (y * hs * w2s[...]).astype(BF16).astype(F32)
+
+
 def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hbm, w2s_hbm,
-                y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256):
+                y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256,
+                interleave=0):
     """Routed experts. Rows are grouped by expert (expert e's segment starts at off[e], padded to
     a multiple of `rt`), gathered by DMA from the normed activations, quantized per row, run
     through w13 -> SwiGLU -> w2 (w8a8), and written to y_sorted [n_pad, H] f32 (bf16 values) in
@@ -671,6 +699,9 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
     The grouped tiles of all experts form one list, software-pipelined: tile g+1's rows are
     gathered while tile g computes, outputs are written asynchronously, and each expert's
     weights are prefetched while the previous expert runs. Experts with no rows cost nothing.
+    interleave=S > 0: the next tile's rt row DMAs (pad rows re-read the tile's first token) are
+    started in S chunks between the matmul column chunks instead of before the tile, so their
+    issue overlaps the MXU work; each row has its own semaphore.
 
     xb [T, H] f32 (bf16 values), topi / rank [T, K] i32, counts [1, E] i32, w13 [E, H, 2I] fp8,
     w13s [E, 1, 2I] f32, w2 [E, I, H] fp8, w2s [E, 1, H] f32."""
@@ -753,7 +784,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
         with jax.named_scope("moe_scatter"):
             jax.lax.fori_loop(0, t // rows_per_stage, scatter_stage, 0)
 
-        def experts(w13_v, w13s_v, w2_v, w2s_v, xin, yout, wsem, ysem):
+        def experts(w13_v, w13s_v, w2_v, w2s_v, xin, yout, wsem, ysem, isems):
             wpairs = ((w13_hbm, w13_v, 0), (w13s_hbm, w13s_v, 1), (w2_hbm, w2_v, 2),
                       (w2s_hbm, w2s_v, 3))
 
@@ -775,19 +806,41 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                     yout.at[b], y_sorted_hbm.at[pl.ds(pl.multiple_of(t_r0[g], rt), rt)],
                     ysem.at[b])
 
+            def row_copy(g, b, r):
+                # Rows past the tile's live count re-read its first token (never used).
+                src = tok_s[t_r0[g] + jnp.where(r < t_n[g], r, 0)]
+                return pltpu.make_async_copy(xb_hbm.at[pl.ds(src, 1)], xin.at[b, pl.ds(r, 1)],
+                                             isems.at[b, r])
+
+            def gather_full(g, b, rs):
+                for r in rs:
+                    row_copy(g, b, r).start()
+
+            def drain_full(g, b):
+                for r in range(rt):
+                    pltpu.make_async_copy(xb_hbm.at[pl.ds(0, 1)], xin.at[b, pl.ds(r, 1)],
+                                          isems.at[b, r]).wait()
+
             @pl.when(n_tiles > 0)
             def _():
                 fetch(t_e[0], 0)
-                gather(0, 0)
+                if interleave:
+                    gather_full(0, 0, range(rt))
+                else:
+                    gather(0, 0)
 
             def tile(g, wslot):
                 b = g % 2
-                # The next tile's rows start moving before this tile computes.
-                @pl.when(g + 1 < n_tiles)
-                def _():
-                    gather(g + 1, 1 - b)
+                # The next tile's rows start moving before (or while) this tile computes.
+                if not interleave:
+                    @pl.when(g + 1 < n_tiles)
+                    def _():
+                        gather(g + 1, 1 - b)
                 with jax.named_scope("moe_gather_wait"):
-                    _gather_drain(xb_hbm, xin.at[b], t_n[g], sems.at[b], inflight)
+                    if interleave:
+                        drain_full(g, b)
+                    else:
+                        _gather_drain(xb_hbm, xin.at[b], t_n[g], sems.at[b], inflight)
                 first = t_first[g] == 1
                 wslot = jnp.where(first & (g > 0), 1 - wslot, wslot)
 
@@ -804,12 +857,26 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 def _():
                     ywrite(g - 2, b).wait()
                 with jax.named_scope("moe_mm"):
-                    yout[b] = _expert_tile(xin[b], w13_v.at[wslot], w13s_v.at[wslot],
-                                           w2_v.at[wslot], w2s_v.at[wslot], inter)
+                    if interleave:
+                        gn = jnp.minimum(g + 1, n_tiles - 1)    # last tile re-gathers itself
+                        per = rt // interleave
+                        chunks = [functools.partial(gather_full, gn, 1 - b,
+                                                    range(c * per, (c + 1) * per))
+                                  for c in range(interleave)]
+                        yout[b] = _expert_tile_interleaved(
+                            xin[b], w13_v.at[wslot], w13s_v.at[wslot], w2_v.at[wslot],
+                            w2s_v.at[wslot], inter, chunks)
+                    else:
+                        yout[b] = _expert_tile(xin[b], w13_v.at[wslot], w13s_v.at[wslot],
+                                               w2_v.at[wslot], w2s_v.at[wslot], inter)
                 ywrite(g, b).start()
                 return wslot
 
             jax.lax.fori_loop(0, n_tiles, tile, jnp.int32(0))
+            if interleave:                          # the last tile's self re-gather
+                @pl.when(n_tiles > 0)
+                def _():
+                    drain_full(n_tiles - 1, n_tiles % 2)
 
             def drain_y(g, c):
                 ywrite(g, g % 2).wait()
@@ -820,7 +887,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                       pltpu.VMEM((2, h, 2 * inter), FP8), pltpu.VMEM((2, 1, 2 * inter), F32),
                       pltpu.VMEM((2, inter, h), FP8), pltpu.VMEM((2, 1, h), F32),
                       pltpu.VMEM((2, rt, h), F32), pltpu.VMEM((2, rt, h), F32),
-                      pltpu.SemaphoreType.DMA((2, 4)), pltpu.SemaphoreType.DMA((2,)))
+                      pltpu.SemaphoreType.DMA((2, 4)), pltpu.SemaphoreType.DMA((2,)),
+                      pltpu.SemaphoreType.DMA((2, rt)))
 
     n_pad = n_slots + e * (rt - 1)
     stage_rows = 64
