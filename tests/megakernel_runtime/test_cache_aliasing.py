@@ -402,3 +402,37 @@ def test_verify_pooled_step_hlo_compile_on_mock_mesh_is_config_error():
         verify_pooled_step_hlo(
             mesh, None, None, [], [], max_pages_per_seq=1, compile_hlo=True
         )
+
+
+def test_build_pooled_step_op_without_torch_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing `torch_tpu` defers to TPU execution; other import errors propagate."""
+    from vllm_torchtpu.megakernel_runtime import exported_bridge
+
+    mesh = _cpu_mesh(1)
+    g = _tiny_geom(L=4, att_every=4)
+    ex = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    spec = qwen35.qwen35_spec(g)
+
+    def _missing(name: str) -> Any:
+        def _raise(*_args: Any, **_kwargs: Any) -> Any:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+        return _raise
+
+    monkeypatch.setattr(
+        exported_bridge, "sharded_jax_callable", _missing("torch_tpu._internal")
+    )
+    op, _, _, _ = exported_bridge.build_pooled_step_op(
+        mesh, spec, ex, op_name="megakernel_runtime::no_torch_tpu_probe"
+    )
+    assert op is not None
+
+    monkeypatch.setattr(
+        exported_bridge, "sharded_jax_callable", _missing("some_other_dep")
+    )
+    with pytest.raises(ModuleNotFoundError, match="some_other_dep"):
+        exported_bridge.build_pooled_step_op(
+            mesh, spec, ex, op_name="megakernel_runtime::other_dep_probe"
+        )

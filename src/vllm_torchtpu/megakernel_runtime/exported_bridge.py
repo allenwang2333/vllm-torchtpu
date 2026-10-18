@@ -559,14 +559,20 @@ def build_pooled_step_op(
     typed_fn = make_typed_step_wrapper(
         fn_name, step_fn, num_inputs=len(in_specs), num_outputs=len(out_specs)
     )
-    flat_callable = sharded_jax_callable(
-        op_name,
-        typed_fn,
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        donate_argnums=donate_argnums,
-    )
+    try:
+        flat_callable: Any = sharded_jax_callable(
+            op_name,
+            typed_fn,
+            mesh=mesh,
+            input_partition_specs=in_specs,
+            output_partition_specs=out_specs,
+            donate_argnums=donate_argnums,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("torch_tpu"):
+            flat_callable = None
+        else:
+            raise
 
     in_sh = tuple(NamedSharding(mesh, s) for s in in_specs)
     out_sh = tuple(NamedSharding(mesh, s) for s in out_specs)
@@ -609,6 +615,10 @@ def build_pooled_step_op(
                 _jax_to_torch_cpu(o, lk)
                 for o, lk in zip(jax_outs, like_tensors, strict=True)
             ]
+        if flat_callable is None:
+            raise RuntimeError(
+                "torch_tpu is required to execute build_pooled_step_op on TPU"
+            )
         return list(flat_callable(*all_tensors))
 
     @op.register_fake
