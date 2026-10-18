@@ -170,24 +170,19 @@ class AllReduceRing:
         with sc("ar_comm"):
             self.ar_round(slot, 0)
         if HIER == 3:
+            for rnd_i in range(1, cp.N_HIER3):
+                with sc("ar_sum"):
+                    bi = lax.rem(me >> rnd_i, 2)
+                    send[rnd_i, slot] = (
+                        recv[rnd_i - 1, slot, 0].astype(F32)
+                        + recv[rnd_i - 1, slot, 1].astype(F32)
+                    ).astype(BF16)
+                    recv[rnd_i, slot, bi] = send[rnd_i, slot]
+                with sc("ar_comm"):
+                    self.ar_round(slot, rnd_i)
             with sc("ar_sum"):
-                b1 = lax.rem(me // 2, 2)
-                send[1, slot] = (
-                    recv[0, slot, 0].astype(F32) + recv[0, slot, 1].astype(F32)
-                ).astype(BF16)
-                recv[1, slot, b1] = send[1, slot]
-            with sc("ar_comm"):
-                self.ar_round(slot, 1)
-            with sc("ar_sum"):
-                b2 = lax.rem(me // 4, 2)
-                send[2, slot] = (
-                    recv[1, slot, 0].astype(F32) + recv[1, slot, 1].astype(F32)
-                ).astype(BF16)
-                recv[2, slot, b2] = send[2, slot]
-            with sc("ar_comm"):
-                self.ar_round(slot, 2)
-            with sc("ar_sum"):
-                return recv[2, slot, 0].astype(F32) + recv[2, slot, 1].astype(F32)
+                last = cp.N_HIER3 - 1
+                return recv[last, slot, 0].astype(F32) + recv[last, slot, 1].astype(F32)
         if HIER in (1, 2):
             ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
             with sc("ar_sum"):

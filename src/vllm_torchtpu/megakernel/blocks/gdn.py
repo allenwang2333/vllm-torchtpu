@@ -29,6 +29,8 @@ from ..ops import (
     F32,
     FP8,
     I32,
+    U32,
+    bswitch,
     rnd,
     rup,
 )
@@ -39,6 +41,19 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
+from . import fused_pool_io
+
+
+def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
+    """Emit `pl.debug_check` and enforce it in CPU `interpret` mode when enabled."""
+    pl.debug_check(cond, msg)
+    if interpret and pl.enable_debug_checks.value:
+
+        def _cb(ok: Any) -> None:
+            if not bool(ok):
+                raise RuntimeError(msg)
+
+        jax.debug.callback(_cb, cond)
 
 
 @dataclass(frozen=True)
@@ -85,6 +100,89 @@ class GDNParams:
     eps: float
     zero_centered_norm: bool
     l2_eps: float = 1e-6
+    NGI: int = 0
+    NGO: int = 0
+    G_PER_ATT: int = 0
+    REC_PAGES: int = 4
+    GDN_PAGES: int = 5
+    SSM_U32_CAP: int = 512
+    ssm_u32_rows: int = 0
+    qkv_128: int = 0
+    A_conv: int = 16
+    conv8_rows: int = 0
+    ckpt_is_3d: bool = True
+    roff_is_2d: bool = True
+    K_ckpt: int = 1
+    ckpt_t_off: int = 0
+    GPR: bool = False
+    GCONV_ROWS: int = 0
+    conv_stage: bool = True
+
+
+class _GprRecIn:
+    """In-kernel checkpoint-to-`recb` gather handle for `GPR=True`."""
+
+    def __init__(
+        self,
+        blk: GDNBlock,
+        ctx: Any,
+        gp: GDNParams,
+        o: Any,
+        j: Any,
+        s: Any,
+        n: int,
+    ) -> None:
+        self.blk = blk
+        self.ctx = ctx
+        self.gp = gp
+        self.o = o
+        self.s = s
+        self.n = n
+        self.nseq = n // (ctx.ex.T * gp.vh)
+        self.seqs = [j * (gp.CB // ctx.ex.T) + q for q in range(self.nseq)]
+        self.dsts = [ctx.scr["gpr_rec"].at[s, q] for q in range(self.nseq)]
+
+    def start(self) -> None:
+        self.blk._gpr_start(
+            self.ctx,
+            self.gp,
+            self.o,
+            self.seqs,
+            self.dsts,
+            self.ctx.scr["rec_sem"].at[0, self.s],
+            0,
+            self.gp.REC_PAGES,
+        )
+
+    def wait(self) -> None:
+        ctx, gp = self.ctx, self.gp
+        scr = ctx.scr
+        T = ctx.ex.T
+        vh, KD, VD = gp.vh, gp.KD, gp.VD
+        SSM_U32_CAP, ssm_u32_rows = gp.SSM_U32_CAP, gp.ssm_u32_rows
+        s, n = self.s, self.n
+        for sq, dst in zip(self.seqs, self.dsts):
+            self.blk._gpr_wait(
+                ctx, gp, self.o, sq, dst, scr["rec_sem"].at[0, s], gp.REC_PAGES
+            )
+        for q, sq in enumerate(self.seqs):
+            if ctx.ex.interpret:
+                u32 = pltpu.bitcast(scr["gpr_rec"][s, q], U32).reshape(
+                    SSM_U32_CAP, 128
+                )[:ssm_u32_rows, :]
+            else:
+                u32 = (
+                    scr["gpr_rec"]
+                    .at[s, q]
+                    .bitcast(U32)
+                    .reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
+                )
+            u32 = jnp.where(
+                self.blk._has_gpr_input(ctx, gp, self.o, sq), u32, jnp.uint32(0)
+            )
+            scr["recb"][s, pl.ds(n - n // T + q * vh, vh)] = pltpu.bitcast(
+                u32, BF16
+            ).reshape(vh, KD, VD)
 
 
 class GDNBlock(Block):
@@ -170,6 +268,41 @@ class GDNBlock(Block):
         ]
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
+        if ex.FUSED or ex.GPR:
+            g_per_att = g.att_every - 1
+            k_ckpt = ex.ckpt_k if ex.ckpt_k > 0 else ex.T
+            ckpt_sh = (ex.NS, k_ckpt) if ex.ckpt_2d else (g_per_att, ex.NS, k_ckpt)
+            roff_sh = (ex.NS,) if ex.roff_1d else (g_per_att, ex.NS)
+            st = [
+                StateDecl(
+                    "ckpt_indices",
+                    shape=ckpt_sh,
+                    dtype=I32,
+                    access="r",
+                    per_layer=False,
+                    memory_space="smem",
+                ),
+                StateDecl(
+                    "read_offsets",
+                    shape=roff_sh,
+                    dtype=I32,
+                    access="r",
+                    per_layer=False,
+                    memory_space="smem",
+                ),
+            ]
+            if ex.act_mode == "ref":
+                st.append(
+                    StateDecl(
+                        "active_seqs",
+                        shape=(ex.NS,),
+                        dtype=I32,
+                        access="r",
+                        per_layer=False,
+                        memory_space="smem",
+                    )
+                )
+            return st
         lay = self.lin_in_layout(g, ex)
         conv_shape = (
             (rup(3 * ex.B, 8), lay.QKV)
@@ -184,13 +317,15 @@ class GDNBlock(Block):
         ]
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
+        if ex.FUSED:
+            return []
         lay = self.lin_in_layout(g, ex)
         if ex.VER:
             return [
                 StateDecl(
                     "conv_ckpt",
                     shape=(ex.NS, rup(3 + ex.T, 8), lay.QKV),
-                    dtype=F32,
+                    dtype=BF16 if ex.GPR else F32,
                     access="w",
                 ),
                 StateDecl(
@@ -229,7 +364,7 @@ class GDNBlock(Block):
         }
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
-        tiles = ex.resolved_tiles
+        tiles = ex.resolve_tiles(g)
         R, B, T = ex.R, ex.B, ex.T
         assert not (ex.VER and tiles.inplace), (
             "verify returns per-token checkpoints: no aliasing"
@@ -254,7 +389,12 @@ class GDNBlock(Block):
         HR = rup(3 + T, 8)
 
         ngdn = plan.block_layer_counts.get(self.name, 0)
-        GCH = ex.WIDE and tiles.gdn_rows > 0 and ngdn > 0
+        GCH = (
+            (ex.WIDE or bool(ex.GPR))
+            and tiles.gdn_rows > 0
+            and ngdn > 0
+            and not ex.FUSED
+        )
         CB = tiles.gdn_rows if GCH else B
         assert not GCH or CB % 8 == 0, (
             "gdn_rows must be a multiple of 8",
@@ -270,6 +410,37 @@ class GDNBlock(Block):
         NRB = min(tiles.gdn_bufs, NCH)
         assert not GCH or NCH == 1 or NRB >= 2, ("gdn_bufs >= 2", tiles.gdn_bufs)
         CBV = CB * lay.vh
+
+        GPR = bool(ex.GPR and GCH and ex.VER)
+        assert not ex.GPR or GPR, (
+            "pool_gather needs the paged chunked verify path",
+            B,
+            T,
+        )
+        GCONV_ROWS = (HR * lay.QKV * 2) // (4 * 128)
+        assert not GPR or ex.page_size == 128, ex.page_size
+        assert not GPR or (HR * lay.QKV * 2) % (4 * 128) == 0, (HR, lay.QKV)
+        assert not GPR or GCONV_ROWS <= 64, GCONV_ROWS
+
+        g_per_att = max(0, getattr(g, "att_every", 1) - 1)
+        ssm_u32_rows = (lay.vh * lay.KD) // 2
+        REC_PAGES = max(4, (ssm_u32_rows + 127) // 128)
+        GDN_PAGES = REC_PAGES + 1
+        SSM_U32_CAP = REC_PAGES * 128
+        qkv_128 = lay.QKV // 128
+        A_conv = max(16, rup(3 + T, 8))
+        conv8_rows = A_conv * qkv_128
+        NGI = min(ex.NS, 8) if ex.FUSED else 0
+        NGO = min(ex.NS, 2) if ex.FUSED else 0
+        K_ckpt = ex.ckpt_k if ex.ckpt_k > 0 else T
+        ckpt_t_off = K_ckpt - T if K_ckpt > T else 0
+        if ex.FUSED or GPR:
+            assert ex.page_size == 128, (
+                f"pool I/O requires page_size == 128, got {ex.page_size}"
+            )
+            assert g_per_att > 0, (
+                f"pool I/O on GDNBlock requires att_every > 1, got {g.att_every}"
+            )
 
         return GDNParams(
             kh=lay.kh,
@@ -296,10 +467,29 @@ class GDNBlock(Block):
             eps=g.eps,
             zero_centered_norm=bool(g.zero_centered_norm),
             l2_eps=float(g.gdn_l2_eps),
+            NGI=NGI,
+            NGO=NGO,
+            G_PER_ATT=g_per_att,
+            REC_PAGES=REC_PAGES,
+            GDN_PAGES=GDN_PAGES,
+            SSM_U32_CAP=SSM_U32_CAP,
+            ssm_u32_rows=ssm_u32_rows,
+            qkv_128=qkv_128,
+            A_conv=A_conv,
+            conv8_rows=conv8_rows,
+            ckpt_is_3d=not ex.ckpt_2d,
+            roff_is_2d=not ex.roff_1d,
+            K_ckpt=K_ckpt,
+            ckpt_t_off=ckpt_t_off,
+            GPR=GPR,
+            GCONV_ROWS=GCONV_ROWS,
+            conv_stage=bool(tiles.conv_stage),
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]
+        if ex.FUSED:
+            return fused_pool_io.gdn_fused_scratch(ex, gp)
         scr: dict[str, Any] = {
             "recb": (
                 pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), BF16)
@@ -321,7 +511,132 @@ class GDNBlock(Block):
             )
         if gp.GCH:
             scr["rec_sem"] = pltpu.SemaphoreType.DMA((2, gp.NRB))
+            if gp.GPR:
+                scr["gpr_rec"] = pltpu.VMEM(
+                    (gp.NRB, gp.CB // ex.T, gp.REC_PAGES, 2, 64, 4, ex.page_size),
+                    FP8,
+                )
+                scr["gpr_conv"] = pltpu.VMEM(
+                    (ex.NS, gp.GCONV_ROWS, 4, ex.page_size), FP8
+                )
+                scr["convb16"] = pltpu.VMEM((ex.NS, gp.HR, gp.QKV), BF16)
         return scr
+
+    def init_buffers(self, ctx: Any) -> None:
+        if not ctx.ex.FUSED:
+            return
+        gp: GDNParams = ctx.block_params(self.name)
+        fused_pool_io.gdn_fused_init_buffers(ctx, gp)
+
+    def _is_seq_active(self, ctx: Any, gp: GDNParams, s: Any) -> Any:
+        ex, ST = ctx.ex, ctx.ST
+        if ex.act_mode == "all":
+            return jnp.bool_(True)
+        if ex.act_mode == "ref":
+            return ST["active_seqs"][s] != 0
+        return (
+            (ST["ckpt_indices"][0, s, 0] > 0)
+            if gp.ckpt_is_3d
+            else (ST["ckpt_indices"][s, 0] > 0)
+        )
+
+    def _gdn_roff(self, ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
+        ST = ctx.ST
+        return ST["read_offsets"][sub, s] if gp.roff_is_2d else ST["read_offsets"][s]
+
+    def _has_gpr_input(self, ctx: Any, gp: GDNParams, o: Any, s: Any) -> Any:
+        sub = lax.rem(o, gp.G_PER_ATT)
+        return jnp.logical_and(
+            self._is_seq_active(ctx, gp, s),
+            self._gdn_roff(ctx, gp, sub, s) >= 0,
+        )
+
+    def _gdn_pb_in(self, ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
+        ex, ST = ctx.ex, ctx.ST
+        GDN_PAGES, G_PER_ATT = gp.GDN_PAGES, gp.G_PER_ATT
+        roff = jnp.maximum(self._gdn_roff(ctx, gp, sub, s), jnp.int32(0))
+        if gp.ckpt_is_3d:
+            pb = ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+        else:
+            pb = ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
+        _kernel_debug_check(
+            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= ex.num_pages),
+            "GDN gather checkpoint slot maps outside [0, num_pages)",
+            interpret=bool(ex.interpret),
+        )
+        return jnp.clip(pb, 0, ex.num_pages - GDN_PAGES)
+
+    def _gpr_start(
+        self,
+        ctx: Any,
+        gp: GDNParams,
+        o: Any,
+        seqs: list[Any],
+        dsts: list[Any],
+        sem: Any,
+        first: int,
+        npages: int,
+    ) -> None:
+        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+        sub = lax.rem(o, gp.G_PER_ATT)
+        g_pool = lax.div(o, gp.G_PER_ATT)
+
+        def issue(r):
+            for sq, dst in zip(seqs, dsts):
+
+                @pl.when(self._has_gpr_input(ctx, gp, o, sq))
+                def _(sq=sq, dst=dst):
+                    pb = self._gdn_pb_in(ctx, gp, sub, sq) + first
+                    pltpu.make_async_copy(r.at[pl.ds(pb, npages)], dst, sem).start()
+
+        bswitch(g_pool, [lambda r=r: issue(r) for r in raw_refs])
+
+    def _gpr_wait(
+        self,
+        ctx: Any,
+        gp: GDNParams,
+        o: Any,
+        sq: Any,
+        dst: Any,
+        sem: Any,
+        npages: int,
+    ) -> None:
+        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+
+        @pl.when(self._has_gpr_input(ctx, gp, o, sq))
+        def _():
+            pltpu.make_async_copy(raw_refs[0].at[pl.ds(0, npages)], dst, sem).wait()
+
+    def _gpr_conv_copy(
+        self, ctx: Any, gp: GDNParams, r: Any, sq: int, pb: Any, sem: Any
+    ) -> Any:
+        return pltpu.make_async_copy(
+            r.at[pb, 0, pl.ds(0, gp.GCONV_ROWS)], ctx.scr["gpr_conv"].at[sq], sem
+        )
+
+    def _gpr_conv_start(self, ctx: Any, gp: GDNParams, o: Any) -> None:
+        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+        sub = lax.rem(o, gp.G_PER_ATT)
+        g_pool = lax.div(o, gp.G_PER_ATT)
+
+        def issue(r):
+            for sq in range(ctx.ex.NS):
+
+                @pl.when(self._has_gpr_input(ctx, gp, o, sq))
+                def _(sq=sq):
+                    self._gpr_conv_copy(
+                        ctx,
+                        gp,
+                        r,
+                        sq,
+                        self._gdn_pb_in(ctx, gp, sub, sq) + gp.REC_PAGES,
+                        ctx.scr["st_sem"].at[0],
+                    ).start()
+
+        bswitch(g_pool, [lambda r=r: issue(r) for r in raw_refs])
+
+    def _conv_out_src(self, ctx: Any, gp: GDNParams) -> Any:
+        return ctx.scr["convb16"] if gp.GPR else ctx.scr["convb"]
 
     def _rec_chunk(
         self, ctx: Any, gp: GDNParams, o: Any, j: Any, s: Any, out: bool
@@ -340,6 +655,8 @@ class GDNBlock(Block):
                 ctx.O[rec_out_key].at[o, pl.ds(r0, n)],
                 ctx.scr["rec_sem"].at[1, s],
             )
+        if gp.GPR:
+            return _GprRecIn(self, ctx, gp, o, j, s, n)
         if ex.VER:
             ni = n // ex.T
             ri = (
@@ -436,11 +753,12 @@ class GDNBlock(Block):
         gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
         expand = vh // kh
 
-        def cols(x):
-            xc = jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
-            return jnp.broadcast_to(xc[:, None], (kh, expand, KD, VD)).reshape(
-                vh, KD, VD
-            )
+        def colsk(x):
+            return jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
+
+        assert 2 * kh <= vh, (kh, vh)
+        NCB = 2 if 4 * kh <= vh else 1
+        hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
 
         def rows(r0, n: int, s):
             n_pad = rup(n, 8)
@@ -458,21 +776,31 @@ class GDNBlock(Block):
                 q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
                 q = q * KD**-0.5
                 k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
-                qc, kc_ = cols(q), cols(k)
+                cb = (bb % NCB) * 2 * kh
+                sb[cb : cb + kh] = colsk(k)
+                sb[cb + kh : cb + 2 * kh] = colsk(q)
                 beta = rnd(jax.nn.sigmoid(bac[bb, 0:vh]))
                 a = bac[bb, A_REL : A_REL + vh]
                 decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+                eg = jnp.exp(decay)[:, None, None]
+                beta2 = beta[:, None]
                 src = (
                     ((n - n // T + bb // T) if bb % T == 0 else bb - 1) * vh
                     if VER
                     else h0
                 )
-                sb[...] = st[src : src + vh].astype(F32) * jnp.exp(decay)[:, None, None]
-                pred = jnp.sum(sb[...] * kc_, axis=1)
-                delta = (v - pred) * beta[:, None]
-                sb[...] = sb[...] + kc_ * delta[:, None, :]
-                out = rnd(jnp.sum(sb[...] * qc, axis=1))
-                st[h0 : h0 + vh] = sb[...].astype(BF16)
+                out_acc = jnp.zeros((vh, VD), F32)
+                for h in range(vh):
+                    j = h // expand
+                    kc_h = sb[cb + j : cb + j + 1]
+                    s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
+                    pred_h = jnp.sum(s_h * kc_h, axis=1)
+                    delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                    s_h = s_h + kc_h * delta_h[:, None, :]
+                    qc_h = sb[cb + kh + j : cb + kh + j + 1]
+                    out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
+                    st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
+                out = rnd(out_acc)
                 val = out * lax.rsqrt(
                     jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps
                 )
@@ -525,15 +853,18 @@ class GDNBlock(Block):
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
         gp: GDNParams = ctx.block_params(self.name)
+        o = ctx.stream.sp.block_ord(l, self.name)
+        if ex.FUSED:
+            return fused_pool_io.gdn_fused_emit(ctx, gp, o, slot)
         scr, ST, O = ctx.scr, ctx.ST, ctx.O  # noqa: E741
+        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST.get("raw")
         skip, sc, stream = ctx.skip, ctx.sc, ctx.stream
         B, T, NS, VER = ex.B, ex.T, ex.NS, ex.VER
         vh, QKV, Z, NLI, H = gp.vh, gp.QKV, gp.Z, gp.NLI, gp.H
-        GCH, NRB = gp.GCH, gp.NRB
+        GCH, NRB, GPR = gp.GCH, gp.NRB, gp.GPR
         conv_out_key = "conv_ckpt" if VER else "conv"
         rec_out_key = "rec_ckpt" if VER else "rec"
 
-        o = stream.sp.block_ord(l, self.name)
         convb, recb, sem = scr["convb"], scr["recb"], scr["st_sem"]
 
         def rec_in():
@@ -551,11 +882,17 @@ class GDNBlock(Block):
         with stream.segment(lazy=False):
             with sc("gdn_in"):
                 if "gdn_state" not in skip:
+                    if GPR:
+                        self._gpr_conv_start(ctx, gp, o)
+                        for s_ in range(NRB):
+                            self._rec_chunk(ctx, gp, o, s_, s_, False).start()
 
                     @pl.when(o > 0)
                     def _():
                         pltpu.make_async_copy(
-                            convb, O[conv_out_key].at[0], sem.at[2]
+                            self._conv_out_src(ctx, gp),
+                            O[conv_out_key].at[0],
+                            sem.at[2],
                         ).wait()
                         if GCH:
                             self._rec_drain(ctx, gp, 0)
@@ -564,13 +901,16 @@ class GDNBlock(Block):
                                 recb, O[rec_out_key].at[0], sem.at[3]
                             ).wait()
 
-                    pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).start()
-                    if GCH:
-                        for s_ in range(NRB):
-                            self._rec_chunk(ctx, gp, o, s_, s_, False).start()
-                    else:
-                        for d in rec_in():
-                            d.start()
+                    if not GPR:
+                        pltpu.make_async_copy(
+                            ST["conv"].at[o], convb, sem.at[0]
+                        ).start()
+                        if GCH:
+                            for s_ in range(NRB):
+                                self._rec_chunk(ctx, gp, o, s_, s_, False).start()
+                        else:
+                            for d in rec_in():
+                                d.start()
 
                 y = stream.dmatmul("lin_in", scr["xb"], NLI)
                 ybuf = scr["ybuf"]
@@ -578,7 +918,38 @@ class GDNBlock(Block):
 
             with sc("gdn_conv"):
                 if "gdn_state" not in skip:
-                    pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).wait()
+                    if GPR:
+                        hr_rows_128 = gp.HR * gp.qkv_128
+                        conv_row_iota = lax.broadcasted_iota(I32, (gp.HR, QKV), 0)
+                        for s_ in range(NS):
+
+                            @pl.when(self._has_gpr_input(ctx, gp, o, s_))
+                            def _(s_=s_):
+                                self._gpr_conv_copy(
+                                    ctx, gp, raw_refs[0], s_, 0, sem.at[0]
+                                ).wait()
+
+                        for s_ in range(NS):
+                            if ex.interpret:
+                                raw_hr = pltpu.bitcast(
+                                    scr["gpr_conv"][s_], BF16
+                                ).reshape(2 * gp.GCONV_ROWS, 128)
+                            else:
+                                raw_hr = (
+                                    scr["gpr_conv"]
+                                    .at[s_]
+                                    .bitcast(BF16)
+                                    .reshape(2 * gp.GCONV_ROWS, 128)
+                                )
+                            raw_hr = (
+                                raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
+                            )
+                            keep = jnp.logical_and(
+                                self._has_gpr_input(ctx, gp, o, s_), conv_row_iota < 3
+                            )
+                            convb[s_] = jnp.where(keep, raw_hr, 0.0)
+                    else:
+                        pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).wait()
                 ow, _ = stream.sp.lay["conv"]
                 taps = [
                     scr["sm"][slot, :, ow + t * QKV : ow + (t + 1) * QKV]
@@ -617,13 +988,18 @@ class GDNBlock(Block):
                     convb[0:B, :] = s1
                     convb[B : 2 * B, :] = s2
                     convb[2 * B : 3 * B, :] = x
+                if GPR:
+                    scr["convb16"][...] = convb[...].astype(BF16)
                 if "gdn_state" not in skip:
                     pltpu.make_async_copy(
-                        convb, O[conv_out_key].at[o], sem.at[2]
+                        self._conv_out_src(ctx, gp),
+                        O[conv_out_key].at[o],
+                        sem.at[2],
                     ).start()
                 if GCH:
-                    u_pad = jnp.pad(u, ((0, ex.MR - B), (0, 0))) if B < ex.MR else u
-                    ybuf[0 : ex.MR, 0:QKV] = u_pad
+                    b_pad = rup(B, 8)
+                    u_pad = jnp.pad(u, ((0, b_pad - B), (0, 0))) if b_pad > B else u
+                    ybuf[0:b_pad, 0:QKV] = u_pad
 
             if GCH:
                 with sc("gdn_rec"):
@@ -646,12 +1022,15 @@ class GDNBlock(Block):
 
     def epilogue(self, ctx: Any) -> None:
         gp: GDNParams = ctx.block_params(self.name)
+        if ctx.ex.FUSED:
+            fused_pool_io.gdn_fused_epilogue(ctx, gp)
+            return
         if gp.NGDN > 0 and "gdn_state" not in ctx.skip:
             conv_out_key = "conv_ckpt" if ctx.ex.VER else "conv"
             rec_out_key = "rec_ckpt" if ctx.ex.VER else "rec"
             o_last = gp.NGDN - 1
             pltpu.make_async_copy(
-                ctx.scr["convb"],
+                self._conv_out_src(ctx, gp),
                 ctx.O[conv_out_key].at[o_last],
                 ctx.scr["st_sem"].at[2],
             ).wait()
@@ -672,6 +1051,8 @@ class GDNBlock(Block):
         states: dict[str, Any],
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
+        if ex.FUSED:
+            return {}
         if ex.VER:
             return {
                 "conv_ckpt": raw_outputs["conv_ckpt"],

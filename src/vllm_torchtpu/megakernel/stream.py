@@ -66,12 +66,14 @@ class TwoRing:
         self._in_segment: bool = False
         self._branch_offsets: list[int] | None = None
         self._active_branches: tuple[int, ...] = tuple(range(len(sp.branch_counts)))
+        self._cur_layer: Any = None
 
     def begin_layer(self, lyr: Any) -> Any:
         """Reset `self.cursor` and per-branch segment offsets at layer `lyr`."""
         assert not self._in_segment, (
             "begin_layer() cannot be called inside stream.segment()"
         )
+        self._cur_layer = lyr
         self.cursor = self.sp.layer_start_tile(lyr)
         self._cursor_delta = 0
         self._branch_offsets = [0 for _ in self.sp.branch_counts]
@@ -142,6 +144,11 @@ class TwoRing:
             "at the top level of Block.emit()"
         )
         g_start = self.cursor
+        seg_offsets = (
+            {b_idx: self._branch_offsets[b_idx] for b_idx in self._active_branches}
+            if self._branch_offsets is not None
+            else None
+        )
         prev_lazy = self._lazy
         prev_tiles = self._seg_tiles
         self._in_segment = True
@@ -156,7 +163,42 @@ class TwoRing:
             self._seg_tiles = prev_tiles
             if lazy and n_tiles > 0:
                 with self.sc("refill"):
-                    self.flush(g_start, n_tiles)
+                    if self._cur_layer is not None and seg_offsets is not None:
+                        sp = self.sp
+                        blk = (
+                            self._cur_layer
+                            if sp.period == 1
+                            else self._cur_layer // sp.period
+                        )
+                        if len(self._active_branches) == 1:
+                            b_idx = self._active_branches[0]
+                            r0 = seg_offsets[b_idx]
+                            l_start = sum(sp.branch_counts[:b_idx])
+                            c_b = sp.branch_counts[b_idx]
+                            if c_b == 1:
+                                self.flush_rel(g_start, blk, l_start, r0, n_tiles)
+                            else:
+                                lt_tr = self._cur_layer % sp.period
+                                for lt_s in range(l_start, l_start + c_b):
+                                    pl.when(lt_tr == lt_s)(
+                                        lambda lt_s=lt_s, r0=r0: self.flush_rel(
+                                            g_start, blk, lt_s, r0, n_tiles
+                                        )
+                                    )
+                        else:
+                            lt_tr = self._cur_layer % sp.period
+                            for b_idx in self._active_branches:
+                                r0 = seg_offsets[b_idx]
+                                l_start = sum(sp.branch_counts[:b_idx])
+                                c_b = sp.branch_counts[b_idx]
+                                for lt_s in range(l_start, l_start + c_b):
+                                    pl.when(lt_tr == lt_s)(
+                                        lambda lt_s=lt_s, r0=r0: self.flush_rel(
+                                            g_start, blk, lt_s, r0, n_tiles
+                                        )
+                                    )
+                    else:
+                        self.flush(g_start, n_tiles)
 
     def mm(self, x, w, dims=NN):
         if self.interpret and x.dtype != w.dtype:
@@ -175,6 +217,14 @@ class TwoRing:
             shp,
             dt,
         )
+
+    def borrow_epool(self):
+        """Return `scr['epool']` for non-overlapping block use (e.g. GQA `KVE`)."""
+        assert not getattr(self, "_in_dynamic", False), (
+            "borrow_epool() cannot be called while dynamic expert streaming is active"
+        )
+        assert "epool" in self.scr, "borrow_epool() requires 'epool' in scratch"
+        return self.scr["epool"]
 
     def eview(self, kind: str, bank):
         sp = self.sp
@@ -249,6 +299,76 @@ class TwoRing:
                 tile_lo = tile_hi
                 layer_lo += c_b
 
+    def fetch_rel(self, g, blk, lt, r: int, dt=None, dt_vals=(0,), lts=None):
+        """Issue dense stream tile `g` using trace-time `(layer, kind, row)` decode."""
+        sp = self.sp
+        if sp.T_TOTAL == 0:
+            return
+        if not isinstance(lt, int):
+            for lt_s in range(sp.period) if lts is None else lts:
+                pl.when(lt == lt_s)(
+                    lambda lt_s=lt_s: self.fetch_rel(g, blk, lt_s, r, dt, dt_vals)
+                )
+            return
+        if dt is None:
+            dt_vals = (0,)
+        groups: dict[tuple[int, int, int, int, str, int, int], list[int]] = {}
+        for v in dt_vals:
+            groups.setdefault(sp.rel_decode(lt, r + v), []).append(v)
+        for (b_off, lt_, b_idx, lt_in_b, kind, ordi, lo), vs in groups.items():
+            b = blk + b_off
+            c_b = sp.branch_counts[b_idx]
+            ord_b = b if c_b == 1 else b * c_b + lt_in_b
+            ord_l = b if sp.period == 1 else b * sp.period + lt_
+            ords = (ord_b, ord_l)
+            row = r - lo if dt is None else dt + (r - lo)
+            cond = jnp.logical_and(b < sp.L // sp.period, "dense" not in self.skip)
+            if len(groups) > 1:
+                hit = dt == vs[0]
+                for v in vs[1:]:
+                    hit = jnp.logical_or(hit, dt == v)
+                cond = jnp.logical_and(cond, hit)
+
+            @pl.when(cond)
+            def _(kind=kind, ords=ords, ordi=ordi, row=row):
+                self.dcopy(
+                    kind, self.W[kind].at[ords[ordi], row], lax.rem(g, sp.NBD)
+                ).start()
+
+    def flush_rel(self, g0, blk, lt, r0: int, n: int):
+        """Refill `n` lazy tiles starting at `g0` (`r0` in layer type `lt`)."""
+        NBD = self.sp.NBD
+        for t in range(n):
+            self.fetch_rel(g0 + t + NBD, blk, lt, r0 + t + NBD)
+
+    def _give_tile(self, g0, t, u: int, t_vals, dmm_ctx):
+        """Refill tile `g0 + t + u` via `fetch_rel` when `dmm_ctx` is known."""
+        NBD = self.sp.NBD
+        if dmm_ctx is None:
+            self.dgive(g0 + t + u)
+            return
+        blk, lt, r0, lts = dmm_ctx
+        if isinstance(r0, dict):
+            for lt_s, r0_s in r0.items():
+                pl.when(lt == lt_s)(
+                    lambda lt_s=lt_s, r0_s=r0_s: self._give_tile(
+                        g0, t, u, t_vals, (blk, lt_s, r0_s, (lt_s,))
+                    )
+                )
+            return
+        if isinstance(t, int):
+            self.fetch_rel(g0 + t + u + NBD, blk, lt, r0 + t + u + NBD, lts=lts)
+        else:
+            self.fetch_rel(
+                g0 + t + u + NBD,
+                blk,
+                lt,
+                r0 + u + NBD,
+                dt=t,
+                dt_vals=t_vals,
+                lts=lts,
+            )
+
     def dtake(self, kind: str, g):
         bank = g % self.sp.NBD
         if "dense" not in self.skip:
@@ -265,6 +385,60 @@ class TwoRing:
         for t in range(n):
             self.fetch(g0 + t + NBD)
 
+    def dmatmul_pair(
+        self,
+        kind: str,
+        g0,
+        xsrc,
+        N: int,
+        *,
+        lazy: bool = False,
+        dmm_ctx=None,
+    ):
+        """Paired/unrolled dense matmul: `acc[:, :N] = xsrc[:, :K] @ W(kind)`."""
+        sp = self.sp
+        n_t, t_k = sp.nt[kind], sp.tk[kind]
+        acc = self.scr["acc"]
+        DMU = min(sp.dmm_unroll, sp.NBD)
+        DCW = 512
+        U = n_t if n_t <= DMU else (2 if n_t % 2 == 0 and N > DCW else 1)
+        chunks = [(c0, min(DCW, N - c0)) for c0 in range(0, N, DCW)]
+        n_s = n_t // U
+
+        def step(t, first):
+            ws, xs = [], []
+            for u in range(U):
+                ws.append(self.dtake(kind, g0 + t + u))
+                k0 = (t + u) * t_k
+                if not isinstance(k0, int):
+                    k0 = pl.multiple_of(k0, t_k)
+                xs.append(xsrc[:, pl.ds(k0, t_k)])
+            for c0, cw in chunks:
+                p = self.mm(xs[0], ws[0][:, c0 : c0 + cw])
+                for u in range(1, U):
+                    p = p + self.mm(xs[u], ws[u][:, c0 : c0 + cw])
+                if first:
+                    acc[:, c0 : c0 + cw] = p
+                else:
+                    acc[:, c0 : c0 + cw] += p
+            if not lazy:
+                for u in range(U):
+                    self._give_tile(
+                        g0, t, u, tuple(i * U for i in range(1, n_s)), dmm_ctx
+                    )
+
+        step(0, True)
+        if n_s == 2:
+            step(U, False)
+        elif n_s > 2:
+
+            def body_pair(i, carry):
+                step(i * U, False)
+                return carry
+
+            lax.fori_loop(1, n_s, body_pair, 0)
+        return acc[:, :N]
+
     def dmatmul(
         self,
         kind: str,
@@ -277,8 +451,39 @@ class TwoRing:
         """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`."""
         sp = self.sp
         n_t, t_k = sp.nt[kind], sp.tk[kind]
+        dmm_ctx = None
         if g0 is None:
             if self._branch_offsets is not None:
+                if self._cur_layer is not None:
+                    blk = (
+                        self._cur_layer
+                        if sp.period == 1
+                        else self._cur_layer // sp.period
+                    )
+                    if len(self._active_branches) == 1:
+                        b_idx = self._active_branches[0]
+                        r0 = self._branch_offsets[b_idx]
+                        l_start = sum(sp.branch_counts[:b_idx])
+                        c_b = sp.branch_counts[b_idx]
+                        lt = l_start if c_b == 1 else (self._cur_layer % sp.period)
+                        lts = tuple(range(l_start, l_start + c_b))
+                        dmm_ctx = (blk, lt, r0, lts)
+                    else:
+                        r0_map = {
+                            lt_s: self._branch_offsets[b]
+                            for b in self._active_branches
+                            for lt_s in range(
+                                sum(sp.branch_counts[:b]),
+                                sum(sp.branch_counts[: b + 1]),
+                            )
+                        }
+                        r0_vals = set(r0_map.values())
+                        lt = self._cur_layer % sp.period
+                        lts = tuple(r0_map.keys())
+                        r0_arg: Any = (
+                            next(iter(r0_vals)) if len(r0_vals) == 1 else r0_map
+                        )
+                        dmm_ctx = (blk, lt, r0_arg, lts)
                 for b_idx in self._active_branches:
                     cur_off = self._branch_offsets[b_idx]
                     matched = [
@@ -301,6 +506,9 @@ class TwoRing:
             self._seg_tiles += n_t
             self._cursor_delta += n_t
         use_lazy = self._lazy if lazy is None else lazy
+        DMU = min(sp.dmm_unroll, sp.NBD)
+        if n_t <= DMU or sp.dense_acc_pair:
+            return self.dmatmul_pair(kind, g0, xsrc, N, lazy=use_lazy, dmm_ctx=dmm_ctx)
         acc = self.scr["acc"]
         acc[:, :N] = jnp.zeros((sp.MB, N), F32)
 
@@ -310,7 +518,7 @@ class TwoRing:
             k0 = pl.multiple_of(t * t_k, t_k)
             acc[:, :N] += self.mm(xsrc[:, pl.ds(k0, t_k)], w[...])
             if not use_lazy:
-                self.dgive(g)
+                self._give_tile(g0, t, 0, tuple(range(n_t)), dmm_ctx)
             return carry
 
         lax.fori_loop(0, n_t, body, 0)

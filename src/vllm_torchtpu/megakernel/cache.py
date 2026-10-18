@@ -1,25 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model-agnostic cache pool pipeline (`CachePipe`, `DirectHBM`, `PallasWriter`).
 
-Architecture (Communicating vs. Non-Communicating Split):
----------------------------------------------------------
-Mosaic TPU enforces a hardware/compiler invariant (`custom_call_importer.cc`):
-a `pallas_call` that carries a `collective_id` or issues cross-device DMAs
-(`all-reduce-start`, `collective-permute-start`, `semaphore_signal` with
-`device_id`) **cannot** also alias an `HBM` state buffer in-place via
-`input_output_aliases`.
+Architecture (Default Split Pool I/O vs. Opt-In Experimental `fused_pool_io`):
+------------------------------------------------------------------------------
+`PallasWriter` (`make_pooled_step` / `make_flat_pooled_step`) operates over
+unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
 
-Therefore, the pooled cache pipeline splits execution into three phases via the
-model-injected `ModelSpec.pool_backend`:
-1. **Non-communicating gather (`pool_backend.gather_states`)**: Reads per-sequence
-   recurrent/conv checkpoints from unified block pools into dense per-step tiles.
-2. **Communicating megakernel (`kernel.build(..., paged_kv=True)`)**: Takes
-   unified block pools as **read-only** `HBM` inputs (`access="r"`) for paged
-   KV reads, performs all layer compute and cross-chip communication, and emits
-   small per-step outputs.
-3. **Non-communicating scatter (`pool_backend.scatter_states`)**: Runs with
-   `collective_id=None` and `input_output_aliases` to scatter new KV and
-   recurrent/conv states in-place into the unified block pools.
+1. **Default split pool I/O (`fused_pool_io=False`)**:
+   - **3-stage split (or 2-stage with `GPR` in-kernel GDN gather)**:
+     - Non-communicating gather (`pool_backend.gather_states`, or in-kernel
+       read-only `GPR` gather on wide `T > 1` verify) reads per-sequence
+       recurrent/conv checkpoints from the unified block pools.
+     - Communicating megakernel (`kernel.build(..., paged_kv=True)`) takes the
+       unified block pools as **read-only** `HBM` inputs (`access="r"`) with no
+       Pallas pool aliasing, performs all layer compute and cross-chip
+       collectives, and emits small per-step state outputs (`knew`, `vnew`,
+       `conv`/`conv_ckpt`, `rec`/`rec_ckpt`).
+     - Non-communicating scatter (`pool_backend.scatter_states`) runs with
+       `collective_id=None` and Pallas `input_output_aliases` to scatter new KV
+       and recurrent/conv states in-place into the unified block pools.
+
+2. **Experimental opt-in 1-launch fused pool I/O (`fused_pool_io=True`)**:
+   - Isolated in `cache_experimental.py` and `blocks/fused_pool_io.py` (disabled
+     by default everywhere: `fused_pool_io=False`).
+   - On TPU (`ex.interpret=False`), `ST[pool_state_name]` is declared
+     `access="r"` with no Pallas-level alias (avoiding Mosaic's full-pool copy
+     on communicating kernels), `GQABlock` and `GDNBlock` issue async HBM DMA
+     reads/writes directly against `ST[pool_state_name]`, and the outer
+     `jax.jit` (`donate_argnums`) returns the donated input pool references
+     directly as outputs (relying on outer XLA `input_output_alias` /
+     `jax.buffer_donor = true`). On CPU (`ex.interpret=True`), `O[pool_state_name]`
+     is aliased to `ST[pool_state_name]` via `pallas_call(input_output_aliases=...)`.
 """
 
 from __future__ import annotations
@@ -31,9 +42,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 
-from . import kernel
+from . import cache_experimental, kernel
+from .cache_experimental import should_fuse_pool_io
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
 
@@ -68,6 +81,81 @@ def _unwrap_active_seqs(active_seqs: Any) -> Any:
     if isinstance(active_seqs, _ModeTag):
         return active_seqs.mode
     return active_seqs
+
+
+def _resolve_active_seqs_mode(
+    active_seqs: Any,
+    *,
+    default_mode: str = "from_ckpt",
+) -> tuple[str, jax.Array | None]:
+    if active_seqs is None:
+        return default_mode, None
+    if isinstance(active_seqs, str):
+        if active_seqs in ("from_ckpt", "all"):
+            return active_seqs, None
+        raise ValueError(
+            f"Unsupported active_seqs mode {active_seqs!r}; "
+            "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
+        )
+    return "ref", jnp.asarray(active_seqs, dtype=jnp.int32)
+
+
+def _validate_ckpt_bounds(
+    ckpt_indices: Any,
+    num_pages: int,
+    g_per_att: int,
+    *,
+    pages_per_slot: int = 5,
+    act_mode: str = "from_ckpt",
+    active_mask: Any = None,
+) -> None:
+    if (
+        ckpt_indices is None
+        or g_per_att <= 0
+        or isinstance(ckpt_indices, jax.core.Tracer)
+    ):
+        return
+    ckpt_np = np.asarray(ckpt_indices)
+    if ckpt_np.ndim == 4:
+        ckpt_np = ckpt_np[0]
+    is_3d = ckpt_np.ndim == 3
+    ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
+    mask_np = (
+        None
+        if (active_mask is None or isinstance(active_mask, jax.core.Tracer))
+        else np.asarray(active_mask).reshape(-1)
+    )
+    pps = int(pages_per_slot)
+    for s in range(ns):
+        if act_mode == "from_ckpt":
+            active = int(ckpt_np[0, s, 0] if is_3d else ckpt_np[s, 0]) > 0
+        elif act_mode == "ref" and mask_np is not None:
+            active = int(mask_np[s]) != 0
+        else:
+            active = True
+        if not active:
+            continue
+        seen_sub_slots: dict[int, int] = {}
+        for sub in range(g_per_att):
+            slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
+            for slot in np.ravel(slots):
+                slot_i = int(slot)
+                pb = slot_i * pps if is_3d else slot_i * (pps * g_per_att) + sub * pps
+                if pb < 0 or pb + pps > num_pages:
+                    raise ValueError(
+                        f"GDN checkpoint slot {slot_i} (sub={sub}, s={s}) "
+                        f"maps to pages [{pb}, {pb + pps}), which exceeds pool "
+                        f"capacity [0, {num_pages})"
+                    )
+                if is_3d and g_per_att > 1:
+                    prev_sub = seen_sub_slots.get(slot_i)
+                    if prev_sub is not None and prev_sub != sub:
+                        raise ValueError(
+                            f"3D ckpt_indices for active sequence s={s} reuses "
+                            f"slot {slot_i} across sub={prev_sub} and sub={sub} "
+                            f"(both map to pages [{pb}, {pb + pps}))"
+                        )
+                    seen_sub_slots[slot_i] = sub
 
 
 def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
@@ -133,6 +221,8 @@ def check_pooled_step_hlo(
     hd: int = 256,
     min_pool_pages: int = 16,
     require_scatter: bool = True,
+    fused_pool_io: bool = False,
+    kernel_names: tuple[str, str] = ("gather_gdn_states", "scatter_pool_states"),
 ) -> tuple[bool, str]:
     """Verify that a compiled pooled step HLO has no full-pool HBM or VMEM copies.
 
@@ -143,15 +233,24 @@ def check_pooled_step_hlo(
     n_tpu_cc = hlo_text.count("tpu_custom_call")
     n_cpu_cc = hlo_text.count("xla_ffi_python_cpu_callback")
     is_cpu_interp = n_cpu_cc > 0
-    min_cc = 2 if require_scatter else 1
-    if require_scatter:
-        has_scatter = (
-            "scatter_pool_states" in hlo_text
-            or n_tpu_cc >= 2
-            or (is_cpu_interp and n_cpu_cc >= 2)
+    _, scatter_name = kernel_names
+    if fused_pool_io:
+        min_cc = 1
+        ok_f, msg_f = cache_experimental.check_fused_pooled_step_hlo(
+            hlo_text, kernel_names=kernel_names
         )
-        if not has_scatter:
-            return False, "missing scatter_pool_states in HLO"
+        if not ok_f:
+            return False, msg_f
+    else:
+        min_cc = 2 if require_scatter else 1
+        if require_scatter:
+            has_scatter = (
+                (bool(scatter_name) and scatter_name in hlo_text)
+                or n_tpu_cc >= 2
+                or (is_cpu_interp and n_cpu_cc >= 2)
+            )
+            if not has_scatter:
+                return False, f"missing {scatter_name or 'scatter'} in HLO"
     has_mk = (
         "decode_megakernel" in hlo_text
         or n_tpu_cc >= min_cc
@@ -179,12 +278,42 @@ def check_pooled_step_hlo(
     return True, "ok"
 
 
+def _should_use_pool_gather(
+    ms: ModelSpec,
+    pb: PoolBackend,
+    ex: ExecSpec,
+    *,
+    use_fused: bool,
+) -> bool:
+    """Return True when non-fused verify should gather GDN states in-kernel (`GPR`)."""
+    if use_fused or ex.pool_gather is False:
+        return False
+    if not pb.supports_pool_gather or not pb.has_recurrent_pool:
+        if ex.pool_gather is True:
+            raise ValueError(
+                f"ModelSpec {ms.name!r} pool_backend does not support pool_gather"
+            )
+        return False
+    if pb.can_pool_gather is not None:
+        ok = bool(pb.can_pool_gather(ex))
+        if ex.pool_gather is True and not ok:
+            raise ValueError(
+                f"pool_gather=True is not supported for ExecSpec(B={ex.B}, T={ex.T}, "
+                f"page_size={ex.page_size})"
+            )
+        return ok
+    return bool(ex.pool_gather)
+
+
 def make_flat_pooled_step(
     mesh: Any,
     model_spec: Any,
     ex: ExecSpec,
     *,
     donate_pools: bool = True,
+    fused_pool_io: bool | str | None = None,
+    max_b_low: int = 24,
+    min_b_hi: int = 56,
 ) -> tuple[Any, tuple[Any, ...], tuple[Any, ...], tuple[int, ...]]:
     """Build a flat-signature `shard_map` step for `torch_xla` bridge integration.
 
@@ -195,8 +324,41 @@ def make_flat_pooled_step(
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
-    ex_paged = dataclasses.replace(ex, paged_kv=True)
-    call, info = kernel.build(ms, ex_paged)
+    use_fused = should_fuse_pool_io(
+        ms,
+        ex,
+        fused_pool_io=fused_pool_io,
+        max_b_low=max_b_low,
+        min_b_hi=min_b_hi,
+    )
+    use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    ex_paged = dataclasses.replace(
+        ex,
+        paged_kv=True,
+        fused_pool_io=use_fused,
+        pool_gather=use_gpr,
+    )
+    _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
+
+    def _get_compiled(
+        act_mode: str, ckpt_2d: bool, ckpt_k: int, roff_1d: bool
+    ) -> tuple[Any, dict[str, Any]]:
+        key = (act_mode, ckpt_2d, ckpt_k, roff_1d)
+        if key not in _build_cache:
+            ex_k = dataclasses.replace(
+                ex_paged,
+                act_mode=act_mode,
+                ckpt_2d=ckpt_2d,
+                ckpt_k=ckpt_k,
+                roff_1d=roff_1d,
+            )
+            _build_cache[key] = kernel.build(ms, ex_k)
+        return _build_cache[key]
+
+    default_ckpt_k = ex_paged.ckpt_k if ex_paged.ckpt_k > 0 else ex_paged.T
+    call, info = _get_compiled(
+        ex_paged.act_mode, ex_paged.ckpt_2d, default_ckpt_k, ex_paged.roff_1d
+    )
     p = info["plan"]
     w_names = p.w_names
     s_names = p.s_names
@@ -204,6 +366,7 @@ def make_flat_pooled_step(
     wsh = info["wshape"]
     num_pools = pb.num_pools
     has_rec = pb.has_recurrent_pool
+    rec_slots = pb.recurrent_slots_per_pool
 
     w_tuple_lens = [
         len(wsh[k]) if kernel.is_tupled_weight(wsh[k]) else 1 for k in w_names
@@ -265,6 +428,58 @@ def make_flat_pooled_step(
             page_table = page_table.squeeze(0)
         if page_table.shape[-1] > max_pt:
             page_table = page_table[..., :max_pt]
+        if ckpt_indices is not None and ckpt_indices.ndim == 4:
+            ckpt_indices = ckpt_indices.squeeze(0)
+        if read_offsets is not None and read_offsets.ndim == 3:
+            read_offsets = read_offsets.squeeze(0)
+
+        if use_fused or use_gpr:
+            act_mode_l = "from_ckpt" if has_rec else "all"
+            if has_rec:
+                _validate_ckpt_bounds(
+                    ckpt_indices,
+                    ex_paged.num_pages,
+                    rec_slots,
+                    act_mode=act_mode_l,
+                    pages_per_slot=pb.ckpt_pages_per_slot,
+                )
+            ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
+            ckpt_k_l = (
+                int(ckpt_indices.shape[-1]) if ckpt_indices is not None else ex_paged.T
+            )
+            roff_1d_l = bool(read_offsets is not None and read_offsets.ndim == 1)
+            call_l, info_l = _get_compiled(act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l)
+            p_l = info_l["plan"]
+            st_map_f: dict[str, Any] = {
+                pb.pool_state_name: raw_pools,
+                pb.page_table_state_name: page_table,
+            }
+            if has_rec:
+                st_map_f["ckpt_indices"] = ckpt_indices
+                st_map_f["read_offsets"] = read_offsets
+            s_args_f = [st_map_f[k] for k in p_l.s_names]
+            out_vals_f = call_l(pos, hidden, *w_args, *s_args_f)
+            if not isinstance(out_vals_f, (tuple, list)):
+                out_vals_f = (out_vals_f,)
+            out_map_f = dict(zip(p_l.o_names, out_vals_f))
+            hid = out_map_f["hidden"]
+            if use_fused:
+                raw_out = (
+                    tuple(out_map_f[pb.pool_state_name])
+                    if pb.pool_state_name in out_map_f
+                    else tuple(raw_pools)
+                )
+                return (hid, *raw_out)
+            raw_out = pb.scatter_states(
+                ex_paged,
+                raw_pools,
+                pos,
+                page_table,
+                out_map_f,
+                ckpt_indices if has_rec else None,
+                act_mode_l if has_rec else None,
+            )
+            return (hid, *raw_out)
 
         gathered = (
             pb.gather_states(
@@ -316,6 +531,9 @@ def make_pooled_step(
     ex: ExecSpec,
     *,
     donate_pools: bool = False,
+    fused_pool_io: bool | str | None = None,
+    max_b_low: int = 24,
+    min_b_hi: int = 56,
 ) -> Any:
     """Build the `jax.jit` `shard_map` step over unified block pools.
 
@@ -333,8 +551,41 @@ def make_pooled_step(
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
-    ex_paged = dataclasses.replace(ex, paged_kv=True)
-    call, info = kernel.build(ms, ex_paged)
+    use_fused = should_fuse_pool_io(
+        ms,
+        ex,
+        fused_pool_io=fused_pool_io,
+        max_b_low=max_b_low,
+        min_b_hi=min_b_hi,
+    )
+    use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    ex_paged = dataclasses.replace(
+        ex,
+        paged_kv=True,
+        fused_pool_io=use_fused,
+        pool_gather=use_gpr,
+    )
+    _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
+
+    def _get_compiled(
+        act_mode: str, ckpt_2d: bool, ckpt_k: int, roff_1d: bool
+    ) -> tuple[Any, dict[str, Any]]:
+        key = (act_mode, ckpt_2d, ckpt_k, roff_1d)
+        if key not in _build_cache:
+            ex_k = dataclasses.replace(
+                ex_paged,
+                act_mode=act_mode,
+                ckpt_2d=ckpt_2d,
+                ckpt_k=ckpt_k,
+                roff_1d=roff_1d,
+            )
+            _build_cache[key] = kernel.build(ms, ex_k)
+        return _build_cache[key]
+
+    default_ckpt_k = ex_paged.ckpt_k if ex_paged.ckpt_k > 0 else ex_paged.T
+    call, info = _get_compiled(
+        ex_paged.act_mode, ex_paged.ckpt_2d, default_ckpt_k, ex_paged.roff_1d
+    )
     p = info["plan"]
     w_names = p.w_names
     s_names = p.s_names
@@ -394,6 +645,59 @@ def make_pooled_step(
             )
             for k in w_names
         ]
+
+        if use_fused or use_gpr:
+            act_mode_l, active_mask_l = _resolve_active_seqs_mode(
+                active_seqs, default_mode="from_ckpt" if has_rec else "all"
+            )
+            if has_rec:
+                _validate_ckpt_bounds(
+                    ckpt_indices,
+                    ex_paged.num_pages,
+                    rec_slots,
+                    act_mode=act_mode_l,
+                    active_mask=active_mask_l,
+                    pages_per_slot=pb.ckpt_pages_per_slot,
+                )
+            ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
+            ckpt_k_l = (
+                int(ckpt_indices.shape[-1]) if ckpt_indices is not None else ex_paged.T
+            )
+            roff_1d_l = bool(read_offsets is not None and read_offsets.ndim == 1)
+            call_l, info_l = _get_compiled(act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l)
+            p_l = info_l["plan"]
+            st_map_f: dict[str, Any] = {
+                pool_key: raw_in,
+                pt_key: page_table,
+            }
+            if has_rec:
+                st_map_f["ckpt_indices"] = ckpt_indices
+                st_map_f["read_offsets"] = read_offsets
+                if act_mode_l == "ref":
+                    st_map_f["active_seqs"] = active_mask_l
+            s_args_f = [st_map_f[k] for k in p_l.s_names]
+            out_vals_f = call_l(pos, hidden, *w, *s_args_f, *rb_tuple)
+            if not isinstance(out_vals_f, (tuple, list)):
+                out_vals_f = (out_vals_f,)
+            out_map_f = dict(zip(p_l.o_names, out_vals_f))
+            hid = out_map_f["hidden"]
+            if use_fused:
+                raw_out = (
+                    tuple(out_map_f[pool_key]) if pool_key in out_map_f else raw_in
+                )
+            else:
+                raw_out = pb.scatter_states(
+                    ex_paged,
+                    raw_in,
+                    pos,
+                    page_table,
+                    out_map_f,
+                    ckpt_indices if has_rec else None,
+                    active_seqs,
+                )
+            if raw_6d:
+                raw_out = tuple(jnp.expand_dims(r, 0) for r in raw_out)
+            return hid, raw_out
 
         gathered = (
             pb.gather_states(
@@ -594,6 +898,19 @@ def make_pooled_step(
             active_seqs,
             rb_tuple,
         ) = _parse_call_args(states_or_raw, rest)
+        if has_rec:
+            act_m, act_arr = _resolve_active_seqs_mode(
+                _unwrap_active_seqs(active_seqs),
+                default_mode="from_ckpt",
+            )
+            _validate_ckpt_bounds(
+                ckpt_indices,
+                ex_paged.num_pages,
+                rec_slots,
+                act_mode=act_m,
+                active_mask=act_arr,
+                pages_per_slot=pb.ckpt_pages_per_slot,
+            )
         hid, new_raw = _jitted_step(
             pos,
             hidden,
@@ -671,13 +988,17 @@ class DirectHBM(CachePipe):
     ) -> Any:
         use_donate = donate if donate_states is None else bool(donate_states)
         ms = _resolve_model_spec(g_or_spec)
-        ex_direct = dataclasses.replace(ex, paged_kv=False)
+        ex_direct = dataclasses.replace(ex, paged_kv=False, fused_pool_io=False)
         return kernel.make_step(mesh, ms, ex_direct, donate_states=use_donate)
 
 
 @dataclass(frozen=True)
 class PallasWriter(CachePipe):
-    """M3 pooled cache pipe (`gather_states` -> `megakernel` -> `scatter_states`)."""
+    """M3 pooled cache pipe (default GPR+scatter or split; optional `fused_pool_io`)."""
+
+    fused_pool_io: bool | str | None = None
+    max_b_low: int = 24
+    min_b_hi: int = 56
 
     def make_step(
         self,
@@ -687,10 +1008,20 @@ class PallasWriter(CachePipe):
         *,
         donate: bool = False,
         donate_pools: bool | None = None,
+        fused_pool_io: bool | str | None = None,
     ) -> Any:
         use_donate = donate if donate_pools is None else bool(donate_pools)
+        f_mode = self.fused_pool_io if fused_pool_io is None else fused_pool_io
         ms = _resolve_model_spec(g_or_spec)
-        return make_pooled_step(mesh, ms, ex, donate_pools=use_donate)
+        return make_pooled_step(
+            mesh,
+            ms,
+            ex,
+            donate_pools=use_donate,
+            fused_pool_io=f_mode,
+            max_b_low=self.max_b_low,
+            min_b_hi=self.min_b_hi,
+        )
 
 
 __all__ = [
@@ -700,4 +1031,5 @@ __all__ = [
     "check_pooled_step_hlo",
     "make_flat_pooled_step",
     "make_pooled_step",
+    "should_fuse_pool_io",
 ]

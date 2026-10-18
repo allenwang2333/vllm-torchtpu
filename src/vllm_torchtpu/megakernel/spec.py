@@ -113,7 +113,16 @@ class Tiles:
     gdn_bufs: int = 3  # GDN state ring depth
     kv_sub: int = 0  # KV tokens per online-softmax update inside a block (0: full)
     amask: int = 1  # Attention mask mode (0..4)
-    ecopy_opt: int = 0  # Redundant expert dedup optimization (0 or 1)
+    ecopy_opt: int = 1  # Redundant expert dedup optimization (0 or 1)
+    r2_direct_store: bool = True  # Direct VMEM store on MoE r2 tile 0
+    route_vec: bool = True  # Vectorized MXU expert route packing
+    dense_acc_pair: bool = True  # Unrolled / paired dense matmul accumulation
+    kv_ering: bool = True  # Alias KV DMA ring onto epool when unused in GQA
+    pair_kv: bool = True  # Pair KV attention items to overlap KV DMA + softmax
+    dmm_unroll: int = 8  # Max tiles to fully unroll in dmatmul
+    gq_pack: bool = True  # Pack G*nh Q heads into 16-row MXU tiles on verify
+    topk_lanes: bool = True  # Batcher odd-even top-k on lanes for E >= 128
+    conv_stage: bool = True  # Stage GDN conv taps in VMEM sbuf on TPU
 
     def tk(self, K: int, N: int, dtype: Any, bank: int) -> int:
         """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank`."""
@@ -128,29 +137,83 @@ class Tiles:
         return best
 
 
-DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
+DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2, kv_sub=1024)
 VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
 WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
 TINY_TILES = Tiles(
-    bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, nkv=3, vmem_mib=32
+    bank=128 << 10,
+    nbd=10,
+    nbe=6,
+    ebank=256 << 10,
+    kv_blk=256,
+    nkv=3,
+    vmem_mib=32,
+    kv_sub=0,
+    dense_acc_pair=False,
 )
 
 
-def default_tiles(B: int) -> Tiles:
+def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     """Tuned default tiles for batch row count `B`."""
+    nbe_ep = 12 if not moe_tp else 10
+    nbe_small = 20 if not moe_tp else nbe_ep
     if B > 48:
-        return dataclasses.replace(WIDE_TILES, nbe=6)
+        t = dataclasses.replace(WIDE_TILES, nbd=8 if B <= 56 else 7, nbe=nbe_ep, hier=2)
+    elif B > 32:
+        t = dataclasses.replace(WIDE_TILES, nbd=8, nbe=nbe_ep, hier=2)
+    elif B > 24:
+        t = dataclasses.replace(WIDE_TILES, nbe=nbe_ep, hier=2)
+    elif B > 16:
+        t = dataclasses.replace(WIDE_TILES, nbd=12, nbe=nbe_ep, hier=2)
+    elif B > 8:
+        t = dataclasses.replace(VERIFY_TILES, nbe=nbe_ep)
+    elif B > 4:
+        t = dataclasses.replace(
+            DEFAULT_TILES, nbe=nbe_small, rsag=True, hier=2, ecopy_opt=1
+        )
+    else:
+        t = dataclasses.replace(DEFAULT_TILES, nbe=nbe_small, ecopy_opt=1)
+    if R != 8 and t.hier in (1, 2):
+        is_pow2_r = R >= 2 and (R & (R - 1)) == 0
+        t = dataclasses.replace(t, hier=3 if (B <= 32 and is_pow2_r) else 0)
+    return t
+
+
+def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+    """Tiles matching the frozen prototype (`megakernel.py`) for bit-exact parity."""
+    del R
+    base = Tiles(
+        hier=1,
+        pack=1,
+        mb8=2,
+        kv_sub=0,
+        ecopy_opt=0,
+        pipe=moe_tp,
+        r2_direct_store=False,
+        route_vec=False,
+        dense_acc_pair=False,
+        kv_ering=False,
+        pair_kv=False,
+        dmm_unroll=0,
+        gq_pack=False,
+        topk_lanes=False,
+        conv_stage=False,
+    )
+    ver = dataclasses.replace(base, nkv=4, rsag=True, hier=2, ecopy_opt=1)
+    wide = dataclasses.replace(ver, nbd=10, nkv=3, vmem_mib=62, hier=0)
+    if B > 48:
+        return dataclasses.replace(wide, nbe=6)
     if B > 32:
-        return WIDE_TILES
+        return wide
     if B > 24:
-        return dataclasses.replace(WIDE_TILES, hier=2)
+        return dataclasses.replace(wide, hier=2)
     if B > 16:
-        return dataclasses.replace(WIDE_TILES, nbd=12, hier=2)
+        return dataclasses.replace(wide, nbd=12, hier=2)
     if B > 8:
-        return VERIFY_TILES
+        return ver
     if B > 4:
-        return dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
-    return DEFAULT_TILES
+        return dataclasses.replace(base, rsag=True, hier=2, ecopy_opt=1)
+    return base
 
 
 @dataclass(frozen=True)
@@ -178,13 +241,33 @@ class ExecSpec:
     page_size: int = 128  # Tokens per KV page
     num_pages: int = 4096  # Total pages per attention pool per rank
     max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
+    fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
+    pool_gather: bool | None = None  # None: auto; True/False: in-kernel GDN gather
+    act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
+    ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
+    ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
+    roff_1d: bool = False  # True: 1D read_offsets (NS,); False: 2D (G_PER_ATT, NS)
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     tiles: Tiles | None = None  # None -> default_tiles(B)
     debug: DebugOptions = DebugOptions()
 
     @property
+    def FUSED(self) -> bool:
+        return bool(self.paged_kv and self.fused_pool_io)
+
+    @property
+    def GPR(self) -> bool:
+        return bool(self.paged_kv and not self.fused_pool_io and self.pool_gather)
+
+    @property
     def resolved_tiles(self) -> Tiles:
-        return self.tiles if self.tiles is not None else default_tiles(self.B)
+        return self.tiles if self.tiles is not None else default_tiles(self.B, R=self.R)
+
+    def resolve_tiles(self, g: Any = None) -> Tiles:
+        if self.tiles is not None:
+            return self.tiles
+        moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
+        return default_tiles(self.B, moe_tp=moe_tp, R=self.R)
 
     @property
     def resolved_max_pages_per_seq(self) -> int:
@@ -351,10 +434,15 @@ class PoolBackend:
     num_pools: int
     has_recurrent_pool: bool
     recurrent_slots_per_pool: int = 1
+    ckpt_pages_per_slot: int = 5
     pool_state_name: str = "raw"
     page_table_state_name: str = "page_table"
+    kernel_names: tuple[str, str] = ("gather_gdn_states", "scatter_pool_states")
     gather_states: Any = None
     scatter_states: Any = None
+    can_pool_gather: Any = None
+    supports_fused_io: bool = False
+    supports_pool_gather: bool = False
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,12 @@ from jax import lax  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
-from vllm_torchtpu.megakernel import cache, kernel, planner  # noqa: E402
+from vllm_torchtpu.megakernel import (  # noqa: E402
+    cache,
+    cache_experimental,
+    kernel,
+    planner,
+)
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
@@ -50,7 +55,11 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     I32,
     rup,
 )
-from vllm_torchtpu.megakernel.spec import ExecSpec, default_tiles  # noqa: E402
+from vllm_torchtpu.megakernel.spec import (  # noqa: E402
+    ExecSpec,
+    default_tiles,
+    frozen_parity_tiles,
+)
 
 
 def _has_tpu_v7x8() -> bool:
@@ -537,7 +546,14 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
     results = []
 
     for T, B in buckets:
-        ex = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True)
+        ex = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            stack_e=True,
+            tiles=frozen_parity_tiles(B),
+        )
         c_f = frozen_mk.MKConfig(
             R=8,
             B=B,
@@ -760,7 +776,14 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
 
     m1_results = []
     for T, B in [(1, 64), (4, 64)]:
-        ex_m1 = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True)
+        ex_m1 = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            stack_e=True,
+            tiles=frozen_parity_tiles(B),
+        )
         c_f_m1 = frozen_mk.MKConfig(
             R=8,
             B=B,
@@ -1099,6 +1122,9 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
             paged_kv=True,
             num_pages=num_pages,
             stack_e=True,
+            pool_gather=False,
+            fused_pool_io=False,
+            tiles=frozen_parity_tiles(B),
         )
         c_f = frozen_mk.MKConfig(
             R=8,
@@ -1345,6 +1371,9 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
         num_pages=4608,
         max_pages_per_seq=1024,
         stack_e=True,
+        pool_gather=False,
+        fused_pool_io=False,
+        tiles=frozen_parity_tiles(64),
     )
     step_128k_b64, info_128k_b64 = cache.PallasWriter().make_step(
         mesh, g, ex_128k_b64, donate=True
@@ -1396,7 +1425,16 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
 
     # Verify & time PallasWriter with stack_e=False on TPU at T=1, B=16 vs frozen
     ex_pw_u = ExecSpec(
-        B=16, T=1, R=8, ctx=4096, paged_kv=True, num_pages=4096, stack_e=False
+        B=16,
+        T=1,
+        R=8,
+        ctx=4096,
+        paged_kv=True,
+        num_pages=4096,
+        stack_e=False,
+        pool_gather=False,
+        fused_pool_io=False,
+        tiles=frozen_parity_tiles(16),
     )
     c_f_pw_u = frozen_mk.MKConfig(
         R=8,
@@ -1575,7 +1613,14 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     assert pu_row["delta_pct"] <= 2.0
 
     for T, B in [(1, 16), (4, 16)]:
-        ex_u = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=False)
+        ex_u = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            stack_e=False,
+            tiles=frozen_parity_tiles(B),
+        )
         c_f_u = frozen_mk.MKConfig(
             R=8,
             B=B,
@@ -1742,7 +1787,9 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     eplb_results = []
     for ecopy_opt in (0, 1):
         for T, B in [(1, 16), (4, 16)]:
-            tiles_lib_e = dataclasses.replace(default_tiles(B), ecopy_opt=ecopy_opt)
+            tiles_lib_e = dataclasses.replace(
+                frozen_parity_tiles(B), ecopy_opt=ecopy_opt
+            )
             ex_e = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True, tiles=tiles_lib_e)
             c_f_e = frozen_mk.MKConfig(
                 R=8,
@@ -1884,7 +1931,14 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
 
     tp_results = []
     for T, B in [(1, 16), (4, 16)]:
-        ex_tp = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True)
+        ex_tp = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            stack_e=True,
+            tiles=frozen_parity_tiles(B, moe_tp=True),
+        )
         c_f_tp = frozen_mk.MKConfig(
             R=8,
             B=B,
@@ -1969,3 +2023,202 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     print("\n=== M3_TPU_V7X8_BENCH_JSON_START ===")
     print(json.dumps(m3_summary, indent=2))
     print("=== M3_TPU_V7X8_BENCH_JSON_END ===", flush=True)
+
+
+def test_m5_tpu_v7x8_default_tiles_and_pool_gather_bench():
+    """Benchmark M5 default_tiles + pool_gather (GPR) and opt-in fused_pool_io."""
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    tpu_devs = jax.devices("tpu")
+    frozen_mk = _load_frozen_mk()
+    mesh = Mesh(tpu_devs[:8], ("tp",))
+
+    g = dataclasses.replace(qwen35.FULL_EP, L=60, att_every=4)
+    ex_init = ExecSpec(B=4, T=1, R=8, ctx=4096, stack_e=True)
+    c_f_init = frozen_mk.MKConfig(
+        R=8,
+        B=4,
+        T=1,
+        L=60,
+        att_every=4,
+        moe_tp=False,
+        ctx=4096,
+        stack_e=True,
+    )
+    f_lay, f_S = frozen_mk.smalls_layout(c_f_init)
+    w_lib, w_f = _init_shared_weights_on_tpu(mesh, g, ex_init, f_lay, f_S)
+    del w_f
+    gc.collect()
+
+    buckets = [
+        (1, 4),
+        (1, 16),
+        (1, 32),
+        (1, 64),
+        (4, 4),
+        (4, 16),
+        (4, 64),
+    ]
+    m5_results = []
+
+    for T, B in buckets:
+        # 1. Baseline: frozen_parity_tiles(B), pool_gather=False, fused_pool_io=False
+        ex_base = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            paged_kv=True,
+            num_pages=4096,
+            stack_e=True,
+            pool_gather=False,
+            fused_pool_io=False,
+            tiles=frozen_parity_tiles(B),
+        )
+        pos_b, hid_b, raw_b, pt_b, ckpt_b, roff_b = _init_pooled_bucket_on_tpu(
+            mesh, g, ex_base
+        )
+        step_base, _ = cache.PallasWriter().make_step(mesh, g, ex_base, donate=True)
+        out_hid_base, raw_b = step_base(
+            pos_b, hid_b, w_lib, raw_b, pt_b, ckpt_b, roff_b
+        )
+        jax.block_until_ready(out_hid_base)
+        hid_base_np = np.asarray(jax.device_get(kernel.unfold(out_hid_base, 8)))[
+            :, :B, :
+        ].astype(np.float32)
+        base_stats, raw_b = _time_pooled_step_fn(
+            step_base, pos_b, hid_b, w_lib, raw_b, pt_b, ckpt_b, roff_b
+        )
+        del pos_b, hid_b, raw_b, pt_b, ckpt_b, roff_b, out_hid_base, step_base
+        gc.collect()
+
+        # 2. M5 default: default_tiles(B), fused_pool_io=False, pool_gather=None
+        ex_m5 = ExecSpec(
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            paged_kv=True,
+            num_pages=4096,
+            stack_e=True,
+            tiles=default_tiles(B),
+        )
+        pos_m, hid_m, raw_m, pt_m, ckpt_m, roff_m = _init_pooled_bucket_on_tpu(
+            mesh, g, ex_m5
+        )
+        step_m5, info_m5 = cache.PallasWriter().make_step(mesh, g, ex_m5, donate=True)
+        comp_m5 = step_m5.lower(
+            pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m
+        ).compile()
+        ok_hlo, msg_hlo = cache.check_pooled_step_hlo(
+            comp_m5.as_text(),
+            page_size=ex_m5.page_size,
+            kernel_names=qwen35.qwen35_pool_backend().kernel_names,
+        )
+        assert ok_hlo, f"HLO check failed at (T={T}, B={B}): {msg_hlo}"
+        del comp_m5
+
+        out_hid_m5, raw_m = step_m5(pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m)
+        jax.block_until_ready(out_hid_m5)
+        hid_m5_np = np.asarray(jax.device_get(kernel.unfold(out_hid_m5, 8)))[
+            :, :B, :
+        ].astype(np.float32)
+        assert np.all(np.isfinite(hid_m5_np))
+        cos_m5 = float(
+            np.dot(hid_base_np.ravel(), hid_m5_np.ravel())
+            / (
+                np.linalg.norm(hid_base_np.ravel()) * np.linalg.norm(hid_m5_np.ravel())
+                + 1e-12
+            )
+        )
+        assert cos_m5 >= 0.9995, (
+            f"M5 default_tiles cos_sim={cos_m5:.6f} < 0.9995 at (T={T}, B={B})"
+        )
+        m5_stats, raw_m = _time_pooled_step_fn(
+            step_m5, pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m
+        )
+        del pos_m, hid_m, raw_m, pt_m, ckpt_m, roff_m, out_hid_m5, step_m5
+        gc.collect()
+
+        speedup_pct = (
+            (m5_stats["median_us"] - base_stats["median_us"])
+            / base_stats["median_us"]
+            * 100.0
+        )
+        row: dict[str, Any] = {
+            "T": T,
+            "B": B,
+            "base_median_us": round(base_stats["median_us"], 1),
+            "m5_gpr_median_us": round(m5_stats["median_us"], 1),
+            "m5_gpr_delta_pct": round(speedup_pct, 2),
+            "m5_gpr_cos_sim": round(cos_m5, 6),
+            "vmem_m5_mib": round(info_m5["vmem_scratch_bytes"] / (1024 * 1024), 2),
+            "pool_gather": bool(info_m5.get("pool_gather", False)),
+        }
+
+        # 3. Opt-in experimental fused_pool_io at eligible buckets
+        if cache_experimental.should_fuse_pool_io(ex_m5, True):
+            ex_fused = dataclasses.replace(ex_m5, fused_pool_io=True)
+            pos_f, hid_f, raw_f, pt_f, ckpt_f, roff_f = _init_pooled_bucket_on_tpu(
+                mesh, g, ex_fused
+            )
+            step_fused, info_fused = cache_experimental.make_fused_pooled_step(
+                mesh, qwen35.qwen35_spec(g), ex_fused, donate=True
+            )
+            comp_fused = step_fused.lower(
+                pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
+            ).compile()
+            ok_fhlo, msg_fhlo = cache_experimental.check_fused_pooled_step_hlo(
+                comp_fused.as_text(), page_size=ex_fused.page_size
+            )
+            assert ok_fhlo, f"Fused HLO check failed at (T={T}, B={B}): {msg_fhlo}"
+            del comp_fused
+
+            out_hid_f, raw_f = step_fused(
+                pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
+            )
+            jax.block_until_ready(out_hid_f)
+            hid_f_np = np.asarray(jax.device_get(kernel.unfold(out_hid_f, 8)))[
+                :, :B, :
+            ].astype(np.float32)
+            cos_fused = float(
+                np.dot(hid_base_np.ravel(), hid_f_np.ravel())
+                / (
+                    np.linalg.norm(hid_base_np.ravel())
+                    * np.linalg.norm(hid_f_np.ravel())
+                    + 1e-12
+                )
+            )
+            assert cos_fused >= 0.9995, (
+                f"M5 fused_pool_io cos_sim={cos_fused:.6f} < 0.9995 at (T={T}, B={B})"
+            )
+            fused_stats, raw_f = _time_pooled_step_fn(
+                step_fused, pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
+            )
+            del pos_f, hid_f, raw_f, pt_f, ckpt_f, roff_f, out_hid_f, step_fused
+            gc.collect()
+            row["m5_fused_median_us"] = round(fused_stats["median_us"], 1)
+            row["m5_fused_delta_pct"] = round(
+                (fused_stats["median_us"] - base_stats["median_us"])
+                / base_stats["median_us"]
+                * 100.0,
+                2,
+            )
+            row["m5_fused_cos_sim"] = round(cos_fused, 6)
+            row["vmem_fused_mib"] = round(
+                info_fused["vmem_scratch_bytes"] / (1024 * 1024), 2
+            )
+
+        m5_results.append(row)
+        print(
+            f"[M5 Bench T={T} B={B:2d}] base={row['base_median_us']:6.1f} us | "
+            f"m5_gpr={row['m5_gpr_median_us']:6.1f} us "
+            f"({row['m5_gpr_delta_pct']:+.2f}%, "
+            f"cos={row['m5_gpr_cos_sim']:.6f}) | "
+            f"m5_fused={row.get('m5_fused_median_us', 'N/A')}",
+            flush=True,
+        )
+
+    print("\n=== M5_TPU_V7X8_BENCH_JSON_START ===")
+    print(json.dumps({"m5_bench": m5_results}, indent=2))
+    print("=== M5_TPU_V7X8_BENCH_JSON_END ===", flush=True)

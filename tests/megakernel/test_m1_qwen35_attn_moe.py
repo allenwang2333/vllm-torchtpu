@@ -67,9 +67,10 @@ def test_m1_recorded_full_ep_build_invariants():
     }
     assert info["T_TOTAL"] == 840
     assert p.block_params["moe"].TE == 12
-    assert p.block_params["moe"].NSS == 3
-    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,031,744 < frozen's 49,178,624
-    assert info["vmem_scratch_bytes"] == 48_031_744 < 49_178_624
+    assert p.block_params["moe"].NSS == 4
+    # GDN-free M1 omits `recb`/`sbuf`/`convb` and uses 7/5 EP banks
+    assert info["vmem_scratch_bytes"] == 60_669_952
+    assert info["vmem_scratch_bytes"] <= ex.resolved_tiles.vmem_mib * (1 << 20)
     assert "recb" not in info["vmem_shapes"]
     assert "sbuf" not in info["vmem_shapes"]
     assert "convb" not in info["vmem_shapes"]
@@ -370,3 +371,114 @@ def test_m1_bit_exact_vs_frozen_qwen35():
     assert jnp.array_equal(out_hid_lib, out_hid_f)
     assert jnp.array_equal(out_st_lib["kc"], out_st_f["kc"])
     assert jnp.array_equal(out_st_lib["vc"], out_st_f["vc"])
+
+
+def test_m1_m5_optimization_flags_parity():
+    """Verify CPU parity for M5 optimization flags."""
+    devs = jax.devices("cpu")
+    mesh1 = Mesh(devs[:1], ("tp",))
+
+    # 1. topk_lanes (TOPK=10, E=128), pair_kv, dense_acc_pair (U=2 with fetch_rel),
+    # and PIPE_EP + r2_direct_store (ebank=65536 -> tk_e13=128, T13=4; tk_e2=128, T2=2).
+    g = qwen35.Qwen35Geometry(
+        L=2,
+        att_every=1,
+        H=256,
+        NH=2,
+        NKV=1,
+        HD=128,
+        ROT=32,
+        KH=2,
+        VH=2,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=10,
+        I=256,
+        IS=256,
+        moe_tp=False,
+    )
+    # bank=32768 -> tk_att_in=128 (nt=2), tk_router=128 (nt=2), tk_sh13=128 (nt=2),
+    # tk_sh2=128 (nt=2), tk_att_out=128 (nt=2) => T_TOTAL = 2 * 10 = 20 > nbd=6,
+    # exercising dmatmul U=2 with dynamic streaming (fetch_rel).
+    # ebank=65536 -> tk_e13=128 (T13=4), tk_e2=128 (T2=2) => T13 == 2 * T2.
+    tiles_base = dataclasses.replace(
+        TINY_TILES,
+        bank=32 << 10,
+        nbd=6,
+        ebank=64 << 10,
+        nbe=6,
+        kv_blk=128,
+        nkv=3,
+        pipe=False,
+        r2_direct_store=False,
+        route_vec=False,
+        dense_acc_pair=False,
+        pair_kv=False,
+        topk_lanes=False,
+    )
+    ex_base = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=tiles_base, interpret=True)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.PRNGKey(501), g, ex_base
+    )
+    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_base, mesh=mesh1
+    )
+    step_base, info_base = qwen35.make_step(mesh1, g, ex_base)
+    assert info_base["T_TOTAL"] > tiles_base.nbd
+    out_hid_base, out_st_base = step_base(pos_mk, hid_mk, w_mk, st_mk)
+
+    # Check bit-exact parity for topk_lanes, pair_kv, and PIPE_EP + r2_direct_store
+    for flag_kw in (
+        {"topk_lanes": True},
+        {"pair_kv": True},
+        {"pipe": True, "r2_direct_store": True},
+    ):
+        tiles_opt = dataclasses.replace(tiles_base, **flag_kw)
+        ex_opt = dataclasses.replace(ex_base, tiles=tiles_opt)
+        step_opt, info_opt = qwen35.make_step(mesh1, g, ex_opt)
+        if flag_kw.get("pipe"):
+            assert info_opt["plan"].block_params["moe"].PIPE_EP
+        out_hid_opt, out_st_opt = step_opt(pos_mk, hid_mk, w_mk, st_mk)
+        assert jnp.array_equal(out_hid_opt, out_hid_base), flag_kw
+        assert jnp.array_equal(out_st_opt["kc"], out_st_base["kc"]), flag_kw
+        assert jnp.array_equal(out_st_opt["vc"], out_st_base["vc"]), flag_kw
+
+    # Check numerical parity for dense_acc_pair=True (U=2 paired accumulation)
+    tiles_dmm = dataclasses.replace(tiles_base, dense_acc_pair=True, dmm_unroll=2)
+    ex_dmm = dataclasses.replace(ex_base, tiles=tiles_dmm)
+    step_dmm, _ = qwen35.make_step(mesh1, g, ex_dmm)
+    out_hid_dmm, _ = step_dmm(pos_mk, hid_mk, w_mk, st_mk)
+    assert jnp.allclose(
+        out_hid_dmm[: ex_base.B].astype(F32),
+        out_hid_base[: ex_base.B].astype(F32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+    # 2. HIER == 3 butterfly all-reduce at R=2 and R=4
+    for R_test in (2, 4):
+        if len(devs) < R_test:
+            continue
+        mesh_r = Mesh(devs[:R_test], ("tp",))
+        g_r = dataclasses.replace(
+            g, L=1, NH=2 * R_test, KH=2 * R_test, VH=2 * R_test, TOPK=2
+        )
+        tiles_h0 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=0, split=False)
+        tiles_h3 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=3, split=False)
+        ex_h0 = ExecSpec(B=2, T=1, R=R_test, ctx=256, tiles=tiles_h0, interpret=True)
+        ex_h3 = ExecSpec(B=2, T=1, R=R_test, ctx=256, tiles=tiles_h3, interpret=True)
+        pos_r, hid_lr, w_lr, st_lr = qwen35.random_logical_inputs(
+            jax.random.PRNGKey(510 + R_test), g_r, ex_h0
+        )
+        pos_mkr, hid_mkr, w_mkr, st_mkr = qwen35.pack_inputs(
+            pos_r, hid_lr, w_lr, st_lr, g_r, ex_h0, mesh=mesh_r
+        )
+        step_h0, _ = qwen35.make_step(mesh_r, g_r, ex_h0)
+        step_h3, info_h3 = qwen35.make_step(mesh_r, g_r, ex_h3)
+        assert info_h3["plan"].HIER == 3
+        out_h0, _ = step_h0(pos_mkr, hid_mkr, w_mkr, st_mkr)
+        out_h3, _ = step_h3(pos_mkr, hid_mkr, w_mkr, st_mkr)
+        assert jnp.allclose(
+            out_h3.astype(F32), out_h0.astype(F32), atol=1e-2, rtol=1e-2
+        )

@@ -506,6 +506,8 @@ def test_long_context_128k_page_table_plan_and_interpret():
     cp_128k_paged, _ = mk.vmem.build_scratch(spec_full, ex_128k_paged)
 
     def _buf_bytes(cp_info, name: str) -> int:
+        if name not in cp_info.vmem_shapes:
+            return 0
         shape, dt = cp_info.vmem_shapes[name]
         return int(np.prod(shape)) * jnp.dtype(dt).itemsize
 
@@ -522,7 +524,8 @@ def test_long_context_128k_page_table_plan_and_interpret():
         == expected_direct_minus_paged
     )
     assert cp_128k_paged.smem_shapes["page_table"] == ((64, 1024), jnp.int32)
-    assert 256 * 1024 <= cp_128k_paged.smem_bytes < 350 * 1024
+    pt_bytes = 64 * 1024 * 4
+    assert pt_bytes <= cp_128k_paged.smem_bytes <= pt_bytes + 4096
 
     # SMEM budget check raises ValueError when page_table exceeds tiles.smem_mib (1 MiB)
     ex_smem_overflow = mk.ExecSpec(
@@ -1222,11 +1225,18 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     g_tp = _tiny_geom(L=4, att_every=4, moe_tp=True, e_slots=0)
 
     ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
-    ex_opt0 = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=0)
-    ex_po2c = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1)
-    ex_eplb_unstacked = _tiny_exec(
-        R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1, stack_e=False
+    ex_opt0_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=0)
+    ex_opt0 = replace(
+        ex_opt0_base, tiles=replace(ex_opt0_base.resolved_tiles, route_vec=False)
     )
+    ex_po2c_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1)
+    ex_po2c = replace(
+        ex_po2c_base, tiles=replace(ex_po2c_base.resolved_tiles, route_vec=False)
+    )
+    ex_vec = replace(
+        ex_po2c_base, tiles=replace(ex_po2c_base.resolved_tiles, route_vec=True)
+    )
+    ex_eplb_unstacked = replace(ex_vec, stack_e=False)
 
     key = jax.random.key(202 + T)
     k_hf, k_in = jax.random.split(key)
@@ -1349,11 +1359,12 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     out_ep = run_cfg(g_ep, ex_base, w_ep_l)
     out_eplb_opt0 = run_cfg(g_eplb, ex_opt0, w_eplb_l)
     out_eplb_opt1 = run_cfg(g_eplb, ex_po2c, w_eplb_l)
+    out_eplb_vec = run_cfg(g_eplb, ex_vec, w_eplb_l)
     out_eplb_unstacked = run_cfg(g_eplb, ex_eplb_unstacked, w_eplb_l)
     out_tp = run_cfg(g_tp, ex_base, w_tp_l)
 
     # Prove that replica routing actually occurred: corrupting redundant slots [64:68]
-    # changes the output of both load-balanced ecopy_opt=0 and deduplicated ecopy_opt=1.
+    # changes the output of ecopy_opt=0, ecopy_opt=1 (scalar), and route_vec=True (VEC).
     er = g_eplb.ER(ex_base.R)
     w_eplb_zero_rep = dict(
         w_eplb_l,
@@ -1362,7 +1373,11 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
         .at[:, :, er:]
         .set(jnp.zeros_like(w_eplb_l["e2_s"][:, :, er:])),
     )
-    for ex_opt, ref_opt_out in ((ex_opt0, out_eplb_opt0), (ex_po2c, out_eplb_opt1)):
+    for ex_opt, ref_opt_out in (
+        (ex_opt0, out_eplb_opt0),
+        (ex_po2c, out_eplb_opt1),
+        (ex_vec, out_eplb_vec),
+    ):
         out_eplb_zero_rep = run_cfg(g_eplb, ex_opt, w_eplb_zero_rep)
         assert not jnp.allclose(
             out_eplb_zero_rep.astype(jnp.float32),
@@ -1371,20 +1386,38 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
         )
 
     np.testing.assert_array_equal(
-        np.asarray(out_eplb_unstacked), np.asarray(out_eplb_opt1)
+        np.asarray(out_eplb_unstacked), np.asarray(out_eplb_vec)
     )
-    assert jnp.allclose(
-        out_eplb_opt0.astype(jnp.float32),
-        out_ep.astype(jnp.float32),
-        atol=1.6e-2,
-        rtol=1.6e-2,
-    )
-    assert jnp.allclose(
-        out_eplb_opt1.astype(jnp.float32),
-        out_ep.astype(jnp.float32),
-        atol=1.6e-2,
-        rtol=1.6e-2,
-    )
+    for out_cand in (out_eplb_opt0, out_eplb_opt1, out_eplb_vec):
+        assert jnp.allclose(
+            out_cand.astype(jnp.float32),
+            out_ep.astype(jnp.float32),
+            atol=1.6e-2,
+            rtol=1.6e-2,
+        )
+
+    if T == 1:
+        # Also test randomized routing across all experts (no router bias) comparing
+        # route_vec=True vs route_vec=False (ecopy_opt=0 and ecopy_opt=1)
+        hf_rand = qwen35.random_hf_weights(jax.random.key(299), g_ep)
+        hf_rand_unfused = {k: v for k, v in hf_rand.items() if k not in fused_keys}
+        w_eplb_rand = qwen35.split_hf_weights(hf_rand_unfused, g_eplb, ex_base)
+        out_rand_opt0 = run_cfg(g_eplb, ex_opt0, w_eplb_rand)
+        out_rand_opt1 = run_cfg(g_eplb, ex_po2c, w_eplb_rand)
+        out_rand_vec = run_cfg(g_eplb, ex_vec, w_eplb_rand)
+        assert jnp.allclose(
+            out_rand_vec.astype(jnp.float32),
+            out_rand_opt0.astype(jnp.float32),
+            atol=1.6e-2,
+            rtol=1.6e-2,
+        )
+        assert jnp.allclose(
+            out_rand_vec.astype(jnp.float32),
+            out_rand_opt1.astype(jnp.float32),
+            atol=1.6e-2,
+            rtol=1.6e-2,
+        )
+
     assert jnp.allclose(
         out_ep.astype(jnp.float32), ref_ep.astype(jnp.float32), atol=3e-2, rtol=3e-2
     )
@@ -1418,13 +1451,33 @@ def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
     """Bit-exact check vs canonical `c196d2500` frozen `pool_io` and `R=2` EPLB."""
     frozen_mk, frozen_pio = load_frozen_qwen35()
 
+    def _frozen_equiv_tiles(t_base, *, ecopy_opt: int = 0):
+        return replace(
+            t_base,
+            ecopy_opt=ecopy_opt,
+            pipe=False,
+            r2_direct_store=False,
+            route_vec=False,
+            dense_acc_pair=False,
+            kv_ering=False,
+            pair_kv=False,
+            dmm_unroll=0,
+            gq_pack=False,
+            topk_lanes=False,
+            conv_stage=False,
+        )
+
     # 1. Pooled step (`pool_io.make_pooled_step`) bit-exact comparison
     mesh1 = _cpu_mesh(1)
     tp1 = NamedSharding(mesh1, P("tp"))
 
     g_pool = replace(_tiny_geom(L=4, att_every=4, e_slots=0), NKV=1)
-    ex_pool = _tiny_exec(
+    ex_pool_base = _tiny_exec(
         R=1, B=B, T=T, ctx=256, paged_kv=True, num_pages=96, stack_e=False
+    )
+    ex_pool = replace(
+        ex_pool_base,
+        tiles=_frozen_equiv_tiles(ex_pool_base.resolved_tiles, ecopy_opt=0),
     )
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.key(303 + T), g_pool, ex_pool
@@ -1499,8 +1552,12 @@ def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
     mesh2 = _cpu_mesh(2)
     tp2 = NamedSharding(mesh2, P("tp"))
     g_eplb = _tiny_geom(L=4, att_every=4, moe_tp=False, e_slots=68)
-    ex_eplb = _tiny_exec(
+    ex_eplb_base = _tiny_exec(
         R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1, stack_e=False
+    )
+    ex_eplb = replace(
+        ex_eplb_base,
+        tiles=_frozen_equiv_tiles(ex_eplb_base.resolved_tiles, ecopy_opt=1),
     )
     pos_e, hid_le, w_le, st_le = qwen35.random_logical_inputs(
         jax.random.key(404 + T), g_eplb, ex_eplb
@@ -1859,3 +1916,356 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
     assert jnp.allclose(
         out_r0.astype(jnp.float32), ref_mixed.astype(jnp.float32), atol=2e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize(
+    "T,B",
+    [
+        (1, 2),
+        (2, 4),
+        (4, 8),
+        pytest.param(1, 56, marks=pytest.mark.slow),
+    ],
+)
+def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
+    """Verify 1-launch `fused_pool_io=True` is bit-exact vs split `PallasWriter`."""
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(
+        R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=512, stack_e=False
+    )
+    # Use conv_stage=False for bit-exact comparison against split gather/scatter,
+    # then test conv_stage=True separately below.
+    ex = replace(
+        ex_base,
+        tiles=replace(ex_base.resolved_tiles, conv_stage=False),
+        pool_gather=False,
+    )
+    spec = qwen35.qwen35_spec(g)
+
+    if (T, B) == (1, 2):
+        # Verify should_fuse_pool_io defaults to False, and auto bucket policy
+        for b_chk, exp_fused in (
+            (8, True),
+            (24, True),
+            (32, False),
+            (40, False),
+            (48, False),
+            (56, True),
+            (64, True),
+        ):
+            ex_b = replace(ex, B=b_chk)
+            assert mk.should_fuse_pool_io(spec, ex_b) is False
+            assert mk.should_fuse_pool_io(spec, ex_b, fused_pool_io="auto") is exp_fused
+            assert mk.should_fuse_pool_io(spec, ex_b, fused_pool_io=True) is True
+            assert mk.should_fuse_pool_io(spec, ex_b, fused_pool_io=False) is False
+
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(710 + T * 10 + B), g, ex
+    )
+    if T > 1:
+        # Exercise cross-page KV boundary (pos 127 -> page 0, pos 128 -> page 1)
+        pos_list = []
+        for s_i in range(ex.NS):
+            base_p = 126 if s_i == 0 else (20 + 10 * s_i)
+            pos_list.extend(base_p + t_i for t_i in range(T))
+        pos = jnp.asarray(pos_list, dtype=jnp.int32)
+    st_l = dict(
+        st_l,
+        conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
+    )
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    if T == 1:
+        # Exercise 2-column [read_slot, write_slot] ckpt_indices with roff=-1 on seq 1
+        ckpt = jnp.concatenate([ckpt, ckpt + ex.NS + 4], axis=-1)
+        roff = roff.at[:, 1].set(-1)
+
+    def _fresh_pools():
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(
+                g,
+                ex,
+                st_l,
+                pt,
+                ckpt[..., :T],
+                jnp.maximum(roff, 0),
+            )
+        )
+
+    step_split, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex, donate=False
+    )
+    step_fused, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+        mesh, spec, ex, donate=True
+    )
+
+    pools_s = _fresh_pools()
+    pools_f = _fresh_pools()
+    hlo_f = step_fused.lower(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff).as_text("hlo")
+    ok_f, msg_f = mk.check_pooled_step_hlo(
+        hlo_f, page_size=ex.page_size, kvh=1, hd=g.HD, fused_pool_io=True
+    )
+    assert ok_f, msg_f
+
+    out_s, raw_s = step_split(pos, hid_mk, w_mk, pools_s, pt, ckpt, roff)
+    out_f, raw_f = step_fused(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff)
+
+    np.testing.assert_array_equal(
+        np.asarray(out_f).view(np.uint8),
+        np.asarray(out_s).view(np.uint8),
+    )
+    for r_f, r_s in zip(raw_f, raw_s):
+        np.testing.assert_array_equal(
+            np.asarray(r_f).view(np.uint8),
+            np.asarray(r_s).view(np.uint8),
+        )
+
+    if (T, B) in ((1, 2), (2, 4)):
+        # Verify conv_stage=True (conv_fast VMEM staging) on CPU interpret
+        ex_cstage = replace(
+            ex, tiles=replace(ex.resolved_tiles, conv_stage=True), fused_pool_io=True
+        )
+        step_cstage, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+            mesh, spec, ex_cstage, donate=False
+        )
+        out_cs, raw_cs = step_cstage(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+        np.testing.assert_array_equal(
+            np.asarray(out_cs).view(np.uint8),
+            np.asarray(out_s).view(np.uint8),
+        )
+        for r_cs, r_s in zip(raw_cs, raw_s):
+            u_cs = np.asarray(r_cs).view(np.uint8).astype(np.int32)
+            u_s = np.asarray(r_s).view(np.uint8).astype(np.int32)
+            assert int(np.max(np.abs(u_cs - u_s))) <= 1
+
+    if (T, B) == (1, 2):
+        # Verify act_mode="ref" with explicit active_seqs mask [1, 0]
+        act_mask = jnp.asarray([1, 0], dtype=jnp.int32)
+        ex_ref = replace(ex, act_mode="ref")
+        step_s_ref, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+            mesh, spec, ex_ref, donate=False
+        )
+        step_f_ref, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+            mesh, spec, ex_ref, donate=False
+        )
+        out_sr, raw_sr = step_s_ref(
+            pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff, act_mask
+        )
+        out_fr, raw_fr = step_f_ref(
+            pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff, act_mask
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_fr).view(np.uint8),
+            np.asarray(out_sr).view(np.uint8),
+        )
+        for r_fr, r_sr in zip(raw_fr, raw_sr):
+            np.testing.assert_array_equal(
+                np.asarray(r_fr).view(np.uint8),
+                np.asarray(r_sr).view(np.uint8),
+            )
+
+        # Also trace non-interpret TPU path for fused_pool_io=True
+        ex_tpu = replace(ex, interpret=False, fused_pool_io=True, ckpt_k=2)
+        step_tpu, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+            mesh, spec, ex_tpu, donate=True
+        )
+        jaxpr_tpu = jax.make_jaxpr(
+            lambda p, h, w, r, pt_i, ck_i, ro_i: step_tpu(p, h, w, r, pt_i, ck_i, ro_i)
+        )(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+        jaxpr_str = str(jaxpr_tpu)
+        assert "decode_megakernel" in jaxpr_str
+        assert "gather_gdn_states" not in jaxpr_str
+        assert "scatter_pool_states" not in jaxpr_str
+
+
+def test_pool_gather_verify_wide_cpu_interpret():
+    """Verify `pool_gather` (`GPR`), `KVE`, and `GQ` against split 3-stage reference."""
+    R, B, T = 2, 24, 4
+    mesh = _cpu_mesh(R)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    ex_gpr = replace(
+        _tiny_exec(R=R, B=B, T=T, ctx=256, paged_kv=True, num_pages=512),
+        pool_gather=True,
+    )
+    ex_split = replace(ex_gpr, pool_gather=False)
+    spec = qwen35.qwen35_spec(g)
+    step_gpr, info_gpr = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex_gpr, donate=False
+    )
+    step_split, info_split = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex_split, donate=False
+    )
+    assert info_gpr["plan"].block_params["gdn"].GPR is True
+    assert info_split["plan"].block_params["gdn"].GPR is False
+    # KVE is enabled in CPU interpret mode when kv_ering=True
+    assert info_gpr["plan"].block_params["gqa"].KVE is True
+    assert "kvbuf" not in info_gpr["vmem_shapes"]
+    assert info_gpr["plan"].s_names == (
+        "ckpt_indices",
+        "read_offsets",
+        "raw",
+        "page_table",
+    )
+    assert info_gpr["plan"].o_names == (
+        "hidden",
+        "conv_ckpt",
+        "rec_ckpt",
+        "knew",
+        "vnew",
+    )
+    assert info_gpr["oshape"]["conv_ckpt"][1] == jnp.bfloat16
+    assert info_gpr["oshape"]["knew"][1] == jnp.float8_e4m3fn
+    assert info_gpr["oshape"]["vnew"][1] == jnp.float8_e4m3fn
+
+    # Trace non-interpret TPU path for GPR (megakernel + scatter, no separate gather)
+    ex_tpu = replace(ex_gpr, interpret=False)
+    step_gpr_tpu, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex_tpu, donate=True
+    )
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(824), g, ex_gpr)
+    st_l = dict(
+        st_l,
+        conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32),
+    )
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_gpr, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex_gpr)
+
+    def _fresh_pools(roff_init=roff):
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(
+                g, ex_gpr, st_l, pt, ckpt, jnp.maximum(roff_init, 0)
+            )
+        )
+
+    pools = _fresh_pools()
+    jaxpr_gpr = str(
+        jax.make_jaxpr(
+            lambda p, h, w, r, pt_i, ck_i, ro_i: step_gpr_tpu(
+                p, h, w, r, pt_i, ck_i, ro_i
+            )
+        )(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
+    )
+    assert "decode_megakernel" in jaxpr_gpr
+    assert "gather_gdn_states" not in jaxpr_gpr
+    assert "scatter_pool_states" in jaxpr_gpr
+
+    out_gpr, raw_gpr = step_gpr(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    out_split, raw_split = step_split(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    np.testing.assert_array_equal(
+        np.asarray(out_gpr).view(np.uint8),
+        np.asarray(out_split).view(np.uint8),
+    )
+    for r_g, r_s in zip(raw_gpr, raw_split):
+        np.testing.assert_array_equal(
+            np.asarray(r_g).view(np.uint8),
+            np.asarray(r_s).view(np.uint8),
+        )
+
+    # Verify GPR cold-start (read_offsets = -1 on sequence 0 with 0x7F NaN-corrupted
+    # initial pool pages for sequence 0) matches split 3-stage bit-for-bit.
+    roff_cold = roff.at[:, 0].set(-1)
+    pools_cold_gpr = []
+    pools_cold_split = []
+    for r_arr in _fresh_pools():
+        p_np = (
+            np.asarray(r_arr)
+            .reshape(R, ex_gpr.num_pages, 2, 64, 4, ex_gpr.page_size)
+            .copy()
+        )
+        for sub in range(g.att_every - 1):
+            s0_slot = int(ckpt[sub, 0, 0])
+            p_np[:, s0_slot * 5 : (s0_slot + 1) * 5].view(np.uint8)[:] = 0x7F
+        corrupted = p_np.reshape(R * ex_gpr.num_pages, 2, 64, 4, ex_gpr.page_size)
+        pools_cold_gpr.append(jax.device_put(corrupted.copy(), tp))
+        pools_cold_split.append(jax.device_put(corrupted.copy(), tp))
+    out_gpr_cold, raw_gpr_cold = step_gpr(
+        pos, hid_mk, w_mk, tuple(pools_cold_gpr), pt, ckpt, roff_cold
+    )
+    out_split_cold, raw_split_cold = step_split(
+        pos, hid_mk, w_mk, tuple(pools_cold_split), pt, ckpt, roff_cold
+    )
+    assert jnp.all(jnp.isfinite(out_gpr_cold))
+    np.testing.assert_array_equal(
+        np.asarray(out_gpr_cold).view(np.uint8),
+        np.asarray(out_split_cold).view(np.uint8),
+    )
+    for r_g, r_s in zip(raw_gpr_cold, raw_split_cold):
+        np.testing.assert_array_equal(
+            np.asarray(r_g).view(np.uint8),
+            np.asarray(r_s).view(np.uint8),
+        )
+
+    # Verify KVE (kv_ering=True vs False) and GQ (gq_pack=True vs False)
+    # on R=4, NKV=2, NH=8, T=4, B=8 (G=2, nh=2, G*nh=4 <= 8 -> GQ=True)
+    mesh4 = _cpu_mesh(4)
+    g_gq = replace(_tiny_geom(L=4, att_every=4, NKV=2), NH=8, KH=4, VH=8)
+    ex_gq_on = _tiny_exec(
+        R=4, B=8, T=4, ctx=256, paged_kv=True, num_pages=256, stack_e=False
+    )
+    ex_gq_on = replace(
+        ex_gq_on,
+        tiles=replace(
+            ex_gq_on.resolved_tiles,
+            gq_pack=True,
+            kv_ering=True,
+            split=True,
+            rsag=True,
+        ),
+        pool_gather=False,
+    )
+    ex_gq_off = replace(
+        ex_gq_on,
+        tiles=replace(ex_gq_on.resolved_tiles, gq_pack=False, kv_ering=False),
+    )
+    spec_gq = qwen35.qwen35_spec(g_gq)
+    step_gq_on, info_gq_on = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh4, spec_gq, ex_gq_on, donate=False
+    )
+    step_gq_off, info_gq_off = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh4, spec_gq, ex_gq_off, donate=False
+    )
+    assert info_gq_on["plan"].block_params["gqa"].GQ is True
+    assert info_gq_on["plan"].block_params["gqa"].KVE is True
+    assert info_gq_off["plan"].block_params["gqa"].GQ is False
+    assert info_gq_off["plan"].block_params["gqa"].KVE is False
+
+    pos4, hid_l4, w_l4, st_l4 = qwen35.random_logical_inputs(
+        jax.random.key(844), g_gq, ex_gq_on
+    )
+    _, hid_mk4, w_mk4, _ = qwen35.pack_inputs(
+        pos4, hid_l4, w_l4, st_l4, g_gq, ex_gq_on, mesh=mesh4, build_default_pool=True
+    )
+    pt4, ckpt4, roff4, _ = mk.default_pool_layout(g_gq, ex_gq_on)
+    tp4 = NamedSharding(mesh4, P("tp"))
+    pools4_on = tuple(
+        jax.device_put(np.asarray(r).copy(), tp4)
+        for r in mk.states_to_pool(g_gq, ex_gq_on, st_l4, pt4, ckpt4, roff4)
+    )
+    pools4_off = tuple(
+        jax.device_put(np.asarray(r).copy(), tp4)
+        for r in mk.states_to_pool(g_gq, ex_gq_on, st_l4, pt4, ckpt4, roff4)
+    )
+    out_gq_on, raw_gq_on = step_gq_on(
+        pos4, hid_mk4, w_mk4, pools4_on, pt4, ckpt4, roff4
+    )
+    out_gq_off, raw_gq_off = step_gq_off(
+        pos4, hid_mk4, w_mk4, pools4_off, pt4, ckpt4, roff4
+    )
+    np.testing.assert_array_equal(
+        np.asarray(out_gq_on).view(np.uint8),
+        np.asarray(out_gq_off).view(np.uint8),
+    )
+    for r_on, r_off in zip(raw_gq_on, raw_gq_off):
+        np.testing.assert_array_equal(
+            np.asarray(r_on).view(np.uint8),
+            np.asarray(r_off).view(np.uint8),
+        )

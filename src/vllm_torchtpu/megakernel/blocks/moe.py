@@ -41,6 +41,67 @@ from ..spec import (
     WeightDecl,
 )
 
+NT = (((1,), (1,)), ((), ()))
+TOPK_NL = 16
+
+
+def _batcher_net(n: int) -> list[tuple[int, int]]:
+    """Batcher odd-even mergesort comparators `(i, j)` (`i < j`, `i` takes max)."""
+    out: list[tuple[int, int]] = []
+    p = 1
+    while p < n:
+        k = p
+        while k >= 1:
+            for j in range(k % p, n - k, 2 * k):
+                for i in range(min(k, n - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        out.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return out
+
+
+def topk_rows_on_lanes(
+    key, topk: int, em: int, need_ids: bool = True, nl: int = TOPK_NL
+):
+    """Exact top-k of distinct f32 keys `[MR, E]` (`MR <= 128`)."""
+    mr, e = key.shape
+    kp = (
+        key
+        if mr == 128
+        else jnp.concatenate([key, jnp.zeros((128 - mr, e), F32)], axis=0)
+    )
+    kt = kp.T  # [E, 128]
+    sl = 128 // nl
+    lev = [
+        jnp.concatenate(
+            [kt[bk * 128 + i * sl : bk * 128 + (i + 1) * sl] for bk in range(e // 128)],
+            axis=0,
+        )
+        for i in range(nl)
+    ]
+    for i, j in _batcher_net(nl):
+        lev[i], lev[j] = jnp.maximum(lev[i], lev[j]), jnp.minimum(lev[i], lev[j])
+    ks = []
+    for k in range(topk):
+        m = jnp.max(lev[0], axis=0, keepdims=True)
+        ks.append(m)
+        nup = min(nl, topk - 1 - k)
+        if nup == 0:
+            break
+        hit = lev[0] == m
+        for j in range(nup):
+            lev[j] = jnp.where(hit, lev[j + 1] if j + 1 < nl else -1.0, lev[j])
+    thr = jnp.broadcast_to(ks[topk - 1], (128, 128)).T[0:mr, :]
+    sel = key >= jnp.concatenate([thr] * (e // 128), axis=1)
+    ids = None
+    if need_ids:
+        rows = jnp.concatenate(ks + [jnp.zeros((128 - topk, 128), F32)], axis=0)
+        kk = rows.T[0:mr, :]
+        lane = lax.broadcasted_iota(I32, (mr, 128), 1)
+        ids = jnp.where(lane < topk, em - (lax.bitcast_convert_type(kk, I32) & em), 0)
+    return ids, sel
+
 
 @dataclass(frozen=True)
 class MoEParams:
@@ -61,12 +122,16 @@ class MoEParams:
     NBE: int
     NSS: int
     PIPE: bool
+    PIPE_EP: bool
     LAZY_MOE: bool
     N_MOE: int
     ECOPY: bool
     moe_tp: bool
     stack_e: bool
     topk_packed: bool
+    topk_lanes: bool
+    route_vec: bool
+    r2_direct_store: bool
     ecopy_opt: int
     eps: float
     zero_centered_norm: bool
@@ -139,7 +204,7 @@ class MoEBlock(Block):
         }
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> MoEParams:
-        tiles = ex.resolved_tiles
+        tiles = ex.resolve_tiles(g)
         er = g.E // ex.R
         isr = g.IS // ex.R
         ir = g.I // ex.R if g.moe_tp else g.I
@@ -152,6 +217,9 @@ class MoEBlock(Block):
         nbe = tiles.nbe
         nss = 3 + (nbe - 1) // te
         pipe = tiles.pipe and t13 == 1 and t2 == 1
+        pipe_ep = (
+            tiles.pipe and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
+        )
         n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
         lazy_moe = tiles.lazy and n_moe <= tiles.nbd
         ecopy = not g.moe_tp and g.e_slots > er
@@ -172,12 +240,16 @@ class MoEBlock(Block):
             NBE=nbe,
             NSS=nss,
             PIPE=pipe,
+            PIPE_EP=pipe_ep,
             LAZY_MOE=lazy_moe,
             N_MOE=n_moe,
             ECOPY=ecopy,
             moe_tp=g.moe_tp,
             stack_e=ex.stack_e,
             topk_packed=tiles.topk,
+            topk_lanes=tiles.topk_lanes,
+            route_vec=tiles.route_vec,
+            r2_direct_store=tiles.r2_direct_store,
             ecopy_opt=tiles.ecopy_opt,
             eps=g.eps,
             zero_centered_norm=bool(g.zero_centered_norm),
@@ -198,6 +270,8 @@ class MoEBlock(Block):
             "es_sem": pltpu.SemaphoreType.DMA((mp.NSS,)),
             "st": pltpu.SMEM((1,), I32),
         }
+        if mp.PIPE_EP:
+            scr["acc13"] = pltpu.VMEM((ex.MB, 2 * mp.IR), F32)
         if mp.ECOPY:
             scr.update(
                 {
@@ -284,7 +358,12 @@ class MoEBlock(Block):
             mp.CH,
         )
         NSS, T13, T2, TE, NBE = mp.NSS, mp.T13, mp.T2, mp.TE, mp.NBE
-        PIPE, LAZY_MOE, ECOPY = mp.PIPE, mp.LAZY_MOE, mp.ECOPY
+        PIPE, PIPE_EP, LAZY_MOE, ECOPY = (
+            mp.PIPE,
+            mp.PIPE_EP,
+            mp.LAZY_MOE,
+            mp.ECOPY,
+        )
         lane_e8 = lax.broadcasted_iota(I32, (MR, E), 1)
         lane128 = lax.broadcasted_iota(I32, (MR, 128), 1)
         row8 = lax.broadcasted_iota(I32, (MR, 1), 0)
@@ -362,11 +441,107 @@ class MoEBlock(Block):
 
         def egive(u, l_idx, t=None):
             nu = u + NBE
-            nt_ = None if t is None or NBE % TE else t
+            nt_ = None if t is None else (t + NBE) % TE
 
             @pl.when(nu < scr["st"][0])
             def _():
                 fetch_e(nu, l_idx, nt_)
+
+        def _unit_meta(u, t):
+            if t is None and isinstance(u, int):
+                t = u % TE
+            dyn = not isinstance(u, int)
+            if t is None:
+                i = lax.div(u, jnp.int32(TE)) if dyn else u // TE
+            else:
+                i = lax.div(u - t, jnp.int32(TE)) if dyn else (u - t) // TE
+            lst = scr["wlist"] if ECOPY else scr["elist"]
+            n_l = lst.shape[0]
+            ic = i if isinstance(i, int) else jnp.minimum(i, n_l - 1)
+            if ECOPY:
+                w = lst[ic]
+            else:
+                e = lst[ic]
+                w = e if mp.moe_tp else e - me * ER
+            td = None if t is not None else u - i * TE
+            bank = lax.rem(u, jnp.int32(NBE)) if dyn else u % NBE
+            return i, w, bank, t, td
+
+        def _es_start(i, w, l_idx):
+            s = lax.rem(i, jnp.int32(NSS)) if not isinstance(i, int) else i % NSS
+            pltpu.make_async_copy(
+                W["es"].at[l_idx, w], scr["es"].at[s], scr["es_sem"].at[s]
+            ).start()
+
+        def _arm_issue(r13, r2, w, bank, t, td, gate):
+            def g(p):
+                return p if gate is None else jnp.logical_and(gate, p)
+
+            if t is not None:
+
+                def go():
+                    if t < T13:
+                        stream.ecopy("e13", r13.at[w, t], bank).start()
+                    else:
+                        stream.ecopy("e2", r2.at[w, t - T13], bank).start()
+
+                if gate is None:
+                    go()
+                else:
+                    pl.when(gate)(go)
+                return
+
+            @pl.when(g(td < T13))
+            def _():
+                stream.ecopy("e13", r13.at[w, td], bank).start()
+
+            @pl.when(g(td >= T13))
+            def _():
+                stream.ecopy("e2", r2.at[w, td - T13], bank).start()
+
+        def egive_group(items, l_idx):
+            if mp.stack_e:
+                for u, t in items:
+                    egive(u, l_idx, t)
+                return
+            st = scr["st"][0]
+            metas = []
+            for u, t in items:
+                nu = u + NBE
+                nt_ = None if t is None else (t + NBE) % TE
+                metas.append(_unit_meta(nu, nt_) + (nu < st,))
+
+            def arm(r13, r2):
+                for _, w, bank, t, td, gate in metas:
+                    _arm_issue(r13, r2, w, bank, t, td, gate)
+
+            bswitch(
+                l_idx,
+                [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
+            )
+            for i, w, _, t, td, gate in metas:
+                if t is not None:
+                    if t == 0:
+                        pl.when(gate)(lambda i=i, w=w: _es_start(i, w, l_idx))
+                else:
+                    pl.when(jnp.logical_and(gate, td == 0))(
+                        lambda i=i, w=w: _es_start(i, w, l_idx)
+                    )
+
+        def fetch_loop(nf, l_idx):
+            def arm(r13, r2):
+                def body(k, carry):
+                    i, w, _, t, td = _unit_meta(k, None)
+                    _arm_issue(r13, r2, w, k, t, td, None)
+                    pl.when(td == 0)(lambda: _es_start(i, w, l_idx))
+                    return carry
+
+                lax.fori_loop(0, nf, body, 0)
+
+            bswitch(
+                l_idx,
+                [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])],
+            )
 
         def es_wait(i):
             s = i % NSS
@@ -395,21 +570,29 @@ class MoEBlock(Block):
             s = i % NSS
             base = i * TE
             acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
+            DIRECT0 = mp.r2_direct_store
             if T13 == 1:
                 h = stream.mm(xb[...], etake("e13", base)[...])
                 egive(base, l_idx)
             else:
-                acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
-
-                def b13(t, cc):
+                TK13 = tk["e13"]
+                if not DIRECT0:
+                    acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
+                for t in range(T13):
                     u = base + t
                     w = etake("e13", u)
-                    k0 = pl.multiple_of(t * tk["e13"], tk["e13"])
-                    acc[:, : 2 * IR] += stream.mm(xb[:, pl.ds(k0, tk["e13"])], w[...])
-                    egive(u, l_idx)
-                    return cc
-
-                lax.fori_loop(0, T13, b13, 0)
+                    m13 = stream.mm(xb[:, t * TK13 : (t + 1) * TK13], w[...])
+                    if DIRECT0 and t == 0:
+                        acc[:, : 2 * IR] = m13
+                    else:
+                        acc[:, : 2 * IR] += m13
+                    if B <= 40:
+                        if t % 2 == 1:
+                            egive_group([(u - 1, t - 1), (u, t)], l_idx)
+                        elif t == T13 - 1:
+                            egive(u, l_idx, t)
+                    else:
+                        egive(u, l_idx, t)
                 h = acc[:, : 2 * IR]
             es_wait(i)
             h = h * scr["es"][s, :, : 2 * IR]
@@ -429,17 +612,24 @@ class MoEBlock(Block):
                     part[0:MR, j * CH : (j + 1) * CH] += wcol * y
                 egive(u2, l_idx)
             else:
-                acc[:, :H] = jnp.zeros((MB, H), F32)
-
-                def b2(t, cc):
+                TK2 = tk["e2"]
+                if not DIRECT0:
+                    acc[:, :H] = jnp.zeros((MB, H), F32)
+                for t in range(T2):
                     u = u2 + t
                     w = etake("e2", u)
-                    k0 = pl.multiple_of(t * tk["e2"], tk["e2"])
-                    acc[:, :H] += stream.mm(xb2[:, pl.ds(k0, tk["e2"])], w[...])
-                    egive(u, l_idx)
-                    return cc
-
-                lax.fori_loop(0, T2, b2, 0)
+                    m2 = stream.mm(xb2[:, t * TK2 : (t + 1) * TK2], w[...])
+                    if DIRECT0 and t == 0:
+                        acc[:, :H] = m2
+                    else:
+                        acc[:, :H] += m2
+                    if B <= 40:
+                        if t % 2 == 1:
+                            egive_group([(u - 1, T13 + t - 1), (u, T13 + t)], l_idx)
+                        elif t == T2 - 1:
+                            egive(u, l_idx, T13 + t)
+                    else:
+                        egive(u, l_idx, T13 + t)
                 y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
                 part[0:MR, :] += wcol * y
             return carry
@@ -473,6 +663,131 @@ class MoEBlock(Block):
                 down(last, xb2[:, :IR], etake("e2", u2)[...])
                 egive(u2, l_idx, T13)
 
+        def experts_piped_ep(l_idx, n_hit):
+            @pl.when(n_hit > 0)
+            def _():
+                acc, acc13 = scr["acc"], scr["acc13"]
+                xb, xb2, part = scr["xb"], scr["xb2"], scr["part"]
+                BN = 2 * IR
+                TK13, TK2 = tk["e13"], tk["e2"]
+                DIRECT0 = mp.r2_direct_store
+
+                if not DIRECT0:
+                    acc13[...] = jnp.zeros((MB, BN), F32)
+                for t in range(T13):
+                    w13 = etake("e13", t)
+                    k0 = t * TK13
+                    mm13 = stream.mm(xb[:, k0 : k0 + TK13], w13[...])
+                    if DIRECT0 and t == 0:
+                        acc13[:, :BN] = mm13
+                    else:
+                        acc13[:, :BN] += mm13
+                    if B <= 40:
+                        if t % 2 == 1:
+                            egive_group([(t - 1, t - 1), (t, t)], l_idx)
+                        elif t == T13 - 1:
+                            egive(t, l_idx, t)
+                    else:
+                        egive(t, l_idx, t)
+                es_wait(0)
+                h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+                mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+                xb2[:, :IR] = mid0.astype(BF16)
+
+                def body_ep(i, _):
+                    e = scr["elist"][i]
+                    s_cur = i % NSS
+                    s_nxt = (i + 1) % NSS
+                    base_w2 = i * TE + T13
+                    base_nxt13 = (i + 1) * TE
+
+                    if not DIRECT0:
+                        acc[:, :H] = jnp.zeros((MB, H), F32)
+                        acc13[...] = jnp.zeros((MB, BN), F32)
+
+                    for s_step in range(T2):
+                        u2 = base_w2 + s_step
+                        t0 = 2 * s_step
+                        t1 = 2 * s_step + 1
+                        u13_0 = base_nxt13 + t0
+                        u13_1 = base_nxt13 + t1
+
+                        w2 = etake("e2", u2)
+                        w13_0 = etake("e13", u13_0)
+                        k2 = s_step * TK2
+                        k13_0 = t0 * TK13
+                        mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
+                        mm13_0 = stream.mm(xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                        if DIRECT0 and s_step == 0:
+                            acc[:, :H] = mm2
+                            acc13[:, :BN] = mm13_0
+                        else:
+                            acc[:, :H] += mm2
+                            acc13[:, :BN] += mm13_0
+                        if B <= 40:
+                            egive_group([(u2, T13 + s_step), (u13_0, t0)], l_idx)
+                        else:
+                            egive(u2, l_idx, T13 + s_step)
+                            egive(u13_0, l_idx, t0)
+
+                        w13_1 = etake("e13", u13_1)
+                        k13_1 = t1 * TK13
+                        acc13[:, :BN] += stream.mm(
+                            xb[:, k13_1 : k13_1 + TK13], w13_1[...]
+                        )
+                        egive(u13_1, l_idx, t1)
+
+                    wcol = jnp.sum(
+                        jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
+                        axis=1,
+                        keepdims=True,
+                    )
+                    y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                    part[0:MR, :] += wcol * y
+
+                    es_wait(i + 1)
+                    h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+                    mid_nxt = rnd(
+                        rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:])
+                    )
+                    xb2[:, :IR] = mid_nxt.astype(BF16)
+                    return 0
+
+                lax.fori_loop(0, n_hit - 1, body_ep, 0)
+
+                i_last = n_hit - 1
+                e_last = scr["elist"][i_last]
+                s_last = i_last % NSS
+                base_last_w2 = i_last * TE + T13
+                if not DIRECT0:
+                    acc[:, :H] = jnp.zeros((MB, H), F32)
+                for s_step in range(T2):
+                    u2 = base_last_w2 + s_step
+                    w2 = etake("e2", u2)
+                    k2 = s_step * TK2
+                    mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
+                    if DIRECT0 and s_step == 0:
+                        acc[:, :H] = mm2
+                    else:
+                        acc[:, :H] += mm2
+                    if B <= 40:
+                        if s_step % 2 == 1:
+                            egive_group(
+                                [(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)],
+                                l_idx,
+                            )
+                        elif s_step == T2 - 1:
+                            egive(u2, l_idx, T13 + s_step)
+                    else:
+                        egive(u2, l_idx, T13 + s_step)
+                wcol_last = jnp.sum(
+                    jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0),
+                    axis=1,
+                    keepdims=True,
+                )
+                y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+                part[0:MR, :] += wcol_last * y_last
+
         def route(l_idx, p8):
             choice = p8
             if ex.forced_routing:
@@ -490,17 +805,42 @@ class MoEBlock(Block):
                     ).start()
 
                 choice = scr["rb"][rs, 0:MR, :]
+            # Note on ordering: when `VEC` (`route_vec=True`) is active,
+            # `elist`/`wlist` are populated in ascending local slot order
+            # (`0..ER-1`) and `cplist` is populated in ascending replica-slot
+            # order (`0..NCP-1`). When `VEC` is False (`ecopy_opt` 0 or 1),
+            # both lists are populated in token/pick first-appearance order
+            # (`b=0..B-1, k=0..TOPK-1`). Because Po2C is greedy and expert
+            # partial sums accumulate into `part` in `elist` order, `route_vec`
+            # is a distinct routing/Po2C policy (`frozen_parity_tiles` sets
+            # `route_vec=False` to preserve first-appearance order).
+            nb_picks = scr["elist"].shape[0]
+            VEC = (
+                mp.route_vec
+                and ECOPY
+                and E % 128 == 0
+                and E // 128 + 1 <= MR
+                and R * EXTRA + R + 1 <= 128
+                and nb_picks >= ER
+            )
+            slot_ec = l_idx % 2
             with sc("route_topk", 2):
                 ids = jnp.zeros((MR, 128), I32)
                 if mp.topk_packed:
                     kb = lax.bitcast_convert_type(jnp.maximum(choice, FLT_MIN), I32)
                     key = lax.bitcast_convert_type((kb & ~EM) | (EM - lane_e8), F32)
-                    for k in range(TOPK):
-                        kmax = jnp.max(key, axis=-1, keepdims=True)
-                        am_ = EM - (lax.bitcast_convert_type(kmax, I32) & EM)
-                        ids = jnp.where(lane128 == k, am_, ids)
-                        key = jnp.where(key == kmax, -1.0, key)
-                    sel = key < 0.0
+                    if mp.topk_lanes and E % 128 == 0 and MR <= 128 and TOPK <= 128:
+                        ids_l, sel = topk_rows_on_lanes(key, TOPK, EM, need_ids=not VEC)
+                        if not VEC:
+                            ids = ids_l
+                    else:
+                        for k in range(TOPK):
+                            kmax = jnp.max(key, axis=-1, keepdims=True)
+                            if not VEC:
+                                am_ = EM - (lax.bitcast_convert_type(kmax, I32) & EM)
+                                ids = jnp.where(lane128 == k, am_, ids)
+                            key = jnp.where(key == kmax, -1.0, key)
+                        sel = key < 0.0
                 else:
                     sel = jnp.zeros((MR, E), jnp.bool_)
                     for k in range(TOPK):
@@ -514,7 +854,51 @@ class MoEBlock(Block):
                         hit = lane_e8 == am_
                         sel = jnp.logical_or(sel, hit)
                         choice = jnp.where(hit, -jnp.inf, choice)
-                scr["hitv"][...] = ids
+                NCP = R * EXTRA
+                MROW = E // 128
+                if VEC:
+                    hitf = jnp.max(
+                        jnp.where(jnp.logical_and(sel, row8 < B), 1, 0).astype(I32),
+                        axis=0,
+                        keepdims=True,
+                    )
+                    cpi = ctx.sm(slot_ec, "ecopy").astype(I32)
+                    fixed = jnp.where(cpi > 0, 0, hitf)
+                    for j in range(MROW):
+                        scr["hitv"][j : j + 1, :] = fixed[:, j * 128 : (j + 1) * 128]
+                    lane_1e = lax.broadcasted_iota(I32, (1, E), 1)
+                    v1 = (lane_1e + 1) * hitf
+                    row_a = lax.broadcasted_iota(I32, (16, E), 0)
+                    a = jnp.where(
+                        row_a == 0,
+                        lax.shift_right_logical(v1, 5),
+                        jnp.where(
+                            row_a == 1,
+                            lax.bitwise_and(v1, 31),
+                            jnp.where(row_a == 2, hitf, 0),
+                        ),
+                    )
+                    a = a.astype(F32).astype(BF16)
+                    row_b = lax.broadcasted_iota(I32, (128, E), 0)
+                    lane_b = lax.broadcasted_iota(I32, (128, E), 1)
+                    rr = row_b - NCP
+                    in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
+                    bm = jnp.where(
+                        row_b < NCP,
+                        jnp.where(cpi == row_b + 1, 1.0, 0.0),
+                        jnp.where(
+                            rr < R,
+                            jnp.where(in_rank, 1.0, 0.0),
+                            jnp.where(rr == R, 1.0, 0.0),
+                        ),
+                    )
+                    bm = bm.astype(BF16)
+                    res = stream.mm(a, bm, NT)
+                    lane_r = lax.broadcasted_iota(I32, (1, 128), 1)
+                    meta = jnp.where(lane_r < NCP, res[0:1] * 32.0 + res[1:2], res[2:3])
+                    scr["hitv"][MROW : MROW + 1, :] = meta.astype(I32)
+                else:
+                    scr["hitv"][...] = ids
                 wsel = jnp.where(sel, p8, 0.0)
                 scr["wn"][...] = jnp.where(
                     row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
@@ -524,12 +908,43 @@ class MoEBlock(Block):
                 cp.start()
                 cp.wait()
             stamp = l_idx + 1
-            slot_ec = l_idx % 2
-            if ECOPY:
-                for r in range(R):
-                    scr["rload"][r] = jnp.int32(0)
+            n_tot: Any = jnp.int32(0)
+            n_hit: Any = jnp.int32(0)
+            n_cp: Any = jnp.int32(0)
+            if VEC:
+                with sc("route_dedup", 2):
+                    for r in range(R):
+                        scr["rload"][r] = scr["hits"][MROW, NCP + r]
+                    n_tot = scr["hits"][MROW, NCP + R]
+                    base = me * ER
 
-                if mp.ecopy_opt == 1:
+                    def prim(s, n):
+                        e = base + s
+                        f = scr["hits"][
+                            lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
+                        ]
+                        idx = jnp.minimum(n, nb_picks - 1)
+                        scr["elist"][idx] = e
+                        scr["wlist"][idx] = s
+                        return n + f
+
+                    n_hit = lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
+
+                    def cpl(j, n):
+                        v1 = scr["hits"][MROW, j]
+                        idx = jnp.minimum(n, nb_picks - 1)
+                        scr["cplist"][idx] = v1 - 1
+                        return n + jnp.where(v1 > 0, 1, 0).astype(I32)
+
+                    n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
+            if ECOPY:
+                if not VEC:
+                    for r in range(R):
+                        scr["rload"][r] = jnp.int32(0)
+
+                if VEC:
+                    pass
+                elif mp.ecopy_opt == 1:
 
                     def pick_uniq(b, k, n_tot):
                         e = scr["hits"][b, k]
@@ -733,12 +1148,15 @@ class MoEBlock(Block):
                         def _(k=k):
                             fetch_e(k, l_idx)
                 else:
-                    lax.fori_loop(
-                        0,
-                        jnp.minimum(NBE, n_hit * TE),
-                        lambda k, _: (fetch_e(k, l_idx), 0)[1],
-                        0,
-                    )
+                    if B <= 40:
+                        fetch_loop(jnp.minimum(NBE, n_hit * TE), l_idx)
+                    else:
+                        lax.fori_loop(
+                            0,
+                            jnp.minimum(NBE, n_hit * TE),
+                            lambda k, _: (fetch_e(k, l_idx), 0)[1],
+                            0,
+                        )
             return n_hit
 
         with stream.segment(lazy=LAZY_MOE):
@@ -764,6 +1182,8 @@ class MoEBlock(Block):
             with sc("moe_experts"):
                 if PIPE:
                     experts_piped(l, n_hit)
+                elif PIPE_EP:
+                    experts_piped_ep(l, n_hit)
                 else:
                     lax.fori_loop(0, n_hit, functools.partial(expert, l), 0)
         return scr["part"][...]

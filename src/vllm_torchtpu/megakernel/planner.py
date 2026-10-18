@@ -166,7 +166,7 @@ def _discover_schedule(
 def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata."""
     g = model_spec.config
-    tiles = ex.resolved_tiles
+    tiles = ex.resolve_tiles(g)
     (
         period,
         branch_counts,
@@ -244,7 +244,12 @@ def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
             )
 
         for st in b.states(g, ex):
-            assert st.name not in state_decls, f"Duplicate state declaration: {st.name}"
+            if st.name in state_decls:
+                prev = state_decls[st.name]
+                assert st == prev and not st.per_layer and st.access == "r", (
+                    f"Duplicate state declaration {st.name!r}: {st} vs {prev}"
+                )
+                continue
             state_decls[st.name] = st
             state_owners[st.name] = b.name
 

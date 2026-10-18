@@ -64,6 +64,7 @@ class KernelContext:
     skip: frozenset[str]
     sc: Any
     norm_x: Any = None
+    raw_refs: Any = None
 
     def block_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Block.plan_params`."""
@@ -102,7 +103,7 @@ def build(
         g.check(ex)
     skip = ex.skip
     assert set(skip) <= set(ABLATIONS), skip
-    tiles = ex.resolved_tiles
+    tiles = ex.resolve_tiles(g)
     scopes = ex.scopes
 
     def sc(name: str, level: int = 1):
@@ -138,6 +139,16 @@ def build(
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
         out_ref = O["hidden"]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
+        pool_key = (
+            model_spec.pool_backend.pool_state_name
+            if model_spec.pool_backend is not None
+            else "raw"
+        )
+        raw_refs = (
+            (O[pool_key] if bool(ex.interpret) else ST[pool_key])
+            if ex.FUSED
+            else (ST.get(pool_key) if ex.paged_kv else None)
+        )
 
         me = lax.axis_index("tp").astype(I32)
         row_m = lax.broadcasted_iota(I32, (ex.MB, 1), 0)
@@ -164,6 +175,7 @@ def build(
             comm=comm,
             skip=skip,
             sc=sc,
+            raw_refs=raw_refs,
         )
 
         # ------------------------------ layer loop ------------------------------
@@ -336,8 +348,25 @@ def build(
         else 1
         for k in w_names
     )
+    pool_key = (
+        model_spec.pool_backend.pool_state_name
+        if model_spec.pool_backend is not None
+        else "raw"
+    )
     aliases: dict[int, int] = {}
-    if tiles.inplace:
+    if ex.FUSED and bool(ex.interpret) and pool_key in st_names and pool_key in o_names:
+        raw_s_offset = sum(
+            len(ssh[k]) if p.state_decls[k].tupled else 1
+            for k in st_names[: st_names.index(pool_key)]
+        )
+        raw_o_offset = sum(
+            len(osh[k]) if (k != "hidden" and p.output_decls[k].tupled) else 1
+            for k in o_names[: o_names.index(pool_key)]
+        )
+        n_raw = len(ssh[pool_key]) if p.state_decls[pool_key].tupled else 1
+        for a_i in range(n_raw):
+            aliases[2 + n_w_leaves + raw_s_offset + a_i] = raw_o_offset + a_i
+    elif tiles.inplace:
         assert ex.R == 1, (
             "tiles.inplace cannot alias rw states inside a communicating "
             "R > 1 pallas_call"

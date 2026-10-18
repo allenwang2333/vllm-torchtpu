@@ -40,10 +40,21 @@ import jax
 import numpy as np
 import torch
 import torch.nn.functional as F
-from vllm.forward_context import get_forward_context
+
+try:
+    from vllm.forward_context import get_forward_context
+except ImportError:
+
+    def get_forward_context() -> Any:  # type: ignore[misc]
+        raise RuntimeError("vllm.forward_context is unavailable")
+
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.cache import (
+    _should_use_pool_gather,
+    should_fuse_pool_io,
+)
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.spec import ExecSpec
@@ -73,6 +84,8 @@ _DEFAULT_BUCKETS = (8, 16, 32)
 _DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 _MTP_VERIFY_TOKENS = 4
 _MTP_SPECULATIVE_TOKENS = _MTP_VERIFY_TOKENS - 1
+_DEFAULT_FUSED_POOL_IO_MAX_B = 24
+_DEFAULT_FUSED_POOL_IO_MIN_B_HI = 56
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -145,6 +158,44 @@ def _parse_bool(val: Any) -> bool:
     raise ValueError(f"MegakernelDriver: invalid boolean value {val!r}")
 
 
+def _parse_fused_pool_io(val: Any) -> bool | str:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("", "auto"):
+        return "auto"
+    if s in ("1", "true", "yes", "on", "fused"):
+        return True
+    if s in ("0", "false", "no", "off", "none", "split", "3stage"):
+        return False
+    raise ValueError(
+        f"MegakernelDriver: invalid fused_pool_io={val!r}; "
+        "expected 'auto', 'true', or 'false'"
+    )
+
+
+def _parse_pool_gather(val: Any) -> bool | None:
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("", "auto"):
+        return None
+    if s in ("1", "true", "yes", "on", "gpr"):
+        return True
+    if s in ("0", "false", "no", "off", "none", "split", "3stage"):
+        return False
+    raise ValueError(
+        f"MegakernelDriver: invalid pool_gather={val!r}; "
+        "expected 'auto', 'true', or 'false'"
+    )
+
+
 def parse_mk_buckets(val: str | Sequence[int] | None = None) -> tuple[int, ...]:
     """Parse `T=1` decode batch buckets from a string or sequence (`'0'` disables)."""
     if val is None:
@@ -204,7 +255,7 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
     - `""` / `"0"` / `"false"`: disabled (default)
     - `"1"` / `"true"`: enabled with default settings
     - `"ep"` / `"tp"`: enabled with explicit sharding mode
-    - `"mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1,stats_period_s=30"`
+    - `"mode=tp,buckets=8:16:32,verify_buckets=4:8:16,fused_pool_io=false,ab=1"`
     - JSON object string, e.g. `'{"mode": "tp", "buckets": [8, 16], "ab": true}'`
     """
     cfg: dict[str, Any] = {
@@ -214,6 +265,10 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
         "verify_buckets": _DEFAULT_VERIFY_BUCKETS,
         "buckets_explicit": False,
         "verify_buckets_explicit": False,
+        "fused_pool_io": False,
+        "fused_pool_io_max_b": _DEFAULT_FUSED_POOL_IO_MAX_B,
+        "fused_pool_io_min_b_hi": _DEFAULT_FUSED_POOL_IO_MIN_B_HI,
+        "pool_gather": None,
         "ab": False,
         "stats_period_s": 60.0,
         "compile_hlo_check": False,
@@ -231,6 +286,14 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
         if "verify_buckets" in d and d["verify_buckets"] is not None:
             cfg["verify_buckets"] = parse_mk_verify_buckets(d["verify_buckets"])
             cfg["verify_buckets_explicit"] = True
+        if "fused_pool_io" in d and d["fused_pool_io"] is not None:
+            cfg["fused_pool_io"] = _parse_fused_pool_io(d["fused_pool_io"])
+        if "fused_pool_io_max_b" in d and d["fused_pool_io_max_b"] is not None:
+            cfg["fused_pool_io_max_b"] = int(d["fused_pool_io_max_b"])
+        if "fused_pool_io_min_b_hi" in d and d["fused_pool_io_min_b_hi"] is not None:
+            cfg["fused_pool_io_min_b_hi"] = int(d["fused_pool_io_min_b_hi"])
+        if "pool_gather" in d and d["pool_gather"] is not None:
+            cfg["pool_gather"] = _parse_pool_gather(d["pool_gather"])
         if "ab" in d and d["ab"] is not None:
             cfg["ab"] = _parse_bool(d["ab"])
         if "stats_period_s" in d and d["stats_period_s"] is not None:
@@ -739,6 +802,10 @@ class MegakernelDriver:
         verify_buckets: Sequence[int] = _DEFAULT_VERIFY_BUCKETS,
         reshard_ep_to_tp: bool = False,
         expert_placement: Any = None,
+        fused_pool_io: bool | str | None = None,
+        fused_pool_io_max_b: int | None = None,
+        fused_pool_io_min_b_hi: int | None = None,
+        pool_gather: bool | str | None = None,
         ab: bool | None = None,
         stats_period_s: float | None = None,
         compile_hlo_check: bool | None = None,
@@ -789,6 +856,26 @@ class MegakernelDriver:
         self.w_flat: list[torch.Tensor] = self.weights["w_flat"]
 
         default_cfg = parse_megakernel_config()
+        self.fused_pool_io: bool | str = (
+            default_cfg["fused_pool_io"]
+            if fused_pool_io is None
+            else _parse_fused_pool_io(fused_pool_io)
+        )
+        self.fused_pool_io_max_b: int = int(
+            default_cfg["fused_pool_io_max_b"]
+            if fused_pool_io_max_b is None
+            else fused_pool_io_max_b
+        )
+        self.fused_pool_io_min_b_hi: int = int(
+            default_cfg["fused_pool_io_min_b_hi"]
+            if fused_pool_io_min_b_hi is None
+            else fused_pool_io_min_b_hi
+        )
+        self.pool_gather: bool | None = (
+            default_cfg["pool_gather"]
+            if pool_gather is None
+            else _parse_pool_gather(pool_gather)
+        )
         self.raw_pools: list[torch.Tensor] = []
         self.num_pages: int = 0
         self.page_size: int = 128
@@ -801,6 +888,8 @@ class MegakernelDriver:
         self._bucket_steps: dict[Any, Any] = {}
         self._bucket_ops: dict[tuple[int, int], Any] = {}
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
+        self._bucket_fused_io: dict[tuple[int, int], bool] = {}
+        self._bucket_gpr: dict[tuple[int, int], bool] = {}
         self._bound = False
         self._hlo_checked_buckets: set[tuple[int, int]] = set()
         self._torchtpu_ir_checked_buckets: set[tuple[int, int]] = set()
@@ -1009,6 +1098,10 @@ class MegakernelDriver:
             buckets=buckets,
             verify_buckets=verify_buckets,
             reshard_ep_to_tp=reshard,
+            fused_pool_io=cfg["fused_pool_io"],
+            fused_pool_io_max_b=int(cfg["fused_pool_io_max_b"]),
+            fused_pool_io_min_b_hi=int(cfg["fused_pool_io_min_b_hi"]),
+            pool_gather=cfg["pool_gather"],
             ab=bool(cfg["ab"]),
             stats_period_s=float(cfg["stats_period_s"]),
             compile_hlo_check=bool(cfg["compile_hlo_check"]),
@@ -1106,15 +1199,23 @@ class MegakernelDriver:
         )
         self._build_all_buckets()
         self._bound = True
+        fused_bkts = [k for k, v in sorted(self._bucket_fused_io.items()) if v]
+        gpr_bkts = [k for k, v in sorted(self._bucket_gpr.items()) if v]
         logger.info(
             "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
-            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s)",
+            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, "
+            "verify_buckets=%s, fused_pool_io=%s, fused_buckets=%s, "
+            "pool_gather=%s, gpr_buckets=%s)",
             len(self.raw_pools),
             self.num_pages,
             self.page_size,
             self.max_pages_per_seq,
             self.buckets,
             self.verify_buckets,
+            self.fused_pool_io,
+            fused_bkts,
+            self.pool_gather,
+            gpr_bkts,
         )
 
     def _runner_out_rows(self, b: int, m_rows: int) -> int:
@@ -1127,6 +1228,8 @@ class MegakernelDriver:
         self._bucket_steps.clear()
         self._bucket_ops.clear()
         self._bucket_out_rows.clear()
+        self._bucket_fused_io.clear()
+        self._bucket_gpr.clear()
         self._hlo_checked_buckets.clear()
         self._torchtpu_ir_checked_buckets.clear()
         for b in self.buckets:
@@ -1151,10 +1254,38 @@ class MegakernelDriver:
         out_pad_rows: int | None = None,
     ) -> Any:
         """Build the custom op and step wrapper for `(tokens_per_seq, bucket_t)`."""
-        ex = dataclasses.replace(
+        ex_cand = dataclasses.replace(
             self.base_exec,
             B=bucket_t,
             T=tokens_per_seq,
+            pool_gather=(
+                self.pool_gather
+                if self.pool_gather is not None
+                else self.base_exec.pool_gather
+            ),
+        )
+        use_fused = should_fuse_pool_io(
+            self.spec,
+            ex_cand,
+            fused_pool_io=self.fused_pool_io,
+            max_b_low=self.fused_pool_io_max_b,
+            min_b_hi=self.fused_pool_io_min_b_hi,
+        )
+        ex_cand2 = dataclasses.replace(ex_cand, fused_pool_io=use_fused)
+        pb = self.spec.pool_backend
+        use_gpr = (
+            False
+            if (use_fused or pb is None)
+            else _should_use_pool_gather(
+                self.spec,
+                pb,
+                ex_cand2,
+                use_fused=use_fused,
+            )
+        )
+        ex = dataclasses.replace(
+            ex_cand2,
+            pool_gather=use_gpr,
         )
         is_tpu = self.raw_pools[0].device.type == "tpu"
         ckpt_cols_hlo = 2 if tokens_per_seq == 1 else tokens_per_seq
@@ -1175,16 +1306,22 @@ class MegakernelDriver:
             if not ok_hlo:
                 raise RuntimeError(
                     "Qwen3.5 megakernel HLO pool-donation check failed for "
-                    f"(T={tokens_per_seq}, B={bucket_t}): {reason_hlo}"
+                    f"(T={tokens_per_seq}, B={bucket_t}, "
+                    f"fused_pool_io={use_fused}, pool_gather={use_gpr}): "
+                    f"{reason_hlo}"
                 )
             logger.info(
                 "Qwen3.5 megakernel HLO pool-donation check passed for "
-                "(T=%d, B=%d): %s",
+                "(T=%d, B=%d, fused_pool_io=%s, pool_gather=%s): %s",
                 tokens_per_seq,
                 bucket_t,
+                use_fused,
+                use_gpr,
                 reason_hlo,
             )
 
+        self._bucket_fused_io[bkt_key] = use_fused
+        self._bucket_gpr[bkt_key] = use_gpr
         op_name = (
             f"megakernel_runtime::{self.spec.name}_t{tokens_per_seq}"
             f"_b{bucket_t}_{self.mode}"
@@ -1388,15 +1525,21 @@ class MegakernelDriver:
         r_raw = roff_buf if isinstance(roff_buf, torch.Tensor) else self._zero_roff_1d
         uses_mrope = bool(getattr(runner, "uses_mrope", False))
         is_eager = bool(eager_only or getattr(runner, "enforce_eager", False))
-        sentinel_checked_t: set[int] = set()
+        sentinel_checked_variants: set[tuple[int, bool, bool]] = set()
         warmed_buckets: list[tuple[int, int]] = []
         try:
             for T, b_list in ((1, self.buckets), (4, self.verify_buckets)):
                 for b in b_list:
-                    if is_eager and T in sentinel_checked_t:
-                        break
-                    step_fn = self._bucket_steps[(T, b)]
-                    warmed_buckets.append((T, b))
+                    bkt_key = (T, b)
+                    variant_key = (
+                        T,
+                        bool(self._bucket_fused_io.get(bkt_key, False)),
+                        bool(self._bucket_gpr.get(bkt_key, False)),
+                    )
+                    if is_eager and variant_key in sentinel_checked_variants:
+                        continue
+                    step_fn = self._bucket_steps[bkt_key]
+                    warmed_buckets.append(bkt_key)
                     nseq = b // T
                     if runner_tok_pads and req_block_pairs:
                         tok_pad = next(
@@ -1411,7 +1554,7 @@ class MegakernelDriver:
                         shapes_to_warm = [(b, nseq, self.max_pages_per_seq)]
 
                     for tok_pad, req_pad, blk_pad in shapes_to_warm:
-                        if is_eager and T in sentinel_checked_t:
+                        if is_eager and variant_key in sentinel_checked_variants:
                             break
                         ids_b = torch.zeros((tok_pad,), dtype=torch.int32, device=dev)
                         pos_shape = (3, tok_pad) if uses_mrope else (tok_pad,)
@@ -1440,17 +1583,24 @@ class MegakernelDriver:
                         r_call = r_raw
 
                         # Note: on TPU, the warmup sentinel writes to unallocated
-                        # KV/GDN pages per T variant without restoring them,
-                        # avoiding slice-writes (`as_strided_copy_inverse`) on
-                        # the 2.30 GiB pools.
-                        kv_page = 1 if (T > 1 and 1 in sentinel_checked_t) else 0
-                        gdn_base = 4 if (T > 1 and 1 in sentinel_checked_t) else 1
+                        # KV/GDN pages per (T, fused, gpr) kernel variant without
+                        # restoring them, avoiding slice-writes
+                        # (`as_strided_copy_inverse`) on the 2.30 GiB pools.
+                        v_idx = len(sentinel_checked_variants)
+                        kv_page = v_idx
+                        gdn_base = 1 + v_idx * 12
+                        if kv_page >= self.num_pages or self.num_pages < 5 * (
+                            gdn_base + 3 * T
+                        ):
+                            has_t1 = any(k[0] == 1 for k in sentinel_checked_variants)
+                            kv_page = 1 if (T > 1 and has_t1) else 0
+                            gdn_base = 4 if (T > 1 and has_t1) else 1
                         disjoint_subs = self.num_pages >= 5 * (gdn_base + 3 * T)
                         if not disjoint_subs:
                             kv_page = 0
                             gdn_base = 1
                         do_sentinel = (
-                            T not in sentinel_checked_t
+                            variant_key not in sentinel_checked_variants
                             and self.num_pages >= 5 * (gdn_base + T)
                         )
                         gdn_p0 = 5 * gdn_base
@@ -1507,7 +1657,7 @@ class MegakernelDriver:
 
                             synchronize_tensors([out_b, *self.raw_pools])
                         if do_sentinel:
-                            sentinel_checked_t.add(T)
+                            sentinel_checked_variants.add(variant_key)
                             assert sent_kv is not None and sent_gdn is not None
                             out_cpu = out_b[:b].detach().float().cpu()
                             out_fin_ok = bool(torch.isfinite(out_cpu).all())
@@ -1548,7 +1698,8 @@ class MegakernelDriver:
                                     ]
                                     raise RuntimeError(
                                         "MegakernelDriver: warmup sentinel check "
-                                        f"failed on pool[{idx}] for (T={T}, B={b}) "
+                                        f"failed on pool[{idx}] for "
+                                        f"(T={T}, B={b}, variant={variant_key}) "
                                         f"(kv_ok={kv_ok}, gdn_ok={gdn_ok}, "
                                         f"out_nz={out_nz}/{out_cpu.numel()}, "
                                         f"out_fin={out_fin}, "

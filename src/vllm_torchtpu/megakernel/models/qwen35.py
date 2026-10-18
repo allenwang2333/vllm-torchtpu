@@ -237,10 +237,21 @@ def make_pooled_step(
     *,
     gdn_block: Block | None = None,
     donate_pools: bool = False,
+    fused_pool_io: bool | str | None = None,
+    max_b_low: int = 24,
+    min_b_hi: int = 56,
 ):
     """Build Qwen3.5 paged-pool `shard_map` step (`PallasWriter`)."""
     spec = qwen35_spec(g, gdn_block=gdn_block)
-    return cache.make_pooled_step(mesh, spec, ex, donate_pools=donate_pools)
+    return cache.make_pooled_step(
+        mesh,
+        spec,
+        ex,
+        donate_pools=donate_pools,
+        fused_pool_io=fused_pool_io,
+        max_b_low=max_b_low,
+        min_b_hi=min_b_hi,
+    )
 
 
 def accept_states(

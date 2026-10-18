@@ -189,16 +189,29 @@ def _check_ckpt_bounds(
             active = True
         if not active:
             continue
+        seen_slots: dict[int, int] = {}
         for sub in range(g_per_att):
             slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
             for slot in np.ravel(slots):
-                pb = int(slot) * 5 if is_3d else int(slot) * (5 * g_per_att) + sub * 5
+                slot_i = int(slot)
+                pb = slot_i * 5 if is_3d else slot_i * (5 * g_per_att) + sub * 5
                 if pb < 0 or pb + 5 > num_pages:
                     raise ValueError(
-                        f"GDN checkpoint slot {int(slot)} (sub={sub}, s={s}) "
+                        f"GDN checkpoint slot {slot_i} (sub={sub}, s={s}) "
                         f"maps to pages [{pb}, {pb + 5}), which exceeds pool "
                         f"capacity [0, {num_pages})"
                     )
+                if is_3d:
+                    prev_sub = seen_slots.get(slot_i)
+                    if prev_sub is not None and prev_sub != sub:
+                        raise ValueError(
+                            f"3D ckpt_indices slot {slot_i} is shared between "
+                            f"sub={prev_sub} and sub={sub} for active sequence "
+                            f"s={s}; 3D ckpt_indices requires disjoint slots "
+                            f"across sub-layers (use 2D ckpt_indices if slots "
+                            f"are shared across sub-layers)"
+                        )
+                    seen_slots[slot_i] = sub
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -887,6 +900,7 @@ def scatter_pool_states(
     active_seqs: jax.Array | str | None = None,
     *,
     interpret: bool | None = None,
+    conv_partial: bool | None = None,
 ) -> tuple[jax.Array, ...]:
     """Scatter `knew`/`vnew` and GDN `conv`/`rec` checkpoints into `raw_pools` in-place.
 
@@ -921,6 +935,11 @@ def scatter_pool_states(
             f"page_table has shape {page_table.shape}, expected ({NS}, >=1)"
         )
     has_gdn = G_PER_ATT > 0
+    use_conv_partial = (
+        bool(ex.GPR if conv_partial is None else conv_partial)
+        and has_gdn
+        and not bool(interpret)
+    )
     act_mode, active_mask = _resolve_active_seqs(
         active_seqs, default_mode="from_ckpt" if has_gdn else "all"
     )
@@ -1161,6 +1180,19 @@ def scatter_pool_states(
                     sem_in.at[in_slot, 1],
                 ).wait()
 
+        CP_ROWS = conv_rows_pad // 2
+        SLOT_ROWS = 4 * 128 + CP_ROWS
+
+        def slot_copy(raw_out_ref, slot, t, pb_t):
+            src = page_buf.at[slot].reshape(T * 5 * 128, 4, page_size)
+            dst = raw_out_ref.reshape(ex.num_pages * 128, 4, page_size)
+            r0 = pl.multiple_of(pb_t * 128, 128)
+            return pltpu.make_async_copy(
+                src.at[pl.ds(t * 5 * 128, SLOT_ROWS)],
+                dst.at[pl.ds(r0, SLOT_ROWS)],
+                sem_p.at[slot, t],
+            )
+
         def start_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
@@ -1230,7 +1262,12 @@ def scatter_pool_states(
                             :conv_rows_pad, :
                         ] = conv_taps
 
-                if T == 1:
+                if use_conv_partial:
+                    for t in range(T):
+                        slot_copy(
+                            raw_out_ref, slot, t, pb_for(sub, s, t, span=5)
+                        ).start()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0, span=5)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
@@ -1262,7 +1299,12 @@ def scatter_pool_states(
         def wait_scatter_seq(raw_out_ref, sub, s, slot):
             @pl.when(is_active(s))
             def _():
-                if T == 1:
+                if use_conv_partial:
+                    for t in range(T):
+                        slot_copy(
+                            raw_out_ref, slot, t, pb_for(sub, s, t, span=5)
+                        ).wait()
+                elif T == 1:
                     pb0 = pb_for(sub, s, 0, span=5)
                     pltpu.make_async_copy(
                         page_buf.at[slot],
@@ -1313,10 +1355,11 @@ def scatter_pool_states(
                             page_buf.at[slot, pl.ds(t * 5, 4)].bitcast(U32).reshape(
                                 512, 128
                             )[...] = jnp.zeros((512, 128), U32)
-                    for t in range(T):
-                        page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(256, 128)[
-                            ...
-                        ] = jnp.zeros((256, 128), BF16)
+                    if not use_conv_partial:
+                        for t in range(T):
+                            page_buf.at[slot, t * 5 + 4].bitcast(BF16).reshape(
+                                256, 128
+                            )[...] = jnp.zeros((256, 128), BF16)
 
         cp_knew.wait()
         cp_vnew.wait()
@@ -1747,7 +1790,7 @@ def qwen35_pool_backend(g: Any) -> PoolBackend:
         read_offsets: jax.Array | None,
         active_seqs: Any,
     ) -> dict[str, Any]:
-        if not has_gdn:
+        if not has_gdn or ex_paged.GPR:
             return {}
         assert ckpt_indices is not None and read_offsets is not None
         conv, rec = gather_gdn_states(
@@ -1785,7 +1828,31 @@ def qwen35_pool_backend(g: Any) -> PoolBackend:
             ckpt_indices if has_gdn else None,
             active_seqs,
             interpret=ex_paged.interpret,
+            conv_partial=ex_paged.GPR,
         )
+
+    def _can_pool_gather(ex_paged: ExecSpec) -> bool:
+        if not has_gdn or ex_paged.page_size != 128 or ex_paged.T <= 1:
+            return False
+        if ex_paged.pool_gather is False:
+            return False
+        if ex_paged.pool_gather is None and not ex_paged.WIDE:
+            return False
+        tiles = ex_paged.resolve_tiles(g)
+        cb = tiles.gdn_rows
+        if cb <= 0 or cb % 8 != 0 or cb % ex_paged.T != 0:
+            return False
+        _, tr = divmod(ex_paged.B, cb)
+        nch = ex_paged.B // cb + int(tr > 0)
+        nrb = min(tiles.gdn_bufs, nch)
+        if nch > 1 and nrb < 2:
+            return False
+        lay = GDNBlock.lin_in_layout(g, ex_paged)
+        hr = rup(3 + ex_paged.T, 8)
+        if (hr * lay.QKV * 2) % (4 * 128) != 0:
+            return False
+        gconv_rows = (hr * lay.QKV * 2) // (4 * 128)
+        return gconv_rows <= 64
 
     return PoolBackend(
         num_pools=g.NATT,
@@ -1795,6 +1862,11 @@ def qwen35_pool_backend(g: Any) -> PoolBackend:
         page_table_state_name="page_table",
         gather_states=_gather,
         scatter_states=_scatter,
+        supports_fused_io=True,
+        supports_pool_gather=True,
+        ckpt_pages_per_slot=5,
+        kernel_names=("gather_gdn_states", "scatter_pool_states"),
+        can_pool_gather=_can_pool_gather,
     )
 
 

@@ -319,12 +319,20 @@ def verify_pooled_step_hlo(
     g: Any = spec.config
     kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
     hd = int(getattr(g, "HD", 256))
+    pb = spec.pool_backend
+    k_names = (
+        pb.kernel_names
+        if pb is not None
+        else ("gather_gdn_states", "scatter_pool_states")
+    )
     return cache.check_pooled_step_hlo(
         hlo_text,
         page_size=page_size,
         kvh=kvh,
         hd=hd,
         min_pool_pages=max(16, num_pages),
+        fused_pool_io=ex.FUSED,
+        kernel_names=k_names,
     )
 
 

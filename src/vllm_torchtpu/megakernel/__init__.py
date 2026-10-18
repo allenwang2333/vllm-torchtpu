@@ -16,6 +16,7 @@
 from . import (
     blocks,
     cache,
+    cache_experimental,
     comm,
     kernel,
     models,
@@ -42,6 +43,12 @@ from .cache import (
     check_pooled_step_hlo,
     make_flat_pooled_step,
     make_pooled_step,
+    should_fuse_pool_io,
+)
+from .cache_experimental import (
+    check_fused_pooled_step_hlo,
+    make_flat_fused_pooled_step,
+    make_fused_pooled_step,
 )
 from .comm import AllReduceRing
 from .kernel import (
@@ -82,6 +89,7 @@ from .spec import (
     Tiles,
     WeightDecl,
     default_tiles,
+    frozen_parity_tiles,
 )
 from .stream import TwoRing
 
@@ -115,6 +123,8 @@ __all__ = [
     "blocks",
     "build",
     "cache",
+    "cache_experimental",
+    "check_fused_pooled_step_hlo",
     "check_pooled_step_hlo",
     "comm",
     "conv_to_raw_page",
@@ -122,10 +132,13 @@ __all__ = [
     "default_tiles",
     "encode_ecopy",
     "fold",
+    "frozen_parity_tiles",
     "gather_gdn_states",
     "kernel",
     "kv_to_raw_page",
+    "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
+    "make_fused_pooled_step",
     "make_pooled_step",
     "make_step",
     "models",
@@ -139,6 +152,7 @@ __all__ = [
     "raw_pages_to_ssm",
     "rup",
     "scatter_pool_states",
+    "should_fuse_pool_io",
     "spec",
     "ssm_to_raw_pages",
     "states_to_pool",

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from . import pool_alias
-from .ops import BF16, F32, rup
+from .ops import BF16, F32, FP8, rup
 from .planner import Plan, plan
 from .spec import ExecSpec, ModelSpec, ScratchReq
 
@@ -57,6 +57,8 @@ class StreamParams:
     lay: dict[str, tuple[int, int]]
     S: int
     typed: bool
+    dmm_unroll: int = 8
+    dense_acc_pair: bool = True
 
     def layer_start_tile(self, lyr: Any) -> Any:
         """Return global static stream tile index at the start of layer `lyr`."""
@@ -82,6 +84,33 @@ class StreamParams:
             (lyr % self.period) - start_b, 0, c_b - 1
         )
 
+    def lt_to_branch(self, lt: int) -> tuple[int, int]:
+        """Map cycle-relative layer `lt` to `(branch_idx, lt_in_branch)`."""
+        lo = 0
+        for b_idx, c_b in enumerate(self.branch_counts):
+            if lt < lo + c_b:
+                return b_idx, lt - lo
+            lo += c_b
+        raise AssertionError(f"Layer type {lt} out of range for period {self.period}")
+
+    def rel_decode(self, lt: int, r: int) -> tuple[int, int, int, int, str, int, int]:
+        """Trace-time decode of tile `r` relative to cycle-relative layer `lt`."""
+        b_off, lt_, base = 0, lt, 0
+        while True:
+            b_idx, lt_in_b = self.lt_to_branch(lt_)
+            t_len = self.branch_tiles[b_idx]
+            if r - base < t_len:
+                break
+            base += t_len
+            lt_ += 1
+            if lt_ == self.period:
+                lt_, b_off = 0, b_off + 1
+        r_in_layer = r - base
+        for kind, s_lo, s_hi, ordi in self.branch_segs[b_idx]:
+            if r_in_layer < s_hi:
+                return b_off, lt_, b_idx, lt_in_b, kind, ordi, base + s_lo
+        raise AssertionError(f"Tile {r} out of range for layer type {lt}")
+
 
 @dataclass(frozen=True)
 class CommParams:
@@ -105,6 +134,7 @@ class CommParams:
     HC2: int
     AR_ROUNDS: tuple[int, ...]
     AR_PEERS: int
+    N_HIER3: int = 3
 
 
 @dataclass(frozen=True)
@@ -184,7 +214,7 @@ def build_scratch(
     if p is None:
         p = plan(model_spec, ex)
     g = model_spec.config
-    tiles = ex.resolved_tiles
+    tiles = ex.resolve_tiles(g)
 
     R, B, M, MR, MB = ex.R, ex.B, ex.M, ex.MR, ex.MB
     H, L = g.H, g.L
@@ -206,16 +236,25 @@ def build_scratch(
 
     HIER = tiles.hier if R > 1 else 0
     RSAG = tiles.rsag and R > 1 and HIER == 0
-    WAR = (ex.WIDE or MR * H <= PR * PC) if tiles.war < 0 else bool(tiles.war)
+    WAR = (
+        (ex.WIDE or MR * H <= PR * PC or (RSAG and (PC // R) % 128 != 0))
+        if tiles.war < 0
+        else bool(tiles.war)
+    )
     AR_R = MR if WAR else PR
     AR_C = H if WAR else PC
     CW = AR_C // R
     HC2 = AR_C // 2
+    N_HIER3 = max(1, R.bit_length() - 1)
     assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (HIER == 0 or R == 8)
+    assert HIER in (0, 1, 2, 3) and (
+        HIER == 0 or R == 8 or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
+    )
     assert HIER != 2 or HC2 % 128 == 0
     AR_ROUNDS = (
-        (0, 1, 2) if HIER in (2, 3) else ((0, 1) if (RSAG or HIER == 1) else (0,))
+        tuple(range(N_HIER3))
+        if HIER == 3
+        else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
     )
     AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
 
@@ -238,7 +277,7 @@ def build_scratch(
         "part": pltpu.VMEM((MB, H), F32),
         "mix": pltpu.VMEM((MB, NMIX), F32),
         "send": pltpu.VMEM(
-            (3, 2, AR_R, AR_C)
+            (N_HIER3, 2, AR_R, AR_C)
             if HIER == 3
             else (2, 2, AR_R, HC2)
             if HIER == 2
@@ -248,7 +287,7 @@ def build_scratch(
             BF16,
         ),
         "recv": pltpu.VMEM(
-            (3, 2, 2, AR_R, AR_C)
+            (N_HIER3, 2, 2, AR_R, AR_C)
             if HIER == 3
             else (2, 2, AR_R, HC2)
             if HIER == 2
@@ -293,6 +332,11 @@ def build_scratch(
         for k in p.dynamic_kinds:
             scratch["ering_" + k] = pltpu.VMEM((NBE,) + vshape[k], vdtype[k])
             phase_map["ering_" + k] = "persistent"
+        if p.dynamic_kinds and any(
+            getattr(bp, "KVE", False) for bp in block_plans.values()
+        ):
+            scratch["epool"] = pltpu.VMEM((NBE, 2, g.HD // 4, 4, tiles.kv_blk), FP8)
+            phase_map["epool"] = "persistent"
     else:
         scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
         phase_map["dpool"] = "persistent"
@@ -377,6 +421,8 @@ def build_scratch(
         lay=lay,
         S=S,
         typed=typed,
+        dmm_unroll=tiles.dmm_unroll,
+        dense_acc_pair=tiles.dense_acc_pair,
     )
     cp = CommParams(
         R=R,
@@ -397,6 +443,7 @@ def build_scratch(
         HC2=HC2,
         AR_ROUNDS=AR_ROUNDS,
         AR_PEERS=AR_PEERS,
+        N_HIER3=N_HIER3,
     )
     core_plan = CorePlan(
         plan=p,

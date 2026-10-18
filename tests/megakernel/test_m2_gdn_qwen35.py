@@ -96,7 +96,8 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
     assert p.s_names == ("conv", "rec", "kc", "vc")
     assert p.o_names == ("hidden", "conv", "rec", "knew", "vnew")
     assert info_4k["T_TOTAL"] == 840
-    assert info_4k["vmem_scratch_bytes"] == 49_760_256
+    assert info_4k["vmem_scratch_bytes"] == 62_398_464
+    assert info_4k["vmem_scratch_bytes"] <= ex_4k.resolved_tiles.vmem_mib * (1 << 20)
     assert "recb" in info_4k["vmem_shapes"]
     assert "sbuf" in info_4k["vmem_shapes"]
     assert "convb" in info_4k["vmem_shapes"]
@@ -113,7 +114,7 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
 
     ex_10k = ExecSpec(B=4, T=1, R=8, ctx=10240)
     _, info_10k = qwen35.build(g, ex_10k)
-    assert info_10k["vmem_scratch_bytes"] == 49_760_256
+    assert info_10k["vmem_scratch_bytes"] == 62_398_464
 
 
 def test_m2_gdn_block_invariants_and_layout():

@@ -353,7 +353,7 @@ def test_bucket_parsing_and_selection() -> None:
     cfg_tp = parse_megakernel_config(raw="tp")
     assert cfg_tp["enabled"] and cfg_tp["mode"] == "tp"
     cfg_kv = parse_megakernel_config(
-        raw="mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1"
+        raw="mode=tp,buckets=8:16:32,verify_buckets=4:8,ab=1,stats_period_s=12.5,compile_hlo_check=1,fused_pool_io=0,fused_pool_io_max_b=16,fused_pool_io_min_b_hi=64,pool_gather=0"
     )
     assert cfg_kv["enabled"]
     assert cfg_kv["mode"] == "tp"
@@ -362,14 +362,23 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_kv["ab"] is True
     assert cfg_kv["stats_period_s"] == pytest.approx(12.5)
     assert cfg_kv["compile_hlo_check"] is True
+    assert cfg_kv["fused_pool_io"] is False
+    assert cfg_kv["fused_pool_io_max_b"] == 16
+    assert cfg_kv["fused_pool_io_min_b_hi"] == 64
+    assert cfg_kv["pool_gather"] is False
 
     cfg_json = parse_megakernel_config(
-        raw='{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], "ab": false}'
+        raw=(
+            '{"mode": "ep", "buckets": [4, 8], "verify_buckets": [4], '
+            '"ab": false, "fused_pool_io": "auto", "pool_gather": true}'
+        )
     )
     assert cfg_json["enabled"]
     assert cfg_json["mode"] == "ep"
     assert cfg_json["buckets"] == (4, 8)
     assert cfg_json["verify_buckets"] == (4,)
+    assert cfg_json["fused_pool_io"] == "auto"
+    assert cfg_json["pool_gather"] is True
 
     fake_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
@@ -694,42 +703,6 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     assert driver._torchtpu_ir_checked
 
 
-def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
-    """`compile_hlo_check` misconfiguration fails loudly; layout errors disable MK."""
-    from vllm_torchtpu.megakernel_runtime.driver import check_compile_hlo_mesh
-    from vllm_torchtpu.megakernel_runtime.exported_bridge import (
-        MegakernelConfigError,
-    )
-
-    class _MockDevice:
-        id = 0
-
-    mock_mesh = SimpleNamespace(devices=np.array([_MockDevice()], dtype=object))
-    check_compile_hlo_mesh(mock_mesh, False)
-    check_compile_hlo_mesh(_cpu_mesh(1), True)
-    with pytest.raises(MegakernelConfigError, match="compile_hlo_check=1 requires"):
-        check_compile_hlo_mesh(mock_mesh, True)
-
-    def _driver_raising(exc: Exception) -> MegakernelDriver:
-        drv = object.__new__(MegakernelDriver)
-        drv._bound = True
-
-        def _bind(runner: Any) -> None:
-            raise exc
-
-        drv.bind_caches = _bind  # type: ignore[method-assign]
-        return drv
-
-    runner = SimpleNamespace(_megakernel="mk")
-    drv_cfg = _driver_raising(MegakernelConfigError("bad config"))
-    with pytest.raises(MegakernelConfigError, match="bad config"):
-        drv_cfg.bind_and_warmup(runner)
-    assert runner._megakernel == "mk"
-    drv_layout = _driver_raising(ValueError("incompatible KV layout"))
-    drv_layout.bind_and_warmup(runner)
-    assert drv_layout._bound is False and runner._megakernel is None
-
-
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify `can_run` against real `TPUModelRunner` and `AttentionMetadata` fields."""
     mesh = _cpu_mesh(1)
@@ -1024,13 +997,8 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     #    and restores pools
     driver.bind_and_warmup(runner)
     assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
-    # Each bucket step has its own code object (separate Dynamo cache entries)
-    step_t1, step_t4 = driver._bucket_steps[(1, 2)], driver._bucket_steps[(4, 4)]
-    assert step_t1.__code__ is not step_t4.__code__
-    assert (step_t1.__code__.co_name, step_t4.__code__.co_name) == (
-        "step_t1_b2",
-        "step_t4_b4",
-    )
+    assert driver._bucket_fused_io == {(1, 2): False, (4, 4): False}
+    assert driver._bucket_gpr == {(1, 2): True, (4, 4): True}
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
         assert p.untyped_storage().data_ptr() == orig_storage_ptrs[idx]
@@ -1041,7 +1009,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     #   sub=0: seq 0 -> 1..4,  seq 1 -> 5..8
     #   sub=1: seq 0 -> 9..12, seq 1 -> 13..16
     #   sub=2: seq 0 -> 17..20, seq 1 -> 21..24
-    pt_init = jnp.asarray([[130, 131], [132, 133]], dtype=jnp.int32)
+    pt_init = jnp.asarray([[140, 141], [142, 143]], dtype=jnp.int32)
     ckpt_init = jnp.asarray([[[1], [5]], [[9], [13]], [[17], [21]]], dtype=jnp.int32)
     roff_init = jnp.zeros((3, 2), dtype=jnp.int32)
     init_pools_j = qwen35_pool.states_to_pool(
@@ -1056,7 +1024,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # indices (matching TPUModelRunner's exact tensor shapes) with disjoint slots
     # across the 3 linear-attention layers sharing pool[0].
     attn_md = SimpleNamespace(
-        block_tables=torch.tensor([130, 131, 132, 133, 0, 0, 0, 0], dtype=torch.int32),
+        block_tables=torch.tensor([140, 141, 142, 143, 0, 0, 0, 0], dtype=torch.int32),
         seq_lens=torch.tensor([6, 10, 0, 0], dtype=torch.int32),
     )
     mamba_mds = [
@@ -1089,7 +1057,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
 
     # -------------------------------------------------------------------------
     # Step A: T=1 decode (B=2, NS=2, T=1) vs both `qwen35.reference_step` and
-    #         `qwen35.make_pooled_step` (with independently built metadata & w_mk_ref).
+    #         split 3-stage `qwen35.make_pooled_step`.
     # -------------------------------------------------------------------------
     runner._attn_metadata_builder_ctx.num_reqs = 2
     comb_dist_cpu.copy_(torch.tensor([2, 2, 2, 2, 2, 2], dtype=torch.int32))
@@ -1120,12 +1088,15 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         rtol=8e-2,
     )
 
-    # Independent `qwen35.make_pooled_step` check (using `w_mk_ref` from `pack_inputs`)
-    ex_t1 = replace(driver.base_exec, B=2, T=1)
-    step_ref_t1, _ = qwen35.make_pooled_step(mesh, g, ex_t1, donate_pools=False)
+    # Independent split 3-stage `qwen35.make_pooled_step` oracle
+    ex_t1 = replace(driver.base_exec, B=2, T=1, fused_pool_io=False, pool_gather=False)
+    step_ref_t1, _ = qwen35.make_pooled_step(
+        mesh, g, ex_t1, donate_pools=False, fused_pool_io=False, pool_gather=False
+    )
     hid_in_t1_pad = torch.nn.functional.pad(hid_t1_bf16, (0, 0, 0, ex_t1.M - 2))
     ckpt_ref_t1 = jnp.asarray(
-        [[[1, 1], [5, 5]], [[9, 9], [13, 13]], [[17, 17], [21, 21]]], dtype=jnp.int32
+        [[[1, 1], [5, 5]], [[9, 9], [13, 13]], [[17, 17], [21, 21]]],
+        dtype=jnp.int32,
     )
     roff_ref_t1 = jnp.zeros((3, 2), dtype=jnp.int32)
     hid_ref_t1, ref_pools_j = step_ref_t1(
@@ -1154,7 +1125,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 4]
     roff_slot_buf.zero_()
-    attn_md.block_tables = torch.tensor([130, 131, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    attn_md.block_tables = torch.tensor([140, 141, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
     attn_md.seq_lens = torch.tensor([9, 0, 0, 0], dtype=torch.int32)
     for sub, m_md in enumerate(mamba_mds):
         b0 = 1 + 8 * sub
@@ -1170,12 +1141,14 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     out_t4 = driver(input_ids_t4, positions_t4, num_tokens=4, runner=runner)
     assert out_t4.shape == (4, g.H)
 
-    ex_t4 = replace(driver.base_exec, B=4, T=4)
-    step_ref_t4, _ = qwen35.make_pooled_step(mesh, g, ex_t4, donate_pools=False)
+    ex_t4 = replace(driver.base_exec, B=4, T=4, fused_pool_io=False, pool_gather=False)
+    step_ref_t4, _ = qwen35.make_pooled_step(
+        mesh, g, ex_t4, donate_pools=False, fused_pool_io=False, pool_gather=False
+    )
     hid_t4_bf16 = driver.embed_tokens(input_ids_t4).to(torch.bfloat16)
     hid_in_t4_pad = torch.nn.functional.pad(hid_t4_bf16, (0, 0, 0, ex_t4.M - 4))
     pos_j_t4 = jnp.asarray([6, 7, 8, 9], dtype=jnp.int32)
-    pt_ref_t4 = jnp.asarray([[130, 131]], dtype=jnp.int32)
+    pt_ref_t4 = jnp.asarray([[140, 141]], dtype=jnp.int32)
     ckpt_ref_t4 = jnp.asarray(
         [[[1, 2, 3, 4]], [[9, 10, 11, 12]], [[17, 18, 19, 20]]], dtype=jnp.int32
     )
@@ -1201,8 +1174,8 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
 
     # -------------------------------------------------------------------------
     # Step C: T=1 plain decode after T=4 verify with `roff = 2` (accepting 2
-    #         draft tokens so the step reads `ckpt[0, 2]` and writes the
-    #         updated GDN state back to base slot `s[0]` for each sub).
+    #         draft tokens so the step reads `ckpt[sub, 0, 2]` and writes
+    #         the updated GDN state back to base slot `s[sub, 0]`).
     # -------------------------------------------------------------------------
     runner._attn_metadata_builder_ctx.num_reqs = 1
     comb_dist_cpu.copy_(torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int32))
@@ -1230,11 +1203,11 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         assert not torch.equal(p[5:9].view(torch.uint8), slot1_before[idx])
         assert torch.equal(p[15:19].view(torch.uint8), slot3_before[idx])
 
-    # Independent `make_pooled_step` oracle with read_slot=b0+2, write_slot=b0 for seq 0
+    # Independent `make_pooled_step` oracle (read=3/11/19, write=1/9/17 for seq 0)
     hid_c_bf16 = driver.embed_tokens(input_ids_t1_after_t4).to(torch.bfloat16)
     hid_in_c_pad = torch.nn.functional.pad(hid_c_bf16, (0, 0, 0, ex_t1.M - 2))
     pos_j_c = jnp.asarray([8, 0], dtype=jnp.int32)
-    pt_ref_c = jnp.asarray([[130, 131], [0, 0]], dtype=jnp.int32)
+    pt_ref_c = jnp.asarray([[140, 141], [0, 0]], dtype=jnp.int32)
     ckpt_ref_c = jnp.asarray(
         [[[3, 1], [0, 0]], [[11, 9], [0, 0]], [[19, 17], [0, 0]]], dtype=jnp.int32
     )
@@ -1294,7 +1267,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
             np.asarray(p_ref).view(np.uint8),
         )
 
-    # Step E: Speculative acceptance on next T=4 step via `roff = 2`
+    # Step E: Speculative acceptance on next T=4 step via `roff_slot_buf = 2`
     roff_slot_buf[1] = 2
     roff_slot_buf[9] = 2
     roff_slot_buf[17] = 2

@@ -24,6 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from .. import pool_alias
 from ..ops import (
     BF16,
     F32,
@@ -43,6 +44,7 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
+from . import fused_pool_io
 
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))
@@ -60,6 +62,11 @@ class GQAParams:
     G: int
     BLK: int
     NKV: int
+    NKVR: int
+    KVE: bool
+    KV_ITEM: int
+    EBROWS: int
+    PAIR_KV: bool
     SUB: int
     AMASK: int
     SPLIT: bool
@@ -71,6 +78,13 @@ class GQAParams:
     PACK: bool
     PB: int
     NBP: int
+    QV: bool
+    GQ: bool
+    NHH: int
+    SR: int
+    QG: int
+    MLW: int
+    QVR: int
     LAZY_ATT: bool
     eps: float
     theta: float
@@ -108,7 +122,7 @@ class GQABlock(Block):
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if ex.paged_kv:
-            return [
+            st = [
                 StateDecl(
                     "raw",
                     (ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
@@ -127,12 +141,17 @@ class GQABlock(Block):
                     memory_space="smem",
                 ),
             ]
+            if ex.FUSED:
+                st.extend(fused_pool_io.gqa_fused_states(ex))
+            return st
         return [
             StateDecl("kc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
             StateDecl("vc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
         ]
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
+        if ex.FUSED:
+            return fused_pool_io.gqa_fused_outputs(g, ex)
         kv_dt = FP8 if ex.paged_kv else F32
         return [
             StateDecl("knew", (ex.MR, g.HD), kv_dt, access="w"),
@@ -150,11 +169,13 @@ class GQABlock(Block):
         }
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
-        tiles = ex.resolved_tiles
+        tiles = ex.resolve_tiles(g)
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
         G = max(1, ex.R // g.NKV)
-        BLK, NKV = tiles.kv_blk, tiles.nkv
+        BLK = tiles.kv_blk
+        PAIR_KV = tiles.pair_kv
+        NKV = max(tiles.nkv, 4) if PAIR_KV else tiles.nkv
         assert ex.ctx % BLK == 0 and BLK % 128 == 0, (ex.ctx, BLK)
         if ex.paged_kv:
             assert g.HD % 4 == 0, f"paged_kv requires HD % 4 == 0, got {g.HD}"
@@ -177,6 +198,17 @@ class GQABlock(Block):
             assert tiles.amask not in (3, 4), (
                 f"paged_kv requires amask in {{0, 1, 2}}, got {tiles.amask}"
             )
+        KV_ITEM = 2 * (g.HD // 4) * BLK * 4
+        EBROWS = tiles.ebank // 128
+        KVE = bool(
+            ex.paged_kv
+            and tiles.kv_ering
+            and bool(plan.dynamic_kinds)
+            and tiles.nbe >= NKV
+            and tiles.ebank >= KV_ITEM
+            and g.HD == 256
+        )
+        NKVR = tiles.nbe if KVE else NKV
         SUB = tiles.kv_sub or BLK
         assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
         SPLIT = tiles.split and G > 1
@@ -195,6 +227,29 @@ class GQABlock(Block):
         PACK = (ex.WIDE if tiles.pack < 0 else bool(tiles.pack)) and SPLIT and nh < 8
         PB = 8 // nh if PACK else 1
         NBP = -(-ex.B // PB)
+        NHH = g.HD // 128
+        SR = 8 // PB
+        QV = (
+            (SPLIT or ex.VER)
+            and g.HD % 128 == 0
+            and nh <= 8
+            and (not PACK or PB * nh == 8)
+        )
+        QG = ex.T * nh
+        GQ = bool(
+            tiles.gq_pack
+            and QV
+            and SPLIT
+            and ex.VER
+            and G * nh == QR
+            and QG % 16 == 0
+            and ex.NS <= 64
+            and g.HD == 256
+        )
+        MLW = 128 // ex.NS if GQ else 0
+        if GQ:
+            SR = nh
+        QVR = ex.B * nh + 8 if GQ else NBP * 8
         nt_att = plan.nt["att_in"] + plan.nt["att_out"]
         LAZY_ATT = tiles.lazy and nt_att <= tiles.nbd
         return GQAParams(
@@ -206,6 +261,11 @@ class GQABlock(Block):
             G=G,
             BLK=BLK,
             NKV=NKV,
+            NKVR=NKVR,
+            KVE=KVE,
+            KV_ITEM=KV_ITEM,
+            EBROWS=EBROWS,
+            PAIR_KV=PAIR_KV,
             SUB=SUB,
             AMASK=tiles.amask,
             SPLIT=SPLIT,
@@ -217,6 +277,13 @@ class GQABlock(Block):
             PACK=PACK,
             PB=PB,
             NBP=NBP,
+            QV=QV,
+            GQ=GQ,
+            NHH=NHH,
+            SR=SR,
+            QG=QG,
+            MLW=MLW,
+            QVR=QVR,
             LAZY_ATT=LAZY_ATT,
             eps=g.eps,
             theta=g.theta,
@@ -232,7 +299,7 @@ class GQABlock(Block):
         scr.update(
             {
                 "kv_sem": pltpu.SemaphoreType.DMA(
-                    (ap.NKV,) if ex.paged_kv else (2, ap.NKV)
+                    (ap.NKVR,) if ex.paged_kv else (2, ap.NKV)
                 ),
                 "wl_b": pltpu.SMEM((ap.NWL,), I32),
                 "wl_t": pltpu.SMEM((ap.NWL,), I32),
@@ -244,13 +311,20 @@ class GQABlock(Block):
                 "knew": pltpu.VMEM((ex.MR, ap.HD), F32),
                 "vnew": pltpu.VMEM((ex.MR, ap.HD), F32),
                 "gate": pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32),
-                "kv_out_sem": pltpu.SemaphoreType.DMA((2,)),
+                "rope": pltpu.VMEM((2, ex.MR, 128), F32),
+                "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
             }
         )
+        if not ex.FUSED:
+            scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
+        else:
+            scr.update(fused_pool_io.gqa_fused_scratch(ex, ap.HD))
         if ex.paged_kv:
-            scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
+            if not ap.KVE:
+                scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
             scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
             scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
+            scr["wl_kp"] = pltpu.SMEM((ap.NWL * (ap.BLK // ex.page_size),), I32)
         if ap.SPLIT:
             q_rows = ap.NBP if ap.PACK else ex.B
             scr.update(
@@ -266,13 +340,27 @@ class GQABlock(Block):
             )
         elif ex.VER:
             scr["qg"] = pltpu.VMEM((1, ex.B, 8, ap.HD), F32)
+        if ap.QV:
+            scr["qg"] = pltpu.VMEM(
+                (ap.G if ap.SPLIT and not ap.GQ else 1, ap.NHH, ap.QVR, 128), F32
+            )
+            scr["ost"] = pltpu.VMEM((ap.NHH, ap.QVR, 128), F32)
+        if ap.GQ:
+            del scr["pso"]
+            scr.update(
+                {
+                    "qxb": pltpu.VMEM((ap.G, ex.NS, ap.QG, ap.HD), BF16),
+                    "psend": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
+                    "pri": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
+                }
+            )
         return scr
 
     def prologue(self, ctx: Any) -> None:
-        """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_cnt[0]`)."""
+        """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)."""
         ex = ctx.ex
         ap: GQAParams = ctx.block_params(self.name)
-        scr, pos_ref = ctx.scr, ctx.pos_ref
+        scr, ST, pos_ref = ctx.scr, ctx.ST, ctx.pos_ref
         NS, T, BLK, TS, SPLIT = ex.NS, ex.T, ap.BLK, ap.TS, ap.SPLIT
         gi = lax.rem(ctx.me, ap.G) if SPLIT else jnp.int32(0)
         eff_ctx = (
@@ -281,6 +369,7 @@ class GQABlock(Block):
             else ex.ctx
         )
         max_nb = -(-eff_ctx // BLK)
+        max_p = ex.resolved_max_pages_per_seq
 
         n = jnp.int32(0)
         for b in range(NS):
@@ -291,6 +380,16 @@ class GQABlock(Block):
             def put(j, carry, b=b, t0=t0, n=n):
                 scr["wl_b"][n + j] = jnp.int32(b)
                 scr["wl_t"][n + j] = t0 + j * TS
+                if ex.paged_kv:
+                    pt_ref_ = ST["page_table"]
+                    pb = BLK // ex.page_size
+                    p0 = (t0 + j * TS) * pb
+                    k0 = (n + j) * pb
+                    for p in range(pb):
+                        col = jnp.minimum(p0 + p, max_p - 1)
+                        scr["wl_kp"][k0 + p] = jnp.clip(
+                            pt_ref_[b, col], 0, ex.num_pages - 1
+                        )
                 return carry
 
             lax.fori_loop(0, cnt, put, 0)
@@ -299,17 +398,33 @@ class GQABlock(Block):
 
     def init_buffers(self, ctx: Any) -> None:
         """Initialize attention-specific VMEM scratch buffers after barrier."""
+        ex = ctx.ex
         ap: GQAParams = ctx.block_params(self.name)
-        scr = ctx.scr
-        scr["knew"][...] = jnp.zeros((ctx.ex.MR, ap.HD), F32)
-        scr["vnew"][...] = jnp.zeros((ctx.ex.MR, ap.HD), F32)
-        if ctx.ex.paged_kv:
-            scr["knew_o"][...] = jnp.zeros((ctx.ex.MR, ap.HD), FP8)
-            scr["vnew_o"][...] = jnp.zeros((ctx.ex.MR, ap.HD), FP8)
-        if ap.SPLIT:
+        scr, pos_ref = ctx.scr, ctx.pos_ref
+        scr["knew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
+        scr["vnew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
+        if ex.paged_kv:
+            scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
+            scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
+        if ex.FUSED:
+            fused_pool_io.gqa_fused_init_buffers(ctx)
+        if ap.SPLIT and not ap.GQ:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
-        if ap.PACK:
+        if ap.PACK or ap.QV:
             scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
+        if ap.QV:
+            half_ = ap.ROT // 2
+            inv_ = 1.0 / (
+                ap.theta
+                ** (lax.broadcasted_iota(I32, (1, half_), 1).astype(F32) * 2.0 / ap.ROT)
+            )
+            rows_ = lax.broadcasted_iota(I32, (ex.MR, half_), 0)
+            pf = jnp.zeros((ex.MR, half_), F32)
+            for b in range(ex.B):
+                pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
+            ang_ = pf * inv_
+            scr["rope"][0, :, :half_] = rnd(jnp.cos(ang_))
+            scr["rope"][1, :, :half_] = rnd(jnp.sin(ang_))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
@@ -317,7 +432,9 @@ class GQABlock(Block):
         scr, ST, O = ctx.scr, ctx.ST, ctx.O  # noqa: E741
         pos_ref, skip, sc = ctx.pos_ref, ctx.skip, ctx.sc
         stream, comm = ctx.stream, ctx.comm
-        NKV, BLK, SUB, AMASK = ap.NKV, ap.BLK, ap.SUB, ap.AMASK
+        NKV, NKVR, KVE, PAIR_KV = ap.NKV, ap.NKVR, ap.KVE, ap.PAIR_KV
+        KV_ITEM, EBROWS = ap.KV_ITEM, ap.EBROWS
+        BLK, SUB, AMASK = ap.BLK, ap.SUB, ap.AMASK
         B, T, NS, VER = ex.B, ex.T, ex.NS, ex.VER
         G, nh, HD, H, NAI, ROT = ap.G, ap.nh, ap.HD, ap.H, ap.NAI, ap.ROT
         QR, TQ, PW = ap.QR, ap.TQ, ap.PW
@@ -328,6 +445,14 @@ class GQABlock(Block):
             ap.NBP,
             ap.LAZY_ATT,
         )
+        QV, GQ, NHH, SR, QG, MLW = (
+            ap.QV,
+            ap.GQ,
+            ap.NHH,
+            ap.SR,
+            ap.QG,
+            ap.MLW,
+        )
         interpret = bool(ex.interpret)
         gi = lax.rem(ctx.me, G) if SPLIT else jnp.int32(0)
 
@@ -335,51 +460,89 @@ class GQABlock(Block):
         ksem = scr["kv_sem"]
         am, al, aacc = scr["am"], scr["al"], scr["aacc"]
         n_items = scr["wl_cnt"][0]
+        KR = NKVR if ex.paged_kv else NKV
 
         kvbuf: Any = None
         kbuf: Any = None
         vbuf: Any = None
         if ex.paged_kv:
-            raw_refs = ST["raw"]
-            pt_ref = ST["page_table"]
-            kvbuf = scr["kvbuf"]
+            raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
             P_BLK = BLK // ex.page_size
+
+            if KVE:
+                epool_ref = stream.borrow_epool()
+                if interpret:
+
+                    def kv_slot(s):
+                        return epool_ref.at[s]
+
+                    def kv_src(r, kp):
+                        return r.at[kp]
+
+                    def kv_dst(s, p):
+                        return kv_slot(s).at[
+                            :, :, :, pl.ds(p * ex.page_size, ex.page_size)
+                        ]
+
+                else:
+
+                    def kv_slot(s):
+                        return pool_alias.view(
+                            epool_ref.at[pl.ds(s * EBROWS, KV_ITEM // 128)],
+                            (2, HD // 4, BLK),
+                            U32,
+                        )
+
+                    def kv_src(r, kp):
+                        return r.at[kp].bitcast(U32).reshape(2, HD // 4, ex.page_size)
+
+                    def kv_dst(s, p):
+                        return kv_slot(s).at[
+                            :, :, pl.ds(p * ex.page_size, ex.page_size)
+                        ]
+
+            else:
+                kvbuf = scr["kvbuf"]
+
+                def kv_src(r, kp):
+                    return r.at[kp]
+
+                def kv_dst(s, p):
+                    return kvbuf.at[s, :, :, :, pl.ds(p * ex.page_size, ex.page_size)]
+
+            def kv_stage(s):
+                return kv_slot(s) if KVE else kvbuf.at[s]
 
             def kv_start(i):
                 @pl.when(jnp.logical_and(i < n_items, "kv" not in skip))
                 def _():
-                    s = i % NKV
-                    b, t = scr["wl_b"][i], scr["wl_t"][i]
+                    s = i % KR
+                    k0 = i * P_BLK
+                    sem = ksem.at[s]
+                    kp_tab = scr["wl_kp"]
 
                     def start_for_ref(r):
-                        def issue_p(p, _):
-                            col_idx = jnp.minimum(t * P_BLK + p, pt_ref.shape[1] - 1)
-                            kp = jnp.clip(pt_ref[b, col_idx], 0, ex.num_pages - 1)
-                            dst = kvbuf.at[
-                                s, :, :, :, pl.ds(p * ex.page_size, ex.page_size)
-                            ]
-                            pltpu.make_async_copy(r.at[kp], dst, ksem.at[s]).start()
-                            return 0
-
-                        lax.fori_loop(0, P_BLK, issue_p, 0)
+                        for p in range(P_BLK):
+                            kp = kp_tab[k0 + p]
+                            pltpu.make_async_copy(
+                                kv_src(r, kp), kv_dst(s, p), sem
+                            ).start()
 
                     bswitch(a, [lambda r=r: start_for_ref(r) for r in raw_refs])
 
             def kv_wait(i):
                 if "kv" not in skip:
-                    s = i % NKV
+                    s = i % KR
+                    if interpret:
+                        for p in range(P_BLK):
+                            pltpu.make_async_copy(
+                                raw_refs[0].at[0], kv_dst(s, p), ksem.at[s]
+                            ).wait()
+                    else:
+                        st_ = kv_stage(s)
+                        pltpu.make_async_copy(st_, st_, ksem.at[s]).wait()
 
-                    def wait_p(p, _):
-                        pltpu.make_async_copy(
-                            raw_refs[0].at[0],
-                            kvbuf.at[s, :, :, :, pl.ds(p * ex.page_size, ex.page_size)],
-                            ksem.at[s],
-                        ).wait()
-                        return 0
-
-                    lax.fori_loop(0, P_BLK, wait_p, 0)
-
-            lax.fori_loop(0, NKV, lambda i, _: (kv_start(i), 0)[1], 0)
+            lax.fori_loop(0, KR, lambda i, _: (kv_start(i), 0)[1], 0)
         else:
             kc, vc = ST["kc"], ST["vc"]
             kbuf, vbuf = scr["kbuf"], scr["vbuf"]
@@ -424,82 +587,159 @@ class GQABlock(Block):
                 ** (lax.broadcasted_iota(I32, (1, half), 1).astype(F32) * 2.0 / ROT)
             )
 
+            def rms_zc(x_in, w_in):
+                return rmsnorm(x_in, w_in, ap.eps, zero_centered=ap.zero_centered_norm)
+
+            def rope(x_in, cos_in, sin_in):
+                return rope_partial(x_in, cos_in, sin_in, ROT)
+
             koff = nh * 2 * HD
+            rcs = scr["rcs"]
             with sc("att_qk"):
-                for b in range(B):
-                    pb = pos_ref[b]
-                    ang = pb.astype(F32) * inv
-                    cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
-                    qg = ybuf[b, :koff].reshape(nh, 2 * HD)
-                    scr["gate"][b, :] = qg[:, HD:].reshape(nh * HD)
-                    q = rmsnorm(
-                        qg[:, :HD], qn, ap.eps, zero_centered=ap.zero_centered_norm
-                    )
-                    k = rmsnorm(
-                        ybuf[b : b + 1, koff : koff + HD],
-                        kn,
-                        ap.eps,
-                        zero_centered=ap.zero_centered_norm,
-                    )
-                    v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
-                    q = rnd(rope_partial(q, cos, sin, ROT) * HD**-0.5)
-                    k = rope_partial(k, cos, sin, ROT)
-                    if PACK:
-                        t_, o_ = ap.qrow(b)
-                        scr["qg"][gi, t_, o_ : o_ + nh] = q
-                    else:
-                        if nh < 8:
-                            q = jnp.concatenate(
-                                (q, jnp.zeros((8 - nh, HD), F32)), axis=0
-                            )
-                        if SPLIT or VER:
-                            scr["qg"][gi, b] = q
+                if QV:
+                    cos = scr["rope"][0, :B, :half]
+                    sin = scr["rope"][1, :B, :half]
+                    for h in range(nh):
+                        q0_ = h * 2 * HD
+                        qh = rms_zc(ybuf[:B, q0_ : q0_ + HD], qn)
+                        qh = rnd(rope(qh, cos, sin) * HD**-0.5)
+                        for j in range(NHH):
+                            scr["qg"][
+                                0 if GQ else gi,
+                                jnp.int32(j),
+                                pl.ds(h, B, stride=SR),
+                                :,
+                            ] = qh[:, j * 128 : (j + 1) * 128]
+                    if GQ:
+                        for sq in range(NS):
+                            r0 = sq * QG
+                            scr["qxb"][gi, sq] = jnp.concatenate(
+                                [scr["qg"][0, j, r0 : r0 + QG, :] for j in range(NHH)],
+                                axis=-1,
+                            ).astype(BF16)
+                else:
+                    for b in range(B):
+                        pb = pos_ref[b]
+                        ang = pb.astype(F32) * inv
+                        cos, sin = rnd(jnp.cos(ang)), rnd(jnp.sin(ang))
+                        rcs[0, b : b + 1, :] = cos
+                        rcs[1, b : b + 1, :] = sin
+                        qg = ybuf[b, :koff].reshape(nh, 2 * HD)
+                        q = rms_zc(qg[:, :HD], qn)
+                        q = rnd(rope(q, cos, sin) * HD**-0.5)
+                        if PACK:
+                            t_, o_ = ap.qrow(b)
+                            scr["qg"][gi, t_, o_ : o_ + nh] = q
                         else:
-                            scr["qb"][b] = q.astype(BF16)
+                            if nh < 8:
+                                q = jnp.concatenate(
+                                    (q, jnp.zeros((8 - nh, HD), F32)), axis=0
+                                )
+                            if SPLIT or VER:
+                                scr["qg"][gi, b] = q
+                            else:
+                                scr["qb"][b] = q.astype(BF16)
+
+            qx = []
+            if SPLIT:
+                with sc("att_qgather"):
+                    qgb = scr["qxb"] if GQ else scr["qg"]
+                    qx = comm.group_copies(
+                        lambda off: qgb.at[gi],
+                        qgb.at[gi],
+                        scr["sq_ssem"],
+                        scr["sq_rsem"],
+                        G,
+                    )
+                    for d in qx:
+                        d.start()
+            if ex.FUSED:
+                with sc("att_kvrd"):
+                    fused_pool_io.gqa_fused_kvrd_issue(ctx, a)
+            with sc("att_kvnew"):
+                if QV:
+                    cos = scr["rope"][0, :B, :half]
+                    sin = scr["rope"][1, :B, :half]
+                    for h in range(nh):
+                        q0_ = h * 2 * HD
+                        scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
+                            :B, q0_ + HD : q0_ + 2 * HD
+                        ]
+                    k = rms_zc(ybuf[:B, koff : koff + HD], kn)
+                    v = ybuf[:B, koff + HD : koff + 2 * HD]
+                    k = rope(k, cos, sin)
                     if ex.paged_kv:
                         k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
                         v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
-                        scr["knew"][b : b + 1, :] = k_fp8.astype(F32)
-                        scr["vnew"][b : b + 1, :] = v_fp8.astype(F32)
+                        scr["knew"][:B, :] = k_fp8.astype(F32)
+                        scr["vnew"][:B, :] = v_fp8.astype(F32)
                     else:
-                        scr["knew"][b : b + 1, :] = k
-                        scr["vnew"][b : b + 1, :] = v
+                        scr["knew"][:B, :] = k
+                        scr["vnew"][:B, :] = v
+                else:
+                    for b in range(B):
+                        cos, sin = rcs[0, b : b + 1, :], rcs[1, b : b + 1, :]
+                        qg = ybuf[b, :koff].reshape(nh, 2 * HD)
+                        scr["gate"][b, :] = qg[:, HD:].reshape(nh * HD)
+                        k = rms_zc(ybuf[b : b + 1, koff : koff + HD], kn)
+                        v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
+                        k = rope(k, cos, sin)
+                        if ex.paged_kv:
+                            k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
+                            v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
+                            scr["knew"][b : b + 1, :] = k_fp8.astype(F32)
+                            scr["vnew"][b : b + 1, :] = v_fp8.astype(F32)
+                        else:
+                            scr["knew"][b : b + 1, :] = k
+                            scr["vnew"][b : b + 1, :] = v
                 if ex.paged_kv:
                     scr["knew_o"][...] = scr["knew"][...].astype(FP8)
                     scr["vnew_o"][...] = scr["vnew"][...].astype(FP8)
-                k_src = scr["knew_o"] if ex.paged_kv else scr["knew"]
-                v_src = scr["vnew_o"] if ex.paged_kv else scr["vnew"]
-                kv_out = (
-                    pltpu.make_async_copy(
-                        k_src, O["knew"].at[a], scr["kv_out_sem"].at[0]
-                    ),
-                    pltpu.make_async_copy(
-                        v_src, O["vnew"].at[a], scr["kv_out_sem"].at[1]
-                    ),
-                )
-                for d in kv_out:
-                    d.start()
+                if not ex.FUSED:
+                    k_src = scr["knew_o"] if ex.paged_kv else scr["knew"]
+                    v_src = scr["vnew_o"] if ex.paged_kv else scr["vnew"]
+                    kv_out = (
+                        pltpu.make_async_copy(
+                            k_src, O["knew"].at[a], scr["kv_out_sem"].at[0]
+                        ),
+                        pltpu.make_async_copy(
+                            v_src, O["vnew"].at[a], scr["kv_out_sem"].at[1]
+                        ),
+                    )
+                    for d in kv_out:
+                        d.start()
+                else:
+                    kv_out = ()
 
             if SPLIT or VER:
                 with sc("att_qgather"):
                     qgb = scr["qg"]
-                    if SPLIT:
-                        comm.exchange(
-                            comm.group_copies(
-                                lambda off: qgb.at[gi],
-                                qgb.at[gi],
-                                scr["sq_ssem"],
-                                scr["sq_rsem"],
-                                G,
-                            )
+                    for d in qx:
+                        d.wait_recv()
+                    for d in qx:
+                        d.wait_send()
+                    if GQ:
+                        for sq in range(NS):
+                            for g_idx in range(G):
+                                scr["qb"][sq, g_idx * QG : (g_idx + 1) * QG] = scr[
+                                    "qxb"
+                                ][g_idx, sq]
+
+                    def qg_rows(g_idx, r0, n):
+                        if not QV:
+                            t_, o_ = divmod(r0, 8)
+                            return qgb[g_idx, t_, o_ : o_ + n, :]
+                        return jnp.concatenate(
+                            [qgb[g_idx, j, r0 : r0 + n, :] for j in range(NHH)],
+                            axis=-1,
                         )
 
                     def group_q(b):
                         if not SPLIT:
-                            return qgb[0, b]
+                            return qg_rows(0, b * 8, 8)
                         t_, o_ = ap.qrow(b)
                         qa = jnp.concatenate(
-                            [qgb[g_idx, t_, o_ : o_ + nh, :] for g_idx in range(G)],
+                            [qg_rows(g_idx, t_ * 8 + o_, nh) for g_idx in range(G)],
                             axis=0,
                         )
                         if G * nh < QR:
@@ -508,7 +748,7 @@ class GQABlock(Block):
                             )
                         return qa
 
-                    for sq in range(NS):
+                    for sq in range(NS if not GQ else 0):
                         qs = [group_q(sq * T + t) for t in range(T)]
                         qs = qs[0] if T == 1 else jnp.concatenate(qs, axis=0)
                         scr["qb"][sq] = qs.astype(BF16)
@@ -524,123 +764,177 @@ class GQABlock(Block):
                 al[...] = jnp.zeros(al.shape, F32)
                 aacc[...] = jnp.zeros(aacc.shape, F32)
 
-                def item(i, carry):
-                    s = i % NKV
-                    kv_wait(i)
-                    if "attn" not in skip:
-                        b, t = scr["wl_b"][i], scr["wl_t"][i]
-                        plen = pos_ref[b * T] if VER else pos_ref[b]
-                        qrows = scr["qb"][b]
-                        k_full: Any = None
-                        v_full: Any = None
-                        v_u32: Any = None
+                def item_front(i):
+                    s = i % KR
+                    b, t = scr["wl_b"][i], scr["wl_t"][i]
+                    plen = pos_ref[b * T] if VER else pos_ref[b]
+                    qrows = scr["qb"][b]
+                    k_full: Any = None
+                    v_full: Any = None
+                    v_u32: Any = None
+                    if ex.paged_kv:
+                        if interpret:
+                            kst = kv_slot(s) if KVE else kvbuf.at[s]
+                            k_u32 = lax.bitcast_convert_type(
+                                jnp.swapaxes(kst[0], 1, 2), U32
+                            )
+                            v_u32 = lax.bitcast_convert_type(
+                                jnp.swapaxes(kst[1], 1, 2), U32
+                            )
+                        elif KVE:
+                            kst = kv_slot(s)
+                            k_u32 = kst[0]
+                            v_u32 = kst[1]
+                        else:
+                            k_u32 = (
+                                kvbuf.at[s, 0].bitcast(U32).reshape(HD // 4, BLK)[...]
+                            )
+                            v_u32 = (
+                                kvbuf.at[s, 1].bitcast(U32).reshape(HD // 4, BLK)[...]
+                            )
+                        k_full = pltpu.bitcast(k_u32, FP8)
+                        if AMASK in (0, 3, 4):
+                            v_full = pltpu.bitcast(v_u32, FP8)
+                    outs = []
+                    for j in range(BLK // SUB):
+                        off = t * BLK + j * SUB
+                        rem = plen - off
+                        full_blk = off + SUB <= plen
                         if ex.paged_kv:
-                            if interpret:
-                                k_u32 = lax.bitcast_convert_type(
-                                    jnp.swapaxes(kvbuf[s, 0], 1, 2), U32
-                                )
-                                v_u32 = lax.bitcast_convert_type(
-                                    jnp.swapaxes(kvbuf[s, 1], 1, 2), U32
-                                )
-                            else:
-                                k_u32 = (
-                                    kvbuf.at[s, 0]
-                                    .bitcast(U32)
-                                    .reshape(HD // 4, BLK)[...]
-                                )
-                                v_u32 = (
-                                    kvbuf.at[s, 1]
-                                    .bitcast(U32)
-                                    .reshape(HD // 4, BLK)[...]
-                                )
-                            k_full = pltpu.bitcast(k_u32, FP8)
+                            kj = (
+                                k_full
+                                if SUB == BLK
+                                else k_full[:, j * SUB : (j + 1) * SUB]
+                            )
                             if AMASK == 0:
-                                v_full = pltpu.bitcast(v_u32, FP8)
-                        for j in range(BLK // SUB):
-                            off = t * BLK + j * SUB
-                            rem = plen - off
-                            full_blk = off + SUB <= plen
-                            if ex.paged_kv:
-                                kj = (
-                                    k_full
-                                    if SUB == BLK
-                                    else k_full[:, j * SUB : (j + 1) * SUB]
-                                )
-                                if AMASK == 0:
-                                    vj = (
-                                        v_full
-                                        if SUB == BLK
-                                        else v_full[:, j * SUB : (j + 1) * SUB]
-                                    )
-                                    vj = jnp.where(
-                                        col_v + off < plen, vj, jnp.zeros_like(vj)
-                                    )
-                                elif AMASK == 1:
-                                    vu = (
-                                        v_u32
-                                        if SUB == BLK
-                                        else v_u32[:, j * SUB : (j + 1) * SUB]
-                                    )
-                                    vu = jnp.where(col < rem, vu, jnp.uint32(0))
-                                    vj = pltpu.bitcast(vu, FP8)
-                                else:
-                                    assert AMASK == 2
-                                    vu = (
-                                        v_u32
-                                        if SUB == BLK
-                                        else v_u32[:, j * SUB : (j + 1) * SUB]
-                                    )
-                                    vu = lax.cond(
-                                        full_blk,
-                                        lambda v_val=vu: v_val,
-                                        lambda v_val=vu, r_val=rem: jnp.where(
-                                            col < r_val, v_val, jnp.uint32(0)
-                                        ),
-                                    )
-                                    vj = pltpu.bitcast(vu, FP8)
-                                scores = stream.mm(qrows, kj, NN)
-                            else:
-                                kj = (
-                                    kbuf[s]
-                                    if SUB == BLK
-                                    else kbuf[s, j * SUB : (j + 1) * SUB]
-                                )
                                 vj = (
-                                    vbuf[s]
+                                    v_full
                                     if SUB == BLK
-                                    else vbuf[s, j * SUB : (j + 1) * SUB]
+                                    else v_full[:, j * SUB : (j + 1) * SUB]
                                 )
-                                scores = stream.mm(qrows, kj, NT)
-                            if AMASK == 0:
-                                scores = jnp.where(col + off < plen, scores, -jnp.inf)
-                            elif AMASK in (1, 4):
-                                scores = jnp.where(col < rem, scores, -jnp.inf)
+                                vj = jnp.where(
+                                    col_v + off < plen, vj, jnp.zeros_like(vj)
+                                )
+                            elif AMASK == 1:
+                                vu = (
+                                    v_u32
+                                    if SUB == BLK
+                                    else v_u32[:, j * SUB : (j + 1) * SUB]
+                                )
+                                vu = jnp.where(col < rem, vu, jnp.uint32(0))
+                                vj = pltpu.bitcast(vu, FP8)
                             else:
-                                scores = lax.cond(
+                                assert AMASK == 2
+                                vu = (
+                                    v_u32
+                                    if SUB == BLK
+                                    else v_u32[:, j * SUB : (j + 1) * SUB]
+                                )
+                                vu = lax.cond(
                                     full_blk,
-                                    lambda s_val=scores: s_val,
-                                    lambda s_val=scores, r_val=rem: jnp.where(
-                                        col < r_val, s_val, -jnp.inf
+                                    lambda v_val=vu: v_val,
+                                    lambda v_val=vu, r_val=rem: jnp.where(
+                                        col < r_val, v_val, jnp.uint32(0)
                                     ),
                                 )
-                            m_old = am[b]
-                            m_new = jnp.maximum(
-                                m_old, jnp.max(scores, axis=-1, keepdims=True)
+                                vj = pltpu.bitcast(vu, FP8)
+                            scores = stream.mm(qrows, kj, NN)
+                        else:
+                            kj = (
+                                kbuf[s]
+                                if SUB == BLK
+                                else kbuf[s, j * SUB : (j + 1) * SUB]
                             )
-                            alpha = jnp.exp(m_old - m_new)
-                            pr = jnp.exp(scores - m_new[:, 0:1])
-                            pv = stream.mm(
-                                pr.astype(BF16), vj, NT if ex.paged_kv else NN
+                            vj = (
+                                vbuf[s]
+                                if SUB == BLK
+                                else vbuf[s, j * SUB : (j + 1) * SUB]
                             )
-                            al[b] = al[b] * alpha + jnp.sum(pr, axis=-1, keepdims=True)
-                            aacc[b] = aacc[b] * alpha[:, 0:1] + pv
-                            am[b] = m_new
-                    kv_start(i + NKV)
+                            scores = stream.mm(qrows, kj, NT)
+                        if AMASK == 0:
+                            scores = jnp.where(col + off < plen, scores, -jnp.inf)
+                        elif AMASK in (1, 4):
+                            scores = jnp.where(col < rem, scores, -jnp.inf)
+                        else:
+                            scores = lax.cond(
+                                full_blk,
+                                lambda s_val=scores: s_val,
+                                lambda s_val=scores, r_val=rem: jnp.where(
+                                    col < r_val, s_val, -jnp.inf
+                                ),
+                            )
+                        rmax = jnp.max(scores, axis=-1, keepdims=True)
+                        outs.append((scores, rmax, vj))
+                    return b, outs
+
+                def item_back(b, outs):
+                    for scores, rmax, vj in outs:
+                        m_old = am[b]
+                        m_new = jnp.maximum(m_old, rmax)
+                        alpha = jnp.exp(m_old - m_new)
+                        pr = jnp.exp(scores - m_new[:, 0:1])
+                        pv = stream.mm(pr.astype(BF16), vj, NT if ex.paged_kv else NN)
+                        al[b] = al[b] * alpha + jnp.sum(pr, axis=-1, keepdims=True)
+                        aacc[b] = aacc[b] * alpha[:, 0:1] + pv
+                        am[b] = m_new
+
+                def item(i, carry):
+                    kv_wait(i)
+                    if "attn" not in skip:
+                        item_back(*item_front(i))
+                    kv_start(i + KR)
                     return carry
 
-                lax.fori_loop(0, n_items, item, 0)
+                def item_pair(p, carry):
+                    i0 = 2 * p
+                    i1 = i0 + 1
+                    kv_wait(i0)
+                    kv_wait(i1)
+                    if "attn" not in skip:
+                        f0 = item_front(i0)
+                        f1 = item_front(i1)
+                        item_back(*f0)
+                        item_back(*f1)
+                    kv_start(i0 + KR)
+                    kv_start(i1 + KR)
+                    return carry
 
-            if SPLIT:
+                if PAIR_KV:
+                    lax.fori_loop(0, lax.div(n_items, 2), item_pair, 0)
+
+                    @pl.when(lax.rem(n_items, 2) == 1)
+                    def _():
+                        item(n_items - 1, 0)
+                else:
+                    lax.fori_loop(0, n_items, item, 0)
+
+            def gq_merge_start():
+                psend, pri = scr["psend"], scr["pri"]
+                with sc("att_merge"):
+                    lane = lax.broadcasted_iota(I32, (QG, 128), 1)
+                    for g_idx in range(G):
+                        rs = slice(g_idx * QG, (g_idx + 1) * QG)
+                        for s_ in range(NS):
+                            psend[g_idx, s_] = aacc[s_, rs]
+                        xm, xl = am[0, rs], al[0, rs]
+                        for s_ in range(1, NS):
+                            hi = lane >= s_ * MLW
+                            xm = jnp.where(hi, am[s_, rs], xm)
+                            xl = jnp.where(hi, al[s_, rs], xl)
+                        psend[g_idx, NS] = jnp.concatenate((xm, xl), axis=-1)
+                    pri[gi] = psend[gi]
+                    mx = comm.group_copies(
+                        lambda off: psend.at[gi ^ off],
+                        pri.at[gi],
+                        scr["sp_ssem"],
+                        scr["sp_rsem"],
+                        G,
+                    )
+                    for d in mx:
+                        d.start()
+                return mx
+
+            def slab_merge_start():
                 with sc("att_merge"):
                     pso, pri = scr["pso"], scr["pri"]
                     lane_pw = lax.broadcasted_iota(I32, (nh, 128), 1)
@@ -656,16 +950,31 @@ class GQABlock(Block):
                                 lane_pw < 64, mb[r0 : r0 + nh], lb[r0 : r0 + nh]
                             )
                     pri[gi] = pso[gi]
-                    comm.exchange(
-                        comm.group_copies(
-                            lambda off: pso.at[gi ^ off],
-                            pri.at[gi],
-                            scr["sp_ssem"],
-                            scr["sp_rsem"],
-                            G,
-                        )
+                    mx = comm.group_copies(
+                        lambda off: pso.at[gi ^ off],
+                        pri.at[gi],
+                        scr["sp_ssem"],
+                        scr["sp_rsem"],
+                        G,
                     )
-                    for t in range(NBP):
+                    for d in mx:
+                        d.start()
+                return mx
+
+            if SPLIT:
+                mx = gq_merge_start() if GQ else slab_merge_start()
+                pri = scr["pri"]
+                if ex.FUSED:
+                    with sc("att_kvwr"):
+                        fused_pool_io.gqa_fused_kv_rmw(ctx, ap, a)
+                with sc("att_gate"):
+                    scr["gate"][0:B, :] = rnd(jax.nn.sigmoid(scr["gate"][0:B, :]))
+                with sc("att_merge"):
+                    for d in mx:
+                        d.wait_recv()
+                    for d in mx:
+                        d.wait_send()
+                    for t in range(NBP if not GQ else 0):
                         parts = [pri[g_idx, t] for g_idx in range(G)]
                         mg = [x[:, HD : HD + 1] for x in parts]
                         m = mg[0]
@@ -694,63 +1003,148 @@ class GQABlock(Block):
                             aacc[sq, q0 : q0 + nh] = asum[o_ : o_ + nh]
 
             with sc("att_new"):
-                NR = nh if PACK else 8
-                for b in range(B):
-                    sq, tb = divmod(b, T)
-                    q0 = tb * QR
-                    m_old = am[sq, q0 : q0 + NR][:, 0:1]
-                    l_old = al[sq, q0 : q0 + NR][:, 0:1]
-                    a_old = aacc[sq, q0 : q0 + NR]
-                    if PACK:
-                        t_, o_ = ap.qrow(b)
-                        qf = scr["qg"][gi, t_, o_ : o_ + nh]
-                    else:
-                        qf = (
-                            scr["qg"][gi, b]
-                            if SPLIT or VER
-                            else scr["qb"][b].astype(F32)
+                if GQ:
+                    pri = scr["pri"]
+                    mlt = [pri[g_idx, NS] for g_idx in range(G)]
+                    row_q = lax.broadcasted_iota(I32, (QG, 1), 0)
+                    for sq in range(NS):
+                        f = sq * MLW
+                        parts = [pri[g_idx, sq] for g_idx in range(G)]
+                        mg = [x[:, f : f + 1] for x in mlt]
+                        lg = [x[:, 128 + f : 128 + f + 1] for x in mlt]
+                        m = mg[0]
+                        for x in mg[1:]:
+                            m = jnp.maximum(m, x)
+                        wg = [jnp.exp(x - m) for x in mg]
+                        lsum_gq: Any = sum(w * x for w, x in zip(wg, lg))
+                        asum_gq: Any = sum(w * x for w, x in zip(wg, parts))
+                        r0 = sq * QG
+                        qblk = jnp.concatenate(
+                            [scr["qg"][0, j, r0 : r0 + QG, :] for j in range(NHH)],
+                            axis=-1,
                         )
-                    if VER:
-                        for j in range(tb + 1):
+                        m_old, l_old, a_old = m, lsum_gq, asum_gq
+                        for j in range(T):
                             bj = sq * T + j
                             s_new = jnp.sum(
-                                qf * scr["knew"][bj : bj + 1, :], axis=-1, keepdims=True
+                                qblk * scr["knew"][bj : bj + 1, :],
+                                axis=-1,
+                                keepdims=True,
                             )
                             m_new = jnp.maximum(m_old, s_new)
                             alpha = jnp.exp(m_old - m_new)
                             p_new = jnp.exp(s_new - m_new)
-                            l_old = l_old * alpha + p_new
-                            a_old = a_old * alpha + p_new * scr["vnew"][bj : bj + 1, :]
-                            m_old = m_new
-                        outb = a_old / l_old
-                    else:
-                        s_new = jnp.sum(
-                            qf * scr["knew"][b : b + 1, :], axis=-1, keepdims=True
-                        )
-                        m_new = jnp.maximum(m_old, s_new)
-                        alpha = jnp.exp(m_old - m_new)
-                        p_new = jnp.exp(s_new - m_new)
-                        l_tot = l_old * alpha + p_new
-                        outb = (
-                            a_old * alpha + p_new * scr["vnew"][b : b + 1, :]
-                        ) / l_tot
-                    for h in range(nh):
-                        oh = rnd(outb[h : h + 1, :])
-                        gh = rnd(
-                            jax.nn.sigmoid(
-                                scr["gate"][b : b + 1, h * HD : (h + 1) * HD]
+                            l_new = l_old * alpha + p_new
+                            a_new = a_old * alpha + p_new * scr["vnew"][bj : bj + 1, :]
+                            if j == 0:
+                                m_old, l_old, a_old = m_new, l_new, a_new
+                            else:
+                                upd = row_q >= j * nh
+                                m_old = jnp.where(upd, m_new, m_old)
+                                l_old = jnp.where(upd, l_new, l_old)
+                                a_old = jnp.where(upd, a_new, a_old)
+                        ob = rnd(a_old / l_old)
+                        for j in range(NHH):
+                            scr["ost"][j, r0 : r0 + QG, :] = ob[
+                                :, j * 128 : (j + 1) * 128
+                            ]
+                else:
+                    NR = nh if PACK else 8
+                    for b in range(B):
+                        sq, tb = divmod(b, T)
+                        q0 = tb * QR
+                        m_old = am[sq, q0 : q0 + NR][:, 0:1]
+                        l_old = al[sq, q0 : q0 + NR][:, 0:1]
+                        a_old = aacc[sq, q0 : q0 + NR]
+                        if QV:
+                            qf = jnp.concatenate(
+                                [
+                                    scr["qg"][gi, j, b * SR : b * SR + NR, :]
+                                    for j in range(NHH)
+                                ],
+                                axis=-1,
                             )
+                        elif PACK:
+                            t_, o_ = ap.qrow(b)
+                            qf = scr["qg"][gi, t_, o_ : o_ + nh]
+                        else:
+                            qf = (
+                                scr["qg"][gi, b]
+                                if SPLIT or VER
+                                else scr["qb"][b].astype(F32)
+                            )
+                        if VER:
+                            for j in range(tb + 1):
+                                bj = sq * T + j
+                                s_new = jnp.sum(
+                                    qf * scr["knew"][bj : bj + 1, :],
+                                    axis=-1,
+                                    keepdims=True,
+                                )
+                                m_new = jnp.maximum(m_old, s_new)
+                                alpha = jnp.exp(m_old - m_new)
+                                p_new = jnp.exp(s_new - m_new)
+                                l_old = l_old * alpha + p_new
+                                a_old = (
+                                    a_old * alpha + p_new * scr["vnew"][bj : bj + 1, :]
+                                )
+                                m_old = m_new
+                            outb = a_old / l_old
+                        else:
+                            s_new = jnp.sum(
+                                qf * scr["knew"][b : b + 1, :],
+                                axis=-1,
+                                keepdims=True,
+                            )
+                            m_new = jnp.maximum(m_old, s_new)
+                            alpha = jnp.exp(m_old - m_new)
+                            p_new = jnp.exp(s_new - m_new)
+                            l_tot = l_old * alpha + p_new
+                            outb = (
+                                a_old * alpha + p_new * scr["vnew"][b : b + 1, :]
+                            ) / l_tot
+                        if QV:
+                            ob = rnd(outb[:nh])
+                            for j in range(NHH):
+                                scr["ost"][j, b * SR : b * SR + nh, :] = ob[
+                                    :, j * 128 : (j + 1) * 128
+                                ]
+                            continue
+                        for h in range(nh):
+                            oh = rnd(outb[h : h + 1, :])
+                            gh = scr["gate"][b : b + 1, h * HD : (h + 1) * HD]
+                            if not SPLIT:
+                                gh = rnd(jax.nn.sigmoid(gh))
+                            scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = rnd(oh * gh)
+                if QV:
+                    for h in range(nh):
+                        oh = jnp.concatenate(
+                            [
+                                scr["ost"][jnp.int32(j), pl.ds(h, B, stride=SR), :]
+                                for j in range(NHH)
+                            ],
+                            axis=-1,
                         )
-                        scr["mix"][b : b + 1, h * HD : (h + 1) * HD] = rnd(oh * gh)
+                        gh = scr["gate"][:B, h * HD : (h + 1) * HD]
+                        if not SPLIT:
+                            gh = rnd(jax.nn.sigmoid(gh))
+                        scr["mix"][:B, h * HD : (h + 1) * HD] = rnd(oh * gh)
 
             with sc("att_out"):
-                for d in kv_out:
-                    d.wait()
+                if ex.FUSED and not SPLIT:
+                    fused_pool_io.gqa_fused_kv_rmw(ctx, ap, a)
+                elif not ex.FUSED:
+                    for d in kv_out:
+                        d.wait()
                 NO = nh * HD
                 scr["xb2"][:, :NO] = scr["mix"][:, :NO].astype(BF16)
                 yo = stream.dmatmul("att_out", scr["xb2"], H)
 
         return yo * ctx.sm(slot, "out_s")
+
+    def epilogue(self, ctx: Any) -> None:
+        if ctx.ex.FUSED:
+            fused_pool_io.gqa_fused_epilogue(ctx)
 
     def host_update_states(
         self,
@@ -761,6 +1155,10 @@ class GQABlock(Block):
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
         """Scatter `knew` and `vnew` into `kc` and `vc` inside `shard_map`."""
+        if ex.FUSED:
+            if "raw" in raw_outputs:
+                return {"raw": raw_outputs["raw"]}
+            return {}
         knew, vnew = raw_outputs["knew"], raw_outputs["vnew"]
         if ex.paged_kv or "kc" not in states:
             return {"knew": knew, "vnew": vnew}
