@@ -188,6 +188,30 @@ def make_ffn_configs(
         tile_m -= bucket_base
 
 
+def ffn_tile(
+    tiled_lhs_ref: jax.Array,  # [tile_m // size_lhs_sublane, size_lhs_sublane, k]
+    w13_ref: FusedWeightsRef,
+    w2_ref: WeightsRef,
+    *,
+    bucket_m: int,
+    up: GmmConfigs,
+    down: GmmConfigs,
+) -> jax.Array:
+    """The down leg's f32 accumulator for the tile's first bucket_m rows."""
+    tiled_lhs = tiled_lhs_ref.reshape(-1, up.tiles.tile_k)[:bucket_m]
+    acc = tile_matmul(
+        tiled_lhs, w13_ref, cfgs=up, bucket_m=bucket_m, is_last_k_step=True
+    )
+    if up.rhs_cfgs.has_bias:
+        acc += w13_ref.get_bias().astype(acc.dtype)
+    hidden = apply_act_fn(acc, up.fuse_act).astype(up.out_dtype)
+
+    acc = tile_matmul(hidden, w2_ref, cfgs=down, bucket_m=bucket_m, is_last_k_step=True)
+    if down.rhs_cfgs.has_bias:
+        acc += w2_ref.get_bias().astype(acc.dtype)
+    return acc
+
+
 def ffn_inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,  # [tile_m // size_lhs_sublane, size_lhs_sublane, k]
@@ -211,19 +235,9 @@ def ffn_inner_kernel(
     m_end_local = m_end - m_offset
 
     def run_tile(bucket_m: int):
-        tiled_lhs = tiled_lhs_ref.reshape(-1, up.tiles.tile_k)[:bucket_m]
-        acc = tile_matmul(
-            tiled_lhs, w13_ref, cfgs=up, bucket_m=bucket_m, is_last_k_step=True
+        acc = ffn_tile(
+            tiled_lhs_ref, w13_ref, w2_ref, bucket_m=bucket_m, up=up, down=down
         )
-        if up.rhs_cfgs.has_bias:
-            acc += w13_ref.get_bias().astype(acc.dtype)
-        hidden = apply_act_fn(acc, up.fuse_act).astype(up.out_dtype)
-
-        acc = tile_matmul(
-            hidden, w2_ref, cfgs=down, bucket_m=bucket_m, is_last_k_step=True
-        )
-        if down.rhs_cfgs.has_bias:
-            acc += w2_ref.get_bias().astype(acc.dtype)
         store_tile_output(
             acc,
             tiled_out_ref,
