@@ -1127,6 +1127,39 @@ def kv_write_in_gather_supported(
     )
 
 
+def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
+    """TPU_MLA_FUSED_SMALL_A2A: (operands pinned to HBM, scoped VMEM MiB) of the
+    fused call at a decode bucket of `num_tokens` (static: the JAX op's shape).
+    TPU_MLA_FUSED_SMALL_A2A_BUCKETS, when set, gives it per bucket as
+    `T=<pins>@<MiB>` entries (`<pins>`: all | none | roles of
+    `sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES` joined by `+`); a bucket it does
+    not list, or an empty knob, takes PIN_MIN_TOKENS / PIN_VMEM_MIB / VMEM_MIB."""
+    spec = (envs.TPU_MLA_FUSED_SMALL_A2A_BUCKETS or "").strip()
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        tokens, _, rest = entry.partition("=")
+        pins, _, mib = rest.partition("@")
+        if int(tokens) != num_tokens:
+            continue
+        pins = pins.strip()
+        if pins == "all":
+            pin: bool | tuple = True
+        elif pins in ("none", ""):
+            pin = False
+        else:
+            pin = tuple(sorted(p.strip() for p in pins.split("+")))
+            bad = set(pin) - set(sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES)
+            if bad:
+                raise ValueError(f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}")
+        return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
+    vmem_mib = (
+        envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
+        if pin
+        else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+    )
+    return bool(pin), int(vmem_mib)
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1417,17 +1450,12 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange:
                     # Static per bucket (the JAX op's shape, not a torch gate).
-                    pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
-                    vmem_mib = (
-                        envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
-                        if pin
-                        else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
-                    )
+                    pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
                     split_kwargs["send_exchange"] = (
                         dcp_axis_name,
                         lane_axis,
                         int(vmem_mib) * 1024 * 1024,
-                        bool(pin),
+                        pin,
                     )
                     split_kwargs["send_peer"] = jnp.stack(
                         [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]

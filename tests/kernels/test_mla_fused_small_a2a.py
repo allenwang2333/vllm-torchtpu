@@ -132,3 +132,30 @@ def test_slab_geometry():
     )
     assert sparse_mla.SEND_EXCHANGE_COLLECTIVE_ID == 13
 
+
+
+def test_bucket_config():
+    from vllm_torchtpu.layers.core import attention_interface as ai
+
+    def cfg(tokens, **env):
+        with mock.patch.dict(os.environ, env):
+            for k in ("TPU_MLA_FUSED_SMALL_A2A_BUCKETS",):
+                if k not in env:
+                    os.environ.pop(k, None)
+            return ai.fused_small_a2a_bucket_config(tokens)
+
+    # Defaults (M1e): T < 8 unpinned at 16 MiB, T >= 8 everything pinned at 32.
+    assert cfg(4) == (False, 16) and cfg(8) == (True, 32)
+    spec = "4=kv@16,8=kv+tab@32"
+    assert cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS=spec) == (("kv",), 16)
+    assert cfg(8, TPU_MLA_FUSED_SMALL_A2A_BUCKETS=spec) == (("kv", "tab"), 32)
+    # A bucket the spec does not list keeps the defaults.
+    assert cfg(8, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=all@24") == (True, 32)
+    assert cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=all@24") == (True, 24)
+    assert cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=none@20") == (False, 20)
+    with pytest.raises(ValueError):
+        cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS="4=weights@16")
+
+
+def test_pin_roles_cover_every_operand_class():
+    assert set(sparse_mla.SEND_EXCHANGE_PIN_ROLES) == {"kv", "q", "q_pe", "tab", "recv"}

@@ -1489,6 +1489,10 @@ SEND_EXCHANGE_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 # reserved, XLA would otherwise stage the gathered KV (the call's largest
 # inputs, which the kernel DMAs itself) into VMEM with exposed copies right
 # before the call (served mirror: +3.5 us per layer at T = 4, more at T = 8).
+# Which operands are pinned is a per-bucket choice (`send_exchange[3]`): all,
+# none, or these roles -- "kv" (the gathered KV / live views), "q", "q_pe",
+# "tab" (the q rope table), "recv" (the aliased receive-buffer input).
+SEND_EXCHANGE_PIN_ROLES = ("kv", "q", "q_pe", "tab", "recv")
 # Test-only: positive controls (misrouted / dropped peer block) and timing-
 # only removal arms (the round replaced by local copies; the barrier waited
 # at entry instead of after the body) of the fused exchange.
@@ -3321,8 +3325,9 @@ def sparse_ragged_paged_attention(
         in place of the lse; the attention output is then not written.
       send_exchange: TPU_MLA_FUSED_SMALL_A2A. `(axis, lane_axis or None[,
         vmem_limit_bytes[, hbm_pin]])` of the (lane, DCP) mesh (the call's
-        scoped VMEM, default SEND_EXCHANGE_VMEM_LIMIT_BYTES; whether its array
-        operands are pinned to HBM, default True), with `send_world` on a bucket the attention grid
+        scoped VMEM, default SEND_EXCHANGE_VMEM_LIMIT_BYTES; which array
+        operands are pinned to HBM: True = all (default), False = none, or a
+        tuple of SEND_EXCHANGE_PIN_ROLES), with `send_world` on a bucket the attention grid
         walks in one step, inside a shard_map: the kernel also runs the DCP
         exchange (see SEND_SLAB_ROW0) and returns the receive buffer int16
         `[send_world * block, V]` -- `small_all_to_all(send, row0=
@@ -4399,23 +4404,35 @@ def sparse_attention_chunk(
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        roles = ["q", "kv", "kv"]
         if split_q:
             operands.append(q_pe)
+            roles.append("q_pe")
         if q_rope:
             operands.append(q_rope_table)
+            roles.append("tab")
         if live_views is not None:
             operands += list(live_views)
+            roles += ["kv"] * len(live_views)
         if return_lse and not lse_fill:
             operands.append(lse)
+            roles.append("lse")
         elif return_lse and send_recv_in is not None:
             operands.append(send_recv_in)
+            roles.append("recv")
         if out_carried is not None:
             operands.append(out_carried)
-        if send_exchange is not None and (
-            len(send_exchange) < 4 or send_exchange[3]
-        ):
+            roles.append("out")
+        if send_exchange is not None:
+            pin = send_exchange[3] if len(send_exchange) > 3 else True
+            # True: every array operand; a tuple of roles (SEND_EXCHANGE_PIN_ROLES):
+            # only those -- e.g. ("kv",) keeps the gathered KV in HBM (XLA would
+            # stage it into VMEM ahead of the call) and leaves q where XLA puts it.
             operands = [
-                pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in operands
+                pltpu.with_memory_space_constraint(x, pltpu.HBM)
+                if pin is True or (pin and r in pin)
+                else x
+                for x, r in zip(operands, roles)
             ]
         return kernel(*scalar_prefetches, *operands)
 
