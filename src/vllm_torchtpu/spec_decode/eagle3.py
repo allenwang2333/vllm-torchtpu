@@ -825,14 +825,62 @@ class Eagle3Proposer:
         write lands on exactly these rows and destroys them.
         """
         assert self.draft_model is not None
+        if envs.TPU_MTP_TOPK_INPLACE:
+            # The snapshot alone: every loop step restores these rows before
+            # it reads the table (separate path, fused program, and the fused
+            # path's per-chunk fallback), so the compaction write into the
+            # table would only be overwritten -- and on TPU it is a functional
+            # whole-table copy. Same rows: buf[:n] = buf[idx] then
+            # buf[:n].clone() equals buf[idx] (the right side is read first).
+            return [buf[gather_indices] for buf in self._mtp_topk_buffers]
         self.draft_model.model.compact_topk_indices(gather_indices)
         num_rows = gather_indices.shape[0]
         return [buf[:num_rows].clone() for buf in self._mtp_topk_buffers]
 
+    def _topk_row_ids(self, n: int) -> torch.Tensor:
+        """Device int32 [0, n): the rows a restore writes (cached per n)."""
+        cache = self.__dict__.setdefault("_topk_row_ids_cache", {})
+        ids = cache.get(n)
+        if ids is None:
+            ids = torch.arange(n, dtype=torch.int32).to(self.runner.device)
+            cache[n] = ids
+        return ids
+
     def _mtp_restore_topk(self, saved: list[torch.Tensor]) -> None:
         """Put this chunk's step-0 rows back at the front before its forward."""
+        if envs.TPU_MTP_TOPK_INPLACE:
+            from vllm_torchtpu.kernels.partial_kv_update import pallas_index_copy_
+
+            for buf, rows in zip(self._mtp_topk_buffers, saved):
+                # In place, O(rows): the eager slice assignment below copies
+                # the whole table.
+                pallas_index_copy_(buf, self._topk_row_ids(rows.shape[0]), rows)
+            return
         for buf, rows in zip(self._mtp_topk_buffers, saved):
             buf[: rows.shape[0]] = rows
+
+    def _precompile_topk_restore(self) -> None:
+        """Warm the in-place restore at every loop bucket (TPU_MTP_TOPK_INPLACE),
+        so a propose never compiles it. Writes the rows the table already
+        holds, so its contents do not change."""
+        if not (envs.TPU_MTP_TOPK_INPLACE and self._share_mtp_indices):
+            return
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, runner.max_num_reqs
+        )
+        sizes = sorted(
+            {self._loop_bucket(n) for n in runner.num_reqs_paddings}
+            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
+        )
+        with runner._precompile_timed("drafter top-k restore"):
+            for n in sizes:
+                saved = [buf[:n].clone() for buf in self._mtp_topk_buffers]
+                self._mtp_restore_topk(saved)
+                synchronize_tensors(list(self._mtp_topk_buffers))
+                logger.info("  -- drafter top-k restore rows: %d", n)
 
     def _validate_kv_sharing_supported(self) -> None:
         """Fail closed on TPU paths that cannot honour `skip_kv_update`.
@@ -2149,6 +2197,7 @@ class Eagle3Proposer:
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
+        self._precompile_topk_restore()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.

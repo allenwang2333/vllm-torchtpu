@@ -258,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = False
+    TPU_MTP_TOPK_INPLACE: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1776,6 +1777,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MTP_FUSED_INDEXSHARE": env_bool(
         "VLLM_TPU_MTP_FUSED_INDEXSHARE", default=False
     ),
+    # IndexShare's per-propose top-k bookkeeping without pool-sized copies.
+    # The step-0 rows are snapshotted with one gather (no compaction write
+    # into the shared [max_num_tokens, index_topk] table: every loop step
+    # restores them before it reads), and each restore writes its rows in
+    # place (kernels/partial_kv_update.pallas_index_copy_). Eager slice
+    # assignment into the table is functional on TPU: each one copied the
+    # whole 32 MiB table (~26 us on tpu7x), three times per propose.
+    "TPU_MTP_TOPK_INPLACE": env_bool("TPU_MTP_TOPK_INPLACE", default=False),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
