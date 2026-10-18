@@ -215,6 +215,14 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of
         # recomputing it or paying the full upstream builder walk.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
+        # TPU_DRAFT_LOOP_CACHE_UPLOADS: the loop steps' query_start_loc and
+        # request_distribution, keyed by (kernel_num_reqs, num_reqs). Their
+        # values are a function of that key alone and nothing writes them in
+        # place, so one upload serves every propose with the same key.
+        self._cache_loop_uploads = bool(envs.TPU_DRAFT_LOOP_CACHE_UPLOADS)
+        self._loop_uploads: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -1288,13 +1296,23 @@ class Eagle3Proposer:
                     else runner.num_reqs_most_model_len
                 )
                 assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
-                loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
-                    )
+                cached = (
+                    self._loop_uploads.get((knr, c.num_reqs))
+                    if self._cache_loop_uploads
+                    else None
                 )
+                if cached is None:
+                    qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
+                    cached = (
+                        torch.from_numpy(qsl_np).to(runner.device),
+                        torch.tensor(
+                            [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                        ),
+                    )
+                    if self._cache_loop_uploads:
+                        self._loop_uploads[(knr, c.num_reqs)] = cached
+                loop_qsl_per_chunk.append(cached[0])
+                loop_reqdist_per_chunk.append(cached[1])
 
             def run_draft_step(ci: int, step: int) -> None:
                 """One separate draft step for chunk `ci`: a draft forward
