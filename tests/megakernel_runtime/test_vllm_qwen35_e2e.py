@@ -915,7 +915,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     tp = NamedSharding(mesh, P("tp"))
     unsh = NamedSharding(mesh, P())
     g = _tiny_geom(L=4, att_every=4)
-    num_pages = 96
+    num_pages = 160
     ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=num_pages)
 
     # Generate independent logical weights and packed MK reference weights via pure-JAX
@@ -948,7 +948,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     qsl_np = np.zeros(16, dtype=np.int32)
     req_dist_cpu = torch.zeros(3, dtype=torch.int32)
     comb_dist_cpu = torch.zeros(6, dtype=torch.int32)
-    roff_slot_buf = torch.zeros((16,), dtype=torch.int32)
+    roff_slot_buf = torch.zeros((32,), dtype=torch.int32)
     runner = SimpleNamespace(
         model=model,
         mesh=mesh,
@@ -987,14 +987,19 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # 1. `bind_and_warmup` binds pools, compiles (1, 2) and (4, 4), runs sentinel check,
     #    and restores pools
     driver.bind_and_warmup(runner)
+    assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
         assert p.untyped_storage().data_ptr() == orig_storage_ptrs[idx]
         assert torch.count_nonzero(p.view(torch.uint8)).item() == 0
 
     # Pack initial logical KV and GDN states into Raiden pools via `qwen35_pool`
-    pt_init = jnp.asarray([[60, 61], [62, 63]], dtype=jnp.int32)
-    ckpt_init = jnp.asarray([[[1], [5]], [[1], [5]], [[1], [5]]], dtype=jnp.int32)
+    # using disjoint GDN slot IDs per sub-layer `sub in {0, 1, 2}`:
+    #   sub=0: seq 0 -> 1..4,  seq 1 -> 5..8
+    #   sub=1: seq 0 -> 9..12, seq 1 -> 13..16
+    #   sub=2: seq 0 -> 17..20, seq 1 -> 21..24
+    pt_init = jnp.asarray([[130, 131], [132, 133]], dtype=jnp.int32)
+    ckpt_init = jnp.asarray([[[1], [5]], [[9], [13]], [[17], [21]]], dtype=jnp.int32)
     roff_init = jnp.zeros((3, 2), dtype=jnp.int32)
     init_pools_j = qwen35_pool.states_to_pool(
         g, ex_base, st_l, pt_init, ckpt_init, roff_init
@@ -1005,21 +1010,29 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
 
     # Set up serving forward context with 1-D flattened block_tables and padded mamba
-    # indices (matching TPUModelRunner's exact tensor shapes).
+    # indices (matching TPUModelRunner's exact tensor shapes) with disjoint slots
+    # across the 3 linear-attention layers sharing pool[0].
     attn_md = SimpleNamespace(
-        block_tables=torch.tensor([60, 61, 62, 63, 0, 0, 0, 0], dtype=torch.int32),
+        block_tables=torch.tensor([130, 131, 132, 133, 0, 0, 0, 0], dtype=torch.int32),
         seq_lens=torch.tensor([6, 10, 0, 0], dtype=torch.int32),
     )
     mamba_mds = [
         SimpleNamespace(
-            mamba_state_indices=torch.tensor([1, 5, 0, 0], dtype=torch.int32),
+            mamba_state_indices=torch.tensor(
+                [1 + 8 * sub, 5 + 8 * sub, 0, 0], dtype=torch.int32
+            ),
             mamba_ckpt_indices=torch.tensor(
-                [[1, 2, 3, 4], [5, 6, 7, 8], [0, 0, 0, 0], [0, 0, 0, 0]],
+                [
+                    [1 + 8 * sub, 2 + 8 * sub, 3 + 8 * sub, 4 + 8 * sub],
+                    [5 + 8 * sub, 6 + 8 * sub, 7 + 8 * sub, 8 + 8 * sub],
+                    [0, 0, 0, 0],
+                    [0, 0, 0, 0],
+                ],
                 dtype=torch.int32,
             ),
             mamba_slot_read_offsets=roff_slot_buf,
         )
-        for _ in range(3)
+        for sub in range(3)
     ]
     md_dict = {driver.attn_layer_name: attn_md}
     for name, m_md in zip(driver.mamba_layer_names, mamba_mds, strict=True):
@@ -1069,7 +1082,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     step_ref_t1, _ = qwen35.make_pooled_step(mesh, g, ex_t1, donate_pools=False)
     hid_in_t1_pad = torch.nn.functional.pad(hid_t1_bf16, (0, 0, 0, ex_t1.M - 2))
     ckpt_ref_t1 = jnp.asarray(
-        [[[1, 1], [5, 5]], [[1, 1], [5, 5]], [[1, 1], [5, 5]]], dtype=jnp.int32
+        [[[1, 1], [5, 5]], [[9, 9], [13, 13]], [[17, 17], [21, 21]]], dtype=jnp.int32
     )
     roff_ref_t1 = jnp.zeros((3, 2), dtype=jnp.int32)
     hid_ref_t1, ref_pools_j = step_ref_t1(
@@ -1092,18 +1105,19 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
 
     # -------------------------------------------------------------------------
-    # Step B: T=4 MTP verify (B=4, NS=1, T=4) writing contiguous slots [1, 2, 3, 4]
+    # Step B: T=4 MTP verify (B=4, NS=1, T=4) writing contiguous slots per sub
     # -------------------------------------------------------------------------
     runner._attn_metadata_builder_ctx.num_reqs = 1
     comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 4]
     roff_slot_buf.zero_()
-    attn_md.block_tables = torch.tensor([60, 61, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    attn_md.block_tables = torch.tensor([130, 131, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
     attn_md.seq_lens = torch.tensor([9, 0, 0, 0], dtype=torch.int32)
-    for m_md in mamba_mds:
-        m_md.mamba_state_indices = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
+    for sub, m_md in enumerate(mamba_mds):
+        b0 = 1 + 8 * sub
+        m_md.mamba_state_indices = torch.tensor([b0, 0, 0, 0], dtype=torch.int32)
         m_md.mamba_ckpt_indices = torch.tensor(
-            [[1, 2, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+            [[b0, b0 + 1, b0 + 2, b0 + 3], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
             dtype=torch.int32,
         )
 
@@ -1118,9 +1132,9 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     hid_t4_bf16 = driver.embed_tokens(input_ids_t4).to(torch.bfloat16)
     hid_in_t4_pad = torch.nn.functional.pad(hid_t4_bf16, (0, 0, 0, ex_t4.M - 4))
     pos_j_t4 = jnp.asarray([6, 7, 8, 9], dtype=jnp.int32)
-    pt_ref_t4 = jnp.asarray([[60, 61]], dtype=jnp.int32)
+    pt_ref_t4 = jnp.asarray([[130, 131]], dtype=jnp.int32)
     ckpt_ref_t4 = jnp.asarray(
-        [[[1, 2, 3, 4]], [[1, 2, 3, 4]], [[1, 2, 3, 4]]], dtype=jnp.int32
+        [[[1, 2, 3, 4]], [[9, 10, 11, 12]], [[17, 18, 19, 20]]], dtype=jnp.int32
     )
     roff_ref_t4 = jnp.zeros((3, 1), dtype=jnp.int32)
     hid_ref_t4, ref_pools_j = step_ref_t4(
@@ -1143,15 +1157,17 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
 
     # -------------------------------------------------------------------------
-    # Step C: T=1 plain decode after T=4 verify with `roff[1] = 2` (accepting 2
-    #         draft tokens so the step reads slot `ckpt[0, 2] == 3` and writes
-    #         the updated GDN state back to base slot `s[0] == 1`).
+    # Step C: T=1 plain decode after T=4 verify with `roff = 2` (accepting 2
+    #         draft tokens so the step reads `ckpt[0, 2]` and writes the
+    #         updated GDN state back to base slot `s[0]` for each sub).
     # -------------------------------------------------------------------------
     runner._attn_metadata_builder_ctx.num_reqs = 1
     comb_dist_cpu.copy_(torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 1]
     roff_slot_buf.zero_()
-    roff_slot_buf[1] = 2  # base slot 1 -> read offset 2 (slot 3)
+    roff_slot_buf[1] = 2  # sub=0 base slot 1 -> read offset 2 (slot 3)
+    roff_slot_buf[9] = 2  # sub=1 base slot 9 -> read offset 2 (slot 11)
+    roff_slot_buf[17] = 2  # sub=2 base slot 17 -> read offset 2 (slot 19)
 
     # Snapshot slot 3 (pages 15..19) and slot 1 (pages 5..9) before Step C
     slot3_before = [p[15:19].view(torch.uint8).clone() for p in raw_pools_t]
@@ -1171,13 +1187,13 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         assert not torch.equal(p[5:9].view(torch.uint8), slot1_before[idx])
         assert torch.equal(p[15:19].view(torch.uint8), slot3_before[idx])
 
-    # Independent `make_pooled_step` oracle with read_slot=3, write_slot=1 for seq 0
+    # Independent `make_pooled_step` oracle with read_slot=b0+2, write_slot=b0 for seq 0
     hid_c_bf16 = driver.embed_tokens(input_ids_t1_after_t4).to(torch.bfloat16)
     hid_in_c_pad = torch.nn.functional.pad(hid_c_bf16, (0, 0, 0, ex_t1.M - 2))
     pos_j_c = jnp.asarray([8, 0], dtype=jnp.int32)
-    pt_ref_c = jnp.asarray([[60, 61], [0, 0]], dtype=jnp.int32)
+    pt_ref_c = jnp.asarray([[130, 131], [0, 0]], dtype=jnp.int32)
     ckpt_ref_c = jnp.asarray(
-        [[[3, 1], [0, 0]], [[3, 1], [0, 0]], [[3, 1], [0, 0]]], dtype=jnp.int32
+        [[[3, 1], [0, 0]], [[11, 9], [0, 0]], [[19, 17], [0, 0]]], dtype=jnp.int32
     )
     roff_ref_c = jnp.zeros((3, 2), dtype=jnp.int32)
     hid_ref_c, ref_pools_j = step_ref_t1(
@@ -1200,8 +1216,8 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
 
     # -------------------------------------------------------------------------
-    # Step D: Subsequent T=4 MTP verify with reset `roff[1] = 0` (reads base slot 1
-    #         written by Step C) followed by Step E with `roff[1] = 2`.
+    # Step D: Subsequent T=4 MTP verify with reset `roff = 0` (reads base slots
+    #         written by Step C) followed by Step E with `roff = 2`.
     # -------------------------------------------------------------------------
     runner._attn_metadata_builder_ctx.num_reqs = 1
     comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
@@ -1235,8 +1251,10 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
             np.asarray(p_ref).view(np.uint8),
         )
 
-    # Step E: Speculative acceptance on next T=4 step via `roff_slot_buf[1] = 2`
+    # Step E: Speculative acceptance on next T=4 step via `roff = 2`
     roff_slot_buf[1] = 2
+    roff_slot_buf[9] = 2
+    roff_slot_buf[17] = 2
     input_ids_t4_acc = torch.tensor([31, 32, 33, 34], dtype=torch.int32)
     positions_t4_acc = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
     assert driver.can_run(input_ids_t4_acc, positions_t4_acc, runner=runner)

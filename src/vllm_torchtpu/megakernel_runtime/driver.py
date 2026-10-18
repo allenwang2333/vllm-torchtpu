@@ -19,8 +19,10 @@ Integrates the modular `megakernel` library with `TPUModelRunner`:
 - Binds unified KV+GDN `float8_e4m3fn` raw pools (`bind_caches`) and builds
   per-bucket ops via `exported_bridge.build_pooled_step_op` +
   `execute_pooled_step_inplace`.
-- Verifies pool donation in lowered HLO (`verify_pooled_step_hlo`) and runs a
-  warmup sentinel check confirming both KV and GDN pages are updated in-place.
+- Verifies pool donation in lowered JAX HLO (`verify_pooled_step_hlo`) and
+  outer `torch_tpu` compiled IR (`verify_torchtpu_compiled_step_ir`) across
+  every compiled bucket, and runs a warmup sentinel check per `T` variant
+  confirming both KV and GDN pages are updated in-place.
 - Dispatches eligible `T=1` decode and `T=4` MTP verify steps from
   `TPUModelRunner.forward_model`, with optional A/B calibration (`MKABCalibrator`).
 """
@@ -58,8 +60,16 @@ from vllm_torchtpu.megakernel_runtime.weight_collector import (
 
 logger = init_logger(__name__)
 
+# Default T=1 decode buckets (when speculative decoding is disabled) and T=4 MTP
+# verify buckets (11 buckets covering NS in {1..6, 8, 10, 12, 14, 16} active
+# sequences at T=4 to avoid rounding medium-concurrency steps up to the next
+# power of 2). Cold XLA compilation takes ~12-15s per bucket on TPU v7x-8
+# (~2.5 min total for all 11 verify buckets, <1s/bucket on warm start with
+# Tier-3 PJRT cache); override via VLLM_TPU_MEGAKERNEL="verify_buckets=...".
 _DEFAULT_BUCKETS = (8, 16, 32)
 _DEFAULT_VERIFY_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
+_MTP_VERIFY_TOKENS = 4
+_MTP_SPECULATIVE_TOKENS = _MTP_VERIFY_TOKENS - 1
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -536,9 +546,18 @@ def prepare_step_inputs_eager(
     return ids_b, pos_b, pt_b, ckpt_b, roff_b
 
 
-_compiled_prepare_step_inputs = torch.compile(
-    prepare_step_inputs_eager, backend="tpu", fullgraph=True, dynamic=False
-)
+_compiled_prepare_step_inputs: Callable[..., Any] | None = None
+
+
+def _get_compiled_prepare_step_inputs() -> Callable[..., Any]:
+    global _compiled_prepare_step_inputs
+    fn = _compiled_prepare_step_inputs
+    if fn is None:
+        fn = torch.compile(
+            prepare_step_inputs_eager, backend="tpu", fullgraph=True, dynamic=False
+        )
+        _compiled_prepare_step_inputs = fn
+    return fn
 
 
 def _extract_group_mamba_tensors(
@@ -633,7 +652,7 @@ def prepare_step_metadata(
 
     dummy_ids = torch.ones((active_rows,), dtype=torch.int32, device=dev)
     prep_fn = (
-        _compiled_prepare_step_inputs
+        _get_compiled_prepare_step_inputs()
         if dev.type == "tpu"
         else prepare_step_inputs_eager
     )
@@ -760,9 +779,8 @@ class MegakernelDriver:
         self._bucket_ops: dict[tuple[int, int], Any] = {}
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bound = False
-        self._hlo_checked_t: set[int] = set()
-        self._torchtpu_ir_probe_attached: bool = False
-        self._torchtpu_ir_checked: bool = False
+        self._hlo_checked_buckets: set[tuple[int, int]] = set()
+        self._torchtpu_ir_checked_buckets: set[tuple[int, int]] = set()
         self._torchtpu_ir_error: str | None = None
         self._prepared_step: tuple[Any, ...] | None = None
         self._step_mix: dict[str, int] = {}
@@ -779,6 +797,15 @@ class MegakernelDriver:
             enabled=bool(default_cfg["ab"] if ab is None else ab),
             period_s=self._step_mix_period_s,
         )
+
+    @property
+    def _torchtpu_ir_checked(self) -> bool:
+        return bool(self._torchtpu_ir_checked_buckets)
+
+    @_torchtpu_ir_checked.setter
+    def _torchtpu_ir_checked(self, val: bool) -> None:
+        if not val:
+            self._torchtpu_ir_checked_buckets.clear()
 
     def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
         del r_cnt
@@ -938,9 +965,18 @@ class MegakernelDriver:
         if hasattr(runner, "speculative_config"):
             spec_cfg = getattr(runner, "speculative_config", None)
             num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
-            if num_spec == 3 and not cfg.get("buckets_explicit", False):
+            # When MTP speculative decoding runs with 3 draft tokens (T=4 target
+            # verify), steady-state target steps are all T=4 verify so default
+            # T=1 decode buckets are skipped unless explicitly requested.
+            # Conversely, when num_spec != 3 (e.g. non-speculative T=1 decode),
+            # T=4 verify buckets are skipped unless explicitly requested.
+            if num_spec == _MTP_SPECULATIVE_TOKENS and not cfg.get(
+                "buckets_explicit", False
+            ):
                 buckets = ()
-            elif num_spec == 0 and not cfg.get("verify_buckets_explicit", False):
+            elif num_spec != _MTP_SPECULATIVE_TOKENS and not cfg.get(
+                "verify_buckets_explicit", False
+            ):
                 verify_buckets = ()
         if not buckets and not verify_buckets:
             logger.info("Megakernel disabled (both bucket lists empty).")
@@ -1072,8 +1108,8 @@ class MegakernelDriver:
         self._bucket_steps.clear()
         self._bucket_ops.clear()
         self._bucket_out_rows.clear()
-        self._hlo_checked_t.clear()
-        self._torchtpu_ir_probe_attached = False
+        self._hlo_checked_buckets.clear()
+        self._torchtpu_ir_checked_buckets.clear()
         for b in self.buckets:
             m_rows = max(16, rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
@@ -1103,9 +1139,10 @@ class MegakernelDriver:
         )
         is_tpu = self.raw_pools[0].device.type == "tpu"
         ckpt_cols_hlo = 2 if tokens_per_seq == 1 else tokens_per_seq
-        if tokens_per_seq not in self._hlo_checked_t:
-            self._hlo_checked_t.add(tokens_per_seq)
-            compile_hlo = bool(self._compile_hlo_check) or (is_tpu and not ex.interpret)
+        bkt_key = (tokens_per_seq, bucket_t)
+        if bkt_key not in self._hlo_checked_buckets:
+            self._hlo_checked_buckets.add(bkt_key)
+            compile_hlo = True if self._compile_hlo_check else None
             ok_hlo, reason_hlo = verify_pooled_step_hlo(
                 self.mesh,
                 self.spec,
@@ -1140,7 +1177,7 @@ class MegakernelDriver:
             op_name=op_name,
             donate_pools=True,
         )
-        self._bucket_ops[(tokens_per_seq, bucket_t)] = op
+        self._bucket_ops[bkt_key] = op
 
         m_rows = ex.M
         out_rows = int(out_pad_rows) if out_pad_rows is not None else m_rows
@@ -1204,36 +1241,26 @@ class MegakernelDriver:
                 hid_out = F.pad(hid_out, (0, 0, 0, out_rows - hid_out.shape[0]))
             return hid_out
 
-        _step_impl.__code__ = _step_impl.__code__.replace(
-            co_name=f"step_t{tokens_per_seq}_b{bucket_t}"
-        )
         if is_tpu:
-            if not self._torchtpu_ir_probe_attached and not self._torchtpu_ir_checked:
-                self._torchtpu_ir_probe_attached = True
 
-                def _on_torchtpu_compile(debug: Any) -> None:
-                    self._verify_torchtpu_compile_debug(
-                        debug,
-                        tokens_per_seq=tokens_per_seq,
-                        bucket_t=bucket_t,
-                    )
-
-                compile_opts: dict[str, Any] = {
-                    "debug_callback": _on_torchtpu_compile,
-                    "serializable": False,
-                }
-                return torch.compile(
-                    _step_impl,
-                    backend="tpu",
-                    fullgraph=True,
-                    dynamic=False,
-                    options=compile_opts,
+            def _on_torchtpu_compile(debug: Any) -> None:
+                self._verify_torchtpu_compile_debug(
+                    debug,
+                    tokens_per_seq=tokens_per_seq,
+                    bucket_t=bucket_t,
                 )
+
+            compile_opts: dict[str, Any] = {
+                "name": f"step_t{tokens_per_seq}_b{bucket_t}",
+                "debug_callback": _on_torchtpu_compile,
+                "serializable": False,
+            }
             return torch.compile(
                 _step_impl,
                 backend="tpu",
                 fullgraph=True,
                 dynamic=False,
+                options=compile_opts,
             )
         return _step_impl
 
@@ -1273,38 +1300,13 @@ class MegakernelDriver:
             )
             self._torchtpu_ir_error = msg
             raise RuntimeError(msg)
-        self._torchtpu_ir_checked = True
+        self._torchtpu_ir_checked_buckets.add((tokens_per_seq, bucket_t))
 
     def reset_stats(self) -> None:
         """Reset step-mix counters and A/B latency accumulators."""
         self._step_mix.clear()
         self._step_mix_t0 = time.monotonic()
         self.ab_calibrator.reset()
-
-    def promote_fast_callables(self) -> int:
-        """Promote `_qx_fastcall` wrappers to direct AOT callables."""
-        self.reset_stats()
-        promoted = 0
-        for key, fn in list(self._bucket_steps.items()):
-            st = getattr(fn, "_qx_fast_state", None)
-            if isinstance(st, dict):
-                entries = st.get("entries")
-                entry = st.get("entry")
-                if (
-                    isinstance(entry, tuple)
-                    and len(entry) == 3
-                    and callable(entry[1])
-                    and (not isinstance(entries, list) or len(entries) <= 1)
-                ):
-                    self._bucket_steps[key] = entry[1]
-                    promoted += 1
-        if promoted > 0:
-            logger.info(
-                "MegakernelDriver: promoted %d bucket step callables "
-                "to direct dispatch",
-                promoted,
-            )
-        return promoted
 
     @torch.no_grad()
     def warmup(self, runner: Any = None, *, eager_only: bool = False) -> None:
@@ -1313,7 +1315,7 @@ class MegakernelDriver:
             raise RuntimeError("bind_caches() must be called before warmup()")
         dev = self.raw_pools[0].device
         ckpt_cols = max(1, int(self._ckpt_window))
-        n_save = min(25, self.num_pages)
+        n_save = min(80, self.num_pages)
         # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
         # slice writes on a 2.30 GiB pool to as_strided_copy_inverse, allocating
         # a full 2.30 GiB temporary buffer per pool).
@@ -1355,13 +1357,15 @@ class MegakernelDriver:
         r_raw = roff_buf if isinstance(roff_buf, torch.Tensor) else self._zero_roff_1d
         uses_mrope = bool(getattr(runner, "uses_mrope", False))
         is_eager = bool(eager_only or getattr(runner, "enforce_eager", False))
-        sentinel_checked = False
+        sentinel_checked_t: set[int] = set()
+        warmed_buckets: list[tuple[int, int]] = []
         try:
             for T, b_list in ((1, self.buckets), (4, self.verify_buckets)):
                 for b in b_list:
-                    if is_eager and sentinel_checked:
+                    if is_eager and T in sentinel_checked_t:
                         break
                     step_fn = self._bucket_steps[(T, b)]
+                    warmed_buckets.append((T, b))
                     nseq = b // T
                     if runner_tok_pads and req_block_pairs:
                         tok_pad = next(
@@ -1376,7 +1380,7 @@ class MegakernelDriver:
                         shapes_to_warm = [(b, nseq, self.max_pages_per_seq)]
 
                     for tok_pad, req_pad, blk_pad in shapes_to_warm:
-                        if is_eager and sentinel_checked:
+                        if is_eager and T in sentinel_checked_t:
                             break
                         ids_b = torch.zeros((tok_pad,), dtype=torch.int32, device=dev)
                         pos_shape = (3, tok_pad) if uses_mrope else (tok_pad,)
@@ -1404,47 +1408,53 @@ class MegakernelDriver:
                             c0_b, c1_b, c2_b = s0_b, s1_b, s2_b
                         r_call = r_raw
 
-                        # Note: on TPU, the warmup sentinel writes to page 0 (vLLM's
-                        # reserved null KV page) and GDN block 1 (pages 5..9, which are
-                        # unallocated at warmup time and overwritten when block 1 is
-                        # later allocated) without restoring them, avoiding slice-writes
-                        # (`as_strided_copy_inverse`) on the 2.30 GiB pools.
-                        do_sentinel = not sentinel_checked and self.num_pages >= 5 * (
-                            T + 1
+                        # Note: on TPU, the warmup sentinel writes to unallocated
+                        # KV/GDN pages per T variant without restoring them,
+                        # avoiding slice-writes (`as_strided_copy_inverse`) on
+                        # the 2.30 GiB pools.
+                        kv_page = 1 if (T > 1 and 1 in sentinel_checked_t) else 0
+                        gdn_base = 4 if (T > 1 and 1 in sentinel_checked_t) else 1
+                        disjoint_subs = self.num_pages >= 5 * (gdn_base + 3 * T)
+                        if not disjoint_subs:
+                            kv_page = 0
+                            gdn_base = 1
+                        do_sentinel = (
+                            T not in sentinel_checked_t
+                            and self.num_pages >= 5 * (gdn_base + T)
                         )
+                        gdn_p0 = 5 * gdn_base
                         sent_kv: list[torch.Tensor] | None = None
                         sent_gdn: list[torch.Tensor] | None = None
                         if do_sentinel:
                             if dev.type != "tpu":
                                 for p in self.raw_pools:
-                                    p[0].view(torch.uint8).fill_(0x7F)
-                                    p[5:10].view(torch.uint8).fill_(0xFF)
+                                    p[kv_page].view(torch.uint8).fill_(0x7F)
+                                    p[gdn_p0 : gdn_p0 + 5].view(torch.uint8).fill_(0xFF)
                             sent_kv = [
-                                p[0].view(torch.uint8).cpu().clone()
+                                p[kv_page].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
                             ]
                             sent_gdn = [
-                                p[5:9].view(torch.uint8).cpu().clone()
+                                p[gdn_p0 : gdn_p0 + 4].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
                             ]
                             ids_b[:T] = 1
+                            bt_b[0] = kv_page
                             if T > 1:
                                 pos_b[..., :T] = torch.arange(
                                     T, dtype=torch.int32, device=dev
                                 )
-                            s0_b[0] = 1
-                            s1_b[0] = 1
-                            s2_b[0] = 1
+                            sub_step = T if disjoint_subs else 0
+                            s0_b[0] = gdn_base
+                            s1_b[0] = gdn_base + sub_step
+                            s2_b[0] = gdn_base + 2 * sub_step
                             if c_cols > 1:
-                                blk_ids = torch.arange(
-                                    1,
-                                    1 + min(T, c_cols),
-                                    dtype=torch.int32,
-                                    device=dev,
-                                )
-                                c0_b[0, : blk_ids.numel()] = blk_ids
-                                c1_b[0, : blk_ids.numel()] = blk_ids
-                                c2_b[0, : blk_ids.numel()] = blk_ids
+                                n_c = min(T, c_cols)
+                                for sub_i, c_sub in enumerate((c0_b, c1_b, c2_b)):
+                                    b0 = gdn_base + sub_i * sub_step
+                                    c_sub[0, :n_c] = torch.arange(
+                                        b0, b0 + n_c, dtype=torch.int32, device=dev
+                                    )
                             r_call = torch.full_like(r_raw, -1)
 
                         out_b = step_fn(
@@ -1466,16 +1476,16 @@ class MegakernelDriver:
 
                             synchronize_tensors([out_b, *self.raw_pools])
                         if do_sentinel:
-                            sentinel_checked = True
+                            sentinel_checked_t.add(T)
                             assert sent_kv is not None and sent_gdn is not None
                             out_cpu = out_b[:b].detach().float().cpu()
                             out_fin_ok = bool(torch.isfinite(out_cpu).all())
                             for idx, p in enumerate(self.raw_pools):
                                 kv_ok = not torch.equal(
-                                    p[0].view(torch.uint8).cpu(), sent_kv[idx]
+                                    p[kv_page].view(torch.uint8).cpu(), sent_kv[idx]
                                 )
                                 gdn_ok = not torch.equal(
-                                    p[5:9].view(torch.uint8).cpu(),
+                                    p[gdn_p0 : gdn_p0 + 4].view(torch.uint8).cpu(),
                                     sent_gdn[idx],
                                 )
                                 if not (kv_ok and gdn_ok and out_fin_ok):
@@ -1485,12 +1495,20 @@ class MegakernelDriver:
                                         (
                                             i,
                                             int(
-                                                (rp[0].view(torch.uint8).cpu() != 0)
+                                                (
+                                                    rp[kv_page].view(torch.uint8).cpu()
+                                                    != 0
+                                                )
                                                 .sum()
                                                 .item()
                                             ),
                                             int(
-                                                (rp[5:9].view(torch.uint8).cpu() != 0)
+                                                (
+                                                    rp[gdn_p0 : gdn_p0 + 4]
+                                                    .view(torch.uint8)
+                                                    .cpu()
+                                                    != 0
+                                                )
                                                 .sum()
                                                 .item()
                                             ),
@@ -1499,7 +1517,7 @@ class MegakernelDriver:
                                     ]
                                     raise RuntimeError(
                                         "MegakernelDriver: warmup sentinel check "
-                                        f"failed on pool[{idx}] "
+                                        f"failed on pool[{idx}] for (T={T}, B={b}) "
                                         f"(kv_ok={kv_ok}, gdn_ok={gdn_ok}, "
                                         f"out_nz={out_nz}/{out_cpu.numel()}, "
                                         f"out_fin={out_fin}, "
@@ -1508,12 +1526,17 @@ class MegakernelDriver:
             if dev.type == "tpu" and not is_eager:
                 if self._torchtpu_ir_error is not None:
                     raise RuntimeError(self._torchtpu_ir_error)
-                if not self._torchtpu_ir_checked:
+                missing_ir = [
+                    bkt
+                    for bkt in warmed_buckets
+                    if bkt not in self._torchtpu_ir_checked_buckets
+                ]
+                if missing_ir:
                     raise RuntimeError(
                         "Qwen3.5 megakernel torch_tpu compiled IR pool-donation "
-                        "check did not run during warmup"
+                        f"check did not run for buckets {missing_ir} during warmup"
                     )
-            self.promote_fast_callables()
+            self.reset_stats()
         finally:
             if saved_page0 is not None:
                 for p, saved in zip(self.raw_pools, saved_page0, strict=True):
@@ -1714,8 +1737,6 @@ class MegakernelDriver:
         if getattr(self.backbone, "aux_hidden_state_layers", ()):
             return False
         if runner is not None:
-            if getattr(runner, "_in_precompile_backbone", False):
-                return False
             bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
             if getattr(bctx, "position_ids_override", None) is not None:
                 return False
