@@ -88,7 +88,10 @@ class ScratchReq:
 
 @dataclass(frozen=True)
 class Tiles:
-    """Execution tiling and pipeline depth parameters."""
+    """Execution tiling and pipeline depth parameters.
+
+    Every field declares its numerics class in `TILE_NUMERICS` (below).
+    """
 
     bank: int = 2 << 20  # Bytes per dense ring slot
     nbd: int = 14  # Dense ring slots
@@ -114,6 +117,12 @@ class Tiles:
     kv_sub: int = 0  # KV tokens per online-softmax update inside a block (0: full)
     amask: int = 1  # Attention mask mode (0..4)
     ecopy_opt: int = 0  # Redundant expert dedup optimization (0 or 1)
+    # Per-bucket schedule thresholds (row counts). Blocks never compare `B` to a
+    # literal; they read these, and tile rules (`profiles/`) may tune them.
+    wide_rows: int = 16  # `B > wide_rows`: WIDE schedule (chunked GDN, auto pack/war)
+    # Unrolled / PIPE_EP experts: paired ring releases + unrolled refills up to here
+    moe_group_rows: int = 40
+    kv_scatter_vec_ns: int = 16  # Non-paged host KV update: one scatter above this NS
     # Opt-in performance flags below default to the frozen-parity path. Named
     # profiles (`profile.py`, `profiles/`) turn them on; defaults never do.
     pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
@@ -147,6 +156,65 @@ class Tiles:
         return best
 
 
+NumericsClass = Literal["exact", "approx"]
+
+# Numerics class of every `Tiles` field (`profile.approx_features` reads this).
+# `exact`: moving the field off the `default` profile's value keeps hidden
+# states and pools bit-identical, because it only changes DMA / ring
+# scheduling, budgets or debug checks; each such claim is checked on CPU by
+# `tests/megakernel/test_b1_tiles_profiles.py`. `approx`: changes the
+# arithmetic (matmul K-tiling, reduction / softmax order, rounding, routing) or
+# is not proven exact; profiles that move any of these are `approx`.
+TILE_NUMERICS: dict[str, NumericsClass] = {
+    "bank": "approx",  # dense K-tiling (`Tiles.tk`)
+    "nbd": "exact",  # dense ring depth (scheduling)
+    "nbe": "approx",  # expert ring depth also gates PIPE / PIPE_EP and KVE paths
+    "ebank": "approx",  # expert K-tiling
+    "kv_blk": "approx",  # online-softmax block size
+    "nkv": "exact",  # KV ring depth (scheduling)
+    "vmem_mib": "exact",  # budget only
+    "smem_mib": "exact",  # budget only
+    "bounds_checks": "exact",  # debug checks only
+    "lazy": "exact",  # dense refill placement (scheduling)
+    "pipe": "approx",  # single-tile expert pipelining
+    "topk": "approx",  # packed-key top-k
+    "inplace": "approx",  # state input/output aliasing (not proven exact)
+    "split": "approx",  # sequence-split attention (partial-softmax merge)
+    "rsag": "approx",  # rounds all-reduce partial sums to bf16
+    "hier": "approx",  # all-reduce reduction order
+    "war": "approx",  # all-reduce payload layout
+    "pack": "approx",  # split-attention row packing
+    "mb8": "approx",  # activation row count
+    "gdn_rows": "approx",  # chunked GDN state rows (GCH)
+    "gdn_bufs": "exact",  # GDN state ring depth (scheduling)
+    "kv_sub": "approx",  # online-softmax sub-block updates
+    "amask": "approx",  # attention mask mode
+    "ecopy_opt": "approx",  # redundant-expert dispatch policy
+    "wide_rows": "approx",  # WIDE schedule threshold (GCH, auto pack / war)
+    "moe_group_rows": "exact",  # paired expert-ring releases (scheduling)
+    "kv_scatter_vec_ns": "exact",  # host KV update: one scatter vs per-sequence
+    "pipe_ep": "approx",  # EP expert software pipeline
+    "r2_direct_store": "approx",  # `=` instead of zero-fill + `+=` (signed zero)
+    "route_vec": "approx",  # vectorized routing policy
+    "dense_acc_pair": "approx",  # paired dense accumulation
+    "kv_ering": "exact",  # KV ring staged in the expert pool (TPU bisect, CPU test)
+    "pair_kv": "exact",  # paired KV items (TPU bisect, CPU test)
+    "dmm_unroll": "approx",  # unrolled dense matmul accumulation
+    "gqa_qv": "exact",  # head-batched Q/K norm + RoPE (TPU bisect, CPU test)
+    "gq_pack": "approx",  # packed G*nh query tiles
+    "topk_lanes": "approx",  # Batcher odd-even lane top-k
+    "conv_stage": "approx",  # fused-path conv staging
+    "gdn_head_major": "approx",  # head-major GDN state update (reassociates)
+    "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
+    "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
+}
+
+# Numerics class of the pool-I/O modes selected by profiles.
+POOL_IO_NUMERICS: dict[str, NumericsClass] = {
+    "fused_pool_io": "approx",  # always runs the head-major GDN recurrence
+    "pool_gather": "exact",  # gather-only DMA path (CPU bit-exact vs split)
+}
+
 DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
 VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
 WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
@@ -158,34 +226,13 @@ TINY_TILES = Tiles(
 def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     """General, frozen-parity default tiles for batch row count `B`.
 
-    Matches the frozen prototype's `default_tiles` (`frozen_qwen35/megakernel.py`)
-    with one numerics-neutral deviation kept since M2: `nbe=6` for `B > 48` (the
-    frozen TPU benches apply the same override so 64-row MoE scratch fits VMEM).
-    Every opt-in performance flag stays at its `Tiles` default (off). Tuned,
-    numerics-changing schedules live in named profiles (`profile.py`).
-
-    `moe_tp` is accepted for signature compatibility with profile tile rules; the
-    default schedule does not depend on it. Hierarchical all-reduce (`hier` 1/2)
-    is v7x-8 specific, so `R` outside `{1, 8}` falls back to the flat ring.
+    The per-bucket schedule is the `default` profile's tile rule
+    (`profiles/default.py:frozen_parity_tiles`); this wrapper keeps the public
+    name. Every opt-in performance flag stays at its `Tiles` default (off).
     """
-    del moe_tp
-    if B > 48:
-        t = dataclasses.replace(WIDE_TILES, nbe=6)
-    elif B > 32:
-        t = WIDE_TILES
-    elif B > 24:
-        t = dataclasses.replace(WIDE_TILES, hier=2)
-    elif B > 16:
-        t = dataclasses.replace(WIDE_TILES, nbd=12, hier=2)
-    elif B > 8:
-        t = VERIFY_TILES
-    elif B > 4:
-        t = dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
-    else:
-        t = DEFAULT_TILES
-    if R not in (1, 8) and t.hier != 0:
-        t = dataclasses.replace(t, hier=0)
-    return t
+    from .profiles.default import frozen_parity_tiles as _rule
+
+    return _rule(B, moe_tp=moe_tp, R=R)
 
 
 def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -223,8 +270,10 @@ class ExecSpec:
     max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
     fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
     # In-kernel GDN gather (GPR): False (default) = split gather kernel;
-    # None = auto (pool backend decides); True = required.
-    pool_gather: bool | None = False
+    # None = auto (WIDE verify buckets where eligible); "eligible" = every bucket
+    # the pool backend can gather on; True = required (`MegakernelConfigError`
+    # if the bucket cannot).
+    pool_gather: bool | None | Literal["eligible"] = False
     act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
     ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
@@ -239,7 +288,10 @@ class ExecSpec:
 
     @property
     def GPR(self) -> bool:
-        return bool(self.paged_kv and not self.fused_pool_io and self.pool_gather)
+        """In-kernel GDN gather on (only after `pool_gather` is resolved to `True`)."""
+        return bool(
+            self.paged_kv and not self.fused_pool_io and self.pool_gather is True
+        )
 
     @property
     def resolved_tiles(self) -> Tiles:
@@ -282,7 +334,7 @@ class ExecSpec:
 
     @property
     def WIDE(self) -> bool:
-        return self.B > 16
+        return self.resolved_tiles.wide_rows < self.B
 
     @property
     def forced_routing(self) -> bool:

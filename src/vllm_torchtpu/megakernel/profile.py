@@ -20,10 +20,18 @@ frozen-parity path (`spec.default_tiles`, split pool I/O, no GPR). Adapters
 (vLLM, SGLang, plain JAX) select a profile by name and apply it per bucket via
 `Profile.exec_for`; nothing in the core changes behaviour based on profiles.
 
-Numerics classes:
+Numerics classes (enforced, not just labels):
 - `exact`: must reproduce the `default` profile bit-exactly.
 - `approx`: changes numerics (e.g. `kv_sub`, `route_vec`, `dense_acc_pair`,
-  hierarchical all-reduce variants); must pass the accuracy ladder.
+  head-major GDN, hierarchical all-reduce variants, fused pool I/O); must pass
+  the accuracy ladder.
+
+Every `Tiles` field and pool-I/O mode declares its class in
+`spec.TILE_NUMERICS` / `spec.POOL_IO_NUMERICS`. `approx_features(profile)`
+lists the approx features a profile turns on relative to the `default` tile
+rule; a profile declared `exact` that turns any of them on is rejected at
+construction, and `Profile.with_overrides` re-labels (`<name>+overrides`, class
+derived) instead of silently staying `exact`.
 """
 
 from __future__ import annotations
@@ -33,7 +41,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .spec import ExecSpec, Tiles, default_tiles
+from .spec import POOL_IO_NUMERICS, TILE_NUMERICS, ExecSpec, Tiles, default_tiles
 
 # Tile rule: `(B, *, moe_tp, R) -> Tiles` for a bucket of `B` rows.
 TileRule = Callable[..., Tiles]
@@ -65,7 +73,9 @@ class Profile:
     fused_pool_io: bool | str = False
     fused_pool_io_max_b: int = 24
     fused_pool_io_min_b_hi: int = 56
-    pool_gather: bool | None = False  # In-kernel GDN gather: False | None (auto) | True
+    # In-kernel GDN gather (GPR): False (split) | None (auto: WIDE verify buckets
+    # where eligible) | True (every bucket where eligible, never a T=1 bucket).
+    pool_gather: bool | None = False
     baseline: Baseline | None = None
     description: str = ""
 
@@ -82,6 +92,36 @@ class Profile:
                 f"profile {self.name!r}: fused_pool_io must be a bool or 'auto', "
                 f"got {self.fused_pool_io!r}"
             )
+        if self.pool_gather not in (False, None, True):
+            raise ValueError(
+                f"profile {self.name!r}: pool_gather must be False, None or True, "
+                f"got {self.pool_gather!r}"
+            )
+        if self.numerics == "exact":
+            feats = approx_features(self)
+            if feats:
+                raise ValueError(
+                    f"profile {self.name!r} is declared numerics='exact' but turns on "
+                    f"approx features {list(feats)}; declare numerics='approx'"
+                )
+
+    def with_overrides(self, **overrides: Any) -> Profile:
+        """Return this profile with `overrides` applied, re-labelled if changed.
+
+        Overrides equal to the current values are ignored. Any real change
+        renames the profile to `<name>+overrides` and derives its numerics
+        class: it stays `exact` only if this profile is `exact` and the result
+        turns on no approx feature (it never silently stays `exact`).
+        """
+        changed = {k: v for k, v in overrides.items() if getattr(self, k) != v}
+        if not changed:
+            return self
+        name = (
+            self.name if self.name.endswith("+overrides") else f"{self.name}+overrides"
+        )
+        cand = dataclasses.replace(self, name=name, numerics="approx", **changed)
+        exact = self.numerics == "exact" and not approx_features(cand)
+        return dataclasses.replace(cand, numerics="exact" if exact else "approx")
 
     def tiles_for(self, B: int, *, R: int, moe_tp: bool = False) -> Tiles:
         """Return this profile's tiles for a bucket of `B` rows on `R` ranks."""
@@ -90,10 +130,15 @@ class Profile:
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
 
-        An explicit `base.tiles` always wins (expert / test override); otherwise
-        the profile's tile rule supplies them. `pool_gather` comes from the
-        profile. Fused pool I/O is resolved by the caller through
-        `should_fuse_pool_io` because it also depends on the pool backend.
+        Explicit settings on `base` win (expert / test overrides), the profile
+        fills the rest:
+        - `tiles`: `base.tiles` if set, else the profile's tile rule;
+        - `pool_gather`: `base.pool_gather` if it is not the library default
+          (`False`, which cannot be told apart from "unset"), else the
+          profile's: `None` -> auto, `True` -> `"eligible"` (gather wherever
+          the pool backend can, e.g. never on a `T=1` bucket).
+        Fused pool I/O is resolved by the caller through `should_fuse_pool_io`
+        because it also depends on the pool backend.
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = (
@@ -101,9 +146,45 @@ class Profile:
             if base.tiles is not None
             else self.tiles_for(B, R=base.R, moe_tp=moe_tp)
         )
-        return dataclasses.replace(
-            base, B=B, T=T, tiles=tiles, pool_gather=self.pool_gather
-        )
+        if base.pool_gather is not False:
+            pool_gather = base.pool_gather
+        else:
+            pool_gather = "eligible" if self.pool_gather is True else self.pool_gather
+        return dataclasses.replace(base, B=B, T=T, tiles=tiles, pool_gather=pool_gather)
+
+
+# Bucket grid on which a profile's tile rule is compared to the default rule.
+_NUMERICS_GRID_B = range(1, 65)
+_NUMERICS_GRID_R = (1, 2, 4, 8, 16)
+
+
+def approx_features(profile: Profile) -> tuple[str, ...]:
+    """Approx-class features `profile` turns on relative to the `default` rule.
+
+    A tile field counts when the profile's rule gives it a different value
+    than `default_tiles` on any bucket of the grid (`B` in 1..64, `R` in
+    {1, 2, 4, 8, 16}, EP and TP MoE) and the field is `approx` in
+    `TILE_NUMERICS`; pool-I/O modes count per `POOL_IO_NUMERICS`.
+    """
+    feats: set[str] = set()
+    names = [f.name for f in dataclasses.fields(Tiles)]
+    approx_names = [n for n in names if TILE_NUMERICS[n] == "approx"]
+    for R in _NUMERICS_GRID_R:
+        for moe_tp in (False, True):
+            for B in _NUMERICS_GRID_B:
+                t = profile.tiles(B, moe_tp=moe_tp, R=R)
+                d = default_tiles(B, moe_tp=moe_tp, R=R)
+                feats.update(
+                    f"tiles.{n}" for n in approx_names if getattr(t, n) != getattr(d, n)
+                )
+    if (
+        profile.fused_pool_io is not False
+        and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
+    ):
+        feats.add("fused_pool_io")
+    if profile.pool_gather is not False and POOL_IO_NUMERICS["pool_gather"] == "approx":
+        feats.add("pool_gather")
+    return tuple(sorted(feats))
 
 
 DEFAULT_PROFILE = Profile(
@@ -132,8 +213,10 @@ def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
 def _load_builtins() -> None:
     global _BUILTINS_LOADED
     if not _BUILTINS_LOADED:
-        _BUILTINS_LOADED = True
-        from . import profiles  # noqa: F401  (registers checked-in profiles)
+        from . import profiles
+
+        profiles.load_builtin_profiles()  # registers checked-in profiles
+        _BUILTINS_LOADED = True  # only after a successful import
 
 
 def list_profiles() -> tuple[str, ...]:
@@ -160,6 +243,7 @@ __all__ = [
     "Baseline",
     "Profile",
     "TileRule",
+    "approx_features",
     "get_profile",
     "list_profiles",
     "register_profile",

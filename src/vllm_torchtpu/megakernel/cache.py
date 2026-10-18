@@ -47,6 +47,7 @@ from jax.sharding import PartitionSpec as P
 
 from . import cache_experimental, kernel
 from .cache_experimental import should_fuse_pool_io
+from .errors import MegakernelConfigError
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
 
@@ -290,14 +291,14 @@ def _should_use_pool_gather(
         return False
     if not pb.supports_pool_gather or not pb.has_recurrent_pool:
         if ex.pool_gather is True:
-            raise ValueError(
+            raise MegakernelConfigError(
                 f"ModelSpec {ms.name!r} pool_backend does not support pool_gather"
             )
         return False
     if pb.can_pool_gather is not None:
         ok = bool(pb.can_pool_gather(ex))
         if ex.pool_gather is True and not ok:
-            raise ValueError(
+            raise MegakernelConfigError(
                 f"pool_gather=True is not supported for ExecSpec(B={ex.B}, T={ex.T}, "
                 f"page_size={ex.page_size})"
             )

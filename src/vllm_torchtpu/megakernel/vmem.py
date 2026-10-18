@@ -23,6 +23,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from . import pool_alias
+from .errors import MegakernelConfigError
 from .ops import BF16, F32, FP8, rup
 from .planner import Plan, plan
 from .spec import ExecSpec, ModelSpec, ScratchReq
@@ -382,7 +383,7 @@ def build_scratch(
             for sz, k, sh, dt in breakdown[:10]
         )
         vmem_mib = vmem_bytes / (1024 * 1024)
-        raise ValueError(
+        raise MegakernelConfigError(
             f"VMEM scratch allocation ({vmem_mib:.2f} MiB = {vmem_bytes:,} B) "
             f"exceeds tiles.vmem_mib budget "
             f"({tiles.vmem_mib} MiB = {vmem_limit_bytes:,} B). "
@@ -392,7 +393,7 @@ def build_scratch(
     smem_limit_bytes = tiles.smem_mib * 1024 * 1024
     if smem_bytes > smem_limit_bytes:
         smem_kib = smem_bytes / 1024
-        raise ValueError(
+        raise MegakernelConfigError(
             f"SMEM allocation ({smem_kib:.2f} KiB = {smem_bytes:,} B) "
             f"exceeds tiles.smem_mib budget "
             f"({tiles.smem_mib} MiB = {smem_limit_bytes:,} B)."

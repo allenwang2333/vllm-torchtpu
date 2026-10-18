@@ -133,6 +133,9 @@ class MoEParams:
     route_vec: bool
     r2_direct_store: bool
     unroll: bool
+    # Paired expert-ring releases + unrolled refill loop (unrolled / PIPE_EP
+    # expert paths) for buckets up to `Tiles.moe_group_rows` rows.
+    group_rel: bool
     ecopy_opt: int
     eps: float
     zero_centered_norm: bool
@@ -252,6 +255,7 @@ class MoEBlock(Block):
             route_vec=tiles.route_vec,
             r2_direct_store=tiles.r2_direct_store,
             unroll=bool(tiles.moe_unroll or pipe_ep),
+            group_rel=tiles.moe_group_rows >= ex.B,
             ecopy_opt=tiles.ecopy_opt,
             eps=g.eps,
             zero_centered_norm=bool(g.zero_centered_norm),
@@ -602,7 +606,7 @@ class MoEBlock(Block):
                         acc[:, : 2 * IR] = m13
                     else:
                         acc[:, : 2 * IR] += m13
-                    if B <= 40:
+                    if mp.group_rel:
                         if t % 2 == 1:
                             egive_group([(u - 1, t - 1), (u, t)], l_idx)
                         elif t == T13 - 1:
@@ -653,7 +657,7 @@ class MoEBlock(Block):
                         acc[:, :H] = m2
                     else:
                         acc[:, :H] += m2
-                    if B <= 40:
+                    if mp.group_rel:
                         if t % 2 == 1:
                             egive_group([(u - 1, T13 + t - 1), (u, T13 + t)], l_idx)
                         elif t == T2 - 1:
@@ -712,7 +716,7 @@ class MoEBlock(Block):
                         acc13[:, :BN] = mm13
                     else:
                         acc13[:, :BN] += mm13
-                    if B <= 40:
+                    if mp.group_rel:
                         if t % 2 == 1:
                             egive_group([(t - 1, t - 1), (t, t)], l_idx)
                         elif t == T13 - 1:
@@ -754,7 +758,7 @@ class MoEBlock(Block):
                         else:
                             acc[:, :H] += mm2
                             acc13[:, :BN] += mm13_0
-                        if B <= 40:
+                        if mp.group_rel:
                             egive_group([(u2, T13 + s_step), (u13_0, t0)], l_idx)
                         else:
                             egive(u2, l_idx, T13 + s_step)
@@ -800,7 +804,7 @@ class MoEBlock(Block):
                         acc[:, :H] = mm2
                     else:
                         acc[:, :H] += mm2
-                    if B <= 40:
+                    if mp.group_rel:
                         if s_step % 2 == 1:
                             egive_group(
                                 [(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)],
@@ -1178,7 +1182,7 @@ class MoEBlock(Block):
                         def _(k=k):
                             fetch_e(k, l_idx)
                 else:
-                    if mp.unroll and B <= 40:
+                    if mp.unroll and mp.group_rel:
                         fetch_loop(jnp.minimum(NBE, n_hit * TE), l_idx)
                     else:
                         lax.fori_loop(

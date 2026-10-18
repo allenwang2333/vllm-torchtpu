@@ -55,16 +55,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import cache
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
-
-
-class MegakernelConfigError(RuntimeError):
-    """Invalid megakernel configuration (fail loudly; never a silent fallback).
-
-    Deliberately not a `ValueError`: callers that treat `ValueError` as an
-    incompatible runtime layout (and disable the megakernel) must not swallow
-    configuration mistakes such as `compile_hlo=True` on a mock-device mesh.
-    """
 
 
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:

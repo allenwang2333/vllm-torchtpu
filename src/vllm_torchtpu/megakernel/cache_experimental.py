@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .errors import MegakernelConfigError
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
 
@@ -115,7 +116,7 @@ def should_fuse_pool_io(
 
     if not pb.supports_fused_io:
         if explicit_true:
-            raise ValueError(
+            raise MegakernelConfigError(
                 f"ModelSpec {ms.name!r} pool_backend does not support fused_pool_io"
             )
         return False

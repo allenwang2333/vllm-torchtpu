@@ -464,6 +464,13 @@ def test_resolve_driver_profile_and_fused_ir_rule() -> None:
     assert c30_ov.fused_pool_io == "auto" and c30_ov.pool_gather is False
     assert c30_ov.fused_pool_io_max_b == 16
     assert c30_ov.tiles is c30.tiles
+    # Real overrides re-label the profile; values equal to the profile's don't.
+    assert (c30_ov.name, c30_ov.numerics) == ("qwen35-candidate30+overrides", "approx")
+    d_fused = resolve_driver_profile(None, model_name="qwen3_5", fused_pool_io="auto")
+    assert (d_fused.name, d_fused.numerics) == ("default+overrides", "approx")
+    assert resolve_driver_profile(None, model_name="x", fused_pool_io="0") is d
+    fused = resolve_driver_profile("qwen35-candidate30-fused", model_name="qwen3_5")
+    assert (fused.name, fused.fused_pool_io) == ("qwen35-candidate30-fused", "auto")
     assert (
         resolve_driver_profile(None, model_name="x", fused_pool_io="").fused_pool_io
         is False
@@ -810,6 +817,79 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     drv_layout = _driver_raising(ValueError("incompatible KV layout"))
     drv_layout.bind_and_warmup(runner)
     assert drv_layout._bound is False and runner._megakernel is None
+
+
+def test_bind_caches_budget_overflow_is_config_error() -> None:
+    """VMEM budget overflow in `bind_caches` propagates; it is not a layout error."""
+    from vllm_torchtpu.megakernel import MegakernelConfigError
+
+    mesh = _cpu_mesh(1)
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    ex_base = replace(ex_base, tiles=replace(ex_base.resolved_tiles, vmem_mib=0))
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+    _allocate_aliased_pools(backbone, g, 96)
+    driver = MegakernelDriver(
+        model=model,
+        mesh=mesh,
+        tp_rank=0,
+        mode="ep",
+        geom=g,
+        base_exec=ex_base,
+        buckets=(2,),
+        verify_buckets=(),
+    )
+    runner = SimpleNamespace(model=model, _unified_kv_layout=True, _megakernel=driver)
+    with pytest.raises(MegakernelConfigError, match="VMEM"):
+        driver.bind_and_warmup(runner)
+    assert runner._megakernel is driver
+
+
+def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile + compile-HLO checks run before packing; profile buckets apply."""
+    from vllm_torchtpu.megakernel import MegakernelConfigError, Profile
+    from vllm_torchtpu.megakernel import profile as profile_mod
+
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    model = SimpleNamespace(model=make_synthetic_qwen35_backbone(g, ex_base))
+
+    def _no_pack(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("weights packed before the configuration was validated")
+
+    monkeypatch.setattr(MegakernelDriver, "_prepare_and_pack_weights", _no_pack)
+    kw = dict(model=model, tp_rank=0, mode="ep", geom=g, base_exec=ex_base)
+    with pytest.raises(ValueError, match="unknown megakernel profile"):
+        MegakernelDriver(mesh=_cpu_mesh(1), profile="nope", **kw)
+
+    class _MockDevice:
+        id = 0
+
+    mock_mesh = SimpleNamespace(devices=np.array([_MockDevice()], dtype=object))
+    with pytest.raises(MegakernelConfigError, match="compile_hlo_check=1 requires"):
+        MegakernelDriver(mesh=mock_mesh, compile_hlo_check=True, **kw)
+
+    prof = Profile(name="b1-test-buckets", buckets=(2,), verify_buckets=(4,))
+    monkeypatch.setitem(profile_mod._REGISTRY, prof.name, prof)
+    drv = MegakernelDriver(
+        mesh=_cpu_mesh(1), profile=prof.name, weights={"w_flat": []}, **kw
+    )
+    assert (drv.buckets, drv.verify_buckets) == ((2,), (4,))
+    drv2 = MegakernelDriver(
+        mesh=_cpu_mesh(1),
+        profile=prof.name,
+        weights={"w_flat": []},
+        buckets=(8,),
+        verify_buckets=(),
+        **kw,
+    )
+    assert (drv2.buckets, drv2.verify_buckets) == ((8,), ())
+    drv3 = MegakernelDriver(mesh=_cpu_mesh(1), weights={"w_flat": []}, **kw)
+    assert drv3.buckets == driver_mod._DEFAULT_BUCKETS
+    assert drv3.verify_buckets == driver_mod._DEFAULT_VERIFY_BUCKETS
 
 
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:

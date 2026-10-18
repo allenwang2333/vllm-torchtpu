@@ -20,8 +20,9 @@ This reproduces the tiles and perf flags that `spec.default_tiles` /
 `Tiles` defaults carried at M5 head `bb5316a0a` (including the code paths that
 were unconditional there and are now flags: `pipe_ep`, `gdn_head_major`,
 `gqa_qv`, `moe_unroll`, `rel_fetch`), plus `pool_gather="auto"`.
-Fused pool I/O stays off here (experimental); layer it on explicitly with
-`fused_pool_io=auto` for ablations.
+Fused pool I/O stays off here (experimental); `qwen35-candidate30-fused` is
+the same tuning with `fused_pool_io="auto"`, the configuration measured
+closest to candidate30 in serving (see `CANDIDATE30_BASELINE`).
 """
 
 from __future__ import annotations
@@ -82,6 +83,35 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     return t
 
 
+# candidate30 reference run (vLLM serving, v7x-8). The image's vllm-torchtpu
+# commit is `8743659cd` (a bit-exact block refactor of the `36beb0816` kernel).
+CANDIDATE30_BASELINE = Baseline(
+    ref="candidate30",
+    commit="8743659cdfcfbb0d77d7fc454f519520d223e785",
+    job=(
+        "c8 j-07676b1a-25aa-48f3-a600, c16 j-ffda2788-53ab-4d8a-a419, "
+        "c32 j-de863aa4-7371-49ac-b57f"
+    ),
+    config=(
+        "image vllm-torchtpu-caojx_google_com:infx-qwen35-agentx-candidate30; "
+        "VLLM_TPU_QWEN35_MEGAKERNEL=1 VLLM_TPU_QWEN35_MK_MODE=ep, MTP=3; "
+        "kernel: verify buckets 4..64, fused pool I/O for B<=24 or B>=56, "
+        "GPR on the 3-stage buckets, e_slots=72"
+    ),
+    bench=(
+        "cdk recipe infx-qwen35-agentx CLIENT_CONCURRENCIES={8,16,32} "
+        "MAX_NUM_SEQS={16,16,32} DURATION=3600 SYNTHETIC_ACCEPTANCE_LENGTH=3.39 "
+        "MTP=true MTP_NUM_SPECULATIVE_TOKENS=3 (job parameters of the jobs above)"
+    ),
+)
+
+_DESCRIPTION = (
+    "M5 Qwen3.5 tuning (bb5316a0a defaults): kv_sub=1024, route_vec, "
+    "dense_acc_pair, pair_kv, KVE, QV/GQ, Batcher top-k, unrolled experts "
+    "+ PIPE_EP, head-major GDN, deeper EP expert rings, hier=2 for B>16, "
+    "conv staging from B>=8, GPR auto. Numerics: approx."
+)
+
 PROFILE = register_profile(
     Profile(
         name="qwen35-candidate30",
@@ -90,14 +120,28 @@ PROFILE = register_profile(
         tiles=candidate30_tiles,
         fused_pool_io=False,
         pool_gather=None,
-        baseline=Baseline(ref="candidate30"),
-        description=(
-            "M5 Qwen3.5 tuning (bb5316a0a defaults): kv_sub=1024, route_vec, "
-            "dense_acc_pair, pair_kv, KVE, QV/GQ, Batcher top-k, unrolled experts "
-            "+ PIPE_EP, head-major GDN, deeper EP expert rings, hier=2 for B>16, "
-            "GPR auto. Numerics: approx."
-        ),
+        baseline=CANDIDATE30_BASELINE,
+        description=_DESCRIPTION,
     )
 )
 
-__all__ = ["CONV_STAGE_MIN_B", "PROFILE", "candidate30_tiles"]
+# The same tiles plus selective 1-launch fused pool I/O (`auto`: B <= 24 or
+# B >= 56), as in candidate30's own kernel; measured closest to candidate30 in
+# serving. Fused pool I/O stays experimental: it requires pool
+# donation (enforced) and the driver IR-checks every fused bucket.
+FUSED_PROFILE = register_profile(
+    dataclasses.replace(
+        PROFILE,
+        name="qwen35-candidate30-fused",
+        fused_pool_io="auto",
+        description=_DESCRIPTION + " Plus experimental fused pool I/O (auto).",
+    )
+)
+
+__all__ = [
+    "CANDIDATE30_BASELINE",
+    "CONV_STAGE_MIN_B",
+    "FUSED_PROFILE",
+    "PROFILE",
+    "candidate30_tiles",
+]

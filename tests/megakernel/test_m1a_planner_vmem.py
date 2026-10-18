@@ -28,6 +28,7 @@ from conftest import (
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import planner, pool_alias, vmem
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.ops import (
     BF16,
     F32,
@@ -235,9 +236,9 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     with pytest.raises(ValueError, match="Conflicting scratch buffer 'kbuf'"):
         vmem.build_scratch(bad_ms, fake_ex)
 
-    # Exceeding tiles.vmem_mib raises ValueError with per-buffer breakdown
+    # Exceeding tiles.vmem_mib raises MegakernelConfigError with per-buffer breakdown
     tiny_budget_ex = dataclasses.replace(
         fake_ex, tiles=dataclasses.replace(TINY_TILES, vmem_mib=1)
     )
-    with pytest.raises(ValueError, match="exceeds tiles.vmem_mib budget"):
+    with pytest.raises(MegakernelConfigError, match="exceeds tiles.vmem_mib budget"):
         vmem.build_scratch(ms_hybrid, tiny_budget_ex)

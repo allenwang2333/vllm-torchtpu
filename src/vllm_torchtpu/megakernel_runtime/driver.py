@@ -182,7 +182,11 @@ def _parse_fused_pool_io(val: Any) -> bool | str:
 
 
 def _parse_pool_gather(val: Any) -> bool | str:
-    """Parse `pool_gather` to `True`, `False`, or `"auto"` (empty string: off)."""
+    """Parse `pool_gather` to `True`, `False`, or `"auto"` (empty string: off).
+
+    As a profile setting, `True` means "every bucket where the pool backend can
+    gather" (never a `T=1` bucket), so it cannot fail a bucket build.
+    """
     if val is None:
         return "auto"
     if isinstance(val, bool):
@@ -418,7 +422,9 @@ def resolve_driver_profile(
     if pool_gather is not None:
         pg = _parse_pool_gather(pool_gather)
         overrides["pool_gather"] = None if pg == "auto" else pg
-    return dataclasses.replace(prof, **overrides) if overrides else prof
+    # Real changes re-label the profile (`<name>+overrides`) and derive its
+    # numerics class, so an override never silently keeps `exact`.
+    return prof.with_overrides(**overrides)
 
 
 def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
@@ -872,8 +878,8 @@ class MegakernelDriver:
         geom: Any = None,
         base_exec: ExecSpec | None = None,
         weights: dict[str, Any] | None = None,
-        buckets: Sequence[int] = _DEFAULT_BUCKETS,
-        verify_buckets: Sequence[int] = _DEFAULT_VERIFY_BUCKETS,
+        buckets: Sequence[int] | None = None,
+        verify_buckets: Sequence[int] | None = None,
         reshard_ep_to_tp: bool = False,
         expert_placement: Any = None,
         profile: str | Profile | None = None,
@@ -892,6 +898,49 @@ class MegakernelDriver:
         self.mesh = mesh
         self.tp_rank = int(tp_rank)
         self.mode = mode
+
+        r_cnt = int(mesh.devices.size)
+        if spec is None:
+            spec = self._build_spec(mode=mode, r_cnt=r_cnt, geom=geom)
+        self.spec = spec
+        self.geom = spec.config
+
+        # Resolve the profile and validate the configuration before any
+        # expensive or mutating work (EP->TP reshard, weight packing) so an
+        # unknown profile or an impossible `compile_hlo_check` fails fast.
+        default_cfg = parse_megakernel_config()
+        self.profile: Profile = resolve_driver_profile(
+            default_cfg["profile"] if profile is None else profile,
+            model_name=self.spec.name,
+            fused_pool_io=fused_pool_io,
+            fused_pool_io_max_b=fused_pool_io_max_b,
+            fused_pool_io_min_b_hi=fused_pool_io_min_b_hi,
+            pool_gather=pool_gather,
+        )
+        self._compile_hlo_check: bool = bool(
+            default_cfg["compile_hlo_check"]
+            if compile_hlo_check is None
+            else compile_hlo_check
+        )
+        check_compile_hlo_mesh(self.mesh, self._compile_hlo_check)
+        self.fused_pool_io: bool | str = self.profile.fused_pool_io
+        self.fused_pool_io_max_b: int = int(self.profile.fused_pool_io_max_b)
+        self.fused_pool_io_min_b_hi: int = int(self.profile.fused_pool_io_min_b_hi)
+        self.pool_gather: bool | None = self.profile.pool_gather
+
+        # Bucket lists: explicit arguments, else the profile's, else defaults.
+        if buckets is None:
+            buckets = (
+                self.profile.buckets
+                if self.profile.buckets is not None
+                else _DEFAULT_BUCKETS
+            )
+        if verify_buckets is None:
+            verify_buckets = (
+                self.profile.verify_buckets
+                if self.profile.verify_buckets is not None
+                else _DEFAULT_VERIFY_BUCKETS
+            )
         self.buckets = tuple(sorted(buckets))
         self.max_bucket = max(self.buckets) if self.buckets else 0
         self.verify_buckets = tuple(sorted(verify_buckets))
@@ -900,12 +949,6 @@ class MegakernelDriver:
             bool(self.buckets or self.verify_buckets),
             "at least one of decode buckets or verify_buckets must be non-empty",
         )
-
-        r_cnt = int(mesh.devices.size)
-        if spec is None:
-            spec = self._build_spec(mode=mode, r_cnt=r_cnt, geom=geom)
-        self.spec = spec
-        self.geom = spec.config
 
         if base_exec is None:
             base_exec = ExecSpec(
@@ -930,19 +973,6 @@ class MegakernelDriver:
         self.weights = weights
         self.w_flat: list[torch.Tensor] = self.weights["w_flat"]
 
-        default_cfg = parse_megakernel_config()
-        self.profile: Profile = resolve_driver_profile(
-            default_cfg["profile"] if profile is None else profile,
-            model_name=self.spec.name,
-            fused_pool_io=fused_pool_io,
-            fused_pool_io_max_b=fused_pool_io_max_b,
-            fused_pool_io_min_b_hi=fused_pool_io_min_b_hi,
-            pool_gather=pool_gather,
-        )
-        self.fused_pool_io: bool | str = self.profile.fused_pool_io
-        self.fused_pool_io_max_b: int = int(self.profile.fused_pool_io_max_b)
-        self.fused_pool_io_min_b_hi: int = int(self.profile.fused_pool_io_min_b_hi)
-        self.pool_gather: bool | None = self.profile.pool_gather
         self.raw_pools: list[torch.Tensor] = []
         self.num_pages: int = 0
         self.page_size: int = 128
@@ -967,12 +997,6 @@ class MegakernelDriver:
         self._step_mix_period_s: float = float(
             default_cfg["stats_period_s"] if stats_period_s is None else stats_period_s
         )
-        self._compile_hlo_check: bool = bool(
-            default_cfg["compile_hlo_check"]
-            if compile_hlo_check is None
-            else compile_hlo_check
-        )
-        check_compile_hlo_mesh(self.mesh, self._compile_hlo_check)
         self.ab_calibrator = MKABCalibrator(
             enabled=bool(default_cfg["ab"] if ab is None else ab),
             period_s=self._step_mix_period_s,

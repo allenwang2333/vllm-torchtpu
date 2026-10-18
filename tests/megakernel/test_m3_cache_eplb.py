@@ -538,7 +538,8 @@ def test_long_context_128k_page_table_plan_and_interpret():
     other = cp_128k_paged.smem_bytes - pt_bytes - wl_kp_bytes
     assert 0 < other < 64 * 1024, other
 
-    # SMEM budget check raises ValueError when page_table exceeds tiles.smem_mib (1 MiB)
+    # SMEM budget check raises MegakernelConfigError when page_table exceeds
+    # tiles.smem_mib (1 MiB)
     ex_smem_overflow = mk.ExecSpec(
         R=8,
         B=64,
@@ -548,7 +549,7 @@ def test_long_context_128k_page_table_plan_and_interpret():
         num_pages=65536,
         max_pages_per_seq=65536,
     )
-    with pytest.raises(ValueError, match="exceeds tiles.smem_mib budget"):
+    with pytest.raises(mk.MegakernelConfigError, match="exceeds tiles.smem_mib budget"):
         mk.vmem.build_scratch(spec_full, ex_smem_overflow)
 
     # Verify eff_ctx = max(ctx, max_pages_per_seq * page_size) does not truncate > ctx
@@ -1916,18 +1917,50 @@ def _rec_page_bf16_bits(pages_u8: np.ndarray) -> np.ndarray:
     return words.view(np.uint16)
 
 
-def _rec_pool_max_ulp(r_a: Any, r_b: Any, num_pages: int) -> int:
+def _pool_page_kinds(
+    pt: Any, ckpt: Any, *, g_per_att: int, pages_per_slot: int = 5, rec_pages: int = 4
+) -> dict[int, str]:
+    """Classify the pages referenced by a layout as `kv`, `rec` or `conv`.
+
+    Uses the real unified-pool layout (`qwen35_pool`): KV pages come from the
+    page table; GDN checkpoint slot `slot` of linear-attention group `sub` owns
+    pages `base .. base + pages_per_slot - 1` with `base = slot * pages_per_slot`
+    for 3D `ckpt_indices` and `slot * pages_per_slot * g_per_att + sub *
+    pages_per_slot` for 2D, of which the first `rec_pages` hold recurrent state
+    and the last one the conv taps.
+    """
+    kinds: dict[int, str] = {int(p): "kv" for p in np.asarray(pt).reshape(-1)}
+    ck = np.asarray(ckpt)
+    bases = []
+    if ck.ndim == 3:
+        bases = [int(v) * pages_per_slot for v in ck.reshape(-1)]
+    else:
+        for v in ck.reshape(-1):
+            for sub in range(g_per_att):
+                bases.append(int(v) * pages_per_slot * g_per_att + sub * pages_per_slot)
+    for base in bases:
+        for k in range(pages_per_slot):
+            kind = "rec" if k < rec_pages else "conv"
+            prev = kinds.setdefault(base + k, kind)
+            assert prev == kind, f"page {base + k} is both {prev} and {kind}"
+    return kinds
+
+
+def _rec_pool_max_ulp(r_a: Any, r_b: Any, num_pages: int, kinds: dict[int, str]) -> int:
     """Max bf16 ULP distance between two pools; asserts all diffs are rec-state.
 
-    Non-recurrent pages (KV, conv) must match bytewise, and no recurrent-state
-    value may flip sign.
+    `kinds` comes from `_pool_page_kinds` (the real layout). Every differing
+    page must be a GDN recurrent-state page: KV pages, conv pages and
+    unreferenced pages must match bytewise, and no recurrent-state value may
+    flip sign.
     """
     a = np.asarray(r_a).view(np.uint8)
     b = np.asarray(r_b).view(np.uint8)
     worst = 0
     for gp_ in np.unique(np.argwhere(a != b)[:, 0]):
         local = int(gp_) % num_pages
-        assert local % 5 < 4, f"non-recurrent page {local} differs"
+        kind = kinds.get(local, "unreferenced")
+        assert kind == "rec", f"{kind} page {local} differs"
         ba = _rec_page_bf16_bits(a[gp_]).astype(np.int32)
         bb = _rec_page_bf16_bits(b[gp_]).astype(np.int32)
         same_sign = (ba >> 15) == (bb >> 15)
@@ -1937,23 +1970,63 @@ def _rec_pool_max_ulp(r_a: Any, r_b: Any, num_pages: int) -> int:
 
 
 def _assert_pools_equal_up_to_rec_ulp(
-    r_a: Any, r_b: Any, num_pages: int, *, max_ulp: int
+    r_a: Any, r_b: Any, num_pages: int, kinds: dict[int, str], *, max_ulp: int
 ) -> None:
     """Pools equal bytewise, except GDN rec-state pages within `max_ulp` bf16 ULP."""
-    worst = _rec_pool_max_ulp(r_a, r_b, num_pages)
+    worst = _rec_pool_max_ulp(r_a, r_b, num_pages, kinds)
     assert worst <= max_ulp, (worst, max_ulp)
 
 
+def test_pool_page_kinds_follow_layout():
+    """`_pool_page_kinds` tells KV pages from GDN slot pages (not `page % 5`)."""
+    g = _tiny_geom(L=4, att_every=4)
+    ex = _tiny_exec(R=2, B=4, T=2, ctx=256, paged_kv=True, num_pages=512)
+    pt, ckpt, _, _ = mk.default_pool_layout(g, ex)
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    kv = {p for p, k in kinds.items() if k == "kv"}
+    rec = {p for p, k in kinds.items() if k == "rec"}
+    conv = {p for p, k in kinds.items() if k == "conv"}
+    assert kv and rec and conv and not (kv & rec) and not (kv & conv)
+    # The old `page % 5 < 4` rule would call some KV pages recurrent state.
+    assert any(p % 5 < 4 for p in kv)
+    assert all(kinds[p + 4] == "conv" for p in rec if p % 5 == 0)
+
+
+# Fused vs split on WIDE buckets: measured 12 bf16 ULP on recurrent-state pages
+# at `0cd141946` (CPU interpret, B=56, T=1); hidden output is bitwise equal.
+WIDE_FUSED_REC_ULP_BOUND = 12
+
+
 @pytest.mark.parametrize(
-    "T,B",
+    "T,B,seed",
     [
-        (1, 2),
-        (2, 4),
-        (4, 8),
-        pytest.param(1, 56, marks=pytest.mark.slow),
+        (1, 2, 0),
+        (2, 4, 0),
+        (4, 8, 0),
+        # Extra seeds: the T > 1 bounds below are empirical.
+        (2, 4, 1),
+        (2, 4, 2),
+        (4, 8, 1),
+        # Open (fused is experimental, numerics class approx): with this seed
+        # fused vs split differs beyond rec-state rounding at T=4 (hidden rows
+        # 2-3 by up to 6 bf16 ULP, plus the KV bytes of those tokens). Seed 4
+        # (not run here) differs on rows 3-7 by up to 177 ULP, including t=0 of
+        # the second sequence, so it is not only intermediate-checkpoint
+        # rounding; root cause under investigation. Strict, so it fails loudly
+        # once fixed.
+        pytest.param(
+            4,
+            8,
+            2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="fused T=4 deviation beyond rec-state ULP for this seed (open)",
+            ),
+        ),
+        pytest.param(1, 56, 0, marks=pytest.mark.slow),
     ],
 )
-def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
+def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     """Verify 1-launch `fused_pool_io=True` is bit-exact vs split `PallasWriter`."""
     mesh = _cpu_mesh(2)
     tp = NamedSharding(mesh, P("tp"))
@@ -1995,7 +2068,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
             assert mk.should_fuse_pool_io(spec, ex_b, fused_pool_io=False) is False
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
-        jax.random.key(710 + T * 10 + B), g, ex
+        jax.random.key(710 + T * 10 + B + 1000 * seed), g, ex
     )
     if T > 1:
         # Exercise cross-page KV boundary (pos 127 -> page 0, pos 128 -> page 1)
@@ -2055,18 +2128,24 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
         np.asarray(out_f).view(np.uint8),
         np.asarray(out_s).view(np.uint8),
     )
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
     rec_ulp = max(1, T - 1)
     if ex.WIDE:
-        # Known open deviation: on WIDE buckets (split uses the chunked GCH
-        # recurrence, fused does not) recurrent-state pages differ from split by
-        # several bf16 ULP on CPU interpret even though hidden output is bitwise
-        # equal. Report it explicitly instead of widening a tolerance to fit.
+        # Known open deviation (root cause under investigation): on WIDE buckets
+        # recurrent-state pages differ from split by a few bf16 ULP on CPU
+        # interpret, although hidden output is bitwise equal. Both sides run the
+        # head-major recurrence (the split reference opts into gdn_head_major),
+        # so this is not head-major vs key-major. Bounded at the measured value
+        # and reported as XFAIL instead of widening a tolerance to fit.
         worst = max(
-            _rec_pool_max_ulp(r_f, r_s, ex.num_pages) for r_f, r_s in zip(raw_f, raw_s)
+            _rec_pool_max_ulp(r_f, r_s, ex.num_pages, kinds)
+            for r_f, r_s in zip(raw_f, raw_s)
         )
+        assert worst <= WIDE_FUSED_REC_ULP_BOUND, (worst, WIDE_FUSED_REC_ULP_BOUND)
         if worst:
             pytest.xfail(
-                f"fused WIDE rec-state deviation vs split: {worst} bf16 ULP (open)"
+                f"fused WIDE rec-state deviation vs split: {worst} bf16 ULP "
+                f"(bound {WIDE_FUSED_REC_ULP_BOUND}, open)"
             )
     for r_f, r_s in zip(raw_f, raw_s):
         if T == 1:
@@ -2075,13 +2154,15 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
                 np.asarray(r_s).view(np.uint8),
             )
         else:
-            # Known deviation (open): for T > 1 a few bf16 GDN recurrent-state
-            # values of the t >= 1 checkpoints differ from split by up to T - 1
-            # ULP on CPU interpret; hidden output stays bitwise equal and all
-            # other pages (KV, conv) must match exactly.
-            _assert_pools_equal_up_to_rec_ulp(r_f, r_s, ex.num_pages, max_ulp=rec_ulp)
+            # Known deviation (open; empirical: seeds 0-2 at T=2, 0-1 at T=4):
+            # for T > 1 a few bf16 GDN recurrent-state values of the t >= 1
+            # checkpoints differ from split by up to T - 1 ULP on CPU interpret;
+            # hidden output and KV / conv pages match exactly for these seeds.
+            _assert_pools_equal_up_to_rec_ulp(
+                r_f, r_s, ex.num_pages, kinds, max_ulp=rec_ulp
+            )
 
-    if (T, B) in ((1, 2), (2, 4)):
+    if seed == 0 and (T, B) in ((1, 2), (2, 4)):
         # Verify conv_stage=True (conv_fast VMEM staging) on CPU interpret
         ex_cstage = replace(
             ex, tiles=replace(ex.resolved_tiles, conv_stage=True), fused_pool_io=True
@@ -2102,7 +2183,9 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int):
                 np.asarray(r_cs).view(np.uint8),
                 np.asarray(r_f0).view(np.uint8),
             )
-            _assert_pools_equal_up_to_rec_ulp(r_cs, r_s, ex.num_pages, max_ulp=rec_ulp)
+            _assert_pools_equal_up_to_rec_ulp(
+                r_cs, r_s, ex.num_pages, kinds, max_ulp=rec_ulp
+            )
 
     if (T, B) == (1, 2):
         # Verify act_mode="ref" with explicit active_seqs mask [1, 0]

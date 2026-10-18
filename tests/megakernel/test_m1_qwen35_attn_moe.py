@@ -68,10 +68,10 @@ def test_m1_recorded_full_ep_build_invariants():
     assert info["T_TOTAL"] == 840
     assert p.block_params["moe"].TE == 12
     assert p.block_params["moe"].NSS == 3
-    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,041,984 < frozen's 49,178,624.
-    # (M4b: 48,031,744; +10,240 B of always-allocated M5 GQA scratch: `rope`
-    # 8,192 and `rcs` 2,048. The QV staging slabs are opt-in via `gqa_qv`.)
-    assert info["vmem_scratch_bytes"] == 48_041_984 < 49_178_624
+    # GDN-free M1 omits `recb`/`sbuf`/`convb` -> 48,033,792 < frozen's 49,178,624.
+    # (M4b: 48,031,744; +2,048 B of always-allocated M5 GQA scratch `rcs`. The
+    # `rope` table and the QV staging slabs are allocated only under `gqa_qv`.)
+    assert info["vmem_scratch_bytes"] == 48_033_792 < 49_178_624
     assert info["vmem_scratch_bytes"] <= ex.resolved_tiles.vmem_mib * (1 << 20)
     assert "recb" not in info["vmem_shapes"]
     assert "sbuf" not in info["vmem_shapes"]

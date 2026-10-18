@@ -49,6 +49,15 @@ from . import fused_pool_io
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))
 
+# Geometry (layout) requirements, not per-bucket tuning:
+# - KVE views each KV ring stage as `(2, HD // 4, BLK)` u32 rows of the untyped
+#   expert pool; that view is validated for HD == 256 only (the frozen /
+#   candidate30 layout). Other head dims keep the separate `kvbuf` ring.
+# - GQ sends the partial-softmax `(m | l)` pair as two 128-lane halves of one
+#   HD-wide row of the exchange buffer, so it needs HD == 2 * 128.
+KVE_HD = 256
+GQ_ML_LANES = 2 * 128
+
 
 @dataclass(frozen=True)
 class GQAParams:
@@ -210,7 +219,7 @@ class GQABlock(Block):
             and bool(plan.dynamic_kinds)
             and tiles.nbe >= NKV
             and tiles.ebank >= KV_ITEM
-            and g.HD == 256
+            and g.HD == KVE_HD
         )
         NKVR = tiles.nbe if KVE else NKV
         SUB = tiles.kv_sub or BLK
@@ -240,6 +249,7 @@ class GQABlock(Block):
             and nh <= 8
             and (not PACK or PB * nh == 8)
         )
+        assert not tiles.gq_pack or tiles.gqa_qv, "Tiles.gq_pack requires gqa_qv"
         QG = ex.T * nh
         GQ = bool(
             tiles.gq_pack
@@ -249,7 +259,7 @@ class GQABlock(Block):
             and G * nh == QR
             and QG % 16 == 0
             and ex.NS <= 64
-            and g.HD == 256
+            and g.HD == GQ_ML_LANES
         )
         MLW = 128 // ex.NS if GQ else 0
         if GQ:
@@ -316,7 +326,6 @@ class GQABlock(Block):
                 "knew": pltpu.VMEM((ex.MR, ap.HD), F32),
                 "vnew": pltpu.VMEM((ex.MR, ap.HD), F32),
                 "gate": pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32),
-                "rope": pltpu.VMEM((2, ex.MR, 128), F32),
                 "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
             }
         )
@@ -346,6 +355,7 @@ class GQABlock(Block):
         elif ex.VER:
             scr["qg"] = pltpu.VMEM((1, ex.B, 8, ap.HD), F32)
         if ap.QV:
+            scr["rope"] = pltpu.VMEM((2, ex.MR, 128), F32)  # QV-only cos / sin table
             scr["qg"] = pltpu.VMEM(
                 (ap.G if ap.SPLIT and not ap.GQ else 1, ap.NHH, ap.QVR, 128), F32
             )
@@ -1168,7 +1178,7 @@ class GQABlock(Block):
         if ex.paged_kv or "kc" not in states:
             return {"knew": knew, "vnew": vnew}
         kc, vc = states["kc"], states["vc"]
-        if ex.NS > 16:
+        if ex.resolve_tiles(g).kv_scatter_vec_ns < ex.NS:
             bi = jnp.arange(ex.B) if ex.T == 1 else jnp.arange(ex.B) // ex.T
             kw = dict(
                 indices_are_sorted=True, unique_indices=True, mode="promise_in_bounds"
