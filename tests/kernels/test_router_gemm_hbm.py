@@ -39,12 +39,16 @@ def _x(m, real, seed=0):
 
 def _w(e, seed=1):
     rng = np.random.default_rng(seed)
-    return jnp.asarray(rng.standard_normal((e, K), dtype=np.float32) * 0.02, jnp.bfloat16)
+    return jnp.asarray(
+        rng.standard_normal((e, K), dtype=np.float32) * 0.02, jnp.bfloat16
+    )
 
 
 def _xla(x, w):
     # What the gate's F.linear lowers to: dot over k, bf16 result.
-    return jax.jit(lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))(x, w)
+    return jax.jit(lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))(
+        x, w
+    )
 
 
 def _ulp_check(y, ref, tag=""):
@@ -71,7 +75,10 @@ def test_matches_xla_dot_to_one_ulp(e, m, real):
     assert n <= max(1, m * e // 1000)
     # and it is the product (positive control for a no-op comparison)
     f64 = np.asarray(x, np.float64) @ np.asarray(w, np.float64).T
-    assert np.abs(np.asarray(y, np.float64) - f64).max() <= 2.0**-7 * np.abs(f64).max() + 1e-6
+    assert (
+        np.abs(np.asarray(y, np.float64) - f64).max()
+        <= 2.0**-7 * np.abs(f64).max() + 1e-6
+    )
 
 
 @pytest.mark.parametrize("config", [(32, 2), (16, 4), (64, 3), (128, 2)])
@@ -88,7 +95,9 @@ def test_fault_is_caught():
     x, w = _x(8, 8), _w(256)
     bad = w.at[200, 17].add(jnp.bfloat16(0.5))
     y = jax.jit(rg.router_gemm_hbm)(x, bad)
-    assert not np.array_equal(np.asarray(y, np.float32), np.asarray(_xla(x, w), np.float32))
+    assert not np.array_equal(
+        np.asarray(y, np.float32), np.asarray(_xla(x, w), np.float32)
+    )
 
 
 def test_router_logits_dispatch():
@@ -139,7 +148,9 @@ def test_no_vmem_staging_of_the_weight(e):
     # A dot whose weight is a parameter feeding a following op (so it is not the
     # whole program) -- XLA stages it.
     xla_hlo = (
-        jax.jit(lambda a, b: jnp.tanh(jax.lax.dot_general(a, b, (((1,), (1,)), ((), ())))))
+        jax.jit(
+            lambda a, b: jnp.tanh(jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))
+        )
         .lower(x, w)
         .compile()
         .as_text()
@@ -152,7 +163,7 @@ def test_speed_vs_xla(e):
     """Informational: wall per call, kernel (HBM) vs XLA dot, 200 chained calls."""
     import time
 
-    x, w = _x(16, 4), _w(e)
+    x = _x(16, 4)
     ws = [_w(e, seed=s) for s in range(8)]  # rotate weights: cold-ish
 
     def chain(f):
@@ -163,13 +174,20 @@ def test_speed_vs_xla(e):
                 y = f(acc, ws[i % len(ws)])
                 acc = acc + y[:, :1].astype(acc.dtype) * 0  # serialise
             return acc
+
         return run
 
-    for name, f in (("kernel", rg.router_gemm_hbm), ("xla", lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))):
+    for name, f in (
+        ("kernel", rg.router_gemm_hbm),
+        ("xla", lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ())))),
+    ):
         r = chain(f)
         r(x, *ws).block_until_ready()
         t = time.perf_counter()
         for _ in range(20):
             out = r(x, *ws)
         out.block_until_ready()
-        print(f"ROUTERSPEED {name} e={e}: {(time.perf_counter() - t) / 20 / 64 * 1e6:.2f} us/call")
+        print(
+            f"ROUTERSPEED {name} e={e}: "
+            f"{(time.perf_counter() - t) / 20 / 64 * 1e6:.2f} us/call"
+        )

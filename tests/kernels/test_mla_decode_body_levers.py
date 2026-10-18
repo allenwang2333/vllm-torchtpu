@@ -149,7 +149,9 @@ def test_bit_identical(query_tokens, seq_q, send_world, shift):
 
     def same_real(got):
         g, r = _real(got, real, heads, world), _real(ref, real, heads, world)
-        return all(np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r))
+        return all(
+            np.array_equal(x.view(np.uint16), y.view(np.uint16)) for x, y in zip(g, r)
+        )
 
     # The real tokens' bits: a padding token's rows are left unwritten by a
     # grid that stops at the real tokens (whatever the buffer held) and are

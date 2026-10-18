@@ -265,7 +265,9 @@ def _route_inputs(kind, rows=16, e=256, seed=0):
     return jnp.asarray(scores), jnp.asarray(bias)
 
 
-@pytest.mark.parametrize("kind", ["bf16_logits", "coarse", "boundary", "signed_zero", "nan"])
+@pytest.mark.parametrize(
+    "kind", ["bf16_logits", "coarse", "boundary", "signed_zero", "nan"]
+)
 @pytest.mark.parametrize("n_valid", [16, 5])
 def test_fast_route_breaks_ties_as_the_exact_route(kind, n_valid):
     # The keyed pick takes tied columns lowest first, as _route does, so tied
@@ -274,7 +276,9 @@ def test_fast_route_breaks_ties_as_the_exact_route(kind, n_valid):
     want = kernel_impl._route(scores, bias, n_valid, topk=8)
     got, flag = kernel_impl._route_fast(scores, bias, n_valid, topk=8)
     assert float(flag[0, 0]) == 0.0
-    assert np.array_equal(np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32))
+    assert np.array_equal(
+        np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32)
+    )
 
 
 def test_fast_route_flags_picks_beyond_the_key_window():

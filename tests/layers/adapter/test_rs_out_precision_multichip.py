@@ -107,7 +107,11 @@ def _check(rank, cp_mla, path):
                     return merge(o, lse, query_start_loc=qsl)
 
                 res = {}
-                for name, flag, roll in (("f32", False, False), ("bf16", True, False), ("ctl", True, True)):
+                for name, flag, roll in (
+                    ("f32", False, False),
+                    ("bf16", True, False),
+                    ("ctl", True, True),
+                ):
                     cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = flag
                     fn = fn0 if how == "eager" else mm._compile(fn0)
                     o, lse = t4m._partials(z, step, "on", rank, dcp, roll)
@@ -125,7 +129,9 @@ def _check(rank, cp_mla, path):
                     "bf16_vs_f32_maxulp": int(u.max()) if u.numel() else 0,
                 }
                 for name in ("f32", "bf16", "ctl"):
-                    c[f"{name}_scale"] = t3m._scale_err(res[name], outs, lses, rank, dcp)["max_ulp"]
+                    c[f"{name}_scale"] = t3m._scale_err(
+                        res[name], outs, lses, rank, dcp
+                    )["max_ulp"]
                     for k, v in _err_stats(res[name], outs, lses, rank, dcp).items():
                         c[f"{name}_{k}"] = v
                 d = (res["bf16"].float() - res["f32"].float()).abs()
@@ -192,25 +198,47 @@ def test_rs_out_precision_on_real_collectives(tmp_path):
     import subprocess
 
     cmd = [
-        sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
-        f"--nproc-per-node={WORLD_SIZE}", str(Path(__file__).resolve()),
-        "--result-dir", str(tmp_path), "--partials", path,
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc-per-node={WORLD_SIZE}",
+        str(Path(__file__).resolve()),
+        "--result-dir",
+        str(tmp_path),
+        "--partials",
+        path,
     ]
     done = subprocess.run(
-        cmd, cwd=Path(__file__).resolve().parents[3], env=mm._prepare_worker_env(),
-        capture_output=True, text=True, errors="replace", timeout=mm.LAUNCH_TIMEOUT_SECONDS,
+        cmd,
+        cwd=Path(__file__).resolve().parents[3],
+        env=mm._prepare_worker_env(),
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=mm.LAUNCH_TIMEOUT_SECONDS,
     )
     results = mm._results(tmp_path, WORLD_SIZE)
-    assert not [r for r in results if "error" in r], (results, (done.stdout or "")[-8000:])
+    assert not [r for r in results if "error" in r], (
+        results,
+        (done.stdout or "")[-8000:],
+    )
     total = {}
     for r in results:
         for key, c in r["check"].items():
             assert "error" not in c, (r["rank"], key, c)
-            t = total.setdefault(key, {"tokens": c["tokens"], "real": c["real"], "chunked": c["chunked"]})
+            t = total.setdefault(
+                key, {"tokens": c["tokens"], "real": c["real"], "chunked": c["chunked"]}
+            )
             for k, v in c.items():
                 if k in ("tokens", "real", "chunked"):
                     continue
-                if k.endswith(("ndiff", "sum_abs")) or k in ("elements",) or k.endswith("_n"):
+                if (
+                    k.endswith(("ndiff", "sum_abs"))
+                    or k in ("elements",)
+                    or k.endswith("_n")
+                ):
                     t[k] = t.get(k, 0) + v
                 else:
                     t[k] = max(t.get(k, 0), v)
@@ -225,7 +253,11 @@ def test_rs_out_precision_on_real_collectives(tmp_path):
             ok = t["bf16_vs_f32_ndiff"] == 0
         else:
             bound = t["f32_scale"] + t3m.RS_BF16_MAX_SCALE_ULP
-            ok = t["bf16_scale"] <= bound and t["ctl_scale"] > bound and t["bf16_vs_f32_ndiff"] > 0
+            ok = (
+                t["bf16_scale"] <= bound
+                and t["ctl_scale"] > bound
+                and t["bf16_vs_f32_ndiff"] > 0
+            )
         if not ok:
             failures.append((key, t))
     assert not failures, failures

@@ -6318,9 +6318,7 @@ class TPUModelRunner(GPUModelRunner):
                     group_indices,
                 ) = token_inputs
                 # padded_num_reqs-shaped inputs.
-                draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
-                    self.device
-                )
+                draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                 bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(
                     self.device
                 )
@@ -6328,10 +6326,8 @@ class TPUModelRunner(GPUModelRunner):
                     self.device
                 )
                 # --- greedy verify path (do_sampling=False) ---
-                bonus_token_ids, target_logits_warm = (
-                    self.spec_bonus_and_target_logits(
-                        dummy_logits, bonus_logits_indices, target_logits_indices
-                    )
+                bonus_token_ids, target_logits_warm = self.spec_bonus_and_target_logits(
+                    dummy_logits, bonus_logits_indices, target_logits_indices
                 )
                 out = self.rejection_sampler(
                     draft_token_ids=draft_token_ids,
@@ -6342,9 +6338,7 @@ class TPUModelRunner(GPUModelRunner):
                     group_indices=group_indices,
                     max_draft_tokens=k,
                     accept_u=(
-                        warm_accept_u
-                        if self.rejection_sampler.synthetic_mode
-                        else None
+                        warm_accept_u if self.rejection_sampler.synthetic_mode else None
                     ),
                 )
                 synchronize_tensors(out)

@@ -236,11 +236,10 @@ def vspace_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     if _merge_chunks(num_tokens) <= 1:
         return False
     min_tokens = envs.TPU_DCP_MERGE_VSPACE_MIN_TOKENS
-    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and not (
-        num_tokens > envs.bucket_gate_edge(min_tokens)
-    ):
-        return False
-    return True
+    return not (
+        min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
+        and not num_tokens > envs.bucket_gate_edge(min_tokens)
+    )
 
 
 def _merge_chunks(num_tokens: int) -> int:
@@ -1117,11 +1116,13 @@ def _mask_unpack(recv, rows, tl: int):
     words = recv[:, SEND_PAD_ROWS - 1]
     hi = words[:, :tl].astype(jnp.int32)
     lo = words[:, tl : 2 * tl].astype(jnp.int32)
-    l = jax.lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
-    return o, l
+    lse = jax.lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), jnp.float32)
+    return o, lse
 
 
-def send_group_unpack_local(x, rows, rank, *, world: int, group_rows: int, axis_name: str):
+def send_group_unpack_local(
+    x, rows, rank, *, world: int, group_rows: int, axis_name: str
+):
     """One rank's `TPU_DCP_MLA_SEND_GROUP_ROWS` exchange + unpack inside a
     `shard_map` over the DCP axis: `_build_send_unpack`'s result, bit for bit.
 
@@ -1210,7 +1211,9 @@ def send_dense_unpack_local(x, rows, *, world: int, axis_name: str):
 
     block = x.shape[0] // world
     vdim = x.shape[1]
-    recv = jax.lax.all_to_all(x, axis_name, 0, 0, tiled=True).reshape(world, block, vdim)
+    recv = jax.lax.all_to_all(x, axis_name, 0, 0, tiled=True).reshape(
+        world, block, vdim
+    )
     return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
 
 

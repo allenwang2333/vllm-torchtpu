@@ -754,10 +754,9 @@ class TiedSymbolsModel(nn.Module):
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         p = positions.to(x.dtype)
-        if x.shape[0] > TIE_ROWS:
-            y = x + p.unsqueeze(-1)  # ties the positions' length to the rows
-        else:
-            y = x * p.sum()  # leaves it free: its symbol is an input of its own
+        # x + p ties the positions' length to the rows; x * sum(p) leaves it
+        # free: its symbol is an input of its own.
+        y = x + p.unsqueeze(-1) if x.shape[0] > TIE_ROWS else x * p.sum()
         return WAVE(y)
 
 

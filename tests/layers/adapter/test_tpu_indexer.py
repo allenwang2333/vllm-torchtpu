@@ -583,7 +583,8 @@ def test_streamidx_block_sizes_mixed_kv_pages():
 
 
 def test_streamidx_block_sizes_decode_pack():
-    """TPU_STREAMIDX_DECODE_PACK picks the small-bucket kv block by bucket (T <= 8: 32)."""
+    """TPU_STREAMIDX_DECODE_PACK picks the small-bucket kv block by bucket
+    (T <= 8: 32)."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP,
         _streamidx_block_sizes,
@@ -597,7 +598,10 @@ def test_streamidx_block_sizes_decode_pack():
     assert mixed_bkvp(4, bkvp=8) == 8
     assert mixed_bkvp(4, pack=False) == STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     # Buckets past the small-bucket cap are untouched.
-    assert _streamidx_block_sizes(128, 4, None, 64, None, True) == ((2, 2, 2), (1, 128, 128))
+    assert _streamidx_block_sizes(128, 4, None, 64, None, True) == (
+        (2, 2, 2),
+        (1, 128, 128),
+    )
 
 
 def test_streamidx_small_bucket_tokens_default_is_64(monkeypatch):

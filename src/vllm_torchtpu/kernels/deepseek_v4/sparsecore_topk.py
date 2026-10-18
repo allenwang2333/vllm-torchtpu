@@ -731,6 +731,12 @@ def _topk_body(
         row = flat
         active_row = row < b
         num_dmas = jnp.where(active_row, rank_major_dcp, 0)
+        assert (
+            lenall_vmem is not None
+            and lidx_vmem is not None
+            and rowdata_vmem is not None
+            and dma_sem is not None
+        )
         # The row's rank and local slots are only read at emission: fetch them
         # on their own semaphore, in flight with the score pieces, rather than
         # as two serial copies ahead of them.

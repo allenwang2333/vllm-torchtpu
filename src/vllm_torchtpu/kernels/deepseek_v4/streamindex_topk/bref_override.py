@@ -228,9 +228,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     # > 0: page-major block [seq_batch, bkv_p * groups, packing, page_size];
     # page i fills sublane groups [i * groups, (i + 1) * groups), one
     # contiguous copy. 0: pages side by side on the lane axis.
-    page_major_groups: int = dataclasses.field(
-        default=0, metadata=dict(static=True)
-    )
+    page_major_groups: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch

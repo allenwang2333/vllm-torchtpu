@@ -204,18 +204,18 @@ _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 # given: keep it at or below the kernel's smallest all-reduce (3 MiB for
 # GLM-5.2 at its 256-token minimum).
 _PREFILL_KERNEL_ALL_REDUCE_BYTES = 1 << 20
-_SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 _PREFILL_KERNEL_LOWERS_FLOOR = envs.FUSED_MOE_PREFILL_KERNEL and envs.is_set(
     "FUSED_MOE_PREFILL_KERNEL"
 )
 if _sc_offload_bytes is not None:
     for _flag_name in (
-        _SC_ALL_REDUCE_FLAG,
+        SC_ALL_REDUCE_FLAG,
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
     ):
         _bytes = _sc_offload_bytes
         if (
-            _flag_name == _SC_ALL_REDUCE_FLAG
+            _flag_name == SC_ALL_REDUCE_FLAG
             and _PREFILL_KERNEL_LOWERS_FLOOR
             and envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
         ):
@@ -228,7 +228,7 @@ if _PREFILL_KERNEL_LOWERS_FLOOR:
         (
             token.split("=", 1)[1]
             for token in [*_libtpu_extra_args, *_existing_libtpu_args.split()]
-            if token.startswith(_SC_ALL_REDUCE_FLAG + "=")
+            if token.startswith(SC_ALL_REDUCE_FLAG + "=")
         ),
         None,
     )
@@ -251,6 +251,16 @@ if _libtpu_extra_args:
     if _existing_libtpu_args:
         _assembled = _assembled + " " + _existing_libtpu_args
     os.environ["LIBTPU_INIT_ARGS"] = _assembled
+
+
+def sc_all_reduce_floor() -> str | None:
+    """The SparseCore all-reduce offload floor libtpu gets, as LIBTPU_INIT_ARGS
+    gives it (the last one wins), or None when no flag sets it."""
+    floor = None
+    for token in os.environ.get("LIBTPU_INIT_ARGS", "").split():
+        if token.startswith(SC_ALL_REDUCE_FLAG + "="):
+            floor = token.split("=", 1)[1]
+    return floor
 
 
 def _patch_jax_pallas_fori_lowering() -> None:
