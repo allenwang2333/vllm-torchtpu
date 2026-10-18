@@ -279,6 +279,7 @@ if TYPE_CHECKING:
     )
     TPU_DISABLE_RUNNER_STAGE_TIMING: bool = False
     TPU_SKIP_UNCHANGED_PADDING_UPLOAD: bool = False
+    TPU_DRAFT_LOOP_CACHE_UPLOADS: bool = False
 
 
 def env_with_choices(
@@ -1866,6 +1867,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # synchronous H2D every forward. Skip it when the step's (valid, padded)
     # rows equal the ones last written, as in steady decode. Values unchanged.
     "TPU_SKIP_UNCHANGED_PADDING_UPLOAD": env_bool("TPU_SKIP_UNCHANGED_PADDING_UPLOAD"),
+    # The drafter's loop steps upload query_start_loc and request_distribution
+    # (two H2Ds per chunk) on every propose. Keep them per (kernel_num_reqs,
+    # num_reqs) instead, at most 2 * max_num_reqs small tensors. Values unchanged.
+    "TPU_DRAFT_LOOP_CACHE_UPLOADS": env_bool("TPU_DRAFT_LOOP_CACHE_UPLOADS"),
 }
 
 
