@@ -229,6 +229,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
         # req_id -> (boundary tokens, state keys) of the admission's hit.
         self._state_hits: dict[str, tuple[int, list[OffloadKey]]] = {}
+        # req_id -> state-group keys of each store job, in submission order.
+        self._state_store_seq: dict[str, list[list[OffloadKey]]] = {}
 
     def _complete_jobs_directly(
         self,
@@ -362,6 +364,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 keys=dst_spec.keys, device_block_ids=device_block_ids
             )
             new_fence_ids.add(job_id)
+            if self._demote_stale_state and self._state_group_ids:
+                # Generic GDN-state tracking: covers store paths that bypass
+                # _build_aligned_boundary_store_jobs (e.g. PP chunked prefill),
+                # where _state_boundaries stays empty and nothing was demoted.
+                req_id = getattr(job, "req_id", None)
+                state_keys = [
+                    key
+                    for key in dst_spec.keys
+                    if get_offload_group_idx(key) in self._state_group_ids
+                ]
+                if req_id is not None and state_keys:
+                    self._state_store_seq.setdefault(req_id, []).append(state_keys)
 
         # Submit load jobs immediately: destination HBM blocks are freshly
         # allocated and safe to write into.
@@ -678,7 +692,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         for req_id in finished_req_ids:
             boundaries = self._state_boundaries.pop(req_id, None)
             hit = self._state_hits.pop(req_id, None)
+            seq = self._state_store_seq.pop(req_id, None)
             if not boundaries:
+                # Fallback: GDN states stored outside the aligned-boundary path.
+                # Keep only the newest stored state set; older ones (and the
+                # state this request was admitted from, which it superseded)
+                # are demoted: still answer lookups, evicted before live KV.
+                if seq and len(seq) > 1 or (seq and hit is not None):
+                    newest = set(seq[-1])
+                    stale = [k for keys in seq[:-1] for k in keys if k not in newest]
+                    if hit is not None:
+                        stale.extend(k for k in hit[1] if k not in newest)
+                    if stale:
+                        self._raiden_manager.demote(stale)
                 continue
             newest = max(boundaries)
             stale = [
