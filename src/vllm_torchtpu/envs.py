@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
     TPU_MTP_DCP_MERGE_SIZED: bool = False
+    TPU_VOCAB_EMBED_I32_BOUNDS: bool = False
     TPU_DCP_MLA_SEND_LAYOUT: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
@@ -532,6 +533,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-element weights as the reduce-scatter merge; only the order the
     # ranks' weighted partials are summed in differs.
     "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=False),
+    # VocabParallelEmbedding's five shard bounds as int32 scalar buffers
+    # instead of int64. An int64 scalar program input costs one X64SplitLow
+    # custom call (~1.15 us, serial, at every program start that embeds: the
+    # backbone once per step, the MTP drafter once per draft pass). The
+    # bounds are < 2**31, so the masks and the shifted ids are the same
+    # values; the ids are widened to int64 for the lookup as before.
+    "TPU_VOCAB_EMBED_I32_BOUNDS": env_bool(
+        "TPU_VOCAB_EMBED_I32_BOUNDS", default=False
+    ),
     # With TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and TPU_MLA_DECODE_PROLOGUE: on
     # decode buckets the DCP MLA kernel writes the packed real-rows exchange's
     # send buffer itself (partials destination-major, lse words in place), so
