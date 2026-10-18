@@ -1466,7 +1466,7 @@ def sparsecore_topk_dcp_merge_coop(
         ),
         scratch_types=scratch_types,
         mesh=mesh,
-        name=f"sc_topk_merge_coop_b{b}_n{n}_k{k}_p{p}",
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}_coop",
     )(words.reshape(-1), lengths_in, local_idxs.astype(jnp.int32).reshape(-1))
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(

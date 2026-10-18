@@ -158,7 +158,7 @@ def test_coop_merge_route(monkeypatch):
             .lower(flat, idxs)
             .as_text()
         )
-        assert ("sc_topk_merge_coop" in txt) is routed, b
+        assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_coop", txt)) is routed, b
     assert sc_valid.coop_merge_fits(16, 8, K) and not sc_valid.coop_merge_fits(32, 8, K)
     assert not sc_valid.coop_merge_fits(4, 6, K)
 
