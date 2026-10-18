@@ -26,11 +26,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-pytestmark = pytest.mark.skipif(
-    jax.default_backend() != "tpu" or len(jax.devices()) not in (8, 16),
-    reason="needs a TPU host (8 or 16 cores)",
-)
-
 ROUTED_SCALE = 2.5
 
 
@@ -50,6 +45,8 @@ def test_hbm_operands_bitwise(rows, n_valid):
 
     from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel
 
+    if jax.default_backend() != "tpu" or len(jax.devices()) not in (8, 16):
+        pytest.skip("needs a TPU host (8 or 16 cores)")
     devices = jax.devices()
     n = len(devices)
     c = dict(h=6144, e=256, i=2048 // n, fs=2048 // n, topk=8)
