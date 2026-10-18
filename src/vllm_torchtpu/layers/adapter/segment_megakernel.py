@@ -175,7 +175,7 @@ _ARGS = (
     "w2",
     "s2",
     "qkv_w",  # fp8 [H, qkv_pad] (the lane-padded copy)
-    "fstack",  # f32 [boundaries, row_width] (this rank's)
+    "fstack",  # f32 [boundaries, 1, row_width] (this rank's)
     "s13s",  # f32 [boundaries, E, 2I]
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
@@ -716,7 +716,7 @@ def _build_stacks(layers: list, plan: list) -> None:
     stack8 = lambda xs: torch.stack([x.view(torch.uint8) for x in xs]).view(  # noqa: E731
         xs[0].dtype
     )
-    _STACKS["fstack"] = fresh_buffer(torch.stack(rows))
+    _STACKS["fstack"] = fresh_buffer(torch.stack(rows)[:, None, :])
     _STACKS["s13s"] = fresh_buffer(torch.stack(s13s).to(torch.float32))
     _STACKS["sw13s"] = fresh_buffer(stack8(sw13s))
     _STACKS["sw2s"] = fresh_buffer(stack8(sw2s))

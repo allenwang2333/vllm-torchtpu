@@ -122,7 +122,7 @@ class SegCfg:
 
     def fields(self) -> tuple[tuple[str, int, int], ...]:
         """(name, offset, width) of each small f32 constant in one row of the
-        all-layer constant stack `fstack` [boundaries, row_width]."""
+        all-layer constant stack `fstack` [boundaries, 1, row_width]."""
         widths = (
             ("oproj_s", self.hidden),
             ("g_post", self.hidden),
@@ -416,7 +416,7 @@ HBM_IN = (
     "w2",
     "s2",
     "qkv_w",
-    "fstack",  # f32 [boundaries, row_width]: SegCfg.fields() per boundary
+    "fstack",  # f32 [boundaries, 1, row_width]: SegCfg.fields() per boundary
     "s13s",  # f32 [boundaries, E, 2I]: routed gate/up scales
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
@@ -536,7 +536,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     def frow(name):
         off, w = cfg.field(name)
-        return r["fstack"].at[pl.ds(slot_k, 1), pl.ds(off, w)]
+        return r["fstack"].at[slot_k, :, pl.ds(off, w)]
 
     # ---- 1. barrier signals for BOTH in-kernel all-reduces (one prologue;
     #         AR2 skips its wait)
@@ -945,7 +945,7 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
         "w2": ((cfg.experts, cfg.moe_i, H), F8),
         "s2": ((cfg.experts, 1, 1, H), F32),
         "qkv_w": ((H, cfg.qkv_pad), F8),
-        "fstack": ((boundaries, cfg.row_width), F32),
+        "fstack": ((boundaries, 1, cfg.row_width), F32),
         "s13s": ((boundaries, cfg.experts, 2 * cfg.moe_i), F32),
         "sw13s": ((boundaries, H, 2 * cfg.shared_i), F8),
         "sw2s": ((boundaries, cfg.shared_i, H), F8),

@@ -287,7 +287,7 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
         w2=pr["w2"],
         s2=pr["s2"],
         qkv_w=qkv_w,
-        fstack=jnp.stack([decoy, row]),
+        fstack=jnp.stack([decoy, row])[:, None, :],
         s13s=jnp.stack([jnp.flip(pr["s13"][:, 0, 0], 0), pr["s13"][:, 0, 0]]),
         sw13s=jnp.stack([jnp.flip(pr["sw13"], 0), pr["sw13"]]),
         sw2s=jnp.stack([jnp.flip(pr["sw2"], 0), pr["sw2"]]),
