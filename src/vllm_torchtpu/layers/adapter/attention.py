@@ -2728,8 +2728,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # lane ids, sharded
         output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
         if fused_merge:
-            # Caches, then this rank's merged [T, L, V]: three outputs.
+            # Caches, then this rank's merged [T, L, V]: three outputs. The op's
+            # schema is inferred from the return annotation, so it must say
+            # three as well (the lane variant's says four).
             output_specs = output_specs[:2] + (P(DCP_AXIS_NAME, None, None),)
+            core_fn.__annotations__ = {
+                **core_fn.__annotations__,
+                "return": tuple[jax.Array, jax.Array, jax.Array],
+            }
         elif fused_exchange:
             # Caches, then this rank's received [dcp, rows] partials and
             # [dcp, rows] lse: four outputs, as the partial + lse op's.
