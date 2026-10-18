@@ -1498,7 +1498,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # `sparsecore_topk_valid` (TPU_SC_TOPK_VALID_READS) at P > 1: the refinement
     # levels as one runtime loop (the SparseCore call's startup grows with its
-    # program size) and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
+    # program size), each level's peer reduce + scan + bucket search as one
+    # loop, and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
     # decode shapes): each subcore scatters its winners into the group's
     # staging slot at its prefix offset; P = 2: all peer copies in flight
     # before the first wait. Single-wave calls only (T <= 16 at DCP8); larger

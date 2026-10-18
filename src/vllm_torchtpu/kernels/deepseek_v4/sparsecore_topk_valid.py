@@ -28,8 +28,9 @@ Single-stage multi-subcore selection with VMEM_SHARED global histogram:
 
 5. ``TPU_SC_TOPK_COOP_V2`` (P > 1 only): the refinement levels run as one
    runtime loop (one copy of their code: the SparseCore call's startup grows
-   with program size), and the winners reach HBM without subcore 0 pulling its
-   peers one by one -- at P >= 4 every subcore scatters its winners into the
+   with program size), each level's peer reduce, scan and bucket search share
+   one loop over the histogram, and the winners reach HBM without subcore 0
+   pulling its peers one by one -- at P >= 4 every subcore scatters its winners into the
    group's staging slot at its prefix offset; at P = 2 the peer's copies are all
    in flight before the first wait. ``sparsecore_topk_dcp_merge_coop`` splits
    each DCP merge row over P subcores by rank segment instead of one subcore
@@ -129,6 +130,9 @@ def _topk_body(
     if coop_v2 and p > 1 and not merge_coop:
         gather_mode = "shared" if p >= 4 else "async"
     level_loop = coop_v2 or merge_coop
+    # Same flags: the peer reduce, the scan and (refinement levels) the bucket
+    # search run as one loop over the histogram (`reduce_scan`).
+    fused_reduce = (coop_v2 or merge_coop) and p > 1
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -217,6 +221,50 @@ def _topk_body(
 
             plsc.parallel_loop(1, p, unroll=1)(add_peer)
 
+    def exchange_hist(slot, active_hist):
+        """The histogram exchange alone: own histogram out, barrier, the group's p in."""
+
+        @pl.when(active_hist)
+        def _():
+            dst_off = pl.multiple_of((slot * num_subcores + sub) * NUM_BUCKETS, LANES)
+            pltpu.sync_copy(
+                glob_vmem.at[pl.ds(0, NUM_BUCKETS)],
+                shared_hist_vmem.at[pl.ds(dst_off, NUM_BUCKETS)],
+            )
+
+        plsc.subcore_barrier()
+
+        @pl.when(active_hist)
+        def _():
+            src_off = pl.multiple_of(
+                (slot * num_subcores + group_base) * NUM_BUCKETS, LANES
+            )
+            pltpu.sync_copy(
+                shared_hist_vmem.at[pl.ds(src_off, p * NUM_BUCKETS)],
+                peer_hist_vmem.at[pl.ds(0, p * NUM_BUCKETS)],
+            )
+
+    def reduce_scan(bound, thresh=None):
+        """glob = running bucket counts of the sum of the group's p histograms,
+        chunk by chunk (the sum stays in registers); with `thresh`, also the
+        number of buckets whose running count is <= thresh (`find_bucket`).
+        Returns (total, that number)."""
+
+        def body(i, carry):
+            run, below = carry
+            v = peer_hist_vmem[pl.ds(i * LANES, LANES)]
+            for t in range(1, p):
+                v = v + peer_hist_vmem[pl.ds(t * NUM_BUCKETS + i * LANES, LANES)]
+            c = plsc.cumsum(v) + run
+            glob_vmem[pl.ds(i * LANES, LANES)] = c
+            if thresh is not None:
+                below = below + plsc.all_reduce_population_count(c <= thresh)[0]
+            return c[LANES - 1], below
+
+        return plsc.parallel_loop(
+            0, bound, unroll=2, carry=(jnp.int32(0), jnp.int32(0))
+        )(body)  # pytype: disable=bad-argument-type
+
     def scan_glob(bound):
         def body(i, carry):
             c = plsc.cumsum(glob_vmem[pl.ds(i * LANES, LANES)]) + carry
@@ -295,9 +343,12 @@ def _topk_body(
 
             plsc.parallel_loop(0, walk_chunks, unroll=SCAN_UNROLL)(hist0_body)
 
-        sync_and_reduce_hist(0, active)
-
-        total = scan_glob(NUM_BUCKETS // LANES)
+        if fused_reduce:
+            exchange_hist(0, active)
+            total, _ = reduce_scan(NUM_BUCKETS // LANES)
+        else:
+            sync_and_reduce_hist(0, active)
+            total = scan_glob(NUM_BUCKETS // LANES)
         keep_all = total <= k
 
         b_star = find_bucket(NUM_BUCKETS // LANES, total - k)
@@ -327,10 +378,16 @@ def _topk_body(
 
             plsc.parallel_loop(0, active_walk, unroll=SCAN_UNROLL)(ref_body)
 
-            sync_and_reduce_hist(slot, ~done)
-
-            sub_total = scan_glob(hist_bound)
-            b2 = find_bucket(hist_bound, sub_total - quota)
+            if fused_reduce:
+                # This level's histogram total is the previous level's boundary
+                # bucket count `cnt`, so the bucket search shares the loop.
+                exchange_hist(slot, ~done)
+                sub_total = cnt
+                _, b2 = reduce_scan(hist_bound, cnt - quota)
+            else:
+                sync_and_reduce_hist(slot, ~done)
+                sub_total = scan_glob(hist_bound)
+                b2 = find_bucket(hist_bound, sub_total - quota)
             cum_at2 = vec_at(glob_vmem, b2)
             cum_lo2 = jnp.where(b2 > 0, vec_at(glob_vmem, jnp.maximum(b2 - 1, 0)), 0)
             c_above2 = sub_total - cum_at2
