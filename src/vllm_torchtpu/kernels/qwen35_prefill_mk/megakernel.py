@@ -26,8 +26,8 @@ HBM workspaces, which are extra outputs of the call and are reused across layers
 residual and hidden live in the call's first two outputs. KV caches and GDN states are updated
 in place (input/output aliases).
 
-M1 scope: one sequence of T new tokens at positions ctx .. ctx+T-1 (ctx is a runtime scalar),
-contiguous per-layer KV caches [NKV, S, HD] fp8, dense per-layer GDN states.
+M1 scope: one sequence of T new tokens at positions ctx .. ctx+T-1 (ctx is a runtime scalar,
+a multiple of 32), contiguous per-layer KV caches [NKV, S, HD] fp8, dense per-layer GDN states.
 """
 
 import dataclasses
@@ -62,7 +62,7 @@ class MKTiles:
     bkv: int = 512           # attention kv tile
     rt: int = 128            # MoE grouped rows per tile
     tm_route: int = 256
-    tm_combine: int = 128
+    tm_combine: int = 64
     inflight: int = 64
     vmem_mib: int = 63
 
@@ -112,7 +112,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
           "lg": ((t, c.E), BF16), "sgu": ((t, 2 * c.IS), BF16), "hq": ((t, c.IS), FP8),
           "hs": ((t, 1), F32), "sd": ((t, c.H), BF16), "sg": ((t, 1), F32),
           "topi": ((t, c.TOPK), I32), "topw": ((t, c.TOPK), F32), "rank": ((t, c.TOPK), I32),
-          "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), BF16), "pos": ((t, c.TOPK), I32)}
+          "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), F32), "xf": ((t, c.H), F32), "pos": ((t, c.TOPK), I32)}
     if has_gdn:
         kdim = c.KH * c.KD
         ws.update({"qkvz": ((t, c.QKV + c.Z), BF16), "ba": ((t, 2 * c.VH), BF16),
@@ -186,7 +186,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
             # MoE
             with jax.named_scope(f"L{li}_post_norm"):
                 P.norm_add_quant(h_out, r_out, lw["post_norm"], r_out, W["xb"], W["xq"], W["xs"],
-                                 eps=c.eps, tm=tl.tm_norm)
+                                 eps=c.eps, tm=tl.tm_norm, xf_hbm=W["xf"])
             with jax.named_scope(f"L{li}_router"):
                 P.qmatmul(W["xq"], W["xs"], lw["gate_gu_w"], lw["gate_gu_s"], W["lg"], tm=tl.tm,
                           tn=tn_e, n0=0, nn=c.E // tn_e)
@@ -203,7 +203,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                 P.moe_route(W["lg"], W["topi"], W["topw"], W["rank"], W["cnt"], e=c.E, topk=c.TOPK,
                             tm=tl.tm_route)
             with jax.named_scope(f"L{li}_moe_experts"):
-                P.moe_experts(W["xb"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
+                P.moe_experts(W["xf"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
                               lw["w2"], lw["w2_s"], W["ys"], W["pos"], e=c.E, topk=c.TOPK,
                               inter=c.I, rt=tl.rt, inflight=tl.inflight, tm=tl.tm_route)
             with jax.named_scope(f"L{li}_moe_combine"):

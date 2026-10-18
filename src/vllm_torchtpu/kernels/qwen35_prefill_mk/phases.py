@@ -48,20 +48,24 @@ def quantize_rows(x):
     return jnp.clip(x / s, -FP8_MAX, FP8_MAX).astype(FP8), s
 
 
-def norm_add_quant(h_hbm, r_hbm, w_hbm, r_out_hbm, x_bf_hbm, xq_hbm, xs_hbm, *, eps, tm):
+def norm_add_quant(h_hbm, r_hbm, w_hbm, r_out_hbm, x_bf_hbm, xq_hbm, xs_hbm, *, eps, tm,
+                   xf_hbm=None):
     """residual' = h + r (stored bf16); x = rmsnorm(h + r in f32) * (1 + w) -> bf16 and per-row fp8.
 
     h, r, r_out, x_bf: [T, H] bf16; w: [1, H] bf16; xq: [T, H] fp8; xs: [T, 1] f32.
-    r_out may alias r (each tile is read before it is written)."""
+    r_out may alias r (each tile is read before it is written). xf: optional [T, H] f32 copy of
+    x (32-bit rows, which single-row DMA gathers need)."""
     t, h = h_hbm.shape
 
-    def body(h_ref, r_ref, w_ref, ro_ref, xb_ref, xq_ref, xs_ref):
+    def body(h_ref, r_ref, w_ref, ro_ref, xb_ref, xq_ref, xs_ref, *xf_ref):
         # vLLM's fused_add_rms_norm: the residual is stored in bf16, the norm uses the f32 sum.
         res = h_ref[...].astype(F32) + r_ref[...].astype(F32)
         ro_ref[...] = res.astype(BF16)
         x = res * jax.lax.rsqrt(jnp.mean(res * res, -1, keepdims=True) + eps)
         x = (x * (1.0 + w_ref[...].astype(F32))).astype(BF16)
         xb_ref[...] = x
+        if xf_ref:
+            xf_ref[0][...] = x.astype(F32)
         xq, xs = quantize_rows(x)
         xq_ref[...] = xq
         xs_ref[...] = xs
@@ -71,8 +75,10 @@ def norm_add_quant(h_hbm, r_hbm, w_hbm, r_out_hbm, x_bf_hbm, xq_hbm, xs_hbm, *, 
         body,
         grid=(t // tm,),
         in_specs=[row, row, pl.BlockSpec((1, h), lambda i: (0, 0))],
-        out_specs=[row, row, row, pl.BlockSpec((tm, 1), lambda i: (i, 0))],
-    )(h_hbm, r_hbm, w_hbm, r_out_hbm, x_bf_hbm, xq_hbm, xs_hbm)
+        out_specs=[row, row, row, pl.BlockSpec((tm, 1), lambda i: (i, 0))]
+        + ([row] if xf_hbm is not None else []),
+    )(h_hbm, r_hbm, w_hbm, r_out_hbm, x_bf_hbm, xq_hbm, xs_hbm,
+      *([xf_hbm] if xf_hbm is not None else []))
 
 
 def qmatmul(xq_hbm, xs_hbm, w_hbm, ws_hbm, out_hbm, *, tm, tn, n0=0, nn=None, out_n0=0,
@@ -165,23 +171,26 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
     (the sequence's last ks - 1 conv inputs)."""
     t = qkvz_hbm.shape[0]
     qkv = 2 * kq * kd + vh * vd
-    halo = 8                                  # >= ks - 1, sublane aligned
+    halo = 16                                 # >= ks - 1; whole bf16 (16, 128) tiles
+    assert tm % halo == 0
 
-    def run(prev_ref, sem):
-        # prev_ref[halo - (ks - 1):] holds the ks - 1 input rows before the current tile.
-        cp = pltpu.make_async_copy(conv_state_hbm, prev_ref.at[pl.ds(halo - (ks - 1), ks - 1)],
-                                   sem.at[0])
+    def run(prev_ref, cs_v, sem):
+        # prev_ref holds the 16 input rows before the current tile (f32); the conv taps use its
+        # last ks - 1. Every DMA and store is whole and tile aligned.
+        cp = pltpu.make_async_copy(conv_state_hbm, cs_v, sem.at[0])
         cp.start()
         cp.wait()
+        prev_ref[...] = jnp.concatenate(
+            [jnp.zeros((halo - (ks - 1), qkv), F32), cs_v[...].astype(F32)], 0)
 
         def body(x_ref, ba_ref, w_ref, al_ref, dt_ref, q_ref, k_ref, v_ref, gb_ref):
             x = x_ref[...].astype(F32)                                  # [tm, QKV]
-            full = jnp.concatenate([prev_ref[...].astype(F32), x], 0)   # [halo + tm, QKV]
+            full = jnp.concatenate([prev_ref[...], x], 0)               # [halo + tm, QKV]
             w = w_ref[...].astype(F32)                                  # [ks, QKV]
             acc = jnp.zeros_like(x)
             for j in range(ks):
                 acc = acc + full[halo - (ks - 1) + j:halo - (ks - 1) + j + tm] * w[j:j + 1]
-            prev_ref[...] = x_ref[tm - halo:tm, :]
+            prev_ref[...] = x[tm - halo:tm]
             y = jax.nn.silu(acc.astype(BF16).astype(F32))
             kdim = kq * kd
             def l2(z):
@@ -210,13 +219,14 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
                        pl.BlockSpec((tm, vh * vd), lambda i: (i, 0)),
                        pl.BlockSpec((tm, 2 * vh), lambda i: (i, 0))],
         )(qkvz_hbm, ba_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm, q_hbm, k_hbm, v_hbm, gb_hbm)
-        # New conv state: the sequence's last ks - 1 conv inputs.
-        cp = pltpu.make_async_copy(qkvz_hbm.at[pl.ds(t - (ks - 1), ks - 1), pl.ds(0, qkv)],
-                                   conv_out_hbm, sem.at[0])
+        # New conv state: the sequence's last ks - 1 conv inputs, from the halo.
+        cs_v[...] = prev_ref[halo - (ks - 1):, :].astype(cs_v.dtype)
+        cp = pltpu.make_async_copy(cs_v, conv_out_hbm, sem.at[0])
         cp.start()
         cp.wait()
 
-    pl.run_scoped(run, pltpu.VMEM((halo, qkv), BF16), pltpu.SemaphoreType.DMA((1,)))
+    pl.run_scoped(run, pltpu.VMEM((halo, qkv), F32), pltpu.VMEM((ks - 1, qkv), BF16),
+                  pltpu.SemaphoreType.DMA((1,)))
 
 
 def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, *, kq, vh, kd, vd, chunk):
@@ -370,14 +380,16 @@ def att_qk_norm_rope_kv(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, ctx, qn_hbm, kc_h
     kc, vc [nkv, S, hd] at rows ctx .. ctx + T - 1 (by DMA: ctx is dynamic).
 
     att [2 nh + 2 nkv, T, hd] bf16 (head-major, see att_tile_dest), qn_w / kn_w [1, hd] bf16,
-    rope [S, rot] f32 (cos | sin, rot / 2 each) for absolute positions, ctx: traced scalar."""
+    rope [S, rot] f32 (cos | sin, rot / 2 each) for absolute positions, ctx: traced scalar.
+    Precondition: ctx % 32 == 0 (the fp8 cache tile). It holds for the PP prefill this serves:
+    prefix hits land on 2176-token KV blocks and pipeline chunks on 2304-token granules."""
     t = att_hbm.shape[1]
     half = rot // 2
 
     def run(rope_v, k8, v8, sem):
         def body(q_ref, k_ref, v_ref, qw_ref, kw_ref, qo_ref):
             m = pl.program_id(0)
-            r0 = ctx + m * tm
+            r0 = pl.multiple_of(ctx + m * tm, 32)
             cp = pltpu.make_async_copy(rope_hbm.at[pl.ds(r0, tm)], rope_v, sem.at[0])
             cp.start()
             cp.wait()
@@ -589,11 +601,12 @@ def _gather_rows(src_hbm, idx_fn, dst_vmem, n, sems, inflight):
 def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hbm, w2s_hbm,
                 y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256):
     """Routed experts. Rows are grouped by expert (expert e's segment starts at off[e], padded to
-    a multiple of `rt`), gathered by DMA from the bf16 normed activations, quantized per row,
-    run through w13 -> SwiGLU -> w2 (w8a8), and written to y_sorted [n_pad, H] bf16 in grouped
-    order. Also writes pos [T, K] = off[topi] + rank, the grouped row of every (token, slot).
+    a multiple of `rt`), gathered by DMA from the normed activations, quantized per row, run
+    through w13 -> SwiGLU -> w2 (w8a8), and written to y_sorted [n_pad, H] f32 (bf16 values) in
+    grouped order. Also writes pos [T, K] = off[topi] + rank, the grouped row of every (token,
+    slot). Rows are 32-bit: a single-row DMA cannot address one row of a packed bf16 tile.
 
-    xb [T, H] bf16, topi / rank [T, K] i32, counts [1, E] i32, w13 [E, H, 2I] fp8,
+    xb [T, H] f32 (bf16 values), topi / rank [T, K] i32, counts [1, E] i32, w13 [E, H, 2I] fp8,
     w13s [E, 1, 2I] f32, w2 [E, I, H] fp8, w2s [E, 1, H] f32."""
     t, h = xb_hbm.shape
     n_slots = t * topk
@@ -670,7 +683,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 base = off_s[0, ei]
 
                 def tile(ri, c):
-                    r0 = base + ri * rt
+                    r0 = pl.multiple_of(base + ri * rt, rt)   # offsets are padded to rt rows
                     nr = jnp.minimum(rt, n - ri * rt)
                     _gather_rows(xb_hbm, lambda r: tok_s[r0 + r], xin, nr, sems, inflight)
                     xq, xs = quantize_rows(xin[...])
@@ -680,7 +693,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                     hq, hs = quantize_rows(jax.nn.silu(gu[:, :inter]) * gu[:, inter:])
                     y = jax.lax.dot_general(hq, w2_v[slot], (((1,), (0,)), ((), ())),
                                             preferred_element_type=F32)
-                    xin[...] = (y * hs * w2s_v[slot]).astype(BF16)
+                    xin[...] = (y * hs * w2s_v[slot]).astype(BF16).astype(F32)
                     cpy = pltpu.make_async_copy(xin, y_sorted_hbm.at[pl.ds(r0, rt)], sem1.at[0])
                     cpy.start()
                     cpy.wait()
@@ -691,7 +704,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
         pl.run_scoped(experts,
                       pltpu.VMEM((2, h, 2 * inter), FP8), pltpu.VMEM((2, 1, 2 * inter), F32),
                       pltpu.VMEM((2, inter, h), FP8), pltpu.VMEM((2, 1, h), F32),
-                      pltpu.VMEM((rt, h), BF16), pltpu.SemaphoreType.DMA((2, 4)))
+                      pltpu.VMEM((rt, h), F32), pltpu.SemaphoreType.DMA((2, 4)))
 
     n_pad = n_slots + e * (rt - 1)
     stage_rows = 64
@@ -703,7 +716,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
 def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, topk, tm,
                 inflight=64):
     """out[t] = sum_k topw[t, k] * y_sorted[pos[t, k]] + sd[t] * sigmoid(sg[t]) -> bf16.
-    y_sorted [n_pad, H] bf16, pos / topw [T, K], sd [T, H] (shared expert down, bf16),
+    y_sorted [n_pad, H] f32, pos / topw [T, K], sd [T, H] (shared expert down, bf16),
     sg [T, 1] f32 (shared expert gate logit), out [T, H] bf16."""
     t, h = out_hbm.shape
 
@@ -731,5 +744,5 @@ def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, top
             out_specs=[pl.BlockSpec((tm, h), lambda i: (i, 0))],
         )(topw_hbm, sd_hbm, sg_hbm, out_hbm)
 
-    pl.run_scoped(run, pltpu.SMEM((tm, topk), jnp.int32), pltpu.VMEM((tm * topk, h), BF16),
+    pl.run_scoped(run, pltpu.SMEM((tm, topk), jnp.int32), pltpu.VMEM((tm * topk, h), F32),
                   pltpu.SemaphoreType.DMA((inflight,)), pltpu.SemaphoreType.DMA((1,)))
