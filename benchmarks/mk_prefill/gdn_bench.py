@@ -3,7 +3,7 @@
 One sequence of Q new tokens with an initial state (a cached context), all 16 k/q heads and 64
 v heads (head dims 128), conv kernel 4: one GatedDeltaNet layer's fused_conv1d_gdn call on a
 PP8 x TP1 stage, with dense f32 states. `sweep` runs each arm in its own process; an arm is
-`name:key=value,...` with keys prec (f32|bf16), tile (mixed_tile_size) and env_<VAR>=<value>.
+`name:key=value,...` with keys prec (f32|bf16), tile (mixed_tile_size), env_<VAR>=<value>, and impl=chunked\n(gdn_chunked.gdn_prefill) with chunk and factors (f32|bf16).
 Arms are compared with the first arm's output; xprof is captured per arm.
 
     python3 gdn_bench.py sweep --q 8192 --arms "default:" "bf16:prec=bf16"
@@ -87,6 +87,19 @@ def run_arm(args):
         return wrapper.fused_conv1d_gdn(
             qkv, b, a, conv, rec, conv_w, None, a_log, dt_bias, qsl, state_idx, dist, lens,
             n_kq=NKQ, n_v=NV, d_k=DK, d_v=DV, kernel_size=KS, **kw)
+
+    if opts.get("impl") == "chunked":
+        from vllm_torchtpu.kernels.qwen35_prefill_mk import gdn_chunked
+        fdt = jnp.bfloat16 if opts.get("factors") == "bf16" else jnp.float32
+
+        def call(conv, rec, lens):  # noqa: F811 - the chunk-parallel block, sequence 0 only
+            # lens - seq_lens is 0 but loop-variant in the timed loop.
+            bump = (lens[0] - seq_lens[0]).astype(jnp.float32)
+            (c0, s0), out = gdn_chunked.gdn_prefill(
+                qkv, b, a, conv[0], rec[0] + bump, conv_w, None, a_log, dt_bias, n_kq=NKQ,
+                n_v=NV, d_k=DK, d_v=DV, kernel_size=KS, chunk=int(opts.get("chunk", 64)),
+                factor_dtype=fdt)
+            return (conv.at[0].set(c0.astype(conv.dtype)), rec.at[0].set(s0)), out
 
     once = jax.jit(call)
     if args.mode == "profile":
