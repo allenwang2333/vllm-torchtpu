@@ -1111,6 +1111,36 @@ class TPUModelRunner(GPUModelRunner):
             )
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
+        # vLLM switches enable_mm_embeds on for every KV consumer so that the
+        # frontend accepts metadata-only embedding requests, and that flag by
+        # itself keeps supports_multimodal_inputs true. When no modality is
+        # allowed per prompt the model never receives an embedding, and the
+        # embedding-input forward (input_ids None) is one the Qwen3.5
+        # megakernel refuses, so the runner takes the token-id path of a
+        # text-only model.
+        mm_config = self.model_config.multimodal_config
+        if (
+            self.supports_mm_inputs
+            and mm_config is not None
+            and (
+                mm_config.language_model_only
+                or (
+                    bool(mm_config.limit_per_prompt)
+                    and all(
+                        mm_config.get_limit_per_prompt(m) == 0
+                        for m in mm_config.limit_per_prompt
+                    )
+                )
+            )
+        ):
+            self.supports_mm_inputs = False
+            logger.info(
+                "Multimodal inputs disabled in the runner: no modality is "
+                "allowed per prompt (language_model_only=%s, limits=%s); "
+                "the forward takes token ids.",
+                mm_config.language_model_only,
+                dict(mm_config.limit_per_prompt),
+            )
         self.sequence_layout_planner = sequence_layout_planner
         _validate_libtpu_version()
         self.is_pooling_model = (
