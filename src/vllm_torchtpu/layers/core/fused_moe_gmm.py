@@ -856,8 +856,10 @@ def fused_moe_func_ep_combine(
     # Route f of device b is row f % rows_per_rank of block b: device b's
     # token f // topk % tokens_per_rank, slot f % topk.
     expert = jax.lax.all_gather(own_expert, axis_name, tiled=True)
-    me = jax.lax.axis_index(axis_name)
     start = experts_start.reshape(())
+    # Not lax.axis_index: under torch_tpu's export it lowers to a partition-id
+    # the SPMD partitioner refuses.
+    me = jnp.asarray(mesh_index_of_rank, jnp.int32)[start // local_experts]
 
     # Grouped rows: this rank's routes in (expert, route) order. A route lands
     # in slot-major row k * tokens_per_rank + t of its owner's receive buffer.
