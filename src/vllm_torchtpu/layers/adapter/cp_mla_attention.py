@@ -1602,7 +1602,9 @@ def prebuild_sized_merge(world: int) -> None:
             small=small,
         )
 
-    def fn_small(output, lse, rank, lane):
+    def fn_small(
+        output: jax.Array, lse: jax.Array, rank: jax.Array, lane: jax.Array
+    ) -> jax.Array:
         return jax.shard_map(
             body_small,
             mesh=mesh,

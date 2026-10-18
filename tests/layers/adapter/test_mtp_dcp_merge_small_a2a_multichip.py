@@ -52,6 +52,13 @@ def _compile(fn):
     return torch.compile(fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend())
 
 
+def _partials(world, tokens):
+    # base._global_partials needs >= 5 tokens (its special rows 0-4); take the
+    # first `tokens` rows of an 8-token draw below that.
+    outputs, lses = base._global_partials(world, max(tokens, 8))
+    return outputs[:, :tokens].contiguous(), lses[:, :tokens].contiguous()
+
+
 def _arm(cp_mla, world, small):
     cp_mla.envs.TPU_MTP_DCP_MERGE_SMALL_A2A = small
     cp_mla._SIZED_MERGE_OPS.pop(world, None)
@@ -65,7 +72,7 @@ def _check(rank, world, cp_mla):
     report = {}
     local = HEADS // world
     for tokens in (4, 8, 16, 24):
-        outputs, lses = base._global_partials(world, tokens)
+        outputs, lses = _partials(world, tokens)
         poisoned = outputs.clone()
         poisoned[~torch.isfinite(lses)] = float("nan")
         ref = base._reference(outputs, lses)[:, rank * local : (rank + 1) * local]
@@ -97,7 +104,7 @@ def _check(rank, world, cp_mla):
 
     cp_mla._small_exchange = rotated
     try:
-        outputs, lses = base._global_partials(world, 4)
+        outputs, lses = _partials(world, 4)
         ref = base._reference(outputs, lses)[:, rank * local : (rank + 1) * local]
         sized = _compile(_arm(cp_mla, world, False))(outputs[rank].to("tpu"), lses[rank].to("tpu")).cpu()
         y = _compile(_arm(cp_mla, world, True))(outputs[rank].to("tpu"), lses[rank].to("tpu")).cpu()
