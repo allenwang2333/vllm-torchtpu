@@ -930,6 +930,16 @@ class TpuPlatform(Platform):
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+            # Under prefill context parallelism a bucket holds one rank's share
+            # of the step, so the step budget does not bound it.
+            if pcp_size == 1:
+                compilation_config.compile_sizes = cast(
+                    list[int | str],
+                    _cover_step_budget(
+                        [int(size) for size in compilation_config.compile_sizes],
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                    ),
+                )
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
@@ -1575,6 +1585,28 @@ def _get_token_paddings(
         )
     logger.info("Using token paddings: %s", paddings)
     return paddings
+
+
+def _cover_step_budget(compile_sizes: list[int], budget: int) -> list[int]:
+    """Extends explicit compile sizes so the largest one holds a full step.
+
+    TPUModelRunner sizes its host staging buffers (token ids, positions,
+    M-RoPE positions) and its largest padding bucket from the largest compile
+    size, and the scheduler may issue up to ``budget`` tokens in one step. A
+    decode leg reaches the budget whenever it prefills locally: a request
+    resumed after preemption recomputes its sequence from token 0, and a
+    request whose kv_transfer_params are rejected prefills from scratch.
+    """
+    if not compile_sizes or compile_sizes[-1] >= budget:
+        return compile_sizes
+    logger.warning(
+        "Largest compile size %d is below --max-num-batched-tokens %d; adding "
+        "a %d bucket so a full scheduler step fits the runner.",
+        compile_sizes[-1],
+        budget,
+        budget,
+    )
+    return [*compile_sizes, int(budget)]
 
 
 def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:

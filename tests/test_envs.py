@@ -36,6 +36,7 @@ def vllm_config():
     config.model_config.is_hybrid = False
     config.cache_config = CacheConfig(enable_prefix_caching=False)
     config.compilation_config.compile_sizes = [16, 32]
+    config.scheduler_config.max_num_batched_tokens = 32
     config.speculative_config = None
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1

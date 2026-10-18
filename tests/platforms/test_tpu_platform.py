@@ -20,6 +20,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.config import (
@@ -643,6 +644,58 @@ class TestTpuPlatform:
 
             assert len(paddings) <= tpu_platform._MAX_LINEAR_BUCKETS
             assert all(budget // 4 < p <= budget for p in paddings)
+
+    @pytest.mark.parametrize(
+        ("compile_sizes", "expected"),
+        [
+            # The decode leg's list stops at 256 under a 2048-token budget.
+            (
+                [256, 4, 8, 16, 24, 32, 48, 64, 96, 128],
+                [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 2048],
+            ),
+            ([16, 2048], [16, 2048]),
+            ([64, 4096], [64, 4096]),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_explicit_compile_sizes_cover_the_step_budget(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        compile_sizes,
+        expected,
+    ):
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.compile_sizes == expected
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_pcp_compile_sizes_keep_per_rank_buckets(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, monkeypatch
+    ):
+        monkeypatch.setattr(
+            tpu_platform.PcpStaticSupportValidator,
+            "validate_platform_config",
+            staticmethod(
+                lambda *_args, **_kwargs: SimpleNamespace(pcp_size=8, enabled=False)
+            ),
+        )
+        vllm_config.compilation_config.compile_sizes = [4096]
+        vllm_config.scheduler_config.max_num_batched_tokens = 32768
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.compile_sizes == [4096]
 
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
@@ -1354,3 +1407,87 @@ def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypa
     assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
     assert len(to_calls) == 2
 
+
+# One decode step of a text-only M-RoPE model behind a KV producer: 25 running
+# requests verify 1 + 3 speculative tokens each, and one request resumed after
+# preemption recomputes its 95061-token prompt from token 0 in a 1920-token
+# chunk, 2020 tokens under a 2048-token budget.
+_DECODE_COMPILE_SIZES = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256]
+_DECODE_STEP_BUDGET = 2048
+_NUM_DECODES = 25
+_DECODE_TOKENS = 4
+_RESUMED_PROMPT_TOKENS = 95061
+_RESUMED_CHUNK = 1920
+
+
+def _text_mrope_state(num_prompt_tokens: int) -> SimpleNamespace:
+    positions = torch.arange(num_prompt_tokens, dtype=torch.long)
+    return SimpleNamespace(
+        prompt_token_ids=[0] * num_prompt_tokens,
+        prompt_embeds=None,
+        mrope_positions=positions.unsqueeze(0).expand(3, -1),
+        mrope_position_delta=0,
+    )
+
+
+def _fill_decode_step_mrope(compile_sizes: list[int]) -> tuple[torch.Tensor, list]:
+    """Runs vLLM's M-RoPE fill for the step into a TPUModelRunner-sized buffer.
+
+    Returns the buffer and the (num_computed_tokens, num_scheduled_tokens)
+    of each request in batch order.
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    # TPUModelRunner takes max_num_tokens from the largest compile size and
+    # stages M-RoPE positions in a (3, max_num_tokens + 1) buffer.
+    cpu = torch.zeros((3, int(compile_sizes[-1]) + 1), dtype=torch.int32)
+    requests = {}
+    batch = []
+    for i in range(_NUM_DECODES):
+        num_prompt_tokens = 90000 + 1000 * i
+        requests[f"decode{i}"] = _text_mrope_state(num_prompt_tokens)
+        batch.append((f"decode{i}", num_prompt_tokens + 300, _DECODE_TOKENS))
+    requests["resumed"] = _text_mrope_state(_RESUMED_PROMPT_TOKENS)
+    batch.append(("resumed", 0, _RESUMED_CHUNK))
+
+    runner = SimpleNamespace(
+        mrope_positions=SimpleNamespace(cpu=cpu, np=cpu.numpy()),
+        input_batch=SimpleNamespace(
+            req_ids=[req_id for req_id, _, _ in batch],
+            num_computed_tokens_cpu=np.asarray(
+                [computed for _, computed, _ in batch], dtype=np.int32
+            ),
+        ),
+        requests=requests,
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={req_id: n for req_id, _, n in batch}
+    )
+    GPUModelRunner._calc_mrope_positions(runner, scheduler_output)
+    return cpu, [(computed, n) for _, computed, n in batch]
+
+
+def test_decode_buckets_below_the_budget_overflow_the_mrope_buffer():
+    with pytest.raises(
+        RuntimeError,
+        match=r"expanded size of the tensor \(157\) must match the existing "
+        r"size \(1920\)",
+    ):
+        _fill_decode_step_mrope(_DECODE_COMPILE_SIZES)
+
+
+def test_covered_decode_buckets_hold_the_resumed_prefill_step():
+    sizes = tpu_platform._cover_step_budget(
+        list(_DECODE_COMPILE_SIZES), _DECODE_STEP_BUDGET
+    )
+    assert sizes == [*_DECODE_COMPILE_SIZES, _DECODE_STEP_BUDGET]
+
+    cpu, batch = _fill_decode_step_mrope(sizes)
+
+    # Text-only M-RoPE: all three rows carry the 1-D position.
+    expected = np.concatenate(
+        [np.arange(computed, computed + n) for computed, n in batch]
+    )
+    assert expected.shape[0] == 2020
+    for row in range(3):
+        np.testing.assert_array_equal(cpu[row, : expected.shape[0]].numpy(), expected)
