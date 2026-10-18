@@ -295,6 +295,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             if retention.enabled:
                 self._retention = retention
         self._enable_memo_xstep()
+        self._init_paw_sort()
         self._init_kv_prefetch()
 
         logger.info(
@@ -494,6 +495,161 @@ class PrefixAwareScheduler(AsyncScheduler):
             len(self.running),
             len(self.waiting) + len(getattr(self, "kv_holding_waiting", ())),
         )
+
+    # ------------------------------------------------------------------
+    # Waiting-queue SRPF sort (TPU_SCHED_PAW_SORT_WAITING, default off).
+    #
+    # vLLM v0.31.0's waiting loop reads ``self.kv_holding_waiting or
+    # self.waiting`` directly; it no longer calls
+    # ``_select_waiting_queue_for_scheduling``, so ``_promote_warmest`` (and
+    # the TPU_SCHED_PAW_AGING_TOK_PER_S aging inside ``_rank_and_warmth``)
+    # never runs and admission is first-come-first-served. With the flag on,
+    # ``schedule()`` sorts the head of ``self.waiting`` itself before the
+    # base scheduler admits from it, so every admission of the step follows
+    # the order. The key is the request's estimated uncached prompt tokens
+    # (prompt minus local HBM hit minus a loadable external hit) minus
+    # TPU_SCHED_PAW_AGING_TOK_PER_S x seconds waited, which bounds how long a
+    # large prompt can be overtaken. Requests that already hold computed
+    # tokens or were preempted go first, and requests whose uncached tokens
+    # do not fit the free HBM blocks go last, so they cannot stall the head.
+    # ------------------------------------------------------------------
+    _PAW_SORT_LOG_INTERVAL_S = 60.0
+
+    def _init_paw_sort(self) -> None:
+        self._paw_sort = _env_on("TPU_SCHED_PAW_SORT_WAITING", "0")
+        try:
+            self._paw_sort_window = max(
+                2, int(os.environ.get("TPU_SCHED_PAW_SORT_WINDOW", "128"))
+            )
+        except ValueError:
+            self._paw_sort_window = 128
+        try:
+            self._paw_aging_tok_per_s = max(
+                0.0, float(os.environ.get("TPU_SCHED_PAW_AGING_TOK_PER_S", "0") or 0)
+            )
+        except ValueError:
+            self._paw_aging_tok_per_s = 0.0
+        self._paw_sort_steps = 0
+        self._paw_sort_reordered = 0
+        self._paw_sort_moved = 0
+        self._paw_sort_head_cold = 0
+        self._paw_sort_log_t = time.monotonic()
+        if self._paw_sort:
+            logger.info(
+                "PrefixAwareScheduler: waiting-queue SRPF sort ACTIVE "
+                "(window=%d, aging_tok_per_s=%g)",
+                self._paw_sort_window,
+                self._paw_aging_tok_per_s,
+            )
+        elif not self._base_calls_waiting_hook():
+            logger.warning(
+                "PrefixAwareScheduler: this vLLM's waiting loop does not call "
+                "_select_waiting_queue_for_scheduling, so warmest-first "
+                "promotion and TPU_SCHED_PAW_AGING_TOK_PER_S are inactive and "
+                "admission is FCFS; set TPU_SCHED_PAW_SORT_WAITING=1 to sort "
+                "the waiting queue in schedule()."
+            )
+
+    @staticmethod
+    def _base_calls_waiting_hook() -> bool:
+        """Whether the installed vLLM scheduler still calls
+        ``_select_waiting_queue_for_scheduling`` (v0.30.0 did, v0.31.0 does
+        not). True when it cannot be determined."""
+        try:
+            import inspect
+
+            from vllm.v1.core.sched.scheduler import Scheduler
+
+            return "_select_waiting_queue_for_scheduling" in inspect.getsource(
+                Scheduler.schedule
+            )
+        except Exception:
+            return True
+
+    def _paw_sort_key(
+        self,
+        request: Request,
+        now: float,
+        free_blocks: int | None,
+        free_blocks_for_ext: int | None,
+    ) -> tuple[int, int, float, float]:
+        """Sort key for TPU_SCHED_PAW_SORT_WAITING; lower is admitted first."""
+        local_warmth = self._prefix_warmth(request)
+        num_tokens = int(request.num_tokens)
+        hbm_cold_tokens = max(num_tokens - local_warmth, 0)
+        block_size = self._get_block_size()
+        fits_hbm = (
+            free_blocks is None
+            or math.ceil(hbm_cold_tokens / block_size) <= free_blocks
+        )
+        ext_warmth = self._external_warmth(request, local_warmth)
+        if ext_warmth > 0 and not (
+            fits_hbm
+            and (
+                free_blocks_for_ext is None
+                or math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
+            )
+        ):
+            ext_warmth = 0
+        uncached = max(num_tokens - local_warmth - ext_warmth, 0)
+        arrival = float(getattr(request, "arrival_time", now) or now)
+        aged = uncached - self._paw_aging_tok_per_s * max(0.0, now - arrival)
+        started = (
+            getattr(request, "num_preemptions", 0) > 0
+            or getattr(request, "num_computed_tokens", 0) > 0
+        )
+        return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
+
+    def _sort_waiting_queue(self) -> None:
+        """Stable-sort the first TPU_SCHED_PAW_SORT_WINDOW waiting requests by
+        ``_paw_sort_key`` in place."""
+        queue = self.waiting
+        if self.policy != SchedulingPolicy.FCFS or len(queue) < 2:
+            return
+        window = list(islice(queue, self._paw_sort_window))
+        free_blocks = self._get_num_free_blocks()
+        free_blocks_for_ext = free_blocks
+        if (
+            free_blocks is not None
+            and getattr(self, "_is_kv_producer", False)
+            and hasattr(self, "_inflight_prefill_reserved_blocks")
+        ):
+            try:
+                reserved = int(self._inflight_prefill_reserved_blocks() or 0)
+            except Exception:
+                reserved = 0
+            free_blocks_for_ext = max(0, free_blocks - reserved)
+        now = time.time()
+        keys = [
+            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext)
+            for r in window
+        ]
+        order = sorted(range(len(window)), key=lambda i: (keys[i], i))
+        self._paw_sort_steps += 1
+        head = window[order[0]]
+        self._paw_sort_head_cold += max(
+            int(head.num_tokens) - self._prefix_warmth(head), 0
+        )
+        if order != list(range(len(window))):
+            self._paw_sort_reordered += 1
+            self._paw_sort_moved += sum(1 for pos, i in enumerate(order) if pos != i)
+            # The window is the queue's head: pop it and put it back sorted.
+            for _ in window:
+                queue.pop_request()
+            # prepend_requests reverses its argument (deque.extendleft).
+            queue.prepend_requests([window[i] for i in reversed(order)])
+        now_m = time.monotonic()
+        if now_m - self._paw_sort_log_t >= self._PAW_SORT_LOG_INTERVAL_S:
+            self._paw_sort_log_t = now_m
+            logger.info(
+                "paw-sort telemetry: steps=%d reordered=%d moved=%d "
+                "mean_head_cold_tokens=%.0f waiting=%d",
+                self._paw_sort_steps,
+                self._paw_sort_reordered,
+                self._paw_sort_moved,
+                self._paw_sort_head_cold / max(self._paw_sort_steps, 1),
+                len(queue),
+            )
 
     # ------------------------------------------------------------------
     # Cross-step memo of find_longest_cache_hit (TPU_SCHED_PAW_MEMO_XSTEP).
@@ -894,6 +1050,15 @@ class PrefixAwareScheduler(AsyncScheduler):
         if prefilling and (decoding or (srpf_running and len(prefilling) > 1)):
             self.running[:] = decoding + prefilling
         self._step_num_decoding = len(decoding)
+        if getattr(self, "_paw_sort", False):
+            try:
+                self._sort_waiting_queue()
+            except Exception:
+                logger.exception(
+                    "PrefixAwareScheduler: waiting-queue sort failed; disabling "
+                    "TPU_SCHED_PAW_SORT_WAITING."
+                )
+                self._paw_sort = False
         self._step_decode_tokens = sum(
             max(
                 getattr(r, "num_tokens_with_spec", 0)
