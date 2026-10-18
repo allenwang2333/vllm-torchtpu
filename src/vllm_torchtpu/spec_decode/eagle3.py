@@ -571,13 +571,18 @@ class Eagle3Proposer:
         keeps positions and seq_lens fixed across steps where the program
         advances them.
 
-        IndexShare (GLM-5.2 / DeepSeek-V3.2) gets its own variant, on unless
-        `VLLM_TPU_MTP_FUSED_INDEXSHARE=0`. The per-step loop restores each
-        chunk's step-0 top-k rows on the host before every step; this program
-        takes those rows as an argument and stores them into the draft's top-k
-        table in-graph before every unrolled step instead. It needs the one
-        2-D table a single nextn layer owns, and the loop-step program for the
-        per-chunk fallback; without either the per-step loop runs, which is
+        IndexShare (GLM-5.2 / DeepSeek-V3.2) gets its own variant with
+        `VLLM_TPU_MTP_FUSED_INDEXSHARE=1`. The per-step loop restores each
+        chunk's step-0 top-k rows before every step; the fused variant
+        restores them once, eagerly, right before the chunk's program, and the
+        program only reads the table: with skip_topk set no draft step writes
+        it (the MLA layer takes `topk_indices_buffer` as is), so every
+        unrolled step reads the rows the per-step loop would have restored.
+        Writing the rows into the table in-graph instead made the program
+        copy the whole [max_num_tokens, index_topk] table back on every call
+        (s32[4096, 2048], ~68 us/step on tpu7x). It needs the one 2-D table a
+        single nextn layer owns, and the loop-step program for the per-chunk
+        fallback; without either the per-step loop runs, which is
         IndexShare-correct on its own.
         """
         self._mtp_fused_loop = None
@@ -623,6 +628,9 @@ class Eagle3Proposer:
                 return
             topk_indices_buffer = buffers[0]
         indexshare = topk_indices_buffer is not None
+        # The program reads the table but never writes it: the rows are
+        # restored eagerly before each call (_run_mtp_fused_loop).
+        topk_indices_buffer = None
         try:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
@@ -662,7 +670,7 @@ class Eagle3Proposer:
             "compiled program%s.",
             "MtpFusedLoop+IndexShare" if indexshare else "MtpFusedLoop",
             K - 1,
-            " (each chunk's step-0 top-k rows installed in-graph)"
+            " (each chunk's step-0 top-k rows restored before the program)"
             if indexshare
             else "",
         )
@@ -700,9 +708,10 @@ class Eagle3Proposer:
 
         `input_ids` is step 0's token and `positions` step 1's. Under
         IndexShare, `shared_topk_indices` is the chunk's saved step-0 top-k
-        rows, [p, index_topk]. Returns the K-1 tokens, or None when this
-        chunk's metadata or rows don't fit the program (the caller then runs
-        the per-step loop).
+        rows, [p, index_topk], restored into the table right before the
+        program (which reads but never writes it). Returns the K-1 tokens, or
+        None when this chunk's metadata or rows don't fit the program (the
+        caller then runs the per-step loop, which restores on its own).
         """
         if self._mtp_fused_indexshare:
             if not self._shared_topk_rows_fit(shared_topk_indices, input_ids):
@@ -755,29 +764,32 @@ class Eagle3Proposer:
                 input_ids_in = input_ids
                 positions_in = positions
                 hidden_states_in = hidden_states
-                shared_topk_in = shared_topk_indices
                 if not self._mtp_fused_loop_warm:
                     # The first call traces and compiles; like the loop-step
                     # program's, its outputs can carry symbolic sizes, so run it
-                    # again compiled. The repeat rewrites the same KV entries (and,
-                    # under IndexShare, the same top-k rows); seq_lens is put back
-                    # first because the program advanced it.
+                    # again compiled. The repeat rewrites the same KV entries;
+                    # seq_lens is put back first because the program advanced it.
+                    if shared_topk_indices is not None:
+                        self._mtp_restore_topk([shared_topk_indices])
                     seq_lens_step1 = seq_lens.clone()
                     self._mtp_fused_loop(
                         input_ids_in.clone(),
                         positions_in.clone(),
                         hidden_states_in.clone(),
                         seq_lens,
-                        shared_topk_in.clone() if shared_topk_in is not None else None,
                     )
                     seq_lens.copy_(seq_lens_step1)
                     self._mtp_fused_loop_warm = True
+                if shared_topk_indices is not None:
+                    # Eager, once per chunk, right before its program: the
+                    # unrolled steps all read these rows and none writes the
+                    # table.
+                    self._mtp_restore_topk([shared_topk_indices])
                 return self._mtp_fused_loop(
                     input_ids_in,
                     positions_in,
                     hidden_states_in,
                     seq_lens,
-                    shared_topk_in,
                 )
         finally:
             self._mtp_set_skip_topk(False)
@@ -1450,8 +1462,8 @@ class Eagle3Proposer:
                 # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
                 # is fine here even under IndexShare: the separate path is
                 # step-major only because the chunks share one top-k buffer,
-                # and the IndexShare program installs the chunk's own saved
-                # rows in-graph before each of its steps.
+                # and _run_mtp_fused_loop restores the chunk's own saved rows
+                # right before its program, which only reads them.
                 for ci, chunk in enumerate(chunks):
                     fused = self._run_mtp_fused_loop(
                         chunk=chunk,
@@ -1462,8 +1474,9 @@ class Eagle3Proposer:
                         num_rejected_dev=rejected_dev_per_chunk[ci],
                         loop_query_start_loc=loop_qsl_per_chunk[ci],
                         loop_request_distribution=loop_reqdist_per_chunk[ci],
+                        # Restored into the table (copied), not consumed.
                         shared_topk_indices=(
-                            saved_topk_per_chunk[ci][0].clone()
+                            saved_topk_per_chunk[ci][0]
                             if self._mtp_fused_indexshare
                             else None
                         ),

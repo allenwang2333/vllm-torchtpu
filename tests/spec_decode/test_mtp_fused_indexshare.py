@@ -53,6 +53,7 @@ def _loop(table, num_steps=2):
     loop.mtp = mtp
     loop.num_steps = num_steps
     loop.topk_indices_buffer = table
+    loop.vocab_parallel_argmax = None
     return loop, mtp
 
 
@@ -112,3 +113,146 @@ def test_flag_defaults_off(monkeypatch):
     assert envs.VLLM_TPU_MTP_FUSED_INDEXSHARE is False
     monkeypatch.setenv("VLLM_TPU_MTP_FUSED_INDEXSHARE", "1")
     assert envs.VLLM_TPU_MTP_FUSED_INDEXSHARE is True
+
+
+# --- Eagle3Proposer side: rows restored eagerly before a read-only program ---
+
+
+class _RecordingProgram:
+    """Stands in for the compiled fused loop: records the table's front rows at
+    each call (what every unrolled step reads, since no step writes it) and the
+    call's arguments; returns K-1 tokens."""
+
+    def __init__(self, table, num_steps=2, clobber=False):
+        self.table = table
+        self.num_steps = num_steps
+        self.clobber = clobber
+        self.calls: list[tuple] = []
+
+    def __call__(self, input_ids, positions, hidden_states, seq_lens, *rest):
+        p = input_ids.shape[0]
+        self.calls.append((self.table[:p].clone(), len(rest), seq_lens.clone()))
+        if self.clobber:
+            self.table.fill_(-9)
+        seq_lens.add_(self.num_steps - 1)
+        return tuple(torch.full((p,), i, dtype=torch.int32) for i in range(self.num_steps))
+
+
+def _proposer(monkeypatch, table, program, warm=True):
+    import contextlib
+    import types
+
+    from vllm_torchtpu.spec_decode import eagle3
+
+    for name in ("set_forward_context", "set_vllm_model_wrapper_context", "set_model_tag"):
+        monkeypatch.setattr(eagle3, name, lambda *a, **k: contextlib.nullcontext())
+    prop = eagle3.Eagle3Proposer.__new__(eagle3.Eagle3Proposer)
+    skips = []
+    inner = types.SimpleNamespace(set_skip_topk=skips.append)
+    prop.draft_model = types.SimpleNamespace(model=inner)
+    prop._share_mtp_indices = True
+    prop._mtp_fused_indexshare = True
+    prop._mtp_topk_buffers = [table]
+    prop._mtp_fused_loop = program
+    prop._mtp_fused_loop_warm = warm
+    prop._draft_md_cache = {}
+    prop.draft_vllm_config = None
+    prop.runner = types.SimpleNamespace(
+        mesh=None, _dp_num_tokens_across_dp=lambda n: None
+    )
+
+    def md(**kw):
+        seq = torch.full((8,), 5, dtype=torch.int32)
+        return {"l0": types.SimpleNamespace(seq_lens=seq)}
+
+    prop._build_draft_attn_metadata = md
+    return prop, skips
+
+
+def _run(prop, p, rows):
+    return prop._run_mtp_fused_loop(
+        chunk=object(),
+        input_ids=torch.zeros(p, dtype=torch.int32),
+        positions=torch.zeros(p, dtype=torch.int32),
+        hidden_states=torch.zeros(p, 16),
+        num_rejected_np=None,
+        num_rejected_dev=None,
+        loop_query_start_loc=None,
+        loop_request_distribution=None,
+        shared_topk_indices=rows,
+    )
+
+
+@pytest.mark.parametrize("warm", [True, False], ids=["warm", "first-call"])
+def test_proposer_restores_each_chunks_rows_before_its_program(monkeypatch, warm):
+    p, k = 4, 32
+    table = torch.full((16, k), -1, dtype=torch.int32)
+    prog = _RecordingProgram(table, clobber=True)
+    prop, skips = _proposer(monkeypatch, table, prog, warm=warm)
+    rows_a = torch.arange(p * k, dtype=torch.int32).reshape(p, k)
+    rows_b = rows_a + 1000
+    out_a = _run(prop, p, rows_a)
+    table.fill_(-3)  # the next chunk's step 0 overwrites the table
+    out_b = _run(prop, p, rows_b)
+    assert out_a is not None and out_b is not None and len(out_a) == 2
+    # A first call runs the program twice (trace, then compiled); chunk B then
+    # runs warm. The program clobbers the table after every call, so each call
+    # seeing its chunk's rows proves a restore right before it.
+    n_a = 1 if warm else 2
+    assert len(prog.calls) == n_a + 1
+    for seen, _, _ in prog.calls[:n_a]:
+        assert torch.equal(seen, rows_a)
+    assert torch.equal(prog.calls[-1][0], rows_b)
+    assert all(n_rest == 0 for _, n_rest, _ in prog.calls), "no rows argument"
+    assert skips[0] is True and skips[-1] is False
+
+
+def test_proposer_negative_control_without_restore(monkeypatch):
+    """Fault injection: drop the restore and the program reads another chunk's
+    rows -- the check above would catch a missing or misplaced restore."""
+    p, k = 4, 32
+    table = torch.full((16, k), -1, dtype=torch.int32)
+    prog = _RecordingProgram(table)
+    prop, _ = _proposer(monkeypatch, table, prog)
+    prop._mtp_restore_topk = lambda saved: None
+    rows = torch.ones(p, k, dtype=torch.int32)
+    _run(prop, p, rows)
+    assert not torch.equal(prog.calls[0][0], rows)
+
+
+def test_proposer_rows_that_do_not_fit_leave_the_table_alone(monkeypatch):
+    p, k = 4, 32
+    table = torch.full((16, k), -1, dtype=torch.int32)
+    prog = _RecordingProgram(table)
+    prop, _ = _proposer(monkeypatch, table, prog)
+    before = table.clone()
+    assert _run(prop, p, torch.ones(p + 1, k, dtype=torch.int32)) is None
+    assert _run(prop, p, torch.ones(p, k, dtype=torch.int64)) is None
+    assert _run(prop, p, None) is None
+    assert torch.equal(table, before) and not prog.calls
+
+
+def test_fused_loop_takes_the_vocab_parallel_argmax(monkeypatch):
+    """With vocab_parallel_argmax set, each step's token is that reduction of
+    the draft's (shard) logits, not their plain argmax."""
+    import vllm_torchtpu.spec_decode.utils as su
+
+    seen = []
+
+    def fake_vpa(logits, info):
+        seen.append((logits.clone(), info))
+        return torch.full((logits.shape[0],), 42, dtype=torch.int32)
+
+    monkeypatch.setattr(su, "vocab_parallel_argmax", fake_vpa)
+    table = torch.zeros(8, 8, dtype=torch.int32)
+    loop, _ = _loop(table)
+    loop.topk_indices_buffer = None
+    loop.vocab_parallel_argmax = "INFO"
+    toks = loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
+                torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
+    assert [t.tolist() for t in toks] == [[42, 42], [42, 42]]
+    assert len(seen) == 2 and all(info == "INFO" for _, info in seen)
+    loop.vocab_parallel_argmax = None
+    toks = loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
+                torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
+    assert all(t.dtype == torch.int32 for t in toks) and len(seen) == 2

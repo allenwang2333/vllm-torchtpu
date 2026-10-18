@@ -18,11 +18,16 @@ IndexShare (GLM-5.2 / DeepSeek-V3.2 DSA drafts): draft step 0 computes the
 sparse top-k and steps 1..K-1 reuse it, read from the draft's one shared
 ``topk_indices_buffer``. The next chunk's step-0 indexer overwrites that
 buffer, so the per-step loop puts each chunk's saved rows back from the host
-before every step. Here the rows come in as ``shared_topk_indices`` and the
-program stores them into the buffer itself before each unrolled step -- the
-same in-graph store the indexer already makes into it -- so the K-1 steps
-still cost one dispatch. Like every vLLM program this one is compiled once
-with its guards dropped, so its first trace must run with ``skip_topk`` True.
+before every step. With ``topk_indices_buffer`` the rows come in as
+``shared_topk_indices`` and the program stores them into the buffer itself
+before each unrolled step (#1517). Eagle3Proposer does not use that form: the
+in-graph store is a mutation of a captured buffer, and the compiled program
+copies the whole buffer back on every call (s32[4096, 2048], ~68 us/step on
+tpu7x). It builds the program without the buffer and restores the chunk's
+rows eagerly right before the call instead; no step writes the buffer while
+``skip_topk`` is set, so every unrolled step reads those rows. Like every vLLM
+program this one is compiled once with its guards dropped, so its first trace
+must run with ``skip_topk`` True.
 
 This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
