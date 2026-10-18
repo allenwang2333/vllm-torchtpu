@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_STAGE3_SUBMIT_WORKERS: int = 1
+    TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS: int = 0
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -1116,6 +1117,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at its TPU_RAIDEN_POOL_STAGING_LEASES.
     "TPU_RAIDEN_STAGE3_SUBMIT_WORKERS": env_nonnegative_int(
         "TPU_RAIDEN_STAGE3_SUBMIT_WORKERS", 1
+    ),
+    # Decode-side cap on Stage-3 loads that hold allocated blocks and have
+    # not landed; a request over the cap is skipped without allocation and
+    # asked again on the next scheduling pass. 0 = unbounded.
+    "TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS": env_nonnegative_int(
+        "TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS", 0
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),

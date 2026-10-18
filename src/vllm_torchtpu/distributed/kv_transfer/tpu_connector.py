@@ -385,6 +385,14 @@ class _Stage3Dsv4GroupPages:
 
 
 @dataclass
+class _Stage3InFlightLoad:
+    """A consumer's Stage-3 load from block allocation to landing."""
+
+    request: "Request"
+    armed: bool = False
+
+
+@dataclass
 class _Stage3LoadMeta:
     """Decode-local declaration for one controller-driven FA transfer.
 
@@ -1534,6 +1542,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Decoder: prefill (source) req_id -> the admitted destination
         # req_id.
         self._stage3_active_source_req_ids: dict[str, str] = {}
+        # Loads with blocks allocated and not landed, for the in-flight cap
+        # (TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS). An entry arms once vLLM has
+        # moved its request to WAITING_FOR_REMOTE_KVS and leaves when the
+        # status moves on (landed, failed, finished) or the request finishes.
+        self._stage3_loads_in_flight: dict[str, _Stage3InFlightLoad] = {}
+        self._stage3_load_cap_engaged = False
         # Pipeline producer register-ahead state: the scheduled requests and
         # their per-group block tables as accumulated from scheduler output,
         # the uuids published ahead of the finish and not yet adopted by
@@ -1722,7 +1736,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         if not self._admit_kv_transfer_params(
             request
         ) or request.kv_transfer_params.get("_remote_kv_processed"):
@@ -1739,6 +1753,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             count = max(transfer_tokens - num_computed_tokens, 0)
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
+            if count > 0 and self._stage3_load_cap_reached():
+                # None makes vLLM skip the request without allocating
+                # blocks; it stays in the waiting queue and is asked again
+                # on the next scheduling pass.
+                return None, False
             return count, count > 0
 
         rounded_num_prompt_tokens = round_down(
@@ -1759,6 +1778,43 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 return count, False
             return count, True
         return 0, False
+
+    def _stage3_loads_in_flight_count(self) -> int:
+        """Loads that hold allocated blocks on this engine and have not landed.
+
+        An entry counts from its allocation; it arms when vLLM has set its
+        request to WAITING_FOR_REMOTE_KVS (the step after allocation at the
+        latest) and is dropped once the status moves on, which is how a
+        landed load (promoted to WAITING), a failed one (reset for
+        recompute) and a finished request all leave the count.
+        """
+        done = []
+        for req_id, load in self._stage3_loads_in_flight.items():
+            status = load.request.status
+            if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                load.armed = True
+            elif load.armed or RequestStatus.is_finished(status):
+                done.append(req_id)
+        for req_id in done:
+            del self._stage3_loads_in_flight[req_id]
+        return len(self._stage3_loads_in_flight)
+
+    def _stage3_load_cap_reached(self) -> bool:
+        cap = int(tpu_envs.TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS)
+        if cap <= 0:
+            return False
+        in_flight = self._stage3_loads_in_flight_count()
+        reached = in_flight >= cap
+        if reached != self._stage3_load_cap_engaged:
+            self._stage3_load_cap_engaged = reached
+            logger.info(
+                "TPURaidenConnectorScheduler Stage-3 in-flight load cap %s: "
+                "%d loads in flight, cap %d",
+                "reached" if reached else "released",
+                in_flight,
+                cap,
+            )
+        return reached
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -1998,6 +2054,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             group_block_ids=group_block_ids,
             skip_tokens=skip_tokens,
         )
+        self._stage3_loads_in_flight[request.request_id] = _Stage3InFlightLoad(request)
         params["_remote_kv_processed"] = True
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
@@ -2247,6 +2304,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         group_block_ids: list[list[int]] | None,
     ) -> tuple[bool, dict[str, Any] | None]:
         if not self.is_producer:
+            self._stage3_loads_in_flight.pop(request.request_id, None)
             params = request.kv_transfer_params
             if isinstance(params, dict) and params.get(_KV_PARAMS_ADMITTED):
                 source_req_id = params["req_id"]

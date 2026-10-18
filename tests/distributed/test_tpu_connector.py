@@ -1660,6 +1660,148 @@ class TestTPURaidenConnectorScheduler:
         assert load.src_engine_id == "producer-engine"
         assert not hasattr(load, "remote_block_ids")
 
+    # ---- Stage-3 in-flight load cap -------------------------------------
+
+    @staticmethod
+    def _stage3_load_request(req_id: str, num_tokens: int = 65_023):
+        req = MagicMock()
+        req.request_id = req_id
+        req.num_prompt_tokens = num_tokens + 1
+        req.prompt_token_ids = [0] * (num_tokens + 1)
+        req.status = RequestStatus.WAITING
+        req.kv_transfer_params = {
+            "req_id": req_id,
+            "uuid": hash(req_id) & 0xFFFF,
+            "num_tokens": num_tokens,
+            "src_controller_address": "prefill-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "producer-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
+        }
+        return req
+
+    @staticmethod
+    def _stage3_blocks(first: int = 200, count: int = 64):
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = (list(range(first, first + count)),)
+        return blocks
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _stage3_load_cap(cap: int):
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS",
+                cap,
+                create=True,
+            ),
+        ):
+            yield
+
+    def test_stage3_inflight_load_cap_skips_without_allocating(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        first = self._stage3_load_request("load-a")
+        second = self._stage3_load_request("load-b")
+        with self._stage3_load_cap(cap=1):
+            matched, is_async = consumer.get_num_new_matched_tokens(first, 0)
+            assert (matched, is_async) == (65_023, True)
+            consumer.update_state_after_alloc(first, self._stage3_blocks(), matched)
+            # vLLM sets the status right after the allocation; the entry
+            # counts before that, within the same scheduling pass.
+            assert consumer.get_num_new_matched_tokens(second, 0) == (None, False)
+            first.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert consumer.get_num_new_matched_tokens(second, 0) == (None, False)
+        assert "load-b" not in consumer.reqs_to_load
+        assert second.kv_transfer_params.get("_remote_kv_processed") is None
+        assert consumer._stage3_loads_in_flight_count() == 1
+
+    def test_stage3_inflight_load_cap_releases_when_the_load_lands(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        first = self._stage3_load_request("load-a")
+        second = self._stage3_load_request("load-b")
+        with self._stage3_load_cap(cap=1):
+            matched, _ = consumer.get_num_new_matched_tokens(first, 0)
+            consumer.update_state_after_alloc(first, self._stage3_blocks(), matched)
+            first.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert consumer.get_num_new_matched_tokens(second, 0) == (None, False)
+            # The landed load is promoted back to WAITING by the scheduler.
+            first.status = RequestStatus.WAITING
+            matched, is_async = consumer.get_num_new_matched_tokens(second, 0)
+            assert (matched, is_async) == (65_023, True)
+            consumer.update_state_after_alloc(
+                second, self._stage3_blocks(first=300), matched
+            )
+            assert consumer._stage3_loads_in_flight_count() == 1
+            assert set(consumer._stage3_loads_in_flight) == {"load-b"}
+
+    @pytest.mark.parametrize(
+        "status",
+        [RequestStatus.FINISHED_ABORTED, RequestStatus.PREEMPTED],
+    )
+    def test_stage3_inflight_load_cap_releases_a_failed_or_finished_load(self, status):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        first = self._stage3_load_request("load-a")
+        second = self._stage3_load_request("load-b")
+        with self._stage3_load_cap(cap=1):
+            matched, _ = consumer.get_num_new_matched_tokens(first, 0)
+            consumer.update_state_after_alloc(first, self._stage3_blocks(), matched)
+            first.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert consumer.get_num_new_matched_tokens(second, 0) == (None, False)
+            first.status = status
+            assert consumer.get_num_new_matched_tokens(second, 0) == (65_023, True)
+
+    def test_stage3_inflight_load_cap_releases_on_request_finished(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        first = self._stage3_load_request("load-a")
+        second = self._stage3_load_request("load-b")
+        with self._stage3_load_cap(cap=1):
+            matched, _ = consumer.get_num_new_matched_tokens(first, 0)
+            consumer.update_state_after_alloc(first, self._stage3_blocks(), matched)
+            first.status = RequestStatus.FINISHED_ABORTED
+            consumer.request_finished(first, list(range(200, 264)))
+            assert "load-a" not in consumer._stage3_loads_in_flight
+            assert consumer.get_num_new_matched_tokens(second, 0) == (65_023, True)
+
+    def test_stage3_inflight_load_cap_default_off(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        with self._stage3_load_cap(cap=0):
+            for i in range(4):
+                req = self._stage3_load_request(f"load-{i}")
+                matched, is_async = consumer.get_num_new_matched_tokens(req, 0)
+                assert (matched, is_async) == (65_023, True)
+                consumer.update_state_after_alloc(
+                    req, self._stage3_blocks(first=100 * i), matched
+                )
+                req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            assert len(consumer.reqs_to_load) == 4
+            assert consumer._stage3_loads_in_flight_count() == 4
+
+    def test_stage3_inflight_load_cap_leaves_allocated_requests_alone(self):
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        reqs = [self._stage3_load_request(f"load-{i}") for i in range(3)]
+        with self._stage3_load_cap(cap=0):
+            for i, req in enumerate(reqs):
+                matched, _ = consumer.get_num_new_matched_tokens(req, 0)
+                consumer.update_state_after_alloc(
+                    req, self._stage3_blocks(first=100 * i), matched
+                )
+                req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        with self._stage3_load_cap(cap=1):
+            # A request past the check keeps answering as processed, and a
+            # load with no bytes to move is not held by the cap.
+            for req in reqs:
+                assert consumer.get_num_new_matched_tokens(req, 0) == (0, False)
+            full_hit = self._stage3_load_request("load-hit", num_tokens=1024)
+            assert consumer.get_num_new_matched_tokens(full_hit, 1024) == (0, False)
+            assert consumer.get_num_new_matched_tokens(
+                self._stage3_load_request("load-new"), 0
+            ) == (None, False)
+
     def test_stage3_consumer_writes_committed_mamba_checkpoint(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=16)
         consumer._stage3_fa_group_index = 0
