@@ -235,13 +235,14 @@ def _op_body(st: _Statics):
         g_qa,
         g_kva,
     ):
-        del e0
         T = res.shape[0]  # static: one export per token bucket
         cfg = st.cfg(T)
         page_size, num_pages = _kv_geometry()
         n_valid = T - jnp.sum(pad_mask[:T].astype(jnp.int32))
+        # meta[3] is unread by the kernel; e0 rides there so it stays an
+        # operand of the exported function (an unused one would be pruned).
         meta = jnp.stack(
-            [n_valid, rank.reshape(()), jnp.int32(0), jnp.int32(0)]
+            [n_valid, rank.reshape(()), jnp.int32(0), e0.reshape(())]
         ).astype(jnp.int32)
         cfull, sfull = kernel.rope_lane_tables(cos, sin, cfg.m)
         # The step's KV destination rows on this DCP rank, exactly as

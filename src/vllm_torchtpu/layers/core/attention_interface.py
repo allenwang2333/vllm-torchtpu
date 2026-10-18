@@ -1451,10 +1451,13 @@ def sparse_mla_attention_dcp(
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:
         in_specs = in_specs + (P(dcp_axis_name),)
+    # kv_rows leaves seq_lens and the rank operand unread; keep them, so the
+    # exported function takes every operand the torch op passes.
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
-        )
+        ),
+        keep_unused=kv_rows is not None,
     )(
         ql_nope,
         q_pe,
