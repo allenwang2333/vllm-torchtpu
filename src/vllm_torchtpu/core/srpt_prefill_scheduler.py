@@ -75,6 +75,14 @@ chunk deep in a long prompt still sets every rank's off-cadence step. With
 positions below ``C``; ``C=0`` leaves off-cadence steps decode-only on every
 rank, decode-free ranks included.
 
+The DSv4 indexer and compressed-attention mixed passes tile a prefill chunk's
+queries in 32-row blocks aligned to the chunk's start and each block scans the
+whole context, so a chunk of 33 tokens deep in a long prompt costs as much as
+one of 64. With ``TPU_SRPT_DEEP_CHUNK_ALIGN=A`` a chunk that starts at or past
+context ``TPU_SRPT_DEEP_CHUNK_CONTEXT`` and does not finish its prompt is
+rounded down to a multiple of ``A`` tokens (none, if under ``A``): the step
+does fewer whole blocks rather than a partial one.
+
 With ``TPU_SRPT_ATTN_WORK_CAP=W`` a step's attention work -- the sum over its
 scheduled tokens of the context each attends to, decodes included -- is kept
 under ``W`` by clipping prefill chunks: a chunk of ``n`` tokens starting at
@@ -131,6 +139,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._offcadence_tokens = envs.TPU_SRPT_OFFCADENCE_TOKENS
         self._offcadence_max_context = envs.TPU_SRPT_OFFCADENCE_MAX_CONTEXT
         self._offcadence_active = False
+        self._deep_chunk_align = envs.TPU_SRPT_DEEP_CHUNK_ALIGN
+        self._deep_chunk_context = envs.TPU_SRPT_DEEP_CHUNK_CONTEXT
+        self._deep_chunks_aligned = 0
         if self._offcadence_max_context is not None and not self._offcadence_tokens:
             raise ValueError(
                 "TPU_SRPT_OFFCADENCE_MAX_CONTEXT needs TPU_SRPT_OFFCADENCE_TOKENS"
@@ -272,6 +283,15 @@ class SrptPrefillScheduler(AsyncScheduler):
             # waiting request; both wait for the next cadence step.
             room = max(self._offcadence_max_context - num_computed_tokens, 0)
             num_new_tokens = min(num_new_tokens, room)
+        if (
+            self._deep_chunk_align
+            and prefill
+            and num_computed_tokens >= self._deep_chunk_context
+            and num_computed_tokens + num_new_tokens < request.num_tokens
+        ):
+            aligned = num_new_tokens - num_new_tokens % self._deep_chunk_align
+            self._deep_chunks_aligned += aligned != num_new_tokens
+            num_new_tokens = aligned
         if self._attn_work_cap and prefill and num_new_tokens > 0:
             fit = self._attn_fit(num_computed_tokens)
             if fit < num_new_tokens:
@@ -367,12 +387,13 @@ class SrptPrefillScheduler(AsyncScheduler):
         if self._srpt_steps % _LOG_EVERY_STEPS == 0:
             logger.info(
                 "SRPT prefill: steps=%d held_steps=%d held_chunks=%d paused_steps=%d "
-                "attn_clipped_chunks=%d offcadence_steps=%d",
+                "attn_clipped_chunks=%d offcadence_steps=%d deep_chunks_aligned=%d",
                 self._srpt_steps,
                 self._srpt_held_steps,
                 self._srpt_held_chunks,
                 self._srpt_paused_steps,
                 self._attn_clipped_chunks,
                 self._offcadence_steps,
+                self._deep_chunks_aligned,
             )
         return output

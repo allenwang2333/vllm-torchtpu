@@ -79,6 +79,8 @@ if TYPE_CHECKING:
     TPU_SRPT_ATTN_WORK_CAP: int = 0
     TPU_SRPT_OFFCADENCE_TOKENS: int = 0
     TPU_SRPT_OFFCADENCE_MAX_CONTEXT: int | None = None
+    TPU_SRPT_DEEP_CHUNK_ALIGN: int = 0
+    TPU_SRPT_DEEP_CHUNK_CONTEXT: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
     TPU_HOST_LOOP_TRACE_DIR: str = ""
     TPU_BLOCK_TABLE_STAGE_SPARSE_ZERO: bool = False
@@ -716,6 +718,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode-only. Unset: no limit.
     "TPU_SRPT_OFFCADENCE_MAX_CONTEXT": env_nonnegative_int_or_auto(
         "TPU_SRPT_OFFCADENCE_MAX_CONTEXT"
+    ),
+    # SrptPrefillScheduler: round a prefill chunk that starts at or past
+    # TPU_SRPT_DEEP_CHUNK_CONTEXT and does not end its prompt down to a multiple
+    # of this many tokens (the attention mixed passes' query block). 0 disables.
+    "TPU_SRPT_DEEP_CHUNK_ALIGN": env_nonnegative_int("TPU_SRPT_DEEP_CHUNK_ALIGN", 0),
+    "TPU_SRPT_DEEP_CHUNK_CONTEXT": env_nonnegative_int(
+        "TPU_SRPT_DEEP_CHUNK_CONTEXT", 0
     ),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.

@@ -56,6 +56,9 @@ def _make_scheduler(running=(), waiting=(), max_running=8):
     s._offcadence_steps = 0
     s._offcadence_max_context = None
     s._offcadence_active = False
+    s._deep_chunk_align = 0
+    s._deep_chunk_context = 0
+    s._deep_chunks_aligned = 0
     s.max_num_scheduled_tokens = 128
     s.prefill_capacity_bound = False
     s._srpt_hold_paused = False
@@ -468,6 +471,36 @@ def test_offcadence_step_flag_set_only_during_capped_schedule():
         s.schedule(True)
         s.schedule(False)
     assert seen == [True, False] and not s._offcadence_active
+
+
+def _deep_aligned(align=32, context=16384):
+    s = _capped(0)
+    s._deep_chunk_align = align
+    s._deep_chunk_context = context
+    return s
+
+
+def test_deep_chunk_rounded_down_to_whole_query_blocks():
+    s = _deep_aligned()
+    assert s._reserve_prefill_lookahead(_req(200_000), 84_000, 49) == 32
+    assert s._reserve_prefill_lookahead(_req(200_000), 84_000, 113) == 96
+    assert s._reserve_prefill_lookahead(_req(200_000), 84_000, 64) == 64
+    assert s._reserve_prefill_lookahead(_req(200_000), 84_000, 17) == 0
+    assert s._deep_chunks_aligned == 3
+
+
+def test_deep_chunk_alignment_spares_shallow_and_final_chunks():
+    s = _deep_aligned()
+    assert s._reserve_prefill_lookahead(_req(200_000), 1000, 49) == 49  # shallow
+    assert s._reserve_prefill_lookahead(_req(84_049), 84_000, 49) == 49  # ends prompt
+    decode = _req(200_000, num_tokens=200_010)
+    assert s._reserve_prefill_lookahead(decode, 200_010, 7) == 7
+    assert s._deep_chunks_aligned == 0
+
+
+def test_deep_chunk_alignment_off_by_default():
+    s = _capped(0)
+    assert s._reserve_prefill_lookahead(_req(200_000), 84_000, 49) == 49
 
 
 def test_attn_cap_off_leaves_chunks_alone():
