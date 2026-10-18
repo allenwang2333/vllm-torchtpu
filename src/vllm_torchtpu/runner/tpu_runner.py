@@ -450,6 +450,7 @@ def _sample_from_logits_impl(
     need_top_p: bool = True,
     radix_bits: int = 1,
     fast_top_p: bool = False,
+    mass_f32: bool = False,
 ) -> torch.Tensor:
     """Non-greedy body of TPUModelRunner.sample_from_logits (traced inline)."""
     is_greedy = temperatures <= SAMPLING_EPS
@@ -464,6 +465,7 @@ def _sample_from_logits_impl(
         radix_bits,
         fast_top_p,
         topk_candidates=topk_candidates,
+        mass_f32=mass_f32,
     )
     u_clamped = torch.clamp(
         u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
@@ -945,6 +947,8 @@ class TPUModelRunner(GPUModelRunner):
         self._sampler_need_top_p = True
         # TPU_SAMPLER_FAST_TOP_P: top-p bisection minus its idle steps.
         self._sampler_fast_top_p = bool(envs.TPU_SAMPLER_FAST_TOP_P)
+        # TPU_SAMPLER_BONUS_MASS_F32: bf16 top-p mass accumulated in float32.
+        self._sampler_mass_f32 = bool(envs.TPU_SAMPLER_BONUS_MASS_F32)
         # TPU_SAMPLER_FUSED_CHAIN: one compiled non-greedy verify program.
         self._sampler_fused_chain = bool(envs.TPU_SAMPLER_FUSED_CHAIN)
         # TPU_SAMPLER_VERIFY_TRIM: the fused chain's target work on 8 rows
@@ -6039,6 +6043,8 @@ class TPUModelRunner(GPUModelRunner):
         """Every static-kwarg variant _sampler_kwargs() can return at runtime
         (none with the flag off)."""
         fast = {"fast_top_p": True} if self._sampler_fast_top_p else {}
+        if self._sampler_mass_f32:
+            fast["mass_f32"] = True
         if not self._sampler_light:
             return [fast] if fast else []
         return [
@@ -7724,6 +7730,8 @@ class TPUModelRunner(GPUModelRunner):
             }
         if self._sampler_fast_top_p:
             kwargs["fast_top_p"] = True
+        if self._sampler_mass_f32:
+            kwargs["mass_f32"] = True
         return kwargs
 
     def _apply_temperature(
@@ -7748,6 +7756,7 @@ class TPUModelRunner(GPUModelRunner):
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        mass_f32: bool = False,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -7766,6 +7775,7 @@ class TPUModelRunner(GPUModelRunner):
             need_top_p,
             radix_bits,
             fast_top_p,
+            mass_f32,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7790,6 +7800,7 @@ class TPUModelRunner(GPUModelRunner):
         radix_bits: int = 1,
         fast_top_p: bool = False,
         verify_rows: int = 0,
+        mass_f32: bool = False,
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
         _sample_spec_verify_chunk as one program -- the logits gathers, bonus
@@ -7821,6 +7832,7 @@ class TPUModelRunner(GPUModelRunner):
             need_top_p=need_top_p,
             radix_bits=radix_bits,
             fast_top_p=fast_top_p,
+            mass_f32=mass_f32,
         ).view(-1)
         return _random_rejection_sample_with_segment_impl(
             draft_token_ids,
@@ -7841,6 +7853,7 @@ class TPUModelRunner(GPUModelRunner):
             need_top_p=need_top_p,
             radix_bits=radix_bits,
             fast_top_p=fast_top_p,
+            mass_f32=mass_f32,
         )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
