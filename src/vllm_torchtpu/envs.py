@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = False
     TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = False
+    TPU_HOST_SCHED_DIAG_STEPS: int = 0
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
@@ -1288,6 +1289,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER": env_bool(
         "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER"
     ),
+    # Every N runner steps, log the serving thread's CPU time and run-queue
+    # wait, the process's busiest threads and the cgroup's CFS throttling
+    # (runner/host_sched_diag.py). 0 = off.
+    "TPU_HOST_SCHED_DIAG_STEPS": env_int("TPU_HOST_SCHED_DIAG_STEPS", 0),
     # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
     # at most 1024), derive the stable-sort positions, permuted token ids and
     # group sizes by int32 compare-and-count instead of three comparison

@@ -138,6 +138,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.host_sched_diag import HostSchedDiag
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -1049,6 +1050,9 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(
             profiler_rank, enabled=self._stage_timing_has_consumer()
+        )
+        self._host_sched_diag = HostSchedDiag(
+            profiler_rank, envs.TPU_HOST_SCHED_DIAG_STEPS
         )
 
     def _stage_timing_has_consumer(self) -> bool:
@@ -3576,6 +3580,9 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        diag = getattr(self, "_host_sched_diag", None)
+        if diag is not None:
+            diag.tick()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
