@@ -61,7 +61,7 @@ class MKTiles:
     bq: int = 256            # attention q tile (tokens)
     bkv: int = 2048          # attention kv tile (j-692719db-95ef-4ea4-8b2f: best of 512..4096)
     att_sub: int = 8         # attention row sub-chunks (MXU / softmax overlap)
-    rt: int = 128            # MoE grouped rows per tile
+    rt: int = 256            # MoE grouped rows per tile (j-964229e0-90a9-4258-a763: 150 vs 153 ms)
     moe_interleave: int = 0  # >0: next tile's row DMAs started in this many chunks in the matmuls
     tm_route: int = 256
     tm_combine: int = 64
