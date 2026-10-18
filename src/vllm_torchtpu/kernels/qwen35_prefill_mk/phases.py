@@ -455,6 +455,15 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
         def step(q_ref, k_ref, v_ref, i, j, masked):
             kk = k_ref[0].astype(BF16)
             vv = v_ref[0].astype(BF16)
+
+            def pv(c, p, alpha):                 # chunk c's PV and accumulator update
+                r = slice(c * rc, (c + 1) * rc)
+                acc_ref[r, :] = alpha * acc_ref[r, :] + jax.lax.dot_general(
+                    p, vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+
+            # Software pipelined like the serving RPA: chunk c's QK + softmax, then chunk c-1's
+            # PV, so the MXU has independent work while the VPU runs the softmax.
+            prev = None
             for c in range(sub):
                 r = slice(c * rc, (c + 1) * rc)
                 q = q_ref[...].reshape(rows, hd)[r]
@@ -475,8 +484,10 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                 l_ref[r, :] = jnp.broadcast_to(
                     alpha * l_ref[r, :1] + jnp.sum(p, -1, keepdims=True, dtype=F32), (rc, 128))
                 m_ref[r, :] = jnp.broadcast_to(m_new, (rc, 128))
-                acc_ref[r, :] = alpha * acc_ref[r, :] + jax.lax.dot_general(
-                    p, vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+                if prev is not None:
+                    pv(*prev)
+                prev = (c, p, alpha)
+            pv(*prev)
 
         def body(q_ref, k_ref, v_ref, o_ref):
             i, j = pl.program_id(1), pl.program_id(2)
@@ -623,6 +634,17 @@ def _gather_rows(src_hbm, idx_fn, dst_vmem, n, sems, inflight):
     jax.lax.fori_loop(jnp.maximum(n - inflight, 0), n, lambda r, c: (wait(r), c)[1], 0)
 
 
+def _expert_tile(x, w13, w13s, w2, w2s, inter):
+    """One grouped tile through an expert: per-row fp8, w13, SwiGLU, per-row fp8, w2 (w8a8),
+    bf16-rounded like the serving grouped matmul. x [rt, H] f32 -> [rt, H] f32."""
+    xq, xs = quantize_rows(x)
+    gu = jax.lax.dot_general(xq, w13[...], (((1,), (0,)), ((), ())), preferred_element_type=F32)
+    gu = (gu * xs * w13s[...]).astype(BF16).astype(F32)
+    hq, hs = quantize_rows(jax.nn.silu(gu[:, :inter]) * gu[:, inter:])
+    y = jax.lax.dot_general(hq, w2[...], (((1,), (0,)), ((), ())), preferred_element_type=F32)
+    return (y * hs * w2s[...]).astype(BF16).astype(F32)
+
+
 def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hbm, w2s_hbm,
                 y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256):
     """Routed experts. Rows are grouped by expert (expert e's segment starts at off[e], padded to
@@ -645,7 +667,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
         def off_body(i, acc):
             off_s[0, i] = acc
             return acc + ((cnt_s[0, i] + rt - 1) // rt) * rt
-        jax.lax.fori_loop(0, e, off_body, jnp.int32(0))
+        with jax.named_scope("moe_offsets"):
+            jax.lax.fori_loop(0, e, off_body, jnp.int32(0))
 
         # pos = off[topi] + rank (vector pass), and the inverse map tok_s[pos] = t (scalar).
         def pos_pass(off_v):
@@ -667,7 +690,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 out_specs=[pl.BlockSpec((tm, topk), lambda i: (i, 0))],
             )(topi_hbm, rank_hbm, pos_hbm)
 
-        pl.run_scoped(pos_pass, pltpu.VMEM((1, e), jnp.int32))
+        with jax.named_scope("moe_pos"):
+            pl.run_scoped(pos_pass, pltpu.VMEM((1, e), jnp.int32))
 
         rows_per_stage = stage_s.shape[0]
 
@@ -681,7 +705,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 tok_s[stage_s[j // topk, j % topk]] = si * rows_per_stage + j // topk
                 return c
             return jax.lax.fori_loop(0, rows_per_stage * topk, tok_body, c)
-        jax.lax.fori_loop(0, t // rows_per_stage, scatter_stage, 0)
+        with jax.named_scope("moe_scatter"):
+            jax.lax.fori_loop(0, t // rows_per_stage, scatter_stage, 0)
 
         # Expert loop with double-buffered weights.
         def experts(w13_v, w13s_v, w2_v, w2s_v, xin, wsem):
@@ -710,18 +735,15 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 def tile(ri, c):
                     r0 = pl.multiple_of(base + ri * rt, rt)   # offsets are padded to rt rows
                     nr = jnp.minimum(rt, n - ri * rt)
-                    _gather_rows(xb_hbm, lambda r: tok_s[r0 + r], xin, nr, sems, inflight)
-                    xq, xs = quantize_rows(xin[...])
-                    gu = jax.lax.dot_general(xq, w13_v[slot], (((1,), (0,)), ((), ())),
-                                             preferred_element_type=F32)
-                    gu = (gu * xs * w13s_v[slot]).astype(BF16).astype(F32)
-                    hq, hs = quantize_rows(jax.nn.silu(gu[:, :inter]) * gu[:, inter:])
-                    y = jax.lax.dot_general(hq, w2_v[slot], (((1,), (0,)), ((), ())),
-                                            preferred_element_type=F32)
-                    xin[...] = (y * hs * w2s_v[slot]).astype(BF16).astype(F32)
-                    cpy = pltpu.make_async_copy(xin, y_sorted_hbm.at[pl.ds(r0, rt)], sem1.at[0])
-                    cpy.start()
-                    cpy.wait()
+                    with jax.named_scope("moe_gather"):
+                        _gather_rows(xb_hbm, lambda r: tok_s[r0 + r], xin, nr, sems, inflight)
+                    with jax.named_scope("moe_mm"):
+                        xin[...] = _expert_tile(xin[...], w13_v.at[slot], w13s_v.at[slot],
+                                                w2_v.at[slot], w2s_v.at[slot], inter)
+                    with jax.named_scope("moe_ywrite"):
+                        cpy = pltpu.make_async_copy(xin, y_sorted_hbm.at[pl.ds(r0, rt)], sem1.at[0])
+                        cpy.start()
+                        cpy.wait()
                     return c
                 return jax.lax.fori_loop(0, (n + rt - 1) // rt, tile, c)
             jax.lax.fori_loop(0, e, expert, 0)
@@ -752,8 +774,9 @@ def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, top
             cp.start()
             cp.wait()
             # Slot-major: rows[k * tm + t] = y_sorted[pos[t, k]], summed one slot at a time.
-            _gather_rows(y_sorted_hbm, lambda r: pos_s[r % tm, r // tm], rows, tm * topk,
-                         sems, inflight)
+            with jax.named_scope("combine_gather"):
+                _gather_rows(y_sorted_hbm, lambda r: pos_s[r % tm, r // tm], rows, tm * topk,
+                             sems, inflight)
             tw = tw_ref[...]
             routed = jnp.zeros((tm, h), F32)
             for kk in range(topk):
