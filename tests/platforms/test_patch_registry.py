@@ -378,8 +378,8 @@ def test_sequence_parallel_moe_admission(monkeypatch):
     # EP=True, TP=1, DP=1 -> False
     assert not ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 1, 1))
 
-    # EP=True, TP=8, DP=2 -> False
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 8, 2))
+    # EP=True, TP=8, DP=2 -> True (attention data parallelism over EP ranks)
+    assert ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 8, 2))
 
     # EP=True, TP=8, DP=1 -> True
     assert ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 8, 1))
