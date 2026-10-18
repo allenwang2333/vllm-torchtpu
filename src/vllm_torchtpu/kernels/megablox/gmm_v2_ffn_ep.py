@@ -414,7 +414,6 @@ def gmm_v2_ffn_ep(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
             collective_id=COLLECTIVE_ID,
-            has_side_effects=True,
         ),
         name=name,
         cost_estimate=pl.CostEstimate(
