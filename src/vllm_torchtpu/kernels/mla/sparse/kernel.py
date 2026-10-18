@@ -1485,6 +1485,10 @@ SEND_EXCHANGE_COLLECTIVE_ID = 13
 # its prefetch copies under the call -- the cover the separate all-to-all
 # call used to give them (served mirror: +4.8 us per layer of exposed glue).
 SEND_EXCHANGE_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
+# ... and its array operands are pinned to HBM: with VMEM no longer all
+# reserved, XLA would otherwise stage the gathered KV (the call's largest
+# inputs, which the kernel DMAs itself) into VMEM with exposed copies right
+# before the call (served mirror: +3.5 us per layer at T = 4, more at T = 8).
 # Test-only: positive controls (misrouted / dropped peer block) and timing-
 # only removal arms (the round replaced by local copies; the barrier waited
 # at entry instead of after the body) of the fused exchange.
@@ -4400,6 +4404,10 @@ def sparse_attention_chunk(
             operands.append(send_recv_in)
         if out_carried is not None:
             operands.append(out_carried)
+        if send_exchange is not None:
+            operands = [
+                pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in operands
+            ]
         return kernel(*scalar_prefetches, *operands)
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
