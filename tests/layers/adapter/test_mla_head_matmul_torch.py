@@ -13,6 +13,10 @@
 # limitations under the License.
 """TPU_MLA_ABSORB_TOKEN_MAJOR torch bridge vs the bmm code it replaces.
 
+W_UK is the served path. The W_UV cases hold the op's two epilogues against
+`project_uv_heads`'s bmm (the end-of-forward W_UV uses the first; the
+pre-merge W_UV itself keeps the bmm, whose head-major output the merge reads).
+
 The incumbent is the flag-off code of `TPUMLAAttentionImpl.forward` /
 `project_uv_heads`, verbatim, compiled by the TPU backend -- the graph the
 served model runs. GLM-5.2 per-rank shapes, decode bucket 128 and a 4096-token

@@ -538,13 +538,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
         "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
     ),
-    # MLA absorbs (q_nope @ W_UK, and the W_UV up-projection) as one Pallas
-    # kernel that reads token-major [T, H, D] and writes token-major [T, H, L]
+    # MLA W_UK absorb (q_nope @ W_UK) as one Pallas kernel that reads
+    # token-major [T, H, D] and writes token-major [T, H, L]
     # (`kernels/mla/head_matmul.py`), instead of `torch.bmm`'s head-major
-    # [H, T, D] contract. Removes the relayout copy on each side of the bmm
-    # (the input transpose and the output `copy bf16[64,T,512]`), and converts
-    # an fp8 W_UK/W_UV (QUANTIZE_ON_LOAD_PREFIXES=attn) in VMEM. Same
-    # contraction, same f32 accumulation and roundings as the bmm path.
+    # [H, T, D] contract. Removes the relayout on each side of the bmm (the q
+    # transpose and the output `copy bf16[64,T,512]`), and converts an fp8 W_UK
+    # (QUANTIZE_ON_LOAD_PREFIXES=attn) in VMEM. Also the end-of-forward W_UV
+    # (token-major in and out). Not W_UV before the DCP merge: the merge's
+    # reduce-scatter reads head-major, which the bmm already writes. Same
+    # contraction, f32 accumulation and roundings as the bmm path.
     "TPU_MLA_ABSORB_TOKEN_MAJOR": env_bool(
         "TPU_MLA_ABSORB_TOKEN_MAJOR", default=False
     ),

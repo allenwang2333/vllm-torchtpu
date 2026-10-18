@@ -92,20 +92,6 @@ def project_uv_heads(
     W_UV is linear and the merge weights are per (token, head), so projecting
     each partial before the merge gives the same result as projecting after.
     """
-    if envs.TPU_MLA_ABSORB_TOKEN_MAJOR and partial.dtype == torch.bfloat16:
-        # Token-major, no relayout either side (`mla_head_matmul`). The two
-        # branches below in one kernel: round to bf16 when narrow and
-        # unscaled, else scale in f32.
-        from vllm_torchtpu.layers.adapter import mla_head_matmul
-
-        narrow = out_dtype != torch.float32 and w_uv_scale is None
-        return mla_head_matmul.head_matmul(
-            partial,
-            w_uv,
-            w_uv_scale,
-            round_before_scale=narrow,
-            out_dtype=out_dtype,
-        )
     if out_dtype != torch.float32 and w_uv_scale is None:
         # One MXU pass that writes the narrow dtype directly.
         out = torch.bmm(partial.transpose(0, 1), w_uv.to(partial.dtype))

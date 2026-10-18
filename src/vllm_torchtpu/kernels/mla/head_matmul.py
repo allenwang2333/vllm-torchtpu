@@ -37,14 +37,19 @@ from jax.experimental.pallas import tpu as pltpu
 # Heads per grid step. 16 fills a bf16 sublane tile; smaller head counts take
 # the whole head axis as one block.
 HEADS_PER_BLOCK = 16
-# Largest token tile tried; the largest divisor of T in this ladder is used.
-_TOKEN_TILES = (256, 128, 64, 32, 16, 8)
+# Token tiles tried, largest first: the first that divides T and keeps the
+# double-buffered blocks under _BLOCK_BYTES is used. 512 over 256 is ~7% on
+# the 4096-token W_UK (v7x, measured).
+_TOKEN_TILES = (512, 256, 128, 64, 32, 16, 8)
+_BLOCK_BYTES = 32 * 1024 * 1024
 _VMEM_LIMIT_BYTES = 56 * 1024 * 1024
 
 
-def _token_tile(num_tokens: int) -> int | None:
+def _token_tile(num_tokens: int, row_bytes: int = 0, w_bytes: int = 0) -> int | None:
+    """`row_bytes`: x + out bytes per token per head block; `w_bytes`: one
+    weight block. Both double-buffered."""
     for t in _TOKEN_TILES:
-        if num_tokens % t == 0:
+        if num_tokens % t == 0 and 2 * (t * row_bytes + w_bytes) <= _BLOCK_BYTES:
             return t
     return None
 
@@ -147,7 +152,15 @@ def head_matmul(
             x, w, scale, round_before_scale=round_before_scale, out_dtype=out_dtype
         )
     g = min(HEADS_PER_BLOCK, num_heads)
-    t = _token_tile(num_tokens)
+    t = _token_tile(
+        num_tokens,
+        row_bytes=g * (dq * x.dtype.itemsize + n_out * out_dtype.itemsize),
+        w_bytes=g * p * n_out * w.dtype.itemsize,
+    )
+    if t is None:
+        return reference(
+            x, w, scale, round_before_scale=round_before_scale, out_dtype=out_dtype
+        )
     in_specs = [
         pl.BlockSpec((t, g, dq), lambda hg, i: (i, hg, 0)),
         pl.BlockSpec((g, p, n_out), lambda hg, i: (hg, 0, 0)),
