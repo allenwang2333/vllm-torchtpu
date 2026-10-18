@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_SEGMENT_MEGAKERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -870,6 +871,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # At decode token buckets of at most 32, run each MoE layer whose next
+    # layer is a skip layer (sparse MLA reusing the shared top-k, no indexer)
+    # as one Pallas call from its DCP merge to the next layer's KV pack: merge,
+    # o_proj, both TP all-reduces, the norms, routing, the MoE, q_a/kv_a and
+    # the KV write rows (kernels/experimental/segment_megakernel,
+    # layers/adapter/segment_megakernel.py). Armed once after load, after
+    # USE_MOE_TP_DECODE_KERNEL's arming, on TP16 x DCP8 with
+    # VLLM_DCP_Q_REPLICATE, TPU_DCP_MLA_UV_BEFORE_MERGE, TPU_SMALL_ALL_REDUCE
+    # and the fp8 sites it reproduces; any other setup, bucket or layer keeps
+    # the usual path. Pads each armed head layer's fused_qkv_a weight to a
+    # lane multiple in place. Remove once the path is the default or replaced.
+    "TPU_SEGMENT_MEGAKERNEL": env_bool("TPU_SEGMENT_MEGAKERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

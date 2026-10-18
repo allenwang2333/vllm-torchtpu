@@ -1107,8 +1107,8 @@ def kv_write_in_gather_supported(
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
-    kv_c_normed: jax.Array,
-    k_pe: jax.Array,
+    kv_c_normed: jax.Array | None,
+    k_pe: jax.Array | None,
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
     local_topk_indices: jax.Array,
@@ -1129,6 +1129,7 @@ def sparse_mla_attention_dcp(
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
+    kv_rows: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1156,6 +1157,11 @@ def sparse_mla_attention_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
         the `all_to_all` of an iota. Same result.
+      kv_rows: TPU_SEGMENT_MEGAKERNEL. This step's KV write already packed,
+        per rank, in `native_sc_gather.pack_write_rows`' one-operand layout
+        (int32 bits of the u32[3 * Tp, 128] rows, sharded over
+        `dcp_axis_name`: each rank's own owner mask). `kv_c_normed` and `k_pe`
+        are then None; only TPU_MLA_KV_WRITE_IN_GATHER decode buckets take it.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1187,6 +1193,8 @@ def sparse_mla_attention_dcp(
             f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}."
         )
     num_tokens = ql_nope.shape[0]
+    if (kv_rows is None) != (kv_c_normed is not None and k_pe is not None):
+        raise ValueError("pass either kv_c_normed and k_pe, or kv_rows")
     if local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
             "local_topk_indices must carry one row per (rank, token): "
@@ -1194,22 +1202,27 @@ def sparse_mla_attention_dcp(
             f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}."
         )
 
-    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
-    word_bytes = kv_cache_utils.WORD_BYTES
-    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
-    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
-        "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
-        f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
-        f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
-        f"{rope_dim}"
-    )
+    if kv_rows is None:
+        lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+        word_bytes = kv_cache_utils.WORD_BYTES
+        lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+        assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes, (
+            "dsa_gather used in the sparse MLA kernel needs the fp8 nope "
+            f"head dimension to be {word_bytes * lane_bytes} and the fp8 "
+            f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
+            f"{rope_dim}"
+        )
+        kv_operands = (kv_c_normed, k_pe)
+        kv_specs = (P(None, None), P(None, None))  # replicated latents
+    else:
+        kv_operands = (kv_rows,)
+        kv_specs = (P(dcp_axis_name, None),)  # each rank's packed rows
 
     replicated_3d = P(None, None, None)
     in_specs = (
         replicated_3d,  # ql_nope
         replicated_3d,  # q_pe
-        P(None, None),  # kv_c_normed
-        P(None, None),  # k_pe
+        *kv_specs,  # (kv_c_normed, k_pe) or kv_rows
         P(dcp_axis_name),  # kv_cache_nope
         P(dcp_axis_name),  # kv_cache_rope
         P(dcp_axis_name, None),  # local_topk_indices
@@ -1238,20 +1251,23 @@ def sparse_mla_attention_dcp(
         )
     cache_layout = nope_spec.layout.value
 
-    def _local(
-        ql_nope,
-        q_pe,
-        kv_c_normed,
-        k_pe,
-        kv_cache_nope,
-        kv_cache_rope,
-        topk_idx,
-        seq_lens_,
-        block_tables_,
-        query_start_loc_,
-        request_distribution_,
-        *extra_,
-    ):
+    def _local(ql_nope, q_pe, *operands):
+        if kv_rows is None:
+            kv_c_normed, k_pe, *operands = operands
+            rows_ = None
+        else:
+            rows_, *operands = operands
+            kv_c_normed = k_pe = None
+        (
+            kv_cache_nope,
+            kv_cache_rope,
+            topk_idx,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            request_distribution_,
+            *extra_,
+        ) = operands
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
         # then this shard's DCP rank (TPU_DCP_RANK_OPERAND).
         rope_table_ = extra_[0] if q_rope else None
@@ -1266,11 +1282,24 @@ def sparse_mla_attention_dcp(
             and envs.TPU_DCP_MLA_FUSED_PREP
             and decode_bucket
             and kv_write_in_gather_supported(
-                nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
+                nope_spec, rope_spec, ql_nope.shape[0], topk_idx.shape[-1]
             )
         )
         kv_write = None
-        if kv_in_gather:
+        if rows_ is not None:
+            # TPU_SEGMENT_MEGAKERNEL: the rows were packed upstream with this
+            # rank's owner mask; nothing else here writes the step's KV.
+            if not kv_in_gather:
+                raise ValueError(
+                    "kv_rows needs a TPU_MLA_KV_WRITE_IN_GATHER decode bucket "
+                    f"({ql_nope.shape[0]} tokens)"
+                )
+            tp_ = -(-ql_nope.shape[0] // native_sc_gather.NUM_SUBCORES)
+            want = (3 * tp_ * native_sc_gather.NUM_SUBCORES, 128)
+            if tuple(rows_.shape) != want:
+                raise ValueError(f"kv_rows is {rows_.shape}, expected {want}")
+            kv_write = jax.lax.bitcast_convert_type(rows_, jnp.uint32)
+        elif kv_in_gather:
             # The gather writes the rows; only their addresses and packed
             # bytes are built here (what `tc_scatter` computed in-kernel).
             write_rank = dcp_rank
@@ -1429,8 +1458,7 @@ def sparse_mla_attention_dcp(
     )(
         ql_nope,
         q_pe,
-        kv_c_normed,
-        k_pe,
+        *kv_operands,
         kv_cache_nope,
         kv_cache_rope,
         local_topk_indices,
