@@ -278,6 +278,7 @@ if TYPE_CHECKING:
         "fused_qkv_a_proj,q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     )
     TPU_DISABLE_RUNNER_STAGE_TIMING: bool = False
+    TPU_SKIP_UNCHANGED_PADDING_UPLOAD: bool = False
 
 
 def env_with_choices(
@@ -1861,6 +1862,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # no TpuEvent records on the serving thread and no collector thread. The
     # timings feed only TpuKVConnectorStats; with this set they are empty.
     "TPU_DISABLE_RUNNER_STAGE_TIMING": env_bool("TPU_DISABLE_RUNNER_STAGE_TIMING"),
+    # The token padding mask (TPU_MOE_SKIP_PADDED_TOKENS) is uploaded with a
+    # synchronous H2D every forward. Skip it when the step's (valid, padded)
+    # rows equal the ones last written, as in steady decode. Values unchanged.
+    "TPU_SKIP_UNCHANGED_PADDING_UPLOAD": env_bool("TPU_SKIP_UNCHANGED_PADDING_UPLOAD"),
 }
 
 
