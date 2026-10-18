@@ -10,6 +10,9 @@ torch = pytest.importorskip("torch")
 
 from vllm_torchtpu.layers.adapter import moe_tp_decode  # noqa: E402
 
+# Pallas TPU kernels (no CPU interpret mode): off the CPU unit-test lane.
+pytestmark = pytest.mark.tpu_test
+
 H, E = 6144, 256
 
 

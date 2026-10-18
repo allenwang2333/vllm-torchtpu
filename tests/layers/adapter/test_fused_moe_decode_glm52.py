@@ -183,6 +183,9 @@ def arming(monkeypatch):
     monkeypatch.setattr(bridge, "_build_op", build_op)
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL", "1")
     monkeypatch.setenv("FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", "256")
+    # The decode kernel alone (the prefill kernel is on by default since trial
+    # 4; test_fused_moe_prefill_glm52 covers it).
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "0")
     return built, vmem
 
 
