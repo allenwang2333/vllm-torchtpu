@@ -346,8 +346,8 @@ local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFI
 local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
-// Empty = off.
-local srptAttnWorkCap = cdk.var('TPU_SRPT_ATTN_WORK_CAP', '');
+// Default 25,000,000; empty = off.
+local srptAttnWorkCap = cdk.var('TPU_SRPT_ATTN_WORK_CAP', '25000000');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40).
