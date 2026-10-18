@@ -138,7 +138,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
-from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner.stage_timing import NullStageTiming, RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1041,7 +1041,11 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing: RunnerStageTiming | NullStageTiming = (
+            NullStageTiming()
+            if envs.TPU_DISABLE_RUNNER_STAGE_TIMING
+            else RunnerStageTiming(profiler_rank)
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
