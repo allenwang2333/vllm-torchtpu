@@ -96,15 +96,16 @@ The configuration convergence is a draft until its current-head CI, quality and
 performance results have been reviewed. Kernel correctness at long context does
 not substitute for a 512K Agent evaluation.
 
-### Experimental DSpark attention fusion
+### DSpark attention fusion
 
-`TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION=1` opts into fused BF16 QK,
-online softmax, AV and sink normalization for the draft's fixed request blocks.
-It requires BF16 queries with head dimension 512. The default is `0`, which
-keeps the reference attention path; target attention is unaffected.
+DSpark fixed request blocks use fused BF16 QK, online softmax, AV and sink
+normalization. This path requires BF16 queries with head dimension 512 and
+whole request blocks sharing an uncompressed, noncausal SWA window. Invalid
+query rows produce zero output; incompatible windows within a block produce
+NaNs to expose a violated caller contract. Target attention and single-query
+blocks retain the general attention path.
 
-This is a draft quality/performance tradeoff: reduction order can change BF16
-proposal probabilities near rounding boundaries. Evaluate actual accepted draft
-tokens per speculative round and full model accuracy before adopting it. The
-kernel must still preserve request masks, padding and KV semantics. An increase
-in standalone kernel speed is not evidence of end-to-end decode improvement.
+Fusion changes floating-point reduction order and can change draft proposals.
+Validate accepted draft tokens per speculative round and full model accuracy
+when changing the kernel. Standalone kernel speed is not evidence of
+end-to-end decode improvement.

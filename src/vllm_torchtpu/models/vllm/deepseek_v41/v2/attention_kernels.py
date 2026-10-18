@@ -366,38 +366,13 @@ def _swa_attention(q, pool, records, sink, scale):
     )
 
 
-def _attend_shared_swa(q, pool, records, scale, query_block_size):
-    """Share fixed noncausal query blocks' KV without sharing their softmax."""
-    tokens, heads, dim = q.shape
-    if not records.shape[1]:
-        return _attention_state(q)
-    groups = tokens // query_block_size
-    grouped_records = records.reshape(groups, query_block_size, records.shape[1])
-    shared_records = grouped_records.max(axis=1)
-    valid_query = (grouped_records >= 0).any(axis=-1)
-    compatible = (
-        (grouped_records == shared_records[:, None]) | ~valid_query[..., None]
-    ).all(axis=(1, 2))
-    grouped_q = q.reshape(groups, query_block_size * heads, dim)
-    state = _attend(grouped_q, pool, shared_records, _attention_state(grouped_q), scale)
-    result = []
-    for value, empty in zip(state, (-1e30, 0, 0)):
-        value = value.reshape(tokens, heads, *value.shape[2:])
-        valid = valid_query.reshape(tokens, *([1] * (value.ndim - 1)))
-        value = jnp.where(valid, value, empty)
-        # A caller violating the fixed-block contract must not silently reuse KV.
-        supported = jnp.repeat(compatible, query_block_size).reshape(
-            tokens, *([1] * (value.ndim - 1))
-        )
-        result.append(jnp.where(supported, value, jnp.nan))
-    return tuple(result)
-
-
 def _fused_shared_swa(q, pool, records, sink, scale, query_block_size):
     """Draft-only fixed-window fusion; target attention retains its own path."""
     from vllm_torchtpu.kernels.deepseek_v41.dspark_attention import fused_attention
 
     tokens, _, dim = q.shape
+    if q.dtype != jnp.bfloat16 or dim != 512:
+        raise ValueError("DSpark shared SWA requires BF16 queries with D=512")
     width = records.shape[1]
     if not width:
         return jnp.zeros_like(q)
@@ -435,11 +410,11 @@ def paged_attention_jax(
 
     assert query_block_size >= 1 and q.shape[0] % query_block_size == 0
     assert query_block_size == 1 or main_records.shape[1] == 0
-    if query_block_size > 1 and envs.TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION:
+    if query_block_size > 1:
         return _fused_shared_swa(
             q, swa_pool, swa_records, sink, scale, query_block_size
         )
-    if query_block_size == 1 and main_records.shape[1] == 0 and supports_swa(q, swa_records):
+    if main_records.shape[1] == 0 and supports_swa(q, swa_records):
         return _swa_attention(q, swa_pool, swa_records, sink, scale)
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
@@ -447,11 +422,7 @@ def paged_attention_jax(
         q,
         main_pool,
         main_records,
-        (
-            _attend_shared_swa(q, swa_pool, swa_records, scale, query_block_size)
-            if query_block_size > 1
-            else _attend_window(q, swa_pool, swa_records, _attention_state(q), scale)
-        ),
+        _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
         scale,
         gathered=gathered,
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Measured prototype: request-shared SWA online softmax in one Pallas call."""
+"""DSpark request-shared SWA online softmax in one Pallas call."""
 
 import functools
 

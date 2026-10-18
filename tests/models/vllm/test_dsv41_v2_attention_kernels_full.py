@@ -88,11 +88,26 @@ class _FakeKVBuffer:
 # ==============================================================================
 
 
+@pytest.fixture
+def interpret_dspark_attention(monkeypatch):
+    import functools
+
+    from vllm_torchtpu.kernels.deepseek_v41 import dspark_attention
+
+    monkeypatch.setattr(
+        dspark_attention,
+        "fused_attention",
+        functools.partial(dspark_attention.fused_attention, interpret=True),
+    )
+
+
 class TestWindowAttentionAndAttend:
     @pytest.mark.parametrize("block", [1, 5, 6])
     @pytest.mark.parametrize("width", [0, 64, 133, 192])
     @pytest.mark.parametrize("two_banks", [False, True])
-    def test_request_shared_swa(self, block, width, two_banks):
+    def test_request_shared_swa(
+        self, block, width, two_banks, interpret_dspark_attention
+    ):
         rng = np.random.default_rng(31)
         requests, heads, dim = 3, 4, 512
         tokens = requests * block
@@ -128,11 +143,14 @@ class TestWindowAttentionAndAttend:
         np.testing.assert_allclose(
             np.asarray(actual, np.float32),
             np.asarray(expected, np.float32),
-            rtol=0,
-            atol=1e-6,
+            # BF16 fusion changes reduction order; masks are checked exactly below.
+            rtol=2e-2 if block > 1 else 0,
+            atol=1e-3 if block > 1 else 1e-6,
         )
 
-    def test_request_shared_swa_rejects_different_windows(self):
+    def test_request_shared_swa_rejects_different_windows(
+        self, interpret_dspark_attention
+    ):
         q = jnp.ones((5, 2, 512), jnp.bfloat16)
         pool = jnp.zeros((32, 128), jnp.int32)
         records = jnp.zeros((5, 64), jnp.int32).at[1, 0].set(1)
@@ -149,13 +167,12 @@ class TestWindowAttentionAndAttend:
         assert jnp.isnan(result).all()
 
     @pytest.mark.parametrize("width", [0, 64, 133, 192])
-    def test_fused_draft_swa_masks_and_sink(self, width, monkeypatch):
+    def test_fused_draft_swa_masks_and_sink(self, width):
         """Exercise real fused attention with uniform scores and masked queries."""
         import functools
 
         from vllm_torchtpu.kernels.deepseek_v41 import dspark_attention
 
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_DSPARK_FUSED_ATTENTION", "1")
         kernel = functools.partial(dspark_attention.fused_attention, interpret=True)
         q = jnp.zeros((10, 64, 512), jnp.bfloat16)
         # Two BF16 1.0 values packed into each word.
@@ -196,6 +213,47 @@ class TestWindowAttentionAndAttend:
                     query_block_size=5,
                 )
             assert jnp.isnan(bad[:5]).all()
+
+    @pytest.mark.parametrize("width", [0, 64])
+    @pytest.mark.parametrize("dim,dtype", [(128, jnp.bfloat16), (512, jnp.float32)])
+    def test_shared_swa_rejects_unsupported_queries(self, width, dim, dtype):
+        q = jnp.zeros((5, 2, dim), dtype)
+        pool = jnp.zeros((32, 128), jnp.int32)
+        with pytest.raises(ValueError, match="BF16 queries with D=512"):
+            paged_attention_jax(
+                q,
+                pool,
+                pool,
+                jnp.zeros((5, width), jnp.int32),
+                jnp.empty((5, 0), jnp.int32),
+                jnp.zeros(2),
+                0.125,
+                query_block_size=5,
+            )
+
+    @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+    def test_single_query_attention_does_not_use_draft_fusion(self, dtype):
+        q = jnp.zeros((1, 2, 512), dtype)
+        # Both SWA and compressed/main records use the general path.
+        pool = jnp.full((128, 128), 0x3F803F80, jnp.int32)
+        records = jnp.zeros((1, 64), jnp.int32)
+        with mock.patch.object(
+            attention_kernels,
+            "_fused_shared_swa",
+            side_effect=AssertionError("target must not use draft fusion"),
+        ):
+            actual = paged_attention_jax(
+                q,
+                pool,
+                pool,
+                records,
+                records,
+                jnp.zeros(2),
+                512**-0.5,
+            )
+        np.testing.assert_array_equal(
+            np.asarray(actual), np.asarray(jnp.full_like(q, 128 / 129))
+        )
 
     def test_attention_state(self):
         q = jnp.zeros((8, 4, 128), dtype=jnp.float32)
