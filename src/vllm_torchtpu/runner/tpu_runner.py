@@ -7776,9 +7776,12 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
-        block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
-        )
+        # The compact slot pool sets _has_mamba_state; under the unified pool
+        # the KV cache config says whether mamba layers exist. A granule that
+        # is not block aligned leaves a request's aligned tail chunk
+        # unschedulable, and the request never finishes.
+        has_mamba = self._has_mamba_state or self.kv_cache_config.has_mamba_layers
+        block_aligned = has_mamba and self.cache_config.mamba_cache_mode == "align"
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
         )

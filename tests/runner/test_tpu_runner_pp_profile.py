@@ -149,6 +149,9 @@ def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=
     runner._pp_chunk_granularity = None
     runner.drafter = None
     runner._has_mamba_state = mamba_state
+    # The unified pool never sets _has_mamba_state; the KV cache config
+    # says whether mamba layers exist (see the has_mamba_layers test).
+    runner.kv_cache_config = SimpleNamespace(has_mamba_layers=False)
     runner.cache_config = SimpleNamespace(block_size=block_size, mamba_cache_mode=mode)
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
@@ -191,6 +194,16 @@ def test_chunk_buckets_use_an_eighth_step_without_alignment():
         14336,
         16384,
     ]
+
+
+def test_chunk_buckets_follow_the_block_under_the_unified_pool():
+    # The unified pool leaves _has_mamba_state unset; the KV cache config
+    # alone says the model has mamba layers, and the align mode needs
+    # block-aligned granules or the tail chunk never schedules.
+    runner = _bucket_runner([16, 4096, 8192, 16384], 4352, False, "align")
+    runner.kv_cache_config = SimpleNamespace(has_mamba_layers=True)
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 4352
 
 
 def test_chunk_buckets_hold_whole_query_blocks_under_context_parallelism():
