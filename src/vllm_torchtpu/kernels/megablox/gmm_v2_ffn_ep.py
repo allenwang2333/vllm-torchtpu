@@ -106,21 +106,21 @@ def _barrier_signal(num_devices: int):
         )
 
 
-def _barrier_wait(num_devices: int):
+def _barrier_wait(num_devices: int, second):
     """Completes the barrier `_barrier_signal` opened at entry.
 
-    The second, call-scoped round stops a peer that already re-entered on the
-    next call from standing in, with its next signal, for one still behind.
+    The second round, on the kernel-scratch semaphore `second`, stops a peer
+    that already re-entered on the next call from standing in, with its next
+    signal, for one still behind. It is scratch rather than run_scoped because
+    a device with no rows reaches it after the pipeline, where a scoped
+    semaphore need not have the address its peers signal from inside it.
     """
     pl.semaphore_wait(pltpu.get_barrier_semaphore(), num_devices)
-
-    @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
-    def _(second):
-        for d in range(num_devices):
-            pl.semaphore_signal(
-                second, 1, device_id=(d,), device_id_type=pl.DeviceIdType.MESH
-            )
-        pl.semaphore_wait(second, num_devices)
+    for d in range(num_devices):
+        pl.semaphore_signal(
+            second, 1, device_id=(d,), device_id_type=pl.DeviceIdType.MESH
+        )
+    pl.semaphore_wait(second, num_devices)
 
 
 def ep_inner_kernel(
@@ -137,6 +137,7 @@ def ep_inner_kernel(
     send_sems,  # DMA[2]
     local_sems,  # DMA[2]
     recv_sem,  # DMA
+    barrier_sem,  # REGULAR: `_barrier_wait`'s second round
     *,
     up,
     down,
@@ -174,7 +175,7 @@ def ep_inner_kernel(
     # Peers' receive buffers are only theirs to write once they have entered.
     @pl.when(pending_ref[_BARRIER_DONE] == 0)
     def _():
-        _barrier_wait(num_devices)
+        _barrier_wait(num_devices, barrier_sem)
         pending_ref[_BARRIER_DONE] = 1
 
     me = lax.axis_index(axis_name)
@@ -227,6 +228,7 @@ def ep_kernel_main(
     send_sems,
     local_sems,
     recv_sem,
+    barrier_sem,
     *,
     up,
     down,
@@ -273,13 +275,14 @@ def ep_kernel_main(
             send_sems,
             local_sems,
             recv_sem,
+            barrier_sem,
         ],
     )
 
     # A device with no local rows still owes its peers the barrier.
     @pl.when(pending_ref[_BARRIER_DONE] == 0)
     def _():
-        _barrier_wait(num_devices)
+        _barrier_wait(num_devices, barrier_sem)
 
     for slot in range(2):
         staging = staging_ref.at[slot]
@@ -381,6 +384,7 @@ def gmm_v2_ffn_ep(
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA,
+        pltpu.SemaphoreType.REGULAR,
     ]
     up_cost, down_cost = get_cost_estimate(up), get_cost_estimate(down)
     name = (
