@@ -42,7 +42,7 @@ o = jax.jit(call)(*args)
 y, conv_out, s_out = o[-1], o[10], o[12]
 
 res = (h.astype(R.F32) + r.astype(R.F32)).astype(R.BF16)
-x = R.rmsnorm_zc(res, w["in_norm"], c.eps).astype(R.BF16)
+x = R.rmsnorm_zc(h.astype(R.F32) + r.astype(R.F32), w["in_norm"], c.eps).astype(R.BF16)
 y_ref, conv_ref, rec_ref = R.gdn_layer(c, w, x, st["conv"], st["rec"])
 rel = lambda a, b: float(jnp.linalg.norm(a.astype(R.F32) - b.astype(R.F32)) / jnp.linalg.norm(b.astype(R.F32)))
 print("gdn out rel", rel(y, y_ref), " state rel", rel(s_out, rec_ref), " conv eq", bool(jnp.all(conv_out == conv_ref)))

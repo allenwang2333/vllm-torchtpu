@@ -35,7 +35,7 @@ ro, xb, xq, xs, lg, sgu, hq, hs, sd, sg = jax.jit(call)(*args)
 
 # Reference pieces.
 res = (h.astype(R.F32) + r.astype(R.F32)).astype(R.BF16)
-x = R.rmsnorm_zc(res, w["in_norm"], c.eps).astype(R.BF16)
+x = R.rmsnorm_zc(h.astype(R.F32) + r.astype(R.F32), w["in_norm"], c.eps).astype(R.BF16)
 fused = R.qlinear(x, w["gate_gu_w"], w["gate_gu_s"])
 sh = (jax.nn.silu(fused[:, c.E:][:, :c.IS]) * fused[:, c.E:][:, c.IS:]).astype(R.BF16)
 sd_ref = R.qlinear(sh, w["sd_w"], w["sd_s"])

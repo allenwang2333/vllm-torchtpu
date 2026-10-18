@@ -123,9 +123,11 @@ def gdn_layer(c, w, x, conv_state, rec_state):
     return out, new_conv, new_rec
 
 
-def attn_layer(c, w, x, k_cache, v_cache, ctx):
+def attn_layer(c, w, x, k_cache, v_cache, ctx, flash_bkv=None):
     """x [T, H]; k_cache, v_cache [ctx + T, NKV, HD] fp8 with the context in [:ctx].
-    Returns out [T, H] f32 and the caches with the new tokens' K/V written at ctx .. ctx+T-1."""
+    Returns out [T, H] f32 and the caches with the new tokens' K/V written at ctx .. ctx+T-1.
+    flash_bkv: emulate a tiled online softmax over KV tiles of that size (bf16 P per tile),
+    for bit-level comparison with a flash kernel."""
     t = x.shape[0]
     qkv = qlinear(x, w["qkv_w"], w["qkv_s"]).astype(BF16)
     qg = qkv[:, :2 * c.NH * c.HD].reshape(t, c.NH, 2 * c.HD)
@@ -144,8 +146,25 @@ def attn_layer(c, w, x, k_cache, v_cache, ctx):
     s = jnp.einsum("tgqd,sgd->gqts", qq, kk) * (c.HD ** -0.5)
     visible = jnp.arange(kk.shape[0])[None, :] <= pos[:, None]
     s = jnp.where(visible[None, None], s, -jnp.inf)
-    p = jax.nn.softmax(s, -1)
-    o = jnp.einsum("gqts,sgd->tgqd", p, vv).reshape(t, c.NH * c.HD)
+    if flash_bkv is None:
+        # The serving kernels feed bf16 probabilities to PV and normalize by the f32 sum.
+        e = jnp.exp(s - jnp.max(s, -1, keepdims=True))
+        o = jnp.einsum("gqts,sgd->tgqd", e.astype(BF16).astype(F32), vv)
+        o = (o / jnp.einsum("gqts->tgq", e)[..., None]).reshape(t, c.NH * c.HD)
+    else:
+        m = jnp.full(s.shape[:-1] + (1,), -jnp.inf)
+        l = jnp.zeros_like(m)
+        acc = jnp.zeros(s.shape[:-1] + (c.HD,))
+        for j0 in range(0, s.shape[-1], flash_bkv):
+            st = s[..., j0:j0 + flash_bkv]
+            m_new = jnp.maximum(m, jnp.max(st, -1, keepdims=True))
+            alpha = jnp.where(jnp.isfinite(m_new), jnp.exp(m - m_new), 1.0)
+            pe = jnp.where(jnp.isfinite(m_new), jnp.exp(st - m_new), 0.0)
+            l = alpha * l + jnp.sum(pe, -1, keepdims=True)
+            acc = alpha * acc + jnp.einsum("gqts,sgd->gqtd", pe.astype(BF16).astype(F32),
+                                           vv[j0:j0 + flash_bkv])
+            m = m_new
+        o = jnp.einsum("gqtd->tgqd", acc / l).reshape(t, c.NH * c.HD)
     o = (o * jax.nn.sigmoid(gate.astype(F32))).astype(BF16)
     return qlinear(o, w["o_w"], w["o_s"]), k_cache, v_cache
 
@@ -172,7 +191,7 @@ def moe(c, w, x):
     return routed + shared * sgate
 
 
-def stage_step(c, weights, hidden, residual, states, ctx):
+def stage_step(c, weights, hidden, residual, states, ctx, flash_bkv=None):
     """weights: per-layer dicts; states: per-layer dicts (gdn: conv [CONV-1, QKV] bf16,
     rec [VH, KD, VD] f32; attn: k, v [ctx + T, NKV, HD] fp8). Returns hidden, residual
     (bf16, [T, H]) and the new states."""
@@ -185,7 +204,7 @@ def stage_step(c, weights, hidden, residual, states, ctx):
             y, conv, rec = gdn_layer(c, w, x, st["conv"], st["rec"])
             new_states.append({"conv": conv, "rec": rec})
         else:
-            y, kc, vc = attn_layer(c, w, x, st["k"], st["v"], ctx)
+            y, kc, vc = attn_layer(c, w, x, st["k"], st["v"], ctx, flash_bkv)
             new_states.append({"k": kc, "v": vc})
         res = y.astype(BF16).astype(F32) + residual.astype(F32)
         residual = res.astype(BF16)
