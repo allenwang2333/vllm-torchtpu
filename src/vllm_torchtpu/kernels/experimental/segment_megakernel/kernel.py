@@ -417,7 +417,7 @@ HBM_IN = (
     "s2",
     "qkv_w",
     "fstack",  # f32 [boundaries, 1, row_width]: SegCfg.fields() per boundary
-    "s13s",  # f32 [boundaries, E, 2I]: routed gate/up scales
+    "s13s",  # f32 [boundaries, E, 1, 2I]: routed gate/up scales
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
 )
@@ -656,7 +656,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
                 r["w2"].at[e], r["w2_r"].at[slot], ring_sem.at[slot, 1]
             ),
             pltpu.make_async_copy(
-                r["s13s"].at[slot_k, pl.ds(e, 1)],
+                r["s13s"].at[slot_k, e],
                 r["s1_r"].at[slot],
                 ring_sem.at[slot, 2],
             ),
@@ -946,7 +946,7 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
         "s2": ((cfg.experts, 1, 1, H), F32),
         "qkv_w": ((H, cfg.qkv_pad), F8),
         "fstack": ((boundaries, 1, cfg.row_width), F32),
-        "s13s": ((boundaries, cfg.experts, 2 * cfg.moe_i), F32),
+        "s13s": ((boundaries, cfg.experts, 1, 2 * cfg.moe_i), F32),
         "sw13s": ((boundaries, H, 2 * cfg.shared_i), F8),
         "sw2s": ((boundaries, cfg.shared_i, H), F8),
     }
