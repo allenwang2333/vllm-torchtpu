@@ -750,6 +750,26 @@ class TpuPlatform(Platform):
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+            spec_cfg = getattr(vllm_config, "speculative_config", None)
+            sched_cfg = getattr(vllm_config, "scheduler_config", None)
+            num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+            max_seqs = int(getattr(sched_cfg, "max_num_seqs", 0) or 0)
+            if envs.TPU_DEEPSEEK_V41_CED and num_spec > 0 and max_seqs > 0:
+                verify_bucket = max_seqs * (1 + num_spec)
+                replay_bucket = 2 * verify_bucket
+                int_sizes = [
+                    int(s)
+                    for s in compilation_config.compile_sizes
+                    if isinstance(s, int)
+                ]
+                if (
+                    verify_bucket in int_sizes
+                    and not any(verify_bucket < s <= replay_bucket for s in int_sizes)
+                    and any(s > replay_bucket for s in int_sizes)
+                ):
+                    compilation_config.compile_sizes = sorted(
+                        [*compilation_config.compile_sizes, replay_bucket]
+                    )
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []

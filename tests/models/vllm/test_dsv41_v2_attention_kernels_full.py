@@ -2497,3 +2497,92 @@ def test_sparse_fp8_attention_jax_pure_swa_matches_paged_attention():
         page_size=64,
     )
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_paged_indexer_tpu_tile48_and_zero_length_padding(monkeypatch):
+    """TP-sharded CED replay bucket (rows=96, records.shape[0]=64) uses 48-row
+    tiles on TPU and ignores zero-length padding rows when grouping requests."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+
+    rng = np.random.default_rng(43)
+    requests_count, rows, width, topk = 64, 96, 256, 16
+    keys = jnp.asarray(rng.standard_normal((requests_count * width, 128)), jnp.bfloat16)
+    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
+    records = jnp.arange(requests_count * width, dtype=jnp.int32).reshape(
+        requests_count, width
+    )
+    # Tile 0 (0..47): 7 decode groups of 6 + 2 active tokens of req 7 + 4 zero-length
+    # padding tokens stamped with req 63. Tile 1 (48..95): 10 active tokens of req 8
+    # + 38 zero-length padding tokens stamped with req 63.
+    req_tile0 = jnp.concatenate(
+        [
+            jnp.repeat(jnp.arange(7, dtype=jnp.int32), 6),
+            jnp.full((2,), 7, dtype=jnp.int32),
+            jnp.full((4,), 63, dtype=jnp.int32),
+        ]
+    )
+    req_tile1 = jnp.concatenate(
+        [
+            jnp.full((10,), 8, dtype=jnp.int32),
+            jnp.full((38,), 63, dtype=jnp.int32),
+        ]
+    )
+    requests = jnp.concatenate([req_tile0, req_tile1])
+    len_tile0 = jnp.concatenate(
+        [
+            jnp.full((44,), 128, dtype=jnp.int32),
+            jnp.zeros((4,), dtype=jnp.int32),
+        ]
+    )
+    len_tile1 = jnp.concatenate(
+        [
+            jnp.full((10,), 128, dtype=jnp.int32),
+            jnp.zeros((38,), dtype=jnp.int32),
+        ]
+    )
+    lengths = jnp.concatenate([len_tile0, len_tile1])
+    candidates = jnp.zeros((rows, 4), jnp.int32)
+
+    ref_scores = paged_index_scores_jax(
+        q,
+        pool,
+        records,
+        weights,
+        lengths,
+        requests,
+        zero_length_grouping=True,
+    )
+    expected = select_indices_jax(
+        ref_scores, lengths, candidates, topk, 16, False, False, True
+    )
+
+    score_rows = []
+    original = attention_kernels.paged_index_scores_jax
+
+    def record_shape(queries, *args, **kwargs):
+        score_rows.append((queries.shape[0], kwargs.get("zero_length_grouping")))
+        with mock.patch("jax.default_backend", return_value="cpu"):
+            return original(queries, *args, **kwargs)
+
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    monkeypatch.setattr(attention_kernels, "paged_index_scores_jax", record_shape)
+    actual = paged_indexer_jax(
+        q,
+        pool,
+        records,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        topk,
+        16,
+        False,
+        False,
+        True,
+        page_records=64,
+    )
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
+    assert set(score_rows) == {(48, False), (48, True)}

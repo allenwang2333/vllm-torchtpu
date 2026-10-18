@@ -534,6 +534,30 @@ class TestTpuPlatform:
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_ced_speculative_replay_bucket(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True)
+        vllm_config.scheduler_config.max_num_seqs = 64
+        vllm_config.speculative_config = SimpleNamespace(
+            num_speculative_tokens=5,
+            method="dspark",
+            use_eagle=lambda: True,
+        )
+        vllm_config.compilation_config.compile_sizes = [64, 384, 8192]
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.compilation_config.compile_sizes == [64, 384, 768, 8192]
+
     @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
         [

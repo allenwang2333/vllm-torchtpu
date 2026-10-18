@@ -2316,6 +2316,7 @@ def paged_index_scores_jax(
     page_records: int | None = None,
     records_are_pages: bool = False,
     mask_invalid: bool = False,
+    zero_length_grouping: bool = False,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
@@ -2565,9 +2566,24 @@ def paged_index_scores_jax(
         if requests is not None and tokens >= 6 and tokens % 6 == 0:
             group_tokens = 6
             groups = tokens // group_tokens
-            can_group = jnp.all(
-                requests.reshape(groups, group_tokens) == requests[::group_tokens, None]
-            )
+            if zero_length_grouping:
+                l_groups = lengths.reshape(groups, group_tokens)
+                r_groups = requests.reshape(groups, group_tokens)
+                can_group = jnp.all(
+                    (r_groups == r_groups[:, :1])
+                    | (
+                        (l_groups <= 0)
+                        & (
+                            (l_groups[:, :1] > 0)
+                            | jnp.all(l_groups <= 0, axis=1, keepdims=True)
+                        )
+                    )
+                )
+            else:
+                can_group = jnp.all(
+                    requests.reshape(groups, group_tokens)
+                    == requests[::group_tokens, None]
+                )
 
             def _grouped_or_raw(_):
                 return jax.lax.cond(
@@ -2580,7 +2596,14 @@ def paged_index_scores_jax(
                 )
 
             if groups > 1:
-                same_request = jnp.all(requests == requests[0])
+                if zero_length_grouping:
+                    l_flat = lengths.reshape(tokens)
+                    same_request = jnp.all(
+                        (requests == requests[0])
+                        | ((l_flat <= 0) & ((l_flat[0] > 0) | jnp.all(l_flat <= 0)))
+                    )
+                else:
+                    same_request = jnp.all(requests == requests[0])
                 return jax.lax.cond(
                     same_request,
                     lambda _: _run_word_loop(jnp.take(records, requests[:1], axis=0)),
@@ -2985,6 +3008,9 @@ def paged_indexer_jax(
                     row_requests,
                     page_records,
                     mask_invalid=True,
+                    zero_length_grouping=(
+                        not grouped and 48 < rows < 6 * records.shape[0]
+                    ),
                 )
 
             def select(i, scores):
@@ -3056,10 +3082,22 @@ def paged_indexer_jax(
 
     def full_context(_):
         rows = q.shape[0]
+        use_tile48 = (
+            jax.default_backend() == "tpu"
+            and (rows >= 512 or (rows >= 48 and rows % 48 == 0))
+            and page_records is not None
+            and q.dtype == jnp.bfloat16
+            and q.shape[-1] == index_word_scores.DIM
+        )
         if (
             records.shape[0] > 1
             and (
-                records.shape[0] < rows < _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+                (
+                    records.shape[0]
+                    < rows
+                    < _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+                    and not (use_tile48 and rows < 6 * records.shape[0])
+                )
                 or (
                     rows <= records.shape[0]
                     and rows <= 64
@@ -3077,17 +3115,7 @@ def paged_indexer_jax(
             # The untiled score buffer is small here; keep one query tile.
             return score_context(records, rows)
         columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
-        default_query_tile = (
-            48
-            if (
-                jax.default_backend() == "tpu"
-                and rows >= 512
-                and page_records is not None
-                and q.dtype == jnp.bfloat16
-                and q.shape[-1] == index_word_scores.DIM
-            )
-            else indexer.QUERY_TILE
-        )
+        default_query_tile = 48 if use_tile48 else indexer.QUERY_TILE
         if (
             not candidate_write
             and not candidate_filter
@@ -3097,9 +3125,10 @@ def paged_indexer_jax(
         ):
             # Select a smaller working shape without limiting request length.
             # Publication/filtering retain their full-width candidate contract.
+            bucket_tile = 48 if default_query_tile == 48 else query_tile
             return jax.lax.cond(
-                lengths.max() <= columns,
-                lambda _: score_context(records[:, :columns], query_tile),
+                (lengths.max() if batch_max is None else batch_max.max()) <= columns,
+                lambda _: score_context(records[:, :columns], bucket_tile),
                 lambda _: score_context(records, default_query_tile),
                 None,
             )
