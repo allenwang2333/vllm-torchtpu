@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import collections
 import importlib
+import itertools
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +23,28 @@ TPU_SECOND_LAST_MINOR = 8
 
 _megacore = False
 logger = init_logger(__name__)
+
+
+# Custom ops shared by every layer with the same kernel config. A JaxCallable
+# caches its jax.export per instance, so one op per layer re-exported (and
+# re-lowered) the identical kernel for every layer at every compile bucket.
+_shared_jax_ops: dict[tuple, Any] = {}
+_shared_jax_op_ids: collections.defaultdict[str, itertools.count] = (
+    collections.defaultdict(itertools.count)
+)
+
+
+def get_shared_jax_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
+    """Return ``build("pallas::<kind>_<n>")`` for ``(kind, key)``, built once.
+
+    ``kind`` and ``key`` together must cover every value that the op's kernel
+    and fake capture. ``n`` counts per ``kind``.
+    """
+    op = _shared_jax_ops.get((kind, key))
+    if op is None:
+        op = build(f"pallas::{kind}_{next(_shared_jax_op_ids[kind])}")
+        _shared_jax_ops[(kind, key)] = op
+    return op
 
 
 def align_to(unpadded_dim, pad_multiple):
@@ -348,3 +372,24 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a copy of `t` backed by a fresh device buffer of its own shape.
+
+    torch_tpu hands a compiled executable the buffer behind each argument. If a
+    persistent tensor's storage is a buffer of a different shape (e.g. it is a
+    view, or was filled by `copy_` from a view), torch_tpu re-materializes it as
+    a standalone `tt_jit_as_strided` program before every forward. Calling this
+    once at load time removes that per-step program.
+
+    `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
+    same-shape, same-dtype `copy_` by aliasing the destination's storage to
+    `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
+    a real op whose output buffer has `t`'s logical shape. Other devices get a
+    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    """
+    out = torch.clone(t, memory_format=torch.contiguous_format)
+    if out.device.type == "tpu":
+        out = out + 0
+    return out

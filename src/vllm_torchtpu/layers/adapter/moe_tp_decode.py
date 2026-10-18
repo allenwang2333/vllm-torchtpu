@@ -61,6 +61,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
@@ -106,6 +107,56 @@ _RANK_BUFFER: torch.Tensor | None = None
 # TPU_MOE_TP_DECODE_SHARED_META: one experts_start buffer per (device, value).
 _E0_BUFFERS: dict[tuple[str, int], torch.Tensor] = {}
 _SELFTEST_DONE = False
+_ROUTER_OP: Any = None
+
+
+def get_router_logits_op() -> Any:
+    """TPU_MOE_ROUTER_HBM_PIN: the torch op computing `F.linear(x, w)` for a bf16
+    router (`router_gemm_hbm.router_logits`). Build at load: jax_op takes a Lock."""
+    global _ROUTER_OP
+    if _ROUTER_OP is None:
+        op = pallas.jax_op("pallas::moe_router_logits_hbm", router_gemm_hbm.router_logits)
+        op.register_fake(
+            lambda x, w: torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+        )
+        _ROUTER_OP = op
+    return _ROUTER_OP
+
+
+class RouterHbmPinMethod:
+    """The gate's linear method under TPU_MOE_ROUTER_HBM_PIN: a bias-free bf16
+    router's logits from `router_gemm_hbm.router_logits` (decode token counts stream
+    the weight from HBM, ~1e-4 of logits one bf16 ulp off the XLA dot's; other
+    counts run the same dot as before). Everything else is the wrapped method's."""
+
+    def __init__(self, base: Any, op: Any) -> None:
+        self._base = base
+        self._op = op
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def apply(self, layer: Any, x: torch.Tensor, bias: torch.Tensor | None = None):
+        if bias is not None or x.dtype != torch.bfloat16:
+            return self._base.apply(layer, x, bias)
+        x2 = x.reshape(-1, x.shape[-1])
+        out = self._op(x2, layer.weight)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+def _pin_router(runner: Any) -> bool:
+    """Wrap `runner.gate`'s linear method in RouterHbmPinMethod when it is a
+    bias-free bf16 [E, hidden] router; True when wrapped (or already)."""
+    gate = getattr(runner, "gate", None)
+    if gate is None or getattr(gate, "bias", None) is not None:
+        return False
+    w = getattr(gate, "weight", None)
+    if w is None or w.dtype != torch.bfloat16 or w.dim() != 2:
+        return False
+    if isinstance(gate.quant_method, RouterHbmPinMethod):
+        return True
+    gate.quant_method = RouterHbmPinMethod(gate.quant_method, get_router_logits_op())
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,6 +182,8 @@ class _OpStatics:
     # run the fused MoE prefill kernel (layers/adapter/fused_moe_prefill.py)
     # instead of the psum path; None keeps the psum path for every count.
     prefill_min_tokens: int | None = None
+    # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
+    fast: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -339,6 +392,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
         # The prefill kernel's weight ring holds whole experts: TP experts only.
         prefill_min_tokens=None if par.use_ep else prefill_min_tokens(),
+        fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )
     return _Admitted(
         shared=shared,
@@ -453,6 +507,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     routed_scale=statics.routed_scale,
                     topk=statics.topk,
                     n_ranks=n_ranks,
+                    fast=statics.fast,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -468,6 +523,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 routed_scale=statics.routed_scale,
                 topk=statics.topk,
                 n_ranks=n_ranks,
+                fast=statics.fast,
             )
         if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
             # Prefill-sized steps: the fused MoE prefill kernel (shared +
@@ -789,6 +845,16 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
+    pinned_routers = (
+        sum(_pin_router(r) for r, _ in plan) if envs.TPU_MOE_ROUTER_HBM_PIN else 0
+    )
+    if envs.TPU_MOE_ROUTER_HBM_PIN:
+        logger.info(
+            "moe_tp_decode: TPU_MOE_ROUTER_HBM_PIN router weight streamed from HBM "
+            "on %d/%d armed layers",
+            pinned_routers,
+            len(plan),
+        )
     armed_drafter = sum(1 for r, _ in plan if id(r) not in known)
     # On by default, so a model it does not serve is the common case there.
     log = (

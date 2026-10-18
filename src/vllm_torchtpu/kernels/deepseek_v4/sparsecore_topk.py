@@ -93,6 +93,7 @@ def _topk_body(
     rowdata_vmem=None,
     lenall_vmem=None,
     dma_sem=None,
+    lidx_vmem=None,
     *,
     b: int,
     n: int,
@@ -105,10 +106,16 @@ def _topk_body(
     local_idxs_hbm: Any = None,
     row_cap: bool = False,
     dma_chunk: int = 0,
+    rank_major_dcp: int = 0,
 ):
     dcp_merge = local_idxs_hbm is not None
     if row_cap:
         assert not dcp_merge and dma_chunk > 0
+    if rank_major_dcp:
+        # Unpadded DCP merge (see `_sc_topk_direct`): one wave, P = 1, and the
+        # row arrives as `rank_major_dcp` k-word DMAs of `dma_chunk` words.
+        assert dcp_merge and p == 1 and num_waves == 1 and not row_cap
+        assert dma_chunk == k and n == rank_major_dcp * k
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -480,7 +487,7 @@ def _topk_body(
             carry=(jnp.int32(0), prior_ties),
         )(emit_ranked)
 
-        if row_cap and p == 1:
+        if (row_cap or rank_major_dcp) and p == 1:
             # The caller copies `rowbuf_vmem` / `keybuf_vmem` out itself.
             pass
         elif p == 1:
@@ -713,6 +720,69 @@ def _topk_body(
                     keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)]
                 )
 
+    elif rank_major_dcp:
+        # Unpadded DCP merge: subcore `flat` owns row `flat` if `flat < b`.
+        # Its `n = dcp * k` scores are rank-major in HBM -- rank r's list for
+        # every row, then rank r + 1's (the flat candidate all-gather) -- so
+        # the row is `dcp` k-word pieces at stride `b * k`, landed back to back
+        # in VMEM: the same `n` words, in the same order, as the padded path's
+        # row. Each piece is waited for just before its histogram pass.
+        # Subcores past `b` read and write nothing.
+        row = flat
+        active_row = row < b
+        num_dmas = jnp.where(active_row, rank_major_dcp, 0)
+        # The row's rank and local slots are only read at emission: fetch them
+        # on their own semaphore, in flight with the score pieces, rather than
+        # as two serial copies ahead of them.
+        meta_copies = (
+            pltpu.make_async_copy(
+                lengths_hbm.at[pl.ds(pl.multiple_of(row * LANES, LANES), LANES)],
+                lenall_vmem.at[pl.ds(0, LANES)],
+                dma_sem.at[1],
+            ),
+            pltpu.make_async_copy(
+                local_idxs_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
+                lidx_vmem.at[pl.ds(0, k)],
+                dma_sem.at[1],
+            ),
+        )
+
+        @pl.when(active_row)
+        def _():
+            for c in meta_copies:
+                c.start()
+
+        @pl.loop(0, num_dmas)
+        def _(r):
+            pltpu.make_async_copy(
+                scores_hbm.at[pl.ds(pl.multiple_of((r * b + row) * k, LANES), k)],
+                rowdata_vmem.at[pl.ds(pl.multiple_of(r * k, LANES), k)],
+                dma_sem.at[0],
+            ).start()
+
+        @pl.when(active_row)
+        def _():
+            for c in meta_copies:
+                c.wait()
+
+        _run_step(
+            rowdata_vmem,
+            lenall_vmem,
+            None,
+            None,
+            lidx_vmem,
+            w_override=jnp.int32(0),
+            row_len_override=jnp.where(active_row, n, 0),
+            hist0_chunks=num_dmas,
+        )
+
+        @pl.when(active_row)
+        def _():
+            pltpu.sync_copy(
+                rowbuf_vmem.at[pl.ds(0, k)],
+                out_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
+            )
+
     elif p == 1:
         in_specs = (
             pl.BlockSpec(
@@ -812,6 +882,7 @@ def _sc_topk_direct(
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
     row_cap: bool = False,
+    rank_major_dcp: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -825,9 +896,27 @@ def _sc_topk_direct(
     ``row_cap`` replaces the pipelined full-width read with per-row DMAs
     bounded by the row's length; see ``_row_cap_dma_chunk``. At ``p > 1`` the
     ``p`` subcores of a group split each row by its length.
+
+    ``rank_major_dcp`` (DCP merge only, ``b <= 32``): ``scores`` is the flat
+    rank-major candidate all-gather ``i32[dcp * b * k]`` -- every row's list
+    from rank 0, then from rank 1, ... -- rather than ``[b, dcp * k]``. Each
+    subcore fetches its own row's ``dcp`` pieces, so the scores and
+    ``local_idxs`` are neither padded to 32 rows nor relaid out from 2-D tiles,
+    and only ``b * k`` slots are written. Same row contents, same output.
     """
-    b, n = scores.shape
-    dma_chunk = 0
+    if rank_major_dcp:
+        if local_idxs is None or p != 1 or row_cap or scores.ndim != 1:
+            raise ValueError("rank_major_dcp needs a flat DCP merge at p = 1")
+        b = local_idxs.shape[0]
+        n = rank_major_dcp * k
+        if scores.shape != (rank_major_dcp * b * k,) or not rank_major_merge_fits(b):
+            raise ValueError(
+                f"rank_major_dcp={rank_major_dcp}: scores {scores.shape} for"
+                f" {b} rows of k={k}"
+            )
+    else:
+        b, n = scores.shape
+    dma_chunk = k if rank_major_dcp else 0
     if row_cap:
         if local_idxs is not None:
             raise ValueError("row_cap needs no local_idxs")
@@ -851,7 +940,8 @@ def _sc_topk_direct(
     groups_per_chip = 32 // p
     slice_len = _align_to(n // p, LANES)
     num_waves = _cdiv(b, groups_per_chip)
-    padded_b = num_waves * groups_per_chip
+    # The rank-major merge fetches only its b rows: nothing is padded.
+    padded_b = b if rank_major_dcp else num_waves * groups_per_chip
     pad_b = padded_b - b
     pad_n = slice_len * p - n
     if pad_b > 0 or pad_n > 0:
@@ -914,6 +1004,14 @@ def _sc_topk_direct(
             pltpu.VMEM((padded_b + LANES,), jnp.int32),  # lenall_vmem
             pltpu.SemaphoreType.DMA((1,)),  # dma_sem
         )
+    elif rank_major_dcp:
+        scratch_types = (
+            *scratch_types,
+            pltpu.VMEM((slice_len,), jnp.int32),  # rowdata_vmem
+            pltpu.VMEM((LANES,), jnp.int32),  # lenall_vmem: this row's rank
+            pltpu.SemaphoreType.DMA((2,)),  # dma_sem: [scores, rank + slots]
+            pltpu.VMEM((k,), jnp.int32),  # lidx_vmem: this row's local idxs
+        )
 
     body_fn = functools.partial(
         _topk_body,
@@ -927,6 +1025,7 @@ def _sc_topk_direct(
         return_scores=return_scores,
         row_cap=row_cap,
         dma_chunk=dma_chunk,
+        rank_major_dcp=rank_major_dcp,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -1132,26 +1231,44 @@ def sparsecore_topk(
     )
 
 
+def rank_major_merge_fits(b: int) -> bool:
+    """Whether `sparsecore_topk_dcp_merge` takes ``rank_major`` scores for
+    ``b`` rows: one wave of the 32 P = 1 subcores, ``b <= 32``. Wider calls
+    keep the pipelined, double-buffered row read (``b > 32``)."""
+    return b <= 32
+
+
 @functools.partial(
     jax.jit,
-    static_argnames=("k", "dcp_size", "scheduling_group_id"),
+    static_argnames=("k", "dcp_size", "scheduling_group_id", "rank_major"),
 )
 def sparsecore_topk_dcp_merge(
-    scores: jax.Array,  # f32[b, dcp_size * k] or i32[b, dcp_size * k]
+    scores: jax.Array,  # [b, dcp_size * k], or [dcp_size * b * k] if rank_major
     local_idxs: jax.Array,  # i32[b, k]
     k: int,
     *,
     dcp_rank: jax.Array,  # i32[]
     dcp_size: int,
     scheduling_group_id: int | None = None,
+    rank_major: bool = False,
 ) -> jax.Array:  # i32[b, k]
-    """Fused global top-k threshold selection, owner filter, and prefix compact."""
-    b, n = scores.shape
-    if n != dcp_size * k or local_idxs.shape != (b, k):
+    """Fused global top-k threshold selection, owner filter, and prefix compact.
+
+    ``rank_major`` (``rank_major_merge_fits(b)``): ``scores`` is the flat
+    candidate all-gather of each rank's ``[b * k]`` list, ``scores[r * b * k +
+    t * k + j] == scores_2d[t, r * k + j]``. The kernel reads the rows in place,
+    with no 32-row pad and no 2-D relayout of the scores or ``local_idxs``.
+    Same result.
+    """
+    b = local_idxs.shape[0]
+    want = (dcp_size * b * k,) if rank_major else (b, dcp_size * k)
+    if scores.shape != want or local_idxs.shape != (b, k):
         raise ValueError(
-            f"Expected scores {(b, dcp_size * k)} and local_idxs {(b, k)}, got"
+            f"Expected scores {want} and local_idxs {(b, k)}, got"
             f" {scores.shape} and {local_idxs.shape}"
         )
+    if rank_major and not rank_major_merge_fits(b):
+        raise ValueError(f"rank_major merge needs b <= 32, got {b}")
     ranks = jnp.full((b,), jnp.reshape(dcp_rank.astype(jnp.int32), ()), jnp.int32)
     out = _sc_topk_direct(
         scores,
@@ -1162,6 +1279,7 @@ def sparsecore_topk_dcp_merge(
         write_empty=True,
         return_scores=False,
         scheduling_group_id=scheduling_group_id,
+        rank_major_dcp=dcp_size if rank_major else 0,
     )
     assert isinstance(out, jax.Array)
     return out

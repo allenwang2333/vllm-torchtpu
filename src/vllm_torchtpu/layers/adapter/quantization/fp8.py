@@ -88,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
+    FP8_PALLAS_HBM_PIN_ATTR,
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
@@ -116,7 +117,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -405,18 +406,13 @@ def _quantize_and_format_single_moe_weight(
     w = w.transpose(1, 2).contiguous()
 
     # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
+    # The `unsqueeze(2)` view is backed by the 3-D scale buffer, which
+    # torch_tpu would re-materialize as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. `fresh_buffer` gives the
+    # persistent parameter a plain 4-D buffer of its own.
     if w_scale is not None:
         s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+        w_scale = fresh_buffer(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -1360,6 +1356,18 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
     return False
 
 
+def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
+    """TPU_FP8_SKINNY_HBM_PIN_SITES lists `prefix`'s site, "."-bounded: the layer's
+    fp8_skinny weight operand is constrained to HBM."""
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_SKINNY_HBM_PIN_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
 def _fp8_pallas_sched_group(prefix: str) -> int | None:
     """TPU_IDX_TOPK_SCHED_GROUPS: G2 for the q_b_proj of a DCP indexer layer (its
     indexer op, built at model init, registered the layer), else None."""
@@ -1660,17 +1668,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
-        # The dequant/requant chain may leave views backed by higher-rank PJRT
-        # buffers. Allocate fresh contiguous persistent parameters so the
-        # matmul boundary sees plain row-major buffers.
-        weight = torch.empty(
-            weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
-        ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        # The dequant/requant chain may leave views backed by buffers of a
+        # different shape (e.g. a squeezed [n_out, 1] scale). Give the
+        # persistent parameters buffers of their own shape so the matmul
+        # boundary needs no per-step `tt_jit_as_strided` program.
+        weight = fresh_buffer(weight)
+        weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -1700,8 +1703,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             if sched_group is not None:
                 setattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, sched_group)
+            hbm_pin = fp8_skinny_hbm_pin_selected(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if hbm_pin:
+                setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
             get_fp8_linear_pallas_op(
-                padded_copy, sched_group
+                padded_copy, sched_group, hbm_pin
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1772,6 +1780,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             sched_kwargs = (
                 {} if sched_group is None else {"scheduling_group_id": sched_group}
             )
+            if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False):
+                sched_kwargs["hbm_pin"] = True
             out = quantized_matmul_pallas(
                 x,
                 weight,

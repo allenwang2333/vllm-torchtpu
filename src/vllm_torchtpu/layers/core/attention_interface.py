@@ -61,6 +61,26 @@ mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
+def sparse_mla_chunk_kwargs() -> dict[str, int]:
+    """Kernel kwargs for the sparse MLA gather + attention chunk size.
+
+    Empty unless `TPU_SPARSE_MLA_CHUNK_TOKENS` is set, so the kernel keeps its
+    default chunk. The chunk must be a multiple of the attention kernel's batch
+    size: the attention grid walks a chunk in whole batches, and the SparseCore
+    gather splits a chunk's `chunk * topk` rows into whole owner batches.
+    """
+    chunk = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    if chunk is None:
+        return {}
+    batch = sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE
+    if chunk % batch:
+        raise ValueError(
+            f"TPU_SPARSE_MLA_CHUNK_TOKENS={chunk} must be a multiple of the "
+            f"sparse MLA attention kernel batch size ({batch})."
+        )
+    return {"gather_and_attention_chunk_size": chunk}
+
+
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
@@ -920,6 +940,7 @@ def sparse_mla_attention(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    chunk_kwargs = sparse_mla_chunk_kwargs()
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -977,6 +998,7 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             cache_layout=cache_layout,
+            **chunk_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
@@ -1043,6 +1065,16 @@ def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
             v for v in sparse_mla_kernel.MIXED_KERNEL_V2_LEVERS if v not in levers
         )
     return levers
+
+
+def _decode_body_levers(value: str) -> tuple[str, ...]:
+    """TPU_MLA_DECODE_BODY_LEVERS -> the decode body's lever tuple ("1" =
+    `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.DECODE_BODY_DEFAULT
+    return tuple(v.strip() for v in value.split(",") if v.strip())
 
 
 def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
@@ -1401,7 +1433,7 @@ def sparse_mla_attention_dcp(
                 "capped_live_rows": envs.TPU_SPARSE_MLA_LIVE_GATHER,
             }
             if topk_cap
-            else {}
+            else sparse_mla_chunk_kwargs()
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
@@ -1427,7 +1459,8 @@ def sparse_mla_attention_dcp(
             and mask_in_kernel
             and split_q_lse
             and topk_cap
-            and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+            and topk_idx.shape[0]
+            > envs.bucket_gate_edge(envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS)
         ):
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 
@@ -1477,6 +1510,7 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
