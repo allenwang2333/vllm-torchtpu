@@ -69,13 +69,16 @@ def patches_match_vllm() -> bool:
     """Checks that MambaManager has the checkpoint API the patches wrap."""
     from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 
-    # The patches wrap vLLM 0.29's (request_id, num_tokens, num_computed_tokens)
-    # internal-checkpoint hook. vLLM 0.31 keys checkpoints by position
-    # (query_start, query_end, checkpoint_position, prefill_end) and rebuilt
-    # cache_blocks and _cache_partial_tail_block around them, so the patches
-    # need a port before they can run there.
-    params = inspect.signature(MambaManager._needs_internal_checkpoint).parameters
-    return "num_computed_tokens" in params
+    # Position-keyed prefill checkpoints: ``_needs_internal_checkpoint``
+    # takes (request_id, query_start, query_end, checkpoint_position,
+    # prefill_end), ``get_num_blocks_to_allocate`` records the reserved slot
+    # in ``_checkpoints`` and ``_cache_partial_tail_block`` takes the
+    # retention interval to decide whether that slot is re-keyed.
+    ckpt = inspect.signature(MambaManager._needs_internal_checkpoint).parameters
+    tail = inspect.signature(MambaManager._cache_partial_tail_block).parameters
+    return {"query_start", "query_end", "checkpoint_position", "prefill_end"} <= set(
+        ckpt
+    ) and "retention_interval" in tail
 
 
 def supported(scheduler: Any) -> tuple[bool, str]:
@@ -259,8 +262,6 @@ def install_mamba_manager_patches() -> None:
     orig_allocate = MambaManager.allocate_new_blocks
     orig_pop = MambaManager.pop_blocks_for_free
 
-    orig_relocate = MambaManager._relocate_speculative_block
-
     def _plan(self, request_id):
         return self.__dict__.get("_tpu_seg_plan", {}).get(request_id)
 
@@ -268,9 +269,9 @@ def install_mamba_manager_patches() -> None:
         """How the full cut's column gets a real block, or None if it holds
         one already (the previous state block, or the CoW'd hit block):
         "null" -> upstream's internal-checkpoint block lands there;
-        "spec" -> it holds a speculative scratch block that this allocation
-        would relocate (the chunk starts at a block boundary), keep it in
-        place as the checkpoint and let upstream append one more block."""
+        "spec" -> it holds a speculative scratch block (the chunk starts at
+        a block boundary); with a checkpoint reserved upstream leaves it in
+        place as the checkpoint and appends fresh speculative blocks."""
         blocks = self.req_to_blocks[request_id]
         if ckpt_idx >= len(blocks) or blocks[ckpt_idx].is_null:
             return "null"
@@ -282,30 +283,44 @@ def install_mamba_manager_patches() -> None:
             return "spec"
         return None
 
-    @wraps(orig_relocate)
-    def _relocate_speculative_block(self, req_blocks, block_idx):
-        keep = self.__dict__.get("_tpu_keep_spec")
-        if keep is not None and keep[0] is req_blocks and keep[1] == block_idx:
-            return
-        return orig_relocate(self, req_blocks, block_idx)
-
     @wraps(orig_needs_ckpt)
-    def _needs_internal_checkpoint(self, request_id, num_tokens, num_computed_tokens):
+    def _needs_internal_checkpoint(
+        self, request_id, query_start, query_end, checkpoint_position, prefill_end
+    ):
         plan = _plan(self, request_id)
         if plan is not None and plan[1]:
+            # Reserve the full cut's column (upstream records it in
+            # ``_checkpoints`` for this allocation); ``checkpoint_position``
+            # names upstream's own boundary and plays no part here.
             full_cut = plan[1]
             ckpt_idx = full_cut // self.block_size - 1
-            run_start = (num_tokens - 1) // self.block_size * self.block_size
-            if plan[0] < full_cut == run_start < num_tokens:
+            run_start = (query_end - 1) // self.block_size * self.block_size
+            if plan[0] < full_cut == run_start < query_end:
                 return _ckpt_slot_kind(self, request_id, ckpt_idx) is not None
             return False
-        return orig_needs_ckpt(self, request_id, num_tokens, num_computed_tokens)
+        return orig_needs_ckpt(
+            self, request_id, query_start, query_end, checkpoint_position, prefill_end
+        )
 
     @wraps(orig_cache_partial)
-    def _cache_partial_tail_block(self, request, num_tokens):
+    def _cache_partial_tail_block(self, request, num_tokens, retention_interval):
+        rid = request.request_id
         override = self.__dict__.get("_tpu_seg_partial_override")
-        if override is None or override[0] != request.request_id:
-            return orig_cache_partial(self, request, num_tokens)
+        if override is None or override[0] != rid:
+            plan = _plan(self, rid)
+            if plan is None or not plan[1]:
+                return orig_cache_partial(self, request, num_tokens, retention_interval)
+            # The full cut's ``_checkpoints`` entry only sizes the allocation:
+            # its block is hashed by the full-block pass at the cut, so the
+            # tail logic runs without the entry (upstream would re-key the
+            # block at its own checkpoint position or evict the hash as a
+            # transient one).
+            checkpoint = self._checkpoints.pop(rid, None)
+            try:
+                return orig_cache_partial(self, request, num_tokens, retention_interval)
+            finally:
+                if checkpoint is not None:
+                    self._checkpoints[rid] = checkpoint
         # Same checks as upstream, but the tail state lives in the request's
         # first speculative block instead of block num_tokens // block_size.
         block_idx = override[1]
@@ -334,15 +349,26 @@ def install_mamba_manager_patches() -> None:
                 self.num_cached_block.get(request.request_id, 0),
                 num_tokens // self.block_size,
             )
-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            self._producer_partial_tail_reqs[request.request_id] = (
+                source_block,
+                num_tokens,
+            )
             self.__dict__.setdefault("_tpu_spec_partial", set()).add(
                 request.request_id
             )
         return partial_hash
 
     @wraps(orig_cache_blocks)
-    def cache_blocks(self, request, num_tokens, retention_interval=None):
-        orig_cache_blocks(self, request, num_tokens, retention_interval=retention_interval)
+    def cache_blocks(
+        self, request, num_tokens, retention_interval=None, *, replay_boundaries
+    ):
+        orig_cache_blocks(
+            self,
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
         rid = request.request_id
         plan = _plan(self, rid)
         if plan is not None:
@@ -371,7 +397,9 @@ def install_mamba_manager_patches() -> None:
                 try:
                     # Through the instance attribute so HybridStateRetention's
                     # hook sees the real boundary (safe-tail prompt, tracking).
-                    partial_hash = self._cache_partial_tail_block(request, partial_cut)
+                    partial_hash = self._cache_partial_tail_block(
+                        request, partial_cut, retention_interval
+                    )
                 finally:
                     self.__dict__["_tpu_seg_partial_override"] = None
                 if partial_hash is not None:
@@ -389,7 +417,8 @@ def install_mamba_manager_patches() -> None:
             and rid in self._partial_hit_reqs
         ):
             _, partial_blk = self._partial_hit_reqs[rid]
-            boundary_tokens = self._producer_partial_tail_reqs.pop(rid)
+            marker_block, boundary_tokens = self._producer_partial_tail_reqs.pop(rid)
+            assert marker_block is partial_blk
             self._pending_boundary_state_offloads.append(
                 (rid, self.kv_cache_group_id, partial_blk, boundary_tokens)
             )
@@ -414,28 +443,16 @@ def install_mamba_manager_patches() -> None:
             self.block_pool.move_block_hashes(source_block, cow_block)
             self._pending_cow_copies.append((source_block, cow_block))
             source_block.ref_cnt += 1
-            boundary_tokens = self._producer_partial_tail_reqs.pop(request_id, None)
-            if boundary_tokens is not None:
+            producer_tail = self._producer_partial_tail_reqs.pop(request_id, None)
+            if producer_tail is not None:
+                marker_block, boundary_tokens = producer_tail
+                assert marker_block is source_block
                 self._pending_boundary_state_offloads.append(
                     (request_id, self.kv_cache_group_id, cow_block, boundary_tokens)
                 )
             if cow_block.block_hash is not None:
                 self.cached_blocks_this_step.add(cow_block.block_hash)
-        keep = None
-        plan = _plan(self, request_id)
-        if (
-            plan is not None
-            and plan[1]
-            and self._num_checkpoint_blocks.get(request_id, 0)
-            and _ckpt_slot_kind(self, request_id, plan[1] // self.block_size - 1)
-            == "spec"
-        ):
-            keep = (self.req_to_blocks[request_id], plan[1] // self.block_size - 1)
-        self.__dict__["_tpu_keep_spec"] = keep
-        try:
-            return orig_allocate(self, request_id, num_tokens, num_tokens_main_model)
-        finally:
-            self.__dict__["_tpu_keep_spec"] = None
+        return orig_allocate(self, request_id, num_tokens, num_tokens_main_model)
 
     @wraps(orig_pop)
     def pop_blocks_for_free(self, request_id):
@@ -445,7 +462,6 @@ def install_mamba_manager_patches() -> None:
         return orig_pop(self, request_id)
 
     for fn in (
-        _relocate_speculative_block,
         _needs_internal_checkpoint,
         _cache_partial_tail_block,
         cache_blocks,
@@ -453,7 +469,6 @@ def install_mamba_manager_patches() -> None:
         pop_blocks_for_free,
     ):
         setattr(fn, _PATCH_FLAG, True)
-    MambaManager._relocate_speculative_block = _relocate_speculative_block
     MambaManager._needs_internal_checkpoint = _needs_internal_checkpoint
     MambaManager._cache_partial_tail_block = _cache_partial_tail_block
     MambaManager.cache_blocks = cache_blocks
