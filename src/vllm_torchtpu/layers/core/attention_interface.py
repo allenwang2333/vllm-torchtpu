@@ -1299,6 +1299,11 @@ def sparse_mla_attention_dcp(
             if tuple(rows_.shape) != want:
                 raise ValueError(f"kv_rows is {rows_.shape}, expected {want}")
             kv_write = jax.lax.bitcast_convert_type(rows_, jnp.uint32)
+            # seq_lens and the rank are otherwise unread on this path, and an
+            # unread operand is pruned from the exported callee (which then
+            # takes fewer operands than the torch op passes). A zero keeps them.
+            zero = (seq_lens_[0] * 0 + jnp.asarray(dcp_rank) * 0).astype(jnp.uint32)
+            kv_write = kv_write + zero
         elif kv_in_gather:
             # The gather writes the rows; only their addresses and packed
             # bytes are built here (what `tc_scatter` computed in-kernel).
@@ -1451,13 +1456,10 @@ def sparse_mla_attention_dcp(
     rank_args = () if dcp_rank_ids is None else (dcp_rank_ids,)
     if rank_args:
         in_specs = in_specs + (P(dcp_axis_name),)
-    # kv_rows leaves seq_lens and the rank operand unread; keep them, so the
-    # exported function takes every operand the torch op passes.
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
         ),
-        keep_unused=kv_rows is not None,
     )(
         ql_nope,
         q_pe,
