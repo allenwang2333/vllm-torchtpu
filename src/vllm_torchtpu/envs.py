@@ -280,6 +280,7 @@ if TYPE_CHECKING:
     TPU_DISABLE_RUNNER_STAGE_TIMING: bool = False
     TPU_SKIP_UNCHANGED_PADDING_UPLOAD: bool = False
     TPU_DRAFT_LOOP_CACHE_UPLOADS: bool = False
+    TPU_GC_STEP_ALIGNED_COLLECT: int = 0
 
 
 def env_with_choices(
@@ -1871,6 +1872,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (two H2Ds per chunk) on every propose. Keep them per (kernel_num_reqs,
     # num_reqs) instead, at most 2 * max_num_reqs small tensors. Values unchanged.
     "TPU_DRAFT_LOOP_CACHE_UPLOADS": env_bool("TPU_DRAFT_LOOP_CACHE_UPLOADS"),
+    # Worker: after warmup (and vLLM's gc.freeze of the warmed heap) turn
+    # automatic GC off and run gc.collect() every this many execute_model
+    # calls, at the same step on every rank. 0 keeps Python's automatic GC.
+    "TPU_GC_STEP_ALIGNED_COLLECT": env_nonnegative_int(
+        "TPU_GC_STEP_ALIGNED_COLLECT", 0
+    ),
 }
 
 

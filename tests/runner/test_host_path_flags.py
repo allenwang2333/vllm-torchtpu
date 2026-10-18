@@ -5,6 +5,10 @@
 """Host-path flags of the decode loop: each is off by default, and on it must
 change only host work, never a value the device computes."""
 
+import gc
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 from vllm_torchtpu import envs
@@ -29,3 +33,34 @@ def test_null_stage_timing_runs_the_body_and_records_nothing():
     assert timing.take_samples() == ([], [])
     with pytest.raises(RuntimeError), timing.stage("sample"):
         raise RuntimeError("stage body error propagates")
+
+
+@pytest.mark.parametrize("every", [0, 3])
+def test_gc_step_aligned_collect(monkeypatch, every):
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
+
+    monkeypatch.setenv("TPU_GC_STEP_ALIGNED_COLLECT", str(every))
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            capture_model=lambda: None, execute_model=lambda so: ("out", so)
+        ),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+        _gc_collect_every=0,
+        _gc_steps_since_collect=0,
+    )
+    was_enabled = gc.isenabled()
+    try:
+        with (
+            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap"),
+            patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+            patch("vllm_torchtpu.worker.tpu_worker.set_torch_threads_for_runtime"),
+        ):
+            TPUWorker.compile_or_warm_up_model(worker)
+        assert gc.isenabled() == (every == 0)
+        with patch("vllm_torchtpu.worker.tpu_worker.gc.collect") as collect:
+            outs = [TPUWorker.execute_model(worker, i) for i in range(7)]
+        assert outs == [("out", i) for i in range(7)]
+        assert collect.call_count == (7 // every if every else 0)
+    finally:
+        if was_enabled:
+            gc.enable()
