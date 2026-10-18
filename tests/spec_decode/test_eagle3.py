@@ -2570,7 +2570,15 @@ def test_propose_loop_upload_cache(cache_uploads, device):
                 discard_sampled_tokens_req_indices=[],
                 num_rejected_tokens_np=None,
                 scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+                # The async path GLM-5.2 serves with: device drafts and a
+                # device num_rejected.
+                return_device=True,
+                next_tokens_per_chunk=[
+                    torch.zeros((num_reqs, K + 1), dtype=torch.int32, device=device)
+                ],
             )
+            .cpu()
+            .tolist()
         )
 
     assert results[0] == results[1] == [[40, 41, 42]] * num_reqs
