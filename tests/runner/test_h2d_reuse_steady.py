@@ -26,8 +26,8 @@ def _runner(temps, top_k, top_p):
     return r
 
 
-def _call(r, n=3, padded=8):
-    logits = torch.zeros(padded, 4, dtype=torch.float32)
+def _call(r, n=3, padded=8, dtype=torch.float32):
+    logits = torch.zeros(padded, 4, dtype=dtype)
     return TPUModelRunner._build_padded_sampling_params(r, 0, n, logits, padded_num_reqs=padded)
 
 
@@ -59,3 +59,24 @@ def test_shape_change_uploads(monkeypatch):
     a = _call(r, padded=8)
     b = _call(r, padded=16)
     assert a[0].shape[0] == 8 and b[0].shape[0] == 16 and a[0] is not b[0]
+
+
+def test_bfloat16_logits(monkeypatch):
+    """The temperatures follow the logits dtype; bf16 has no numpy dtype."""
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "1")
+    r = _runner([0.7, 1.0, 0.5], [20, 0, 5], [0.9, 1.0, 0.8])
+    a = _call(r, dtype=torch.bfloat16)
+    b = _call(r, dtype=torch.bfloat16)
+    assert a[0].dtype == torch.bfloat16 and all(x is y for x, y in zip(a, b))
+    r.input_batch.temperature_cpu_tensor[0] = 0.71  # differs in bf16 too
+    c = _call(r, dtype=torch.bfloat16)
+    assert c[0] is not a[0]
+    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    for x, y in zip(c, _call(r, dtype=torch.bfloat16)):
+        assert x.dtype == y.dtype and torch.equal(x, y)
+
+
+def test_key_bytes_match_numpy_for_numpy_dtypes():
+    for t in (torch.arange(9, dtype=torch.int32), torch.arange(6, dtype=torch.int64)[::2],
+              torch.tensor([True, False]), torch.rand(3, 2).t()):
+        assert t.contiguous().view(torch.uint8).numpy().tobytes() == t.numpy().tobytes()

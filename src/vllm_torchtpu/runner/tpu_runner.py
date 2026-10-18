@@ -3422,7 +3422,14 @@ class TPUModelRunner(GPUModelRunner):
         The entry also holds `host`, so a temporary array stays alive while its
         non-blocking upload may still be reading it.
         """
-        key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
+        # Raw bytes via a uint8 view: numpy has no bfloat16 (the sampling
+        # temperatures are in the logits dtype); same bytes as numpy's
+        # C-order tobytes() for every dtype numpy does have.
+        key = (
+            host.dtype,
+            tuple(host.shape),
+            host.contiguous().view(torch.uint8).numpy().tobytes(),
+        )
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
