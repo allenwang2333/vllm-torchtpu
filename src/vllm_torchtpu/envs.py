@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     TPU_MTP_DCP_MERGE_SMALL_A2A: bool = False
     TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_VOCAB_EMBED_I32_BOUNDS: bool = False
+    TPU_MOE_TP_DECODE_HBM_OPERANDS: str = ""
     TPU_DCP_MLA_SEND_LAYOUT: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = False
@@ -1132,6 +1133,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (n_valid, rank, experts_start) is the same HLO value in every layer and
     # XLA CSE keeps one per step (was one HBM->HBM op per layer). Exact.
     "TPU_MOE_TP_DECODE_SHARED_META": env_bool("TPU_MOE_TP_DECODE_SHARED_META"),
+    # moe_tp_decode's 8 weight operands (routed w13/w2 and scales, shared
+    # expert and scales) constrained to HBM: "drafter" = the MTP drafter's
+    # MoE layer only, "all" = every armed layer, "" = off. The kernel DMAs
+    # what it reads from HBM itself; unconstrained, XLA can stage whole
+    # weights into VMEM with a copy-start/-done right before the call (the
+    # drafter's one-layer program: ~7 us/pass exposed). Same output bits.
+    "TPU_MOE_TP_DECODE_HBM_OPERANDS": lambda: os.getenv(
+        "TPU_MOE_TP_DECODE_HBM_OPERANDS", ""
+    ).strip().lower(),
     # Decode-sized residual RMSNorm (rows below the Pallas threshold): pin the
     # f32 sum x + residual and the bf16 residual it returns behind an
     # optimization barrier, so XLA materializes each once instead of
