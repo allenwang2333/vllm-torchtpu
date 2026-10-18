@@ -2416,19 +2416,23 @@ def _attention_kernel(
     def xchg_merge_store():
         """Merge mode: the unpack + torch `_merge_received` on the W received
         slabs in `recv_v_ref`, term by term, senders in order 0..W-1; the bf16
-        result's words go to bo slot 1 and one DMA to the second output."""
+        result's words go to bo slot 1 and one DMA to the second output.
+
+        Two passes so that few values are live at once: the lse columns and
+        weights first (one [tl, 1] column per sender), then each sender's
+        partial rows streamed into two f32 accumulators."""
         n = send_world
         tl = send_rows
+        hdr = SEND_PAD_ROWS  # the first int16 tile of a slab (word row inside)
         live = start_end_seq_idx_ref[4] * send_per  # real tokens x L
-        rows_i = lax.broadcasted_iota(jnp.int32, (tl, o_dim), 0)
         r128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 0)
         c128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 1)
-        l_cols, o_rows = [], []
+        l_cols = []
         for w in range(n):
             # int16 words to int32 lanes (sign-extended): row SEND_SLAB_ROW0 - 1
-            # is the lse word row, rows from SEND_SLAB_ROW0 the bf16 partials.
-            xi = recv_v_ref[w].astype(jnp.int32)  # [SEND_SLAB_ROW0 + tl, o_dim]
-            words = xi[SEND_SLAB_ROW0 - 1 : SEND_SLAB_ROW0]  # [1, o_dim]
+            # of the slab is the lse word row.
+            head = recv_v_ref[w, pl.ds(0, hdr), :].astype(jnp.int32)
+            words = head[SEND_SLAB_ROW0 - 1 : SEND_SLAB_ROW0]  # [1, o_dim]
             lo_src = pltpu.roll(words, o_dim - tl, 1)  # lane r <- lane tl + r
             bits = lax.shift_left(words, jnp.int32(16)) | (lo_src & 0xFFFF)
             l_row = lax.bitcast_convert_type(bits, jnp.float32)[:, :128]
@@ -2440,13 +2444,6 @@ def _attention_kernel(
                     keepdims=True,
                 )
             )  # f32 [tl, 1]
-            # bf16 -> f32 is the bits shifted up 16 (exact, NaNs kept).
-            part = lax.bitcast_convert_type(
-                lax.shift_left(xi[SEND_SLAB_ROW0 : SEND_SLAB_ROW0 + tl], jnp.int32(16)),
-                jnp.float32,
-            )
-            # The unpack: partial rows past the real ones are zero.
-            o_rows.append(jnp.where(rows_i < live, part, 0.0))
         finite = [jnp.isfinite(c) for c in l_cols]
         shift = jnp.where(finite[0], l_cols[0], -jnp.inf)
         for w in range(1, n):
@@ -2459,6 +2456,7 @@ def _attention_kernel(
         for w in range(1, n):
             denom = denom + weights[w]
         denom = jnp.where(denom > 0, denom, 1.0)
+        rows_i = lax.broadcasted_iota(jnp.int32, (tl, o_dim), 0)
         acc_hi = jnp.zeros((tl, o_dim), jnp.float32)
         acc_lo = jnp.zeros((tl, o_dim), jnp.float32)
         for w in range(n):
@@ -2467,9 +2465,18 @@ def _attention_kernel(
             w_lo = wt - w_hi
             if fault == "send_merge_lo_skip":
                 w_lo = jnp.zeros_like(w_lo)
-            of = jnp.where(jnp.isnan(o_rows[w]), 0.0, o_rows[w])
-            acc_hi = acc_hi + of * w_hi
-            acc_lo = acc_lo + of * w_lo
+            # bf16 -> f32 is the bits shifted up 16 (exact, NaNs kept); the
+            # unpack zeroes partial rows past the real ones; NaN partials are
+            # zeroed as the merge does.
+            xi = recv_v_ref[w].astype(jnp.int32)  # [SEND_SLAB_ROW0 + tl, o_dim]
+            part = lax.bitcast_convert_type(
+                lax.shift_left(xi[SEND_SLAB_ROW0 : SEND_SLAB_ROW0 + tl], jnp.int32(16)),
+                jnp.float32,
+            )
+            part = jnp.where(rows_i < live, part, 0.0)
+            part = jnp.where(jnp.isnan(part), 0.0, part)
+            acc_hi = acc_hi + part * w_hi
+            acc_lo = acc_lo + part * w_lo
         out = (acc_hi + acc_lo).astype(jnp.bfloat16)
         bo_x2_ref[1, 0, pl.ds(0, tl), :] = pltpu.bitcast(out, jnp.int16)
         copy = pltpu.make_async_copy(
