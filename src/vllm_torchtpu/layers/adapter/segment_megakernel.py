@@ -129,8 +129,7 @@ class _Tail:
     dcp_rank: torch.Tensor  # the DCP attention ops' rank operand (one buffer)
 
 
-# Layer N's hand-off to layer N+1: (residual, q_c, kv_rows). A plain tuple, so
-# Dynamo traces it without a user class.
+# The megakernel's outputs for layer N+1: (residual, q_c, kv_rows).
 SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
@@ -506,6 +505,8 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
     runner = _moe_runner(layer)
     if runner is None:
         return "layer N is not a MoE layer (dense FFN tails keep the usual path)"
+    if getattr(layer.mlp, "experts", None) is not runner:
+        return "layer N's MoE runner is not layer.mlp.experts"
     if not moe_tp_decode.moe_tp_decode_supported(runner._quant_method):
         return "layer N's MoE is not armed by moe_tp_decode"
     moe = runner.routed_experts
@@ -781,21 +782,31 @@ def takes_tail(layer: Any, positions: torch.Tensor) -> bool:
 
 
 def segment_forward(
-    layer: Any, recv: torch.Tensor, residual: torch.Tensor, positions: torch.Tensor
+    prev: Any,
+    layer: Any,
+    recv: torch.Tensor,
+    residual: torch.Tensor,
+    positions: torch.Tensor,
 ) -> SegmentOut:
-    """Run the megakernel for armed layer N from its merge receive buffer."""
+    """The megakernel for the boundary (prev = armed layer N, layer = N+1)
+    from N's merge receive buffer. Called from N+1's step, and every tensor is
+    read through the module paths the usual forward reads it through
+    (`layers[i].mlp.experts.routed_experts...`): Dynamo names a lifted tensor
+    after its first access path, and the backbone warmup hands a bucket
+    between the two sides of the token-count branch only if both lift the
+    same names."""
     from vllm.model_executor.layers.attention.attention import get_attention_context
 
-    tail: _Tail = getattr(layer, TAIL_ATTR)
-    nxt = tail.head_layer
-    wrap, nwrap = layer.self_attn.mla_attn, nxt.self_attn.mla_attn
+    tail: _Tail = getattr(prev, TAIL_ATTR)
+    wrap, nwrap = prev.self_attn.mla_attn, layer.self_attn.mla_attn
     md, _, _, _ = get_attention_context(nwrap.mla_attn.layer_name)
     padding = token_padding._padding_state
     assert padding is not None, "the segment megakernel needs the token-padding mask"
     # N+1's rope rows, as rope_half_split reads them (bf16 cache).
     cache = nwrap.rotary_emb._match_cos_sin_cache_dtype(residual)
     cos, sin = cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
-    moe = tail.moe_layer
+    runner = prev.mlp.experts
+    moe = runner.routed_experts
     sw13, ss13, sw2, ss2, bias, rank, e0 = (
         getattr(moe, n) for n in moe_tp_decode._BUFFERS
     )
@@ -814,8 +825,8 @@ def segment_forward(
         e0,
         wrap.o_proj.weight,
         wrap.o_proj.weight_scale,
-        layer.post_attention_layernorm.weight,
-        tail.gate.weight,
+        prev.post_attention_layernorm.weight,
+        runner.gate.weight,
         bias,
         moe.w13_weight,
         moe.w2_weight,
@@ -825,7 +836,7 @@ def segment_forward(
         ss13,
         sw2,
         ss2,
-        nxt.input_layernorm.weight,
+        layer.input_layernorm.weight,
         qkv.weight,
         qkv.weight_scale,
         nwrap.q_a_layernorm.weight,
@@ -834,26 +845,33 @@ def segment_forward(
     return res_out, q_c, kv_rows
 
 
+# Layer N's hand-off: (layer N, its merge receive buffer, the residual).
+Pending = tuple[Any, torch.Tensor, torch.Tensor]
+
+
 def run_layer(
     layer: Any,
     positions: torch.Tensor,
     hidden_states: torch.Tensor | None,
     residual: torch.Tensor | None,
     llama_4_scaling: torch.Tensor | None,
-    head: SegmentOut | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, SegmentOut | None]:
-    """One DeepseekV2DecoderLayer step with the segment hand-offs: `head` is
-    layer N-1's (or None); returns (hidden_states, residual, hand-off to
-    N+1). Without either hand-off this is DeepseekV2DecoderLayer.forward on
-    the MLA / no-sequence-parallel path."""
+    pending: Pending | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, Pending | None]:
+    """One DeepseekV2DecoderLayer step with the segment hand-offs: `pending`
+    is armed layer N-1's (or None); returns (hidden_states, residual,
+    hand-off to N+1). Without either hand-off this is
+    DeepseekV2DecoderLayer.forward on the MLA / no-sequence-parallel path."""
     tail = takes_tail(layer, positions)
-    if head is None and not tail:
+    if pending is None and not tail:
         hs, res = layer(positions, hidden_states, residual, llama_4_scaling)
         return hs, res, None
     assert not layer.use_sequence_parallel_moe and not layer.use_mha
     attn_kwargs: dict[str, Any] = {}
-    if head is not None:
-        residual, q_c, kv_rows = head
+    if pending is not None:
+        prev, recv, prev_residual = pending
+        residual, q_c, kv_rows = segment_forward(
+            prev, layer, recv, prev_residual, positions
+        )
         hidden_states = residual  # token-count template only
         attn_kwargs["segment_head"] = (q_c, kv_rows)
     elif residual is None:
@@ -867,7 +885,7 @@ def run_layer(
         positions, hidden_states, llama_4_scaling, **attn_kwargs
     )
     if tail:
-        return None, None, segment_forward(layer, out, residual, positions)
+        return None, None, (layer, out, residual)
     hidden_states, residual = layer.post_attention_layernorm(out, residual)
     hidden_states = layer.mlp(hidden_states)
     return hidden_states, residual, None

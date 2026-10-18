@@ -70,7 +70,7 @@ def patched_model_forward(
         llama_4_scaling = None
 
     aux_hidden_states = []
-    handoff = None  # segment megakernel: layer N's output for layer N+1
+    handoff = None  # segment megakernel: armed layer N's hand-off to layer N+1
     for idx, layer in enumerate(
         islice(self.layers, self.start_layer, self.end_layer),
         start=self.start_layer,
