@@ -91,8 +91,8 @@ from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
-# TPU_SEGMENT_MEGAKERNEL: set on a fused_qkv_a_proj whose weight the segment
-# arming padded to a lane multiple; the value is the logical output width.
+# TPU_SEGMENT_MEGAKERNEL: set on a fused_qkv_a_proj the segment arming gave a
+# lane-padded copy of its weight; the value is the logical output width.
 SEGMENT_QKV_LOGICAL_ATTR = "_segment_megakernel_n_logical"
 
 # Skip indexer scoring when every sequence in the batch is shorter than
@@ -1905,12 +1905,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
 
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-                # TPU_SEGMENT_MEGAKERNEL pads this weight to a lane multiple
-                # at arming (the megakernel's layout); cut back to the width.
-                qkv_layer = self.fused_qkv_a_proj
-                n_logical = getattr(qkv_layer, SEGMENT_QKV_LOGICAL_ATTR, None)
-                if n_logical is not None:
-                    qkv_lora = qkv_lora[..., :n_logical]
                 if self.gate_is_fused:
                     q_c, kv_lora, output_gate = qkv_lora.split(
                         [

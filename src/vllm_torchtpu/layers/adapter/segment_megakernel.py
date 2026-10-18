@@ -127,10 +127,17 @@ class _Tail:
 
     op: Any
     dcp_rank: torch.Tensor  # the DCP attention ops' rank operand (one buffer)
+    slot: torch.Tensor  # int32 [1, 1]: this boundary's row of the stacks
 
 
 # The megakernel's outputs for layer N+1: (residual, q_c, kv_rows).
 SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+# All armed boundaries' small constants, one row / slice per boundary
+# (`fstack`, `sw13s`, `sw2s`; kernel.SegCfg.fields()). One stack per tensor is
+# too large for XLA to place in VMEM ahead of the call; per-layer operands of
+# these sizes each got a serial copy there (j-7694e3a5).
+_STACKS: dict[str, torch.Tensor] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -140,17 +147,14 @@ _PER_RANK = (
     "a2a",
     "dcp_rank",
     "rank",
-    "e0",
+    "slot",
     "oproj_w",
-    "oproj_s",
     "w13",
     "w2",
-    "s13",
     "s2",
-    "sw13",
-    "ss13",
-    "sw2",
-    "ss2",
+    "fstack",
+    "sw13s",
+    "sw2s",
 )
 _ARGS = (
     "a2a",  # int16 [dcp, 1 + 4T, v_head]: N's packed merge receive buffer
@@ -163,27 +167,16 @@ _ARGS = (
     "query_start_loc",
     "dcp_rank",  # int32 [1]
     "rank",  # int32 [1, 1]: mesh index (moe_tp_decode's)
-    # int32 [1, 1]: N's moe_tp_decode first expert (0 under TP). Unused; taken
-    # so both sides of the token-count branch lift the same buffers.
-    "e0",
+    "slot",  # int32 [1, 1]: the boundary's row of the constant stacks
     "oproj_w",  # fp8 [o_in, H]
-    "oproj_s",  # f32 [H]
-    "g_post",  # bf16 [H]
     "gate",  # bf16 [E, H]
-    "bias",  # f32 [E]
     "w13",
     "w2",
-    "s13",
     "s2",
-    "sw13",
-    "ss13",
-    "sw2",
-    "ss2",
-    "g_in",  # bf16 [H]
-    "qkv_w",  # fp8 [H, qkv_pad]
-    "qkv_s",  # f32 [qkv_pad]
-    "g_qa",  # bf16 [q_lora]
-    "g_kva",  # bf16 [kv_lora]
+    "qkv_w",  # fp8 [H, qkv_pad] (the lane-padded copy)
+    "fstack",  # f32 [boundaries, row_width] (this rank's)
+    "sw13s",  # fp8 [boundaries, H, 2 Fs]
+    "sw2s",  # fp8 [boundaries, Fs, H]
 )
 
 
@@ -214,40 +207,26 @@ def _op_body(st: _Statics):
         query_start_loc,
         dcp_rank,
         rank,
-        e0,
+        slot,
         oproj_w,
-        oproj_s,
-        g_post,
         gate,
-        bias,
         w13,
         w2,
-        s13,
         s2,
-        sw13,
-        ss13,
-        sw2,
-        ss2,
-        g_in,
         qkv_w,
-        qkv_s,
-        g_qa,
-        g_kva,
+        fstack,
+        sw13s,
+        sw2s,
     ):
         T = res.shape[0]  # static: one export per token bucket
         cfg = st.cfg(T)
         page_size, num_pages = _kv_geometry()
         n_valid = T - jnp.sum(pad_mask[:T].astype(jnp.int32))
-        # meta[3] is unread by the kernel; e0 rides there so it stays an
-        # operand of the exported function (an unused one would be pruned).
-        meta = jnp.stack(
-            [n_valid, rank.reshape(()), jnp.int32(0), e0.reshape(())]
-        ).astype(jnp.int32)
         cfull, sfull = kernel.rope_lane_tables(cos, sin, cfg.m)
         # The step's KV destination rows on this DCP rank, exactly as
         # sparse_mla_attention_dcp builds them for the gather's KV write.
         spec = types.SimpleNamespace(page_size=page_size, num_pages=num_pages)
-        page, slot = mla_kv_utils._get_dcp_page_and_slot(
+        page, row_slot = mla_kv_utils._get_dcp_page_and_slot(
             T,
             seq_lens,
             block_tables,
@@ -257,36 +236,21 @@ def _op_body(st: _Statics):
             dcp_size=st.dcp,
             interleave_size=st.interleave,
         )
-        dst = mla_kv_utils._dst_rows(page, slot, page_size)
-        row = lambda x: x.reshape(1, -1)  # noqa: E731
+        dst = mla_kv_utils._dst_rows(page, row_slot, page_size)
         ops = dict(
-            meta=meta,
+            meta=kernel.pack_meta(n_valid, rank, slot, dst),
             a2a=a2a,
-            res=res,
-            cfull=cfull,
-            sfull=sfull,
-            g_post=row(g_post),
-            g_in=row(g_in),
-            g_qa=row(g_qa),
-            g_kva=row(g_kva),
-            bias=row(bias),
-            enc=kernel.kv_dst_block(dst, cfg.tok_rows),
+            act=kernel.pack_act(res, cfull, sfull),
             oproj_w=oproj_w,
-            oproj_s=row(oproj_s),
             gate=gate,
             w13=w13,
             w2=w2,
-            s13=s13,
             s2=s2,
-            sw13=sw13,
-            ss13=row(ss13),
-            sw2=sw2,
-            ss2=row(ss2),
             qkv_w=qkv_w,
-            qkv_s=row(qkv_s),
+            fstack=fstack,
+            sw13s=sw13s,
+            sw2s=sw2s,
         )
-        shapes = kernel.operand_shapes(cfg)
-        ops = {k: v.reshape(shapes[k][0]) for k, v in ops.items()}
         out = kernel.segment_call(cfg, ops)
         # int32 across the torch boundary (torch has no general uint32).
         kv_rows = lax.bitcast_convert_type(out["kvp_out"], jnp.int32)
@@ -331,25 +295,16 @@ def _get_op(mesh, st: _Statics):
         query_start_loc: jax.Array,
         dcp_rank: jax.Array,
         rank: jax.Array,
-        e0: jax.Array,
+        slot: jax.Array,
         oproj_w: jax.Array,
-        oproj_s: jax.Array,
-        g_post: jax.Array,
         gate: jax.Array,
-        bias: jax.Array,
         w13: jax.Array,
         w2: jax.Array,
-        s13: jax.Array,
         s2: jax.Array,
-        sw13: jax.Array,
-        ss13: jax.Array,
-        sw2: jax.Array,
-        ss2: jax.Array,
-        g_in: jax.Array,
         qkv_w: jax.Array,
-        qkv_s: jax.Array,
-        g_qa: jax.Array,
-        g_kva: jax.Array,
+        fstack: jax.Array,
+        sw13s: jax.Array,
+        sw2s: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         args = (
             a2a,
@@ -362,25 +317,16 @@ def _get_op(mesh, st: _Statics):
             query_start_loc,
             dcp_rank,
             rank,
-            e0,
+            slot,
             oproj_w,
-            oproj_s,
-            g_post,
             gate,
-            bias,
             w13,
             w2,
-            s13,
             s2,
-            sw13,
-            ss13,
-            sw2,
-            ss2,
-            g_in,
             qkv_w,
-            qkv_s,
-            g_qa,
-            g_kva,
+            fstack,
+            sw13s,
+            sw2s,
         )
         return sharded(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
@@ -638,31 +584,76 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
     return st
 
 
-def _pad_qkv(qkv: Any, n_pad: int, n_logical: int) -> None:
-    """Replace fused_qkv_a_proj's weight / scale by copies zero-padded to
-    `n_pad` columns (the kernel's layout); the usual path cuts its output back
-    to `n_logical` (SEGMENT_QKV_LOGICAL_ATTR)."""
-    from vllm.model_executor.utils import replace_parameter
+QKV_W_BUF = "_segment_megakernel_qkv_w"
 
+
+def _pad_qkv(qkv: Any, n_pad: int, n_logical: int) -> None:
+    """Register on fused_qkv_a_proj row-major copies of its weight / scale
+    zero-padded to `n_pad` columns (the kernel's layout). The parameters stay
+    as they are: the usual path's GEMM reads the weight in the layout its
+    loader left (j-7694e3a5: on a row-major padded weight the 4096-token
+    q_a/kv_a GEMM ran 155 us instead of 80). Costs n_pad x hidden fp8 of HBM
+    per armed boundary."""
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         SEGMENT_QKV_LOGICAL_ATTR,
     )
     from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-    w, s = qkv.weight.data, qkv.weight_scale.data
+    w = qkv.weight.data
     pad = n_pad - w.shape[1]
-    # fresh_buffer: a dtype view as a parameter is re-materialized by a
+    # fresh_buffer: a dtype view handed to an op is re-materialized by a
     # tt_jit_as_strided program before every forward (j-da0b4092).
     w_pad = fresh_buffer(
-        torch.nn.functional.pad(w.view(torch.uint8), (0, pad)).view(w.dtype)
+        torch.nn.functional.pad(w.contiguous().view(torch.uint8), (0, pad)).view(
+            w.dtype
+        )
     )
-    s_pad = fresh_buffer(torch.nn.functional.pad(s, (0, pad)))
-    replace_parameter(qkv, "weight", torch.nn.Parameter(w_pad, requires_grad=False))
-    replace_parameter(
-        qkv, "weight_scale", torch.nn.Parameter(s_pad, requires_grad=False)
-    )
+    qkv.register_buffer(QKV_W_BUF, w_pad, persistent=False)
     setattr(qkv, SEGMENT_QKV_LOGICAL_ATTR, n_logical)
-    synchronize_tensors([qkv.weight, qkv.weight_scale])
+    synchronize_tensors([w_pad])
+
+
+def _one_side_tensors(model: Any, i: int) -> list[torch.Tensor]:
+    """Every tensor of armed boundary (i, i+1) that only one side of the
+    token-count branch reads, through the module paths the usual forward
+    uses."""
+    layer, nxt = model.layers[i], model.layers[i + 1]
+    moe = layer.mlp.experts.routed_experts
+    nwrap = nxt.self_attn.mla_attn
+    qkv = nwrap.fused_qkv_a_proj
+    out = [
+        getattr(layer, TAIL_ATTR).slot,
+        layer.self_attn.mla_attn.o_proj.weight_scale,
+        layer.post_attention_layernorm.weight,
+        moe.w13_weight_scale_inv,
+        *(getattr(moe, n) for n in moe_tp_decode._BUFFERS),
+        nxt.input_layernorm.weight,
+        nwrap.q_a_layernorm.weight,
+        nwrap.kv_a_layernorm.weight,
+        qkv.weight,
+        qkv.weight_scale,
+        getattr(qkv, QKV_W_BUF),
+    ]
+    return out
+
+
+def lift_segment_buffers(model: Any, positions: torch.Tensor) -> torch.Tensor:
+    """`positions` plus a zero read from every tensor only one side of the
+    token-count branch would read (the stacks and padded q_a/kv_a copies on
+    the kernel side; the boundaries' own constants on the usual side), so both
+    traces lift the same inputs, under the same names (this runs first in
+    both), and the backbone warmup can hand buckets between them. XLA drops
+    the zero."""
+    tensors = list(_STACKS.values()) if _STACKS else []
+    for i, layer in enumerate(model.layers):
+        if getattr(layer, TAIL_ATTR, None) is not None:
+            tensors += _one_side_tensors(model, i)
+    zero = None
+    for t in tensors:
+        v = t.reshape(-1)[:1].to(torch.float32)
+        z = (v - v).to(positions.dtype)
+        zero = z if zero is None else zero + z
+    return positions if zero is None else positions + zero
 
 
 def _compile_sizes_reason(vllm_config: Any) -> str | None:
@@ -672,6 +663,55 @@ def _compile_sizes_reason(vllm_config: Any) -> str | None:
     if bad:
         return f"token buckets {bad} <= {kernel.MAX_TOKENS} are not kernel buckets"
     return None
+
+
+def layer_device(layer: Any) -> torch.device:
+    return layer.post_attention_layernorm.weight.device
+
+
+def _consts_row(st: _Statics, layer: Any, nxt: Any) -> torch.Tensor:
+    """Boundary (layer, nxt)'s fstack row (kernel.SegCfg.fields() order)."""
+    moe = _moe_runner(layer).routed_experts
+    sw13, ss13, sw2, ss2, bias, _, _ = (getattr(moe, n) for n in moe_tp_decode._BUFFERS)
+    nwrap = nxt.self_attn.mla_attn
+    consts = dict(
+        oproj_s=layer.self_attn.mla_attn.o_proj.weight_scale,
+        g_post=layer.post_attention_layernorm.weight,
+        g_in=nxt.input_layernorm.weight,
+        g_qa=nwrap.q_a_layernorm.weight,
+        g_kva=nwrap.kv_a_layernorm.weight,
+        bias=bias,
+        ss13=ss13,
+        ss2=ss2,
+        qkv_s=nwrap.fused_qkv_a_proj.weight_scale,
+        s13=moe.w13_weight_scale_inv,
+    )
+    parts = []
+    for name, _, w in st.cfg(kernel.TOKEN_BUCKETS[0]).fields():
+        v = consts[name].detach().reshape(-1).to(torch.float32)
+        parts.append(torch.nn.functional.pad(v, (0, w - v.shape[0])))
+    return torch.cat(parts)
+
+
+def _build_stacks(layers: list, plan: list) -> None:
+    """The constant stacks, one row / slice per armed boundary, as fresh
+    buffers (a view would be re-materialized every forward)."""
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+    rows, sw13s, sw2s = [], [], []
+    for i, st in plan:
+        layer, nxt = layers[i], layers[i + 1]
+        moe = _moe_runner(layer).routed_experts
+        rows.append(_consts_row(st, layer, nxt))
+        sw13s.append(getattr(moe, moe_tp_decode._BUFFERS[0]).detach().contiguous())
+        sw2s.append(getattr(moe, moe_tp_decode._BUFFERS[2]).detach().contiguous())
+    stack8 = lambda xs: torch.stack([x.view(torch.uint8) for x in xs]).view(  # noqa: E731
+        xs[0].dtype
+    )
+    _STACKS["fstack"] = fresh_buffer(torch.stack(rows))
+    _STACKS["sw13s"] = fresh_buffer(stack8(sw13s))
+    _STACKS["sw2s"] = fresh_buffer(stack8(sw2s))
+    synchronize_tensors(list(_STACKS.values()))
 
 
 def arm(model: torch.nn.Module, vllm_config: Any) -> int:
@@ -718,7 +758,9 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     moe_tp_decode._check_ranks_agree(
         dict(sig=sig, mesh_index=mesh_index, armed=len(plan))
     )
-    for i, st in plan:
+    if plan:
+        _build_stacks(layers, plan)
+    for k, (i, st) in enumerate(plan):
         assert not isinstance(topo, str)
         layer, nxt = layers[i], layers[i + 1]
         nwrap = nxt.self_attn.mla_attn
@@ -739,6 +781,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             _Tail(
                 op=_get_op(topo.mesh, st),
                 dcp_rank=dcp_rank_operand(),
+                slot=torch.tensor([[k]], dtype=torch.int32, device=layer_device(layer)),
             ),
         )
         setattr(nxt, HEAD_ATTR, True)
@@ -808,10 +851,7 @@ def segment_forward(
     cos, sin = cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
     runner = prev.mlp.experts
     moe = runner.routed_experts
-    sw13, ss13, sw2, ss2, bias, rank, e0 = (
-        getattr(moe, n) for n in moe_tp_decode._BUFFERS
-    )
-    qkv = nwrap.fused_qkv_a_proj
+    rank = getattr(moe, moe_tp_decode._BUFFERS[5])
     res_out, q_c, kv_rows = tail.op(
         recv,
         residual,
@@ -823,25 +863,16 @@ def segment_forward(
         md.query_start_loc,
         tail.dcp_rank,
         rank,
-        e0,
+        tail.slot,
         wrap.o_proj.weight,
-        wrap.o_proj.weight_scale,
-        prev.post_attention_layernorm.weight,
         runner.gate.weight,
-        bias,
         moe.w13_weight,
         moe.w2_weight,
-        moe.w13_weight_scale_inv,
         moe.w2_weight_scale_inv,
-        sw13,
-        ss13,
-        sw2,
-        ss2,
-        layer.input_layernorm.weight,
-        qkv.weight,
-        qkv.weight_scale,
-        nwrap.q_a_layernorm.weight,
-        nwrap.kv_a_layernorm.weight,
+        getattr(nwrap.fused_qkv_a_proj, QKV_W_BUF),
+        _STACKS["fstack"],
+        _STACKS["sw13s"],
+        _STACKS["sw2s"],
     )
     return res_out, q_c, kv_rows
 

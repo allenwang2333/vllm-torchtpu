@@ -95,9 +95,6 @@ class SegCfg:
     o_tile: int = 1536
     o_slots: int = 2
     qkv_chunks: int = 4
-    # The norm weights and the router bias as 1-D operands (reshaped to one
-    # row in VMEM): their [1, N] reshape is otherwise an XLA copy per call.
-    vec_1d: bool = True
 
     @property
     def m(self) -> int:  # moe_tp_decode row bucket of this token bucket
@@ -122,6 +119,38 @@ class SegCfg:
     @property
     def a2a_rows(self) -> int:  # entry rows per source: lse words + partials
         return -(-2 * self.R4 // self.v_head) + self.R4
+
+    def fields(self) -> tuple[tuple[str, int, int], ...]:
+        """(name, offset, width) of each small f32 constant in one row of the
+        all-layer constant stack `fstack` [boundaries, row_width]."""
+        widths = (
+            ("oproj_s", self.hidden),
+            ("g_post", self.hidden),
+            ("g_in", self.hidden),
+            ("g_qa", self.q_lora),
+            ("g_kva", self.kv_lora),
+            ("bias", self.e_pad),
+            ("ss13", 2 * self.shared_i),
+            ("ss2", self.hidden),
+            ("qkv_s", self.qkv_pad),
+            ("s13", self.experts * 2 * self.moe_i),
+        )
+        out, off = [], 0
+        for name, w in widths:
+            out.append((name, off, w))
+            off += w
+        return tuple(out)
+
+    @property
+    def row_width(self) -> int:
+        _, off, w = self.fields()[-1]
+        return off + w
+
+    def field(self, name: str) -> tuple[int, int]:
+        for n, off, w in self.fields():
+            if n == name:
+                return off, w
+        raise KeyError(name)
 
 
 def supported(cfg: SegCfg) -> str | None:
@@ -358,16 +387,6 @@ def _compact_mxu(cfg, r):
     return r["cnt_s"][0, 0]
 
 
-def _vshape(cfg, n):
-    return (n,) if cfg.vec_1d else (1, n)
-
-
-def _vec(cfg, r, name):
-    """A staged vector operand as one [1, N] row."""
-    v = r[name][...]
-    return v.reshape(1, -1) if cfg.vec_1d else v
-
-
 def _sel(rows, cols, fn):
     """0/1 bf16 selection matrix S[i, j] = fn(i, j) (an exact row permutation
     on the MXU)."""
@@ -383,36 +402,35 @@ _NT = (((1,), (1,)), ((), ()))
 # =====================================================================================
 # operand tables (name order = pallas_call operand order)
 # =====================================================================================
-SMEM_IN = ("meta",)
-# Small per-call operands, taken in HBM and copied to VMEM in the kernel
-# (started at entry, waited at first use): declared VMEM, XLA would copy each
-# into VMEM ahead of the call, serially and exposed (~0.7 us apiece).
-STAGED_IN = (
-    "a2a",
-    "res",
-    "cfull",
-    "sfull",
+SMEM_IN = ("meta",)  # [n_valid, rank, boundary slot, 0 x5, KV dst rows x T]
+META_DST = 8
+# Taken in HBM / anywhere and copied to VMEM in the kernel. XLA places small
+# custom-call operands in VMEM itself (memory space S(1)) with a copy each,
+# and at T = 4 those copies ran serially in front of the call (j-7694e3a5,
+# 16 of them, 12.7 us): so the per-step inputs come as two operands and the
+# per-layer constants as rows of all-layer stacks too large to be placed.
+STAGED_IN = ("a2a", "act")  # act = [res (T rows); cfull (m); sfull (m)], width H
+HBM_IN = (
+    "oproj_w",
+    "gate",
+    "w13",
+    "w2",
+    "s2",
+    "qkv_w",
+    "fstack",  # f32 [boundaries, row_width]: SegCfg.fields() per boundary
+    "sw13s",  # fp8 [boundaries, H, 2 Fs]
+    "sw2s",  # fp8 [boundaries, Fs, H]
+)
+# fstack fields copied whole to VMEM (s13 rows go straight to the expert ring)
+VEC_FIELDS = (
+    "oproj_s",
     "g_post",
     "g_in",
     "g_qa",
     "g_kva",
     "bias",
-    "enc",
-)
-VECTORS = ("g_post", "g_in", "g_qa", "g_kva", "bias")
-HBM_IN = (
-    "oproj_w",
-    "oproj_s",
-    "gate",
-    "w13",
-    "w2",
-    "s13",
-    "s2",
-    "sw13",
     "ss13",
-    "sw2",
     "ss2",
-    "qkv_w",
     "qkv_s",
 )
 OUTS = ("res_out", "qc_out", "kvp_out")
@@ -426,14 +444,10 @@ def scratch_table(cfg: SegCfg):
     spec = MAR.make_spec(cfg.tp, m, H)
     sc = [
         ("o_tiles", pltpu.VMEM((cfg.o_slots, cfg.o_in, cfg.o_tile), F8)),
-        ("os_v", pltpu.VMEM((1, H), F32)),
         ("gate_v", pltpu.VMEM((cfg.e_pad, H), BF16)),
         ("sw13_v", pltpu.VMEM((H, 2 * cfg.shared_i), F8)),
-        ("ss13_v", pltpu.VMEM((1, 2 * cfg.shared_i), F32)),
         ("sw2_v", pltpu.VMEM((cfg.shared_i, H), F8)),
-        ("ss2_v", pltpu.VMEM((1, H), F32)),
         ("qkv_v", pltpu.VMEM((H, cfg.qkv_pad), F8)),
-        ("qkvs_v", pltpu.VMEM((1, cfg.qkv_pad), F32)),
         ("w1_r", pltpu.VMEM((nb, H, 2 * ic), F8)),
         ("w2_r", pltpu.VMEM((nb, ic, H), F8)),
         ("s1_r", pltpu.VMEM((nb, 1, 2 * ic), F32)),
@@ -461,18 +475,17 @@ def scratch_table(cfg: SegCfg):
         ("qc_x", pltpu.VMEM((T, cfg.q_lora), BF16)),
         ("kvp_x", pltpu.VMEM((3 * cfg.tok_rows, LANES), U32)),
         ("in_sem", pltpu.SemaphoreType.DMA((len(STAGED_IN),))),
+        ("vec_sem", pltpu.SemaphoreType.DMA((len(VEC_FIELDS),))),
         ("o_sem", pltpu.SemaphoreType.DMA((cfg.o_slots,))),
-        (
-            "w_sem",
-            pltpu.SemaphoreType.DMA((3 + cfg.qkv_chunks,)),
-        ),  # os, gate, qkv_s, qkv chunks
-        ("shared_sem", pltpu.SemaphoreType.DMA((4,))),
+        ("w_sem", pltpu.SemaphoreType.DMA((1 + cfg.qkv_chunks,))),  # gate, qkv
+        ("shared_sem", pltpu.SemaphoreType.DMA((2,))),
         ("ring_sem", pltpu.SemaphoreType.DMA((nb, 4))),
         ("hit_sem", pltpu.SemaphoreType.DMA((2,))),
         ("out_sem", pltpu.SemaphoreType.DMA((3,))),
     ]
     shapes = operand_shapes(cfg)
     sc += [(n, pltpu.VMEM(*shapes[n])) for n in STAGED_IN]
+    sc += [(f"{n}_v", pltpu.VMEM((1, cfg.field(n)[1]), F32)) for n in VEC_FIELDS]
     sc += [(f"ar1_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     sc += [(f"ar2_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     return sc, spec
@@ -485,9 +498,7 @@ def vmem_need_bytes(cfg: SegCfg) -> dict:
     t = functools.partial(MAR.tiled_bytes, info=info)
     sc, spec = scratch_table(cfg)
     tot = 0
-    for name, s in sc:
-        if name in STAGED_IN:  # counted below, as 2-D rows
-            continue
+    for _, s in sc:
         ms = str(getattr(s, "memory_space", ""))
         if "VMEM" in ms.upper() and hasattr(s, "shape"):
             tot += t(tuple(s.shape), s.dtype)
@@ -496,18 +507,6 @@ def vmem_need_bytes(cfg: SegCfg) -> dict:
         - t((spec.n, spec.m, spec.chunk), BF16)
         - t((spec.m, spec.chunk), BF16)
     )
-    H, T, m = cfg.hidden, cfg.T, cfg.m
-    vin = (
-        t((cfg.dcp, 1 + cfg.R4, cfg.v_head), jnp.int16)
-        + t((T, H), BF16)
-        + 2 * t((m, LANES), BF16)
-        + 2 * t((1, H), BF16)
-        + t((1, cfg.q_lora), BF16)
-        + t((1, cfg.kv_lora), BF16)
-        + t((1, cfg.e_pad), F32)
-        + t((cfg.tok_rows, LANES), U32)
-    )
-    tot += vin
     return {"need": tot, "limit": tot + 2 * MIB}
 
 
@@ -532,7 +531,12 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     meta = r["meta"]
     n_valid = meta[0]
     rank = meta[1]
+    slot_k = meta[2]  # this boundary's row of the constant stacks
     eps = jnp.float32(cfg.rms_eps)
+
+    def frow(name, extra=0, width=None):
+        off, w = cfg.field(name)
+        return r["fstack"].at[pl.ds(slot_k, 1), pl.ds(off + extra, width or w)]
 
     # ---- 1. barrier signals for BOTH in-kernel all-reduces (one prologue;
     #         AR2 skips its wait)
@@ -551,30 +555,29 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     for j in range(min(cfg.o_slots, n_ot)):
         o_copy(j).start()
     w_sem = r["w_sem"]
-    os_copy = pltpu.make_async_copy(r["oproj_s"], r["os_v"], w_sem.at[0])
-    os_copy.start()
+    vec = {}
+    for i, n in enumerate(VEC_FIELDS):
+        vec[n] = pltpu.make_async_copy(frow(n), r[f"{n}_v"], r["vec_sem"].at[i])
+        vec[n].start()
 
     qc_rows = H // cfg.qkv_chunks
     pre = {}
 
     def issue_prefetch():
         """The data-independent weights: router gate, shared expert, q_a/kv_a."""
-        gate = pltpu.make_async_copy(r["gate"], r["gate_v"], w_sem.at[1])
+        gate = pltpu.make_async_copy(r["gate"], r["gate_v"], w_sem.at[0])
         gate.start()
         shared = []
-        for i, (nm, dst) in enumerate(
-            (("sw13", "sw13_v"), ("ss13", "ss13_v"), ("sw2", "sw2_v"), ("ss2", "ss2_v"))
-        ):
-            c = pltpu.make_async_copy(r[nm], r[dst], r["shared_sem"].at[i])
+        for i, (nm, dst) in enumerate((("sw13s", "sw13_v"), ("sw2s", "sw2_v"))):
+            c = pltpu.make_async_copy(r[nm].at[slot_k], r[dst], r["shared_sem"].at[i])
             c.start()
             shared.append(c)
-        qkv = [pltpu.make_async_copy(r["qkv_s"], r["qkvs_v"], w_sem.at[2])]
-        qkv[0].start()
+        qkv = []
         for c in range(cfg.qkv_chunks):
             cp = pltpu.make_async_copy(
                 r["qkv_w"].at[pl.ds(c * qc_rows, qc_rows)],
                 r["qkv_v"].at[pl.ds(c * qc_rows, qc_rows)],
-                w_sem.at[3 + c],
+                w_sem.at[1 + c],
             )
             cp.start()
             qkv.append(cp)
@@ -595,12 +598,12 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     for j in range(n_ot):
         o_copy(j).wait()
         if j == 0:
-            os_copy.wait()
+            vec["oproj_s"].wait()
         y = lax.dot_general(
             xq_o, r["o_tiles"][j % cfg.o_slots], _NN, preferred_element_type=F32
         )
         cols = pl.ds(j * cfg.o_tile, cfg.o_tile)
-        yb = (y * xs_o * r["os_v"][:, cols]).astype(BF16)
+        yb = (y * xs_o * r["oproj_s_v"][:, cols]).astype(BF16)
         r["y_pad"][pl.ds(0, T), cols] = yb.astype(F32)
         if j + cfg.o_slots < n_ot:
             o_copy(j + cfg.o_slots).start()
@@ -616,11 +619,11 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     # ---- 6. post_attention_layernorm(attn_sum, residual)
     r["res_pad"][...] = jnp.zeros((m, H), F32)
-    staged["res"].wait()
-    staged["g_post"].wait()
-    r["res_pad"][pl.ds(0, T), :] = r["res"][...].astype(F32)
+    staged["act"].wait()
+    vec["g_post"].wait()
+    r["res_pad"][pl.ds(0, T), :] = r["act"][pl.ds(0, T), :].astype(F32)
     h, s1 = rms_add(
-        r["ar1_out"][...].astype(F32), r["res_pad"][...], _vec(cfg, r, "g_post"), eps
+        r["ar1_out"][...].astype(F32), r["res_pad"][...], r["g_post_v"][...], eps
     )
     r["res1_v"][...] = s1.astype(BF16).astype(F32)
     r["h_v"][...] = h
@@ -633,8 +636,8 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     scores = jax.nn.sigmoid(logits)
 
     # ---- 8a. routing
-    staged["bias"].wait()
-    r["wtab"][...] = _route_argmax(scores, _vec(cfg, r, "bias"), n_valid, topk=cfg.topk)
+    vec["bias"].wait()
+    r["wtab"][...] = _route_argmax(scores, r["bias_v"][...], n_valid, topk=cfg.topk)
     hit = jnp.any(r["wtab"][...] != 0, axis=0, keepdims=True)
     r["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
     ring_sem = r["ring_sem"]
@@ -653,7 +656,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
                 r["w2"].at[e], r["w2_r"].at[slot], ring_sem.at[slot, 1]
             ),
             pltpu.make_async_copy(
-                r["s13"].at[e, 0], r["s1_r"].at[slot], ring_sem.at[slot, 2]
+                frow("s13", e * (2 * cfg.moe_i), 2 * cfg.moe_i),
+                r["s1_r"].at[slot],
+                ring_sem.at[slot, 2],
             ),
             pltpu.make_async_copy(
                 r["s2"].at[e, 0], r["s2_r"].at[slot], ring_sem.at[slot, 3]
@@ -670,6 +675,8 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     # ---- 8c. shared expert + x quant
     for c in pre["shared"]:
         c.wait()
+    vec["ss13"].wait()
+    vec["ss2"].wait()
     x_bf = r["h_v"][...]
     r["owner"][...] = jnp.zeros((m, H), F32)
     sxq, sxs = quantize_block(x_bf, axis=1, target_dtype=F8)
@@ -748,9 +755,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     _ar_epilogue(spec, rank, n_valid, combined, r["ar2_out"], ar2, wait_barrier=False)
 
     # ---- 10. input_layernorm of layer N+1; residual exit (async)
-    staged["g_in"].wait()
+    vec["g_in"].wait()
     h2, s2 = rms_add(
-        r["ar2_out"][...].astype(F32), r["res1_v"][...], _vec(cfg, r, "g_in"), eps
+        r["ar2_out"][...].astype(F32), r["res1_v"][...], r["g_in_v"][...], eps
     )
     r["res_m"][...] = s2.astype(BF16)
     r["res_x"][...] = r["res_m"][pl.ds(0, T), :]
@@ -760,10 +767,10 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     # ---- 11. fused q_a/kv_a (xla_quantized_matmul numerics), K-chunked
     xq2, xs2 = quant_rows_block(h2)
-    pre["qkv"][0].wait()
+    vec["qkv_s"].wait()
     acc = None
     for c in range(cfg.qkv_chunks):
-        pre["qkv"][1 + c].wait()
+        pre["qkv"][c].wait()
         part = lax.dot_general(
             xq2[:, c * qc_rows : (c + 1) * qc_rows],
             r["qkv_v"][pl.ds(c * qc_rows, qc_rows), :],
@@ -771,21 +778,23 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
             preferred_element_type=F32,
         )
         acc = part if acc is None else acc + part
-    qkv = ((acc * xs2) * r["qkvs_v"][...]).astype(BF16)  # [m, qkv_pad]
+    qkv = ((acc * xs2) * r["qkv_s_v"][...]).astype(BF16)  # [m, qkv_pad]
     q_pre = qkv[:, : cfg.q_lora]
     kv_c = qkv[:, cfg.q_lora : cfg.q_lora + cfg.kv_lora]
     k0 = cfg.q_lora + cfg.kv_lora
     pe_blk = qkv[:, k0 : k0 + LANES]  # k_pe in lanes 0..63
 
     # ---- 12. q_a_layernorm -> q_c exit (async); KV pack exit
-    for n in ("g_qa", "g_kva", "cfull", "sfull", "enc"):
-        staged[n].wait()
-    q_c, _ = rms_add(q_pre.astype(F32), None, _vec(cfg, r, "g_qa"), eps)
+    vec["g_qa"].wait()
+    vec["g_kva"].wait()
+    q_c, _ = rms_add(q_pre.astype(F32), None, r["g_qa_v"][...], eps)
     r["qc_m"][...] = q_c
     r["qc_x"][...] = r["qc_m"][pl.ds(0, T), :]
     qc_copy = pltpu.make_async_copy(r["qc_x"], r["qc_out"], out_sem.at[1])
     qc_copy.start()
-    _skip_exit(cfg, r, kv_c, pe_blk, r["cfull"][...], r["sfull"][...], eps)
+    cfull = r["act"][pl.ds(T, m), pl.ds(0, LANES)]
+    sfull = r["act"][pl.ds(T + m, m), pl.ds(0, LANES)]
+    _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps)
     kvp_copy = pltpu.make_async_copy(r["kvp_x"], r["kvp_out"], out_sem.at[2])
     kvp_copy.start()
     for c in (res_copy, qc_copy, kvp_copy):
@@ -845,9 +854,9 @@ def _entry_merge(cfg: SegCfg, r):
 def _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps):
     """kv_a_layernorm, k_pe NeoX rope, clamp-convert to fp8, `_pack_lane_dense`
     words, `pack_write_rows` layout u32[3 Tp, 128] (rows >= T zero; the
-    destination block `enc` comes from the wrapper)."""
+    destination rows come in meta)."""
     T, m, tp = cfg.T, cfg.m, cfg.tok_rows
-    kv_n, _ = rms_add(kv_c.astype(F32), None, _vec(cfg, r, "g_kva"), eps)
+    kv_n, _ = rms_add(kv_c.astype(F32), None, r["g_kva_v"][...], eps)
     pe_r = rope_lanes(pe_blk, cfull, sfull)
     row = lax.broadcasted_iota(I32, (m, LANES), 0)
     lane = lax.broadcasted_iota(I32, (m, LANES), 1)
@@ -870,7 +879,13 @@ def _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps):
     kvp = r["kvp_x"]
     kvp[pl.ds(0, tp), :] = nope[:tp]
     kvp[pl.ds(tp, tp), :] = ropew[:tp]
-    kvp[pl.ds(2 * tp, tp), :] = r["enc"][...]
+    # The gather's destination block: enc = dst + 1 (0 = skip) on all lanes.
+    rows = lax.broadcasted_iota(I32, (tp, LANES), 0)
+    enc = jnp.zeros((tp, LANES), I32)
+    for t in range(T):
+        d = r["meta"][META_DST + t]
+        enc = jnp.where(rows == t, jnp.where(d >= 0, d + 1, 0), enc)
+    kvp[pl.ds(2 * tp, tp), :] = pltpu.bitcast(enc, U32)
 
 
 # =====================================================================================
@@ -916,35 +931,51 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
     return dict(zip(OUTS, outs, strict=True))
 
 
-def operand_shapes(cfg: SegCfg) -> dict:
-    """name -> (shape, dtype) the kernel takes (per device)."""
+def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
+    """name -> (shape, dtype) the kernel takes (per device); `boundaries`
+    sizes the constant stacks."""
     H, T, m = cfg.hidden, cfg.T, cfg.m
     return {
-        "meta": ((4,), I32),  # [n_valid, rank, 0, 0]
+        "meta": ((META_DST + T,), I32),
         "a2a": ((cfg.dcp, 1 + cfg.R4, cfg.v_head), jnp.int16),
-        "res": ((T, H), BF16),
-        "cfull": ((m, LANES), BF16),
-        "sfull": ((m, LANES), BF16),
-        "g_post": (_vshape(cfg, H), BF16),
-        "g_in": (_vshape(cfg, H), BF16),
-        "g_qa": (_vshape(cfg, cfg.q_lora), BF16),
-        "g_kva": (_vshape(cfg, cfg.kv_lora), BF16),
-        "bias": (_vshape(cfg, cfg.e_pad), F32),
-        "enc": ((cfg.tok_rows, LANES), U32),
+        "act": ((T + 2 * m, H), BF16),
         "oproj_w": ((cfg.o_in, H), F8),
-        "oproj_s": ((1, H), F32),
         "gate": ((cfg.e_pad, H), BF16),
         "w13": ((cfg.experts, H, 2 * cfg.moe_i), F8),
         "w2": ((cfg.experts, cfg.moe_i, H), F8),
-        "s13": ((cfg.experts, 1, 1, 2 * cfg.moe_i), F32),
         "s2": ((cfg.experts, 1, 1, H), F32),
-        "sw13": ((H, 2 * cfg.shared_i), F8),
-        "ss13": ((1, 2 * cfg.shared_i), F32),
-        "sw2": ((cfg.shared_i, H), F8),
-        "ss2": ((1, H), F32),
         "qkv_w": ((H, cfg.qkv_pad), F8),
-        "qkv_s": ((1, cfg.qkv_pad), F32),
+        "fstack": ((boundaries, cfg.row_width), F32),
+        "sw13s": ((boundaries, H, 2 * cfg.shared_i), F8),
+        "sw2s": ((boundaries, cfg.shared_i, H), F8),
     }
+
+
+def pack_act(res, cfull, sfull):
+    """The `act` operand: [res (T rows); cfull (m rows); sfull (m rows)], the
+    rope tables zero-padded to the residual's width."""
+    H = res.shape[1]
+    pad = lambda x: jnp.pad(x, ((0, 0), (0, H - x.shape[1])))  # noqa: E731
+    return jnp.concatenate([res, pad(cfull), pad(sfull)], axis=0)
+
+
+def pack_meta(n_valid, rank, slot, dst_rows):
+    """The SMEM `meta` operand."""
+    head = jnp.stack([jnp.asarray(x, I32).reshape(()) for x in (n_valid, rank, slot)])
+    return jnp.concatenate(
+        [head, jnp.zeros((META_DST - 3,), I32), dst_rows.astype(I32)]
+    )
+
+
+def fstack_row(cfg: SegCfg, consts: dict):
+    """One boundary's `fstack` row (f32 [row_width]) from its constants:
+    oproj_s, g_post, g_in, g_qa, g_kva, bias, ss13, ss2, qkv_s (padded to
+    qkv_pad), s13 ([E, 1, 1, 2I])."""
+    parts = []
+    for name, _, w in cfg.fields():
+        v = consts[name].astype(F32).reshape(-1)
+        parts.append(jnp.pad(v, (0, w - v.shape[0])))
+    return jnp.concatenate(parts)
 
 
 def rope_lane_tables(cos, sin, m):

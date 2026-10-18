@@ -250,7 +250,6 @@ def _shared_inputs(d: Dims, T: int, n_valid: int, seed: int):
 # =====================================================================================
 def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=None):
     cfg = d.cfg(T)
-    row = lambda x: x.reshape(1, -1)  # noqa: E731
     g_post, g_in = sh["g_post"], sh["g_in"]
     oproj_s = pr["oproj_s"]
     qkv_w, qkv_s = sh["qkv_w"], sh["qkv_s"]
@@ -263,34 +262,36 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
     elif fault == "wrong_qkv":
         qkv_w = jnp.roll(qkv_w, 1, axis=0)
     cfull, sfull = seg.rope_lane_tables(sh["cos"], sh["sin"], cfg.m)
+    consts = dict(
+        oproj_s=oproj_s,
+        g_post=g_post,
+        g_in=g_in,
+        g_qa=sh["g_qa"],
+        g_kva=sh["g_kva"],
+        bias=sh["bias"],
+        ss13=pr["ss13"],
+        ss2=pr["ss2"],
+        qkv_s=qkv_s,
+        s13=pr["s13"],
+    )
+    # Two boundaries in the stacks, this one in row 1 (row 0 a decoy: wrong
+    # row indexing shows up as garbage constants).
+    row = seg.fstack_row(cfg, consts)
+    decoy = jnp.flip(row) + 1.0
     ops = dict(
-        meta=jnp.stack([jnp.int32(n_valid), rank[0], jnp.int32(0), jnp.int32(0)]),
+        meta=seg.pack_meta(n_valid, rank[0], 1, dst_rows),
         a2a=pr["a2a"],
-        res=sh["res"],
-        cfull=cfull,
-        sfull=sfull,
-        g_post=row(g_post),
-        g_in=row(g_in),
-        g_qa=row(sh["g_qa"]),
-        g_kva=row(sh["g_kva"]),
-        bias=row(sh["bias"]),
-        enc=seg.kv_dst_block(dst_rows, cfg.tok_rows),
+        act=seg.pack_act(sh["res"], cfull, sfull),
         oproj_w=pr["oproj_w"],
-        oproj_s=row(oproj_s),
         gate=sh["gate"],
         w13=pr["w13"],
         w2=pr["w2"],
-        s13=pr["s13"],
         s2=pr["s2"],
-        sw13=pr["sw13"],
-        ss13=row(pr["ss13"]),
-        sw2=pr["sw2"],
-        ss2=row(pr["ss2"]),
         qkv_w=qkv_w,
-        qkv_s=row(qkv_s),
+        fstack=jnp.stack([decoy, row]),
+        sw13s=jnp.stack([jnp.flip(pr["sw13"], 0), pr["sw13"]]),
+        sw2s=jnp.stack([jnp.flip(pr["sw2"], 0), pr["sw2"]]),
     )
-    shapes = seg.operand_shapes(cfg)
-    ops = {k: v.reshape(shapes[k][0]) for k, v in ops.items()}
     out = seg.segment_call(cfg, ops, interpret=interpret)
     return out["res_out"], out["qc_out"], out["kvp_out"]
 

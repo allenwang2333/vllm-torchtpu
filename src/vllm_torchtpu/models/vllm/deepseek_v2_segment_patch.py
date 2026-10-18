@@ -69,6 +69,8 @@ def patched_model_forward(
     else:
         llama_4_scaling = None
 
+    # Both sides of the segment's token-count branch lift the same tensors.
+    positions = _SEGMENT.lift_segment_buffers(self, positions)
     aux_hidden_states = []
     handoff = None  # segment megakernel: armed layer N's hand-off to layer N+1
     for idx, layer in enumerate(
