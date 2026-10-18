@@ -2423,6 +2423,11 @@ def _attention_kernel(
         partial rows streamed into two f32 accumulators."""
         n = send_world
         tl = send_rows
+        # Trace-time: the lse word row carries row r's hi/lo halves in lanes r
+        # and tl + r of one o_dim-wide row, and the lane->sublane select reads
+        # the first 128 lanes -- both need these static bounds.
+        assert tl <= 128, ("in-kernel merge needs send_rows <= 128", tl)
+        assert 2 * tl <= o_dim, ("in-kernel merge needs 2*send_rows <= o_dim", tl, o_dim)
         hdr = SEND_PAD_ROWS  # the first int16 tile of a slab (word row inside)
         live = start_end_seq_idx_ref[4] * send_per  # real tokens x L
         r128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 0)
