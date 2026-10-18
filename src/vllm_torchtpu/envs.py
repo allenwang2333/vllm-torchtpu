@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_FUSED_CHAIN: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_DISABLE_RUNNER_STAGE_TIMING: bool = False
 
 
 def env_with_choices(
@@ -1522,6 +1523,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
     ),
+    # Skip the runner's per-stage device/CPU timings (runner/stage_timing.py):
+    # no TpuEvent records on the serving thread and no collector thread. The
+    # timings feed only TpuKVConnectorStats; with this set they are empty.
+    "TPU_DISABLE_RUNNER_STAGE_TIMING": env_bool("TPU_DISABLE_RUNNER_STAGE_TIMING"),
 }
 
 
