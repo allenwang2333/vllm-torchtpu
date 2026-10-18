@@ -289,6 +289,8 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
         qkv_w=qkv_w,
         qkv_s=row(qkv_s),
     )
+    shapes = seg.operand_shapes(cfg)
+    ops = {k: v.reshape(shapes[k][0]) for k, v in ops.items()}
     out = seg.segment_call(cfg, ops, interpret=interpret)
     return out["res_out"], out["qc_out"], out["kvp_out"]
 
@@ -536,7 +538,8 @@ def _run_case(mesh, d, T, n_valid, seed, *, interpret=None, faults=(), incumbent
     """-> {build: per-device [(metrics, flags)]} for "kernel", each fault, and
     "incumbent" when asked. Inputs are built on device, per rank."""
     rank_ids = jax.device_put(
-        np.arange(N_RANKS, dtype=np.int32).reshape(N_RANKS, 1), NamedSharding(mesh, P(AXIS))
+        np.arange(N_RANKS, dtype=np.int32).reshape(N_RANKS, 1),
+        NamedSharding(mesh, P(AXIS)),
     )
     shared = _shared_inputs(d, T, n_valid, seed)
     sh = {k: v for k, v in shared.items() if k not in ("dst", "planted")}

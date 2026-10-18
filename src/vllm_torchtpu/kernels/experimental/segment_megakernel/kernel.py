@@ -95,6 +95,9 @@ class SegCfg:
     o_tile: int = 1536
     o_slots: int = 2
     qkv_chunks: int = 4
+    # The norm weights and the router bias as 1-D operands (reshaped to one
+    # row in VMEM): their [1, N] reshape is otherwise an XLA copy per call.
+    vec_1d: bool = True
 
     @property
     def m(self) -> int:  # moe_tp_decode row bucket of this token bucket
@@ -355,6 +358,16 @@ def _compact_mxu(cfg, r):
     return r["cnt_s"][0, 0]
 
 
+def _vshape(cfg, n):
+    return (n,) if cfg.vec_1d else (1, n)
+
+
+def _vec(cfg, r, name):
+    """A staged vector operand as one [1, N] row."""
+    v = r[name][...]
+    return v.reshape(1, -1) if cfg.vec_1d else v
+
+
 def _sel(rows, cols, fn):
     """0/1 bf16 selection matrix S[i, j] = fn(i, j) (an exact row permutation
     on the MXU)."""
@@ -371,7 +384,10 @@ _NT = (((1,), (1,)), ((), ()))
 # operand tables (name order = pallas_call operand order)
 # =====================================================================================
 SMEM_IN = ("meta",)
-VMEM_IN = (
+# Small per-call operands, taken in HBM and copied to VMEM in the kernel
+# (started at entry, waited at first use): declared VMEM, XLA would copy each
+# into VMEM ahead of the call, serially and exposed (~0.7 us apiece).
+STAGED_IN = (
     "a2a",
     "res",
     "cfull",
@@ -383,6 +399,7 @@ VMEM_IN = (
     "bias",
     "enc",
 )
+VECTORS = ("g_post", "g_in", "g_qa", "g_kva", "bias")
 HBM_IN = (
     "oproj_w",
     "oproj_s",
@@ -443,6 +460,7 @@ def scratch_table(cfg: SegCfg):
         ("qc_m", pltpu.VMEM((m, cfg.q_lora), BF16)),
         ("qc_x", pltpu.VMEM((T, cfg.q_lora), BF16)),
         ("kvp_x", pltpu.VMEM((3 * cfg.tok_rows, LANES), U32)),
+        ("in_sem", pltpu.SemaphoreType.DMA((len(STAGED_IN),))),
         ("o_sem", pltpu.SemaphoreType.DMA((cfg.o_slots,))),
         (
             "w_sem",
@@ -453,6 +471,8 @@ def scratch_table(cfg: SegCfg):
         ("hit_sem", pltpu.SemaphoreType.DMA((2,))),
         ("out_sem", pltpu.SemaphoreType.DMA((3,))),
     ]
+    shapes = operand_shapes(cfg)
+    sc += [(n, pltpu.VMEM(*shapes[n])) for n in STAGED_IN]
     sc += [(f"ar1_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     sc += [(f"ar2_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     return sc, spec
@@ -465,7 +485,9 @@ def vmem_need_bytes(cfg: SegCfg) -> dict:
     t = functools.partial(MAR.tiled_bytes, info=info)
     sc, spec = scratch_table(cfg)
     tot = 0
-    for _, s in sc:
+    for name, s in sc:
+        if name in STAGED_IN:  # counted below, as 2-D rows
+            continue
         ms = str(getattr(s, "memory_space", ""))
         if "VMEM" in ms.upper() and hasattr(s, "shape"):
             tot += t(tuple(s.shape), s.dtype)
@@ -494,7 +516,12 @@ def vmem_need_bytes(cfg: SegCfg) -> dict:
 # =====================================================================================
 def _segment_kernel(*refs, cfg: SegCfg, spec):
     sc_t, _ = scratch_table(cfg)
-    names = list(SMEM_IN + VMEM_IN + HBM_IN + OUTS) + [n for n, _ in sc_t]
+    names = (
+        list(SMEM_IN)
+        + [f"in_{n}" for n in STAGED_IN]
+        + list(HBM_IN + OUTS)
+        + [n for n, _ in sc_t]
+    )
     assert len(names) == len(refs), (len(names), len(refs))
     r = dict(zip(names, refs, strict=True))
     n_ar = len(MAR.scratch_shapes(spec))
@@ -554,6 +581,11 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         pre.update(gate=gate, shared=shared, qkv=qkv)
 
     # ---- 3. entry: online LSE merge with guards -> attn [T, o_in] bf16
+    staged = {}
+    for i, n in enumerate(STAGED_IN):
+        staged[n] = pltpu.make_async_copy(r[f"in_{n}"], r[n], r["in_sem"].at[i])
+        staged[n].start()
+    staged["a2a"].wait()
     attn = _entry_merge(cfg, r)
 
     # ---- 4. o_proj (fp8_skinny numerics), tile ring; prefetch issued after the
@@ -584,9 +616,11 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     # ---- 6. post_attention_layernorm(attn_sum, residual)
     r["res_pad"][...] = jnp.zeros((m, H), F32)
+    staged["res"].wait()
+    staged["g_post"].wait()
     r["res_pad"][pl.ds(0, T), :] = r["res"][...].astype(F32)
     h, s1 = rms_add(
-        r["ar1_out"][...].astype(F32), r["res_pad"][...], r["g_post"][...], eps
+        r["ar1_out"][...].astype(F32), r["res_pad"][...], _vec(cfg, r, "g_post"), eps
     )
     r["res1_v"][...] = s1.astype(BF16).astype(F32)
     r["h_v"][...] = h
@@ -599,7 +633,8 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     scores = jax.nn.sigmoid(logits)
 
     # ---- 8a. routing
-    r["wtab"][...] = _route_argmax(scores, r["bias"][...], n_valid, topk=cfg.topk)
+    staged["bias"].wait()
+    r["wtab"][...] = _route_argmax(scores, _vec(cfg, r, "bias"), n_valid, topk=cfg.topk)
     hit = jnp.any(r["wtab"][...] != 0, axis=0, keepdims=True)
     r["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
     ring_sem = r["ring_sem"]
@@ -714,7 +749,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     # ---- 10. input_layernorm of layer N+1; residual exit (async)
     h2, s2 = rms_add(
-        r["ar2_out"][...].astype(F32), r["res1_v"][...], r["g_in"][...], eps
+        r["ar2_out"][...].astype(F32), r["res1_v"][...], _vec(cfg, r, "g_in"), eps
     )
     r["res_m"][...] = s2.astype(BF16)
     r["res_x"][...] = r["res_m"][pl.ds(0, T), :]
@@ -742,7 +777,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     pe_blk = qkv[:, k0 : k0 + LANES]  # k_pe in lanes 0..63
 
     # ---- 12. q_a_layernorm -> q_c exit (async); KV pack exit
-    q_c, _ = rms_add(q_pre.astype(F32), None, r["g_qa"][...], eps)
+    for n in ("g_qa", "g_kva", "cfull", "sfull", "enc"):
+        staged[n].wait()
+    q_c, _ = rms_add(q_pre.astype(F32), None, _vec(cfg, r, "g_qa"), eps)
     r["qc_m"][...] = q_c
     r["qc_x"][...] = r["qc_m"][pl.ds(0, T), :]
     qc_copy = pltpu.make_async_copy(r["qc_x"], r["qc_out"], out_sem.at[1])
@@ -809,7 +846,7 @@ def _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps):
     words, `pack_write_rows` layout u32[3 Tp, 128] (rows >= T zero; the
     destination block `enc` comes from the wrapper)."""
     T, m, tp = cfg.T, cfg.m, cfg.tok_rows
-    kv_n, _ = rms_add(kv_c.astype(F32), None, r["g_kva"][...], eps)  # [m, 512] bf16
+    kv_n, _ = rms_add(kv_c.astype(F32), None, _vec(cfg, r, "g_kva"), eps)
     pe_r = rope_lanes(pe_blk, cfull, sfull)
     row = lax.broadcasted_iota(I32, (m, LANES), 0)
     lane = lax.broadcasted_iota(I32, (m, LANES), 1)
@@ -844,14 +881,13 @@ def kernel_name(cfg: SegCfg) -> str:
 
 def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
     """One boundary on one device. `ops`: name -> array for every name of
-    SMEM_IN + VMEM_IN + HBM_IN, shapes as `operand_shapes(cfg)`. Returns
+    SMEM_IN + STAGED_IN + HBM_IN, shapes as `operand_shapes(cfg)`. Returns
     {res_out bf16 [T, H], qc_out bf16 [T, q_lora], kvp_out u32 [3 Tp, 128]}."""
     reason = supported(cfg)
     if reason is not None:
         raise ValueError(f"segment megakernel: {reason}")
     sc_t, spec = scratch_table(cfg)
     T, H = cfg.T, cfg.hidden
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)  # moe_tp_decode kernel.py form
     anyspace = pl.BlockSpec(memory_space=pl.ANY)  # outputs written by async DMA
     out_shapes = (
@@ -865,7 +901,7 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         out_shape=out_shapes,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(SMEM_IN),
-            in_specs=[vmem] * len(VMEM_IN) + [hbm] * len(HBM_IN),
+            in_specs=[anyspace] * len(STAGED_IN) + [hbm] * len(HBM_IN),
             out_specs=tuple([anyspace] * len(out_shapes)),
             scratch_shapes=[s for _, s in sc_t],
         ),
@@ -875,7 +911,7 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         name=kernel_name(cfg),
         **({} if interpret is None else {"interpret": interpret}),
     )
-    outs = call(*[ops[n] for n in SMEM_IN + VMEM_IN + HBM_IN])
+    outs = call(*[ops[n] for n in SMEM_IN + STAGED_IN + HBM_IN])
     return dict(zip(OUTS, outs, strict=True))
 
 
@@ -888,11 +924,11 @@ def operand_shapes(cfg: SegCfg) -> dict:
         "res": ((T, H), BF16),
         "cfull": ((m, LANES), BF16),
         "sfull": ((m, LANES), BF16),
-        "g_post": ((1, H), BF16),
-        "g_in": ((1, H), BF16),
-        "g_qa": ((1, cfg.q_lora), BF16),
-        "g_kva": ((1, cfg.kv_lora), BF16),
-        "bias": ((1, cfg.e_pad), F32),
+        "g_post": (_vshape(cfg, H), BF16),
+        "g_in": (_vshape(cfg, H), BF16),
+        "g_qa": (_vshape(cfg, cfg.q_lora), BF16),
+        "g_kva": (_vshape(cfg, cfg.kv_lora), BF16),
+        "bias": (_vshape(cfg, cfg.e_pad), F32),
         "enc": ((cfg.tok_rows, LANES), U32),
         "oproj_w": ((cfg.o_in, H), F8),
         "oproj_s": ((1, H), F32),

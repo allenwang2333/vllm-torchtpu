@@ -285,6 +285,8 @@ def _op_body(st: _Statics):
             qkv_w=qkv_w,
             qkv_s=row(qkv_s),
         )
+        shapes = kernel.operand_shapes(cfg)
+        ops = {k: v.reshape(shapes[k][0]) for k, v in ops.items()}
         out = kernel.segment_call(cfg, ops)
         # int32 across the torch boundary (torch has no general uint32).
         kv_rows = lax.bitcast_convert_type(out["kvp_out"], jnp.int32)
