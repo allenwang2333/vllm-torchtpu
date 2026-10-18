@@ -138,7 +138,6 @@ def test_candidate30_profile_carries_m5_tuning():
         "pair_kv",
         "gq_pack",
         "topk_lanes",
-        "conv_stage",
         "gdn_head_major",
         "gqa_qv",
         "moe_unroll",
@@ -157,6 +156,15 @@ def test_candidate30_profile_carries_m5_tuning():
     assert candidate30_tiles(16, R=4).hier == 3
     assert candidate30_tiles(64, R=4).hier == 0
     assert candidate30_tiles(16, R=6).hier == 0
+
+
+@pytest.mark.parametrize("moe_tp", [False, True])
+@pytest.mark.parametrize("R", [8, 4])
+def test_candidate30_conv_stage_only_from_b8(R: int, moe_tp: bool):
+    """Fused-path conv staging is on from B >= 8 only, as in candidate30's kernel."""
+    for B in (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64):
+        t = candidate30_tiles(B, moe_tp=moe_tp, R=R)
+        assert t.conv_stage is (B >= 8), (B, R, moe_tp)
 
 
 def test_profile_exec_for_respects_explicit_tiles():
