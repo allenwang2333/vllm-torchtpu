@@ -133,6 +133,18 @@ def run_arm(args):
             return jax.lax.fori_loop(0, n, body, (cache, jnp.float32(0)))
         return f
 
+    if args.mode == "profile":
+        # Three calls under one xprof capture; its own process, since the client-side tracer
+        # can segfault on some jaxlib/libtpu pairings and must not take the timing with it.
+        jax.block_until_ready(once(put(inp["cache"])))
+        d = os.path.join(args.xprof_dir, name)
+        os.makedirs(d, exist_ok=True)
+        with jax.profiler.trace(d):
+            for _ in range(3):
+                jax.block_until_ready(once(put(inp["cache"])))
+        print("PROFILE_DONE " + d, flush=True)
+        return
+
     res = {"arm": name, "opts": opts, "ctx": args.ctx, "q": args.q}
     try:
         t0 = time.time()
@@ -182,6 +194,11 @@ def sweep(args):
         line = [l for l in p.stdout.splitlines() if l.startswith("ARM_RESULT ")]
         r = json.loads(line[-1][11:]) if line else {"arm": spec, "ok": False,
                                                        "error": (p.stderr or p.stdout)[-1500:]}
+        if args.xprof and r.get("ms_per_call"):
+            pc = [c if c != "arm" else "profile" for c in cmd] + ["--xprof-dir", args.xprof_dir]
+            pp = subprocess.run(pc, capture_output=True, text=True)
+            done = [l for l in pp.stdout.splitlines() if l.startswith("PROFILE_DONE ")]
+            r["xprof"] = done[-1][13:] if done else f"failed rc={pp.returncode}: {(pp.stderr or '')[-300:]}"
         print(f"[attn_bench] {json.dumps(r)}", flush=True)
         results.append(r)
     out = os.environ.get("CDK_OUTPUT_DIR", args.workdir)
@@ -196,7 +213,7 @@ def sweep(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["sweep", "arm"])
+    ap.add_argument("mode", choices=["sweep", "arm", "profile"])
     ap.add_argument("--arms", nargs="*", default=["default:"])
     ap.add_argument("--arm", default="default:")
     ap.add_argument("--ctx", type=int, default=87040)
@@ -209,8 +226,10 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--tol", type=float, default=2e-2)
     ap.add_argument("--workdir", default="/tmp")
+    ap.add_argument("--xprof", type=int, default=1, help="capture xprof of every arm that ran")
+    ap.add_argument("--xprof-dir", default=os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof"))
     args = ap.parse_args()
-    (sweep if args.mode == "sweep" else run_arm)(args)
+    (sweep if args.mode == "sweep" else run_arm)(args)  # run_arm also serves "profile"
 
 
 if __name__ == "__main__":
