@@ -328,3 +328,176 @@ def gdn_gated_norm_quant(o_hbm, qkvz_hbm, w_hbm, xq_hbm, xs_hbm, *, vh, vd, qkv,
         out_specs=[pl.BlockSpec((tm, z_cols), lambda i: (i, 0)),
                    pl.BlockSpec((tm, 1), lambda i: (i, 0))],
     )(o_hbm, *([qkvz_hbm] * nzb), w_hbm, xq_hbm, xs_hbm)
+
+
+# ------------------------------------------------------------------------------------------------
+# Gated attention
+# ------------------------------------------------------------------------------------------------
+
+
+def att_tile_dest(n, nh, nkv):
+    """qkv_proj column tile n (256 wide) -> head-major buffer slot. The projection's columns are
+    [q_0 | gate_0 | q_1 | gate_1 | ... | k_0 .. k_{nkv-1} | v_0 ..]; slots are
+    [q_0 .. q_{nh-1} | gate_0 .. | k_0 .. | v_0 ..]."""
+    qg = n < 2 * nh
+    return jnp.where(qg, (n % 2) * nh + n // 2, n)
+
+
+def qmatmul_heads(xq_hbm, xs_hbm, w_hbm, ws_hbm, out_hbm, *, tm, nh, nkv, hd):
+    """qkv_proj, w8a8, written head-major: out [2 nh + 2 nkv, T, hd] bf16 (att_tile_dest)."""
+    t, k = xq_hbm.shape
+    n_tiles = w_hbm.shape[1] // hd
+
+    def body(x_ref, s_ref, w_ref, ws_ref, o_ref):
+        y = jax.lax.dot_general(x_ref[...], w_ref[...], (((1,), (0,)), ((), ())),
+                                preferred_element_type=F32)
+        o_ref[...] = (y * s_ref[...] * ws_ref[...]).astype(o_ref.dtype)[None]
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(n_tiles, t // tm),
+        in_specs=[pl.BlockSpec((tm, k), lambda n, m: (m, 0)),
+                  pl.BlockSpec((tm, 1), lambda n, m: (m, 0)),
+                  pl.BlockSpec((k, hd), lambda n, m: (0, n)),
+                  pl.BlockSpec((1, hd), lambda n, m: (0, n))],
+        out_specs=[pl.BlockSpec((1, tm, hd), lambda n, m: (att_tile_dest(n, nh, nkv), m, 0))],
+    )(xq_hbm, xs_hbm, w_hbm, ws_hbm, out_hbm)
+
+
+def att_qk_norm_rope_kv(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, ctx, qn_hbm, kc_hbm, vc_hbm, *,
+                        nh, nkv, hd, rot, eps, tm):
+    """Per-head zero-centered RMSNorm of q and k, NeoX RoPE on their first `rot` dims at
+    positions ctx + row, then q -> qn [nh, T, hd] bf16 and the new k, v -> fp8 into the caches
+    kc, vc [nkv, S, hd] at rows ctx .. ctx + T - 1 (by DMA: ctx is dynamic).
+
+    att [2 nh + 2 nkv, T, hd] bf16 (head-major, see att_tile_dest), qn_w / kn_w [1, hd] bf16,
+    rope [S, rot] f32 (cos | sin, rot / 2 each) for absolute positions, ctx: traced scalar."""
+    t = att_hbm.shape[1]
+    half = rot // 2
+
+    def run(rope_v, k8, v8, sem):
+        def body(q_ref, k_ref, v_ref, qw_ref, kw_ref, qo_ref):
+            m = pl.program_id(0)
+            r0 = ctx + m * tm
+            cp = pltpu.make_async_copy(rope_hbm.at[pl.ds(r0, tm)], rope_v, sem.at[0])
+            cp.start()
+            cp.wait()
+            cs = rope_v[...]
+            cos, sin = cs[:, :half][None], cs[:, half:][None]           # [1, tm, half]
+
+            def norm_rope(x, w):                                         # x [n, tm, hd]
+                x = x.astype(F32)
+                x = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+                x = (x * (1.0 + w.astype(F32).reshape(1, 1, hd))).astype(BF16).astype(F32)
+                x1, x2, rest = x[..., :half], x[..., half:rot], x[..., rot:]
+                y = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], -1)
+                return y.astype(BF16)
+
+            qo_ref[...] = norm_rope(q_ref[...], qw_ref[...])
+            k8[...] = norm_rope(k_ref[...], kw_ref[...]).astype(FP8)
+            v8[...] = v_ref[...].astype(FP8)
+            ck = pltpu.make_async_copy(k8, kc_hbm.at[:, pl.ds(r0, tm)], sem.at[1])
+            cv = pltpu.make_async_copy(v8, vc_hbm.at[:, pl.ds(r0, tm)], sem.at[2])
+            ck.start()
+            cv.start()
+            ck.wait()
+            cv.wait()
+
+        kslot, vslot = 2 * nh // nkv, (2 * nh + nkv) // nkv
+        pltpu.emit_pipeline(
+            body,
+            grid=(t // tm,),
+            in_specs=[pl.BlockSpec((nh, tm, hd), lambda m: (0, m, 0)),
+                      pl.BlockSpec((nkv, tm, hd), lambda m: (kslot, m, 0)),
+                      pl.BlockSpec((nkv, tm, hd), lambda m: (vslot, m, 0)),
+                      pl.BlockSpec((1, hd), lambda m: (0, 0)),
+                      pl.BlockSpec((1, hd), lambda m: (0, 0))],
+            out_specs=[pl.BlockSpec((nh, tm, hd), lambda m: (0, m, 0))],
+        )(att_hbm, att_hbm, att_hbm, qn_w_hbm, kn_w_hbm, qn_hbm)
+
+    pl.run_scoped(run, pltpu.VMEM((tm, rot), F32), pltpu.VMEM((nkv, tm, hd), FP8),
+                  pltpu.VMEM((nkv, tm, hd), FP8), pltpu.SemaphoreType.DMA((3,)))
+
+
+def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max):
+    """Causal GQA attention of the T new tokens (positions ctx + t) over the cache rows
+    0 .. ctx + T - 1, per kv head with its nh / nkv q heads folded into the rows, f32 online
+    softmax. qn [nh, T, hd] bf16, kc / vc [nkv, S, hd] fp8, o [nh, T, hd] f32."""
+    t = qn_hbm.shape[1]
+    grp = nh // nkv
+    rows = grp * bq
+    n_kv = pl.cdiv(s_max, bkv)
+    scale = hd ** -0.5
+
+    def last_kv(i):                         # last kv tile the q tile i needs
+        return (ctx + (i + 1) * bq - 1) // bkv
+
+    def run(m_ref, l_ref, acc_ref):
+        def body(q_ref, k_ref, v_ref, o_ref):
+            i, j = pl.program_id(1), pl.program_id(2)
+
+            @pl.when(j == 0)
+            def _():
+                m_ref[...] = jnp.full(m_ref.shape, -jnp.inf, F32)
+                l_ref[...] = jnp.zeros(l_ref.shape, F32)
+                acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
+
+            @pl.when(j <= last_kv(i))
+            def _():
+                q = q_ref[...].reshape(rows, hd)
+                kk = k_ref[0].astype(BF16)
+                vv = v_ref[0].astype(BF16)
+                s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
+                                        preferred_element_type=F32) * scale
+                row = jax.lax.broadcasted_iota(jnp.int32, (rows, bkv), 0)
+                col = jax.lax.broadcasted_iota(jnp.int32, (rows, bkv), 1)
+                pos = ctx + i * bq + row % bq        # rows are (head, token) head-major
+                s = jnp.where(j * bkv + col <= pos, s, -jnp.inf)
+                m_prev = m_ref[...][:, :1]
+                m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True))
+                alpha = jnp.exp(m_prev - m_new)
+                p = jnp.exp(s - m_new)
+                l_ref[...] = jnp.broadcast_to(alpha * l_ref[...][:, :1] + jnp.sum(p, -1, keepdims=True),
+                                              l_ref.shape)
+                m_ref[...] = jnp.broadcast_to(m_new, m_ref.shape)
+                acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
+                    p.astype(BF16), vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+
+            @pl.when(j == n_kv - 1)
+            def _():
+                o_ref[...] = (acc_ref[...] / l_ref[...][:, :1]).reshape(grp, bq, hd)
+
+        kv_map = lambda g, i, j: (g, jnp.minimum(j, last_kv(i)), 0)
+        pltpu.emit_pipeline(
+            body,
+            grid=(nkv, t // bq, n_kv),
+            in_specs=[pl.BlockSpec((grp, bq, hd), lambda g, i, j: (g, i, 0)),
+                      pl.BlockSpec((1, bkv, hd), kv_map),
+                      pl.BlockSpec((1, bkv, hd), kv_map)],
+            out_specs=[pl.BlockSpec((grp, bq, hd), lambda g, i, j: (g, i, 0))],
+        )(qn_hbm, kc_hbm, vc_hbm, o_hbm)
+
+    pl.run_scoped(run, pltpu.VMEM((rows, 128), F32), pltpu.VMEM((rows, 128), F32),
+                  pltpu.VMEM((rows, hd), F32))
+
+
+def att_gate_quant(o_hbm, att_hbm, xq_hbm, xs_hbm, *, nh, hd, tm):
+    """y = o * sigmoid(gate) -> bf16 -> per-row fp8 over all heads, token-major for o_proj.
+    o [nh, T, hd] f32, gate = att[nh:2 nh], xq [T, nh * hd] fp8, xs [T, 1] f32."""
+    t = o_hbm.shape[1]
+
+    def body(o_ref, g_ref, xq_ref, xs_ref):
+        y = o_ref[...] * jax.nn.sigmoid(g_ref[...].astype(F32))          # [nh, tm, hd]
+        y = jnp.swapaxes(y, 0, 1).reshape(tm, nh * hd)
+        xq, xs = quantize_rows(y)
+        xq_ref[...] = xq
+        xs_ref[...] = xs
+
+    pltpu.emit_pipeline(
+        body,
+        grid=(t // tm,),
+        in_specs=[pl.BlockSpec((nh, tm, hd), lambda m: (0, m, 0)),
+                  pl.BlockSpec((nh, tm, hd), lambda m: (1, m, 0))],
+        out_specs=[pl.BlockSpec((tm, nh * hd), lambda m: (m, 0)),
+                   pl.BlockSpec((tm, 1), lambda m: (m, 0))],
+    )(o_hbm, att_hbm, xq_hbm, xs_hbm)
