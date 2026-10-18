@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     TPU_FUSED_QK_NORM_ROPE: bool = True
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
     TPU_RPA_DECODE_BATCHED: bool = False
+    TPU_RPA_KV_SPLIT: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -875,6 +876,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
     # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
+    # Decode steps split the KV read over the tensor-parallel ranks that share
+    # a KV head (layers/adapter/kv_split_attention.py).
+    "TPU_RPA_KV_SPLIT": env_bool("TPU_RPA_KV_SPLIT"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()

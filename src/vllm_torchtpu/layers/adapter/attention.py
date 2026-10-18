@@ -78,6 +78,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import batched_rpa_decode
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter import kv_split_attention as _kv_split
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
@@ -1162,6 +1163,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.dcp_rank = 0
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
+        # Split KV read over the TP ranks sharing this layer's KV head
+        # (TPU_RPA_KV_SPLIT). Populated by initialize_kernel().
+        self.kv_split: _kv_split.KVSplitKernels | None = None
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
         # setup_bundled() after bundle allocation and prior to torch.compile tracing.
         # During profile_run, ctx.kv_cache_bundle is None and forward falls back to
@@ -1659,6 +1663,34 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             return
 
+        if _kv_split.enabled() and vllm_config is not None:
+            if skip_kv_update or self.sinks is not None or self._bm_kernel:
+                raise NotImplementedError(
+                    "TPU_RPA_KV_SPLIT does not support KV sharing, attention "
+                    "sinks or the block-major pool."
+                )
+            if self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE and (
+                not isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+                or self.head_size == 64
+            ):
+                raise NotImplementedError(
+                    "TPU_RPA_KV_SPLIT with HND requires the CUSTOM attention "
+                    "backend and head_size != 64."
+                )
+            self.kv_split = _kv_split.build(
+                tp_size=parallel_config.tensor_parallel_size,
+                total_num_kv_heads=vllm_config.model_config.get_total_num_kv_heads(),
+                max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+                decode_query_size=self.decode_query_size,
+                sliding_window=self.sliding_window,
+                sm_scale=self.scale,
+                logits_soft_cap=self.logits_soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                kv_layout=self.kv_layout,
+            )
+
         self.rpa_kernel = self._build_rpa_kernel(
             q_scale,
             k_scale,
@@ -2021,6 +2053,31 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             outputs = self._run_dcp_forward(
                 layer, query, key, value, kv_cache, attn_metadata
+            )
+            if outputs.shape[-1] > self.head_size:
+                outputs = outputs[..., : self.head_size]
+            if query_dim == 2:
+                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+            if output is not None:
+                output.copy_(outputs)
+            return outputs
+
+        if self.kv_split is not None and q_len <= self.kv_split.max_tokens:
+            if sink is not None or ctx.kv_cache_bundle is not None:
+                raise NotImplementedError(
+                    "TPU_RPA_KV_SPLIT does not support attention sinks or the "
+                    "bundled KV cache path."
+                )
+            outputs = _kv_split.forward(
+                self.kv_split,
+                query=query,
+                key=key,
+                value=value,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                q_scale=None,
+                k_scale=layer._k_scale_float if self.kv_cache_quantized_dtype else None,
+                v_scale=layer._v_scale_float if self.kv_cache_quantized_dtype else None,
             )
             if outputs.shape[-1] > self.head_size:
                 outputs = outputs[..., : self.head_size]
