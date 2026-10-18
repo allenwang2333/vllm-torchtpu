@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import re
 from typing import Any, cast
 
 import jax
@@ -493,10 +494,38 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_args)
 
 
+def _is_draft_layer_prefix(prefix: str, num_hidden_layers: int | None) -> bool:
+    """True for an MTP draft layer: vLLM numbers those from the target's
+    `num_hidden_layers` up (`DeepSeekMultiTokenPredictor.mtp_start_layer_idx`),
+    so `...layers.<i>...` with `i >= num_hidden_layers` is the drafter's."""
+    if num_hidden_layers is None:
+        return False
+    m = re.search(r"layers\.(\d+)", prefix or "")
+    return m is not None and int(m.group(1)) >= num_hidden_layers
+
+
+def _streamidx_shared_meta_for(prefix: str) -> bool:
+    """TPU_STREAMIDX_SHARED_META for the indexer at `prefix`: off for the MTP
+    draft layer. Its rows are q_len 1, so the DECODE pass runs, and under the
+    flag that schedule is built lazily inside the skip-empty conditional,
+    serial with the kernel (+19 us per step on GLM-5.2, cancelling the drafter
+    LM head's gain); the flag's CSE across indexer layers is a backbone win
+    (one indexer layer in the drafter, nothing to share). Same result."""
+    if not envs.TPU_STREAMIDX_SHARED_META:
+        return False
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    return not _is_draft_layer_prefix(
+        prefix, num_layers if isinstance(num_layers, int) else None
+    )
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._shared_meta = _streamidx_shared_meta_for(self.k_cache.prefix)
         # Build eagerly: pallas.jax_op runs inspect.signature(), which Dynamo
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
@@ -549,7 +578,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
-        shared_meta = envs.TPU_STREAMIDX_SHARED_META
+        shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -712,7 +741,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
-        shared_meta = envs.TPU_STREAMIDX_SHARED_META
+        shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
