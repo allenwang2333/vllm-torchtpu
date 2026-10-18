@@ -141,7 +141,10 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 //   Both limits only meet near 0.92, with ~35M to spare. 2048 at 0.90 had 15.59 GiB (1,264,937
 //   tokens, j-68dfea6b-1db1-465b-91ef). Interpolating, 3072 at 0.90 leaves ~13.4 GiB and ~2G of
 //   compile headroom.
-local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 128);
+// c=96 interactivity default (forge run regg7mw5): 96 with TPU_SRPT_ATTN_WORK_CAP=12000000 below took
+// p90 interactivity 44.4 -> 58.8 tok/s/user at 331k vs 338k total tok/s (j-67d83a5a, j-3ead2530 vs 4 base runs).
+// At c=192, 128 was the throughput optimum (run 362mfwyj).
+local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 96);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
 local quantization = cdk.var('QUANTIZATION', 'deepseek_v4_fp8');
@@ -341,7 +344,9 @@ local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
-local srptAttnWorkCap = cdk.var('TPU_SRPT_ATTN_WORK_CAP', '');
+// 12000000 at c=96 with MAX_NUM_BATCHED_TOKENS=96 (see there); 18000000 kept total tok/s flat at 56.3 p90
+// interactivity (j-67e992fc).
+local srptAttnWorkCap = cdk.var('TPU_SRPT_ATTN_WORK_CAP', '12000000');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
 // mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40).
