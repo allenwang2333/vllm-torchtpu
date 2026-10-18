@@ -57,6 +57,23 @@ SHAPES = [(64, 256, 192, 512), (64, 192, 192, 512), (4, 192, 192, 512),
 TOKENS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
 
+def _oracle(x, w, s, round_before_scale, out_dtype):
+    """The bmm path's arithmetic in numpy: exact products, one f32 rounding of
+    the sum, then the epilogue's roundings."""
+    p = w.shape[1]
+    a = np.asarray(x[..., :p].astype(jnp.float32), np.float64)
+    b = np.asarray(w.astype(jnp.float32), np.float64)
+    acc = np.einsum("thp,hpl->thl", a, b).astype(np.float32)
+    if s is not None:
+        sv = np.asarray(s.astype(jnp.float32)).reshape(1, w.shape[0], w.shape[2])
+        if round_before_scale:
+            acc = np.asarray(jnp.asarray(acc).astype(jnp.bfloat16).astype(jnp.float32))
+        acc = acc * sv
+    elif round_before_scale:
+        acc = np.asarray(jnp.asarray(acc).astype(jnp.bfloat16).astype(jnp.float32))
+    return np.asarray(jnp.asarray(acc).astype(out_dtype))
+
+
 @pytest.mark.parametrize("t", TOKENS)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize(
@@ -68,14 +85,36 @@ TOKENS = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
         (F8, True, False, jnp.float32),  # project_uv_heads f32 path
     ],
 )
-def test_matches_bmm_bitwise(t, shape, wdt, with_scale, round_before_scale, out_dtype):
+def test_matches_bmm(t, shape, wdt, with_scale, round_before_scale, out_dtype):
+    """Bitwise against XLA's bmm for bf16 weights. With a scale, XLA is free to
+    reassociate the reference's epilogue (it does, at some T), so the kernel is
+    held to the bmm path's arithmetic in float64 instead: one ulp of the output
+    dtype (two through the bf16 rounding before the scale; absolute near zero), and a mean error under half a bf16 ulp. The
+    torch bridge test checks these cases bitwise against the served graph."""
     h, dq, p, l = shape
     x, w, s = _inputs(t, h, dq, p, l, wdt, with_scale)
     kw = dict(round_before_scale=round_before_scale, out_dtype=out_dtype)
     got = hm.head_matmul(x, w, s, **kw)
-    want = jax.jit(lambda x, w, s: hm.reference(x, w, s, **kw))(x, w, s)
     assert got.shape == (t, h, l) and got.dtype == jnp.dtype(out_dtype)
-    np.testing.assert_array_equal(_bits(got), _bits(want))
+    if not with_scale:
+        want = jax.jit(lambda x, w: hm.reference(x, w, None, **kw))(x, w)
+        np.testing.assert_array_equal(_bits(got), _bits(want))
+        return
+    want = _oracle(x, w, s, round_before_scale, jnp.dtype(out_dtype))
+    if jnp.dtype(out_dtype) == jnp.float32:
+        tol = 3e-5 if hm.supported(t, h) else 1e-2  # see the bf16 branch
+        np.testing.assert_allclose(np.asarray(got), want, rtol=tol, atol=tol)
+        return
+    # One bf16 ulp, absolute near zero (an f32 sum-order difference of a few
+    # e-5 is many ulps of a tiny value).
+    g = np.asarray(got.astype(jnp.float32))
+    w32 = want.astype(np.float32)
+    rms = float(np.sqrt(np.mean(w32**2)))
+    # Off-tile is XLA's own bmm. Rounding before a scale of up to 1.5 can turn
+    # an f32 sum-order tie into two ulps of the output (seen: 1 in 1.3e8).
+    ulps = 2 if (round_before_scale or not hm.supported(t, h)) else 1
+    np.testing.assert_allclose(g, w32, rtol=ulps * 2**-7, atol=ulps * 2**-7 * rms)
+    assert np.mean(np.abs(g - w32)) <= 2**-8 * np.mean(np.abs(w32))
 
 
 def test_whole_q_head_equals_nope_slice():

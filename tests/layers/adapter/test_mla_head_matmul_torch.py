@@ -134,9 +134,10 @@ def test_w_uv_projection_matches_compiled_bmm(tokens, fp8, out_dtype):
     got = torch.compile(flag_on, fullgraph=True, dynamic=False)(partial, w, s)
     d = _diff(got, ref)
     print(f"W_UV T={tokens} fp8={fp8} out={out_dtype}: {d}")
-    # The f32 path's reference is an f32 x f32 dot of bf16-exact operands; it
-    # may sum in another order. Bound it at 1 ulp on a small fraction.
-    if narrow:
+    # The f32 path's reference is an f32 x f32 dot of bf16-exact operands, and
+    # the compiled reference sums in another order at some T (it then also
+    # differs from its own eager run). Hold it to f32 sum-order noise.
+    if narrow or out_dtype != torch.float32:
         assert d == (0, 0.0)
     else:
-        assert d[0] <= 1 and d[1] <= 1e-3, d
+        torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)
