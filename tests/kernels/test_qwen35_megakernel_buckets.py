@@ -208,9 +208,9 @@ def test_fused_pool_io_fallback_rebuilds_only_fused_buckets(monkeypatch):
     assert not any(mk._bucket_fused.values())
 
 
-# Fused verify buckets of 80..112 rows run as ONE kernel each, with the flat reduce-scatter +
+# Fused verify buckets of 72..112 rows run as ONE kernel each, with the flat reduce-scatter +
 # all-gather all-reduce and the dense ring depth that fits the scoped VMEM limit.
-WIDE_SINGLE_RSAG_NBD = {80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
+WIDE_SINGLE_RSAG_NBD = {72: 11, 76: 10, 80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
 
 
 @pytest.mark.parametrize("b", sorted(WIDE_SINGLE_RSAG_NBD))

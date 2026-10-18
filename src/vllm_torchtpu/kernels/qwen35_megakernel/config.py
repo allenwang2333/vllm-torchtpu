@@ -495,15 +495,16 @@ FUSED_WIDE_NBD = {
     32: 12, 40: 12, 44: 12, 48: 12, 52: 11, 56: 11, 60: 10, 64: 9, 68: 9, 72: 8, 76: 8,
     80: 8, 96: 5, 112: 2,
 }
-# Fused verify buckets of 80..112 rows (20..28 sequences at K=3), each ONE kernel (see
+# Fused verify buckets of 72..112 rows (18..28 sequences at K=3), each ONE kernel (see
 # vllm_adapter._MAX_SINGLE_KERNEL_B) instead of a 2-microbatch split that re-streams every hit
 # expert's weights per microbatch. They use the flat reduce-scatter + all-gather all-reduce
 # (hier=0, rsag): its send / recv / gather buffers take half the VMEM of hier=2's (10.5 MiB at
 # 112 rows), which buys back dense-ring depth under the 62 MiB scoped limit. Value: the dense
 # ring depth (nbd) that fits. Microbench ms (v7x-8, DCP=4, ctx 80K; rsag vs hier=2 at its
-# deepest fitting ring): 80: 17.63 vs 18.25, 84: 19.59 vs 19.53, 88: 19.97 vs 20.24,
-# 96: 21.07 vs 21.51, 104: 23.86 vs 24.01, 112: 24.35 vs 25.22.
-FUSED_WIDE_RSAG_NBD = {80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
+# deepest fitting ring): 72: 16.64 vs 16.98, 76: 17.39 vs 17.59, 80: 17.63 vs 18.25,
+# 84: 19.59 vs 19.53, 88: 19.97 vs 20.24, 96: 21.07 vs 21.51, 104: 23.86 vs 24.01,
+# 112: 24.35 vs 25.22 (68 rows and below: no gain, keep hier=2).
+FUSED_WIDE_RSAG_NBD = {72: 11, 76: 10, 80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
 # EP expert ring refills with static banks and one layer-dispatch walk per macro-step
 # (moe_block.experts_piped_ep). Bit-exact; microbench -1.5% at 64 / 80 rows, -6% at 96 / 112.
 EP_FAST_REFILL = True
