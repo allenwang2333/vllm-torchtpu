@@ -489,7 +489,21 @@ ARPIPE_ON = True
 ARPIPE_OFF_B = (20, 24, 32)
 ARPIPE_H1_ON = True
 AR0S_ON = True
-FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9, 80: 8, 96: 5, 112: 2}
+# Dense ring depth of the fused verify buckets: the deepest ring that fits the 62 MiB scoped
+# VMEM limit (44 / 52 / 60 / 68 / 76: compile-searched on v7x-8, DCP=4).
+FUSED_WIDE_NBD = {
+    32: 12, 40: 12, 44: 12, 48: 12, 52: 11, 56: 11, 60: 10, 64: 9, 68: 9, 72: 8, 76: 8,
+    80: 8, 96: 5, 112: 2,
+}
+# Fused verify buckets of 80..112 rows (20..28 sequences at K=3), each ONE kernel (see
+# vllm_adapter._MAX_SINGLE_KERNEL_B) instead of a 2-microbatch split that re-streams every hit
+# expert's weights per microbatch. They use the flat reduce-scatter + all-gather all-reduce
+# (hier=0, rsag): its send / recv / gather buffers take half the VMEM of hier=2's (10.5 MiB at
+# 112 rows), which buys back dense-ring depth under the 62 MiB scoped limit. Value: the dense
+# ring depth (nbd) that fits. Microbench ms (v7x-8, DCP=4, ctx 80K; rsag vs hier=2 at its
+# deepest fitting ring): 80: 17.63 vs 18.25, 84: 19.59 vs 19.53, 88: 19.97 vs 20.24,
+# 96: 21.07 vs 21.51, 104: 23.86 vs 24.01, 112: 24.35 vs 25.22.
+FUSED_WIDE_RSAG_NBD = {80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
 
 # ROUTE_SHRINK (VEC route): shorter serial scalar chain from the EARLY_FILL issue to the first
 # expert compute. The copy-candidate scan packs each candidate's copy slot (its meta lane) above
@@ -553,6 +567,8 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(t, hier=3 if c.B <= 32 else 0)
     if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_NBD:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
+    if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_RSAG_NBD:
+        t = dataclasses.replace(t, hier=0, rsag=True, nbd=FUSED_WIDE_RSAG_NBD[c.B])
     if c.NGDN == 0:
         t = dataclasses.replace(t, nbd=14 if c.B <= 64 else 10)
     t = dataclasses.replace(t, dcp_fast_rmw=bool(c.dcp_size > 1 and c.B != 64), fuse_att_new=2)

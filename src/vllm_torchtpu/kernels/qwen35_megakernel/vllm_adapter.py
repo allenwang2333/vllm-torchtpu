@@ -89,7 +89,15 @@ _DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 # or falling back to slow stock_t4_b96 / stock_t4_b128 (256-padded XLA).
 _DEFAULT_WIDE_VERIFY_BUCKETS_128 = (80, 84, 88, 96, 104, 112, 120, 128)
 _DEFAULT_WIDE_VERIFY_BUCKETS_160 = (80, 84, 88, 96, 104, 112, 120, 128, 136, 144, 160)
-_MAX_SINGLE_KERNEL_B = 80
+# Largest verify bucket built as ONE Pallas call; wider buckets run as a 2-microbatch split
+# (each microbatch re-streams every hit expert's weights). Fused verify buckets 84..112 fit
+# the 62 MiB scoped VMEM limit as one call with the flat reduce-scatter + all-gather
+# all-reduce and a shallower dense ring (FUSED_WIDE_RSAG_NBD in config.py); microbench
+# (v7x-8, DCP=4, ctx 80K) 8-10% faster than the split at 84..96 rows. Above 112 rows the
+# ring gets too shallow (120 / 128 rows: slower than stock). Needs the attention_block GDEF
+# n_ai <= NBD guard (an 8-tile att_in hold deadlocks rings of < 8 slots).
+# `VLLM_TPU_QWEN35_MK_MAX_SINGLE_B=80` restores the previous single-call cap.
+_MAX_SINGLE_KERNEL_B = int(os.environ.get("VLLM_TPU_QWEN35_MK_MAX_SINGLE_B", "112"))
 _SPLIT_BASE_B = 80
 _OPTIMAL_WIDE_SPLIT_PAIRS: dict[int, tuple[int, int]] = {
     84: (64, 20),
