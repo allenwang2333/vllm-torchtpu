@@ -644,25 +644,49 @@ def _one_side_tensors(model: Any, i: int) -> list[torch.Tensor]:
     return out
 
 
-def lift_segment_buffers(model: Any, positions: torch.Tensor) -> torch.Tensor:
-    """`positions` plus a zero read from every tensor only one side of the
-    token-count branch would read (the stacks and padded q_a/kv_a copies on
-    the kernel side; the boundaries' own constants on the usual side), so both
-    traces lift the same inputs, under the same names (this runs first in
-    both), and the backbone warmup can hand buckets between them. XLA drops
-    the zero."""
-    tensors = list(_STACKS.values()) if _STACKS else []
+def _lift_tensors(model: Any) -> list[torch.Tensor]:
+    tensors = list(_STACKS.values())
     for i, layer in enumerate(model.layers):
         if getattr(layer, TAIL_ATTR, None) is not None:
             tensors += _one_side_tensors(model, i)
-    zero = None
-    for t in tensors:
-        # One element by index: a reshape first would relayout the whole
-        # tensor (j-2f95e1a1: +167 us/step on fp8 weights).
-        v = t[(0,) * t.dim()].to(torch.float32)
-        z = (v - v).to(positions.dtype)
-        zero = z if zero is None else zero + z
-    return positions if zero is None else positions + zero
+    return tensors
+
+
+_LIFT_OP: Any = None
+
+
+def _build_lift_op(n: int) -> Any:
+    """positions + 0 * (one element of each of n tensors), in JAX: the
+    integer zero folds away in XLA (no reads, no copies), but every tensor is
+    an operand of the op, so Dynamo lifts it."""
+    params = ", ".join(f"t{i}: jax.Array" for i in range(n))
+    body = "".join(
+        f"    z = z + t{i}.reshape(-1)[0].astype(jnp.int32) * 0\n" for i in range(n)
+    )
+    src = (
+        f"def segment_lift(positions: jax.Array, {params}) -> jax.Array:\n"
+        "    z = jnp.int32(0)\n"
+        + body
+        + "    return positions + z.astype(positions.dtype)\n"
+    )
+    ns: dict[str, Any] = {"jax": jax, "jnp": jnp}
+    exec(src, ns)  # a fixed-arity signature: torch_tpu reads the annotations
+    op = pallas.jax_op(f"pallas::segment_megakernel_lift_{n}", ns["segment_lift"])
+    op.register_fake(lambda positions, *a, **k: torch.empty_like(positions))
+    return op
+
+
+def lift_segment_buffers(model: Any, positions: torch.Tensor) -> torch.Tensor:
+    """`positions`, through an op that takes every tensor only one side of
+    the token-count branch reads (the stacks and padded q_a/kv_a copies on the
+    kernel side; the boundaries' own constants on the usual side), so both
+    traces lift the same inputs, under the same names (this runs first in
+    both), and the backbone warmup can hand buckets between them. Reading
+    them in torch instead materialized relayout copies of the fp8 weights
+    every step (twin j-8f7e86c3: layer 0 +337 us)."""
+    if _LIFT_OP is None:
+        return positions
+    return _LIFT_OP(positions, *_lift_tensors(model))
 
 
 def _compile_sizes_reason(vllm_config: Any) -> str | None:
@@ -805,6 +829,9 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             ),
         )
         setattr(nxt, HEAD_ATTR, True)
+    if plan:
+        global _LIFT_OP
+        _LIFT_OP = _build_lift_op(len(_lift_tensors(inner)))
     log = logger.info if plan else logger.warning
     log(
         "segment_megakernel: armed %d boundaries (layers N = %s, buckets %s, sig %s); "
