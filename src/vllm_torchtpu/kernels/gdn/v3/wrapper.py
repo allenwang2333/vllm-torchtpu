@@ -955,6 +955,14 @@ def fused_conv1d_gdn(
             # repeated rollback and slot reuse on v7, independent of TP size.
             decode_tile_size = 1
 
+    # The output epilogue zeroes the rows past the last token itself, so
+    # neither launch writes them.
+    epilogue_zeroes_tail = (
+        out_quant_dtype is not None
+        and qkv_row_tiled
+        and epilogue.supports(padded_batch_size, n_v, d_v)
+    )
+
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
     # KDA's gate carries d_k channels per value head, so it pads out to a
@@ -1033,7 +1041,11 @@ def fused_conv1d_gdn(
         # With both launches, every row up to the last real token is
         # computed by one of them, so the rest is zeroed by DMAs inside a
         # launch instead of the whole buffer being zero-filled first.
-        zero_out_tail = zero_initialize_out and not (batched_only or prefill_only)
+        zero_out_tail = (
+            zero_initialize_out
+            and not (batched_only or prefill_only)
+            and not epilogue_zeroes_tail
+        )
 
         cfg = config.GDNConfig(
             mode=mode,
@@ -1102,7 +1114,11 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 4] = 2
         out_shape = cfg.get_out_shape()
 
-        if in_act is None and zero_initialize_out and not zero_out_tail:
+        if (
+            in_act is None
+            and zero_initialize_out
+            and not (zero_out_tail or epilogue_zeroes_tail)
+        ):
             in_act = jnp.zeros_like(out_shape)
         if in_act is not None:
             out_shape = in_act
@@ -1148,13 +1164,14 @@ def fused_conv1d_gdn(
     def quantize_out(
         out_act: jax.Array, qkv: jax.Array, sliced_z: jax.Array | None
     ) -> tuple[jax.Array, jax.Array]:
-        if epilogue.supports(padded_batch_size, n_v, d_v) and qkv_row_tiled:
+        if epilogue_zeroes_tail:
             # Where the launches did not gate, the epilogue reads z out of the
             # same row tiles they read q/k/v from.
             out_q, out_scale = epilogue.gate_and_quantize(
                 out_act,
                 None if gate_out else qkv,
                 None if gate_out else out_norm_weight,
+                query_start_loc[distribution[-1]],
                 z_group=dim // num_lanes,
                 eps=out_norm_eps,
                 quant_dtype=out_quant_dtype,

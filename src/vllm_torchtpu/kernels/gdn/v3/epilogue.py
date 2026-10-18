@@ -53,11 +53,65 @@ def supports(num_tokens: int, num_heads: int, head_dim: int) -> bool:
     )
 
 
-def _kernel(*refs, gate: bool, eps: float, quant_dtype: jnp.dtype, row_group: int):
+def _kernel(
+    live_rows_ref, *refs, gate: bool, eps: float, quant_dtype: jnp.dtype, row_group: int
+):
     if gate:
         out_ref, z_ref, norm_ref, q_ref, scale_ref, gated_ref = refs
     else:
         out_ref, q_ref, scale_ref, gated_ref = refs
+        z_ref = norm_ref = None
+    block = out_ref.shape[0]
+    first_row = pl.program_id(0) * block
+    live_rows = live_rows_ref[0]
+    gate_and_quantize = functools.partial(
+        _gate_and_quantize_block,
+        out_ref,
+        z_ref,
+        norm_ref,
+        q_ref,
+        scale_ref,
+        gated_ref,
+        eps=eps,
+        quant_dtype=quant_dtype,
+        row_group=row_group,
+    )
+
+    @pl.when(first_row + block <= live_rows)
+    def _():
+        gate_and_quantize(None)
+
+    # A gated zero row keeps the sign of its norm weight times silu(z), so
+    # only an ungated block past the last token is a constant.
+    has_rows = True if gate else first_row < live_rows
+
+    @pl.when(jnp.logical_and(has_rows, first_row + block > live_rows))
+    def _():
+        gate_and_quantize(live_rows - first_row)
+
+    if not gate:
+
+        @pl.when(first_row >= live_rows)
+        def _():
+            # What a zero row quantizes to.
+            q_ref[...] = jnp.zeros(q_ref.shape, q_ref.dtype)
+            scale_ref[...] = jnp.ones(scale_ref.shape, scale_ref.dtype)
+
+
+def _gate_and_quantize_block(
+    out_ref,
+    z_ref,
+    norm_ref,
+    q_ref,
+    scale_ref,
+    gated_ref,
+    live_rows: jax.Array | None,
+    *,
+    eps: float,
+    quant_dtype: jnp.dtype,
+    row_group: int,
+):
+    """One token block; its rows from `live_rows` on (None: none) are zero."""
     block, num_heads, head_dim = out_ref.shape
     q_max = float(jnp.finfo(quant_dtype).max)
     # `quantize_block`'s `abs_max / dtype_max`, as XLA folds it: a multiply
@@ -73,7 +127,11 @@ def _kernel(*refs, gate: bool, eps: float, quant_dtype: jnp.dtype, row_group: in
             heads = pl.ds(h0, EPILOGUE_HEAD_CHUNK)
             # [tokens, heads, d_v] -> [heads, tokens, d_v]
             x = jnp.swapaxes(out_ref[rows, heads].astype(jnp.float32), 0, 1)
-            if gate:
+            if live_rows is not None:
+                # No launch writes the rows past the last token: they are zero.
+                row = t0 + jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+                x = jnp.where(row < live_rows, x, 0.0)
+            if z_ref is not None:
                 z = z_ref[pl.ds(t0 // tile_rows, row_group // tile_rows), heads]
                 z = jnp.swapaxes(z, 0, 1).reshape(x.shape)
                 x = compute_gdn.gated_rms_norm(
@@ -104,6 +162,7 @@ def gate_and_quantize(
     out: jax.Array,
     z_tiles: jax.Array | None,
     norm_weight: jax.Array | None,
+    live_rows: jax.Array,
     *,
     z_group: int = 0,
     eps: float = 0.0,
@@ -119,6 +178,9 @@ def gate_and_quantize(
             `compute_gdn.gated_rms_norm(out, z, norm_weight, eps)` per head
             before it is quantized. None if `out` is already gated.
         norm_weight: [d_v] f32 norm weight, with `z_tiles`.
+        live_rows: Scalar int32 count of leading rows of `out` that hold
+            tokens. The rows after them are taken as zero and never read, so
+            no launch has to write them.
         quant_dtype: The activation dtype the projection consumes.
 
     Returns:
@@ -131,7 +193,17 @@ def gate_and_quantize(
     row_group = min(EPILOGUE_ROW_GROUP, block)
     gate = z_tiles is not None
 
-    in_specs = [pl.BlockSpec((block, num_heads, head_dim), lambda i: (i, 0, 0))]
+    def live_block(i, live_rows_ref):
+        # Blocks past the last token re-index the last live one, so the
+        # pipeline fetches nothing for them.
+        last = jnp.maximum(pl.cdiv(live_rows_ref[0], block) - 1, 0)
+        return jnp.minimum(i, last)
+
+    in_specs = [
+        pl.BlockSpec(
+            (block, num_heads, head_dim), lambda i, n: (live_block(i, n), 0, 0)
+        )
+    ]
     operands = [out]
     if gate:
         tile_rows = config.QKV_TILE_ROWS
@@ -145,7 +217,7 @@ def gate_and_quantize(
                     pl.Element(tile_rows),
                     pl.Element(head_dim),
                 ),
-                lambda i: (i * (block // tile_rows), z_group, 0, 0),
+                lambda i, n: (i * (block // tile_rows), z_group, 0, 0),
             ),
             pl.BlockSpec(memory_space=pltpu.VMEM),
         ]
@@ -155,17 +227,20 @@ def gate_and_quantize(
         functools.partial(
             _kernel, gate=gate, eps=eps, quant_dtype=quant_dtype, row_group=row_group
         ),
-        grid=(num_tokens // block,),
-        in_specs=in_specs,
-        out_specs=(
-            pl.BlockSpec((block, num_heads * head_dim), lambda i: (i, 0)),
-            pl.BlockSpec((block, 1), lambda i: (i, 0)),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_tokens // block,),
+            in_specs=in_specs,
+            out_specs=(
+                pl.BlockSpec((block, num_heads * head_dim), lambda i, n: (i, 0)),
+                pl.BlockSpec((block, 1), lambda i, n: (i, 0)),
+            ),
+            scratch_shapes=(pltpu.VMEM((num_heads, block, head_dim), jnp.float32),),
         ),
         out_shape=(
             jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), quant_dtype),
             jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32),
         ),
-        scratch_shapes=(pltpu.VMEM((num_heads, block, head_dim), jnp.float32),),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         name="gdn_gate_and_quantize",
-    )(*operands)
+    )(jnp.reshape(live_rows, (1,)).astype(jnp.int32), *operands)
