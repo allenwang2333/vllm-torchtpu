@@ -647,12 +647,16 @@ def _pad_qkv(qkv: Any, n_pad: int, n_logical: int) -> None:
     from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
         SEGMENT_QKV_LOGICAL_ATTR,
     )
-    from vllm_torchtpu.utils import synchronize_tensors
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
     w, s = qkv.weight.data, qkv.weight_scale.data
     pad = n_pad - w.shape[1]
-    w_pad = torch.nn.functional.pad(w.view(torch.uint8), (0, pad)).view(w.dtype)
-    s_pad = torch.nn.functional.pad(s, (0, pad))
+    # fresh_buffer: a dtype view as a parameter is re-materialized by a
+    # tt_jit_as_strided program before every forward (j-da0b4092).
+    w_pad = fresh_buffer(
+        torch.nn.functional.pad(w.view(torch.uint8), (0, pad)).view(w.dtype)
+    )
+    s_pad = fresh_buffer(torch.nn.functional.pad(s, (0, pad)))
     replace_parameter(qkv, "weight", torch.nn.Parameter(w_pad, requires_grad=False))
     replace_parameter(
         qkv, "weight_scale", torch.nn.Parameter(s_pad, requires_grad=False)
