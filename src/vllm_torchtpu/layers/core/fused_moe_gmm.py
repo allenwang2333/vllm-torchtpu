@@ -326,12 +326,8 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-    permute: bool = True,
-) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
-
-    With `permute=False` the expert-sorted rows are left to the caller, which
-    gathers them through `token_indices_sorted`, and `x` is None.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -411,9 +407,7 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
-    if not permute:
-        x = None
-    elif use_ep and use_sparse_core:
+    if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
