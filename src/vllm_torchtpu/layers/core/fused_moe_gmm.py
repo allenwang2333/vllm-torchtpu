@@ -233,6 +233,12 @@ def gmm_wrapper(
 # trades that against the number of blocks.
 _COUNTING_SORT_BLOCK = 512
 
+# fused_moe_func_ep_combine pushes each routed token row to its expert's rank
+# from inside the kernel up to this many tokens per rank; past it, an XLA
+# all-gather moves the batch faster than per-row remote DMAs, and each rank
+# copies the rows it computes from the gathered block instead.
+EP_DISPATCH_MAX_TOKENS = 256
+
 
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
@@ -875,52 +881,71 @@ def fused_moe_func_ep_combine(
     entry = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
     dest = jnp.zeros_like(route).at[position].set(entry, unique_indices=True)
 
-    # Pushes: where each of this device's routes sits among its computing
-    # rank's grouped rows -- the routes of earlier experts there, then those of
-    # its own expert on earlier devices, then those before it here -- ordered
-    # by local expert index, then rank, so every rank's early experts fill first.
-    dest_rank = jnp.minimum(own_expert // local_experts, num_devices - 1)
-    send_key = jnp.where(
-        own_valid.reshape(-1),
-        own_expert % local_experts * num_devices + dest_rank,
-        num_experts,
+    x = pack_rows(
+        jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
     )
-    send_position, send_counts = _stable_bucket_positions(send_key, num_experts + 1)
-    send_base = jnp.cumsum(send_counts) - send_counts
-    block_counts = jax.nn.one_hot(
-        expert.reshape(num_devices, rows_per_rank), num_experts, dtype=jnp.int32
-    ).sum(axis=1)
-    expert_base = jnp.cumsum(block_counts.sum(axis=0))
-    expert_base = jnp.concatenate([jnp.zeros((1,), jnp.int32), expert_base])
-    earlier = (jnp.cumsum(block_counts, axis=0) - block_counts)[me]
-    earlier = jnp.concatenate([earlier, jnp.zeros((1,), jnp.int32)])
-    lhs_row = (
-        expert_base[own_expert]
-        - expert_base[dest_rank * local_experts]
-        + earlier[own_expert]
-        + send_position
-        - send_base[send_key]
-    )
-    device = jnp.asarray(mesh_index_of_rank, jnp.int32)[dest_rank]
-    own_route = jnp.arange(rows_per_rank, dtype=jnp.int32)
-    send_dest = (
-        jnp.zeros_like(own_route)
-        .at[send_position]
-        .set(jnp.left_shift(device, DEST_DEVICE_SHIFT) | lhs_row, unique_indices=True)
-    )
-    send_src = (
-        jnp.zeros_like(own_route)
-        .at[send_position]
-        .set(own_route // topk, unique_indices=True)
-    )
-    send_bounds = send_base[::num_devices]
+    if tokens_per_rank > EP_DISPATCH_MAX_TOKENS:
+        # Every push is a local copy of a grouped row's token from the
+        # gathered block, whose rows are in mesh order.
+        x = jax.lax.all_gather(x, axis_name, tiled=True)
+        row_mask = (1 << DEST_DEVICE_SHIFT) - 1
+        send_src = (dest >> DEST_DEVICE_SHIFT) * tokens_per_rank + (
+            dest & row_mask
+        ) % tokens_per_rank
+        send_dest = jnp.left_shift(me, DEST_DEVICE_SHIFT) | route
+        send_bounds = jnp.concatenate(
+            [jnp.zeros((1,), jnp.int32), jnp.cumsum(group_sizes, dtype=jnp.int32)]
+        )
+    else:
+        # Pushes: where each of this device's routes sits among its computing
+        # rank's grouped rows -- the routes of earlier experts there, then
+        # those of its own expert on earlier devices, then those before it
+        # here -- ordered by local expert index, then rank, so every rank's
+        # early experts fill first.
+        dest_rank = jnp.minimum(own_expert // local_experts, num_devices - 1)
+        send_key = jnp.where(
+            own_valid.reshape(-1),
+            own_expert % local_experts * num_devices + dest_rank,
+            num_experts,
+        )
+        send_position, send_counts = _stable_bucket_positions(
+            send_key, num_experts + 1
+        )
+        send_base = jnp.cumsum(send_counts) - send_counts
+        block_counts = jax.nn.one_hot(
+            expert.reshape(num_devices, rows_per_rank), num_experts, dtype=jnp.int32
+        ).sum(axis=1)
+        expert_base = jnp.cumsum(block_counts.sum(axis=0))
+        expert_base = jnp.concatenate([jnp.zeros((1,), jnp.int32), expert_base])
+        earlier = (jnp.cumsum(block_counts, axis=0) - block_counts)[me]
+        earlier = jnp.concatenate([earlier, jnp.zeros((1,), jnp.int32)])
+        lhs_row = (
+            expert_base[own_expert]
+            - expert_base[dest_rank * local_experts]
+            + earlier[own_expert]
+            + send_position
+            - send_base[send_key]
+        )
+        device = jnp.asarray(mesh_index_of_rank, jnp.int32)[dest_rank]
+        own_route = jnp.arange(rows_per_rank, dtype=jnp.int32)
+        send_dest = (
+            jnp.zeros_like(own_route)
+            .at[send_position]
+            .set(
+                jnp.left_shift(device, DEST_DEVICE_SHIFT) | lhs_row,
+                unique_indices=True,
+            )
+        )
+        send_src = (
+            jnp.zeros_like(own_route)
+            .at[send_position]
+            .set(own_route // topk, unique_indices=True)
+        )
+        send_bounds = send_base[::num_devices]
 
     own_local = (topk_ids >= start) & (topk_ids < start + local_experts)
     num_recv = jnp.sum(own_valid & ~own_local, dtype=jnp.int32)[None]
 
-    x = pack_rows(
-        jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
-    )
     recv = gmm_v2_ffn_ep(
         x,
         w1,
