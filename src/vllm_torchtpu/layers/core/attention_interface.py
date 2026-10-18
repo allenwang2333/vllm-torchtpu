@@ -1193,14 +1193,14 @@ def sparse_mla_attention_dcp(
             f"{dcp_axis_name!r} of size {mesh.shape[dcp_axis_name]}."
         )
     num_tokens = ql_nope.shape[0]
-    if (kv_rows is None) != (kv_c_normed is not None and k_pe is not None):
-        raise ValueError("pass either kv_c_normed and k_pe, or kv_rows")
     if local_topk_indices.shape[0] != dcp_size * num_tokens:
         raise ValueError(
             "local_topk_indices must carry one row per (rank, token): "
             f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
             f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}."
         )
+    if (kv_rows is None) != (kv_c_normed is not None and k_pe is not None):
+        raise ValueError("pass either kv_c_normed and k_pe, or kv_rows")
 
     if kv_rows is None:
         lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]

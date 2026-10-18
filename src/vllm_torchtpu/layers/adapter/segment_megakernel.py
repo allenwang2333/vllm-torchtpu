@@ -120,12 +120,12 @@ class _Statics:
 
 @dataclasses.dataclass
 class _Tail:
-    """What an armed layer N needs at forward time."""
+    """What an armed layer N needs at forward time. No module references:
+    Dynamo names a module's tensors after the first path it reaches the module
+    by, and a path through here would rename layer N+1's (and break the
+    backbone warmup's hand-over, j-cf10a39a)."""
 
     op: Any
-    head_layer: torch.nn.Module  # decoder layer N+1
-    moe_layer: torch.nn.Module  # N's routed-experts layer (moe_tp_decode buffers)
-    gate: torch.nn.Module  # N's router gate
     dcp_rank: torch.Tensor  # the DCP attention ops' rank operand (one buffer)
 
 
@@ -715,7 +715,6 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     for i, st in plan:
         assert not isinstance(topo, str)
         layer, nxt = layers[i], layers[i + 1]
-        runner = _moe_runner(layer)
         nwrap = nxt.self_attn.mla_attn
         width = nwrap.q_lora_rank + nwrap.kv_lora_rank + nwrap.qk_rope_head_dim
         _pad_qkv(nwrap.fused_qkv_a_proj, st.qkv_pad, width)
@@ -733,9 +732,6 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             TAIL_ATTR,
             _Tail(
                 op=_get_op(topo.mesh, st),
-                head_layer=nxt,
-                moe_layer=runner.routed_experts,
-                gate=runner.gate,
                 dcp_rank=dcp_rank_operand(),
             ),
         )
@@ -776,9 +772,8 @@ def takes_tail(layer: Any, positions: torch.Tensor) -> bool:
         return False
     if positions.shape[0] > kernel.MAX_TOKENS:
         return False
-    return _kv_bound(tail.head_layer.self_attn.mla_attn) and _kv_bound(
-        layer.self_attn.mla_attn
-    )
+    # One KV allocation covers every layer: N's cache stands for N+1's.
+    return _kv_bound(layer.self_attn.mla_attn)
 
 
 def segment_forward(
