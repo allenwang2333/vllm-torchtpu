@@ -1,5 +1,5 @@
 import contextlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -371,7 +371,9 @@ class VocabParallelArgmax:
     """This rank's slice of a vocab-parallel lm_head, for an argmax that
     all-gathers one (max, index) pair per row instead of the full logits."""
 
-    org_vocab_start: int  # global id of local column 0
+    # Global id of local column 0. An int, or (with_device_vocab_start) the
+    # same value as a device int32 scalar.
+    org_vocab_start: int | torch.Tensor
     num_org_local: int  # local columns that are real (not padding / added)
     tp_size: int
     # TPU_MTP_ONEHOT_AR: bool [tp], True at this rank (data, not a constant).
@@ -418,6 +420,22 @@ def install_vocab_parallel_draft_argmax(
         tp_size=tp_size,
         slot=slot,
     )
+
+
+def with_device_vocab_start(
+    info: VocabParallelArgmax, device
+) -> VocabParallelArgmax:
+    """`info` with its shard offset as a device int32 scalar.
+
+    For a program compiled once and shared across ranks (peer replay): an int
+    offset is a constant of the traced graph, different on every rank, so no
+    rank can replay another's artifact; a tensor is an input of it, like
+    `slot`. Same ids either way.
+    """
+    if isinstance(info.org_vocab_start, torch.Tensor):
+        return info
+    start = torch.tensor(int(info.org_vocab_start), dtype=torch.int32).to(device)
+    return replace(info, org_vocab_start=start)
 
 
 def rank_slot(tp_rank: int, tp_size: int, device) -> torch.Tensor:

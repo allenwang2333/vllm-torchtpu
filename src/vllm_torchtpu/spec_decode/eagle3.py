@@ -36,6 +36,7 @@ from vllm_torchtpu.spec_decode.utils import (
     maybe_share_lm_head,
     shard_draft_eh_proj,
     vocab_parallel_argmax,
+    with_device_vocab_start,
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -230,6 +231,8 @@ class Eagle3Proposer:
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._vocab_parallel_argmax = None
         self._mtp_fused_loop_warm = False
+        # The token counts that program was compiled for (its loop buckets).
+        self._mtp_fused_loop_sizes: frozenset[int] | None = None
         # Whether that program is the IndexShare variant, which takes each
         # chunk's saved step-0 top-k rows and installs them in-graph.
         self._mtp_fused_indexshare = False
@@ -347,9 +350,16 @@ class Eagle3Proposer:
             )
             logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
             if self._mtp_fused_loop is not None:
-                # Before its first call: the program traces lazily.
+                # Before its first call: the program traces lazily. The shard
+                # offset goes in as a device tensor, not a Python int: an int
+                # is baked into the graph, so every rank traced its own
+                # program and peer replay (TPU_PRECOMPILE_PEER_REPLAY) refused
+                # every other rank's artifact -- each rank compiled every
+                # bucket itself.
                 self._mtp_fused_loop.vocab_parallel_argmax = (
-                    self._vocab_parallel_argmax
+                    with_device_vocab_start(
+                        self._vocab_parallel_argmax, self.runner.device
+                    )
                 )
 
         # IndexShare assumes the draft owns its KV cache and advances
@@ -586,6 +596,7 @@ class Eagle3Proposer:
         IndexShare-correct on its own.
         """
         self._mtp_fused_loop = None
+        self._mtp_fused_loop_sizes = None
         self._mtp_fused_indexshare = False
         draft_model = self.draft_model
         if (
@@ -631,6 +642,17 @@ class Eagle3Proposer:
         # The program reads the table but never writes it: the rows are
         # restored eagerly before each call (_run_mtp_fused_loop).
         topk_indices_buffer = None
+        # The program only ever runs at a loop bucket p = pad(num_reqs) <=
+        # pad(max_num_reqs) (_run_mtp_fused_loop), so compile it at those
+        # buckets alone, not at every token bucket up to
+        # max_num_batched_tokens: two draft passes plus the LM head at 4096
+        # tokens is ~45 s of compile per bucket that no propose dispatches.
+        # Its own config copy, so the draft and loop-step programs keep theirs.
+        fused_vllm_config = copy.copy(self.draft_vllm_config)
+        fused_compilation_config = copy.copy(self.draft_vllm_config.compilation_config)
+        loop_sizes = self._loop_bucket_sizes()
+        fused_compilation_config.compile_sizes = list(loop_sizes)
+        fused_vllm_config.compilation_config = fused_compilation_config
         try:
             from vllm_torchtpu.spec_decode.mtp_fused_loop import build_mtp_fused_loop
 
@@ -639,10 +661,10 @@ class Eagle3Proposer:
                 set_vllm_model_wrapper_context(
                     mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
                 ),
-                set_current_vllm_config(self.draft_vllm_config),
+                set_current_vllm_config(fused_vllm_config),
             ):
                 self._mtp_fused_loop = build_mtp_fused_loop(
-                    vllm_config=self.draft_vllm_config,
+                    vllm_config=fused_vllm_config,
                     # The variants trace different graphs: keep their compile
                     # caches apart.
                     prefix=(
@@ -664,6 +686,7 @@ class Eagle3Proposer:
             self._mtp_fused_loop = None
             return
         self._mtp_fused_loop_warm = False
+        self._mtp_fused_loop_sizes = frozenset(loop_sizes)
         self._mtp_fused_indexshare = indexshare
         logger.info(
             "Applied TPU patch: %s - MTP draft loop steps 1..%d run as one "
@@ -673,6 +696,20 @@ class Eagle3Proposer:
             " (each chunk's step-0 top-k rows restored before the program)"
             if indexshare
             else "",
+        )
+
+    def _loop_bucket_sizes(self) -> list[int]:
+        """Every loop bucket p a propose can pick: the token buckets up to
+        pad(max_num_reqs), which is what `_loop_bucket` returns at most."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, runner.max_num_reqs
+        )
+        return sorted(
+            {self._loop_bucket(n) for n in runner.num_reqs_paddings}
+            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
         )
 
     def _shared_topk_rows_fit(
@@ -717,6 +754,10 @@ class Eagle3Proposer:
             if not self._shared_topk_rows_fit(shared_topk_indices, input_ids):
                 return None
         elif shared_topk_indices is not None:
+            return None
+        sizes = self._mtp_fused_loop_sizes
+        if sizes is not None and input_ids.shape[0] not in sizes:
+            # Compiled at the loop buckets only (_build_mtp_fused_loop).
             return None
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
@@ -865,16 +906,8 @@ class Eagle3Proposer:
         holds, so its contents do not change."""
         if not (envs.TPU_MTP_TOPK_INPLACE and self._share_mtp_indices):
             return
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
-        sizes = sorted(
-            {self._loop_bucket(n) for n in runner.num_reqs_paddings}
-            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
-        )
+        sizes = self._loop_bucket_sizes()
         with runner._precompile_timed("drafter top-k restore"):
             for n in sizes:
                 saved = [buf[:n].clone() for buf in self._mtp_topk_buffers]

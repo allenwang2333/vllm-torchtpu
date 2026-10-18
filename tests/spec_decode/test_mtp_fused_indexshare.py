@@ -155,6 +155,7 @@ def _proposer(monkeypatch, table, program, warm=True):
     prop._mtp_topk_buffers = [table]
     prop._mtp_fused_loop = program
     prop._mtp_fused_loop_warm = warm
+    prop._mtp_fused_loop_sizes = None
     prop._draft_md_cache = {}
     prop.draft_vllm_config = None
     prop.runner = types.SimpleNamespace(
@@ -256,3 +257,182 @@ def test_fused_loop_takes_the_vocab_parallel_argmax(monkeypatch):
     toks = loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
                 torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
     assert all(t.dtype == torch.int32 for t in toks) and len(seen) == 2
+
+
+# --- compile time: one program for every rank, at the loop buckets only ----
+
+
+def _traced_argmax_graph(info, onehot):
+    """The FX graph Dynamo traces for the fused loop's draft argmax on one
+    rank (the collective is stubbed; only the traced code matters)."""
+    import vllm.distributed as vd
+
+    import vllm_torchtpu.spec_decode.utils as su
+
+    graphs = []
+
+    def capture(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(vd, "tensor_model_parallel_all_gather", lambda x, dim=0: x.repeat(2, 1))
+        mp.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: x)
+        fn = torch.compile(
+            lambda logits: su.vocab_parallel_argmax(logits, info),
+            backend=capture,
+            fullgraph=True,
+        )
+        fn(torch.randn(4, 256).to(torch.bfloat16 if onehot else torch.float32))
+    torch._dynamo.reset()
+    assert len(graphs) == 1
+    return graphs[0]
+
+
+@pytest.mark.parametrize("onehot", [False, True], ids=["all-gather", "onehot-ar"])
+def test_fused_argmax_graph_is_the_same_on_every_rank(onehot):
+    """With the shard offset as a device scalar (with_device_vocab_start) the
+    two ranks trace the same graph, so TPU_PRECOMPILE_PEER_REPLAY can replay
+    one rank's fused-loop artifact on the other. Control: the int offset
+    bakes the rank into the graph and splits the fingerprint -- what made
+    every rank compile every fused-loop bucket itself."""
+    import vllm_torchtpu.spec_decode.utils as su
+    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+    def info(r, device_start):
+        i = su.VocabParallelArgmax(
+            r * 256, 256, 2, slot=su.rank_slot(r, 2, "cpu") if onehot else None
+        )
+        return su.with_device_vocab_start(i, "cpu") if device_start else i
+
+    fp = {
+        (r, d): _graph_fingerprint(_traced_argmax_graph(info(r, d), onehot))
+        for r in (0, 1)
+        for d in (False, True)
+    }
+    assert None not in fp.values()
+    assert fp[(0, True)] == fp[(1, True)]
+    assert fp[(0, False)] != fp[(1, False)]  # control: the int offset
+
+
+@pytest.mark.parametrize("onehot", [False, True], ids=["all-gather", "onehot-ar"])
+def test_device_vocab_start_gives_the_same_ids(monkeypatch, onehot):
+    import vllm.distributed as vd
+
+    import vllm_torchtpu.spec_decode.utils as su
+
+    tp, width = 4, 300
+    g = torch.Generator().manual_seed(3)
+    dtype = torch.bfloat16 if onehot else torch.float32
+    full = torch.randn(8, tp * width, generator=g).to(dtype)
+    full[1, width - 1] = full[1, width + 1] = 50.0  # tie across shards
+    shards = full.split(width, dim=-1)
+    for device_start in (False, True):
+        infos = []
+        for r in range(tp):
+            i = su.VocabParallelArgmax(
+                r * width, width, tp, slot=su.rank_slot(r, tp, "cpu") if onehot else None
+            )
+            infos.append(su.with_device_vocab_start(i, "cpu") if device_start else i)
+        sent = []
+        monkeypatch.setattr(
+            vd, "tensor_model_parallel_all_gather", lambda x, dim=0: sent.append(x) or x.repeat(tp, 1)
+        )
+        monkeypatch.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: sent.append(x) or x)
+        for r in range(tp):
+            su.vocab_parallel_argmax(shards[r], infos[r])
+        total = (
+            sum(s.float() for s in sent).to(dtype) if onehot else torch.cat(sent, dim=0)
+        )
+        monkeypatch.setattr(vd, "tensor_model_parallel_all_gather", lambda x, dim=0: total)
+        monkeypatch.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: total)
+        expected = torch.argmax(full, dim=-1).to(torch.int32)
+        for r in range(tp):
+            out = su.vocab_parallel_argmax(shards[r], infos[r])
+            assert out.dtype == torch.int32 and torch.equal(out, expected), (device_start, r)
+
+
+def _bucket_runner(max_num_reqs=8):
+    import types
+
+    return types.SimpleNamespace(
+        num_tokens_paddings=[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        num_reqs_paddings=[1, 2, 4, 8, 16][: 1 + [1, 2, 4, 8, 16].index(max_num_reqs)],
+        max_num_reqs=max_num_reqs,
+        _dp_lockstep_enabled=lambda: False,
+        mesh=None,
+        device="cpu",
+    )
+
+
+def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch):
+    """The fused program is built with its own config whose compile_sizes are
+    the loop buckets pad(num_reqs) <= pad(max_num_reqs) -- [4, 8] at
+    max_num_seqs 8, not the 11 token buckets up to 4096 -- and the draft's
+    own config (draft and loop-step programs) keeps every bucket."""
+    import contextlib
+    import types
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.spec_decode import eagle3, mtp_fused_loop
+
+    for name in ("set_vllm_model_wrapper_context", "set_model_tag"):
+        monkeypatch.setattr(eagle3, name, lambda *a, **k: contextlib.nullcontext())
+    seen = {}
+
+    @contextlib.contextmanager
+    def current(cfg):
+        seen["current"] = cfg
+        yield
+
+    monkeypatch.setattr(eagle3, "set_current_vllm_config", current)
+
+    def build(**kw):
+        seen.update(kw)
+        return types.SimpleNamespace(vocab_parallel_argmax=None)
+
+    monkeypatch.setattr(mtp_fused_loop, "build_mtp_fused_loop", build)
+    monkeypatch.setattr(envs, "VLLM_TPU_FUSED_DRAFT_LOOP", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MTP_FUSED_INDEXSHARE", True, raising=False)
+
+    prop = eagle3.Eagle3Proposer.__new__(eagle3.Eagle3Proposer)
+    prop.runner = _bucket_runner(8)
+    prop.draft_model = types.SimpleNamespace(_dynamic_arg_dims={"input_ids": 0})
+    prop.speculative_config = types.SimpleNamespace(method="mtp", num_speculative_tokens=3)
+    prop._draft_kv_shared = False
+    prop._share_mtp_indices = True
+    prop._mtp_topk_buffers = [torch.zeros(16, 4, dtype=torch.int32)]
+    prop._mtp_loop_model = object()
+    all_sizes = list(prop.runner.num_tokens_paddings)
+    cc = types.SimpleNamespace(compile_sizes=list(all_sizes))
+    prop.draft_vllm_config = types.SimpleNamespace(compilation_config=cc)
+    monkeypatch.setattr(
+        eagle3.Eagle3Proposer, "advance_draft_positions", property(lambda self: True)
+    )
+
+    prop._build_mtp_fused_loop()
+
+    assert prop._mtp_fused_loop is not None and prop._mtp_fused_indexshare
+    cfg = seen["vllm_config"]
+    assert cfg is seen["current"] and cfg is not prop.draft_vllm_config
+    assert cfg.compilation_config.compile_sizes == [4, 8]
+    assert prop._mtp_fused_loop_sizes == {4, 8}
+    assert cc.compile_sizes == all_sizes  # the draft's config is untouched
+    assert prop._loop_bucket_sizes() == [4, 8]
+    prop.runner = _bucket_runner(16)
+    assert prop._loop_bucket_sizes() == [4, 8, 16]
+
+
+def test_proposer_bucket_outside_the_compiled_sizes_falls_back(monkeypatch):
+    """A token count the fused program was not compiled for never reaches it
+    (the per-step loop runs instead), and the table is left alone."""
+    p, k = 16, 32
+    table = torch.full((32, k), -1, dtype=torch.int32)
+    prog = _RecordingProgram(table)
+    prop, _ = _proposer(monkeypatch, table, prog)
+    prop._mtp_fused_loop_sizes = frozenset({4, 8})
+    before = table.clone()
+    assert _run(prop, p, torch.ones(p, k, dtype=torch.int32)) is None
+    assert torch.equal(table, before) and not prog.calls
+    assert _run(prop, 8, torch.ones(8, k, dtype=torch.int32)) is not None
