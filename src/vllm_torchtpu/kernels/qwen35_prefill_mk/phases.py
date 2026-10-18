@@ -613,25 +613,40 @@ def moe_route(logits_hbm, topi_hbm, topw_hbm, rank_hbm, counts_hbm, *, e, topk, 
     pl.run_scoped(run, pltpu.VMEM((1, e), F32), pltpu.SemaphoreType.DMA((1,)))
 
 
-def _gather_rows(src_hbm, idx_fn, dst_vmem, n, sems, inflight):
-    """dst_vmem[r] = src_hbm[idx_fn(r)] for r < n, one DMA per row, `inflight` outstanding."""
-    def issue(r):
+def _gather_issue(src_hbm, idx_fn, dst_vmem, n, sems, inflight, unroll=8):
+    """Start dst_vmem[r] = src_hbm[idx_fn(r)] for r < n, one DMA per row; at most `inflight`
+    are left outstanding (the oldest are waited as new ones start). Pair with _gather_drain."""
+    def one(r):
+        @pl.when(r >= inflight)
+        def _():
+            pltpu.make_async_copy(src_hbm.at[pl.ds(0, 1)], dst_vmem.at[pl.ds(r - inflight, 1)],
+                                  sems.at[(r - inflight) % inflight]).wait()
         pltpu.make_async_copy(src_hbm.at[pl.ds(idx_fn(r), 1)], dst_vmem.at[pl.ds(r, 1)],
                               sems.at[r % inflight]).start()
 
-    def wait(r):
-        pltpu.make_async_copy(src_hbm.at[pl.ds(0, 1)], dst_vmem.at[pl.ds(r, 1)],
-                              sems.at[r % inflight]).wait()
-
-    def body(r, carry):
-        @pl.when(r >= inflight)
-        def _():
-            wait(r - inflight)
-        issue(r)
+    def group(gi, carry):                    # n is dynamic, so unroll by hand
+        for u in range(unroll):
+            one(gi * unroll + u)
         return carry
 
-    jax.lax.fori_loop(0, n, body, 0)
-    jax.lax.fori_loop(jnp.maximum(n - inflight, 0), n, lambda r, c: (wait(r), c)[1], 0)
+    groups = n // unroll
+    jax.lax.fori_loop(0, groups, group, 0)
+    jax.lax.fori_loop(groups * unroll, n, lambda r, c: (one(r), c)[1], 0)
+
+
+def _gather_drain(src_hbm, dst_vmem, n, sems, inflight):
+    """Wait for the rows _gather_issue left outstanding."""
+    def body(r, c):
+        pltpu.make_async_copy(src_hbm.at[pl.ds(0, 1)], dst_vmem.at[pl.ds(r, 1)],
+                              sems.at[r % inflight]).wait()
+        return c
+    jax.lax.fori_loop(jnp.maximum(n - inflight, 0), n, body, 0)
+
+
+def _gather_rows(src_hbm, idx_fn, dst_vmem, n, sems, inflight):
+    """dst_vmem[r] = src_hbm[idx_fn(r)] for r < n (issue, then drain)."""
+    _gather_issue(src_hbm, idx_fn, dst_vmem, n, sems, inflight)
+    _gather_drain(src_hbm, dst_vmem, n, sems, inflight)
 
 
 def _expert_tile(x, w13, w13s, w2, w2s, inter):
@@ -653,22 +668,50 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
     grouped order. Also writes pos [T, K] = off[topi] + rank, the grouped row of every (token,
     slot). Rows are 32-bit: a single-row DMA cannot address one row of a packed bf16 tile.
 
+    The grouped tiles of all experts form one list, software-pipelined: tile g+1's rows are
+    gathered while tile g computes, outputs are written asynchronously, and each expert's
+    weights are prefetched while the previous expert runs. Experts with no rows cost nothing.
+
     xb [T, H] f32 (bf16 values), topi / rank [T, K] i32, counts [1, E] i32, w13 [E, H, 2I] fp8,
     w13s [E, 1, 2I] f32, w2 [E, I, H] fp8, w2s [E, 1, H] f32."""
     t, h = xb_hbm.shape
     n_slots = t * topk
+    max_tiles = n_slots // rt + e
 
-    def run(cnt_s, off_s, tok_s, stage_s, sems, sem1):
+    def run(cnt_s, off_s, tok_s, stage_s, t_e, t_r0, t_n, t_first, t_next, sems, sem1):
         cp = pltpu.make_async_copy(counts_hbm, cnt_s, sem1.at[0])
         cp.start()
         cp.wait()
 
-        # Offsets: exclusive prefix of the counts rounded up to rt rows.
-        def off_body(i, acc):
-            off_s[0, i] = acc
-            return acc + ((cnt_s[0, i] + rt - 1) // rt) * rt
+        # Offsets (each expert's segment padded to rt rows) and the flat tile list: per tile its
+        # expert, first grouped row, live rows, whether it starts its expert, and the next
+        # expert with rows (to prefetch, -1 if none).
+        def off_body(ei, carry):
+            acc, ntile, prev_first = carry
+            n = cnt_s[0, ei]
+            off_s[0, ei] = acc
+            nt = (n + rt - 1) // rt
+
+            @pl.when(nt > 0)
+            def _():
+                @pl.when(prev_first >= 0)
+                def _():
+                    t_next[prev_first] = ei
+
+            def tile_body(ti, c):
+                g = ntile + ti
+                t_e[g] = ei
+                t_r0[g] = acc + ti * rt
+                t_n[g] = jnp.minimum(rt, n - ti * rt)
+                t_first[g] = (ti == 0).astype(jnp.int32)
+                t_next[g] = -1
+                return c
+            jax.lax.fori_loop(0, nt, tile_body, 0)
+            return (acc + nt * rt, ntile + nt, jnp.where(nt > 0, ntile, prev_first))
+
         with jax.named_scope("moe_offsets"):
-            jax.lax.fori_loop(0, e, off_body, jnp.int32(0))
+            _, n_tiles, _ = jax.lax.fori_loop(0, e, off_body,
+                                              (jnp.int32(0), jnp.int32(0), jnp.int32(-1)))
 
         # pos = off[topi] + rank (vector pass), and the inverse map tok_s[pos] = t (scalar).
         def pos_pass(off_v):
@@ -700,97 +743,142 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                                         stage_s, sem1.at[0])
             cps.start()
             cps.wait()
+            t0 = si * rows_per_stage
 
             def tok_body(j, c):
-                tok_s[stage_s[j // topk, j % topk]] = si * rows_per_stage + j // topk
+                for kk in range(topk):
+                    tok_s[stage_s[j, kk]] = t0 + j
                 return c
-            return jax.lax.fori_loop(0, rows_per_stage * topk, tok_body, c)
+            return jax.lax.fori_loop(0, rows_per_stage, tok_body, c, unroll=2)
         with jax.named_scope("moe_scatter"):
             jax.lax.fori_loop(0, t // rows_per_stage, scatter_stage, 0)
 
-        # Expert loop with double-buffered weights.
-        def experts(w13_v, w13s_v, w2_v, w2s_v, xin, wsem):
+        def experts(w13_v, w13s_v, w2_v, w2s_v, xin, yout, wsem, ysem):
+            wpairs = ((w13_hbm, w13_v, 0), (w13s_hbm, w13s_v, 1), (w2_hbm, w2_v, 2),
+                      (w2s_hbm, w2s_v, 3))
+
             def fetch(ei, slot):
-                for src, dst, k in ((w13_hbm, w13_v, 0), (w13s_hbm, w13s_v, 1),
-                                    (w2_hbm, w2_v, 2), (w2s_hbm, w2s_v, 3)):
+                for src, dst, k in wpairs:
                     pltpu.make_async_copy(src.at[ei], dst.at[slot], wsem.at[slot, k]).start()
 
             def wait_w(slot):
-                for src, dst, k in ((w13_hbm, w13_v, 0), (w13s_hbm, w13s_v, 1),
-                                    (w2_hbm, w2_v, 2), (w2s_hbm, w2s_v, 3)):
+                for src, dst, k in wpairs:
                     pltpu.make_async_copy(src.at[0], dst.at[slot], wsem.at[slot, k]).wait()
 
-            fetch(0, 0)
+            def gather(g, b):
+                r0 = t_r0[g]
+                _gather_issue(xb_hbm, lambda r: tok_s[r0 + r], xin.at[b], t_n[g], sems.at[b],
+                              inflight)
 
-            def expert(ei, c):
-                slot = ei % 2
+            def ywrite(g, b):
+                return pltpu.make_async_copy(
+                    yout.at[b], y_sorted_hbm.at[pl.ds(pl.multiple_of(t_r0[g], rt), rt)],
+                    ysem.at[b])
 
-                @pl.when(ei + 1 < e)
+            @pl.when(n_tiles > 0)
+            def _():
+                fetch(t_e[0], 0)
+                gather(0, 0)
+
+            def tile(g, wslot):
+                b = g % 2
+                # The next tile's rows start moving before this tile computes.
+                @pl.when(g + 1 < n_tiles)
                 def _():
-                    fetch(ei + 1, 1 - slot)
-                wait_w(slot)
-                n = cnt_s[0, ei]
-                base = off_s[0, ei]
+                    gather(g + 1, 1 - b)
+                with jax.named_scope("moe_gather_wait"):
+                    _gather_drain(xb_hbm, xin.at[b], t_n[g], sems.at[b], inflight)
+                first = t_first[g] == 1
+                wslot = jnp.where(first & (g > 0), 1 - wslot, wslot)
 
-                def tile(ri, c):
-                    r0 = pl.multiple_of(base + ri * rt, rt)   # offsets are padded to rt rows
-                    nr = jnp.minimum(rt, n - ri * rt)
-                    with jax.named_scope("moe_gather"):
-                        _gather_rows(xb_hbm, lambda r: tok_s[r0 + r], xin, nr, sems, inflight)
-                    with jax.named_scope("moe_mm"):
-                        xin[...] = _expert_tile(xin[...], w13_v.at[slot], w13s_v.at[slot],
-                                                w2_v.at[slot], w2s_v.at[slot], inter)
-                    with jax.named_scope("moe_ywrite"):
-                        cpy = pltpu.make_async_copy(xin, y_sorted_hbm.at[pl.ds(r0, rt)], sem1.at[0])
-                        cpy.start()
-                        cpy.wait()
-                    return c
-                return jax.lax.fori_loop(0, (n + rt - 1) // rt, tile, c)
-            jax.lax.fori_loop(0, e, expert, 0)
+                @pl.when(first)
+                def _():
+                    wait_w(wslot)
+                    nxt = t_next[g]
+
+                    @pl.when(nxt >= 0)
+                    def _():
+                        fetch(nxt, 1 - wslot)
+
+                @pl.when(g >= 2)
+                def _():
+                    ywrite(g - 2, b).wait()
+                with jax.named_scope("moe_mm"):
+                    yout[b] = _expert_tile(xin[b], w13_v.at[wslot], w13s_v.at[wslot],
+                                           w2_v.at[wslot], w2s_v.at[wslot], inter)
+                ywrite(g, b).start()
+                return wslot
+
+            jax.lax.fori_loop(0, n_tiles, tile, jnp.int32(0))
+
+            def drain_y(g, c):
+                ywrite(g, g % 2).wait()
+                return c
+            jax.lax.fori_loop(jnp.maximum(n_tiles - 2, 0), n_tiles, drain_y, 0)
 
         pl.run_scoped(experts,
                       pltpu.VMEM((2, h, 2 * inter), FP8), pltpu.VMEM((2, 1, 2 * inter), F32),
                       pltpu.VMEM((2, inter, h), FP8), pltpu.VMEM((2, 1, h), F32),
-                      pltpu.VMEM((rt, h), F32), pltpu.SemaphoreType.DMA((2, 4)))
+                      pltpu.VMEM((2, rt, h), F32), pltpu.VMEM((2, rt, h), F32),
+                      pltpu.SemaphoreType.DMA((2, 4)), pltpu.SemaphoreType.DMA((2,)))
 
     n_pad = n_slots + e * (rt - 1)
     stage_rows = 64
     pl.run_scoped(run, pltpu.SMEM((1, e), jnp.int32), pltpu.SMEM((1, e), jnp.int32),
                   pltpu.SMEM((n_pad,), jnp.int32), pltpu.SMEM((stage_rows, topk), jnp.int32),
-                  pltpu.SemaphoreType.DMA((inflight,)), pltpu.SemaphoreType.DMA((1,)))
+                  pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
+                  pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
+                  pltpu.SMEM((max_tiles,), jnp.int32),
+                  pltpu.SemaphoreType.DMA((2, inflight)), pltpu.SemaphoreType.DMA((1,)))
 
 
 def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, topk, tm,
                 inflight=64):
     """out[t] = sum_k topw[t, k] * y_sorted[pos[t, k]] + sd[t] * sigmoid(sg[t]) -> bf16.
     y_sorted [n_pad, H] f32, pos / topw [T, K], sd [T, H] (shared expert down, bf16),
-    sg [T, 1] f32 (shared expert gate logit), out [T, H] bf16."""
+    sg [T, 1] f32 (shared expert gate logit), out [T, H] bf16. Slot-major gathers
+    (rows[k * tm + t] = y_sorted[pos[t, k]]), pipelined: tile i+1's rows move while tile i
+    sums."""
     t, h = out_hbm.shape
+    n_rows = tm * topk
+    n_t = t // tm
 
     def run(pos_s, rows, sems, sem1):
-        def body(tw_ref, sd_ref, sg_ref, o_ref):
-            i = pl.program_id(0)
-            cp = pltpu.make_async_copy(pos_hbm.at[pl.ds(i * tm, tm)], pos_s, sem1.at[0])
+        def load_pos(i, b):
+            cp = pltpu.make_async_copy(pos_hbm.at[pl.ds(i * tm, tm)], pos_s.at[b], sem1.at[0])
             cp.start()
             cp.wait()
-            # Slot-major: rows[k * tm + t] = y_sorted[pos[t, k]], summed one slot at a time.
-            with jax.named_scope("combine_gather"):
-                _gather_rows(y_sorted_hbm, lambda r: pos_s[r % tm, r // tm], rows, tm * topk,
-                             sems, inflight)
+
+        def issue(i, b):
+            load_pos(i, b)
+            _gather_issue(y_sorted_hbm, lambda r: pos_s[b, r % tm, r // tm], rows.at[b], n_rows,
+                          sems.at[b], inflight)
+
+        issue(0, 0)
+
+        def body(tw_ref, sd_ref, sg_ref, o_ref):
+            i = pl.program_id(0)
+            b = i % 2
+
+            @pl.when(i + 1 < n_t)
+            def _():
+                issue(i + 1, 1 - b)
+            with jax.named_scope("combine_gather_wait"):
+                _gather_drain(y_sorted_hbm, rows.at[b], n_rows, sems.at[b], inflight)
             tw = tw_ref[...]
             routed = jnp.zeros((tm, h), F32)
             for kk in range(topk):
-                routed = routed + rows[kk * tm:(kk + 1) * tm, :].astype(F32) * tw[:, kk:kk + 1]
+                routed = routed + rows[b, kk * tm:(kk + 1) * tm, :] * tw[:, kk:kk + 1]
             shared = sd_ref[...].astype(F32) * jax.nn.sigmoid(sg_ref[...])
             o_ref[...] = (routed + shared).astype(o_ref.dtype)
 
         pltpu.emit_pipeline(
-            body, grid=(t // tm,),
+            body, grid=(n_t,),
             in_specs=[pl.BlockSpec((tm, topk), lambda i: (i, 0)),
                       pl.BlockSpec((tm, h), lambda i: (i, 0)),
                       pl.BlockSpec((tm, 1), lambda i: (i, 0))],
             out_specs=[pl.BlockSpec((tm, h), lambda i: (i, 0))],
         )(topw_hbm, sd_hbm, sg_hbm, out_hbm)
 
-    pl.run_scoped(run, pltpu.SMEM((tm, topk), jnp.int32), pltpu.VMEM((tm * topk, h), F32),
-                  pltpu.SemaphoreType.DMA((inflight,)), pltpu.SemaphoreType.DMA((1,)))
+    pl.run_scoped(run, pltpu.SMEM((2, tm, topk), jnp.int32), pltpu.VMEM((2, n_rows, h), F32),
+                  pltpu.SemaphoreType.DMA((2, inflight)), pltpu.SemaphoreType.DMA((1,)))

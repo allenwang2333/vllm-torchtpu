@@ -59,8 +59,8 @@ class MKTiles:
     tn: int = 512
     chunk: int = 64          # GDN chunk
     bq: int = 256            # attention q tile (tokens)
-    bkv: int = 512           # attention kv tile
-    att_sub: int = 4         # attention row sub-chunks (MXU / softmax overlap)
+    bkv: int = 2048          # attention kv tile (j-692719db-95ef-4ea4-8b2f: best of 512..4096)
+    att_sub: int = 8         # attention row sub-chunks (MXU / softmax overlap)
     rt: int = 128            # MoE grouped rows per tile
     tm_route: int = 256
     tm_combine: int = 64
