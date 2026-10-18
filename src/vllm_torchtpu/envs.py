@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED: bool = False
     TPU_STREAMIDX_MIXED_KV_PAGES: int | None = None
     TPU_STREAMIDX_DECODE_PACK: bool = False
+    TPU_STREAMIDX_SHARED_META: bool = False
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
@@ -1465,6 +1466,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # passes are unchanged. Pairs with TPU_STREAMIDX_SMALL_BUCKET_BKVP=32
     # (GLM-5.2 DCP8, 9k-67k keys per rank: -10...-48 % per call).
     "TPU_STREAMIDX_DECODE_PACK": env_bool("TPU_STREAMIDX_DECODE_PACK", default=False),
+    # StreamIdx per-step inputs built once per step instead of once per
+    # indexer layer: the MIXED pass schedule without its empty-pass cond (so
+    # XLA CSEs the layers' identical copies), its scalar [start, end, chunk]
+    # operand outside the skip-empty conditional, and the DECODE schedules
+    # only inside the branch that runs them (never, under MTP). GLM-5.2 full
+    # depth, 1 decoder: 21 layers x (3 schedule conds + 1 operand fusion)
+    # = 190 us per step. Same operands, same result.
+    "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=False),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
