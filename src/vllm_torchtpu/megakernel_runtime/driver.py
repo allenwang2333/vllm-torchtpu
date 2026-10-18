@@ -500,7 +500,7 @@ def prepare_step_inputs_eager(
                 src_1d = c_raw[:, 0] if c_raw.ndim == 2 else c_raw.reshape(-1)
                 ckpt_1d = _slice_or_pad_1d(src_1d, nseq_bkt).to(torch.int32)
                 ckpt_g = ckpt_1d.unsqueeze(1).expand(nseq_bkt, T).contiguous()
-                roff_g = torch.zeros_like(roff_g)
+                roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
         else:
             # For T=1, build 2-column `[read_slot, write_slot]` so `gather_gdn`
             # reads from `c_b[s, roff[s]]` while `scatter_gdn` (`ckpt_t_off=1`)
@@ -515,7 +515,7 @@ def prepare_step_inputs_eager(
                 read_col = s_b.unsqueeze(1)
             write_col = s_b.unsqueeze(1)
             ckpt_g = torch.cat([read_col, write_col], dim=1)
-            roff_g = torch.zeros_like(roff_g)
+            roff_g = torch.where(roff_g < 0, roff_g, torch.zeros_like(roff_g))
 
         active_g = (s_b > 0) & (ckpt_g[:, 0] > 0)
         ckpt_g = torch.where(active_g.unsqueeze(1), ckpt_g, torch.zeros_like(ckpt_g))
@@ -1417,8 +1417,8 @@ class MegakernelDriver:
                         if do_sentinel:
                             if dev.type != "tpu":
                                 for p in self.raw_pools:
-                                    p[0].view(torch.uint8).fill_(0x5A)
-                                    p[5:10].view(torch.uint8).fill_(0x5A)
+                                    p[0].view(torch.uint8).fill_(0x7F)
+                                    p[5:10].view(torch.uint8).fill_(0xFF)
                             sent_kv = [
                                 p[0].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
@@ -1427,7 +1427,11 @@ class MegakernelDriver:
                                 p[5:9].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
                             ]
-                            ids_b[0] = 1
+                            ids_b[:T] = 1
+                            if T > 1:
+                                pos_b[..., :T] = torch.arange(
+                                    T, dtype=torch.int32, device=dev
+                                )
                             s0_b[0] = 1
                             s1_b[0] = 1
                             s2_b[0] = 1
@@ -1441,6 +1445,7 @@ class MegakernelDriver:
                                 c0_b[0, : blk_ids.numel()] = blk_ids
                                 c1_b[0, : blk_ids.numel()] = blk_ids
                                 c2_b[0, : blk_ids.numel()] = blk_ids
+                            r_call = torch.full_like(r_raw, -1)
 
                         out_b = step_fn(
                             ids_b,
@@ -1463,6 +1468,8 @@ class MegakernelDriver:
                         if do_sentinel:
                             sentinel_checked = True
                             assert sent_kv is not None and sent_gdn is not None
+                            out_cpu = out_b[:b].detach().float().cpu()
+                            out_fin_ok = bool(torch.isfinite(out_cpu).all())
                             for idx, p in enumerate(self.raw_pools):
                                 kv_ok = not torch.equal(
                                     p[0].view(torch.uint8).cpu(), sent_kv[idx]
@@ -1471,11 +1478,32 @@ class MegakernelDriver:
                                     p[5:9].view(torch.uint8).cpu(),
                                     sent_gdn[idx],
                                 )
-                                if not (kv_ok and gdn_ok):
+                                if not (kv_ok and gdn_ok and out_fin_ok):
+                                    out_nz = int((out_cpu != 0).sum().item())
+                                    out_fin = int(torch.isfinite(out_cpu).sum().item())
+                                    pool_diag = [
+                                        (
+                                            i,
+                                            int(
+                                                (rp[0].view(torch.uint8).cpu() != 0)
+                                                .sum()
+                                                .item()
+                                            ),
+                                            int(
+                                                (rp[5:9].view(torch.uint8).cpu() != 0)
+                                                .sum()
+                                                .item()
+                                            ),
+                                        )
+                                        for i, rp in enumerate(self.raw_pools[:4])
+                                    ]
                                     raise RuntimeError(
                                         "MegakernelDriver: warmup sentinel check "
                                         f"failed on pool[{idx}] "
-                                        f"(kv_ok={kv_ok}, gdn_ok={gdn_ok})"
+                                        f"(kv_ok={kv_ok}, gdn_ok={gdn_ok}, "
+                                        f"out_nz={out_nz}/{out_cpu.numel()}, "
+                                        f"out_fin={out_fin}, "
+                                        f"pool0_3_nz={pool_diag})"
                                     )
             if dev.type == "tpu" and not is_eager:
                 if self._torchtpu_ir_error is not None:
@@ -1686,6 +1714,8 @@ class MegakernelDriver:
         if getattr(self.backbone, "aux_hidden_state_layers", ()):
             return False
         if runner is not None:
+            if getattr(runner, "_in_precompile_backbone", False):
+                return False
             bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
             if getattr(bctx, "position_ids_override", None) is not None:
                 return False
