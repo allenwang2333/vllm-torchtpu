@@ -36,6 +36,7 @@ kernel when ``FUSED_MOE_DECODE_KERNEL=1`` and its cap allows, else GMM MoE.
 
 import functools
 import math
+import os
 from typing import Any, cast
 
 import jax
@@ -488,6 +489,36 @@ def _check_vmem(max_tokens: int, layer, i_s: int, n_ranks: int) -> None:
         )
 
 
+_SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+
+
+def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
+    """With the prefill kernel on by default (env_override.py lowers the
+    SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL is set),
+    warn when the effective floor would keep the kernel's smallest all-reduce
+    (bf16 [min_tokens, hidden]) on the TensorCore, where MTP draft acceptance
+    collapsed with GLM-5.2."""
+    if envs.is_set("FUSED_MOE_PREFILL_KERNEL"):
+        return  # env_override.py lowered the floor or warned at import
+    smallest = min_tokens * hidden * 2
+    floor = None
+    for token in os.environ.get("LIBTPU_INIT_ARGS", "").split():
+        if token.startswith(_SC_ALL_REDUCE_FLAG + "="):
+            floor = token.split("=", 1)[1]  # the last one wins, as in libtpu
+    if floor is not None and floor.isdigit() and int(floor) <= smallest:
+        return
+    logger.warning(
+        "Fused MoE prefill kernel armed (on by default) but the SparseCore "
+        "all-reduce offload floor is %s, above its smallest all-reduce (%d "
+        "bytes); with GLM-5.2 + MTP pass %s=2097152 in LIBTPU_INIT_ARGS (the "
+        "AgentX launch does) or set FUSED_MOE_PREFILL_KERNEL=1 explicitly. "
+        "See env_override.py.",
+        floor or "libtpu's default",
+        smallest,
+        _SC_ALL_REDUCE_FLAG,
+    )
+
+
 def arm_fused_moe_decode(model: torch.nn.Module) -> int:
     """Arm every eligible MoE layer of `model` for the decode and/or prefill
     kernel; returns how many were armed."""
@@ -581,6 +612,10 @@ def arm_fused_moe_decode(model: torch.nn.Module) -> int:
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, _RUNNER_ARMED_ATTR, True)
         armed += 1
+    if armed and min_tokens is not None:
+        hidden = getattr(runners[0].moe_config, "hidden_dim", None)
+        if hidden:
+            _warn_sc_all_reduce_floor(min_tokens, int(hidden))
     if armed:
         logger.info(
             "Armed fused MoE kernels on %d of %d MoE layers (%d ranks; decode "

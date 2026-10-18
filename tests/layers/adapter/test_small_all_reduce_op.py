@@ -279,6 +279,8 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
     # On by default; its op needs a TPU (get_tpu_info) and is covered below.
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_VALID_ROWS", False)
+    # On by default (trial 5); its fused matmul + all-reduce op is covered below.
+    monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", False)
     for name in ("_AR_OP", "_AR_SIZED_OP", "_RS_OP", "_RANK"):
         monkeypatch.setattr(op, name, None)
     monkeypatch.setattr(
@@ -570,8 +572,10 @@ def test_fused_input_depends_on_the_rank_buffer(fused, monkeypatch):
     assert torch.isnan(block).all()
 
 
-def test_fused_flag_defaults_off():
+def test_fused_flag_defaults_on(monkeypatch):
     from vllm_torchtpu import envs
 
-    assert envs.environment_variables["TPU_FUSED_OPROJ_AR"]() is False
+    monkeypatch.delenv("TPU_FUSED_OPROJ_AR", raising=False)
+    monkeypatch.delenv("TPU_FUSED_OPROJ_AR_WAVES", raising=False)
+    assert envs.environment_variables["TPU_FUSED_OPROJ_AR"]() is True
     assert envs.environment_variables["TPU_FUSED_OPROJ_AR_WAVES"]() is True

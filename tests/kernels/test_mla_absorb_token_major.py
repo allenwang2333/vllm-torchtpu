@@ -144,16 +144,16 @@ def test_mode_gate_starts_above_the_a2a_merge_cap(monkeypatch):
     """`T >= 64` here and the DCP merge's `T <= 64` in one trace pinned the
     64-token bucket to a constant (GLM-5.2 trial-4 warmup: ShapeSpecialization
     / ConstraintViolationError). With the a2a merge on, the gate starts above
-    its cap."""
+    its cap (default 32 since trial 5)."""
     from vllm_torchtpu.layers.adapter import attention
 
     monkeypatch.setenv("TPU_MLA_ABSORB_TOKEN_MAJOR", "1")
     monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A", "1")
     monkeypatch.delenv("TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", raising=False)
-    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", "64")
     assert attention.mla_absorb_mode(64) is None
     assert attention.mla_absorb_mode(128) == "pallas"
-    monkeypatch.setenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", "32")
+    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", raising=False)
     assert attention.mla_absorb_mode(64) == "pallas"
 
 

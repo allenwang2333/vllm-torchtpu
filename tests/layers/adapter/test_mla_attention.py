@@ -861,7 +861,8 @@ def test_streamidx_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
         (1024, None, None, None),
         (2048, 512, None, None),
         (2048, None, "xla", None),
-        (2048, None, None, 4),
+        # 4 is the default (unset), so a different query block keys apart.
+        (2048, None, None, 8),
     ],
 )
 def test_streamidx_op_is_not_shared_across_kernel_configs(
@@ -1323,13 +1324,13 @@ def test_dcp_indexer_a2a_default_steps_aside_on_indivisible_bucket(monkeypatch):
 
 
 def test_dcp_indexer_a2a_env_defaults_and_forwarding(monkeypatch):
-    """Off by default (the trial-4 E2E served the all-gather merge), threshold
-    64, and both reach the workers on multi-host."""
+    """On by default (the trial-5 E2E served the a2a merge; trial 4 had served
+    the all-gather), threshold 64, and both reach the workers on multi-host."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", raising=False)
-    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 64
 
     monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")

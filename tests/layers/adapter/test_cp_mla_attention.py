@@ -674,6 +674,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_RS_LAG": 0,
         "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
         "TPU_DCP_MERGE_VSPACE": False,
+        "TPU_DCP_RS_OUT_PRECISION": False,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -1588,10 +1589,13 @@ def test_rs_out_precision_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
     assert got.dtype == torch.bfloat16
 
 
-def test_rs_out_precision_defaults_off(monkeypatch):
+def test_rs_out_precision_defaults_on(monkeypatch):
+    """On by default (GLM-5.2 trial 5, mmlu_pro-gated); 0 turns it off."""
     monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
     from vllm_torchtpu import envs as _envs
 
+    assert _envs.environment_variables["TPU_DCP_RS_OUT_PRECISION"]() is True
+    monkeypatch.setenv("TPU_DCP_RS_OUT_PRECISION", "0")
     assert _envs.environment_variables["TPU_DCP_RS_OUT_PRECISION"]() is False
 
 
@@ -1605,7 +1609,9 @@ def test_rs_out_precision_leaves_the_drafter_in_f32(monkeypatch):
     seen = []
     _spy_reduce_scatter(group, seen)
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
-    got = cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], is_backbone=False)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=False
+    )
     assert seen == [torch.float32]
     assert got.dtype == torch.bfloat16
 
@@ -1625,8 +1631,12 @@ def test_rs_out_precision_is_the_bf16_rank_order_sum(dcp_size, monkeypatch):
         TPU_DCP_MERGE_CHUNKED=8,
         TPU_DCP_MERGE_CHUNKED_MIN_TOKENS=1024,
     )
-    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=True, **env)
-    f32 = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=False, **env)
+    got = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=True, **env
+    )
+    f32 = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=False, **env
+    )
     # The construction: rank-order bf16 sum of bf16-rounded f32 terms.
     lse_all = lses.to(torch.float32)
     merged_lse = torch.logsumexp(lse_all, dim=0)
@@ -1642,12 +1652,18 @@ def test_rs_out_precision_is_the_bf16_rank_order_sum(dcp_size, monkeypatch):
     assert not torch.equal(got, f32)
 
 
-@pytest.mark.parametrize("tokens,env_extra", [(16, {}), (1024, {"TPU_DCP_MERGE_RS_BF16": 1})])
-def test_rs_out_precision_leaves_a2a_and_chunked_buckets_alone(tokens, env_extra, monkeypatch):
+@pytest.mark.parametrize(
+    "tokens,env_extra", [(16, {}), (1024, {"TPU_DCP_MERGE_RS_BF16": 1})]
+)
+def test_rs_out_precision_leaves_a2a_and_chunked_buckets_alone(
+    tokens, env_extra, monkeypatch
+):
     """The flag only touches the unchunked reduce-scatter: an a2a bucket
     (T <= cap) and a chunked bucket (TPU_DCP_MERGE_CHUNKED) are bitwise
     unchanged by it."""
-    outputs, lses = _partials(np.random.default_rng(7), 4, tokens=tokens, local_heads=2, vdim=16)
+    outputs, lses = _partials(
+        np.random.default_rng(7), 4, tokens=tokens, local_heads=2, vdim=16
+    )
     outputs = outputs.to(torch.bfloat16)
     env = dict(
         TPU_DCP_LSE_MERGE_A2A=True,
@@ -1658,6 +1674,10 @@ def test_rs_out_precision_leaves_a2a_and_chunked_buckets_alone(tokens, env_extra
         TPU_DCP_MERGE_CHUNKED_MIN_TOKENS=1024,
         **env_extra,
     )
-    on = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=True, **env)
-    off = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=False, **env)
+    on = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=True, **env
+    )
+    off = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=False, **env
+    )
     assert torch.equal(on, off)
