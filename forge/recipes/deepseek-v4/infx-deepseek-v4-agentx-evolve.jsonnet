@@ -135,7 +135,10 @@ local maxNumSeqs = cdk.numVar('MAX_NUM_SEQS', 64);
 //   Both limits only meet near 0.92, with ~35M to spare. 2048 at 0.90 had 15.59 GiB (1,264,937
 //   tokens, j-68dfea6b-1db1-465b-91ef). Interpolating, 3072 at 0.90 leaves ~13.4 GiB and ~2G of
 //   compile headroom.
-local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 128);
+// c=64 (forge run ya5w5534, objective p90 interactivity): every step pays the DP-wide max bucket, which
+// at 128 is T128 on ~100% of steps (~73.5 ms). 64 runs every step at T64 (~57 ms): n=2 248.1k vs 243.0k
+// total tok/s, intvty p90 60.8 vs 47.05 (j-418771d5, j-d1e2c60f). 48 is no cheaper than 64 (T48 56 ms).
+local maxNumBatchedTokens = cdk.numVar('MAX_NUM_BATCHED_TOKENS', 64);
 // As in j-2c8a1b3b-17f0-4b33-bfb6. BLOCK_SIZE=0 drops --block-size and leaves it to vLLM.
 local blockSize = cdk.numVar('BLOCK_SIZE', 1024);
 local quantization = cdk.var('QUANTIZATION', 'deepseek_v4_fp8');
@@ -336,10 +339,18 @@ local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
 local srptAttnWorkCap = cdk.var('TPU_SRPT_ATTN_WORK_CAP', '');
+// SrptPrefillScheduler rounds a prefill chunk that starts at or past TPU_SRPT_DEEP_CHUNK_CONTEXT and does not
+// end its prompt down to whole 32-row query blocks of the indexer/compressed-attention mixed passes, so a
+// deep 49-token chunk runs as one block (32) instead of two. With MNBT64 + ICTP off at c=64: T64 period
+// 54.0 vs 56.7 ms, n=3 239.7k tok/s / intvty p90 68.10 (j-ecb8962a, j-50d206be, j-bf611e59). Empty = off.
+local deepChunkAlign = cdk.var('TPU_SRPT_DEEP_CHUNK_ALIGN', '32');
+local deepChunkContext = cdk.var('TPU_SRPT_DEEP_CHUNK_CONTEXT', '16384');
 // Each TensorCore keeps half of wq_b/wo_a/wo_b and the chip pair exchanges activations; the freed HBM goes
 // to KV (1.875M -> 3.14M tokens/rank in j-02810869, 361,390 vs ~310k total tok/s). Tolerance tier:
-// mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40).
-local attnIntraChipTp = cdk.var('TPU_DSV4_ATTN_INTRA_CHIP_TP', '1');
+// mmlu_pro 0.8386 vs 0.845 off (McNemar p=0.40). Off at c=64, where KV demand is small: with MNBT64,
+// n=2 253.9k vs 248.1k tok/s and intvty p90 63.2 vs 60.8 (j-d65fcf1c, j-3631bbd5), KV 1.97M tokens/rank,
+// prefix cache read unchanged (96.65%). Set 1 again for c>=128, where KV capacity binds.
+local attnIntraChipTp = cdk.var('TPU_DSV4_ATTN_INTRA_CHIP_TP', '0');
 // Sliding-window groups keep each request's replay-boundary checkpoint until the request is freed, so the next
 // turn can hit there after a long decode (j-0cda3671: uncached/request 5926 -> 5771).
 local kvHoldReplayCheckpoint = cdk.var('TPU_KV_HOLD_REPLAY_CHECKPOINT', '1');
@@ -827,6 +838,8 @@ local serverJob = cdk.job(
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
+        [if deepChunkAlign != '' then 'TPU_SRPT_DEEP_CHUNK_ALIGN']: deepChunkAlign,
+        [if deepChunkAlign != '' then 'TPU_SRPT_DEEP_CHUNK_CONTEXT']: deepChunkContext,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
         [if finePrefixHitTokens != '' then 'TPU_FINE_PREFIX_HIT_TOKENS']: finePrefixHitTokens,
