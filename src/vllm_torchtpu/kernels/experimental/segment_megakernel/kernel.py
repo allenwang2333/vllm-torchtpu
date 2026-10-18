@@ -748,6 +748,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     _ar_epilogue(spec, rank, n_valid, combined, r["ar2_out"], ar2, wait_barrier=False)
 
     # ---- 10. input_layernorm of layer N+1; residual exit (async)
+    staged["g_in"].wait()
     h2, s2 = rms_add(
         r["ar2_out"][...].astype(F32), r["res1_v"][...], _vec(cfg, r, "g_in"), eps
     )
