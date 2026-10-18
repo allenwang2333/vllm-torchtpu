@@ -85,6 +85,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -451,6 +452,17 @@ class RaidenOffloadingManager(OffloadingManager):
             "state_finished_reqs": 0,
             "state_tracked_reqs": 0,
             "state_demoting_reqs": 0,
+            # Keys the scheduler withheld from demotion: still the newest
+            # state or the admission hit of a live request.
+            "demote_guarded_keys": 0,
+            # TPU_RAIDEN_TIER_DEMOTE_SHIM (stores without demote()): keys
+            # taken out of the refresh sweep, keys the manager refused to
+            # take out (in-flight job), keys the sweep refreshed and its
+            # time, and the swept set's size at the last log line.
+            "demote_emulated_keys": 0,
+            "demote_emulated_skipped_keys": 0,
+            "shim_sweep_keys": 0,
+            "shim_sweep_ns": 0,
         }
         self._tel_launch: dict[int, tuple[float, int]] = {}
         self._tel_last_log = time.monotonic()
@@ -564,6 +576,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
         self._warned_no_demote = False
+        self._init_demote_shim()
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -744,6 +757,107 @@ class RaidenOffloadingManager(OffloadingManager):
             self._remote_slices.update(remote_slices)
         return LookupResult.HIT
 
+    # -- demotion shim for stores without demote() ----------------------
+
+    def _init_demote_shim(self) -> None:
+        """Sets up the LRU demotion shim (TPU_RAIDEN_TIER_DEMOTE_SHIM=1).
+
+        The native store is a strict LRU over unpinned entries with no removal
+        or demotion call: release() of a pinned entry moves it to the MRU end,
+        release() of an unpinned entry and lookup(pin_found=False) change
+        nothing. So "evict these first" can only be had by refreshing
+        everything else. The shim keeps every live key in `_shadow`, oldest
+        first, and a clock sweep re-touches the oldest live keys so each one
+        is refreshed at least once per TPU_RAIDEN_TIER_DEMOTE_SHIM_PERIOD_S,
+        in its current order. A demoted key leaves `_shadow`, is never
+        refreshed again, and so falls behind every live key: it is evicted
+        first once it has gone one period without use. A later touch, load or
+        store of the key puts it back.
+        """
+        self._shim = os.environ.get(
+            "TPU_RAIDEN_TIER_DEMOTE_SHIM"
+        ) == "1" and not callable(getattr(self._store, "demote", None))
+        self._shadow: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._shim_evicted: list[OffloadKey] = []
+        self._shim_period_s = float(
+            os.environ.get("TPU_RAIDEN_TIER_DEMOTE_SHIM_PERIOD_S", "30")
+        )
+        self._shim_max_keys = int(
+            os.environ.get("TPU_RAIDEN_TIER_DEMOTE_SHIM_MAX_KEYS_PER_STEP", "2048")
+        )
+        self._shim_last = time.monotonic()
+        self._shim_credit = 0.0
+        if self._shim:
+            logger.info(
+                "TPURaidenOffloadingConnector: demotion shim on (store has no "
+                "demote()): live keys refreshed every %.0fs, at most %d per step",
+                self._shim_period_s,
+                self._shim_max_keys,
+            )
+
+    def _shadow_touch(self, keys: Sequence[OffloadKey]) -> None:
+        if not getattr(self, "_shim", False):
+            return
+        shadow = self._shadow
+        for key in keys:
+            shadow[key] = None
+            shadow.move_to_end(key)
+
+    def _touch_key(self, key: OffloadKey) -> bool:
+        """Probe-then-release one key; True when its first sub-hash was found."""
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        matches = self._store.lookup(self._sub_hashes(key))
+        held = [sub_hash for sub_hash, block in matches if block.status not in skip]
+        if held:
+            self._store.release(held)
+        return bool(matches)
+
+    def _shim_step(self) -> None:
+        """Advances the refresh sweep by the keys this step's time accrued."""
+        if not getattr(self, "_shim", False):
+            return
+        now = time.monotonic()
+        shadow = self._shadow
+        with self._eviction_lock:
+            evicted, self._shim_evicted = self._shim_evicted, []
+        for key in evicted:
+            shadow.pop(key, None)
+        if self._shim_period_s > 0:
+            self._shim_credit += (
+                (now - self._shim_last) * len(shadow) / self._shim_period_s
+            )
+        self._shim_last = now
+        n = min(int(self._shim_credit), self._shim_max_keys, len(shadow))
+        if n <= 0:
+            return
+        self._shim_credit -= n
+        t0 = time.perf_counter_ns()
+        for _ in range(n):
+            key = next(iter(shadow))
+            if self._touch_key(key):
+                shadow.move_to_end(key)
+            else:
+                del shadow[key]
+        self.telemetry["shim_sweep_keys"] += n
+        self.telemetry["shim_sweep_ns"] += time.perf_counter_ns() - t0
+
+    def _emulate_demote(self, keys: Sequence[OffloadKey]) -> int:
+        """Takes keys out of the refresh sweep; skips keys a job still uses."""
+        emulated = skipped = 0
+        for key in keys:
+            if key in self._inflight_store_keys or any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            ):
+                skipped += 1
+                continue
+            if key in self._shadow:
+                del self._shadow[key]
+                emulated += 1
+        self.telemetry["demote_emulated_keys"] += emulated
+        self.telemetry["demote_emulated_skipped_keys"] += skipped
+        return emulated
+
     def touch(self, keys, req_context: ReqContext) -> None:
         # A lookup pins what it finds and releasing drops the entry back at
         # the Most Recently Used position, so probe-then-release is the touch:
@@ -767,6 +881,7 @@ class RaidenOffloadingManager(OffloadingManager):
             ]
             if held:
                 self._store.release(held)
+                self._shadow_touch((key,))
 
     def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
         keys = list(keys)
@@ -925,6 +1040,8 @@ class RaidenOffloadingManager(OffloadingManager):
             return 0
         self.telemetry["demote_req_keys"] += len(keys)
         demote = getattr(self._store, "demote", None)
+        if demote is None and getattr(self, "_shim", False):
+            return self._emulate_demote(keys)
         if demote is None:
             # The native KVCacheStore of tpu-sync-torch 0.0.1.dev20261012084241
             # has no demote() (and no removal API), so the request is dropped.
@@ -978,6 +1095,8 @@ class RaidenOffloadingManager(OffloadingManager):
                     # Report eviction on the first sub-block loss: the logical
                     # block is no longer intact or retrievable from host cache.
                     self._evicted_keys_queue.append(key)
+                    if getattr(self, "_shim", False):
+                        self._shim_evicted.append(key)
                 sub_indices.add(sub_idx)
                 if len(sub_indices) >= self._device_block_size_factor:
                     self._evicted_sub_hashes.pop(key, None)
@@ -1088,6 +1207,7 @@ class RaidenOffloadingManager(OffloadingManager):
             # All sub-hashes are already resident: unpin and finish successfully
             # without issuing redundant DMA transfers.
             self._store.release(sub_hashes)
+            self._shadow_touch(keys)
             self._inflight_store_keys.difference_update(keys)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
@@ -1283,6 +1403,9 @@ class RaidenOffloadingManager(OffloadingManager):
         held = self._pins_still_held(admission)
         if held:
             self._store.release(held)
+        if success:
+            # A landed save or load leaves its entries at the MRU end.
+            self._shadow_touch(admission.keys)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
             self._finished.append(
@@ -1488,7 +1611,9 @@ class RaidenOffloadingManager(OffloadingManager):
             "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d"
             " demote_keys=%d demoted_sub_hashes=%d finished_reqs=%d"
             " state_tracked_reqs=%d state_demoting_reqs=%d demote_req_keys=%d"
-            " demote_unsupported_keys=%d",
+            " demote_unsupported_keys=%d demote_guarded_keys=%d"
+            " demote_emulated_keys=%d demote_emulated_skipped_keys=%d"
+            " shim_live_keys=%d shim_sweep_keys=%d shim_sweep_ms=%.0f",
             dt,
             d["split_fa_keys"],
             d["split_mamba_keys"],
@@ -1499,6 +1624,12 @@ class RaidenOffloadingManager(OffloadingManager):
             d.get("state_demoting_reqs", 0),
             d.get("demote_req_keys", 0),
             d.get("demote_unsupported_keys", 0),
+            d.get("demote_guarded_keys", 0),
+            d.get("demote_emulated_keys", 0),
+            d.get("demote_emulated_skipped_keys", 0),
+            len(getattr(self, "_shadow", ())),
+            d.get("shim_sweep_keys", 0),
+            d.get("shim_sweep_ns", 0) / 1e6,
         )
         class_evicted = getattr(self._store, "evicted_sub_hashes", None)
         if class_evicted is not None:
@@ -1537,6 +1668,7 @@ class RaidenOffloadingManager(OffloadingManager):
     def poll_finished_jobs(self) -> list[FinishedJob]:
         """Poll raiden completion and return newly terminal jobs."""
         self._poll_once()
+        self._shim_step()
         finished = self._finished
         self._finished = []
         self._maybe_log_telemetry()

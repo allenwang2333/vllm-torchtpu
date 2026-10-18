@@ -692,9 +692,25 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         tel = getattr(self._raiden_manager, "telemetry", None)
         if not isinstance(tel, dict):
             tel = {}
-        for req_id in finished_req_ids:
-            boundaries = self._state_boundaries.pop(req_id, None)
-            hit = self._state_hits.pop(req_id, None)
+        finished = [
+            (
+                self._state_boundaries.pop(req_id, None),
+                self._state_hits.pop(req_id, None),
+            )
+            for req_id in finished_req_ids
+        ]
+        if not finished:
+            return
+        # A key that is still the newest stored state, or the admission hit,
+        # of a request that has not finished stays live: a fork or a sibling
+        # turn resumes from it.
+        protected: set[OffloadKey] = set()
+        for boundaries in self._state_boundaries.values():
+            if boundaries:
+                protected.update(boundaries[max(boundaries)])
+        for _, keys in self._state_hits.values():
+            protected.update(keys)
+        for boundaries, hit in finished:
             tel["state_finished_reqs"] = tel.get("state_finished_reqs", 0) + 1
             if not boundaries:
                 # Nothing stored by this request: whatever it was admitted from
@@ -712,6 +728,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             if hit is not None and hit[0] < newest:
                 stale.extend(hit[1])
             stale = [key for key in dict.fromkeys(stale) if key not in keep]
+            guarded = [key for key in stale if key in protected]
+            if guarded:
+                tel["demote_guarded_keys"] = tel.get("demote_guarded_keys", 0) + len(
+                    guarded
+                )
+                stale = [key for key in stale if key not in protected]
             if stale:
                 tel["state_demoting_reqs"] = tel.get("state_demoting_reqs", 0) + 1
                 self._raiden_manager.demote(stale)
