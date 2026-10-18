@@ -139,6 +139,9 @@ if TYPE_CHECKING:
     TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = False
     TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = False
     TPU_HOST_SCHED_DIAG_STEPS: int = 0
+    TPU_WORKER_CPU_PIN: bool = False
+    TPU_WORKER_CPU_PIN_SKIP: int = 2
+    TPU_AOT_SKIP_GUARD_CHECK: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
@@ -1293,6 +1296,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # wait, the process's busiest threads and the cgroup's CFS throttling
     # (runner/host_sched_diag.py). 0 = off.
     "TPU_HOST_SCHED_DIAG_STEPS": env_int("TPU_HOST_SCHED_DIAG_STEPS", 0),
+    # Give each worker's serving thread a whole physical core on the NUMA node
+    # of its TPU chip (core TPU_WORKER_CPU_PIN_SKIP + LOCAL_RANK of that node)
+    # and move the process's other threads to the rest of the node
+    # (worker/cpu_pin.py). Placement only.
+    "TPU_WORKER_CPU_PIN": env_bool("TPU_WORKER_CPU_PIN"),
+    "TPU_WORKER_CPU_PIN_SKIP": env_int("TPU_WORKER_CPU_PIN_SKIP", 2),
+    # After warmup, skip the per-call Dynamo guard check of AOT-compiled model
+    # forwards when vLLM compiled them without guards (dynamic_shapes_config
+    # .evaluate_guards False). vLLM already does this for an AOT artifact
+    # loaded from disk; a freshly compiled one keeps checking an empty guard
+    # set on every call.
+    "TPU_AOT_SKIP_GUARD_CHECK": env_bool("TPU_AOT_SKIP_GUARD_CHECK"),
     # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
     # at most 1024), derive the stable-sort positions, permuted token ids and
     # group sizes by int32 compare-and-count instead of three comparison

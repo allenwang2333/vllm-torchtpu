@@ -139,6 +139,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.host_sched_diag import HostSchedDiag
+from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -1054,6 +1055,49 @@ class TPUModelRunner(GPUModelRunner):
         self._host_sched_diag = HostSchedDiag(
             profiler_rank, envs.TPU_HOST_SCHED_DIAG_STEPS
         )
+        self._cpu_pinner = WorkerCpuPinner(
+            envs.TPU_WORKER_CPU_PIN,
+            local_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
+            local_world_size=int(os.environ.get("LOCAL_WORLD_SIZE", "1") or 1),
+            skip=envs.TPU_WORKER_CPU_PIN_SKIP,
+        )
+
+    def _skip_aot_guard_checks(self) -> int:
+        """TPU_AOT_SKIP_GUARD_CHECK: disable the per-call guard check of every
+        AOT-compiled forward (target model and drafter) compiled without guards.
+
+        vLLM compiles with ``guard_filter_fn=skip_all_guards_unsafe`` unless
+        ``dynamic_shapes_config.evaluate_guards`` is set (or the mode is stock
+        torch.compile), so the check evaluates an empty guard set; vLLM's own
+        loader already calls ``disable_guard_check()`` on an artifact loaded
+        from disk under the same condition. Returns how many were disabled.
+        """
+        from vllm.config import CompilationMode
+
+        cc = self.vllm_config.compilation_config
+        if cc.dynamic_shapes_config.evaluate_guards or (
+            cc.mode == CompilationMode.STOCK_TORCH_COMPILE
+        ):
+            logger.warning("TPU_AOT_SKIP_GUARD_CHECK: guards are evaluated; kept")
+            return 0
+        roots = [getattr(self, "model", None)]
+        if self.drafter is not None:
+            roots += [v for v in vars(self.drafter).values() if isinstance(v, torch.nn.Module)]
+        seen: set[int] = set()
+        n = 0
+        for root in roots:
+            if not isinstance(root, torch.nn.Module):
+                continue
+            for m in root.modules():
+                fn = m.__dict__.get("aot_compiled_fn")
+                if fn is None or id(fn) in seen:
+                    continue
+                seen.add(id(fn))
+                if hasattr(fn, "disable_guard_check"):
+                    fn.disable_guard_check()
+                    n += 1
+        logger.warning("TPU_AOT_SKIP_GUARD_CHECK: disabled %d guard checks", n)
+        return n
 
     def _stage_timing_has_consumer(self) -> bool:
         """Whether runner stage timings can reach a sink.
@@ -3580,6 +3624,14 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        pinner = getattr(self, "_cpu_pinner", None)
+        if pinner is not None:
+            pinner.maybe_pin()
+        if envs.TPU_AOT_SKIP_GUARD_CHECK and not getattr(
+            self, "_aot_guard_skip_done", False
+        ):
+            self._aot_guard_skip_done = True
+            self._skip_aot_guard_checks()
         diag = getattr(self, "_host_sched_diag", None)
         if diag is not None:
             diag.tick()

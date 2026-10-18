@@ -16,7 +16,7 @@ def test_off_reads_nothing(monkeypatch):
 
 
 def test_line_every_n_steps_with_sane_values():
-    d = diag_mod.HostSchedDiag(7, 3)
+    d = diag_mod.HostSchedDiag(7, 3, fwd_timers=False)
     stop = threading.Event()
     worker = threading.Thread(target=lambda: [sum(range(1000)) for _ in iter(stop.is_set, True)])
     worker.start()
@@ -43,6 +43,47 @@ def test_line_every_n_steps_with_sane_values():
 
 def test_missing_cgroup_is_tolerated(monkeypatch):
     monkeypatch.setattr(diag_mod, "_CGROUP_STATS", ("/nonexistent/cpu.stat",))
-    d = diag_mod.HostSchedDiag(0, 1)
+    d = diag_mod.HostSchedDiag(0, 1, fwd_timers=False)
     line = d.tick()
     assert "cg_throttled=0/0" in line
+
+
+def test_line_carries_fwd_timers_and_thread_placement(monkeypatch):
+    calls = []
+
+    class Fake:
+        def __call__(self, x):
+            calls.append(x)
+            return x + 1
+
+    # the timer wrapper keeps the callee's behaviour and accumulates per name
+    wrapped = diag_mod._timed("unit_fake", Fake.__call__)
+    monkeypatch.setattr(Fake, "__call__", wrapped)
+    f = Fake()
+    assert [f(i) for i in range(4)] == [1, 2, 3, 4] and calls == [0, 1, 2, 3]
+    ns, n = diag_mod.FWD_TIMERS["unit_fake"]
+    assert n == 4 and ns > 0
+    d = diag_mod.HostSchedDiag(1, 2, fwd_timers=False)
+    d.tick()
+    line = d.tick()
+    assert re.search(r" cpu=\d+ nvcsw/step=[\d.]+$", line), line
+    assert "fwd_ms/step(calls)=" in line
+
+
+def test_install_fwd_timers_is_idempotent(monkeypatch):
+    from torch._dynamo.aot_compile import AOTCompiledFunction
+
+    # restore the classes after the test (monkeypatch undoes these setattrs)
+    for attr in ("__call__", "guard_check"):
+        monkeypatch.setattr(AOTCompiledFunction, attr, AOTCompiledFunction.__dict__[attr])
+    try:
+        from vllm.compilation.caching import VllmSerializableFunction
+
+        monkeypatch.setattr(VllmSerializableFunction, "__call__", VllmSerializableFunction.__dict__["__call__"])
+    except ImportError:
+        pass
+    first = diag_mod.install_fwd_timers()
+    assert "aot" in first and "guard" in first
+    assert diag_mod.install_fwd_timers() == []
+    fn = AOTCompiledFunction.__dict__["__call__"]
+    assert fn._h5_timed and not getattr(fn.__wrapped__, "_h5_timed", False)
