@@ -299,8 +299,9 @@ def fused_moe_gmm(
     )
 
 
-# Serve DP-attention + EP layers with gmm_v2_ffn_ep, which sends each routed
-# row to its token's owner, in place of the combine + reduce-scatter.
+# Serve DP-attention + EP layers with gmm_v2_ffn_ep, which pushes each routed
+# token row to its expert's rank and each result row back to its token's owner,
+# in place of the all-gather, combine and reduce-scatter.
 GMM_EP_COMBINE = True
 GMM_EP_COMBINE_OP_ATTR = "_gmm_ep_combine_op"
 
@@ -334,7 +335,7 @@ def _gmm_ep_combine_refusal(layer) -> str | None:
         return "expert biases are not wired through"
     ep_group = get_ep_group()
     if ep_group is None or tuple(ep_group.ranks) != tuple(get_dp_group().ranks):
-        # The op reads the DP-gathered token block of rank r as EP rank r's.
+        # Each rank's tokens enter and leave the op on that rank.
         return "the EP group is not the DP group in the same order"
     if layer.global_num_experts != layer.w13_weight.shape[0] * ep_group.world_size:
         return "experts do not split into equal contiguous blocks"
@@ -424,9 +425,7 @@ def prebuild_gmm_ep_combine(
     ep = len(mesh_index_of_rank)
 
     def _fake(hidden_states, *_args, **_kwargs):
-        return hidden_states.new_empty(
-            (hidden_states.shape[0] // ep, hidden_states.shape[1])
-        )
+        return hidden_states.new_empty(hidden_states.shape)
 
     op.register_fake(_fake)
     _fused_moe_kernel_cache[key] = op
@@ -449,8 +448,8 @@ def gmm_ep_combine(
     topk_ids: torch.Tensor,
     experts_start: torch.Tensor,
 ) -> torch.Tensor:
-    """This rank's tokens of the DP-gathered `hidden_states`, summed over all
-    ranks' experts: the caller must not reduce-scatter the result."""
+    """This rank's `hidden_states`, summed over all ranks' experts: the caller
+    must neither all-gather the input nor reduce-scatter the result."""
     op = getattr(owner, GMM_EP_COMBINE_OP_ATTR)
     return op(
         hidden_states,

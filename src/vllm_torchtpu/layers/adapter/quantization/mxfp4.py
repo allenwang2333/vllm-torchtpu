@@ -363,8 +363,8 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
         if gmm_ep_combine_supported(self):
-            # Returns this rank's tokens already summed over the DP group, so
-            # VllmMoERunner._maybe_combine skips the reduce-scatter.
+            # Takes and returns this rank's own tokens, summed over the DP
+            # group; supports_internal_mk keeps vLLM's gather/scatter off.
             return gmm_ep_combine(
                 self,
                 x,
@@ -400,7 +400,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # bracket it with an all-gather/reduce-scatter of its own.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return (
+            enable_pipelined_collective_and_compute()
+            or fused_moe_ep_supported(self)
+            or gmm_ep_combine_supported(self)
+        )
 
     def _prebuild_w4a8(
         self,

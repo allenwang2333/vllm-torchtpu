@@ -280,6 +280,25 @@ def _counting_sort_positions(
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
+def _stable_bucket_positions(
+    sort_keys: jax.Array, num_buckets: int
+) -> tuple[jax.Array, jax.Array]:
+    """`_counting_sort_positions` at any length: rows -> stable sorted position,
+    and the bucket counts (the last bucket's count is not meaningful).
+
+    Short inputs are padded into the last bucket up to one full block, so
+    `num_buckets` only has to fit a block, not the input.
+    """
+    if num_buckets > _COUNTING_SORT_BLOCK:
+        raise ValueError(f"{num_buckets=} exceeds one {_COUNTING_SORT_BLOCK}-row block")
+    m = sort_keys.shape[0]
+    pad = max(0, _COUNTING_SORT_BLOCK - m)
+    keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
+    position, counts = _counting_sort_positions(keys, num_buckets)
+    assert position is not None and counts is not None
+    return position[:m], counts
+
+
 def _single_sort_permutation(
     sort_keys: jax.Array, topk: int, flat_bits: int
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -801,19 +820,20 @@ def fused_moe_func_ep_combine(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
 ) -> jax.Array:
-    """`fused_moe_func`'s EP layer followed by the DP group's reduce-scatter.
+    """`fused_moe_func`'s EP layer with the DP group's dispatch and
+    reduce-scatter folded into the expert kernel.
 
     Runs per device under shard_map over `axis_name`. `hidden_states`,
-    `topk_weights` and `topk_ids` are the DP group's gathered tokens, EP rank
-    r's at rows [r * T / ep, (r + 1) * T / ep); `mesh_index_of_rank[r]` is
-    rank r's index on `axis_name`, and `experts_start` ([1]) this rank's
-    first expert under linear placement. Returns this rank's [T / ep, hidden]
-    tokens summed over every rank's experts.
+    `topk_weights` and `topk_ids` are this device's own [T / ep] tokens;
+    `mesh_index_of_rank[r]` is EP rank r's index on `axis_name`, and
+    `experts_start` ([1]) this rank's first expert under linear placement.
+    Returns this device's tokens summed over every rank's experts.
 
-    The expert FFN sends each routed row to its token's owner (gmm_v2_ffn_ep),
-    and the owner sums a token's top-k rows in f32 and rounds once, where the
-    gather-reduce + reduce-scatter path rounds each rank's partial sum to bf16
-    before the cross-rank sum.
+    Only the routing table is gathered. The expert FFN pushes each routed
+    token row to the rank that computes it and sends each result row back to
+    its token's owner (gmm_v2_ffn_ep), and the owner sums a token's top-k rows
+    in f32 and rounds once, where the gather-reduce + reduce-scatter path
+    rounds each rank's partial sum to bf16 before the cross-rank sum.
     """
     if w1_scale is not None and w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
@@ -821,74 +841,100 @@ def fused_moe_func_ep_combine(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_devices = len(mesh_index_of_rank)
-    num_tokens, hidden_size = hidden_states.shape
-    tokens_per_rank = num_tokens // num_devices
+    tokens_per_rank, hidden_size = hidden_states.shape
+    num_tokens = tokens_per_rank * num_devices
     rows_per_rank = tokens_per_rank * topk
     local_experts, padded_hidden_size, _ = w1.shape
     padded_hidden_size *= get_packing_factor(w1.dtype, rhs_quant_dtype)
+    num_experts = local_experts * num_devices
     topk_weights = topk_weights.astype(hidden_states.dtype)
     if use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
         # As in fused_moe_func: the one-hot permute spreads 0 * NaN to all.
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
+    # The routes some rank computes: the predicate prepare_routed_gmm_inputs
+    # applies. Invalid routes take expert `num_experts`, which sorts last.
+    own_valid = (topk_ids >= 0) & (topk_ids < num_experts)
+    if skip_padded_tokens:
+        own_valid &= topk_weights != 0
+    own_expert = jnp.where(own_valid, topk_ids, num_experts).reshape(-1)
+    # Route f of device b is row f % rows_per_rank of block b: device b's
+    # token f // topk % tokens_per_rank, slot f % topk.
+    expert = jax.lax.all_gather(own_expert, axis_name, tiled=True)
+    me = jax.lax.axis_index(axis_name)
     start = experts_start.reshape(())
-    local_ids = topk_ids - start
+
+    # Grouped rows: this rank's routes in (expert, route) order. A route lands
+    # in slot-major row k * tokens_per_rank + t of its owner's receive buffer.
+    local_ids = expert - start
     is_local = (local_ids >= 0) & (local_ids < local_experts)
-    # The kernel gathers each grouped row from the packed tokens itself.
-    _, group_sizes, argsort_revert_indices, _, _, _ = prepare_routed_gmm_inputs(
-        hidden_states,
-        jnp.where(is_local, local_ids, -1),
-        jnp.where(is_local, topk_weights, 0),
-        local_num_experts=local_experts,
-        topk=topk,
-        use_ep=True,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        skip_padded_tokens=skip_padded_tokens,
-        permute=False,
+    position, counts = _stable_bucket_positions(
+        jnp.where(is_local, local_ids, local_experts), local_experts + 1
     )
+    group_sizes = counts[:local_experts]
+    route = jnp.arange(num_tokens * topk, dtype=jnp.int32)
+    owner = route // rows_per_rank
+    row = (route % topk) * tokens_per_rank + route // topk % tokens_per_rank
+    entry = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
+    dest = jnp.zeros_like(route).at[position].set(entry, unique_indices=True)
+
+    # Pushes: where each of this device's routes sits among its computing
+    # rank's grouped rows -- the routes of earlier experts there, then those of
+    # its own expert on earlier devices, then those before it here -- ordered
+    # by local expert index, then rank, so every rank's early experts fill first.
+    dest_rank = jnp.minimum(own_expert // local_experts, num_devices - 1)
+    send_key = jnp.where(
+        own_valid.reshape(-1),
+        own_expert % local_experts * num_devices + dest_rank,
+        num_experts,
+    )
+    send_position, send_counts = _stable_bucket_positions(send_key, num_experts + 1)
+    send_base = jnp.cumsum(send_counts) - send_counts
+    block_counts = jax.nn.one_hot(
+        expert.reshape(num_devices, rows_per_rank), num_experts, dtype=jnp.int32
+    ).sum(axis=1)
+    expert_base = jnp.cumsum(block_counts.sum(axis=0))
+    expert_base = jnp.concatenate([jnp.zeros((1,), jnp.int32), expert_base])
+    earlier = (jnp.cumsum(block_counts, axis=0) - block_counts)[me]
+    earlier = jnp.concatenate([earlier, jnp.zeros((1,), jnp.int32)])
+    lhs_row = (
+        expert_base[own_expert]
+        - expert_base[dest_rank * local_experts]
+        + earlier[own_expert]
+        + send_position
+        - send_base[send_key]
+    )
+    device = jnp.asarray(mesh_index_of_rank, jnp.int32)[dest_rank]
+    own_route = jnp.arange(rows_per_rank, dtype=jnp.int32)
+    send_dest = (
+        jnp.zeros_like(own_route)
+        .at[send_position]
+        .set(jnp.left_shift(device, DEST_DEVICE_SHIFT) | lhs_row, unique_indices=True)
+    )
+    send_src = (
+        jnp.zeros_like(own_route)
+        .at[send_position]
+        .set(own_route // topk, unique_indices=True)
+    )
+    send_bounds = send_base[::num_devices]
+
+    own_local = (topk_ids >= start) & (topk_ids < start + local_experts)
+    num_recv = jnp.sum(own_valid & ~own_local, dtype=jnp.int32)[None]
+
     x = pack_rows(
         jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
     )
-
-    # Grouped row r computes route f = sorted_route[r]: one scatter gives
-    # both its token, for the kernel's gather, and its destination. Route f
-    # (token t = f // topk, slot k = f % topk) lands in row
-    # k * tokens_per_rank + t % tokens_per_rank of t's owner's receive buffer,
-    # so each slot's rows are one contiguous block there.
-    route = jnp.arange(num_tokens * topk, dtype=jnp.int32)
-    sorted_route = (
-        jnp.zeros_like(route).at[argsort_revert_indices].set(route, unique_indices=True)
-    )
-    tokens = sorted_route // topk
-    owner = jnp.asarray(mesh_index_of_rank, jnp.int32)[tokens // tokens_per_rank]
-    row = (sorted_route % topk) * tokens_per_rank + tokens % tokens_per_rank
-    dest = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
-
-    rank = start // local_experts
-    own_ids = jax.lax.dynamic_slice_in_dim(
-        topk_ids, rank * tokens_per_rank, tokens_per_rank
-    )
-    own_weights = jax.lax.dynamic_slice_in_dim(
-        topk_weights, rank * tokens_per_rank, tokens_per_rank
-    )
-    # The rows some rank computes for this rank's tokens: the same predicate
-    # prepare_routed_gmm_inputs applies on the computing rank.
-    own_valid = (own_ids >= 0) & (own_ids < local_experts * num_devices)
-    if skip_padded_tokens:
-        own_valid &= own_weights != 0
-    own_local = (own_ids >= start) & (own_ids < start + local_experts)
-    num_recv = jnp.sum(own_valid & ~own_local, dtype=jnp.int32)[None]
-
     recv = gmm_v2_ffn_ep(
         x,
-        tokens,
         w1,
         w2,
         group_sizes,
         dest,
         num_recv,
+        send_dest,
+        send_src,
+        send_bounds,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         recv_rows=-(-rows_per_rank // 8) * 8,
@@ -899,7 +945,7 @@ def fused_moe_func_ep_combine(
         rhs_quant_dtype=rhs_quant_dtype,
         preferred_element_type=hidden_states.dtype,
     )
-    weights = own_weights.astype(jnp.float32)
+    weights = topk_weights.astype(jnp.float32)
     out = 0.0
     for k in range(topk):
         rows = unpack_rows(recv[k * tokens_per_rank : (k + 1) * tokens_per_rank])
