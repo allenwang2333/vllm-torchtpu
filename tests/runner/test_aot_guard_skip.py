@@ -6,8 +6,16 @@ from types import SimpleNamespace
 
 import torch
 
+import pytest
+
 from vllm.config import CompilationMode
+from vllm_torchtpu.compilation import aot_guard_skip
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fns(monkeypatch):
+    monkeypatch.setattr(aot_guard_skip, "FNS", [])
 
 
 class _Fn:
@@ -107,3 +115,31 @@ def test_set_host_levers_toggles_each_listed_lever(monkeypatch):
     r._lever_alt["levers"] = {"h2d"}
     TPUModelRunner._set_host_levers(r, False)
     assert foreach_epilogue.ON == [True] and not any(f.enabled for f in _fns(r))
+
+
+def test_install_disables_every_fresh_aot_compile(monkeypatch):
+    """Forwards compiled after the first step (the drafter's, lazily) are
+    caught at compile time; guarded configs are left alone."""
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper as W
+
+    monkeypatch.setattr(W, "aot_compile", lambda self, *a, **k: _Fn())
+    monkeypatch.setattr(aot_guard_skip, "_installed", False)
+    aot_guard_skip.install()
+    assert aot_guard_skip.install() is True  # idempotent
+
+    def wrapper(evaluate_guards=False, mode=CompilationMode.VLLM_COMPILE):
+        w = W.__new__(W)
+        w.vllm_config = _runner(evaluate_guards, mode).vllm_config
+        return w
+
+    f1 = W.aot_compile(wrapper(), "args")
+    assert not f1.enabled and aot_guard_skip.FNS == [f1]
+    for w in (wrapper(evaluate_guards=True), wrapper(mode=CompilationMode.STOCK_TORCH_COMPILE)):
+        f = W.aot_compile(w, "args")
+        assert f.enabled
+    assert aot_guard_skip.FNS == [f1]
+    # the walk does not double-count a function the hook already switched off
+    r = _runner()
+    r.model[1].aot_compiled_fn = f1
+    TPUModelRunner._skip_aot_guard_checks(r)
+    assert sum(f is f1 for f in aot_guard_skip.FNS) == 1

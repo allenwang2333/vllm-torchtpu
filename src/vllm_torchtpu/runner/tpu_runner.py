@@ -1059,6 +1059,10 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.compilation import foreach_epilogue
 
             foreach_epilogue.install()
+        if envs.TPU_AOT_SKIP_GUARD_CHECK:
+            from vllm_torchtpu.compilation import aot_guard_skip
+
+            aot_guard_skip.install()
         self._host_levers_pending = bool(
             envs.TPU_AOT_SKIP_GUARD_CHECK
             or envs.TPU_FOREACH_MUTATION_EPILOGUE
@@ -1104,7 +1108,9 @@ class TPUModelRunner(GPUModelRunner):
             if on:
                 self._cpu_pinner.maybe_pin()
         if "guard" in levers and envs.TPU_AOT_SKIP_GUARD_CHECK:
-            for fn in getattr(self, "_aot_guard_fns", ()):
+            from vllm_torchtpu.compilation import aot_guard_skip
+
+            for fn in aot_guard_skip.FNS:
                 fn._guard_check_enabled = not on
         if "foreach" in levers and envs.TPU_FOREACH_MUTATION_EPILOGUE:
             from vllm_torchtpu.compilation import foreach_epilogue
@@ -1114,21 +1120,15 @@ class TPUModelRunner(GPUModelRunner):
             self._h2d_reuse_on = on
 
     def _skip_aot_guard_checks(self) -> int:
-        """TPU_AOT_SKIP_GUARD_CHECK: disable the per-call guard check of every
-        AOT-compiled forward (target model and drafter) compiled without guards.
-
-        vLLM compiles with ``guard_filter_fn=skip_all_guards_unsafe`` unless
-        ``dynamic_shapes_config.evaluate_guards`` is set (or the mode is stock
-        torch.compile), so the check evaluates an empty guard set; vLLM's own
-        loader already calls ``disable_guard_check()`` on an artifact loaded
-        from disk under the same condition. Returns how many were disabled.
+        """TPU_AOT_SKIP_GUARD_CHECK: disable the guard check of every AOT-compiled
+        forward already compiled under the target model and the drafter (forwards
+        compiled later are caught by compilation/aot_guard_skip.install(), done
+        at runner init). Only when vLLM dropped every guard (see
+        aot_guard_skip.guards_dropped). Returns how many this walk disabled.
         """
-        from vllm.config import CompilationMode
+        from vllm_torchtpu.compilation import aot_guard_skip
 
-        cc = self.vllm_config.compilation_config
-        if cc.dynamic_shapes_config.evaluate_guards or (
-            cc.mode == CompilationMode.STOCK_TORCH_COMPILE
-        ):
+        if not aot_guard_skip.guards_dropped(self.vllm_config.compilation_config):
             logger.warning("TPU_AOT_SKIP_GUARD_CHECK: guards are evaluated; kept")
             return 0
         roots = [getattr(self, "model", None)]
@@ -1144,11 +1144,12 @@ class TPUModelRunner(GPUModelRunner):
                 if fn is None or id(fn) in seen:
                     continue
                 seen.add(id(fn))
-                if hasattr(fn, "disable_guard_check"):
-                    fn.disable_guard_check()
-                    n += 1
-                    self._aot_guard_fns = getattr(self, "_aot_guard_fns", []) + [fn]
-        logger.warning("TPU_AOT_SKIP_GUARD_CHECK: disabled %d guard checks", n)
+                n += aot_guard_skip.disable(fn)
+        logger.warning(
+            "TPU_AOT_SKIP_GUARD_CHECK: walk disabled %d, %d off in total",
+            n,
+            len(aot_guard_skip.FNS),
+        )
         return n
 
     def _stage_timing_has_consumer(self) -> bool:
