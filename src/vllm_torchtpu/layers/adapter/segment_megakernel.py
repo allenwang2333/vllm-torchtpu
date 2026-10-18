@@ -176,7 +176,7 @@ _ARGS = (
     "s2",
     "qkv_w",  # fp8 [H, qkv_pad] (the lane-padded copy)
     "fstack",  # f32 [boundaries, 1, row_width] (this rank's)
-    "s13s",  # f32 [boundaries, E, 2I]
+    "s13s",  # f32 [boundaries, E, 1, 2I]
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
 )
@@ -709,7 +709,7 @@ def _build_stacks(layers: list, plan: list) -> None:
         moe = _moe_runner(layer).routed_experts
         rows.append(_consts_row(st, layer, nxt))
         s13s.append(
-            moe.w13_weight_scale_inv.detach().reshape(moe.w13_weight.shape[0], -1)
+            moe.w13_weight_scale_inv.detach().reshape(moe.w13_weight.shape[0], 1, -1)
         )
         sw13s.append(getattr(moe, moe_tp_decode._BUFFERS[0]).detach().contiguous())
         sw2s.append(getattr(moe, moe_tp_decode._BUFFERS[2]).detach().contiguous())
