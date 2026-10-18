@@ -5061,6 +5061,19 @@ class TPUModelRunner(GPUModelRunner):
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
+        # After the drafter has bound its heads (an MTP draft's shared heads are the
+        # target's lm_head module) and before any program is compiled.
+        if envs.TPU_LM_HEAD_HBM and self._pp_is_last and not self.is_pooling_model:
+            from vllm_torchtpu.layers.adapter.lm_head_hbm import install_lm_head_hbm
+
+            install_lm_head_hbm(
+                self.model,
+                getattr(self.drafter, "draft_model", None)
+                if self._is_async_drafter
+                else None,
+                envs.TPU_LM_HEAD_HBM,
+            )
+
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
