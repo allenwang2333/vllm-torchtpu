@@ -159,3 +159,13 @@ def test_bucket_config():
 
 def test_pin_roles_cover_every_operand_class():
     assert set(sparse_mla.SEND_EXCHANGE_PIN_ROLES) == {"kv", "q", "q_pe", "tab", "recv"}
+
+
+def test_min_tokens_default_fuses_every_gated_bucket():
+    from vllm_torchtpu import envs
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS", None)
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS == 1
+    with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": "8"}):
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS == 8

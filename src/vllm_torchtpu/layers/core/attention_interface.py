@@ -1359,6 +1359,12 @@ def sparse_mla_attention_dcp(
         # (TPU_MLA_FUSED_SMALL_A2A).
         rope_table_ = extra_[0] if q_rope else None
         dcp_lane = extra_[-1][0] if fused_exchange else None
+        # TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: whether this bucket (static T)
+        # runs the exchange inside the kernel or by the separate small a2a.
+        fuse_here = bool(
+            fused_exchange
+            and topk_idx.shape[0] >= envs.TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS
+        )
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
         else:
@@ -1448,7 +1454,7 @@ def sparse_mla_attention_dcp(
                 )
                 if send_layout:
                     split_kwargs["send_world"] = dcp_size
-                if fused_exchange:
+                if fused_exchange and fuse_here:
                     # Static per bucket (the JAX op's shape, not a torch gate).
                     pin, vmem_mib = fused_small_a2a_bucket_config(num_tokens)
                     split_kwargs["send_exchange"] = (
@@ -1558,14 +1564,28 @@ def sparse_mla_attention_dcp(
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
         if fused_exchange:
-            # `lse` is the receive buffer [W * block, V]: the small all-to-all
-            # path's unpack (cp_mla_attention.send_small_unpack_local's).
-            from vllm_torchtpu.layers.adapter.cp_mla_attention import _mask_unpack
+            from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp
 
             per = ql_nope.shape[1] // dcp_size
             block = sparse_mla_kernel.SEND_PAD_ROWS + num_tokens * per
             rows = 1 + query_start_loc_[-1:].astype(jnp.int32) * per
-            o_recv, l_recv = _mask_unpack(
+            if not fuse_here:
+                # Below TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: `lse` is the send
+                # buffer, exchanged by the separate small all-to-all + unpack
+                # exactly as the unfused op pair does (same kernels, same bits).
+                o_recv, l_recv = _cp.send_small_unpack_local(
+                    lse.reshape(dcp_size * block, lse.shape[-1]),
+                    rows,
+                    jnp.reshape(dcp_rank, (1,)).astype(jnp.int32),
+                    jnp.reshape(dcp_lane, (1,)).astype(jnp.int32),
+                    world=dcp_size,
+                    axis_name=dcp_axis_name,
+                    lane_axis=lane_axis,
+                )
+                return (kv_cache_nope, kv_cache_rope, o_recv, l_recv)
+            # `lse` is the receive buffer [W * block, V]: the small all-to-all
+            # path's unpack (cp_mla_attention.send_small_unpack_local's).
+            o_recv, l_recv = _cp._mask_unpack(
                 lse.reshape(dcp_size, block, lse.shape[-1]),
                 rows,
                 block - sparse_mla_kernel.SEND_PAD_ROWS,

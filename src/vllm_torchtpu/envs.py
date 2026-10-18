@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
     TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB: int = 32
     TPU_MLA_FUSED_SMALL_A2A_BUCKETS: str = ""
+    TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -662,6 +663,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered KV and leaves q (and its relayout copy) where XLA puts it.
     "TPU_MLA_FUSED_SMALL_A2A_BUCKETS": lambda: os.getenv(
         "TPU_MLA_FUSED_SMALL_A2A_BUCKETS", ""
+    ),
+    # Buckets below this many tokens keep the separate small all-to-all inside
+    # the same op (kernel send buffer -> small_all_to_all -> unpack: the
+    # unfused pair's kernels and bits); only buckets >= it run the exchange in
+    # the kernel. Decided on the JAX op's static shape: no second token-count
+    # gate in the traced graph. 1 = every bucket the flag takes.
+    "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS": env_int(
+        "TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS", 1
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
