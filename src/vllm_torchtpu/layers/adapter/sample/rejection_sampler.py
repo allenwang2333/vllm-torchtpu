@@ -72,6 +72,7 @@ class RejectionSampler:
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        mass_f32: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -93,6 +94,7 @@ class RejectionSampler:
             need_top_p=need_top_p,
             radix_bits=radix_bits,
             fast_top_p=fast_top_p,
+            mass_f32=mass_f32,
         )
 
     def forward(
@@ -116,6 +118,7 @@ class RejectionSampler:
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        mass_f32: bool = False,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -147,6 +150,8 @@ class RejectionSampler:
           radix_bits: bits per pass of the top-k/top-p threshold bisection.
           fast_top_p: static; skip the top-p bisection's provably idle steps
             (same threshold, see top_k_top_p.topp_mask).
+          mass_f32: static; accumulate bf16 top-p mass in float32 (see
+            top_k_top_p._topp_bisect_threshold). No effect on float32 rows.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -189,6 +194,7 @@ class RejectionSampler:
                 need_top_p,
                 radix_bits,
                 fast_top_p,
+                mass_f32,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -462,6 +468,7 @@ def _random_rejection_sample_with_segment_impl(
     need_top_p: bool = True,
     radix_bits: int = 1,
     fast_top_p: bool = False,
+    mass_f32: bool = False,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -489,6 +496,7 @@ def _random_rejection_sample_with_segment_impl(
         radix_bits,
         fast_top_p,
         topk_candidates=topk_candidates,
+        mass_f32=mass_f32,
     )
     target_probs = torch.softmax(masked_logits, dim=-1)
 

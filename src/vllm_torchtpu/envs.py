@@ -234,6 +234,7 @@ if TYPE_CHECKING:
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
+    TPU_SAMPLER_BONUS_MASS_F32: bool = False
     TPU_SAMPLER_FUSED_CHAIN: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
@@ -1510,6 +1511,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verify rows. Same threshold bit for bit (top_k_top_p.topp_mask). A top-K
     # candidate prefilter was measured 10x slower (lax.top_k sorts the vocab).
     "TPU_SAMPLER_FAST_TOP_P": env_bool("TPU_SAMPLER_FAST_TOP_P", True),
+    # Non-greedy sampler + verify: sum the top-p bisection's probability mass
+    # of bf16 probs (the bonus rows) with a float32 accumulator, rounded back
+    # to bf16. The bf16-accumulated sum of a broad row falls below top_p, so
+    # top-p is silently skipped there (top_k_top_p._topp_bisect_threshold).
+    # Changes sampled bonus tokens on those rows: off until accuracy-checked.
+    "TPU_SAMPLER_BONUS_MASS_F32": env_bool("TPU_SAMPLER_BONUS_MASS_F32", False),
     # Non-greedy spec verify: logits gathers, bonus sampling, the per-token
     # param gathers and the rejection sampler as ONE compiled program (the
     # three uniform draws stay eager: same generator, shapes and order).

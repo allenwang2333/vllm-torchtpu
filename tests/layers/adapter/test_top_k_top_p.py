@@ -312,3 +312,93 @@ def test_fast_top_p_matches_bisection(device, monkeypatch):
             want = mask(logits, top_k, top_p, False).cpu()
             got = mask(logits, top_k, top_p, True).cpu()
             assert torch.equal(got, want), (str(dtype), name)
+
+
+def _topp_oracle_bf16(probs: torch.Tensor, p: float) -> float:
+    """float64 reference of the bf16 top-p threshold: the largest prob value v
+    whose set {probs >= v} has a mass that rounds (to bf16) to >= p."""
+    v = probs.double().numpy()
+    vals, inv = np.unique(v, return_inverse=True)
+    cum = np.cumsum(np.bincount(inv, weights=v)[::-1])[::-1]
+    rounded = torch.tensor(cum.copy(), dtype=torch.float32).to(torch.bfloat16).double()
+    ok = np.nonzero(rounded.numpy() >= np.float32(p))[0]
+    return float(vals[ok[-1]]) if ok.size else -float("inf")
+
+
+def _broad_bf16_probs(rows: int, vocab: int, seed: int) -> torch.Tensor:
+    # mixes one-token, ~6-token, ~40-token and ~1e3..1e4-token top-p sets
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn((rows, vocab), generator=g)
+    x[:, :1] += torch.tensor([18.0, 0.0, 0.0, 0.0] * (rows // 4)).view(-1, 1)
+    x[1::4, :8] += 14.0
+    x[2::4, :64] += 11.0
+    x[3::4] *= 2.0
+    return torch.softmax(x, dim=-1).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("fast", [False, True])
+def test_mass_f32_threshold_matches_float64_oracle(fast):
+    """TPU_SAMPLER_BONUS_MASS_F32: on bf16 probs the threshold is the float64
+    top-p cutoff of the float32-accumulated, bf16-rounded mass."""
+    rows, vocab = 8, 65536
+    probs = _broad_bf16_probs(rows, vocab, seed=11)
+    p = torch.full((rows,), 0.95)
+    got = sampling._topp_bisect_threshold(probs, p, 1, fast, mass_f32=True)
+    for r in range(rows):
+        assert float(got[r]) == _topp_oracle_bf16(probs[r], 0.95), r
+
+
+def test_mass_f32_leaves_float32_rows_unchanged():
+    probs = _broad_bf16_probs(8, 4096, seed=12).float()
+    probs = probs / probs.sum(-1, keepdim=True)
+    p = torch.full((8,), 0.9)
+    want = sampling._topp_bisect_threshold(probs, p, 1, True)
+    got = sampling._topp_bisect_threshold(probs, p, 1, True, mass_f32=True)
+    assert torch.equal(got, want)
+
+
+def test_mass_f32_threads_through_apply_top_k_top_p():
+    logits = torch.log(_broad_bf16_probs(8, 4096, seed=13).float()).to(torch.bfloat16)
+    k = torch.zeros((8, 1), dtype=torch.int32)
+    p = torch.full((8, 1), 0.95)
+    want = sampling.topp_mask(logits, p, sampling.MASKED_LOGIT_VALUE, 1, True, True)
+    got = sampling.apply_top_k_top_p(logits, k, p, False, True, 1, True, mass_f32=True)
+    assert torch.equal(got, want)
+
+
+def test_sampler_kwargs_carry_mass_f32():
+    runner = SimpleNamespace(
+        _sampler_light=True,
+        _sampler_need_top_k=False,
+        _sampler_need_top_p=True,
+        _sampler_radix_bits=1,
+        _sampler_fast_top_p=True,
+        _sampler_mass_f32=True,
+    )
+    kwargs = TPUModelRunner._sampler_kwargs(runner)
+    assert kwargs["mass_f32"] is True
+    assert all(v["mass_f32"] for v in TPUModelRunner._sampler_light_variants(runner))
+    runner._sampler_mass_f32 = False
+    assert "mass_f32" not in TPUModelRunner._sampler_kwargs(runner)
+    assert envs.TPU_SAMPLER_BONUS_MASS_F32 is False
+
+
+@pytest.mark.tpu_test
+def test_mass_f32_restores_top_p_on_tpu(device, monkeypatch):
+    """On TPU the bf16-accumulated mass of a broad bf16 row stays below top_p,
+    so the plain bisection returns -inf (top-p skipped); mass_f32 matches the
+    float64 cutoff."""
+    if device.type != "tpu":
+        pytest.skip("compiled TPU check")
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 64)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def thr(probs, p, mass_f32):
+        return sampling._topp_bisect_threshold(probs, p, 1, True, mass_f32)
+
+    rows, vocab = 8, 154880
+    probs = _broad_bf16_probs(rows, vocab, seed=14)
+    p = torch.full((rows,), 0.95)
+    got = thr(probs.to(device), p.to(device), True).cpu()
+    for r in range(rows):
+        assert float(got[r]) == _topp_oracle_bf16(probs[r], 0.95), r

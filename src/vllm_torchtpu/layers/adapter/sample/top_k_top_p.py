@@ -239,9 +239,21 @@ def topk_mask(
 
 
 def _topp_bisect_threshold(
-    probs: torch.Tensor, p: torch.Tensor, radix_bits: int, fast: bool = False
+    probs: torch.Tensor,
+    p: torch.Tensor,
+    radix_bits: int,
+    fast: bool = False,
+    mass_f32: bool = False,
 ):
     """The top-p threshold bisection; ``fast`` skips the provably idle steps.
+
+    ``mass_f32`` (TPU_SAMPLER_BONUS_MASS_F32): sum a low-precision ``probs``
+    row's mass with a float32 accumulator, then round it to ``probs.dtype``
+    (the dtype the plain sum returns). On TPU a bf16 sum of the bf16 bonus
+    probs accumulates in bf16: a row with ~5e4 tokens in its top-p set sums
+    to ~0.92, below top_p, so every bisection step returns True and the
+    threshold walks to -inf (top-p not applied); smaller sets get a cutoff a
+    few tokens off. float32 rows are unchanged.
 
     The predicate depends on a threshold t only through the set
     {probs >= t}, and is monotonic, so the search returns the largest value
@@ -266,12 +278,17 @@ def _topp_bisect_threshold(
     """
     zero_val = torch.zeros_like(probs)
 
+    accumulate_f32 = mass_f32 and probs.dtype != torch.float32
+
     def predicate(threshold: torch.Tensor) -> torch.Tensor:
         threshold = threshold.unsqueeze(-1)
-        probability_mass = torch.sum(
-            torch.where(probs >= threshold, probs, zero_val),
-            dim=-1,
-        )
+        selected = torch.where(probs >= threshold, probs, zero_val)
+        if accumulate_f32:
+            probability_mass = torch.sum(selected, dim=-1, dtype=torch.float32).to(
+                probs.dtype
+            )
+        else:
+            probability_mass = torch.sum(selected, dim=-1)
         return probability_mass < p
 
     if fast and radix_bits == 1:
@@ -294,6 +311,7 @@ def topp_mask(
     replace_val: float = MASKED_LOGIT_VALUE,
     radix_bits: int = 1,
     fast_top_p: bool = False,
+    mass_f32: bool = False,
 ) -> torch.Tensor:
     """Applies top-p masking to logits.
 
@@ -318,6 +336,8 @@ def topp_mask(
       fast_top_p: skip the bisection steps proven idle for softmax probs
         (bit 30; bits 15..0 for bf16) -- same threshold bit for bit, see
         _topp_bisect_threshold. Needs top_p > 0.
+      mass_f32: accumulate low-precision probability mass in float32 (see
+        _topp_bisect_threshold).
 
     Returns:
       masked version of logits. [batch..., vocab_size]
@@ -325,7 +345,7 @@ def topp_mask(
     probs = torch.softmax(logits, dim=-1)
     replace_tensor = torch.full_like(logits, replace_val)
     threshold = _topp_bisect_threshold(
-        probs, p.squeeze(-1), radix_bits, fast_top_p
+        probs, p.squeeze(-1), radix_bits, fast_top_p, mass_f32
     ).unsqueeze(-1)
 
     return torch.where(probs >= threshold, logits, replace_tensor)
@@ -340,6 +360,7 @@ def apply_top_k_top_p(
     radix_bits: int = 1,
     fast_top_p: bool = False,
     topk_candidates: int = 0,
+    mass_f32: bool = False,
 ) -> torch.Tensor:
     """Top-k then top-p masking, per row.
 
@@ -351,6 +372,7 @@ def apply_top_k_top_p(
     whole: bit-identical output, minus 32-33 full-vocab reduction passes.
     fast_top_p (static, see topp_mask) runs the same top-p bisection minus
     its provably idle steps: 15 vocab passes instead of 32 on bf16 rows.
+    mass_f32 (static, see topp_mask) sums bf16 probability mass in float32.
     """
     if topk_candidates > 0:
         return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
@@ -364,7 +386,7 @@ def apply_top_k_top_p(
         return masked_logits
     should_apply_topp = (top_p < 1.0).expand(-1, masked_logits.shape[-1])
     topp_masked = topp_mask(
-        masked_logits, top_p, MASKED_LOGIT_VALUE, radix_bits, fast_top_p
+        masked_logits, top_p, MASKED_LOGIT_VALUE, radix_bits, fast_top_p, mass_f32
     )
     return torch.where(should_apply_topp, topp_masked, masked_logits)
 
