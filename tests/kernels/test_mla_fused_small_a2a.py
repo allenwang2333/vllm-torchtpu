@@ -180,3 +180,6 @@ def test_merge_mode_constants():
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is False
     with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MERGE": "1"}):
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is True
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", None)
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS == 8

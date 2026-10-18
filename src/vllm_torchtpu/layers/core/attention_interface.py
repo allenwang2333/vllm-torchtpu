@@ -1374,6 +1374,12 @@ def sparse_mla_attention_dcp(
                 "TPU_MLA_FUSED_SMALL_A2A_MERGE needs every fused bucket in the "
                 "kernel (TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS <= the bucket)"
             )
+        # TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: buckets above it keep the
+        # kernel's exchange but merge in the op (jnp), same result schema.
+        merge_here = bool(
+            fused_merge
+            and topk_idx.shape[0] <= envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS
+        )
         if dcp_rank_ids is not None:
             dcp_rank = extra_[int(q_rope)][0]
         else:
@@ -1471,10 +1477,10 @@ def sparse_mla_attention_dcp(
                         lane_axis,
                         int(vmem_mib) * 1024 * 1024,
                         pin,
-                        bool(fused_merge),
+                        bool(merge_here),
                     )
                     peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
-                    if fused_merge:
+                    if merge_here:
                         # The real-token count: the kernel's unpack mask.
                         peer.append(query_start_loc_[-1].astype(jnp.int32))
                     split_kwargs["send_peer"] = jnp.stack(peer)
@@ -1581,9 +1587,19 @@ def sparse_mla_attention_dcp(
             per = ql_nope.shape[1] // dcp_size
             block = sparse_mla_kernel.SEND_PAD_ROWS + num_tokens * per
             rows = 1 + query_start_loc_[-1:].astype(jnp.int32) * per
-            if fused_merge:
+            if merge_here:
                 # The kernel merged: its second output is the merged rows' words.
                 merged = jax.lax.bitcast_convert_type(lse, jnp.bfloat16)
+                return (kv_cache_nope, kv_cache_rope, merged.reshape(num_tokens, per, -1))
+            if fused_merge:
+                # Above MERGE_MAX_TOKENS: `lse` is the receive buffer; the unpack
+                # and the merge (its jnp form) run here, in the op.
+                o_recv, l_recv = _cp._mask_unpack(
+                    lse.reshape(dcp_size, block, lse.shape[-1]),
+                    rows,
+                    block - sparse_mla_kernel.SEND_PAD_ROWS,
+                )
+                merged = _cp.merge_received_jax(o_recv, l_recv).astype(jnp.bfloat16)
                 return (kv_cache_nope, kv_cache_rope, merged.reshape(num_tokens, per, -1))
             if not fuse_here:
                 # Below TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: `lse` is the send

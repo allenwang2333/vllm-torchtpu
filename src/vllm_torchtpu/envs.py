@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_BUCKETS: str = ""
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = False
+    TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 8
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -680,6 +681,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (exp / summation order). Needs MIN_TOKENS = 1.
     "TPU_MLA_FUSED_SMALL_A2A_MERGE": env_bool(
         "TPU_MLA_FUSED_SMALL_A2A_MERGE", default=False
+    ),
+    # With _MERGE: buckets above this many tokens keep the in-kernel exchange
+    # but merge in the op (cp_mla_attention.merge_received_jax), returning the
+    # same merged [T, L, V]. Static per bucket in the JAX op.
+    "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
+        "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 8
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
