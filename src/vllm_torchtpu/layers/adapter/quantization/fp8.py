@@ -1299,7 +1299,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         out = self.apply_monolithic_external_dispatch(
             layer, gathered_x, gathered_logits
         )
-        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+        out = retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+        out = small_all_reduce_op.retain(out)
+        return token_padding.retain_padding_graph_input(out)
 
     def apply_monolithic_external_dispatch(
         self,
@@ -1863,4 +1865,7 @@ def _fused_kernel_takes(rows: int, gate: int) -> bool:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
         if not _sp.is_active():
             return False
+    cap = int(getattr(envs, "TPU_MOE_FUSED_EP_STEP_MAX_TOKENS", 0) or 0)
+    if cap > 0:
+        return rows >= gate and rows <= cap
     return rows >= gate

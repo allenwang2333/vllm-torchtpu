@@ -393,3 +393,28 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+def test_fit_enforces_monotonic_linear_costs_against_profile_dips():
+    # Regression test for j-d2242374: a profiling dip at 7168 (68.8 ms < 6144's
+    # 71.5 ms) must be clamped to >= 71.5 ms so a lone 8K prompt on PP=4 is not
+    # split into 7168 + 1024 chunks.
+    samples = [
+        (1024, 0, 12.6),
+        (2048, 0, 15.8),
+        (3072, 0, 39.2),
+        (4096, 0, 48.0),
+        (5120, 0, 62.6),
+        (6144, 0, 71.5),
+        (7168, 0, 68.8),
+        (8192, 0, 76.2),
+        (4096, 32768, 55.0),
+    ]
+    model = StepCostModel.fit(samples, slack=0.1, granularity=1024)
+    assert model.linear_ms[7168] >= model.linear_ms[6144]
+    assert model.linear_ms[7168] == pytest.approx(71.5)
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit == 8192

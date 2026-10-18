@@ -42,7 +42,7 @@ from vllm_torchtpu import envs
 # Configurable via TPU_MOE_LOWTOK_MAX_TOKENS (default 128).
 MOE_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
 HOT_SLOTS = 128
-_MAX_LOCAL_EXPERTS = 128
+_MAX_LOCAL_EXPERTS = 256
 _TABLE_LANES = 512
 
 _ROW_TILE = 8  # sublane row alignment (avoids padding T=8,16 to 32)

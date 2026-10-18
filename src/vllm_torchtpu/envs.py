@@ -1089,6 +1089,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int(
         "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64
     ),
+    "TPU_MOE_FUSED_EP_STEP_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_FUSED_EP_STEP_MAX_TOKENS", 0
+    ),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_MAX_ROWS": lambda: int(os.getenv("TPU_SP_MAX_ROWS", "0")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),

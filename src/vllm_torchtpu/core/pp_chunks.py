@@ -184,6 +184,10 @@ class StepCostModel:
                 + ", ".join(str(sorted(ladder)) for ladder in ladders)
             )
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
+        running_max = 0.0
+        for b in buckets:
+            running_max = max(running_max, linear[b])
+            linear[b] = running_max
         attn = max(slopes)
         top = buckets[-1]
         full_step = linear[top] + attn * top * top / 2

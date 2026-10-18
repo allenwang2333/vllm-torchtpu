@@ -20,6 +20,8 @@ CDK_DIR="/home/shriharim_google_com/cloud-devkit"
 
 COMMON_ENV="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= TPU_SMALL_ALL_REDUCE=0 TPU_MOE_LOWTOK=0 TPU_MOE_SEQUENCE_PARALLEL=0 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO"
 SP_EP_ENV="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= TPU_SMALL_ALL_REDUCE=0 TPU_MOE_LOWTOK=0 TPU_MOE_SEQUENCE_PARALLEL=1 TPU_SP_MAX_ROWS=2048 USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v3 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO"
+SP_EP_OPT_ENV="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= TPU_SMALL_ALL_REDUCE=1 TPU_MOE_LOWTOK=1 TPU_MOE_SEQUENCE_PARALLEL=1 TPU_SP_MIN_ROWS=512 TPU_SP_MAX_ROWS=0 TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=64 TPU_MOE_FUSED_EP_STEP_MAX_TOKENS=1024 USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v3 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO"
+SP_EP_DECODE_SP_ENV="TPU_QWEN35_AUTO_DEFAULTS=0 TPU_EXPERT_PLACEMENT= TPU_SMALL_ALL_REDUCE=1 TPU_MOE_LOWTOK=1 TPU_MOE_SEQUENCE_PARALLEL=1 TPU_SP_MIN_ROWS=16 TPU_SP_MAX_ROWS=0 TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=64 TPU_MOE_FUSED_EP_STEP_MAX_TOKENS=1024 USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_KERNEL_IMPL=v3 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_LOGGING_LEVEL=INFO"
 TWO_CHIP_ENV="${COMMON_ENV} VLLM_TPU_DEVICE_ORDER=0,2,1,3,4,6,5,7"
 
 run_or_print() {
@@ -78,7 +80,9 @@ bump_kueue_priority() {
   return 0
 }
 
-cd "${CDK_DIR}"
+if [[ "${MODE}" == "--execute" ]]; then
+  cd "${CDK_DIR}"
+fi
 
 case "${JOB_NAME}" in
   ut-1node)
@@ -86,7 +90,7 @@ case "${JOB_NAME}" in
     run_or_print cdk job create \
       simple-run-command \
       DOCKER_IMAGE="${DOCKER_IMAGE}" \
-      RUN_CMD="cp -r /workspace/vllm-torchtpu/src/vllm_torchtpu /root/torchtpu-vllm/src/ && PYTHONPATH=/workspace/vllm-torchtpu/src pytest /workspace/vllm-torchtpu/tests/distributed/test_ep_mesh.py /workspace/vllm-torchtpu/tests/distributed/test_pcp_collectives.py /workspace/vllm-torchtpu/tests/distributed/test_pp_wave.py /workspace/vllm-torchtpu/tests/platforms/test_pp_validation.py /workspace/vllm-torchtpu/tests/platforms/test_tpu_platform.py /workspace/vllm-torchtpu/tests/layers/adapter/test_small_all_reduce_op.py -v" \
+      RUN_CMD="cp -r /workspace/vllm-torchtpu/src/vllm_torchtpu /root/torchtpu-vllm/src/ && PYTHONPATH=/workspace/vllm-torchtpu/src pytest /workspace/vllm-torchtpu/tests/distributed/test_ep_mesh.py /workspace/vllm-torchtpu/tests/distributed/test_pcp_collectives.py /workspace/vllm-torchtpu/tests/distributed/test_pp_wave.py /workspace/vllm-torchtpu/tests/platforms/test_pp_validation.py /workspace/vllm-torchtpu/tests/platforms/test_tpu_platform.py /workspace/vllm-torchtpu/tests/layers/adapter/test_small_all_reduce_op.py /workspace/vllm-torchtpu/tests/test_pp_chunk_scheduler.py /workspace/vllm-torchtpu/tests/models/vllm/test_qwen3_next_patch.py -v" \
       --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
       --tags "qwen35-pp-tp2-tpu-unit-tests,qwen35-pp-tp,agent-jobs"
     ;;
@@ -125,6 +129,60 @@ case "${JOB_NAME}" in
       EVAL_ARGS="--num_fewshot 5" \
       --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
       --tags "qwen35-397b-fp8-pp4xtp2-ep2-sp-fused-v3-1-host-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
+    ;;
+
+  pp4-tp2-ep2-opt-1node)
+    # 2c. Single-host PP4 x TP2 + EP2 Wave 3 Optimized (trunk SP=1 for all T>=512, Fused EP v3 for 512<=T<=2048, gmm_v2 for T>2048, moe_lowtok + small_all_reduce for decode T<=64)
+    run_or_print cdk job create \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
+      DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      MODEL_ID="${MODEL_ID}" \
+      ENV_VARS="${SP_EP_OPT_ENV}" \
+      SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      RUN_EVAL="true" \
+      EVAL_TASK="gsm8k" \
+      EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --tags "qwen35-397b-fp8-pp4xtp2-ep2-opt-wave3-1-host-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
+    ;;
+
+  pp4-tp2-ep2-decode-sp-1node)
+    # 2d. Single-host PP4 x TP2 + EP2 Decode-SP Ablation (TPU_SP_MIN_ROWS=16 so SP=1 stays active during decode T>=16 as well)
+    run_or_print cdk job create \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
+      DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      MODEL_ID="${MODEL_ID}" \
+      ENV_VARS="${SP_EP_DECODE_SP_ENV}" \
+      SERVER_ARGS="--pipeline-parallel-size 4 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      RUN_EVAL="true" \
+      EVAL_TASK="gsm8k" \
+      EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --tags "qwen35-397b-fp8-pp4xtp2-ep2-decode-sp-ablation-1-host-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
+    ;;
+
+  pp2-tp4-ep4-1node)
+    # 2e. Single-host PP2 x TP4 + EP4 (8 cores, 2 megachips / 4 cores per stage, 30 layers & 128 experts per core)
+    run_or_print cdk job create \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      NUM_NODES=1 \
+      TPU_TOPOLOGY=2x2x1 \
+      DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      MODEL_ID="${MODEL_ID}" \
+      ENV_VARS="${SP_EP_OPT_ENV}" \
+      SERVER_ARGS="--pipeline-parallel-size 2 --tensor-parallel-size 4 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 36864 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      RUN_EVAL="true" \
+      EVAL_TASK="gsm8k" \
+      EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --tags "qwen35-397b-fp8-pp2xtp4-ep4-opt-wave3-1-host-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
     ;;
 
   pp8-1node)
@@ -215,6 +273,38 @@ case "${JOB_NAME}" in
       --tags "qwen35-397b-fp8-pp8xtp2-ep2-sp-fused-v3-2-host-2x2x2-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
     ;;
 
+  pp8-tp2-ep2-opt-2node)
+    # 6c. Multi-host PP8 x TP2 + EP2 Wave 3 Optimized (moe_lowtok enabled for 256 local experts + small_all_reduce + trunk SP=1 for all T>=512 + gmm_v2 for T>2048)
+    run_or_print cdk job create \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      MODEL_ID="${MODEL_ID}" \
+      ENV_VARS="${SP_EP_OPT_ENV}" \
+      SERVER_ARGS="--pipeline-parallel-size 8 --tensor-parallel-size 2 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      RUN_EVAL="true" \
+      EVAL_TASK="gsm8k" \
+      EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --tags "qwen35-397b-fp8-pp8xtp2-ep2-opt-wave3-2-host-2x2x2-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
+    ;;
+
+  pp2-tp8-ep8-2node)
+    # 6d. Multi-host PP2 x TP8 + EP8 (16 cores across 2 hosts, 1 host / 8 cores per stage, 30 layers & 64 experts per core)
+    run_or_print cdk job create \
+      vllm-torchtpu-pp-tp-two-node-mp-bench \
+      DOCKER_IMAGE="${DOCKER_IMAGE}" \
+      MODEL_ID="${MODEL_ID}" \
+      ENV_VARS="${SP_EP_OPT_ENV}" \
+      SERVER_ARGS="--pipeline-parallel-size 2 --tensor-parallel-size 8 --prefill-context-parallel-size 1 --enable-expert-parallel --no-async-scheduling --max-model-len 65536 --max-num-batched-tokens 8192 --max-num-seqs 64 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --quantization fp8 --no-enable-prefix-caching" \
+      BENCH_SWEEP="8192,1,1,8;8192,1,8,32;8192,1,16,64;8192,1,32,128;16384,1,1,8;16384,1,8,32;16384,1,16,64;32768,1,1,8;32768,1,8,32;64000,1,1,8;64000,1,4,16;1024,1024,1,8;1024,1024,8,32;1024,1024,32,128;8192,1024,1,8;8192,1024,8,32;8192,1024,16,64" \
+      RUN_EVAL="true" \
+      EVAL_TASK="gsm8k" \
+      EVAL_ARGS="--num_fewshot 5" \
+      --map-dir "${REPO_DIR}:*:/workspace/vllm-torchtpu" \
+      --tags "qwen35-397b-fp8-pp2xtp8-ep8-2-host-2x2x2-gsm8k-sweep,qwen35-pp-tp,agent-jobs"
+    ;;
+
   pp8-pcp2-2node)
     # 7. Multi-host PP8 x PCP2 baseline (16 cores across 2 hosts, 2 chips per stage) - GSM8K + prefill/serving sweep
     run_or_print cdk job create \
@@ -284,17 +374,22 @@ case "${JOB_NAME}" in
 
   *)
     echo "Available jobs:"
-    echo "  ut-1node                - TPU unit tests (2x2x1)"
-    echo "  pp4-tp2-1node           - PP4 x TP2 Pure-TP on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp4-tp2-ep2-1node       - PP4 x TP2 + EP2 on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp8-1node               - PP8 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp4-pcp2-1node          - PP4 x PCP2 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  tp8-1node               - TP8 EP baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
-    echo "  pp8-tp2-2node           - PP8 x TP2 Pure-TP on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
-    echo "  pp8-tp2-ep2-2node       - PP8 x TP2 + EP2 on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
-    echo "  pp8-pcp2-2node          - PP8 x PCP2 baseline on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
-    echo "  xprof-pp4-tp2-ep2-1node - XProf trace capture on PP4 x TP2 + EP2 (2x2x1)"
-    echo "  xprof-pp4-tp2-1node     - XProf trace capture on PP4 x TP2 Pure-TP (2x2x1)"
-    echo "  xprof-pp8-1node         - XProf trace capture on PP8 baseline (2x2x1)"
+    echo "  ut-1node                    - TPU unit tests (2x2x1)"
+    echo "  pp4-tp2-1node               - PP4 x TP2 Pure-TP on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp4-tp2-ep2-1node           - PP4 x TP2 + EP2 (Wave 2) on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp4-tp2-ep2-opt-1node       - PP4 x TP2 + EP2 (Wave 3 Opt: lowtok + small_ar + SP>=512 + gmm>2048) on 1 host (2x2x1)"
+    echo "  pp4-tp2-ep2-decode-sp-1node - PP4 x TP2 + EP2 (Wave 3 Decode-SP Ablation: SP>=16) on 1 host (2x2x1)"
+    echo "  pp2-tp4-ep4-1node           - PP2 x TP4 + EP4 (Wave 3 Opt: 30 layers & 128 experts/core) on 1 host (2x2x1)"
+    echo "  pp8-1node                   - PP8 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp4-pcp2-1node              - PP4 x PCP2 baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  tp8-1node                   - TP8 EP baseline on 1 host (2x2x1): GSM8K + prefill & serving sweep"
+    echo "  pp8-tp2-2node               - PP8 x TP2 Pure-TP on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  pp8-tp2-ep2-2node           - PP8 x TP2 + EP2 (Wave 2) on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  pp8-tp2-ep2-opt-2node       - PP8 x TP2 + EP2 (Wave 3 Opt: lowtok256 + small_ar + SP>=512 + gmm>2048) on 2 hosts (2x2x2)"
+    echo "  pp2-tp8-ep8-2node           - PP2 x TP8 + EP8 on 2 hosts (2x2x2, 1 host/stage): GSM8K + prefill & serving sweep"
+    echo "  pp8-pcp2-2node              - PP8 x PCP2 baseline on 2 hosts (2x2x2): GSM8K + prefill & serving sweep"
+    echo "  xprof-pp4-tp2-ep2-1node     - XProf trace capture on PP4 x TP2 + EP2 (2x2x1)"
+    echo "  xprof-pp4-tp2-1node         - XProf trace capture on PP4 x TP2 Pure-TP (2x2x1)"
+    echo "  xprof-pp8-1node             - XProf trace capture on PP8 baseline (2x2x1)"
     ;;
 esac

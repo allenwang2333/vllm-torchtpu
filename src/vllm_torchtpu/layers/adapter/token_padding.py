@@ -92,12 +92,31 @@ def padding_mask_for(
     num_tokens: int, is_local_tensor: bool = False
 ) -> torch.Tensor | None:
     """The padded-row mask for a [num_tokens, ...] tensor, or None when no padding state is set; gathered
-    across the DP/PCP ranks unless the tensor is local."""
+    across the SP/EP or DP/PCP ranks unless the tensor is local."""
     if _padding_state is None:
         return None
     if is_local_tensor:
         return _padding_state.get_local_padding_mask(num_tokens)
-    from vllm.distributed.parallel_state import get_dp_group, get_pcp_group
+    from vllm.distributed.parallel_state import (
+        get_dp_group,
+        get_ep_group,
+        get_pcp_group,
+        get_tp_group,
+    )
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+
+    if sequence_parallel.is_active():
+        ep_group = get_ep_group()
+        sp_group = ep_group if ep_group.world_size > 1 else get_tp_group()
+        sp_size = sp_group.world_size
+        if sp_size > 1:
+            local_padding = _padding_state.get_local_padding_mask(
+                num_tokens // sp_size
+            )
+            gathered_padding = sp_group.all_gather(
+                local_padding.to(torch.int8), dim=0
+            )
+            return gathered_padding.ne(0)
 
     dp_group = get_dp_group()
     dp_size = dp_group.world_size

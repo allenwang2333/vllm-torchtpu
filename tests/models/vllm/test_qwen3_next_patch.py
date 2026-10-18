@@ -835,3 +835,100 @@ def test_cat768_fp8_fusion_and_weight_deletion():
             dim=0,
         ).item()
         assert cos_moe > 0.999, f"cos_moe={cos_moe}"
+
+
+def test_fused_kernel_takes_respects_step_max_tokens(monkeypatch):
+    from vllm_torchtpu.layers.adapter import sequence_parallel
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import _fused_kernel_takes
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.fused_moe_ep_v3.tensor_parallel_size",
+        lambda: 2,
+    )
+    sequence_parallel.set_active(True)
+    monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MAX_TOKENS", 1024)
+    try:
+        assert _fused_kernel_takes(32, 64) is False
+        assert _fused_kernel_takes(64, 64) is True
+        assert _fused_kernel_takes(1024, 64) is True
+        assert _fused_kernel_takes(2048, 64) is False
+        monkeypatch.setattr(envs, "TPU_MOE_FUSED_EP_STEP_MAX_TOKENS", 0)
+        assert _fused_kernel_takes(2048, 64) is True
+    finally:
+        sequence_parallel.set_active(False)
+
+
+def test_padding_mask_for_gathers_across_ep_group_under_active_sp(monkeypatch):
+    from vllm_torchtpu.layers.adapter import sequence_parallel, token_padding
+
+    state = token_padding.TokenPaddingState.create(16, device="cpu")
+    # Simulate rank 1 of TP=2 / EP=2 on a 8-token step with 5 valid tokens:
+    # rank 0 has 4 valid / 4 padded; rank 1 has 1 valid / 4 padded.
+    state.update(local_valid_tokens=1, local_padded_tokens=4)
+
+    class _FakeGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            rank0 = torch.tensor([0, 0, 0, 0], dtype=t.dtype)
+            return torch.cat([rank0, t], dim=dim)
+
+    class _SingleGroup:
+        world_size = 1
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_ep_group", lambda: _FakeGroup()
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: _FakeGroup()
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group", lambda: _SingleGroup()
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pcp_group", lambda: _SingleGroup()
+    )
+
+    sequence_parallel.set_active(True)
+    try:
+        with token_padding.use_padding_state(state):
+            mask = token_padding.padding_mask_for(8, is_local_tensor=False)
+            assert mask is not None
+            assert mask.tolist() == [
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+                True,
+            ]
+    finally:
+        sequence_parallel.set_active(False)
+
+
+def test_can_use_moe_lowtok_supports_256_local_experts():
+    import jax
+    import jax.numpy as jnp
+    from vllm_torchtpu.kernels.experimental.moe_lowtok.kernel import (
+        can_use_moe_lowtok,
+    )
+
+    hidden = jax.ShapeDtypeStruct((16, 4096), jnp.bfloat16)
+    w13 = jax.ShapeDtypeStruct((256, 2048, 4096), jnp.float8_e4m3fn)
+    w2 = jax.ShapeDtypeStruct((256, 4096, 1024), jnp.float8_e4m3fn)
+    s13 = jax.ShapeDtypeStruct((256, 2048, 1), jnp.float32)
+    s2 = jax.ShapeDtypeStruct((256, 4096, 1), jnp.float32)
+    assert can_use_moe_lowtok(
+        hidden,
+        w13,
+        w2,
+        s13,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+    ) is True

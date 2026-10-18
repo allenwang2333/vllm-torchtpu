@@ -180,7 +180,7 @@ def _unsupported_reason(layer: RoutedExperts, activation: str) -> str | None:
             f"activation={activation}, w13={tuple(w13.shape)} {w13.dtype}, "
             f"w13_scale={tuple(s13.shape)}, hidden={layer.hidden_size} "
             f"{in_dtype} is outside its envelope (silu, bf16 activations, "
-            "FP8 weights with per-channel scales, no bias, at most 128 local "
+            "FP8 weights with per-channel scales, no bias, at most 256 local "
             "experts, gate|up width a multiple of 512)"
         )
     return None
