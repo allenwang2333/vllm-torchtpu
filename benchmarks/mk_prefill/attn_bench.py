@@ -139,7 +139,7 @@ def run_arm(args):
             n_buffer=int(opts.get("nbuf", 3)))
     if opts.get("out") == "f32":
         # out_dtype is also the dtype of the online-softmax state (m, l, acc).
-        kw["out_dtype"] = jnp.float32
+        kw["out_dtype"] = jnp.dtype(jnp.float32)
     if "vmem_mb" in opts:
         kw["vmem_limit_bytes"] = int(opts["vmem_mb"]) << 20
     layout = configs.KVLayout.SEQ_ALONG_LANE
