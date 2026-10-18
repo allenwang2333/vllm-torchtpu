@@ -1510,6 +1510,11 @@ class VllmTPUMLAAttention(MLAAttention):
                 fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
             )
 
+        if envs.TPU_MLA_ABSORB_TOKEN_MAJOR:
+            from vllm_torchtpu.layers.adapter import mla_head_matmul
+
+            mla_head_matmul.build_ops()
+
         # move W_UK_T and W_UV into fresh contiguous buffers
         self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
         self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)

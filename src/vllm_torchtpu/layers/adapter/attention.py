@@ -68,6 +68,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter import mla_head_matmul
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
@@ -2570,16 +2571,33 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        q_nope_t = q_nope.transpose(0, 1)
-        w_uk_t = (
-            w_uk_t_src.to(q_nope_t.dtype)
-            if w_uk_t_src.dtype != q_nope_t.dtype
-            else w_uk_t_src
-        )
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+        if envs.TPU_MLA_ABSORB_TOKEN_MAJOR and input_dtype == torch.bfloat16:
+            # Token-major absorb: no relayout on either side of the
+            # contraction. Under TPU_MLA_DECODE_PROLOGUE the q_pe slot holds
+            # the raw q head `[T, H, nope + rope]`; hand it over whole and the
+            # kernel reads its first `nope` columns, so not even the slice is
+            # materialised.
+            q_src = q_nope
+            if (
+                q_rope_table
+                and q_pe.shape[-1] > q_nope.shape[-1]
+                and q_pe.shape[:-1] == q_nope.shape[:-1]
+            ):
+                q_src = q_pe
+            ql_nope = mla_head_matmul.head_matmul(
+                q_src, w_uk_t_src, w_uk_t_scale, out_dtype=input_dtype
+            )
+        else:
+            q_nope_t = q_nope.transpose(0, 1)
+            w_uk_t = (
+                w_uk_t_src.to(q_nope_t.dtype)
+                if w_uk_t_src.dtype != q_nope_t.dtype
+                else w_uk_t_src
+            )
+            ql_nope = torch.bmm(q_nope_t, w_uk_t)
+            if w_uk_t_scale is not None:
+                ql_nope = ql_nope * w_uk_t_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2717,6 +2735,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if uv_first:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
+            )
+        elif envs.TPU_MLA_ABSORB_TOKEN_MAJOR and outputs.dtype == torch.bfloat16:
+            outputs = (
+                mla_head_matmul.head_matmul(
+                    outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank),
+                    layer.W_UV,
+                    getattr(layer, "W_UV_scale", None),
+                )
+                .to(input_dtype)
+                .reshape(-1, layer.num_heads * layer.v_head_dim)
             )
         else:
             outputs_t = outputs.reshape(

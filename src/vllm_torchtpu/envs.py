@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
+    TPU_MLA_ABSORB_TOKEN_MAJOR: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -536,6 +537,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # v_head_dim (256) instead of kv_lora_rank (512). Replicates W_UV per rank.
     "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
         "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
+    # MLA absorbs (q_nope @ W_UK, and the W_UV up-projection) as one Pallas
+    # kernel that reads token-major [T, H, D] and writes token-major [T, H, L]
+    # (`kernels/mla/head_matmul.py`), instead of `torch.bmm`'s head-major
+    # [H, T, D] contract. Removes the relayout copy on each side of the bmm
+    # (the input transpose and the output `copy bf16[64,T,512]`), and converts
+    # an fp8 W_UK/W_UV (QUANTIZE_ON_LOAD_PREFIXES=attn) in VMEM. Same
+    # contraction, same f32 accumulation and roundings as the bmm path.
+    "TPU_MLA_ABSORB_TOKEN_MAJOR": env_bool(
+        "TPU_MLA_ABSORB_TOKEN_MAJOR", default=False
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
