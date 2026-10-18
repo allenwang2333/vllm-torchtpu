@@ -136,7 +136,9 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     assert seen["input_ids"].abs().sum() == 0
 
 
-def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1):
+def _bucket_runner(
+    paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1, kv_mamba=None
+):
     from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 
     runner = MagicMock(spec=TPUModelRunner)
@@ -149,6 +151,9 @@ def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=
     runner._pp_chunk_granularity = None
     runner.drafter = None
     runner._has_mamba_state = mamba_state
+    runner.kv_cache_config = (
+        None if kv_mamba is None else SimpleNamespace(has_mamba_layers=kv_mamba)
+    )
     runner.cache_config = SimpleNamespace(block_size=block_size, mamba_cache_mode=mode)
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
@@ -174,6 +179,34 @@ def test_chunk_buckets_follow_the_final_block_when_aligned():
     # Idempotent.
     runner._add_pipeline_chunk_buckets()
     assert runner.num_tokens_paddings.count(4352) == 1
+
+
+def test_chunk_buckets_follow_the_block_when_only_the_kv_cache_holds_mamba():
+    # The unified pool and a KV connector's uniform layout hold mamba state
+    # without the compact slot pool. A 512-token granule would let the
+    # scheduler cut a chunk short of the next 2304-token boundary, which its
+    # mamba alignment then clips to zero tokens.
+    runner = _bucket_runner([16, 4096], 2304, False, "align", pp=4, kv_mamba=True)
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 2304
+    assert runner.num_tokens_paddings == [16, 2304, 4096]
+
+
+def test_chunk_buckets_use_an_eighth_step_for_an_attention_only_kv_cache():
+    runner = _bucket_runner([16, 4096], 2304, False, "align", pp=4, kv_mamba=False)
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 512
+    assert runner.num_tokens_paddings == [
+        16,
+        512,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        3584,
+        4096,
+    ]
 
 
 def test_chunk_buckets_use_an_eighth_step_without_alignment():

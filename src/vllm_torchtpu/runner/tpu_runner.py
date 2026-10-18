@@ -5778,9 +5778,18 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
-        block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+        # The scheduler clips every chunk that does not finish its prompt to a
+        # KV block boundary when the KV cache holds mamba state in align mode
+        # (vLLM's need_mamba_block_aligned_split), so a granule short of a
+        # block clips to nothing and the request never advances. Ask what the
+        # scheduler asks: _has_mamba_state only tracks the compact mamba slot
+        # pool, which the unified pool and a KV connector's uniform layout
+        # never build.
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        has_mamba = self._has_mamba_state or (
+            kv_cache_config is not None and kv_cache_config.has_mamba_layers
         )
+        block_aligned = has_mamba and self.cache_config.mamba_cache_mode == "align"
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
         )
