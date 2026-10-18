@@ -177,6 +177,8 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = False
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
+    TPU_SC_TOPK_COOP_V2: bool = False
+    TPU_SC_TOPK_COOP_MERGE: bool = False
     TPU_DCP_INDEXER_SMALL_AG: bool = False
     TPU_INDEXER_TOPK_SHARED_READ: bool = False
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1494,6 +1496,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool(
         "TPU_SC_TOPK_DCP_MERGE_FLAT", default=False
     ),
+    # `sparsecore_topk_valid` (TPU_SC_TOPK_VALID_READS) at P > 1: the refinement
+    # levels as one runtime loop (the SparseCore call's startup grows with its
+    # program size) and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
+    # decode shapes): each subcore scatters its winners into the group's
+    # staging slot at its prefix offset; P = 2: all peer copies in flight
+    # before the first wait. Single-wave calls only (T <= 16 at DCP8); larger
+    # buckets keep the default path. Bitwise identical output.
+    "TPU_SC_TOPK_COOP_V2": env_bool("TPU_SC_TOPK_COOP_V2", default=False),
+    # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat merge and T <= 16 rows: split each
+    # merge row over p = min(dcp, 32 / T) subcores by rank segment
+    # (`sparsecore_topk_valid.sparsecore_topk_dcp_merge_coop`) instead of one
+    # subcore walking all dcp * k scores; only the subcore holding this rank's
+    # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
+    "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=False),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas
