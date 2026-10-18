@@ -28,6 +28,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import gmm_v2_ffn, make_ffn_confi
 from vllm_torchtpu.kernels.megablox.gmm_v2_ffn_ep import (
     DEST_DEVICE_SHIFT,
     gmm_v2_ffn_ep,
+    pack_rows,
     unpack_rows,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
@@ -306,8 +307,12 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    permute: bool = True,
+) -> tuple[jax.Array | None, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    With `permute=False` the expert-sorted rows are left to the caller, which
+    gathers them through `token_indices_sorted`, and `x` is None.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -387,7 +392,9 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
-    if use_ep and use_sparse_core:
+    if not permute:
+        x = None
+    elif use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster
             # for small batch size
@@ -828,7 +835,8 @@ def fused_moe_func_ep_combine(
     start = experts_start.reshape(())
     local_ids = topk_ids - start
     is_local = (local_ids >= 0) & (local_ids < local_experts)
-    x, group_sizes, argsort_revert_indices, _, _, _ = prepare_routed_gmm_inputs(
+    # The kernel gathers each grouped row from the packed tokens itself.
+    _, group_sizes, argsort_revert_indices, _, _, tokens = prepare_routed_gmm_inputs(
         hidden_states,
         jnp.where(is_local, local_ids, -1),
         jnp.where(is_local, topk_weights, 0),
@@ -838,8 +846,11 @@ def fused_moe_func_ep_combine(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        permute=False,
     )
-    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    x = pack_rows(
+        jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    )
 
     # Route f (token t = f // topk, slot k = f % topk) lands in row
     # k * tokens_per_rank + t % tokens_per_rank of t's owner's receive buffer,
@@ -870,6 +881,7 @@ def fused_moe_func_ep_combine(
 
     recv = gmm_v2_ffn_ep(
         x,
+        tokens,
         w1,
         w2,
         group_sizes,

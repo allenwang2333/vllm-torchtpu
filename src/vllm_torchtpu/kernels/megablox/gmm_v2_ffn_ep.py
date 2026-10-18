@@ -19,7 +19,10 @@ a reduce-scatter that run after the kernel, each finished output row is sent,
 while the next experts' weights stream, to the rank that owns its token: into
 that token's top-k slot of the owner's ``[tokens_per_rank * topk, n / 2]``
 receive buffer, two bf16 values per u32 word (`pack_rows`). The owner sums a
-token's slots after the kernel.
+token's slots after the kernel. The input side is gathered the same way: each
+gm tile DMAs its rows from the `pack_rows`-packed token block through the
+sorted token index, one tile ahead, so no expert-sorted copy of the tokens is
+materialized before the kernel.
 
 Must run under ``shard_map`` over a 1-D mesh axis whose index is the device id
 the destination table uses. Every device of the axis must call it the same
@@ -58,8 +61,8 @@ _DEST_ROW_MASK = (1 << DEST_DEVICE_SHIFT) - 1
 # Rows per semaphore wait when draining a count; the remainder waits singly.
 _WAIT_CHUNK = 8
 # pending_ref slots: remote sends per staging slot, local copies per staging
-# slot, and whether this call has passed its barrier.
-_PENDING_REMOTE, _PENDING_LOCAL, _BARRIER_DONE = 0, 2, 4
+# slot, whether this call has passed its barrier, and the number of gm tiles.
+_PENDING_REMOTE, _PENDING_LOCAL, _BARRIER_DONE, _NUM_GM = 0, 2, 4, 5
 
 _HIGH_HALF = 0xFFFF0000
 
@@ -98,6 +101,25 @@ def _wait_rows(sem, rows_ref, num_rows):
     lax.fori_loop(0, num_rows % _WAIT_CHUNK, wait(1), 0)
 
 
+def _gather_tile_rows(
+    gm_id, tokens_ref, x_ref, lhs_staging, sem, metadata_ref, sublane
+):
+    """Starts one row DMA per row of gm tile `gm_id`, at its in-tile position."""
+    m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+    m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+    m_offset = m_start - m_start % sublane
+
+    def gather_row(r, carry):
+        pltpu.make_async_copy(
+            x_ref.at[pl.ds(tokens_ref[r], 1)],
+            lhs_staging.at[pl.ds(r - m_offset, 1)],
+            sem,
+        ).start()
+        return carry
+
+    lax.fori_loop(m_start, m_end, gather_row, 0)
+
+
 def _barrier_signal(num_devices: int):
     barrier = pltpu.get_barrier_semaphore()
     for d in range(num_devices):
@@ -125,10 +147,13 @@ def _barrier_wait(num_devices: int, second):
 
 def ep_inner_kernel(
     # In
-    tiled_lhs_ref,  # [tile_m // size_lhs_sublane, size_lhs_sublane, k]
     w13_ref,
     w2_ref,
     # Passed through
+    tokens_ref,  # SMEM int32[size_m]
+    x_ref,  # HBM u32[num_tokens, k / 2]
+    lhs_staging_ref,  # VMEM u32[2, tile_m, k / 2]
+    gather_sems,  # DMA[2]
     dest_ref,  # SMEM int32[size_m]
     recv_ref,  # HBM u32[recv_rows, n / 2]
     staging_ref,  # VMEM u32[2, tile_m, n / 2]
@@ -153,15 +178,31 @@ def ep_inner_kernel(
     m_end_local = m_end - m_offset
     slot = gm_id % 2
     staging = staging_ref.at[slot]
+    lhs_staging = lhs_staging_ref.at[slot]
+
+    # The next tile's rows land while this one computes; its slot was read by
+    # the tile before this one, which has finished.
+    @pl.when(gm_id + 1 < pending_ref[_NUM_GM])
+    def _():
+        _gather_tile_rows(
+            gm_id + 1,
+            tokens_ref,
+            x_ref,
+            lhs_staging_ref.at[1 - slot],
+            gather_sems.at[1 - slot],
+            metadata_ref,
+            up.dims.size_lhs_sublane,
+        )
+
+    _wait_rows(gather_sems.at[slot], lhs_staging, m_end - m_start)
 
     # The sends of two tiles ago read this staging slot; let them finish.
     _wait_rows(send_sems.at[slot], staging, pending_ref[_PENDING_REMOTE + slot])
     _wait_rows(local_sems.at[slot], staging, pending_ref[_PENDING_LOCAL + slot])
 
     def run_tile(bucket_m: int):
-        acc = ffn_tile(
-            tiled_lhs_ref, w13_ref, w2_ref, bucket_m=bucket_m, up=up, down=down
-        )
+        lhs = unpack_rows(lhs_staging[:bucket_m]).astype(up.lhs_cfgs.dtype)
+        acc = ffn_tile(lhs, w13_ref, w2_ref, bucket_m=bucket_m, up=up, down=down)
         staging[:bucket_m] = pack_rows(acc.astype(down.out_dtype))
 
     branches = []
@@ -213,15 +254,18 @@ def ep_kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref,  # int32[size_lhs_group]
     group_offset_ref,  # int32[1]
+    tokens_ref,  # int32[size_m]: token of each grouped row
     dest_ref,  # int32[size_m]
     num_recv_ref,  # int32[1]: rows peers will send here
     # In
-    lhs_ref,  # [size_m // size_lhs_sublane, size_lhs_sublane, k]
+    x_ref,  # HBM u32[num_tokens, k / 2]: `pack_rows` of the tokens
     w13_ref: WeightsRef,  # [size_group, k, 2 * i]
     w2_ref: WeightsRef,  # [size_group, i, n]
     # Out
     recv_ref,  # u32[recv_rows, n / 2]
     # Scratch
+    lhs_staging_ref,
+    gather_sems,
     staging_ref,
     metadata_ref: MetadataRef,
     pending_ref,
@@ -243,8 +287,21 @@ def ep_kernel_main(
     w13_ref = _unpack(w13_ref, up)
     w2_ref = _unpack(w2_ref, down)
     num_gm = fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=up)
+    pending_ref[_NUM_GM] = num_gm
 
-    (lhs_spec, w13_spec), _ = generate_block_specs(metadata_ref, up)
+    @pl.when(num_gm > 0)
+    def _():
+        _gather_tile_rows(
+            0,
+            tokens_ref,
+            x_ref,
+            lhs_staging_ref.at[0],
+            gather_sems.at[0],
+            metadata_ref,
+            up.dims.size_lhs_sublane,
+        )
+
+    (_, w13_spec), _ = generate_block_specs(metadata_ref, up)
     (_, w2_spec), _ = generate_block_specs(metadata_ref, down)
     w13_up_ref = jax.tree.map(lambda x: x.at[..., up.out_size_n :], w13_ref)
     w13_ref = FusedWeightsRef(gate=w13_ref, up=w13_up_ref)
@@ -259,14 +316,17 @@ def ep_kernel_main(
             axis_name=axis_name,
         ),
         grid=(1, num_gm, 1),
-        in_specs=(lhs_spec, w13_spec, w2_spec),
+        in_specs=(w13_spec, w2_spec),
         out_specs=(),
     )
     pipeline_fn(
-        lhs_ref,
         w13_ref,
         w2_ref,
         scratches=[
+            tokens_ref,
+            x_ref,
+            lhs_staging_ref,
+            gather_sems,
             dest_ref,
             recv_ref,
             staging_ref,
@@ -304,7 +364,8 @@ def ep_kernel_main(
     ]
 )
 def gmm_v2_ffn_ep(
-    lhs: jax.Array,  # [size_m, k]
+    x: jax.Array,  # u32[num_tokens, k / 2]: `pack_rows` of the bf16 tokens
+    tokens: jax.Array,  # int32[size_m]: row r is token tokens[r]; read for grouped rows
     w1: jax.Array,  # [size_group, k, 2 * i]: gate then up along the last dim
     w2: jax.Array,  # [size_group, i, n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
@@ -322,7 +383,8 @@ def gmm_v2_ffn_ep(
     preferred_element_type: jnp.dtype | None = None,
     vmem_limit_bytes: int | None = None,
 ) -> jax.Array:
-    """Each grouped row of `gmm_v2(act(gmm_v2(lhs, w1)), w2)`, packed, at its slot.
+    """Each grouped row of `gmm_v2(act(gmm_v2(lhs, w1)), w2)`, packed, at its slot,
+    where `lhs = unpack_rows(x)[tokens]` in bf16.
 
     Returns this device's u32[recv_rows, n / 2] receive buffer. Row r holds the
     `pack_rows` of the output row some device's `dest` addressed to (this
@@ -331,6 +393,8 @@ def gmm_v2_ffn_ep(
     """
     if vmem_limit_bytes is None:
         vmem_limit_bytes = _default_vmem_limit()
+    size_m = tokens.shape[0]
+    lhs = jax.ShapeDtypeStruct((size_m, 2 * x.shape[1]), jnp.bfloat16)
     cfgs = make_ffn_configs(
         lhs,
         w1,
@@ -361,10 +425,11 @@ def gmm_v2_ffn_ep(
     if recv_rows > _DEST_ROW_MASK + 1:
         raise ValueError(f"{recv_rows=} does not fit the destination table")
 
-    size_m = lhs.shape[0]
+    if x.dtype != jnp.uint32:
+        raise ValueError(f"gmm_v2_ffn_ep gathers pack_rows u32 rows, not {x.dtype}")
     padded_size_m = up.dims.size_m
     if padded_size_m != size_m:
-        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+        tokens = jnp.pad(tokens, (0, padded_size_m - size_m))
         dest = jnp.pad(dest, (0, padded_size_m - size_m))
     group_offset = jnp.zeros((1,), jnp.int32)
 
@@ -375,12 +440,14 @@ def gmm_v2_ffn_ep(
     half_n = down.out_size_n // 2
     max_num_gm = up.dims.size_group + pl.cdiv(padded_size_m, up.tiles.tile_m) - 1
     scratch_shapes = [
+        pltpu.VMEM((2, up.tiles.tile_m, x.shape[1]), jnp.uint32),
+        pltpu.SemaphoreType.DMA((2,)),
         pltpu.VMEM((2, up.tiles.tile_m, half_n), jnp.uint32),
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
             gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
         ),
-        pltpu.SMEM((5,), jnp.int32),
+        pltpu.SMEM((6,), jnp.int32),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA,
@@ -405,7 +472,7 @@ def gmm_v2_ffn_ep(
         ),
         out_shape=jax.ShapeDtypeStruct((recv_rows, half_n), jnp.uint32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=5,
             in_specs=[
                 hbm,
                 WeightsRef(weight=hbm, scale=w1_scale_spec, bias=None),
@@ -431,10 +498,10 @@ def gmm_v2_ffn_ep(
     )(
         group_sizes,
         group_offset,
+        tokens,
         dest,
         num_recv,
-        # Sublane-split outside the kernel: the same bytes, and no ref reshape.
-        lhs.reshape(-1, up.dims.size_lhs_sublane, lhs.shape[-1]),
+        x,
         WeightsRef(weight=w1, scale=w1_scale, bias=None),
         WeightsRef(weight=w2, scale=w2_scale, bias=None),
     )
