@@ -85,6 +85,33 @@ def install_fwd_timers() -> list[str]:
     return done
 
 
+def _proc_stat() -> dict[int, tuple[int, int]]:
+    """Per-CPU (busy, total) jiffies from /proc/stat."""
+    out = {}
+    with open("/proc/stat") as f:
+        for line in f:
+            if not line.startswith("cpu") or line.startswith("cpu "):
+                continue
+            name, *vals = line.split()
+            v = [int(x) for x in vals[:8]]
+            total = sum(v)
+            out[int(name[3:])] = (total - v[3] - v[4], total)  # minus idle, iowait
+    return out
+
+
+def _siblings(cpu: int) -> list[int]:
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+            text = f.read().strip()
+    except OSError:
+        return []
+    out = []
+    for part in text.split(","):
+        lo, _, hi = part.partition("-")
+        out.extend(range(int(lo), int(hi or lo) + 1))
+    return [c for c in out if c != cpu]
+
+
 def _thread_cpu_ctx() -> tuple[int, int]:
     """(CPU the calling thread last ran on, its involuntary context switches)."""
     with open("/proc/thread-self/stat") as f:
@@ -136,6 +163,7 @@ class HostSchedDiag:
         self._fwd0: dict[str, tuple[int, int]] = {}
         self._cpus_seen: set[int] = set()
         self._nvcsw0 = 0
+        self._stat0: dict[int, tuple[int, int]] | None = None
         if every > 0 and fwd_timers:
             logger.warning("HOSTDIAG rank=%d fwd timers: %s", rank, install_fwd_timers())
 
@@ -192,6 +220,21 @@ class HostSchedDiag:
             f" nvcsw/step={(nvcsw - self._nvcsw0) / n:.2f}"
         )
         self._nvcsw0 = nvcsw
+        # How busy the SMT sibling of the serving thread's CPU was over the
+        # window (another thread there halves the serving thread's speed).
+        try:
+            stat = _proc_stat()
+            if self._stat0 is not None and cpu >= 0:
+                sib = [
+                    (stat[c][0] - self._stat0[c][0]) / max(1, stat[c][1] - self._stat0[c][1])
+                    for c in _siblings(cpu)
+                    if c in stat and c in self._stat0
+                ]
+                if sib:
+                    line += f" sib_busy={100 * max(sib):.1f}"
+            self._stat0 = stat
+        except (OSError, ValueError, IndexError):
+            pass
         line += suffix
         logger.warning(line)
         return line

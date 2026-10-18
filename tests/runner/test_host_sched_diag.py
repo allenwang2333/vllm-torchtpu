@@ -66,7 +66,7 @@ def test_line_carries_fwd_timers_and_thread_placement(monkeypatch):
     d = diag_mod.HostSchedDiag(1, 2, fwd_timers=False)
     d.tick()
     line = d.tick()
-    assert re.search(r" cpu=\d+ nvcsw/step=[\d.]+$", line), line
+    assert re.search(r" cpu=\d+ nvcsw/step=[\d.]+( sib_busy=[\d.]+)?$", line), line
     assert "fwd_ms/step(calls)=" in line
 
 
@@ -87,3 +87,12 @@ def test_install_fwd_timers_is_idempotent(monkeypatch):
     assert diag_mod.install_fwd_timers() == []
     fn = AOTCompiledFunction.__dict__["__call__"]
     assert fn._h5_timed and not getattr(fn.__wrapped__, "_h5_timed", False)
+
+
+def test_proc_stat_and_siblings():
+    st = diag_mod._proc_stat()
+    assert st and all(0 <= b <= t for b, t in st.values())
+    import os
+
+    cpu = sorted(os.sched_getaffinity(0))[0]
+    assert cpu not in diag_mod._siblings(cpu)
