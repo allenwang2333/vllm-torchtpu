@@ -138,6 +138,10 @@ def test_dispatch():
     assert not lh.supports(4, _x(4).astype(jnp.float32), w)
     assert not lh.supports(4, _x(4), w[:100])  # 100 rows: not a bf16 tile multiple
     assert not lh.supports(4, _x(4), w.astype(jnp.float32))
+    # a vocab shard whose out block would overflow the VMEM cap keeps XLA's dot
+    wide = jax.ShapeDtypeStruct((154880, K), jnp.bfloat16)
+    assert not lh.supports(64, _x(64), wide)
+    assert lh.supports(4, _x(4), wide)
 
 
 def _weight_vmem_lines(hlo: str, n: int) -> list[str]:

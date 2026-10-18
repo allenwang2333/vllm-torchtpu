@@ -48,9 +48,16 @@ VMEM_LIMIT_MAX = 56 * 1024 * 1024
 _VARIANTS = (None, "dma_only", "compute_only", "drop_tail", "off", "stale", "xrow", "kdrop")
 
 
+def vmem_need(m: int, k: int, n: int, t: int = TILE, nbuf: int = NBUF, item: int = 2) -> int:
+    """Scoped VMEM bytes of one call: the ring plus the double-buffered x and out blocks."""
+    t = min(t, n)
+    return nbuf * t * k * item + 2 * m * k * item + 2 * m * n * item
+
+
 def supports(m: int, x: jax.Array, w: jax.Array) -> bool:
     """Decode row counts (m <= MAX_M), bf16 operands, k a lane multiple <= MAX_K,
-    n a bf16 sublane-tile multiple."""
+    n a bf16 sublane-tile multiple, and the default config's VMEM within the cap (a
+    very wide vocab shard keeps XLA's dot instead of failing to compile)."""
     return (
         1 <= m <= MAX_M
         and x.ndim == 2
@@ -62,6 +69,7 @@ def supports(m: int, x: jax.Array, w: jax.Array) -> bool:
         and w.shape[1] % LANE == 0
         and w.shape[1] <= MAX_K
         and w.shape[0] % SUBLANE_BF16 == 0
+        and vmem_need(m, w.shape[1], w.shape[0]) + (4 << 20) <= VMEM_LIMIT_MAX
     )
 
 
@@ -130,10 +138,9 @@ def _build(m: int, k: int, n: int, dtype, t: int, nbuf: int, variant=None):
         raise ValueError(f"tile {t} / rows {n} must be multiples of {SUBLANE_BF16}")
     tiles = tiles_of(n, t)
     nbuf = max(1, min(nbuf, len(tiles)))
-    item = jnp.dtype(dtype).itemsize
-    # ring + the double-buffered x and out blocks; a non-default config may need more
-    # than the default scoped limit (t=1024 x 3 slots: 37.7 MB), never more than 56 MiB
-    need = nbuf * t * k * item + 2 * m * k * item + 2 * m * n * item
+    # a non-default config may need more than the default scoped limit (t=1024 x 3
+    # slots: 37.7 MB), never more than 56 MiB
+    need = vmem_need(m, k, n, t, nbuf, jnp.dtype(dtype).itemsize)
     vmem_limit = max(VMEM_LIMIT, need + (4 << 20))
     if vmem_limit > VMEM_LIMIT_MAX:
         raise ValueError(f"config t={t} nbuf={nbuf} needs {need} B of VMEM")
