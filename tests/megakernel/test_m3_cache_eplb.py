@@ -505,8 +505,22 @@ def test_long_context_128k_page_table_plan_and_interpret():
     cp_4k_paged, _ = mk.vmem.build_scratch(spec_full, ex_4k_paged)
     cp_128k_paged, _ = mk.vmem.build_scratch(spec_full, ex_128k_paged)
 
+    def _buf_bytes(cp_info, name: str) -> int:
+        shape, dt = cp_info.vmem_shapes[name]
+        return int(np.prod(shape)) * jnp.dtype(dt).itemsize
+
+    expected_direct_minus_paged = (
+        _buf_bytes(cp_4k_direct, "kbuf")
+        + _buf_bytes(cp_4k_direct, "vbuf")
+        - _buf_bytes(cp_128k_paged, "kvbuf")
+        - _buf_bytes(cp_128k_paged, "knew_o")
+        - _buf_bytes(cp_128k_paged, "vnew_o")
+    )
     assert cp_128k_paged.vmem_bytes == cp_4k_paged.vmem_bytes
-    assert cp_4k_direct.vmem_bytes - cp_128k_paged.vmem_bytes == 3 * 1024 * 1024 - 32768
+    assert (
+        cp_4k_direct.vmem_bytes - cp_128k_paged.vmem_bytes
+        == expected_direct_minus_paged
+    )
     assert cp_128k_paged.smem_shapes["page_table"] == ((64, 1024), jnp.int32)
     assert 256 * 1024 <= cp_128k_paged.smem_bytes < 350 * 1024
 
@@ -1560,3 +1574,288 @@ def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
             np.asarray(out_st_lib_e[k]).view(np.uint8),
             np.asarray(out_st_fe[k]).view(np.uint8),
         )
+
+
+@pytest.mark.parametrize("T,B", [(1, 20), (2, 20)])
+def test_gdn_gch_non_multiple_of_8_tail_and_padded_mr(T: int, B: int):
+    """Verify GCH chunked recurrence when `B < MR` and tail chunk `TR % 8 != 0`."""
+    mesh = _cpu_mesh(2)
+    g = _tiny_geom(L=4, att_every=4)
+    # B=20 -> MR=24 (B < MR), WIDE=True, gdn_rows=8 -> CB=8, NF=2, TR=4 (n % 8 != 0)
+    ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
+    ex_gch = replace(
+        ex_base, tiles=replace(ex_base.resolved_tiles, gdn_rows=8, gdn_bufs=2)
+    )
+    ex_noch = replace(ex_base, tiles=replace(ex_base.resolved_tiles, gdn_rows=0))
+    assert ex_gch.B < ex_gch.MR
+
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(601 + T), g, ex_gch
+    )
+    ref_out, _ = qwen35.reference_step(g, ex_gch, pos, hid_l, w_l, st_l)
+
+    pos_in, hid_gch, w_gch, st_gch = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_gch, mesh=mesh
+    )
+    _, hid_noch, w_noch, st_noch = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_noch, mesh=mesh
+    )
+    step_gch, info_gch = qwen35.make_step(mesh, g, ex_gch, donate_states=False)
+    gp = info_gch["plan"].block_params["gdn"]
+    assert gp.GCH and gp.CB == 8 and gp.NF == 2 and gp.TR == 4
+    step_noch, _ = qwen35.make_step(mesh, g, ex_noch, donate_states=False)
+    out_gch, st_out_gch = step_gch(pos_in, hid_gch, w_gch, st_gch)
+    out_noch, st_out_noch = step_noch(pos_in, hid_noch, w_noch, st_noch)
+
+    np.testing.assert_array_equal(
+        np.asarray(mk.unfold(out_gch, 2)[:, :B]).view(np.uint8),
+        np.asarray(mk.unfold(out_noch, 2)[:, :B]).view(np.uint8),
+    )
+    conv_key = "conv" if T == 1 else "conv_ckpt"
+    rec_key = "rec" if T == 1 else "rec_ckpt"
+    np.testing.assert_array_equal(
+        np.asarray(st_out_gch[conv_key]).view(np.uint8),
+        np.asarray(st_out_noch[conv_key]).view(np.uint8),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(st_out_gch[rec_key]).view(np.uint8),
+        np.asarray(st_out_noch[rec_key]).view(np.uint8),
+    )
+    out_r0 = mk.unfold(out_gch, 2)[0, :B]
+    assert jnp.allclose(
+        out_r0.astype(jnp.float32), ref_out.astype(jnp.float32), atol=2e-2, rtol=2e-2
+    )
+
+
+@pytest.mark.parametrize("natt", [1, 2, 3])
+@pytest.mark.parametrize("T,B", [(1, 3), (2, 4)])
+def test_scatter_pool_states_odd_and_even_natt(natt: int, T: int, B: int):
+    """Verify `scatter_pool_states` with odd (`1, 3`) and even (`2`) `NATT`."""
+    g = _tiny_geom(L=4 * natt, att_every=4)
+    assert natt == g.NATT
+    ex = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=160)
+    pos, _, _, st_l = qwen35.random_logical_inputs(
+        jax.random.key(700 + 10 * natt + T), g, ex
+    )
+    # Exercise both same-page and cross-page token positions when T > 1
+    if T > 1:
+        pos = jnp.asarray([10, 11, 127, 128][:B], dtype=jnp.int32)
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    raw_init = mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+
+    k_k, k_v, k_c, k_r = jax.random.split(jax.random.key(750 + natt), 4)
+    knew_l = (
+        jax.random.normal(k_k, (ex.R, g.NATT, ex.MR, g.HD), dtype=jnp.float32) * 2.0
+    ).astype(mk.ops.FP8)
+    vnew_l = (
+        jax.random.normal(k_v, (ex.R, g.NATT, ex.MR, g.HD), dtype=jnp.float32) * 2.0
+    ).astype(mk.ops.FP8)
+    lay = mk.GDNBlock.lin_in_layout(g, ex)
+    hr = mk.ops.rup(3 + T, 8)
+    cr = mk.ops.rup(3 * B, 8)
+    conv_new = (
+        jax.random.normal(
+            k_c,
+            (ex.R, g.NGDN, cr, lay.QKV)
+            if T == 1
+            else (ex.R, g.NGDN, ex.NS, hr, lay.QKV),
+            dtype=jnp.float32,
+        )
+        * 0.2
+    )
+    rec_new = jax.random.normal(
+        k_r, (ex.R, g.NGDN, B * lay.vh, lay.KD, lay.VD), dtype=jnp.bfloat16
+    ) * jnp.bfloat16(0.2)
+
+    # Scatter per rank and unpack via pool_to_states
+    raw_updated = []
+    for r in range(ex.R):
+        pools_r = [
+            raw_init[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            for g_i in range(g.NATT)
+        ]
+        out_r = mk.scatter_pool_states(
+            g,
+            ex,
+            pools_r,
+            pos,
+            pt,
+            knew_l[r],
+            vnew_l[r],
+            conv_new[r],
+            rec_new[r],
+            ckpt,
+            interpret=True,
+        )
+        raw_updated.append(out_r)
+    raw_folded = tuple(
+        jnp.stack([raw_updated[r][g_i] for r in range(ex.R)], axis=0).reshape(
+            ex.R * ex.num_pages, 2, 64, 4, ex.page_size
+        )
+        for g_i in range(g.NATT)
+    )
+    unpacked = mk.pool_to_states(g, ex, raw_folded, pt, ckpt)
+
+    for b in range(B):
+        s_i, p_i = b // T, int(pos[b])
+        np.testing.assert_array_equal(
+            np.asarray(unpacked["kc"][:, :, s_i, p_i, :]).view(np.uint8),
+            np.asarray(knew_l[:, :, b, :]).view(np.uint8),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(unpacked["vc"][:, :, s_i, p_i, :]).view(np.uint8),
+            np.asarray(vnew_l[:, :, b, :]).view(np.uint8),
+        )
+    np.testing.assert_array_equal(
+        np.asarray(unpacked["rec"]).view(np.uint8),
+        np.asarray(rec_new).view(np.uint8),
+    )
+
+
+@pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
+def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
+    """Verify `read_offsets < 0` produces exact zero GDN states and no stale leak."""
+    mesh = _cpu_mesh(2)
+    # Use L=8, att_every=4 (NATT=2, G_PER_ATT=3, NGDN=6) so g_idx >= 1 and o >= 2
+    # reuse double-buffered conv_buf/rec_buf slots.
+    g = _tiny_geom(L=8, att_every=4)
+    ex = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=160)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(810 + T), g, ex)
+    pt, ckpt, roff_zero, _ = mk.default_pool_layout(g, ex)
+    raw_pools = mk.states_to_pool(g, ex, st_l, pt, ckpt, roff_zero)
+
+    # Corrupt sequence 0's checkpoint pages in pool with 0x7f (NaN in BF16/F32)
+    # while sequence 1 retains real state at roff=0.
+    raw_corrupted = []
+    for g_i in range(g.NATT):
+        p_arr = (
+            np.asarray(raw_pools[g_i])
+            .reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)
+            .copy()
+        )
+        for sub in range(g.att_every - 1):
+            slot_s0 = int(ckpt[sub, 0, 0])
+            p_arr[:, slot_s0 * 5 : (slot_s0 + 1) * 5].view(np.uint8)[:] = 0x7F
+        raw_corrupted.append(
+            jnp.asarray(p_arr.reshape(ex.R * ex.num_pages, 2, 64, 4, ex.page_size))
+        )
+
+    # Sequence 0 is cold-start (roff = -1), sequence 1 has real state (roff = 0)
+    roff_mixed = jnp.asarray([[-1, 0], [-1, 0], [-1, 0]], dtype=jnp.int32)
+    lay = mk.GDNBlock.lin_in_layout(g, ex)
+    vh = lay.vh
+
+    for r in range(ex.R):
+        pools_r = [
+            raw_corrupted[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            for g_i in range(g.NATT)
+        ]
+        conv_g, rec_g = mk.gather_gdn_states(
+            g, ex, pools_r, ckpt, roff_mixed, interpret=True
+        )
+        assert jnp.all(jnp.isfinite(conv_g))
+        assert jnp.all(jnp.isfinite(rec_g))
+        # Sequence 0 must have exact zero rec and conv state across all 6 GDN layers
+        np.testing.assert_array_equal(
+            np.asarray(rec_g[:, 0:vh], dtype=np.float32),
+            np.zeros((g.NGDN, vh, lay.KD, lay.VD), dtype=np.float32),
+        )
+        if T == 1:
+            for tap in range(3):
+                np.testing.assert_array_equal(
+                    np.asarray(conv_g[:, tap * B + 0]),
+                    np.zeros((g.NGDN, lay.QKV), dtype=np.float32),
+                )
+        else:
+            np.testing.assert_array_equal(
+                np.asarray(conv_g[:, 0]),
+                np.zeros_like(np.asarray(conv_g[:, 0])),
+            )
+        # Sequence 1 must match the real state from raw_pools (roff=0)
+        pools_r_clean = [
+            raw_pools[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            for g_i in range(g.NATT)
+        ]
+        conv_ref, rec_ref = mk.gather_gdn_states(
+            g, ex, pools_r_clean, ckpt, roff_zero, interpret=True
+        )
+        np.testing.assert_array_equal(
+            np.asarray(rec_g[:, vh : 2 * vh]).view(np.uint8),
+            np.asarray(rec_ref[:, vh : 2 * vh]).view(np.uint8),
+        )
+        if T == 1:
+            for tap in range(3):
+                np.testing.assert_array_equal(
+                    np.asarray(conv_g[:, tap * B + 1]),
+                    np.asarray(conv_ref[:, tap * B + 1]),
+                )
+        else:
+            np.testing.assert_array_equal(
+                np.asarray(conv_g[:, 1]),
+                np.asarray(conv_ref[:, 1]),
+            )
+
+    if T == 1:
+        # Also test non-uniform roff across subs when coal_rec=False (NS * vh > 128)
+        # so rec_buf[o & 1] is shared across o and o - 2:
+        # sub=0 (o=0) has roff=0 (non-zero state), sub=2 (o=2, same slot 0) has roff=-1.
+        g_uncoal = replace(g, KH=4, VH=16)  # vh = 8 -> with NS=17, NS * vh = 136 > 128
+        ex_uncoal = _tiny_exec(R=2, B=17, T=1, ctx=256, paged_kv=True, num_pages=400)
+        _, _, _, st_u = qwen35.random_logical_inputs(
+            jax.random.key(820), g_uncoal, ex_uncoal
+        )
+        pt_u, ckpt_u, roff_u0, _ = mk.default_pool_layout(g_uncoal, ex_uncoal)
+        raw_u = mk.states_to_pool(g_uncoal, ex_uncoal, st_u, pt_u, ckpt_u, roff_u0)
+        roff_np = np.zeros((3, 17), dtype=np.int32)
+        roff_np[2, 0] = -1  # sub=2 (o=2, reusing slot 0) has roff=-1 for seq 0
+        roff_non_unif = jnp.asarray(roff_np)
+        vh_u = g_uncoal.VH // ex_uncoal.R
+        assert ex_uncoal.NS * vh_u > 128  # coal_rec is False
+        pools_u0 = [
+            raw_u[g_i].reshape(
+                ex_uncoal.R, ex_uncoal.num_pages, 2, 64, 4, ex_uncoal.page_size
+            )[0]
+            for g_i in range(g_uncoal.NATT)
+        ]
+        _, rec_u = mk.gather_gdn_states(
+            g_uncoal, ex_uncoal, pools_u0, ckpt_u, roff_non_unif, interpret=True
+        )
+        assert jnp.any(rec_u[0, 0:vh_u] != 0)
+        np.testing.assert_array_equal(
+            np.asarray(rec_u[2, 0:vh_u], dtype=np.float32),
+            np.zeros((vh_u, g_uncoal.KD, g_uncoal.VD), dtype=np.float32),
+        )
+
+    # End-to-end make_pooled_step parity against reference_step with zeroed seq-0 state
+    tp_s = NamedSharding(mesh, P("tp"))
+    rep_s = NamedSharding(mesh, P())
+    st_ref_mixed = {
+        **st_l,
+        "conv": st_l["conv"]
+        .astype(jnp.bfloat16)
+        .astype(jnp.float32)
+        .at[:, :, 0]
+        .set(0.0),
+        "rec": st_l["rec"].at[:, :, 0].set(jnp.bfloat16(0.0)),
+    }
+    ref_mixed, _ = qwen35.reference_step(
+        g, ex, pos, hid_l, w_l, st_ref_mixed, paged_kv=True
+    )
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    raw_sharded = tuple(jax.device_put(r, tp_s) for r in raw_corrupted)
+    step_pooled, _ = qwen35.make_pooled_step(mesh, g, ex, donate_pools=False)
+    out_pooled, _ = step_pooled(
+        jax.device_put(pos, rep_s),
+        hid_mk,
+        w_mk,
+        raw_sharded,
+        jax.device_put(pt, rep_s),
+        jax.device_put(ckpt, rep_s),
+        jax.device_put(roff_mixed, rep_s),
+    )
+    out_r0 = mk.unfold(out_pooled, ex.R)[0, :B]
+    assert jnp.allclose(
+        out_r0.astype(jnp.float32), ref_mixed.astype(jnp.float32), atol=2e-2, rtol=2e-2
+    )

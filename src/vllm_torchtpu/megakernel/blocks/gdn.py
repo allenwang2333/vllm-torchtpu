@@ -443,12 +443,13 @@ class GDNBlock(Block):
             )
 
         def rows(r0, n: int, s):
-            uc = ybuf[pl.ds(r0, n), 0:QKV]
-            bac = ybuf[pl.ds(r0, n), BA : BA + BA_PAD]
-            zc = ybuf[pl.ds(r0, n), QKV : QKV + Z]
+            n_pad = rup(n, 8)
+            uc = ybuf[pl.ds(r0, n_pad), 0:QKV]
+            bac = ybuf[pl.ds(r0, n_pad), BA : BA + BA_PAD]
+            zc = ybuf[pl.ds(r0, n_pad), QKV : QKV + Z]
             st = recb.at[s]
-            row_i = lax.broadcasted_iota(I32, (n, 1), 0)
-            blk = jnp.zeros((n, Z), F32)
+            row_i = lax.broadcasted_iota(I32, (n_pad, 1), 0)
+            blk = jnp.zeros((n_pad, Z), F32)
             for bb in range(n):
                 h0 = bb * vh
                 q = uc[bb, : kh * KD].reshape(kh, KD)
@@ -479,7 +480,7 @@ class GDNBlock(Block):
                 zz = zc[bb].reshape(vh, VD)
                 row = rnd(val * jax.nn.silu(zz)).reshape(1, Z)
                 blk = jnp.where(row_i == bb, row, blk)
-            scr["mix"][pl.ds(r0, n), 0:Z] = blk
+            scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
 
         def chunk(j, carry):
             s = lax.rem(j, NRB)
@@ -621,7 +622,8 @@ class GDNBlock(Block):
                         convb, O[conv_out_key].at[o], sem.at[2]
                     ).start()
                 if GCH:
-                    ybuf[0:B, 0:QKV] = u
+                    u_pad = jnp.pad(u, ((0, ex.MR - B), (0, 0))) if B < ex.MR else u
+                    ybuf[0 : ex.MR, 0:QKV] = u_pad
 
             if GCH:
                 with sc("gdn_rec"):

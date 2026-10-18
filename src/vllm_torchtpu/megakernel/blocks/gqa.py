@@ -301,6 +301,8 @@ class GQABlock(Block):
         """Initialize attention-specific VMEM scratch buffers after barrier."""
         ap: GQAParams = ctx.block_params(self.name)
         scr = ctx.scr
+        scr["knew"][...] = jnp.zeros((ctx.ex.MR, ap.HD), F32)
+        scr["vnew"][...] = jnp.zeros((ctx.ex.MR, ap.HD), F32)
         if ctx.ex.paged_kv:
             scr["knew_o"][...] = jnp.zeros((ctx.ex.MR, ap.HD), FP8)
             scr["vnew_o"][...] = jnp.zeros((ctx.ex.MR, ap.HD), FP8)
@@ -457,13 +459,14 @@ class GQABlock(Block):
                     if ex.paged_kv:
                         k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
                         v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
-                        scr["knew_o"][b : b + 1, :] = k_fp8
-                        scr["vnew_o"][b : b + 1, :] = v_fp8
                         scr["knew"][b : b + 1, :] = k_fp8.astype(F32)
                         scr["vnew"][b : b + 1, :] = v_fp8.astype(F32)
                     else:
                         scr["knew"][b : b + 1, :] = k
                         scr["vnew"][b : b + 1, :] = v
+                if ex.paged_kv:
+                    scr["knew_o"][...] = scr["knew"][...].astype(FP8)
+                    scr["vnew_o"][...] = scr["vnew"][...].astype(FP8)
                 k_src = scr["knew_o"] if ex.paged_kv else scr["knew"]
                 v_src = scr["vnew_o"] if ex.paged_kv else scr["vnew"]
                 kv_out = (

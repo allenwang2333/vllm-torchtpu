@@ -327,6 +327,8 @@ def states_to_pool(
             for r in range(R):
                 for s in range(NS):
                     ro_val = int(roff[sub, s]) if roff_is_2d else int(roff[s])
+                    if ro_val < 0:
+                        continue
                     if ckpt_is_3d:
                         slot = int(ckpt[sub, s, ro_val])
                         page_base = slot * 5
@@ -455,7 +457,10 @@ def gather_gdn_states(
         or `(NS, K_ckpt)`. For 3D `ckpt_indices`, `page_base = slot * 5`; for 2D,
         `page_base = slot * (5 * G_PER_ATT) + sub * 5`.
       read_offsets: `int32` index into `ckpt_indices` axis `-1` for the input
-        checkpoint slot per sequence, shape `(G_PER_ATT, NS)` or `(NS,)`.
+        checkpoint slot per sequence, shape `(G_PER_ATT, NS)` or `(NS,)`. A
+        negative offset (`read_offsets < 0`) indicates a cold-start sequence
+        with no prior GDN state in the pool; the gather skips the pool DMA for
+        that `(sub, s)` and outputs zero `conv` and `rec` state.
       active_seqs: Optional activity mask (`None` or `"from_ckpt"` to check
         `ckpt_indices[..., 0] > 0`, `"all"` for all sequences active, or
         `(NS,) int32` mask).
@@ -550,8 +555,14 @@ def gather_gdn_states(
                 return (ckpt_ref[0, s, 0] > 0) if ckpt_is_3d else (ckpt_ref[s, 0] > 0)
             return act_ref[s] != 0
 
-        def page_base_for(sub, s):
+        def has_input_state(sub, s):
             roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
+            return jnp.logical_and(is_active(s), roff >= 0)
+
+        def page_base_for(sub, s):
+            roff = jnp.maximum(
+                roff_ref[sub, s] if roff_is_2d else roff_ref[s], jnp.int32(0)
+            )
             if ckpt_is_3d:
                 slot = ckpt_ref[sub, s, roff]
                 pb = slot * 5
@@ -566,7 +577,7 @@ def gather_gdn_states(
             return jnp.clip(pb, 0, ex.num_pages - 5)
 
         def start_page_read(raw_ref, sub, s, p_slot):
-            @pl.when(is_active(s))
+            @pl.when(has_input_state(sub, s))
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
@@ -574,7 +585,10 @@ def gather_gdn_states(
                 ).start()
 
         def finish_page_read(raw_ref, sub, s, p_slot, g_slot, r_slot, r_sub):
-            @pl.when(is_active(s))
+            has_st = has_input_state(sub, s)
+            h0 = s * vh if isinstance(s, int) else pl.multiple_of(s * vh, vh)
+
+            @pl.when(has_st)
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
@@ -587,7 +601,6 @@ def gather_gdn_states(
                     .reshape(512, 128)[:ssm_u32_rows, :]
                 )
                 s_km = pltpu.bitcast(u32_val, BF16).reshape(vh, KD, VD)
-                h0 = s * vh if isinstance(s, int) else pl.multiple_of(s * vh, vh)
                 rec_buf[r_slot, r_sub, pl.ds(h0, vh)] = s_km
 
                 if direct_conv:
@@ -609,6 +622,21 @@ def gather_gdn_states(
                         page_buf.at[p_slot, 4]
                         .bitcast(BF16)
                         .reshape(256, 128)[:conv_rows_pad, :]
+                    )
+
+            @pl.when(jnp.logical_not(has_st))
+            def _():
+                rec_buf[r_slot, r_sub, pl.ds(h0, vh)] = jnp.zeros((vh, KD, VD), rec_dt)
+                if direct_conv:
+                    conv_buf[g_slot, sub, s] = jnp.zeros((HR, QKV), conv_raw_dt)
+                else:
+                    c0 = (
+                        s * conv_rows_pad
+                        if isinstance(s, int)
+                        else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
+                    )
+                    conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = jnp.zeros(
+                        (conv_rows_pad, 128), conv_raw_dt
                     )
 
         total_gdn = g.NATT * G_PER_ATT
@@ -1302,25 +1330,28 @@ def scatter_pool_states(
             p = pos_ref[b_idx]
             ln = lax.rem(p, page_size)
             kp = jnp.clip(kv_pages_ref[s_idx, t_idx], 0, ex.num_pages - 1)
-            mask_b = lane_iota == b_idx
             mask_ln = lane_iota == ln
+            sh_b = lax.rem(ln + (page_size - lax.rem(b_idx, page_size)), page_size)
 
             pltpu.make_async_copy(
                 raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
             ).start()
-            if g.NATT >= 2:
-                pltpu.make_async_copy(
-                    raw_out_refs[1].at[kp], kv_page.at[1], sem_kv_rd.at[1]
-                ).start()
 
             for g_idx in range(g.NATT):
                 k_slot = g_idx & 1
-                if g_idx >= 2:
+                nxt_slot = 1 - k_slot
+                if g_idx >= 1:
                     pltpu.make_async_copy(
-                        kv_page.at[k_slot],
-                        raw_out_refs[g_idx - 2].at[kp],
-                        sem_kv_wr.at[k_slot],
+                        kv_page.at[nxt_slot],
+                        raw_out_refs[g_idx - 1].at[kp],
+                        sem_kv_wr.at[nxt_slot],
                     ).wait()
+                if g_idx + 1 < g.NATT:
+                    pltpu.make_async_copy(
+                        raw_out_refs[g_idx + 1].at[kp],
+                        kv_page.at[nxt_slot],
+                        sem_kv_rd.at[nxt_slot],
+                    ).start()
                 pltpu.make_async_copy(
                     raw_out_refs[g_idx].at[kp],
                     kv_page.at[k_slot],
@@ -1333,12 +1364,8 @@ def scatter_pool_states(
                 v_cols = (
                     v_cols_buf[g_idx] if NS > 1 else batch_to_i32_cols(vnew_buf[g_idx])
                 )
-                k_col = jnp.sum(
-                    jnp.where(mask_b, k_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
-                v_col = jnp.sum(
-                    jnp.where(mask_b, v_cols, jnp.int32(0)), axis=1, keepdims=True
-                )
+                k_col = pltpu.roll(k_cols, sh_b, 1)
+                v_col = pltpu.roll(v_cols, sh_b, 1)
                 k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(h4, page_size)
                 v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(h4, page_size)
                 k_new = jnp.where(mask_ln, k_col, k_view[...])
@@ -1359,19 +1386,13 @@ def scatter_pool_states(
                     raw_out_refs[g_idx].at[kp],
                     sem_kv_wr.at[k_slot],
                 ).start()
-                if g_idx + 2 < g.NATT:
-                    pltpu.make_async_copy(
-                        raw_out_refs[g_idx + 2].at[kp],
-                        kv_page.at[k_slot],
-                        sem_kv_rd.at[k_slot],
-                    ).start()
 
-            for g_tail in range(max(0, g.NATT - 2), g.NATT):
-                tail_slot = g_tail & 1
+            if g.NATT >= 1:
+                last_slot = (g.NATT - 1) & 1
                 pltpu.make_async_copy(
-                    kv_page.at[tail_slot],
-                    raw_out_refs[g_tail].at[kp],
-                    sem_kv_wr.at[tail_slot],
+                    kv_page.at[last_slot],
+                    raw_out_refs[g.NATT - 1].at[kp],
+                    sem_kv_wr.at[last_slot],
                 ).wait()
 
         if T == 1:
@@ -1404,28 +1425,37 @@ def scatter_pool_states(
                     @pl.when(same_page)
                     def _():
                         kp = kp0
-                        mask_b_list = [lane_iota == (b0 + t) for t in range(T)]
-                        mask_ln_list = [
-                            lane_iota == lax.rem(pos_ref[b0 + t], page_size)
+                        ln_list = [
+                            lax.rem(pos_ref[b0 + t], page_size) for t in range(T)
+                        ]
+                        mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
+                        sh_list = [
+                            lax.rem(
+                                ln_list[t] + (page_size - lax.rem(b0 + t, page_size)),
+                                page_size,
+                            )
                             for t in range(T)
                         ]
 
                         pltpu.make_async_copy(
                             raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
                         ).start()
-                        if g.NATT >= 2:
-                            pltpu.make_async_copy(
-                                raw_out_refs[1].at[kp], kv_page.at[1], sem_kv_rd.at[1]
-                            ).start()
 
                         for g_idx in range(g.NATT):
                             k_slot = g_idx & 1
-                            if g_idx >= 2:
+                            nxt_slot = 1 - k_slot
+                            if g_idx >= 1:
                                 pltpu.make_async_copy(
-                                    kv_page.at[k_slot],
-                                    raw_out_refs[g_idx - 2].at[kp],
-                                    sem_kv_wr.at[k_slot],
+                                    kv_page.at[nxt_slot],
+                                    raw_out_refs[g_idx - 1].at[kp],
+                                    sem_kv_wr.at[nxt_slot],
                                 ).wait()
+                            if g_idx + 1 < g.NATT:
+                                pltpu.make_async_copy(
+                                    raw_out_refs[g_idx + 1].at[kp],
+                                    kv_page.at[nxt_slot],
+                                    sem_kv_rd.at[nxt_slot],
+                                ).start()
                             pltpu.make_async_copy(
                                 raw_out_refs[g_idx].at[kp],
                                 kv_page.at[k_slot],
@@ -1455,16 +1485,8 @@ def scatter_pool_states(
                             k_cur = k_view[...]
                             v_cur = v_view[...]
                             for t in range(T):
-                                k_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], k_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
-                                v_col = jnp.sum(
-                                    jnp.where(mask_b_list[t], v_cols, jnp.int32(0)),
-                                    axis=1,
-                                    keepdims=True,
-                                )
+                                k_col = pltpu.roll(k_cols, sh_list[t], 1)
+                                v_col = pltpu.roll(v_cols, sh_list[t], 1)
                                 k_cur = jnp.where(mask_ln_list[t], k_col, k_cur)
                                 v_cur = jnp.where(mask_ln_list[t], v_col, v_cur)
                             if bool(interpret):
@@ -1483,19 +1505,13 @@ def scatter_pool_states(
                                 raw_out_refs[g_idx].at[kp],
                                 sem_kv_wr.at[k_slot],
                             ).start()
-                            if g_idx + 2 < g.NATT:
-                                pltpu.make_async_copy(
-                                    raw_out_refs[g_idx + 2].at[kp],
-                                    kv_page.at[k_slot],
-                                    sem_kv_rd.at[k_slot],
-                                ).start()
 
-                        for g_tail in range(max(0, g.NATT - 2), g.NATT):
-                            tail_slot = g_tail & 1
+                        if g.NATT >= 1:
+                            last_slot = (g.NATT - 1) & 1
                             pltpu.make_async_copy(
-                                kv_page.at[tail_slot],
-                                raw_out_refs[g_tail].at[kp],
-                                sem_kv_wr.at[tail_slot],
+                                kv_page.at[last_slot],
+                                raw_out_refs[g.NATT - 1].at[kp],
+                                sem_kv_wr.at[last_slot],
                             ).wait()
 
                     @pl.when(jnp.logical_not(same_page))
@@ -1704,6 +1720,10 @@ def scatter_pool_states(
         + ((ckpt_indices,) if has_gdn else ())
         + ((active_mask,) if act_mode == "ref" else ())
     )
+    if knew.dtype != FP8:
+        knew = jnp.clip(knew, -448.0, 448.0).astype(FP8)
+    if vnew.dtype != FP8:
+        vnew = jnp.clip(vnew, -448.0, 448.0).astype(FP8)
     if not bool(interpret):
         knew = pltpu.with_memory_space_constraint(knew, pltpu.HBM)
         vnew = pltpu.with_memory_space_constraint(vnew, pltpu.HBM)
