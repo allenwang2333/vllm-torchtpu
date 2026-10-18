@@ -25,6 +25,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import gmm_v2_ffn, make_ffn_configs
+from vllm_torchtpu.kernels.megablox.gmm_v2_ffn_ep import (
+    DEST_DEVICE_SHIFT,
+    gmm_v2_ffn_ep,
+    unpack_rows,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -768,3 +773,121 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     return x[:num_tokens, :hidden_size]
+
+
+def fused_moe_func_ep_combine(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    *,
+    topk: int,
+    activation: str,
+    mesh_index_of_rank: tuple[int, ...],
+    axis_name: str,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """`fused_moe_func`'s EP layer followed by the DP group's reduce-scatter.
+
+    Runs per device under shard_map over `axis_name`. `hidden_states`,
+    `topk_weights` and `topk_ids` are the DP group's gathered tokens, EP rank
+    r's at rows [r * T / ep, (r + 1) * T / ep); `mesh_index_of_rank[r]` is
+    rank r's index on `axis_name`, and `experts_start` ([1]) this rank's
+    first expert under linear placement. Returns this rank's [T / ep, hidden]
+    tokens summed over every rank's experts.
+
+    The expert FFN sends each routed row to its token's owner (gmm_v2_ffn_ep),
+    and the owner sums a token's top-k rows in f32 and rounds once, where the
+    gather-reduce + reduce-scatter path rounds each rank's partial sum to bf16
+    before the cross-rank sum.
+    """
+    if w1_scale is not None and w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale is not None and w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+
+    num_devices = len(mesh_index_of_rank)
+    num_tokens, hidden_size = hidden_states.shape
+    tokens_per_rank = num_tokens // num_devices
+    rows_per_rank = tokens_per_rank * topk
+    local_experts, padded_hidden_size, _ = w1.shape
+    padded_hidden_size *= get_packing_factor(w1.dtype, rhs_quant_dtype)
+    topk_weights = topk_weights.astype(hidden_states.dtype)
+    if use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+        # As in fused_moe_func: the one-hot permute spreads 0 * NaN to all.
+        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+
+    start = experts_start.reshape(())
+    local_ids = topk_ids - start
+    is_local = (local_ids >= 0) & (local_ids < local_experts)
+    x, group_sizes, argsort_revert_indices, _, _, _ = prepare_routed_gmm_inputs(
+        hidden_states,
+        jnp.where(is_local, local_ids, -1),
+        jnp.where(is_local, topk_weights, 0),
+        local_num_experts=local_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+
+    # Route f (token t = f // topk, slot k = f % topk) lands in row
+    # k * tokens_per_rank + t % tokens_per_rank of t's owner's receive buffer,
+    # so each slot's rows are one contiguous block there.
+    route = jnp.arange(num_tokens * topk, dtype=jnp.int32)
+    token = route // topk
+    owner = jnp.asarray(mesh_index_of_rank, jnp.int32)[token // tokens_per_rank]
+    row = (route % topk) * tokens_per_rank + token % tokens_per_rank
+    entry = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
+    dest = (
+        jnp.zeros_like(route).at[argsort_revert_indices].set(entry, unique_indices=True)
+    )
+
+    rank = start // local_experts
+    own_ids = jax.lax.dynamic_slice_in_dim(
+        topk_ids, rank * tokens_per_rank, tokens_per_rank
+    )
+    own_weights = jax.lax.dynamic_slice_in_dim(
+        topk_weights, rank * tokens_per_rank, tokens_per_rank
+    )
+    # The rows some rank computes for this rank's tokens: the same predicate
+    # prepare_routed_gmm_inputs applies on the computing rank.
+    own_valid = (own_ids >= 0) & (own_ids < local_experts * num_devices)
+    if skip_padded_tokens:
+        own_valid &= own_weights != 0
+    own_local = (own_ids >= start) & (own_ids < start + local_experts)
+    num_recv = jnp.sum(own_valid & ~own_local, dtype=jnp.int32)[None]
+
+    recv = gmm_v2_ffn_ep(
+        x,
+        w1,
+        w2,
+        group_sizes,
+        dest,
+        num_recv,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        recv_rows=-(-rows_per_rank // 8) * 8,
+        num_devices=num_devices,
+        axis_name=axis_name,
+        fuse_act=activation,
+        maybe_quantize_lhs=_quantize_lhs_for(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+        preferred_element_type=hidden_states.dtype,
+    )
+    weights = own_weights.astype(jnp.float32)
+    out = 0.0
+    for k in range(topk):
+        rows = unpack_rows(recv[k * tokens_per_rank : (k + 1) * tokens_per_rank])
+        out += jnp.where(own_valid[:, k, None], weights[:, k, None] * rows, 0)
+    return out.astype(hidden_states.dtype)[:, :hidden_size]
