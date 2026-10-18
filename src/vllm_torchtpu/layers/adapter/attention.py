@@ -5,6 +5,8 @@ import dataclasses
 import functools
 import inspect
 import math
+import threading
+import weakref
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -98,7 +100,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.tpu_info import get_chip_version
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import get_shared_jax_op, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -110,6 +112,16 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
+
+
+def _sparse_mla_trace_config(layer: Any) -> tuple[Any, Any, bool]:
+    """What the sparse MLA kernel reads from its layer when it is traced.
+
+    The (nope, rope) KV cache specs and masked-dense admission, both recorded
+    when the layer's KV cache is allocated, which precedes tracing.
+    """
+    nope_spec, rope_spec = layer.mla_kv_spec
+    return nope_spec, rope_spec, getattr(layer, "allow_masked_dense", False) is True
 
 
 # TPU requires the head size to be a multiple of 128.
@@ -560,6 +572,122 @@ def _pallas_rpa_kernel_batched(
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
+# --- TPU_MLA_ABSORB_TOKEN_MAJOR: token-major W_UK absorb -------------------
+# `pallas.jax_op` infers static args from the signature (non-`jax.Array`
+# positional params), so each operand arity is its own function.
+def _mla_absorb_jax(q: jax.Array, w_uk_t: jax.Array, nope_dim: int) -> jax.Array:
+    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
+
+    return mla_absorb_token_major(q, w_uk_t, None, nope_dim=nope_dim)
+
+
+def _mla_absorb_scaled_jax(
+    q: jax.Array, w_uk_t: jax.Array, w_scale: jax.Array, nope_dim: int
+) -> jax.Array:
+    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
+
+    return mla_absorb_token_major(q, w_uk_t, w_scale, nope_dim=nope_dim)
+
+
+_MLA_ABSORB_OPS: dict[bool, Any] = {}
+_MLA_ABSORB_OPS_LOCK = threading.Lock()
+
+
+def get_mla_absorb_op(scaled: bool) -> Any:
+    """The cached torch op; build it outside Dynamo (it takes a lock)."""
+    op = _MLA_ABSORB_OPS.get(scaled)
+    if op is not None:
+        return op
+    with _MLA_ABSORB_OPS_LOCK:
+        op = _MLA_ABSORB_OPS.get(scaled)
+        if op is not None:
+            return op
+        if scaled:
+            op = pallas.jax_op(
+                "pallas::mla_absorb_token_major_s", _mla_absorb_scaled_jax
+            )
+        else:
+            op = pallas.jax_op("pallas::mla_absorb_token_major", _mla_absorb_jax)
+
+        def _fake(q, w_uk_t, *rest):
+            return q.new_empty((q.shape[0], q.shape[1], w_uk_t.shape[-1]))
+
+        op.register_fake(_fake)
+        _MLA_ABSORB_OPS[scaled] = op
+        return op
+
+
+def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
+    """ "pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
+    of `num_tokens` tokens, else None (the head-major bmm).
+
+    Only the backbone may branch on the token count: it is traced once per
+    bucket group (`_precompile_backbone` retraces where a branch needs it).
+    The MTP drafter (model_tag "eagle_head") is traced once for every bucket,
+    so the comparison below would pin its graph to the first size and the
+    other buckets fail with ShapeSpecializationError. The drafter keeps the
+    bmm, so the flag never touches its graph (checked before the comparison:
+    no guard is recorded)."""
+    mode = envs.TPU_MLA_ABSORB_TOKEN_MAJOR
+    if mode in (None, "0") or not is_backbone:
+        return None
+    # Cap rule: absorb is `T > edge` (edge a power of 2), MIN_TOKENS (the
+    # smallest bucket that absorbs) giving the edge below it.
+    edge = envs.bucket_gate_edge(envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS)
+    if envs.TPU_DCP_LSE_MERGE_A2A:
+        # The DCP merge takes the all-to-all at `T <= cap` (same trace). An
+        # absorb gate that also held at a bucket `<= cap` would leave a trace
+        # where both hold; at the cap bucket that pins the token count to one
+        # constant (ConstraintViolationError, and the bucket's inputs lose a
+        # SymInt). Starting above the cap reuses the merge's own comparison:
+        # absorb `T > cap`, the merge's reduce-scatter side.
+        edge = max(edge, envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS)
+    if not num_tokens > edge:
+        return None
+    return "pallas" if mode == "1" else mode
+
+
+def mla_absorb_w_uk(
+    q_src: torch.Tensor,
+    nope_dim: int,
+    w_uk_t: torch.Tensor,
+    w_uk_t_scale: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    mode: str | None,
+) -> torch.Tensor:
+    """``ql_nope [T, H, lora] = q_src[:, :, :nope_dim] @ w_uk_t[h]`` per head.
+
+    `q_src` is ``[T, H, qk]`` with the nope part leading (`qk >= nope_dim`);
+    passing the whole q head (not the nope slice) lets the Pallas kernel read
+    q_b's output in place. `mode` None is the reference path: head-major bmm
+    between two transposes, bit for bit what `forward` always did.
+    """
+    if mode == "pallas":
+        if (
+            q_src.dtype != torch.bfloat16
+            or w_uk_t.shape[-1] % 128
+            or q_src.shape[1] % ABSORB_HEADS_PER_BLOCK
+        ):
+            mode = "einsum"
+        else:
+            if w_uk_t_scale is None:
+                out = get_mla_absorb_op(False)(q_src, w_uk_t, nope_dim)
+            else:
+                out = get_mla_absorb_op(True)(q_src, w_uk_t, w_uk_t_scale, nope_dim)
+            return out.to(out_dtype)
+    q_nope = q_src[..., :nope_dim]
+    w = w_uk_t.to(q_nope.dtype) if w_uk_t.dtype != q_nope.dtype else w_uk_t
+    if mode == "einsum":
+        ql_nope = torch.einsum("thd,hdc->thc", q_nope, w)
+        if w_uk_t_scale is not None:
+            ql_nope = ql_nope * w_uk_t_scale.transpose(0, 1)
+        return ql_nope.to(out_dtype)
+    ql_nope = torch.bmm(q_nope.transpose(0, 1), w)
+    if w_uk_t_scale is not None:
+        ql_nope = ql_nope * w_uk_t_scale
+    return ql_nope.transpose(0, 1).to(out_dtype)
+
+
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
         "auto",
@@ -2015,6 +2143,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         _cp_mla_attention.prebuild_send_merge(self.dcp_size)
                     if envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK:
                         _cp_mla_attention.prebuild_send_unpack(self.dcp_size)
+                    if envs.TPU_DCP_MLA_SEND_DENSE:
+                        _cp_mla_attention.prebuild_send_dense(self.dcp_size)
+                    if envs.TPU_DCP_MLA_SEND_GROUP_ROWS > 0:
+                        _cp_mla_attention.prebuild_send_group(
+                            self.dcp_size, envs.TPU_DCP_MLA_SEND_GROUP_ROWS
+                        )
 
     def _get_kv_scales(
         self, layer: Any
@@ -2140,13 +2274,26 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def _build_sparse_mla_op(self, layer: Any):
         from vllm_torchtpu.layers.core.attention_interface import sparse_mla_attention
 
-        vllm_context = get_vllm_model_wrapper_context()
+        mesh = get_vllm_model_wrapper_context().mesh
+        sm_scale = layer.scale
+        num_heads = layer.num_heads
+        kv_lora_rank = layer.kv_lora_rank
 
         # Per-tensor fp8 dequant scale for the packed nope cache -- the
-        # same checkpoint k_scale the dense path uses.
+        # same checkpoint k_scale the dense path uses. The kernel only reads
+        # float(k_scale), so it is converted here to key the shared op.
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
+            if k_scale is not None:
+                k_scale = float(k_scale)
+
+        # The sparse layers that use the op. Their KV cache specs and
+        # masked-dense admission are recorded after the op is built, so they
+        # cannot key it: the kernel reads them from the first and checks that
+        # the others recorded the same. Weak references, so the shared op does
+        # not keep a discarded model's layers alive.
+        layers: list[weakref.ref] = []
 
         def sparse_mla_attention_core_tpu(
             kv_cache_nope: jax.Array,
@@ -2161,9 +2308,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            nope_spec, rope_spec = layer.mla_kv_spec
-            # Recorded when the KV cache is allocated, which precedes tracing.
-            allow_masked_dense = getattr(layer, "allow_masked_dense", False) is True
+            live = [ref() for ref in layers]
+            live = [sharer for sharer in live if sharer is not None]
+            traced = _sparse_mla_trace_config(live[0])
+            for other in live[1:]:
+                if _sparse_mla_trace_config(other) != traced:
+                    # TODO: key the op on these once they are known before it
+                    # is built, so layers that differ get separate ops.
+                    raise NotImplementedError(
+                        f"{other.layer_name} shares a sparse MLA op with "
+                        f"{live[0].layer_name} but recorded different KV cache "
+                        "specs or masked-dense admission "
+                        f"({_sparse_mla_trace_config(other)} != {traced}); layers "
+                        "with the same kernel config must record the same. If "
+                        "masked-dense admission differs, set "
+                        "TPU_MLA_MASKED_DENSE_ENABLED=0."
+                    )
+            nope_spec, rope_spec, allow_masked_dense = traced
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -2176,18 +2337,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
-                vllm_context.mesh,
+                mesh,
                 nope_spec,
                 rope_spec,
-                sm_scale=layer.scale,
+                sm_scale=sm_scale,
                 k_scale=k_scale,
                 allow_masked_dense=allow_masked_dense,
             )
-
-        op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
-        sparse_mla_jax_op = pallas.jax_op(
-            op_name, sparse_mla_attention_core_tpu, donate_argnums=(0, 1)
-        )
 
         def _fake_sparse_mla(
             kv_cache_nope,
@@ -2201,14 +2357,29 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             **kwargs,
         ):
             num_tokens = ql_nope.size(0)
-            out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
+            out_shape = (num_tokens, num_heads, kv_lora_rank)
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
                 torch.empty(out_shape, dtype=ql_nope.dtype, device=ql_nope.device),
             )
 
-        sparse_mla_jax_op.register_fake(_fake_sparse_mla)
+        def build_op(op_name: str):
+            op = pallas.jax_op(
+                op_name, sparse_mla_attention_core_tpu, donate_argnums=(0, 1)
+            )
+            op.register_fake(_fake_sparse_mla)
+            return op, layers
+
+        sparse_mla_jax_op, sharers = get_shared_jax_op(
+            "sparse_mla_attention",
+            (id(mesh), sm_scale, k_scale, num_heads, kv_lora_rank),
+            build_op,
+        )
+        # Dense MLA layers build this op too but never trace it, and record no
+        # sparse KV cache spec to check.
+        if layer.use_sparse and not any(ref() is layer for ref in sharers):
+            sharers.append(weakref.ref(layer))
 
         def sparse_mla_impl(
             kv_cache: tuple[torch.Tensor, torch.Tensor],

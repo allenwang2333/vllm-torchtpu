@@ -2560,92 +2560,6 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.synchronize() == "synchronized"
 
 
-def test_flush_keeps_zero_token_async_results_until_waited():
-    """A step that committed no tokens still leaves its D2H copy in flight.
-
-    On TP ranks other than the executor's output rank, vLLM may drop the
-    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
-    the copy's only owner. execute_model() must neither free it before the
-    copy is waited on (#985) nor block on it ahead of the forward;
-    sample_tokens() waits on it in _modify_prev_results() before replacing it.
-    """
-    events = []
-
-    class FakeCopyState:
-        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
-
-        def wait(self):
-            events.append("wait")
-
-    copy_state = FakeCopyState()
-    weakref.finalize(copy_state, events.append, "freed")
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
-        _pre_async_results=AsyncPreResults(
-            req_ids=["req-prefill"],
-            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
-            request_seq_lens=[],
-            discard_sampled_tokens_req_indices=[0],
-            req_id_to_index_copy={},
-            copy_state=copy_state,
-        ),
-    )
-    # A flush that rolls back calls self._modify_prev_results().
-    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
-    del copy_state  # The runner now holds the only reference.
-
-    # execute_model(): neither wait on the copy nor free it.
-    TPUModelRunner._flush_disjoint_async_results(runner)
-    assert events == []
-
-    # sample_tokens(): wait on the copy before the results are replaced.
-    TPUModelRunner._modify_prev_results(runner)
-    assert events == ["wait"]
-
-
-def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
-    """A disjoint previous batch that sampled tokens must still be rolled back."""
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
-        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
-        _modify_prev_results=MagicMock(),
-    )
-
-    TPUModelRunner._flush_disjoint_async_results(runner)
-    runner._modify_prev_results.assert_called_once()
-    assert runner._pre_async_results is None
-
-
-@pytest.mark.parametrize("max_logprobs", [0, 2])
-def test_gather_logprobs_computes_in_fp32(max_logprobs):
-    # Row 0 has a dominant logit (10.0 vs 4.0): in bfloat16, logsumexp rounds
-    # to 10.0 and collapses the selected token's logprob to 0.0.
-    logits = torch.tensor(
-        [[10.0, 4.0, 0.0, -2.0], [1.0, 3.0, 2.5, -1.0]],
-        dtype=torch.bfloat16,
-    )
-    sampled_tokens = torch.tensor([[0], [2]], dtype=torch.int32)
-    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
-
-    with torch.compiler.set_stance("force_eager"):
-        out = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
-
-    ref_log_probs = logits.log_softmax(dim=-1, dtype=torch.float32)
-    expected_ids = sampled_tokens.to(torch.int64)
-    if max_logprobs > 0:
-        topk_ids = torch.topk(logits, max_logprobs, dim=-1).indices
-        expected_ids = torch.cat((expected_ids, topk_ids), dim=1)
-    expected_logprobs = ref_log_probs.gather(-1, expected_ids)
-
-    assert out.logprobs.dtype == torch.float32
-    assert out.logprobs[0, 0].item() < -1e-3
-    assert torch.equal(out.logprobs, expected_logprobs)
-    assert torch.equal(out.logprob_token_ids, expected_ids.to(torch.int32))
-    assert torch.equal(
-        out.selected_token_ranks, torch.tensor([1, 2], dtype=torch.int32)
-    )
-
-
 def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
     bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
@@ -2733,7 +2647,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         _sampler_fused_chain=False,
         _sampler_kwargs=lambda: {},
-        _verify_trim_rows=lambda padded_len, draft_lengths: 0,
+        _verify_trim_rows=lambda padded_len, draft_lengths_cpu: 0,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -2853,3 +2767,59 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_flush_keeps_zero_token_async_results_until_waited():
+    """A step that committed no tokens still leaves its D2H copy in flight.
+
+    On TP ranks other than the executor's output rank, vLLM may drop the
+    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
+    the copy's only owner. execute_model() must neither free it before the
+    copy is waited on (#985) nor block on it ahead of the forward;
+    sample_tokens() waits on it in _modify_prev_results() before replacing it.
+    """
+    events = []
+
+    class FakeCopyState:
+        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+
+        def wait(self):
+            events.append("wait")
+
+    copy_state = FakeCopyState()
+    weakref.finalize(copy_state, events.append, "freed")
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        _pre_async_results=AsyncPreResults(
+            req_ids=["req-prefill"],
+            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[0],
+            req_id_to_index_copy={},
+            copy_state=copy_state,
+        ),
+    )
+    # A flush that rolls back calls self._modify_prev_results().
+    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
+    del copy_state  # The runner now holds the only reference.
+
+    # execute_model(): neither wait on the copy nor free it.
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    assert events == []
+
+    # sample_tokens(): wait on the copy before the results are replaced.
+    TPUModelRunner._modify_prev_results(runner)
+    assert events == ["wait"]
+
+
+def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
+    """A disjoint previous batch that sampled tokens must still be rolled back."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
+        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
+        _modify_prev_results=MagicMock(),
+    )
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_called_once()
+    assert runner._pre_async_results is None

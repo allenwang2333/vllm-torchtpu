@@ -1082,6 +1082,16 @@ def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     return levers
 
 
+def _decode_body_levers(value: str) -> tuple[str, ...]:
+    """TPU_MLA_DECODE_BODY_LEVERS -> the decode body's lever tuple ("1" =
+    `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.DECODE_BODY_DEFAULT
+    return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
 def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
     """`kv_cache_utils.pack_tokens`, bit for bit, as 128-lane u32 rows.
 
@@ -1435,7 +1445,8 @@ def sparse_mla_attention_dcp(
             and mask_in_kernel
             and envs.TPU_MLA_SPARSE_SPLIT_Q
             and topk_cap
-            and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+            and topk_idx.shape[0]
+            > envs.bucket_gate_edge(envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS)
         ):
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 
@@ -1482,6 +1493,7 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
