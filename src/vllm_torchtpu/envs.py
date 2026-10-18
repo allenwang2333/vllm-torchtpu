@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = False
     TPU_MTP_TOPK_INPLACE: bool = False
+    TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1785,6 +1786,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # assignment into the table is functional on TPU: each one copied the
     # whole 32 MiB table (~26 us on tpu7x), three times per propose.
     "TPU_MTP_TOPK_INPLACE": env_bool("TPU_MTP_TOPK_INPLACE", default=False),
+    # Benchmark fidelity: run_dp_dummy_draft (outside DP lockstep, i.e. the
+    # workload microbenchmark's drafter replay) also does propose()'s
+    # IndexShare host work -- the step-0 snapshot and the restore before each
+    # loop step -- so a replay times what a served propose runs. A real
+    # lockstep padding chunk never does it.
+    "TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST": env_bool(
+        "TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST", default=False
+    ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

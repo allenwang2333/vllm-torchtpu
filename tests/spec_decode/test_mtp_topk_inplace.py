@@ -109,7 +109,7 @@ def test_flag_off_keeps_the_eager_paths(monkeypatch):
 def test_flags_default_off(monkeypatch):
     import vllm_torchtpu.envs as envs
 
-    for name in ("TPU_MTP_TOPK_INPLACE",):
+    for name in ("TPU_MTP_TOPK_INPLACE", "TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST"):
         monkeypatch.delenv(name, raising=False)
         assert getattr(envs, name) is False
 
