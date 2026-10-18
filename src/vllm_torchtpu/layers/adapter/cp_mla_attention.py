@@ -1448,7 +1448,13 @@ def _unpack_words(recv: jax.Array, tokens: int, local: int, dtype) -> tuple[jax.
 
 
 def sized_merge_local(
-    o: jax.Array, lse: jax.Array, *, world: int, a2a_max_tokens: int, axis_name: str
+    o: jax.Array,
+    lse: jax.Array,
+    *,
+    world: int,
+    a2a_max_tokens: int,
+    axis_name: str,
+    small: dict | None = None,
 ) -> jax.Array:
     """One rank's merge inside a `shard_map` over the DCP axis.
 
@@ -1465,6 +1471,12 @@ def sized_merge_local(
       all-gather, weight, f32 reduce-scatter over heads.
 
     The two differ only in the order the `world` weighted f32 terms are summed.
+
+    With `small` (TPU_MTP_DCP_MERGE_SMALL_A2A: `max_tokens`, `rank`, `lane`,
+    `lane_axis`), buckets of `T <= small["max_tokens"]` move the packed words
+    with the Pallas small all-to-all: each destination block padded to whole
+    8-row tiles, every row moved (row0 = 0), so the received words the unpack
+    reads are `lax.all_to_all`'s bit for bit.
     """
     tokens, heads, vdim = o.shape
     local = heads // world
@@ -1477,7 +1489,10 @@ def sized_merge_local(
     o_send = o.reshape(tokens, world, local, vdim).transpose(1, 0, 2, 3)
     l_send = lse.reshape(tokens, world, local).transpose(1, 0, 2)
     send, _ = _pack_words(o_send, l_send)
-    recv = jax.lax.all_to_all(send, axis_name, 0, 0, tiled=True)
+    if small is not None and tokens <= small["max_tokens"]:
+        recv = _small_exchange(send, world=world, axis_name=axis_name, **small)
+    else:
+        recv = jax.lax.all_to_all(send, axis_name, 0, 0, tiled=True)
     o_recv, l_recv = _unpack_words(recv, tokens, local, o.dtype)
     # Rank r's weight reads every rank's lse for this rank's heads, which is
     # exactly l_recv `[world, T, local]`.
@@ -1488,6 +1503,40 @@ def sized_merge_local(
     for r in range(1, world):
         acc = acc + terms[r]
     return acc.astype(o.dtype)
+
+
+def _small_exchange(
+    send: jax.Array,
+    *,
+    world: int,
+    axis_name: str,
+    max_tokens: int,
+    rank: jax.Array,
+    lane: jax.Array,
+    lane_axis: str | None,
+) -> jax.Array:
+    """`lax.all_to_all(send, axis_name, 0, 0, tiled=True)` of the packed
+    `[world, R, V]` words through `small_all_to_all`: blocks padded to
+    `ceil(R / 8) * 8` rows, all rows moved, the padding sliced off."""
+    from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
+        small_all_to_all,
+    )
+
+    del max_tokens
+    _, rows, vdim = send.shape
+    block = -(-rows // 8) * 8
+    padded = jnp.pad(send, ((0, 0), (0, block - rows), (0, 0)))
+    recv = small_all_to_all(
+        padded.reshape(world * block, vdim),
+        num_cores=world,
+        axis=axis_name,
+        row0=0,
+        rank=jnp.reshape(rank, (1,)),
+        lane_axis=lane_axis,
+        lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
+        hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
+    ).reshape(world, block, vdim)
+    return recv[:, :rows]
 
 
 def prebuild_sized_merge(world: int) -> None:
@@ -1507,25 +1556,71 @@ def prebuild_sized_merge(world: int) -> None:
     # (`_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS`).
     spec = P(DCP_AXIS_NAME)
 
-    def body(o, lse):
-        return sized_merge_local(
-            o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME
-        )
-
-    def fn(output: jax.Array, lse: jax.Array) -> jax.Array:
-        return jax.shard_map(
-            body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
-        )(output, lse)
-
-    def fake(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    def fake(output: torch.Tensor, lse: torch.Tensor, *_) -> torch.Tensor:
         tokens, heads, vdim = output.shape
         return output.new_empty((tokens, heads // world, vdim))
 
-    _SIZED_MERGE_OPS[world] = sharded_jax_op(
-        f"pallas::mtp_dcp_merge_sized_{world}",
-        fn,
+    if not (envs.TPU_MTP_DCP_MERGE_SMALL_A2A and envs.TPU_DCP_RANK_OPERAND):
+
+        def body(o, lse):
+            return sized_merge_local(
+                o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME
+            )
+
+        def fn(output: jax.Array, lse: jax.Array) -> jax.Array:
+            return jax.shard_map(
+                body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+            )(output, lse)
+
+        _SIZED_MERGE_OPS[world] = sharded_jax_op(
+            f"pallas::mtp_dcp_merge_sized_{world}",
+            fn,
+            mesh=mesh,
+            input_partition_specs=(spec, spec),
+            output_partition_specs=spec,
+            fake=fake,
+        )
+        return
+
+    # TPU_MTP_DCP_MERGE_SMALL_A2A: the op takes this rank's DCP index and lane
+    # as data on every bucket (the small all-to-all addresses peers by them);
+    # buckets above the small cap ignore them.
+    from vllm_torchtpu.distributed.dcp import dcp_lane_operand, dcp_rank_operand
+
+    small_cap = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
+    assert len(lane_axes) <= 1, mesh.axis_names
+    lane_axis = lane_axes[0] if lane_axes else None
+    rank_t = dcp_rank_operand(torch.device("tpu"))
+    lane_t = dcp_lane_operand(torch.device("tpu"))
+
+    def body_small(o, lse, rank, lane):
+        small = {"max_tokens": small_cap, "rank": rank, "lane": lane,
+                 "lane_axis": lane_axis}
+        return sized_merge_local(
+            o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME,
+            small=small,
+        )
+
+    def fn_small(output, lse, rank, lane):
+        return jax.shard_map(
+            body_small,
+            mesh=mesh,
+            in_specs=(spec, spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(output, lse, rank, lane)
+
+    op = sharded_jax_op(
+        f"pallas::mtp_dcp_merge_sized_small_{world}",
+        fn_small,
         mesh=mesh,
-        input_partition_specs=(spec, spec),
+        input_partition_specs=(spec, spec, spec, spec),
         output_partition_specs=spec,
         fake=fake,
     )
+
+    def merge(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        return op(output, lse, rank_t, lane_t)
+
+    _SIZED_MERGE_OPS[world] = merge

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
     TPU_MTP_DCP_MERGE_SIZED: bool = False
+    TPU_MTP_DCP_MERGE_SMALL_A2A: bool = False
+    TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_VOCAB_EMBED_I32_BOUNDS: bool = False
     TPU_DCP_MLA_SEND_LAYOUT: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
@@ -533,6 +535,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-element weights as the reduce-scatter merge; only the order the
     # ranks' weighted partials are summed in differs.
     "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=False),
+    # With TPU_MTP_DCP_MERGE_SIZED, on drafter buckets of
+    # T <= TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS tokens (a power of 2): move
+    # the sized merge's packed words with one Pallas round of remote DMAs
+    # (small_collectives.all_to_all) instead of XLA's all-to-all. Each
+    # destination block is padded to whole 8-row tiles; every row the unpack
+    # reads arrives bit for bit, so the merge is unchanged. Peers are
+    # addressed by (lane, rank) as data (the op takes the DCP rank and lane
+    # operands on every bucket). Needs TPU_DCP_RANK_OPERAND.
+    "TPU_MTP_DCP_MERGE_SMALL_A2A": env_bool(
+        "TPU_MTP_DCP_MERGE_SMALL_A2A", default=False
+    ),
+    "TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS": env_int(
+        "TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS", 8
+    ),
     # VocabParallelEmbedding's five shard bounds as int32 scalar buffers
     # instead of int64. An int64 scalar program input costs one X64SplitLow
     # custom call (~1.15 us, serial, at every program start that embeds: the
