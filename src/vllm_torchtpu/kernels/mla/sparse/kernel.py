@@ -3320,8 +3320,9 @@ def sparse_ragged_paged_attention(
         buffer (`SEND_PAD_ROWS`) for a group of `send_world` ranks, returned
         in place of the lse; the attention output is then not written.
       send_exchange: TPU_MLA_FUSED_SMALL_A2A. `(axis, lane_axis or None[,
-        vmem_limit_bytes])` of the (lane, DCP) mesh (the call's scoped VMEM,
-        default SEND_EXCHANGE_VMEM_LIMIT_BYTES), with `send_world` on a bucket the attention grid
+        vmem_limit_bytes[, hbm_pin]])` of the (lane, DCP) mesh (the call's
+        scoped VMEM, default SEND_EXCHANGE_VMEM_LIMIT_BYTES; whether its array
+        operands are pinned to HBM, default True), with `send_world` on a bucket the attention grid
         walks in one step, inside a shard_map: the kernel also runs the DCP
         exchange (see SEND_SLAB_ROW0) and returns the receive buffer int16
         `[send_world * block, V]` -- `small_all_to_all(send, row0=
@@ -3411,7 +3412,7 @@ def sparse_ragged_paged_attention(
     ):
         raise ValueError(f"unknown prologue_fault {prologue_fault}")
     if send_exchange is not None and (
-        not send_world or send_peer is None or len(send_exchange) not in (2, 3)
+        not send_world or send_peer is None or len(send_exchange) not in (2, 3, 4)
     ):
         raise ValueError(
             "send_exchange = (axis, lane_axis) needs send_world and send_peer "
@@ -4410,7 +4411,9 @@ def sparse_attention_chunk(
             operands.append(send_recv_in)
         if out_carried is not None:
             operands.append(out_carried)
-        if send_exchange is not None:
+        if send_exchange is not None and (
+            len(send_exchange) < 4 or send_exchange[3]
+        ):
             operands = [
                 pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in operands
             ]

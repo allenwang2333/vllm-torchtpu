@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_MLA_FUSED_SMALL_A2A: bool = False
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
+    TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
+    TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB: int = 32
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -641,6 +643,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decides what XLA may keep in VMEM across the call -- the receive buffer
     # the unpack reads, and the prefetches of the next ops' weights.
     "TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB": env_int("TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB", 16),
+    # Fused calls of buckets of at least this many tokens pin their array
+    # operands to HBM (so XLA cannot stage the gathered KV into VMEM ahead of
+    # the call) and take TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB of scoped VMEM;
+    # smaller buckets take neither. Decided on the bucket's static shape in the
+    # JAX op. Full-depth decode (78 layers): T=4 best unpinned at 16 MiB, T=8
+    # best pinned at 32 MiB.
+    "TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS": env_int(
+        "TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS", 8
+    ),
+    "TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB": env_int(
+        "TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB", 32
+    ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done

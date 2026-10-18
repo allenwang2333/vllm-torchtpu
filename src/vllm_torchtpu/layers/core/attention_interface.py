@@ -1416,10 +1416,18 @@ def sparse_mla_attention_dcp(
                 if send_layout:
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange:
+                    # Static per bucket (the JAX op's shape, not a torch gate).
+                    pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
+                    vmem_mib = (
+                        envs.TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB
+                        if pin
+                        else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
+                    )
                     split_kwargs["send_exchange"] = (
                         dcp_axis_name,
                         lane_axis,
-                        int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB) * 1024 * 1024,
+                        int(vmem_mib) * 1024 * 1024,
+                        bool(pin),
                     )
                     split_kwargs["send_peer"] = jnp.stack(
                         [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
