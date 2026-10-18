@@ -63,8 +63,8 @@ def build_inputs(ctx, q_len, num_seqs, pages_per_seq, seed):
     cu = np.full((num_seqs + 1,), q_len, np.int32)
     cu[0] = 0
     dist = np.array([0, 0, 1], np.int32)
-    return dict(q=q.astype(ml_dtypes.bfloat16), k=k_all[ctx:].astype(ml_dtypes.bfloat16),
-                v=v_all[ctx:].astype(ml_dtypes.bfloat16), cache=cache, kv_lens=kv_lens,
+    # The new tokens' K/V reach the kernel already in the cache dtype, as in serving.
+    return dict(q=q.astype(ml_dtypes.bfloat16), k=k8[ctx:], v=v8[ctx:], cache=cache, kv_lens=kv_lens,
                 page_indices=page_indices, cu=cu, dist=dist, k8=k8, v8=v8)
 
 
