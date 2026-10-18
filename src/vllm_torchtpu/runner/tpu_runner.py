@@ -3426,7 +3426,12 @@ class TPUModelRunner(GPUModelRunner):
         # Raw bytes via a uint8 view: numpy has no bfloat16 (the sampling
         # temperatures are in the logits dtype); same bytes as numpy's
         # C-order tobytes() for every dtype numpy does have.
+        # The target device is part of the key: a caller that asks for another
+        # device (e.g. a CPU probe of _build_padded_sampling_params) must not
+        # get the previous upload back on the wrong device.
+        target = self.device if device is None else device
         key = (
+            str(target),
             host.dtype,
             tuple(host.shape),
             host.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
@@ -3434,7 +3439,7 @@ class TPUModelRunner(GPUModelRunner):
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
-        dev = host.to(self.device if device is None else device, non_blocking=True)
+        dev = host.to(target, non_blocking=True)
         self._h2d_reuse[slot] = (key, dev, host)
         return dev
 

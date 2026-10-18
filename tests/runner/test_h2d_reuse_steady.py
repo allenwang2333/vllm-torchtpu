@@ -87,3 +87,20 @@ def test_zero_dim_host_key():
     a = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
     b = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
     assert a is b and int(a) == 5
+
+
+def test_target_device_is_part_of_the_key(monkeypatch):
+    """Same values asked for on another device: a fresh copy on that device,
+    never the previous upload (a CPU probe followed by device logits)."""
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "1")
+    r = _runner([0.7, 1.0, 0.5], [20, 0, 5], [0.9, 1.0, 0.8])
+    host = torch.tensor([1, 2, 3], dtype=torch.int32)
+    a = TPUModelRunner._upload_unless_unchanged(r, "s", host, torch.device("cpu"))
+    m = TPUModelRunner._upload_unless_unchanged(r, "s", host.clone(), torch.device("meta"))
+    assert a.device.type == "cpu" and m.device.type == "meta"
+    m2 = TPUModelRunner._upload_unless_unchanged(r, "s", host.clone(), torch.device("meta"))
+    assert m2 is m
+    probe = _call(r)  # logits on cpu
+    meta_logits = torch.zeros(8, 4, dtype=torch.float32, device="meta")
+    p = TPUModelRunner._build_padded_sampling_params(r, 0, 3, meta_logits, padded_num_reqs=8)
+    assert all(x.device.type == "meta" for x in p[:3]) and all(x.device.type == "cpu" for x in probe[:3])
