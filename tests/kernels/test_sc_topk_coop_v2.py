@@ -101,7 +101,7 @@ def test_coop_v2_local_is_bitwise(b, kind):
 
 def test_coop_v2_engages_on_single_wave_only():
     _require_sparsecore()
-    for b, engaged in ((4, True), (16, True), (32, False), (64, False)):
+    for b, engaged in ((1, False), (2, False), (4, True), (16, True), (32, False), (64, False)):
         scores = jnp.zeros((b, N), jnp.float32)
         lens = jnp.full((b,), 4096, jnp.int32)
         txt = (

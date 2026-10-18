@@ -1159,7 +1159,10 @@ def _sc_topk_direct(
     # Single-wave calls only (b * p <= 32: the decode buckets, T <= 16 at the
     # DCP8 per-rank width); multi-wave calls (mixed / prefill chunks) keep the
     # default path.
-    coop_v2 = coop_v2 and p > 1 and wave_loop and num_waves == 1
+    # P = 16 (b <= 2 rows at this width) is excluded: that configuration hung the
+    # device on hardware (tests/kernels/test_sc_topk_coop_v2.py, b = 1) and no
+    # decode bucket reaches it at DCP8 (T >= 4 -> P <= 8).
+    coop_v2 = coop_v2 and 1 < p <= 8 and wave_loop and num_waves == 1
     shared_gather = coop_v2 and p >= 4
     async_gather = coop_v2 and p < 4
     peer_n = p if async_gather else 1
