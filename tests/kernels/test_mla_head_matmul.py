@@ -18,7 +18,7 @@ batched dot, transpose out) with the same epilogue, compiled by XLA. Shapes are
 GLM-5.2's per rank: W_UK `[64, 192, 512]` (qrep group heads; 4 heads without
 qrep) fed the whole `[T, H, 256]` q head or its 192-wide nope slice, and W_UV
 `[64, 512, 256]`. T covers every serving token padding, including the ones
-below the kernel's 8-token tile (they take the reference path).
+below `MIN_TOKENS` (they take the reference path).
 """
 
 import jax
@@ -126,7 +126,7 @@ def test_whole_q_head_equals_nope_slice():
 
 def test_kernel_path_taken_and_catches_a_head_swap():
     """Positive control: the comparison above sees a one-head permutation."""
-    assert hm.supported(4096, 64) and hm.supported(8, 4) and not hm.supported(4, 64)
+    assert hm.supported(4096, 64) and hm.supported(64, 4) and not hm.supported(32, 64)
     x, w, s = _inputs(512, 64, 256, 192, 512, jnp.bfloat16, False)
     got = hm.head_matmul(x, w, s)
     w_bad = w.at[jnp.array([3, 4])].set(w[jnp.array([4, 3])])

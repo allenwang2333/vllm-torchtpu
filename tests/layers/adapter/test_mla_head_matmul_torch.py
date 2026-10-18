@@ -88,7 +88,7 @@ def _ops():
     mla_head_matmul.build_ops()
 
 
-@pytest.mark.parametrize("tokens", [128, 4096])
+@pytest.mark.parametrize("tokens", [16, 128, 4096])  # 16: below MIN_TOKENS
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("whole_q", [True, False])
 def test_w_uk_absorb_matches_compiled_bmm(tokens, fp8, whole_q):

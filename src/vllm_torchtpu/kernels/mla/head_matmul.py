@@ -54,10 +54,21 @@ def _token_tile(num_tokens: int, row_bytes: int = 0, w_bytes: int = 0) -> int | 
     return None
 
 
+# Below this many tokens the bmm's relayouts are a few us and the kernel's
+# fixed cost (four weight-block steps, fp8 converted in VMEM) is not repaid:
+# twin GLM-5.2 W_UK, T=8..32 bmm path 2.8-5.6 us vs kernel 5.6-8.4 us; T=64
+# 12.9 vs 11.2 us; T=128 14.6 vs 11-13 us.
+MIN_TOKENS = 64
+
+
 def supported(num_tokens: int, num_heads: int) -> bool:
     """Whether the Pallas kernel takes this shape (else the bmm reference)."""
     g = min(HEADS_PER_BLOCK, num_heads)
-    return _token_tile(num_tokens) is not None and num_heads % g == 0
+    return (
+        num_tokens >= MIN_TOKENS
+        and _token_tile(num_tokens) is not None
+        and num_heads % g == 0
+    )
 
 
 def _finish(acc, scale, *, act_dtype, round_before_scale, out_dtype):
@@ -102,22 +113,27 @@ def reference(
     round_before_scale: bool = True,
     out_dtype=None,
 ) -> jax.Array:
-    """The bmm formulation (head-major, relayout on both sides)."""
+    """The bmm formulation, op for op as the torch code writes it (head-major,
+    relayout on both sides), so XLA compiles the same graph for the shapes
+    the kernel does not take."""
     out_dtype = out_dtype or x.dtype
     p = w.shape[1]
     xt = jnp.swapaxes(x[..., :p], 0, 1)
-    acc = jax.lax.dot_general(
-        xt,
-        w.astype(x.dtype),
-        (((2,), (1,)), ((0,), (0,))),
-        preferred_element_type=jnp.float32,
-    )
     s = None if scale is None else scale.reshape(w.shape[0], 1, w.shape[2])
-    o = _finish(
-        acc, s, act_dtype=x.dtype, round_before_scale=round_before_scale,
-        out_dtype=out_dtype,
-    )
-    return jnp.swapaxes(o, 0, 1)
+    dims = (((2,), (1,)), ((0,), (0,)))
+    if round_before_scale:
+        # torch.bmm(q_t, w.to(q.dtype)) [* scale]
+        o = jax.lax.dot_general(xt, w.astype(x.dtype), dims)
+        if s is not None:
+            o = o * s.astype(o.dtype)
+    else:
+        # torch.bmm(p_t.to(f32), w.to(f32)) [* scale.to(f32)]
+        o = jax.lax.dot_general(
+            xt.astype(jnp.float32), w.astype(jnp.float32), dims
+        )
+        if s is not None:
+            o = o * s.astype(jnp.float32)
+    return jnp.swapaxes(o, 0, 1).astype(out_dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("round_before_scale", "out_dtype"))
