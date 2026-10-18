@@ -50,6 +50,11 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
 # gmm_v2.generate_block_specs streams each rhs with this many buffers.
 _RHS_BUFFERS = 3
 
+# Upper bound on the fused kernel's tile_m; 0 keeps gmm_v2's own choice as the
+# starting point. Either way tile_m shrinks in bucket_base steps until both
+# legs' pipelines fit in VMEM.
+FFN_MAX_TILE_M = 0
+
 
 def _default_vmem_limit() -> int:
     return int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
@@ -111,7 +116,9 @@ def make_ffn_configs(
     The fused kernel runs one gm tile through both legs per grid step, so it
     needs w2 to consume exactly the activated width, both legs to tile m
     identically and to cover k and n in one tile, and both legs' rhs pipelines
-    to fit in VMEM together.
+    to fit in VMEM together. When gmm_v2's tile_m does not fit, a smaller one
+    on the same bucket ladder is used: rows are computed independently, so
+    tile_m changes the schedule, not the result.
     """
     if vmem_limit_bytes is None:
         vmem_limit_bytes = _default_vmem_limit()
@@ -162,9 +169,23 @@ def make_ffn_configs(
     ) and up.dims.size_lhs_sublane == down.dims.size_lhs_sublane
     if not (same_m_tiling and single_tile(up) and single_tile(down)):
         return None
-    if _ffn_vmem_estimate(up, down) > vmem_limit_bytes:
-        return None
-    return up, down
+
+    bucket_base = up.tiles.bucket_base
+    tile_m = up.tiles.tile_m
+    if FFN_MAX_TILE_M:
+        tile_m = min(
+            tile_m, max(bucket_base, FFN_MAX_TILE_M // bucket_base * bucket_base)
+        )
+    while True:
+        up = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
+        down = dataclasses.replace(
+            down, tiles=dataclasses.replace(down.tiles, tile_m=tile_m)
+        )
+        if _ffn_vmem_estimate(up, down) <= vmem_limit_bytes:
+            return up, down
+        if tile_m <= bucket_base:
+            return None
+        tile_m -= bucket_base
 
 
 def ffn_inner_kernel(
