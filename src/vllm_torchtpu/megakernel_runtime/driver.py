@@ -32,9 +32,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
+import types
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import jax
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -46,6 +48,7 @@ from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.spec import ExecSpec
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
+    MegakernelConfigError,
     build_pooled_step_op,
     execute_pooled_step_inplace,
     verify_pooled_step_hlo,
@@ -279,6 +282,26 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
         _apply_dict(kv_dict)
 
     return cfg
+
+
+def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
+    """Fail at config time if `compile_hlo_check=1` cannot work on `mesh`.
+
+    Compiled-HLO verification needs real `jax.Device`s; under torch_tpu's
+    `_PallasDevice` mesh XLA compilation belongs to torch_tpu and is verified via
+    the compiled-IR check instead. Raises `MegakernelConfigError` (not a
+    `ValueError`, which `bind_and_warmup` treats as an incompatible layout).
+    """
+    if not compile_hlo_check:
+        return
+    devs = getattr(mesh, "devices", None)
+    first = devs.flat[0] if devs is not None and devs.size > 0 else None
+    if not isinstance(first, jax.Device):
+        raise MegakernelConfigError(
+            "MegakernelDriver: compile_hlo_check=1 requires a mesh of real "
+            f"jax.Device instances (got {type(first).__name__}); drop "
+            "compile_hlo_check under torch_tpu (its compiled IR is checked instead)"
+        )
 
 
 def select_bucket(num_tokens: int, buckets: Sequence[int] = _DEFAULT_BUCKETS) -> int:
@@ -793,6 +816,7 @@ class MegakernelDriver:
             if compile_hlo_check is None
             else compile_hlo_check
         )
+        check_compile_hlo_mesh(self.mesh, self._compile_hlo_check)
         self.ab_calibrator = MKABCalibrator(
             enabled=bool(default_cfg["ab"] if ab is None else ab),
             period_s=self._step_mix_period_s,
@@ -801,11 +825,6 @@ class MegakernelDriver:
     @property
     def _torchtpu_ir_checked(self) -> bool:
         return bool(self._torchtpu_ir_checked_buckets)
-
-    @_torchtpu_ir_checked.setter
-    def _torchtpu_ir_checked(self, val: bool) -> None:
-        if not val:
-            self._torchtpu_ir_checked_buckets.clear()
 
     def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
         del r_cnt
@@ -1241,6 +1260,18 @@ class MegakernelDriver:
                 hid_out = F.pad(hid_out, (0, 0, 0, out_rows - hid_out.shape[0]))
             return hid_out
 
+        # Give each bucket its own code object: nested closures share `__code__`,
+        # and Dynamo caches compiled graphs per code object, so all buckets
+        # would otherwise compete for one entry's `cache_size_limit`.
+        bkt_name = f"step_t{tokens_per_seq}_b{bucket_t}"
+        _step_impl = types.FunctionType(
+            _step_impl.__code__.replace(co_name=bkt_name, co_qualname=bkt_name),
+            _step_impl.__globals__,
+            bkt_name,
+            _step_impl.__defaults__,
+            _step_impl.__closure__,
+        )
+
         if is_tpu:
 
             def _on_torchtpu_compile(debug: Any) -> None:
@@ -1251,7 +1282,7 @@ class MegakernelDriver:
                 )
 
             compile_opts: dict[str, Any] = {
-                "name": f"step_t{tokens_per_seq}_b{bucket_t}",
+                "name": bkt_name,
                 "debug_callback": _on_torchtpu_compile,
                 "serializable": False,
             }

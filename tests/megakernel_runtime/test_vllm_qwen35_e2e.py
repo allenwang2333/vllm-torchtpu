@@ -694,6 +694,42 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     assert driver._torchtpu_ir_checked
 
 
+def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
+    """`compile_hlo_check` misconfiguration fails loudly; layout errors disable MK."""
+    from vllm_torchtpu.megakernel_runtime.driver import check_compile_hlo_mesh
+    from vllm_torchtpu.megakernel_runtime.exported_bridge import (
+        MegakernelConfigError,
+    )
+
+    class _MockDevice:
+        id = 0
+
+    mock_mesh = SimpleNamespace(devices=np.array([_MockDevice()], dtype=object))
+    check_compile_hlo_mesh(mock_mesh, False)
+    check_compile_hlo_mesh(_cpu_mesh(1), True)
+    with pytest.raises(MegakernelConfigError, match="compile_hlo_check=1 requires"):
+        check_compile_hlo_mesh(mock_mesh, True)
+
+    def _driver_raising(exc: Exception) -> MegakernelDriver:
+        drv = object.__new__(MegakernelDriver)
+        drv._bound = True
+
+        def _bind(runner: Any) -> None:
+            raise exc
+
+        drv.bind_caches = _bind  # type: ignore[method-assign]
+        return drv
+
+    runner = SimpleNamespace(_megakernel="mk")
+    drv_cfg = _driver_raising(MegakernelConfigError("bad config"))
+    with pytest.raises(MegakernelConfigError, match="bad config"):
+        drv_cfg.bind_and_warmup(runner)
+    assert runner._megakernel == "mk"
+    drv_layout = _driver_raising(ValueError("incompatible KV layout"))
+    drv_layout.bind_and_warmup(runner)
+    assert drv_layout._bound is False and runner._megakernel is None
+
+
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify `can_run` against real `TPUModelRunner` and `AttentionMetadata` fields."""
     mesh = _cpu_mesh(1)
@@ -988,6 +1024,13 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     #    and restores pools
     driver.bind_and_warmup(runner)
     assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
+    # Each bucket step has its own code object (separate Dynamo cache entries)
+    step_t1, step_t4 = driver._bucket_steps[(1, 2)], driver._bucket_steps[(4, 4)]
+    assert step_t1.__code__ is not step_t4.__code__
+    assert (step_t1.__code__.co_name, step_t4.__code__.co_name) == (
+        "step_t1_b2",
+        "step_t4_b4",
+    )
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
         assert p.untyped_storage().data_ptr() == orig_storage_ptrs[idx]

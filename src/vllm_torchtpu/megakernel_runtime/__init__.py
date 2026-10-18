@@ -34,6 +34,7 @@ _DRIVER_EXPORTS = frozenset(
 
 _BRIDGE_EXPORTS = frozenset(
     {
+        "MegakernelConfigError",
         "PooledStepExport",
         "build_pooled_step_op",
         "execute_pooled_step_inplace",
@@ -131,6 +132,7 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "MKABCalibrator",
+    "MegakernelConfigError",
     "MegakernelDriver",
     "PooledStepExport",
     "Qwen35Megakernel",
