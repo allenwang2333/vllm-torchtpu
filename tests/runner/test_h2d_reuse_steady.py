@@ -1,0 +1,61 @@
+"""TPU_H2D_REUSE_STEADY: the padded sampling params reuse the previous device
+copy only while their values repeat; values always equal a fresh upload."""
+
+from types import SimpleNamespace
+
+import torch
+
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+def _runner(temps, top_k, top_p):
+    r = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=torch.tensor(temps, dtype=torch.float32),
+            top_k_cpu_tensor=torch.tensor(top_k, dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor(top_p, dtype=torch.float32),
+        ),
+        vocab_size=1000,
+        _sampler_light=False,
+        _h2d_reuse={},
+        device=torch.device("cpu"),
+    )
+    r._upload_unless_unchanged = lambda slot, host, device=None: TPUModelRunner._upload_unless_unchanged(
+        r, slot, host, device
+    )
+    return r
+
+
+def _call(r, n=3, padded=8):
+    logits = torch.zeros(padded, 4, dtype=torch.float32)
+    return TPUModelRunner._build_padded_sampling_params(r, 0, n, logits, padded_num_reqs=padded)
+
+
+def test_reuse_only_while_values_repeat(monkeypatch):
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "1")
+    r = _runner([0.7, 1.0, 0.5], [20, 0, 5000], [0.9, 1.0, 0.8])
+    a = _call(r)
+    b = _call(r)
+    assert all(x is y for x, y in zip(a, b))  # steady: no new upload
+    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    fresh = _call(r)
+    for x, y in zip(a, fresh):
+        assert x is not y and x.dtype == y.dtype and torch.equal(x, y)
+    # top_k >= vocab is neutralised to 0 on both paths
+    assert fresh[1][2, 0] == 0 and fresh[1][3, 0] == 0
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "1")
+    r.input_batch.temperature_cpu_tensor[1] = 0.25  # a request changes
+    c = _call(r)
+    assert c[0] is not a[0] and float(c[0][1, 0]) == 0.25
+    assert c[1] is a[1] and c[2] is a[2]  # unchanged tensors still reused
+    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    for x, y in zip(c, _call(r)):
+        assert torch.equal(x, y)
+
+
+def test_shape_change_uploads(monkeypatch):
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "1")
+    r = _runner([0.7, 1.0, 0.5], [20, 0, 5], [0.9, 1.0, 0.8])
+    a = _call(r, padded=8)
+    b = _call(r, padded=16)
+    assert a[0].shape[0] == 8 and b[0].shape[0] == 16 and a[0] is not b[0]

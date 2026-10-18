@@ -1055,6 +1055,10 @@ class TPUModelRunner(GPUModelRunner):
         self._host_sched_diag = HostSchedDiag(
             profiler_rank, envs.TPU_HOST_SCHED_DIAG_STEPS
         )
+        if envs.TPU_FOREACH_MUTATION_EPILOGUE:
+            from vllm_torchtpu.compilation import foreach_epilogue
+
+            foreach_epilogue.install()
         self._cpu_pinner = WorkerCpuPinner(
             envs.TPU_WORKER_CPU_PIN,
             local_rank=int(os.environ.get("LOCAL_RANK", "0") or 0),
@@ -3358,7 +3362,9 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
-    def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
+    def _upload_unless_unchanged(
+        self, slot: str, host: torch.Tensor, device: torch.device | None = None
+    ) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
 
@@ -3372,7 +3378,7 @@ class TPUModelRunner(GPUModelRunner):
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
-        dev = host.to(self.device, non_blocking=True)
+        dev = host.to(self.device if device is None else device, non_blocking=True)
         self._h2d_reuse[slot] = (key, dev, host)
         return dev
 
@@ -3632,6 +3638,15 @@ class TPUModelRunner(GPUModelRunner):
         ):
             self._aot_guard_skip_done = True
             self._skip_aot_guard_checks()
+        if envs.TPU_FOREACH_MUTATION_EPILOGUE and not getattr(
+            self, "_foreach_epilogue_logged", False
+        ):
+            from vllm_torchtpu.compilation import foreach_epilogue
+
+            self._foreach_epilogue_logged = True
+            logger.warning(
+                "TPU_FOREACH_MUTATION_EPILOGUE: %s", dict(foreach_epilogue.STATS)
+            )
         diag = getattr(self, "_host_sched_diag", None)
         if diag is not None:
             diag.tick()
@@ -7699,6 +7714,20 @@ class TPUModelRunner(GPUModelRunner):
             self._sampler_need_top_k = bool((top_k_cpu > 0).any())
             self._sampler_need_top_p = bool((top_p_cpu < 1.0).any())
 
+        if envs.TPU_H2D_REUSE_STEADY:
+            # The three are read-only inputs of the sampler programs and their
+            # values repeat while the batch's requests do.
+            return (
+                self._upload_unless_unchanged(
+                    "sampling_temperature", temps_cpu.unsqueeze(1), logits.device
+                ),
+                self._upload_unless_unchanged(
+                    "sampling_top_k", top_k_cpu.unsqueeze(1), logits.device
+                ),
+                self._upload_unless_unchanged(
+                    "sampling_top_p", top_p_cpu.unsqueeze(1), logits.device
+                ),
+            )
         return (
             temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
             top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),

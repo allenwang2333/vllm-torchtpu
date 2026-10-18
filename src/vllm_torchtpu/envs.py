@@ -142,6 +142,8 @@ if TYPE_CHECKING:
     TPU_WORKER_CPU_PIN: bool = False
     TPU_WORKER_CPU_PIN_SKIP: int = 2
     TPU_AOT_SKIP_GUARD_CHECK: bool = False
+    TPU_FOREACH_MUTATION_EPILOGUE: bool = False
+    TPU_H2D_REUSE_STEADY: bool = False
     TPU_MOE_ONEHOT_SORTFREE: bool = False
     TPU_MOE_SC_COMBINE_TILED: bool = False
     TPU_MOE_SC_COMBINE_V5: bool = False
@@ -1308,6 +1310,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loaded from disk; a freshly compiled one keeps checking an empty guard
     # set on every call.
     "TPU_AOT_SKIP_GUARD_CHECK": env_bool("TPU_AOT_SKIP_GUARD_CHECK"),
+    # Write the inputs a compiled graph mutates (the KV caches) back with one
+    # torch._foreach_copy_ instead of one copy_ per input in AOTAutograd's
+    # epilogue (compilation/foreach_epilogue.py). Same pairs, same order.
+    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE"),
+    # Reuse the previous device copy of per-step host tensors whose values
+    # repeat in steady decode -- the padded sampling params (temperature,
+    # top_k, top_p) and the drafter loop's query_start_loc / request
+    # distribution -- instead of a fresh H2D each step (value-keyed, like
+    # _upload_unless_unchanged).
+    "TPU_H2D_REUSE_STEADY": env_bool("TPU_H2D_REUSE_STEADY"),
     # Under the EP one-hot MoE permute (routed rows <= the one-hot threshold,
     # at most 1024), derive the stable-sort positions, permuted token ids and
     # group sizes by int32 compare-and-count instead of three comparison

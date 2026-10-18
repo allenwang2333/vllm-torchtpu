@@ -1493,7 +1493,7 @@ class Eagle3Proposer:
             # rebuilding (with an H2D) on every one of the K-1 steps.
             loop_qsl_per_chunk = []
             loop_reqdist_per_chunk = []
-            for c in chunks:
+            for ci, c in enumerate(chunks):
                 knr = (
                     runner.num_reqs_max_model_len
                     if c.attn_ctx.use_max_model_len
@@ -1501,6 +1501,21 @@ class Eagle3Proposer:
                 )
                 assert knr is not None
                 qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
+                if envs.TPU_H2D_REUSE_STEADY:
+                    # Functions of (knr, num_reqs) only, read-only in the loop
+                    # draft programs: reuse the last upload while they repeat.
+                    loop_qsl_per_chunk.append(
+                        runner._upload_unless_unchanged(
+                            f"draft_loop_qsl_{ci}", torch.from_numpy(qsl_np)
+                        )
+                    )
+                    loop_reqdist_per_chunk.append(
+                        runner._upload_unless_unchanged(
+                            f"draft_loop_reqdist_{ci}",
+                            torch.tensor([c.num_reqs] * 3, dtype=torch.int32),
+                        )
+                    )
+                    continue
                 loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
                 loop_reqdist_per_chunk.append(
                     torch.tensor(
