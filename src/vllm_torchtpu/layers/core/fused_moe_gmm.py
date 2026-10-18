@@ -836,7 +836,7 @@ def fused_moe_func_ep_combine(
     local_ids = topk_ids - start
     is_local = (local_ids >= 0) & (local_ids < local_experts)
     # The kernel gathers each grouped row from the packed tokens itself.
-    _, group_sizes, argsort_revert_indices, _, _, tokens = prepare_routed_gmm_inputs(
+    _, group_sizes, argsort_revert_indices, _, _, _ = prepare_routed_gmm_inputs(
         hidden_states,
         jnp.where(is_local, local_ids, -1),
         jnp.where(is_local, topk_weights, 0),
@@ -852,17 +852,19 @@ def fused_moe_func_ep_combine(
         jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
     )
 
-    # Route f (token t = f // topk, slot k = f % topk) lands in row
+    # Grouped row r computes route f = sorted_route[r]: one scatter gives
+    # both its token, for the kernel's gather, and its destination. Route f
+    # (token t = f // topk, slot k = f % topk) lands in row
     # k * tokens_per_rank + t % tokens_per_rank of t's owner's receive buffer,
     # so each slot's rows are one contiguous block there.
     route = jnp.arange(num_tokens * topk, dtype=jnp.int32)
-    token = route // topk
-    owner = jnp.asarray(mesh_index_of_rank, jnp.int32)[token // tokens_per_rank]
-    row = (route % topk) * tokens_per_rank + token % tokens_per_rank
-    entry = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
-    dest = (
-        jnp.zeros_like(route).at[argsort_revert_indices].set(entry, unique_indices=True)
+    sorted_route = (
+        jnp.zeros_like(route).at[argsort_revert_indices].set(route, unique_indices=True)
     )
+    tokens = sorted_route // topk
+    owner = jnp.asarray(mesh_index_of_rank, jnp.int32)[tokens // tokens_per_rank]
+    row = (sorted_route % topk) * tokens_per_rank + tokens % tokens_per_rank
+    dest = jnp.left_shift(owner, DEST_DEVICE_SHIFT) | row
 
     rank = start // local_experts
     own_ids = jax.lax.dynamic_slice_in_dim(
