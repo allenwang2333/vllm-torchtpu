@@ -366,11 +366,13 @@ def _bucket_runner(max_num_reqs=8):
     )
 
 
-def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch):
+@pytest.mark.parametrize("mns,expected", [(8, [4, 8]), (16, [4, 8, 16])])
+def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch, mns, expected):
     """The fused program is built with its own config whose compile_sizes are
-    the loop buckets pad(num_reqs) <= pad(max_num_reqs) -- [4, 8] at
-    max_num_seqs 8, not the 11 token buckets up to 4096 -- and the draft's
-    own config (draft and loop-step programs) keeps every bucket."""
+    the loop buckets pad(num_reqs) <= pad(max_num_reqs), derived from the
+    server's max_num_seqs -- [4, 8] at 8, [4, 8, 16] at 16, not the 11 token
+    buckets up to 4096 -- and the draft's own config (draft and loop-step
+    programs) keeps every bucket."""
     import contextlib
     import types
 
@@ -397,7 +399,7 @@ def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_TPU_MTP_FUSED_INDEXSHARE", True, raising=False)
 
     prop = eagle3.Eagle3Proposer.__new__(eagle3.Eagle3Proposer)
-    prop.runner = _bucket_runner(8)
+    prop.runner = _bucket_runner(mns)
     prop.draft_model = types.SimpleNamespace(_dynamic_arg_dims={"input_ids": 0})
     prop.speculative_config = types.SimpleNamespace(method="mtp", num_speculative_tokens=3)
     prop._draft_kv_shared = False
@@ -416,12 +418,12 @@ def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch):
     assert prop._mtp_fused_loop is not None and prop._mtp_fused_indexshare
     cfg = seen["vllm_config"]
     assert cfg is seen["current"] and cfg is not prop.draft_vllm_config
-    assert cfg.compilation_config.compile_sizes == [4, 8]
-    assert prop._mtp_fused_loop_sizes == {4, 8}
+    assert cfg.compilation_config.compile_sizes == expected
+    assert prop._mtp_fused_loop_sizes == set(expected)
     assert cc.compile_sizes == all_sizes  # the draft's config is untouched
-    assert prop._loop_bucket_sizes() == [4, 8]
-    prop.runner = _bucket_runner(16)
-    assert prop._loop_bucket_sizes() == [4, 8, 16]
+    # Every loop bucket a propose can pick is compiled: no chunk of up to
+    # max_num_seqs requests falls back to the per-step loop.
+    assert {prop._loop_bucket(n) for n in range(1, mns + 1)} <= set(expected)
 
 
 def test_proposer_bucket_outside_the_compiled_sizes_falls_back(monkeypatch):
