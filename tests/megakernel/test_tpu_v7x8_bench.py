@@ -42,11 +42,11 @@ from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.megakernel import (  # noqa: E402
     cache,
-    cache_experimental,
     kernel,
     planner,
 )
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
+from vllm_torchtpu.megakernel.cache import should_fuse_pool_io  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     BF16,
@@ -55,6 +55,7 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     I32,
     rup,
 )
+from vllm_torchtpu.megakernel.profile import get_profile  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
     ExecSpec,
     default_tiles,
@@ -2025,8 +2026,44 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     print("=== M3_TPU_V7X8_BENCH_JSON_END ===", flush=True)
 
 
-def test_m5_tpu_v7x8_default_tiles_and_pool_gather_bench():
-    """Benchmark M5 default_tiles + pool_gather (GPR) and opt-in fused_pool_io."""
+def _check_pooled_hlo_or_fail(
+    compiled_text: str, spec: Any, ex: ExecSpec, *, fused: bool, tag: str
+) -> None:
+    """Pool-donation HLO guard: kernel layout + no full-pool HBM/VMEM copies."""
+    g = spec.config
+    ok, msg = cache.check_pooled_step_hlo(
+        compiled_text,
+        page_size=ex.page_size,
+        kvh=max(1, int(g.NKV) // ex.R),
+        hd=int(g.HD),
+        min_pool_pages=16,
+        fused_pool_io=fused,
+        kernel_names=spec.pool_backend.kernel_names,
+    )
+    assert ok, f"HLO check failed for {tag}: {msg}"
+
+
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    return float(
+        np.dot(a.ravel(), b.ravel())
+        / (np.linalg.norm(a.ravel()) * np.linalg.norm(b.ravel()) + 1e-12)
+    )
+
+
+def test_m5_tpu_v7x8_profile_ablation_bench():
+    """M5 profile bench: `default` vs `qwen35-candidate30` (+ GPR / fused ablation).
+
+    Per bucket, every variant is built through `Profile.exec_for` with donated
+    pools, passes the pool-donation HLO guard (fused variants included: no
+    separate gather/scatter and no full-pool copy), and is timed:
+      - `default`: frozen-parity profile (split pool I/O).
+      - `c30`: `qwen35-candidate30` as checked in (GPR auto, split).
+      - `c30_gpr_off`: c30 with `pool_gather=False` (only where c30 used GPR).
+      - `c30_fused`: c30 with experimental `fused_pool_io=True` at the buckets
+        the `"auto"` policy would fuse (B <= 24 or B >= 56).
+    Numerics: `default` is the frozen-parity reference; c30 variants are
+    `approx` and are reported as cosine similarity vs `default`.
+    """
     if not _has_tpu_v7x8():
         pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
     tpu_devs = jax.devices("tpu")
@@ -2034,6 +2071,7 @@ def test_m5_tpu_v7x8_default_tiles_and_pool_gather_bench():
     mesh = Mesh(tpu_devs[:8], ("tp",))
 
     g = dataclasses.replace(qwen35.FULL_EP, L=60, att_every=4)
+    spec = qwen35.qwen35_spec(g)
     ex_init = ExecSpec(B=4, T=1, R=8, ctx=4096, stack_e=True)
     c_f_init = frozen_mk.MKConfig(
         R=8,
@@ -2050,175 +2088,85 @@ def test_m5_tpu_v7x8_default_tiles_and_pool_gather_bench():
     del w_f
     gc.collect()
 
-    buckets = [
-        (1, 4),
-        (1, 16),
-        (1, 32),
-        (1, 64),
-        (4, 4),
-        (4, 16),
-        (4, 64),
-    ]
-    m5_results = []
+    p_def = get_profile("default")
+    p_c30 = get_profile("qwen35-candidate30")
+    base = ExecSpec(R=8, ctx=4096, paged_kv=True, num_pages=4096, stack_e=True)
+    buckets = [(1, 4), (1, 16), (1, 32), (1, 64), (4, 4), (4, 16), (4, 64)]
+    rows = []
+
+    def _run(ex: ExecSpec, fused: bool, tag: str):
+        pos, hid, raw, pt, ckpt, roff = _init_pooled_bucket_on_tpu(mesh, g, ex)
+        step, info = cache.make_pooled_step(
+            mesh, spec, ex, donate_pools=True, fused_pool_io=fused
+        )
+        comp = step.lower(pos, hid, w_lib, raw, pt, ckpt, roff).compile()
+        _check_pooled_hlo_or_fail(comp.as_text(), spec, ex, fused=fused, tag=tag)
+        del comp
+        out, raw = step(pos, hid, w_lib, raw, pt, ckpt, roff)
+        jax.block_until_ready(out)
+        hid_np = np.asarray(jax.device_get(kernel.unfold(out, 8)))[:, : ex.B, :].astype(
+            np.float32
+        )
+        assert np.all(np.isfinite(hid_np)), tag
+        stats, raw = _time_pooled_step_fn(step, pos, hid, w_lib, raw, pt, ckpt, roff)
+        gpr = bool(info["plan"].block_params["gdn"].GPR)
+        del pos, hid, raw, pt, ckpt, roff, out, step
+        gc.collect()
+        return hid_np, stats, gpr, info["vmem_scratch_bytes"]
+
+    def _record(name, ex, fused, row, hid_ref, med_ref, tag) -> bool:
+        hid_v, st_v, gpr_v, vmem_v = _run(ex, fused, f"{name} {tag}")
+        med = st_v["median_us"]
+        row[f"{name}_median_us"] = round(med, 1)
+        row[f"{name}_delta_pct"] = round((med - med_ref) / med_ref * 100.0, 2)
+        row[f"{name}_cos"] = round(_cos(hid_ref, hid_v), 6)
+        row[f"{name}_vmem_mib"] = round(vmem_v / (1 << 20), 2)
+        return gpr_v
 
     for T, B in buckets:
-        # 1. Baseline: frozen_parity_tiles(B), pool_gather=False, fused_pool_io=False
-        ex_base = ExecSpec(
-            B=B,
-            T=T,
-            R=8,
-            ctx=4096,
-            paged_kv=True,
-            num_pages=4096,
-            stack_e=True,
-            pool_gather=False,
-            fused_pool_io=False,
-            tiles=frozen_parity_tiles(B),
-        )
-        pos_b, hid_b, raw_b, pt_b, ckpt_b, roff_b = _init_pooled_bucket_on_tpu(
-            mesh, g, ex_base
-        )
-        step_base, _ = cache.PallasWriter().make_step(mesh, g, ex_base, donate=True)
-        out_hid_base, raw_b = step_base(
-            pos_b, hid_b, w_lib, raw_b, pt_b, ckpt_b, roff_b
-        )
-        jax.block_until_ready(out_hid_base)
-        hid_base_np = np.asarray(jax.device_get(kernel.unfold(out_hid_base, 8)))[
-            :, :B, :
-        ].astype(np.float32)
-        base_stats, raw_b = _time_pooled_step_fn(
-            step_base, pos_b, hid_b, w_lib, raw_b, pt_b, ckpt_b, roff_b
-        )
-        del pos_b, hid_b, raw_b, pt_b, ckpt_b, roff_b, out_hid_base, step_base
-        gc.collect()
-
-        # 2. M5 default: default_tiles(B), fused_pool_io=False, pool_gather=None
-        ex_m5 = ExecSpec(
-            B=B,
-            T=T,
-            R=8,
-            ctx=4096,
-            paged_kv=True,
-            num_pages=4096,
-            stack_e=True,
-            tiles=default_tiles(B),
-        )
-        pos_m, hid_m, raw_m, pt_m, ckpt_m, roff_m = _init_pooled_bucket_on_tpu(
-            mesh, g, ex_m5
-        )
-        step_m5, info_m5 = cache.PallasWriter().make_step(mesh, g, ex_m5, donate=True)
-        comp_m5 = step_m5.lower(
-            pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m
-        ).compile()
-        ok_hlo, msg_hlo = cache.check_pooled_step_hlo(
-            comp_m5.as_text(),
-            page_size=ex_m5.page_size,
-            kernel_names=qwen35.qwen35_pool_backend().kernel_names,
-        )
-        assert ok_hlo, f"HLO check failed at (T={T}, B={B}): {msg_hlo}"
-        del comp_m5
-
-        out_hid_m5, raw_m = step_m5(pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m)
-        jax.block_until_ready(out_hid_m5)
-        hid_m5_np = np.asarray(jax.device_get(kernel.unfold(out_hid_m5, 8)))[
-            :, :B, :
-        ].astype(np.float32)
-        assert np.all(np.isfinite(hid_m5_np))
-        cos_m5 = float(
-            np.dot(hid_base_np.ravel(), hid_m5_np.ravel())
-            / (
-                np.linalg.norm(hid_base_np.ravel()) * np.linalg.norm(hid_m5_np.ravel())
-                + 1e-12
-            )
-        )
-        assert cos_m5 >= 0.9995, (
-            f"M5 default_tiles cos_sim={cos_m5:.6f} < 0.9995 at (T={T}, B={B})"
-        )
-        m5_stats, raw_m = _time_pooled_step_fn(
-            step_m5, pos_m, hid_m, w_lib, raw_m, pt_m, ckpt_m, roff_m
-        )
-        del pos_m, hid_m, raw_m, pt_m, ckpt_m, roff_m, out_hid_m5, step_m5
-        gc.collect()
-
-        speedup_pct = (
-            (m5_stats["median_us"] - base_stats["median_us"])
-            / base_stats["median_us"]
-            * 100.0
-        )
-        row: dict[str, Any] = {
-            "T": T,
-            "B": B,
-            "base_median_us": round(base_stats["median_us"], 1),
-            "m5_gpr_median_us": round(m5_stats["median_us"], 1),
-            "m5_gpr_delta_pct": round(speedup_pct, 2),
-            "m5_gpr_cos_sim": round(cos_m5, 6),
-            "vmem_m5_mib": round(info_m5["vmem_scratch_bytes"] / (1024 * 1024), 2),
-            "pool_gather": bool(info_m5.get("pool_gather", False)),
-        }
-
-        # 3. Opt-in experimental fused_pool_io at eligible buckets
-        if cache_experimental.should_fuse_pool_io(ex_m5, True):
-            ex_fused = dataclasses.replace(ex_m5, fused_pool_io=True)
-            pos_f, hid_f, raw_f, pt_f, ckpt_f, roff_f = _init_pooled_bucket_on_tpu(
-                mesh, g, ex_fused
-            )
-            step_fused, info_fused = cache_experimental.make_fused_pooled_step(
-                mesh, qwen35.qwen35_spec(g), ex_fused, donate=True
-            )
-            comp_fused = step_fused.lower(
-                pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
-            ).compile()
-            ok_fhlo, msg_fhlo = cache_experimental.check_fused_pooled_step_hlo(
-                comp_fused.as_text(), page_size=ex_fused.page_size
-            )
-            assert ok_fhlo, f"Fused HLO check failed at (T={T}, B={B}): {msg_fhlo}"
-            del comp_fused
-
-            out_hid_f, raw_f = step_fused(
-                pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
-            )
-            jax.block_until_ready(out_hid_f)
-            hid_f_np = np.asarray(jax.device_get(kernel.unfold(out_hid_f, 8)))[
-                :, :B, :
-            ].astype(np.float32)
-            cos_fused = float(
-                np.dot(hid_base_np.ravel(), hid_f_np.ravel())
-                / (
-                    np.linalg.norm(hid_base_np.ravel())
-                    * np.linalg.norm(hid_f_np.ravel())
-                    + 1e-12
-                )
-            )
-            assert cos_fused >= 0.9995, (
-                f"M5 fused_pool_io cos_sim={cos_fused:.6f} < 0.9995 at (T={T}, B={B})"
-            )
-            fused_stats, raw_f = _time_pooled_step_fn(
-                step_fused, pos_f, hid_f, w_lib, raw_f, pt_f, ckpt_f, roff_f
-            )
-            del pos_f, hid_f, raw_f, pt_f, ckpt_f, roff_f, out_hid_f, step_fused
-            gc.collect()
-            row["m5_fused_median_us"] = round(fused_stats["median_us"], 1)
-            row["m5_fused_delta_pct"] = round(
-                (fused_stats["median_us"] - base_stats["median_us"])
-                / base_stats["median_us"]
-                * 100.0,
-                2,
-            )
-            row["m5_fused_cos_sim"] = round(cos_fused, 6)
-            row["vmem_fused_mib"] = round(
-                info_fused["vmem_scratch_bytes"] / (1024 * 1024), 2
-            )
-
-        m5_results.append(row)
-        print(
-            f"[M5 Bench T={T} B={B:2d}] base={row['base_median_us']:6.1f} us | "
-            f"m5_gpr={row['m5_gpr_median_us']:6.1f} us "
-            f"({row['m5_gpr_delta_pct']:+.2f}%, "
-            f"cos={row['m5_gpr_cos_sim']:.6f}) | "
-            f"m5_fused={row.get('m5_fused_median_us', 'N/A')}",
-            flush=True,
-        )
+        tag = f"T={T},B={B}"
+        ex_def = p_def.exec_for(base, B=B, T=T, g=g)
+        hid_def, st_def, _, _ = _run(ex_def, False, f"default {tag}")
+        med_def = st_def["median_us"]
+        row: dict[str, Any] = {"T": T, "B": B, "default_median_us": round(med_def, 1)}
+        ref = (row, hid_def, med_def, tag)
+        ex_c30 = p_c30.exec_for(base, B=B, T=T, g=g)
+        row["c30_gpr"] = _record("c30", ex_c30, False, *ref)
+        if row["c30_gpr"]:
+            ex_off = dataclasses.replace(ex_c30, pool_gather=False)
+            _record("c30_gpr_off", ex_off, False, *ref)
+        if should_fuse_pool_io(spec, ex_c30, fused_pool_io="auto"):
+            _record("c30_fused", ex_c30, True, *ref)
+        rows.append(row)
+        print(f"[M5 profile bench {tag}] {json.dumps(row)}", flush=True)
 
     print("\n=== M5_TPU_V7X8_BENCH_JSON_START ===")
-    print(json.dumps({"m5_bench": m5_results}, indent=2))
+    print(json.dumps({"m5_profile_bench": rows}, indent=2))
     print("=== M5_TPU_V7X8_BENCH_JSON_END ===", flush=True)
+
+
+@pytest.mark.parametrize(
+    "variant", ["default", "gqa_qv", "moe_unroll", "gqa_qv+moe_unroll"]
+)
+def test_m5_tpu_v7x8_frozen_parity_bisect(variant: str, monkeypatch):
+    """Re-run the M2 frozen-parity bench with single M5 flags enabled.
+
+    `default` must be bit-exact vs frozen; the other variants report which
+    always-on-at-M5 code paths change TPU numerics (now opt-in flags).
+    """
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    flags = {} if variant == "default" else dict.fromkeys(variant.split("+"), True)
+    monkeypatch.setitem(
+        globals(),
+        "frozen_parity_tiles",
+        lambda B, **kw: dataclasses.replace(default_tiles(B, **kw), **flags),
+    )
+    print(f"\n=== M5_BISECT variant={variant} flags={flags}", flush=True)
+    try:
+        test_m2_tpu_v7x8_full_ep_parity_and_latency()
+        print(f"=== M5_BISECT variant={variant} BIT_EXACT", flush=True)
+    except AssertionError as exc:
+        print(f"=== M5_BISECT variant={variant} NOT_EXACT: {exc}", flush=True)
+        if variant == "default":
+            raise

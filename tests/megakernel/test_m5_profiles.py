@@ -1,0 +1,260 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Frozen-parity defaults, named profiles, and M5 safety guards (CPU only)."""
+
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import replace
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from jax.sharding import Mesh
+
+import vllm_torchtpu.megakernel as mk
+from tests.megakernel.frozen_utils import load_frozen_qwen35
+from vllm_torchtpu.megakernel import spec as mk_spec
+from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.profiles.qwen35_candidate30 import (
+    candidate30_tiles,
+)
+from vllm_torchtpu.megakernel.stream import TwoRing
+
+# Every opt-in performance flag added in M5 and its frozen-parity (off) value.
+_M5_FLAGS_OFF = dict(
+    ecopy_opt=0,
+    pipe_ep=False,
+    r2_direct_store=False,
+    route_vec=False,
+    dense_acc_pair=False,
+    kv_ering=False,
+    pair_kv=False,
+    dmm_unroll=0,
+    gq_pack=False,
+    topk_lanes=False,
+    conv_stage=False,
+    gdn_head_major=False,
+    gqa_qv=False,
+    moe_unroll=False,
+    rel_fetch=False,
+)
+
+
+def test_tiles_field_defaults_are_frozen_parity():
+    t = mk.Tiles()
+    for k, v in _M5_FLAGS_OFF.items():
+        assert getattr(t, k) == v, k
+    assert t.kv_sub == 0
+    assert mk.Tiles(hier=1, pack=1, mb8=2) == mk_spec.DEFAULT_TILES
+
+
+@pytest.mark.parametrize("R", [1, 8])
+@pytest.mark.parametrize("moe_tp", [False, True])
+def test_default_tiles_equal_frozen_parity_and_ignore_moe_tp(R: int, moe_tp: bool):
+    for B in range(1, 65):
+        t = mk.default_tiles(B, moe_tp=moe_tp, R=R)
+        assert t == mk.frozen_parity_tiles(B, moe_tp=moe_tp, R=R)
+        assert t == mk.default_tiles(B, R=R)  # no moe_tp dependence
+        assert t.kv_sub == 0 and not t.route_vec and not t.dense_acc_pair
+        assert not t.pipe_ep and t.pipe  # frozen PIPE stays on (TP single tile)
+
+
+def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
+    g_tp = replace(qwen35.FULL, moe_tp=True)
+    for B in (4, 8, 16, 32, 64):
+        ex = mk.ExecSpec(B=B, R=8)
+        assert ex.resolved_tiles == ex.resolve_tiles(g_tp) == ex.resolve_tiles()
+
+
+def test_default_tiles_match_frozen_prototype_schedule():
+    """`default_tiles(B)` reproduces `frozen_qwen35.megakernel.default_tiles`.
+
+    The only deviation is `nbe=6` for `B > 48` (numerics-neutral ring depth kept
+    since M2; the frozen TPU benches apply the same override).
+    """
+    frozen_mk, _ = load_frozen_qwen35()
+    frozen_fields = {f.name for f in dataclasses.fields(frozen_mk.Tiles)}
+    for B in range(1, 65):
+        c = frozen_mk.MKConfig(R=8, B=B, T=1, L=4, att_every=4, ctx=4096)
+        tf = frozen_mk.default_tiles(c)
+        if B > 48:
+            tf = dataclasses.replace(tf, nbe=6)
+        tl = mk.default_tiles(B, R=8)
+        for name in frozen_fields:
+            assert getattr(tl, name) == getattr(tf, name), (B, name)
+
+
+@pytest.mark.parametrize("R", [2, 4])
+def test_default_tiles_non_v7x8_ranks_use_flat_ring(R: int):
+    for B in (2, 4, 8, 16, 32, 64):
+        assert mk.default_tiles(B, R=R).hier == 0
+
+
+def test_profile_registry_and_default_profile():
+    assert {"default", "qwen35-candidate30"} <= set(mk.list_profiles())
+    d = mk.get_profile(None)
+    assert d is mk.DEFAULT_PROFILE and mk.get_profile("") is d
+    assert d.numerics == "exact" and d.fused_pool_io is False
+    assert d.pool_gather is False
+    for B in (1, 4, 8, 16, 24, 32, 48, 64):
+        assert d.tiles_for(B, R=8) == mk.default_tiles(B, R=8)
+    with pytest.raises(KeyError, match="unknown megakernel profile"):
+        mk.get_profile("nope")
+    with pytest.raises(ValueError, match="already registered"):
+        mk.register_profile(mk.Profile(name="default"))
+    with pytest.raises(ValueError, match="numerics"):
+        mk.Profile(name="x", numerics="bitwise")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fused_pool_io"):
+        mk.Profile(name="x", fused_pool_io="sometimes")
+
+
+def test_candidate30_profile_carries_m5_tuning():
+    p = mk.get_profile("qwen35-candidate30")
+    assert p.model == qwen35.qwen35_spec(qwen35.FULL).name
+    assert p.numerics == "approx"
+    assert p.pool_gather is None  # GPR auto
+    assert p.fused_pool_io is False  # experimental: explicit opt-in only
+    t4 = p.tiles_for(4, R=8)
+    assert (t4.kv_sub, t4.nbe, t4.hier, t4.ecopy_opt) == (1024, 20, 1, 1)
+    for flag in (
+        "pipe_ep",
+        "r2_direct_store",
+        "route_vec",
+        "dense_acc_pair",
+        "kv_ering",
+        "pair_kv",
+        "gq_pack",
+        "topk_lanes",
+        "conv_stage",
+        "gdn_head_major",
+        "gqa_qv",
+        "moe_unroll",
+        "rel_fetch",
+    ):
+        assert getattr(t4, flag) is True, flag
+    assert t4.dmm_unroll == 8
+    assert p.tiles_for(4, R=8, moe_tp=True).nbe == 10
+    t64 = p.tiles_for(64, R=8)
+    assert (t64.nbd, t64.nbe, t64.hier) == (7, 12, 2)
+    t56 = p.tiles_for(56, R=8)
+    assert (t56.nbd, t56.nbe, t56.hier) == (8, 12, 2)
+    t16 = p.tiles_for(16, R=8)
+    assert (t16.nkv, t16.rsag, t16.hier, t16.nbe) == (4, True, 2, 12)
+    # HIER3 remap for power-of-2 R != 8 (B <= 32), flat ring otherwise
+    assert candidate30_tiles(16, R=4).hier == 3
+    assert candidate30_tiles(64, R=4).hier == 0
+    assert candidate30_tiles(16, R=6).hier == 0
+
+
+def test_profile_exec_for_respects_explicit_tiles():
+    p = mk.get_profile("qwen35-candidate30")
+    base = mk.ExecSpec(R=8, paged_kv=True)
+    ex = p.exec_for(base, B=16, T=4, g=qwen35.FULL_EP)
+    assert (ex.B, ex.T) == (16, 4)
+    assert ex.tiles == candidate30_tiles(16, R=8, moe_tp=False)
+    assert ex.pool_gather is None
+    base_t = replace(base, tiles=mk_spec.TINY_TILES)
+    assert p.exec_for(base_t, B=8, T=1).tiles is mk_spec.TINY_TILES
+    d = mk.get_profile("default").exec_for(base, B=8, T=1)
+    assert d.tiles == mk.default_tiles(8) and d.pool_gather is False
+
+
+def test_exec_spec_pool_gather_default_is_split():
+    assert mk.ExecSpec().pool_gather is False
+    assert not mk.ExecSpec(paged_kv=True, T=4, B=24).GPR
+
+
+def test_borrow_epool_rejected_inside_expert_stream():
+    ring = object.__new__(TwoRing)
+    ring._ering_busy = False
+    ring.scr = {"epool": "EPOOL"}
+    assert ring.borrow_epool() == "EPOOL"
+    with ring.expert_stream():
+        with pytest.raises(AssertionError, match="dynamic expert streaming"):
+            ring.borrow_epool()
+        with (
+            pytest.raises(AssertionError, match="not re-entrant"),
+            ring.expert_stream(),
+        ):
+            pass
+    assert ring.borrow_epool() == "EPOOL"
+
+
+def _tiny_pool_setup(R: int = 1, B: int = 2, T: int = 1):
+    g = qwen35.Qwen35Geometry(
+        L=4,
+        H=256,
+        I=256,
+        IS=256,
+        E=128,
+        TOPK=2,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        att_every=4,
+        moe_tp=False,
+    )
+    tiles = replace(mk_spec.TINY_TILES, bank=512 << 10)
+    ex = mk.ExecSpec(
+        R=R,
+        B=B,
+        T=T,
+        ctx=256,
+        paged_kv=True,
+        num_pages=64,
+        stack_e=False,
+        interpret=True,
+        tiles=tiles,
+    )
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    return g, ex, mesh
+
+
+def test_fused_pool_io_requires_pool_donation():
+    g, ex, mesh = _tiny_pool_setup()
+    spec = qwen35.qwen35_spec(g)
+    with pytest.raises(ValueError, match="requires donate_pools=True"):
+        mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=True)
+    with pytest.raises(ValueError, match="requires donate_pools=True"):
+        mk.make_flat_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=True)
+    with pytest.raises(ValueError, match="requires donate_pools=True"):
+        mk.PallasWriter(fused_pool_io=True).make_step(mesh, spec, ex, donate=False)
+    # "auto" selecting fused at this B is held to the same rule
+    with pytest.raises(ValueError, match="requires donate_pools=True"):
+        mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io="auto")
+    # Split pool I/O does not need donation
+    mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=False)
+
+
+def test_ckpt_bounds_host_check_is_debug_opt_in():
+    g, ex, mesh = _tiny_pool_setup()
+    spec = qwen35.qwen35_spec(g)
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+    bad_ckpt = ckpt + ex.num_pages  # every slot maps past the pool
+    dummy = (jnp.zeros((1,), jnp.int32),) * 3
+    ex_dbg = replace(ex, debug=mk.DebugOptions(check_ckpt_bounds=True))
+    step_dbg = mk.make_pooled_step(mesh, spec, ex_dbg)
+    raw = tuple(
+        jnp.zeros((ex.num_pages, 2, g.HD // 4, 4, ex.page_size), jnp.float8_e4m3fn)
+        for _ in range(g.NATT)
+    )
+    with pytest.raises(ValueError, match="maps to pages"):
+        step_dbg(*dummy, raw, pt, bad_ckpt, roff)

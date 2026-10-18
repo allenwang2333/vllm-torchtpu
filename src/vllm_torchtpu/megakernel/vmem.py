@@ -57,8 +57,9 @@ class StreamParams:
     lay: dict[str, tuple[int, int]]
     S: int
     typed: bool
-    dmm_unroll: int = 8
-    dense_acc_pair: bool = True
+    dmm_unroll: int = 0
+    dense_acc_pair: bool = False
+    rel_fetch: bool = False
 
     def layer_start_tile(self, lyr: Any) -> Any:
         """Return global static stream tile index at the start of layer `lyr`."""
@@ -423,6 +424,7 @@ def build_scratch(
         typed=typed,
         dmm_unroll=tiles.dmm_unroll,
         dense_acc_pair=tiles.dense_acc_pair,
+        rel_fetch=tiles.rel_fetch,
     )
     cp = CommParams(
         R=R,

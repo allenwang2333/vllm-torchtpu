@@ -23,6 +23,8 @@ from . import (
     ops,
     planner,
     pool_alias,
+    profile,
+    profiles,
     spec,
     stream,
     vmem,
@@ -74,6 +76,14 @@ from .models.qwen35_pool import (
 )
 from .ops import rup
 from .planner import encode_ecopy
+from .profile import (
+    DEFAULT_PROFILE,
+    Baseline,
+    Profile,
+    get_profile,
+    list_profiles,
+    register_profile,
+)
 from .spec import (
     Block,
     DebugOptions,
@@ -94,7 +104,9 @@ from .spec import (
 from .stream import TwoRing
 
 __all__ = [
+    "DEFAULT_PROFILE",
     "AllReduceRing",
+    "Baseline",
     "Block",
     "CachePipe",
     "DebugOptions",
@@ -112,6 +124,7 @@ __all__ = [
     "ModelSpec",
     "PallasWriter",
     "PoolBackend",
+    "Profile",
     "ScratchReq",
     "SmallField",
     "Spec",
@@ -134,8 +147,10 @@ __all__ = [
     "fold",
     "frozen_parity_tiles",
     "gather_gdn_states",
+    "get_profile",
     "kernel",
     "kv_to_raw_page",
+    "list_profiles",
     "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
     "make_fused_pooled_step",
@@ -146,10 +161,13 @@ __all__ = [
     "planner",
     "pool_alias",
     "pool_to_states",
+    "profile",
+    "profiles",
     "qwen35_pool_backend",
     "raw_page_to_conv",
     "raw_page_to_kv",
     "raw_pages_to_ssm",
+    "register_profile",
     "rup",
     "scatter_pool_states",
     "should_fuse_pool_io",

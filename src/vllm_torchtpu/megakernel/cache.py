@@ -305,6 +305,20 @@ def _should_use_pool_gather(
     return bool(ex.pool_gather)
 
 
+def _require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) -> None:
+    """Fail closed: fused pool I/O is only correct with outer pool donation.
+
+    On TPU the fused megakernel writes the pools through unaliased HBM DMAs and
+    returns the donated inputs as outputs (see `cache_experimental`). Without
+    `donate_pools=True` XLA may hand the kernel a copy, silently dropping writes.
+    """
+    if use_fused and not donate_pools:
+        raise ValueError(
+            f"fused_pool_io for ModelSpec {ms.name!r} requires donate_pools=True "
+            "(the fused kernel relies on outer buffer donation for its pool writes)"
+        )
+
+
 def make_flat_pooled_step(
     mesh: Any,
     model_spec: Any,
@@ -332,6 +346,7 @@ def make_flat_pooled_step(
         min_b_hi=min_b_hi,
     )
     use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    _require_fused_donation(ms, use_fused, donate_pools)
     ex_paged = dataclasses.replace(
         ex,
         paged_kv=True,
@@ -435,7 +450,7 @@ def make_flat_pooled_step(
 
         if use_fused or use_gpr:
             act_mode_l = "from_ckpt" if has_rec else "all"
-            if has_rec:
+            if has_rec and ex_paged.debug.check_ckpt_bounds:
                 _validate_ckpt_bounds(
                     ckpt_indices,
                     ex_paged.num_pages,
@@ -559,6 +574,7 @@ def make_pooled_step(
         min_b_hi=min_b_hi,
     )
     use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    _require_fused_donation(ms, use_fused, donate_pools)
     ex_paged = dataclasses.replace(
         ex,
         paged_kv=True,
@@ -650,7 +666,7 @@ def make_pooled_step(
             act_mode_l, active_mask_l = _resolve_active_seqs_mode(
                 active_seqs, default_mode="from_ckpt" if has_rec else "all"
             )
-            if has_rec:
+            if has_rec and ex_paged.debug.check_ckpt_bounds:
                 _validate_ckpt_bounds(
                     ckpt_indices,
                     ex_paged.num_pages,
@@ -898,7 +914,7 @@ def make_pooled_step(
             active_seqs,
             rb_tuple,
         ) = _parse_call_args(states_or_raw, rest)
-        if has_rec:
+        if has_rec and ex_paged.debug.check_ckpt_bounds:
             act_m, act_arr = _resolve_active_seqs_mode(
                 _unwrap_active_seqs(active_seqs),
                 default_mode="from_ckpt",
@@ -994,7 +1010,7 @@ class DirectHBM(CachePipe):
 
 @dataclass(frozen=True)
 class PallasWriter(CachePipe):
-    """M3 pooled cache pipe (default GPR+scatter or split; optional `fused_pool_io`)."""
+    """M3 pooled cache pipe (default split 3-stage; opt-in GPR or `fused_pool_io`)."""
 
     fused_pool_io: bool | str | None = None
     max_b_low: int = 24

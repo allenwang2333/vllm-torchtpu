@@ -67,6 +67,7 @@ class TwoRing:
         self._branch_offsets: list[int] | None = None
         self._active_branches: tuple[int, ...] = tuple(range(len(sp.branch_counts)))
         self._cur_layer: Any = None
+        self._ering_busy: bool = False
 
     def begin_layer(self, lyr: Any) -> Any:
         """Reset `self.cursor` and per-branch segment offsets at layer `lyr`."""
@@ -163,7 +164,11 @@ class TwoRing:
             self._seg_tiles = prev_tiles
             if lazy and n_tiles > 0:
                 with self.sc("refill"):
-                    if self._cur_layer is not None and seg_offsets is not None:
+                    if (
+                        self.sp.rel_fetch
+                        and self._cur_layer is not None
+                        and seg_offsets is not None
+                    ):
                         sp = self.sp
                         blk = (
                             self._cur_layer
@@ -218,9 +223,24 @@ class TwoRing:
             dt,
         )
 
+    @contextlib.contextmanager
+    def expert_stream(self):
+        """Mark the expert ring (`epool`) as owned by dynamic expert streaming.
+
+        Tracked at trace time: `Block.emit` bodies are traced sequentially, so a
+        `borrow_epool()` traced inside this window would alias in-flight expert
+        DMAs and is rejected.
+        """
+        assert not self._ering_busy, "expert_stream() is not re-entrant"
+        self._ering_busy = True
+        try:
+            yield
+        finally:
+            self._ering_busy = False
+
     def borrow_epool(self):
         """Return `scr['epool']` for non-overlapping block use (e.g. GQA `KVE`)."""
-        assert not getattr(self, "_in_dynamic", False), (
+        assert not self._ering_busy, (
             "borrow_epool() cannot be called while dynamic expert streaming is active"
         )
         assert "epool" in self.scr, "borrow_epool() requires 'epool' in scratch"
@@ -454,7 +474,7 @@ class TwoRing:
         dmm_ctx = None
         if g0 is None:
             if self._branch_offsets is not None:
-                if self._cur_layer is not None:
+                if self.sp.rel_fetch and self._cur_layer is not None:
                     blk = (
                         self._cur_layer
                         if sp.period == 1

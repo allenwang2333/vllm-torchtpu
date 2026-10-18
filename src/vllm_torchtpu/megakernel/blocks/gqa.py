@@ -200,6 +200,10 @@ class GQABlock(Block):
             )
         KV_ITEM = 2 * (g.HD // 4) * BLK * 4
         EBROWS = tiles.ebank // 128
+        # KVE stages KV blocks in the (idle) expert ring. On TPU this aliases the
+        # untyped byte pool `epool` via `pool_alias.view`; in CPU interpret mode
+        # `vmem.build_scratch` allocates a separate typed `epool`, so the
+        # aliasing itself is only exercised on TPU (the KV math is shared).
         KVE = bool(
             ex.paged_kv
             and tiles.kv_ering
@@ -230,7 +234,8 @@ class GQABlock(Block):
         NHH = g.HD // 128
         SR = 8 // PB
         QV = (
-            (SPLIT or ex.VER)
+            tiles.gqa_qv
+            and (SPLIT or ex.VER)
             and g.HD % 128 == 0
             and nh <= 8
             and (not PACK or PB * nh == 8)

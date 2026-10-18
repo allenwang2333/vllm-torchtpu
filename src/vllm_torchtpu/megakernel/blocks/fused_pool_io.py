@@ -40,6 +40,27 @@ aliasing contracts:
    - `GQABlock.outputs` declares `O["raw"]` (`access="w"`), `kernel.build`
      aliases `ST["raw"] -> O["raw"]` in `pallas_call(input_output_aliases=...)`,
      and `ctx.raw_refs = O["raw"]`.
+
+CPU vs TPU code-path differences (beyond aliasing):
+---------------------------------------------------
+The `if interpret:` branches below emulate TPU ref views with value ops, so CPU
+tests cover the arithmetic but not every TPU lowering:
+- FP8 page access: CPU uses value-level `lax.bitcast_convert_type` + `swapaxes`
+  on whole pages; TPU uses ref `.bitcast(...).reshape(...)` views (sublane-packed
+  `(4, page_size)` layout).
+- KV column placement (RMW of the new token's KV lane): CPU selects the column
+  with a masked lane sum; TPU rotates it with `pltpu.roll` (same bit pattern).
+- GDN recurrent state: CPU materializes the whole `[vh, KD, VD]` state as a value
+  and writes all `REC_PAGES` at once; TPU streams per-head reads (from the input
+  page at t=0, else from the previous token's output page) and per-head writes.
+- GDN input refill: CPU issues the next sequence's gather before the recurrence;
+  TPU issues it after (DMA scheduling only).
+- Conv checkpoint page: CPU zero-pads the staged taps to the full 256-row page;
+  TPU writes the live rows only and relies on the zero-initialized staging page.
+Only the TPU paths are exercised by the TPU benches (`test_tpu_v7x8_bench.py`).
+
+The fused GDN recurrence is always head-major (`Tiles.gdn_head_major=True`
+numerics); compare it against the split path with that flag enabled.
 """
 
 from __future__ import annotations
@@ -104,10 +125,10 @@ def gqa_fused_outputs(g: Any, ex: ExecSpec) -> list[StateDecl]:
     return []
 
 
-def gqa_fused_scratch(ex: ExecSpec, ap: Any) -> dict[str, Any]:
+def gqa_fused_scratch(ex: ExecSpec, hd: int) -> dict[str, Any]:
     """Scratch buffers for in-kernel KV page RMW (`ex.FUSED=True`)."""
     return {
-        "kv_scat_page": pltpu.VMEM((ex.NS, 2, ap.HD // 4, 4, ex.page_size), FP8),
+        "kv_scat_page": pltpu.VMEM((ex.NS, 2, hd // 4, 4, ex.page_size), FP8),
         "kv_rd_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
         "kv_wr_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
         "kv_rd_pend": pltpu.SMEM((ex.NS,), I32),
@@ -895,6 +916,10 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                 .reshape(256, 128)
                             )
                             if conv_fast:
+                                # Rows [conv_live, 256) stay zero: `gdn_out_page`
+                                # is zero-filled in `gdn_fused_init_buffers` and
+                                # only this conv write touches the conv page, so
+                                # the HBM page matches split's zero-padded page.
                                 cv[0:conv_live, :] = conv_head
                             else:
                                 cv[:conv8_rows, :] = w_conv.reshape(conv8_rows, 128)

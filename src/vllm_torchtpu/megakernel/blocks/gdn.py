@@ -116,7 +116,8 @@ class GDNParams:
     ckpt_t_off: int = 0
     GPR: bool = False
     GCONV_ROWS: int = 0
-    conv_stage: bool = True
+    conv_stage: bool = False
+    head_major: bool = False
 
 
 class _GprRecIn:
@@ -484,6 +485,7 @@ class GDNBlock(Block):
             GPR=GPR,
             GCONV_ROWS=GCONV_ROWS,
             conv_stage=bool(tiles.conv_stage),
+            head_major=bool(tiles.gdn_head_major),
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
@@ -756,7 +758,13 @@ class GDNBlock(Block):
         def colsk(x):
             return jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
 
-        assert 2 * kh <= vh, (kh, vh)
+        def cols(x):
+            return jnp.broadcast_to(colsk(x)[:, None], (kh, expand, KD, VD)).reshape(
+                vh, KD, VD
+            )
+
+        HEAD_MAJOR = gp.head_major
+        assert not HEAD_MAJOR or 2 * kh <= vh, (kh, vh)
         NCB = 2 if 4 * kh <= vh else 1
         hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
 
@@ -776,31 +784,47 @@ class GDNBlock(Block):
                 q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
                 q = q * KD**-0.5
                 k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
-                cb = (bb % NCB) * 2 * kh
-                sb[cb : cb + kh] = colsk(k)
-                sb[cb + kh : cb + 2 * kh] = colsk(q)
                 beta = rnd(jax.nn.sigmoid(bac[bb, 0:vh]))
                 a = bac[bb, A_REL : A_REL + vh]
                 decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
-                eg = jnp.exp(decay)[:, None, None]
-                beta2 = beta[:, None]
                 src = (
                     ((n - n // T + bb // T) if bb % T == 0 else bb - 1) * vh
                     if VER
                     else h0
                 )
-                out_acc = jnp.zeros((vh, VD), F32)
-                for h in range(vh):
-                    j = h // expand
-                    kc_h = sb[cb + j : cb + j + 1]
-                    s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
-                    pred_h = jnp.sum(s_h * kc_h, axis=1)
-                    delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
-                    s_h = s_h + kc_h * delta_h[:, None, :]
-                    qc_h = sb[cb + kh + j : cb + kh + j + 1]
-                    out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
-                    st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
-                out = rnd(out_acc)
+                if not HEAD_MAJOR:
+                    # Frozen-parity recurrence: whole-state update staged in `sb`.
+                    qc, kc_ = cols(q), cols(k)
+                    sb[...] = (
+                        st[src : src + vh].astype(F32) * jnp.exp(decay)[:, None, None]
+                    )
+                    pred = jnp.sum(sb[...] * kc_, axis=1)
+                    delta = (v - pred) * beta[:, None]
+                    sb[...] = sb[...] + kc_ * delta[:, None, :]
+                    out = rnd(jnp.sum(sb[...] * qc, axis=1))
+                    st[h0 : h0 + vh] = sb[...].astype(BF16)
+                else:
+                    # Head-major recurrence (opt-in `Tiles.gdn_head_major`):
+                    # per-head update with `colsk` K/Q double-buffered in `sb`.
+                    cb = (bb % NCB) * 2 * kh
+                    sb[cb : cb + kh] = colsk(k)
+                    sb[cb + kh : cb + 2 * kh] = colsk(q)
+                    eg = jnp.exp(decay)[:, None, None]
+                    beta2 = beta[:, None]
+                    out_acc = jnp.zeros((vh, VD), F32)
+                    for h in range(vh):
+                        j = h // expand
+                        kc_h = sb[cb + j : cb + j + 1]
+                        s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
+                        pred_h = jnp.sum(s_h * kc_h, axis=1)
+                        delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                        s_h = s_h + kc_h * delta_h[:, None, :]
+                        qc_h = sb[cb + kh + j : cb + kh + j + 1]
+                        out_acc = jnp.where(
+                            hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc
+                        )
+                        st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
+                    out = rnd(out_acc)
                 val = out * lax.rsqrt(
                     jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps
                 )

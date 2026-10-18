@@ -113,16 +113,26 @@ class Tiles:
     gdn_bufs: int = 3  # GDN state ring depth
     kv_sub: int = 0  # KV tokens per online-softmax update inside a block (0: full)
     amask: int = 1  # Attention mask mode (0..4)
-    ecopy_opt: int = 1  # Redundant expert dedup optimization (0 or 1)
-    r2_direct_store: bool = True  # Direct VMEM store on MoE r2 tile 0
-    route_vec: bool = True  # Vectorized MXU expert route packing
-    dense_acc_pair: bool = True  # Unrolled / paired dense matmul accumulation
-    kv_ering: bool = True  # Alias KV DMA ring onto epool when unused in GQA
-    pair_kv: bool = True  # Pair KV attention items to overlap KV DMA + softmax
-    dmm_unroll: int = 8  # Max tiles to fully unroll in dmatmul
-    gq_pack: bool = True  # Pack G*nh Q heads into 16-row MXU tiles on verify
-    topk_lanes: bool = True  # Batcher odd-even top-k on lanes for E >= 128
-    conv_stage: bool = True  # Stage GDN conv taps in VMEM sbuf on TPU
+    ecopy_opt: int = 0  # Redundant expert dedup optimization (0 or 1)
+    # Opt-in performance flags below default to the frozen-parity path. Named
+    # profiles (`profile.py`, `profiles/`) turn them on; defaults never do.
+    pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
+    r2_direct_store: bool = False  # Direct VMEM store on MoE r2 tile 0
+    # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
+    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.route` holds)
+    route_vec: bool = False
+    dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
+    kv_ering: bool = False  # Alias KV DMA ring onto epool when unused in GQA
+    pair_kv: bool = False  # Pair KV attention items to overlap KV DMA + softmax
+    dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
+    gqa_qv: bool = False  # Head-batched Q/K norm+RoPE and 128-lane Q/O staging
+    gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
+    topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
+    conv_stage: bool = False  # Stage fused-path GDN conv taps through VMEM `sb`
+    # Head-major GDN recurrence (per-head state update; reassociates vs frozen)
+    gdn_head_major: bool = False
+    moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
+    rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
 
     def tk(self, K: int, N: int, dtype: Any, bank: int) -> int:
         """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank`."""
@@ -137,83 +147,50 @@ class Tiles:
         return best
 
 
-DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2, kv_sub=1024)
+DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
 VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
 WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
 TINY_TILES = Tiles(
-    bank=128 << 10,
-    nbd=10,
-    nbe=6,
-    ebank=256 << 10,
-    kv_blk=256,
-    nkv=3,
-    vmem_mib=32,
-    kv_sub=0,
-    dense_acc_pair=False,
+    bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, nkv=3, vmem_mib=32
 )
 
 
 def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Tuned default tiles for batch row count `B`."""
-    nbe_ep = 12 if not moe_tp else 10
-    nbe_small = 20 if not moe_tp else nbe_ep
+    """General, frozen-parity default tiles for batch row count `B`.
+
+    Matches the frozen prototype's `default_tiles` (`frozen_qwen35/megakernel.py`)
+    with one numerics-neutral deviation kept since M2: `nbe=6` for `B > 48` (the
+    frozen TPU benches apply the same override so 64-row MoE scratch fits VMEM).
+    Every opt-in performance flag stays at its `Tiles` default (off). Tuned,
+    numerics-changing schedules live in named profiles (`profile.py`).
+
+    `moe_tp` is accepted for signature compatibility with profile tile rules; the
+    default schedule does not depend on it. Hierarchical all-reduce (`hier` 1/2)
+    is v7x-8 specific, so `R` outside `{1, 8}` falls back to the flat ring.
+    """
+    del moe_tp
     if B > 48:
-        t = dataclasses.replace(WIDE_TILES, nbd=8 if B <= 56 else 7, nbe=nbe_ep, hier=2)
+        t = dataclasses.replace(WIDE_TILES, nbe=6)
     elif B > 32:
-        t = dataclasses.replace(WIDE_TILES, nbd=8, nbe=nbe_ep, hier=2)
+        t = WIDE_TILES
     elif B > 24:
-        t = dataclasses.replace(WIDE_TILES, nbe=nbe_ep, hier=2)
+        t = dataclasses.replace(WIDE_TILES, hier=2)
     elif B > 16:
-        t = dataclasses.replace(WIDE_TILES, nbd=12, nbe=nbe_ep, hier=2)
+        t = dataclasses.replace(WIDE_TILES, nbd=12, hier=2)
     elif B > 8:
-        t = dataclasses.replace(VERIFY_TILES, nbe=nbe_ep)
+        t = VERIFY_TILES
     elif B > 4:
-        t = dataclasses.replace(
-            DEFAULT_TILES, nbe=nbe_small, rsag=True, hier=2, ecopy_opt=1
-        )
+        t = dataclasses.replace(DEFAULT_TILES, rsag=True, hier=2, ecopy_opt=1)
     else:
-        t = dataclasses.replace(DEFAULT_TILES, nbe=nbe_small, ecopy_opt=1)
-    if R != 8 and t.hier in (1, 2):
-        is_pow2_r = R >= 2 and (R & (R - 1)) == 0
-        t = dataclasses.replace(t, hier=3 if (B <= 32 and is_pow2_r) else 0)
+        t = DEFAULT_TILES
+    if R not in (1, 8) and t.hier != 0:
+        t = dataclasses.replace(t, hier=0)
     return t
 
 
 def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Tiles matching the frozen prototype (`megakernel.py`) for bit-exact parity."""
-    del R
-    base = Tiles(
-        hier=1,
-        pack=1,
-        mb8=2,
-        kv_sub=0,
-        ecopy_opt=0,
-        pipe=moe_tp,
-        r2_direct_store=False,
-        route_vec=False,
-        dense_acc_pair=False,
-        kv_ering=False,
-        pair_kv=False,
-        dmm_unroll=0,
-        gq_pack=False,
-        topk_lanes=False,
-        conv_stage=False,
-    )
-    ver = dataclasses.replace(base, nkv=4, rsag=True, hier=2, ecopy_opt=1)
-    wide = dataclasses.replace(ver, nbd=10, nkv=3, vmem_mib=62, hier=0)
-    if B > 48:
-        return dataclasses.replace(wide, nbe=6)
-    if B > 32:
-        return wide
-    if B > 24:
-        return dataclasses.replace(wide, hier=2)
-    if B > 16:
-        return dataclasses.replace(wide, nbd=12, hier=2)
-    if B > 8:
-        return ver
-    if B > 4:
-        return dataclasses.replace(base, rsag=True, hier=2, ecopy_opt=1)
-    return base
+    """Tiles matching the frozen prototype for bit-exact parity (`== default_tiles`)."""
+    return default_tiles(B, moe_tp=moe_tp, R=R)
 
 
 @dataclass(frozen=True)
@@ -226,6 +203,9 @@ class DebugOptions:
         frozenset()
     )  # Ablation skip set (e.g. {"dense", "comm", "kv", "experts"})
     scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
+    # Host-side ckpt_indices bounds validation on every eager pooled-step call
+    # (device-to-host sync + Python loop). In-kernel clamps always apply.
+    check_ckpt_bounds: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,13 +222,15 @@ class ExecSpec:
     num_pages: int = 4096  # Total pages per attention pool per rank
     max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
     fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
-    pool_gather: bool | None = None  # None: auto; True/False: in-kernel GDN gather
+    # In-kernel GDN gather (GPR): False (default) = split gather kernel;
+    # None = auto (pool backend decides); True = required.
+    pool_gather: bool | None = False
     act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
     ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
     roff_1d: bool = False  # True: 1D read_offsets (NS,); False: 2D (G_PER_ATT, NS)
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
-    tiles: Tiles | None = None  # None -> default_tiles(B)
+    tiles: Tiles | None = None  # None -> default_tiles(B, R=R)
     debug: DebugOptions = DebugOptions()
 
     @property
@@ -264,10 +246,9 @@ class ExecSpec:
         return self.tiles if self.tiles is not None else default_tiles(self.B, R=self.R)
 
     def resolve_tiles(self, g: Any = None) -> Tiles:
-        if self.tiles is not None:
-            return self.tiles
-        moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
-        return default_tiles(self.B, moe_tp=moe_tp, R=self.R)
+        """Same as `resolved_tiles` (`g` kept for callers; defaults ignore `moe_tp`)."""
+        del g
+        return self.resolved_tiles
 
     @property
     def resolved_max_pages_per_seq(self) -> int:

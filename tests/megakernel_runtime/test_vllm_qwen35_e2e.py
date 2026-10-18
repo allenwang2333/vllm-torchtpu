@@ -50,6 +50,7 @@ from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     parse_mk_verify_buckets,
     prepare_step_inputs_eager,
     prepare_step_metadata,
+    resolve_driver_profile,
     select_bucket,
 )
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
@@ -380,6 +381,29 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_json["fused_pool_io"] == "auto"
     assert cfg_json["pool_gather"] is True
 
+    # Defaults come from the `default` profile (frozen-parity, split pool I/O)
+    cfg_def = parse_megakernel_config(raw="1")
+    assert cfg_def["profile"] == "default"
+    assert cfg_def["fused_pool_io"] is False
+    assert cfg_def["pool_gather"] is False
+    # An empty value means "off", not "auto"
+    cfg_empty = parse_megakernel_config(raw="fused_pool_io=,pool_gather=")
+    assert cfg_empty["fused_pool_io"] is False
+    assert cfg_empty["pool_gather"] is False
+    # Named profile selection via VLLM_TPU_MEGAKERNEL; explicit keys win
+    cfg_c30 = parse_megakernel_config(raw="profile=qwen35-candidate30")
+    assert cfg_c30["enabled"] and cfg_c30["profile"] == "qwen35-candidate30"
+    assert cfg_c30["pool_gather"] == "auto"
+    assert cfg_c30["fused_pool_io"] is False
+    assert cfg_c30["buckets"] == cfg_def["buckets"]
+    cfg_c30_ov = parse_megakernel_config(
+        raw="profile=qwen35-candidate30,pool_gather=0,fused_pool_io=auto"
+    )
+    assert cfg_c30_ov["pool_gather"] is False
+    assert cfg_c30_ov["fused_pool_io"] == "auto"
+    with pytest.raises(ValueError, match="unknown megakernel profile"):
+        parse_megakernel_config(raw="profile=does-not-exist")
+
     fake_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(
             additional_config={
@@ -392,6 +416,18 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_runner["mode"] == "tp"
     assert cfg_runner["buckets"] == (16, 32)
     assert cfg_runner["ab"] is True
+    assert cfg_runner["profile"] == "default"
+
+    # Named profile selection via `additional_config`
+    fake_runner_c30 = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={"megakernel": {"profile": "qwen35-candidate30"}}
+        )
+    )
+    cfg_runner_c30 = parse_megakernel_config(runner=fake_runner_c30, raw="")
+    assert cfg_runner_c30["enabled"]
+    assert cfg_runner_c30["profile"] == "qwen35-candidate30"
+    assert cfg_runner_c30["pool_gather"] == "auto"
 
     import vllm_torchtpu.megakernel_runtime as mk_rt
 
@@ -410,6 +446,43 @@ def test_bucket_parsing_and_selection() -> None:
     assert select_bucket(5, buckets) == 8
     with pytest.raises(ValueError, match="exceeds max bucket"):
         select_bucket(9, buckets)
+
+
+def test_resolve_driver_profile_and_fused_ir_rule() -> None:
+    """Profile resolution (overrides, model check) and the eager fused IR rule."""
+    d = resolve_driver_profile(None, model_name="qwen3_5")
+    assert d.name == "default" and d.pool_gather is False and d.fused_pool_io is False
+    c30 = resolve_driver_profile("qwen35-candidate30", model_name="qwen3_5")
+    assert c30.pool_gather is None and c30.numerics == "approx"
+    c30_ov = resolve_driver_profile(
+        "qwen35-candidate30",
+        model_name="qwen3_5",
+        fused_pool_io="auto",
+        pool_gather="0",
+        fused_pool_io_max_b=16,
+    )
+    assert c30_ov.fused_pool_io == "auto" and c30_ov.pool_gather is False
+    assert c30_ov.fused_pool_io_max_b == 16
+    assert c30_ov.tiles is c30.tiles
+    assert (
+        resolve_driver_profile(None, model_name="x", fused_pool_io="").fused_pool_io
+        is False
+    )
+    assert (
+        resolve_driver_profile(None, model_name="x", pool_gather="auto").pool_gather
+        is None
+    )
+    with pytest.raises(ValueError, match="targets model"):
+        resolve_driver_profile("qwen35-candidate30", model_name="other_model")
+    with pytest.raises(ValueError, match="unknown megakernel profile"):
+        resolve_driver_profile("nope", model_name="qwen3_5")
+
+    # Eager warmup must still IR-check every fused bucket (donation is required).
+    drv = object.__new__(MegakernelDriver)
+    drv._bucket_fused_io = {(1, 8): False, (1, 16): True, (4, 8): False}
+    warmed = [(1, 8), (1, 16), (4, 8)]
+    assert drv._ir_required_buckets(warmed, is_eager=False) == warmed
+    assert drv._ir_required_buckets(warmed, is_eager=True) == [(1, 16)]
 
 
 def test_ab_calibrator() -> None:
@@ -998,7 +1071,10 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     driver.bind_and_warmup(runner)
     assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
     assert driver._bucket_fused_io == {(1, 2): False, (4, 4): False}
-    assert driver._bucket_gpr == {(1, 2): True, (4, 4): True}
+    # Default profile: split pool I/O everywhere (GPR is opt-in; it never applies at
+    # T=1 and "auto" only selects it for WIDE verify buckets, B > 16).
+    assert driver.profile.name == "default"
+    assert driver._bucket_gpr == {(1, 2): False, (4, 4): False}
     for idx, p in enumerate(raw_pools_t):
         assert p.data_ptr() == orig_data_ptrs[idx]
         assert p.untyped_storage().data_ptr() == orig_storage_ptrs[idx]
@@ -1091,7 +1167,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # Independent split 3-stage `qwen35.make_pooled_step` oracle
     ex_t1 = replace(driver.base_exec, B=2, T=1, fused_pool_io=False, pool_gather=False)
     step_ref_t1, _ = qwen35.make_pooled_step(
-        mesh, g, ex_t1, donate_pools=False, fused_pool_io=False, pool_gather=False
+        mesh, g, ex_t1, donate_pools=False, fused_pool_io=False
     )
     hid_in_t1_pad = torch.nn.functional.pad(hid_t1_bf16, (0, 0, 0, ex_t1.M - 2))
     ckpt_ref_t1 = jnp.asarray(
@@ -1143,7 +1219,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
 
     ex_t4 = replace(driver.base_exec, B=4, T=4, fused_pool_io=False, pool_gather=False)
     step_ref_t4, _ = qwen35.make_pooled_step(
-        mesh, g, ex_t4, donate_pools=False, fused_pool_io=False, pool_gather=False
+        mesh, g, ex_t4, donate_pools=False, fused_pool_io=False
     )
     hid_t4_bf16 = driver.embed_tokens(input_ids_t4).to(torch.bfloat16)
     hid_in_t4_pad = torch.nn.functional.pad(hid_t4_bf16, (0, 0, 0, ex_t4.M - 4))

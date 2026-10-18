@@ -132,6 +132,7 @@ class MoEParams:
     topk_lanes: bool
     route_vec: bool
     r2_direct_store: bool
+    unroll: bool
     ecopy_opt: int
     eps: float
     zero_centered_norm: bool
@@ -218,7 +219,7 @@ class MoEBlock(Block):
         nss = 3 + (nbe - 1) // te
         pipe = tiles.pipe and t13 == 1 and t2 == 1
         pipe_ep = (
-            tiles.pipe and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
+            tiles.pipe_ep and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
         )
         n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
         lazy_moe = tiles.lazy and n_moe <= tiles.nbd
@@ -250,6 +251,7 @@ class MoEBlock(Block):
             topk_lanes=tiles.topk_lanes,
             route_vec=tiles.route_vec,
             r2_direct_store=tiles.r2_direct_store,
+            unroll=bool(tiles.moe_unroll or pipe_ep),
             ecopy_opt=tiles.ecopy_opt,
             eps=g.eps,
             zero_centered_norm=bool(g.zero_centered_norm),
@@ -574,6 +576,20 @@ class MoEBlock(Block):
             if T13 == 1:
                 h = stream.mm(xb[...], etake("e13", base)[...])
                 egive(base, l_idx)
+            elif not mp.unroll:
+                # Frozen-parity path: rolled tile loop with per-tile refill.
+                acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
+
+                def b13(t, cc):
+                    u = base + t
+                    w = etake("e13", u)
+                    k0 = pl.multiple_of(t * tk["e13"], tk["e13"])
+                    acc[:, : 2 * IR] += stream.mm(xb[:, pl.ds(k0, tk["e13"])], w[...])
+                    egive(u, l_idx)
+                    return cc
+
+                lax.fori_loop(0, T13, b13, 0)
+                h = acc[:, : 2 * IR]
             else:
                 TK13 = tk["e13"]
                 if not DIRECT0:
@@ -611,6 +627,20 @@ class MoEBlock(Block):
                     y = rnd(y * scr["es"][s, :, lo : lo + CH])
                     part[0:MR, j * CH : (j + 1) * CH] += wcol * y
                 egive(u2, l_idx)
+            elif not mp.unroll:
+                acc[:, :H] = jnp.zeros((MB, H), F32)
+
+                def b2(t, cc):
+                    u = u2 + t
+                    w = etake("e2", u)
+                    k0 = pl.multiple_of(t * tk["e2"], tk["e2"])
+                    acc[:, :H] += stream.mm(xb2[:, pl.ds(k0, tk["e2"])], w[...])
+                    egive(u, l_idx)
+                    return cc
+
+                lax.fori_loop(0, T2, b2, 0)
+                y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+                part[0:MR, :] += wcol * y
             else:
                 TK2 = tk["e2"]
                 if not DIRECT0:
@@ -1148,7 +1178,7 @@ class MoEBlock(Block):
                         def _(k=k):
                             fetch_e(k, l_idx)
                 else:
-                    if B <= 40:
+                    if mp.unroll and B <= 40:
                         fetch_loop(jnp.minimum(NBE, n_hit * TE), l_idx)
                     else:
                         lax.fori_loop(
@@ -1159,7 +1189,7 @@ class MoEBlock(Block):
                         )
             return n_hit
 
-        with stream.segment(lazy=LAZY_MOE):
+        with stream.expert_stream(), stream.segment(lazy=LAZY_MOE):
             with sc("moe_router"):
                 assert ctx.norm_x is not None, (
                     "MoEBlock requires input_norm='post_norm' to populate ctx.norm_x"
