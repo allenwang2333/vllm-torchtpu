@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
 
 
 def env_with_choices(
@@ -2023,6 +2024,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
+    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
+    # without getting one KV block of tokens before it moves ahead of the
+    # other prefill chunks and is no longer held (0 disables hold-back).
+    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
+    # copies it automatically to DP/Ray engine-core actors.
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
 }
 
