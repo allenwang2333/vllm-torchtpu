@@ -126,8 +126,8 @@ def gdn_layer(c, w, x, conv_state, rec_state):
 def attn_layer(c, w, x, k_cache, v_cache, ctx, flash_bkv=None):
     """x [T, H]; k_cache, v_cache [ctx + T, NKV, HD] fp8 with the context in [:ctx].
     Returns out [T, H] f32 and the caches with the new tokens' K/V written at ctx .. ctx+T-1.
-    flash_bkv: emulate a tiled online softmax over KV tiles of that size (bf16 P per tile),
-    for bit-level comparison with a flash kernel."""
+    flash_bkv: emulate a tiled online softmax over KV tiles of that size (bf16 scores and P per
+    tile, f32 state, as the serving RPA), for close comparison with a flash kernel."""
     t = x.shape[0]
     qkv = qlinear(x, w["qkv_w"], w["qkv_s"]).astype(BF16)
     qg = qkv[:, :2 * c.NH * c.HD].reshape(t, c.NH, 2 * c.HD)
@@ -156,10 +156,12 @@ def attn_layer(c, w, x, k_cache, v_cache, ctx, flash_bkv=None):
         l = jnp.zeros_like(m)
         acc = jnp.zeros(s.shape[:-1] + (c.HD,))
         for j0 in range(0, s.shape[-1], flash_bkv):
-            st = s[..., j0:j0 + flash_bkv]
-            m_new = jnp.maximum(m, jnp.max(st, -1, keepdims=True))
+            # bf16 scores and exponentials, f32 running max / sum / accumulator (serving RPA).
+            st = s[..., j0:j0 + flash_bkv].astype(BF16)
+            m_new = jnp.maximum(m, jnp.max(st, -1, keepdims=True).astype(F32))
             alpha = jnp.where(jnp.isfinite(m_new), jnp.exp(m - m_new), 1.0)
-            pe = jnp.where(jnp.isfinite(m_new), jnp.exp(st - m_new), 0.0)
+            pe = jnp.where(jnp.isfinite(m_new), jnp.exp(st - m_new.astype(BF16)), 0.0)
+            pe = pe.astype(BF16).astype(F32)
             l = alpha * l + jnp.sum(pe, -1, keepdims=True)
             acc = alpha * acc + jnp.einsum("gqts,sgd->gqtd", pe.astype(BF16).astype(F32),
                                            vv[j0:j0 + flash_bkv])

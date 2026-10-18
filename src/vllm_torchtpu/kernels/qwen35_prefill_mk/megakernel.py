@@ -60,6 +60,7 @@ class MKTiles:
     chunk: int = 64          # GDN chunk
     bq: int = 256            # attention q tile (tokens)
     bkv: int = 512           # attention kv tile
+    att_sub: int = 4         # attention row sub-chunks (MXU / softmax overlap)
     rt: int = 128            # MoE grouped rows per tile
     tm_route: int = 256
     tm_combine: int = 64
@@ -177,7 +178,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                                           eps=c.eps, tm=tl.tm_gate)
                 with jax.named_scope(f"L{li}_att_flash"):
                     P.att_flash(W["qn"], ls["k"], ls["v"], ctx, W["ao"], nh=c.NH, nkv=c.NKV,
-                                hd=c.HD, bq=tl.bq, bkv=tl.bkv, s_max=s_max)
+                                hd=c.HD, bq=tl.bq, bkv=tl.bkv, s_max=s_max, sub=tl.att_sub)
                 with jax.named_scope(f"L{li}_att_gate_quant"):
                     P.att_gate_quant(W["ao"], W["att"], W["aq"], W["as"], nh=c.NH, hd=c.HD,
                                      tm=tl.tm_gate)

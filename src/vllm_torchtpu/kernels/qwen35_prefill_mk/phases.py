@@ -430,20 +430,54 @@ def att_qk_norm_rope_kv(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, ctx, qn_hbm, kc_h
                   pltpu.VMEM((nkv, tm, hd), FP8), pltpu.SemaphoreType.DMA((3,)))
 
 
-def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max):
+def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max, sub=4):
     """Causal GQA attention of the T new tokens (positions ctx + t) over the cache rows
-    0 .. ctx + T - 1, per kv head with its nh / nkv q heads folded into the rows, f32 online
-    softmax. qn [nh, T, hd] bf16, kc / vc [nkv, S, hd] fp8, o [nh, T, hd] f32."""
+    0 .. ctx + T - 1, per kv head with its nh / nkv q heads folded into the rows.
+
+    Like the serving RPA: the 1/sqrt(hd) scale is folded into q when it is a power of two (exact;
+    hd 256 gives 1/16), scores
+    go to bf16 for the max / exp (sum, running max and accumulator in f32), and only KV tiles
+    that cross the causal diagonal are masked. The rows are split into `sub` chunks, unrolled, so
+    one chunk's QK matmul can overlap another's softmax.
+    qn [nh, T, hd] bf16, kc / vc [nkv, S, hd] fp8, o [nh, T, hd] f32."""
     t = qn_hbm.shape[1]
     grp = nh // nkv
     rows = grp * bq
+    rc = rows // sub
     n_kv = pl.cdiv(s_max, bkv)
     scale = hd ** -0.5
+    fold = math.frexp(scale)[0] == 0.5      # exact in q only for a power of two (hd 256: 1/16)
 
     def last_kv(i):                         # last kv tile the q tile i needs
         return (ctx + (i + 1) * bq - 1) // bkv
 
     def run(m_ref, l_ref, acc_ref):
+        def step(q_ref, k_ref, v_ref, i, j, masked):
+            kk = k_ref[0].astype(BF16)
+            vv = v_ref[0].astype(BF16)
+            for c in range(sub):
+                r = slice(c * rc, (c + 1) * rc)
+                q = q_ref[...].reshape(rows, hd)[r]
+                if fold:
+                    q = q * jnp.asarray(scale, BF16)
+                s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
+                                        preferred_element_type=F32)
+                s = (s if fold else s * scale).astype(BF16)
+                if masked:
+                    row = jax.lax.broadcasted_iota(jnp.int32, (rc, 1), 0) + c * rc
+                    col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
+                    pos = ctx + i * bq + row % bq        # rows are (head, token), head-major
+                    s = jnp.where(j * bkv + col <= pos, s, -jnp.inf)
+                m_prev = m_ref[r, :1]
+                m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True).astype(F32))
+                alpha = jnp.exp(m_prev - m_new)
+                p = jnp.exp(s - m_new.astype(BF16))
+                l_ref[r, :] = jnp.broadcast_to(
+                    alpha * l_ref[r, :1] + jnp.sum(p, -1, keepdims=True, dtype=F32), (rc, 128))
+                m_ref[r, :] = jnp.broadcast_to(m_new, (rc, 128))
+                acc_ref[r, :] = alpha * acc_ref[r, :] + jax.lax.dot_general(
+                    p, vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+
         def body(q_ref, k_ref, v_ref, o_ref):
             i, j = pl.program_id(1), pl.program_id(2)
 
@@ -453,30 +487,21 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                 l_ref[...] = jnp.zeros(l_ref.shape, F32)
                 acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
 
-            @pl.when(j <= last_kv(i))
+            # Fully below the diagonal: every key of the tile precedes the tile's first query.
+            full = (j + 1) * bkv - 1 <= ctx + i * bq
+            live = j <= last_kv(i)
+
+            @pl.when(live & full)
             def _():
-                q = q_ref[...].reshape(rows, hd)
-                kk = k_ref[0].astype(BF16)
-                vv = v_ref[0].astype(BF16)
-                s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
-                                        preferred_element_type=F32) * scale
-                row = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
-                col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
-                pos = ctx + i * bq + row % bq        # rows are (head, token) head-major
-                s = jnp.where(j * bkv + col <= pos, s, -jnp.inf)
-                m_prev = m_ref[...][:, :1]
-                m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True))
-                alpha = jnp.exp(m_prev - m_new)
-                p = jnp.exp(s - m_new)
-                l_ref[...] = jnp.broadcast_to(alpha * l_ref[...][:, :1] + jnp.sum(p, -1, keepdims=True),
-                                              l_ref.shape)
-                m_ref[...] = jnp.broadcast_to(m_new, m_ref.shape)
-                acc_ref[...] = alpha * acc_ref[...] + jax.lax.dot_general(
-                    p.astype(BF16), vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+                step(q_ref, k_ref, v_ref, i, j, False)
+
+            @pl.when(live & jnp.logical_not(full))
+            def _():
+                step(q_ref, k_ref, v_ref, i, j, True)
 
             @pl.when(j == n_kv - 1)
             def _():
-                o_ref[...] = (acc_ref[...] / l_ref[...][:, :1]).reshape(grp, bq, hd)
+                o_ref[...] = (acc_ref[...] / l_ref[:, :1]).reshape(grp, bq, hd)
 
         kv_map = lambda g, i, j: (g, jnp.minimum(j, last_kv(i)), 0)
         pltpu.emit_pipeline(

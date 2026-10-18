@@ -129,9 +129,26 @@ def time_step(args):
         print("XPROF " + d, flush=True)
 
 
+def sweep(args):
+    """One `time` run per --sweep-tiles entry, each in its own process (one TPU holder at a time)."""
+    rows = []
+    for tiles in args.sweep_tiles:
+        cmd = [sys.executable, os.path.abspath(__file__), "time", "--layers", args.layers, "--t",
+               str(args.t), "--ctx", str(args.ctx), "--reps", str(args.reps), "--tiles", tiles]
+        print(f"[mk_sweep] {tiles}", flush=True)
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        line = [l for l in p.stdout.splitlines() if l.startswith("MK_RESULT ")]
+        r = json.loads(line[-1][10:]) if line else {"error": (p.stderr or p.stdout)[-800:]}
+        r["tiles_arg"] = tiles
+        print("[mk_sweep] " + json.dumps(r), flush=True)
+        rows.append(r)
+    with open(os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "mk_sweep.json"), "w") as f:
+        json.dump(rows, f, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["check", "time", "profile"])
+    ap.add_argument("mode", choices=["check", "time", "profile", "sweep"])
     ap.add_argument("--layers", default="gdn,attn")
     ap.add_argument("--t", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=4096)
@@ -139,9 +156,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--xprof", action="store_true")
+    ap.add_argument("--sweep-tiles", nargs="*", default=[""])
     ap.add_argument("--xprof-dir", default=os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof"))
     args = ap.parse_args()
-    {"check": check, "time": time_step, "profile": time_step}[args.mode](args)
+    {"check": check, "time": time_step, "profile": time_step, "sweep": sweep}[args.mode](args)
 
 
 if __name__ == "__main__":

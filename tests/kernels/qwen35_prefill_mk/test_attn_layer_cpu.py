@@ -51,7 +51,7 @@ y, kc, vc = o[9], o[10], o[11]
 
 res = (h.astype(R.F32) + r.astype(R.F32)).astype(R.BF16)
 x = R.rmsnorm_zc(h.astype(R.F32) + r.astype(R.F32), w["in_norm"], c.eps).astype(R.BF16)
-y_ref, k_ref, v_ref = R.attn_layer(c, w, x, st["k"], st["v"], CTX)
+y_ref, k_ref, v_ref = R.attn_layer(c, w, x, st["k"], st["v"], CTX, flash_bkv=bkv)
 rel = lambda a, b: float(jnp.linalg.norm(a.astype(R.F32) - b.astype(R.F32)) / jnp.linalg.norm(b.astype(R.F32)))
 print("attn out rel", rel(y, y_ref), " k cache rel", rel(jnp.swapaxes(kc, 0, 1), k_ref),
       " v cache eq", bool(jnp.all(jnp.swapaxes(vc, 0, 1).astype(R.F32) == v_ref.astype(R.F32))))
