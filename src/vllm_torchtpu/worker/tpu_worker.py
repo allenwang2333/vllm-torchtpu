@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import gc
 import os
 import time
 from typing import Any, cast
@@ -130,6 +131,10 @@ class TPUWorker(WorkerBase):
         # sandbox, and the captures are merged into one run directory on stop
         # (see profiler_trace). A worker can only trace its own chips, so
         # capturing on rank 0 alone would miss the rest of the slice.
+        # TPU_GC_STEP_ALIGNED_COLLECT: collect every this many execute_model
+        # calls once warmed up, with automatic collection off (0: Python's GC).
+        self._gc_collect_every = 0
+        self._gc_steps_since_collect = 0
         self.profile_dir: str | None = None
         self.profile_context = None
         self.profile_run_dir: str | None = None
@@ -584,7 +589,15 @@ class TPUWorker(WorkerBase):
         )
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        output = self.model_runner.execute_model(scheduler_output)
+        if self._gc_collect_every:
+            # After the step's forward is dispatched, at the same step count
+            # on every rank, so a pause never makes one rank the straggler.
+            self._gc_steps_since_collect += 1
+            if self._gc_steps_since_collect >= self._gc_collect_every:
+                self._gc_steps_since_collect = 0
+                gc.collect()
+        return output
 
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
@@ -758,6 +771,17 @@ class TPUWorker(WorkerBase):
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
         freeze_gc_heap()
+        if envs.TPU_GC_STEP_ALIGNED_COLLECT:
+            # A young-generation collection still fires on an allocation
+            # count, at a different point of the step on each rank, and the
+            # slowest rank sets every rank's step. Collect on a step count
+            # instead, the same one on every rank.
+            gc.disable()
+            self._gc_collect_every = envs.TPU_GC_STEP_ALIGNED_COLLECT
+            logger.info(
+                "Automatic GC off; collecting every %d steps.",
+                self._gc_collect_every,
+            )
         maybe_attach_gc_debug_callback()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
