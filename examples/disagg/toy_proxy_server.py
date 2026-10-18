@@ -467,7 +467,7 @@ class _PrefixAffinityRouter:
             if (
                 has_warm_prefix
                 and q_reqs[best_cache_rank] <= min_reqs + self.slack
-                and est_ttft_s[best_cache_rank] <= min_ttft + _env_float("PROXY_PREFILL_STICKY_TTFT_SLACK_S", 0.65)
+                and est_ttft_s[best_cache_rank] <= min_ttft + _env_float("PROXY_PREFILL_STICKY_TTFT_SLACK_S", 8.0)
             ):
                 rank = best_cache_rank
                 is_sticky = True
@@ -927,7 +927,7 @@ async def lifespan(app: FastAPI):
             n=len(app.state.prefill_clients),
             chunk=prefill_chunk_bytes,
             min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.40),
-            slack=_env_int("PROXY_PREFIX_HASH_SLACK", 10),
+            slack=_env_int("PROXY_PREFIX_HASH_SLACK", 48),
             role="prefill",
             block_tokens=prefill_block_tokens,
             hbm_max_blocks=_env_int("PROXY_PREFILL_HBM_MAX_BLOCKS", default_prefill_hbm_blocks),
