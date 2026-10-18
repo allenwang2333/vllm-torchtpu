@@ -1826,7 +1826,7 @@ def _attention_kernel(
         assert not preserve_suffix and batch_size == num_tokens, (
             "the fused exchange runs on a one-step grid"
         )
-        xchg_axis, xchg_lane_axis = send_exchange
+        xchg_axis, xchg_lane_axis = send_exchange[:2]
         # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
         xchg_rows = SEND_SLAB_ROW0 + send_rows
         xchg_block = SEND_PAD_ROWS + send_rows
@@ -3319,8 +3319,9 @@ def sparse_ragged_paged_attention(
         geometry: the kernel writes the DCP merge's packed real-rows send
         buffer (`SEND_PAD_ROWS`) for a group of `send_world` ranks, returned
         in place of the lse; the attention output is then not written.
-      send_exchange: TPU_MLA_FUSED_SMALL_A2A. `(axis, lane_axis or None)` of
-        the (lane, DCP) mesh, with `send_world` on a bucket the attention grid
+      send_exchange: TPU_MLA_FUSED_SMALL_A2A. `(axis, lane_axis or None[,
+        vmem_limit_bytes])` of the (lane, DCP) mesh (the call's scoped VMEM,
+        default SEND_EXCHANGE_VMEM_LIMIT_BYTES), with `send_world` on a bucket the attention grid
         walks in one step, inside a shard_map: the kernel also runs the DCP
         exchange (see SEND_SLAB_ROW0) and returns the receive buffer int16
         `[send_world * block, V]` -- `small_all_to_all(send, row0=
@@ -3410,7 +3411,7 @@ def sparse_ragged_paged_attention(
     ):
         raise ValueError(f"unknown prologue_fault {prologue_fault}")
     if send_exchange is not None and (
-        not send_world or send_peer is None or len(send_exchange) != 2
+        not send_world or send_peer is None or len(send_exchange) not in (2, 3)
     ):
         raise ValueError(
             "send_exchange = (axis, lane_axis) needs send_world and send_peer "
@@ -4327,7 +4328,12 @@ def sparse_attention_chunk(
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
                     vmem_limit_bytes=(
-                        min(vmem_limit_bytes, SEND_EXCHANGE_VMEM_LIMIT_BYTES)
+                        min(
+                            vmem_limit_bytes,
+                            send_exchange[2]
+                            if len(send_exchange) > 2
+                            else SEND_EXCHANGE_VMEM_LIMIT_BYTES,
+                        )
                         if send_exchange is not None
                         else vmem_limit_bytes
                     ),

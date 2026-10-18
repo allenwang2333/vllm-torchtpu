@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_MLA_FUSED_SMALL_A2A: bool = False
+    TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
@@ -636,6 +637,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the separate small all-to-all call are gone. Same received bits,
     # same unpack and merge. Other buckets keep their exchange.
     "TPU_MLA_FUSED_SMALL_A2A": env_bool("TPU_MLA_FUSED_SMALL_A2A", default=False),
+    # With TPU_MLA_FUSED_SMALL_A2A: the fused call's scoped VMEM limit (MiB). It
+    # decides what XLA may keep in VMEM across the call -- the receive buffer
+    # the unpack reads, and the prefetches of the next ops' weights.
+    "TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB": env_int("TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB", 16),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done

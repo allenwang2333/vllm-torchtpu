@@ -1416,7 +1416,11 @@ def sparse_mla_attention_dcp(
                 if send_layout:
                     split_kwargs["send_world"] = dcp_size
                 if fused_exchange:
-                    split_kwargs["send_exchange"] = (dcp_axis_name, lane_axis)
+                    split_kwargs["send_exchange"] = (
+                        dcp_axis_name,
+                        lane_axis,
+                        int(envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB) * 1024 * 1024,
+                    )
                     split_kwargs["send_peer"] = jnp.stack(
                         [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
                     )
