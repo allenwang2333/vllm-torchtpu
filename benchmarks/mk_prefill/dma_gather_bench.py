@@ -100,8 +100,8 @@ def main():
                 kernel,
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=1, grid=(),
-                    in_specs=[pl.BlockSpec(memory_space=pltpu.ANY)],
-                    out_specs=pl.BlockSpec(memory_space=pltpu.ANY),
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                    out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
                     scratch_shapes=scratch),
                 out_shape=jax.ShapeDtypeStruct((N, W), jnp.uint32),
             )
