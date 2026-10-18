@@ -297,7 +297,7 @@ class TestTpuCompilerCache:
     def test_env_override_sc_offload_threshold(self, value, expected_threshold):
         """An explicit value is used as given, unset/empty/auto resolves
         from the chip family, and 0 sets no flag at all. (The fused MoE
-        prefill kernel, on by default, lowers the all-reduce one; see
+        prefill kernel, set explicitly, lowers the all-reduce one; see
         test_env_override_sc_all_reduce_floor_with_prefill_kernel.)"""
         env_mock = {
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
@@ -323,8 +323,12 @@ class TestTpuCompilerCache:
     @pytest.mark.parametrize(
         "kernel,extra_env,all_reduce,all_gather",
         [
-            # The chip-family default: lowered for all-reduces with the kernel on.
+            # The chip-family default: lowered for all-reduces with the kernel
+            # set on explicitly ...
             ("1", {}, 1 << 20, 64 << 20),
+            # ... but not by the kernel's default (on): this runs before the
+            # model is known, and the floor would move for every model.
+            (None, {}, 64 << 20, 64 << 20),
             ("0", {}, 64 << 20, 64 << 20),
             # An explicit value is kept as given, below or above 1 MiB.
             ("1", {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "12345"}, 12345, 12345),
@@ -341,11 +345,11 @@ class TestTpuCompilerCache:
     def test_env_override_sc_all_reduce_floor_with_prefill_kernel(
         self, kernel, extra_env, all_reduce, all_gather
     ):
-        """With the fused MoE prefill kernel on, the chip-family all-reduce
-        threshold is lowered to 1 MiB; explicit values are kept; all-gathers
-        keep their threshold."""
+        """With the fused MoE prefill kernel set on, the chip-family all-reduce
+        threshold is lowered to 1 MiB (not by its default); explicit values are
+        kept; all-gathers keep their threshold."""
         env_mock = {
-            "FUSED_MOE_PREFILL_KERNEL": kernel,
+            **({} if kernel is None else {"FUSED_MOE_PREFILL_KERNEL": kernel}),
             "TPU_ACCELERATOR_TYPE": "tpu7x-16",
             **extra_env,
         }

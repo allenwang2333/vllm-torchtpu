@@ -40,6 +40,7 @@ compares a signature across the EP group and raises on any mismatch.
 """
 
 import functools
+import os
 from typing import Any, cast
 
 import jax
@@ -569,6 +570,36 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
+_SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+
+
+def _warn_sc_all_reduce_floor(min_tokens: int, hidden: int) -> None:
+    """With the prefill kernel on by default (env_override.py lowers the
+    SparseCore all-reduce floor only when FUSED_MOE_PREFILL_KERNEL is set),
+    warn when the effective floor would keep the kernel's smallest all-reduce
+    (bf16 [min_tokens, hidden]) on the TensorCore, where MTP draft acceptance
+    collapsed with GLM-5.2."""
+    if envs.is_set("FUSED_MOE_PREFILL_KERNEL"):
+        return  # env_override.py lowered the floor or warned at import
+    smallest = min_tokens * hidden * 2
+    floor = None
+    for token in os.environ.get("LIBTPU_INIT_ARGS", "").split():
+        if token.startswith(_SC_ALL_REDUCE_FLAG + "="):
+            floor = token.split("=", 1)[1]  # the last one wins, as in libtpu
+    if floor is not None and floor.isdigit() and int(floor) <= smallest:
+        return
+    logger.warning(
+        "Fused MoE prefill kernel armed (on by default) but the SparseCore "
+        "all-reduce offload floor is %s, above its smallest all-reduce (%d "
+        "bytes); with GLM-5.2 + MTP pass %s=2097152 in LIBTPU_INIT_ARGS (the "
+        "AgentX launch does) or set FUSED_MOE_PREFILL_KERNEL=1 explicitly. "
+        "See env_override.py.",
+        floor or "libtpu's default",
+        smallest,
+        _SC_ALL_REDUCE_FLAG,
+    )
+
+
 def _serves_prefill_kernel(expert_parallel: bool) -> bool:
     """FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only for now: an EP
     layer keeps the GMM path above the cap, which at GLM-5.2 shapes was faster
@@ -686,6 +717,12 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         if any(_serves_prefill_kernel(s[1]) for s in signature[1])
         else "GMM MoE",
     )
+    if armed and any(_serves_prefill_kernel(s[1]) for s in signature[1]):
+        hidden = getattr(runners[0].moe_config, "hidden_dim", None)
+        if hidden:
+            _warn_sc_all_reduce_floor(
+                envs.FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS, int(hidden)
+            )
     if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
         logger.info(
             "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "

@@ -192,12 +192,22 @@ _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 # collapsed. With all-reduces of 1 MiB or more on the SparseCore, the layer's
 # own all-reduce took that place and acceptance was normal; what goes wrong
 # in the first case is not identified. So while that kernel is on, the
-# chip-family all-reduce threshold is lowered to 1 MiB. An explicit
+# chip-family all-reduce threshold is lowered to 1 MiB -- only when
+# FUSED_MOE_PREFILL_KERNEL is set explicitly. On by default, the kernel arms
+# only layers shaped like GLM-5.2's (TP experts, an ungated shared expert), but this
+# runs at import, before the model is known, so lowering it by default would
+# move every model's all-reduces onto the SparseCore. With the default, the
+# layers the kernel arms log a warning instead when the floor is above their
+# smallest all-reduce (fused_moe_decode.arm_fused_moe_decode); the GLM-5.2
+# AgentX launch passes 2 MiB in LIBTPU_INIT_ARGS. An explicit
 # SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES or all-reduce flag is kept as
 # given: keep it at or below the kernel's smallest all-reduce (3 MiB for
 # GLM-5.2 at its 256-token minimum).
 _PREFILL_KERNEL_ALL_REDUCE_BYTES = 1 << 20
 _SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
+_PREFILL_KERNEL_LOWERS_FLOOR = envs.FUSED_MOE_PREFILL_KERNEL and envs.is_set(
+    "FUSED_MOE_PREFILL_KERNEL"
+)
 if _sc_offload_bytes is not None:
     for _flag_name in (
         _SC_ALL_REDUCE_FLAG,
@@ -206,14 +216,14 @@ if _sc_offload_bytes is not None:
         _bytes = _sc_offload_bytes
         if (
             _flag_name == _SC_ALL_REDUCE_FLAG
-            and envs.FUSED_MOE_PREFILL_KERNEL
+            and _PREFILL_KERNEL_LOWERS_FLOOR
             and envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
         ):
             _bytes = min(_bytes, _PREFILL_KERNEL_ALL_REDUCE_BYTES)
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_bytes}")
 
-if envs.FUSED_MOE_PREFILL_KERNEL:
+if _PREFILL_KERNEL_LOWERS_FLOOR:
     _all_reduce_floor = next(
         (
             token.split("=", 1)[1]
