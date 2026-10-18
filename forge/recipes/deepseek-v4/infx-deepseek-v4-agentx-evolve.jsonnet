@@ -307,6 +307,15 @@ local logHostTensorsAfterLoad = cdk.var('TPU_LOG_HOST_TENSORS_AFTER_LOAD', '1');
 // Steps between each rank's "step timing" log line (step period by DP token bucket, vllm-torchtpu
 // runner/step_timing_log.py); 0 turns it off.
 local stepTimingLogSteps = cdk.var('TPU_STEP_TIMING_LOG_STEPS', '2000');
+// API-server frontend. vLLM renders and tokenizes every chat request on a thread pool of
+// --renderer-num-workers threads (default 1); at c=160 (~3.6 req/s, ~120k-token prompts, ~1.6 us/token to
+// tokenize) that single worker queued requests for 1.8-2.4 s mean before the engine saw them (aiperf
+// request_ack). 16 workers with per-thread tokenizer copies (TPU_DSV4_RENDERER_THREAD_POOL; a shared copy fails
+// with "Already borrowed") and 32-token detokenizer priming: ack mean 2.1 -> 0.40 s, 445,560 vs 434,383 total tok/s
+// (j-28734f74 vs j-f7915d25/j-fa2530f0). RENDERER_NUM_WORKERS=1 and empty env values restore vLLM's defaults.
+local rendererNumWorkers = cdk.numVar('RENDERER_NUM_WORKERS', 16);
+local dsv4RendererThreadPool = cdk.var('TPU_DSV4_RENDERER_THREAD_POOL', '1');
+local detokPrimeTailTokens = cdk.var('TPU_DETOK_PRIME_TAIL_TOKENS', '32');
 // DSv4 indexer K-cache layout (vllm-torchtpu VLLM_TPU_DSV4_INDEXER_KV_LAYOUT): sal or has. sal measured slightly
 // ahead of has three times (out tok/s +3.9/+3.6/+1.8% vs the same tree on has, each within noise).
 local indexerKvLayout = cdk.var('VLLM_TPU_DSV4_INDEXER_KV_LAYOUT', 'sal');
@@ -439,6 +448,7 @@ local serveArgs = [
 + [
   '--port %d' % port,
   '--api-server-count=1',
+  '--renderer-num-workers=%d' % rendererNumWorkers,
   '--async-scheduling',
   if enablePrefixCaching then '--enable-prefix-caching' else '--no-enable-prefix-caching',
   '--enable-prompt-tokens-details',
@@ -834,6 +844,8 @@ local serverJob = cdk.job(
         [if premappedBufferSize != 'none' then 'TPU_PREMAPPED_BUFFER_TRANSFER_THRESHOLD_BYTES']: premappedBufferSize,
         TPU_LOG_HOST_TENSORS_AFTER_LOAD: logHostTensorsAfterLoad,
         TPU_STEP_TIMING_LOG_STEPS: stepTimingLogSteps,
+        [if dsv4RendererThreadPool != '' then 'TPU_DSV4_RENDERER_THREAD_POOL']: dsv4RendererThreadPool,
+        [if detokPrimeTailTokens != '' then 'TPU_DETOK_PRIME_TAIL_TOKENS']: detokPrimeTailTokens,
         VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: indexerKvLayout,
         [if schedUnchargedDraftSlots != '' then 'TPU_SCHED_UNCHARGED_DRAFT_SLOTS']: schedUnchargedDraftSlots,
         [if srptHoldProgressGuard != '' then 'TPU_SRPT_HOLD_PROGRESS_GUARD']: srptHoldProgressGuard,
