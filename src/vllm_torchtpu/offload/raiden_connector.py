@@ -19,6 +19,7 @@ mixed local-HBM / offloaded-DRAM prefix hit composition for hybrid models.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable, Mapping
@@ -206,19 +207,26 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     def _init_state_demotion(self, default_on: bool) -> None:
         """Sets up demotion of superseded Mamba/GDN boundary states.
 
-        A conversation's next turn resumes from the newest boundary state its
-        last turn stored; older boundaries of the same chain serve only forks.
-        With TPU_RAIDEN_TIER_DEMOTE_STATE on (default: on with the deduplicated
-        layout), a finished request's boundary states below its newest one,
-        and the boundary it was admitted from, are demoted: they still answer
-        lookups, but the tier evicts them before any live entry.
+        A conversation's next turn resumes from two states its last turn
+        stored: the newest full-block boundary, where the complete-chunk
+        lookup needs the GDN key, and the partial tail above it, which a
+        lookup reaches only on top of that full-block hit. Older boundaries of
+        the same chain serve only forks. With TPU_RAIDEN_TIER_DEMOTE_STATE on
+        (default: on with the deduplicated layout), a finished request demotes
+        its boundary states below the newest full-block boundary it holds in
+        the tier, and the boundary it was admitted from when that lies below
+        it too. Demoted entries still answer lookups, but the tier evicts them
+        before any live entry.
         """
         env = os.environ.get("TPU_RAIDEN_TIER_DEMOTE_STATE")
         self._demote_stale_state = (env == "1") if env is not None else default_on
-        self._state_group_ids = frozenset(
-            g.group_idx for g in self.config.kv_group_configs if g.requires_cow_source
-        )
-        # req_id -> boundary tokens -> the state keys stored for that boundary.
+        state_groups = [
+            g for g in self.config.kv_group_configs if g.requires_cow_source
+        ]
+        self._state_group_ids = frozenset(g.group_idx for g in state_groups)
+        # A boundary is a full block when it ends a chunk of every state group.
+        self._state_chunk_tokens = math.lcm(*(g.tokens_per_chunk for g in state_groups))
+        # req_id -> boundary tokens -> the state keys offered for that boundary.
         self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
         # req_id -> (boundary tokens, state keys) of the admission's hit.
         self._state_hits: dict[str, tuple[int, list[OffloadKey]]] = {}
@@ -638,15 +646,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     continue
                 boundaries = self._state_boundaries.setdefault(req_id, {})
                 for group_idx, _, boundary in entries:
-                    if group_idx in self._state_group_ids:
-                        boundaries.setdefault(boundary, []).append(
-                            self._make_boundary_key(
-                                req_status.req,
-                                group_idx,
-                                boundary,
-                                req_status.req_context,
-                            )
-                        )
+                    if group_idx not in self._state_group_ids:
+                        continue
+                    key = self._make_boundary_key(
+                        req_status.req, group_idx, boundary, req_status.req_context
+                    )
+                    keys = boundaries.setdefault(boundary, [])
+                    if key not in keys:
+                        keys.append(key)
         return jobs
 
     def _record_state_hit(self, request: Request, hit_tokens: int) -> None:
@@ -668,22 +675,42 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
 
     def _demote_superseded_states(self, finished_req_ids: Iterable[str]) -> None:
+        """Demotes each finished request's states below its kept full block.
+
+        The kept boundary is the newest full-block boundary whose state keys
+        the tier holds (stored, or with the store in flight). Offered
+        boundaries the base skipped, or whose store was cancelled, do not
+        count, so a newer boundary that never reached the tier cannot push an
+        older one out. A partial tail above the kept boundary is kept with it.
+        With no full-block boundary held, nothing is demoted.
+        """
+        manager = self._raiden_manager
         for req_id in finished_req_ids:
             boundaries = self._state_boundaries.pop(req_id, None)
             hit = self._state_hits.pop(req_id, None)
             if not boundaries:
                 continue
-            newest = max(boundaries)
+            kept = max(
+                (
+                    boundary
+                    for boundary, keys in boundaries.items()
+                    if boundary % self._state_chunk_tokens == 0
+                    and all(manager.holds(key) for key in keys)
+                ),
+                default=None,
+            )
+            if kept is None:
+                continue
             stale = [
                 key
                 for boundary, keys in boundaries.items()
-                if boundary < newest
+                if boundary < kept
                 for key in keys
             ]
-            if hit is not None and hit[0] < newest:
+            if hit is not None and hit[0] < kept:
                 stale.extend(hit[1])
             if stale:
-                self._raiden_manager.demote(stale)
+                manager.demote(list(dict.fromkeys(stale)))
 
     def _touch(self, req_status: Any) -> None:
         """Refreshes the Raiden host LRU for one request's offloaded keys.

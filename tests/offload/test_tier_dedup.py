@@ -400,6 +400,245 @@ class TestStateDemotion(unittest.TestCase):
         self.assertEqual(sched._state_hits, {})
 
 
+class _Prompt:
+    """A request whose block hashes follow one conversation's token chain."""
+
+    def __init__(self, req_id, num_tokens, chain=b"c", fork_at=None, fork=b"f"):
+        self.request_id = req_id
+        self.num_tokens = num_tokens
+        self.num_prompt_tokens = num_tokens
+        self.kv_transfer_params = None
+        hashes = []
+        for i in range(num_tokens // TestStateDemotionChain.TPH):
+            prefix = chain if fork_at is None or i < fork_at else fork
+            hashes.append(prefix + b"%03d" % i)
+        self.block_hashes = hashes
+
+
+class TestStateDemotionChain(unittest.TestCase):
+    """Demotion over a conversation's turns, against the upstream store-job
+    builders and lookup, the real manager and a class-routed fake tier.
+
+    One block is TPC tokens (the f640 granularity), one hash TPH tokens (the
+    f128 granularity). Group 0 is full attention, group 1 the GDN state.
+    """
+
+    TPC = 20
+    TPH = 4
+
+    def setUp(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            GroupOffloadConfig,
+            SchedulerOffloadConfig,
+        )
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        def group(idx, recurrent):
+            return GroupOffloadConfig(
+                group_idx=idx,
+                tokens_per_block=self.TPC,
+                tokens_per_chunk=self.TPC,
+                hashes_per_chunk=self.TPC // self.TPH,
+                kv_event_group_spec=MagicMock(),
+                sliding_window_size_in_chunks=1 if recurrent else None,
+                kv_cache_spec=MagicMock(),
+                manager_cls=MagicMock(),
+                requires_cow_source=recurrent,
+            )
+
+        self.facade, self.stores = _facade()
+        self.manager = make_manager(
+            self.facade, num_blocks=64, device_block_size_factor=FACTOR
+        )
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = SchedulerOffloadConfig(
+            kv_group_configs=(group(0, False), group(1, True)),
+            blocks_per_chunk=1,
+            tokens_per_hash=self.TPH,
+            num_workers=1,
+            offload_prompt_only=False,
+            supports_partial_tail=True,
+        )
+        sched.manager = self.manager
+        sched._raiden_manager = self.manager
+        sched._req_status = {}
+        sched._jobs = {}
+        sched._job_counter = 0
+        sched._block_id_to_pending_jobs = {}
+        sched._connector_stats = MagicMock()
+        sched._events_tracker = MagicMock()
+        sched._sliding_window_groups = (1,)
+        sched._lookup_groups = (0, 1)
+        sched._mamba_align_size = self.TPC
+        sched._partial_tail_block_size = self.TPC
+        sched._cow_source_groups = frozenset({1})
+        sched._chunks_being_loaded = None
+        sched._init_state_demotion(True)
+        self.sched = sched
+        self.demoted = []
+        self.manager.demote = MagicMock(
+            side_effect=lambda keys: (
+                self.demoted.extend(keys),
+                type(self.manager).demote(self.manager, keys),
+            )[1]
+        )
+
+    def _track(self, req):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            RequestOffloadState,
+        )
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+
+        status = RequestOffloadState(
+            config=self.sched.config,
+            req=req,
+            req_context=ReqContext(req_id=req.request_id),
+            offloading_context=RequestOffloadingContext(),
+        )
+        status.update_offload_keys()
+        num_blocks = -(-req.num_tokens // self.TPC)
+        status.group_states[0].block_ids.extend(range(100, 100 + num_blocks))
+        self.sched._req_status[req.request_id] = status
+        return status
+
+    def _key(self, req, group_idx, boundary):
+        return make_offload_key(req.block_hashes[boundary // self.TPH - 1], group_idx)
+
+    def _store_fa_chunks(self, req):
+        """Lands the full-attention chunks a finished prefill stores."""
+        from test_raiden_store_offload import seed_host_entries
+
+        for boundary in range(self.TPC, req.num_tokens + 1, self.TPC):
+            key = self._key(req, 0, boundary)
+            if not self.manager.holds(key):
+                seed_host_entries(self.stores[FA_CLASS], key, FACTOR)
+
+    def _step(self, req_id, entries, land=True):
+        """Runs one step's boundary hand-offs through the store-job builders."""
+        output = SimpleNamespace(
+            kv_connector_block_state=SimpleNamespace(
+                boundary_state_offloads={req_id: entries}
+            )
+        )
+        jobs = self.sched._build_partial_tail_store_jobs(output)
+        if not land:
+            return jobs
+        for job_id, job in jobs.items():
+            self.manager.submit_store_job(
+                job_id, job.dst_spec.keys, job.src_spec.block_ids.tolist()
+            )
+        for store in self.stores.values():
+            if store._saving:
+                store.complete_save(list(store._saving))
+        self.manager.poll_finished_jobs()
+        return jobs
+
+    def _turn(self, req, hit, steps):
+        """Admits a request at `hit` tokens, runs its hand-offs, finishes it."""
+        self._track(req)
+        if hit:
+            self.sched._record_state_hit(req, hit)
+        for entries in steps:
+            self._step(req.request_id, entries)
+        self._store_fa_chunks(req)
+        self.demoted.clear()
+        self.sched._demote_superseded_states([req.request_id])
+        return list(self.demoted)
+
+    def _evict_demoted(self):
+        """Evicts every demoted entry, as a full tier does first."""
+        for store in self.stores.values():
+            for sub_hash in store.demoted:
+                store.entries.pop(sub_hash, None)
+            store.demoted.clear()
+
+    def _first_turn(self):
+        # Cold prefill of 70 tokens: chunk ends at 40 and 60 (f640), then the
+        # partial tail at 68 (f128).
+        req = _Prompt("t1", 70)
+        demoted = self._turn(req, 0, [[(1, 11, 40)], [(1, 12, 60)], [(1, 13, 68)]])
+        self.assertEqual(demoted, [self._key(req, 1, 40)])
+        return req
+
+    def _lookup(self, req):
+        status = self._track(req)
+        status.num_locally_computed_tokens = 0
+        return self.sched._lookup(status), status
+
+    def test_warm_turn_keeps_its_full_block_and_partial_tail(self):
+        self._first_turn()
+        # Warm turn admitted at the first turn's partial tail (68); its chunk
+        # ends at the new full block (80), then the new partial tail (92).
+        req = _Prompt("t2", 95)
+        demoted = self._turn(req, 68, [[(1, 21, 80)], [(1, 22, 92)]])
+        self.assertEqual(demoted, [self._key(req, 1, 68)])
+        self.assertTrue(self.manager.holds(self._key(req, 1, 80)))
+        self.assertTrue(self.manager.holds(self._key(req, 1, 92)))
+
+    def test_single_step_hand_off_gives_the_same_demotion(self):
+        self._first_turn()
+        req = _Prompt("t2", 95)
+        demoted = self._turn(req, 68, [[(1, 21, 80), (1, 22, 92)]])
+        self.assertEqual(demoted, [self._key(req, 1, 68)])
+
+    def test_next_lookup_hits_the_partial_tail_after_demoted_entries_evict(self):
+        self._first_turn()
+        self._turn(_Prompt("t2", 95), 68, [[(1, 21, 80)], [(1, 22, 92)]])
+        self._evict_demoted()
+
+        hit, status = self._lookup(_Prompt("t3", 120))
+
+        self.assertEqual(hit, 92)
+        self.assertEqual(status.partial_tail_boundary, 92)
+
+    def test_unstored_full_block_does_not_supersede_older_states(self):
+        first = self._first_turn()
+        req = _Prompt("t2", 95)
+        # The base skips the 80 hand-off (no block), so only 92 is stored.
+        demoted = self._turn(req, 68, [[(1, 0, 80)], [(1, 22, 92)]])
+        self.assertEqual(demoted, [])
+        self.assertFalse(self.manager.holds(self._key(req, 1, 80)))
+        self._evict_demoted()
+
+        hit, _ = self._lookup(_Prompt("t3", 120))
+
+        # 80 was never stored, so the next turn resumes from the first turn's
+        # f640 and partial tail, which stayed live.
+        self.assertEqual(hit, 68)
+        self.assertTrue(self.manager.holds(self._key(first, 1, 68)))
+
+    def test_fork_demotes_states_a_newer_full_block_supersedes(self):
+        self._first_turn()
+        # A fork shares the conversation's first 40 tokens, then diverges.
+        req = _Prompt("f1", 86, fork_at=40 // self.TPH)
+        demoted = self._turn(req, 40, [[(1, 31, 60)], [(1, 32, 80)], [(1, 33, 84)]])
+        self.assertEqual(
+            demoted,
+            [
+                self._key(req, 1, 60),  # below the kept full block 80
+                self._key(req, 1, 40),  # admitted below it
+            ],
+        )
+        self.assertTrue(self.manager.holds(self._key(req, 1, 84)))
+        self.assertEqual(
+            set(self.stores[STATE_CLASS].demoted),
+            set(sub_hashes(self._key(req, 1, 60)))
+            | set(sub_hashes(self._key(req, 1, 40))),
+        )
+
+    def test_partial_tail_only_demotes_nothing(self):
+        self._first_turn()
+        # A short follow-up stays inside the block the first turn ended in.
+        req = _Prompt("t2", 78)
+        demoted = self._turn(req, 68, [[(1, 22, 76)]])
+        self.assertEqual(demoted, [])
+        # Only the first turn's demotion of 40 reached the tier.
+        self.assertEqual(
+            self.stores[STATE_CLASS].demoted, sub_hashes(self._key(req, 1, 40))
+        )
+
+
 class TestFaRegistration(unittest.TestCase):
     def test_worker_joins_its_group_segment_and_clears_stale_ones(self):
         from vllm_torchtpu.offload import raiden_store

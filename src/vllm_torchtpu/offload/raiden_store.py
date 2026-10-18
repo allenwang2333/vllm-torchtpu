@@ -850,22 +850,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # or whose recall found no host room. The save puts it back in host
         # DRAM and rewrites the files, which also repairs a copy that could
         # not be read.
-        keys_to_store: list[OffloadKey] = []
-        resident_statuses = (
-            self._block_status.HOST,
-            self._block_status.HOST_AND_HBM,
-            self._block_status.REMOTE,
-        )
-        for key in keys:
-            if key in self._inflight_store_keys:
-                continue
-            sub_hashes = self._sub_hashes(key)
-            matches = self._probe(sub_hashes)
-            if len(matches) == len(sub_hashes) and all(
-                block.status in resident_statuses for _, block in matches
-            ):
-                continue
-            keys_to_store.append(key)
+        keys_to_store = [key for key in keys if not self.holds(key)]
         if len(keys_to_store) > self._capacity_keys:
             return None
         # Atomic admission happens at job-submit time via insert; in-flight
@@ -876,6 +861,26 @@ class RaidenOffloadingManager(OffloadingManager):
             keys_to_store=keys_to_store,
             store_spec=RaidenLoadStoreSpec(keys_to_store),
             evicted_keys=[],
+        )
+
+    def holds(self, key: OffloadKey) -> bool:
+        """Reports whether the key is stored or has a store in flight.
+
+        Stored means the whole sub-hash chain is host-resident
+        (HOST/HOST_AND_HBM) or cluster-resident (REMOTE). The probe takes no
+        pin, so asking does not reorder the LRU.
+        """
+        if key in self._inflight_store_keys:
+            return True
+        sub_hashes = self._sub_hashes(key)
+        matches = self._probe(sub_hashes)
+        resident_statuses = (
+            self._block_status.HOST,
+            self._block_status.HOST_AND_HBM,
+            self._block_status.REMOTE,
+        )
+        return len(matches) == len(sub_hashes) and all(
+            block.status in resident_statuses for _, block in matches
         )
 
     def _launch_save(self, sub_hashes: list[bytes]) -> tuple[list[bytes], list[bytes]]:
