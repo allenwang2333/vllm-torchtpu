@@ -28,11 +28,13 @@ The weight stream is the pipelining axis: the data-independent weights
 tile, so they stream under the o_proj tail and AR1; the expert ring is primed
 after routing.
 
-Ported from the verified rung-2 variant of the segment-megakernel campaign
-(close-gaps miliu_1016_curve, kernel_work/segment-mk/variants/rung2_segment.py,
-md5 daa29cb4; measured -6.5..-7.9 us per skip boundary at T <= 16 against the
-incumbent, oracle and 11 fault controls clean), skip exit only, without the
-diagnostic arms and fault switches. Code reused from this package's siblings:
+Ported from the segment-megakernel campaign's rung 2b for skip boundaries
+(close-gaps miliu_1016_curve, kernel_work/segment-mk/variants/rung2_segment.py:
+rung 2, md5 daa29cb4, plus the L3 MXU expert-id compaction, WHITEBOARD.v6 md5
+94d747cd; measured -7.7/-8.5/-6.8/-9.0/-3.8 us per skip boundary at
+decode_first/decode_last/b2/b4/b8 against the incumbent, j-b722fa4c), skip
+exit only, without the diagnostic arms and fault switches. Code reused from
+this package's siblings:
   moe_tp_decode/kernel.py: `_route` constants, `_shared_expert`,
     `_quantize_blocks`, `_combine`, the expert body;
   moe_tp_decode/all_reduce.py: prologue / exchange / fold pieces;
@@ -320,6 +322,39 @@ def _route_argmax(scores, bias, n_valid, *, topk):
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(F32), 0.0)
 
 
+def _compact_mxu(cfg, r):
+    """Ascending ids of the hit experts without a scalar loop over experts:
+    incl = hits . U (U upper-triangular ones) is each expert's inclusive rank;
+    P[j, e] = hit[e] & (incl[e] - 1 == j); ids[j] = sum_e e P[j, e] (one
+    nonzero term). Every operand is 0/1 or an integer <= 256, exact in bf16
+    with f32 accumulation: the same ids in the same order as moe_tp_decode's
+    branch-free compaction. Rung 2b of the campaign (lever L3, WHITEBOARD.v6,
+    variants/rung2_segment.py `_compact_mxu`). Returns the hit count."""
+    E = cfg.e_pad
+    hit = r["hits_v"][...] != 0  # [1, E]
+    hit8 = jnp.broadcast_to(jnp.where(hit, 1.0, 0.0), (8, E)).astype(BF16)
+    U = _sel(E, E, lambda i, j: i <= j)
+    incl = jnp.max(
+        lax.dot_general(hit8, U, _NN, preferred_element_type=F32), axis=0, keepdims=True
+    )  # [1, E]
+    jj = lax.broadcasted_iota(I32, (E, E), 0)
+    P = jnp.where((jj == (incl.astype(I32) - 1)) & hit, 1.0, 0.0).astype(BF16)
+    er = lax.broadcasted_iota(I32, (8, E), 1)
+    erow = jnp.where(lax.broadcasted_iota(I32, (8, E), 0) == 0, er, 0)
+    erow = erow.astype(F32).astype(BF16)
+    ids = lax.dot_general(erow, P, _NT, preferred_element_type=F32)  # [8, E]; row 0
+    r["ids_v"][...] = ids.astype(I32)
+    cnt = jnp.sum(jnp.where(hit, 1, 0), axis=1, keepdims=True)  # [1, 1]
+    r["cnt_v"][...] = jnp.broadcast_to(cnt, (8, LANES)).astype(I32)
+    a = pltpu.make_async_copy(r["ids_v"], r["ids_s"], r["hit_sem"].at[0])
+    b = pltpu.make_async_copy(r["cnt_v"], r["cnt_s"], r["hit_sem"].at[1])
+    a.start()
+    b.start()
+    a.wait()
+    b.wait()
+    return r["cnt_s"][0, 0]
+
+
 def _sel(rows, cols, fn):
     """0/1 bf16 selection matrix S[i, j] = fn(i, j) (an exact row permutation
     on the MXU)."""
@@ -399,8 +434,10 @@ def scratch_table(cfg: SegCfg):
         ("shared", pltpu.VMEM((m, H), F32)),
         ("wtab", pltpu.VMEM((m, cfg.e_pad), F32)),
         ("hits_v", pltpu.VMEM((1, cfg.e_pad), I32)),
-        ("hits_s", pltpu.SMEM((1, cfg.e_pad), I32)),
-        ("active", pltpu.SMEM((cfg.experts,), I32)),
+        ("ids_v", pltpu.VMEM((8, cfg.e_pad), I32)),
+        ("cnt_v", pltpu.VMEM((8, LANES), I32)),
+        ("ids_s", pltpu.SMEM((8, cfg.e_pad), I32)),
+        ("cnt_s", pltpu.SMEM((8, LANES), I32)),
         ("res_m", pltpu.VMEM((m, H), BF16)),
         ("res_x", pltpu.VMEM((T, H), BF16)),
         ("qc_m", pltpu.VMEM((m, cfg.q_lora), BF16)),
@@ -413,7 +450,7 @@ def scratch_table(cfg: SegCfg):
         ),  # os, gate, qkv_s, qkv chunks
         ("shared_sem", pltpu.SemaphoreType.DMA((4,))),
         ("ring_sem", pltpu.SemaphoreType.DMA((nb, 4))),
-        ("hit_sem", pltpu.SemaphoreType.DMA((1,))),
+        ("hit_sem", pltpu.SemaphoreType.DMA((2,))),
         ("out_sem", pltpu.SemaphoreType.DMA((3,))),
     ]
     sc += [(f"ar1_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
@@ -565,14 +602,13 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     r["wtab"][...] = _route_argmax(scores, r["bias"][...], n_valid, topk=cfg.topk)
     hit = jnp.any(r["wtab"][...] != 0, axis=0, keepdims=True)
     r["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
-    hit_copy = pltpu.make_async_copy(r["hits_v"], r["hits_s"], r["hit_sem"].at[0])
-    hit_copy.start()
-    hit_copy.wait()
-    active, ring_sem = r["active"], r["ring_sem"]
+    ring_sem = r["ring_sem"]
+    # ---- 8b. compaction (two exact 0/1 matmuls) + ring prime
+    items = _compact_mxu(cfg, r)
+    ids = r["ids_s"]
 
-    # ---- 8b. compaction + ring prime
     def transfers(step):
-        e = active[step]
+        e = ids[0, step]
         slot = step % nb
         return [
             pltpu.make_async_copy(
@@ -588,13 +624,6 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
                 r["s2"].at[e, 0], r["s2_r"].at[slot], ring_sem.at[slot, 3]
             ),
         ]
-
-    def compact(e, count):
-        hit_e = r["hits_s"][0, e] != 0
-        active[count] = e
-        return count + hit_e.astype(I32)
-
-    items = lax.fori_loop(0, cfg.experts, compact, jnp.int32(0))
 
     for s_ in range(nb):
 
@@ -637,7 +666,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         return acc
 
     def finish(step, slot, acc1):
-        e = active[step]
+        e = ids[0, step]
         coeff = jnp.sum(
             jnp.where(expert_columns == e, r["wtab"][...], 0.0), axis=1, keepdims=True
         )
