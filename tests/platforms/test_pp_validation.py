@@ -102,6 +102,33 @@ def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
 
 
+def _multi(*children):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": name} for name in children]
+        },
+    )
+
+
+RAIDEN_MULTI = _multi("TPURaidenConnector", "TPURaidenOffloadingConnector")
+
+
+def test_accepts_the_multi_connector_over_raiden_transfer_and_offload():
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN_MULTI))
+
+
+@pytest.mark.parametrize(
+    "multi",
+    [_multi("TPURaidenConnector", "LMCacheConnectorV1"), _multi()],
+    ids=["other-child", "no-children"],
+)
+def test_rejects_a_multi_connector_unless_every_child_is_raiden(multi):
+    with pytest.raises(NotImplementedError, match="TPUMultiConnector over"):
+        validate_pipeline_parallel_config(_config(pp=2, kv_transfer=multi))
+
+
 def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
     monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     with pytest.raises(
@@ -177,6 +204,13 @@ def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
 
 def test_raiden_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+
+
+def test_rejects_the_multi_connector_with_context_parallel_stages(stage_meshes):
+    with pytest.raises(NotImplementedError, match="context-parallel stages"):
+        validate_pipeline_parallel_config(
+            _config(pp=4, pcp=2, kv_transfer=RAIDEN_MULTI)
+        )
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):
