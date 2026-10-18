@@ -276,6 +276,7 @@ if TYPE_CHECKING:
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
     TPU_MOE_ROUTER_HBM_PIN: bool = False
+    TPU_LM_HEAD_HBM: str = ""
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
@@ -1956,6 +1957,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the neighbouring bf16 (a top-k flip needs a logit within an ulp of the
     # boundary); needs an accuracy check. Prefill sizes unchanged.
     "TPU_MOE_ROUTER_HBM_PIN": env_bool("TPU_MOE_ROUTER_HBM_PIN"),
+    # The LM head (vocab-parallel `F.linear(x, W)`, W bf16 [vocab/tp, hidden] N-major)
+    # at <= 64 logits rows runs as a Pallas kernel that streams W from HBM through a
+    # 3-slot VMEM ring (kernels/lm_head_hbm.py; GLM-5.2 TP16 [9680, 6144] on tpu7x:
+    # ~36.6-37.3 us vs XLA's 44-47 us per call). Other row counts keep XLA's dot.
+    # "drafter": only an MTP/eagle draft's passes (the draft gets its own head object
+    # sharing the target's weight) -- drafts only, lossless for the target
+    # distribution. "all": also the target sampler's logits. NOT bit-identical: ~1-2
+    # in 10^4 logits differ from XLA's dot by 1-4 bf16 ulp (MXU accumulation order),
+    # so "all" needs an accuracy check. "" (default): off.
+    "TPU_LM_HEAD_HBM": env_str("TPU_LM_HEAD_HBM", ""),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
