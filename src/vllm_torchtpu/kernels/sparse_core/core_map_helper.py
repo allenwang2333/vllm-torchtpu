@@ -11,31 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run single-mesh SparseCore kernels through ``core_map``.
+"""Run single-mesh SparseCore kernels that produce fresh outputs.
 
-``pl.kernel`` now dispatches to ``mpmd_map``; ``kernel`` here bypasses that
-and calls ``core_map`` directly on the given mesh. Near drop-in for
-``pl.kernel`` -- note ``out_shape`` becomes ``out_type`` and ``scratch_shapes``
-(list) becomes ``scratch_types`` (dict).
+``kernel`` takes the ``pl.kernel`` arguments by keyword (``out_type``,
+``scratch_types`` as a sequence or a dict) and returns a jitted program.
 """
 
-from typing import cast
-
-from jax._src import api, lax, tree_util
-from jax._src import core as jax_core
-from jax._src.pallas import core as pl_core
-
-
-def _empty_out_ref(out_type):
-    # Mirrors internal `pl.kernel` logic; may need updating on JAX bumps.
-    aval = cast(jax_core.ShapedArray, pl_core._convert_out_shape_to_aval(out_type))
-    memory_space = (
-        None
-        if isinstance(aval.memory_space, jax_core.MemorySpace)
-        else aval.memory_space
-    )
-    value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
-    return jax_core.new_ref(value, memory_space=memory_space)
+import jax
+from jax.experimental import pallas as pl
 
 
 def kernel(
@@ -51,33 +34,26 @@ def kernel(
     name=None,
     metadata=None,
 ):
-    """Near drop-in for ``pl.kernel`` that lowers via ``core_map``.
+    """Builds a jitted ``pl.kernel`` program over one mesh.
 
-    Differs in that ``out_shape`` is renamed to ``out_type`` and
-    ``scratch_shapes`` (list) is renamed to ``scratch_types`` (dict).
+    ``body(*operand_refs, *out_refs, *scratch_refs)`` runs with a dict of
+    scratch types passed as keyword refs. The outputs are the kernel's own,
+    buffers the compiler allocates for the call: an allocation made in the
+    program (``lax.empty`` written in place through a ref) is identical in
+    every inlined copy of the program, so the torch bridge's
+    common-subexpression pass merges one model's layers onto a single buffer,
+    which then has to be copied before every in-place write.
     """
-    single_output = not isinstance(out_type, (tuple, list))
-    out_types = (out_type,) if single_output else out_type
-
-    @api.jit
-    def run(*operands):
-        arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-        out_refs = tree_util.tree_map(_empty_out_ref, out_types)
-
-        @pl_core.core_map(
-            mesh,
-            scratch_shapes=scratch_types,
-            compiler_params=compiler_params,
-            interpret=interpret,
-            cost_estimate=cost_estimate,
-            debug=debug,
-            name=name,
-            metadata=metadata,
-        )
-        def _(*scratch_refs, **scratch_kwrefs):
-            return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
-
-        outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
-        return outs[0] if single_output else outs
-
-    return run
+    program = pl.kernel(
+        body,
+        out_type,
+        mesh=mesh,
+        scratch_types=scratch_types,
+        compiler_params=compiler_params,
+        interpret=interpret,
+        cost_estimate=cost_estimate,
+        debug=debug,
+        name=name,
+        metadata=metadata,
+    )
+    return jax.jit(program)
