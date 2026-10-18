@@ -3,7 +3,7 @@
 The production call (RPAm-snh): one sequence of Q new tokens behind a CTX-token cached context,
 32 q heads / 2 kv heads / head_dim 256, fp8 KV cache in SEQ_ALONG_LANE pages of 128 tokens,
 bf16 q, causal. `sweep` runs every arm in its own process on one clock and writes
-attn_bench.json; an arm is `name:key=value,...` (keys: bq, bqc, bkv, batch, nbuf, vmem_mb, impl).
+attn_bench.json; an arm is `name:key=value,...` (keys: bq, bqc, bkv, batch, nbuf, vmem_mb, out=f32).
 
     python3 attn_bench.py sweep --ctx 87040 --q 8192 --arms "default:" "b512:bq=512,bqc=512,bkv=512"
 """
@@ -102,6 +102,9 @@ def run_arm(args):
             bq_sz=int(opts["bq"]), bq_c_sz=int(opts.get("bqc", opts["bq"])),
             bkv_sz=int(opts["bkv"]), batch_size=int(opts.get("batch", 1)),
             n_buffer=int(opts.get("nbuf", 3)))
+    if opts.get("out") == "f32":
+        # out_dtype is also the dtype of the online-softmax state (m, l, acc).
+        kw["out_dtype"] = jnp.float32
     if "vmem_mb" in opts:
         kw["vmem_limit_bytes"] = int(opts["vmem_mb"]) << 20
     layout = configs.KVLayout.SEQ_ALONG_LANE
