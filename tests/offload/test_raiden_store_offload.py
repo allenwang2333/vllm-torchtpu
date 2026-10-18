@@ -3522,6 +3522,7 @@ class TestStoreSplitTelemetry(unittest.TestCase):
         )
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        sched._req_status = {}
         sched._init_store_split()
         sched._init_state_demotion(False)
         return sched

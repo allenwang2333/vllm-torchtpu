@@ -439,8 +439,18 @@ class RaidenOffloadingManager(OffloadingManager):
             # store keys of the full-attention groups and of all others.
             "split_fa_keys": 0,
             "split_mamba_keys": 0,
+            # Superseded GDN state demotion. demote_req_keys: keys the
+            # scheduler asked to demote; demote_keys / demoted_sub_hashes:
+            # what the store applied; demote_unsupported_keys: keys dropped
+            # because the store has no demote(). state_*_reqs are filled by
+            # the connector scheduler per finished request.
+            "demote_req_keys": 0,
             "demote_keys": 0,
             "demoted_sub_hashes": 0,
+            "demote_unsupported_keys": 0,
+            "state_finished_reqs": 0,
+            "state_tracked_reqs": 0,
+            "state_demoting_reqs": 0,
         }
         self._tel_launch: dict[int, tuple[float, int]] = {}
         self._tel_last_log = time.monotonic()
@@ -553,6 +563,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+        self._warned_no_demote = False
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -910,8 +921,24 @@ class RaidenOffloadingManager(OffloadingManager):
         leave before any entry that is still live. Returns how many sub-hash
         entries were queued; 0 on a store without demote().
         """
+        if not keys:
+            return 0
+        self.telemetry["demote_req_keys"] += len(keys)
         demote = getattr(self._store, "demote", None)
-        if demote is None or not keys:
+        if demote is None:
+            # The native KVCacheStore of tpu-sync-torch 0.0.1.dev20261012084241
+            # has no demote() (and no removal API), so the request is dropped.
+            # Count it, so the telemetry line separates "never asked" from
+            # "asked, but the store cannot apply it".
+            self.telemetry["demote_unsupported_keys"] += len(keys)
+            if not getattr(self, "_warned_no_demote", False):
+                self._warned_no_demote = True
+                logger.warning(
+                    "TPURaidenOffloadingConnector: the Raiden store has no "
+                    "demote(); superseded GDN states stay in plain LRU order. "
+                    "Counted as demote_unsupported_keys in the offload-tier "
+                    "store-split line."
+                )
             return 0
         demoted = demote(self._expand_keys(list(keys)))
         self.telemetry["demote_keys"] += len(keys)
@@ -1459,12 +1486,19 @@ class RaidenOffloadingManager(OffloadingManager):
         )
         logger.info(
             "offload-tier store-split: window %.0fs fa_keys=%d mamba_keys=%d"
-            " demote_keys=%d demoted_sub_hashes=%d",
+            " demote_keys=%d demoted_sub_hashes=%d finished_reqs=%d"
+            " state_tracked_reqs=%d state_demoting_reqs=%d demote_req_keys=%d"
+            " demote_unsupported_keys=%d",
             dt,
             d["split_fa_keys"],
             d["split_mamba_keys"],
             d.get("demote_keys", 0),
             d.get("demoted_sub_hashes", 0),
+            d.get("state_finished_reqs", 0),
+            d.get("state_tracked_reqs", 0),
+            d.get("state_demoting_reqs", 0),
+            d.get("demote_req_keys", 0),
+            d.get("demote_unsupported_keys", 0),
         )
         class_evicted = getattr(self._store, "evicted_sub_hashes", None)
         if class_evicted is not None:

@@ -225,12 +225,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self._demote_stale_state = env == "1"
         else:
             self._demote_stale_state = default_on or bool(self._state_group_ids)
-        # req_id -> boundary tokens -> the state keys stored for that boundary.
+        # req_id -> boundary tokens -> the state keys a store job launched for
+        # that boundary. Filled from the store jobs themselves, not from the
+        # boundary hand-offs: a hand-off whose boundary no job stores (e.g. a
+        # producer partial tail while supports_partial_tail is off) must not
+        # count as the newest state, or the state that WAS stored is demoted.
         self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
         # req_id -> (boundary tokens, state keys) of the admission's hit.
         self._state_hits: dict[str, tuple[int, list[OffloadKey]]] = {}
-        # req_id -> state-group keys of each store job, in submission order.
-        self._state_store_seq: dict[str, list[list[OffloadKey]]] = {}
 
     def _complete_jobs_directly(
         self,
@@ -365,17 +367,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             )
             new_fence_ids.add(job_id)
             if self._demote_stale_state and self._state_group_ids:
-                # Generic GDN-state tracking: covers store paths that bypass
-                # _build_aligned_boundary_store_jobs (e.g. PP chunked prefill),
-                # where _state_boundaries stays empty and nothing was demoted.
-                req_id = getattr(job, "req_id", None)
-                state_keys = [
-                    key
-                    for key in dst_spec.keys
-                    if get_offload_group_idx(key) in self._state_group_ids
-                ]
-                if req_id is not None and state_keys:
-                    self._state_store_seq.setdefault(req_id, []).append(state_keys)
+                self._record_state_store(job.req_id, dst_spec.keys)
 
         # Submit load jobs immediately: destination HBM blocks are freshly
         # allocated and safe to write into.
@@ -648,27 +640,26 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 self._touch(req_status)
         return store_jobs
 
-    def _build_aligned_boundary_store_jobs(
-        self, handoffs: dict[str, list[tuple[int, int, int]]]
-    ) -> dict[int, TransferJob]:
-        jobs = super()._build_aligned_boundary_store_jobs(handoffs)
-        if self._demote_stale_state:
-            for req_id, entries in handoffs.items():
-                req_status = self._req_status.get(req_id)
-                if req_status is None:
-                    continue
+    def _record_state_store(self, req_id: str, keys: Iterable[OffloadKey]) -> None:
+        """Records the state-group keys of a store job under their boundary.
+
+        Called for every store job the step builds (aligned boundaries and
+        partial tails alike), so only boundaries that are really being stored
+        can become a request's newest state.
+        """
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        boundaries = None
+        for key in keys:
+            if get_offload_group_idx(key) not in self._state_group_ids:
+                continue
+            boundary = req_status.req_context.get_offload_key_position(key)
+            if boundary is None:
+                continue
+            if boundaries is None:
                 boundaries = self._state_boundaries.setdefault(req_id, {})
-                for group_idx, _, boundary in entries:
-                    if group_idx in self._state_group_ids:
-                        boundaries.setdefault(boundary, []).append(
-                            self._make_boundary_key(
-                                req_status.req,
-                                group_idx,
-                                boundary,
-                                req_status.req_context,
-                            )
-                        )
-        return jobs
+            boundaries.setdefault(boundary, []).append(key)
 
     def _record_state_hit(self, request: Request, hit_tokens: int) -> None:
         if not self._demote_stale_state or hit_tokens <= 0 or not self._state_group_ids:
@@ -678,35 +669,40 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         req_status = self._req_status.get(request.request_id)
         if req_status is None:
             return
-        self._state_hits[request.request_id] = (
-            hit_tokens,
-            [
-                self._make_boundary_key(
-                    request, group_idx, hit_tokens, req_status.req_context
-                )
-                for group_idx in sorted(self._state_group_ids)
-            ],
-        )
+        # The state a hit resumes from, and the chunk-aligned boundary at or
+        # below it. A hit on an HBM partial tail (a prompt end that is not
+        # chunk aligned) resumes past the boundary the previous turn actually
+        # stored in the tier when partial-tail offload is off; that stored
+        # state is the one this request supersedes.
+        keys: list[OffloadKey] = []
+        for group in self.config.kv_group_configs:
+            if group.group_idx not in self._state_group_ids:
+                continue
+            aligned = hit_tokens // group.tokens_per_chunk * group.tokens_per_chunk
+            for boundary in dict.fromkeys((hit_tokens, aligned)):
+                if boundary > 0:
+                    keys.append(
+                        self._make_boundary_key(
+                            request, group.group_idx, boundary, req_status.req_context
+                        )
+                    )
+        self._state_hits[request.request_id] = (hit_tokens, keys)
 
     def _demote_superseded_states(self, finished_req_ids: Iterable[str]) -> None:
+        tel = getattr(self._raiden_manager, "telemetry", None)
+        if not isinstance(tel, dict):
+            tel = {}
         for req_id in finished_req_ids:
             boundaries = self._state_boundaries.pop(req_id, None)
             hit = self._state_hits.pop(req_id, None)
-            seq = self._state_store_seq.pop(req_id, None)
+            tel["state_finished_reqs"] = tel.get("state_finished_reqs", 0) + 1
             if not boundaries:
-                # Fallback: GDN states stored outside the aligned-boundary path.
-                # Keep only the newest stored state set; older ones (and the
-                # state this request was admitted from, which it superseded)
-                # are demoted: still answer lookups, evicted before live KV.
-                if seq and len(seq) > 1 or (seq and hit is not None):
-                    newest = set(seq[-1])
-                    stale = [k for keys in seq[:-1] for k in keys if k not in newest]
-                    if hit is not None:
-                        stale.extend(k for k in hit[1] if k not in newest)
-                    if stale:
-                        self._raiden_manager.demote(stale)
+                # Nothing stored by this request: whatever it was admitted from
+                # is still the conversation's newest state.
                 continue
+            tel["state_tracked_reqs"] = tel.get("state_tracked_reqs", 0) + 1
             newest = max(boundaries)
+            keep = set(boundaries[newest])
             stale = [
                 key
                 for boundary, keys in boundaries.items()
@@ -715,7 +711,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             ]
             if hit is not None and hit[0] < newest:
                 stale.extend(hit[1])
+            stale = [key for key in dict.fromkeys(stale) if key not in keep]
             if stale:
+                tel["state_demoting_reqs"] = tel.get("state_demoting_reqs", 0) + 1
                 self._raiden_manager.demote(stale)
 
     def _touch(self, req_status: Any) -> None:

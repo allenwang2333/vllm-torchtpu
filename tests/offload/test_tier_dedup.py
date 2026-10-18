@@ -316,7 +316,6 @@ class TestStateDemotion(unittest.TestCase):
     def _sched(self, manager, on=True):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             GroupOffloadConfig,
-            OffloadingConnectorScheduler,
             SchedulerOffloadConfig,
         )
 
@@ -346,15 +345,19 @@ class TestStateDemotion(unittest.TestCase):
         )
         sched._raiden_manager = manager
         sched._req_status = {}
-        sched._init_state_demotion(on)
-        self._patch = patch.object(
-            OffloadingConnectorScheduler,
-            "_build_aligned_boundary_store_jobs",
-            return_value={},
-        )
-        self._patch.start()
-        self.addCleanup(self._patch.stop)
+        env = {} if on else {"TPU_RAIDEN_TIER_DEMOTE_STATE": "0"}
+        with patch.dict(os.environ, env):
+            sched._init_state_demotion(on)
         return sched
+
+    @staticmethod
+    def _store(sched, req, entries):
+        """Records a store job's state keys, as build_connector_meta does."""
+        ctx = sched._req_status[req.request_id].req_context
+        sched._record_state_store(
+            req.request_id,
+            [sched._make_boundary_key(req, g, b, ctx) for g, b in entries],
+        )
 
     def test_finish_demotes_older_boundaries_and_the_admission_hit(self):
         manager = MagicMock()
@@ -362,8 +365,9 @@ class TestStateDemotion(unittest.TestCase):
         req = _Req("r1", [b"h%02d" % i for i in range(8)])
         sched._req_status["r1"] = _tracked(req)
         sched._record_state_hit(req, 8)
-        sched._build_aligned_boundary_store_jobs({"r1": [(1, 5, 16), (0, 6, 16)]})
-        sched._build_aligned_boundary_store_jobs({"r1": [(1, 7, 24)]})
+        # Group 0 is full attention: never a state key.
+        self._store(sched, req, [(1, 16), (0, 16)])
+        self._store(sched, req, [(1, 24)])
 
         sched._demote_superseded_states(["r1"])
 
@@ -394,9 +398,8 @@ class TestStateDemotion(unittest.TestCase):
         sched = self._sched(manager, on=False)
         req = _Req("r1", [b"h%02d" % i for i in range(8)])
         sched._req_status["r1"] = _tracked(req)
+        self.assertFalse(sched._demote_stale_state)
         sched._record_state_hit(req, 8)
-        sched._build_aligned_boundary_store_jobs({"r1": [(1, 5, 16)]})
-        self.assertEqual(sched._state_boundaries, {})
         self.assertEqual(sched._state_hits, {})
 
 
