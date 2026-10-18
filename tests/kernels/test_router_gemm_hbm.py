@@ -26,6 +26,9 @@ import pytest
 
 from vllm_torchtpu.kernels import router_gemm_hbm as rg
 
+# Pallas TPU kernels (no CPU interpret mode): off the CPU unit-test lane.
+pytestmark = pytest.mark.tpu_test
+
 K = 6144
 
 

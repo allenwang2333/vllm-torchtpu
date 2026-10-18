@@ -771,12 +771,12 @@ class TestTpuCompilerCache:
         compile(b)
         assert compiled == [0, 1]
 
-    @pytest.mark.parametrize("peer_replay", ["0", None])
+    @pytest.mark.parametrize("peer_replay", ["0"])
     def test_peer_replay_off_compiles_every_rank_itself(
         self, tmp_path, monkeypatch, peer_replay
     ):
-        """TPU_PRECOMPILE_PEER_REPLAY off, explicitly or by default (None): no
-        peer lookup, no wait, no link, and no fingerprint recorded; each rank
+        """TPU_PRECOMPILE_PEER_REPLAY=0 (on by default since trial 5): no peer
+        lookup, no wait, no link, and no fingerprint recorded; each rank
         compiles and saves its own."""
         import pickle
 

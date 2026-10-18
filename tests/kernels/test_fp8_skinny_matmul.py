@@ -301,6 +301,7 @@ def _weight_vmem_lines(hlo: str, k: int, n: int) -> list[str]:
     return out
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("k,n", PIN_SITES)
 @pytest.mark.parametrize("sd", [False, True])
 def test_hbm_pin_is_bit_identical(k, n, sd):
@@ -320,6 +321,7 @@ def test_hbm_pin_is_bit_identical(k, n, sd):
     )
 
 
+@pytest.mark.tpu_test
 def test_hbm_pin_stacked_eager_bit_identical():
     """The constraint cannot run eagerly; the pinned path jits itself."""
     k, n = 1024, 6144
@@ -341,6 +343,7 @@ def test_hbm_pin_stacked_eager_bit_identical():
 
 # staged: whether XLA stages the unpinned weight in this standalone module (the
 # positive control). q_b's 16 MiB is not staged standalone; it is in the model.
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "k,n,staged", [(1024, 6144, True), (2048, 8192, True), (2048, 16384, False)]
 )
