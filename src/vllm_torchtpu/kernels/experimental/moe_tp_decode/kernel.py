@@ -701,7 +701,8 @@ def _kernel(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "fast")
+    jax.jit,
+    static_argnames=("routed_scale", "topk", "n_ranks", "fast", "hbm_operands"),
 )
 def moe_tp_decode(
     x,
