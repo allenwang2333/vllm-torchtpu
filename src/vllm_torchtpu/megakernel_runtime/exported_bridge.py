@@ -58,6 +58,15 @@ from vllm_torchtpu.megakernel import cache
 from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
 
 
+class MegakernelConfigError(RuntimeError):
+    """Invalid megakernel configuration (fail loudly; never a silent fallback).
+
+    Deliberately not a `ValueError`: callers that treat `ValueError` as an
+    incompatible runtime layout (and disable the megakernel) must not swallow
+    configuration mistakes such as `compile_hlo=True` on a mock-device mesh.
+    """
+
+
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
     """Flatten `output_partition_specs` to one `PartitionSpec` per output leaf."""
     return jax.tree.leaves(output_partition_specs, is_leaf=lambda s: isinstance(s, P))
@@ -261,7 +270,7 @@ def verify_pooled_step_hlo(
     HLO when `mesh` uses `torch_tpu`'s `_PallasDevice` mock devices (where XLA
     compilation is owned by `torch_tpu` `StaticCompiler` and verified via
     `verify_torchtpu_compiled_step_ir`). Passing `compile_hlo=True` with a
-    non-`jax.Device` mesh raises `ValueError`.
+    non-`jax.Device` mesh raises `MegakernelConfigError`.
     """
     has_real_jax_devices = bool(
         mesh.devices.size > 0 and isinstance(mesh.devices.flat[0], jax.Device)
@@ -270,7 +279,7 @@ def verify_pooled_step_hlo(
         dev_type = (
             type(mesh.devices.flat[0]).__name__ if mesh.devices.size > 0 else "empty"
         )
-        raise ValueError(
+        raise MegakernelConfigError(
             f"compile_hlo=True requires a Mesh of real jax.Device instances "
             f"(got {dev_type}); under torch_tpu's _PallasDevice mesh, XLA "
             f"compilation is performed by StaticCompiler and verified via "

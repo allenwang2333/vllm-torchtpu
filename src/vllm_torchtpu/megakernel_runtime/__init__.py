@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from .exported_bridge import (
+    MegakernelConfigError,
     PooledStepExport,
     build_pooled_step_op,
     execute_pooled_step_inplace,
@@ -45,6 +46,7 @@ from .weight_collector import (
 )
 
 __all__ = [
+    "MegakernelConfigError",
     "PooledStepExport",
     "apply_tp_moe_flags",
     "build_pooled_step_op",

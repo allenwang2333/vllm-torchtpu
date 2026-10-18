@@ -377,3 +377,28 @@ def test_verify_torchtpu_compiled_step_ir() -> None:
     )
     assert not ok_bad_hlo
     assert "unexpected full-pool copy in torch_tpu HLO" in msg_bad_hlo
+
+
+def test_verify_pooled_step_hlo_compile_on_mock_mesh_is_config_error():
+    """`compile_hlo=True` on a non-`jax.Device` mesh is a config error, not layout.
+
+    `MegakernelConfigError` must not be a `ValueError`, so runtime code that
+    disables the megakernel on `ValueError` (incompatible KV layout) cannot
+    swallow it.
+    """
+    from vllm_torchtpu.megakernel_runtime.exported_bridge import (
+        MegakernelConfigError,
+    )
+
+    class _MockDevice:
+        id = 0
+        process_index = 0
+        device_kind = "mock"
+        platform = "mock"
+
+    mesh = Mesh(np.array([_MockDevice()], dtype=object), ("tp",))
+    assert not issubclass(MegakernelConfigError, ValueError)
+    with pytest.raises(MegakernelConfigError, match="compile_hlo=True requires"):
+        verify_pooled_step_hlo(
+            mesh, None, None, [], [], max_pages_per_seq=1, compile_hlo=True
+        )
