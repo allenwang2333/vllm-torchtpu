@@ -52,7 +52,9 @@ MOE_W = ("post_norm", "gate_gu_w", "gate_gu_s", "sd_w", "sd_s", "sgate_w", "w13"
 
 @dataclasses.dataclass(frozen=True)
 class MKTiles:
-    tm_norm: int = 256
+    tm_norm: int = 256      # norms, swiglu
+    tm_prep: int = 64       # GDN conv/gates prep (wide f32 temporaries)
+    tm_gate: int = 128      # GDN gated norm, attention q/k norm + rope, attention gate
     tm: int = 512
     tn: int = 512
     chunk: int = 64          # GDN chunk
@@ -62,7 +64,7 @@ class MKTiles:
     tm_route: int = 256
     tm_combine: int = 128
     inflight: int = 64
-    vmem_mib: int = 100
+    vmem_mib: int = 63
 
 
 def kernel_weight_layout(c, w, lt):
@@ -143,49 +145,70 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
             ls_in = dict(zip(s_names[li], s_in[si:si + 2]))
             si += 2
             hsrc, rsrc = (h_in, r_in) if li == 0 else (h_out, r_out)
-            P.norm_add_quant(hsrc, rsrc, lw["in_norm"], r_out, W["xb"], W["xq"], W["xs"],
-                             eps=c.eps, tm=tl.tm_norm)
+            with jax.named_scope(f"L{li}_in_norm"):
+                P.norm_add_quant(hsrc, rsrc, lw["in_norm"], r_out, W["xb"], W["xq"], W["xs"],
+                                 eps=c.eps, tm=tl.tm_norm)
             if lt == "gdn":
-                P.qmatmul(W["xq"], W["xs"], lw["qkvz_w"], lw["qkvz_s"], W["qkvz"], tm=tl.tm,
-                          tn=tl.tn)
-                P.bmatmul(W["xb"], lw["ba_w"], W["ba"], tm=tl.tm)
-                P.gdn_prep(W["qkvz"], W["ba"], ls_in["conv"], lw["conv_w"], lw["a_log"],
-                           lw["dt_bias"], W["gq"], W["gk"], W["gv"], W["gb"], ls["conv"],
-                           kq=c.KH, vh=c.VH, kd=c.KD, vd=c.VD, ks=c.CONV, eps=c.eps,
-                           tm=tl.tm_norm)
-                P.gdn_chunks(W["gq"], W["gk"], W["gv"], W["gb"], ls_in["rec"], W["core"],
-                             ls["rec"], kq=c.KH, vh=c.VH, kd=c.KD, vd=c.VD, chunk=tl.chunk)
-                P.gdn_gated_norm_quant(W["core"], W["qkvz"], lw["gnorm_w"], W["oq"], W["os"],
-                                       vh=c.VH, vd=c.VD, qkv=c.QKV, eps=c.eps, tm=tl.tm_norm)
-                P.qmatmul(W["oq"], W["os"], lw["out_w"], lw["out_s"], h_out, tm=tl.tm, tn=tl.tn)
+                with jax.named_scope(f"L{li}_gdn_in_proj"):
+                    P.qmatmul(W["xq"], W["xs"], lw["qkvz_w"], lw["qkvz_s"], W["qkvz"], tm=tl.tm,
+                              tn=tl.tn)
+                with jax.named_scope(f"L{li}_gdn_ba"):
+                    P.bmatmul(W["xb"], lw["ba_w"], W["ba"], tm=tl.tm)
+                with jax.named_scope(f"L{li}_gdn_prep"):
+                    P.gdn_prep(W["qkvz"], W["ba"], ls_in["conv"], lw["conv_w"], lw["a_log"],
+                               lw["dt_bias"], W["gq"], W["gk"], W["gv"], W["gb"], ls["conv"],
+                               kq=c.KH, vh=c.VH, kd=c.KD, vd=c.VD, ks=c.CONV, eps=c.eps,
+                               tm=tl.tm_prep)
+                with jax.named_scope(f"L{li}_gdn_chunks"):
+                    P.gdn_chunks(W["gq"], W["gk"], W["gv"], W["gb"], ls_in["rec"], W["core"],
+                                 ls["rec"], kq=c.KH, vh=c.VH, kd=c.KD, vd=c.VD, chunk=tl.chunk)
+                with jax.named_scope(f"L{li}_gdn_gated_norm_quant"):
+                    P.gdn_gated_norm_quant(W["core"], W["qkvz"], lw["gnorm_w"], W["oq"], W["os"],
+                                           vh=c.VH, vd=c.VD, qkv=c.QKV, eps=c.eps, tm=tl.tm_gate)
+                with jax.named_scope(f"L{li}_gdn_out_proj"):
+                    P.qmatmul(W["oq"], W["os"], lw["out_w"], lw["out_s"], h_out, tm=tl.tm, tn=tl.tn)
             else:
-                P.qmatmul_heads(W["xq"], W["xs"], lw["qkv_w"], lw["qkv_s"], W["att"], tm=tl.tm,
-                                nh=c.NH, nkv=c.NKV, hd=c.HD)
-                P.att_qk_norm_rope_kv(W["att"], lw["q_norm"], lw["k_norm"], rope, ctx, W["qn"],
-                                      ls["k"], ls["v"], nh=c.NH, nkv=c.NKV, hd=c.HD, rot=c.ROT,
-                                      eps=c.eps, tm=tl.tm_norm)
-                P.att_flash(W["qn"], ls["k"], ls["v"], ctx, W["ao"], nh=c.NH, nkv=c.NKV,
-                            hd=c.HD, bq=tl.bq, bkv=tl.bkv, s_max=s_max)
-                P.att_gate_quant(W["ao"], W["att"], W["aq"], W["as"], nh=c.NH, hd=c.HD,
-                                 tm=tl.tm_norm // 2)
-                P.qmatmul(W["aq"], W["as"], lw["o_w"], lw["o_s"], h_out, tm=tl.tm, tn=tl.tn)
+                with jax.named_scope(f"L{li}_att_qkv_proj"):
+                    P.qmatmul_heads(W["xq"], W["xs"], lw["qkv_w"], lw["qkv_s"], W["att"], tm=tl.tm,
+                                    nh=c.NH, nkv=c.NKV, hd=c.HD)
+                with jax.named_scope(f"L{li}_att_qk_norm_rope_kv"):
+                    P.att_qk_norm_rope_kv(W["att"], lw["q_norm"], lw["k_norm"], rope, ctx, W["qn"],
+                                          ls["k"], ls["v"], nh=c.NH, nkv=c.NKV, hd=c.HD, rot=c.ROT,
+                                          eps=c.eps, tm=tl.tm_gate)
+                with jax.named_scope(f"L{li}_att_flash"):
+                    P.att_flash(W["qn"], ls["k"], ls["v"], ctx, W["ao"], nh=c.NH, nkv=c.NKV,
+                                hd=c.HD, bq=tl.bq, bkv=tl.bkv, s_max=s_max)
+                with jax.named_scope(f"L{li}_att_gate_quant"):
+                    P.att_gate_quant(W["ao"], W["att"], W["aq"], W["as"], nh=c.NH, hd=c.HD,
+                                     tm=tl.tm_gate)
+                with jax.named_scope(f"L{li}_att_o_proj"):
+                    P.qmatmul(W["aq"], W["as"], lw["o_w"], lw["o_s"], h_out, tm=tl.tm, tn=tl.tn)
             # MoE
-            P.norm_add_quant(h_out, r_out, lw["post_norm"], r_out, W["xb"], W["xq"], W["xs"],
-                             eps=c.eps, tm=tl.tm_norm)
-            P.qmatmul(W["xq"], W["xs"], lw["gate_gu_w"], lw["gate_gu_s"], W["lg"], tm=tl.tm,
-                      tn=tn_e, n0=0, nn=c.E // tn_e)
-            P.qmatmul(W["xq"], W["xs"], lw["gate_gu_w"], lw["gate_gu_s"], W["sgu"], tm=tl.tm,
-                      tn=tn_e, n0=c.E // tn_e, nn=2 * c.IS // tn_e)
-            P.swiglu_quant(W["sgu"], W["hq"], W["hs"], inter=c.IS, tm=tl.tm_norm)
-            P.qmatmul(W["hq"], W["hs"], lw["sd_w"], lw["sd_s"], W["sd"], tm=tl.tm, tn=tl.tn)
-            P.bmatmul(W["xb"], lw["sgate_w"], W["sg"], tm=tl.tm)
-            P.moe_route(W["lg"], W["topi"], W["topw"], W["rank"], W["cnt"], e=c.E, topk=c.TOPK,
-                        tm=tl.tm_route)
-            P.moe_experts(W["xb"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
-                          lw["w2"], lw["w2_s"], W["ys"], W["pos"], e=c.E, topk=c.TOPK,
-                          inter=c.I, rt=tl.rt, inflight=tl.inflight, tm=tl.tm_route)
-            P.moe_combine(W["ys"], W["pos"], W["topw"], W["sd"], W["sg"], h_out, topk=c.TOPK,
-                          tm=tl.tm_combine, inflight=tl.inflight)
+            with jax.named_scope(f"L{li}_post_norm"):
+                P.norm_add_quant(h_out, r_out, lw["post_norm"], r_out, W["xb"], W["xq"], W["xs"],
+                                 eps=c.eps, tm=tl.tm_norm)
+            with jax.named_scope(f"L{li}_router"):
+                P.qmatmul(W["xq"], W["xs"], lw["gate_gu_w"], lw["gate_gu_s"], W["lg"], tm=tl.tm,
+                          tn=tn_e, n0=0, nn=c.E // tn_e)
+            with jax.named_scope(f"L{li}_shared_gate_up"):
+                P.qmatmul(W["xq"], W["xs"], lw["gate_gu_w"], lw["gate_gu_s"], W["sgu"], tm=tl.tm,
+                          tn=tn_e, n0=c.E // tn_e, nn=2 * c.IS // tn_e)
+            with jax.named_scope(f"L{li}_swiglu_quant"):
+                P.swiglu_quant(W["sgu"], W["hq"], W["hs"], inter=c.IS, tm=tl.tm_norm)
+            with jax.named_scope(f"L{li}_shared_down"):
+                P.qmatmul(W["hq"], W["hs"], lw["sd_w"], lw["sd_s"], W["sd"], tm=tl.tm, tn=tl.tn)
+            with jax.named_scope(f"L{li}_shared_gate"):
+                P.bmatmul(W["xb"], lw["sgate_w"], W["sg"], tm=tl.tm)
+            with jax.named_scope(f"L{li}_moe_route"):
+                P.moe_route(W["lg"], W["topi"], W["topw"], W["rank"], W["cnt"], e=c.E, topk=c.TOPK,
+                            tm=tl.tm_route)
+            with jax.named_scope(f"L{li}_moe_experts"):
+                P.moe_experts(W["xb"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
+                              lw["w2"], lw["w2_s"], W["ys"], W["pos"], e=c.E, topk=c.TOPK,
+                              inter=c.I, rt=tl.rt, inflight=tl.inflight, tm=tl.tm_route)
+            with jax.named_scope(f"L{li}_moe_combine"):
+                P.moe_combine(W["ys"], W["pos"], W["topw"], W["sd"], W["sg"], h_out, topk=c.TOPK,
+                              tm=tl.tm_combine, inflight=tl.inflight)
             # Each layer's states were copied into the outputs' aliases before any phase reads
             # them (in place: s_out aliases s_in), so nothing else to do here.
 

@@ -191,7 +191,7 @@ def moe(c, w, x):
     return routed + shared * sgate
 
 
-def stage_step(c, weights, hidden, residual, states, ctx, flash_bkv=None):
+def stage_step(c, weights, hidden, residual, states, ctx, flash_bkv=None, moe_fn=None):
     """weights: per-layer dicts; states: per-layer dicts (gdn: conv [CONV-1, QKV] bf16,
     rec [VH, KD, VD] f32; attn: k, v [ctx + T, NKV, HD] fp8). Returns hidden, residual
     (bf16, [T, H]) and the new states."""
@@ -209,7 +209,7 @@ def stage_step(c, weights, hidden, residual, states, ctx, flash_bkv=None):
         res = y.astype(BF16).astype(F32) + residual.astype(F32)
         residual = res.astype(BF16)
         x = rmsnorm_zc(res, w["post_norm"], c.eps).astype(BF16)
-        hidden = moe(c, w, x).astype(BF16)
+        hidden = (moe_fn or moe)(c, w, x).astype(BF16)
     return hidden, residual, new_states
 
 
@@ -254,3 +254,76 @@ def random_stage(c, t, ctx, seed=0, n_layers=None):
     hidden = vec((t, c.H), 1.0)
     residual = vec((t, c.H), 1.0)
     return types, weights, states, hidden, residual
+
+
+def _quant_rows(x):
+    x = x.astype(BF16).astype(F32)
+    amax = jnp.max(jnp.abs(x), -1, keepdims=True)
+    s = jnp.where(amax > 0, amax * (1.0 / FP8_MAX), 1.0)
+    return jnp.clip(x / s, -FP8_MAX, FP8_MAX).astype(FP8), s
+
+
+def moe_ragged(c, w, x):
+    """moe() at full scale: slots grouped by expert (stable argsort) and run through
+    jax.lax.ragged_dot, w8a8 like the serving grouped matmul."""
+    t = x.shape[0]
+    fused = qlinear(x, w["gate_gu_w"], w["gate_gu_s"])
+    logits, sgu = fused[:, :c.E], fused[:, c.E:]
+    topw, topi = jax.lax.top_k(jax.nn.softmax(logits, -1), c.TOPK)
+    topw = topw / jnp.sum(topw, -1, keepdims=True)
+    flat_e = topi.reshape(-1)
+    order = jnp.argsort(flat_e, stable=True)
+    e_sorted = flat_e[order]
+    sizes = jnp.bincount(flat_e, length=c.E).astype(jnp.int32)
+    xq, xs = _quant_rows(x[order // c.TOPK])
+    gu = jax.lax.ragged_dot(xq, w["w13"], sizes, preferred_element_type=F32)
+    gu = (gu * xs * w["w13_s"][e_sorted]).astype(BF16).astype(F32)
+    hq, hs = _quant_rows(jax.nn.silu(gu[:, :c.I]) * gu[:, c.I:])
+    y = jax.lax.ragged_dot(hq, w["w2"], sizes, preferred_element_type=F32)
+    y = (y * hs * w["w2_s"][e_sorted]).astype(BF16).astype(F32)
+    y = jnp.zeros_like(y).at[order].set(y).reshape(t, c.TOPK, c.H)
+    routed = jnp.sum(y * topw[..., None], 1)
+    sh = (jax.nn.silu(sgu[:, :c.IS]) * sgu[:, c.IS:]).astype(BF16)
+    shared = qlinear(sh, w["sd_w"], w["sd_s"])
+    sgate = jax.nn.sigmoid(jax.lax.dot_general(x, w["sgate_w"], (((1,), (0,)), ((), ())),
+                                               preferred_element_type=F32))
+    return routed + shared * sgate
+
+
+def random_stage_device(c, t, ctx, key, kv_rows=None):
+    """random_stage on the device (jax.random), for full-size stages. Same layouts."""
+    kv_rows = kv_rows or ctx + t
+    keys = iter(jax.random.split(key, 4096))
+    nrm = lambda shape, s=1.0, dt=F32: (jax.random.normal(next(keys), shape, F32) * s).astype(dt)
+
+    def fp8w(din, dout, *lead):
+        w = nrm((*lead, din, dout), 0.5, FP8)
+        s = jax.random.uniform(next(keys), (*lead, dout), F32, 0.5, 1.5) / np.sqrt(din) / 0.5
+        return w, s
+
+    weights, states = [], []
+    for lt in c.layer_types:
+        w = {"in_norm": nrm((c.H,), 0.1, BF16), "post_norm": nrm((c.H,), 0.1, BF16)}
+        if lt == "gdn":
+            w["qkvz_w"], w["qkvz_s"] = fp8w(c.H, c.QKV + c.Z)
+            w["ba_w"] = nrm((c.H, 2 * c.VH), 0.02, BF16)
+            w["conv_w"] = nrm((c.QKV, c.CONV), 0.3, BF16)
+            w["a_log"] = jnp.log(jax.random.uniform(next(keys), (c.VH,), F32, 1.0, 16.0))
+            w["dt_bias"] = nrm((c.VH,))
+            w["gnorm_w"] = 1.0 + nrm((c.VD,), 0.1)
+            w["out_w"], w["out_s"] = fp8w(c.Z, c.H)
+            states.append({"conv": nrm((c.CONV - 1, c.QKV), 0.5, BF16),
+                           "rec": nrm((c.VH, c.KD, c.VD), 0.05)})
+        else:
+            w["qkv_w"], w["qkv_s"] = fp8w(c.H, c.ATT_QKV)
+            w["q_norm"], w["k_norm"] = nrm((c.HD,), 0.1, BF16), nrm((c.HD,), 0.1, BF16)
+            w["o_w"], w["o_s"] = fp8w(c.NH * c.HD, c.H)
+            states.append({"k": nrm((kv_rows, c.NKV, c.HD), 1.0, FP8),
+                           "v": nrm((kv_rows, c.NKV, c.HD), 1.0, FP8)})
+        w["gate_gu_w"], w["gate_gu_s"] = fp8w(c.H, c.E + 2 * c.IS)
+        w["w13"], w["w13_s"] = fp8w(c.H, 2 * c.I, c.E)
+        w["w2"], w["w2_s"] = fp8w(c.I, c.H, c.E)
+        w["sd_w"], w["sd_s"] = fp8w(c.IS, c.H)
+        w["sgate_w"] = nrm((c.H, 1), 0.02, BF16)
+        weights.append(w)
+    return weights, states, nrm((t, c.H), 1.0, BF16), nrm((t, c.H), 1.0, BF16)

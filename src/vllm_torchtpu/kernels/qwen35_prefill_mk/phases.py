@@ -448,8 +448,8 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                 vv = v_ref[0].astype(BF16)
                 s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
                                         preferred_element_type=F32) * scale
-                row = jax.lax.broadcasted_iota(jnp.int32, (rows, bkv), 0)
-                col = jax.lax.broadcasted_iota(jnp.int32, (rows, bkv), 1)
+                row = jax.lax.broadcasted_iota(jnp.int32, (rows, 1), 0)
+                col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
                 pos = ctx + i * bq + row % bq        # rows are (head, token) head-major
                 s = jnp.where(j * bkv + col <= pos, s, -jnp.inf)
                 m_prev = m_ref[...][:, :1]
@@ -713,10 +713,13 @@ def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, top
             cp = pltpu.make_async_copy(pos_hbm.at[pl.ds(i * tm, tm)], pos_s, sem1.at[0])
             cp.start()
             cp.wait()
-            _gather_rows(y_sorted_hbm, lambda r: pos_s[r // topk, r % topk], rows, tm * topk,
+            # Slot-major: rows[k * tm + t] = y_sorted[pos[t, k]], summed one slot at a time.
+            _gather_rows(y_sorted_hbm, lambda r: pos_s[r % tm, r // tm], rows, tm * topk,
                          sems, inflight)
-            y = rows[...].astype(F32).reshape(tm, topk, h)
-            routed = jnp.sum(y * tw_ref[...][:, :, None], 1)
+            tw = tw_ref[...]
+            routed = jnp.zeros((tm, h), F32)
+            for kk in range(topk):
+                routed = routed + rows[kk * tm:(kk + 1) * tm, :].astype(F32) * tw[:, kk:kk + 1]
             shared = sd_ref[...].astype(F32) * jax.nn.sigmoid(sg_ref[...])
             o_ref[...] = (routed + shared).astype(o_ref.dtype)
 
