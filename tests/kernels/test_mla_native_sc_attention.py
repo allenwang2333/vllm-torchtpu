@@ -1541,6 +1541,77 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
     @parameterized.product(
         (
+            {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+            {"query_tokens": 2048, "seq_q": (4, 4, 2040)},
+        ),
+        pieces=(0, 2),
+    )
+    def test_mixed_chunk_512_bit_identical(self, query_tokens, seq_q, pieces):
+        """TPU_DCP_MLA_TOPK_CAP_CHUNK=512 vs the served 256 on the served
+        mixed config (raw top-k, fused prep, live gather, widths 256/384, in-
+        kernel mask, split q, merge pieces): every real row's output and lse
+        bit for bit. The chunk only regroups whole 16-token grid steps into
+        gather calls; each grid step's rows, widths and softmax are the same."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        rng = np.random.default_rng(20261018 + query_tokens + pieces)
+        problem, _, _, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        counts[16:32] = 0
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, chunk):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=chunk,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=sparse_mla.MIXED_BODY_DEFAULT,
+                mixed_fused_prep=True,
+                out_pieces=pieces,
+            )
+            return out[..., :NOPE_DIM], lse
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        self.assertGreater(int((counts[:real_tokens] > 512).sum()), 0)  # overflow rows
+        ref, ref_lse = jax.block_until_ready(run(topk_raw, 256))
+        out, lse = jax.block_until_ready(run(topk_raw, 512))
+        np.testing.assert_array_equal(bits(out)[:real_tokens], bits(ref)[:real_tokens])
+        np.testing.assert_array_equal(
+            np.asarray(lse)[:real_tokens].view(np.uint32),
+            np.asarray(ref_lse)[:real_tokens].view(np.uint32),
+        )
+        # Positive control: one moved live entry of the longest row moves it.
+        row = int(np.argmax(counts[:real_tokens]))
+        moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
+        bad, _ = jax.block_until_ready(run(moved, 512))
+        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    @parameterized.product(
+        (
             {"query_tokens": 512, "seq_q": (4, 4, 504)},
             {"query_tokens": 1024, "seq_q": (4, 4, 1016)},
         ),
