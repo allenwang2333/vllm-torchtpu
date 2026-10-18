@@ -5845,11 +5845,8 @@ class TPURaidenConnectorWorker:
     def _ensure_stage3_submit_workers(self) -> None:
         if self._stage3_submit_threads:
             return
-        # Qwen TP previously coordinated loads serially on the model thread.
-        # Keep that order off-thread: concurrent coordinations can arm A on
-        # TP0 and B on TP1, each holding staging slots needed by its sibling.
         num_workers = (
-            1
+            self._stage3_sharded_submit_workers()
             if self._stage3_sharded_consumer() and not self._stage3_kimi
             else _STAGE3_SUBMIT_WORKERS
         )
@@ -5861,6 +5858,35 @@ class TPURaidenConnectorWorker:
             )
             thread.start()
             self._stage3_submit_threads.append(thread)
+
+    @staticmethod
+    def _stage3_sharded_submit_workers() -> int:
+        """Bounds the concurrent coordinations of a head-sharded consumer.
+
+        One coordination arms every TP worker of this engine, and each arm
+        leases at most one max-length request's pages per storage from that
+        worker's bounded staging arena, which holds
+        TPU_RAIDEN_POOL_STAGING_LEASES of them. With no more coordinations in
+        flight than leases, an arm that finds the arena full waits only for
+        receives that already have their senders and land on their own. More
+        coordinations than leases can arm A on TP0 and B on TP1, each holding
+        staging slots its sibling needs, until the arm deadline expires. The
+        full host mirror (leases 0) takes no slots at arm time.
+        """
+        requested = max(1, int(tpu_envs.TPU_RAIDEN_STAGE3_SUBMIT_WORKERS))
+        leases = int(dist_utils.get_raiden_pool_staging_leases())
+        if leases <= 0:
+            return requested
+        if requested > leases:
+            logger.warning(
+                "TPU_RAIDEN_STAGE3_SUBMIT_WORKERS=%d exceeds "
+                "TPU_RAIDEN_POOL_STAGING_LEASES=%d; using %d concurrent "
+                "Stage-3 coordinations",
+                requested,
+                leases,
+                leases,
+            )
+        return min(requested, leases)
 
     def _stage3_submit_worker_loop(self) -> None:
         while True:

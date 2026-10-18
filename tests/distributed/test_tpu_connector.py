@@ -4025,6 +4025,40 @@ class TestTPURaidenConnectorWorker:
             assert worker._stage3_inflight_submits == set()
         assert worker.get_block_ids_with_load_errors() == set()
 
+    @pytest.mark.parametrize(
+        ("requested", "leases", "expected"),
+        [(1, 8, 1), (2, 8, 2), (4, 2, 2), (0, 8, 1), (3, 0, 3)],
+    )
+    def test_stage3_sharded_submit_workers_capped_by_staging_leases(
+        self, requested, leases, expected
+    ):
+        worker = _make_raiden_worker(is_producer=False, tp_rank=0, tp_size=8)
+        assert worker._stage3_sharded_consumer()
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_SUBMIT_WORKERS", requested),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_leases",
+                return_value=leases,
+            ),
+            patch.object(worker, "_stage3_submit_worker_loop", return_value=None),
+        ):
+            worker._ensure_stage3_submit_workers()
+        assert len(worker._stage3_submit_threads) == expected
+        for thread in worker._stage3_submit_threads:
+            thread.join(timeout=5)
+
+    def test_stage3_unsharded_consumer_keeps_submit_pool(self):
+        worker = _make_raiden_worker(is_producer=False, tp_rank=0, tp_size=1)
+        assert not worker._stage3_sharded_consumer()
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_SUBMIT_WORKERS", 1),
+            patch.object(worker, "_stage3_submit_worker_loop", return_value=None),
+        ):
+            worker._ensure_stage3_submit_workers()
+        assert len(worker._stage3_submit_threads) == 4
+        for thread in worker._stage3_submit_threads:
+            thread.join(timeout=5)
+
     @pytest.mark.parametrize("queued", [False, True])
     def test_stage3_async_submit_keeps_blocks_until_rpc_settles(self, queued):
         worker = _make_raiden_worker(

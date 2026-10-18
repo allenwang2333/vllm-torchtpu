@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_RAIDEN_STAGE3_SUBMIT_WORKERS: int = 1
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -1110,6 +1111,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
+    ),
+    # Concurrent Stage-3 coordinations of a head-sharded decode engine, capped
+    # at its TPU_RAIDEN_POOL_STAGING_LEASES.
+    "TPU_RAIDEN_STAGE3_SUBMIT_WORKERS": env_nonnegative_int(
+        "TPU_RAIDEN_STAGE3_SUBMIT_WORKERS", 1
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
