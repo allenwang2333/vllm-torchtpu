@@ -138,7 +138,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
-from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner.stage_timing import NullStageTiming, RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1068,7 +1068,11 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing: RunnerStageTiming | NullStageTiming = (
+            NullStageTiming()
+            if envs.TPU_DISABLE_RUNNER_STAGE_TIMING
+            else RunnerStageTiming(profiler_rank)
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -5156,7 +5160,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                self.max_num_tokens, self.device
+                self.max_num_tokens,
+                self.device,
+                skip_unchanged=envs.TPU_SKIP_UNCHANGED_PADDING_UPLOAD,
             )
             token_padding.set_padding_state(self._token_padding_state)
 

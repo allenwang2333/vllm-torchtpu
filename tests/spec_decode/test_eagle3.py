@@ -2763,3 +2763,106 @@ def test_static_shape_args_passes_non_tensors_through():
 
     t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
     assert step_idx == 3 and flag is None and t.shape == (2,)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("cache_uploads", [False, True])
+def test_propose_loop_upload_cache(cache_uploads, device):
+    """TPU_DRAFT_LOOP_CACHE_UPLOADS: the loop steps see the same
+    query_start_loc / request_distribution values, the drafts are unchanged,
+    and with the flag on a repeated propose reuses the first one's tensors."""
+    import torch._dynamo
+
+    torch._dynamo.reset()
+    hidden_size, vocab_size, K, num_reqs = 8, 128, 3, 2
+    proposer = _make_proposer(draft_tp=1)
+    proposer._cache_loop_uploads = cache_uploads
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=num_reqs),
+        max_num_reqs=16,
+        num_reqs_max_model_len=16,
+        num_reqs_most_model_len=16,
+        num_tokens_paddings=[16, 32, 64, 128],
+        device=device,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: False,
+    )
+
+    class _StubDraftModel:
+        model = SimpleNamespace(use_aux_hidden_state=True)
+
+        def combine_hidden_states(self, x):
+            return x
+
+        def compute_logits(self, hidden):
+            tokens = hidden[:, 0].round().clamp(min=0).to(torch.int64)
+            return torch.nn.functional.one_hot(tokens, vocab_size).to(torch.float32)
+
+    proposer.draft_model = _StubDraftModel()
+
+    def _prepare(chunk, *_args, **_kwargs):
+        return (
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.zeros(16, dtype=torch.int32, device=device),
+            torch.arange(chunk.num_reqs, device=device),
+            torch.ones(chunk.num_reqs, dtype=torch.int32, device=device),
+        )
+
+    proposer._prepare_draft_inputs = _prepare
+    seen = []
+
+    def _forward_draft(*, chunk, input_ids, step_idx, **kwargs):
+        n = input_ids.shape[0]
+        last_hidden = torch.zeros((n, hidden_size), device=device)
+        if step_idx == 0:
+            last_hidden[torch.arange(chunk.num_reqs, device=device), 0] = 40.0
+        else:
+            seen.append(
+                (kwargs["loop_query_start_loc"], kwargs["loop_request_distribution"])
+            )
+            last_hidden[:, 0] = (input_ids + 1).to(torch.float32)
+        return last_hidden, last_hidden
+
+    proposer._forward_draft = _forward_draft
+
+    results = []
+    for _ in range(2):
+        proposer.draft_chunks = [
+            _make_chunk(
+                input_ids=torch.zeros(16, dtype=torch.int32, device=device),
+                position_ids=torch.zeros(16, dtype=torch.int32, device=device),
+                query_start_loc_np=np.arange(num_reqs + 1, dtype=np.int32),
+                start_index=0,
+                num_reqs=num_reqs,
+                hidden=hidden_size,
+                device=device,
+                attn_ctx=SimpleNamespace(use_max_model_len=True),
+            )
+        ]
+        results.append(
+            proposer.propose(
+                sampled_token_ids=[[0]] * num_reqs,
+                discard_sampled_tokens_req_indices=[],
+                num_rejected_tokens_np=None,
+                scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+                # The async path GLM-5.2 serves with: device drafts and a
+                # device num_rejected.
+                return_device=True,
+                next_tokens_per_chunk=[
+                    torch.zeros((num_reqs, K + 1), dtype=torch.int32, device=device)
+                ],
+            )
+            .cpu()
+            .tolist()
+        )
+
+    assert results[0] == results[1] == [[40, 41, 42]] * num_reqs
+    assert len(seen) == 2 * (K - 1)
+    expected_qsl = np.minimum(np.arange(17), num_reqs).tolist()
+    for qsl, reqdist in seen:
+        assert qsl.cpu().tolist() == expected_qsl
+        assert reqdist.cpu().tolist() == [num_reqs] * 3
+    # The two proposes' loop steps share tensors exactly when caching.
+    assert (seen[0][0] is seen[-1][0]) == cache_uploads
+    assert (seen[0][1] is seen[-1][1]) == cache_uploads

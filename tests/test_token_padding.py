@@ -198,3 +198,28 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_skip_unchanged_writes_the_same_masks():
+    """TPU_SKIP_UNCHANGED_PADDING_UPLOAD: every mask equals the always-write one."""
+    ref = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    fast = TokenPaddingState(
+        local_padding_mask=torch.zeros(8, dtype=torch.bool), skip_unchanged=True
+    )
+    for bounds in [(4, 4), (4, 4), (1, 4), (1, 4), (0, 8), (4, 4), (4, 4), (3, 6)]:
+        ref.update(*bounds)
+        fast.update(*bounds)
+        assert torch.equal(fast.local_padding_mask, ref.local_padding_mask), bounds
+
+
+def test_skip_unchanged_skips_only_a_repeat():
+    state = TokenPaddingState(
+        local_padding_mask=torch.zeros(4, dtype=torch.bool), skip_unchanged=True
+    )
+    state.update(1, 4)
+    # Poison the buffer: a repeat must not write, a change must.
+    state.local_padding_mask.fill_(False)
+    state.update(1, 4)
+    assert state.local_padding_mask.sum().item() == 0
+    state.update(2, 4)
+    assert state.local_padding_mask.tolist() == [False, False, True, True]

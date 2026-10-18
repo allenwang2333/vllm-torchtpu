@@ -215,6 +215,12 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of
         # recomputing it or paying the full upstream builder walk.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
+        # TPU_DRAFT_LOOP_CACHE_UPLOADS: the loop steps' query_start_loc and
+        # request_distribution, keyed by (kernel_num_reqs, num_reqs). Their
+        # values are a function of that key alone and nothing writes them in
+        # place, so one upload serves every propose with the same key (held
+        # in _loop_qsl_reqdist_cache, shared with the fused tail).
+        self._cache_loop_uploads = bool(envs.TPU_DRAFT_LOOP_CACHE_UPLOADS)
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -1566,7 +1572,11 @@ class Eagle3Proposer:
             loop_qsl_per_chunk = []
             loop_reqdist_per_chunk = []
             for c in chunks:
-                qsl, reqdist = self._loop_qsl_reqdist(c, cached=False)
+                # TPU_DRAFT_LOOP_CACHE_UPLOADS reuses the per-(num_reqs, knr)
+                # upload across proposes, as the fused tail always does.
+                qsl, reqdist = self._loop_qsl_reqdist(
+                    c, cached=self._cache_loop_uploads
+                )
                 loop_qsl_per_chunk.append(qsl)
                 loop_reqdist_per_chunk.append(reqdist)
 

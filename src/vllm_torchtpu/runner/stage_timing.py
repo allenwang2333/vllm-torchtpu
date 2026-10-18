@@ -86,3 +86,25 @@ class RunnerStageTiming:
         with self._samples_lock:
             device, self._device_samples = self._device_samples, []
         return cpu, device
+
+
+class NullStageTiming:
+    """`RunnerStageTiming`'s interface with no events, queue or thread.
+
+    TPU_DISABLE_RUNNER_STAGE_TIMING: the timed stages cost the serving thread
+    eight `TpuEvent` records per spec-decode step, and the collector wakes
+    and takes the GIL four times a step. Runner timings are dropped.
+    """
+
+    @contextlib.contextmanager
+    def host_stage(self, stage: str) -> Iterator[None]:
+        yield
+
+    @contextlib.contextmanager
+    def stage(self, stage: str) -> Iterator[None]:
+        yield
+
+    def take_samples(
+        self,
+    ) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
+        return [], []
