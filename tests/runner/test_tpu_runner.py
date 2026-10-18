@@ -2710,7 +2710,13 @@ def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
             ],
         )
         chunks, indices, rejected, counts = runner._assemble_async_spec_substitution(
-            drafts, next_tokens, state
+            drafts,
+            next_tokens,
+            state,
+            [
+                (torch.tensor([[7], [0], [0], [0]]), torch.tensor([2, 0, 0, 0])),
+                (torch.tensor([[8], [0]]), torch.tensor([0, 0])),
+            ],
         )
     else:
         chunks, indices, rejected, counts = runner._assemble_async_prefill_bootstrap(
@@ -2723,3 +2729,45 @@ def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
     assert source[indices[1]].tolist() == [8, 22, 22]
     assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
     assert counts == ({0: 2} if verify else {0: 0, 1: 0})
+
+
+def test_prepare_async_rejection_keeps_bucket_rows_and_submits_without_wait(
+    monkeypatch,
+):
+    from vllm_torchtpu.runner import tpu_runner_async_output as async_output
+
+    monkeypatch.setattr(
+        async_output,
+        "prepare_spec_rejection_state",
+        async_output.prepare_spec_rejection_state._torchdynamo_orig_callable,
+    )
+    submit = MagicMock()
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", submit)
+    runner = object.__new__(TPUModelRunner)
+    runner.drafter = SimpleNamespace(bucketed_drafts=True)
+    state = SimpleNamespace(
+        num_reqs_list=[1, 1],
+        spec_decode_metadata_list=[
+            SimpleNamespace(draft_lengths=torch.tensor([2, 0, 0])),
+            None,
+        ],
+    )
+    chunks = [
+        torch.tensor([[7, -1, -1], [0, -1, -1], [-1, -1, -1]]),
+        torch.tensor([[8, -1, -1], [-1, -1, -1]]),
+    ]
+    prepared = runner._prepare_async_spec_rejection(chunks, state)
+    assert prepared[0][0].tolist() == [[7], [0], [-1]]
+    assert prepared[0][1].tolist() == [2, 0, 1]
+    assert prepared[1][0].tolist() == [[8], [-1]]
+    assert prepared[1][1].tolist() == [0, 0]
+    submit.assert_called_once()
+    assert submit.call_args.kwargs == {"wait": False}
+    assert all(
+        a is b
+        for a, b in zip(
+            submit.call_args.args[0],
+            [t for pair in prepared for t in pair],
+            strict=True,
+        )
+    )

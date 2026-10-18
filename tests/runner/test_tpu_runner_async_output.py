@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
@@ -25,6 +26,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     assemble_spec_next_tokens,
     compute_num_rejected,
     extract_draft_token_ids,
+    prepare_spec_rejection_state,
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
 )
@@ -257,3 +259,31 @@ def test_get_output_skips_wait_when_all_requests_discarded():
     ).get_output()
     assert out.sampled_token_ids == [[]]
     assert out.logprobs is None
+
+
+@pytest.mark.parametrize("with_drafts", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_prepare_rejection_state_before_new_drafts(device, with_drafts, dtype):
+    # Full acceptance, partial acceptance, first rejection, empty/padded row.
+    tokens = torch.tensor(
+        [[10, 11, 12, 99], [20, 21, -1, -1], [30, -1, -1, -1], [-1] * 4],
+        dtype=dtype,
+        device=device,
+    )
+    counts = torch.tensor([3, 2, 1, 0], dtype=torch.int32, device=device)
+    prepare = prepare_spec_rejection_state
+    if device.type == "cpu":
+        prepare = prepare._torchdynamo_orig_callable
+    bonus, rejected = prepare(tokens, counts if with_drafts else None)
+    assert bonus.tolist() == [[99], [21], [30], [-1]]
+    assert rejected.tolist() == ([0, 1, 1, 1] if with_drafts else [0] * 4)
+    assert bonus.dtype == dtype
+    assert rejected.dtype == torch.int32
+    assert torch.equal(
+        tokens,
+        torch.tensor(
+            [[10, 11, 12, 99], [20, 21, -1, -1], [30, -1, -1, -1], [-1] * 4],
+            dtype=dtype,
+            device=device,
+        ),
+    )

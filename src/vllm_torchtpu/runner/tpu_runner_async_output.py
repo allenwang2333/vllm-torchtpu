@@ -257,6 +257,22 @@ def assemble_spec_next_tokens(
     return src.reshape(-1)  # [num_reqs * (1 + K)]
 
 
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def prepare_spec_rejection_state(
+    next_tokens: torch.Tensor, num_draft: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare bonus and rejection counts without depending on new drafts."""
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1, dtype=torch.int32)
+    last_valid_col = num_valid.clamp(min=1) - 1
+    bonus = next_tokens.gather(1, last_valid_col.unsqueeze(1).to(torch.int64))
+    rejected = (
+        torch.zeros_like(num_valid)
+        if num_draft is None
+        else (num_draft.to(torch.int32) - num_valid + 1).clamp(min=0)
+    )
+    return bonus, rejected
+
+
 def subtract_num_rejected_tokens(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,

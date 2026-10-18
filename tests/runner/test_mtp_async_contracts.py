@@ -345,7 +345,16 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
             ],
         )
         chunks, _indices, rejected, counts = runner._assemble_async_spec_substitution(
-            drafts, [verified, newly_sampled], state
+            drafts,
+            [verified, newly_sampled],
+            state,
+            [
+                (verified[:, :1], torch.tensor([k], dtype=torch.int32, device=device)),
+                (
+                    newly_sampled[:, :1],
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                ),
+            ],
         )
         ids = ["verify", "new"]
     else:

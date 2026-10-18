@@ -105,6 +105,7 @@ def _fake_runner(method, is_async, verify, propose):
         _update_num_xla_graphs=lambda *_args: None,
         _modify_prev_results=lambda: None,
         _sync_replicated_drafts_across_tp=lambda drafts: drafts,
+        _prepare_async_spec_rejection=lambda *_args: [],
         _assemble_async_spec_substitution=lambda *_args: async_source,
         _assemble_async_prefill_bootstrap=lambda *_args: async_source,
         _update_placeholder=lambda *_args: {"r0": 0},
@@ -242,3 +243,31 @@ def test_device_drafter_runs_before_kv_connector_save(
     )
     assert output.kv_connector_output.finished_sending == {"sent"}
     assert output.kv_connector_output.finished_recving == {"loaded"}
+
+
+def test_async_verify_prepares_rejection_before_draft_dispatch():
+    events = []
+    prepared = [(torch.tensor([[7]]), torch.tensor([1], dtype=torch.int32))]
+
+    def propose(**kwargs):
+        events.append("draft")
+        return torch.tensor([[8]])
+
+    runner = _fake_runner("mtp", True, True, propose)
+    runner.max_num_reqs = 1
+    runner._prepare_async_spec_rejection = MagicMock(
+        side_effect=lambda *_args: events.append("prepare") or prepared
+    )
+    runner._assemble_async_spec_substitution = MagicMock(
+        return_value=([torch.tensor([7, 8])], {0: 0}, prepared[0][1], {0: 1})
+    )
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+    assert events == ["prepare", "draft"]
+    assert runner._assemble_async_spec_substitution.call_args.args[3] is prepared
+    assert output.get_output().sampled_token_ids == [[7]]

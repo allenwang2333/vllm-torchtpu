@@ -2718,7 +2718,28 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
-    def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
+    def _prepare_async_spec_rejection(self, next_tokens_per_chunk, state):
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            prepare_spec_rejection_state,
+        )
+
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        prepared = []
+        for nt, num_reqs, md in zip(
+            next_tokens_per_chunk,
+            state.num_reqs_list,
+            state.spec_decode_metadata_list,
+        ):
+            rows = nt.shape[0] if bucketed else num_reqs
+            counts = None if md is None else fit_rows(md.draft_lengths, rows)
+            prepared.append(prepare_spec_rejection_state(nt[:rows], counts))
+        # Submit independent work before draft dispatch; do not wait on the host.
+        synchronize_tensors([t for pair in prepared for t in pair], wait=False)
+        return prepared
+
+    def _assemble_async_spec_substitution(
+        self, drafts, next_tokens_per_chunk, state, rejection_state
+    ):
         """Async-spec substitution assembler.
 
         From the already-proposed on-device ``drafts`` (the unified eagle3
@@ -2728,11 +2749,6 @@ class TPUModelRunner(GPUModelRunner):
         Returns ``(next_tokens_tpu_chunks, next_token_indices,
         spec_decode_num_rejected_tokens, num_draft_per_req)``.
         """
-        from vllm_torchtpu.runner.tpu_runner_async_output import (
-            assemble_spec_next_tokens,
-            compute_num_rejected,
-        )
-
         assert drafts is not None, (
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
@@ -2751,40 +2767,32 @@ class TPUModelRunner(GPUModelRunner):
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
         # proposals, even if they did not verify drafts in the current step.
-        for nt_chunk, num_reqs, md, drafts_chunk in zip(
+        for nt_chunk, num_reqs, md, drafts_chunk, (bonus, rejected) in zip(
             next_tokens_per_chunk,
             state.num_reqs_list,
             state.spec_decode_metadata_list,
             drafts_per_chunk,
+            rejection_state,
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
             drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
-            src = assemble_spec_next_tokens(
-                nt_chunk, drafts_chunk, None if bucketed else num_reqs
-            )
+            src = torch.cat([bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1)
+            src = src.reshape(-1)
+            num_rejected_chunks.append(rejected)
             if md is not None:
-                num_rejected_chunks.append(
-                    compute_num_rejected(
-                        nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
-                    )
-                )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
-            else:
-                # No drafts were verified this step, so there is no rejection
-                # correction or speculative output-placeholder rollback.
-                num_rejected_chunks.append(
-                    torch.zeros(
-                        chunk_padded_num_reqs, dtype=torch.int32, device=nt_chunk.device
-                    )
-                )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
                 next_token_indices[req_offset + r] = padded_req_offset + r
             req_offset += num_reqs
             padded_req_offset += chunk_padded_num_reqs
         spec_num_rejected = (
-            torch.cat(num_rejected_chunks) if num_rejected_chunks else None
+            num_rejected_chunks[0]
+            if len(num_rejected_chunks) == 1
+            else torch.cat(num_rejected_chunks)
+            if num_rejected_chunks
+            else None
         )
         return (
             next_tokens_tpu_chunks,
@@ -4614,6 +4622,12 @@ class TPUModelRunner(GPUModelRunner):
                 self._update_num_xla_graphs("decoding_step")
                 cur_start_idx = cur_end_idx
 
+        rejection_state = None
+        if self.scheduler_config.async_scheduling and is_spec_step:
+            rejection_state = self._prepare_async_spec_rejection(
+                next_tokens_per_chunk, state
+            )
+
         # NOTE: current kv load and save get h2d/d2h copies involved.
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
@@ -4809,7 +4823,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_num_rejected,
                     num_draft_per_req,
                 ) = self._assemble_async_spec_substitution(
-                    eagle3_drafts, next_tokens_per_chunk, state
+                    eagle3_drafts, next_tokens_per_chunk, state, rejection_state
                 )
             elif (
                 self._is_async_drafter
