@@ -5,8 +5,8 @@
 Run on a TPU in the project environment:
     python scripts/dsv41_bench/bench_csa2_decode.py --out /tmp/csa2-decode --profile
 
-For region tracing and compiler inspection, add:
-    --trace-mode TRACE_REGION --dump-llo /tmp/csa2-compiler
+For tracing and compiler inspection, add:
+    --trace-mode TRACE_COMPUTE --dump-llo /tmp/csa2-compiler
 This selects libtpu's trace mode; it does not insert kernel-internal markers.
 Compiler dumps are in /tmp/csa2-compiler/rank0, indexed by compiler-dumps.json
 in the output directory. Search those files for csa2_swa_csa_inverse_rope.
@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument(
         "--trace-mode",
         type=str.upper,
-        choices=("TRACE_COMPUTE", "TRACE_REGION"),
+        choices=("TRACE_COMPUTE", "TRACE_ONLY_HOST"),
         default=None,
         help="libtpu trace mode; implies --profile (default: TRACE_COMPUTE)",
     )
