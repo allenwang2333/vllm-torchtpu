@@ -150,6 +150,7 @@ class Qwen35PrefillMegakernel:
             self.final_norm = self.backbone.norm.weight
         self.w_flat = [w[n] for li, w in enumerate(self.weights)
                        for n in ((MK.GDN_W if self.types[li] == "gdn" else MK.ATT_W) + MK.MOE_W)]
+        self.max_tok = int(runner.max_num_tokens)
         self.bound = True
         logger.info("Qwen3.5 prefill megakernel bound: %d regions, pool %s, block %d tokens, "
                     "plan stride %d, pps %d", len(self.pools), self.pool_shape, self.block_tokens,
@@ -304,6 +305,30 @@ class Qwen35PrefillMegakernel:
                         "fallbacks %d", why, self.n_run, self.n_fallback)
         return False
 
+    def warmup(self, runner: Any) -> None:
+        """Compile every bucket before serving, on all-padding metadata (no sequence: nothing is
+        read from or written to the pools)."""
+        import time
+
+        dev = self.rope.device
+        S = self.max_seqs
+        for bucket in self.buckets:
+            t0 = time.perf_counter()
+            self._steps[bucket] = step = self._build_step(bucket)
+            z = lambda n: torch.zeros(n, dtype=torch.int32, device=dev)
+            if self.first:
+                hidden, residual, aux = self.embed, self.embed[:1], z(self.max_tok)
+            else:
+                hidden = torch.zeros(self.max_tok, self.c.H, dtype=torch.bfloat16, device=dev)
+                residual, aux = hidden, z(1)
+            norm = self.final_norm if self.last else self.rope[:1, :1]
+            outs = step(z(S + 1), z(S), z(1), z(S * self.pps), z(S), z(S), z(S), hidden, residual,
+                        aux, norm, self.rope, *self.w_flat, *self.pools)
+            for dst, src in zip(self.pools, outs[2:]):
+                dst.set_(src)
+            logger.info("Qwen3.5 prefill megakernel: bucket %d compiled in %.1f s", bucket,
+                        time.perf_counter() - t0)
+
     def __call__(self, input_ids, positions, intermediate_tensors=None, runner=None):
         md = get_forward_context().attn_metadata
         attn_md = md[self.attn_name]
@@ -330,16 +355,24 @@ class Qwen35PrefillMegakernel:
         for name in self.mamba_names:
             si = md[name].mamba_state_indices.to(torch.int32).reshape(-1)
             slots.append(torch.nn.functional.pad(si, (0, max(0, S - si.numel())))[:S])
+        # Fixed op shapes (max_num_tokens rows) whatever the runner's padding for the step, so
+        # each bucket compiles once.
+        n_tok = int(positions.shape[-1])
+        fit = lambda x: torch.nn.functional.pad(x, (0, 0, 0, self.max_tok - x.shape[0])) \
+            if x.shape[0] < self.max_tok else x[:self.max_tok]
         if self.first:
-            hidden, residual, aux = self.embed, self.embed[:1], input_ids.to(torch.int32)
+            ids = input_ids.to(torch.int32).reshape(-1)
+            ids = torch.nn.functional.pad(ids, (0, self.max_tok - ids.shape[0])) \
+                if ids.shape[0] < self.max_tok else ids[:self.max_tok]
+            hidden, residual, aux = self.embed, self.embed[:1], ids
         else:
-            hidden = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden = fit(intermediate_tensors["hidden_states"])
+            residual = fit(intermediate_tensors["residual"])
             aux = n_seq
         norm = self.final_norm if self.last else self.rope[:1, :1]
         outs = step(qsl, seq_lens, n_seq, bt, *slots, hidden, residual, aux, norm, self.rope,
                     *self.w_flat, *self.pools)
-        h, r = outs[0], outs[1]
+        h, r = outs[0][:n_tok], outs[1][:n_tok]
         for dst, src in zip(self.pools, outs[2:]):
             dst.set_(src)
         self.n_run += 1

@@ -8454,6 +8454,7 @@ class TPUModelRunner(GPUModelRunner):
         if getattr(self, "_qwen35_prefill_mk", None) is not None:
             with self._precompile_timed("Qwen3.5 prefill megakernel"):
                 self._qwen35_prefill_mk.bind_caches(self)
+                self._qwen35_prefill_mk.warmup(self)
         if getattr(self, "_qwen35_mk", None) is not None:
             with self._precompile_timed("Qwen3.5 megakernel"):
                 self._qwen35_mk.bind_caches(self)
@@ -8640,6 +8641,15 @@ class TPUModelRunner(GPUModelRunner):
             )
         return attempt_succeeded
 
+    def _stock_bucket_ok(self, num_tokens: int) -> bool:
+        """With the prefill megakernel serving this stage's prefill steps, the stock backbone
+        is compiled (and warmed through the hand-off) only up to
+        VLLM_TPU_QWEN35_PREFILL_MK_STOCK_MAX tokens (default 0: not at all): its large-bucket
+        temporaries are what does not fit beside a stage's full set of experts."""
+        if getattr(self, "_qwen35_prefill_mk", None) is None:
+            return True
+        return num_tokens <= int(os.environ.get("VLLM_TPU_QWEN35_PREFILL_MK_STOCK_MAX", "0"))
+
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
 
@@ -8653,6 +8663,8 @@ class TPUModelRunner(GPUModelRunner):
         try:
             with shape_variants.warmup() as buckets:
                 for num_tokens in self.num_tokens_paddings:
+                    if not self._stock_bucket_ok(num_tokens):
+                        continue
                     logger.info("  -- num_tokens: %d", num_tokens)
                     if buckets.needs_retrace(num_tokens):
                         shape_variants.retrace(self.model, self.vllm_config)
@@ -8698,6 +8710,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self._pp_wave is not None
         started = time.perf_counter()
         for num_tokens in self.num_tokens_paddings:
+            if not self._stock_bucket_ok(num_tokens):
+                continue
             self._dummy_run(
                 num_tokens,
                 self.num_reqs_max_model_len,
