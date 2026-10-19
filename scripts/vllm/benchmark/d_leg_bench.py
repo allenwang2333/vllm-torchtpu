@@ -274,11 +274,17 @@ PROD_COMPILE_SIZES = "4,8,16,24,32,48,64,96,128,160,192,256,320,384,448,512,2048
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--n", default="40,48,64,80,96,112,128", help="running seqs per case")
+    p.add_argument(
+        "--n", default="40,48,64,80,96,112,128", help="running seqs per case"
+    )
     p.add_argument("--ctx", type=int, default=80000)
     p.add_argument("--suffix", type=int, default=64)
-    p.add_argument("--steps", type=int, default=80, help="target full decode steps/round")
-    p.add_argument("--rounds", type=int, default=3, help="rounds per case (first warms)")
+    p.add_argument(
+        "--steps", type=int, default=80, help="target full decode steps/round"
+    )
+    p.add_argument(
+        "--rounds", type=int, default=3, help="rounds per case (first warms)"
+    )
     p.add_argument("--profile-n", default="", help="cases that get an xprof round")
     p.add_argument("--profile-steps", type=int, default=6)
     p.add_argument("--acceptance", type=float, default=3.39)
@@ -296,11 +302,19 @@ def parse_args(argv=None):
     p.add_argument("--tag", default="")
     p.add_argument("--cache-root", default="/tmp/d-leg-cache")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--checksum", type=int, default=1,
-                   help="greedy output-token checksum per case (bit-exactness A/B)")
+    p.add_argument(
+        "--checksum",
+        type=int,
+        default=1,
+        help="greedy output-token checksum per case (bit-exactness A/B)",
+    )
     p.add_argument("--router-noise", default="corr", help="corr | indep | none")
-    p.add_argument("--sample", type=int, default=1,
-                   help="stack-sample the engine core and driver during round 1 of each case")
+    p.add_argument(
+        "--sample",
+        type=int,
+        default=1,
+        help="stack-sample the engine core and driver during round 1 of each case",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args(argv)
 
@@ -332,7 +346,9 @@ def build_env(a, out_dir):
     # live on local tmpfs: the out dir is a gcsfuse mount under CDK, where one
     # append per engine step cost ~150 ms and made every step host-bound
     # (j-ed8e470b, j-dd39b313). They are copied to the out dir at the end.
-    scratch = os.path.join("/dev/shm", "d-leg-" + hashlib.sha256(out_dir.encode()).hexdigest()[:8])
+    scratch = os.path.join(
+        "/dev/shm", "d-leg-" + hashlib.sha256(out_dir.encode()).hexdigest()[:8]
+    )
     os.makedirs(scratch, exist_ok=True)
     env["D_LEG_SCRATCH"] = scratch
     env["P_LEG_STEP_LOG"] = os.path.join(scratch, "steps.jsonl")
@@ -454,7 +470,9 @@ def run(a, out_dir):
     t0 = time.time()
     outs = llm.generate(
         [{"prompt_token_ids": prefix}],
-        SamplingParams(max_tokens=1, temperature=0.0, ignore_eos=True, detokenize=False),
+        SamplingParams(
+            max_tokens=1, temperature=0.0, ignore_eos=True, detokenize=False
+        ),
         use_tqdm=False,
     )
     prefix_s = time.time() - t0
@@ -477,7 +495,10 @@ def run(a, out_dir):
             # greedy outputs are comparable across runs for bit-exactness.
             srng = np.random.default_rng(1000 + n)
             prompts = [
-                {"prompt_token_ids": prefix + srng.integers(1000, 200000, a.suffix).tolist()}
+                {
+                    "prompt_token_ids": prefix
+                    + srng.integers(1000, 200000, a.suffix).tolist()
+                }
                 for _ in range(n)
             ]
             flag = os.environ.get("D_LEG_SAMPLE_FLAG")
@@ -488,17 +509,23 @@ def run(a, out_dir):
             if not profiled:
                 outs = llm.generate(prompts, sp, use_tqdm=False)
             else:
-                outs = _profiled_generate(llm, prompts, sp, n, k, a.profile_steps,
-                                          step_log, f"n{n}")
+                outs = _profiled_generate(
+                    llm, prompts, sp, n, k, a.profile_steps, step_log, f"n{n}"
+                )
             t1 = time.time()
             if flag:
                 with open(flag, "w") as fh:
                     fh.write("")
             steps = [s for s in PL._read_steps(step_log) if t0 <= s["t"] <= t1 + 0.5]
             iv = _intervals(steps, n, k)
-            rd = {"round": r, "profiled": profiled, "sampled": bool(flag) and r == 1 and not profiled,
-                  "wall_s": round(t1 - t0, 2),
-                  "steps": len(steps), "full_steps": len(_full_steps(steps, n, k))}
+            rd = {
+                "round": r,
+                "profiled": profiled,
+                "sampled": bool(flag) and r == 1 and not profiled,
+                "wall_s": round(t1 - t0, 2),
+                "steps": len(steps),
+                "full_steps": len(_full_steps(steps, n, k)),
+            }
             rd.update(_summ(iv))
             toks = [list(o.outputs[0].token_ids) for o in outs]
             rd["gen_tokens"] = sum(len(t) for t in toks)
@@ -508,31 +535,45 @@ def run(a, out_dir):
                 rd["out_md5"] = h
             case["rounds"].append(rd)
             print(f"[d_leg_bench] n={n} round {r}: {json.dumps(rd)}", flush=True)
-        plain = [x for x in case["rounds"][1:] if not x["profiled"] and "step_ms_median" in x]
+        plain = [
+            x for x in case["rounds"][1:] if not x["profiled"] and "step_ms_median" in x
+        ]
         if any(not x["sampled"] for x in plain):
             plain = [x for x in plain if not x["sampled"]]
         if plain:
-            case["step_ms_median"] = round(statistics.median(x["step_ms_median"] for x in plain), 2)
+            case["step_ms_median"] = round(
+                statistics.median(x["step_ms_median"] for x in plain), 2
+            )
             case["tok_per_s"] = round(n * a.acceptance / (case["step_ms_median"] / 1e3))
-        case["cached_ok"] = all(x["cached_min"] >= a.ctx - a.block_size for x in case["rounds"])
+        case["cached_ok"] = all(
+            x["cached_min"] >= a.ctx - a.block_size for x in case["rounds"]
+        )
         cases.append(case)
-        print(f"[d_leg_bench] CASE {json.dumps({k2: v for k2, v in case.items() if k2 != 'rounds'})}",
-              flush=True)
+        print(
+            f"[d_leg_bench] CASE {json.dumps({k2: v for k2, v in case.items() if k2 != 'rounds'})}",
+            flush=True,
+        )
     time.sleep(12)
     scratch = os.environ.get("D_LEG_SCRATCH")
     if scratch:
         import shutil
+
         for f in os.listdir(scratch):
             try:
                 shutil.copy(os.path.join(scratch, f), out_dir)
             except OSError:
                 pass
     _print_stacks(out_dir)
-    return {"startup_s": round(startup_s, 1), "prefix_s": round(prefix_s, 1), "cases": cases}
+    return {
+        "startup_s": round(startup_s, 1),
+        "prefix_s": round(prefix_s, 1),
+        "cases": cases,
+    }
 
 
 def _print_stacks(out_dir, top=30):
     import glob
+
     for f in sorted(glob.glob(os.path.join(out_dir, "stacks_*.json"))):
         try:
             data = json.load(open(f))
@@ -585,8 +626,12 @@ def _sitecustomize():
     src = PL.SITECUSTOMIZE
     anchor = "_PATCHES = {"
     assert anchor in src
-    src = src.replace(anchor, SAMPLER + "\n" + anchor + '\n    "vllm.v1.engine.core": _patch_engine_core,'
-                      '\n    "vllm_torchtpu.layers.adapter.quantization.fp8": _patch_moe_router_noise,', 1)
+    src = src.replace(
+        anchor,
+        SAMPLER + "\n" + anchor + '\n    "vllm.v1.engine.core": _patch_engine_core,'
+        '\n    "vllm_torchtpu.layers.adapter.quantization.fp8": _patch_moe_router_noise,',
+        1,
+    )
     return src
 
 
@@ -594,12 +639,17 @@ def main(argv=None):
     a = parse_args(argv)
     name = os.environ.get("CDK_JOB_ID") or time.strftime("%Y%m%d-%H%M%S")
     out_dir = a.out_dir or os.path.join(
-        os.environ.get("CDK_OUTPUT_DIR", "/tmp/d-leg-bench"), name + ("-" + a.tag if a.tag else "")
+        os.environ.get("CDK_OUTPUT_DIR", "/tmp/d-leg-bench"),
+        name + ("-" + a.tag if a.tag else ""),
     )
     env, unset = build_env(a, out_dir)
     argv_engine = engine_argv(a, os.path.join(out_dir, "xprof"))
     if a.dry_run:
-        print(json.dumps({"env": env, "unset": unset, "engine_argv": argv_engine}, indent=1))
+        print(
+            json.dumps(
+                {"env": env, "unset": unset, "engine_argv": argv_engine}, indent=1
+            )
+        )
         return 0
     os.makedirs(os.path.join(out_dir, "sitecustomize"), exist_ok=True)
     with open(os.path.join(out_dir, "sitecustomize", "sitecustomize.py"), "w") as f:
@@ -607,12 +657,20 @@ def main(argv=None):
     os.environ.update(env)
     for key in unset:
         os.environ.pop(key, None)
-    result = {"config": {"argv": sys.argv[1:] if argv is None else argv,
-                         "env_overrides": a.env, "engine_argv": argv_engine,
-                         "stack": PL._stack_tag(), "out_dir": out_dir}}
+    result = {
+        "config": {
+            "argv": sys.argv[1:] if argv is None else argv,
+            "env_overrides": a.env,
+            "engine_argv": argv_engine,
+            "stack": PL._stack_tag(),
+            "out_dir": out_dir,
+        }
+    }
     try:
         result.update(run(a, out_dir))
-        result["ok"] = all(c["cached_ok"] and "step_ms_median" in c for c in result["cases"])
+        result["ok"] = all(
+            c["cached_ok"] and "step_ms_median" in c for c in result["cases"]
+        )
     finally:
         with open(os.path.join(out_dir, "result.json"), "w") as f:
             json.dump(result, f, indent=1)

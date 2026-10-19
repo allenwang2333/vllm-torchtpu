@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Standalone TPU microbenchmark of the batched-RPA DCP CACHE_ONLY decode pass (pure JAX).
 
 Geometry of the Qwen3.5-397B decode leg (TP8, DCP4, MTP K=3): per device 16 q heads (4 own
@@ -38,12 +39,20 @@ AP.add_argument("--n", default="64,128")
 AP.add_argument("--ctx", type=int, default=80000)
 AP.add_argument("--T", type=int, default=4)
 AP.add_argument("--dcp", type=int, default=4)
-AP.add_argument("--qh", type=int, default=16, help="q heads per device after the DCP gather")
+AP.add_argument(
+    "--qh", type=int, default=16, help="q heads per device after the DCP gather"
+)
 AP.add_argument("--cfg", default="default")
 AP.add_argument("--iters", type=int, default=20)
 AP.add_argument("--max_pages", type=int, default=515)
-AP.add_argument("--shared", default="0", help="comma list of 0/1: all sequences read one page list")
-AP.add_argument("--run", default="1", help="comma list: contiguous pages per allocation run (0: whole seq)")
+AP.add_argument(
+    "--shared", default="0", help="comma list of 0/1: all sequences read one page list"
+)
+AP.add_argument(
+    "--run",
+    default="1",
+    help="comma list: contiguous pages per allocation run (0: whole seq)",
+)
 A = AP.parse_args()
 
 PAGE = 128
@@ -82,15 +91,20 @@ def build(n, shared=False, run=1):
     T = A.T
     local = -(-A.ctx // A.dcp)
     num_pages = n * (-(-local // PAGE) + 2) * 2 + 64
-    shape = W.get_kv_cache_shape(num_pages, PAGE, 1, D, jnp.float8_e4m3fn,
-                                 kv_layout=C.KVLayout.SEQ_ALONG_LANE)
+    shape = W.get_kv_cache_shape(
+        num_pages, PAGE, 1, D, jnp.float8_e4m3fn, kv_layout=C.KVLayout.SEQ_ALONG_LANE
+    )
     key = jax.random.PRNGKey(0)
     k1, k2, k3, k4 = jax.random.split(key, 4)
     kv = (jax.random.normal(k1, shape, jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
     q = jax.random.normal(k2, (n * T, A.qh, D), jnp.float32).astype(jnp.bfloat16)
     # New K/V arrive already in the cache dtype (the adapter quantizes them).
-    knew = (jax.random.normal(k3, (n * T, 1, D), jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
-    vnew = (jax.random.normal(k4, (n * T, 1, D), jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
+    knew = (jax.random.normal(k3, (n * T, 1, D), jnp.float32) * 0.5).astype(
+        jnp.float8_e4m3fn
+    )
+    vnew = (jax.random.normal(k4, (n * T, 1, D), jnp.float32) * 0.5).astype(
+        jnp.float8_e4m3fn
+    )
     kv_lens = jnp.full((n,), A.ctx + T, jnp.int32)
     pages = np.zeros((n, A.max_pages), np.int32)
     per = -(-local // PAGE) + 1
@@ -99,8 +113,13 @@ def build(n, shared=False, run=1):
     slots = (num_pages - 1) // R
     if slots < n * nruns:
         raise ValueError("not enough pages for runs")
-    starts = np.random.default_rng(0).permutation(slots)[: n * nruns].reshape(n, nruns) * R + 1
-    allp = (starts[:, :, None] + np.arange(R)[None, None, :]).reshape(n, nruns * R)[:, :per]
+    starts = (
+        np.random.default_rng(0).permutation(slots)[: n * nruns].reshape(n, nruns) * R
+        + 1
+    )
+    allp = (starts[:, :, None] + np.arange(R)[None, None, :]).reshape(n, nruns * R)[
+        :, :per
+    ]
     pages[:, :per] = allp
     if shared:
         pages[:, :per] = pages[0, :per]
@@ -118,19 +137,40 @@ def run(n, name, data, shared=False, runlen=1):
     kv, q, knew, vnew, kv_lens, pidx, cu, dist, nbytes = data
     if blocks:
         # Start from the wrapper's own pick and override the named fields.
-        model = C.ModelConfigs(num_q_heads=A.qh, num_kv_heads=1, head_dim=D,
-                               mask_value=float(jnp.finfo(jnp.bfloat16).min), sm_scale=1 / 16)
+        model = C.ModelConfigs(
+            num_q_heads=A.qh,
+            num_kv_heads=1,
+            head_dim=D,
+            mask_value=float(jnp.finfo(jnp.bfloat16).min),
+            sm_scale=1 / 16,
+        )
         serve = C.ServingConfigs(
-            native_fp8=kw.get("native_fp8", ""), num_seqs=n, num_page_indices=pidx.shape[0],
-            total_q_tokens=q.shape[0], dtype_q=q.dtype, dtype_kv=kv.dtype, dtype_out=q.dtype,
-            page_size=PAGE, kv_layout=C.KVLayout.SEQ_ALONG_LANE, decode_query_size=A.T,
-            cp_group_size=A.dcp, attention_scope=C.AttentionScope.CACHE_ONLY, return_lse=True)
+            native_fp8=kw.get("native_fp8", ""),
+            num_seqs=n,
+            num_page_indices=pidx.shape[0],
+            total_q_tokens=q.shape[0],
+            dtype_q=q.dtype,
+            dtype_kv=kv.dtype,
+            dtype_out=q.dtype,
+            page_size=PAGE,
+            kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+            decode_query_size=A.T,
+            cp_group_size=A.dcp,
+            attention_scope=C.AttentionScope.CACHE_ONLY,
+            return_lse=True,
+        )
         from jax.experimental.pallas import tpu as pltpu
+
         vmem = kw.get("vmem_limit_bytes", pltpu.get_tpu_info().vmem_capacity_bytes)
         dflt, _ = W.calculate_block_sizes(
-            model, serve, vmem, decode_query_size=A.T,
-            decode_batch_size=kw.get("decode_batch_size", 8))
+            model,
+            serve,
+            vmem,
+            decode_query_size=A.T,
+            decode_batch_size=kw.get("decode_batch_size", 8),
+        )
         import dataclasses
+
         kw["decode_block_sizes"] = dataclasses.replace(dflt, **blocks)
         print("  blocks:", kw["decode_block_sizes"], flush=True)
 
@@ -139,11 +179,25 @@ def run(n, name, data, shared=False, runlen=1):
     @functools.partial(jax.jit, donate_argnums=(0,))
     def f(kv, q, knew, vnew, kv_lens, pidx, cu, dist):
         out, new_kv, lse = W.ragged_paged_attention(
-            q, knew, vnew, kv, kv_lens, pidx, cu, dist,
-            sm_scale=1 / 16, k_scale=1.0, v_scale=1.0,
-            cp_group_size=A.dcp, cp_rank=jnp.array([0], jnp.int32),
-            attention_scope=C.AttentionScope.CACHE_ONLY, decode_query_size=A.T,
-            return_lse=True, kv_layout=C.KVLayout.SEQ_ALONG_LANE, **kw)
+            q,
+            knew,
+            vnew,
+            kv,
+            kv_lens,
+            pidx,
+            cu,
+            dist,
+            sm_scale=1 / 16,
+            k_scale=1.0,
+            v_scale=1.0,
+            cp_group_size=A.dcp,
+            cp_rank=jnp.array([0], jnp.int32),
+            attention_scope=C.AttentionScope.CACHE_ONLY,
+            decode_query_size=A.T,
+            return_lse=True,
+            kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+            **kw,
+        )
         return out, lse, new_kv
 
     try:
@@ -159,11 +213,22 @@ def run(n, name, data, shared=False, runlen=1):
             jax.block_until_ready(o)
             ts.append((time.perf_counter() - t0) * 1e6)
         us = statistics.median(ts)
-        md5 = hashlib.md5(np.asarray(out.astype(jnp.float32)).tobytes()).hexdigest()[:12]
+        md5 = hashlib.md5(np.asarray(out.astype(jnp.float32)).tobytes()).hexdigest()[
+            :12
+        ]
         finite = bool(jnp.isfinite(out.astype(jnp.float32)).all())
-        rec = {"n": n, "cfg": name, "shared": shared, "run": runlen, "us": round(us, 1), "us_min": round(min(ts), 1),
-               "GBps": round(nbytes / us / 1e3, 1), "compile_s": round(comp, 1),
-               "md5": md5, "finite": finite}
+        rec = {
+            "n": n,
+            "cfg": name,
+            "shared": shared,
+            "run": runlen,
+            "us": round(us, 1),
+            "us_min": round(min(ts), 1),
+            "GBps": round(nbytes / us / 1e3, 1),
+            "compile_s": round(comp, 1),
+            "md5": md5,
+            "finite": finite,
+        }
     except Exception as e:  # noqa: BLE001
         rec = {"n": n, "cfg": name, "error": f"{type(e).__name__}: {str(e)[:300]}"}
     finally:

@@ -20,7 +20,9 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "src"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "src")
+)
 try:
     from vllm_torchtpu.tools import xplane_pb2
 except Exception:  # standalone: proto module next to this file
@@ -102,22 +104,35 @@ def summarize(path, steps, top, dump_names):
         rows = sorted(agg.items(), key=lambda kv: -kv[1][0])
         out[lname] = {
             "total_ms": round(tot, 3),
-            "span_ms": round((span[1] - span[0]) / 1e9, 3) if span[0] is not None else 0,
+            "span_ms": round((span[1] - span[0]) / 1e9, 3)
+            if span[0] is not None
+            else 0,
             "n_names": len(agg),
-            "top": [(n, round(v[0], 3), v[1], round(v[0] / steps, 4)) for n, v in rows[:top]],
+            "top": [
+                (n, round(v[0], 3), v[1], round(v[0] / steps, 4)) for n, v in rows[:top]
+            ],
         }
         if base:
             out[lname]["by_base"] = sorted(
-                ((f"{c} | {b}", round(v[0], 3), v[1], round(v[0] / steps, 4)) for (c, b), v in base.items()),
+                (
+                    (f"{c} | {b}", round(v[0], 3), v[1], round(v[0] / steps, 4))
+                    for (c, b), v in base.items()
+                ),
                 key=lambda r: -r[1],
             )[:top]
             out[lname]["by_program"] = sorted(
-                ((pid, round(v[0], 3), v[1], round(v[0] / steps, 4)) for pid, v in prog.items()),
+                (
+                    (pid, round(v[0], 3), v[1], round(v[0] / steps, 4))
+                    for pid, v in prog.items()
+                ),
                 key=lambda r: -r[1],
             )[:20]
         if cat:
             out[lname]["by_category"] = sorted(
-                ((c, round(v[0], 3), v[1], round(v[0] / steps, 4)) for c, v in cat.items()),
+                (
+                    (c, round(v[0], 3), v[1], round(v[0] / steps, 4))
+                    for c, v in cat.items()
+                ),
                 key=lambda r: -r[1],
             )
     res["lines"] = out
@@ -143,12 +158,20 @@ def summarize(path, steps, top, dump_names):
 def _guess_cat(name):
     n = name.lower()
     for key, c in (
-        ("all-reduce", "all-reduce"), ("all-gather", "all-gather"),
-        ("reduce-scatter", "reduce-scatter"), ("all-to-all", "all-to-all"),
-        ("collective-permute", "collective-permute"), ("custom-call", "custom-call"),
-        ("convolution", "convolution"), ("dot", "dot"), ("fusion", "fusion"),
-        ("copy", "copy"), ("dynamic-update-slice", "dus"), ("gather", "gather"),
-        ("scatter", "scatter"), ("sort", "sort"),
+        ("all-reduce", "all-reduce"),
+        ("all-gather", "all-gather"),
+        ("reduce-scatter", "reduce-scatter"),
+        ("all-to-all", "all-to-all"),
+        ("collective-permute", "collective-permute"),
+        ("custom-call", "custom-call"),
+        ("convolution", "convolution"),
+        ("dot", "dot"),
+        ("fusion", "fusion"),
+        ("copy", "copy"),
+        ("dynamic-update-slice", "dus"),
+        ("gather", "gather"),
+        ("scatter", "scatter"),
+        ("sort", "sort"),
     ):
         if key in n:
             return c
@@ -164,31 +187,51 @@ def main():
     ap.add_argument("--max-files", type=int, default=2)
     ap.add_argument("--json", default="")
     a = ap.parse_args()
-    files = [a.path] if os.path.isfile(a.path) else sorted(
-        glob.glob(os.path.join(a.path, "**", "*.xplane.pb"), recursive=True))
+    files = (
+        [a.path]
+        if os.path.isfile(a.path)
+        else sorted(
+            glob.glob(os.path.join(a.path, "**", "*.xplane.pb"), recursive=True)
+        )
+    )
     print(f"XPLANE files: {len(files)}")
     for f in files:
         print("  ", f, os.path.getsize(f))
     # rank 0 first when the names carry it
-    files.sort(key=lambda f: (0 if re.search(r"rank0[^0-9]", os.path.basename(f)) else 1, f))
+    files.sort(
+        key=lambda f: (0 if re.search(r"rank0[^0-9]", os.path.basename(f)) else 1, f)
+    )
     allres = []
     for f in files[: a.max_files]:
         r = summarize(f, a.steps, a.top, a.dump_names)
         allres.append(r)
         print(f"===== {f}")
         for p in r["planes"]:
-            print(f"  plane {p['name']}: " + "; ".join(f"{n}({c}, {t}ms)" for n, c, t in p["lines"][:12]))
+            print(
+                f"  plane {p['name']}: "
+                + "; ".join(f"{n}({c}, {t}ms)" for n, c, t in p["lines"][:12])
+            )
         for lname, d in r.get("lines", {}).items():
-            print(f"  --- {r['device_plane']} / {lname}: total {d['total_ms']} ms, span "
-                  f"{d['span_ms']} ms, {d['n_names']} names (per step = /{a.steps})")
+            print(
+                f"  --- {r['device_plane']} / {lname}: total {d['total_ms']} ms, span "
+                f"{d['span_ms']} ms, {d['n_names']} names (per step = /{a.steps})"
+            )
             for row in d.get("by_category", []):
-                print(f"      CAT {row[0]:<28} {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:.4f}")
+                print(
+                    f"      CAT {row[0]:<28} {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:.4f}"
+                )
             for row in d.get("by_program", []):
-                print(f"      PROG {row[0]:<24} {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:.4f}")
+                print(
+                    f"      PROG {row[0]:<24} {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:.4f}"
+                )
             for row in d.get("by_base", []):
-                print(f"      BASE {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:>8.4f}  {row[0][:140]}")
+                print(
+                    f"      BASE {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:>8.4f}  {row[0][:140]}"
+                )
             for row in d["top"]:
-                print(f"      {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:>8.4f}  {row[0][:150]}")
+                print(
+                    f"      {row[1]:>10.3f} ms  n={row[2]:<6} /step {row[3]:>8.4f}  {row[0][:150]}"
+                )
         for name, st in r.get("op_meta", {}).items():
             print(f"  META {name[:80]}: {json.dumps(st)[:900]}")
     if a.json:

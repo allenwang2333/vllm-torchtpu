@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Component breakdown of one decode step from a d_leg_bench xprof capture (rank 0, TPU:0).
 
     python3 scripts/vllm/benchmark/d_leg_breakdown.py <rank0 .xplane.pb> [--steps N]
@@ -7,14 +8,16 @@ Steps are counted from the backbone program's executions. Device op time (XLA Op
 grouped by program (target backbone / MTP draft step 0 / MTP draft loop / other) and by
 component (attention, GDN, MoE experts, MoE dispatch, collectives, dense matmul, other).
 """
+
 import argparse
 import collections
+import os  # noqa: E402
 import re
 import sys
 
-import os  # noqa: E402
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "src"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "src")
+)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from vllm_torchtpu.tools import xplane_pb2  # noqa: E402
@@ -26,8 +29,11 @@ COMP = [
     ("gdn", r"fused_conv1d_gdn|fused_out_proj|gdn"),
     ("moe_experts", r"moe_lowtok|^gmm_v2|fused_ep_moe|^moe$|^moe\b|dense_expert"),
     ("moe_dispatch", r"fused_ep_|sc_ragged|scatter_offload|^sort|gather_rows|ragged"),
-    ("collective", r"all-reduce|all_reduce|all-gather|all_gather|reduce-scatter|reduce_scatter|"
-                   r"collective-permute|psum|small_all_reduce"),
+    (
+        "collective",
+        r"all-reduce|all_reduce|all-gather|all_gather|reduce-scatter|reduce_scatter|"
+        r"collective-permute|psum|small_all_reduce",
+    ),
     ("dense_matmul", r"^convolution|^fusion\.\d+\.refs|convolution"),
 ]
 
@@ -84,11 +90,17 @@ def main():
             name = md.display_name or md.name
             st = {smd.get(s.metadata_id): s for s in md.stats}
             cat = st["hlo_category"].str_value if "hlo_category" in st else ""
-            pid = str(st["program_id"].uint64_value or st["program_id"].int64_value) \
-                if "program_id" in st else "?"
+            pid = (
+                str(st["program_id"].uint64_value or st["program_id"].int64_value)
+                if "program_id" in st
+                else "?"
+            )
             ops[pid][comp_of(name, cat)] += e.duration_ps / 1e9
     tot_by_pid = {pid: sum(c.values()) for pid, c in ops.items()}
-    gem = sorted((p for p, g in prog_group.items() if g == "gemma"), key=lambda p: -tot_by_pid.get(p, 0))
+    gem = sorted(
+        (p for p, g in prog_group.items() if g == "gemma"),
+        key=lambda p: -tot_by_pid.get(p, 0),
+    )
     names = {}
     if gem:
         names[gem[0]] = "target"
@@ -107,12 +119,21 @@ def main():
     print("group," + ",".join(comps) + ",total")
     for g in ("target", "mtp_step0", "mtp_loop", "other"):
         c = groups.get(g, collections.Counter())
-        print(g + "," + ",".join(f"{c[k] / steps:.2f}" for k in comps) + f",{sum(c.values()) / steps:.2f}")
+        print(
+            g
+            + ","
+            + ",".join(f"{c[k] / steps:.2f}" for k in comps)
+            + f",{sum(c.values()) / steps:.2f}"
+        )
     allc = collections.Counter()
     for c in groups.values():
         allc.update(c)
     print("all," + ",".join(f"{allc[k] / steps:.2f}" for k in comps) + f",{total:.2f}")
-    print("pct," + ",".join(f"{100 * allc[k] / steps / total:.1f}" for k in comps) + ",100")
+    print(
+        "pct,"
+        + ",".join(f"{100 * allc[k] / steps / total:.1f}" for k in comps)
+        + ",100"
+    )
 
 
 if __name__ == "__main__":
