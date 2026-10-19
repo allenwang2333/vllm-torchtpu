@@ -238,6 +238,7 @@ if TYPE_CHECKING:
     VLLM_TPU_RAIDEN_LOAD_WAIT_MS: float = 1.5
     VLLM_TPU_QWEN35_MEGAKERNEL: bool = False
     VLLM_TPU_QWEN35_MK_WIDE_MB: int = 0
+    VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS: int = 160
 
 
 def env_with_choices(
@@ -1385,6 +1386,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Rows per microbatch of the Qwen3.5 megakernel's wide verify step, 0 for
     # off; parse_mk_wide_mb checks the value.
     "VLLM_TPU_QWEN35_MK_WIDE_MB": env_nonnegative_int("VLLM_TPU_QWEN35_MK_WIDE_MB", 0),
+    # Smallest verify bucket (rows) the wide step applies to when it is on; smaller
+    # buckets above 80 rows keep the split plan of 80-row calls.
+    "VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS": env_nonnegative_int("VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS", 160),
 }
 
 
