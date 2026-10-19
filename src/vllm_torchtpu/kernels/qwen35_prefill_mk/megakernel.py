@@ -63,6 +63,7 @@ class MKTiles:
     att_sub: int = 8         # attention row sub-chunks (MXU / softmax overlap)
     att_fp8: int = 0         # 1: native fp8 QK / PV (opt-in, changes attention numerics)
     rt: int = 256            # MoE grouped rows per tile (j-964229e0-90a9-4258-a763: 150 vs 153 ms)
+    moe_wslots: int = 2      # expert weight buffers (lookahead = wslots - 1)
     moe_interleave: int = 0  # >0: next tile's row DMAs started in this many chunks in the matmuls
     tm_route: int = 256
     tm_combine: int = 64
@@ -211,7 +212,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                 P.moe_experts(W["xf"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
                               lw["w2"], lw["w2_s"], W["ys"], W["pos"], e=c.E, topk=c.TOPK,
                               inter=c.I, rt=tl.rt, inflight=tl.inflight, tm=tl.tm_route,
-                                  interleave=tl.moe_interleave)
+                                  interleave=tl.moe_interleave, wslots=tl.moe_wslots)
             with jax.named_scope(f"L{li}_moe_combine"):
                 P.moe_combine(W["ys"], W["pos"], W["topw"], W["sd"], W["sg"], h_out, topk=c.TOPK,
                               tm=tl.tm_combine, inflight=tl.inflight)

@@ -710,7 +710,7 @@ def _expert_tile_interleaved(x, w13, w13s, w2, w2s, inter, issue_chunks):
 
 def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hbm, w2s_hbm,
                 y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256,
-                interleave=0):
+                interleave=0, wslots=2):
     """Routed experts. Rows are grouped by expert (expert e's segment starts at off[e], padded to
     a multiple of `rt`), gathered by DMA from the normed activations, quantized per row, run
     through w13 -> SwiGLU -> w2 (w8a8), and written to y_sorted [n_pad, H] f32 (bf16 values) in
@@ -722,7 +722,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
     weights are prefetched while the previous expert runs. Experts with no rows cost nothing.
     interleave=S > 0: the next tile's rt row DMAs (pad rows re-read the tile's first token) are
     started in S chunks between the matmul column chunks instead of before the tile, so their
-    issue overlaps the MXU work; each row has its own semaphore.
+    issue overlaps the MXU work; each row has its own semaphore. wslots: expert weight buffers
+    (2: one expert of lookahead, 3: two).
 
     xb [T, H] f32 (bf16 values), topi / rank [T, K] i32, counts [1, E] i32, w13 [E, H, 2I] fp8,
     w13s [E, 1, 2I] f32, w2 [E, I, H] fp8, w2s [E, 1, H] f32."""
@@ -730,7 +731,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
     n_slots = t * topk
     max_tiles = n_slots // rt + e
 
-    def run(cnt_s, off_s, tok_s, stage_s, t_e, t_r0, t_n, t_first, t_next, sems, sem1):
+    def run(cnt_s, off_s, tok_s, stage_s, t_e, t_r0, t_n, t_first, t_next, t_next2, sems,
+            sem1):
         cp = pltpu.make_async_copy(counts_hbm, cnt_s, sem1.at[0])
         cp.start()
         cp.wait()
@@ -739,7 +741,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
         # expert, first grouped row, live rows, whether it starts its expert, and the next
         # expert with rows (to prefetch, -1 if none).
         def off_body(ei, carry):
-            acc, ntile, prev_first = carry
+            acc, ntile, prev_first, prev2_first = carry
             n = cnt_s[0, ei]
             off_s[0, ei] = acc
             nt = (n + rt - 1) // rt
@@ -750,6 +752,10 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 def _():
                     t_next[prev_first] = ei
 
+                @pl.when(prev2_first >= 0)
+                def _():
+                    t_next2[prev2_first] = ei
+
             def tile_body(ti, c):
                 g = ntile + ti
                 t_e[g] = ei
@@ -757,13 +763,15 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 t_n[g] = jnp.minimum(rt, n - ti * rt)
                 t_first[g] = (ti == 0).astype(jnp.int32)
                 t_next[g] = -1
+                t_next2[g] = -1
                 return c
             jax.lax.fori_loop(0, nt, tile_body, 0)
-            return (acc + nt * rt, ntile + nt, jnp.where(nt > 0, ntile, prev_first))
+            return (acc + nt * rt, ntile + nt, jnp.where(nt > 0, ntile, prev_first),
+                    jnp.where(nt > 0, prev_first, prev2_first))
 
         with jax.named_scope("moe_offsets"):
-            _, n_tiles, _ = jax.lax.fori_loop(0, e, off_body,
-                                              (jnp.int32(0), jnp.int32(0), jnp.int32(-1)))
+            _, n_tiles, _, _ = jax.lax.fori_loop(
+                0, e, off_body, (jnp.int32(0), jnp.int32(0), jnp.int32(-1), jnp.int32(-1)))
 
         # pos = off[topi] + rank (vector pass), and the inverse map tok_s[pos] = t (scalar).
         def pos_pass(off_v):
@@ -845,12 +853,16 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
             @pl.when(n_tiles > 0)
             def _():
                 fetch(t_e[0], 0)
+                if wslots > 2:
+                    @pl.when(t_next[0] >= 0)
+                    def _():
+                        fetch(t_next[0], 1)
                 if interleave:
                     gather_full(0, 0, range(rt))
                 else:
                     gather(0, 0)
 
-            def tile(g, wslot):
+            def tile(g, ordinal):
                 b = g % 2
                 # The next tile's rows start moving before (or while) this tile computes.
                 if not interleave:
@@ -863,16 +875,18 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                     else:
                         _gather_drain(xb_hbm, xin.at[b], t_n[g], sems.at[b], inflight)
                 first = t_first[g] == 1
-                wslot = jnp.where(first & (g > 0), 1 - wslot, wslot)
+                ordinal = jnp.where(first & (g > 0), ordinal + 1, ordinal)
+                wslot = ordinal % wslots
 
                 @pl.when(first)
                 def _():
                     wait_w(wslot)
-                    nxt = t_next[g]
+                    # Prefetch the expert wslots - 1 ahead into the slot that just retired.
+                    nxt = t_next2[g] if wslots > 2 else t_next[g]
 
                     @pl.when(nxt >= 0)
                     def _():
-                        fetch(nxt, 1 - wslot)
+                        fetch(nxt, (ordinal + wslots - 1) % wslots)
 
                 @pl.when(g >= 2)
                 def _():
@@ -888,10 +902,18 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                             xin[b], w13_v.at[wslot], w13s_v.at[wslot], w2_v.at[wslot],
                             w2s_v.at[wslot], inter, chunks)
                     else:
-                        yout[b] = _expert_tile(xin[b], w13_v.at[wslot], w13s_v.at[wslot],
-                                               w2_v.at[wslot], w2s_v.at[wslot], inter)
+                        # Sub-blocks with no live rows are skipped (experts average ~160 rows,
+                        # so a 256-row tile is often half padding).
+                        sb = min(rt, 128)
+                        for k in range(rt // sb):
+                            @pl.when(k * sb < t_n[g])
+                            def _():
+                                r = slice(k * sb, (k + 1) * sb)
+                                yout[b, r, :] = _expert_tile(
+                                    xin[b, r, :], w13_v.at[wslot], w13s_v.at[wslot],
+                                    w2_v.at[wslot], w2s_v.at[wslot], inter)
                 ywrite(g, b).start()
-                return wslot
+                return ordinal
 
             jax.lax.fori_loop(0, n_tiles, tile, jnp.int32(0))
             if interleave:                          # the last tile's self re-gather
@@ -905,10 +927,11 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
             jax.lax.fori_loop(jnp.maximum(n_tiles - 2, 0), n_tiles, drain_y, 0)
 
         pl.run_scoped(experts,
-                      pltpu.VMEM((2, h, 2 * inter), FP8), pltpu.VMEM((2, 1, 2 * inter), F32),
-                      pltpu.VMEM((2, inter, h), FP8), pltpu.VMEM((2, 1, h), F32),
+                      pltpu.VMEM((wslots, h, 2 * inter), FP8),
+                      pltpu.VMEM((wslots, 1, 2 * inter), F32),
+                      pltpu.VMEM((wslots, inter, h), FP8), pltpu.VMEM((wslots, 1, h), F32),
                       pltpu.VMEM((2, rt, h), F32), pltpu.VMEM((2, rt, h), F32),
-                      pltpu.SemaphoreType.DMA((2, 4)), pltpu.SemaphoreType.DMA((2,)),
+                      pltpu.SemaphoreType.DMA((wslots, 4)), pltpu.SemaphoreType.DMA((2,)),
                       pltpu.SemaphoreType.DMA((2, rt)))
 
     n_pad = n_slots + e * (rt - 1)
@@ -917,7 +940,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                   pltpu.SMEM((n_pad,), jnp.int32), pltpu.SMEM((stage_rows, topk), jnp.int32),
                   pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
                   pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
-                  pltpu.SMEM((max_tiles,), jnp.int32),
+                  pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
                   pltpu.SemaphoreType.DMA((2, inflight)), pltpu.SemaphoreType.DMA((1,)))
 
 
