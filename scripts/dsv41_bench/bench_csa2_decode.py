@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument("--queries", type=int, default=6)
     parser.add_argument("--heads", type=int, choices=range(8, 129, 8), default=64)
     parser.add_argument("--context-length", type=int, default=98304)
-    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
         "--trace-mode",
@@ -57,6 +57,9 @@ def main() -> None:
 
         dump_env = dict(os.environ)
         _llo_env(args.dump_llo.resolve(), 0, dump_env)
+        dump_env["LIBTPU_INIT_ARGS"] += (
+            " --xla_jf_dump_to_filter=module=.*csa2_swa_csa_inverse_rope.*"
+        )
         os.environ.update(dump_env)
 
     import jax
