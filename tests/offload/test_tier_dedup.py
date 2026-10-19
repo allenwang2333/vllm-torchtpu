@@ -572,7 +572,9 @@ class TestStateDemotionChain(unittest.TestCase):
         # ends at the new full block (80), then the new partial tail (92).
         req = _Prompt("t2", 95)
         demoted = self._turn(req, 68, [[(1, 21, 80)], [(1, 22, 92)]])
-        self.assertEqual(demoted, [self._key(req, 1, 68)])
+        # The first turn's pair (partial tail 68 over full block 60) goes
+        # together once 80 is held.
+        self.assertEqual(demoted, [self._key(req, 1, 68), self._key(req, 1, 60)])
         self.assertTrue(self.manager.holds(self._key(req, 1, 80)))
         self.assertTrue(self.manager.holds(self._key(req, 1, 92)))
 
@@ -580,7 +582,33 @@ class TestStateDemotionChain(unittest.TestCase):
         self._first_turn()
         req = _Prompt("t2", 95)
         demoted = self._turn(req, 68, [[(1, 21, 80), (1, 22, 92)]])
-        self.assertEqual(demoted, [self._key(req, 1, 68)])
+        self.assertEqual(demoted, [self._key(req, 1, 68), self._key(req, 1, 60)])
+
+    def test_warm_turn_admitted_at_a_full_block_demotes_only_it(self):
+        self._first_turn()
+        # Admitted at the first turn's full block (its partial tail is gone):
+        # nothing lies under a full-block admission point.
+        req = _Prompt("t2", 95)
+        demoted = self._turn(req, 60, [[(1, 21, 80)], [(1, 22, 92)]])
+        self.assertEqual(demoted, [self._key(req, 1, 60)])
+        self.assertTrue(self.manager.holds(self._key(req, 1, 68)))
+
+    def test_third_turn_holds_only_the_latest_pair(self):
+        self._first_turn()
+        self._turn(_Prompt("t2", 95), 68, [[(1, 21, 80)], [(1, 22, 92)]])
+        third = _Prompt("t3", 120)
+        demoted = self._turn(third, 92, [[(1, 31, 100)], [(1, 32, 116)]])
+        self.assertEqual(demoted, [self._key(third, 1, 92), self._key(third, 1, 80)])
+        self._evict_demoted()
+        for boundary in (40, 60, 68, 80, 92):
+            self.assertFalse(
+                self.manager.holds(self._key(third, 1, boundary)), boundary
+            )
+        for boundary in (100, 116):
+            self.assertTrue(self.manager.holds(self._key(third, 1, boundary)), boundary)
+        hit, status = self._lookup(_Prompt("t4", 140))
+        self.assertEqual(hit, 116)
+        self.assertEqual(status.partial_tail_boundary, 116)
 
     def test_next_lookup_hits_the_partial_tail_after_demoted_entries_evict(self):
         self._first_turn()

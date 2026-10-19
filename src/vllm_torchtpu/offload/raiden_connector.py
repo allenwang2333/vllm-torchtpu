@@ -214,9 +214,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         the same chain serve only forks. With TPU_RAIDEN_TIER_DEMOTE_STATE on
         (default: on with the deduplicated layout), a finished request demotes
         its boundary states below the newest full-block boundary it holds in
-        the tier, and the boundary it was admitted from when that lies below
-        it too. Demoted entries still answer lookups, but the tier evicts them
-        before any live entry.
+        the tier, and the boundary it was admitted from (with the full block
+        under a partial-tail admission point) when that lies below it too.
+        Demoted entries still answer lookups, but the tier evicts them before
+        any live entry.
         """
         env = os.environ.get("TPU_RAIDEN_TIER_DEMOTE_STATE")
         self._demote_stale_state = (env == "1") if env is not None else default_on
@@ -230,6 +231,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._state_boundaries: dict[str, dict[int, list[OffloadKey]]] = {}
         # req_id -> (boundary tokens, state keys) of the admission's hit.
         self._state_hits: dict[str, tuple[int, list[OffloadKey]]] = {}
+        # Requests whose admission line is out; the alloc hook runs again when an
+        # asynchronous tier load lands.
+        self._admission_logged: set[str] = set()
 
     def _complete_jobs_directly(
         self,
@@ -437,6 +441,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     finished_loads[finished_job.job_id] = finished_job.req_id
                     failed_load_block_ids.extend(finished_job.failed_device_block_ids)
 
+        self._admission_logged.difference_update(scheduler_output.finished_req_ids or ())
         if self._demote_stale_state:
             self._demote_superseded_states(scheduler_output.finished_req_ids or ())
 
@@ -609,9 +614,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_state_after_alloc(request, blocks, num_external_tokens)
         req_status = self._req_status.get(request.request_id)
         if req_status is not None:
-            self._record_state_hit(
-                request, req_status.num_locally_computed_tokens + num_external_tokens
-            )
+            local_tokens = req_status.num_locally_computed_tokens
+            if request.request_id not in self._admission_logged:
+                self._admission_logged.add(request.request_id)
+                logger.info(
+                    '{"event": "raiden_tier_admission", "req_id": "%s", '
+                    '"prompt_tokens": %d, "local_tokens": %d, "external_tokens": %d}',
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    local_tokens,
+                    num_external_tokens,
+                )
+            self._record_state_hit(request, local_tokens + num_external_tokens)
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -664,15 +678,26 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         req_status = self._req_status.get(request.request_id)
         if req_status is None:
             return
-        self._state_hits[request.request_id] = (
-            hit_tokens,
+        hit_keys = [
+            self._make_boundary_key(
+                request, group_idx, hit_tokens, req_status.req_context
+            )
+            for group_idx in sorted(self._state_group_ids)
+        ]
+        # A partial-tail admission point sits above the full block that ends
+        # the same turn; the pair is superseded together.
+        full_below = hit_tokens - hit_tokens % self._state_chunk_tokens
+        below_keys = (
             [
                 self._make_boundary_key(
-                    request, group_idx, hit_tokens, req_status.req_context
+                    request, group_idx, full_below, req_status.req_context
                 )
                 for group_idx in sorted(self._state_group_ids)
-            ],
+            ]
+            if 0 < full_below < hit_tokens
+            else []
         )
+        self._state_hits[request.request_id] = (hit_tokens, hit_keys + below_keys)
 
     def _demote_superseded_states(self, finished_req_ids: Iterable[str]) -> None:
         """Demotes each finished request's states below its kept full block.
@@ -682,7 +707,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         boundaries the base skipped, or whose store was cancelled, do not
         count, so a newer boundary that never reached the tier cannot push an
         older one out. A partial tail above the kept boundary is kept with it.
-        With no full-block boundary held, nothing is demoted.
+        With no full-block boundary held, nothing is demoted. The admission
+        point below the kept boundary is demoted with the full block under it
+        when it is a partial tail: the previous turn's pair serves only forks
+        once a newer full block exists, and leaving the full block live would
+        let each turn add one stale boundary to the tier.
         """
         manager = self._raiden_manager
         for req_id in finished_req_ids:

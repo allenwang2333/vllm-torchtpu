@@ -948,6 +948,7 @@ async def _handle_completions(api: str, request: Request):
             request.app.state, "decode_router", None
         )
         prefill_idx: int | None = None
+        prefill_sticky = False
         decode_idx: int | None = None
         hs: list[bytes] = []
         if router is not None or decode_router is not None:
@@ -1038,7 +1039,7 @@ async def _handle_completions(api: str, request: Request):
                 await admit_decode(admit_point)
 
             if router is not None:
-                prefill_idx, _ = router.route(hs)
+                prefill_idx, prefill_sticky = router.route(hs)
                 prefill_client_info = request.app.state.prefill_clients[prefill_idx]
             else:
                 prefill_client_info = get_next_client(request.app, "prefill")
@@ -1075,6 +1076,7 @@ async def _handle_completions(api: str, request: Request):
                 print(
                     f"PERF PROXY prefill_send req_id={request_id} "
                     f"prefill_id={prefill_client_info.get('id', 0)} "
+                    f"sticky={int(prefill_sticky)} "
                     f"ts={t_prefill_send:.6f}",
                     flush=True,
                 )
