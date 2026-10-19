@@ -9,7 +9,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("tokens", [1, 513])
+@pytest.mark.parametrize("tokens", [1, 288, 384, 513])
 def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
     gathered, consumed = [], []
 
