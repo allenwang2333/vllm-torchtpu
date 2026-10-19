@@ -1037,7 +1037,9 @@ class TpuPlatform(Platform):
             # Calibrated for 80 expert slots per rank (64 primary + 16 replicated slots)
             # while reserving ~2.5 GiB of HBM headroom for runtime activations
             # and program-load scratch buffers under DCP=1 and DCP>1.
-            if dcp_size == 1 and scheduler_config.max_num_seqs > 16:
+            if (
+                dcp_size == 1 or envs.VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM
+            ) and scheduler_config.max_num_seqs > 16:
                 safe_kv = 32_500_000_000
                 max_ablat_kv = 41_559_696_640
             else:
