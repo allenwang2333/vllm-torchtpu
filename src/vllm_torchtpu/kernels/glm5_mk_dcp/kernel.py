@@ -34,7 +34,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import pool_alias, topk2
+import types
+
+from . import dsa_batched, pool_alias, topk2
 from .layout import rup, smalls_layout
 
 FP8 = jnp.float8_e4m3fn
@@ -118,6 +120,19 @@ class Tiles:
                                 # exact (fallback to KT for the layer when a truncated rank reaches T')
     kch: int = 0                # candidate-key AG in chunks of kch rows, double-buffered (0: all TMAX rows
                                 # at once). VMEM R * TMAX * KT * 4 B -> 2 * R * kch * KT * 4 B (conc 16)
+    # --- DSA core variant (G1, gates/g1/design.md): "legacy" = the shell's per-request path, "batched" =
+    # dsa_batched.py. The drafter build always keeps the legacy path.
+    dsa: str = os.environ.get("MKD_DSA", "legacy")
+    pool: int = 1344            # batched: key pool pages (8 req x 168 pages ~ 688K context per wave)
+    gring: int = 32             # batched: gather ring granules of 128 entries
+    scan_sd: int = 4            # batched: scan ring slots
+    scan_np: int = 16           # batched: pages per scan ring slot
+    pv: str = "bf16"            # batched: PV matmul operands "bf16" (p rounded) | "f32" (served)
+    kscale: float = 1.0         # batched: KV cache k_scale (served: scores and PV), static like the served kernel
+    thr_switch: int = 512       # batched: sum of a wave's local pages above which the threshold uses 2-bit digits
+    fault: str = ""             # batched: oracle fault controls (dsa_batched.FAULTS); timing / tests only
+    gunroll: int = 16           # batched: gather issue manual unroll
+    xkc: int = 256              # batched: union extraction chunk
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank."""
@@ -298,7 +313,8 @@ def stack_kinds(v, kinds):
 # ------------------------------------------------------------------------------------------
 
 def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debug=False,
-          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None, draft=False, dbg_part=True):
+          skip=frozenset(), axis_name=None, stack_w=None, stack_c=None, draft=False, dbg_part=True,
+          probe=False):
     """Returns (step_fn, info). step_fn(scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls, *weights,
     *caches) -> (out [M, H] bf16, *caches[, dbg_h, dbg_own]) for ONE rank; wrap in shard_map.
 
@@ -325,6 +341,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     pass). Only pass 0 writes KV (passes 1-2's rows are dead stores in main, never attended)."""
     assert set(skip) <= set(ABLATIONS), skip
     assert not draft or cfg.V > 0
+    DSA = "legacy" if draft else tiles.dsa
+    assert DSA in ("legacy", "batched"), DSA
+    assert not (probe and (draft or debug))
     R, L, H = cfg.R, cfg.L, cfg.H
     TMAX, RPR = cfg.TMAX, cfg.RPR
     BMAX = bmax or TMAX
@@ -410,7 +429,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         return lambda l: jnp.clip(f(l), 0, n - 1)
     WPOS = {k: lpos_fn(ls) for k, (ls, _, _) in wk.items()}
     CPOS = {k: lpos_fn(ls) for k, (ls, _, _) in ck.items()}
-    n_fixed = 12 if draft else 8
+    n_fixed = 12 if draft else (6 if probe else 8)
+    if probe:                                            # the DSA probe has no weights
+        w_names = []
     n_w = len(w_names)
     if draft:
         VR = cfg.V // R                                  # this rank's vocab rows
@@ -485,6 +506,16 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     for nm in ("ag", "q", "k", "a2a", "rso", "rsm"):
         scratch[nm + "_send"] = pltpu.SemaphoreType.DMA(())
         scratch[nm + "_recv"] = pltpu.SemaphoreType.DMA(())
+    if DSA == "batched":
+        for k_ in ("keys", "kpre", "tk_acc", "tk_cc", "cidx", "ksend", "kall", "gk", "gmk", "oslot", "oslot_s",
+                   "cand_v", "own_s", "own_v", "fb_s", "ipage", "ip_sem", "k_send", "k_recv", "rec_s",
+                   "own_u", "own_uv", "g_nope", "g_rope", "g_sem", "kvb", "qb", "q0b", "q1b", "att_acc",
+                   "m_s", "l_s", "nu_s", "uo_s", "nuo_s", "nown_s"):
+            scratch.pop(k_)
+        scratch.update(dsa_batched.scratch(cfg, tiles, max_pages, BMAX))
+    if probe:
+        scratch["p_sem"] = pltpu.SemaphoreType.DMA((4,))
+        scratch["p_req"] = pltpu.SMEM((4, BMAX), I32)
     wshape = {
         "qkv_a": (tk["qkv_a"], rup(cfg.QKVA)), "q_b": (tk["q_b"], NQB),
         "o_proj": (tk["o_proj"], H), "idx_wq": (tk["idx_wq"], cfg.IH * cfg.IDIM),
@@ -566,15 +597,26 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     s_names = list(scratch)
 
     def kernel(*refs):
+        NPIN = 6 if probe else 0
+        core = {}                                        # the batched DSA core's entry points (filled below)
         if draft:
             scal_a, rmeta_a, qmeta_a, bt, rvec_a, h0, tab_a, smalls, dmeta, emb_h, lm_h, eht_h = refs[:n_fixed]
+        elif probe:
+            scal, rmeta, qmeta, bt, rvec, sched = refs[:n_fixed]
+            h0 = rope_tab = smalls = None
         else:
             scal, rmeta, qmeta, bt, rvec, h0, rope_tab, smalls = refs[:n_fixed]
         w_in = refs[n_fixed:n_fixed + n_w]
-        c_in = refs[n_fixed + n_w:n_fixed + n_w + n_c]          # read-only (see build_writer)
-        o0 = n_fixed + n_w + n_c
-        out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
-        rest = refs[o0 + 4:]
+        pin = refs[n_fixed + n_w:n_fixed + n_w + NPIN]
+        c_in = refs[n_fixed + n_w + NPIN:n_fixed + n_w + NPIN + n_c]          # read-only (see build_writer)
+        o0 = n_fixed + n_w + NPIN + n_c
+        if probe:
+            p_osend, p_dbg_uv, p_dbg_req = refs[o0:o0 + 3]
+            rest = refs[o0 + 3:]
+            irec_out = None
+        else:
+            out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
+            rest = refs[o0 + 4:]
         if debug:
             dbg_h, dbg_own, dbg_lse, dbg_part = rest[:4]
             rest = rest[4:]
@@ -839,7 +881,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         # the stream starts before anything else
         for i_, v_ in enumerate((0, 0, 0, 0, 0, -1, 0, 0)):
             st[i_] = jnp.int32(v_)
-        pump("init")
+        if not probe:
+            pump("init")
 
         # ---------------- collectives ----------------
         if R > 1:
@@ -1098,25 +1141,36 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             else:
                 stage_rows(l)
 
-            @pl.when(jnp.logical_not(full_idx))
-            def _():
-                attn_first(l)
+            if DSA == "batched":
+                # 7: indexer (fresh top-k layers); 9: all-request gather ring + attention (IndexShare
+                # layers issue the ring before the q all-gather wait)
+                ph.mark("L_index")
 
-            # 7: indexer (fresh top-k layers)
-            ph.mark("L_index")
+                @pl.when(full_idx)
+                def _():
+                    indexer(l, slot)
+                ph.mark("L_attn")
+                core["attention"](l, full_idx, q_wait)
+            else:
+                @pl.when(jnp.logical_not(full_idx))
+                def _():
+                    attn_first(l)
 
-            @pl.when(jnp.logical_and(full_idx, "index" not in skip))
-            def _():
-                indexer(l, slot)
+                # 7: indexer (fresh top-k layers)
+                ph.mark("L_index")
 
-            @pl.when(full_idx)
-            def _():
-                attn_first(l)
+                @pl.when(jnp.logical_and(full_idx, "index" not in skip))
+                def _():
+                    indexer(l, slot)
 
-            # 9: per row: gather + attention -> partial + lse
-            ph.mark("L_attn")
-            q_wait()
-            attention(l)
+                @pl.when(full_idx)
+                def _():
+                    attn_first(l)
+
+                # 9: per row: gather + attention -> partial + lse
+                ph.mark("L_attn")
+                q_wait()
+                attention(l)
 
             # 10: A2A partials to head owners, LSE merge
             ph.mark("L_merge")
@@ -1181,7 +1235,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                                              scr["dbg_sem"].at[0]),
                        pltpu.make_async_copy(scr["res"].at[pl.ds(0, RPR)], dbg_h.at[l, 1],
                                              scr["dbg_sem"].at[0]),
-                       pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1]),
+                       ] + ([pltpu.make_async_copy(scr["own_v"], dbg_own.at[l], scr["dbg_sem"].at[1])]
+                            if "own_v" in scr else []) + [
                        pltpu.make_async_copy(scr["dbgl"], dbg_lse.at[l], scr["dbg_sem"].at[2]),
                        ] + ([pltpu.make_async_copy(scr["dbgo"], dbg_part.at[l], scr["dbg_sem"].at[2])]
                             if "dbgo" in scr else [])
@@ -1197,9 +1252,22 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             return carry
 
         # ---------------- indexer ----------------
-        def indexer(l, slot):
+        def indexer(l, slot, proj=True):
             IH, IDIM = cfg.IH, cfg.IDIM
             pi = Phases(tiles.trace)
+            if proj:
+                indexer_proj(l, slot, pi)
+            if DSA == "batched":
+                core["indexer_tail"](l)
+                if proj:
+                    pi.mark("I_recw")
+                    pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
+                pi.end()
+                return
+            indexer_tail_legacy(l, pi, proj)
+
+        def indexer_proj(l, slot, pi):
+            IH, IDIM = cfg.IH, cfg.IDIM
             pi.mark("I_proj")
             # q: fp8 linear (replicated), rope on dims 0..DR-1, fp8 per (row, head), bf16 scale
             xq, sx = quant_rows(scr["qc"][...])
@@ -1240,10 +1308,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             rec = jnp.concatenate([k8, jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) == 0,
                                                  e + 127, 0)], axis=1)        # [M, 256] bytes
             scr["rec_v"][...] = rec[0:TMAX]
-            cp = pltpu.make_async_copy(scr["rec_v"], scr["rec_s"], scr["misc_sem"])
-            cp.start()
-            cp.wait()
+            if DSA == "legacy":
+                cp = pltpu.make_async_copy(scr["rec_v"], scr["rec_s"], scr["misc_sem"])
+                cp.start()
+                cp.wait()
             pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).start()
+
+        def indexer_tail_legacy(l, pi, proj=True):
             # local scan per request -> keys per row -> local top-k -> ksend -> AG -> global top-KT
             def topk_round(klr, ph):
                 scr["ksend"][...] = jnp.full((TMAX, KR_, 128), INT_MIN, I32)
@@ -1308,8 +1379,9 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             cpb = pltpu.make_async_copy(scr["own_uv"], scr["own_u"], scr["misc_sem"])
             cpb.start()
             cpb.wait()
-            pi.mark("I_recw")
-            pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
+            if proj:
+                pi.mark("I_recw")
+                pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
             pi.end()
 
         def scan_request(l, b, klr=KR_):
@@ -2145,6 +2217,113 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 draft_prologue(lambda t_: scr["tok_s"][t_, 0] if t_ < XR else jnp.int32(0),
                                lambda t_: rmeta_a[l1 * TMAX + t_, 0] > 0 if t_ < XR else jnp.bool_(False), prev, slot)
 
+        def legacy_step_init():
+            scr["own_v"][...] = jnp.full(scr["own_v"].shape, -1, I32)
+            scr["own_uv"][...] = jnp.full(scr["own_uv"].shape, -1, I32)
+
+            def zn(t_, c):
+                scr["nown_s"][t_] = jnp.int32(0)
+                return c
+            lax.fori_loop(0, TMAX, zn, 0)
+
+            def zb(b_, c):
+                scr["nu_s"][b_] = jnp.int32(0)
+                scr["uo_s"][b_] = jnp.int32(0)
+                scr["nuo_s"][b_] = jnp.int32(0)
+                return c
+            lax.fori_loop(0, BMAX, zb, 0)
+
+        def run_probe():
+            """DSA probe: per scheduled layer (sched[i], i < scal[2]) the index tail (fresh layers) and the
+            gather + attention on precomputed inputs (iqv / wts / rec_v / qall / wrow / rwrow per layer);
+            osend -> p_osend[l] (every layer if scal[3] else the last), fresh layers' union / owned lists
+            -> p_dbg_uv[l], p_dbg_req[l]."""
+            scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
+            if DSA == "batched":
+                core["step_init"]()
+            else:
+                legacy_step_init()
+            iqv_in, wts_in, rec_in, qall_in, wrow_in, rwrow_in = pin
+            n_it = scal[2]
+            wflag = scal[3]
+            psem = scr["p_sem"]
+            pairs = ((iqv_in, "iqv"), (wts_in, "wts"), (rec_in, "rec_v"), (qall_in, "qall"),
+                     (wrow_in, "wrow"), (rwrow_in, "rwrow"))
+
+            def load(l):
+                for src_, nm_ in pairs:
+                    pltpu.make_async_copy(src_.at[l], scr[nm_], psem.at[0]).start()
+                for src_, nm_ in pairs:
+                    pltpu.make_async_copy(src_.at[l], scr[nm_], psem.at[0]).wait()
+                if DSA == "legacy":
+                    c_ = pltpu.make_async_copy(scr["rec_v"], scr["rec_s"], psem.at[1])
+                    c_.start()
+                    c_.wait()
+
+            def it(i, prev):
+                l = sched[i]
+
+                @pl.when(l != prev)
+                def _():
+                    load(l)
+                full = jnp.logical_or(l < cfg.idx_skip,
+                                      jnp.logical_and(l >= cfg.idx_skip,
+                                                      (l - cfg.idx_skip) % cfg.idx_freq == cfg.idx_freq - 1))
+                ph = Phases(tiles.trace)
+                ph.mark("P_index")
+
+                @pl.when(full)
+                def _():
+                    indexer(l, None, proj=False)
+                ph.mark("P_attn")
+                if DSA == "batched":
+                    core["attention"](l, full, lambda: None)
+                else:
+                    attn_first(l)
+                    attention(l)
+                ph.end()
+                wr = jnp.logical_or(wflag > 0, i == n_it - 1)
+
+                @pl.when(wr)
+                def _():
+                    c_ = pltpu.make_async_copy(scr["osend"], p_osend.at[l], psem.at[2])
+                    c_.start()
+                    c_.wait()
+
+                @pl.when(jnp.logical_and(wr, full))
+                def _():
+                    if DSA == "batched":
+                        src_ = scr["own_uv"]
+                        for b_ in range(BMAX):
+                            for k_ in range(3):
+                                scr["p_req"][k_, b_] = scr["b_req"][b_, k_]
+                    else:
+                        src_ = scr["own_v"]
+                        for t_ in range(TMAX):
+                            scr["p_req"][0, t_] = scr["nown_s"][t_]
+                    c1 = pltpu.make_async_copy(src_, p_dbg_uv.at[l], psem.at[3])
+                    c2 = pltpu.make_async_copy(scr["p_req"], p_dbg_req.at[l], psem.at[3])
+                    c1.start()
+                    c2.start()
+                    c1.wait()
+                    c2.wait()
+                return l
+            lax.fori_loop(0, n_it, it, jnp.int32(-1))
+
+        # ---------------- batched DSA core ----------------
+        if DSA == "batched":
+            E_ = types.SimpleNamespace(
+                cfg=cfg, tiles=tiles, scr=scr, max_pages=max_pages, BMAX=BMAX, me=me, scal=scal, rmeta=rmeta,
+                qmeta=qmeta, bt=bt, rvec=rvec, skip=skip, MB_SH=MB_SH, SRC_MASK=SRC_MASK, QA=QA, QH=QH, OH=OH,
+                sm_scale=sm_scale, Phases=Phases, csel=csel, mxu=mxu, fp8_decode_hw=fp8_decode_hw,
+                mono_key=mono_key, pack2=pack2, unpack_lo=unpack_lo, unpack_hi=unpack_hi, bf=bf,
+                misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M, debug=debug, nb=nb)
+            core.update(dsa_batched.make(E_))
+
+        if probe:
+            run_probe()
+            return
+
         # ---------------- step ----------------
         pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
         if draft:
@@ -2161,20 +2340,10 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["h"][...] = own_rows_pad(jnp.concatenate(h_rows, axis=0))
             scr["res"][...] = jnp.zeros((RO8, H), F32)
         scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
-        scr["own_v"][...] = jnp.full(scr["own_v"].shape, -1, I32)
-        scr["own_uv"][...] = jnp.full(scr["own_uv"].shape, -1, I32)
-
-        def zn(t_, c):
-            scr["nown_s"][t_] = jnp.int32(0)
-            return c
-        lax.fori_loop(0, TMAX, zn, 0)
-
-        def zb(b_, c):
-            scr["nu_s"][b_] = jnp.int32(0)
-            scr["uo_s"][b_] = jnp.int32(0)
-            scr["nuo_s"][b_] = jnp.int32(0)
-            return c
-        lax.fori_loop(0, BMAX, zb, 0)
+        if DSA == "batched":
+            core["step_init"]()
+        else:
+            legacy_step_init()
         if "weights" in skip:
             for k in tkinds:
                 scr["ibuf_" + k][...] = jnp.zeros(scr["ibuf_" + k].shape, wdtype[k])
@@ -2191,6 +2360,31 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
         out_ref[...] = gather_rows_all(y, "ag_send", "ag_recv").astype(BF16)
 
     # ---------------- pallas_call ----------------
+    if probe:
+        bg = dsa_batched.geometry(cfg, tiles, max_pages, BMAX)
+        uv_shape = (L, bg["UR2"], 128) if DSA == "batched" else (L, TMAX, KR_, 128)
+        call = pl.pallas_call(
+            kernel,
+            name=f"glm5_mk_dsa_probe_{DSA}",
+            out_shape=[jax.ShapeDtypeStruct((L, R, TMAX, OW), U32), jax.ShapeDtypeStruct(uv_shape, I32),
+                       jax.ShapeDtypeStruct((L, 4, BMAX), I32)],
+            in_specs=([pl.BlockSpec(memory_space=pltpu.SMEM)] * 4 + [pl.BlockSpec(memory_space=pltpu.VMEM)]
+                      + [pl.BlockSpec(memory_space=pltpu.SMEM)] + [pl.BlockSpec(memory_space=pl.ANY)] * (6 + n_c)),
+            out_specs=[pl.BlockSpec(memory_space=pl.ANY)] * 3,
+            scratch_shapes=[scratch[k] for k in s_names],
+            compiler_params=pltpu.CompilerParams(
+                collective_id=COLLECTIVE_ID if R > 1 else None, vmem_limit_bytes=100 * 1024 * 1024,
+                disable_bounds_checks=True),
+            interpret=pltpu.InterpretParams() if interpret else False,
+        )
+        vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
+                   if str(getattr(v, "memory_space", "")).lower().endswith("vmem")}
+        pin_shapes = [((L, cfg.IH, M + QB8, 128), F32), ((L, M + QB8, 128), F32), ((L, TMAX, 256), I32),
+                      ((L, R, TMAX, QH), U32), ((L, TMAX, 128), U32), ((L, TMAX, 128), U32)]
+        return call, dict(s_names=s_names, w_names=[], c_names=c_names, M=M, ck=ck, OW=OW, OH=OH, QH=QH,
+                          QA=QA, uv_shape=uv_shape, pin_shapes=pin_shapes, MB_SH=MB_SH, KR_=KR_, UR_=UR_,
+                          vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by, stack_c=SC, dsa=DSA,
+                          geometry=bg)
     in_specs = ([pl.BlockSpec(memory_space=pltpu.SMEM)] * 4
                 + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 3
                 + [pl.BlockSpec(memory_space=pl.ANY)]
@@ -2223,7 +2417,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
                if str(getattr(v, "memory_space", "")).lower().endswith("vmem")}
     info = dict(s_names=s_names, w_names=w_names, c_names=c_names, tk=tk, S=S, ROWSL=ROWSL, M=M, wk=wk,
-                ck=ck, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by, stack_w=SW, stack_c=SC)
+                ck=ck, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by, stack_w=SW, stack_c=SC, dsa=DSA)
     if draft:
         info.update(VR=VR, VRP=VRP, XR=XR, DH=DH)
     return call, info
